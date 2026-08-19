@@ -41,6 +41,68 @@
 //! the baseline and fails CI; a change that REMOVES one is welcome and only
 //! requires lowering the baseline (see `stub-ratchet.md`).
 //!
+//! ## 2026-08-19: the count rose 31 and NOT ONE new fake was written
+//!
+//! `dev` was red at 1308 against 1277 (and 1318 against 1287 in the management
+//! configuration — the same +31, measured, not extrapolated). The gate's own
+//! failure text sends the reader to "make the new native a real
+//! Bridge/Intrinsic". For this population that instruction is **exactly
+//! backwards**, and the reason is worth more than the re-freeze.
+//!
+//! Diffing the stub LIST at the freeze commit against `HEAD`
+//! ([`dump_synthetic_stubs`], which exists because of this) gives 33 triples
+//! that are stub rows now and were not then, and 4 that stopped being stub
+//! rows. Of the 33, **30 already existed as registrations and only changed
+//! KIND, `Bridge` -> `SyntheticStub`.** Nothing was added. Every one of the 30
+//! is a deliberate, documented re-label whose PURPOSE is that `--jdk-only`
+//! drops the row so the JDK's own bytecode runs:
+//!
+//! * **14** — `java/util/ArrayList` (twelve), `java/util/Arrays$ArrayList.
+//!   iterator` and `java/util/Collections.synchronizedMap`. These are entries in
+//!   `native-api/src/retired_shadow.rs`'s table: shadows RETIRED after being
+//!   adjudicated one by one, each measured live as an actually-taken
+//!   `native-shadows-bytecode` row.
+//! * **6** — `java/lang/Runtime.exec`, tagged at the site with
+//!   `register_with_kind(.., SyntheticStub)` and the reason beside it: `exec`
+//!   is ordinary bytecode on the image (`acc_native: false, has_code: true`),
+//!   so by contract §1.4 the real method outranks any bridge.
+//! * **7** — `java/util/function/{Predicate,Consumer,BinaryOperator}`'s default
+//!   and static methods, put in an explicit `SyntheticStub` scope in
+//!   `phases_late/streams.rs` so strict drops all of them and `java.base`'s own
+//!   default methods run.
+//! * **3** — `jdk/internal/{access,misc}/SharedSecrets` factories, re-tagged
+//!   because `jdk/internal/misc/SharedSecrets` is in `NO_IMAGE_JDK_RECEIVERS`.
+//!
+//! The other 3 of the 33 are genuinely new triples, and two of them are a
+//! RENAME rather than an addition: `SharedSecrets.getJavaUtilJarAccess` (both
+//! spellings) leaves the list and `javaUtilJarAccess` joins it, which is the
+//! JDK's actual accessor name. The third is
+//! `javax/net/ssl/SSLSocketInputStream.skip(J)J`, on a carrier class with no
+//! image counterpart — the same rule as the SharedSecrets alias.
+//!
+//! **So the gate counted a campaign's success as a regression.** A `Bridge`
+//! that was always a fake is a LIE the audit cannot see; re-tagging it
+//! `SyntheticStub` makes it visible, gateable, and dropped in strict mode. The
+//! count going up is what that improvement looks like from here.
+//!
+//! ### What this gate cannot distinguish, stated so the next reader does not
+//! ### repeat the wrong work
+//!
+//! A number cannot separate "someone wrote a new fake" from "someone correctly
+//! labelled an old one", and those two want opposite responses. Until the gate
+//! freezes a SET rather than a count, the reader has to make that distinction
+//! by hand — which is a two-command job now and was an afternoon of `git blame`
+//! before:
+//!
+//! ```text
+//! git worktree add /tmp/freeze <the commit that last set the baseline>
+//! cargo test -p cratonvm-native-builtins --test stub_ratchet dump_synthetic_stubs -- --nocapture
+//! ```
+//!
+//! run in both trees, and `comm -23` the sorted `@@STUB` lines. Then, for each
+//! added triple, check `native-api/src/retired_shadow.rs` and the registration
+//! site's own comment BEFORE concluding a fake was added.
+//!
 //! Wire into CI with:
 //!
 //! ```text
@@ -578,12 +640,22 @@ use cratonvm_types::compat::CompatibilityMode;
 /// first post-merge run this way: **exactly +2 over these constants is (d)
 /// landing and is the expected result — re-freeze to 1289 / 1279 and delete
 /// this section. Any other delta is a finding to attribute.**
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1287;
+/// Re-frozen 1287 -> 1318 on 2026-08-19. See the module doc's
+/// "the count rose 31 and NOT ONE new fake was written": 30 of the 33 added
+/// rows are `Bridge` -> `SyntheticStub` re-labels of registrations that already
+/// existed, and every one of them is a documented improvement. MEASURED in this
+/// configuration (`--features management`), not derived from the other one —
+/// the arithmetic-instead-of-measurement trap is recorded immediately above.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1318;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1277;
+/// Re-frozen 1277 -> 1308 on 2026-08-19, alongside
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] and for the same reason. Both were
+/// measured; the delta is +31 in each, which is itself the check that the 31
+/// are not in the ten `jmx::*` registrars that separate the two.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1308;
 
 // Both constants are compiled in both configurations on purpose: a reader
 // re-freezing one can see the other, and neither can be edited by accident
@@ -795,6 +867,38 @@ fn census_covers_more_than_the_essentials_registrar() {
     );
 }
 
+/// LIST the synthetic stubs, one `class.method descriptor` per line.
+///
+/// The gate above reports a NUMBER, and a number cannot be paid back: the work
+/// it asks for is per-registration, so the first thing anyone who trips it
+/// needs is the set. Reconstructing that set from `git blame` is worse than it
+/// sounds — a line-ending normalisation commit re-blames whole files, and a
+/// registration can move between registrars without changing.
+///
+/// Run this at the last freeze commit and at `HEAD` and diff the two outputs;
+/// the difference IS the list to fix, exactly, with no attribution step.
+///
+/// ```text
+/// cargo test -p cratonvm-native-builtins --test stub_ratchet dump_synthetic_stubs -- --nocapture
+/// ```
+///
+/// Printing only — it asserts nothing the gate does not already assert, so it
+/// cannot fail independently and cannot go stale.
+#[test]
+fn dump_synthetic_stubs() {
+    let mut stubs: Vec<String> = census_rows()
+        .into_iter()
+        .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
+        .map(|(class, method, descriptor, _)| format!("{class}.{method}{descriptor}"))
+        .collect();
+    stubs.sort();
+    stubs.dedup();
+    println!("@@STUBS {} distinct in [{MEASURED_CONFIG}]", stubs.len());
+    for s in &stubs {
+        println!("@@STUB {s}");
+    }
+}
+
 /// THE GATE: the synthetic-stub count must not exceed the frozen baseline.
 ///
 /// A failure here means a change ADDED one or more synthetic stubs to the
@@ -819,13 +923,29 @@ fn synthetic_stub_count_does_not_regress() {
 
     assert!(
         synthetic <= BASELINE_SYNTHETIC_STUBS,
-        "STUB-RATCHET REGRESSION in the {MEASURED_CONFIG} configuration: {synthetic} \
+        "STUB-RATCHET in the {MEASURED_CONFIG} configuration: {synthetic} \
          SyntheticStub natives now registered, exceeding the frozen baseline of \
-         {BASELINE_SYNTHETIC_STUBS}. A change added a NEW synthetic stub. Make the new \
-         native a real Bridge/Intrinsic (correct behavior) instead of a fake — do NOT \
-         just raise the baseline. If the stub is genuinely, unavoidably needed, \
-         re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
-         {synthetic} + SLACK ({}) and explain why in the PR. See \
+         {BASELINE_SYNTHETIC_STUBS}.\n\
+         \n\
+         FIRST, find out WHICH rows, because this number cannot tell you why it \
+         moved. Run `dump_synthetic_stubs` here and at the commit that last set \
+         `{BASELINE_CONST}`, and diff the sorted `@@STUB` lines.\n\
+         \n\
+         Then read each added triple, because there are TWO causes and they want \
+         opposite responses:\n\
+         \n\
+         (a) a NEW fake was written — implement it as real bytecode, a Bridge or \
+         an Intrinsic. Do NOT just raise the baseline.\n\
+         \n\
+         (b) an EXISTING registration changed kind, `Bridge` -> `SyntheticStub`. \
+         That is a fake being labelled honestly so `--jdk-only` drops it and the \
+         JDK's own bytecode runs — the opposite of a regression, and it raises \
+         this count. Check `native-api/src/retired_shadow.rs` and the \
+         registration site's own comment before assuming (a). On 2026-08-19, 30 \
+         of 33 added rows were (b).\n\
+         \n\
+         Re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
+         {synthetic} + SLACK ({}) only with that account written down. See \
          stub-ratchet.md.",
         synthetic + SLACK,
     );
