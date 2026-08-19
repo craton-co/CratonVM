@@ -4907,7 +4907,24 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
     // Fix (item 6): the backed-view class returned by `subList`.
     register_al_sublist_natives(r);
     // The classes a map's `values()`/`entrySet()` view is minted under.
-    register_map_view_carrier_natives(r);
+    //
+    // RETAGGED per subsystem — the set-view carriers' sibling, and safe for the
+    // same measured reason.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry` + the reflection split in
+    // `regression-suite/probes/NotDeclaredSplit.java`, `--jdk-only`):
+    //   registrations 84 | invocations 2 | overwrote 0
+    //   46 not-declared-here rows resolve as 46 INHERITED-CONCRETE and
+    //   **0 ABSTRACT-INTERFACE**; the other 38 are declared with code here.
+    //
+    // Every row resolves to a concrete method with a body, so the header's
+    // user-implementor dispatch hazard does not apply. Ranked by the CORRECTED
+    // criterion (reflection split, not the raw not-declared-here count) — see
+    // the note at `register_set_view_carrier_natives`.
+    r.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_map_view_carrier_natives,
+    );
 }
 
 /// The `Collection` surface of a map view, registered on each of the
