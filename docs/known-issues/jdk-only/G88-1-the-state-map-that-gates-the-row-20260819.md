@@ -207,3 +207,59 @@ wave 2 from "reclassify 1300 registrations" into a list of clusters with a
 size, a crate span and a vector that proves each. This record contains two of
 them: the map/set cluster (ten registrars, one crate, three vectors green when
 moved together) and Properties/Hashtable (two crates, blocked by §8).
+
+## 8. The wave-1 tail, worked — and two ways a "safe-looking" registrar is not
+
+After §6 the cluster map's remaining wave-1-eligible entries were small. Working
+them produced one landed retag, one revert, and one refusal to act — each for a
+different reason, which is the useful part.
+
+**LANDED.** `stream_decoder` (10) and `stream_encoder` (12) in `native-io`, plus
+`string_rw` (1). All three had a `JDK-ONLY-CLASSIFY: stub` verdict written above
+a `Bridge` tag — the classification was already made in-tree and only the tag
+disagreed. Arms green; charset decoding is not a niche path, so 101 vectors
+passing with the shim refused is worth more than 22 registrations suggests.
+
+**REVERTED — a correct classification is not a licence.**
+`register_scanner_natives` (40 registrations, 0 invocations) is correctly
+classified "stub": `java.util.Scanner` declares no `ACC_NATIVE` method. Retagged,
+the strict arm failed —
+
+```
+RJdkIntrinsics3: findWithinHorizon(String, 0) expected "42", got null
+```
+
+— because this VM OWNS a Scanner's state: an `Arc<str>` source and a Rust regex
+tokenizer (`G71-1`). **"Stub" describes what the code IS; load-bearing describes
+what the VM currently DEPENDS ON.** They are different questions and this file
+already knew it: its `FileInputStream` block says "correctly tagged, and the tag
+is LOAD-BEARING". §5's cluster rule sharpens to include clusters of ONE.
+
+**NOT ACTED ON — the census stopped a blind retag.**
+`vm/src/runtime/instrument.rs`: 33 registrations, 0 invocations, 0 `overwrote`,
+all `Bridge`, one class VM-internal (`cratonvm/Instrument`). Every superficial
+signal said "safe". Every one of the 33 also read `class-not-loaded`, i.e. NO
+census verdict — nothing in the corpus loads the instrumentation surface.
+
+Force-loading the two real classes (`regression-suite/probes/InstrCensus.java`,
+the `G79-1` pattern) gives the verdict:
+
+| verdict | count |
+| --- | ---: |
+| **`ACC_NATIVE` — genuine bridge** | **10** |
+| has bytecode (shim) | 13 |
+| not declared here | 3 |
+| class-not-loaded (`cratonvm/Instrument`) | 7 |
+
+The ten are `InstrumentationImpl.redefineClasses0`, `retransformClasses0`,
+`getAllLoadedClasses0`, `getInitiatedClasses0`, `getObjectSize0`,
+`isModifiableClass0`, `isRetransformClassesSupported0`,
+`appendToClassLoaderSearch0` and two more — JNI-backed leaves that MUST stay
+`Bridge`. **A wholesale retag would have dropped all ten.** It needs the
+per-group split `native-awt` got (`G80-1` §4b), not a single tag change, and it
+cannot be verified anyway at 0 invocations.
+
+**The discipline that caught it is worth stating on its own:** `class-not-loaded`
+is not a verdict. Reading it as "nothing objectionable found" is how a blind
+retag gets shipped, and this registrar is the case where it would have cost ten
+real bridges.
