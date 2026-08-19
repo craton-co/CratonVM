@@ -46,9 +46,25 @@ public final class LongBoxOracle {
     public static void main(String[] args) {
         // Warm: drive both helpers through the tiering thresholds so the values
         // below are produced by compiled code, not by the interpreter.
-        for (int i = 0; i < 400000; i++) {
-            sink += box(i).longValue() + box(-i).longValue();
+        //
+        // The round trip lives in its OWN small method, called many times, and
+        // is repeated as a loop inside `main`. Both shapes are needed and
+        // neither is decoration: the first is what the single-pass whole-method
+        // door compiles, the second is what the OSR door compiles, and the
+        // `Long` binds exist at both. An earlier cut of this probe warmed only
+        // through `box(i).longValue()` in `main` and reported
+        // `Long.valueOf=2 Long.longValue=0` — it verified half of what it
+        // claimed to. Read the bind counters
+        // (`CRATONVM_DBG_JIT_METHOD_STATS=1`) beside this output: BOTH must be
+        // non-zero, or the run agreed about a path it never took.
+        for (int r = 0; r < 200; r++) {
+            sink += roundTrip(20000);
         }
+        long warm = 0;
+        for (int i = 0; i < 400000; i++) {
+            warm += Long.valueOf(i * 7919L).longValue();
+        }
+        sink += warm;
 
         System.out.println("== values ==");
         for (long v : VALUES) {
@@ -98,7 +114,12 @@ public final class LongBoxOracle {
         System.out.println("sinkNonZero=" + (sink != 0));
     }
 
-    private static Long box(long v) {
-        return Long.valueOf(v);
+    /** One box + one unbox per iteration, in a method small enough to compile. */
+    private static long roundTrip(int n) {
+        long a = 0;
+        for (int i = 0; i < n; i++) {
+            a += Long.valueOf(i * 2654435761L).longValue();
+        }
+        return a;
     }
 }

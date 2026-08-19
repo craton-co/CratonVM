@@ -77,13 +77,26 @@ session did.
    `buffer-alignment-abort-cluster-not-a-cratonvm-bug-20260819.md`.
 3. **3 HTTP/2 classes**: `DataCompressionHttp2Test`,
    `UniformStreamByteDistributorFlowControllerTest`,
-   `WeightedFairQueueRemoteFlowControllerTest`.
+   `WeightedFairQueueRemoteFlowControllerTest`. **TRIAGED 2026-08-19, closed.**
+   The two flow controllers were a harness gap — `common.args` never passed
+   `-ea`, so the netty internal `assert`s their 6 shared tests exist to
+   observe were no-ops. The flag is passed now and both are
+   `found=34 ok=34 failed=0`, deterministically, 3 isolated reruns per arm.
+   `DataCompressionHttp2Test` is the already-documented snappy throughput
+   wall: recompiled with its 5 s `await` raised to 600 s, all 42 tests pass,
+   the two snappy arms taking 8.1 s and 11.0 s. See
+   `http2-flowcontroller-ea-and-datacompression-snappy-20260819.md`.
 4. **`BouncyCastleEngineAlpnTest`**, **`NioUdtByteRendezvousChannelTest`**
    (the latter plausibly needs a native UDT library this host doesn't have
    — check before treating as a defect).
 5. **`HashedWheelTimerTest`** — see regressions below, it's both a
    still-open class on G1 (was already non-passing there) and an apparent
-   new fail on default/ZGC.
+   new fail on default/ZGC. **ROOT-CAUSED 2026-08-19**: the wheel's bucket
+   arithmetic is correct (nothing fires early at any N, and at N ≤ 10 000 the
+   max delay is 257 ms against the algorithm's own 325 ms worst case). The
+   failure is the per-call dispatch floor — the worker needs ~669 ms to
+   transfer and expire 100 000 tasks where the test allows ~450. See
+   `hashedwheeltimertest-late-task-firing-RETIRED-20260819.md`.
 
 ## Three apparent regressions on default and ZGC (not G1) — likely environment, not code
 
