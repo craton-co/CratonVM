@@ -2,7 +2,11 @@
 
 **Status:** FIXED (17 of 19 measured rows), 2 rows deliberately left and costed.
 **Provenance:** both VMs. Oracle HotSpot 25.0.3+9-LTS; CratonVM
-`C:/craton/target-nolto`, `--jdk-only`. Probe
+`C:/craton/target-nolto`, `--jdk-only`. **Re-verified on the fat-LTO binary**
+(`C:/craton/target-rel13`): both probes give identical row counts (Sweep16 2 of
+44, Sweep12 0 of 26), the vector passes with the same 483 checks, and all three
+arms sit at baseline by name — 100/100, 95/100, 61/62. The non-LTO and LTO
+builds agree, so no release claim rests on the faster build alone. Probe
 `regression-suite/probes/Sweep16ReadStringCallers.java` (44 rows). Vector rows
 in `regression-suite/src/RJdkBridge1.java`, family `surrog` (82 → 111).
 The `URI.relativize` half also closes `G75-1` N3, verified by
