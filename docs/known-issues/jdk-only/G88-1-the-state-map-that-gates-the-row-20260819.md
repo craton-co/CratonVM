@@ -184,8 +184,23 @@ per-group split, the `unmodifiable` wrappers, the factories, `Comparator`,
 
 ## 7. NOMINATION
 
-**N4 — map the clusters BEFORE the wave-2 work starts, and map them by
-ownership rather than by crate.** The two instruments needed both exist and
+**N4 — PARTLY DONE, with its limitation stated.**
+`regression-suite/probes/cluster-map.py` builds the map from a registry dump.
+First result, 2026-08-19: **only 8 of 48 clusters are confined to a crate that
+is not `native-builtins`, and they hold 303 registrations between them.** The
+rest touch the file contract §8 protects. That ratio is the honest scale of
+what wave 1 can reach, and it is consistent with where this session's 404
+retagged registrations actually came from.
+
+The join is per FILE and OVER-MERGES: `native-builtins/src/lib.rs` holds dozens
+of unrelated registrars, so its top "cluster" is 9324 registrations over 889
+classes spanning four crates — an artefact, not an ownership group. Only the
+small clusters are trustworthy as-is. Sharpening it means joining by REGISTRAR
+FUNCTION (the line→enclosing-`fn` technique from `G79-1`), which needs per-crate
+source parsing. Stated rather than left to be discovered.
+
+*Original nomination, for the record:* map the clusters before wave 2 starts,
+by ownership rather than by crate. The two instruments needed both exist and
 are cheap: `--dump-native-registry` gives `registered_by` per registration, so
 grouping by (class → registrars → crates) is a script. The map is what turns
 wave 2 from "reclassify 1300 registrations" into a list of clusters with a
