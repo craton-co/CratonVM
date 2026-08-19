@@ -744,13 +744,24 @@ thread_local! {
     /// hot loop containing a `getstatic` (e.g. `name.toLowerCase(Locale.ENGLISH)`,
     /// which reads `Locale.ENGLISH` every iteration) degraded sharply as soon
     /// as more than one mutator thread ran it.
-    static CLASS_INITIALIZED_MEMO: std::cell::RefCell<Vec<(usize, u32)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// # A `Vec` with a 64-entry cap until 2026-08-19, and the cap was the bug
+    ///
+    /// The memo was linear-scanned and evicted FIFO with `remove(0)`. Below 64
+    /// hot classes that is fine; above it the structure THRASHES -- every call
+    /// scans all 64 entries, misses, takes the process-wide `class_manager`
+    /// `RwLock` anyway, then pays an O(64) shift to evict. The memo stops
+    /// paying for itself at exactly the workloads that need it most, and
+    /// `is_class_initialized_via_manager` measured **3.11%** of
+    /// `LegendreHighPrecisionTest`.
+    ///
+    /// An `FxHashSet` with no cap removes both costs. Unbounded is right here:
+    /// an entry is one `(vm, ClassId)` pair, so the set is bounded by the
+    /// number of classes the VM ever loads -- a few thousand at most, 12 bytes
+    /// each, per thread that asks. Capping a structure whose key space is
+    /// already bounded buys nothing and reintroduces the thrash.
+    static CLASS_INITIALIZED_MEMO: std::cell::RefCell<rustc_hash::FxHashSet<(usize, u32)>> =
+        std::cell::RefCell::new(rustc_hash::FxHashSet::default());
 }
-
-/// Entry cap for [`CLASS_INITIALIZED_MEMO`]. Linear-scanned; one entry per
-/// distinct class whose statics this thread touches on a hot path.
-const CLASS_INITIALIZED_MEMO_CAP: usize = 64;
 
 /// Round-9 vm CRIT-1 fix: convenience wrapper that takes a
 /// `ClassId`, briefly holds `class_manager.read()` to resolve it to a
@@ -767,7 +778,7 @@ const CLASS_INITIALIZED_MEMO_CAP: usize = 64;
 pub fn is_class_initialized_via_manager(shared: &SharedVm, class_id: ClassId) -> bool {
     let vm_key = shared as *const SharedVm as usize;
     let raw = class_id.as_u32();
-    if CLASS_INITIALIZED_MEMO.with(|memo| memo.borrow().iter().any(|e| *e == (vm_key, raw))) {
+    if CLASS_INITIALIZED_MEMO.with(|memo| memo.borrow().contains(&(vm_key, raw))) {
         return true;
     }
     let initialized = {
@@ -779,11 +790,7 @@ pub fn is_class_initialized_via_manager(shared: &SharedVm, class_id: ClassId) ->
     };
     if initialized {
         CLASS_INITIALIZED_MEMO.with(|memo| {
-            let mut memo = memo.borrow_mut();
-            if memo.len() >= CLASS_INITIALIZED_MEMO_CAP {
-                memo.remove(0);
-            }
-            memo.push((vm_key, raw));
+            memo.borrow_mut().insert((vm_key, raw));
         });
     }
     initialized
