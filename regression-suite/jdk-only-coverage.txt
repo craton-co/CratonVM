@@ -120,7 +120,10 @@ row in docs/jdk-only-runtime-services.md it maps to (P0/P1 table).
                                                        a split brain; every assertion here is
                                                        a value such a model gets wrong)
   headless AWT contracts        RJdkAwtHeadless    P0 "Wholesale Bridge over-tagging"
-                                                   P2 "Headful AWT"
+                                                   P2 "Headful AWT"  <-- CLOSES this
+                                                   row under closure rule 5; the
+                                                   headfulRefused() section IS the
+                                                   test that closure names.
                                                    (the suite had NO AWT coverage at all, so
                                                    all three arms were blind to the subsystem
                                                    the over-tagging row nominates for retagging

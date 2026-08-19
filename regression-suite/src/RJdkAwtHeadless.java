@@ -1,6 +1,11 @@
 import java.awt.Color;
 import java.awt.Graphics2D;
+import java.awt.Frame;
 import java.awt.GraphicsEnvironment;
+import java.awt.HeadlessException;
+import java.awt.MouseInfo;
+import java.awt.Toolkit;
+import java.awt.Window;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
 import java.awt.image.ColorModel;
@@ -253,6 +258,58 @@ public class RJdkAwtHeadless {
         System.out.println("CK RJdkAwtHeadless raster=ok");
     }
 
+    // ---- the HEADFUL contract: out of scope, and failing correctly ----------
+    // This is the test the P2 "Headful AWT" row's closure rule 5 requires:
+    // "explicitly out of scope, failing with a specification-consistent error
+    // rather than a fabricated success". A fabricated Frame would be the
+    // failure mode; HeadlessException is the contract. All of these were
+    // already correct when measured -- the rows exist so they STAY correct,
+    // because a future retag decides which implementation answers each call.
+    static void headfulRefused() {
+        refuses("new Frame()", () -> new Frame());
+        refuses("new Window(null)", () -> new Window(null));
+        refuses("Toolkit.getScreenSize()", () -> Toolkit.getDefaultToolkit().getScreenSize());
+        refuses("Toolkit.getScreenResolution()",
+                () -> Toolkit.getDefaultToolkit().getScreenResolution());
+        refuses("getScreenDevices()",
+                () -> GraphicsEnvironment.getLocalGraphicsEnvironment().getScreenDevices());
+        refuses("getDefaultScreenDevice()",
+                () -> GraphicsEnvironment.getLocalGraphicsEnvironment().getDefaultScreenDevice());
+        refuses("getSystemClipboard()", () -> Toolkit.getDefaultToolkit().getSystemClipboard());
+        refuses("MouseInfo.getPointerInfo()", () -> MouseInfo.getPointerInfo());
+
+        check("sun.java2d.HeadlessGraphicsEnvironment".equals(
+                        GraphicsEnvironment.getLocalGraphicsEnvironment().getClass().getName()),
+                "the local GE is the headless wrapper, got "
+                        + GraphicsEnvironment.getLocalGraphicsEnvironment().getClass().getName());
+
+        // Font FAMILIES are not headful: the five logical families are
+        // guaranteed by the specification and present on HotSpot headless too.
+        // Only the five are asserted -- physical fonts vary by machine, so a
+        // vector cannot pin the full list without pinning the host.
+        java.util.List<String> fams = java.util.Arrays.asList(
+                GraphicsEnvironment.getLocalGraphicsEnvironment().getAvailableFontFamilyNames());
+        for (String logical : new String[] {"Dialog", "DialogInput", "Monospaced",
+                "SansSerif", "Serif"}) {
+            check(fams.contains(logical), "the logical font family " + logical
+                    + " must be available headless");
+        }
+        System.out.println("CK RJdkAwtHeadless headful=refused");
+    }
+
+    interface Act { Object run() throws Exception; }
+
+    static void refuses(String what, Act a) {
+        try {
+            a.run();
+            check(false, what + " must throw HeadlessException, it returned normally");
+        } catch (HeadlessException e) {
+            check(true, what);
+        } catch (Exception e) {
+            check(false, what + " must throw HeadlessException, got " + e.getClass().getName());
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         System.setProperty("java.awt.headless", "true");
         check(GraphicsEnvironment.isHeadless(), "the vector must run headless");
@@ -265,6 +322,7 @@ public class RJdkAwtHeadless {
         bounds();
         rasterModel();
         imageio();
+        headfulRefused();
 
         System.out.println("CK RJdkAwtHeadless checks=" + checks);
         System.out.println("PASS RJdkAwtHeadless (" + checks + " checks)");

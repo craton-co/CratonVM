@@ -872,6 +872,55 @@ fn register_headless_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/awt/GraphicsEnvironment;",
         |ctx, _args| build_local_graphics_environment(ctx),
     );
+
+    // Font family enumeration.
+    //
+    // MEASURED (G81-1): this threw a NullPointerException, because the real
+    // implementation walks `sun.font` machinery that has no platform font
+    // service behind it here. An NPE is not an acceptable answer under EITHER
+    // reading of the closure rule: it is not a working implementation, and it
+    // is not a "specification-consistent error" — rule 5 names
+    // `UnsupportedOperationException` and friends, not a null dereference from
+    // the middle of the JDK.
+    //
+    // What is returned is the five LOGICAL font families, which the Java
+    // specification guarantees every implementation provides
+    // (`Font.DIALOG`, `DIALOG_INPUT`, `SANS_SERIF`, `SERIF`, `MONOSPACED`).
+    // That is a truthful answer rather than a fabricated one: these are the
+    // families this VM can actually name, and HotSpot lists all five too. It
+    // is deliberately NOT the complete list HotSpot returns — physical fonts
+    // are a platform service CratonVM does not have — and no test can assert
+    // the complete list anyway, because it varies by machine.
+    fn logical_font_families(ctx: &mut dyn NativeContext) -> MethodCallResult {
+        const FAMILIES: [&str; 5] = ["Dialog", "DialogInput", "Monospaced", "SansSerif", "Serif"];
+        let Some(string_class) = ctx.class_id_by_name("java/lang/String") else {
+            return Ok(Some(Value::Object(None)));
+        };
+        let arr = ctx.new_ref_array(string_class, FAMILIES.len());
+        for (i, name) in FAMILIES.iter().enumerate() {
+            let s = ctx.create_string(name);
+            ctx.set_array_element(arr, i, Value::Object(Some(s)));
+        }
+        Ok(Some(Value::Object(Some(arr))))
+    }
+    // Registered on the CONCRETE receiver, not on abstract
+    // `java.awt.GraphicsEnvironment`. Measured: a registration on the abstract
+    // class is not reached, because `HeadlessGraphicsEnvironment` declares its
+    // own method with code and virtual dispatch correctly prefers it. That is
+    // the same abstract-class interception this crate does elsewhere and should
+    // not — see G79-1 §2 — so it is not repeated here.
+    registry.register(
+        "sun/java2d/HeadlessGraphicsEnvironment",
+        "getAvailableFontFamilyNames",
+        "()[Ljava/lang/String;",
+        |ctx, _args| logical_font_families(ctx),
+    );
+    registry.register(
+        "sun/java2d/HeadlessGraphicsEnvironment",
+        "getAvailableFontFamilyNames",
+        "(Ljava/util/Locale;)[Ljava/lang/String;",
+        |ctx, _args| logical_font_families(ctx),
+    );
 }
 
 /// Read the effective `java.awt.headless` value. Unset → default headless
