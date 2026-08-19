@@ -1089,3 +1089,4 @@ Three of those are worth reading before acting anywhere in this tree:
   SHAPES never asked (concurrency, GC pressure, scale), which is where a next
   sweep should go rather than at another subject.
 - [G78-1](G78-1-the-read-string-audit-and-the-file-that-merged-20260818.md) — the `read_string` caller audit: 2904 grep hits narrowed to 18 by dataflow and registry measurement; `java.io.File` lost the unit three times over and MERGED two distinct paths in equals/hashCode/compareTo. Closes G70-1 N1. 18 rows -> 2.
+- [G79-1](G79-1-the-census-that-was-said-not-to-exist-20260818.md) — the P0 over-tagging census EXISTS today (`--dump-native-registry` + a class-loading probe). `native-awt` measured: 187 registrations not 122, 22 genuine bridges not 10, and the "names absent methods" count is inflated ~4x by inheritance and placement. The suite has ZERO AWT coverage, so the arms cannot adjudicate a retag.
