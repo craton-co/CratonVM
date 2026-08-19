@@ -2560,7 +2560,35 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_concurrent_hashmap_natives(registry);
     register_properties_natives(registry);
     register_collections_extras_natives(registry);
-    register_unmodifiable_natives(registry);
+    // RETAGGED per subsystem — the largest single win available on the ambient
+    // path, and the evidence is unusually direct.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, default mode):
+    //   registrations 300 | overwrote 2
+    //   all 300 target ELEVEN `cratonvm/internal/Unmodifiable*` classes —
+    //   VM-INTERNAL STAND-INS that no JDK declares. There is nothing to bridge
+    //   to: a native registered against a class this VM invented is a
+    //   compatibility shim by definition, which is exactly what this file's
+    //   header says of the crate as a whole.
+    //
+    // And under `--jdk-only` they are already inert. Measured directly:
+    //
+    //   Collections.unmodifiableList(...).getClass().getName()
+    //     HotSpot   java.util.Collections$UnmodifiableRandomAccessList
+    //     CratonVM  java.util.Collections$UnmodifiableRandomAccessList
+    //
+    // — plus the same for `unmodifiableMap`, the delegating reads, and the
+    // `UnsupportedOperationException` on mutation. Strict mode already answers
+    // this surface from real bytecode and never reaches the stand-ins, so
+    // dropping them removes dead weight rather than changing behaviour.
+    //
+    // This registrar is one of the twelve that INHERIT the ambient tag, so the
+    // call-site wrapper takes effect; the other 48 override it (G85-1). The tag
+    // move is asserted from a dump, not inferred from green arms.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_unmodifiable_natives,
+    );
     register_set_from_map_natives(registry);
     // BlockingQueue family (LinkedBlockingQueue, ArrayBlockingQueue,
     // ConcurrentLinkedQueue, ConcurrentLinkedDeque) is overridden with a
