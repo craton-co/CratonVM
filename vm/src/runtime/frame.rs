@@ -228,12 +228,25 @@ pub fn frame_kind_counts() -> (u64, u64) {
 /// by value into the frame stack on every call, so those bytes are memory
 /// traffic per invocation, and again on pop.
 ///
-/// The trade is one heap allocation per `Owned` frame. That is the cold side:
-/// the interpreted call path builds `Cached` frames through
-/// `new_pooled_cached`, while `Owned` is reached from reflection, JNI, JVMTI,
-/// `invokedynamic`, virtual-thread bootstraps and tail calls.
-/// `CRATONVM_DBG_INVOKE_PHASES=1` reports the observed split, so the claim that
-/// `Owned` is cold is checked rather than assumed.
+/// The trade is one heap allocation per `Owned` frame, and the frequency of
+/// those was MEASURED rather than reasoned about, because reasoning about it
+/// gave the wrong answer twice. Call-site counts suggest `Owned` dominates
+/// (~74 `Frame::new` sites against 8 for `new_pooled_cached`); two small runs
+/// then reported near-identical absolute counts (466 over 8M calls, 478 over
+/// ~1.6k), which reads as a fixed bootstrap cost. Both were wrong. Scaling the
+/// workload shows `Owned` frames growing at exactly ONE PER REFLECTIVE INVOKE:
+///
+/// ```text
+///   plain calls   owned=242   1.2%   (bootstrap only)
+///   lambdas/indy  owned=242   1.2%   (bootstrap only — indy builds NONE)
+///   throw/catch   owned=244          (bootstrap only — unwinding builds NONE)
+///   reflection    owned=20241 97.5%  (one per `Method.invoke`)
+/// ```
+///
+/// So the allocation lands on reflection alone. It is invisible there: a
+/// reflective invoke costs ~9us in this interpreter, against ~25ns for the
+/// malloc — 0.3%, and a reflection-dominated A/B measured no regression.
+/// `CRATONVM_DBG_INVOKE_PHASES=1` reports the split so this stays checked.
 #[derive(Clone)]
 pub struct OwnedFrameMeta {
     pub class_name: Arc<str>,
