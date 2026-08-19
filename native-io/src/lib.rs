@@ -12648,6 +12648,29 @@ const DOS_WRITTEN_FIELD: &str = "written";
 // `register_io_natives`.
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
+    // RETAG ATTEMPTED 2026-08-19 AND REVERTED — LOAD-BEARING, like
+    // `register_scanner_natives`. The verdict above is right and the tag is
+    // still doing work.
+    //
+    // The classification holds: 0 ACC_NATIVE, 25 of 37 shadow concrete
+    // bytecode, and 4 land on the `DataInput`/`DataOutput` INTERFACES (so this
+    // shim decides dispatch for every USER implementor — worth removing on its
+    // own, once it can be). And unlike the cold registrars, this one is
+    // genuinely exercised: 1039 invocations, five vectors.
+    //
+    // Retagged, that exercise reported the answer immediately:
+    //
+    //   RDataInputFastPull: skipped.next = -19
+    //
+    // The stream's position state is this VM's, not the real object's — see the
+    // 2-field synthetic layout documented at the top of this section, and the
+    // `written` slot fallback below it, which exists precisely because a
+    // synthetically-allocated `DataOutputStream` has no field NAMES to address.
+    // Refuse the shim and real bytecode reads a position it never wrote.
+    //
+    // Third instance of the same shape (G88-1 §8, with `scanner`): "stub"
+    // describes what the code IS; load-bearing describes what the VM DEPENDS
+    // ON. The state must move first, which is wave-2 work.
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let dis = "java/io/DataInputStream";
     // <init> intentionally not registered: real JDK bytecode correctly initializes
