@@ -3085,11 +3085,16 @@ type ScopedValueCache<const N: usize> =
 /// index computed against the latched bound is always in range.
 type ScopedIntegerCache = std::collections::HashMap<usize, Vec<Option<cratonvm_types::ObjectRef>>>;
 
-static INTEGER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedIntegerCache>> =
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`, like the rest of this
+/// family. Safe only BECAUSE `INTEGER_CACHE_HIGH` is unordered:
+/// `resolve_integer_cache_high` holds that guard across this acquisition. If
+/// `INTEGER_CACHE_HIGH` is ever given a level it must be a HIGHER one, never an
+/// equal — see its own comment for why it has none today.
+static INTEGER_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedIntegerCache>> =
     std::sync::OnceLock::new();
 
-fn integer_cache() -> &'static parking_lot::Mutex<ScopedIntegerCache> {
-    INTEGER_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn integer_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedIntegerCache> {
+    INTEGER_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// `IntegerCache.low` — `-128`, and NOT configurable. `jdk25src/java.base/
@@ -3223,22 +3228,22 @@ fn integer_cache_bound(ctx: &mut dyn NativeContext) -> i32 {
     high
 }
 
-static BOOLEAN_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<2>>> =
+static BOOLEAN_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<2>>> =
     std::sync::OnceLock::new();
 
-fn boolean_cache() -> &'static parking_lot::Mutex<ScopedValueCache<2>> {
-    BOOLEAN_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn boolean_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<2>> {
+    BOOLEAN_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// `LongCache` for `Long.valueOf(long)` — JLS §5.1.7 mandates the canonical
 /// cached instance for values in [-128, 127] so `Long.valueOf(x) ==
 /// Long.valueOf(x)` holds. Shared across threads but VM-scoped and GC-scanned
 /// for the same reasons documented above for `INTEGER_CACHE`.
-static LONG_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+static LONG_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>> =
     std::sync::OnceLock::new();
 
-fn long_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
-    LONG_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn long_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>> {
+    LONG_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 // ---------------------------------------------------------------------------
@@ -3309,7 +3314,7 @@ fn short_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedVa
 /// it must hold for. The loser's allocation is unreachable and collectible.
 fn cached_wrapper_box<const N: usize>(
     ctx: &mut dyn NativeContext,
-    cache: &'static parking_lot::Mutex<ScopedValueCache<N>>,
+    cache: &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<N>>,
     idx: usize,
     class_name: &'static str,
     value: Value,
@@ -3357,7 +3362,7 @@ fn cached_wrapper_box<const N: usize>(
 /// call sites below are unchanged and no cache can acquire a second, separate
 /// hook — which is the failure this function was factored out to prevent.
 fn scan_one_cache<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
-    cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+    cache: &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<usize, C>>,
     vm_identity: usize,
     out: &mut Vec<cratonvm_types::ObjectRef>,
 ) {
@@ -3371,7 +3376,7 @@ fn scan_one_cache<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
 
 /// Remap one cache's entries for `vm_identity` through the GC pointer map.
 fn update_one_cache<C: AsMut<[Option<cratonvm_types::ObjectRef>]>>(
-    cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+    cache: &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<usize, C>>,
     vm_identity: usize,
     pointer_map: &cratonvm_types::PointerMap,
 ) {
@@ -3456,7 +3461,7 @@ pub fn canonical_wrapper_if_cached(
     v: Value,
 ) -> Option<cratonvm_types::ObjectRef> {
     fn read<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
-        cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+        cache: &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<usize, C>>,
         vm_identity: usize,
         idx: usize,
     ) -> Option<cratonvm_types::ObjectRef> {

@@ -189,13 +189,23 @@ use std::path::{Path, PathBuf};
 /// silently adjusted, because a baseline moved by someone other than the author
 /// of the improvement is the bookkeeping this ratchet exists to keep honest.
 ///
-/// Lowered 432 -> 431 on 2026-08-19. `dev` was red at 452; twenty-one
-/// conversions pay back the twenty that had landed AND retire one more, because
-/// `TlsEntry::stream` is one field with four construction sites and the fourth
-/// predates the freeze. One lock has been retired below the frozen figure, so
-/// unlike the two entries below this number moves — that is what "converting one
-/// to an ordered wrapper requires lowering the baseline in the same change"
-/// means when it actually happens.
+/// Lowered 432 -> 428 on 2026-08-19. `dev` was red at 452; twenty-four
+/// conversions pay back the twenty that had landed AND retire four more. Unlike
+/// the two entries below, this number moves — that is what "converting one to an
+/// ordered wrapper requires lowering the baseline in the same change" means when
+/// it actually happens.
+///
+/// The four beyond the payback are not a bonus, they are unavoidable: a lock is
+/// converted by changing a TYPE, and two of these types are shared.
+/// `TlsEntry::stream` is one field with four construction sites, of which only
+/// three are new. The `valueOf` box caches share `cached_wrapper_box`,
+/// `scan_one_cache`, `update_one_cache` and `canonical_wrapper_if_cached::read`,
+/// all four of which take the mutex by type — so `CHARACTER_CACHE`,
+/// `BYTE_CACHE` and `SHORT_CACHE` could not convert without `INTEGER_CACHE`,
+/// `BOOLEAN_CACHE` and `LONG_CACHE` coming with them. Verified safe together:
+/// `gc_scan_value_of_cache_roots` and `canonical_wrapper_if_cached` take these
+/// guards one at a time, never nested, so six locks at an equal level cannot
+/// trip the checker.
 ///
 /// Held at 432 again on 2026-08-17 while converting twenty-four locks, for the
 /// same reason as the 2026-08-11 entry below: `dev` had gone red at 456, and
@@ -210,7 +220,7 @@ use std::path::{Path, PathBuf};
 /// the ratchet is green again — a conversion that lowered it would have been
 /// the wrong bookkeeping, because no lock has been retired below the frozen
 /// figure.
-const BASELINE_RAW_LOCKS: usize = 431;
+const BASELINE_RAW_LOCKS: usize = 428;
 
 /// Minimum number of source lines the scan must see before its count means
 /// anything.
