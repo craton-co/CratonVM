@@ -2491,7 +2491,28 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     }
     register_iterator_natives(registry);
     register_arrays_natives(registry);
-    register_optional_natives(registry);
+    // RETAGGED per subsystem — fourth of ~45, and the first with a NON-ZERO
+    // invocation count, which changes what the evidence proves.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, `--jdk-only`):
+    //   registrations 20 | invocations 27 | overwrote 0
+    //   real target: 20 CONCRETE BYTECODE, 0 abstract, 0 ACC_NATIVE,
+    //                0 unmeasured
+    //
+    // The three retags below (ArrayDeque, LinkedList, Vector) all had ZERO
+    // invocations: nothing in the corpus depended on those shims answering, so
+    // dropping them could not change a live answer. This one IS live — 27
+    // dispatches in a single censused run — so the argument is different and
+    // weaker: it rests on `java.util.Optional` having a complete real
+    // implementation (all 20 targets carry concrete bytecode) and on the arms
+    // exercising it heavily, rather than on nothing depending on it.
+    //
+    // Exercised by six vectors: RJdkOptionalShape, RJdkCollections,
+    // RJdkBridge1, RJdkForeign, RJdkModule and RJdkProcess.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_optional_natives,
+    );
     register_collections_utility_natives(registry);
     register_map_entry_natives(registry);
     register_factory_natives(registry);
