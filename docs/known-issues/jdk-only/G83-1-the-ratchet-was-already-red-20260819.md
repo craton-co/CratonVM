@@ -2,7 +2,7 @@
 
 **Status:** MEASURED. Nothing fixed — the failure is PRE-EXISTING, its remedy is
 explicitly not "raise the baseline", and the work is CONTRACTUALLY DEFERRED to a
-later wave (§5). Three published numbers corrected.
+later wave (§3a). Three published numbers corrected.
 **Provenance:** `cargo test -p cratonvm-native-builtins --test stub_ratchet`,
 run 2026-08-19 on `90d27779d` and again on `8a7e2727f` in a clean worktree.
 Registry composition from `--dump-native-registry` on both modes.
@@ -89,7 +89,7 @@ own ratchet is red.
 It does not license raising the baseline to 1308, which the failure message
 explicitly forbids and which would erase the only signal that 31 stubs appeared.
 
-## 5. THE END-STATE GATE — and the contract clause that defers it
+## 3a. THE END-STATE GATE — and the contract clause that defers it
 
 The same file carries an `#[ignore]`d test, `strict_mode_refuses_nothing`,
 labelled **"THE END-STATE GATE"**. Run on demand (`-- --ignored`), it reports:
