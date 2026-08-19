@@ -2494,7 +2494,27 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_optional_natives(registry);
     register_collections_utility_natives(registry);
     register_map_entry_natives(registry);
-    register_factory_natives(registry);
+    // RETAGGED per subsystem — second of the twelve AMBIENT-inheriting
+    // registrars (see the note at `register_comparator_natives`; the other 48
+    // set their own category and a call-site wrapper is inert on them, G85-1).
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, default mode):
+    //   registrations 36 | invocations 61 | overwrote 0
+    //   real target: 36 DECLARED WITH CODE, 0 not-declared-here, 0 ACC_NATIVE
+    //
+    // Every row shadows a concrete real implementation — rule 4 with no
+    // residue. It is LIVE (61 dispatches), so unlike Comparator this does not
+    // rest on "nothing depends on it"; it rests on `List.of`/`Map.of`/`Set.of`
+    // having complete real bytecode and on heavy arm coverage.
+    //
+    // Note for whoever reads a red `RImmutableFactoryTypes`: that vector was
+    // ALREADY failing in `SUITE=all` before this change, and is one of the five
+    // long-standing baseline failures. The tag move and the arm result were
+    // both checked against that baseline rather than assumed.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_factory_natives,
+    );
     register_stream_natives(registry);
     register_collectors_natives(registry);
     register_int_stream_natives(registry);
