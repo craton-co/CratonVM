@@ -1413,6 +1413,37 @@ fn native_jboss_init(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     Ok(None)
 }
 
+/// `LogManager.getLogger(String)` when the active singleton is
+/// `org/jboss/logmanager/LogManager` (`java.util.logging.manager` was set to
+/// it — see [`jboss_log_manager_requested`]).
+///
+/// `getLogger` is inherited unchanged from `java.util.logging.LogManager`,
+/// so before this fix `CLS_JBOSS_LOG_MANAGER`'s `getLogger` was registered
+/// to the same [`native_get_logger`] as the plain-JUL manager, which always
+/// allocates a `CLS_JUL_LOGGER`-shaped object. Callers that cast the result
+/// to `org.jboss.logmanager.Logger` (as JBoss LogManager's own API contract
+/// promises once its LogManager subclass is active — see
+/// `AbstractQuarkusExtensionTest`'s `(Logger) LogManager.getLogManager()
+/// .getLogger("")`) got a real `ClassCastException` even though the
+/// singleton swap itself (`native_get_jboss_log_manager`) was correct.
+///
+/// [`get_or_create_jboss_logger`] already exists and is correct — it backs
+/// `LogContext.getLogger`, JBoss's own internal entry point — so this just
+/// wires the same allocation to the path real application/test code
+/// actually calls. Mirrors [`native_get_logger`]'s null-name NPE contract.
+fn native_get_jboss_manager_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `getLogger(String)` — receiver in args[0], name in args[1].
+    if jul_arg_is_null(args, 1) {
+        return jul_throw_npe(JUL_NPE_NULL_KEY);
+    }
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let logger = get_or_create_jboss_logger(ctx, &name);
+    Ok(Some(Value::Object(Some(logger?))))
+}
+
 fn native_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `getLogger(String)` — receiver in args[0], name in args[1].
     //
@@ -6389,7 +6420,7 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         CLS_JBOSS_LOG_MANAGER,
         "getLogger",
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
-        native_get_logger,
+        native_get_jboss_manager_logger,
     );
     registry.register(
         CLS_JBOSS_LOG_MANAGER,
