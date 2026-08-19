@@ -1196,6 +1196,15 @@ pub enum RuntimeError {
     #[error("NoSuchFileException: {path}")]
     NoSuchFileException { path: String },
 
+    /// `java.nio.file.NotDirectoryException` — a directory operation applied to
+    /// something that is not one.
+    ///
+    /// Like [`Self::NoSuchFileException`] the message is the PATH alone, because
+    /// `FileSystemException.getMessage` builds its text from the `file` field; a
+    /// populated `detailMessage` renders as `<path>: <path>`.
+    #[error("NotDirectoryException: {path}")]
+    NotDirectoryException { path: String },
+
     #[error("UnsupportedOperationException: {message}")]
     UnsupportedOperationException { message: String },
 
@@ -1734,6 +1743,9 @@ impl RuntimeError {
             }
             RuntimeError::NoSuchFileException { path } => {
                 ("java/nio/file/NoSuchFileException", Some(path.as_str()))
+            }
+            RuntimeError::NotDirectoryException { path } => {
+                ("java/nio/file/NotDirectoryException", Some(path.as_str()))
             }
             RuntimeError::UnsupportedOperationException { message } => (
                 "java/lang/UnsupportedOperationException",

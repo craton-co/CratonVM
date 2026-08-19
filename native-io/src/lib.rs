@@ -22793,9 +22793,30 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         .into());
     }
 
+    // MEASURED (Sweep18): a WatchService may only watch a DIRECTORY. HotSpot
+    // throws `NotDirectoryException` for a regular file; this accepted it and
+    // returned a live key that could never fire, which is the "fabricated
+    // success" shape rather than a refusal.
+    if !Path::new(&path_str).is_dir() {
+        return Err(RuntimeError::NotDirectoryException {
+            path: path_str.clone(),
+        }
+        .into());
+    }
+
     // Read the event kind bitmask. `watch_event_kind_bit` handles both the
     // real `StandardWatchEventKinds` singletons and the synthetic stand-ins.
     let kinds_len = ctx.array_length(kinds_arr);
+    // MEASURED (Sweep18): registering with NO event kinds is an
+    // `IllegalArgumentException` on HotSpot — `AbstractWatchService.register`
+    // rejects an empty set before it reaches the OS. This returned a valid key
+    // for a watch that can never fire.
+    if kinds_len == 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "no events to register".into(),
+        }
+        .into());
+    }
     let mut event_mask = 0i32;
     for i in 0..kinds_len {
         if let Value::Object(Some(kind)) = ctx.get_array_element(kinds_arr, i) {
