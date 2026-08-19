@@ -86,6 +86,55 @@ which stand on their own and are independent of the failed retags:
   (`getMethods()` cannot see `<init>`), which is fixed and is why the absent
   count moved 14 → 9.
 
+## 3a. A SECOND constraint, found by a retag that broke
+
+After the corrected procedure was working, a batch of four small registrars
+(`stack` 18, `linked_hashmap` 23, `chm_key_set_view` 23, `priority_queue` 15)
+passed the tag assertion — all four moved to `synthetic-stub` — and then
+**failed the arms**: `RCollections`, `RStrings` and `RChmKeySetView` all red.
+
+```
+java.lang.NullPointerException: Cannot read the array length because "a" is null
+    at RCollections.main(RCollections.java:59)          // new ArrayList<>(lh.keySet())
+    at java/util/ArrayList.<init>(ArrayList.java:183)   // c.toArray() returned null
+```
+
+**Retagging drops the shim, but the OBJECT LAYOUT is still ours.** A
+`LinkedHashMap` built by our natives has our field layout; drop the `keySet()`
+shim and real JDK bytecode runs against an instance whose real internals were
+never populated, so the view it returns is empty and `toArray()` answers null.
+
+That is a different constraint from anything in §0–§3, and it is the one that
+actually bounds this work:
+
+> A registrar is safe to retag only if the OBJECTS its methods receive are real
+> too. Rule 4's "concrete bytecode + incomplete replacement → delete from the
+> strict path" assumes the real bytecode can READ the receiver. Where the VM
+> mints the object itself, it cannot.
+
+**This retroactively weakens my earlier confidence, and the record should say
+so.** `Vector` (28 registrations) was retagged and the arms stayed green — but
+it had **0 invocations**, meaning nothing in the corpus exercised it. Green
+arms over an unexercised surface prove nothing about it. The
+`unmodifiable` retag (300) is on firmer ground because it was measured
+DIRECTLY: `Collections.unmodifiableList(...)` returns the real
+`java.util.Collections$UnmodifiableRandomAccessList` under `--jdk-only`, so
+real objects are already in play there. `Comparator` (14, 0 invocations) and
+the collection factories (36, 61 invocations, real `List.of` objects) sit
+between those two poles.
+
+The batch of four was reverted; it was never committed.
+
+## 3b. So the verification a retag needs is THREE things, not one
+
+1. **the tag moved** — from a registry dump (§1, the test I first missed);
+2. **the behaviour holds** — the arms (which caught this one);
+3. **the surface was actually exercised** — non-zero invocations, or a direct
+   measurement that real objects are in play. Without this, (2) is vacuous.
+
+Only the `unmodifiable` retag in this session satisfies all three on its own
+evidence.
+
 ## 4. NOMINATIONS
 
 **N1 — retagging these 48 registrars means editing their explicit
