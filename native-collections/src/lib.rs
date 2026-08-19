@@ -2473,7 +2473,32 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_arraylist_natives(registry);
-    register_hashmap_natives(registry);
+    // RETAGGED per subsystem — fifth of ~45, and the hottest so far.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, `--jdk-only`):
+    //   registrations 29 | invocations 69 | overwrote 0
+    //   real target: 26 CONCRETE BYTECODE, 0 ACC_NATIVE, 0 unmeasured,
+    //                3 "not declared with code here"
+    //
+    // Those 3 were checked individually rather than trusted to the count, and
+    // the distinction matters: they are `HashMap.equals`, `hashCode` and
+    // `toString` — INHERITED from `AbstractMap`/`Object` on a CONCRETE class,
+    // not registrations on an abstract interface. The file header's warning is
+    // about the latter, which decide dispatch for every implementor; these
+    // reach only `HashMap` subclasses, and all three have 0 invocations.
+    //
+    // (That count column conflates "abstract interface" with "inherited, so
+    // not declared here" — the same methodology error G79-1 §2 found in the
+    // audit's own absent-method figures. Worth re-checking per registrar
+    // rather than ranking on the raw number.)
+    //
+    // Rule 4. `java.util.HashMap` has a complete real implementation and no VM
+    // boundary to bridge to; it is exercised by essentially every collections
+    // vector in all three arms.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_hashmap_natives,
+    );
     register_hashset_natives(registry);
     register_hibernate_persistent_map_natives(registry);
     // Guard against an invokeinterface/assignability edge where AssertJ's
