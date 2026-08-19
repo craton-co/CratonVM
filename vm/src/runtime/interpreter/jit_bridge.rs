@@ -7693,6 +7693,18 @@ fn resolve_inline_site_from(
                 // Virtual / interface: one body per receiver class, so a splice
                 // needs a guard and the profile has to name the class.
                 0 | 2 => {
+                    // THE GATE, and it belongs here rather than only on the
+                    // profile fetch below. Gating just the profile left the MIC
+                    // fallback running with `CRATONVM_JIT_INLINE_SPLICE_DEVIRT`
+                    // OFF, so devirtualisation happened whenever nesting did and
+                    // the flag's two arms were byte-identical — measured
+                    // 2026-08-18, `nested-splice-guarded=1` in both. A switch
+                    // that does not switch anything is worse than no switch: it
+                    // makes an A/B report "no difference" for a feature that was
+                    // on in both arms.
+                    if !crate::runtime::env_cache::jit_inline_splice_devirt() {
+                        continue;
+                    }
                     // TWO sources, in this order, and the second is the one
                     // that actually answers for this workload.
                     //

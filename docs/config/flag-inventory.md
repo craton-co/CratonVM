@@ -1165,6 +1165,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_IR_OVER_INTRINSIC` | JIT | `CRATONVM_JIT=ir-over-intrinsic` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_RELOC_EMIT` | JIT | `CRATONVM_JIT=ir-reloc-emit` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_SELFREC_DIRECT` | JIT | `CRATONVM_JIT=ir-selfrec-direct` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` | JIT | `CRATONVM_JIT=nested-trace-frames` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_KERNEL_REG_LOCALS` | JIT | `CRATONVM_JIT=kernel-reg-locals` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_KERNEL_REG_OSR` | JIT | `CRATONVM_JIT=kernel-reg-osr` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LAMBDA_ADAPTER` | JIT | `CRATONVM_JIT=lambda-adapter` | opt-in | off | behaviour | snapshot | vm |

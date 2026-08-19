@@ -12191,6 +12191,164 @@ fn a_nested_splice_that_bails_falls_back_to_the_call() {
     assert_eq!(args, vec![5, 10], "with the same arguments the nested body would have had");
 }
 
+/// A VALUE-PRODUCING BRANCH MERGE splices, and both paths answer correctly.
+///
+/// This is the shape that blocked the whole netty inlining line of work.
+/// `AssertionUtils.objectsAreEqual` — the first rung past `assertEquals` — is
+/// exactly it:
+///
+/// ```text
+///    8: iconst_1     9: goto 13    12: iconst_0    13: ireturn
+/// ```
+///
+/// Two paths reach pc 13 with the same value in different places, and the
+/// emitter's symbolic operand stack can only name one, so commit 419a6f5
+/// refused every such body outright. Measured 2026-08-18, that refusal is what
+/// made `nested-splice=0` and `outer-splice-rolled-back=2`: the call the
+/// devirtualisation work was aimed at, one instruction later at pc 16, was
+/// never emitted at all.
+///
+/// One compiled body, both paths, and the two answers differ — which is the
+/// only way to show the merge carries a VALUE rather than happening to agree.
+#[test]
+fn a_value_producing_branch_merge_splices_and_both_paths_are_right() {
+    // callee: `static int f(int a) { return a != 0 ? 0 : 1; }`, emitted as the
+    // objectsAreEqual diamond.
+    //   0: iload_0
+    //   1: ifne 8
+    //   4: iconst_1
+    //   5: goto 9
+    //   8: iconst_0
+    //   9: ireturn      <-- merge, one value live
+    let callee = make_inline_site(
+        &[0x1a, 0x9a, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
+
+    // caller: `static int g(int a) { return f(a); }`
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a diamond-shaped callee must now splice");
+
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap.
+    unsafe {
+        assert_eq!(
+            compiled.call_with_heap(0, &[0]),
+            1,
+            "fall-through path: iconst_1 must survive the goto to the merge",
+        );
+        assert_eq!(
+            compiled.call_with_heap(0, &[7]),
+            0,
+            "taken path: iconst_0 must be what the merge reads",
+        );
+    }
+    assert_eq!(
+        calls_to(&compiled, test_helpers().invoke_dispatch),
+        0,
+        "and the body must be spliced, not called",
+    );
+}
+
+/// The two paths leave the value in DIFFERENT slots, which is what the merge
+/// region is actually for — and what makes the spill's ORDER observable.
+///
+/// The other two merge tests do not discriminate that order, and it is worth
+/// saying why rather than leaving it implied: in a constant-vs-constant
+/// diamond both paths push into the same operand slot (each starts from an
+/// empty callee stack and the emitter allocates deterministically from
+/// `save_spill`), so re-running one path's store on the other path reads the
+/// slot that path already wrote. Idempotent — correct by accident. Verified by
+/// mutation: recording the label BEFORE the fall-through spill leaves both of
+/// them passing.
+///
+/// `iload` is the discriminator. It pushes `StackSlot::Frame(local_offset)` —
+/// the LOCAL's slot, not a fresh operand slot — so here the taken path's value
+/// lives in the merge region's source at one address and the fall-through's at
+/// another. If the fall-through's stores are emitted after the label, the
+/// branch path re-runs them against a slot it never wrote.
+#[test]
+fn a_merge_whose_paths_use_different_slots_pins_the_spill_order() {
+    // callee: `static int f(int a) { return a != 0 ? a : 1; }`
+    //   0: iload_0
+    //   1: ifeq 8        (a == 0 -> 8)
+    //   4: iload_0       <-- pushes the LOCAL's slot
+    //   5: goto 9
+    //   8: iconst_1      <-- pushes a fresh operand slot
+    //   9: ireturn       <-- merge; the two sources are different addresses
+    let callee = make_inline_site(
+        &[0x1a, 0x99, 0x00, 0x07, 0x1a, 0xa7, 0x00, 0x04, 0x04, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a merge over two different slots must splice");
+
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap.
+    unsafe {
+        assert_eq!(
+            compiled.call_with_heap(0, &[5]),
+            5,
+            "the branch path must read the local it stored, not the \
+             fall-through's operand slot",
+        );
+        assert_eq!(compiled.call_with_heap(0, &[0]), 1);
+    }
+}
+
+/// Two values live across the merge, and two merges at different depths in one
+/// body.
+///
+/// Depth 1 is the common case and could pass by accident — a single value that
+/// both paths happen to leave in the same slot proves nothing about the
+/// canonical-home machinery. Here `iconst_5` stays live UNDER the diamond, so
+/// the `goto`'s merge carries two values while the branch target above it
+/// carries one; the two depths must be tracked per target rather than globally.
+#[test]
+fn two_merges_at_different_depths_in_one_body() {
+    //   0: iconst_5          [5]
+    //   1: iload_0
+    //   2: ifne 9            -> target 9 with depth 1
+    //   5: iconst_1          [5, 1]
+    //   6: goto 10           -> target 10 with depth 2
+    //   9: iconst_0          [5, 0]
+    //  10: iadd              <-- merge, depth 2
+    //  11: ireturn
+    let callee = make_inline_site(
+        &[0x08, 0x1a, 0x9a, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0x60, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a two-deep merge must splice");
+
+    // SAFETY: as above.
+    unsafe {
+        assert_eq!(compiled.call_with_heap(0, &[0]), 6, "5 + 1");
+        assert_eq!(compiled.call_with_heap(0, &[7]), 5, "5 + 0");
+    }
+}
+
 /// DEVIRTUALISATION INSIDE A SPLICE. Both edges of the receiver guard, from one
 /// compiled body.
 ///
