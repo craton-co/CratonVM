@@ -646,7 +646,16 @@ use cratonvm_types::compat::CompatibilityMode;
 /// existed, and every one of them is a documented improvement. MEASURED in this
 /// configuration (`--features management`), not derived from the other one —
 /// the arithmetic-instead-of-measurement trap is recorded immediately above.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1318;
+/// Re-frozen 1318 -> 1321 on 2026-08-19 (same day, second move). The three are
+/// `getTrustedAttributes`, `isInitializing` and `entryFor` on
+/// `cratonvm/internal/ss/JavaUtilJarAccess$1` — interface methods that were not
+/// registered AT ALL, so the carrier answered them with an `AbstractMethodError`.
+/// Registering them is case (b) in this gate's own failure message: the carrier
+/// is in `NO_IMAGE_JDK_RECEIVERS`, so every row on it is re-tagged
+/// `SyntheticStub` and dropped under `--jdk-only` whatever the body does. Three
+/// honest rows that strict mode drops beat three abstract methods that throw.
+/// MEASURED with `--features management`.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1321;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -655,7 +664,10 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1318;
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] and for the same reason. Both were
 /// measured; the delta is +31 in each, which is itself the check that the 31
 /// are not in the ten `jmx::*` registrars that separate the two.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1308;
+/// Re-frozen 1308 -> 1311 on 2026-08-19 alongside
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`], same three rows, same reason. +3 in
+/// both configurations, both measured.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1311;
 
 // Both constants are compiled in both configurations on purpose: a reader
 // re-freezing one can see the other, and neither can be edited by accident
