@@ -2558,7 +2558,24 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
         register_array_deque_natives,
     );
     register_priority_queue_natives(registry);
-    register_vector_natives(registry);
+    // RETAGGED per subsystem — third of ~45, and the cleanest profile in the
+    // crate by the ranking the header's warning implies.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, `--jdk-only`):
+    //   registrations 28 | invocations 0 | overwrote 0
+    //   real target: 28 CONCRETE BYTECODE, 0 abstract, 0 ACC_NATIVE,
+    //                0 unmeasured
+    //
+    // Every single registration shadows real bytecode and none is on an
+    // abstract interface, so rule 4 applies to the whole registrar with no
+    // residue and no user-subclass dispatch to disturb — the one case so far
+    // where the evidence has no caveat attached.
+    //
+    // Exercised by RJdkBridge1 and RChaCha20Cipher.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_vector_natives,
+    );
     register_stack_natives(registry);
     register_bulk_ops_natives(registry);
     register_queue_deque_interface_natives(registry);
