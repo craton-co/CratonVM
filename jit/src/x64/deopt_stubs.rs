@@ -17,7 +17,28 @@
 
 use super::*;
 
+/// Default-ON: a per-bci `Ambiguous` local in an exception-free method is
+/// published `Undefined` rather than `Unsupported`. See the call site for the
+/// JVMS argument. `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD=1` is the kill switch.
+/// Default-ON: a per-bci `Ref` local at a bci where the oop mask has no
+/// opinion is published as a reference rather than `Unsupported`. See the call
+/// site. `CRATONVM_JIT_NO_OSR_REFINED_REF=1` is the kill switch.
+fn osr_refined_ref_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_REFINED_REF").is_none()
+    })
+}
+
+fn osr_ambiguous_dead_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD").is_none()
+    })
+}
+
 impl Compiler {
+
     /// deopt-osr Step 1: record a precise deopt-exit snapshot (the interpreter
     /// frame state — locals + operand stack as `FrameValue`s — reconstructable
     /// from live machine state) at an eligible guard whose loop-header/canonical
@@ -533,12 +554,136 @@ impl Compiler {
                 // for the METHOD and usually not here. `kind_at` only ever
                 // answers a concrete NON-ref kind, so the oop mask (which ran
                 // above) keeps sole authority over ref-typed slots.
-                let kind = if matches!(kind, LocalKind::Ambiguous) {
-                    self.local_kinds_refined.kind_at(bci, i).unwrap_or(kind)
+                let refined = if matches!(kind, LocalKind::Ambiguous) {
+                    self.local_kinds_refined.kind_at(bci, i)
                 } else {
-                    kind
+                    None
                 };
-                typed_local_frame_value(reg, xmm, off, kind)
+                // A per-bci REFERENCE, at a bci where the oop mask has no
+                // opinion to defer to.
+                //
+                // `kind_at` filters `Ref` out on the stated grounds that "the
+                // flow-sensitive oop mask is the sole authority for ref-typed
+                // slots and has already had its say". At these bci it has not.
+                // The mask is a single `u64`, so it cannot address a slot at
+                // or above 64 at all -- the comment on `oop_mask` above says
+                // so, and names `local_kinds`'s `Ref` arm as "the reference
+                // authority above slot 63" -- and when the dataflow declines
+                // outright it publishes `oop_reached=false oop_mask=0x0`,
+                // which is silence, not a negative answer. Deferring to
+                // silence is what cost `BOBYQAOptimizer.trsbox` its OSR:
+                // `oop_reached=false` at EVERY one of its snapshots, local 87
+                // settled `Ref` by the per-bci dataflow, and the slot
+                // published `Unsupported` anyway.
+                //
+                // So publish exactly what `typed_local_frame_value`'s
+                // `LocalKind::Ref` arm publishes, for the reason it already
+                // gives, on a strictly stronger premise: that arm trusts a
+                // WHOLE-METHOD scan ("`Ref` everywhere it is ever accessed"),
+                // and this is a flow-sensitive answer at this pc.
+                //
+                // `has_jsr` is the one condition that must hold: `ret` is
+                // given no successors, which makes the graph NARROWER than the
+                // verifier's and could settle a kind the verifier would merge
+                // further. A handler's TOP seed is the opposite -- it can only
+                // turn a settled kind into `Ambiguous` -- so it is not checked.
+                let mask_has_no_opinion = !oop_reached || i >= 64;
+                let refined_ref = mask_has_no_opinion
+                    && !self.local_kinds_refined.has_jsr
+                    && matches!(
+                        self.local_kinds_refined.raw_at(bci, i),
+                        Some(LocalKind::Ref)
+                    )
+                    && osr_refined_ref_enabled();
+                let kind = if refined_ref {
+                    LocalKind::Ref
+                } else {
+                    refined.unwrap_or(kind)
+                };
+                let mut fv = typed_local_frame_value(reg, xmm, off, kind);
+                let was_unsupported = matches!(fv, crate::deopt::FrameValue::Unsupported);
+                // A slot the per-bci dataflow SETTLED as `Ambiguous` is not
+                // undescribable — it is unreadable, and `Undefined` describes
+                // it exactly.
+                //
+                // `Ambiguous` here means the dataflow reached this bci and two
+                // different concrete kinds arrive on different paths. JVMS
+                // 4.10.1.6 merges those to `top`, and 4.10.1.9's load rules
+                // make a `top` local an illegal operand of every `?load`, so
+                // no bytecode reachable from this bci can read the slot before
+                // redefining it. Resuming with an inert zero is therefore
+                // unobservable — the identical argument the `LocalKind::Ref`
+                // arm of `typed_local_frame_value` already makes, on a
+                // strictly weaker premise (a whole-method scan rather than a
+                // flow-sensitive answer at this pc).
+                //
+                // Three conditions, each load-bearing:
+                //
+                //  * `raw_at` must say `Ambiguous` specifically. `Unknown` is
+                //    "no evidence" (an unreached pc), and `Ref` belongs to the
+                //    flow-sensitive oop mask, which has already had its say.
+                //  * `cfg_is_exact` — with an exception range in the method
+                //    the pass seeds handlers TOP and is COARSER than the
+                //    verifier, so `Ambiguous` there does not imply `top` and
+                //    this would drop a live value. See its doc.
+                //  * The whole-method kind must be `Ambiguous` too, i.e. this
+                //    slot is genuinely reused; a settled kind that contradicts
+                //    its machine home is a different bug and keeps re-running.
+                //
+                // Why it matters: `osr_exit_policy` is an ARTIFACT-WIDE veto.
+                // One `Unsupported` slot at one deopt point refuses OSR entry
+                // at every back edge of the method. `BOBYQAOptimizer.trsbox`
+                // reuses local 87 as a double, an int AND a reference, and
+                // paid its entire OSR for it: 15,152 refusals per
+                // `BobyqaOne 8 1`, a `perf` profile 94% VM binary / 0.7%
+                // JIT-compiled code, and the class over its 90 s suite budget.
+                //
+                // `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD=1` restores the
+                // re-run encoding, so the A/B is one binary.
+                if matches!(fv, crate::deopt::FrameValue::Unsupported)
+                    && self.local_kinds_refined.cfg_is_exact
+                    && matches!(self.local_kinds.get(i), Some(LocalKind::Ambiguous))
+                    && matches!(
+                        self.local_kinds_refined.raw_at(bci, i),
+                        Some(LocalKind::Ambiguous)
+                    )
+                    && osr_ambiguous_dead_enabled()
+                {
+                    fv = crate::deopt::FrameValue::Undefined;
+                }
+                // `CRATONVM_DBG_OSR_SLOTS=1` names the slot that costs a method
+                // its OSR entry. `osr_exit_policy` is an artifact-wide veto --
+                // ONE `Unsupported` slot at ONE deopt point refuses OSR entry
+                // at every back edge of the method -- and until this existed
+                // the only report was "local 87 is Unsupported", which says
+                // that a slot could not be described but not WHY. The three
+                // answers below are three different bugs: an `Ambiguous` kind
+                // the per-bci dataflow did not settle, a settled kind whose
+                // machine home contradicts it, or a slot liveness should have
+                // dropped before reaching here.
+                if was_unsupported
+                    && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_SLOTS").is_some()
+                {
+                    eprintln!(
+                        "[osr-slot] {} local={i} bci={bci} whole_method_kind={:?} \
+                         refined={:?} raw={:?} cfg_exact={} reg={:?} xmm={:?} spill_off={off} \
+                         live_covered={} method={}",
+                        if matches!(fv, crate::deopt::FrameValue::Unsupported) {
+                            "UNSUPPORTED"
+                        } else {
+                            "RELAXED-TO-UNDEFINED"
+                        },
+                        self.local_kinds.get(i),
+                        refined,
+                        self.local_kinds_refined.raw_at(bci, i),
+                        self.local_kinds_refined.cfg_is_exact,
+                        reg,
+                        xmm,
+                        self.local_liveness_covered.get(bci).copied().unwrap_or(false),
+                        self.method_key,
+                    );
+                }
+                fv
             } else {
                 // No kind table (gate off / unmapped) — Phase-A int/provenance.
                 frame_value_for_slot(reg, xmm, off, false)

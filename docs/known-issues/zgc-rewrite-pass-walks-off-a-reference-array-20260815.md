@@ -817,6 +817,37 @@ known. The `0/52` on current `dev` is the one figure here that clears the bar
 **Do not narrow the range further on 26-rep steps.** Re-run `175dc1751` at n ≥ 38
 before trusting the bracket above.
 
+## Bisect log — running, 2026-08-19
+
+Every "clean" below is **38 reps**, the power step 1 derived
+(`0.923^38 = 0.047`). Every arm is the same machine, same harness, same
+`common.args`; only the VM binary differs. Newest first.
+
+| commit | date | reps | SIGSEGV | verdict |
+|---|---|---:|---:|---|
+| current `dev` | 08-19 | 52 | 0 | clean |
+| `175dc1751` (the remap suspect) | 08-18 | 26 | 0 | clean (underpowered, moot) |
+| `9389c4256` = `175dc1751^` | 08-18 | 38 | 0 | **clean** |
+| `829171d20` | 08-17 | 38 | 0 | **clean** |
+| `b447e775e` | 08-17 | 38 | 0 | **clean** |
+| `2fe85641d` "ZGC: genuine concurrent marking" | 08-16 | 38 | 0 | **clean** |
+| `7eab6d6c2` (the control) | 08-16 | 26 | **2** | **crashes** |
+
+**Bracket: `(7eab6d6c2, 2fe85641d]` — 57 commits**, and every one of them is
+2026-08-16. Next pivot `c69ad84d9`.
+
+Cost so far: 5 builds and ~5 hours of running. Each step is ~20 min of build plus
+~57 min of reps, and the remaining ~6 steps put the total near the 8–9 hours
+step 1 priced.
+
+### Read this table for what it does NOT say
+
+Four consecutive clean 38-rep readings are four independent 4.7% risks, so the
+chance that *at least one* of them is a false clean is about **18%**. A single
+wrong "clean" sends every later step into the wrong half. If the bisect lands on
+a commit whose diff cannot plausibly explain the crash, **that is the signal to
+re-run the nearest clean arms at higher n**, not to invent a mechanism for it.
+
 ## Bisect, step 2 — the suspect is exonerated, at full power
 
 Step 1's suspect was `175dc1751`, *"the proxy Method cache was rooted but never

@@ -1,3 +1,53 @@
+# `BOBYQAOptimizerTest` times out — FIXED 2026-08-19, and it was an OSR admission failure, not throughput
+
+**Status: FIXED 2026-08-19.** `BOBYQAOptimizerTest` **HANG (≥400 s) → PASS
+(14.2 s, 17/17)**, against HotSpot's 11.8 s on the same host — a 1.2x gap where
+this page's title says 80x. The kernel probe `BobyqaOne 12 1` went
+**22.8-26.3 s → 1.0-1.4 s** over four interleaved pairs, with a bit-identical
+result (`value=6.634794878318594E-15`).
+
+The full write-up is
+fixed-bugs/osr-entry-deferred-to-an-oop-mask-that-never-ran-FIXED-20260819.md.
+
+**This page's central claim was wrong, and everything below it is preserved as
+the record of how.** It says:
+
+> The process is not deadlocked and is not stuck in the interpreter — it is
+> running compiled code, correctly, about eighty times too slowly.
+
+A `perf record` of `probes/BobyqaOne.java` on `dev` `0db5456d7` reads **94.2% VM
+binary / 0.67% JIT-compiled code**, with `interpreter::execute_frame_from_index`
+at 17.3% and `interpreter::opcodes::op_getfield` at 11.2%. It was interpreting.
+
+The profile this page quotes — "66.1% JIT-compiled code / 31.2% VM binary" — was
+taken on `probes/AccessorDispatchProbe.java`, the shape-only microbench this
+page built *because* "a 45-second `optimize()` call cannot be iterated against",
+and then read as if it described the workload. **The instrument was a different
+program.** Every subtraction in the taxes table below is a correct measurement
+of that probe; none of it was ever a measurement of BOBYQA.
+
+What was actually wrong: `BOBYQAOptimizer.trsbox` reuses local 87 as a `double`,
+an `int` AND a reference, and the per-bci reaching-kind dataflow settles it as
+`Ref` — but `kind_at` filtered `Ref` out, deferring to a precise oop mask that
+had `oop_reached=false oop_mask=0x0` at every snapshot in the method and could
+not have addressed slot 87 anyway (it is a single `u64`). One `Unsupported` slot
+is an artifact-wide OSR veto, so both hot methods compiled and could never be
+entered: `osr_refused_entry=15152` beside `hot_but_stuck_in_interpreter=0`.
+
+**Two of this page's own conclusions survive and one is inverted:**
+
+* The OSR-admission diagnosis it opens by *retracting* ("the first was an OSR
+  admission gap … every word true; not the cause") was the right family after
+  all. `RBC.6` really was not the blocker; a different OSR gate was.
+* Its measured refusals of the getfield page's candidate fixes stand, and so do
+  the accessor taxes — of the probe.
+* Its verdict that the fix "is the ZGC JIT load barrier … 3-5 weeks" pointed at
+  a change worth roughly 8% here. The ZGC read-bounds publish landed on the same
+  branch and is measured separately: `jit_getfield` helper calls on `BobyqaOne`
+  **2 125 738 → 0**, wall clock ~1.08x. Real, and not this.
+
+---
+
 # `BOBYQAOptimizerTest` times out because compiled numeric code is ~80x HotSpot — and 70% of it is one `getfield`
 
 **Status: OPEN, root cause identified and sized 2026-08-18.** Not fixed here;
