@@ -263,3 +263,48 @@ cannot be verified anyway at 0 invocations.
 is not a verdict. Reading it as "nothing objectionable found" is how a blind
 retag gets shipped, and this registrar is the case where it would have cost ten
 real bridges.
+
+## 9. The rest of the wave-1 tail, censused — and why it stops here
+
+`sunec_point.rs` (1) and `sunec_intpoly.rs` (2) in `native-builtins-security`
+are already `Intrinsic`. Correctly tagged; nothing to do.
+
+`native-io/src/watch.rs` — 36 registrations (27 `Bridge`, 9 already
+`SyntheticStub`), on `sun.nio.fs.{AbstractWatchService, PollingWatchService,
+WindowsWatchService}`. Censused by force-loading:
+
+| verdict | count |
+| --- | ---: |
+| **`ACC_NATIVE`** | **0** |
+| has bytecode | 0 |
+| not declared here | 18 |
+| class-not-loaded (`PollingWatchService`, absent on Windows) | 9 |
+
+**Zero genuine bridges**, so all 27 are mistagged by the same standard the other
+retags used. And it is NOT retagged here, for a reason worth stating rather than
+quietly skipping:
+
+**invocations = 0.** Nothing in 101 vectors exercises a `WatchService`. By this
+session's own three-part rule (`G85-1` §3b) that fails verification (3): the tag
+would move and the arms would stay green, and neither fact would say anything
+about whether file watching still works. `Vector` (28 registrations) already sits
+in the tree in exactly that state — retagged, green, and unproven — and one such
+entry is enough.
+
+The honest options are to write a `WatchService` vector first (a temp directory,
+a registration, a file creation, a bounded poll — timing-sensitive, so it needs
+care to not be flaky), or to leave it. Left, with the census recorded so the next
+person starts from the verdict rather than from the tag.
+
+**That closes the wave-1 tail.** What remains in it is each blocked for a
+*different, measured* reason, which is the useful summary:
+
+| entry | regs | why not now |
+| --- | ---: | --- |
+| `data_stream` | 37 | 1039 invocations — hot, and by §8's pattern likely load-bearing |
+| `instrument.rs` | 33 | mixed: 10 genuine `ACC_NATIVE` bridges; needs a per-group split, unverifiable at 0 invocations |
+| `watch.rs` | 27 | 0 bridges but 0 invocations — correct by classification, unverifiable by exercise |
+| `scanner` | 40 | correctly classified, LOAD-BEARING (measured) |
+| `native-builtins-security` | 3 | already `Intrinsic` |
+
+None of these is blocked by judgement or appetite. Each has a number attached.
