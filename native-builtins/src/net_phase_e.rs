@@ -999,9 +999,9 @@ fn ssc_set<F: FnOnce(&mut SscSide)>(ctx: &dyn NativeContext, this: ObjectRef, f:
 /// `usize` root handle in or out in a single statement; the
 /// `ctx.resolve_global_root` calls that surround them run on the next
 /// statement, with no guard held.
-fn ssc_carrier_roots() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<SscKey, usize>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<SscKey, usize>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn ssc_carrier_roots() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<SscKey, usize>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<SscKey, usize>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The carrier for `(owner, tag)`, minted once and handed back thereafter.
@@ -15527,9 +15527,9 @@ struct SssOptionDelegate {
 /// acquisitions is one statement — a `get().copied()` or an `insert()` of a
 /// `Copy` row — and the delegate construction (`new_object_initialized`,
 /// `add_global_root`) happens between them rather than under them.
-fn sss_option_delegates() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<i32, SssOptionDelegate>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<i32, SssOptionDelegate>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn sss_option_delegates() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<i32, SssOptionDelegate>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<i32, SssOptionDelegate>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Resolve — creating on first use — the delegate handle for `this`, and bring

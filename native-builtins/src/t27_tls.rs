@@ -6863,9 +6863,9 @@ const SSS_MODE_DEFAULT: (i32, i32) = (0, 1);
 /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Every acquisition takes
 /// the guard after `gc_stable_objref_key` has already produced the key, and
 /// holds it only across a `HashMap::entry` on a `(i32, i32)`.
-fn sss_mode_states() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, (i32, i32)>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, (i32, i32)>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn sss_mode_states() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (i32, i32)>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (i32, i32)>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn sss_mode_state(ctx: &dyn NativeContext, socket: ObjectRef) -> (i32, i32) {
@@ -6882,9 +6882,9 @@ fn sss_mode_state(ctx: &dyn NativeContext, socket: ObjectRef) -> (i32, i32) {
 /// one, which would say this socket can negotiate nothing.
 /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both acquisitions are one
 /// statement over an already-built key and an already-built `Vec<String>`.
-fn sss_enabled_suites_table() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, Vec<String>>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, Vec<String>>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn sss_enabled_suites_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<String>>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Vec<String>>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn stash_sss_enabled_suites(ctx: &dyn NativeContext, socket: ObjectRef, suites: Vec<String>) {
@@ -18565,9 +18565,9 @@ pub(crate) fn record_local_cert_chain(
 /// `gc_stable_objref_key` — which calls `ctx.identity_hash_code` — into a local
 /// BEFORE acquiring. It used to sit inside the lock expression, which is the
 /// same shape the 2026-08-17 round hoisted out of five other tables.
-fn session_peer_endpoint_table() -> &'static cratonvm_types::lock_order::OrderedMutex<HashMap<u64, (String, i32)>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<HashMap<u64, (String, i32)>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn session_peer_endpoint_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (String, i32)>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, (String, i32)>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Record the endpoint a session's peer was reached at. See
@@ -18820,9 +18820,9 @@ pub(crate) fn peer_certs_for_session(ctx: &dyn NativeContext, session: ObjectRef
 /// [`session_peer_endpoint_table`]: `gc_stable_objref_key` is evaluated into a
 /// local before either acquisition, so no `NativeContext` call runs under the
 /// guard.
-fn session_invalidated_table() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashSet<u64>> {
-    static T: OnceLock<cratonvm_types::lock_order::OrderedMutex<std::collections::HashSet<u64>>> = OnceLock::new();
-    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashSet::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+fn session_invalidated_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashSet::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// Record that `invalidate()` was called on this session. Crate-visible so
