@@ -74,8 +74,18 @@ pub const P_RET_TOTAL: usize = 5;
 /// `Frame`'s `Drop` (two `Arc` decrements — `code` and the cached method) plus
 /// routing four `Vec` headers back to the thread-local pools.
 pub const P_RET_RECYCLE: usize = 6;
+/// CALIBRATION: two back-to-back `now()` calls measuring nothing at all.
+///
+/// Every other phase is inflated by roughly one `rdtsc` latency, and
+/// `P_RET_TOTAL` by THREE, because it brackets the nested `P_RET_RECYCLE`
+/// pair. Comparing a nested phase against a flat one without accounting for
+/// that is not like-for-like, and at a plausible ~25 cyc per read it is enough
+/// to invert the ranking. So the overhead is measured on this workload rather
+/// than assumed, and `dump` prints each phase both raw and
+/// overhead-corrected.
+pub const P_CALIB: usize = 7;
 
-const N: usize = 7;
+const N: usize = 8;
 const NAMES: [&str; N] = [
     "ic_lookup   ",
     "guards      ",
@@ -84,6 +94,7 @@ const NAMES: [&str; N] = [
     "frame_push  ",
     "ret_total   ",
     "  ret_recycle",
+    "CALIB(noop) ",
 ];
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -153,9 +164,13 @@ pub fn dump() {
     // Summing all seven would double-count it and quietly inflate the whole
     // table.
     let total: u64 = (0..N)
-        .filter(|i| *i != P_RET_RECYCLE)
+        .filter(|i| *i != P_RET_RECYCLE && *i != P_CALIB)
         .map(|i| CYCLES[i].load(Ordering::Relaxed))
         .sum();
+    // Measured cost of ONE `now()` pair on this workload. Each flat phase
+    // carries one; `P_RET_TOTAL` carries three, because it brackets the nested
+    // `P_RET_RECYCLE` pair.
+    let calib = CYCLES[P_CALIB].load(Ordering::Relaxed) as f64 / calls as f64;
     eprintln!("[invoke-phases] instrumented invokestatic calls={calls} total_cycles={total}");
     for i in 0..N {
         let c = CYCLES[i].load(Ordering::Relaxed);
@@ -165,7 +180,18 @@ pub fn dump() {
         } else {
             100.0 * c as f64 / total as f64
         };
-        eprintln!("[invoke-phases]   {} {per:8.1} cyc/call  {pct:5.1}%", NAMES[i]);
+        let overhead = if i == P_CALIB {
+            0.0
+        } else if i == P_RET_TOTAL {
+            calib * 3.0
+        } else {
+            calib
+        };
+        let corrected = (per - overhead).max(0.0);
+        eprintln!(
+            "[invoke-phases]   {} {per:8.1} raw  {corrected:8.1} corrected  {pct:5.1}% raw",
+            NAMES[i]
+        );
     }
     eprintln!(
         "[invoke-phases]   {:8.1} cyc/call measured (rdtsc overhead INCLUDED; ranking, not costing)",
