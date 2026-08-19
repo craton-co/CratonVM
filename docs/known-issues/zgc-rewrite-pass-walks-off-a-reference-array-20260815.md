@@ -4,9 +4,10 @@
 **0 SIGSEGV in 52 reps** (26 instrumented, 26 not) in an arm proven to collect
 AND compact; under the documented 3/23 that is a sub-0.1% outcome. Not retired: the
 writer was never identified, both instruments are armed and SILENT rather than
-vindicated, and **the control is missing — nobody has shown this machine
-reproduces the crash at all**, so "does not reproduce here" is as far as it
-goes. Sixth pass 2026-08-18 — two more bulk writers closed
+vindicated, and although the control is now POSITIVE (2/26 on the pre-fix
+tree, against 0/52 on current dev — so the tree changed, not the box), the
+control's crashes symbolize into `chm_collect_all_entries`, NOT the documented
+`reference_slots`/`relocate_stw`. Sixth pass 2026-08-18 — two more bulk writers closed
 by construction, and the evidence re-read: the corrupting value is a *heap
 pointer at offset 0*, which is equally consistent with an unregistered object
 based 16 bytes below the victim. Fifth pass 2026-08-18 — the fourth pass's prescribed
@@ -727,7 +728,96 @@ Three reasons, and the first is this page's own scar tissue:
   and from several sessions. Any of them may have closed it. Nobody has bisected
   it, and the honest record is "does not reproduce", not "was fixed by X".
 
-## The control this run is MISSING, and it is the one that matters
+## The control was RUN, 2026-08-18: positive, but on different frames
+
+Built `dev` at **`7eab6d6c2`** — the commit immediately before
+`fix/zgc-slide-origin`, i.e. the tree the 3/23 belongs to, before the cursor
+check that took it to 1/14 — and ran the same 26 reps on the same machine, same
+harness, same `common.args` (the classpath points at the main worktree's netty
+build, so the Java side is held constant and only the VM binary differs).
+
+| tree | reps | SIGSEGV |
+|---|---:|---:|
+| `7eab6d6c2` (pre-fix, the 3/23 tree) | 26 | **2** |
+| current `dev` | 52 | **0** |
+
+**So the environment is exonerated.** This machine reproduces a ZGC `--nojit`
+SIGSEGV on this class at ~2/26, and current `dev` produced none in twice as many
+reps. At the control's own rate the chance of 0 in 52 is `0.923^52 ≈ 1.6%`; at
+the page's 3/23 it is 0.075%. **The difference is in the tree, not the box** —
+which is what the 52-rep run could not say on its own.
+
+### But it is NOT demonstrably the same crash
+
+Both control crashes carry this page's signature —
+`jit: guarded compiled frames live process-wide: no (quiescence depth=0)`,
+`0 compiled code range(s)` — so no compiled frame is involved, as documented.
+Symbolized against the control binary, though, the frames are:
+
+```
+cratonvm_native_collections::chm_collect_all_entries
+cratonvm_native_collections::map_state
+```
+
+**not** `reference_slots` / `relocate_stw`, which is what this page's fault
+records. Two readings, and this page's own text supports either:
+
+* **the same corruption, a different reader** — it already says "an unwalkable
+  rewrite target is one route to the SIGSEGV and not the only one", and a
+  corrupted header faults whoever walks it first;
+* **a second defect** on the same workload and the same arm.
+
+So the control proves the *tree* changed, and does **not** prove the documented
+rewrite-pass fault is what changed. A bisect is now justified — and its first
+duty is to **record which frames each crash symbolizes to**, or it will merge two
+defects into one answer.
+
+## Bisect, step 1 — and the step size is wrong
+
+Rather than a blind midpoint over 108 GC-touching commits, the first step tested
+a commit with prior evidence: **`175dc1751`**, *"the proxy Method cache was rooted
+but never remapped"* — a cache holding pre-slide addresses the slide moved, which
+is this defect's shape exactly.
+
+| tree | reps | SIGSEGV |
+|---|---:|---:|
+| `7eab6d6c2` (pre-fix control) | 26 | **2** |
+| `175dc1751` (the remap fix) | 26 | **0** |
+| current `dev` | 52 | **0** |
+
+So the closer is **provisionally** in `(7eab6d6c2, 175dc1751]`.
+
+### Why "provisionally", and this is the important part
+
+**A 26-rep clean step is not evidence.** At the control's measured rate of
+2/26 ≈ 0.077:
+
+```
+P(0 crashes in 26 | p = 0.077) = 0.923^26 = 0.125
+```
+
+**One step in eight will read clean when nothing changed.** A bisect built on
+26-rep steps therefore makes a wrong call at roughly that rate, and every step
+after a wrong call searches the wrong half — which is exactly the failure this
+page already has on its record, where a `0/12` closed the case and the reopening
+noted "a ~1-in-10 event and zero in twelve draws are entirely compatible".
+
+For 95% confidence that a step is genuinely clean, at this rate:
+
+```
+0.923^n < 0.05  ->  n >= 38 reps per step
+```
+
+At ~90 s per rep that is ~1 hour of running per step **plus** a ~20 minute build,
+over log₂ of the ~124 commits still in range — call it 7 steps, so **the honest
+price of this bisect is 8–9 hours**, not the ~4 estimated before the rate was
+known. The `0/52` on current `dev` is the one figure here that clears the bar
+(P = 1.6%); the two 26-rep readings do not, on their own.
+
+**Do not narrow the range further on 26-rep steps.** Re-run `175dc1751` at n ≥ 38
+before trusting the bracket above.
+
+## The control this run WAS missing, and why it mattered
 
 The arm was proven non-vacuous — it collects and it compacts, checked above. **The
 environment was not.** Nobody has shown that *this machine* reproduces the crash

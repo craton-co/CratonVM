@@ -396,8 +396,21 @@ pub mod site_stats {
     /// answer is `false`. A counter whose name implies the wrong cause is the
     /// same defect as a counter that does not fire.
     pub const CAST_UNUSABLE: usize = 15;
+    /// An `ldc` answered from the recorded-resolution store — the whole
+    /// instruction, before the class_manager lock.
+    pub const LDC_HIT: usize = 16;
+    /// An `ldc` that had to resolve. Non-zero with `LDC_HIT` at zero would
+    /// mean the store is never being written, which is a different defect
+    /// from a cache that is written and never read.
+    pub const LDC_MISS: usize = 17;
+    /// An `ldc` result written to the store. Every tag `ldc` can push records,
+    /// including `Integer`/`Float`: an unrecorded tag would MISS the probe on
+    /// every execution and then resolve anyway, so the probe would be pure
+    /// added cost for it. `ldc2_w` does not probe or record — see
+    /// `constants::execute_ldc2w`.
+    pub const LDC_FILL: usize = 18;
 
-    const N: usize = 16;
+    const N: usize = 19;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -423,7 +436,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -441,6 +454,9 @@ pub mod site_stats {
             COUNTS[CAST_FILL].load(Ordering::Relaxed),
             COUNTS[CAST_REJECT_LOADER].load(Ordering::Relaxed),
             COUNTS[CAST_UNUSABLE].load(Ordering::Relaxed),
+            COUNTS[LDC_HIT].load(Ordering::Relaxed),
+            COUNTS[LDC_MISS].load(Ordering::Relaxed),
+            COUNTS[LDC_FILL].load(Ordering::Relaxed),
         );
     }
 

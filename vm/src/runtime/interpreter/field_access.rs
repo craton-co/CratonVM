@@ -1164,8 +1164,10 @@ pub(super) fn pop_coerced_invoke_args_virtual(
         b'L',
         tmp_cv[0].0.decode_by_descriptor(b'L'),
     ));
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&method_descriptor);
     for i in 0..num_params {
-        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
+        let pd_byte = param_tags.get(&method_descriptor, i);
         let (cv, is_long) = tmp_cv[i + 1];
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
@@ -1205,8 +1207,10 @@ pub(super) fn pop_coerced_invoke_args_static(
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&method_descriptor);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
+        let pd_byte = param_tags.get(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }

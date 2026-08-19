@@ -626,6 +626,70 @@ Until a spliced body can carry a value across a branch merge, the assertion
 chain cannot collapse, because its very first rung past `assertEquals` is
 this shape.
 
+### The wall came down — 2026-08-18, and devirtualisation finally engages
+
+`try_emit_inline_body` now splices a value-producing branch merge. Each path
+stores its live values to a reserved merge region before transferring control and
+the target reads them from there; the region sits below the callee's operand
+area so a store can never alias the slot it reads from. Depth and oop marks are
+recorded per target and checked across incoming paths.
+
+That unblocked everything downstream of it. With the merge fix in,
+`AssertionUtils.objectsAreEqual` splices, its `invokevirtual equals` is reached,
+and the guarded splice fires for the first time in this line of work:
+
+```
+                            nest (devirt off)     devirt on
+spliced-call-direct                  12                10
+spliced-call-dispatch                 0                 1   <- the guard's cold miss edge
+nested-splice-guarded                 0                 1
+outer-splice-rolled-back              1                 1
+```
+
+`probes/AssertChainProbe`, one binary, five interleaved rounds, `assertFull`:
+
+| round | base | + direct-bind | + merge & devirt |
+|---|---:|---:|---:|
+| 1 | 45.16 | 39.05 | **33.60** |
+| 2 | 44.43 | 39.41 | **34.08** |
+| 3 | 44.26 | 39.11 | **34.08** |
+| 4 | 44.63 | 39.16 | **33.65** |
+| 5 | 44.51 | 39.37 | **33.60** |
+
+**44.6 -> 33.8 ns/iter, −24%**, monotone in all five rounds and with the arms
+never overlapping. Direct-binding bought the first −12%; the merge fix plus the
+devirtualisation it unblocked bought another −14%.
+
+codec-http, 93 classes, same binary: **identical per-class result sets with the
+flags off and on**, 87 PASS both. The merge change is not behind a flag — it
+changes the default inline emitter for every compile — so the off arm is the one
+that matters there, and it matches the dev baseline exactly.
+
+### What is left, and it is now arithmetic
+
+The loop runs 4 294 967 296 iterations. JUnit's own `@Timeout` on
+`testHttpStatusClassValueOf` is 120 s, so the method needs **≤ 27.9 ns/iter**.
+At 33.8 it takes ~145 s. The remaining gap is **−17%**, against **−24% already
+taken**.
+
+The class still reports `HANG` under the 4-shard harness at a 180 s wall,
+because 145 s for the one method plus the other twelve tests exceeds it under
+load. As recorded above, that class-level state has been marginal in both
+directions all day; the ns/iter figure is the one to track.
+
+Where the remaining 17% would come from, in the order the counters point:
+
+* `outer-splice-rolled-back=1` — one admitted splice is still refused at
+  emission. Whatever that body contains is the next unmodelled construct, and
+  the arm census will name it the moment someone asks.
+* `valueOf` itself, measured at ~9-10 ns of the ~34, is five `invokevirtual
+  contains` calls on static-final constants of anonymous subclasses. Those are
+  now devirtualisable in principle — the machinery that just fired on `equals`
+  is the same — but each needs its own MIC evidence, and an anonymous-subclass
+  receiver is a different shape from an enum.
+* `MAX_INLINE_MERGE_DEPTH` is 4 and `MAX_INLINE_NEST_DEPTH` is 3; neither has
+  been tuned against anything.
+
 ### A correction to the direct-bind result
 
 This page reported `HttpResponseStatusTest` moving from `HANG found=0 started=0`

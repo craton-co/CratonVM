@@ -5044,16 +5044,38 @@ fn get_client_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     )))))
 }
 
+/// Build a Java `String[]` from `items`.
+///
+/// GC NOTE, and it is the whole reason this is not three lines. `arr` outlives
+/// `create_string`, which ALLOCATES: under a moving young collector the array
+/// is relocated by that allocation and every `set_array_element` after it
+/// writes into the vacated slots. What the live array keeps is whatever the
+/// collector left there — usually `null`.
+///
+/// This is the same defect
+/// `openssl-key-material-and-engine-residuals-20260813.md` §D recorded against
+/// `getAcceptedIssuers`, at the two methods it did NOT sweep:
+/// `getServerAliases` and `getClientAliases`. A null-riddled alias array is
+/// exactly what netty's `OpenSslKeyMaterialProvider` turns into
+/// `NO_CERTIFICATE_SET` / `Unable to find key material for auth method(s)`,
+/// and it is intermittent for the same reason every instance of this shape is:
+/// it needs a collection to land inside the loop.
+///
+/// `t27_tls::build_issuer_principals` has carried the rooted form since
+/// 2026-08-01; this is that form.
 fn materialize_string_array(ctx: &mut dyn NativeContext, items: &[String]) -> ObjectRef {
     let cls_id = ctx
         .ensure_class_initialized("java/lang/String")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, items.len());
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let arr = scope.new_ref_array(cls_id, items.len());
+    let arr_h = scope.root(arr);
     for (i, s) in items.iter().enumerate() {
-        let js = ctx.create_string(s);
-        ctx.set_array_element(arr, i, Value::Object(Some(js)));
+        let js = scope.create_string(s);
+        let arr = scope.get(&arr_h);
+        scope.set_array_element(arr, i, Value::Object(Some(js)));
     }
-    arr
+    scope.get(&arr_h)
 }
 
 // ---------------------------------------------------------------------------
@@ -5277,11 +5299,22 @@ fn kmf_engine_get_key_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let cls_id = ctx
         .ensure_class_initialized("javax/net/ssl/KeyManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, 1);
-    let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
-    set_km_id(ctx, km, id);
-    ctx.set_array_element(arr, 0, Value::Object(Some(km)));
-    Ok(Some(Value::Object(Some(arr))))
+    // GC NOTE: `try_alloc_concurrent_synthetic` allocates, so the array must be
+    // rooted across it — see `materialize_string_array`. A length-1 array is
+    // not exempt: the relocation moves the array, not the element count, and a
+    // `KeyManager[]` whose only slot reads back `null` is
+    // `getKeyManagers()[0]` throwing where the caller cannot see why.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let arr = scope.new_ref_array(cls_id, 1);
+    let arr_h = scope.root(arr);
+    let km = try_alloc_concurrent_synthetic(&mut *scope, mirror, 2)?;
+    let km_h = scope.root(km);
+    let km = scope.get(&km_h);
+    set_km_id(&mut *scope, km, id);
+    let km = scope.get(&km_h);
+    let arr = scope.get(&arr_h);
+    scope.set_array_element(arr, 0, Value::Object(Some(km)));
+    Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
 }
 
 fn tmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5319,9 +5352,15 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let cls_id = ctx
         .ensure_class_initialized("javax/net/ssl/TrustManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, 1);
-    let tm = try_alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2)?;
-    set_tm_id(ctx, tm, id);
+    // GC NOTE: same rooting as `kmf_engine_get_key_managers` above.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let arr = scope.new_ref_array(cls_id, 1);
+    let arr_h = scope.root(arr);
+    let tm = try_alloc_concurrent_synthetic(&mut *scope, FQN_X509_TM, 2)?;
+    let tm_h = scope.root(tm);
+    let tm = scope.get(&tm_h);
+    set_tm_id(&mut *scope, tm, id);
+    let tm = scope.get(&tm_h);
     if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] tmf_engine_get_trust_managers stamped tm_ptr={:?} id={}",
@@ -5329,8 +5368,9 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
             id
         );
     }
-    ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
-    Ok(Some(Value::Object(Some(arr))))
+    let arr = scope.get(&arr_h);
+    scope.set_array_element(arr, 0, Value::Object(Some(tm)));
+    Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
 }
 
 // ---------------------------------------------------------------------------

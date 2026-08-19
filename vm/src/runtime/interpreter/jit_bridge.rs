@@ -7693,6 +7693,18 @@ fn resolve_inline_site_from(
                 // Virtual / interface: one body per receiver class, so a splice
                 // needs a guard and the profile has to name the class.
                 0 | 2 => {
+                    // THE GATE, and it belongs here rather than only on the
+                    // profile fetch below. Gating just the profile left the MIC
+                    // fallback running with `CRATONVM_JIT_INLINE_SPLICE_DEVIRT`
+                    // OFF, so devirtualisation happened whenever nesting did and
+                    // the flag's two arms were byte-identical — measured
+                    // 2026-08-18, `nested-splice-guarded=1` in both. A switch
+                    // that does not switch anything is worse than no switch: it
+                    // makes an A/B report "no difference" for a feature that was
+                    // on in both arms.
+                    if !crate::runtime::env_cache::jit_inline_splice_devirt() {
+                        continue;
+                    }
                     // TWO sources, in this order, and the second is the one
                     // that actually answers for this workload.
                     //
@@ -8109,14 +8121,14 @@ pub(super) fn jit_saved_args_to_values(
 ) -> Vec<Value> {
     let is_static = cached.is_static;
     let mut out = Vec::with_capacity(np);
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&cached.method_descriptor);
     for i in 0..np {
         let (cv, is_long) = saved_args[i];
         let desc_byte = if is_static {
-            nth_param_tag_byte(&cached.method_descriptor, i)
-        } else if i == 0 {
-            b'L' // receiver
+            param_tags.get(&cached.method_descriptor, i)
         } else {
-            nth_param_tag_byte(&cached.method_descriptor, i - 1)
+            param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
         out.push(decode_arg_kind_aware(cv, is_long, desc_byte));
     }
@@ -8295,17 +8307,17 @@ pub(super) fn execute_jit_call(
     // that arm for the underflow this prevents.
     let mut saved_args: [(CompactValue, bool); JIT_ABI_MAX_JAVA_ARGS] =
         [(CompactValue::zero(), false); JIT_ABI_MAX_JAVA_ARGS];
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&cached.method_descriptor);
     for i in (0..np).rev() {
         let (cv, is_long) = thread.frames[frame_idx]
             .stack
             .pop_compact_with_long_mark_unchecked();
         saved_args[i] = (cv, is_long);
         let desc_byte = if is_static {
-            nth_param_tag_byte(&cached.method_descriptor, i)
-        } else if i == 0 {
-            b'L' // receiver
+            param_tags.get(&cached.method_descriptor, i)
         } else {
-            nth_param_tag_byte(&cached.method_descriptor, i - 1)
+            param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
         let v = decode_arg_kind_aware(cv, is_long, desc_byte);
         jit_args[i] = match v {
