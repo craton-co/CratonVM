@@ -90,10 +90,13 @@ or the call sites not reaching it — turns an emergent property into a stated
 one, and would let the row's remaining work be about `--real-jdk` only, which
 is a much smaller question.
 
-**N2 — the row's real content is the THIRD location.** With the two lists
-centralised and the strict path inert, what is left is the JIT: seven ladders
-plus five bypassing paths. That is where "duplicate dispatch implementations"
-still literally exists, and it is not measured by anything this session ran.
+**N2 — MEASURED (`G87-1`).** The JIT third location under `--jdk-only`: 0
+direct native binds, 0 inline-cache natives, and 38 by-name fast-path
+admissions REFUSED — measured on `RJitStringLayout`, a run with 1.75M intrinsic
+invocations, so the JIT was thoroughly exercised. Same shape as the allow-list:
+the mechanism is live in `--real-jdk` and neutralised in strict. The row's
+remaining content is therefore the DEFAULT mode plus the missing single
+resolver, not the strict path.
 
 **N3 — re-derive every P0 row's evidence before planning against it.** This is
 the fourth stale row found by reading the tree instead of the table. A row that
