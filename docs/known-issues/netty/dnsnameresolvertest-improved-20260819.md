@@ -47,5 +47,5 @@ isn't available to compare against directly.
 - `fail-hang-crash-rerun-20260817.md` — flagged this class's status change
   (`HANG` in the original characterization → `ABORTED` here) as worth a
   look.
-- `docs/internal/fixed-suite-bugs/netty/dns-searchdomaintest-and-dnsnameresolvertest-regressed-20260813.md` —
+- `fixed-suite-bugs/netty/dns-searchdomaintest-and-dnsnameresolvertest-regressed-20260813.md` —
   an earlier round of the same two classes' history.

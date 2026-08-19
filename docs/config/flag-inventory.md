@@ -822,8 +822,6 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_LINKER` | DBG | `CRATONVM_DBG=linker` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_LOADCLASS` | DBG | `CRATONVM_DBG=loadclass` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_LOADER_CHAIN` | DBG | `CRATONVM_DBG=loader-chain` | opt-in | off | diag | snapshot | classloading |
-| `CRATONVM_DBG_GETFIELD_RECEIVERS` | DBG | `CRATONVM_DBG=getfield-receivers` | opt-in | off | diag | snapshot | vm |
-| `CRATONVM_DBG_JIT_BORROW_SITES` | DBG | `CRATONVM_DBG=jit-borrow-sites` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LOADER_TRACE` | DBG | `CRATONVM_DBG=loader-trace` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO` | DBG | `CRATONVM_DBG=load-transform-no-memo` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LOGPROV` | DBG | `CRATONVM_DBG=logprov` | opt-in | off | diag | snapshot | types |
