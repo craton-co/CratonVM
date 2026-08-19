@@ -677,12 +677,38 @@ use cratonvm_types::compat::CompatibilityMode;
 /// list is above. Nor does it license a future re-freeze: the next rise must
 /// come with the same two columns (stubs AND rows) and the same enumeration,
 /// which is why the failure message now prints the per-file breakdown itself.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1396;
+/// # 1396 / 1386 -> 1622 / 1611, 2026-08-19 — the §1.4 shadow wave, and the
+/// first time the two-column rule adjudicated a change instead of explaining one
+///
+/// 227 triples over five subsystems were RETIRED as contract §1.4 shadows
+/// (`native-api/src/retired_shadow.rs`, `G90-1`): a native standing in front of
+/// concrete JDK bytecode now yields to it under `--jdk-only`. Retirement is
+/// implemented as a re-tag to `SyntheticStub` at registration, so this count
+/// rises by exactly the number retired on the boot path — **+226 management,
+/// +225 no-management, and the registry did not grow by ONE ROW** (13160 and
+/// 12792, both unchanged).
+///
+/// That is the whole adjudication, and it took no recollection of what the
+/// change did. The rule added above on the same day says a relabel keeps its
+/// row while a new fake adds one; the row column did not move; therefore every
+/// one of the 226 is a relabel. The *157 -> 165* note further up argues the
+/// same conclusion in eight paragraphs of prose about eight registrations,
+/// because at the time there was no second number to point at.
+///
+/// **Read the direction correctly.** This is the largest single rise this
+/// constant has ever taken and it is the most correct the registry has been:
+/// 227 fakes stopped claiming to be `Bridge` AND stopped shadowing real
+/// bytecode under `--jdk-only`. The acceptance test is
+/// `regression-suite/run.sh` with `CRATONVM_ARGS=--jdk-only` — 102 / 102, the
+/// baseline — and it is the test that matters, because it is the one that
+/// rejected 28 further triples the 36-vector screen had passed
+/// (`java/lang/ref/`, `sun/nio/fs/`; see `G90-1` §5).
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1622;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1386;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1611;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///

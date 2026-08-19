@@ -243,8 +243,11 @@ jobs:
       # of them was ever run here. `BASELINE_SYNTHETIC_STUBS_MANAGEMENT` is the
       # SHIPPING registry — `cratonvm-cli` enables `management`, so the ten
       # `jmx::*` registrars and their 10 stub rows are in the binary users run
-      # and were in nothing CI adjudicated. Measured 2026-08-19: no-management
-      # 1386 stubs / 12792 rows, management 1396 / 13160.
+      # and were in nothing CI adjudicated. Measured 2026-08-19 after the §1.4
+      # shadow wave: no-management 1611 stubs / 12792 rows, management 1622 /
+      # 13160. Both configurations report BOTH numbers, which is the point —
+      # the row count is what separates a relabel (welcome) from a new fake
+      # (the regression this gate exists for).
       #
       # This is the same shape as the two scope defects the ratchet file
       # records against itself — a gate that names a population wider than the
