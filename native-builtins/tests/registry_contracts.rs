@@ -391,12 +391,34 @@ fn exempt_helper_callers_all_gate_first() {
     let mut ungated: Vec<usize> = Vec::new();
     let mut calls = 0usize;
     let mut from = 0usize;
-    let needle = format!("{HELPER}(ctx");
+    let needle = format!("{HELPER}(");
     while let Some(rel) = body[from..].find(&needle) {
         let at = from + rel;
         from = at + needle.len();
-        // The definition itself is `fn load_library_or_throw(\n    ctx:` — the
-        // needle requires `(ctx` with no newline, so it matches calls only.
+        // WHITESPACE-TOLERANT, and that is the whole point of this loop.
+        //
+        // This used to look for the literal `load_library_or_throw(ctx`, with a
+        // comment claiming the newline in the DEFINITION (`fn
+        // load_library_or_throw(\n    ctx:`) was what kept the definition out of
+        // the count. Then the call sites grew a fifth argument, rustfmt wrapped
+        // seven of the eight the same way, and the needle stopped matching them
+        // too: the scan found ONE call and checked the gate on ONE call, which
+        // is a detector that had quietly stopped detecting. It only became
+        // visible when the count fell under the `>= 4` floor below — i.e. the
+        // floor caught it, the check did not.
+        //
+        // So: match the call by name, skip whitespace, and require the first
+        // argument to be `ctx`. The definition is excluded explicitly, by its
+        // `fn ` prefix, rather than by relying on how rustfmt happens to wrap
+        // it today.
+        let is_definition = body[..at].trim_end().ends_with("fn");
+        if is_definition {
+            continue;
+        }
+        let arg = body[from..].trim_start();
+        if !(arg.starts_with("ctx,") || arg.starts_with("ctx)") || arg.starts_with("ctx ")) {
+            continue;
+        }
         calls += 1;
         // Look back to the start of the enclosing registered closure.
         let scope_start = body[..at]

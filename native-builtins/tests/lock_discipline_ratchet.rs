@@ -67,6 +67,57 @@
 //!   across `throw_jca_exc`. Each now binds the (copied or cloned) row to a
 //!   local first, so the guard drops before the body runs.
 //!
+//! Twenty-one more on 2026-08-19, all at `LockLevel::Scratch`, paying back the
+//! twenty raw locks that had landed since the 2026-08-17 freeze (`dev` was red
+//! at 452) and retiring one more besides. Found the same way — census the
+//! crate at the freeze commit and at `HEAD`, take the per-file delta, then
+//! blame the sites in the files that grew:
+//!
+//! * blame needs `-w --ignore-rev` here. A line-ending normalisation commit
+//!   ("chore: normalise nine files back to LF before merging dev") re-blames
+//!   every line of nine files, and reported **39** new sites where the census
+//!   delta is 20. A date is not an attribution.
+//!
+//! The twenty-one: `CACHE` (the NIST curve parameters, `src/crypto_impl.rs`),
+//! `https_response_streams` (`src/http_url_connection.rs`),
+//! `BOOLEAN_COMPONENTS` (`src/intrinsics/record.rs`), `FILE_PROPS`
+//! (`src/jca/provider_chain.rs`), `x500_der_table` (`src/jca/x500.rs`), the
+//! three box caches `CHARACTER_CACHE` / `BYTE_CACHE` / `SHORT_CACHE`
+//! (`src/lang_math.rs`), `surrogate_intern_pool` (`src/lang_string.rs`),
+//! `ssc_carrier_roots` and `sss_option_delegates` (`src/net_phase_e.rs`),
+//! `BC_SHA256_SLOTS` (`src/phases_late/bouncycastle.rs`), `TlsEntry::stream`
+//! (`src/servlet.rs`, four construction sites for one field), `sss_mode_states`,
+//! `sss_enabled_suites_table`, `session_peer_endpoint_table` and
+//! `session_invalidated_table` (`src/t27_tls.rs`), and `ArenaStore::translated`
+//! (`src/unsafe_natives_ext.rs`).
+//!
+//! Sixteen met the standard as written. Five did not:
+//!
+//! * `session_peer_endpoint_table`, `session_invalidated_table` and
+//!   `https_response_streams` evaluated the key — `gc_stable_objref_key` /
+//!   `ctx.identity_hash_code` — INSIDE the lock expression. Same hoist as the
+//!   five the 2026-08-17 round fixed, and behaviour-preserving for the same
+//!   reason: the key is idempotent.
+//! * `FILE_PROPS` held its guard across `ctx.get_system_property` AND a
+//!   `read_to_string` of `java.security`. The parse now runs outside the lock
+//!   and only the publish is taken under it; two threads that miss together
+//!   both parse and `get_or_insert` keeps the first, which is the same map.
+//! * `session_is_valid` had the guard inside a `&&` whose left operand calls
+//!   back into the VM; it is now an early `return` with the key hoisted.
+//!
+//! `TlsEntry::stream` is the one that lowers the baseline. It is a single
+//! FIELD with four construction sites, three of them new; converting the field
+//! necessarily converts the fourth (`TlsClientStream::Native`), which predates
+//! the freeze. That is a lock retired below the frozen figure, so
+//! [`BASELINE_RAW_LOCKS`] drops 432 -> 431 in this same change — the
+//! bookkeeping the 2026-08-11 and 2026-08-17 entries declined to do because
+//! they had retired nothing.
+//!
+//! `ArenaStore::translated` is `Scratch` only because its enclosing lock is
+//! unordered: `real_ptr` holds `ArenaStore::inner`'s `RwLock` across it. Same
+//! caveat as the two JFR tables — if `inner` is ever given a level it must be
+//! a HIGHER one, never an equal one.
+//!
 //! Not converted, and worth naming so the next person does not re-derive it:
 //! `boot_layer_memo` (`src/jboss_jdkspecific.rs`) and `p60_current_handle_memo`
 //! (`src/phases_late.rs`) both hold their guard across `ctx.add_global_root`,
@@ -84,6 +135,18 @@
 //! comments. Those two are only safely `Scratch` *because* the enclosing lock
 //! is unordered; if `java_recordings` is ever given a level, it must be a
 //! higher one than theirs, not an equal one.
+//!
+//! Joined on 2026-08-19 by `INTEGER_CACHE_HIGH` (`src/lang_math.rs`), which is
+//! the interesting one: it is the OUTER lock of a two-lock nest over the
+//! unordered `INTEGER_CACHE`. A level claims nothing at or below it is held on
+//! acquisition, and the ordering that implies runs the wrong way here — the
+//! INNER lock would have to sit below this one, and `Scratch` is the floor.
+//! Any higher level would be this cache asserting a place in the VM's own
+//! hierarchy. The nesting is load-bearing (`high` and the matching `entries`
+//! must be published atomically or a racing thread can pair a `high` with a
+//! wrong-length cache), so the publish has to be restructured before a level
+//! can be stamped. Its three siblings in that file — `CHARACTER_CACHE`,
+//! `BYTE_CACHE`, `SHORT_CACHE` — take no nested lock and were converted.
 //!
 //! ## Why this gate ratchets instead of converting
 //!
@@ -126,6 +189,24 @@ use std::path::{Path, PathBuf};
 /// silently adjusted, because a baseline moved by someone other than the author
 /// of the improvement is the bookkeeping this ratchet exists to keep honest.
 ///
+/// Lowered 432 -> 428 on 2026-08-19. `dev` was red at 452; twenty-four
+/// conversions pay back the twenty that had landed AND retire four more. Unlike
+/// the two entries below, this number moves — that is what "converting one to an
+/// ordered wrapper requires lowering the baseline in the same change" means when
+/// it actually happens.
+///
+/// The four beyond the payback are not a bonus, they are unavoidable: a lock is
+/// converted by changing a TYPE, and two of these types are shared.
+/// `TlsEntry::stream` is one field with four construction sites, of which only
+/// three are new. The `valueOf` box caches share `cached_wrapper_box`,
+/// `scan_one_cache`, `update_one_cache` and `canonical_wrapper_if_cached::read`,
+/// all four of which take the mutex by type — so `CHARACTER_CACHE`,
+/// `BYTE_CACHE` and `SHORT_CACHE` could not convert without `INTEGER_CACHE`,
+/// `BOOLEAN_CACHE` and `LONG_CACHE` coming with them. Verified safe together:
+/// `gc_scan_value_of_cache_roots` and `canonical_wrapper_if_cached` take these
+/// guards one at a time, never nested, so six locks at an equal level cannot
+/// trip the checker.
+///
 /// Held at 432 again on 2026-08-17 while converting twenty-four locks, for the
 /// same reason as the 2026-08-11 entry below: `dev` had gone red at 456, and
 /// the twenty-four conversions pay that regression back exactly. No lock has
@@ -139,7 +220,7 @@ use std::path::{Path, PathBuf};
 /// the ratchet is green again — a conversion that lowered it would have been
 /// the wrong bookkeeping, because no lock has been retired below the frozen
 /// figure.
-const BASELINE_RAW_LOCKS: usize = 432;
+const BASELINE_RAW_LOCKS: usize = 428;
 
 /// Minimum number of source lines the scan must see before its count means
 /// anything.
