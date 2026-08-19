@@ -203,7 +203,9 @@ pub const SYNTHETIC_THREAD_VIRTUAL_SLOT: usize = 5;
 /// W7-77-guarded-slot-maps.md, against `javap -p java.lang.Thread` on Eclipse
 /// Adoptium 25.0.3.9 (19 instance fields, static excluded, declaration order):
 ///
-///     0 eetop  1 tid  2 name  3 interrupted  4 contextClassLoader  5 holder
+/// ```text
+/// 0 eetop  1 tid  2 name  3 interrupted  4 contextClassLoader  5 holder
+/// ```
 ///
 /// so **four** of this run's five slots disagree with the real class, not one:
 /// `NAME`(0) is `eetop`, `PRIORITY`(1) is `tid`, `TARGET`(3) is `interrupted`,

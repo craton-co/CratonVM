@@ -5455,16 +5455,18 @@ fn j25_joiner_on_fork(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 /// 25.0.3+9-LTS (this host's `java.home`) and every one is JDK-true, descriptor
 /// included.
 ///
-///     $ javap java.util.concurrent.StructuredTaskScope
-///       public abstract R join() throws InterruptedException;   -> ()Ljava/lang/Object;
-///       public abstract boolean isCancelled();
-///       public abstract <U extends T> Subtask<U> fork(Runnable);
-///       public static <T,R> StructuredTaskScope<T,R> open(Joiner, Function);
-///     $ javap -p java.util.concurrent.StructuredTaskScope\$Joiner
-///       public static <T> Joiner<...> allUntil(Predicate<...>);
-///       public default boolean onFork(Subtask<? extends T>);
-///     $ javap -p java.util.concurrent.StructuredTaskScope\$Configuration
-///       withName / withThreadFactory / withTimeout  (all three, exact descriptors)
+/// ```text
+/// $ javap java.util.concurrent.StructuredTaskScope
+///   public abstract R join() throws InterruptedException;   -> ()Ljava/lang/Object;
+///   public abstract boolean isCancelled();
+///   public abstract <U extends T> Subtask<U> fork(Runnable);
+///   public static <T,R> StructuredTaskScope<T,R> open(Joiner, Function);
+/// $ javap -p java.util.concurrent.StructuredTaskScope\$Joiner
+///   public static <T> Joiner<...> allUntil(Predicate<...>);
+///   public default boolean onFork(Subtask<? extends T>);
+/// $ javap -p java.util.concurrent.StructuredTaskScope\$Configuration
+///   withName / withThreadFactory / withTimeout  (all three, exact descriptors)
+/// ```
 ///
 /// Cross-checked against the frozen baselines
 /// `scripts/baselines/jdk25-java.util.concurrent.StructuredTaskScope*.tsv`,
