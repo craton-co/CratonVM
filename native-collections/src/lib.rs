@@ -2510,7 +2510,32 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_optional_double_natives(registry);
     register_linked_list_natives(registry);
     register_linked_hashmap_natives(registry);
-    register_array_deque_natives(registry);
+    // RETAGGED per subsystem (P0 "wholesale Bridge over-tagging"), with the
+    // evidence this file's own header demands — "Retag per subsystem, one PR
+    // each, with schema-v2 `invocations` and `overwrote` evidence".
+    //
+    // MEASURED 2026-08-19 from `--dump-native-registry` under `--jdk-only`:
+    //   registrations 33 | invocations 0 | overwrote 0
+    //   real target: 32 have CONCRETE BYTECODE, 1 abstract, 0 ACC_NATIVE
+    //
+    // That is jdk-only-native-review.md rule 4 — "concrete bytecode +
+    // incomplete replacement -> delete from the strict path". `java.util` is
+    // pure Java; there is no VM/OS boundary here to bridge to, and `ArrayDeque`
+    // has a complete real implementation to fall back to.
+    //
+    // Chosen FIRST of this crate's ~45 registrars precisely because it is the
+    // least entangled: `overwrote` is 0, so no other registration depends on
+    // this one winning, and only ONE registration is abstract — the header
+    // warns that abstract-interface registrations decide dispatch for every
+    // USER subclass, not just for `java.util`, so a subsystem with 88 of them
+    // (`register_set_view_carrier_natives`) is not where to start.
+    //
+    // Exercised by RCollections and RJdkBridge1 (core) and RJdkMapViews
+    // (jdk-only), so all three arms adjudicate this change.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_array_deque_natives,
+    );
     register_priority_queue_natives(registry);
     register_vector_natives(registry);
     register_stack_natives(registry);
