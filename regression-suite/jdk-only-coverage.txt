@@ -119,6 +119,19 @@ row in docs/jdk-only-runtime-services.md it maps to (P0/P1 table).
                                                        volatile long state into side-state is
                                                        a split brain; every assertion here is
                                                        a value such a model gets wrong)
+  headless AWT contracts        RJdkAwtHeadless    P0 "Wholesale Bridge over-tagging"
+                                                   P2 "Headful AWT"
+                                                   (the suite had NO AWT coverage at all, so
+                                                   all three arms were blind to the subsystem
+                                                   the over-tagging row nominates for retagging
+                                                   FIRST -- see known-issues/jdk-only/
+                                                   G79-1 and G80-1. Asks only CONTRACTS:
+                                                   the opaque-image alpha rule, fill and clip
+                                                   geometry, colour state, the bounds message
+                                                   and a PNG round trip. Deliberately asks
+                                                   NOTHING about rasterization quality, and
+                                                   deliberately omits getRaster/getColorModel,
+                                                   which still answer null -- G80-1 N1.)
   ProcessHandle                 RJdkProcess        P1 "ProcessHandle"        <-- named P1
   files and NIO                 RJdkNio            P1 "NIO, files, networking"
   networking                    RJdkNet            P1 "NIO, files, networking"

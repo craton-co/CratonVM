@@ -122,9 +122,13 @@ declared unsupported under `--jdk-only` — but the present state, returning
 **N2 — DONE.** `Graphics.getColor`, `Graphics2D.setBackground` and
 `getBackground` are registered. 10 diverging rows -> 3.
 
-**N3 — a vector is now possible for 22 of the 25 rows.** That is a real safety
-net for the retag. The three left in §4 must be documented rather than
-asserted; writing them in as-is would freeze a defect into the suite.
+**N3 — DONE.** `regression-suite/src/RJdkAwtHeadless.java`, 32 checks, scheduled
+in the JDK-only corpus and listed in `jdk-only-coverage.txt` against the P0
+over-tagging row. It asserts contracts only, and deliberately does NOT assert
+the three §4 rows — writing the present behaviour in would freeze a defect into
+the suite. **The arms are no longer blind to AWT**: new baseline `--jdk-only`
+101/101, `SUITE=all` 96/101 (the same five known failures), `SUITE=core` 61/62
+unchanged.
 
 **N4 — the probe avoided rasterization on purpose, so nothing here says our
 rasterizer draws correctly.** Lines, curves, antialiasing, strokes, transforms
