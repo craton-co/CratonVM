@@ -300,8 +300,6 @@ export inherited from a parent shell.
 | `linker` | `CRATONVM_DBG_LINKER` |
 | `loadclass` | `CRATONVM_DBG_LOADCLASS` |
 | `loader-chain` | `CRATONVM_DBG_LOADER_CHAIN` |
-| `getfield-receivers` | `CRATONVM_DBG_GETFIELD_RECEIVERS` |
-| `jit-borrow-sites` | `CRATONVM_DBG_JIT_BORROW_SITES` |
 | `loader-trace` | `CRATONVM_DBG_LOADER_TRACE` |
 | `load-transform-no-memo` | `CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO` |
 | `logprov` | `CRATONVM_DBG_LOGPROV` |
