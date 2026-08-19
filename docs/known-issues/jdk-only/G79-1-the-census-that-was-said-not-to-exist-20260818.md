@@ -113,6 +113,41 @@ has "an existing conformance test". It has exactly one:
 subsystem. Whoever performs the retag should know that the arms staying green
 proves nothing about it.
 
+## 4a. The same dump, applied to the other three crates
+
+N4 below asks for the other crates to be re-derived. A first pass costs
+nothing — the same dump already carries every registration. What it does NOT
+carry is a verdict for a class the run never loaded, and this run loaded AWT
+plus whatever the boot path touches. **So each crate's numbers below are only
+as good as its measured fraction, which is stated.**
+
+| crate | registrations | measured | `ACC_NATIVE` | shims (bytecode + abstract) |
+| --- | ---: | ---: | ---: | ---: |
+| `native-collections` | 1301 | **94 %** | **0** | 918 |
+| `native-awt` | 187 | 100 % | 22 | 135 |
+| `native-io` | 965 | 18 % | ≥16 | ≥143 |
+| `native-builtins` | 8166 | 39 % | ≥227 | ≥2255 |
+
+**`native-collections` is the one fully-supported finding here, and it is
+stark: 1301 registrations, 1300 tagged `Bridge`, and NOT ONE targets an
+`ACC_NATIVE` method.** The P0 row said "1,195 of 1,219 … and not one targets an
+`ACC_NATIVE` method"; the count has since grown to 1301 and the "not one"
+independently reproduces. Every one of those 1300 is a shim wearing a bridge's
+tag, and by §3 that is what lets the whole collections surface survive
+`--jdk-only`.
+
+**`native-io` and `native-builtins` are floors, not corrections.** At 18 % and
+39 % measured they are consistent with the published figures (86 `ACC_NATIVE`
+for `native-io`) and must not be read as contradicting them. To finish those
+two, extend the probe's class list — it is a list of names and a
+`Class.forName` loop — or take the dump from a run that exercises them.
+
+**The "not declared here" column is deliberately absent from the table.** §2
+showed it is three different things, and separating them needs the reflection
+pass, not the dump. For `native-collections` the raw figure is 302 against a
+published 91 — which is not a discrepancy so much as evidence that the two
+counts measure different questions.
+
 ## 5. NOMINATIONS
 
 **N1 — pin the 22 genuine bridges with `register_as` BEFORE narrowing the
