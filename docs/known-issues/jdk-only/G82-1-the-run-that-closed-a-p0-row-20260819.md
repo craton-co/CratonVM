@@ -116,10 +116,20 @@ text.
 
 ## 4. NOMINATIONS
 
-**N1 — give the nonexistent-path branch the strict-mode framing.** §3. When
-`--jdk-only` is in force and `--java-home` does not exist, the message should
-say so in the same terms leg 2b uses. Small, and it fixes the case a user is
-most likely to hit.
+**N1 — give the nonexistent-path branch the strict-mode framing. This is a
+CONTRACT deviation, not a nicety.** §3 recorded it as the row's evidence being
+imprecise. Reading the contract directly upgrades it:
+`docs/feature-designs/jdk-only-mode.md` §8 requires that under `JdkOnly` the VM
+
+> fail with a `MissingBootClass` / `InvalidConfiguration` error that names
+> `--jdk-only`, the searched paths and the accepted JDK layout.
+
+Leg 2b does all three. Leg 2a — a `--java-home` that does not exist, i.e. a
+typo, the commonest way to hit this — names NONE of them: it fails earlier, in
+argument parsing, with a generic "path does not exist or is not a directory".
+The closure still stands on rule 5, because that path refuses and fabricates
+nothing. But one of the two branches does not meet §8's wording, and the one
+that does not is the one users will hit.
 
 **N2 — the pattern generalises: look for rows waiting on execution, not on
 work.** This row sat `ENFORCING` with its own provenance note admitting nothing

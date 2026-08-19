@@ -104,6 +104,20 @@ deleted at the source, not merely filtered out of the table on the way in.
 this test's own doc comment saying `549`. The measured registry says 1330. Only
 one of those four numbers is re-derived from the tree.
 
+**And the `157` has a source.** It is not a transcription slip in the P0 row: it
+is the CONTRACT's own figure. `docs/feature-designs/jdk-only-mode.md` §8, read
+directly rather than through a citation, says:
+
+> Do not edit `native-builtins/src/lib.rs`; the **157**-stub reclassification is
+> a separate wave with its own subsystem-per-PR discipline.
+
+So the number originates in the normative document, and the P0 row, the
+ratchet's doc comment and everything downstream inherited it faithfully while
+the tree moved to ~1330. That is a better explanation than "the row went
+stale": **the root citation went stale, and three documents copied it
+correctly.** Fixing the row without fixing §8 would put them back out of step at
+the next re-read.
+
 Its doc comment states plainly why `strict_registry_has_zero_synthetic_stubs`
 passing means so little, in words this record reached independently in §2:
 
