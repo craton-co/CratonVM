@@ -8121,14 +8121,14 @@ pub(super) fn jit_saved_args_to_values(
 ) -> Vec<Value> {
     let is_static = cached.is_static;
     let mut out = Vec::with_capacity(np);
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&cached.method_descriptor);
     for i in 0..np {
         let (cv, is_long) = saved_args[i];
         let desc_byte = if is_static {
-            nth_param_tag_byte(&cached.method_descriptor, i)
-        } else if i == 0 {
-            b'L' // receiver
+            param_tags.get(&cached.method_descriptor, i)
         } else {
-            nth_param_tag_byte(&cached.method_descriptor, i - 1)
+            param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
         out.push(decode_arg_kind_aware(cv, is_long, desc_byte));
     }
@@ -8307,17 +8307,17 @@ pub(super) fn execute_jit_call(
     // that arm for the underflow this prevents.
     let mut saved_args: [(CompactValue, bool); JIT_ABI_MAX_JAVA_ARGS] =
         [(CompactValue::zero(), false); JIT_ABI_MAX_JAVA_ARGS];
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&cached.method_descriptor);
     for i in (0..np).rev() {
         let (cv, is_long) = thread.frames[frame_idx]
             .stack
             .pop_compact_with_long_mark_unchecked();
         saved_args[i] = (cv, is_long);
         let desc_byte = if is_static {
-            nth_param_tag_byte(&cached.method_descriptor, i)
-        } else if i == 0 {
-            b'L' // receiver
+            param_tags.get(&cached.method_descriptor, i)
         } else {
-            nth_param_tag_byte(&cached.method_descriptor, i - 1)
+            param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
         let v = decode_arg_kind_aware(cv, is_long, desc_byte);
         jit_args[i] = match v {
