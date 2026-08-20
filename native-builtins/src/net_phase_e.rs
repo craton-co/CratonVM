@@ -14514,6 +14514,19 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "init",
         "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
         |ctx, args| {
+            // A third party's SPI owns its own init. `SSLContext.init` is
+            // `final` and its entire body is
+            // `contextSpi.engineInit(km, tm, sr)`; everything below records the
+            // managers in CratonVM's side tables for the rustls engine, which
+            // such a context will never use. See `jca::ssl_context_spi`.
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineInit",
+                "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
@@ -14651,6 +14664,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetSocketFactory",
+                "()Ljavax/net/ssl/SSLSocketFactory;",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
@@ -14672,6 +14693,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getServerSocketFactory",
         "()Ljavax/net/ssl/SSLServerSocketFactory;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetServerSocketFactory",
+                "()Ljavax/net/ssl/SSLServerSocketFactory;",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             let f = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 1)?;
             ctx.set_field(f, 0, Value::Object(Some(this)));
@@ -14683,6 +14712,18 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getProtocol",
         "()Ljava/lang/String;",
         |ctx, args| {
+            // A REAL `javax.net.ssl.SSLContext` — one JDK bytecode built around
+            // a provider's SPI, ours or a third party's — has `provider` in
+            // slot 0 and `protocol` in slot 2 (`javap -p --module java.base
+            // javax.net.ssl.SSLContext`, JDK 25). Reading slot 0 on one of
+            // those echoed the PROVIDER back as a protocol name:
+            // `getInstance("TLSv1.3", new BouncyCastleJsseProvider())` answered
+            // "BCJSSE version 1.0023" where HotSpot answers "TLSv1.3". The
+            // slot-0 read below is right only for the synthetic shape this
+            // registration's own `getInstance` allocates.
+            if let Some(v) = crate::jca::ssl_context_spi::real_context_protocol(ctx, args) {
+                return Ok(Some(v));
+            }
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 0)))
         },
@@ -14699,6 +14740,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getSupportedSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineGetSupportedSSLParameters",
+                "()Ljavax/net/ssl/SSLParameters;",
+            ) {
+                return r;
+            }
             let protocols = ["TLSv1.3", "TLSv1.2", "TLSv1.1"];
             // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
             // Tomcat's `JSSEUtil.initialise()` reads this list and
@@ -14740,6 +14789,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getDefaultSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineGetDefaultSSLParameters",
+                "()Ljavax/net/ssl/SSLParameters;",
+            ) {
+                return r;
+            }
             let protocols = ["TLSv1.3", "TLSv1.2"];
             // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
             // Tomcat's `JSSEUtil.initialise()` reads this list and
@@ -14780,6 +14837,24 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
     ] {
         r.register(ctx_cls, "createSSLEngine", desc, |ctx, args| {
+            // A BouncyCastle (or any third-party) context must hand back the
+            // engine ITS provider builds. Allocating CratonVM's rustls-backed
+            // `sun.security.ssl.SSLEngineImpl` unconditionally gave such a
+            // caller a SunJSSE-named engine BC never built and never
+            // initialised — `engine.toString()` alone threw
+            // `NullPointerException: Cannot read field "conSession"`.
+            // The no-arg and (host, port) overloads share this closure, hence
+            // the arity test rather than a per-descriptor guard.
+            let spi_desc = if args.len() >= 3 {
+                "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;"
+            } else {
+                "()Ljavax/net/ssl/SSLEngine;"
+            };
+            if let Some(r) =
+                crate::jca::ssl_context_spi::spi_delegate(ctx, args, "engineCreateSSLEngine", spi_desc)
+            {
+                return r;
+            }
             let eng0 = try_alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4)?;
             // Everything below this point allocates (a ReentrantLock, and the
             // peer-host String further down), so `eng` must be pinned and
@@ -14848,6 +14923,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getClientSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetClientSessionContext",
+                "()Ljavax/net/ssl/SSLSessionContext;",
+            ) {
+                return r;
+            }
             // One carrier per (SSLContext, side), not one per call — see
             // `ssc_carrier` for the measured identity row this restores. The
             // GC-safety that used to live here moved in there with it.
@@ -14864,6 +14947,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getServerSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetServerSessionContext",
+                "()Ljavax/net/ssl/SSLSessionContext;",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             let carrier = ssc_carrier(ctx, this, SSC_TAG_SERVER)?;
             Ok(Some(Value::Object(Some(carrier))))
