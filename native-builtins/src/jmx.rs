@@ -779,6 +779,15 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
 }
 
 fn register_object_name(r: &mut NativeMethodRegistry) {
+    // JDK-ONLY-WAVE2: pinned. This registrar previously set no category of its
+    // own and inherited `Bridge` from `register_jmx_natives`'s window -- the
+    // last ambient-category dependency in the JMX surface, and the one the
+    // `JMX real path` P0 row names as step 1. `javax/management/ObjectName` is
+    // the very class the reverted retag NPE'd on, so the tag being *right by
+    // inheritance* was a coincidence waiting to break the next time a caller
+    // moved. Behaviour is unchanged: the only caller already opens `Bridge`.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/management/ObjectName";
     r.register(
         cls,
@@ -942,6 +951,7 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
         native_object_name_equals,
     );
     r.register(cls, "hashCode", "()I", native_object_name_hash_code);
+    r.set_category(__prev_cat);
 }
 
 fn object_name_string_arg(ctx: &dyn NativeContext, args: &[Value], index: usize) -> String {
@@ -951,25 +961,74 @@ fn object_name_string_arg(ctx: &dyn NativeContext, args: &[Value], index: usize)
     }
 }
 
+/// The slot holding the canonical-name `String` on whichever
+/// `javax.management.ObjectName` carrier this object actually is.
+///
+/// **JDK-ONLY-WAVE2 (the `JMX real path` P0 row, step 2: "convert").** These
+/// three helpers used a hard-coded slot `0`. Against the REAL JDK 25 class that
+/// is right only by coincidence -- `javap -p javax.management.ObjectName` on
+/// 25.0.3+9 gives five instance fields in this order:
+///
+/// ```text
+///   0  private transient java.lang.String                     _canonicalName
+///   1  private transient javax.management.ObjectName$Property[] _kp_array
+///   2  private transient javax.management.ObjectName$Property[] _ca_array
+///   3  private transient java.util.Map<String,String>          _propertyList
+///   4  private transient int                                   _compressed_storage
+/// ```
+///
+/// so slot 0 happens to be `_canonicalName` today. A slot index against a real
+/// layout is heap corruption rather than a wrong answer the moment that order
+/// changes, and nothing in the tree was pinning it. Resolve by NAME instead.
+///
+/// The fallback to slot 0 is deliberate and is NOT a defaulting reader hiding a
+/// wrong write: it fires only where the name does not resolve, i.e. the
+/// synthetic single-slot carrier `object_name_new` fabricates when no real
+/// `java.management` class is available. `set_field_by_name` is documented as a
+/// **no-op when the field is not found**, so switching blindly to the by-name
+/// setter would have silently dropped every write on that carrier.
+fn object_name_text_slot(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
+    let cid = ctx.class_id_of_object(obj);
+    ctx.resolve_field_index_by_class_id(cid, "_canonicalName")
+        .unwrap_or(0)
+}
+
 fn object_name_text(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
-    match ctx.get_field(obj, 0) {
+    let slot = object_name_text_slot(ctx, obj);
+    match ctx.get_field(obj, slot) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => ctx.read_string(obj).unwrap_or_default(),
     }
 }
 
 fn object_name_set_text(ctx: &mut dyn NativeContext, obj: ObjectRef, text: String) {
+    let slot = object_name_text_slot(ctx, obj);
     let s = ctx.create_string(&text);
-    ctx.set_field(obj, 0, Value::Object(Some(s)));
+    ctx.set_field(obj, slot, Value::Object(Some(s)));
 }
 
 fn object_name_new(ctx: &mut dyn NativeContext, text: String) -> Result<ObjectRef, MethodCallFailed> {
+    // Requested width stays 1: `try_alloc_concurrent_synthetic` already widens
+    // the allocation to the loaded class's real instance-field count when one
+    // exists (`max(real, requested)`), so a real `ObjectName` gets all five
+    // slots here and only the synthetic carrier gets one. Padding the request
+    // to 5 would pad the SYNTHETIC carrier too, which is the direction the
+    // object-layout audit wants to unwind ("convert, verify, unpad, then
+    // drop"), not extend.
+    //
+    // WHAT THIS DOES NOT FIX: `_kp_array`, `_ca_array` and `_propertyList` are
+    // still left null on a real `ObjectName`. Real bytecode reading them NPEs
+    // -- that is the `(b) Layout` half of the P0 row and it is unaddressed
+    // here. Only the canonical-name slot is now name-resolved.
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/ObjectName", 1)?;
     object_name_set_text(ctx, obj, text);
     Ok(obj)
 }
 
 fn register_object_instance(r: &mut NativeMethodRegistry) {
+    // JDK-ONLY-WAVE2: pinned, same reason as `register_object_name` above.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/management/ObjectInstance";
     r.register(
         cls,
@@ -984,6 +1043,7 @@ fn register_object_instance(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field_by_name(this, "className")))
     });
+    r.set_category(__prev_cat);
 }
 
 fn object_name_quote_text(input: &str) -> String {

@@ -17426,7 +17426,13 @@ pub(crate) fn basic_file_attributes_time_millis(
             "access" => "lastAccessTime",
             _ => "lastWriteTime",
         };
-        return attrs_long_field(ctx, attrs, field);
+        // These three fields hold Windows FILETIME, not millis — see
+        // `WINDOWS_EPOCH_IN_100NS`. They used to be written AND read as millis,
+        // which was self-consistent and agreed with nothing: real
+        // `WindowsFileAttributes.lastModifiedTime()` bytecode reading the same
+        // field through `toFileTime` reported 1601-01-02T20:42:25.920Z for a
+        // file HotSpot dated 2021-01-01 (G90-1 §5, `RFileTimes`).
+        return win_millis_from_filetime(attrs_long_field(ctx, attrs, field));
     }
     let (sec_field, nsec_field, legacy_field) = unix_attr_time_fields(which);
     if attrs_declares_field(ctx, attrs, sec_field) {
@@ -17476,6 +17482,49 @@ pub(crate) const UNIX_S_IFLNK: i32 = 0o120000;
 pub(crate) const UNIX_S_IFREG: i32 = 0o100000;
 pub(crate) const WIN_ATTR_DIRECTORY: i32 = 0x10;
 pub(crate) const WIN_ATTR_REPARSE_POINT: i32 = 0x400;
+
+/// `IO_REPARSE_TAG_SYMLINK`, quoted from JDK 25
+/// `java.base/sun/nio/fs/WindowsConstants.java`:
+/// `public static final int IO_REPARSE_TAG_SYMLINK = 0xA000000C;`
+///
+/// Real `WindowsFileAttributes.isSymbolicLink()` is `reparseTag ==
+/// IO_REPARSE_TAG_SYMLINK` — it does **not** consult
+/// `FILE_ATTRIBUTE_REPARSE_POINT`. A carrier that sets only the attribute bit
+/// therefore reads back through real bytecode as `isOther()`, never as a link.
+pub(crate) const WIN_IO_REPARSE_TAG_SYMLINK: i32 = 0xA000_000Cu32 as i32;
+
+/// `WindowsFileAttributes.WINDOWS_EPOCH_IN_100NS`, quoted from JDK 25
+/// `java.base/sun/nio/fs/WindowsFileAttributes.java`:
+/// `private static final long WINDOWS_EPOCH_IN_100NS = -116444736000000000L;`
+///
+/// The real class stores `creationTime` / `lastAccessTime` / `lastWriteTime` as
+/// **Windows FILETIME** — 100-nanosecond intervals since 1601-01-01T00:00:00Z —
+/// and converts on the way out:
+///
+/// ```text
+///   static FileTime toFileTime(long time) {
+///       long adjusted = Math.addExact(time, WINDOWS_EPOCH_IN_100NS);
+///       long nanos = Math.multiplyExact(adjusted, 100L);
+///       return FileTime.from(nanos, TimeUnit.NANOSECONDS);
+///   }
+/// ```
+pub(crate) const WINDOWS_EPOCH_IN_100NS: i64 = -116_444_736_000_000_000;
+
+/// Unix-epoch millis -> Windows FILETIME ticks. The inverse of
+/// `WindowsFileAttributes.toFileTime`, and the same arithmetic as its
+/// `toWindowsTime` (`adjusted - WINDOWS_EPOCH_IN_100NS`).
+pub(crate) fn win_filetime_from_millis(millis: i64) -> i64 {
+    millis
+        .saturating_mul(10_000)
+        .saturating_sub(WINDOWS_EPOCH_IN_100NS)
+}
+
+/// Windows FILETIME ticks -> Unix-epoch millis. Mirrors
+/// `WindowsFileAttributes.toFileTime`'s `time + WINDOWS_EPOCH_IN_100NS`, then
+/// scales 100ns to ms.
+pub(crate) fn win_millis_from_filetime(ticks: i64) -> i64 {
+    ticks.saturating_add(WINDOWS_EPOCH_IN_100NS).div_euclid(10_000)
+}
 
 pub(crate) fn basic_file_attributes_is_symlink(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
     if basic_file_attributes_is_synthetic(ctx, attrs) {
@@ -17897,11 +17946,36 @@ pub(crate) fn basic_file_attributes_store(
         ctx.set_field_by_name(
             attrs,
             "fileAttrs",
-            Value::Int(if is_dir { 0x10 } else { 0 }),
+            Value::Int(if is_dir { WIN_ATTR_DIRECTORY } else { 0 }),
         );
-        ctx.set_field_by_name(attrs, "creationTime", Value::Long(creation_millis));
-        ctx.set_field_by_name(attrs, "lastAccessTime", Value::Long(access_millis));
-        ctx.set_field_by_name(attrs, "lastWriteTime", Value::Long(modified_millis));
+        // FILETIME, not millis. The real class reads these three through
+        // `toFileTime`, which adds `WINDOWS_EPOCH_IN_100NS` and scales by 100ns
+        // — a millis value put here is read back as a date two days after
+        // 1601-01-01. Every read path in this file goes through
+        // `basic_file_attributes_time_millis`, which converts back, so the
+        // encoding change is invisible to our own accessors and visible to the
+        // real bytecode, which is the entire point.
+        ctx.set_field_by_name(
+            attrs,
+            "creationTime",
+            Value::Long(win_filetime_from_millis(creation_millis)),
+        );
+        ctx.set_field_by_name(
+            attrs,
+            "lastAccessTime",
+            Value::Long(win_filetime_from_millis(access_millis)),
+        );
+        ctx.set_field_by_name(
+            attrs,
+            "lastWriteTime",
+            Value::Long(win_filetime_from_millis(modified_millis)),
+        );
+        // Explicit, not inherited from a zeroed allocation: real
+        // `isSymbolicLink()` / `isUnixDomainSocket()` compare this word against
+        // a tag, so it must be a definite 0 for everything that is not a link.
+        // `p59_files_read_attributes` raises it to `IO_REPARSE_TAG_SYMLINK`
+        // when the OS says the path is one.
+        ctx.set_field_by_name(attrs, "reparseTag", Value::Int(0));
         ctx.set_field_by_name(attrs, "size", Value::Long(size));
     } else {
         // Was always the bare file-type bits with zero permission bits, so
@@ -19273,6 +19347,44 @@ pub(crate) fn p59_files_read_attributes(
                 mod_millis,
                 perm_bits,
             );
+            // Windows: the real `sun.nio.fs.WindowsFileAttributes` fields are a
+            // verbatim copy of the OS structures, and `std`'s `MetadataExt`
+            // hands back those same raw words. Two things
+            // `basic_file_attributes_store` cannot supply from
+            // `(is_dir, millis, millis, millis)`:
+            //
+            //  * the DOS attribute word. Real `isReadOnly()` / `isHidden()` /
+            //    `isArchive()` / `isSystem()` are single-bit tests on
+            //    `fileAttrs`, so a carrier carrying only `FILE_ATTRIBUTE_
+            //    DIRECTORY` answers `false` to all four for every file on disk.
+            //  * sub-millisecond FILETIME precision, which the millis round
+            //    trip truncates.
+            //
+            // Written by NAME (never by slot): the real layout is the JDK's,
+            // and a slot index against it is heap corruption rather than a
+            // wrong answer.
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if basic_file_attributes_is_windows(ctx, bfa) {
+                    let attr_word = meta.file_attributes();
+                    if attr_word != 0 {
+                        ctx.set_field_by_name(bfa, "fileAttrs", Value::Int(attr_word as i32));
+                    }
+                    // A zero FILETIME means "the OS did not supply this one";
+                    // leaving the store's converted value in place keeps that
+                    // case reading as the Unix epoch rather than as 1601.
+                    for (name, raw) in [
+                        ("creationTime", meta.creation_time()),
+                        ("lastAccessTime", meta.last_access_time()),
+                        ("lastWriteTime", meta.last_write_time()),
+                    ] {
+                        if raw != 0 {
+                            ctx.set_field_by_name(bfa, name, Value::Long(raw as i64));
+                        }
+                    }
+                }
+            }
             // Record link-ness so `isSymbolicLink()` can stop answering a
             // hardcoded `false`. Only reachable under NOFOLLOW_LINKS, since a
             // following read resolves the target (and the real JDK likewise
@@ -19295,6 +19407,17 @@ pub(crate) fn p59_files_read_attributes(
                         bfa,
                         "fileAttrs",
                         Value::Int(cur | WIN_ATTR_REPARSE_POINT),
+                    );
+                    // The attribute bit alone is not what the real class reads.
+                    // `WindowsFileAttributes.isSymbolicLink()` is
+                    // `reparseTag == IO_REPARSE_TAG_SYMLINK`, and `isOther()`
+                    // is true for any reparse point that is NOT a link — so a
+                    // carrier with the bit and a zero tag makes real bytecode
+                    // call every symlink an "other" file.
+                    ctx.set_field_by_name(
+                        bfa,
+                        "reparseTag",
+                        Value::Int(WIN_IO_REPARSE_TAG_SYMLINK),
                     );
                 } else {
                     let cur = match ctx.get_field_by_name(bfa, "st_mode") {

@@ -19,6 +19,14 @@
 #       CI step that exports the variable silently runs the DEFAULT policy, and
 #       its green result says nothing about the policy it claimed to test.
 #
+#       When CRATONVM_ARGS names --jdk-only, every vector is ALSO given
+#       --jdk-only-report writing to a PID-scoped directory, and the run ends
+#       with a union census of what strict mode actually did (native-won versus
+#       bytecode-won shadows, synthetic-native registrations, unenforced
+#       shadows, compatibility classes, and how many reports SATURATED their
+#       bounded sinks). Reported, never counted: it cannot change a verdict.
+#       Suppressed if you pass your own --jdk-only-report.
+#
 #   JDK_ONLY=1
 #       Also run the RJdk* JDK-only corpus (src/RJdk*.java, the named module
 #       under modules/, and the class-path service resources under resources/).
@@ -354,6 +362,47 @@ prune_missing "$JDKONLY_CLASSES"; JDKONLY_CLASSES="$PRUNED"
 case " ${CRATONVM_ARGS:-} " in
   *" --jdk-only "*) JDK_ONLY=1 ;;
 esac
+
+# ---- the strict census, folded into the arm (G84-1 N3) --------------------
+#
+# `--jdk-only-report` counts precisely what three P0 rows in
+# docs/jdk-only-runtime-services.md argue about from source reading:
+# `interpreter_shadow_unenforced`, the `native-shadows-bytecode` population
+# split on its `outcome` field, `synthetic-native-registered`, and
+# `compatibility_classes`. It costs ONE flag on a run that is already happening,
+# and unlike the stub ratchet it needs no frozen baseline to be informative.
+#
+# THREE PROPERTIES THIS MUST NOT BREAK, and how each is kept:
+#
+#  * It must not change a verdict. The launcher writes the report from
+#    `write_jdk_only_dumps`, which returns `()` and has no effect on the exit
+#    code; a write failure is an `eprintln!` warning, not an error. The lines it
+#    prints begin `[cratonvm] ` and `extract()` keeps only `^(PASS|CK) `, so
+#    nothing reaches the cross-VM diff. Nothing here touches HotSpot's command
+#    line — the oracle stays the plain reference run.
+#  * It must not add a second FIXED shared path. `.guard-tmp` is fixed and two
+#    concurrent runs already destroy each other's oracle files; this directory
+#    is PID-scoped so it cannot repeat that. It is created once per invocation
+#    and removed at the end, `rm -rf`, exactly like `.guard-tmp`.
+#  * A missing report must be VISIBLE, not silent. The summary counts the
+#    reports it expected against the ones that exist and prints the shortfall.
+#    A census that is quietly absent is the failure mode this whole area exists
+#    to remove.
+#
+# Skipped when the operator already passed their own `--jdk-only-report`: two
+# copies of the flag would have the second silently win and write somewhere the
+# summary below cannot see.
+STRICT_REPORT=""
+case " ${CRATONVM_ARGS:-} " in
+  *" --jdk-only-report "*) : ;;
+  *" --jdk-only "*)        STRICT_REPORT=1 ;;
+esac
+# PID-scoped, never a fixed shared name. See the note above.
+REPORTDIR="$HERE/.jdk-only-reports.$$"
+# How many per-vector reports we expect to find at the end. Incremented at the
+# launch site rather than derived from $CLASSES, so a vector skipped for any
+# reason cannot silently lower the denominator.
+report_expected=0
 # SUITE selects the list; JDK_ONLY=1 stays additive on top of it.
 SUITE_SET=""
 case "${SUITE:-core}" in
@@ -604,9 +653,17 @@ run_pass() {
     extra=$(class_args "$c")
     cvextra=$(class_cv_args "$c")
     cpx=$(class_cp_extra "$c")
+    # An ARRAY, not a string, because $REPORTDIR is derived from the repository
+    # path and may contain spaces — the flag lists above are expanded unquoted
+    # on purpose and a path cannot join them. Empty array expands to nothing.
+    cvreport=()
+    if [ -n "$STRICT_REPORT" ]; then
+      cvreport=(--jdk-only-report "$REPORTDIR/$c${REL:+-r$REL}.json")
+      report_expected=$((report_expected+1))
+    fi
     # $CRATONVM_ARGS, $extra and $cvextra are intentionally unquoted: all three
     # are flag lists, not single paths.
-    cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" ${CRATONVM_ARGS:-} $cvextra $extra -cp "$BUILD$cpx" "$c" 2>&1)
+    cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" ${CRATONVM_ARGS:-} $cvextra $extra "${cvreport[@]}" -cp "$BUILD$cpx" "$c" 2>&1)
     cvrc=$?
     cvkey=$(printf '%s\n' "$cvout" | extract)
     # A failed assertion throws AssertionError → non-zero exit (handled by the rc
@@ -690,6 +747,19 @@ run_pass() {
 
 total_pass=0; total_fail=0; total_failed=""; ran=0; skipped=""
 total_hbad=0; total_hfailed=""
+
+# Created once per invocation, not once per pass: with RELEASES= set, run_pass
+# runs several times and every pass's reports belong to the one summary at the
+# bottom. Cleaned there. A mkdir failure DISABLES the census rather than failing
+# the run — the report is an instrument bolted onto the verdict, and an
+# instrument must never be the thing that turns a run red.
+if [ -n "$STRICT_REPORT" ]; then
+  rm -rf "$REPORTDIR"
+  if ! mkdir -p "$REPORTDIR" 2>/dev/null; then
+    echo "  NOTE: cannot create $REPORTDIR — the --jdk-only census is SKIPPED for this run"
+    STRICT_REPORT=""
+  fi
+fi
 
 if [ -z "${RELEASES:-}" ]; then
   REL=""
@@ -814,4 +884,59 @@ fi
 # reader does not have to read this script to interpret the line.
 echo "REGRESSION SUITE: $total_pass passed, $total_fail failed${total_failed:+ ( failed:$total_failed )}"
 echo "  COUNTS: $total_pass of $((total_pass+total_vecfail)) SCHEDULED vectors passed; $total_vecfail scheduled vectors failed; $((total_fail-total_vecfail-total_hbad)) list/coverage errors (never scheduled); $total_hbad harness-blindness flags (per-vector flags, not extra vectors)."
+
+# ---- the --jdk-only census, unioned over the vectors that just ran --------
+#
+# Reported, never counted: not one line below touches $total_fail. This is a
+# MEASUREMENT of the mode the arm ran in, and the three P0 rows it feeds want a
+# trend, not a gate — there is no frozen baseline here and deliberately so
+# (G84-1 N3). A census that could turn a run red would acquire a baseline, and a
+# baseline is exactly what makes the stub ratchet unable to tell a regression
+# from an improvement.
+#
+# Every row of `violations[]` is ONE LINE of compact JSON (types::error's
+# to_json has no serde and no pretty-printer), which is why grep/sort is enough
+# and no jq is required. Rows are byte-identical across vectors for the same
+# fact — `summary` is a pure function of the other fields — so `sort -u` is a
+# real UNION and not an approximation. Counter keys are the pretty-printed ones
+# with a space after the colon; violation rows have none, so the two can never
+# be confused by these patterns.
+if [ -n "$STRICT_REPORT" ]; then
+  echo "---------------------------------------------"
+  jr_found=$(ls "$REPORTDIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  jr_rows=$(grep -h '"kind":"native-shadows-bytecode"' "$REPORTDIR"/*.json 2>/dev/null \
+              | sed 's/^[[:space:]]*//; s/,$//' | sort -u)
+  jr_native=$(printf '%s\n' "$jr_rows" | grep -c '"outcome":"native-won"')
+  jr_bytecode=$(printf '%s\n' "$jr_rows" | grep -c '"outcome":"bytecode-won"')
+  jr_stubs=$(grep -h '"kind":"synthetic-native-registered"' "$REPORTDIR"/*.json 2>/dev/null \
+               | sed 's/^[[:space:]]*//; s/,$//' | sort -u | grep -c '"kind"')
+  jr_unenf=$(grep -h '"interpreter_shadow_unenforced": ' "$REPORTDIR"/*.json 2>/dev/null \
+               | sed 's/[^0-9]//g' | awk '{s+=$1} END {print s+0}')
+  jr_compat=$(grep -h '"compatibility_classes": ' "$REPORTDIR"/*.json 2>/dev/null \
+                | sed 's/[^0-9]//g' | awk '{s+=$1} END {print s+0}')
+  # The number that says whether every figure above is a total or a FLOOR.
+  # `truncated` is emitted by all three of the report's bounded collections, so
+  # a file matching it had at least one of them overflow; `dropped` sums what
+  # they could not name. Both are new on 2026-08-20 — before that the only
+  # signal was a boolean inside the file that nothing read, which is why every
+  # shadow count in docs/known-issues/jdk-only/ is a floor.
+  jr_trunc=$(grep -l '"truncated": true' "$REPORTDIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  jr_dropped=$(grep -h '"dropped": ' "$REPORTDIR"/*.json 2>/dev/null | grep -v null \
+                 | sed 's/[^0-9]//g' | awk '{s+=$1} END {print s+0}')
+  echo "JDK-ONLY CENSUS ($jr_found of $report_expected per-vector reports written):"
+  echo "  native-shadows-bytecode, UNION over vectors: $jr_native native-won (the defect), $jr_bytecode bytecode-won (the contract working)"
+  echo "  synthetic-native-registered, UNION: $jr_stubs   ·   interpreter_shadow_unenforced, SUM: $jr_unenf   ·   compatibility_classes, SUM: $jr_compat"
+  if [ "$jr_trunc" -gt 0 ]; then
+    echo "  SATURATED: $jr_trunc report(s) truncated a bounded collection and dropped ~$jr_dropped row(s)."
+    echo "    EVERY count above is a FLOOR. Re-run with CRATONVM_NATIVE_SHADOW_SINK_CAP=<bigger> to make them totals."
+  else
+    echo "  saturation: none — no report truncated a bounded collection, so the counts above are totals, not floors."
+  fi
+  if [ "$jr_found" -lt "$report_expected" ]; then
+    echo "  NOTE: $((report_expected-jr_found)) vector(s) produced no report (a crash before the exit hook, or a write failure)."
+    echo "    Their shadows are missing from the union above. This does NOT affect any vector's verdict."
+  fi
+  rm -rf "$REPORTDIR"
+fi
+
 [ "$total_fail" -eq 0 ]

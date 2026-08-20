@@ -3172,24 +3172,25 @@ pub(super) fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
-    if class_name == "java/util/function/Predicate"
-        && matches!(
-            (method_name, method_descriptor),
-            (
-                "and",
-                "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
-            ) | (
-                "or",
-                "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
-            ) | ("negate", "()Ljava/util/function/Predicate;")
-                | (
-                    "not",
-                    "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;"
-                )
-        )
-    {
-        return true;
-    }
+    // TOMBSTONE (H3-1, 2026-08-20). An arm here forced the native over real
+    // bytecode for `Predicate.{and,or,negate,not}`. Those four registrations
+    // are DELETED -- `javap` on JDK 25 shows none of the four is `ACC_NATIVE`
+    // and all four have real bodies, and `RJdkFunctionCombinators` already
+    // passes under `--jdk-only`, where they were dropped anyway.
+    //
+    // The arm was already INERT rather than fatal: of its three consulting
+    // sites, two re-check the registry (so an unregistered triple falls
+    // through) and the JIT one only seals the method out of compilation. It is
+    // removed because a force-native table naming triples that no longer exist
+    // is a lie about the tree, and the next reader would have to re-derive that
+    // it is harmless.
+    //
+    // NOTE: the `Collections.emptyList` arm above carries a rule that removing
+    // it is a PAIR needing a `RETIRED_SHADOW_TRIPLES` entry. That rule does NOT
+    // apply here -- it is for a live `Bridge` being handed back to bytecode.
+    // These four were `SyntheticStub` (never `allowed_in(JdkOnly)`) and are now
+    // unregistered outright, so there is nothing to re-tag.
+    // docs/known-issues/jdk-only/H3-1-the-ratchet-that-did-not-compile-20260820.md
     // The real DecimalFormatSymbols factories enter CLDR's locale bootstrap.
     // During the early Spring/JUnit summary path that bootstrap can observe a
     // stale Collections empty-list slot, producing a type-correct but wrong

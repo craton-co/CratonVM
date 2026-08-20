@@ -4,6 +4,28 @@
 #
 # bridge-ratchet.sh — THE L6 GATE, run where a JDK exists.
 #
+# SCOPE, 2026-08-20 (H3-1, `G89-1` N3). This script used to take exactly ONE
+# census, in `--real-jdk` (compatible) mode, while two of the five ratchets it
+# scores make claims about the OTHER mode: `bridge.shadows_bytecode_anywhere` is
+# contract §1.4, and `superseded.stub_lost_to_admitted` says "admitted under
+# `--jdk-only`" in its own name. The strict registry ships and was measured by
+# nothing.
+#
+# It could not have been, either: the baseline key was `<jdk-feature>/<os>` with
+# the mode recorded only INSIDE the entry, so the two modes shared one slot and
+# `--update-baseline` on a strict census would have overwritten the compatible
+# baseline. The key is now mode-qualified for every mode but `compatible` (which
+# keeps the two-part key, so every committed baseline still scores), and a
+# SECOND census is taken below under `--jdk-only`.
+#
+# That leg is REPORTED, NOT BLOCKING, until a strict baseline is committed: with
+# no `25/<os>/jdk-only` entry the gate correctly REFUSES (exit 2), and a refusal
+# is not a pass. Exit 1 — the ratchet actually firing against a committed strict
+# baseline — does fail. Set `BRIDGE_RATCHET_STRICT=0` to skip the leg entirely.
+#
+# "A gate whose stated population is wider than its measured one always reads as
+# success. Nothing catches it but running the wider thing."
+#
 # It scores TWO gates over ONE census, and that is deliberate. The second is
 # `scripts/jdk-only-kind-map.py`, a per-registration freeze of `NativeKind`
 # which exists because this file's own ratchet cannot see the dangerous
@@ -54,6 +76,15 @@
 #   PYTHON      python interpreter (default: python3, then python)
 #   JDK_FEATURE override the detected JDK feature version
 #   TIMEOUT     seconds before the census run is killed (default 300)
+#   BRIDGE_RATCHET_STRICT
+#               1 (default) also censuses `--jdk-only` and scores it against the
+#               mode-qualified baseline; 0 skips that leg
+#   CRATONVM_RATCHET_ROWS
+#               1 dumps the ratchet population by NAME (`@@BRIDGEROW` lines) so
+#               two commits can be diffed by row identity; `all` dumps every
+#               registration with its kind, which is what a suspected relabel
+#               needs. Off by default — on the live registry this is thousands
+#               of lines. Passed straight through to the gate.
 #
 # $OUT is never cleaned up on the way out: the census and the adjudication block
 # are the evidence for whatever the gate just said.
@@ -327,8 +358,72 @@ set +e
 km_rc=$?
 set -e
 
+# --- the STRICT leg: the configuration that ships and was never measured -----
+#
+# Same binary, same probe, same gate — only `--jdk-only` differs. See the SCOPE
+# note in this file's header for why it was absent and why it is reported rather
+# than blocking today.
+#
+# `--jdk-only` composes with `--real-jdk` (they select the same class library)
+# and with `--explain-jdk-only` / `--dump-native-registry`; `vm-cli`'s own
+# `jdk_only_flag_surface_matches_the_contract` pins that the seven §9 flags
+# parse together. Gate 2 (the kind map) is deliberately NOT run on this census:
+# its committed TSVs were frozen in compatible mode and it has no mode key.
+strict_fail=0
+if [ "${BRIDGE_RATCHET_STRICT:-1}" = "1" ]; then
+    echo ""
+    echo "== census: --jdk-only against JDK ${JDK_FULL:-$FEATURE} =="
+    if command -v timeout >/dev/null 2>&1; then
+        set -- timeout "$TIMEOUT" "$CV"
+    else
+        set -- "$CV"
+    fi
+    src=0
+    "$@" --jdk-only --java-home "$JDK" --explain-jdk-only \
+         --dump-native-registry "$OUT/census.jdk-only.json" \
+         -cp "$OUT/classes" "$PROBE_CLASS" \
+         > "$OUT/probe.strict.stdout.txt" 2> "$OUT/probe.strict.stderr.txt" || src=$?
+    echo "   vm exit=$src  (stdout/stderr in $OUT/probe.strict.*.txt)"
+    if [ ! -s "$OUT/census.jdk-only.json" ]; then
+        # NOT a hard failure, and the reason is honesty rather than leniency:
+        # this leg has never been run in CI, so its first landing must not be
+        # able to turn a green build red for a reason nobody has diagnosed. It
+        # is loud instead, and promoting it is deleting this branch.
+        echo "   NOTE: no strict census was written (vm exit $src). The --jdk-only"
+        echo "         registry is therefore UNMEASURED on this run — that is a gap,"
+        echo "         not a pass. See $OUT/probe.strict.stderr.txt."
+    else
+        set -- \
+            --census      "$(winpath "$OUT/census.jdk-only.json")" \
+            --baseline    "$(winpath "$ROOT/scripts/baselines/jdk-only-bridge-ratchet.json")" \
+            --jdk-feature "$FEATURE" \
+            --jdk-version "${JDK_FULL:-}" \
+            --workload    "$WORKLOAD"
+        if [ "$UPDATE" -eq 1 ]; then set -- "$@" --update-baseline; fi
+        if [ -n "$NOTE" ]; then set -- "$@" --note "$NOTE (--jdk-only leg)"; fi
+        set +e
+        "$PY" "$(winpath "$GATE")" "$@"
+        strict_rc=$?
+        set -e
+        case "$strict_rc" in
+            0) echo "   strict leg: pass." ;;
+            2) echo "   NOTE: no committed baseline for the --jdk-only leg yet, so it"
+               echo "         REFUSED (exit 2). A refusal is not a pass: the strict"
+               echo "         registry is unmeasured until someone runs"
+               echo "         'sh regression-suite/bridge-ratchet.sh --update-baseline"
+               echo "         --note \"...\"' on this image and commits the result." ;;
+            1) echo "   STRICT BRIDGE-RATCHET FIRED — see above."; strict_fail=1 ;;
+            *) echo "   NOTE: the strict gate exited $strict_rc; nothing was scored." ;;
+        esac
+    fi
+fi
+
 echo ""
 echo "   census        : $OUT/census.json"
 echo "   adjudication  : $OUT/adjudication.json"
+if [ "${BRIDGE_RATCHET_STRICT:-1}" = "1" ] && [ -s "$OUT/census.jdk-only.json" ]; then
+    echo "   strict census : $OUT/census.jdk-only.json"
+fi
 if [ "$gate_rc" -ne 0 ]; then exit "$gate_rc"; fi
-exit "$km_rc"
+if [ "$km_rc" -ne 0 ]; then exit "$km_rc"; fi
+exit "$strict_fail"

@@ -9286,8 +9286,31 @@ static JDK_ONLY_HELPER_VIOLATIONS: std::sync::OnceLock<
     parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>>,
 > = std::sync::OnceLock::new();
 
-/// Maximum number of distinct structured violations these helpers retain.
-pub const JDK_ONLY_HELPER_VIOLATION_CAP: usize = 256;
+/// Maximum number of distinct structured violations these helpers retain, by
+/// default.
+///
+/// Read through [`jdk_only_jit_helper_violation_cap`], never directly — an
+/// operator can raise it, and a site reading this constant would report the
+/// default while the sink obeyed something else. Same shape, same default and
+/// the same override knob as the interpreter's sink
+/// (`crate::vm::JDK_ONLY_NATIVE_SHADOW_CAP`), deliberately: both feed one
+/// `--jdk-only-report`, and two caps a reader has to remember separately is how
+/// one of them ends up quoted for the other.
+pub const JDK_ONLY_HELPER_VIOLATION_CAP: usize = 4096;
+
+/// Ceiling on the operator override. Mirrors the interpreter sink's, for the
+/// same reason: a mistyped value must not turn a diagnostic into a memory leak.
+const JDK_ONLY_HELPER_VIOLATION_CAP_MAX: usize = 65_536;
+
+/// Distinct violations this sink had no room for.
+///
+/// The number that turns `violations[]` from a floor into a total for the JIT
+/// fast-path source, exactly as `JDK_ONLY_NATIVE_SHADOW_DROPPED` does for the
+/// interpreter's. Before 2026-08-20 this sink had **no** saturation signal at
+/// all — not even a boolean — so a truncated JIT list was indistinguishable
+/// from a complete one in the report and in every record quoting it.
+static JDK_ONLY_HELPER_VIOLATIONS_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Times a JIT by-name native fast path was refused because `JdkOnly` is in
 /// force. Includes both outright `Reject`s and §7-step-3 yields to bytecode.
@@ -9315,6 +9338,71 @@ pub fn jdk_only_jit_fastpath_refusals() -> u64 {
     JDK_ONLY_FASTPATH_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The cap this process is actually using for the helper sink.
+///
+/// Reads the SAME declared knob as the interpreter's sink,
+/// `CRATONVM_NATIVE_SHADOW_SINK_CAP` (`flag_groups::INVENTORY`,
+/// `CRATONVM_DBG=native-shadow-sink-cap`). One knob for both on purpose: a
+/// census run raises "the observation sink" once and gets both of the report's
+/// bounded collections, instead of raising one and quietly reading a truncated
+/// other. Reusing the declared name is also what keeps this read out of
+/// `types/tests/flag_declaration_guard.rs` — an undeclared `getenv` is served
+/// from a different source than the latched snapshot every other knob uses, and
+/// is a defect in this tree rather than untidiness.
+///
+/// A value of `0`, a non-numeric value, or anything above
+/// [`JDK_ONLY_HELPER_VIOLATION_CAP_MAX`] leaves the default in place: a
+/// diagnostic must never be the thing that fails, and a cap of zero would
+/// report an empty population as a complete one.
+pub fn jdk_only_jit_helper_violation_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_SHADOW_SINK_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0 && *n <= JDK_ONLY_HELPER_VIOLATION_CAP_MAX)
+            .unwrap_or(JDK_ONLY_HELPER_VIOLATION_CAP)
+    })
+}
+
+/// How many distinct violations this sink is holding right now.
+pub fn jdk_only_jit_helper_sink_len() -> usize {
+    jdk_only_helper_violations().lock().len()
+}
+
+/// How many violations this sink had no room for.
+///
+/// **An EVENT count, and deliberately not dressed up as a distinct-row count.**
+/// This sink dedups with `Vec::contains` over the rows it RETAINED; a row it
+/// dropped was never pushed, so a second refusal naming the same triple is not
+/// recognised as a repeat and is counted again. The number is therefore an
+/// upper bound on the distinct rows missing from `violations[]`, and a
+/// perfectly good answer to the only question that has to be answered without
+/// a rebuild — *is this list the population, or is it short?*
+///
+/// Making it exact costs a second dedup structure that would itself need a cap,
+/// i.e. the same problem one level down. Raising
+/// `CRATONVM_NATIVE_SHADOW_SINK_CAP` until this reads zero is the way to get an
+/// exact list, and it needs no code change at all.
+///
+/// The interpreter's counterpart, `crate::vm::jdk_only_native_shadow_sink_dropped`,
+/// gets closer to distinct-row counting because that sink has a 512-slot
+/// filter that survives the drop. Neither is exact; both are honest about which
+/// way they err, and both err upward.
+pub fn jdk_only_jit_helper_sink_dropped() -> u64 {
+    JDK_ONLY_HELPER_VIOLATIONS_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Was at least one violation dropped for want of room?
+///
+/// **Not `len() == cap`.** A run whose last distinct violation exactly fills the
+/// sink dropped nothing and must not be reported truncated — the same
+/// distinction `crate::vm::jdk_only_native_shadow_sink_saturated` documents, and
+/// the reason this is derived from the drop counter rather than from the length.
+pub fn jdk_only_jit_helper_sink_saturated() -> bool {
+    jdk_only_jit_helper_sink_dropped() > 0
+}
+
 /// Record one refused fast-path admission, with its structured violation when
 /// the resolver produced one.
 ///
@@ -9332,8 +9420,18 @@ fn record_jdk_only_fastpath_refusal(
     JDK_ONLY_FASTPATH_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(violation) = violation {
         let mut recorded = jdk_only_helper_violations().lock();
-        if recorded.len() < JDK_ONLY_HELPER_VIOLATION_CAP && !recorded.contains(&violation) {
-            recorded.push(violation);
+        // The dedup test comes FIRST now. It used to be `len() < CAP && !contains`,
+        // which cannot tell "this is a repeat" from "there was no room" — so a
+        // saturated sink dropped rows with nothing anywhere recording that it
+        // had, and the JIT half of `--jdk-only-report`'s `violations[]` was a
+        // floor that looked exactly like a population.
+        if !recorded.contains(&violation) {
+            if recorded.len() < jdk_only_jit_helper_violation_cap() {
+                recorded.push(violation);
+            } else {
+                JDK_ONLY_HELPER_VIOLATIONS_DROPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
     None
