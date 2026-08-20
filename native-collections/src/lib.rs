@@ -6489,6 +6489,13 @@ fn al_or_collection_elements_pinned(
 ) -> Result<Vec<Value>, MethodCallFailed> {
     let mut elems = collect_collection_elements(ctx, this)?;
     let this = ctx.read_native_pin(this_pin, this);
+    let suspect = !elems.is_empty() && heuristic_snapshot_is_suspect(ctx, this, &elems);
+    // `CRATONVM_DBG_TOARRAY`: the layout-probe answer as it stands BEFORE
+    // either re-derivation below can overwrite it. Reading `nulls` beside
+    // `suspect` is what separates "the probe found nothing" (`heuristic_len=0`,
+    // falls through to the `size()`+real-iterator path) from "the probe found
+    // holes and the guard caught them" — the two ways a `toArray`-family answer
+    // goes wrong, which are indistinguishable from the caller.
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         let cid = ctx.class_id_of_object(this);
         let nm = ctx
@@ -6498,14 +6505,13 @@ fn al_or_collection_elements_pinned(
             .iter()
             .filter(|v| matches!(v, Value::Object(None)))
             .count();
-        let suspect = heuristic_snapshot_is_suspect(ctx, this, &elems);
         eprintln!(
             "[DBG_TOARRAY] al_or_collection_elements recv={nm} heuristic_len={} nulls={nulls} suspect={suspect}",
             elems.len()
         );
     }
     if !elems.is_empty() {
-        if heuristic_snapshot_is_suspect(ctx, this, &elems) {
+        if suspect {
             let this = ctx.read_native_pin(this_pin, this);
             // The `?` matters here even though we already hold `elems`:
             // `heuristic_snapshot_is_suspect` has just said the snapshot in
@@ -6539,6 +6545,13 @@ fn al_or_collection_elements_pinned(
 /// through the bytecode's `Arrays.copyOf(elementData, size, a.getClass())`
 /// path which NPEs on synthetic ArrayLists.
 pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `CRATONVM_DBG_TOARRAY`, at the very top so it reports the calls the
+    // routes below divert as well as the ones that reach the body. The
+    // ABSENCE of this line is itself a finding: this native is registered on
+    // `java/util/AbstractCollection` by `register_collections_natives`, but
+    // real-JDK mode registers `real_jdk_to_array_typed` (`vm/src/vm/
+    // vm_init.rs`) over the top of it, so a silent trace on a real-JDK run
+    // means the OTHER implementation is the one under investigation.
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         let cls = match args.first() {
             Some(Value::Object(Some(o))) => {
@@ -16205,6 +16218,15 @@ fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/Collection;)Z",
             native_hs_contains_all,
         );
+        // `ConcurrentHashMap$EntrySetView` DECLARES `removeIf`, so without this
+        // the receiver-has-own-bytecode rule ran `map.removeEntryIf(filter)`
+        // over a view whose `map` field is null. See `native_hs_remove_if`.
+        r.register(
+            c,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            native_hs_remove_if,
+        );
     }
     r.set_category(__prev_cat);
 }
@@ -24486,6 +24508,59 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     ctx.unpin_native_roots(stream_pin);
     ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(stream))))
+}
+
+/// `TreeSet.spliterator()` / `TreeMap$KeySet.spliterator()` — the same sorted
+/// snapshot [`native_ts_stream`] takes, in the three-field synthetic
+/// `java/util/Spliterator` shape [`native_hs_spliterator`] produces.
+///
+/// The comment on `native_ts_stream` above explains why `stream()` needs an
+/// override; `spliterator()` needs it for the same reason and did not have one.
+/// Both classes DECLARE `spliterator()`, so the receiver-has-own-bytecode rule
+/// ran the JDK body — `TreeMap.keySpliteratorFor(m)` — against fields our
+/// layout keeps in the `ts_array_table` side-table instead, and every caller
+/// got `NullPointerException: Cannot invoke
+/// "java.util.TreeMap$NavigableSubMap.keySpliterator()" because "sm" is null`.
+/// `force_native_over_real_jdk_bytecode` already listed `spliterator` for
+/// `java/util/TreeMap$KeySet`; as ever, a gate entry is not a registration.
+fn native_ts_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+            ctx.set_field(spl, 0, Value::Object(Some(arr)));
+            ctx.set_field(spl, 1, Value::Int(0));
+            ctx.set_field(spl, 2, Value::Int(0));
+            return Ok(Some(Value::Object(Some(spl))));
+        }
+    };
+    let this = resync_ts_view(ctx, this)?;
+    let this_pin = ctx.pin_native_root(this);
+    let (_, size, _) = ts_state(ctx, this);
+    // Allocate first, then RE-read the element table through the pin: the
+    // allocation can move it (same count -> allocate -> re-read discipline as
+    // `native_hs_to_array`).
+    let arr = alloc_ref_array(ctx, size as usize);
+    let arr_pin = ctx.pin_native_root(arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    let (data_opt, live_size, _) = ts_state(ctx, this);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let n = (live_size as usize).min(size as usize);
+    if let Some(data) = data_opt {
+        for i in 0..n {
+            ctx.set_array_element(arr, i, ctx.get_array_element(data, i));
+        }
+    }
+    let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    // The cursor end is the array's own length, so a shrunk-since-allocation
+    // table cannot leave trailing nulls inside the reported range.
+    ctx.set_field(spl, 2, Value::Int(n as i32));
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(spl))))
 }
 
 // -- Intermediate operations --
@@ -42429,6 +42504,82 @@ fn native_hs_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
 
+/// `Collection.removeIf(Predicate)` over a HashSet-layout receiver — including
+/// every [`SET_VIEW_CARRIERS`] keySet/entrySet view, where removal has to write
+/// THROUGH to the backing map (`native_hs_remove` does that).
+///
+/// Registered because `ConcurrentHashMap$EntrySetView` *declares* `removeIf`,
+/// so the receiver-has-own-bytecode rule ran the JDK body —
+/// `return map.removeEntryIf(filter)` — over a CratonVM-minted view whose
+/// `map` field is null (the view's state is the backing set in that slot), and
+/// every caller got `NullPointerException: Cannot invoke
+/// "java.util.concurrent.ConcurrentHashMap.removeEntryIf(...)" because
+/// "this.map" is null`. Spring's `DefaultContextCache.remove` does exactly
+/// `this.contextMap.entrySet().removeIf(..)` from a `@DirtiesContext`
+/// `afterTestClass` callback, which is what made three
+/// `core/spring-boot-test` classes report `containersFailed=1` while every
+/// test in them passed. The other carriers do not declare `removeIf` and were
+/// inheriting `Collection`'s iterator-based default, which already worked —
+/// registering here makes the whole family agree rather than leaving one
+/// member's correctness resting on the JDK not overriding a default.
+///
+/// Note that `force_native_over_real_jdk_bytecode` ALREADY listed `removeIf`
+/// for these classes: the gate said "prefer the native" and there was no
+/// native to prefer, so the lookup fell through to the very bytecode the gate
+/// exists to avoid. A gate entry is not a registration.
+fn native_hs_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, ahead of the route — see the note in `native_hs_for_each`.
+    reject_null_functional(args.get(1))?;
+    if let Some(r) = ksv_route(ctx, args, native_ksv_remove_if) {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pred = match args.get(1) {
+        Some(Value::Object(Some(p))) => *p,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    // GC-safety: `test` and the write-through `native_hs_remove` both run
+    // arbitrary Java. Pin the receiver, the predicate and every element, and
+    // re-read each through its pin per iteration. The body is a closure so an
+    // early `?` cannot skip the unpin.
+    let this_pin = ctx.pin_native_root(this);
+    let pred_pin = ctx.pin_native_root(pred);
+    let result = (|| -> MethodCallResult {
+        let this_now = ctx.read_native_pin(this_pin, this);
+        resync_view_set(ctx, this_now)?;
+        let this_now = ctx.read_native_pin(this_pin, this);
+        let backing = match hs_backing_map(ctx, this_now) {
+            Some(m) => m,
+            None => return Ok(Some(Value::Int(0))),
+        };
+        // For an entrySet-kind view these "keys" ARE the `Map.Entry` objects,
+        // which is what the predicate is handed and what `native_hs_remove`
+        // resolves back to a source-map key.
+        let elems = collect_view_snapshot_ordered(ctx, backing)?;
+        let (_, handles) = pin_value_slice(ctx, &elems);
+        let mut modified = false;
+        for (i, elem) in elems.iter().enumerate() {
+            let p = ctx.read_native_pin(pred_pin, pred);
+            let e = read_pinned_elem(ctx, handles[i], *elem);
+            let verdict = ctx.invoke_virtual(p, "test", "(Ljava/lang/Object;)Z", &[e])?;
+            if !matches!(verdict, Some(Value::Int(1))) {
+                continue;
+            }
+            let this_now = ctx.read_native_pin(this_pin, this);
+            let e = read_pinned_elem(ctx, handles[i], *elem);
+            if native_hs_remove(ctx, &[Value::Object(Some(this_now)), e])? == Some(Value::Int(1)) {
+                modified = true;
+            }
+        }
+        Ok(Some(Value::Int(i32::from(modified))))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
 fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -49775,6 +49926,21 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
         registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
+        // `spliterator()` for the same reason `stream()` is here: both classes
+        // declare it, and the JDK body goes through `TreeMap.keySpliteratorFor`
+        // over fields our layout keeps in the side-table. Without this,
+        // `treeSet.spliterator()` and `treeMap.keySet().spliterator()` threw
+        // `NullPointerException: ... "java.util.TreeMap$NavigableSubMap
+        // .keySpliterator()" because "sm" is null` — and `spliterator` was
+        // already in `force_native_over_real_jdk_bytecode` for
+        // `java/util/TreeMap$KeySet`, which does nothing without a native to
+        // prefer.
+        registry.register(
+            c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_ts_spliterator,
+        );
         // Descending/poll views — read the backing `m` TreeMap in real JDK, which
         // CratonVM's native TreeSet never populates (state lives in the side-table),
         // so the inherited bytecode NPEs on a null `m`. Drive them from `ts_state`.
