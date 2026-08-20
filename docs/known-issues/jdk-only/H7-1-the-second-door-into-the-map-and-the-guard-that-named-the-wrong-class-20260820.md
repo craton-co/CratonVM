@@ -530,6 +530,18 @@ is why it is out of scope here rather than fixed. Nominated as N3.
 
 **O3 — `regression-suite/src/` needs the vector §5b describes.** N1.
 
+**O4 — `docs/known-issues/jdk-only/INDEX.md` needs a row for this record.**
+This lane was explicitly forbidden to edit `INDEX.md`.
+`HANDOFF-20260820.md` §5 records that all eight wave-H records got their rows
+the day they landed, and that "the four previous INDEX passes each discovered
+the wave then in flight had none" — so this one is a known-missing row, not an
+oversight. Suggested row, matching the bullet form the H-wave entries use
+(`INDEX.md:1127` for `H4-1`):
+
+```text
+- [H7-1](H7-1-the-second-door-into-the-map-and-the-guard-that-named-the-wrong-class-20260820.md) — `FIXED-UNVERIFIED` · **SOURCE-ONLY, compatible mode only.** `H4-1` O1's six JIT collection helpers do **not** reimplement the natives — five call the registered Rust function and the sixth is a `pub` re-export of the private stage the native itself calls — and they are **not** past the kind check: two route through `admit_jit_fast_native`, the other four are refused at BIND time by `jit::direct_native_helper`, and all four triples are `bridge` in `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, so under `--jdk-only` none of them can bind. A call-site census cannot see a bind-time refusal. Three real disagreements fixed: `jit_concurrent_hashmap_get_direct` answered `null` for a key address the heap did not recognise (its sibling falls back) and called the non-leaf `native_chm_get` with no funnel; `jit_hashmap_put_direct` inserted through the overlay and then re-dispatched the same put, returning the value it had just written as the previous mapping. **The guard names the wrong class**: two ladders ask §1.4's question about the call site's INTERFACE (`java/util/Map.get`, `ConcurrentMap.get`) while the helper runs the implementation's native — right today only because both rows are `bridge`, which is exactly what a retag would change. Closed. Also: `RJitGc` contains no map, and NO vector in the corpus declares a `ConcurrentMap`-typed variable.
+```
+
 ---
 
 ## 8. NOMINATIONS
