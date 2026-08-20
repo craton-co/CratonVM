@@ -890,11 +890,21 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
     // private fields (`_ca_array`, `_compressed_storage`, ...) that this
     // synthetic 1-field `ObjectName` model never populates (construction is
     // always native-Bridge-shortcut, see `object_name_new`/`object_name_set_text`
-    // above) -- `_ca_array` in particular is a reference field, so an
-    // out-of-bounds read of it yields `null`, and real bytecode's
-    // `_ca_array.length` then NPEs. Implement these against the same
-    // canonical-string text model the rest of this file already uses
-    // (`object_name_parts`, `getDomain`, `getKeyProperty`) instead.
+    // above), so real bytecode's `_ca_array.length` NPEs. Implement these
+    // against the same canonical-string text model the rest of this file
+    // already uses (`object_name_parts`, `getDomain`, `getKeyProperty`)
+    // instead.
+    //
+    // CORRECTED, lane H6 (2026-08-20): this used to add "`_ca_array` in
+    // particular is a reference field, so an OUT-OF-BOUNDS read of it yields
+    // `null`". That mechanism no longer exists. `try_alloc_concurrent_synthetic`
+    // (`util_concurrent_ext.rs`) widens every allocation to
+    // `max(real_instance_field_count, requested)`, so against a real
+    // `java.management` image an `ObjectName` gets all FIVE slots here, not one
+    // -- the read is in bounds and the slot is genuinely null. Same NPE, and it
+    // matters which one it is: the old sentence also underwrites the P0 row's
+    // claim that "any write past slot 0 is silently discarded", which is stale
+    // for the same reason.
     r.register(
         cls,
         "getCanonicalKeyPropertyListString",
@@ -1001,6 +1011,41 @@ fn object_name_text(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
     }
 }
 
+/// Store this file's text model into the canonical-name slot.
+///
+/// **READ THIS BEFORE TRYING TO POPULATE `_kp_array` / `_ca_array` /
+/// `_propertyList` BY HAND (lane H6, 2026-08-20). That change is not merely
+/// laborious, it is UNSOUND, and the reason is here rather than in the record
+/// because this is the function that makes it unsound.**
+///
+/// The text this writes is the **source-order** name. The real JDK's
+/// `_canonicalName` holds the **key-sorted** name. Measured on this host,
+/// HotSpot 25.0.3+9, `new ObjectName("d:b=2,a=1,c=3")`:
+///
+/// ```text
+///   getCanonicalName() = d:a=1,b=2,c=3    (== _canonicalName, ObjectName.java:1452)
+///   toString()         = d:b=2,a=1,c=3    (source order, rebuilt from _kp_array)
+/// ```
+///
+/// The two models therefore put **different strings in the same field**, and
+/// every accessor in this file is written against the source-order one --
+/// `native_object_name_get_key_property_list_string` is *correct only because*
+/// of it.
+///
+/// That is what forbids populating the other three by hand:
+/// `javax.management.ObjectName$Property` (`javap -p`) is
+/// `{ int _key_index; int _key_length; int _value_length; }` with
+/// `getKeyString(String)` / `getValueString(String)` taking the name string as
+/// a PARAMETER. `_kp_array` and `_ca_array` are not independent data -- they
+/// are an **index into `_canonicalName`**. Filling them while this slot holds
+/// source-order text leaves the offsets pointing at the wrong characters, so
+/// `getKeyProperty()` would return silently wrong substrings instead of the
+/// NPE it returns today. A wrong answer that looks like an answer is worse
+/// than the null.
+///
+/// The whole family moves together or none of it does. See
+/// `docs/known-issues/jdk-only/H6-1-*` §2 for the migration and its
+/// precondition.
 fn object_name_set_text(ctx: &mut dyn NativeContext, obj: ObjectRef, text: String) {
     let slot = object_name_text_slot(ctx, obj);
     let s = ctx.create_string(&text);
@@ -1506,11 +1551,31 @@ fn native_object_name_get_canonical_key_property_list_string(
 }
 
 /// `ObjectName.getSerializedNameString()`: see `RKC-ObjectName-03` at the
-/// registration site. Real bytecode rebuilds this from `_canonicalName` and
-/// `_kp_array` byte-by-byte, but the result is simply the canonical name
-/// text (domain + sorted key properties, with the pattern suffix normalised
-/// to a bare `*` when there are no other properties) — exactly what
-/// `canonical_object_name_text` already computes for the synthetic model.
+/// registration site.
+///
+/// **CORRECTED, lane H6 (2026-08-20). This comment used to read "the result is
+/// simply the canonical name text (domain + sorted key properties)" and the
+/// body returned `canonical_object_name_text(..)`. Both were wrong**, and the
+/// oracle says so directly — HotSpot 25.0.3+9 on this host, `ONProbe`:
+///
+/// ```text
+/// new ObjectName("d:b=2,a=1,c=3")
+///   getCanonicalName()  = d:a=1,b=2,c=3     <- SORTED
+///   toString()          = d:b=2,a=1,c=3     <- SOURCE ORDER
+/// ```
+///
+/// and `ObjectName.java:1652` is `public String toString() { return
+/// getSerializedNameString(); }`. So `getSerializedNameString()` is the
+/// **source-order** text, not the canonical one: the real body walks `_kp_array`
+/// (which is in source order) pulling substrings out of `_canonicalName`
+/// (which is in canonical order) — that is the whole reason the two arrays
+/// exist. Returning the canonical form here made every serialized `ObjectName`
+/// on the jmxmp wire disagree with HotSpot on any name whose keys were not
+/// already sorted, which is the exact path `RKC-ObjectName-03` was written for.
+///
+/// In this file's text model the source-order text is `object_name_text` itself,
+/// so this is now the same answer `native_object_name_to_string` gives — which
+/// is what the JDK's own one-line `toString()` asserts.
 fn native_object_name_get_serialized_name_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1520,8 +1585,7 @@ fn native_object_name_get_serialized_name_string(
         _ => return Ok(Some(Value::Object(None))),
     };
     let text = object_name_text(ctx, this);
-    let canonical = canonical_object_name_text(&text);
-    let s = ctx.create_string(&canonical);
+    let s = ctx.create_string(&text);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -2187,6 +2251,8 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let is_heap = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
             let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
+            // Slots by NAME -- see `memory_usage_slots`.
+            let [s_init, s_used, s_committed, s_max] = memory_usage_slots(ctx, obj);
             if is_heap {
                 let used = ctx.heap_allocated_bytes() as i64;
                 // Same source as `Runtime.totalMemory()` (`committed_heap_bytes`),
@@ -2195,19 +2261,19 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 let committed = (ctx.committed_heap_bytes() as i64)
                     .max(used)
                     .min(ctx.max_heap_bytes().max(used));
-                ctx.set_field(obj, 0, Value::Long(ctx.initial_heap_bytes())); // init (real -Xms)
-                ctx.set_field(obj, 1, Value::Long(used)); // used (real)
-                ctx.set_field(obj, 2, Value::Long(committed)); // committed
-                ctx.set_field(obj, 3, Value::Long(ctx.max_heap_bytes())); // max (real -Xmx)
+                ctx.set_field(obj, s_init, Value::Long(ctx.initial_heap_bytes())); // real -Xms
+                ctx.set_field(obj, s_used, Value::Long(used)); // real
+                ctx.set_field(obj, s_committed, Value::Long(committed));
+                ctx.set_field(obj, s_max, Value::Long(ctx.max_heap_bytes())); // real -Xmx
             } else {
                 const AVG_CLASS_METADATA_BYTES: i64 = 4096;
                 const NON_HEAP_INIT_BYTES: i64 = 2 * 1024 * 1024;
                 let used = (ctx.loaded_class_count() as i64 * AVG_CLASS_METADATA_BYTES).max(1);
                 let committed = used + 1024 * 1024;
-                ctx.set_field(obj, 0, Value::Long(NON_HEAP_INIT_BYTES)); // init
-                ctx.set_field(obj, 1, Value::Long(used)); // used (class-count-derived)
-                ctx.set_field(obj, 2, Value::Long(committed)); // committed
-                ctx.set_field(obj, 3, Value::Long(-1)); // max (undefined, honest)
+                ctx.set_field(obj, s_init, Value::Long(NON_HEAP_INIT_BYTES));
+                ctx.set_field(obj, s_used, Value::Long(used)); // class-count-derived
+                ctx.set_field(obj, s_committed, Value::Long(committed));
+                ctx.set_field(obj, s_max, Value::Long(-1)); // undefined, honest
             }
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2937,10 +3003,12 @@ fn long_arg(args: &[Value], idx: usize) -> i64 {
 /// answers with the spec-defined sentinel rather than a fabricated number.
 fn undefined_memory_usage(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let mu = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
-    ctx.set_field(mu, 0, Value::Long(-1));
-    ctx.set_field(mu, 1, Value::Long(-1));
-    ctx.set_field(mu, 2, Value::Long(-1));
-    ctx.set_field(mu, 3, Value::Long(-1));
+    // By NAME -- see `memory_usage_slots`. The value is the same in all four,
+    // so this one is a no-op on behaviour twice over; it is converted so the
+    // bean has no remaining index-into-a-real-layout site to audit.
+    for slot in memory_usage_slots(ctx, mu) {
+        ctx.set_field(mu, slot, Value::Long(-1));
+    }
     Ok(mu)
 }
 
@@ -3845,8 +3913,24 @@ fn platform_mxbean_object_name_text(
         // The collector bean is a NAMED platform bean: its ObjectName carries
         // the collector's own name, which `init_gc_mxbean_fields` puts in
         // slot 0. `java.lang:type=GarbageCollector,name=<getName()>` is the
-        // key order the JDK builds and the order `getCanonicalName()` sorts
-        // to, so the text is already canonical.
+        // key order the JDK builds, i.e. the SOURCE order -- which is what
+        // this file's text model wants (see `object_name_set_text`).
+        //
+        // CORRECTED, lane H6 (2026-08-20): this used to end "...and the order
+        // `getCanonicalName()` sorts to, so the text is already canonical."
+        // That is false, and it is the only multi-property text this function
+        // produces, so it was the one case the claim had to get right.
+        // Measured, HotSpot 25.0.3+9 on this host:
+        //
+        //   new ObjectName("java.lang:type=GarbageCollector,name=G1 Young Generation")
+        //     getCanonicalName()         = java.lang:name=G1 Young Generation,type=GarbageCollector
+        //     getKeyPropertyListString() = type=GarbageCollector,name=G1 Young Generation
+        //
+        // Canonical sorts by key, and `name` < `type`. The text below is
+        // therefore source order, NOT canonical. Nothing here needs changing --
+        // `native_object_name_get_canonical_name` canonicalises on read -- but
+        // a future lane that "stops fabricating" must not carry this sentence
+        // forward as a licence to treat the two orders as interchangeable.
         "java/lang/management/GarbageCollectorMXBean" => {
             let name = match ctx.get_field(this, 0) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -3961,10 +4045,49 @@ fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Re
     ctx.set_field(obj, 7, Value::Long(vm_start_epoch_ms() as i64));
     ctx.set_field(obj, 8, Value::Long(uptime_ms() as i64));
     // field 9 = inputArguments (empty ArrayList)
+    //
+    // Slots 0..=9 above are a CratonVM-fabricated carrier and the indices are
+    // legitimate: `java.lang.management.RuntimeMXBean` is an INTERFACE, so the
+    // real JDK layout it is stamped with has ZERO instance fields and there is
+    // nothing to collide with. `java.util.ArrayList` is the opposite case.
+    //
+    // H6-B, 2026-08-20. `javap -p java.util.ArrayList` / `java.util.AbstractList`
+    // on JDK 25.0.3+9, instance fields in declaration order:
+    //
+    //     0  protected transient int      modCount      (AbstractList)
+    //     1  transient java.lang.Object[] elementData   (ArrayList)
+    //     2  private int                  size          (ArrayList)
+    //
+    // The fixed `0 = array, 1 = size` used here is the SYNTHETIC carrier's
+    // convention. Against the real layout -- which is what the widening in
+    // `try_alloc_concurrent_synthetic` hands back in real-JDK mode -- it put an
+    // OOP into `modCount` (an int) and an `Int` into `elementData` (a
+    // reference the GC scans as an oop). That is not a wrong answer, it is the
+    // heap-corruption species of `docs/architecture/natives-over-real-jdk-classes.md`
+    // §5: `Int(0)` in a reference slot is a bogus pointer for the collector to
+    // mark and move.
+    //
+    // The other two `java/util/ArrayList` allocations in this file (the
+    // component-list registration and `init_notification_emitter_support`)
+    // already write by NAME. This was the one call site that did not -- the
+    // "correct helper exists but only one call site uses it" shape, inverted.
+    //
+    // Resolve the INDEX by name and keep the fixed indices only as the
+    // fallback, rather than switching to `set_field_by_name`: that setter is a
+    // documented NO-OP when the field is absent, and the synthetic carrier
+    // mints fields with no names, so a blind switch would silently drop both
+    // writes there.
     let args_list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let empty_arr = ctx.new_ref_array(ClassId::new(0), 0);
-    ctx.set_field(args_list, 0, Value::Object(Some(empty_arr)));
-    ctx.set_field(args_list, 1, Value::Int(0));
+    let list_cid = ctx.class_id_of_object(args_list);
+    let elem_slot = ctx
+        .resolve_field_index_by_class_id(list_cid, "elementData")
+        .unwrap_or(0);
+    let size_slot = ctx
+        .resolve_field_index_by_class_id(list_cid, "size")
+        .unwrap_or(1);
+    ctx.set_field(args_list, elem_slot, Value::Object(Some(empty_arr)));
+    ctx.set_field(args_list, size_slot, Value::Int(0));
     ctx.set_field(obj, 9, Value::Object(Some(args_list)));
     Ok(())
 }
@@ -4415,6 +4538,47 @@ fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodC
     Ok(obj)
 }
 
+/// The four `java.lang.management.MemoryUsage` slots, resolved by NAME.
+///
+/// **H6-B, 2026-08-20.** `javap -p java.lang.management.MemoryUsage` on JDK
+/// 25.0.3+9, this host, instance fields in declaration order:
+///
+/// ```text
+///   0  private final long init
+///   1  private final long used
+///   2  private final long committed
+///   3  private final long max
+/// ```
+///
+/// `MemoryUsage` is a REAL, concrete JDK class, so the hard-coded `0..=3` this
+/// file used were right BY COINCIDENCE with nothing in the tree pinning the
+/// coincidence -- the same species as `ObjectName`'s canonical-name slot
+/// (H0-1 §3). The fallback below is the identity `[0, 1, 2, 3]` because that is
+/// also the synthetic carrier's convention, so this conversion is
+/// behaviour-neutral on BOTH carriers today and diverges only if the real
+/// declaration order ever moves. That is the point of doing it.
+///
+/// One thing worth stating rather than assuming, because it sets how urgent
+/// this site is next to its neighbours: **`MemoryUsage` has no reference
+/// fields.** All four are `long`. A drifted index here is a wrong NUMBER, not
+/// the bogus oop the same mistake produces on `java.util.ArrayList` or
+/// `javax.management.ObjectName`. It is converted anyway -- the object-layout
+/// audit's order is "convert, verify, unpad, then drop" and it has no "unless
+/// the fields happen to be primitives" arm.
+fn memory_usage_slots(ctx: &dyn NativeContext, obj: ObjectRef) -> [usize; 4] {
+    let cid = ctx.class_id_of_object(obj);
+    let slot = |name: &str, fallback: usize| {
+        ctx.resolve_field_index_by_class_id(cid, name)
+            .unwrap_or(fallback)
+    };
+    [
+        slot("init", 0),
+        slot("used", 1),
+        slot("committed", 2),
+        slot("max", 3),
+    ]
+}
+
 fn alloc_memory_usage(
     ctx: &mut dyn NativeContext,
     init: i64,
@@ -4423,10 +4587,11 @@ fn alloc_memory_usage(
     max: i64,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
-    ctx.set_field(obj, 0, Value::Long(init));
-    ctx.set_field(obj, 1, Value::Long(used));
-    ctx.set_field(obj, 2, Value::Long(committed));
-    ctx.set_field(obj, 3, Value::Long(max));
+    let [s_init, s_used, s_committed, s_max] = memory_usage_slots(ctx, obj);
+    ctx.set_field(obj, s_init, Value::Long(init));
+    ctx.set_field(obj, s_used, Value::Long(used));
+    ctx.set_field(obj, s_committed, Value::Long(committed));
+    ctx.set_field(obj, s_max, Value::Long(max));
     Ok(obj)
 }
 
@@ -4559,10 +4724,9 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
     // same UNDEFINED shape `MemoryPoolImpl` uses for "no measurement taken".
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Long(-1));
-        ctx.set_field(this, 1, Value::Long(-1));
-        ctx.set_field(this, 2, Value::Long(-1));
-        ctx.set_field(this, 3, Value::Long(-1));
+        for slot in memory_usage_slots(ctx, this) {
+            ctx.set_field(this, slot, Value::Long(-1));
+        }
         Ok(None)
     });
     r.register(cls, "<init>", "(JJJJ)V", |ctx, args| {
@@ -4585,28 +4749,29 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        ctx.set_field(this, 0, Value::Long(init_val));
-        ctx.set_field(this, 1, Value::Long(used_val));
-        ctx.set_field(this, 2, Value::Long(committed_val));
-        ctx.set_field(this, 3, Value::Long(max_val));
+        let [s_init, s_used, s_committed, s_max] = memory_usage_slots(ctx, this);
+        ctx.set_field(this, s_init, Value::Long(init_val));
+        ctx.set_field(this, s_used, Value::Long(used_val));
+        ctx.set_field(this, s_committed, Value::Long(committed_val));
+        ctx.set_field(this, s_max, Value::Long(max_val));
         Ok(None)
     });
 
     r.register(cls, "getInit", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(ctx.get_field(this, memory_usage_slots(ctx, this)[0])))
     });
     r.register(cls, "getUsed", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        Ok(Some(ctx.get_field(this, memory_usage_slots(ctx, this)[1])))
     });
     r.register(cls, "getCommitted", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+        Ok(Some(ctx.get_field(this, memory_usage_slots(ctx, this)[2])))
     });
     r.register(cls, "getMax", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        Ok(Some(ctx.get_field(this, memory_usage_slots(ctx, this)[3])))
     });
     // `toString` is NOT overridden on a real JDK: the real bytecode reads the
     // same four slots this file writes by index (`init`, `used`, `committed`,
@@ -4619,19 +4784,20 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
     if memoryusage_tostring_shim_enabled() {
         r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let init_v = match ctx.get_field(this, 0) {
+            let [s_init, s_used, s_committed, s_max] = memory_usage_slots(ctx, this);
+            let init_v = match ctx.get_field(this, s_init) {
                 Value::Long(v) => v,
                 _ => 0,
             };
-            let used_v = match ctx.get_field(this, 1) {
+            let used_v = match ctx.get_field(this, s_used) {
                 Value::Long(v) => v,
                 _ => 0,
             };
-            let committed_v = match ctx.get_field(this, 2) {
+            let committed_v = match ctx.get_field(this, s_committed) {
                 Value::Long(v) => v,
                 _ => 0,
             };
-            let max_v = match ctx.get_field(this, 3) {
+            let max_v = match ctx.get_field(this, s_max) {
                 Value::Long(v) => v,
                 _ => 0,
             };
