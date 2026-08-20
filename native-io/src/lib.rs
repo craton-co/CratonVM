@@ -15369,15 +15369,45 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // RandomAccessFile = 2-field synthetic (fd=0, path=1).
     //
-    // DIAGNOSTIC GATE (CRATONVM_REAL_RAF=1): skip these synthetic natives so
+    // MODE GATE: when real-RAF is on, skip these synthetic natives so
     // `java.io.RandomAccessFile` runs its REAL JDK bytecode (real ctor ->
     // `new FileDescriptor(); open0(...)`, plus the native-io platform primitives
     // open0/read0/write0/seek0/...). The synthetic `<init>` otherwise shadows the
     // real ctor via native-override priority, leaving `this.fd` null. Real-RAF is
-    // required for DaCapo luindex (FSDirectory.sync -> RAF.getFD().sync()); it is
-    // gated rather than removed because the real ctor's FileCleanable/Cleaner/
-    // PhantomReference path still has a separate crash under sustained load that
-    // is being diagnosed (see crash_handler VEH). Default (unset) = synthetic.
+    // required for DaCapo luindex (FSDirectory.sync -> RAF.getFD().sync()).
+    //
+    // THREE CORRECTIONS to what this comment said until 2026-08-20 (H8-1):
+    //
+    //  1. The knob is `CRATONVM_SYNTHETIC_RAF=1`, not `CRATONVM_REAL_RAF=1`.
+    //     The latter is RETIRED — `types/tests/flag_declaration_guard.rs`
+    //     carries a row saying so, and `types/src/flag_groups.rs` declares
+    //     only `off_key: CRATONVM_SYNTHETIC_RAF`. Setting `CRATONVM_REAL_RAF`
+    //     does nothing at all.
+    //  2. "Default (unset) = synthetic" is backwards. `real_raf_enabled()` is
+    //     `!io_flags().synthetic_raf_forced`, so the DEFAULT is real-RAF and
+    //     this whole block is skipped unless the operator opts back in. The
+    //     doc comment on `real_raf_enabled` has said so since 2026-06-02;
+    //     these lines were never updated with it.
+    //  3. The block is not "gated rather than removed because the real ctor's
+    //     FileCleanable/Cleaner/PhantomReference path still has a separate
+    //     crash under sustained load that is being diagnosed". That crash is
+    //     FIXED — see the `real_raf_enabled` doc comment below and
+    //     app-jvm-bugs/real-raf-segv-root-cause.md, 2026-06-02 — and the same
+    //     doc comment calls the surviving synthetic path BROKEN and describes
+    //     the flag as an opt-in back into it. Whatever the reason for keeping
+    //     the block is, it is not the one stated here; this comment does not
+    //     invent a replacement.
+    //
+    // ONE OF THESE 18 TRIPLES USED TO ESCAPE THE GATE.
+    // `getFilePointer()J` is also registered by
+    // `random_access_file::register_random_access_file_natives`, called six
+    // lines after this function in `register_io_natives`, and that
+    // registration was unconditional — so this synthetic row was dead in BOTH
+    // settings of the flag and the synthetic arm's `getFilePointer()` answered
+    // a constant 0. The gate is now mirrored at that call site. It is the only
+    // one: the other nine rows over there are `open0`/`read0`/`readBytes0`/
+    // `write0`/`writeBytes0`/`seek0`/`length0`/`setLength0`/`initIDs`, and no
+    // name on this list matches any of them.
     if !real_raf_enabled() {
         let raf = "java/io/RandomAccessFile";
         registry.register(
