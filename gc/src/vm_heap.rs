@@ -178,6 +178,26 @@ fn mirror_pin_young_defer_enabled() -> bool {
     })
 }
 
+/// Whether the trusted `*_validated` twins may skip the membership walk their
+/// checking counterparts do.
+///
+/// Default ON. `CRATONVM_GC_NO_VALIDATE_ONCE=1` makes every twin re-validate,
+/// restoring the two and three `is_object_address` walks per `NativeContext`
+/// accessor call that "validate once per native accessor call" removed — so
+/// that change is an A/B inside ONE binary. It landed with a walk count and no
+/// wall clock, and on this path those are not the same measurement: the
+/// getfield fix removed 34M walks and bought ~1.05x.
+///
+/// Read once; consulted on the hottest accessor path in the VM.
+#[inline]
+fn validate_once_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_VALIDATE_ONCE").is_none()
+    })
+}
+
 #[cfg(debug_assertions)]
 #[inline]
 fn arm_pending_pre_barrier() {
@@ -509,6 +529,9 @@ impl VmHeap {
     /// from JNI handles, and the sentinel above is the record of one arriving
     /// unvalidated. Anything less certain must keep using `class_id_of`.
     pub fn class_id_of_validated(&self, obj: ObjectRef) -> ClassId {
+        if !validate_once_enabled() {
+            return self.class_id_of(obj);
+        }
         dispatch!(self, class_id_of(obj))
     }
 
@@ -519,6 +542,11 @@ impl VmHeap {
     /// this heap. See [`crate::gen_heap::GenerationalHeap::is_object_address`]
     /// for the full contract.
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
+        // TOTAL walk counter, every caller. The per-site census in
+        // `vm/src/jit/helpers.rs` tags only the JIT helpers; comparing its sum
+        // against this says whether those sites are the whole story or a
+        // fraction. Getting that backwards would mean optimising 3% while
+        // claiming 12%.
         match self {
             VmHeap::Generational(h) => h.is_object_address(addr),
             VmHeap::G1(h) => h.is_object_address(addr),
@@ -792,7 +820,24 @@ impl VmHeap {
     /// compact headers in the future MUST update this method (and
     /// gate the alternate decode path on the appropriate cfg).
     #[inline]
-    pub fn load_and_forward(&self, obj: ObjectRef) -> ObjectRef {
+    /// Shared body of [`Self::load_and_forward`],
+    /// [`Self::load_and_forward_checked`] and
+    /// [`Self::load_and_forward_validated`].
+    ///
+    /// `pre_validated` is the caller's promise that `is_object_address` has
+    /// ALREADY answered `Some` for `obj` on this heap with no intervening
+    /// safepoint - the same contract as [`Self::class_id_of_validated`]. It
+    /// suppresses the ENTRY walk only; every other check below is unchanged,
+    /// including the forwarding-target validation.
+    ///
+    /// The returned flag says whether the reference handed back is a
+    /// **validated live base**. Only a walk that actually happened inside
+    /// this call may set it: the `forwarded_after_slide` answer is reported
+    /// UNvalidated even though the relocation table only holds live bases,
+    /// because that keeps the flag's meaning to one sentence a caller can
+    /// check rather than a chain of invariants it has to trust.
+    #[inline]
+    fn load_and_forward_inner(&self, obj: ObjectRef, pre_validated: bool) -> (ObjectRef, bool) {
         // KINDOF-SENTINEL: `obj` itself has been observed already invalid
         // here (not merely forwarded-to-garbage — see the forwarding-target
         // check below) when the caller's own value was reconstructed across
@@ -832,7 +877,7 @@ impl VmHeap {
                 }
             }
         }
-        if self.is_object_address(obj.as_ptr() as usize).is_none() {
+        if !pre_validated && self.is_object_address(obj.as_ptr() as usize).is_none() {
             // Not a live base. On a collector that leaves a forwarding word
             // this is the end of the road; ZGC's slide leaves none, so ask its
             // relocation table instead — that is the whole point of
@@ -844,10 +889,10 @@ impl VmHeap {
                     // SAFETY: `forwarded_after_slide` only answers with an
                     // address the object-start registry currently holds, i.e. a
                     // live object base inside the arena.
-                    return unsafe { ObjectRef::from_raw(moved_to as *mut u8) };
+                    return (unsafe { ObjectRef::from_raw(moved_to as *mut u8) }, false);
                 }
             }
-            return obj;
+            return (obj, false);
         }
         // SAFETY: the caller guarantees `obj` is a live root. Every
         // current backend lays out `ObjectHeader` at offset 0 of the
@@ -855,7 +900,7 @@ impl VmHeap {
         // structural offset; reading the field is well-formed.
         let header = unsafe { &*(obj.as_ptr() as *const crate::heap::ObjectHeader) };
         if !header.is_forwarded() {
-            return obj;
+            return (obj, true);
         }
         let addr = header.forwarding_address();
         if addr.is_null() {
@@ -865,7 +910,7 @@ impl VmHeap {
             // anticipate). Returning the original pointer is always
             // safe because the original object still exists in memory
             // until the evacuation epoch ends.
-            return obj;
+            return (obj, true);
         }
         // KINDOF-SENTINEL: `header` itself may be corrupted (the same
         // implausible-header family `old_gen::scan_region` guards against —
@@ -880,11 +925,47 @@ impl VmHeap {
         // trusting it; an implausible target falls back to the original
         // pointer, exactly like the null-address case above.
         if self.is_object_address(addr as usize).is_none() {
-            return obj;
+            return (obj, true);
         }
         // SAFETY: the forwarding pointer was installed by the GC and
         // points at a valid object header within this heap.
-        unsafe { ObjectRef::from_raw(addr) }
+        (unsafe { ObjectRef::from_raw(addr) }, true)
+    }
+
+    /// The software read barrier: repair `obj` if the collector moved it.
+    #[inline]
+    pub fn load_and_forward(&self, obj: ObjectRef) -> ObjectRef {
+        self.load_and_forward_inner(obj, false).0
+    }
+
+    /// [`Self::load_and_forward`], also reporting whether the reference it
+    /// hands back is a validated live base.
+    ///
+    /// `load_and_forward` returns its argument UNCHANGED when validation
+    /// fails, so its result is not safe to pass to a `_validated` twin - the
+    /// twin would dereference a pointer nothing has checked. This variant
+    /// hands the caller the one bit needed to tell the two cases apart, and
+    /// costs nothing: the walk that decides it has already happened inside.
+    #[inline]
+    pub fn load_and_forward_checked(&self, obj: ObjectRef) -> (ObjectRef, bool) {
+        self.load_and_forward_inner(obj, false)
+    }
+
+    /// [`Self::load_and_forward`] for a caller that has **just** validated
+    /// `obj` through [`Self::is_object_address`] and still holds it.
+    ///
+    /// Skips the entry walk only. The result is always a validated live base:
+    /// with the entry branch suppressed, every remaining exit either returns
+    /// the caller's already-validated `obj` or a forwarding target this call
+    /// validated itself.
+    ///
+    /// # Contract
+    ///
+    /// As [`Self::class_id_of_validated`]: `is_object_address` must have
+    /// answered `Some` for `obj`, on this heap, with no intervening safepoint.
+    #[inline]
+    pub fn load_and_forward_validated(&self, obj: ObjectRef) -> ObjectRef {
+        self.load_and_forward_inner(obj, validate_once_enabled()).0
     }
 
     /// Decode the first 8 bytes of an object's header as a compact
@@ -941,6 +1022,24 @@ impl VmHeap {
             return ObjectKind::Object;
         }
         dispatch!(self, kind_of(obj))
+    }
+
+    /// [`Self::kind_of`] for a caller holding a validated `ObjectRef`.
+    /// Same contract as [`Self::class_id_of_validated`].
+    pub fn kind_of_validated(&self, obj: ObjectRef) -> ObjectKind {
+        if !validate_once_enabled() {
+            return self.kind_of(obj);
+        }
+        dispatch!(self, kind_of(obj))
+    }
+
+    /// [`Self::element_type_of`] for a caller holding a validated
+    /// `ObjectRef`. Same contract as [`Self::class_id_of_validated`].
+    pub fn element_type_of_validated(&self, obj: ObjectRef) -> ArrayElementType {
+        if !validate_once_enabled() {
+            return self.element_type_of(obj);
+        }
+        dispatch!(self, element_type_of(obj))
     }
 
     pub fn element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
