@@ -3699,6 +3699,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(
         ctx_class,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        |ctx, args| crate::jca::ssl_context_spi::ssl_context_provider(ctx, args),
+    );
+    r.register(
+        ctx_class,
         "createSSLEngine",
         "()Ljavax/net/ssl/SSLEngine;",
         |ctx, _args| {

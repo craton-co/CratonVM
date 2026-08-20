@@ -14728,6 +14728,16 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
+    // getProvider() — see `jca::ssl_context_spi::ssl_context_provider`. Not
+    // registered at all until 2026-08-20, so the real bytecode answered it:
+    // `return provider;`, which is slot 0 — the PROTOCOL on every synthetic
+    // layout. `getProvider()` handed back a `java.lang.String`.
+    r.register(
+        ctx_cls,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        |ctx, args| crate::jca::ssl_context_spi::ssl_context_provider(ctx, args),
+    );
     // getSupportedSSLParameters() — Tomcat's JSSEUtil.initialise() reads the
     // supported protocols + cipher suites here. The synthetic SSLContext has no
     // contextSpi, so the inherited javax bytecode NPEs; return a REAL

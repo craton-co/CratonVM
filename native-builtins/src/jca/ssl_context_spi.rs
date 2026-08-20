@@ -90,6 +90,15 @@ const CONTEXT_SPI_FIELD: &str = "contextSpi";
 /// with. Only read for a context that HAS a real SPI — see [`SslContextOwner`].
 pub(crate) const PROTOCOL_FIELD: &str = "protocol";
 
+/// The real JDK's field name for the `Provider` an `SSLContext` was
+/// constructed with — slot 0, which every synthetic layout uses for the
+/// protocol. See [`ssl_context_provider`].
+pub(crate) const PROVIDER_FIELD: &str = "provider";
+
+/// The provider CratonVM's own `SSLContext.getInstance(String)` stands in for,
+/// and therefore the one a synthetic context must name.
+const SYNTHETIC_CONTEXT_PROVIDER: &str = "SunJSSE";
+
 /// `javax.net.ssl.SSLContextSpi`, in internal form.
 const SPI_BASE_CLASS: &str = "javax/net/ssl/SSLContextSpi";
 
@@ -227,6 +236,43 @@ pub(crate) fn real_context_protocol(ctx: &dyn NativeContext, args: &[Value]) -> 
                 _ => None,
             }
         }
+    }
+}
+
+/// `getProvider()` for any `javax/net/ssl/SSLContext` receiver.
+///
+/// Registered rather than left to the real bytecode, for the same reason
+/// [`real_context_protocol`] exists: `SSLContext.getProvider()` is
+/// `return provider;`, slot 0 — and slot 0 of a CratonVM-allocated context is
+/// the PROTOCOL. Measured on JDK 25 with `probes/SslContextSpiProbe.java`,
+/// before this was registered:
+///
+/// ```text
+///                    HotSpot 25          CratonVM
+/// getProvider()      SunJSSE version 25  TLSv1.3
+/// ```
+///
+/// A `String` where a `java.security.Provider` is contracted: every caller
+/// that does anything with the answer beyond printing it fails on the type.
+///
+/// * a real context (ours or a third party's) answers its own `provider`
+///   field, so `getInstance(algo, p).getProvider() == p` holds by identity;
+/// * a synthetic one answers `SunJSSE`, which is the provider CratonVM's own
+///   `getInstance(String)` stands in for.
+pub(crate) fn ssl_context_provider(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if !matches!(context_owner(ctx, this), SslContextOwner::Synthetic) {
+        return Ok(Some(ctx.get_field_by_name(this, PROVIDER_FIELD)));
+    }
+    match crate::jca::provider_chain::provider_object_named(ctx, SYNTHETIC_CONTEXT_PROVIDER)? {
+        Some(p) => Ok(Some(Value::Object(Some(p)))),
+        None => Ok(Some(Value::Object(None))),
     }
 }
 
@@ -507,7 +553,7 @@ mod registrar_tests {
     use super::fixtures::*;
     use super::*;
     use crate::test_utils::MockNativeContext;
-    use cratonvm_native_api::{NativeHeapAccess, NativeMethodRegistry};
+    use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess, NativeMethodRegistry};
     use std::sync::Mutex;
 
     /// `engine*` methods the delegating arm reached, most recent last.
@@ -678,6 +724,63 @@ mod registrar_tests {
                     "{set}: getProtocol on a real SSLContext read the wrong slot \
                      (slot 0 is `provider`, not `protocol`)"
                 );
+                checked += 1;
+            }
+
+            // --- getProvider: the same slot-0 confusion, the other way up ---
+            //
+            // `SSLContext.getProvider()` is `return provider;` — slot 0 on the
+            // real layout, and the PROTOCOL on every synthetic one. Before
+            // this was registered the real bytecode answered it and handed
+            // back a `java.lang.String` where a `java.security.Provider` is
+            // contracted.
+            if let Some(f) = r.find(
+                "javax/net/ssl/SSLContext",
+                "getProvider",
+                "()Ljava/security/Provider;",
+            ) {
+                // A REAL context answers its own `provider` field, BY IDENTITY
+                // — `getInstance(algo, p).getProvider() == p`.
+                let mut ctx = MockNativeContext::new();
+                let (obj, _) =
+                    make_real_context(&mut ctx, "sun/security/ssl/SSLContextImpl", "TLSv1.3");
+                let want = match ctx.get_field(obj, 0) {
+                    Value::Object(Some(o)) => o,
+                    other => panic!("{set}: fixture slot 0 was {other:?}"),
+                };
+                match f(&mut ctx, &[Value::Object(Some(obj))]) {
+                    Ok(Some(Value::Object(Some(got)))) => assert_eq!(
+                        got, want,
+                        "{set}: getProvider on a real SSLContext must answer its \
+                         own `provider` field, by identity"
+                    ),
+                    other => panic!("{set}: getProvider answered {other:?}"),
+                }
+
+                // A SYNTHETIC context answers a Provider — specifically NOT
+                // the protocol String sitting in its slot 0, which is what the
+                // real bytecode returned.
+                let mut ctx = MockNativeContext::new();
+                let obj = make_synthetic_context(&mut ctx, "TLSv1.3");
+                let slot0 = ctx.get_field(obj, 0);
+                match f(&mut ctx, &[Value::Object(Some(obj))]) {
+                    Ok(Some(Value::Object(Some(got)))) => {
+                        assert_ne!(
+                            Value::Object(Some(got)),
+                            slot0,
+                            "{set}: getProvider on a synthetic SSLContext answered \
+                             its slot 0 — that is the protocol, not a Provider"
+                        );
+                        let cls = ctx
+                            .class_name_of_id(ctx.class_id_of_object(got))
+                            .unwrap_or_default();
+                        assert_eq!(
+                            cls, "java/security/Provider",
+                            "{set}: getProvider must answer a Provider"
+                        );
+                    }
+                    other => panic!("{set}: getProvider answered {other:?}"),
+                }
                 checked += 1;
             }
         }

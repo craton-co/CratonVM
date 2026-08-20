@@ -649,6 +649,14 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(ctx_protocol_name(idx));
         Ok(Some(Value::Object(Some(s))))
     });
+
+    // getProvider() -> Provider. See `jca::ssl_context_spi`.
+    r.register(
+        cls,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        |ctx, args| crate::jca::ssl_context_spi::ssl_context_provider(ctx, args),
+    );
     r.set_category(__prev_cat);
     ()
 }
