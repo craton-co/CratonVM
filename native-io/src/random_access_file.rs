@@ -557,6 +557,12 @@ fn native_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // `setLength` in this marker came from a static read of pre-JDK-19 spellings;
 // the census names the descriptors this crate actually registers.) Residuals:
 // retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
+//
+// COUNT CAVEAT (H8-1, 2026-08-20): the counts above describe the DEFAULT arm.
+// `getFilePointer` is now gated on `crate::real_raf_enabled()`, so under
+// `CRATONVM_SYNTHETIC_RAF=1` this registrar contributes one row fewer and the
+// synthetic twin in `lib.rs::register_io_extras_natives` owns that triple
+// instead. See the row's own comment for why.
 pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) {
     use cratonvm_native_api::NativeKind;
     let __prev_cat = registry.current_category();
