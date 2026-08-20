@@ -26,6 +26,20 @@ prices a retirement **before** anyone attempts it, for one env var and no build.
 | `java/util/concurrent/ConcurrentHashMap` | 93 | 11 | see `H0-3` §2 |
 | `java/util/HashMap` | **81** | **23** | `RCollections` `RSerial` `RExecutorShutdown` `RBlockingQueue` `RChannelInterrupt` `RMapGcStress` `RFileTimes` `RJdkViews` `RSimpleTimeZoneRaw` `RJdkOptionalShape` `RJdkStrict` `RJdkCollections` `RJdkModule` `RJdkExecutors` `RJdkForkJoin` `RJdkNio` `RJdkProcess` `RJdkSecurity` `RJdkJmx` `RJdkFailure` `RJdkLogging` `RJdkEnvMap` `RJdkEnumerations` |
 
+### ⚠ READ THIS BEFORE USING THE TABLE (added 2026-08-20, `H0-7` §4)
+
+**This table orders FAMILIES by aggregate cost. It does not order what any
+individual vector suffers, and it must not be read as a per-vector priority.**
+
+`H0-7` measured the inversion directly. In aggregate `HashMap` (81) is far more
+expensive than `ConcurrentHashMap` (93). But for `RJdkLogging`, arming
+`HashMap` leaves it running to completion with **76 of 79 checks correct**,
+while arming `ConcurrentHashMap` **kills it before it prints anything**. For
+that vector the cheap family is the fatal one.
+
+Stated here rather than only in `H0-7` because this table is the most-quoted
+artefact of the wave and three lanes have planned against it.
+
 ## 2. What this settles
 
 **The collection families are not equally entangled, and nobody knew that.**
@@ -128,10 +142,21 @@ measuring it.
 * **N2 — arm `HashSet` and `Hashtable` together** and see whether the failures
   compose or interact. Two prefixes, one command, and it is the first real test
   of whether this migration can proceed family-by-family at all.
-* **N3 — put this matrix in CI as a scheduled non-blocking job.** It is six env
-  vars over an existing run and it is the only instrument in the tree that
-  prices a retirement before it is attempted. Today it exists because somebody
-  remembered to type it.
+* **N3 — DONE (lane `H10`, 2026-08-20).** `scripts/jdk-only-blast-radius.sh`
+  plus `.github/workflows/jdk-only-blast-radius.yml`, weekly and
+  workflow-dispatch, `continue-on-error`. **Two deviations from what I asked
+  for, both improvements:** the adjudicated cell is the **failing SET, not the
+  pass count** — a count moves whenever the corpus grows, and it grew three
+  times in two days, so a count-based cell would have cried regression on every
+  new vector; and it runs an **unarmed control arm first** and nets every cell
+  against it, generalising §4's `RMapGcStress` subtraction instead of
+  hard-coding it. It also refuses to print a total, on the grounds that the
+  cells do not sum and the prefixes are not disjoint (`LinkedHashMap extends
+  HashMap`) — which is the objection §5 raises against my own table.
+  **The shipped baseline is explicitly non-adjudicating** (transcribed, other
+  binary, other OS, 104-vector corpus) and the script exits 2 rather than
+  scoring against it, so **the first adjudicating baseline is still owed** —
+  see `H10-1` N4.
 * **N4 — re-derive the row's "order: `native-awt` first, `native-collections`
   last and subdivided by collection family"** against §3. The subdivision is
   right; the ordering within it was never measured.
