@@ -6150,6 +6150,34 @@ fn real_filewriter_enabled() -> bool {
 // `set_category(Bridge)` line below were ever moved after a registration, that
 // registration would become a synthetic stub with no syntactic marker at all.
 // Per-entry-point verdicts are annotated on the `register_*` functions.
+//
+// CORRECTIONS 2026-08-20 (H5-1), from a re-derivation of every number above:
+//
+//  * "or through a callee that never sets a category of its own" IS NOW
+//    FALSE. All 29 functions in this crate that call `register`/
+//    `register_with_kind` open with an explicit `set_category(...)` and close
+//    with a `set_category(__prev_cat)` restore. There is no ambient-inheriting
+//    registrar left in `native-io`. Nothing here needs "making explicit".
+//  * The 86/307 split is stale and low. Re-derived by parsing all 1,113
+//    `.register(` / `.register_with_kind(` call sites in `native-io/src`
+//    (1,098 resolved statically, including loop and `let`-bound class names;
+//    15 unresolved, and about a third of THOSE are the regex matching comment
+//    prose rather than code) and adjudicating each triple with `javap -p -s`
+//    against JDK 25.0.3+9. Expanding the loops gives 1,493 registrations and
+//    **1,457 distinct triples**, which split: **106 ACC_NATIVE, 656 shadowing
+//    concrete bytecode, 222 abstract, 367 naming a method the class does not
+//    declare, and 106 on 18 classes the image does not contain.**
+//    Both counts are floors in different directions
+//    — this one includes `#[cfg(feature = "synthetic-jdk")]` and
+//    flag-gated blocks that a given binary may never register, and the JDK
+//    image measured is the WINDOWS one, on which `sun/nio/fs/Unix*`,
+//    `sun/nio/ch/EPoll*` and `KQueuePort` read as absent classes purely
+//    because this host has no Linux image. Take the shape, not the digits.
+//  * `C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot`, cited by 66
+//    records in `docs/known-issues/jdk-only/` and by comments in this file,
+//    DOES NOT EXIST on this host. The JDK 25.0.3+9 oracle is
+//    `C:/Program Files/Microsoft/jdk-25.0.3.9-hotspot`. Resolve it rather than
+//    pasting it: `JDK="$(dirname "$(dirname "$(command -v javap)")")"`.
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -6703,6 +6731,31 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `FileDescriptor.close0()V` above — `args[0]` is the FileDescriptor
     // either way (an explicit static parameter here vs. `this` there) —
     // so the same handler applies unchanged.
+    //
+    // THIS REGISTRATION DOES NOT SURVIVE BOOT, and the paragraph above
+    // describes a callback that never runs (H5-1, 2026-08-20). It is the one
+    // cross-function duplicate in this crate whose two sites carry DIFFERENT
+    // callbacks: `net.rs`'s `register_sun_nio_ch_net` registers the same
+    // triple with `net_close`, and it runs LATER in the same boot —
+    // `register_io_natives` reaches `nio_native::register_t16_channel_overrides`
+    // hundreds of lines below this point, and that function's last statement is
+    // `crate::net::register_sun_nio_ch_net(r)`. `register()` is
+    // last-write-wins, so `net_close` owns the slot and `native_fd_close0`
+    // below is dead here.
+    //
+    // Independently MEASURED before this comment was written: see the
+    // `--dump-native-registry` note earlier in this file (2026-08-17,
+    // `--jdk-only`), which reports this exact registration with
+    // `owns_slot: false` and names `net.rs`'s registration as the winner. That
+    // note cites `native-io/src/net.rs:4188`; the line has since drifted to
+    // 4178 — grep for `"sun/nio/ch/UnixDispatcher"` in `net.rs` rather than
+    // trusting either number.
+    //
+    // Left in place rather than deleted: removing it is a pure no-op TODAY
+    // (the slot already holds `net_close`), but it is the only fallback if the
+    // `register_sun_nio_ch_net` call is ever gated. Whether `net_close`
+    // actually serves the MulticastSocket path this comment was written for is
+    // an open question that needs a run, not a source read.
     registry.register_with_kind(
         "sun/nio/ch/UnixDispatcher",
         "close0",
@@ -7682,7 +7735,21 @@ fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 // on `Scanner` itself, 2 on abstract `Readable`/`Iterator` methods), so there
 // is no VM/OS boundary being crossed: the OS boundary is one layer down, in the
 // `InputStream` these natives read through, and that layer is already bridged.
-// Tagged `Bridge` purely by inheritance from `register_io_natives`.
+//
+// CORRECTION 2026-08-20 (H5-1): this paragraph used to end "Tagged `Bridge`
+// purely by inheritance from `register_io_natives`". That is no longer true of
+// the tree — this function sets `Bridge` EXPLICITLY at its head, because the
+// 2026-08-19 retag attempt was reverted by restoring an explicit
+// `set_category`, not the inheritance. The tag is a stated decision with a
+// measured reason. Two further corrections from the same pass: "2 on abstract
+// `Readable`/`Iterator` methods" is wrong about WHICH two — this crate
+// registers nothing at all on `java/lang/Readable` or `java/util/Iterator`
+// (the `hasNext`/`next` interface rows below are registered on
+// `java/util/Scanner` itself); the two abstract targets are
+// `java/io/Closeable.close()V` and `java/lang/AutoCloseable.close()V` at the
+// foot of this function. And because the effective tag is `Bridge`, none of
+// this is dropped under `--jdk-only`: this registrar is strict-mode LIVE,
+// whatever the "stub" verdict above says.
 fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     // RETAG ATTEMPTED 2026-08-19 AND REVERTED — the classification above is
@@ -12656,8 +12723,13 @@ const DOS_WRITTEN_FIELD: &str = "written";
 // `DataOutput` declare no ACC_NATIVE method in JDK 25; 25 of these 37
 // registrations shadow concrete bytecode and 4 land on abstract interface
 // methods. These are byte-order/encoding conversions expressible in bytecode,
-// which is the definition of "not a bridge". Inherited `Bridge` from
-// `register_io_natives`.
+// which is the definition of "not a bridge".
+//
+// CORRECTION 2026-08-20 (H5-1): this paragraph used to end "Inherited `Bridge`
+// from `register_io_natives`". Not true of the tree — the function sets
+// `Bridge` explicitly below, for the measured reason the block comment inside
+// it gives. Effective tag `Bridge` means `--jdk-only` admits all 37 rows:
+// strict-mode LIVE, not dropped-because-stub.
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     // RETAG ATTEMPTED 2026-08-19 AND REVERTED — LOAD-BEARING, like
