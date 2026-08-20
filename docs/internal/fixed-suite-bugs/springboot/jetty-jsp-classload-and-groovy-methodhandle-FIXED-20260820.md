@@ -243,6 +243,12 @@ before the residual fix.
 
 ## Related
 
+* `fixed-suite-bugs/spring/bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`
+  — the same `d766af065` seen from the Spring **Framework** suite, where the
+  identical `WrongMethodTypeException` shape hit ~11 Groovy-adjacent classes.
+  That page also carries a Groovy-free `asSpreader` repro (a two-`int` static,
+  no framework at all), which is the smaller witness of the two.
+
 * The 2026-08-19 3-GC sweep this page's two defects were extracted from
   reported 93/90/91 FAILs against a 39-FAIL baseline. Most of that increase was
   two harness confounds (a driver that never `cd`'d into the module directory,

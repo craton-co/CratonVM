@@ -2807,6 +2807,66 @@ pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String 
     }
 }
 
+// ---------------------------------------------------------------------------
+// G75-1 N1 — the URI accessors, in code units
+// ---------------------------------------------------------------------------
+//
+// Every `getPath`/`getQuery`/`getFragment` here RE-PARSES the raw URI text; the
+// component fields are only consulted as a fallback. So the loss was not in
+// `url_parse` at all — each getter read the raw string with `read_string`,
+// which cannot hold an unpaired UTF-16 surrogate, and re-lost the unit on its
+// own. Converting the parse alone would have fixed nothing observable.
+//
+// The delimiters that decide URI structure are ALL ASCII (`:`/`/`/`?`/`#`), so
+// scanning units for them is the same logic with a different index type. What
+// matters is that there is still ONE rule: the units functions below are the
+// implementations, and the `&str` spellings that already existed are now thin
+// wrappers over them. A `&str` can never hold a lone surrogate, so encoding one
+// to units and back is exact — the wrappers lose nothing they did not already
+// lack, and the two spellings cannot drift because there is only one body.
+
+/// Index of the first occurrence of an ASCII byte in a unit slice.
+fn u_find(hay: &[u16], needle: u8) -> Option<usize> {
+    hay.iter().position(|&c| c == u16::from(needle))
+}
+
+/// Index of the first occurrence of ANY of the given ASCII bytes.
+fn u_find_any(hay: &[u16], set: &[u8]) -> Option<usize> {
+    hay.iter()
+        .position(|&c| set.iter().any(|&b| u16::from(b) == c))
+}
+
+fn u_starts_with(hay: &[u16], prefix: &str) -> bool {
+    let p: Vec<u16> = prefix.encode_utf16().collect();
+    hay.starts_with(&p)
+}
+
+fn u_hex(c: u16) -> Option<u8> {
+    char::from_u32(u32::from(c))
+        .and_then(|c| c.to_digit(16))
+        .map(|d| d as u8)
+}
+
+/// [`uri_raw_string`] without the loss.
+///
+/// Reuses `uri_raw_string_object`, which already encodes the same field search
+/// order (`string`, then slots 6 and 5), so the two cannot disagree about WHICH
+/// string is the raw one.
+pub(crate) fn uri_raw_units(ctx: &dyn NativeContext, uri: ObjectRef) -> Vec<u16> {
+    if let Some(o) = uri_raw_string_object(ctx, uri) {
+        if let Some(u) = ctx.read_string_units(o) {
+            if !u.is_empty() {
+                return u;
+            }
+        }
+    }
+    // `uri_raw_string` has one further fallback (slot 0, gated on a `:/`
+    // heuristic) that the object finder does not model. Defer to it rather than
+    // restate the heuristic here: those receivers are synthetic-layout `file:`
+    // URLs whose text is ASCII, so nothing is lost by going through `&str`.
+    uri_raw_string(ctx, uri).encode_utf16().collect()
+}
+
 /// The `//authority` component of `uri`, or `None` when it has none.
 ///
 /// The raw string is authoritative — it is what every sibling accessor in this
@@ -3148,26 +3208,63 @@ pub(crate) fn is_windows_drive_path(p: &str) -> bool {
 /// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
 /// escape (missing/non-hex digits) is copied through unchanged.
 pub(crate) fn uri_percent_decode(input: &str) -> String {
-    if !input.contains('%') {
-        return input.to_string();
+    let units: Vec<u16> = input.encode_utf16().collect();
+    String::from_utf16_lossy(&uri_percent_decode_units(&units))
+}
+
+/// [`uri_percent_decode`] in code units — the implementation of both.
+///
+/// Consecutive `%XX` escapes are collected into a RUN and UTF-8 decoded
+/// together, because a non-ASCII character is encoded as several escapes and
+/// only decodes correctly as a group. Units outside an escape run are copied
+/// through verbatim, which is what makes an unpaired surrogate survive: it is
+/// never routed through a `str` at all.
+pub(crate) fn uri_percent_decode_units(input: &[u16]) -> Vec<u16> {
+    if !input.contains(&u16::from(b'%')) {
+        return input.to_vec();
     }
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut out: Vec<u16> = Vec::with_capacity(input.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push(((h << 4) | l) as u8);
-                i += 3;
+    while i < input.len() {
+        if input[i] == u16::from(b'%') {
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut j = i;
+            while j + 2 < input.len() && input[j] == u16::from(b'%') {
+                match (u_hex(input[j + 1]), u_hex(input[j + 2])) {
+                    (Some(h), Some(l)) => {
+                        bytes.push((h << 4) | l);
+                        j += 3;
+                    }
+                    _ => break,
+                }
+            }
+            if !bytes.is_empty() {
+                out.extend(String::from_utf8_lossy(&bytes).encode_utf16());
+                i = j;
                 continue;
             }
         }
-        out.push(bytes[i]);
+        out.push(input[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
+}
+
+/// The raw query of a URI, or `None` when it has none.
+///
+/// A `?` that appears AFTER the `#` belongs to the fragment, not to a query —
+/// the same precedence the text splitter applies.
+pub(crate) fn uri_query_units(raw: &[u16]) -> Option<Vec<u16>> {
+    let hash = u_find(raw, b'#');
+    let q = u_find(raw, b'?').filter(|&qi| hash.is_none_or(|h| qi < h))?;
+    let rest = &raw[q + 1..];
+    let end = u_find(rest, b'#').unwrap_or(rest.len());
+    Some(rest[..end].to_vec())
+}
+
+/// The raw fragment of a URI, or `None` when it has none.
+pub(crate) fn uri_fragment_units(raw: &[u16]) -> Option<Vec<u16>> {
+    u_find(raw, b'#').map(|i| raw[i + 1..].to_vec())
 }
 
 /// Select the raw (still percent-encoded) path of a URI from its full text,
@@ -3183,13 +3280,17 @@ pub(crate) fn uri_percent_decode(input: &str) -> String {
 /// otherwise the `:` sits inside a relative-reference path and there is no
 /// scheme. The path ends at the first `?` or `#`.
 pub(crate) fn uri_select_raw_path(raw: &str) -> Option<String> {
-    let (is_absolute, ssp) = match raw.find(':') {
+    let units: Vec<u16> = raw.encode_utf16().collect();
+    uri_select_raw_path_units(&units).map(|u| String::from_utf16_lossy(&u))
+}
+
+/// [`uri_select_raw_path`] in code units — the implementation of both. The
+/// doc comment above describes the rule; this is where it lives.
+pub(crate) fn uri_select_raw_path_units(raw: &[u16]) -> Option<Vec<u16>> {
+    let (is_absolute, ssp) = match u_find(raw, b':') {
         Some(i) => {
             let scheme = &raw[..i];
-            let scheme_ok = !scheme.is_empty()
-                && !scheme.contains('/')
-                && !scheme.contains('?')
-                && !scheme.contains('#');
+            let scheme_ok = !scheme.is_empty() && u_find_any(scheme, b"/?#").is_none();
             if scheme_ok {
                 (true, &raw[i + 1..])
             } else {
@@ -3198,21 +3299,20 @@ pub(crate) fn uri_select_raw_path(raw: &str) -> Option<String> {
         }
         None => (false, raw),
     };
-    if is_absolute && !ssp.starts_with('/') {
-        return None; // opaque URI → null path
+    if is_absolute && !u_starts_with(ssp, "/") {
+        return None; // opaque URI -> null path
     }
-    // Hierarchical: strip an optional `//authority`, then the trailing
-    // query/fragment. An authority with no following path yields `""`.
-    let after_auth = if let Some(rest) = ssp.strip_prefix("//") {
-        match rest.find(['/', '?', '#']) {
+    let after_auth = if u_starts_with(ssp, "//") {
+        let rest = &ssp[2..];
+        match u_find_any(rest, b"/?#") {
             Some(p) => &rest[p..],
-            None => "",
+            None => &[][..],
         }
     } else {
         ssp
     };
-    let end = after_auth.find(['?', '#']).unwrap_or(after_auth.len());
-    Some(after_auth[..end].to_string())
+    let end = u_find_any(after_auth, b"?#").unwrap_or(after_auth.len());
+    Some(after_auth[..end].to_vec())
 }
 
 /// Byte index of the scheme-terminating `:`, or `None` for a relative
@@ -3252,12 +3352,26 @@ pub(crate) fn uri_scheme_colon(raw: &str) -> Option<usize> {
 /// (`mailto:a#b`) and hierarchical (`https://h/p#b`) URIs. For a relative
 /// reference (no valid scheme) the SSP is the whole input minus fragment.
 fn uri_raw_scheme_specific_part(raw: &str) -> String {
-    let ssp = match uri_scheme_colon(raw) {
+    let units: Vec<u16> = raw.encode_utf16().collect();
+    String::from_utf16_lossy(&uri_raw_scheme_specific_part_units(&units))
+}
+
+/// [`uri_raw_scheme_specific_part`] in code units — the implementation of both.
+///
+/// `uri_scheme_colon` is asked on the TEXT and its answer reused as a unit
+/// index. That is exact and not a coincidence: it returns the offset of an
+/// ASCII `:` that must precede any `/?#`, so every unit before it is ASCII and
+/// the two indexings agree by construction. Anything that made a non-ASCII
+/// character legal before the scheme colon would break this, which is why it is
+/// said out loud rather than left to be noticed.
+fn uri_raw_scheme_specific_part_units(raw: &[u16]) -> Vec<u16> {
+    let text = String::from_utf16_lossy(raw);
+    let ssp = match uri_scheme_colon(&text) {
         Some(colon) => &raw[colon + 1..],
         None => raw,
     };
-    let end = ssp.find('#').unwrap_or(ssp.len());
-    ssp[..end].to_string()
+    let end = u_find(ssp, b'#').unwrap_or(ssp.len());
+    ssp[..end].to_vec()
 }
 
 /// RFC 3986 §5.3 path-merge: combine a base hierarchical path with a
@@ -3281,28 +3395,55 @@ fn uri_merge_paths(base_path: &str, ref_path: &str, base_has_authority: bool) ->
 
 /// RFC 3986 §5.2.4 — remove `.` and `..` segments from a path.
 fn uri_remove_dot_segments(path: &str) -> Result<String, MethodCallFailed> {
-    let absolute = path.starts_with('/');
+    let units: Vec<u16> = path.encode_utf16().collect();
+    Ok(String::from_utf16_lossy(&uri_remove_dot_segments_units(&units)?))
+}
+
+/// [`uri_remove_dot_segments`] in code units — the implementation of both.
+///
+/// Segments split on ASCII `/`, and the only two segments with meaning, `.` and
+/// `..`, are ASCII. Every other segment is copied as an opaque run of units, so
+/// text this function has no opinion about passes through untouched.
+///
+/// That matters here more than anywhere else in the URI family: `relativize` is
+/// the one operation that REBUILDS a path from segments instead of selecting a
+/// range of one, and rebuilding is exactly where a lossy spelling puts the
+/// substitution back after the accessors have avoided it (G75-1 N3).
+fn uri_remove_dot_segments_units(path: &[u16]) -> Result<Vec<u16>, MethodCallFailed> {
+    let slash = u16::from(b'/');
+    let dot = u16::from(b'.');
+    let is_dot = |s: &[u16]| s == [dot];
+    let is_dotdot = |s: &[u16]| s == [dot, dot];
+
+    let absolute = path.first() == Some(&slash);
+    let segs: Vec<&[u16]> = path.split(|&c| c == slash).collect();
     // A path whose final segment is "." or ".." resolves to a directory, so
     // the output must end with '/' (RFC 3986 §5.2.4 behaviour, matches JDK).
-    let segs: Vec<&str> = path.split('/').collect();
-    let trailing_slash = path.ends_with('/') || matches!(segs.last(), Some(&".") | Some(&".."));
-    let mut out: Vec<&str> = Vec::new();
+    let trailing_slash =
+        path.last() == Some(&slash) || segs.last().is_some_and(|l| is_dot(l) || is_dotdot(l));
+    let mut out: Vec<&[u16]> = Vec::new();
     for seg in &segs {
-        match *seg {
-            "" | "." => {}
-            ".." => {
-                out.pop();
-            }
-            s => out.push(s),
+        if seg.is_empty() || is_dot(seg) {
+            continue;
         }
+        if is_dotdot(seg) {
+            out.pop();
+            continue;
+        }
+        out.push(seg);
     }
-    let mut result = String::new();
+    let mut result: Vec<u16> = Vec::new();
     if absolute {
-        result.push('/');
+        result.push(slash);
     }
-    result.push_str(&out.join("/"));
-    if trailing_slash && !result.ends_with('/') {
-        result.push('/');
+    for (i, seg) in out.iter().enumerate() {
+        if i > 0 {
+            result.push(slash);
+        }
+        result.extend_from_slice(seg);
+    }
+    if trailing_slash && result.last() != Some(&slash) {
+        result.push(slash);
     }
     Ok(result)
 }
@@ -3713,6 +3854,38 @@ fn uri_resolve_ref(base: &str, reference: &str) -> Result<String, MethodCallFail
 }
 
 /// RFC 3986 §5.3 — recompose component parts into a URI string.
+/// [`uri_recompose`] in code units. Scheme and authority stay `&str`: they are
+/// ASCII by the URI grammar, and `relativize` only ever COMPARES them. That is
+/// the audit's own rule from G78-1 — a value that is inspected may stay text;
+/// only what is handed back needs units.
+fn uri_recompose_units(
+    scheme: &Option<String>,
+    authority: &Option<String>,
+    path: &[u16],
+    query: &Option<Vec<u16>>,
+    fragment: &Option<Vec<u16>>,
+) -> Vec<u16> {
+    let mut s: Vec<u16> = Vec::new();
+    if let Some(sc) = scheme {
+        s.extend(sc.encode_utf16());
+        s.push(u16::from(b':'));
+    }
+    if let Some(a) = authority {
+        s.extend("//".encode_utf16());
+        s.extend(a.encode_utf16());
+    }
+    s.extend_from_slice(path);
+    if let Some(q) = query {
+        s.push(u16::from(b'?'));
+        s.extend_from_slice(q);
+    }
+    if let Some(f) = fragment {
+        s.push(u16::from(b'#'));
+        s.extend_from_slice(f);
+    }
+    s
+}
+
 fn uri_recompose(
     scheme: &Option<String>,
     authority: &Option<String>,
@@ -3750,6 +3923,37 @@ fn uri_recompose(
 fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodCallFailed> {
     let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 18)?;
     uri_publish_named(ctx, uri_obj, raw, None);
+    Ok(uri_obj)
+}
+
+/// [`make_uri`] from code units.
+///
+/// `uri_publish_named` takes a `&str`, so it is handed the lossy spelling to
+/// set the ASCII-only components (scheme, authority, port) and the three
+/// text-carrying ones are then rewritten from the units. This is the same
+/// correction `URL.toURI()` applies, for the same reason, and is deliberately
+/// spelled the same way so the two cannot drift.
+fn make_uri_units(
+    ctx: &mut dyn NativeContext,
+    raw: &[u16],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 18)?;
+    let lossy = String::from_utf16_lossy(raw);
+    uri_publish_named(ctx, uri_obj, &lossy, None);
+    let raw_obj = ctx.create_string_from_units(raw);
+    ctx.set_field_by_name(uri_obj, "string", Value::Object(Some(raw_obj)));
+    if let Some(pu) = uri_select_raw_path_units(raw) {
+        let o = ctx.create_string_from_units(&pu);
+        ctx.set_field_by_name(uri_obj, "path", Value::Object(Some(o)));
+    }
+    if let Some(q) = uri_query_units(raw) {
+        let o = ctx.create_string_from_units(&q);
+        ctx.set_field_by_name(uri_obj, "query", Value::Object(Some(o)));
+    }
+    if let Some(f) = uri_fragment_units(raw) {
+        let o = ctx.create_string_from_units(&f);
+        ctx.set_field_by_name(uri_obj, "fragment", Value::Object(Some(o)));
+    }
     Ok(uri_obj)
 }
 
@@ -3917,10 +4121,10 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let raw = uri_raw_string(ctx, this);
-            let ssp = uri_raw_scheme_specific_part(&raw);
-            let decoded = uri_percent_decode(&ssp);
-            Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
+            let raw_u = uri_raw_units(ctx, this);
+            let ssp = uri_raw_scheme_specific_part_units(&raw_u);
+            let decoded = uri_percent_decode_units(&ssp);
+            Ok(Some(Value::Object(Some(ctx.create_string_from_units(&decoded)))))
         },
     );
 
@@ -3931,9 +4135,9 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let raw = uri_raw_string(ctx, this);
-            let ssp = uri_raw_scheme_specific_part(&raw);
-            Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
+            let raw_u = uri_raw_units(ctx, this);
+            let ssp = uri_raw_scheme_specific_part_units(&raw_u);
+            Ok(Some(Value::Object(Some(ctx.create_string_from_units(&ssp)))))
         },
     );
 
@@ -3946,12 +4150,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // decoded `/Test Realm:tester` (keycloak OtpPolicyTest label assertions).
     r.register(uri, "getPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
+        // UNITS from here down (G75-1 N1): this getter RE-PARSES the raw text,
+        // so a `read_string` here re-lost the unit no matter what the parse or
+        // the component fields held.
+        let raw_u = uri_raw_units(ctx, this);
+        let raw = String::from_utf16_lossy(&raw_u);
         // Opaque URIs (e.g. `mailto:x@y.com`) have a null path. Decide from the
         // raw text rather than the `path` field, because `make_uri` stores a
         // `path` field for opaque URIs too (from `uri_split`), which would
         // otherwise surface the scheme-specific-part as the path.
-        let parsed = match uri_select_raw_path(&raw) {
+        let parsed = match uri_select_raw_path_units(&raw_u) {
             None => return Ok(Some(Value::Object(None))),
             Some(p) => p,
         };
@@ -3970,39 +4178,46 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         // ProjectBuilder module classpath).
         let mut raw_path = parsed;
         if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
-            if let Some(v) = ctx.read_string(s) {
+            // The FIELD is read as units too. It wins over the parsed value
+            // below, so reading it as text would have put the loss back after
+            // the parse had avoided it.
+            if let Some(v) = ctx.read_string_units(s) {
                 let relative_without_authority =
                     !raw.starts_with('/') && !raw.starts_with("//") && raw.find(':').is_none();
-                if !v.is_empty() && v != raw && !(relative_without_authority && v != raw_path) {
+                if !v.is_empty() && v != raw_u && !(relative_without_authority && v != raw_path) {
                     raw_path = v;
                 }
             }
         }
-        let decoded = uri_percent_decode(&raw_path);
-        Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
+        let decoded = uri_percent_decode_units(&raw_path);
+        Ok(Some(Value::Object(Some(ctx.create_string_from_units(&decoded)))))
     });
 
     // getRawPath() → same path selection as getPath() but WITHOUT decoding.
     // Opaque URIs → null; hierarchical authority-only → "".
     r.register(uri, "getRawPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
-        let parsed = match uri_select_raw_path(&raw) {
+        let raw_u = uri_raw_units(ctx, this);
+        let raw = String::from_utf16_lossy(&raw_u);
+        let parsed = match uri_select_raw_path_units(&raw_u) {
             None => return Ok(Some(Value::Object(None))),
             Some(p) => p,
         };
         // Same slot-collision guard as getPath() above.
         let mut raw_path = parsed;
         if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
-            if let Some(v) = ctx.read_string(s) {
+            // The FIELD is read as units too. It wins over the parsed value
+            // below, so reading it as text would have put the loss back after
+            // the parse had avoided it.
+            if let Some(v) = ctx.read_string_units(s) {
                 let relative_without_authority =
                     !raw.starts_with('/') && !raw.starts_with("//") && raw.find(':').is_none();
-                if !v.is_empty() && v != raw && !(relative_without_authority && v != raw_path) {
+                if !v.is_empty() && v != raw_u && !(relative_without_authority && v != raw_path) {
                     raw_path = v;
                 }
             }
         }
-        Ok(Some(Value::Object(Some(ctx.create_string(&raw_path)))))
+        Ok(Some(Value::Object(Some(ctx.create_string_from_units(&raw_path)))))
     });
 
     // getHost() → host field (1) or parsed from the raw authority.
@@ -4155,13 +4370,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // raw `find('?')` fallback.
     r.register(uri, "getQuery", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
-        if !raw.is_empty() {
-            let (_, _, _, query, _) = uri_split(&raw);
-            return match query {
+        // `uri_query_units` rather than `uri_split`: the query is "between the
+        // first `?` and the first `#` after it", which `uri_split` also
+        // computes, but only the units spelling can carry the result back. The
+        // 26-row probe asserts the two agree on every ordinary URI.
+        let raw_u = uri_raw_units(ctx, this);
+        if !raw_u.is_empty() {
+            return match uri_query_units(&raw_u) {
                 Some(q) => {
-                    let decoded = uri_percent_decode(&q);
-                    Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
+                    let decoded = uri_percent_decode_units(&q);
+                    Ok(Some(Value::Object(Some(ctx.create_string_from_units(&decoded)))))
                 }
                 None => Ok(Some(Value::Object(None))),
             };
@@ -4187,11 +4405,11 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // null for a missing fragment (no spurious "#null").
     r.register(uri, "getFragment", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
-        match raw.find('#') {
-            Some(i) => {
-                let decoded = uri_percent_decode(&raw[i + 1..]);
-                Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
+        let raw_u = uri_raw_units(ctx, this);
+        match uri_fragment_units(&raw_u) {
+            Some(f) => {
+                let decoded = uri_percent_decode_units(&f);
+                Ok(Some(Value::Object(Some(ctx.create_string_from_units(&decoded)))))
             }
             None => Ok(Some(Value::Object(None))),
         }
@@ -4216,11 +4434,10 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // '?' is part of the raw scheme-specific part and must not surface here.
     r.register(uri, "getRawQuery", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
-        if !raw.is_empty() {
-            let (_, _, _, query, _) = uri_split(&raw);
-            return match query {
-                Some(q) => Ok(Some(Value::Object(Some(ctx.create_string(&q))))),
+        let raw_u = uri_raw_units(ctx, this);
+        if !raw_u.is_empty() {
+            return match uri_query_units(&raw_u) {
+                Some(q) => Ok(Some(Value::Object(Some(ctx.create_string_from_units(&q))))),
                 None => Ok(Some(Value::Object(None))),
             };
         }
@@ -4560,10 +4777,26 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let base = uri_raw_string(ctx, this);
-            let target = uri_raw_string(ctx, other);
+            // G75-1 N3, the last diverging row of that probe. `relativize` is
+            // not an accessor: it REBUILDS a path from segments rather than
+            // selecting a range of one, which is why it outlived the accessor
+            // conversion.
+            //
+            // Scheme and authority stay text — ASCII by grammar, and only
+            // COMPARED below. BOTH paths are carried in units, not just the
+            // target's: the base path is prefix-matched against the target, so
+            // a lossy base would fail to match a target that legitimately
+            // starts with it.
+            let base_u = uri_raw_units(ctx, this);
+            let base = String::from_utf16_lossy(&base_u);
+            let target_u = uri_raw_units(ctx, other);
+            let target = String::from_utf16_lossy(&target_u);
             let (b_scheme, b_auth, b_path, _b_query, _b_frag) = uri_split(&base);
-            let (t_scheme, t_auth, t_path, t_query, t_frag) = uri_split(&target);
+            let (t_scheme, t_auth, t_path, _t_q_text, _t_f_text) = uri_split(&target);
+            let b_path_u = uri_select_raw_path_units(&base_u).unwrap_or_default();
+            let t_path_u = uri_select_raw_path_units(&target_u).unwrap_or_default();
+            let t_query = uri_query_units(&target_u);
+            let t_frag = uri_fragment_units(&target_u);
             let b_opaque = b_scheme.is_some() && b_auth.is_none() && !b_path.starts_with('/');
             let t_opaque = t_scheme.is_some() && t_auth.is_none() && !t_path.starts_with('/');
             if b_opaque
@@ -4573,21 +4806,22 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             {
                 return Ok(Some(Value::Object(Some(other))));
             }
-            let b_norm = uri_remove_dot_segments(&b_path)?;
-            let t_norm = uri_remove_dot_segments(&t_path)?;
+            let b_norm = uri_remove_dot_segments_units(&b_path_u)?;
+            let t_norm = uri_remove_dot_segments_units(&t_path_u)?;
             if !t_norm.starts_with(&b_norm) {
                 return Ok(Some(Value::Object(Some(other))));
             }
+            let slash = u16::from(b'/');
             let rel = &t_norm[b_norm.len()..];
             if rel.is_empty() {
                 return Ok(Some(Value::Object(Some(make_uri(ctx, "")?))));
             }
-            if !b_norm.ends_with('/') && !rel.starts_with('/') {
+            if b_norm.last() != Some(&slash) && rel.first() != Some(&slash) {
                 return Ok(Some(Value::Object(Some(other))));
             }
-            let rel = rel.strip_prefix('/').unwrap_or(rel);
-            let recomposed = uri_recompose(&None, &None, rel, &t_query, &t_frag);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)?))))
+            let rel = if rel.first() == Some(&slash) { &rel[1..] } else { rel };
+            let recomposed = uri_recompose_units(&None, &None, rel, &t_query, &t_frag);
+            Ok(Some(Value::Object(Some(make_uri_units(ctx, &recomposed)?))))
         },
     );
 
@@ -9271,10 +9505,21 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // full URL written by url_parse.  We treat any string containing
         // ":" as a full URL so we don't mistake the real-JDK `authority`
         // slot for a synthetic full-URL cache.
-        let synth_full = match ctx.get_field(this, 5) {
-            Value::Object(Some(o)) => ctx.read_string(o),
+        // G75-1 N2: this whole reconstruction used to end in
+        // `create_string(&out)` over a Rust `String`, which cannot hold an
+        // unpaired UTF-16 surrogate — so `new URL(s).toString()` could not give
+        // back the `s` it was handed, while `getPath()`/`getFile()` were exact
+        // (under `--jdk-only` the real JDK constructor fills the component
+        // fields and only this cache goes through us). The STRUCTURE below is
+        // unchanged and still reasons over host text — scheme, host and port
+        // are ASCII by JVMS and by URI syntax. Only the OUTPUT is assembled in
+        // units, and only `file` and `ref` are read as units, because they are
+        // the two components that can carry arbitrary text.
+        let synth_full_obj = match ctx.get_field(this, 5) {
+            Value::Object(Some(o)) => Some(o),
             _ => None,
         };
+        let synth_full = synth_full_obj.and_then(|o| ctx.read_string(o));
         if let Some(ref s) = synth_full {
             // Only treat field 5 as a full-URL cache when it actually carries a
             // scheme — a real java.net.URL's field 5 is the `authority`
@@ -9282,7 +9527,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // instead of being returned as the whole URL. (BUG: openStream then
             // saw `unsupported scheme: localhost:<port>`.)
             if field5_is_full_url(s) {
-                return Ok(Some(Value::Object(Some(ctx.create_string(s)))));
+                // Hand back the STORED OBJECT, not a re-encoding of it: exact
+                // by construction, and one allocation cheaper.
+                if let Some(o) = synth_full_obj {
+                    return Ok(Some(Value::Object(Some(o))));
+                }
             }
         }
         // Real-JDK reconstruction: protocol:[//host[:port]]file[#ref].
@@ -9299,17 +9548,21 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             _ => -1,
         };
         let file = match ctx.get_field(this, 3) {
-            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
-            _ => String::new(),
+            Value::Object(Some(o)) => ctx.read_string_units(o).unwrap_or_default(),
+            _ => Vec::new(),
         };
         let ref_str = match ctx.get_field(this, 8) {
-            Value::Object(Some(o)) => ctx.read_string(o),
+            Value::Object(Some(o)) => ctx.read_string_units(o),
             _ => None,
         };
-        let mut out = String::new();
+        /// Append an ASCII/BMP literal to a UTF-16 buffer.
+        fn pu(buf: &mut Vec<u16>, text: &str) {
+            buf.extend(text.encode_utf16());
+        }
+        let mut out: Vec<u16> = Vec::new();
         if !proto.is_empty() {
-            out.push_str(&proto);
-            out.push(':');
+            pu(&mut out, &proto);
+            out.push(u16::from(b':'));
         }
         // Real java.net.URL.toExternalForm emits `protocol://authority` where
         // the authority (field 5) may carry user-info
@@ -9326,30 +9579,32 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             _ => None,
         };
         if let Some(auth) = authority_from_field5 {
-            out.push_str("//");
-            out.push_str(auth);
+            pu(&mut out, "//");
+            pu(&mut out, auth);
         } else if !host.is_empty() || port >= 0 {
-            out.push_str("//");
-            out.push_str(&host);
+            pu(&mut out, "//");
+            pu(&mut out, &host);
             if port >= 0 {
-                out.push(':');
-                out.push_str(&port.to_string());
+                out.push(u16::from(b':'));
+                pu(&mut out, &port.to_string());
             }
         }
-        out.push_str(&file);
+        out.extend_from_slice(&file);
         if let Some(r) = ref_str {
-            out.push('#');
-            out.push_str(&r);
+            out.push(u16::from(b'#'));
+            out.extend_from_slice(&r);
         }
         // Ultimate fallback: if we built nothing useful, fall back to the
         // legacy field-0 read for synthetic-mode URLs that stored the
         // full path at slot 0.
-        if out.is_empty() || out == ":" {
-            if let Some(s) = synth_full {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&s)))));
+        if out.is_empty() || out == [u16::from(b':')] {
+            if synth_full.is_some() {
+                if let Some(o) = synth_full_obj {
+                    return Ok(Some(Value::Object(Some(o))));
+                }
             }
         }
-        Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
+        Ok(Some(Value::Object(Some(ctx.create_string_from_units(&out)))))
     };
     r.register(url, "toString", "()Ljava/lang/String;", url_to_string);
     r.register(url, "toExternalForm", "()Ljava/lang/String;", url_to_string);
@@ -9389,8 +9644,13 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // `java.net.URI` slot 6 is `path` and slot 3 is `userInfo`, so the full
         // text went into the path and the path into the user information.
         if uri_has_synthetic_layout(ctx, uri) {
-            let raw_s = ctx.create_string(&url_str);
-            ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
+            // G75-1 N1: store the STRING OBJECT `toString()` returned, not a
+            // re-encoding of it. `url_str` came through `read_string` and
+            // cannot hold an unpaired surrogate, so `url.toURI().getPath()`
+            // lost the unit that `url.toString()` had just preserved. Slot 6 is
+            // the raw-string slot every URI accessor reads first, so getting
+            // this one reference right fixes the whole derived family at once.
+            ctx.set_field(uri, 6, Value::Object(Some(url_str_obj))); // raw
             if let Some(colon) = url_str.find(':') {
                 let scheme = &url_str[..colon];
                 let scheme_s = ctx.create_string(scheme);
@@ -9411,6 +9671,34 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             .filter(|p| !p.is_empty())
             .map(str::to_string);
         uri_publish_named(ctx, uri, &url_str, file_path.as_deref());
+        // G75-1 N1: `uri_publish_named` takes `&str`, so every field it wrote
+        // came from a `read_string` of the URL's own `toString()` — which had
+        // just been fixed to preserve an unpaired surrogate, only for this to
+        // drop it again one call later. Restore the raw STRING OBJECT and
+        // re-derive the three text-carrying components from its units, with the
+        // same splitter the accessors and the URI constructor use.
+        //
+        // Skipped when a `path_override` was supplied: that argument exists to
+        // overrule the parse (the `file:` cases above), and this correction
+        // must not overrule it back.
+        if file_path.is_none() {
+            let raw_units = ctx.read_string_units(url_str_obj).unwrap_or_default();
+            if !raw_units.is_empty() {
+                ctx.set_field_by_name(uri, "string", Value::Object(Some(url_str_obj)));
+                if let Some(pu) = uri_select_raw_path_units(&raw_units) {
+                    let o = ctx.create_string_from_units(&pu);
+                    ctx.set_field_by_name(uri, "path", Value::Object(Some(o)));
+                }
+                if let Some(q) = uri_query_units(&raw_units) {
+                    let o = ctx.create_string_from_units(&q);
+                    ctx.set_field_by_name(uri, "query", Value::Object(Some(o)));
+                }
+                if let Some(f) = uri_fragment_units(&raw_units) {
+                    let o = ctx.create_string_from_units(&f);
+                    ctx.set_field_by_name(uri, "fragment", Value::Object(Some(o)));
+                }
+            }
+        }
         Ok(Some(Value::Object(Some(uri))))
     });
 

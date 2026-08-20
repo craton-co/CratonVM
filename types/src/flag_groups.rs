@@ -727,6 +727,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "stw-expected-ids", on_key: Some("CRATONVM_DBG_STW_EXPECTED_IDS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "stw-native-ring", on_key: Some("CRATONVM_DBG_STW_NATIVE_RING"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "surefire-ipc-dbg", on_key: Some("CRATONVM_SUREFIRE_IPC_DBG"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "swchain", on_key: Some("CRATONVM_DBG_SWCHAIN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-census", on_key: Some("CRATONVM_DBG_SWEEP_CENSUS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-edges", on_key: Some("CRATONVM_DBG_SWEEP_EDGES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-referrers", on_key: Some("CRATONVM_DBG_SWEEP_REFERRERS"), off_key: None, off_word: None },
@@ -1107,9 +1108,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "shadow-stack", on_key: Some("CRATONVM_SHADOW_STACK"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "slot-mirror", on_key: None, off_key: Some("CRATONVM_JIT_NO_SLOT_MIRROR"), off_word: None },
     E { group: Group::JIT, token: "sp-coalesce", on_key: None, off_key: Some("CRATONVM_SP_NO_COALESCE"), off_word: None },
-    // Both default-ON and both parsed by an exact `Ok("0")` match — no other
-    // word turns them off, so `off_word` must be exactly `"0"`.
+    // All three are default-ON and all three are parsed by an exact `Ok("0")`
+    // match — no other word turns them off, so `off_word` must be exactly
+    // `"0"`. `sp-tailcall` is the SIBLING tail-call (JMP to another method's
+    // entry); `self-tailcall` is a method jumping back into itself.
     E { group: Group::JIT, token: "sp-inline-ic", on_key: Some("CRATONVM_JIT_SP_INLINE_IC"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "self-tailcall", on_key: Some("CRATONVM_JIT_SELF_TAILCALL"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "sp-tailcall", on_key: Some("CRATONVM_JIT_SP_TAILCALL"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "spec-bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_SPEC_BCE"), off_word: None },
     E { group: Group::JIT, token: "stack-bang", on_key: Some("CRATONVM_JIT_STACK_BANG"), off_key: Some("CRATONVM_JIT_NO_STACK_BANG"), off_word: None },
@@ -1308,6 +1312,9 @@ pub const INVENTORY: &[E] = &[
     // has been untrue since the default flipped, and
     // `CRATONVM_GC=-young-pause-goal-ms` has no way to turn it off.
     E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: Some("0") },
+    // Default-ON: the key's PRESENCE makes the trusted `*_validated` header
+    // accessors re-validate, which is the pre-"validate once" behaviour.
+    E { group: Group::GC, token: "validate-once", on_key: None, off_key: Some("CRATONVM_GC_NO_VALIDATE_ONCE"), off_word: None },
     E { group: Group::REAL, token: "bytebuffer-intrinsic", on_key: Some("CRATONVM_BYTEBUFFER_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },
     // `CRATONVM_REAL` itself is the group variable, so it is not a row here.

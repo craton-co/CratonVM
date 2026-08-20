@@ -3851,6 +3851,7 @@ unsafe fn decode_dispatch_values_into(
                         // heap pointer (else GC SEGVs walking a bogus oop).
                         let bits = ptr as u64;
                         let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                            crate::jit::helpers::note_membership_walk(2);
                             vm.mem.heap.is_object_address(bits as usize)
                         } else {
                             None
@@ -3880,6 +3881,7 @@ unsafe fn decode_dispatch_values_into(
                 } else {
                     let bits = raw as u64;
                     let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                        crate::jit::helpers::note_membership_walk(2);
                         vm.mem.heap.is_object_address(bits as usize)
                     } else {
                         None
@@ -6672,7 +6674,94 @@ fn dump_getfield_guard_failure(obj_ptr: i64) {
     );
 }
 
+
+/// Census of which JIT helper still performs an `is_object_address` heap
+/// membership walk, and how often.
+///
+/// The getfield arm stopped asking (see `GETFIELD_RECEIVER_PROVEN_OOP`), and
+/// roughly half the walk traffic survived. `perf` could not attribute the
+/// remainder: DWARF unwinding on this optimized build returns self-recursive
+/// frames, and LBR is unavailable on the virtualised PMU. So count it.
+///
+/// Index: 0 = `jit_getfield_impl`, 1 = `try_jit_site_cached_native_dispatch`,
+/// 2 = `decode_dispatch_values_into`, 3 = `jit_invoke_dispatch`,
+/// 4 = `jit_checkcast`, 5 = `jit_instanceof`, 6 = everything else.
+pub static MEMBERSHIP_WALK_BY_SITE: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`MEMBERSHIP_WALK_BY_SITE`], index-parallel.
+pub const MEMBERSHIP_WALK_SITE_NAMES: [&str; 7] = [
+    "getfield",
+    "native-dispatch-cached",
+    "native-dispatch-decode-args",
+    "invoke-dispatch",
+    "checkcast",
+    "instanceof",
+    "other",
+];
+
+/// Record one membership walk at `site`.
+#[inline]
+pub fn note_membership_walk(site: usize) {
+    if let Some(c) = MEMBERSHIP_WALK_BY_SITE.get(site) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for every site that walked at least once.
+pub fn membership_walks_by_site() -> Vec<(&'static str, u64)> {
+    MEMBERSHIP_WALK_SITE_NAMES
+        .iter()
+        .zip(MEMBERSHIP_WALK_BY_SITE.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
+}
+
 pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
+    // The JIT may set `GETFIELD_RECEIVER_PROVEN_OOP` to say it has already
+    // proven this receiver is an oop; see that constant for why that is sound
+    // and why it rides in the argument rather than in a second helper slot.
+    let raw = field_index as u64;
+    let proven_oop = raw & cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP != 0;
+    if proven_oop {
+        JIT_GETFIELD_TRUSTED_REF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let field_index = (raw & !cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP) as i64;
+    jit_getfield_impl(vm_ptr, obj_ptr, field_index, !proven_oop)
+}
+
+/// Calls that arrived with `GETFIELD_RECEIVER_PROVEN_OOP` set — the engagement
+/// counter for the trusted-receiver arm, printed beside the total so "adopted"
+/// and "helped" stay separable.
+pub static JIT_GETFIELD_TRUSTED_REF_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`JIT_GETFIELD_TRUSTED_REF_CALLS`].
+pub fn jit_getfield_trusted_ref_calls() -> u64 {
+    JIT_GETFIELD_TRUSTED_REF_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Shared body of [`jit_getfield`] and [`jit_getfield_trusted_ref`].
+///
+/// `validate_membership` is the ONLY difference between them. Kept as one
+/// function so the two entry points cannot drift in the read, the layout
+/// split or the NPE contract — the drift this repository has been bitten by
+/// every time a "fast" copy of a helper was maintained separately.
+#[inline]
+unsafe fn jit_getfield_impl(
+    vm_ptr: i64,
+    obj_ptr: i64,
+    field_index: i64,
+    validate_membership: bool,
+) -> i64 {
     // ENGAGEMENT COUNTER for the guarded inline `getfield` fast path.
     //
     // Reaching this function AT ALL means the inline guard
@@ -6723,10 +6812,14 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         return i64::MIN;
     }
     let vm = &*(vm_ptr as *const SharedVm);
-    if vm.mem.heap.is_object_address(obj_ptr as usize).is_none() {
+    if validate_membership && {
+        note_membership_walk(0);
+        vm.mem.heap.is_object_address(obj_ptr as usize).is_none()
+    } {
         set_jit_pending_npe();
         return i64::MIN;
     }
+    let _ = &vm;
     // B2 fix (audit `vm-runtime.md`): bounds-check the field slot against the
     // receiver's declared `num_slots` BEFORE the raw read, mirroring the
     // symmetric `jit_putfield_slot_in_bounds` guard on every `jit_putfield_*`
@@ -8762,6 +8855,7 @@ pub unsafe extern "C" fn jit_checkcast(
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    crate::jit::helpers::note_membership_walk(4);
     let mut obj_ref = match vm.mem.heap.is_object_address(obj_ptr as usize) {
         Some(r) => r,
         None => {
@@ -8979,6 +9073,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // dereferencing it, degrading a dangling reference to "not an
     // instance" instead of crashing — the same fallback every other stale-
     // reference guard in this codebase uses.
+    crate::jit::helpers::note_membership_walk(5);
     let mut obj_ref = match vm.mem.heap.is_object_address(obj_ptr as usize) {
         Some(r) => r,
         None => return 0,
@@ -10976,6 +11071,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         {
             let receiver_raw = args_slice[0] as u64;
             if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
+                crate::jit::helpers::note_membership_walk(3);
                 if let Some(receiver) = vm.mem.heap.is_object_address(receiver_raw as usize) {
                     if vm.mem.heap.class_id_of_validated(receiver).as_u32()
                         == entry.receiver_class_id
@@ -11442,6 +11538,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         let kind = object_native_kind.expect("checked above");
         let receiver_raw = args_slice[0] as u64;
         if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
+            crate::jit::helpers::note_membership_walk(3);
             if let Some(receiver) = vm.mem.heap.is_object_address(receiver_raw as usize) {
                 let receiver_class_id = vm.mem.heap.class_id_of_validated(receiver).as_u32();
                 if !class_was_redefined(vm, ClassId::new(receiver_class_id)) {
@@ -11524,6 +11621,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // one of them is a fast path that a workload can miss entirely for reasons
     // that have nothing to do with its shape.
     if matches!(info.invoke_kind, 0 | 2) && !args_slice.is_empty() {
+        crate::jit::helpers::note_membership_walk(3);
         if let Some(proxy) = vm.mem.heap.is_object_address(args_slice[0] as usize) {
             let proxy_class_id = vm.mem.heap.class_id_of_validated(proxy);
             if vm
@@ -11550,6 +11648,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         }
     }
     if matches!(info.invoke_kind, 0 | 2) && args_slice.len() == 2 {
+        crate::jit::helpers::note_membership_walk(3);
         if let Some(proxy) = vm.mem.heap.is_object_address(args_slice[0] as usize) {
             let proxy_class_id = vm.mem.heap.class_id_of_validated(proxy);
             if vm
@@ -11926,6 +12025,7 @@ unsafe fn try_jit_site_cached_native_dispatch(
         if raw == 0 || (raw & 0x7) != 0 || raw >= (1u64 << 48) {
             return site_refusal::note_and_decline(0);
         }
+        crate::jit::helpers::note_membership_walk(1);
         match vm.mem.heap.is_object_address(raw as usize) {
             Some(obj) => {
                 receiver = Some(obj);

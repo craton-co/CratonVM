@@ -578,12 +578,15 @@ fn get_double(args: &[Value], idx: usize) -> f64 {
 // must be confirmed with schema-v2 `invocations` counts before any group is
 // retagged. See audits/jdk-only-ambient-category-audit.md.
 pub fn register_all(registry: &mut NativeMethodRegistry) {
-    register_toolkit_natives(registry);
-    register_headless_natives(registry);
+    // EXPERIMENT (P0 over-tagging, per-group split)
+    registry.with_category(NativeKind::Bridge, register_toolkit_natives);
+    registry.with_category(NativeKind::Bridge, register_headless_natives);
     register_component_natives(registry);
     register_frame_natives(registry);
-    register_graphics_natives(registry);
-    register_image_natives(registry);
+    registry.with_category(NativeKind::Bridge, |r| {
+        register_graphics_natives(r);
+        register_image_natives(r);
+    });
     register_event_natives(registry);
     register_font_natives(registry);
     register_swing_natives(registry);
@@ -871,6 +874,55 @@ fn register_headless_natives(registry: &mut NativeMethodRegistry) {
         "getLocalGraphicsEnvironment",
         "()Ljava/awt/GraphicsEnvironment;",
         |ctx, _args| build_local_graphics_environment(ctx),
+    );
+
+    // Font family enumeration.
+    //
+    // MEASURED (G81-1): this threw a NullPointerException, because the real
+    // implementation walks `sun.font` machinery that has no platform font
+    // service behind it here. An NPE is not an acceptable answer under EITHER
+    // reading of the closure rule: it is not a working implementation, and it
+    // is not a "specification-consistent error" — rule 5 names
+    // `UnsupportedOperationException` and friends, not a null dereference from
+    // the middle of the JDK.
+    //
+    // What is returned is the five LOGICAL font families, which the Java
+    // specification guarantees every implementation provides
+    // (`Font.DIALOG`, `DIALOG_INPUT`, `SANS_SERIF`, `SERIF`, `MONOSPACED`).
+    // That is a truthful answer rather than a fabricated one: these are the
+    // families this VM can actually name, and HotSpot lists all five too. It
+    // is deliberately NOT the complete list HotSpot returns — physical fonts
+    // are a platform service CratonVM does not have — and no test can assert
+    // the complete list anyway, because it varies by machine.
+    fn logical_font_families(ctx: &mut dyn NativeContext) -> MethodCallResult {
+        const FAMILIES: [&str; 5] = ["Dialog", "DialogInput", "Monospaced", "SansSerif", "Serif"];
+        let Some(string_class) = ctx.class_id_by_name("java/lang/String") else {
+            return Ok(Some(Value::Object(None)));
+        };
+        let arr = ctx.new_ref_array(string_class, FAMILIES.len());
+        for (i, name) in FAMILIES.iter().enumerate() {
+            let s = ctx.create_string(name);
+            ctx.set_array_element(arr, i, Value::Object(Some(s)));
+        }
+        Ok(Some(Value::Object(Some(arr))))
+    }
+    // Registered on the CONCRETE receiver, not on abstract
+    // `java.awt.GraphicsEnvironment`. Measured: a registration on the abstract
+    // class is not reached, because `HeadlessGraphicsEnvironment` declares its
+    // own method with code and virtual dispatch correctly prefers it. That is
+    // the same abstract-class interception this crate does elsewhere and should
+    // not — see G79-1 §2 — so it is not repeated here.
+    registry.register(
+        "sun/java2d/HeadlessGraphicsEnvironment",
+        "getAvailableFontFamilyNames",
+        "()[Ljava/lang/String;",
+        |ctx, _args| logical_font_families(ctx),
+    );
+    registry.register(
+        "sun/java2d/HeadlessGraphicsEnvironment",
+        "getAvailableFontFamilyNames",
+        "(Ljava/util/Locale;)[Ljava/lang/String;",
+        |ctx, _args| logical_font_families(ctx),
     );
 }
 
@@ -1443,6 +1495,47 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
                 with_gfx(ctx, this, |gs| gs.set_color(r, g, b, a));
             }
             void_ok()
+        });
+
+        // G80-1 N2. Both of these were MISSING, and because the real classes
+        // are abstract the call did not fall through to anything — it raised
+        // `AbstractMethodError: has no Code attribute`, which a user program
+        // cannot work around. `setColor` was registered directly above and
+        // `clearRect` consumes the background, so both gaps sat next to their
+        // own other half; that adjacency is how they survived.
+        registry.register(class, "getColor", "()Ljava/awt/Color;", |ctx, args| {
+            let argb = match get_obj(args, 0) {
+                Some(this) => with_gfx(ctx, this, |gs| gs.color()),
+                None => 0xFF_000000,
+            };
+            let color_obj = ctx.new_object("java/awt/Color")?;
+            if let Some(Value::Object(Some(obj))) = &color_obj {
+                ctx.set_field_by_name(*obj, "value", Value::Int(argb as i32));
+            }
+            Ok(color_obj)
+        });
+        registry.register(class, "setBackground", "(Ljava/awt/Color;)V", |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                let argb = get_obj(args, 1)
+                    .map(|c| match ctx.get_field_by_name(c, "value") {
+                        Value::Int(v) => v as u32,
+                        _ => 0xFF_FFFFFF,
+                    })
+                    .unwrap_or(0xFF_FFFFFF);
+                with_gfx(ctx, this, |gs| gs.set_background(argb));
+            }
+            void_ok()
+        });
+        registry.register(class, "getBackground", "()Ljava/awt/Color;", |ctx, args| {
+            let argb = match get_obj(args, 0) {
+                Some(this) => with_gfx(ctx, this, |gs| gs.background()),
+                None => 0xFF_FFFFFF,
+            };
+            let color_obj = ctx.new_object("java/awt/Color")?;
+            if let Some(Value::Object(Some(obj))) = &color_obj {
+                ctx.set_field_by_name(*obj, "value", Value::Int(argb as i32));
+            }
+            Ok(color_obj)
         });
 
         // ── Font ──────────────────────────────────────────────────
@@ -2018,6 +2111,154 @@ fn encode_rendered_image(
 // remaining 15 (`BufferedImage.createGraphics`, `getRGB`/`setRGB`, …) have
 // concrete bytecode and are stubs; `BufferedImage.flush()V` is inherited from
 // `java.awt.Image` and does not exist on `BufferedImage` itself.
+// ---------------------------------------------------------------------------
+// G80-1 N1 option (A) — give BufferedImage a REAL raster and colour model
+// ---------------------------------------------------------------------------
+//
+// `BufferedImage.getRaster()`, `getSampleModel()` and `getColorModel()`
+// answered `null` under --jdk-only, because our `<init>` shim shadows the real
+// constructor and never populated the fields the real one builds. Returning
+// `null` from a method that cannot return `null` is the one behaviour nobody
+// would defend, so it is fixed here.
+//
+// The 4770 lines of renderer/graphics2d/image are deliberately VM-INDEPENDENT
+// (zero `NativeContext` references), so the rasterizer cannot draw into a Java
+// `int[]`. That rules out making the Java array the single backing store
+// without an ownership inversion. What is done instead — measured feasible
+// first — is to build the genuine JDK objects, which all work verbatim under
+// --jdk-only (`DataBufferInt`, `Raster.createPackedRaster`,
+// `SinglePixelPackedSampleModel`, `DirectColorModel` were each verified
+// identical to HotSpot before a line of this was written), and to SYNCHRONISE
+// the pixels into the data buffer at the point the raster is handed out.
+//
+// THE LIMIT, stated rather than discovered later: the returned raster is a
+// SNAPSHOT, not a view. Pixels written through it do not flow back into the
+// rasterizer's buffer. Reads are exact; writes through the raster are lost.
+// Option (B) in the record removes that limit and costs the VM-independence of
+// four thousand lines.
+
+/// Band masks for the packed int layouts we hand out a raster for.
+fn packed_masks(image_type: i32) -> Option<[i32; 4]> {
+    match image_type {
+        // TYPE_INT_RGB — 3 bands, no alpha.
+        1 => Some([0x00FF0000u32 as i32, 0x0000FF00, 0x000000FF, 0]),
+        // TYPE_INT_ARGB — 4 bands.
+        2 => Some([
+            0x00FF0000u32 as i32,
+            0x0000FF00,
+            0x000000FF,
+            0xFF000000u32 as i32,
+        ]),
+        _ => None,
+    }
+}
+
+/// Build the real `DataBufferInt` / `WritableRaster` / `ColorModel` trio for an
+/// image and stamp them onto the `BufferedImage`'s own fields.
+///
+/// Every object here is built by REAL JDK bytecode; nothing is fabricated.
+fn attach_real_raster(ctx: &mut dyn NativeContext, this: ObjectRef, w: i32, h: i32, image_type: i32) {
+    let Some(masks) = packed_masks(image_type) else {
+        return;
+    };
+    let has_alpha = image_type == 2;
+    let nbands = if has_alpha { 4 } else { 3 };
+
+    let size = match w.checked_mul(h) {
+        Some(v) if v >= 0 => v,
+        _ => return,
+    };
+    let Ok(Some(Value::Object(Some(db)))) =
+        ctx.new_object_initialized("java/awt/image/DataBufferInt", "(I)V", &[Value::Int(size)])
+    else {
+        return;
+    };
+
+    let mask_arr = ctx.new_array(ArrayElementType::Int, nbands);
+    for (i, m) in masks.iter().take(nbands).enumerate() {
+        ctx.set_array_element(mask_arr, i, Value::Int(*m));
+    }
+
+    let raster = match ctx.invoke(
+        "java/awt/image/Raster",
+        "createPackedRaster",
+        "(Ljava/awt/image/DataBuffer;III[ILjava/awt/Point;)Ljava/awt/image/WritableRaster;",
+        &[
+            Value::Object(Some(db)),
+            Value::Int(w),
+            Value::Int(h),
+            Value::Int(w),
+            Value::Object(Some(mask_arr)),
+            Value::Object(None),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(r)))) => r,
+        _ => return,
+    };
+
+    let cm_desc = if has_alpha { "(IIIII)V" } else { "(IIII)V" };
+    let cm_args: Vec<Value> = if has_alpha {
+        vec![
+            Value::Int(32),
+            Value::Int(masks[0]),
+            Value::Int(masks[1]),
+            Value::Int(masks[2]),
+            Value::Int(masks[3]),
+        ]
+    } else {
+        vec![
+            Value::Int(24),
+            Value::Int(masks[0]),
+            Value::Int(masks[1]),
+            Value::Int(masks[2]),
+        ]
+    };
+    let Ok(Some(Value::Object(Some(cm)))) =
+        ctx.new_object_initialized("java/awt/image/DirectColorModel", cm_desc, &cm_args)
+    else {
+        return;
+    };
+
+    ctx.set_field_by_name(this, "raster", Value::Object(Some(raster)));
+    ctx.set_field_by_name(this, "colorModel", Value::Object(Some(cm)));
+}
+
+/// Copy the rasterizer's pixels into the real `DataBufferInt` behind `this`'s
+/// raster, so a raster handed to Java reflects what has been drawn.
+///
+/// Called at the points where a raster (or its data) leaves for Java. See the
+/// SNAPSHOT limit in the block comment above.
+fn sync_raster_pixels(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let Some(id) = buffered_image_id(ctx, this) else {
+        return;
+    };
+    let pixels: Vec<u32> = {
+        let reg = image::image_registry();
+        match reg.get(id) {
+            Some(img) => img.get_rgb_region(0, 0, img.width(), img.height()),
+            None => return,
+        }
+    };
+    let Value::Object(Some(raster)) = ctx.get_field_by_name(this, "raster") else {
+        return;
+    };
+    let Ok(Some(Value::Object(Some(db)))) = ctx.invoke_virtual(
+        raster,
+        "getDataBuffer",
+        "()Ljava/awt/image/DataBuffer;",
+        &[],
+    ) else {
+        return;
+    };
+    let Value::Object(Some(data)) = ctx.get_field_by_name(db, "data") else {
+        return;
+    };
+    let len = ctx.array_length(data).min(pixels.len());
+    for i in 0..len {
+        ctx.set_array_element(data, i, Value::Int(pixels[i] as i32));
+    }
+}
+
 fn register_image_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/image/BufferedImage", "<init>", "(III)V", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
@@ -2054,9 +2295,30 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "width", Value::Int(w as i32));
             ctx.set_field_by_name(this, "height", Value::Int(h as i32));
             bind_buffered_image(ctx, this, img_id);
+            // G80-1 N1(A): give the object the REAL raster and colour model the
+            // real constructor would have built, so getRaster()/getSampleModel()/
+            // getColorModel() stop answering null. Best-effort: an unsupported
+            // image type simply leaves the fields as they were.
+            attach_real_raster(ctx, this, w_raw, h_raw, get_int(args, 3));
         }
         void_ok()
     });
+    // Registered ONLY to synchronise before the raster leaves for Java — the
+    // return value is the field the real constructor's counterpart would have
+    // returned. Without this the raster is real but its pixels are whatever the
+    // rasterizer had not yet written.
+    registry.register(
+        "java/awt/image/BufferedImage",
+        "getRaster",
+        "()Ljava/awt/image/WritableRaster;",
+        |ctx, args| {
+            if let Some(this) = get_obj(args, 0) {
+                sync_raster_pixels(ctx, this);
+                return Ok(Some(ctx.get_field_by_name(this, "raster")));
+            }
+            null_ok()
+        },
+    );
     registry.register(
         "java/awt/image/BufferedImage",
         "getWidth",
@@ -2095,6 +2357,8 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             int_ok(0)
         },
     );
+
+
     registry.register(
         "java/awt/image/BufferedImage",
         "getRGB",
@@ -2111,12 +2375,36 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                     if let Some(img) = reg.get(id) {
                         let (w, h) = (img.width() as i32, img.height() as i32);
                         if x < 0 || y < 0 || x >= w || y >= h {
-                            // Match the JDK: the index reported is the offending
-                            // linear pixel index `y * width + x`.
+                            // MEASURED (Sweep17): the comment that stood here
+                            // claimed the JDK reports the linear pixel index. It
+                            // does not. `BufferedImage.getRGB` bottoms out in the
+                            // raster's own bounds check, which throws
+                            // `ArrayIndexOutOfBoundsException("Coordinate out of
+                            // bounds!")` — no index at all. HotSpot 25.0.3 was
+                            // asked; the index wording was invented.
                             let index = (y as i64) * (w as i64) + (x as i64);
-                            return Err(RuntimeError::aioobe_index_only(index as i32).into());
+                            return Err(RuntimeError::aioobe_with_message(
+                                index as i32,
+                                "Coordinate out of bounds!",
+                            )
+                            .into());
                         }
-                        return int_ok(img.get_rgb(x as u32, y as u32) as i32);
+                        // An OPAQUE image type has no alpha channel to report, so
+                        // `getRGB` must set it: the JDK returns the ColorModel's
+                        // RGB, and an opaque ColorModel answers 0xFF for alpha
+                        // whatever the backing store holds. Ours returned the raw
+                        // 24-bit value, so every pixel the RASTERIZER had touched
+                        // came back with alpha 0 — while a pristine image read
+                        // correctly, because `try_new` fills opaque images with
+                        // 0xFF000000. That split is why this looked like a
+                        // drawing bug rather than a read bug.
+                        let px = img.get_rgb(x as u32, y as u32);
+                        let px = if img.image_type().has_alpha() {
+                            px
+                        } else {
+                            px | 0xFF00_0000
+                        };
+                        return int_ok(px as i32);
                     }
                 }
             }
@@ -2136,8 +2424,13 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                     if let Some(img) = reg.get_mut(id) {
                         let (w, h) = (img.width() as i32, img.height() as i32);
                         if x < 0 || y < 0 || x >= w || y >= h {
+                            // Same correction as `getRGB` above.
                             let index = (y as i64) * (w as i64) + (x as i64);
-                            return Err(RuntimeError::aioobe_index_only(index as i32).into());
+                            return Err(RuntimeError::aioobe_with_message(
+                                index as i32,
+                                "Coordinate out of bounds!",
+                            )
+                            .into());
                         }
                         img.set_rgb(x as u32, y as u32, argb);
                     }

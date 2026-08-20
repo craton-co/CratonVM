@@ -466,8 +466,24 @@ in place but funnel them through `resolve_dispatch` and mark each with
   the accepted JDK layout. Reuse the existing `require_real_jdk` machinery.
 - Emit the census on request; keep the existing manual re-registration order
   (later entries overwrite earlier ones) — do not reorder it this wave.
-- Do not edit `native-builtins/src/lib.rs`; the 157-stub reclassification is a
+- Under `JdkOnly`, a `--java-home` that does not EXIST must carry the same
+  framing as one that exists but is not an image. Both branches now name
+  `--jdk-only`, the accepted layouts and the available fixes; before 2026-08-19
+  only the second did, and the first — the branch a typo takes — failed during
+  argument parsing with a generic message. See
+  `known-issues/jdk-only/G82-1-the-run-that-closed-a-p0-row-20260819.md` §4 N1.
+- Do not edit `native-builtins/src/lib.rs`; the stub reclassification is a
   separate wave with its own subsystem-per-PR discipline.
+
+  **The count in this clause was `157` and was wrong — it is the ROOT of a
+  stale figure that propagated.** Measured 2026-08-19: the registry holds
+  **1330** `SyntheticStub` registrations in the default mode, and
+  `stub_ratchet.rs`'s end-state gate (`strict_mode_refuses_nothing`) reports
+  **1328** still refused at VM init. The P0 *Residual synthetic native set* row
+  and that test's own doc comment (`549`) both inherited a number from here
+  while the tree moved. Anyone re-freezing the ratchet or planning the wave
+  should re-derive the count rather than cite this clause. See
+  `known-issues/jdk-only/G83-1-the-ratchet-was-already-red-20260819.md` §3a.
 
 ---
 
