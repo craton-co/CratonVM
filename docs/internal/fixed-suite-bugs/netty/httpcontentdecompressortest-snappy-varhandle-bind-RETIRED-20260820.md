@@ -15,6 +15,7 @@ Superseded page: `known-issues/netty/httpcontentdecompressortest-hang-20260816.m
 | the wall | 88 % is `testZipBomb` #5 `snappy` | 86 % is the same test, **462 s** (was 566 s) |
 | the next step | "a thin `*_DIRECT_FN` bind for `VarHandle.get` … worth roughly a quarter of this class" | **landed**, measured **1.18x** on the phase and **1.23x** on the test |
 | the residual | "compiled-Java throughput on a byte-shuffling loop" | **63 % is VM runtime, 32 % is compiled code** — decomposed below, each part re-homed |
+| the blast radius | not asked | 274-class slice, one binary, one class differs — and it goes **FAIL -> PASS** |
 
 Measured 2026-08-20 on Azure host 2 (Linux x86_64, 8 cores, JDK 25), release
 build, **one binary** (`bin/cratonvm-vhread20260820`, `md5 c1320f36…`) with the
@@ -176,6 +177,34 @@ claim otherwise. What has changed is that "why" is no longer an open question.
 and were measured at 8 143 ms / 10 956 ms, so 1.15x does not reach it. That row
 is honest about what the bind is worth: it is a real improvement and it is not
 the 1.6–2.2x those two need.
+
+### The regression gate, and a second class that flips
+
+`-ea`, G1, 6 shards, 180 s cap, **one binary**, the 274-class
+`buffer` + `codec-http` + `codec-compression` + `util` slice of the suite run
+twice back to back with only the kill switch between the arms:
+
+| | ABORTED | PASS | HANG | FAIL | NOTESTS | sum class ms |
+|---|---:|---:|---:|---:|---:|---:|
+| bind OFF | 19 | 218 | 18 | **4** | 15 | 2 579 474 |
+| bind ON | 19 | **219** | 18 | **3** | 15 | **2 334 070** |
+
+**Exactly one class differs across 274**, and it moves the right way:
+
+```
+io.netty.buffer.search.SearchProcessorTest  OFF  found=15 ok=14 failed=1  ms=143 469
+io.netty.buffer.search.SearchProcessorTest  ON   found=15 ok=15 failed=0  ms=103 428
+```
+
+The OFF failure is `TimeoutException: testUniqueLen64Substrings … timed out
+after 120 seconds` — a wall-clock budget, on a class that scans `ByteBuf`s
+through the checked accessors, i.e. exactly this bind's shape. 1.39x on the
+class takes it under the budget. One observation of a timeout crossing a
+threshold is not a determinism claim, but it is a class that FAILS without the
+bind and PASSES with it, on one binary.
+
+Nothing else in the 274 changes status or counts, and the slice's total class
+time is 1.105x.
 
 ---
 
