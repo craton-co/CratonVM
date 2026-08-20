@@ -624,6 +624,7 @@ export inherited from a parent shell.
 | `local-liveness` | `CRATONVM_NO_LOCAL_LIVENESS` |
 | `local-regs` | `CRATONVM_JIT_LOCAL_REGS` |
 | `long-intrinsics` | `CRATONVM_JIT_NO_LONG_INTRINSICS` |
+| `long-box-direct-helpers` | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
 | `main-inline` | `CRATONVM_JIT_MAIN_INLINE` |
 | `matrix-dot` | `CRATONVM_JIT_MATRIX_DOT` |

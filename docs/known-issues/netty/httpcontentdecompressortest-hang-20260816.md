@@ -292,6 +292,34 @@ cratonvm --java-home <jdk> -cp . NioAccessorOracle
 `NioAccessorOracle` must print HotSpot's TOTAL exactly; it is the correctness
 pin for every accessor this page touches.
 
+## A second class on the same wall: `DataCompressionHttp2Test` (added 2026-08-19)
+
+`io.netty.handler.codec.http2.DataCompressionHttp2Test` fails exactly two of its
+42 tests on CratonVM and none on HotSpot, and both are
+`encodingTooBigMessage(padding, "snappy")` — the same test method's
+gzip/deflate/br/zstd parameterisations pass in 119–130 ms. It is this page's
+residual reached from a different class, confirmed rather than inferred:
+
+* **It is a budget, not a defect.** The class recompiled with its
+  `assertTrue(serverLatch.await(5, SECONDS))` raised to 600 s passes **42 of 42**,
+  with the two snappy arms taking 8 143 ms and 10 956 ms. HotSpot runs the same
+  two in 28 ms and 99 ms.
+* **It is the same mechanism.** `--dump-native-registry` over that passing run:
+  `VarHandle.get` is 5 356 015 of 18 371 699 native calls (29 %), the same
+  `refCnt()`-through-a-`VarHandle` signature this page censused at 21 368 822
+  per 4 MiB on `NettyZipBombPhases snappy`. The `ByteBuffer.limit` /
+  `checkFromIndexSize` / `reachabilityFence` / `session` / `copyMemory` cluster
+  under it holds a constant 7:1 ratio to `copyMemory` — one bulk copy and its
+  six-native preamble.
+
+So the thin `*_DIRECT_FN` bind for `VarHandle.get` this page names as the next
+measurable step now has a second, much cheaper class to be measured on: 512 KiB
+through the codec against 8 MiB, and a 5 s budget the arms miss by ~1.6–2.2×
+rather than a 180 s one they miss by 3×.
+
+Per-test timings and the override-classpath recipe are on
+`http2-flowcontroller-ea-and-datacompression-snappy-20260819.md`.
+
 ## Related
 
 * `httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`,

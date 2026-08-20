@@ -8865,6 +8865,90 @@ pub fn set_integer_int_value_direct_fn(addr: usize) {
     INTEGER_INT_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `Long.valueOf(J)` / `Long.longValue()` twins of the two `Integer` cells
+/// above. `0` = not wired → the recognition is skipped and the sites use the
+/// generic dispatch helper.
+///
+/// **Why the twin was missing, and what it cost.** `Integer.valueOf`/`intValue`
+/// have had thin binds since 2026-07; `Long.valueOf`/`longValue` are registered
+/// natives on exactly the same terms (`lang_math.rs::register_wrapper_natives`:
+/// a 256-entry `-128..=127` identity cache and a field-0 read) and were not.
+/// Measured on ONE binary, same run, `probes/BoxRungRate.java`:
+///
+/// | rung | HotSpot 25 | CratonVM |
+/// |---|---:|---:|
+/// | `Integer.valueOf` alone | 1.9 ns | 153 ns |
+/// | `Long.valueOf` alone | 2.6 ns | **296 ns** |
+/// | `Integer.valueOf` + `intValue` | 0.24 ns | 151 ns |
+/// | `Long.valueOf` + `longValue` | 0.26 ns | **503 ns** |
+///
+/// The `Integer` PAIR costs the same as `Integer.valueOf` ALONE — `intValue`'s
+/// bind makes the unbox free. The `Long` pair costs `valueOf` plus another
+/// ~207 ns, which is `longValue()` paying the generic funnel. The arms differ
+/// only in which `*_DIRECT_FN` cell exists.
+///
+/// Censused with `--dump-native-registry` on `probes/HwtScaleProbe.java` (the
+/// `HashedWheelTimerTest.testExecutionOnTime` workload): `Long.valueOf` 99 496 +
+/// `Long.longValue` 100 000 calls for 100 000 expired timer tasks — one box and
+/// one unbox each, because the queue under test is a `BlockingQueue<Long>`.
+/// `Long` boxing is the `Integer` case's equal on every `Map<Long, …>`, every
+/// row identifier that reaches a collection, and every `AtomicLong` readout that
+/// is stored rather than consumed.
+pub static LONG_VALUE_OF_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static LONG_LONG_VALUE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Long.valueOf` thin direct-call helper (called once from the
+/// VM's `build_helpers`).
+pub fn set_long_value_of_direct_fn(addr: usize) {
+    LONG_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Register the `Long.longValue` thin direct-call helper (called once from the
+/// VM's `build_helpers`).
+pub fn set_long_long_value_direct_fn(addr: usize) {
+    LONG_LONG_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS=0` — stop binding `Long.valueOf` /
+/// `Long.longValue` to their thin direct helpers and send both back through the
+/// generic native funnel. Default ON.
+///
+/// Same reason the `census-direct-helpers` switch beside it exists: the blast
+/// radius of these binds has to be measurable on ONE binary. A control built
+/// from a different commit manufactured a 13-19% "regression" on phases that
+/// contain neither call the last time that shortcut was taken.
+pub fn long_box_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Sites bound to the two `Long` boxing helpers, so "did this land" is
+/// answerable without a timing run — the lesson `LEAF_NATIVE_HITS` was added
+/// for, and the one `the field site cache shipped default-OFF for 13 days`
+/// was re-learned from.
+pub static LONG_VALUE_OF_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static LONG_LONG_VALUE_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(Long.valueOf, Long.longValue)` sites bound to a thin direct helper.
+pub fn long_box_direct_helper_sites() -> (u64, u64) {
+    (
+        LONG_VALUE_OF_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        LONG_LONG_VALUE_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `Thread.currentThread()` thin direct-call helper — the JIT half of the
 /// funnel bypass the interpreter already has.
 ///
@@ -17717,6 +17801,43 @@ fn try_compile_inner(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
+                            // `Long.valueOf(J)` at THIS door too, for the reason
+                            // the two above are here: the netty workloads that
+                            // motivate it box inside loops, and a loop is
+                            // OSR-compiled at the optimizing tier, which is this
+                            // path. The `Integer.valueOf` twin is still
+                            // single-pass-only (see the scope note above) — it
+                            // is left that way deliberately, so the A/B on
+                            // `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` measures
+                            // the `Long` binds and nothing else.
+                            //
+                            // `Long.longValue()` cannot be bound here at all:
+                            // this door is gated `is_static || is_special`, and
+                            // `longValue` is an `invokevirtual`. That is the
+                            // same reason `Integer.intValue` is single-pass-only
+                            // and is a property of the door, not a decision.
+                            if direct_target.is_none()
+                                && long_box_direct_helpers_enabled()
+                                && is_static
+                                && direct_class == "java/lang/Long"
+                                && mn == "valueOf"
+                                && desc == "(J)Ljava/lang/Long;"
+                            {
+                                let entry = direct_native_helper(
+                                    &LONG_VALUE_OF_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    LONG_VALUE_OF_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                             if direct_target.is_none()
                                 && !closes_cycle
                                 && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
@@ -19524,6 +19645,50 @@ fn try_compile_inner(
                             continue;
                         }
                     }
+
+                    // `Long.valueOf(J)` — the twin of the `Integer.valueOf(I)`
+                    // bind directly above, on the same terms and for the same
+                    // reason (see `LONG_VALUE_OF_DIRECT_FN` for the measured
+                    // gap that says the twin was missing rather than declined).
+                    //
+                    // `num_params: 1` and not 2: the JIT's `count_param_slots`
+                    // counts one operand slot per PARAMETER, not JVMS
+                    // category-2 pairs, so the `J` argument the emitter pops
+                    // for this site is a single 64-bit slot — the same count
+                    // `INTEGER_VALUE_OF`'s `I` gets.
+                    if direct_jit_callee_calls_enabled
+                        && long_box_direct_helpers_enabled()
+                        && invoke_kind == 3
+                        && class_name == "java/lang/Long"
+                        && method_name == "valueOf"
+                        && descriptor == "(J)Ljava/lang/Long;"
+                    {
+                        // JDK-ONLY-WAVE2: see the marker on the
+                        // `StringLatin1.toLowerCase` bind above — same list.
+                        let entry = direct_native_helper(
+                            &LONG_VALUE_OF_DIRECT_FN,
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                        );
+                        if entry != 0 {
+                            LONG_VALUE_OF_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     // STATICALLY BOUND ONLY (`invokespecial` / `invokestatic`).
                     //
                     // `callee_compiler` is asked about the constant-pool
@@ -19846,6 +20011,53 @@ fn try_compile_inner(
                                 needs_context: true,
                                 num_params: 0,
                                 return_type: b'I',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+                // `Long.longValue()` — the twin of the `Integer.intValue()`
+                // bind directly above. `java/lang/Long` is `final` on exactly
+                // the same terms, so a site whose constant-pool class is
+                // `java/lang/Long` is statically monomorphic and the guard-free
+                // virtual direct-call path is sound; the helper handles the
+                // null-receiver NPE itself and declines any receiver that fails
+                // heap validation to the generic dispatcher.
+                if direct_jit_callee_calls_enabled
+                    && long_box_direct_helpers_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/lang/Long"
+                    && method_name == "longValue"
+                    && descriptor == "()J"
+                {
+                    // JDK-ONLY-WAVE2: see the marker on the
+                    // `StringLatin1.toLowerCase` bind above — same list.
+                    let entry = direct_native_helper(
+                        &LONG_LONG_VALUE_DIRECT_FN,
+                        jdk_only,
+                        intrinsic_resolver,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                    );
+                    if entry != 0 {
+                        LONG_LONG_VALUE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                // `b'J'`, and the emitter's return-value ladder
+                                // already handles it: it special-cases only
+                                // `D`/`F` (XMM) and `L`/`[` (oop marking), and
+                                // everything else — `I` and `J` alike — is one
+                                // `push_from_rax`. The JIT's operand stack is
+                                // one 64-bit slot per value, not JVMS
+                                // category-2 pairs.
+                                return_type: b'J',
                                 guard_class_id: 0,
                             },
                         ));
@@ -21485,6 +21697,66 @@ mod code_buffer_retry_tests {
         // …and a neighbouring backend bail is NOT exempted.
         let other: Option<(&'static str, u32, u32)> = Some(("branch-target-not-an-instruction-boundary", 0, 0));
         assert!(!matches!(other, Some((CODE_BUFFER_TOO_SMALL_SITE, _, _))));
+    }
+}
+
+#[cfg(test)]
+mod long_box_direct_bind_tests {
+    use super::*;
+
+    /// The two `Long` cells must be DISTINCT from each other and from the two
+    /// `Integer` cells they are modelled on.
+    ///
+    /// This is not paranoia about copy-paste for its own sake: the whole bind
+    /// is a triple-to-helper-address map, and the failure mode of getting it
+    /// wrong is not a compile error — it is `Long.longValue()` calling
+    /// `jit_integer_int_value_direct`, which reads field 0 and returns whatever
+    /// `Value::Int` arm it finds, silently truncating every `long` above 2^31
+    /// in compiled code only. A pointer-equality check is the only thing that
+    /// catches that before a workload does.
+    #[test]
+    fn the_long_helper_cells_are_not_the_integer_ones() {
+        set_integer_value_of_direct_fn(0x1000);
+        set_integer_int_value_direct_fn(0x2000);
+        set_long_value_of_direct_fn(0x3000);
+        set_long_long_value_direct_fn(0x4000);
+
+        let iv = INTEGER_VALUE_OF_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let ii = INTEGER_INT_VALUE_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let lv = LONG_VALUE_OF_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let ll = LONG_LONG_VALUE_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!((iv, ii, lv, ll), (0x1000, 0x2000, 0x3000, 0x4000));
+        assert_ne!(lv, iv, "Long.valueOf is wired to Integer.valueOf's helper");
+        assert_ne!(ll, ii, "Long.longValue is wired to Integer.intValue's helper");
+        assert_ne!(lv, ll, "both Long cells hold one address");
+
+        // Leave the cells as `build_helpers` would find them: not wired. `0` is
+        // the established "use the generic dispatch helper" sentinel, so a test
+        // that ran before a real VM in the same process cannot leave a fake
+        // address behind for a compile to bake into a `CALL`.
+        set_integer_value_of_direct_fn(0);
+        set_integer_int_value_direct_fn(0);
+        set_long_value_of_direct_fn(0);
+        set_long_long_value_direct_fn(0);
+    }
+
+    /// The site counters start at zero and are independent, so a run that
+    /// reports `Long.valueOf=0 Long.longValue=N` is reporting two facts and not
+    /// one number twice. `the field site cache shipped default-OFF for 13 days`
+    /// is what this row is for: "the bind did not help" and "the bind never
+    /// happened" have to be distinguishable from the log line alone.
+    #[test]
+    fn the_two_long_site_counters_are_separate() {
+        let (before_v, before_l) = long_box_direct_helper_sites();
+        LONG_VALUE_OF_SITES.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        let (after_v, after_l) = long_box_direct_helper_sites();
+        assert_eq!(after_v, before_v + 3);
+        assert_eq!(after_l, before_l, "bumping valueOf moved the longValue tally");
+        LONG_LONG_VALUE_SITES.fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        let (final_v, final_l) = long_box_direct_helper_sites();
+        assert_eq!(final_v, before_v + 3);
+        assert_eq!(final_l, before_l + 5);
     }
 }
 

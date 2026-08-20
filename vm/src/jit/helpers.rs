@@ -12472,6 +12472,238 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     )
 }
 
+/// Synthetic call-site info for [`jit_long_value_of_direct`]'s error path —
+/// same role as [`INTEGER_VALUE_OF_INFO`], and read only for diagnostics and
+/// exception context.
+static LONG_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Long",
+    method_name: "valueOf",
+    descriptor: "(J)Ljava/lang/Long;",
+    num_jit_args: 1,
+    return_type: b'L',
+    invoke_kind: 3,
+    declaring_class_id: 0,
+};
+
+/// Synthetic call-site info for [`jit_long_long_value_direct`]'s
+/// generic-dispatch fallback (a non-null receiver that fails heap validation —
+/// defensive parity with [`INTEGER_INT_VALUE_INFO`]).
+static LONG_LONG_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Long",
+    method_name: "longValue",
+    descriptor: "()J",
+    num_jit_args: 1,
+    return_type: b'J',
+    invoke_kind: 0,
+    declaring_class_id: 0,
+};
+
+thread_local! {
+    /// Real `java/lang/Long` class discovered from the first ordinary
+    /// `valueOf` result in each VM, as `(vm_identity, class id)` — the
+    /// `Long` twin of [`INTEGER_WRAPPER_CLASS_CACHE`], and separate from it
+    /// because the two wrappers are different classes with different layouts.
+    static LONG_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Thin direct-call target for JIT `invokestatic Long.valueOf(J)` sites
+/// (registered into `cratonvm_jit::LONG_VALUE_OF_DIRECT_FN` by
+/// `build_helpers`; the recognition lives in `jit::try_compile`).
+///
+/// Line-for-line the same contract as [`jit_integer_value_of_direct`], against
+/// the same registered native's semantics
+/// (`lang_math.rs::native_long_value_of`, reached here through
+/// `intrinsics::long::intrinsic_long_value_of`, which is a verbatim delegation
+/// to it):
+///
+///  * out-of-cache values allocate a fresh wrapper through the mutator's normal
+///    TLAB path and publish it via `native_pending_return` (the established
+///    JIT→native object-return handoff root);
+///  * `-128..=127`, the cold pre-discovery case, and any class-redefine window
+///    route through `safe_native_call` to the canonical native callback, so the
+///    JLS `Long`-cache identity contract is that native's, not a copy of it;
+///  * errors (OOM) route through `handle_jit_dispatch_error` exactly like the
+///    dispatch helper.
+///
+/// The argument arrives as a full 64-bit word — unlike the `Integer` twin
+/// there is no `as i32` narrowing step, and there must not be one: the JIT
+/// passes a category-2 value in one operand slot.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i64 {
+    // Same Rust<->JIT boundary bookkeeping as `jit_invoke_dispatch`.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if !(-128..=127).contains(&value) {
+        let vm_key = vm.vm_identity;
+        let cached_class = LONG_WRAPPER_CLASS_CACHE.with(|cache| {
+            cache
+                .get()
+                .filter(|(cached_vm, _)| *cached_vm == vm_key)
+                .map(|(_, raw)| ClassId::new(raw))
+                .filter(|class_id| !class_was_redefined(vm, *class_id))
+        });
+        if let Some(class_id) = cached_class {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                thread_local! {
+                    // (vm_key, class_id, slots). The exact-class redefine gate
+                    // above prevents use after that class's layout changes.
+                    static LONG_ALLOC_SLOTS: std::cell::Cell<Option<(usize, u32, u32)>> =
+                        const { std::cell::Cell::new(None) };
+                }
+                let slots = LONG_ALLOC_SLOTS.with(|cache| {
+                    if let Some((vk, cid, slots)) = cache.get() {
+                        if vk == vm_key && cid == class_id.as_u32() {
+                            return slots as usize;
+                        }
+                    }
+                    let resolved = vm
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .map(|c| c.num_total_fields.max(1))
+                        .unwrap_or(1);
+                    // Cast: field counts are far below u32::MAX.
+                    cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
+                    resolved
+                });
+                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+                    crate::runtime::interpreter::tlab_alloc_object(
+                        thread,
+                        vm,
+                        class_id,
+                        slots,
+                        requested_size,
+                    )
+                } else {
+                    None
+                };
+                if let Some(object) = tlab_object {
+                    // Raw primitive-cell write, exactly as the `Integer` twin
+                    // does and for the same reason: this arm JUST allocated
+                    // `object` through the legacy TLAB path (`init_object_header`,
+                    // zeroed 16-byte `Value` cells), so field 0 is the `Value`
+                    // cell at `HEADER_SIZE`. A primitive store takes no write
+                    // barrier.
+                    // SAFETY: `object` is a live legacy-layout allocation with
+                    // >= 1 slot (`slots.max(1)` above); the cell is exclusively
+                    // ours until published below.
+                    unsafe {
+                        std::ptr::write(
+                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                            Value::Long(value),
+                        );
+                    }
+                    thread.native_pending_return = Some(object);
+                    return object.as_ptr() as i64;
+                }
+                use cratonvm_native_api::NativeContext as _;
+                let object = {
+                    // Reborrow: `thread` is used again after this arm for the
+                    // pending-return publication.
+                    let mut ctx = crate::vm::NativeContextImpl {
+                        shared: vm,
+                        thread: &mut *thread,
+                    };
+                    ctx.alloc_object(class_id, 1)
+                };
+                // Descriptor-typed write (`Long.value`, field 0, `J`) — this
+                // cold arm's allocator may pick a non-legacy layout, so keep
+                // the layout-aware store.
+                vm.mem.heap.set_field_as(object, 0, Value::Long(value), b'J');
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+        }
+    }
+    // Cold / in-cache-range / redefine-window path: canonical native callback
+    // via the full safe-native-call wrapper (identity cache; also discovers the
+    // real wrapper ClassId for the fast path above).
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        // No JIT thread context — signal the deopt sentinel; the caller's
+        // post-invoke check bails to the interpreter, which re-dispatches.
+        return i64::MIN;
+    };
+    let arg = Value::Long(value);
+    let result = match crate::vm::safe_native_call_prevalidated_objects(
+        vm,
+        thread,
+        cratonvm_native_builtins::intrinsics::long::intrinsic_long_value_of,
+        std::slice::from_ref(&arg),
+    ) {
+        Ok(value) => value,
+        Err(error) => return handle_jit_dispatch_error(vm, thread, error, &LONG_VALUE_OF_INFO),
+    };
+    match result {
+        Some(Value::Object(Some(object))) => {
+            LONG_WRAPPER_CLASS_CACHE.with(|cache| {
+                cache.set(Some((
+                    vm.vm_identity,
+                    vm.mem.heap.class_id_of(object).as_u32(),
+                )))
+            });
+            object.as_ptr() as i64
+        }
+        _ => 0,
+    }
+}
+
+/// Thin direct-call target for JIT `invokevirtual Long.longValue()` sites whose
+/// constant-pool class is exactly `java/lang/Long` (a `final` class, so the site
+/// is statically monomorphic — no receiver guard needed; only `null` remains,
+/// which throws NPE per JVMS).
+///
+/// Mirrors [`jit_integer_int_value_direct`] and the registered
+/// `lang_math.rs::native_wrapper_long_value` it stands in for, INCLUDING that
+/// native's `Value::Int` arm: reflection can legally leave an int-tagged raw
+/// slot in a `Long` wrapper, and a `()J` caller must see the widened value
+/// rather than the compact tag bits. Dropping that arm here would make the fast
+/// path disagree with the funnel on exactly the receiver the funnel was written
+/// for.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    let raw = receiver as u64;
+    if raw == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if (raw & 0x7) == 0 && raw < (1u64 << 48) {
+        // The arena-membership probe stays, for the reason the `Integer` twin
+        // states: nothing on this path has read the receiver's header yet, so
+        // it is the only thing between a fabricated argument and the
+        // `get_field` dereference.
+        if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
+            match vm.mem.heap.get_field(object, 0) {
+                Value::Long(value) => return value,
+                Value::Int(value) => return i64::from(value),
+                // Anything else is a shape the registered native answers 0 for;
+                // hand it to the generic dispatcher rather than guessing, so the
+                // two paths cannot disagree.
+                _ => {}
+            }
+        }
+    }
+    // Defensive fallback: hand the call to the generic dispatcher (same
+    // machinery the non-direct site would have used).
+    let args = [receiver];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &LONG_LONG_VALUE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        1,
+    )
+}
+
 /// Synthetic call-site info for [`jit_preconditions_check_index_direct`]'s
 /// cold arm — the out-of-range case, which must throw exactly what the
 /// registered native throws.
@@ -12732,13 +12964,17 @@ static STRING_LATIN1_LOWER_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
 /// this VM simply does not resolve and is not marked.
 ///
 /// [`NativeMethodRegistry::record_invocation`]: cratonvm_native_api::NativeMethodRegistry::record_invocation
-const DIRECT_CALL_HELPER_NATIVES: [(&str, &str, &str); 8] = [
+const DIRECT_CALL_HELPER_NATIVES: [(&str, &str, &str); 10] = [
     // `jit_integer_value_of_direct` — TLAB-allocated wrapper, and the cold arm
     // that calls `intrinsic_integer_value_of` through `safe_native_call`
     // directly. Neither counts.
     ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
     // `jit_integer_int_value_direct` — heap-validated field-0 read.
     ("java/lang/Integer", "intValue", "()I"),
+    // `jit_long_value_of_direct` / `jit_long_long_value_direct` — the `Long`
+    // twins of the two rows above, on the same terms.
+    ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;"),
+    ("java/lang/Long", "longValue", "()J"),
     // `jit_hashmap_put_direct` / `jit_hashmap_get_direct` — the overlay probe
     // and the `safe_native_call_prevalidated_objects` arm below it.
     (
@@ -16633,6 +16869,8 @@ mod tests {
         for info in [
             &INTEGER_VALUE_OF_INFO,
             &INTEGER_INT_VALUE_INFO,
+            &LONG_VALUE_OF_INFO,
+            &LONG_LONG_VALUE_INFO,
             &HASHMAP_PUT_DIRECT_INFO,
             &HASHMAP_GET_DIRECT_INFO,
             &CONCURRENT_HASHMAP_GET_DIRECT_INFO,
@@ -18865,6 +19103,10 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         );
         cratonvm_jit::set_integer_int_value_direct_fn(
             jit_integer_int_value_direct as *const () as usize,
+        );
+        cratonvm_jit::set_long_value_of_direct_fn(jit_long_value_of_direct as *const () as usize);
+        cratonvm_jit::set_long_long_value_direct_fn(
+            jit_long_long_value_direct as *const () as usize,
         );
         cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
         cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
