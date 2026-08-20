@@ -2077,13 +2077,19 @@ fn native_fd_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     //     one of which is a socket dispatcher", so a close error there would be
     //     fd release rather than data loss. **The dump refutes the premise.**
     //     `--dump-native-registry` in `--jdk-only` on this tree (2026-08-17)
-    //     reports the `sun/nio/ch/UnixDispatcher.close0` registration made
-    //     twenty lines below this function's own registration with
-    //     `owns_slot: false` — `native-io/src/net.rs:4188`'s registration of the
-    //     same triple runs later and wins. So this body serves exactly ONE
-    //     triple, `java/io/FileDescriptor.close0()V` (`owns_slot: true`), whose
+    //     reported the `sun/nio/ch/UnixDispatcher.close0` registration that
+    //     then sat twenty lines below this function's own registration with
+    //     `owns_slot: false` — `net.rs`'s registration of the same triple runs
+    //     later and wins. So this body serves exactly ONE triple,
+    //     `java/io/FileDescriptor.close0()V` (`owns_slot: true`), whose
     //     receivers are file-stream descriptors. There is no socket on the
     //     other end of it.
+    //
+    //     That dead `UnixDispatcher.close0` registration has since been
+    //     DELETED (H8-1, 2026-08-20), so the "exactly ONE triple" claim is now
+    //     true of the source and not only of the dump. The block comment where
+    //     it used to sit — grep `UnixDispatcher` in `register_io_natives` —
+    //     records why it must not come back.
     //
     //     With the premise gone the blast radius is the same provably-empty one
     //     the flush half already argued: `FdTable::close` answers `Ok(())` for
@@ -5814,7 +5820,9 @@ fn native_scanner_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // receivers whose resolved declaring class IS the interface, which bounds
     // this to synthetic objects typed as bare Closeable/AutoCloseable rather
     // than to user classes — but "only corrupts synthetic receivers" is not a
-    // guarantee worth keeping.
+    // guarantee worth keeping. (That sentence was a premise in a comment with
+    // nothing behind it — `[comment != link]`. It is now backed, and it is if
+    // anything too weak: see "WHAT REACHES THIS BRANCH TODAY" below.)
     //
     // The `object_num_fields(this) > SCAN_FIELD_CLOSED` shape this replaces was
     // the wrong question, and the same wrong question that made three other
@@ -5823,9 +5831,55 @@ fn native_scanner_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // flag by NAME does not fix that either — plenty of `java.io` classes
     // declare a field called `closed`. Ask what the receiver actually IS;
     // `java.util.Scanner` is final, so an exact class match is exact.
+    //
+    // THE DECLINE USED TO BE `Ok(None)`, AND THAT IS NOT A DECLINE.
+    // `Ok(None)` is a COMPLETED void call: the registry has already taken the
+    // call away from the bytecode, so returning it means "close() ran and did
+    // nothing". For a non-`Scanner` receiver that is a resource leak reported
+    // as success, which is worse than the field corruption the guard was added
+    // to stop — `[decline masks]`. `MethodCallResult` carries no
+    // "fall through" value, so the yield has to be performed rather than
+    // signalled: `invoke_virtual_bytecode_only` re-dispatches on the RECEIVER
+    // with the native check skipped, which is the same mechanism
+    // `direct_buffer.rs`'s wide accessors use to bail to the class-file body,
+    // and it cannot re-enter this native. H8-1, 2026-08-20.
+    //
+    // Two receivers still get `Ok(None)`, because for them there is no
+    // bytecode to yield TO and delegating would replace a silent no-op with a
+    // hard failure:
+    //
+    //   * an INTERFACE-typed receiver (a fabricated object stamped
+    //     `java/io/Closeable` or `java/lang/AutoCloseable` itself) — the only
+    //     `close()V` in its hierarchy is the abstract declaration, and
+    //     executing that is `[abstract recv]`, not a close;
+    //   * a receiver whose class resolves no `close()V` at all, which would
+    //     raise `NoSuchMethodError` out of a `close()`.
+    //
+    // WHAT REACHES THIS BRANCH TODAY: as far as a source read can tell,
+    // nothing. `java.util.Scanner` is final, and the two interface doors this
+    // handler is registered on (`java/io/Closeable.close()V`,
+    // `java/lang/AutoCloseable.close()V` at the foot of
+    // `register_scanner_natives` — the ONLY registrations of either triple in
+    // the workspace) are instance methods on an interface, the exact shape
+    // BOTH dispatch guards skip: `invoke.rs`'s step-6
+    // `!(declaring_is_interface && !is_static)` and `vm_exec.rs`'s
+    // `override_cb` arm. Neither name appears in
+    // `should_force_registered_native_over_bytecode`'s force list. So the
+    // guard is a backstop for a door that does not currently open, and this
+    // change makes the backstop correct instead of quietly destructive; it is
+    // NOT a fix for an observed leak. If the doors are ever force-routed, or
+    // if a fabricated receiver is ever stamped `java/util/Scanner`, the
+    // delegation is what keeps `close()` meaning close.
     let class_id = ctx.class_id_of_object(this);
-    if ctx.class_name_arc_of_id(class_id).as_deref() != Some("java/util/Scanner") {
-        return Ok(None);
+    let class_name = ctx.class_name_arc_of_id(class_id);
+    if class_name.as_deref() != Some("java/util/Scanner") {
+        let Some(name) = class_name else {
+            return Ok(None);
+        };
+        if ctx.is_interface_class(class_id) || !ctx.method_exists(&name, "close", "()V") {
+            return Ok(None);
+        }
+        return ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]);
     }
     scan_set_closed(ctx, this, true);
     // Drop the input text. Every read path treats a missing entry as closed and
@@ -6720,49 +6774,45 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         NativeKind::Bridge,
     );
 
-    // sun.nio.ch.UnixDispatcher.close0(FileDescriptor) — the static
-    // NativeDispatcher-family close used by java.net.MulticastSocket's
-    // underlying DatagramChannelImpl (reached e.g. via JGroups'
-    // DiagnosticsHandler/UDP transport standing up a multicast socket).
-    // `UnixDispatcher.init()` was already a no-op above since our socket
-    // I/O doesn't route through a native dispatcher table, but `close0`
-    // itself was never registered, so a real MulticastSocket close hit an
-    // UnsatisfiedLinkError. Same calling convention as the instance
-    // `FileDescriptor.close0()V` above — `args[0]` is the FileDescriptor
-    // either way (an explicit static parameter here vs. `this` there) —
-    // so the same handler applies unchanged.
+    // `sun/nio/ch/UnixDispatcher.close0(Ljava/io/FileDescriptor;)V` IS NOT
+    // REGISTERED HERE, and the deleted registration that used to sit at this
+    // point must not come back. It bound `native_fd_close0` — the body
+    // immediately above, which closes a `ctx.fd_table()` entry — to a triple
+    // whose receivers are NIO SOCKET descriptors, which this crate does not
+    // keep in the fd table at all. `net.rs` keeps them in `net_sockets()`, and
+    // `next_net_fd()` (net.rs, ~line 827) starts its counter at `0x4000_0000`
+    // with the stated reason "so there's no collision with the
+    // `FileDescriptorTable` counter". The two id spaces are therefore DISJOINT
+    // BY CONSTRUCTION: had this registration ever won, `FdTable::flush`/`close`
+    // would have missed on every socket id, the OS socket would have stayed
+    // open, and the only visible effect would have been `fd`/`handle` set to
+    // `-1` — a leak that reports success.
     //
-    // THIS REGISTRATION DOES NOT SURVIVE BOOT, and the paragraph above
-    // describes a callback that never runs (H5-1, 2026-08-20). It is the one
-    // cross-function duplicate in this crate whose two sites carry DIFFERENT
-    // callbacks: `net.rs`'s `register_sun_nio_ch_net` registers the same
-    // triple with `net_close`, and it runs LATER in the same boot —
+    // It never won. `net.rs`'s `register_sun_nio_ch_net` registers the same
+    // triple with `net_close`, and it runs LATER in the same boot:
     // `register_io_natives` reaches `nio_native::register_t16_channel_overrides`
     // hundreds of lines below this point, and that function's last statement is
-    // `crate::net::register_sun_nio_ch_net(r)`. `register()` is
-    // last-write-wins, so `net_close` owns the slot and `native_fd_close0`
-    // below is dead here.
-    //
-    // Independently MEASURED before this comment was written: see the
+    // `crate::net::register_sun_nio_ch_net(r)` — the only call site of it in
+    // the workspace. `register()` is last-write-wins, so `net_close` has always
+    // owned the slot. MEASURED before this comment was written: see the
     // `--dump-native-registry` note earlier in this file (2026-08-17,
-    // `--jdk-only`), which reports this exact registration with
-    // `owns_slot: false` and names `net.rs`'s registration as the winner. That
-    // note cites `native-io/src/net.rs:4188`; the line has since drifted to
-    // 4178 — grep for `"sun/nio/ch/UnixDispatcher"` in `net.rs` rather than
-    // trusting either number.
+    // `--jdk-only`), which reports the deleted registration with
+    // `owns_slot: false` and names `net.rs`'s as the winner.
     //
-    // Left in place rather than deleted: removing it is a pure no-op TODAY
-    // (the slot already holds `net_close`), but it is the only fallback if the
-    // `register_sun_nio_ch_net` call is ever gated. Whether `net_close`
-    // actually serves the MulticastSocket path this comment was written for is
-    // an open question that needs a run, not a source read.
-    registry.register_with_kind(
-        "sun/nio/ch/UnixDispatcher",
-        "close0",
-        "(Ljava/io/FileDescriptor;)V",
-        native_fd_close0,
-        NativeKind::Bridge,
-    );
+    // `net_close` is also the right winner on the merits, not merely the
+    // surviving one: it closes the `net_sockets()` entry the fd id actually
+    // names, and it is the sibling of the `preClose0` registration three lines
+    // below it in `net.rs`, which closes the SAME registry. A "fallback if
+    // `register_sun_nio_ch_net` is ever gated" — the reason the previous
+    // comment gave for leaving the dead line in place — would have been a
+    // fallback that leaks the socket, so there is nothing here worth keeping.
+    // Grep `"sun/nio/ch/UnixDispatcher"` in `net.rs` for the live rows rather
+    // than trusting a line number.
+    //
+    // What this does NOT answer, and a source read cannot: whether `net_close`
+    // actually serves the `java.net.MulticastSocket.close()` path the deleted
+    // registration was originally written for (H5-1 §10.N3). That still needs
+    // a run. H8-1, 2026-08-20.
 
     /// Platform `sockaddr_in`/`sockaddr_in6` ABI facts for the
     /// `sun.nio.ch.NativeSocketAddress` probes below. Unix reads them off
@@ -15367,15 +15417,45 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // RandomAccessFile = 2-field synthetic (fd=0, path=1).
     //
-    // DIAGNOSTIC GATE (CRATONVM_REAL_RAF=1): skip these synthetic natives so
+    // MODE GATE: when real-RAF is on, skip these synthetic natives so
     // `java.io.RandomAccessFile` runs its REAL JDK bytecode (real ctor ->
     // `new FileDescriptor(); open0(...)`, plus the native-io platform primitives
     // open0/read0/write0/seek0/...). The synthetic `<init>` otherwise shadows the
     // real ctor via native-override priority, leaving `this.fd` null. Real-RAF is
-    // required for DaCapo luindex (FSDirectory.sync -> RAF.getFD().sync()); it is
-    // gated rather than removed because the real ctor's FileCleanable/Cleaner/
-    // PhantomReference path still has a separate crash under sustained load that
-    // is being diagnosed (see crash_handler VEH). Default (unset) = synthetic.
+    // required for DaCapo luindex (FSDirectory.sync -> RAF.getFD().sync()).
+    //
+    // THREE CORRECTIONS to what this comment said until 2026-08-20 (H8-1):
+    //
+    //  1. The knob is `CRATONVM_SYNTHETIC_RAF=1`, not `CRATONVM_REAL_RAF=1`.
+    //     The latter is RETIRED — `types/tests/flag_declaration_guard.rs`
+    //     carries a row saying so, and `types/src/flag_groups.rs` declares
+    //     only `off_key: CRATONVM_SYNTHETIC_RAF`. Setting `CRATONVM_REAL_RAF`
+    //     does nothing at all.
+    //  2. "Default (unset) = synthetic" is backwards. `real_raf_enabled()` is
+    //     `!io_flags().synthetic_raf_forced`, so the DEFAULT is real-RAF and
+    //     this whole block is skipped unless the operator opts back in. The
+    //     doc comment on `real_raf_enabled` has said so since 2026-06-02;
+    //     these lines were never updated with it.
+    //  3. The block is not "gated rather than removed because the real ctor's
+    //     FileCleanable/Cleaner/PhantomReference path still has a separate
+    //     crash under sustained load that is being diagnosed". That crash is
+    //     FIXED — see the `real_raf_enabled` doc comment below and
+    //     app-jvm-bugs/real-raf-segv-root-cause.md, 2026-06-02 — and the same
+    //     doc comment calls the surviving synthetic path BROKEN and describes
+    //     the flag as an opt-in back into it. Whatever the reason for keeping
+    //     the block is, it is not the one stated here; this comment does not
+    //     invent a replacement.
+    //
+    // ONE OF THESE 18 TRIPLES USED TO ESCAPE THE GATE.
+    // `getFilePointer()J` is also registered by
+    // `random_access_file::register_random_access_file_natives`, called six
+    // lines after this function in `register_io_natives`, and that
+    // registration was unconditional — so this synthetic row was dead in BOTH
+    // settings of the flag and the synthetic arm's `getFilePointer()` answered
+    // a constant 0. The gate is now mirrored at that call site. It is the only
+    // one: the other nine rows over there are `open0`/`read0`/`readBytes0`/
+    // `write0`/`writeBytes0`/`seek0`/`length0`/`setLength0`/`initIDs`, and no
+    // name on this list matches any of them.
     if !real_raf_enabled() {
         let raf = "java/io/RandomAccessFile";
         registry.register(
