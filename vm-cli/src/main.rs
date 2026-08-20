@@ -160,11 +160,24 @@ fn maybe_dump_shutdown_reports() {
         // paid the helper's `is_object_address` walk. See
         // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
         eprintln!(
-            "[cratonvm] getfield helper calls: {} | CALL sites emitted by arm: {}",
+            "[cratonvm] getfield helper calls: {} (of which trusted-ref: {}) | CALL sites emitted by arm: {}",
             cratonvm_vm::jit::helpers::jit_getfield_helper_calls()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "<not counted>".to_string()),
+            cratonvm_vm::jit::helpers::jit_getfield_trusted_ref_calls(),
             cratonvm_jit::metrics::getfield_arm_emits()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // JIT-side only: these are the sites `helpers.rs` tags by hand. The
+        // whole-VM per-caller census that used to print beneath this was
+        // retired once it had answered — it cost 3.4x on ZGC, which is how
+        // the getfield page's first round of numbers came out wrong.
+        eprintln!(
+            "[cratonvm] membership walks by JIT site: {}",
+            cratonvm_vm::jit::helpers::membership_walks_by_site()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
                 .collect::<Vec<_>>()

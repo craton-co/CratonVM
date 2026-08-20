@@ -753,3 +753,175 @@ faithfully reported every legacy allocation that went through
 legacy receivers — because the TLAB fast path, ~99% of all allocations, does not
 call the planner. An absence in a census is only evidence if you know the census
 covers the path.
+
+## ZGC residual, part 1: stop asking `is_object_address` (2026-08-18, ~1.05x)
+
+The walk is **validation**, not correctness — it defends against a stale
+receiver from a miscompiled frame. Where the IR types the base node `Ref` we
+already have that proof; it is the same proof the PRIMITIVE trusted-oop arm
+relies on, and that arm goes further and does a raw inline load off the very
+same receiver. So the reference slow path now tells the helper to skip it.
+
+**This is not the thing the page refused to do.** The colouring hazard is about
+the loaded VALUE; containment validates the RECEIVER. Nothing here inlines a
+coloured load, publishes `JIT_REGION_BOUNDS`, or touches the inline path.
+
+Carried as a bit in `field_index` (`GETFIELD_RECEIVER_PROVEN_OOP`), not a new
+helper slot: `helpers_abi.rs` pins the table's field count, byte size and golden
+offsets with const assertions plus an ABI version, all so the offsets the JIT
+bakes cannot move. A first attempt added a slot and the guards refused it,
+correctly.
+
+| check | result |
+|---|---|
+| engagement | **34 470 791 of 34 470 791** helper calls take it — 100% |
+| checksum, all three collectors | **MATCH** |
+| ZGC wall, 3 interleaved rounds | 5708→5420, 5646→5448, 5653→5378 — **~1.05x** |
+| Generational / G1 | **0 helper calls** — unaffected, and measured so rather than argued |
+
+### Why only 5% when the walk profiled at 20.6%
+
+Because `getfield` was only about half of it. After the change:
+
+| symbol | before | after |
+|---|---|---|
+| `ZObjectStarts::contains` | 11.08% | **6.40%** |
+| `ZgcRealHeap::is_object_address` | 9.54% | **5.57%** |
+
+Roughly half the membership-walk traffic survives, from **other** helpers
+(`jit_putfield_*`, the array helpers) that still validate their receiver the
+same way. Extending the same proven-oop argument to them is the obvious next
+step and is not done here.
+
+**The Generational A/B rounds also moved (~2-6%) and that was noise**, not an
+effect: the engagement counter reads 0 helper calls there, so this change cannot
+reach it. Recorded because a 6% shift on a shared host is exactly the size that
+invites a false claim — on this page a configuration A/B has already produced
+one.
+
+### What now dominates on ZGC
+
+`try_jit_site_cached_native_dispatch` 8.81% + `safe_native_call_impl` 8.33% —
+per-call native dispatch, a different page — and `jit_getfield`'s own remaining
+body at 16.31%. The membership walk is no longer the single largest item.
+
+## Caller census for the surviving walks — it is NATIVE DISPATCH, not putfield
+
+`perf` could not answer this: DWARF unwinding on the optimized build returns
+self-recursive frames, and LBR is unavailable on the virtualised PMU. Grouping
+all 132 `is_object_address` call sites by enclosing function pointed at the
+native-dispatch path rather than the obvious `getfield` siblings, and counting
+confirmed it (SHA256Digest x200 000, ZGC):
+
+| site | membership walks |
+|---|---|
+| `decode_dispatch_values_into` | **5 495 224** |
+| `try_jit_site_cached_native_dispatch` | 439 463 |
+| `getfield` | **0** |
+
+Two things follow.
+
+**The getfield fix is complete on its own terms** — zero walks remain from that
+arm, where there were ~34 M.
+
+**`putfield` and the array helpers were the wrong suspects.** The surviving
+walker is the per-call native argument decode: ~27 walks per loop iteration,
+which is exactly the native-call count of this kernel (16 `Pack.bigEndianToInt`
+per block x 2 blocks, plus `SHA256Digest.processBlock`). **Every native call
+membership-walks each of its reference arguments.**
+
+That means "extend the proven-oop argument" and "per-call native dispatch" —
+listed as two separate follow-ups — are **one item**. It also means the SHA-256
+intrinsic landed for the bc-java PQC page pays this tax on every invocation, so
+the two pages meet here.
+
+The same trust argument should apply: the JIT knows these arguments are oops.
+That is the next fix, and it is **not** done here — this section is the census,
+not the change.
+
+### Caveat on the census's scope
+
+Only the JIT helpers in `vm/src/jit/helpers.rs` are tagged. `is_object_address`
+has 132 call sites across the VM; the GC's and the interpreter's are not
+counted, so these numbers are the JIT-side share and not the process total. Do
+not subtract them from a profile percentage and expect the remainder to be zero.
+
+## ZGC residual, part 2: validate ONCE per native accessor call (2026-08-20, 1.07x / 1.11x)
+
+The census above identified the surviving walker as per-call native argument
+decode. Following that: the `NativeContext` accessors were walking the SAME
+`ObjectRef` two and three times inside one call, with no safepoint between —
+`array_length` three times (its KINDOF-SENTINEL guard, then `load_and_forward`,
+then `kind_of`), `get_field`/`set_field` twice, the six bulk array helpers
+twice.
+
+`load_and_forward_checked` now reports whether the ref it hands back is a
+validated live base, and the accessors pass that proof to
+`class_id_of_validated` / `kind_of_validated` / `element_type_of_validated` /
+`load_and_forward_validated` instead of re-deriving it. The checked variant
+exists because `load_and_forward` returns its argument **unchanged** on a miss,
+so a trusted twin fed from the plain one would dereference a pointer nothing
+had checked. Every accessor still validates its own input independently, which
+is what the KINDOF-SENTINEL comments require; only the second and third
+validation of the same address inside one call goes away.
+
+**Walk count:** 64 248 919 -> 38 879 898, **-39.5%** against a predicted -38.8%.
+Checksum MATCHES on ZGC, Generational and G1.
+
+### The wall clock, which the count does not give you
+
+A walk count is not a time on this page — the getfield fix removed 34M walks and
+bought ~1.05x — so this landed with a count and no time, and that gap is now
+closed. `CRATONVM_GC_NO_VALIDATE_ONCE=1` makes every `*_validated` twin
+re-validate, restoring the two-and-three-walk behaviour, so the change is an A/B
+inside ONE binary rather than a comparison across two builds.
+
+`probes/Sha256WalkProbe.java` — bc-java's `SHA256Digest` over a 64-byte block,
+200 000 iterations after a 20 000-iteration warm-up, which is the same kernel
+the census above used and makes ~27 walks per iteration. Interleaved
+arm-by-arm, idle host, ms per run:
+
+| collector | validate-once ON | OFF | pairs won by ON |
+|---|---|---|---|
+| ZGC (default) | 1451 1333 1373 1335 1334 | 1565 1489 1427 1426 1409 | **5 of 5**, mean 1365 vs 1463 = **1.07x** |
+| Generational | 1263 1270 1257 1272 1256 | 1445 1390 1398 1376 1381 | **5 of 5**, mean 1264 vs 1398 = **1.11x** |
+
+The probe's checksum was byte-identical in all twenty runs, so the arms are
+computing the same thing. Generational moves too, and should: these accessors
+are collector-independent, unlike the getfield arms.
+
+**A contended-host read said the opposite.** The first Generational rounds were
+taken while a `cargo test` was running on the same host, and they had ON losing
+2 of 3 pairs (2478/1664/1284 against 2226/1391/1391 — note the first pair is
+nearly double the idle number, which is the tell). Idle, the same binary and the
+same command give 5 of 5 the other way. This page has already produced one false
+claim from a configuration A/B on a shared host; that is twice now, and the rule
+that catches it both times is *look at the absolute numbers, not just the
+direction* — a round that is 2x the idle time is not measuring the change.
+
+### The census that found this is retired
+
+The whole-VM `#[track_caller]` per-caller census in `gc/src/vm_heap.rs` is gone
+(`IS_OBJECT_ADDRESS_CALLS`, `note_accessor_call`, `note_census_site`,
+`is_object_address_callers`, and the `vm-cli` lines that printed them). It
+answered its question, and it was not free: an atomic increment plus an
+open-addressed probe on every walk, which is what inflated every ZGC number on
+this page by 3.4x before that was caught.
+
+What that costs: **the walk count above can no longer be read from a running
+VM.** `--diag` still prints "membership walks by JIT site", which is the
+hand-tagged JIT-side census and is what the engagement numbers on this page come
+from; it does not see `decode_dispatch_values_into` or anything else outside
+`helpers.rs`. If the whole-VM count is needed again it is in git history — the
+instrument is small, and the reason to rebuild it deliberately rather than leave
+it running is the 3.4x.
+
+### What is still open
+
+Unchanged by this: ZGC's **getfield** residual is still 56.9M helper calls, all
+`outside-published-bounds`, and still blocked on `feature-designs/zgc-jit-load-barrier.md`.
+A compact reference slot on ZGC holds `Z_COLORED_TAG | colour | offset` rather
+than a pointer, so inlining its load is the use-after-free that design exists to
+prevent. Nothing in this section touches the inline path, publishes
+`JIT_REGION_BOUNDS`, or inlines a coloured load — it removes redundant
+validation of a RECEIVER, which is the same argument part 1 made.

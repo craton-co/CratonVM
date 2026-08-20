@@ -1314,6 +1314,9 @@ pub const INVENTORY: &[E] = &[
     // has been untrue since the default flipped, and
     // `CRATONVM_GC=-young-pause-goal-ms` has no way to turn it off.
     E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: Some("0") },
+    // Default-ON: the key's PRESENCE makes the trusted `*_validated` header
+    // accessors re-validate, which is the pre-"validate once" behaviour.
+    E { group: Group::GC, token: "validate-once", on_key: None, off_key: Some("CRATONVM_GC_NO_VALIDATE_ONCE"), off_word: None },
     E { group: Group::REAL, token: "bytebuffer-intrinsic", on_key: Some("CRATONVM_BYTEBUFFER_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },
     // `CRATONVM_REAL` itself is the group variable, so it is not a row here.
