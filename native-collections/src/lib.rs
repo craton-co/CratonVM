@@ -2663,6 +2663,59 @@ fn native_unsorted_set_comparator(
 // abstract-interface registrations additionally decide dispatch for every USER
 // subclass, not just for `java.util` classes. Retag per subsystem, one PR each,
 // with schema-v2 `invocations` and `overwrote` evidence.
+//
+// ---------------------------------------------------------------------------
+// AND DO NOT FLIP THE *CLUSTER* EITHER — the missing half of `G88-1` §5.
+// (H4-1, 2026-08-20. Source census, no build; every number below is a grep.)
+//
+// `G88-1` §5 measured that retagging the whole map/set ownership cluster at
+// once — containers, view carriers, iterators, map entries, bulk ops — took
+// `RCollections`, `RJdkMapViews` and `RChmKeySetView` from broken to green,
+// and concluded the unit of work is the cluster rather than the registrar.
+// That is right as far as it goes. **It is not the whole boundary of the
+// cluster, because the cluster is not confined to Java dispatch.**
+//
+// Three producer populations write this crate's map/set state WITHOUT going
+// through `NativeMethodRegistry` at all, so refusing a registration under
+// `--jdk-only` does not stop them. `NativeKind` cannot reach any of them:
+//
+//   1. 168 DIRECT RUST CALLS into these natives from 18 files in two other
+//      crates — `native_map_put_pub` (42), `native_map_init` (34),
+//      `native_map_get_pub` (33), `native_map_contains_key_pub` (11),
+//      `native_map_remove_pub` (10), and eleven more. Largest holders:
+//      `native-builtins/src/phases_early.rs` (53),
+//      `phases_late/beans_jndi.rs` (42), `locale_resources.rs` (12),
+//      `phases_late/net_channels.rs` (12), `phases_late/xml_json.rs` (11),
+//      `reflect_annotations.rs` (10).
+//      Recipe: `grep -rn 'cratonvm_native_collections::native_map' --include=*.rs`.
+//   2. 45 `try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", n)` sites
+//      (plus 19 `HashSet`, 89 `ArrayList`, 4 `Hashtable`, 3 `Properties`)
+//      outside this crate. Each allocates under the REAL class id and then
+//      fills it through (1), so the object IS a real `java.util.HashMap`
+//      whose real `table` is null.
+//   3. 6 JIT direct helpers in `vm/src/jit/helpers.rs` that call
+//      `native_chm_get`, `native_hashmap_get_exact`, `native_hashmap_put_exact`
+//      and the two `jit_overlay_hashmap_*` entry points straight from compiled
+//      code, past dispatch and past the kind check entirely.
+//
+// The consequence is the one failure mode a green arm cannot see: after the
+// retag those objects are handed to REAL bytecode, which reads the real
+// (empty) `table` and answers "absent" — a silently empty map, not an error.
+// `G88-1` §5's three green vectors do not construct a map through any of the
+// 168 sites, which is why the experiment read as a success. Compare
+// `HANDOFF-20260819.md` §3: a gate whose stated population is wider than its
+// measured one always reads as success.
+//
+// So the cluster boundary is: **every writer of a container's state, in Java
+// dispatch AND in Rust.** Retiring the side state (`G88-1` N3) means migrating
+// those producers to real construction — `new_object_initialized("java/util/
+// HashMap", "()V", &[])` plus `invoke_virtual("put", …)` — BEFORE any tag
+// moves. That work is almost entirely outside this crate: 6 of the 168 call
+// sites are in files a `native-collections` change may touch.
+//
+// See `docs/known-issues/jdk-only/H4-1-the-cluster-that-is-not-a-tag-20260820.md`
+// for the full map, the per-family split, and the verification plan.
+// ---------------------------------------------------------------------------
 pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_gc_root_provider();
     let __prev_cat = registry.current_category();
@@ -5082,6 +5135,21 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
 /// `add(int, …)` are omitted for the same reason: a `Collection` has no
 /// positional access, and answering one would make the view act like the `List`
 /// it is no longer classed as.
+/// CLUSTER NOTE (H4-1, 2026-08-20). This registrar spans FOUR ownership
+/// families, and a retag of it as a unit is a partial retag of three of them.
+/// [`MAP_VIEW_CARRIERS`] holds `HashMap$Values` and
+/// `LinkedHashMap$LinkedValues` (the HashMap family), `TreeMap$Values` /
+/// `TreeMap$EntrySet` (minted by `register_tree_map_natives`, which nothing
+/// proposes to move), `Hashtable$ValueCollection` (minted by
+/// `register_properties_natives` and by `properties_sidetable.rs`) and
+/// `ConcurrentHashMap$ValuesView`.
+///
+/// A carrier is minted by a LIVE native with its list state at undeclared
+/// slots and `this$0` left null. Refuse this registrar's rows for a carrier
+/// whose producer is still `Bridge` and the real JDK body runs instead —
+/// `TreeMap$Values.size()` dereferences that null `this$0`. So the split has
+/// to be per carrier family, keyed on whether the producing registrar moved,
+/// not per registrar. See the block above `register_collections_natives`.
 fn register_map_view_carrier_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -16145,6 +16213,23 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
 ///
 /// `<init>` is deliberately absent: nothing constructs these, and a constructor
 /// native would fire for a JDK-built view too.
+/// CLUSTER NOTE (H4-1, 2026-08-20). Same four-family span as
+/// [`register_map_view_carrier_natives`], plus one extra edge that is easy to
+/// miss: the `iterator` row below is [`native_hs_iterator`], and it mints its
+/// result through [`key_itr_carrier_for`], which answers
+/// `java/util/HashMap$KeyIterator` for **every receiver that is not
+/// LinkedHashMap-shaped** — including `java/util/Hashtable$KeySet` and
+/// `Hashtable$EntrySet`, whose producers are not part of the HashMap cluster.
+///
+/// So the four [`MAP_KEY_ITR_CARRIERS`] cannot be refused while any
+/// `SET_VIEW_CARRIERS` entry outside the moving family is still `Bridge`: the
+/// live Hashtable carrier would mint a `HashMap$KeyIterator` whose natives are
+/// gone, and real `HashMap$HashIterator.hasNext()` would read a null `next`
+/// field and report an EMPTY iteration rather than fail. Moving them needs
+/// either the Properties/Hashtable cluster in the same commit, or a
+/// Hashtable-family iterator carrier of its own
+/// (`java/util/Hashtable$Enumerator` is what HotSpot actually answers here,
+/// and `deprecated_util.rs` already names it).
 fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -17433,6 +17518,13 @@ fn alloc_key_itr(
     try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS)
 }
 
+/// CLUSTER NOTE (H4-1, 2026-08-20). Two unrelated families in one registrar:
+/// `java/util/ArrayList$Itr` belongs to the ArrayList cluster (whose container
+/// registrar is untouched), the [`MAP_KEY_ITR_CARRIERS`] block to the HashMap
+/// one. Retagging this function as a unit is therefore a partial retag of
+/// ArrayList — `G88-1` §5 did exactly that and its vectors did not ask.
+/// The `MAP_KEY_ITR_CARRIERS` half additionally has the Hashtable edge
+/// described on [`register_set_view_carrier_natives`].
 fn register_iterator_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -41425,6 +41517,13 @@ fn native_stack_search(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // Collection bulk operations (addAll, removeAll, retainAll)
 // ===========================================================================
 
+/// CLUSTER NOTE (H4-1, 2026-08-20). Eight registrations over FIVE containers —
+/// `ArrayList`, `HashSet`, `LinkedList`, `Vector`, `ArrayDeque`. Only the three
+/// `HashSet` rows belong to the map/set ownership cluster; the other five
+/// belong to containers nothing proposes to move. A whole-registrar retag
+/// refuses `ArrayList.removeAll` while `register_arraylist_natives` still owns
+/// the elements, which is the partial retag `G88-1` §5 warns about, one level
+/// down from where it looked for it.
 fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -50434,6 +50533,47 @@ fn native_chm_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     result
 }
 
+/// CLUSTER NOTE (H4-1, 2026-08-20) — **this is the map/set family closest to
+/// being movable, and the exact list of what still blocks it.**
+///
+/// Its carriers are minted by nothing else: `ConcurrentHashMap$KeySetView`
+/// only by `alloc_key_set_view_object` here, `$ValuesView` only by
+/// [`native_chm_values`], `$EntrySetView` only by [`native_chm_entry_set`], and
+/// its iterators go through those views rather than through
+/// [`MAP_KEY_ITR_CARRIERS`]. It also has the one `java.util` container whose
+/// real JDK constructor body is EMPTY, so a `try_alloc_concurrent_synthetic`
+/// object under the real class id is a legitimate freshly-constructed
+/// `ConcurrentHashMap` to real bytecode (contrast `HashMap()`, which must set
+/// `loadFactor`). So the cluster is `ConcurrentHashMap` + the three views +
+/// `register_chm_key_set_view_natives`, and it is closed under minting.
+///
+/// Three things must land in the SAME commit as any retag of it:
+///
+/// 1. **Keep the `java/util/concurrent/ConcurrentMap` rows `Bridge`.** They are
+///    at the tail of this function (`size`/`get`/`put`/`remove`/`containsKey`)
+///    and they are INTERFACE registrations: they answer the no-`Code` door for
+///    receivers whose own class declares nothing, which is not a
+///    ConcurrentHashMap question. Refusing them turns that door into an
+///    `AbstractMethodError`. Wrap them in an inner
+///    `r.with_category(NativeKind::Bridge, …)` window.
+/// 2. **`vm/src/jit/helpers.rs`.** `jit_concurrent_hashmap_get_direct` calls
+///    [`native_chm_get`] as a plain Rust function from compiled code, past
+///    dispatch and past the kind check. After the retag the interpreter would
+///    read the real `table` and the JIT the (now unwritten) side segments, so
+///    a hot loop would start answering null for keys the map holds — a
+///    divergence no arm asks about, because `run.sh` does not diff tiers.
+///    The bind site must be gated on the policy, or the helper deleted.
+/// 3. **A `--dump-native-registry` diff** proving all four class rows moved
+///    from `bridge` to `synthetic-stub` and that `ConcurrentMap`'s five did
+///    not (`G85-1`: an inner `set_category` silently overrides a call-site
+///    wrapper, and six retags written that way were inert).
+///
+/// Pre-flight it for free on the CURRENT binary before building anything:
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ConcurrentHashMap`
+/// over the 36-vector screen (`HANDOFF-20260819.md` §2). The dial yields to
+/// bytecode where bytecode exists, which is the same verdict a refusal gives
+/// for every concrete row here; it differs only on the abstract-interface
+/// rows, i.e. exactly the ones (1) says to keep.
 fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -55360,6 +55500,38 @@ fn alloc_unmod_wrapper(
 /// `copyOf` factories) — an unmodifiable wrapper with the [`UNMOD_FIELD_IMMUTABLE`]
 /// marker set, so `getClass()` reports the `java.util.ImmutableCollections$*`
 /// family rather than `Collections$Unmodifiable*`.
+///
+/// # `H0-2` §4's twelve `instanceof` cells cannot be fixed by a retag
+///
+/// H4-1, 2026-08-20, source-verified. `H0-2` §5 proposes moving the map/set
+/// cluster so that "`Map.of(...)` returns a real `ImmutableCollections$Map1`
+/// and `is_subclass_of` walks a real chain". A `NativeKind` change cannot do
+/// that, in either direction:
+///
+/// * **In `--jdk-only` the producers are ALREADY refused.** Every allocator of
+///   a `cratonvm/internal/Unmodifiable*` — `register_factory_natives`
+///   (`set_category(SyntheticStub)` at its own head), the six `unmodifiable*`
+///   rows in `register_collections_extras_natives` (explicit inner
+///   `SyntheticStub` window) and the three `copyOf` rows (explicit
+///   `register_with_kind(..., SyntheticStub)`) — is dropped by
+///   `NativeMethodRegistry::register_inner`'s `JdkOnly` refusal arm, so strict
+///   mode never reaches this function and already answers all twelve cells
+///   from real bytecode. `HANDOFF-20260819.md` §6 records the corroborating
+///   arm result: `RImmutableFactoryTypes` is one of the SUITE=all five and the
+///   `--jdk-only` arm over the same 102 vectors is 102/102.
+/// * **In `Compatible` the kind is discarded.** `NativeKind::allowed_in`
+///   returns an unconditional `true` for `Compatible`, and the only
+///   Compatible-mode kind test is `invoke_or_native`'s `real_protected_stub`
+///   arm, gated on `real_protected_stub_class` — a twelve-entry allow-list
+///   that contains no `java/util` collection and no `cratonvm/internal/*`
+///   class. So no tag on any registrar changes what this function does under
+///   `--real-jdk`.
+///
+/// Restated as the rule: `HANDOFF-20260819.md` §1's trap runs both ways.
+/// Retiring stubs moves compatible mode by zero; **retagging moves compatible
+/// mode by zero too.** `H0-2` §4 is a compatible-mode measurement, so its
+/// remedy has to be a compatible-mode change — retiring this carrier at its
+/// producers, or `P4A` N1b option (c). Not a tag.
 fn alloc_immutable_wrapper(
     ctx: &mut dyn NativeContext,
     class_name: &str,

@@ -10609,6 +10609,28 @@ pub fn register_essential_natives_with_shims(
         essential_quarkus_locale_convert,
     );
 
+    // CLUSTER ROOT (H4-1, 2026-08-20) — the first note written in this file
+    // after contract §8's ban was lifted for wave 2, and it is a "do not start
+    // here" rather than a change.
+    //
+    // This registration is the entry point of the Properties/Hashtable
+    // state-ownership cluster `G88-1` §6 stopped on. The object below is a
+    // synthetic `Properties` whose inherited `map` ConcurrentHashMap is
+    // permanently null, and every `Properties.*` native in
+    // `properties_sidetable.rs` exists to make it behave like a Map at all.
+    // Retag those `SyntheticStub` and `register_inner`'s `JdkOnly` arm drops
+    // them, which reproduces the 2026-07-14 regression on purpose:
+    // `InternalError: null property: java.home` from `java.util.Locale
+    // .<clinit>`. So the cluster's first move is to make THIS return a real
+    // `Properties` — real `<init>`, real `map` — not to move a tag.
+    //
+    // `G88-1` §6 named contract §8 as the structural blocker on the ground
+    // that the larger half of the cluster lives in this file. Measured
+    // 2026-08-20: registrations whose TARGET class is `java/util/Properties`
+    // or `java/util/Hashtable` in `native-builtins/src/lib.rs` number **zero**
+    // — the 67 are in `properties_sidetable.rs` (32), `deprecated_util.rs`,
+    // `deprecated_io_util.rs` and `wildfly_naming.rs`. The full table and the
+    // rest of the cluster are on `register_properties_sidetable`.
     registry.register(
         "java/lang/System",
         "getProperties",
