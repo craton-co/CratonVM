@@ -881,6 +881,41 @@ pub struct GcFlags {
     /// deliberately not gated on this flag — the counters report the rate in
     /// both arms.
     pub g1_coverage_pin: bool,
+    /// `CRATONVM_G1_PIN_EMPTY_PUBLICATION` — **diagnostic bisection lever,
+    /// default OFF.** Make G1 refuse to evacuate on any pause that runs with a
+    /// live compiled frame and an EMPTY conservative JIT root publication, by
+    /// forcing an empty collection set.
+    ///
+    /// The state it detects is a real defect: with `jit_active=true`,
+    /// `pin_addrs=0` is being consumed as "there are no JIT roots" when it
+    /// actually means "the conservative scan found none", which is unknown, not
+    /// none. Evacuating against it is what moved a live
+    /// `StringLatin1.newString` reference out from under a compiled frame
+    /// (`bug-g1-evacuates-live-jit-reference-20260819.md`).
+    ///
+    /// **It ships OFF because refusing does not fix that, it only relocates the
+    /// symptom — measured, not assumed.** On the failing test itself
+    /// (`PolynomialTest`, `-XX:+UseG1GC --Xmx 1g`) the empty publication is not
+    /// a transient sampling artifact but a standing property of the compiled
+    /// frame, so every retry re-enters the same state: 1444 consecutive refused
+    /// pauses, nothing reclaimed, and the run ends in
+    /// `OutOfMemoryError: Java heap space` on 8 tests instead of the original
+    /// wrong answer on 1. A refusal can only buy time for a publication that
+    /// becomes non-empty, and this one never does.
+    ///
+    /// What it IS good for, and where it beats [`Self::g1_coverage_pin`]:
+    /// discrimination. That lever fires on ~99.99% of pauses, so a failure
+    /// surviving it says little. This one fires only on the precise state, so
+    /// flipping it turns the `PolynomialTest` corruption into a *different*
+    /// failure — which is what identifies evacuation-under-an-empty-publication
+    /// as the cause rather than merely a correlate.
+    ///
+    /// The DETECTION counter
+    /// (`gc_metrics::record_g1_pause_empty_jit_publication`) is deliberately
+    /// NOT gated on this flag, so a normal run still reports how often the
+    /// unsafe state occurs. That rate is the thing to watch; the refusal is
+    /// not the fix.
+    pub g1_pin_empty_publication: bool,
     /// `CRATONVM_G1_WORKERS` — override the G1 worker count, clamped to `>= 1`.
     /// [`parse::usize_min1`].
     pub g1_workers: Option<usize>,
@@ -1066,6 +1101,7 @@ impl GcFlags {
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
+            g1_pin_empty_publication: present(src, "CRATONVM_G1_PIN_EMPTY_PUBLICATION"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
             gc_sweep_anchor_stride: usize_opt(src, "CRATONVM_GC_SWEEP_ANCHOR_STRIDE")
                 .filter(|&n| n >= 64)

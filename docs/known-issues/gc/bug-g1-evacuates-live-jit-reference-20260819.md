@@ -116,16 +116,117 @@ cratonvm --java-home <jdk25> -XX:+UseG1GC --Xmx 1g \
 ~100s, deterministic. `CRATONVM_JIT_DENY=java/lang/StringLatin1.newString`
 turns it green; `--Xmx 8g` turns it green; `-XX:+UseZGC` turns it green.
 
+## Candidate 1 is measured, and it does not work
+
+> **Refuse to evacuate when the publication cannot be trusted.** If
+> `jit_active` and the pin set is empty, run the pause mark-only.
+
+Built and measured (`CRATONVM_G1_PIN_EMPTY_PUBLICATION`, default OFF).
+`G1Collector::empty_jit_publication` detects the state — a compiled frame is
+live (`gc_quiescence::is_active()`, or the A5 unregistered-frame detector) and
+both pin vocabularies are empty — and `collect_garbage` returns an empty
+collection set. That is G1's only production entry to `young_collection` and
+`mixed_collection` (the trait impl has no separate full-GC or compaction
+method), so one refusal covers every path that could move the object.
+
+It stops the corruption and it is still not a fix:
+
+| arm | runs | outcome |
+|---|---|---|
+| pristine `684f37e14` | 6 | `IllegalFormatConversionException: d != java.lang.Object` |
+| + refusal | 7 | **no format exception** — `Tests run: 14, Failures: 0, Errors: 8`, every error `OutOfMemoryError: Java heap space` |
+| + refusal, lever off (`same binary`) | 2 | `IllegalFormatConversionException` returns |
+
+ABBA-interleaved, 3 rounds, on azure host 2. The third row is the control that
+matters: the same binary with the lever flipped reproduces the original failure,
+so the refusal — not the rebuild — is what changed the outcome.
+
+**Why it fails: the empty publication is a standing property of that frame, not
+a sample.** A refused pause reclaims nothing, so the next allocation re-triggers
+a pause that is still inside the same compiled frame and still publishes
+nothing. Under `CRATONVM_G1_DBG_PINS` the fix arm shows **1444 consecutive**
+
+```text
+[g1][PINS] pause REFUSED: jit_active=true unregistered_frame=false pin_addrs=0 tlab_skips=0 -> empty CSet
+```
+
+and then dies of heap exhaustion. This is precisely the failure mode
+`CRATONVM_G1_COVERAGE_PIN` was measured to have (330264 no-op pauses for a run
+needing one collection), reached from a completely different predicate. A
+refusal can only buy time for a publication that later becomes non-empty; this
+one never does.
+
+So candidate 1 trades a wrong answer on 1 test for an `OutOfMemoryError` on 8.
+It ships OFF.
+
+## What the lever IS good for: it discriminates, and `COVERAGE_PIN` does not
+
+The predicate is narrow in exactly the way the coverage one is not. Measured
+with the base binary and `CRATONVM_G1_DBG_PINS=1`, counting only pauses taken
+with a compiled frame live (`young_collection`'s serial arm — the parallel arm
+is gated on `!is_active()`, so an in-JIT pause is always the instrumented one):
+
+| workload | in-JIT pauses | of those, `pin_addrs=0` |
+|---|---|---|
+| `MovingYoungConcurrentProbe 6 400 2000`, `--Xmx 256m` | 1 | **0** (`pin_addrs=18`) |
+| `MovingYoungConcurrentProbe 6 400 2000`, `--Xmx 128m` | 2 | **0** (`pin_addrs=18`) |
+| `PolynomialTest`, `--Xmx 1g` | 1 | **1** |
+
+On the same probe, `moving_young_coverage_incomplete()` — what `COVERAGE_PIN`
+gates on — is true for 330263 of 330264 pauses. So the coverage lever cannot
+tell these two workloads apart at all, while this predicate separates them
+cleanly: the conservative scan is *working* on the probe (18 addresses
+published per pause) and publishing *nothing* on the failing test.
+
+That is the useful result. It narrows candidate 2 from "the contract in
+`conservative_roots`'s header is false" to "the contract holds for the compiled
+frames on this probe and fails for this one", which is a far smaller thing to
+go and find.
+
+Detection is therefore counted on **every** run, not just under the lever:
+`gc_metrics::record_g1_pause_empty_jit_publication`, surfaced as
+
+```text
+[GC] g1 jit publication: pauses=N empty_while_in_jit=K (y%)
+```
+
+next to the existing `[GC] g1 root coverage:` rate (`CRATONVM_GC_STATS=1`), plus
+a throttled `tracing::warn!`. A non-zero count there is a pause that evacuated
+against a root set it could not prove — worth knowing even on a run that is not
+refusing. The two refusals also carry distinct decision reasons
+(`g1-no-evacuation-empty-jit-publication` vs
+`g1-no-evacuation-root-coverage-incomplete`) and distinct degrade bits, so the
+rare one is never triaged as the normal one.
+
+**What the predicate does not catch.** Both halves are process-wide.
+`is_active()` is a striped global depth with no thread identity and the pin map
+is summed across threads, so it actually asks "some thread is in JIT and *no*
+thread published anything". A peer in JIT that published nothing is invisible
+once any other thread published one address. Narrower than the hole it closes,
+and not what this failure was (`pin_addrs=0` was the process-wide total) — but
+another reason to prefer repairing the scan over widening the predicate.
+
 ## Candidate fixes, in increasing ambition
 
-1. **Refuse to evacuate when the publication cannot be trusted.** If
-   `jit_active` and the pin set is empty, run the pause mark-only. Minimal,
-   restores the generational collector's stance, and costs throughput on every
-   JIT-triggered pause whose frame genuinely holds nothing — needs measuring
-   before it is defaulted on.
+1. ~~**Refuse to evacuate when the publication cannot be trusted.**~~
+   **Measured and closed off as a default** — see above. Kept as
+   `CRATONVM_G1_PIN_EMPTY_PUBLICATION`, default OFF, because it discriminates
+   where `CRATONVM_G1_COVERAGE_PIN` cannot.
 2. **Make the conservative scan cover what it claims to.** Find why this frame's
-   reference is not at an 8-byte aligned spill slot the scan walks. This is the
-   real fix; the contract in `conservative_roots`'s header is the thing that is
-   false.
+   reference is not at an 8-byte aligned spill slot the scan walks. **Open, and
+   now the only candidate that can actually fix this.** Newly scoped by the
+   table above: the scan publishes 18 addresses per in-JIT pause on
+   `MovingYoungConcurrentProbe` and zero on this one, so the question is what is
+   different about *this* compiled frame, not whether the contract holds in
+   general.
 3. Precise oop maps for JIT frames under G1, which the module header already
-   names as the eventual answer.
+   names as the eventual answer. **Open.**
+
+## Repro of the measurement
+
+```bash
+# both arms, from the same base commit
+/data/h2ki-build.sh      # -> /data/tgt-h2ki-{base,fix}/release/cratonvm
+/data/h2ki-run.sh        # -> /data/h2ki-run/results.tsv  (ABBA + controls)
+/data/h2ki-rate2.sh      # -> /data/h2ki-rate/summary2.txt (empty-publication rate)
+```

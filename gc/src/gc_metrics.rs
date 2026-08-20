@@ -662,9 +662,23 @@ pub mod decision_reason {
     /// young sweep to divert *to*, so the fail-safe is an empty collection
     /// set: the pause reclaims nothing and every object stays at its address.
     pub const NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE: u8 = 10;
+    /// G1 declined to evacuate anything this pause because a compiled frame was
+    /// live and the conservative JIT root publication was EMPTY.
+    ///
+    /// Distinct from [`NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE`], and the
+    /// distinction is the whole point. That one means "the roots were
+    /// enumerated but are not rewritable" — the normal state under G1, true on
+    /// ~99.9% of pauses, and the reason its refusal is an opt-in lever. This
+    /// one means the scan published *nothing at all* while a compiled frame was
+    /// running, so `pin_addrs=0` cannot be read as "there are no JIT roots"; it
+    /// reads as "the scan found none", which is unknown, not none. An empty
+    /// publication and a genuinely reference-free compiled frame are
+    /// indistinguishable where the CSet is built, and only one of them is safe
+    /// to evacuate. See `G1Collector::empty_jit_publication`.
+    pub const NON_MOVING_G1_EMPTY_JIT_PUBLICATION: u8 = 11;
 
     /// One past the highest defined code.
-    pub const COUNT: u8 = 11;
+    pub const COUNT: u8 = 12;
 
     /// Human-readable label.
     pub fn label(code: u8) -> &'static str {
@@ -680,6 +694,7 @@ pub mod decision_reason {
             NON_MOVING_BACKEND_HAS_NO_YOUNG_COPY => "nonmoving-backend-has-no-young-copy",
             MOVING_BACKEND_ALWAYS_EVACUATES => "moving-backend-always-evacuates",
             NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE => "g1-no-evacuation-root-coverage-incomplete",
+            NON_MOVING_G1_EMPTY_JIT_PUBLICATION => "g1-no-evacuation-empty-jit-publication",
             _ => "unknown",
         }
     }
@@ -1006,6 +1021,18 @@ pub fn collector_decision_report() -> String {
             "[GC] g1 root coverage: pauses={g1_pauses} incomplete={g1_incomplete}              ({:.2}%)",
             100.0 * g1_incomplete as f64 / g1_pauses as f64,
         ));
+        // The narrow sibling of the line above, and the one that can actually
+        // select: how often a pause ran with a compiled frame live and NOTHING
+        // published to pin. Those are the pauses the fail-safe refuses, so this
+        // rate IS the cost of the fail-safe. Printed alongside so the two are
+        // never read as the same number — `incomplete` near 100% is normal,
+        // `empty_publication` above a trickle is not.
+        let empty_pub = g1_empty_jit_publication_count();
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 jit publication: pauses={g1_pauses} empty_while_in_jit={empty_pub} ({:.2}%)",
+            100.0 * empty_pub as f64 / g1_pauses as f64,
+        ));
     }
     // I-6 coverage. Printed whenever the verifier ran at all, including the
     // budgeted release pass, because the interesting reading is `objects`: a
@@ -1101,6 +1128,15 @@ pub mod g1_degraded {
     /// [`EMPTY_COLLECTION_SET`]; it distinguishes "there was nothing to
     /// collect" from "the collector was not allowed to collect".
     pub const ROOT_COVERAGE_INCOMPLETE: u32 = 1 << 9;
+    /// The collection set was forced empty because a compiled frame was live
+    /// and the conservative JIT root publication was empty, so no region could
+    /// be proven free of an object the scan never saw. Always accompanies
+    /// [`EMPTY_COLLECTION_SET`]. Distinct from [`ROOT_COVERAGE_INCOMPLETE`]:
+    /// that bit says the roots are not rewritable, this one says there were no
+    /// roots to rewrite *and a compiled frame was running*, which is the state
+    /// that let a live `StringLatin1.newString` reference get evacuated out
+    /// from under a JIT frame (`docs/known-issues/gc/`).
+    pub const JIT_PUBLICATION_EMPTY: u32 = 1 << 10;
 
     /// Every defined bit. A flag outside this mask is a programming error and
     /// is rejected by `record_g1_cycle`'s `debug_assert!`.
@@ -1113,7 +1149,8 @@ pub mod g1_degraded {
         | JIT_PINNED_REGIONS_EXCLUDED
         | PARALLEL_EVACUATOR
         | EMPTY_COLLECTION_SET
-        | ROOT_COVERAGE_INCOMPLETE;
+        | ROOT_COVERAGE_INCOMPLETE
+        | JIT_PUBLICATION_EMPTY;
 
     /// Stable labels, lowest bit first. A new flag cannot be added without a
     /// label — `every_g1_degraded_flag_has_a_label` pins that.
@@ -1135,6 +1172,7 @@ pub mod g1_degraded {
             (PARALLEL_EVACUATOR, "parallel-evacuator"),
             (EMPTY_COLLECTION_SET, "empty-collection-set"),
             (ROOT_COVERAGE_INCOMPLETE, "root-coverage-incomplete-no-evacuation"),
+            (JIT_PUBLICATION_EMPTY, "jit-publication-empty-no-evacuation"),
         ];
         TABLE
             .iter()
@@ -1284,6 +1322,30 @@ pub fn g1_pause_coverage_counts() -> (u64, u64) {
         G1_PAUSES.load(Ordering::Relaxed),
         G1_PAUSES_COVERAGE_INCOMPLETE.load(Ordering::Relaxed),
     )
+}
+
+static G1_PAUSES_EMPTY_JIT_PUBLICATION: AtomicU64 = AtomicU64::new(0);
+
+/// Count one G1 STW collection that ran with a live compiled frame and an EMPTY
+/// conservative JIT root publication.
+///
+/// Recorded on DETECTION, not on refusal, and deliberately not gated on the
+/// opt-in `CRATONVM_G1_PIN_EMPTY_PUBLICATION` lever: a pause in this state
+/// evacuated against a root set it could not prove, which is worth counting on
+/// a normal run precisely because the shipped default does not decline it.
+///
+/// Contrast `record_g1_pause_coverage`, whose rate is ~100% and therefore
+/// selects nothing. This one discriminates — measured 0 of 3 in-JIT pauses on
+/// `MovingYoungConcurrentProbe` (which publishes 18 addresses per pause) and 1
+/// of 1 on the `PolynomialTest` failure.
+pub fn record_g1_pause_empty_jit_publication() {
+    G1_PAUSES_EMPTY_JIT_PUBLICATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Pauses that ran with a live compiled frame and an empty JIT root
+/// publication. Denominator is `g1_pause_coverage_counts().0`.
+pub fn g1_empty_jit_publication_count() -> u64 {
+    G1_PAUSES_EMPTY_JIT_PUBLICATION.load(Ordering::Relaxed)
 }
 
 pub fn record_g1_cycle(
