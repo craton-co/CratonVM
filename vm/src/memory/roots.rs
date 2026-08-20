@@ -971,7 +971,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         eprintln!(
             "[jitroots] precise_only={precise_only} moving_young={moving_young} \
              osr_fb={osr_fb} incomplete={incomplete} chain={chain} any_jit={any_jit} \
-             scan_added={added} is_g1={is_g1} frames={labels:?}",
+             scan_added={added} is_g1={is_g1} ybounds={ybounds} frames={labels:?}",
             precise_only = moving_young_precise_only,
             osr_fb = moving_young_osr_fallback,
             incomplete = cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete(),
@@ -979,6 +979,12 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             any_jit = crate::jit::conservative_roots::any_thread_in_jit(),
             added = roots.len() - jit_scan_start,
             is_g1 = shared.mem.heap.is_g1(),
+            // Whether `gen_heap::JIT_REGION_BOUNDS` carries a young pair at
+            // all. It is what the moving-young frame-band verifier's residency
+            // test reads, so `ybounds=false` means that verifier inspected the
+            // bands and classified nothing as young — a vacuous pass, not a
+            // clean frame. See `published_young_regions_are_live`.
+            ybounds = cratonvm_gc::gen_heap::published_young_regions_are_live(),
         );
     }
 
