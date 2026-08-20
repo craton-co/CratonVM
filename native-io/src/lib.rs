@@ -5820,7 +5820,9 @@ fn native_scanner_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // receivers whose resolved declaring class IS the interface, which bounds
     // this to synthetic objects typed as bare Closeable/AutoCloseable rather
     // than to user classes — but "only corrupts synthetic receivers" is not a
-    // guarantee worth keeping.
+    // guarantee worth keeping. (That sentence was a premise in a comment with
+    // nothing behind it — `[comment != link]`. It is now backed, and it is if
+    // anything too weak: see "WHAT REACHES THIS BRANCH TODAY" below.)
     //
     // The `object_num_fields(this) > SCAN_FIELD_CLOSED` shape this replaces was
     // the wrong question, and the same wrong question that made three other
@@ -5829,9 +5831,55 @@ fn native_scanner_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // flag by NAME does not fix that either — plenty of `java.io` classes
     // declare a field called `closed`. Ask what the receiver actually IS;
     // `java.util.Scanner` is final, so an exact class match is exact.
+    //
+    // THE DECLINE USED TO BE `Ok(None)`, AND THAT IS NOT A DECLINE.
+    // `Ok(None)` is a COMPLETED void call: the registry has already taken the
+    // call away from the bytecode, so returning it means "close() ran and did
+    // nothing". For a non-`Scanner` receiver that is a resource leak reported
+    // as success, which is worse than the field corruption the guard was added
+    // to stop — `[decline masks]`. `MethodCallResult` carries no
+    // "fall through" value, so the yield has to be performed rather than
+    // signalled: `invoke_virtual_bytecode_only` re-dispatches on the RECEIVER
+    // with the native check skipped, which is the same mechanism
+    // `direct_buffer.rs`'s wide accessors use to bail to the class-file body,
+    // and it cannot re-enter this native. H8-1, 2026-08-20.
+    //
+    // Two receivers still get `Ok(None)`, because for them there is no
+    // bytecode to yield TO and delegating would replace a silent no-op with a
+    // hard failure:
+    //
+    //   * an INTERFACE-typed receiver (a fabricated object stamped
+    //     `java/io/Closeable` or `java/lang/AutoCloseable` itself) — the only
+    //     `close()V` in its hierarchy is the abstract declaration, and
+    //     executing that is `[abstract recv]`, not a close;
+    //   * a receiver whose class resolves no `close()V` at all, which would
+    //     raise `NoSuchMethodError` out of a `close()`.
+    //
+    // WHAT REACHES THIS BRANCH TODAY: as far as a source read can tell,
+    // nothing. `java.util.Scanner` is final, and the two interface doors this
+    // handler is registered on (`java/io/Closeable.close()V`,
+    // `java/lang/AutoCloseable.close()V` at the foot of
+    // `register_scanner_natives` — the ONLY registrations of either triple in
+    // the workspace) are instance methods on an interface, the exact shape
+    // BOTH dispatch guards skip: `invoke.rs`'s step-6
+    // `!(declaring_is_interface && !is_static)` and `vm_exec.rs`'s
+    // `override_cb` arm. Neither name appears in
+    // `should_force_registered_native_over_bytecode`'s force list. So the
+    // guard is a backstop for a door that does not currently open, and this
+    // change makes the backstop correct instead of quietly destructive; it is
+    // NOT a fix for an observed leak. If the doors are ever force-routed, or
+    // if a fabricated receiver is ever stamped `java/util/Scanner`, the
+    // delegation is what keeps `close()` meaning close.
     let class_id = ctx.class_id_of_object(this);
-    if ctx.class_name_arc_of_id(class_id).as_deref() != Some("java/util/Scanner") {
-        return Ok(None);
+    let class_name = ctx.class_name_arc_of_id(class_id);
+    if class_name.as_deref() != Some("java/util/Scanner") {
+        let Some(name) = class_name else {
+            return Ok(None);
+        };
+        if ctx.is_interface_class(class_id) || !ctx.method_exists(&name, "close", "()V") {
+            return Ok(None);
+        }
+        return ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]);
     }
     scan_set_closed(ctx, this, true);
     // Drop the input text. Every read path treats a missing entry as closed and
