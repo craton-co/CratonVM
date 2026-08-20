@@ -1386,6 +1386,42 @@ fn channel_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // already bridges elsewhere. Likely disposition is "move down a layer or
 // delete", but that needs `invocations` to confirm nothing depends on the
 // current placement.
+//
+// CENSUS TAKEN 2026-08-20 (H11). The `invocations` this comment asked for, from
+// `--dump-native-registry` on `fe59bf9d9` under `--jdk-only`, driving a real
+// `Pipe.open()` + `write` + `read` + `close` through `Pipe.SinkChannel`- and
+// `Pipe.SourceChannel`-TYPED locals (so the constant-pool class at every call
+// site is the ABSTRACT nested class):
+//
+//     sun/nio/ch/SourceChannelImpl.read(Ljava/nio/ByteBuffer;)I   invocations: 1
+//     sun/nio/ch/SinkChannelImpl.write(Ljava/nio/ByteBuffer;)I    invocations: 1
+//     sun/nio/ch/{Source,Sink}ChannelImpl.close()V                invocations: 1
+//     java/nio/channels/Pipe$SourceChannel.read(…)I               invocations: 0
+//     java/nio/channels/Pipe$SinkChannel.write(…)I                invocations: 0
+//     java/nio/channels/Pipe$SourceChannel.close()V               invocations: 0
+//     java/nio/channels/Pipe$SinkChannel.close()V                 invocations: 0
+//
+// and `pipe.source().getClass().getName()` answers `sun.nio.ch.SourceChannelImpl`
+// on CratonVM, the same string HotSpot 25.0.3+9 gives. So `pipe_open`'s choice
+// to allocate the two `Impl` classes (below, ~line 1024) is the right one and
+// this family is ALREADY "in the right place" — it is not an instance of the
+// P1 row's "bridges on the abstract public API".
+//
+// The six abstract rows are consequently DEAD WEIGHT for every receiver this VM
+// mints. **Do not delete them from this file on that basis alone.**
+// `native-builtins/src/phases_late/net_channels.rs` (~2281–2400) registers the
+// SAME six triples with a DIFFERENT implementation — its callbacks read the fd
+// from field slot 1 and the open flag from slot 0, a layout unrelated to this
+// module's. Today this file wins the slot (`owns_slot: true` on all six).
+// Deleting these lines does not remove the registrations; it hands them to an
+// incompatible body. `[2 producers, 1 slot]` / `[dup nati]`. Retiring them is a
+// single commit spanning both crates, with a build.
+//
+// The one population that CAN still reach these rows is an application subclass
+// of `Pipe.SourceChannel` / `Pipe.SinkChannel` (both constructors are
+// `protected`): its receiver carries the user's class name, declares none of
+// these methods, and `try_stackless_invoke`'s superclass walk then finds the
+// abstract row and hijacks it. That is a hazard, not a service.
 /// Register the WP3.7 Pipe natives.  Idempotent.
 pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -1422,8 +1458,17 @@ pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
         channel_configure_blocking,
     );
 
-    // Abstract SourceChannel — same implementations, different
-    // declared class so Java-side dispatch lands here either way.
+    // Abstract SourceChannel — same implementations, different declared class.
+    //
+    // CORRECTION 2026-08-20 (H11): this comment used to end "so Java-side
+    // dispatch lands here either way". It does not. Dispatch keys on the
+    // RECEIVER's runtime class, which for every pipe this VM opens is
+    // `sun/nio/ch/SourceChannelImpl` (see `pipe_open`), and the rows above
+    // answer. MEASURED at `invocations: 0` for all three of these while the
+    // `Impl` rows took the calls — the census block at the head of this
+    // function has the numbers. Kept only because `native-builtins` registers
+    // the same triples with an incompatible body; see that block before
+    // touching a line here.
     let abstract_source = "java/nio/channels/Pipe$SourceChannel";
     r.register(
         abstract_source,

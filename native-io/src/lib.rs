@@ -7800,6 +7800,16 @@ fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 // foot of this function. And because the effective tag is `Bridge`, none of
 // this is dropped under `--jdk-only`: this registrar is strict-mode LIVE,
 // whatever the "stub" verdict above says.
+//
+// UPDATE 2026-08-20 (H11): those two abstract targets are MEASURED DEAD —
+// `invocations: 0` for both across 15 corpus vectors and a purpose-built
+// try-with-resources probe, and unreachable by construction because dispatch
+// keys on the receiver's class and the fallback walk never visits an interface.
+// They are still here only because `vm/src/vm/tests.rs`'s
+// `auto_closeable_close_p70` calls the slot directly and its helper panics on
+// an unregistered triple. The count stays 37 and the reason is a test outside
+// this crate, not a dispatch requirement. Long note at the foot of this
+// function.
 fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     // RETAG ATTEMPTED 2026-08-19 AND REVERTED — the classification above is
@@ -7973,6 +7983,55 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "next", "()Ljava/lang/Object;", native_scanner_next);
 
     // Interface dispatch: Closeable
+    //
+    // MEASURED DEAD 2026-08-20 (H11), KEPT ONLY BECAUSE A TEST OUTSIDE THIS
+    // CRATE CALLS THE SLOT DIRECTLY. Both rows are unreachable through ordinary
+    // dispatch and the second of them is an active hazard; the deletion is
+    // written, priced and blocked. Details, so the next lane does not re-derive
+    // them:
+    //
+    // 1. UNREACHABLE. Native dispatch keys on the RECEIVER OBJECT's runtime
+    //    class, not on the constant-pool class named at the call site — the
+    //    `class_name` handed to `resolve_step1_native` is `invoke.rs`'s
+    //    `invoke_class`, whose non-null-object branch resolves to the
+    //    receiver's own class — and the ONE fallback walk in
+    //    `try_stackless_invoke` follows `superclass` links only
+    //    (`cm.get_class(cid)?.superclass?`), so it never visits an INTERFACE.
+    //    An interface registration is reachable only for a receiver whose
+    //    runtime class name IS the interface, and nothing in this tree mints a
+    //    `java/io/Closeable` or a `java/lang/AutoCloseable`.
+    //
+    // 2. NOT EVEN FOR A SCANNER. This function registers
+    //    `java/util/Scanner.close()V` directly, ~80 lines above, with the same
+    //    callback; the receiver-keyed lookup finds THAT row first for every
+    //    real Scanner. The "Interface dispatch" label describes an intent the
+    //    dispatcher does not implement.
+    //
+    // 3. MEASURED. `--dump-native-registry` under `--jdk-only` on `fe59bf9d9`,
+    //    unioned over 15 corpus vectors plus a probe that runs a
+    //    try-with-resources over an `AutoCloseable`-typed local holding a user
+    //    class: BOTH rows report `invocations: 0`, and the user's `close()`
+    //    body runs, byte-identical to HotSpot 25.0.3+9. `java/util/Scanner.
+    //    close()V` is also 0 across that union; the traffic these rows were
+    //    imagined to carry does not exist.
+    //
+    // 4. THE HAZARD. On the one path that can still reach them —
+    //    `execute_invoke_kind`'s `recv_is_bare_object` rescue, which
+    //    substitutes the CP class when a receiver arrives as a bare
+    //    `java/lang/Object` — `native_scanner_close`'s receiver guard rejects
+    //    the non-Scanner by returning `Ok(None)`. That is a COMPLETED void
+    //    call, not a fall-through (`MethodCallResult` has no "decline, run the
+    //    bytecode" value), so the `close()` is silently SWALLOWED.
+    //    `[decline masks]`.
+    //
+    // 5. WHY THE LINES ARE STILL HERE. `vm/src/vm/tests.rs`'s
+    //    `auto_closeable_close_p70` does
+    //    `call_native(.., "java/lang/AutoCloseable", "close", "()V", ..)`, and
+    //    that helper `panic!`s when the triple is not registered. Deleting the
+    //    row turns a unit test red for a reason unrelated to any behaviour it
+    //    means to protect. `vm/` is out of bounds for this lane, so the
+    //    deletion is a two-file commit somebody else has to make. See
+    //    `docs/known-issues/jdk-only/H11-3-*.md` N1.
     registry.register("java/io/Closeable", "close", "()V", native_scanner_close);
     registry.register(
         "java/lang/AutoCloseable",
@@ -12780,6 +12839,12 @@ const DOS_WRITTEN_FIELD: &str = "written";
 // `Bridge` explicitly below, for the measured reason the block comment inside
 // it gives. Effective tag `Bridge` means `--jdk-only` admits all 37 rows:
 // strict-mode LIVE, not dropped-because-stub.
+//
+// UPDATE 2026-08-20 (H11-B): the "4 land on abstract interface methods" half is
+// GONE — see the removal note at the foot of this function. 33 rows remain, all
+// on the two concrete stream classes, and 25 of those still shadow concrete
+// bytecode. The interface rows were measured at ZERO invocations across 15
+// corpus vectors; removing them changes no dispatch this tree can reach.
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     // RETAG ATTEMPTED 2026-08-19 AND REVERTED — LOAD-BEARING, like
@@ -12787,10 +12852,20 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     // still doing work.
     //
     // The classification holds: 0 ACC_NATIVE, 25 of 37 shadow concrete
-    // bytecode, and 4 land on the `DataInput`/`DataOutput` INTERFACES (so this
-    // shim decides dispatch for every USER implementor — worth removing on its
-    // own, once it can be). And unlike the cold registrars, this one is
-    // genuinely exercised: 1039 invocations, five vectors.
+    // bytecode. And unlike the cold registrars, this one is genuinely
+    // exercised: 1039 invocations, five vectors.
+    //
+    // CORRECTION 2026-08-20 (H11-B): this paragraph used to continue "and 4
+    // land on the `DataInput`/`DataOutput` INTERFACES (so this shim decides
+    // dispatch for every USER implementor — worth removing on its own, once it
+    // can be)". The parenthetical is FALSE and it is why the four rows survived
+    // three census passes as a scary-looking blocker. Native dispatch keys on
+    // the RECEIVER's runtime class, and the fallback walk follows `superclass`
+    // links only, so an interface registration never serves a user implementor
+    // — MEASURED: a `DataInput`-typed call on a user implementor returns the
+    // USER's value and the interface slot stays at `invocations: 0`. The four
+    // rows were removed at the foot of this function; the 33 that remain are
+    // the load-bearing ones and none of them is on an interface.
     //
     // Retagged, that exercise reported the answer immediately:
     //
@@ -12860,21 +12935,43 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     registry.register(dos, "close", "()V", native_dos_close);
     registry.register(dos, "size", "()I", native_dos_size);
 
-    // DataInput/DataOutput interface registrations
-    registry.register("java/io/DataInput", "readInt", "()I", native_dis_read_int);
-    registry.register("java/io/DataInput", "readLong", "()J", native_dis_read_long);
-    registry.register(
-        "java/io/DataOutput",
-        "writeInt",
-        "(I)V",
-        native_dos_write_int,
-    );
-    registry.register(
-        "java/io/DataOutput",
-        "writeLong",
-        "(J)V",
-        native_dos_write_long,
-    );
+    // REMOVED 2026-08-20 (H11-B) — the four "DataInput/DataOutput interface
+    // registrations" that used to sit here:
+    //
+    //     registry.register("java/io/DataInput",  "readInt",   "()I",  native_dis_read_int);
+    //     registry.register("java/io/DataInput",  "readLong",  "()J",  native_dis_read_long);
+    //     registry.register("java/io/DataOutput", "writeInt",  "(I)V", native_dos_write_int);
+    //     registry.register("java/io/DataOutput", "writeLong", "(J)V", native_dos_write_long);
+    //
+    // The block comment at the head of this function said these four "decide
+    // dispatch for every USER implementor — worth removing on its own, once it
+    // can be". It can be, and the premise was wrong: they decided dispatch for
+    // NO user implementor.
+    //
+    // MEASURED (`fe59bf9d9`, `--jdk-only`, `--dump-native-registry`):
+    //   * a probe that calls `readInt()` through a `DataInput`-typed local on a
+    //     user class implementing `java.io.DataInput` directly gets the USER's
+    //     answer (9999), identical to HotSpot 25.0.3+9, and the
+    //     `java/io/DataInput.readInt()I` slot reports `invocations: 0`;
+    //   * unioned over 15 corpus vectors — `RDataInputFastPull`, `RSerial`,
+    //     `RFileTimes`, `RJdkIntrinsics3` among them — all four interface rows
+    //     stay at 0 while `java/io/DataInputStream.readInt()I` takes 540 calls
+    //     and `java/io/DataOutputStream.writeInt(I)V` takes 53.
+    //
+    // The mechanism is the same one recorded at the foot of
+    // `register_scanner_natives`: dispatch keys on the RECEIVER's class, and
+    // the one fallback walk follows `superclass` links only, so it never
+    // reaches an interface. The 33 `DataInputStream`/`DataOutputStream` rows —
+    // the load-bearing half, the one whose 2026-08-19 retag broke
+    // `RDataInputFastPull` — are untouched above and keep every one of those
+    // 593 calls.
+    //
+    // FALSIFIER: an `AbstractMethodError` naming `java/io/DataInput.readInt`,
+    // `DataInput.readLong`, `DataOutput.writeInt` or `DataOutput.writeLong`.
+    // Those four image methods have no `Code` attribute, so that error is what
+    // the `recv_is_bare_object` CP-class rescue in `execute_invoke_kind` would
+    // now produce where it previously found a native. Restore the four lines
+    // and record the receiver.
     registry.set_category(__prev_cat);
 }
 
@@ -21907,6 +22004,23 @@ fn native_file_lock_impl_release(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(None)
 }
 
+/// **THIS IS A FABRICATION SITE, and it is the second one `H5-1` N7 could not
+/// find.** The `try_alloc_synthetic` below mints an object whose class NAME is
+/// the abstract `java.nio.channels.AsynchronousFileChannel`. `H5-1` §3.4 marked
+/// that class "abstract; no fabrication site found — candidate, unproven",
+/// i.e. possibly movable down to `sun.nio.ch.*AsynchronousFileChannelImpl`. It
+/// is not movable. The census missed it for the same reason it missed
+/// `aio_assc_open` in `async_socket.rs`: the call is split over four lines and
+/// the grep matched `try_alloc_synthetic(ctx, "…"` on one — `[window≠absence]`.
+///
+/// MEASURED 2026-08-20 (H11), `fe59bf9d9`, `--jdk-only`:
+/// `AsynchronousFileChannel.open(path, CREATE, WRITE).getClass().getName()`
+/// answers `java.nio.channels.AsynchronousFileChannel`, where HotSpot 25.0.3+9
+/// answers `sun.nio.ch.WindowsAsynchronousFileChannelImpl`. Native dispatch
+/// keys on the receiver's runtime class, so moving this class's 16
+/// registrations onto the `Impl` strands every receiver this function returns
+/// and turns every subsequent `read`/`write`/`size`/`close` into a
+/// `NoSuchMethodError`.
 fn alloc_afc_channel(
     ctx: &mut dyn NativeContext,
     path_str: &str,
