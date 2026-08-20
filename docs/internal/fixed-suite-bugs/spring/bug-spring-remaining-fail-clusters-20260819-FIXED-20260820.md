@@ -13,13 +13,22 @@ three 2026-08-19 GC-variant runs), same driver, same host, binary the only
 variable:
 
 ```text
-                                          classes OK / 90
-  dev tip 26e4b5db4                            15
-  + ConcurrentHashMap removeIf fix             83
-  + everything in this doc                     88
+                                                  classes OK / 90
+  dev tip 26e4b5db4                                    15
+  + ConcurrentHashMap removeIf fix                     83
+  + everything in this doc                             88
+  the same, merged with dev tip eadd845c4              85
 ```
 
-The two that remain are named at the bottom; neither is one of this doc's items.
+The 88 → 85 step is not a regression from this work. `dev` commit `9fdc0a3f7`
+flipped `CRATONVM_JIT_SELF_TAILCALL`'s default off, and two Groovy
+markup-template classes fail with that default and pass without it — on pristine
+`dev` tip and on the merged tree identically, binary for binary. It has its own
+page: `known-issues/spring/groovy-markup-self-tailcall-off-20260820.md`.
+
+Of the five classes not OK on the merged tree, then: two are that flag, one
+fails identically on HotSpot, one is the AOT/Mockito throughput wall, and one
+(`WebClientIntegrationTests`) is the partial result described below.
 
 ## The six items, and what each turned out to be
 
@@ -145,27 +154,59 @@ reclaim, never free a slot earlier. Regression test
 `pop_does_not_reclaim_a_slot_a_buried_entry_still_owns` in `jit/src/x64/tests.rs`
 (verified to fail without the fix).
 
-### 4. `WebClientIntegrationTests` — `VerifySubscriber timed out` — FIXED by item 3
+### 4. `WebClientIntegrationTests` — `VerifySubscriber timed out` — MOSTLY fixed by item 3
 
 The 2026-08-19 doc flagged this as possibly load-induced and asked for an
 isolated rerun. Reran five times alone: NOT a flake — 1–2 failures every run,
 always on the `[2] JDK` client variant, always the same
 `VerifySubscriber timed out on ...MonoFlatMap$FlatMapMain` shape.
 
-It then went away with the JIT fix above, with no change of its own: 170 found,
-**169 succeeded, 0 failed, 1 skipped** — identical to HotSpot's own numbers on
-this class. (Both VMs exit on the harness timeout afterwards; this class leaks
-non-daemon threads on HotSpot too, so `rc=124` after a complete `RESULT` line is
-the harness, not the VM.)
+The JIT fix above changed it from always-failing to mostly-passing, with no
+change of its own. Five isolated runs after it:
 
-### 5. Groovy markup-template **compile**-time failures (2 classes) — FIXED by item 1 or the CHM fix
+```text
+  before (5 runs)   167,167,168,167,168 of 170   — 1-2 failures EVERY run
+  after  (5 runs)   169,169,168,168,168 of 170   — 2 runs clean
+  HotSpot (3 runs)  169,169,169         of 170   — 3 runs clean, 1 skipped
+```
 
-`GroovyMarkupViewTests` and `ViewResolutionIntegrationTests.groovyMarkup()` both
-pass. The doc could not tell whether these were a CratonVM defect or a
+169/0/1 is HotSpot's own answer on this class, so the two clean runs are exactly
+right and the other three are one method short. **Not called fixed**: the
+residual failure is the same `VerifySubscriber timed out` shape on the same
+`[2] JDK` client variant, and CratonVM runs this class in ~17 s against
+HotSpot's ~3 s, so a `StepVerifier` deadline is being missed rather than a value
+being computed wrongly. That points at throughput on the reactive path, not at a
+functional defect, and it is not something this doc's items can close.
+
+(Both VMs exit on the harness timeout afterwards; this class leaks non-daemon
+threads on HotSpot too, so `rc=124` after a complete `RESULT` line is the
+harness, not the VM.)
+
+### 5. Groovy markup-template **compile**-time failures (2 classes) — IDENTIFIED, and now gated by a `dev` flag
+
+The 2026-08-19 filing could not tell whether these were a CratonVM defect or a
 Groovy/classpath version mismatch, because the pooled failcause truncated the
-compiler error to `startup failed:`. They are green on the fixed binary and were
-green already at the 83/90 point, so they belonged to one of the collection
-fixes rather than to the Groovy compiler.
+compiler error at `startup failed:`. `KRUN_STACK=1` answers it: a CratonVM
+defect, and one in this doc's own family —
+
+```text
+General error during canonicalization: cannot explicitly cast
+  MethodHandle(Object,Object,String,Object[])Object to (Object,Object)Object
+    at org.codehaus.groovy.vmplugin.v8.Selector$MethodSelector
+       .setCallSiteTarget(Selector.java:1068)
+```
+
+— an adapter chain whose composed type kept the target's arity, refused by
+`explicitCastArguments`, exactly as in item 2 and from a call site that reads the
+type back for exactly the same reason.
+
+Both classes were green on this branch before it merged `dev` tip, and both are
+red after — on pristine `dev` tip too. `dev`'s `9fdc0a3f7` flipped
+`CRATONVM_JIT_SELF_TAILCALL` off by default, and that flag alone decides the
+outcome on either tree (`CRATONVM_JIT_SELF_TAILCALL=1` → 10/10 and 7/7;
+`--nojit` likewise). Whether the elimination cures the defect or hides it is
+undetermined, so the item moves to its own page rather than being claimed here:
+`known-issues/spring/groovy-markup-self-tailcall-off-20260820.md`.
 
 ### 6. The "recheck against `dev` tip" Groovy/JRuby list — DONE
 
@@ -207,6 +248,10 @@ about an extra KEY, and the key is one Spring itself writes).
   `force_native_over_real_jdk_bytecode_memoized`). It was never one of this
   doc's clusters.
 * `FileNativeConfigurationWriterTests` — see above; HotSpot fails it identically.
+* `GroovyMarkupViewTests` and `ViewResolutionIntegrationTests` — item 5; a
+  `dev`-tip flag default, tracked separately.
+* `WebClientIntegrationTests` — item 4; 2 of 5 isolated runs clean where it used
+  to fail every run, the residual being a reactive-path deadline.
 
 Separately, `probes/MhCombinatorProbe.java`'s purity section still fails four
 rows: `asType` and `explicitCastArguments` adapt the RECEIVER in place instead
