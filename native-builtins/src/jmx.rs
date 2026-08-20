@@ -2251,6 +2251,8 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let is_heap = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
             let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
+            // Slots by NAME -- see `memory_usage_slots`.
+            let [s_init, s_used, s_committed, s_max] = memory_usage_slots(ctx, obj);
             if is_heap {
                 let used = ctx.heap_allocated_bytes() as i64;
                 // Same source as `Runtime.totalMemory()` (`committed_heap_bytes`),
@@ -2259,19 +2261,19 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 let committed = (ctx.committed_heap_bytes() as i64)
                     .max(used)
                     .min(ctx.max_heap_bytes().max(used));
-                ctx.set_field(obj, 0, Value::Long(ctx.initial_heap_bytes())); // init (real -Xms)
-                ctx.set_field(obj, 1, Value::Long(used)); // used (real)
-                ctx.set_field(obj, 2, Value::Long(committed)); // committed
-                ctx.set_field(obj, 3, Value::Long(ctx.max_heap_bytes())); // max (real -Xmx)
+                ctx.set_field(obj, s_init, Value::Long(ctx.initial_heap_bytes())); // real -Xms
+                ctx.set_field(obj, s_used, Value::Long(used)); // real
+                ctx.set_field(obj, s_committed, Value::Long(committed));
+                ctx.set_field(obj, s_max, Value::Long(ctx.max_heap_bytes())); // real -Xmx
             } else {
                 const AVG_CLASS_METADATA_BYTES: i64 = 4096;
                 const NON_HEAP_INIT_BYTES: i64 = 2 * 1024 * 1024;
                 let used = (ctx.loaded_class_count() as i64 * AVG_CLASS_METADATA_BYTES).max(1);
                 let committed = used + 1024 * 1024;
-                ctx.set_field(obj, 0, Value::Long(NON_HEAP_INIT_BYTES)); // init
-                ctx.set_field(obj, 1, Value::Long(used)); // used (class-count-derived)
-                ctx.set_field(obj, 2, Value::Long(committed)); // committed
-                ctx.set_field(obj, 3, Value::Long(-1)); // max (undefined, honest)
+                ctx.set_field(obj, s_init, Value::Long(NON_HEAP_INIT_BYTES));
+                ctx.set_field(obj, s_used, Value::Long(used)); // class-count-derived
+                ctx.set_field(obj, s_committed, Value::Long(committed));
+                ctx.set_field(obj, s_max, Value::Long(-1)); // undefined, honest
             }
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -3001,10 +3003,12 @@ fn long_arg(args: &[Value], idx: usize) -> i64 {
 /// answers with the spec-defined sentinel rather than a fabricated number.
 fn undefined_memory_usage(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let mu = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
-    ctx.set_field(mu, 0, Value::Long(-1));
-    ctx.set_field(mu, 1, Value::Long(-1));
-    ctx.set_field(mu, 2, Value::Long(-1));
-    ctx.set_field(mu, 3, Value::Long(-1));
+    // By NAME -- see `memory_usage_slots`. The value is the same in all four,
+    // so this one is a no-op on behaviour twice over; it is converted so the
+    // bean has no remaining index-into-a-real-layout site to audit.
+    for slot in memory_usage_slots(ctx, mu) {
+        ctx.set_field(mu, slot, Value::Long(-1));
+    }
     Ok(mu)
 }
 
@@ -4534,6 +4538,47 @@ fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodC
     Ok(obj)
 }
 
+/// The four `java.lang.management.MemoryUsage` slots, resolved by NAME.
+///
+/// **H6-B, 2026-08-20.** `javap -p java.lang.management.MemoryUsage` on JDK
+/// 25.0.3+9, this host, instance fields in declaration order:
+///
+/// ```text
+///   0  private final long init
+///   1  private final long used
+///   2  private final long committed
+///   3  private final long max
+/// ```
+///
+/// `MemoryUsage` is a REAL, concrete JDK class, so the hard-coded `0..=3` this
+/// file used were right BY COINCIDENCE with nothing in the tree pinning the
+/// coincidence -- the same species as `ObjectName`'s canonical-name slot
+/// (H0-1 §3). The fallback below is the identity `[0, 1, 2, 3]` because that is
+/// also the synthetic carrier's convention, so this conversion is
+/// behaviour-neutral on BOTH carriers today and diverges only if the real
+/// declaration order ever moves. That is the point of doing it.
+///
+/// One thing worth stating rather than assuming, because it sets how urgent
+/// this site is next to its neighbours: **`MemoryUsage` has no reference
+/// fields.** All four are `long`. A drifted index here is a wrong NUMBER, not
+/// the bogus oop the same mistake produces on `java.util.ArrayList` or
+/// `javax.management.ObjectName`. It is converted anyway -- the object-layout
+/// audit's order is "convert, verify, unpad, then drop" and it has no "unless
+/// the fields happen to be primitives" arm.
+fn memory_usage_slots(ctx: &dyn NativeContext, obj: ObjectRef) -> [usize; 4] {
+    let cid = ctx.class_id_of_object(obj);
+    let slot = |name: &str, fallback: usize| {
+        ctx.resolve_field_index_by_class_id(cid, name)
+            .unwrap_or(fallback)
+    };
+    [
+        slot("init", 0),
+        slot("used", 1),
+        slot("committed", 2),
+        slot("max", 3),
+    ]
+}
+
 fn alloc_memory_usage(
     ctx: &mut dyn NativeContext,
     init: i64,
@@ -4542,10 +4587,11 @@ fn alloc_memory_usage(
     max: i64,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
-    ctx.set_field(obj, 0, Value::Long(init));
-    ctx.set_field(obj, 1, Value::Long(used));
-    ctx.set_field(obj, 2, Value::Long(committed));
-    ctx.set_field(obj, 3, Value::Long(max));
+    let [s_init, s_used, s_committed, s_max] = memory_usage_slots(ctx, obj);
+    ctx.set_field(obj, s_init, Value::Long(init));
+    ctx.set_field(obj, s_used, Value::Long(used));
+    ctx.set_field(obj, s_committed, Value::Long(committed));
+    ctx.set_field(obj, s_max, Value::Long(max));
     Ok(obj)
 }
 
@@ -4678,10 +4724,9 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
     // same UNDEFINED shape `MemoryPoolImpl` uses for "no measurement taken".
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Long(-1));
-        ctx.set_field(this, 1, Value::Long(-1));
-        ctx.set_field(this, 2, Value::Long(-1));
-        ctx.set_field(this, 3, Value::Long(-1));
+        for slot in memory_usage_slots(ctx, this) {
+            ctx.set_field(this, slot, Value::Long(-1));
+        }
         Ok(None)
     });
     r.register(cls, "<init>", "(JJJJ)V", |ctx, args| {
@@ -4704,28 +4749,29 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        ctx.set_field(this, 0, Value::Long(init_val));
-        ctx.set_field(this, 1, Value::Long(used_val));
-        ctx.set_field(this, 2, Value::Long(committed_val));
-        ctx.set_field(this, 3, Value::Long(max_val));
+        let [s_init, s_used, s_committed, s_max] = memory_usage_slots(ctx, this);
+        ctx.set_field(this, s_init, Value::Long(init_val));
+        ctx.set_field(this, s_used, Value::Long(used_val));
+        ctx.set_field(this, s_committed, Value::Long(committed_val));
+        ctx.set_field(this, s_max, Value::Long(max_val));
         Ok(None)
     });
 
     r.register(cls, "getInit", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(ctx.get_field(this, memory_usage_slots(ctx, this)[0])))
     });
     r.register(cls, "getUsed", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        Ok(Some(ctx.get_field(this, memory_usage_slots(ctx, this)[1])))
     });
     r.register(cls, "getCommitted", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+        Ok(Some(ctx.get_field(this, memory_usage_slots(ctx, this)[2])))
     });
     r.register(cls, "getMax", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        Ok(Some(ctx.get_field(this, memory_usage_slots(ctx, this)[3])))
     });
     // `toString` is NOT overridden on a real JDK: the real bytecode reads the
     // same four slots this file writes by index (`init`, `used`, `committed`,
@@ -4738,19 +4784,20 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
     if memoryusage_tostring_shim_enabled() {
         r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let init_v = match ctx.get_field(this, 0) {
+            let [s_init, s_used, s_committed, s_max] = memory_usage_slots(ctx, this);
+            let init_v = match ctx.get_field(this, s_init) {
                 Value::Long(v) => v,
                 _ => 0,
             };
-            let used_v = match ctx.get_field(this, 1) {
+            let used_v = match ctx.get_field(this, s_used) {
                 Value::Long(v) => v,
                 _ => 0,
             };
-            let committed_v = match ctx.get_field(this, 2) {
+            let committed_v = match ctx.get_field(this, s_committed) {
                 Value::Long(v) => v,
                 _ => 0,
             };
-            let max_v = match ctx.get_field(this, 3) {
+            let max_v = match ctx.get_field(this, s_max) {
                 Value::Long(v) => v,
                 _ => 0,
             };
