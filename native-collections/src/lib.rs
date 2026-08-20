@@ -6350,6 +6350,13 @@ fn al_or_collection_elements_pinned(
 ) -> Result<Vec<Value>, MethodCallFailed> {
     let mut elems = collect_collection_elements(ctx, this)?;
     let this = ctx.read_native_pin(this_pin, this);
+    let suspect = !elems.is_empty() && heuristic_snapshot_is_suspect(ctx, this, &elems);
+    // `CRATONVM_DBG_TOARRAY`: the layout-probe answer as it stands BEFORE
+    // either re-derivation below can overwrite it. Reading `nulls` beside
+    // `suspect` is what separates "the probe found nothing" (`heuristic_len=0`,
+    // falls through to the `size()`+real-iterator path) from "the probe found
+    // holes and the guard caught them" — the two ways a `toArray`-family answer
+    // goes wrong, which are indistinguishable from the caller.
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         let cid = ctx.class_id_of_object(this);
         let nm = ctx
@@ -6359,14 +6366,13 @@ fn al_or_collection_elements_pinned(
             .iter()
             .filter(|v| matches!(v, Value::Object(None)))
             .count();
-        let suspect = heuristic_snapshot_is_suspect(ctx, this, &elems);
         eprintln!(
             "[DBG_TOARRAY] al_or_collection_elements recv={nm} heuristic_len={} nulls={nulls} suspect={suspect}",
             elems.len()
         );
     }
     if !elems.is_empty() {
-        if heuristic_snapshot_is_suspect(ctx, this, &elems) {
+        if suspect {
             let this = ctx.read_native_pin(this_pin, this);
             // The `?` matters here even though we already hold `elems`:
             // `heuristic_snapshot_is_suspect` has just said the snapshot in
@@ -6400,6 +6406,13 @@ fn al_or_collection_elements_pinned(
 /// through the bytecode's `Arrays.copyOf(elementData, size, a.getClass())`
 /// path which NPEs on synthetic ArrayLists.
 pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `CRATONVM_DBG_TOARRAY`, at the very top so it reports the calls the
+    // routes below divert as well as the ones that reach the body. The
+    // ABSENCE of this line is itself a finding: this native is registered on
+    // `java/util/AbstractCollection` by `register_collections_natives`, but
+    // real-JDK mode registers `real_jdk_to_array_typed` (`vm/src/vm/
+    // vm_init.rs`) over the top of it, so a silent trace on a real-JDK run
+    // means the OTHER implementation is the one under investigation.
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         let cls = match args.first() {
             Some(Value::Object(Some(o))) => {
