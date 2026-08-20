@@ -72,8 +72,35 @@ anyone diagnoses six separate defects, diagnose that one: if it is a single
 GC-interaction defect that every armed prefix exposes, the real per-family costs
 are 0, 2, 6, 7, 10 and 22, and the first two families are essentially free.
 
-**Not investigated.** Stated as the first question the table raises, not as a
-conclusion.
+### ANSWERED, same day, measured — one defect, four faces
+
+`RMapGcStress` run alone under each prefix in turn. Every failure is the same
+mechanism, and each one names it:
+
+| armed prefix | the assertion |
+|---|---|
+| `java/util/HashSet` | `NullPointerException: Cannot invoke "java.lang.Integer.intValue()" because the return value of "java.util.Iterator.next()" is null` |
+| `java/util/Hashtable` | `Hashtable/filled: lost/wrong value for 1 -> null` |
+| `java/util/LinkedHashMap` | `LinkedHashMap/filled: iterated 1 != 3000` |
+| `java/util/HashMap` | `HashMap/filled: iterated 1 != 3000` |
+
+**Real bytecode iterating a table the VM never populated.** `iterated 1 != 3000`
+is the sharpest of the four: the container reports one entry where three
+thousand were inserted, because the inserts went to a CratonVM side structure
+and the iteration reads the real `table`. That is `H4-1` §1's mechanism — *"a
+silently empty map, no error"* — caught in the act, and it is one defect
+presenting under four different family names rather than four defects.
+
+**So the per-family costs in §1 are inflated by one shared row.** Net of
+`RMapGcStress`, the table reads **0 / 2 / 6 / 7 / 10 / 22**, and `java/util/HashSet`
+has **no remaining objection from this corpus at all**.
+
+**What that does NOT license.** §5's first bullet still stands and now matters
+more: a zero here means "these 104 vectors raise no objection", not "`HashSet`
+is retirable". The corpus has no AWT vector at all (`G79-1`), and `G90-1` §5 is
+the standing instance of a screen passing what the wider arm rejected. A zero is
+permission to attempt the migration and measure it — not permission to skip
+measuring it.
 
 ## 5. What this does NOT establish
 
@@ -96,8 +123,8 @@ conclusion.
 
 ## 6. NOMINATIONS
 
-* **N1 — diagnose `RMapGcStress` under one armed prefix.** It is the cheapest
-  question on this page and it re-prices four rows of the table.
+* **N1 — DONE, see §4.** One defect with four faces; the table re-prices to
+  0 / 2 / 6 / 7 / 10 / 22.
 * **N2 — arm `HashSet` and `Hashtable` together** and see whether the failures
   compose or interact. Two prefixes, one command, and it is the first real test
   of whether this migration can proceed family-by-family at all.
