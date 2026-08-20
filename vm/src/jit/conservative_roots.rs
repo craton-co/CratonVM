@@ -3293,7 +3293,7 @@ fn nested_trace_frames_enabled() -> bool {
     })
 }
 
-pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
+pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
     let nested_enabled = nested_trace_frames_enabled();
     let scanner_sp = current_stack_pointer();
     JIT_ENTRY_CHAIN.with(|c| {
@@ -3310,7 +3310,7 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
             }
         }
         let chain = c.borrow();
-        let mut out: Vec<(u32, String, u32)> = Vec::with_capacity(chain.len());
+        let mut out: Vec<(u32, String, u32, usize)> = Vec::with_capacity(chain.len());
         for e in chain.iter() {
             let Some(info) = e.precise else {
                 continue;
@@ -3403,7 +3403,16 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
                 if cm.method_label.is_empty() {
                     continue;
                 }
-                out.push((e.interp_depth, cm.method_label.clone(), cm.owner_class_id));
+                out.push((
+                    e.interp_depth,
+                    cm.method_label.clone(),
+                    cm.owner_class_id,
+                    // The artifact itself, so the trace assembler can ask it
+                    // whether an interpreter frame's pc is one of ITS OSR entry
+                    // points. Valid for exactly as long as the frame is live,
+                    // which is the same window this whole function reads in.
+                    *cm_ptr as usize,
+                ));
             }
         }
         out
