@@ -21288,6 +21288,7 @@ mod tests {
                     roots_for_matching_owners,
                     remap,
                     prune,
+                    gate_stats: None,
                 },
             );
             OWNER.store(owner.as_ptr() as usize, Ordering::Relaxed);

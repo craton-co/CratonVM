@@ -14514,6 +14514,7 @@ pub(crate) mod tests {
                 roots_for_matching_owners: overlay_provider_roots_matching,
                 remap: |_m| {},
                 prune: |_p| {},
+                gate_stats: None,
             },
         );
     }
