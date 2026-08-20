@@ -7,13 +7,28 @@ triage/pointer doc covering the FAIL classes (common to all three GC
 variants) left over after accounting for:
 * `bug-spring-concurrenthashmap-entrysetview-removeif-npe-20260819.md` (66
   classes — `ConcurrentHashMap.entrySet().removeIf()` NPE, root-caused);
-* `bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819.md`
-  (11 confirmed, several more plausibly related — `MethodHandle.asSpreader`
-  broken, root-caused).
+* `MethodHandle.asSpreader` (11 classes matched this shape in the sweep) —
+  turned out to be **already fixed** on `dev` before this sweep even
+  finished (commit `d766af065`, merged 2026-08-19 23:16, `dev` tip
+  `b97c40d97`) — see
+  `docs/internal/fixed-suite-bugs/spring/bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`.
+  Independently reverified 2026-08-20 against a fresh `dev`-tip build: fixed.
 
-That leaves roughly 11 classes. Each item below is a distinct signature, not
+That leaves roughly 11 classes plus whichever of the "plausibly related"
+Groovy/JRuby classes below turn out to share the (now-fixed) `asSpreader`
+root cause — reverify those against `dev` tip before investigating them as a
+separate open issue. Each item below is a distinct signature, not
 individually root-caused — grouped only where the evidence directly suggests
 it.
+
+## Note (2026-08-20): some Groovy classes not listed here may already be fixed
+`GroovyAspectTests`, `GroovyAspectIntegrationTests`, `GroovyScriptFactoryTests`,
+and both `JRubyScriptTemplateTests` classes were filed as "plausibly related"
+to the `MethodHandle.asSpreader` bug in the (now-superseded) doc referenced
+above — that bug turned out to already be fixed on `dev`. Recheck those
+classes against `dev` tip before investigating them as a separate open
+issue; see the FIXED doc's "Independent verification" section for the full
+list.
 
 ## Groovy template **compile**-time failures (2 classes) — different failure stage from the MethodHandle cluster
 ```
