@@ -3477,7 +3477,16 @@ pub fn canonical_wrapper_if_cached(
         // instead would need the memo, and a VM that has not boxed an `int`
         // yet has neither — which is a miss either way.
         ("I", Value::Int(x)) if x >= INTEGER_CACHE_LOW => {
-            read(integer_cache(), vm_identity, (x - INTEGER_CACHE_LOW) as usize)
+            // Widen before subtracting: `x` is unbounded ABOVE here (the
+            // `get(idx)` below is the only bound), so `i32::MAX -
+            // INTEGER_CACHE_LOW` overflows an `i32` and panics a debug build
+            // where it must simply MISS. Both store-SIZING sites in this file
+            // already widen to `i64` for exactly this reason.
+            read(
+                integer_cache(),
+                vm_identity,
+                (x as i64 - INTEGER_CACHE_LOW as i64) as usize,
+            )
         }
         ("J", Value::Long(x)) if (-128..=127).contains(&x) => {
             read(long_cache(), vm_identity, (x + 128) as usize)
