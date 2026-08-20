@@ -16069,6 +16069,15 @@ fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/Collection;)Z",
             native_hs_contains_all,
         );
+        // `ConcurrentHashMap$EntrySetView` DECLARES `removeIf`, so without this
+        // the receiver-has-own-bytecode rule ran `map.removeEntryIf(filter)`
+        // over a view whose `map` field is null. See `native_hs_remove_if`.
+        r.register(
+            c,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            native_hs_remove_if,
+        );
     }
     r.set_category(__prev_cat);
 }
@@ -42264,6 +42273,82 @@ fn native_hs_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
+}
+
+/// `Collection.removeIf(Predicate)` over a HashSet-layout receiver — including
+/// every [`SET_VIEW_CARRIERS`] keySet/entrySet view, where removal has to write
+/// THROUGH to the backing map (`native_hs_remove` does that).
+///
+/// Registered because `ConcurrentHashMap$EntrySetView` *declares* `removeIf`,
+/// so the receiver-has-own-bytecode rule ran the JDK body —
+/// `return map.removeEntryIf(filter)` — over a CratonVM-minted view whose
+/// `map` field is null (the view's state is the backing set in that slot), and
+/// every caller got `NullPointerException: Cannot invoke
+/// "java.util.concurrent.ConcurrentHashMap.removeEntryIf(...)" because
+/// "this.map" is null`. Spring's `DefaultContextCache.remove` does exactly
+/// `this.contextMap.entrySet().removeIf(..)` from a `@DirtiesContext`
+/// `afterTestClass` callback, which is what made three
+/// `core/spring-boot-test` classes report `containersFailed=1` while every
+/// test in them passed. The other carriers do not declare `removeIf` and were
+/// inheriting `Collection`'s iterator-based default, which already worked —
+/// registering here makes the whole family agree rather than leaving one
+/// member's correctness resting on the JDK not overriding a default.
+///
+/// Note that `force_native_over_real_jdk_bytecode` ALREADY listed `removeIf`
+/// for these classes: the gate said "prefer the native" and there was no
+/// native to prefer, so the lookup fell through to the very bytecode the gate
+/// exists to avoid. A gate entry is not a registration.
+fn native_hs_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, ahead of the route — see the note in `native_hs_for_each`.
+    reject_null_functional(args.get(1))?;
+    if let Some(r) = ksv_route(ctx, args, native_ksv_remove_if) {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pred = match args.get(1) {
+        Some(Value::Object(Some(p))) => *p,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    // GC-safety: `test` and the write-through `native_hs_remove` both run
+    // arbitrary Java. Pin the receiver, the predicate and every element, and
+    // re-read each through its pin per iteration. The body is a closure so an
+    // early `?` cannot skip the unpin.
+    let this_pin = ctx.pin_native_root(this);
+    let pred_pin = ctx.pin_native_root(pred);
+    let result = (|| -> MethodCallResult {
+        let this_now = ctx.read_native_pin(this_pin, this);
+        resync_view_set(ctx, this_now)?;
+        let this_now = ctx.read_native_pin(this_pin, this);
+        let backing = match hs_backing_map(ctx, this_now) {
+            Some(m) => m,
+            None => return Ok(Some(Value::Int(0))),
+        };
+        // For an entrySet-kind view these "keys" ARE the `Map.Entry` objects,
+        // which is what the predicate is handed and what `native_hs_remove`
+        // resolves back to a source-map key.
+        let elems = collect_view_snapshot_ordered(ctx, backing)?;
+        let (_, handles) = pin_value_slice(ctx, &elems);
+        let mut modified = false;
+        for (i, elem) in elems.iter().enumerate() {
+            let p = ctx.read_native_pin(pred_pin, pred);
+            let e = read_pinned_elem(ctx, handles[i], *elem);
+            let verdict = ctx.invoke_virtual(p, "test", "(Ljava/lang/Object;)Z", &[e])?;
+            if !matches!(verdict, Some(Value::Int(1))) {
+                continue;
+            }
+            let this_now = ctx.read_native_pin(this_pin, this);
+            let e = read_pinned_elem(ctx, handles[i], *elem);
+            if native_hs_remove(ctx, &[Value::Object(Some(this_now)), e])? == Some(Value::Int(1)) {
+                modified = true;
+            }
+        }
+        Ok(Some(Value::Int(i32::from(modified))))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
