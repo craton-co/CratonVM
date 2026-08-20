@@ -376,25 +376,37 @@ pub fn zgc_read_barrier_blocks_inline_fields() -> bool {
 ///
 /// Still `true`, by TWO independent mechanisms, either of which alone suffices:
 ///
-/// 1. **ZGC does not publish.** `JIT_READ_BOUNDS` is filled by
-///    `GenerationalHeap` and `G1Collector` only; under ZGC its six words stay
-///    zero for the process's life, so the containment check rejects every
-///    receiver and every field read keeps the barriered helper. This was the
-///    deliberate scoping decision: the read table is a G1 fix. Not publishing
-///    is a STRICTLY STRONGER discharge than the per-field-kind gate the
-///    design sketch proposed -- it keeps primitives on the helper too -- and
-///    it costs G1 nothing, whose measured containment-failure split is 100%
-///    reference / 0% primitive.
+/// 1. ~~**ZGC does not publish.**~~ **SUPERSEDED 2026-08-19 — ZGC publishes
+///    now, and mechanism 1 was replaced rather than lost.** The reason it was
+///    safe not to publish was that a compact reference slot under ZGC holds a
+///    colored word; `feature-designs/zgc-reference-slot-representation.md`
+///    measured that premise false for the tree that runs (*"Reference slots
+///    are plain pointers; nothing in the heap stores a colored word"*), and
+///    `ZgcRealHeap::set_barrier_color` — the sole writer of the colored state
+///    — has no non-test caller, so the barrier this predicate is named for is
+///    never armed in a real process.
+///
+///    What took its place is stronger where mechanism 2 is weakest: **arming
+///    the barrier CLEARS `JIT_READ_BOUNDS`** (`gc/src/zgc.rs`,
+///    `set_barrier_color`). The emitted containment sequence loads those words
+///    at RUNTIME, so clearing them disables the inline branch in code that was
+///    ALREADY COMPILED — which mechanism 2, an emission-time gate, cannot do.
+///    Before 2026-08-19 nothing covered that window; it did not matter only
+///    because ZGC published nothing at all.
 /// 2. **Emission is blocked outright while the barrier is armed.** Every
 ///    inline compact-field site is gated on
 ///    [`narrow_oops_block_inline_fields`], which is
 ///    `narrow_oops_enabled() || zgc_read_barrier_blocks_inline_fields()`. An
 ///    armed barrier therefore suppresses the emission, not merely the branch.
 ///
-/// Mechanism 2 is the one that would survive someone later deciding ZGC should
-/// publish its `conservative_addr_span()` after all. Mechanism 1 is the one
-/// that holds during the window between a cycle disarming the barrier and the
-/// next arming it. The obligation above is unchanged and still binds.
+/// Someone later DID decide ZGC should publish its `conservative_addr_span()`
+/// after all — 2026-08-19, to close the 56.9M-call reference-read residual on
+/// the default collector. Mechanism 2 survived that unchanged, as predicted;
+/// mechanism 1 was rewritten above into the runtime clear that covers
+/// already-compiled code. The obligation is unchanged and still binds, and it
+/// now has a third clause: **the clear must not race a live inline sequence**,
+/// so a real cycle has to arm at a safepoint. That is stated at
+/// `set_barrier_color`, where the first non-test caller will read it.
 #[inline]
 pub fn zgc_codegen_honours_read_barrier() -> bool {
     true

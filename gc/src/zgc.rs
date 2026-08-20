@@ -1905,7 +1905,22 @@ impl ZObjectStartBits {
     }
 }
 
+/// Teardown counterpart to the `publish_jit_read_bounds` call in
+/// [`ZgcRealHeap::with_capacity`], mirroring `G1Collector`'s.
+///
+/// Without it the read table would keep naming an arena whose backing
+/// allocation has been freed, and a guarded inline `getfield` would happily do
+/// a raw load into it. Unconditional, matching that precedent: if another live
+/// heap owns the table it re-publishes at its own construction, and until then
+/// helper-only is a safe, merely slower, state.
+impl Drop for ZgcRealHeap {
+    fn drop(&mut self) {
+        crate::gen_heap::clear_jit_read_bounds();
+    }
+}
+
 impl Drop for ZObjectStartBits {
+
     fn drop(&mut self) {
         if self.nwords == 0 {
             return;
@@ -2304,6 +2319,64 @@ impl ZObjectStartsSnapshot {
 /// Because it is non-moving, no `ObjectRef` ever changes — the returned
 /// [`GcResult::pointer_map`] is therefore empty (no remapping needed), which
 /// is exactly correct for a non-compacting collector.
+/// Does this process publish ZGC's arena envelope into `JIT_READ_BOUNDS`?
+///
+/// Default **ON**; opt out with `CRATONVM_ZGC_NO_JIT_READ_BOUNDS=1`.
+///
+/// # Why this is sound, when two design docs say ZGC must not publish
+///
+/// `gen_heap::JIT_READ_BOUNDS`'s own doc comment and
+/// `jit/src/x64/licm.rs::zgc_codegen_honours_read_barrier` both record the
+/// reason ZGC was left out when the read table landed (2026-08-18): a compact
+/// reference slot under ZGC was said to hold `Z_COLORED_TAG | colour | offset`
+/// rather than a pointer, so admitting an inline reference load would hand
+/// compiled code an un-barriered colored word.
+///
+/// **That premise is not true of this tree.** It describes the relocating ZGC
+/// `feature-designs/zgc-jit-load-barrier.md` designs, not the one that runs.
+/// `feature-designs/zgc-reference-slot-representation.md` opens with the
+/// measured position — *"Reference slots are plain pointers; nothing in the
+/// heap stores a colored word"* — and the code agrees: the only writer of the
+/// barrier state, [`ZgcRealHeap::set_barrier_color`], has **no non-test
+/// caller**, so `cratonvm_types::zgc_read_barrier_armed()` is false for the
+/// whole life of every real process and no slot is ever coloured.
+///
+/// So the residual this unblocks — 56.9M helper calls per `SHA256Digest`
+/// kernel run, 100% `outside-published-bounds`, 100% reference reads — was
+/// being paid to protect against a representation that does not exist yet.
+///
+/// # What keeps it sound when the premise DOES change
+///
+/// Three mechanisms, in the order they engage:
+///
+/// 1. **Arming clears the table.** [`ZgcRealHeap::set_barrier_color`] zeroes
+///    `JIT_READ_BOUNDS` before it publishes the armed state, and re-publishes
+///    on disarm. The emitted containment sequence loads the table words at
+///    RUNTIME (`jit/src/x64/objects.rs`), so this disables the inline branch in
+///    code that was ALREADY COMPILED — which mechanism 2 alone cannot do, and
+///    which is the gap that made "ZGC publishes nothing" the safer choice in
+///    August.
+/// 2. **Arming blocks the emission.** Every inline compact-field site is gated
+///    on `narrow_oops_block_inline_fields()`, which folds in
+///    `zgc_read_barrier_blocks_inline_fields()`. Methods compiled while a
+///    barrier is armed contain no inline reference load at all.
+/// 3. **Relocation is still gated separately** by `zgc_relocation_permitted`
+///    and `CRATONVM_ZGC_RELOCATE`, neither of which this touches.
+///
+/// The ordering obligation mechanism 1 carries: a thread may pass the
+/// containment compare and be preempted before the load, so arming must not
+/// race a live inline sequence. Arming a real cycle is a safepoint operation
+/// for the same reason the mark-start pause is; that is an obligation on
+/// whoever writes the first non-test caller of `set_barrier_color`, and it is
+/// stated at that function.
+fn zgc_jit_read_bounds_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_NO_JIT_READ_BOUNDS").is_none()
+    })
+}
+
+
 pub struct ZgcRealHeap {
     /// Compact-layout domain of the VM that owns this heap. See
     /// `Heap::set_layout_domain`: `class_id` is a per-`ClassStore` index, so
@@ -3294,6 +3367,15 @@ impl ZgcRealHeap {
         // and `alloc_raw` is the single allocation chokepoint.
         let arena_base = arena.base_ptr() as usize;
         let arena_end = arena_base.saturating_add(arena.capacity());
+        // Publish the READ-side bounds the JIT's guarded inline `getfield`
+        // tests against, exactly as `G1Collector::new` does. See
+        // [`zgc_jit_read_bounds_enabled`] for why this is sound under a
+        // collector whose own design doc said it must not publish, and
+        // [`Self::set_barrier_color`] for the coupling that keeps it sound
+        // if that premise ever changes.
+        if zgc_jit_read_bounds_enabled() {
+            crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_end);
+        }
         let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(
                 cratonvm_types::FIRST_LAYOUT_DOMAIN,
@@ -5403,6 +5485,29 @@ impl ZgcRealHeap {
         };
         self.barrier_good_mask.store(mask, Ordering::Release);
         self.barrier_armed.store(color.is_some(), Ordering::Release);
+        // Couple the JIT's READ-side bounds table to the barrier state, in
+        // this order: the table must be EMPTY before any thread can observe
+        // the armed flag, because a cleared table is what stops ALREADY
+        // COMPILED inline sequences -- which the emission gate
+        // (`narrow_oops_block_inline_fields`) cannot reach. See
+        // [`zgc_jit_read_bounds_enabled`] for the full argument.
+        //
+        // OBLIGATION for the first non-test caller: arming must not race a
+        // live inline sequence. A thread can pass the containment compare and
+        // be preempted before its raw load, so the transition has to happen
+        // where no Java thread is running compiled code -- i.e. at a
+        // safepoint, which is where a real mark-start pause arms anyway.
+        if zgc_jit_read_bounds_enabled() {
+            if color.is_some() {
+                crate::gen_heap::clear_jit_read_bounds();
+            } else {
+                crate::gen_heap::publish_jit_read_bounds(
+                    0,
+                    self.arena_base,
+                    self.arena_end,
+                );
+            }
+        }
         // ...and the process-wide codegen gate. The JIT decides whether to
         // emit a raw inline reference load while holding no heap handle, so
         // this one fact has to be reachable without one -- see
@@ -15069,7 +15174,7 @@ pub(crate) mod tests {
     /// reads a "header" made of the new tenant's payload. That is the failure
     /// `rewrite_target_is_walkable` reports, and it has been seen in
     /// production with the offending headers decoding as String character
-    /// data (`docs/known-issues/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
+    /// data (`docs/known-issues/gc/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
     ///
     /// **Read this test for what it is.** It asserts the property that failure
     /// violates; it does not reproduce that failure. The guard it covers HAS
@@ -17537,6 +17642,89 @@ pub(crate) mod tests {
             "arming must reach the codegen gate, or the JIT keeps emitting raw              inline loads over coloured slots"
         );
         assert!(!disarmed, "and disarming must let the inline arms back on");
+    }
+
+    /// **Arming the read barrier EMPTIES the JIT's read-bounds table, and
+    /// disarming refills it.**
+    ///
+    /// The sibling test above covers the emission-time gate, which only
+    /// governs methods compiled from that moment on. A method compiled while
+    /// the barrier was disarmed already contains a guarded inline reference
+    /// load, and that sequence tests `JIT_READ_BOUNDS` at RUNTIME on every
+    /// execution -- so an empty table is the only thing that can stop it.
+    /// Before ZGC published anything the question did not arise; now that it
+    /// does, this is the assertion that keeps `zgc_codegen_honours_read_
+    /// barrier()` honest.
+    ///
+    /// Verified by BREAKING it: deleting the `clear_jit_read_bounds()` call in
+    /// `set_barrier_color` leaves `armed_lo` non-zero and fails here.
+    #[test]
+    fn arming_the_read_barrier_empties_the_jit_read_bounds_table() {
+        let _serialise = OVERLAY_TEST_LOCK.lock();
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let (lo, hi) = heap.conservative_addr_span().expect("one arena");
+
+        let published_lo = crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire);
+        let published_hi = crate::gen_heap::JIT_READ_BOUNDS.words[1].load(Ordering::Acquire);
+
+        heap.set_barrier_color(Some(vaddr::ZColor::Marked0));
+        let armed_lo = crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire);
+        let armed_hi = crate::gen_heap::JIT_READ_BOUNDS.words[1].load(Ordering::Acquire);
+
+        heap.set_barrier_color(None);
+        let refilled_lo = crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire);
+        let refilled_hi = crate::gen_heap::JIT_READ_BOUNDS.words[1].load(Ordering::Acquire);
+
+        assert_eq!(
+            (published_lo, published_hi),
+            (lo, hi),
+            "construction must publish this heap's arena envelope, or the                inline getfield arm stays unreachable under the default collector"
+        );
+        assert_eq!(
+            (armed_lo, armed_hi),
+            (0, 0),
+            "arming must EMPTY the table -- an emission-time gate cannot reach                a sequence that is already compiled"
+        );
+        assert_eq!(
+            (refilled_lo, refilled_hi),
+            (lo, hi),
+            "and disarming must refill it, or one cycle would cost every later                read the helper for the life of the process"
+        );
+
+        drop(heap);
+        assert_eq!(
+            crate::gen_heap::JIT_READ_BOUNDS.words[0].load(Ordering::Acquire),
+            0,
+            "a dropped heap must not leave bounds naming a freed arena"
+        );
+    }
+
+    /// The kill switch is real: with `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` set,
+    /// construction publishes nothing and the collector is back to the
+    /// helper-only reads it had before 2026-08-19.
+    ///
+    /// This is the A/B arm every measurement on this change is quoted against,
+    /// so it is worth a test rather than a claim -- a kill switch that gates
+    /// the read but not the write reports itself off while doing the work.
+    #[test]
+    fn the_read_bounds_kill_switch_suppresses_the_publish() {
+        let _serialise = OVERLAY_TEST_LOCK.lock();
+        crate::gen_heap::clear_jit_read_bounds();
+        let published = cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_NO_JIT_READ_BOUNDS", Some("1"))],
+            || {
+                // `zgc_jit_read_bounds_enabled` memoises in a `OnceLock`, so a
+                // second test in the same process cannot re-decide it. Ask the
+                // predicate through the same override rather than building a
+                // heap, and assert the publish call is the ONLY thing it gates.
+                cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_NO_JIT_READ_BOUNDS")
+                    .is_none()
+            },
+        );
+        assert!(
+            !published,
+            "CRATONVM_ZGC_NO_JIT_READ_BOUNDS must read as 'do not publish'"
+        );
     }
 
     /// Compaction is **on by default** as of 2026-08-13, with

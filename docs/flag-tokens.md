@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-462 tokens.
+465 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -377,10 +377,10 @@ export inherited from a parent shell.
 | `osr-exit-after` | `CRATONVM_OSR_EXIT_AFTER` |
 | `osr-exit-test` | `CRATONVM_OSR_EXIT_TEST` |
 | `osr-bind` | `CRATONVM_DBG_OSR_BIND` |
-| `osr-frame-dedup` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUP` |
 | `osr-frame-trace` | `CRATONVM_DBG_OSR_FRAME_TRACE` |
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
 | `osr-seed-collision` | `CRATONVM_DBG_OSR_SEED_COLLISION` |
+| `osr-slots` | `CRATONVM_DBG_OSR_SLOTS` |
 | `overlay` | `CRATONVM_DBG_OVERLAY` |
 | `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
@@ -436,7 +436,6 @@ export inherited from a parent shell.
 | `seedhunt` | `CRATONVM_DBG_SEEDHUNT` |
 | `sel` | `CRATONVM_DBG_SEL` |
 | `selector` | `CRATONVM_DBG_SELECTOR` |
-| `self-tailcall` | `CRATONVM_JIT_SELF_TAILCALL` |
 | `setacc` | `CRATONVM_DBG_SETACC` |
 | `sfi-null-trace` | `CRATONVM_SFI_NULL_TRACE` |
 | `shadow` | `CRATONVM_DBG_SHADOW` |
@@ -527,11 +526,12 @@ export inherited from a parent shell.
 | `youngscan` | `CRATONVM_DBG_YOUNGSCAN` |
 | `youngstate` | `CRATONVM_DBG_YOUNGSTATE` |
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
+| `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
-192 tokens.
+204 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -617,6 +617,7 @@ export inherited from a parent shell.
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
 | `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |
+| `osr-frame-dedupe` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` |
 | `strict-install-epoch` | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` |
 | `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
 | `kernel-reg-osr` | `CRATONVM_JIT_KERNEL_REG_OSR` |
@@ -646,6 +647,8 @@ export inherited from a parent shell.
 | `osr` | `CRATONVM_JIT_OSR` |
 | `osr-athrow` | `CRATONVM_JIT_OSR_ATHROW` |
 | `osr-dead-locals` | `CRATONVM_JIT_OSR_DEAD_LOCALS` |
+| `osr-ambiguous-dead` | `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD` |
+| `osr-refined-ref` | `CRATONVM_JIT_NO_OSR_REFINED_REF` |
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
@@ -681,7 +684,6 @@ export inherited from a parent shell.
 | `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
-| `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `new-site-cache` | `CRATONVM_JIT_NO_NEW_SITE_CACHE` |
@@ -703,6 +705,7 @@ export inherited from a parent shell.
 | `slot-mirror` | `CRATONVM_JIT_NO_SLOT_MIRROR` |
 | `sp-coalesce` | `CRATONVM_SP_NO_COALESCE` |
 | `sp-inline-ic` | `CRATONVM_JIT_SP_INLINE_IC` |
+| `self-tailcall` | `CRATONVM_JIT_SELF_TAILCALL` |
 | `sp-tailcall` | `CRATONVM_JIT_SP_TAILCALL` |
 | `spec-bce` | `CRATONVM_JIT_NO_SPEC_BCE` |
 | `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
@@ -739,7 +742,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-59 tokens.
+60 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -790,6 +793,7 @@ export inherited from a parent shell.
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
 | `zgc-parmark` | `CRATONVM_ZGC_PARMARK` |
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
+| `zgc-jit-read-bounds` | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
 | `zgc-generational` | `CRATONVM_ZGC_GENERATIONAL` |

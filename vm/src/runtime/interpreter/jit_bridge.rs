@@ -2473,7 +2473,7 @@ pub(super) fn try_osr(
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
     let result_i64 = {
         let _jit_root_guard =
-            crate::jit::conservative_roots::JitEntryGuard::enter_with_osr_compiled_at(
+            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
                 &*compiled,
                 Some(thread.frames.len()),
             );
@@ -3276,7 +3276,42 @@ pub(super) fn jit_native_shadow_is_final_wrapper_unbox(
     )
 }
 
+/// The `java.lang.Double` bit reinterpretations the JIT now lowers itself.
+///
+/// Same shape of exemption as [`jit_native_shadow_is_final_wrapper_unbox`] and
+/// for a stronger version of the same reason. The seal exists because a
+/// compiled direct call bypasses the interpreter's native-vs-bytecode
+/// decision; for these two there is nothing to bypass, because the compiled
+/// form is not a call at all. `try_resolve_intrinsic`'s FP_BITS region lowers
+/// each to a single `MOVQ` that is bit-exact with the native it replaces --
+/// including the NaN payload, which is the whole content of the RAW contract.
+///
+/// Both are `public static native` on a `final` class, so no override can
+/// exist and the target is unambiguous.
+///
+/// Without this the intrinsic could never fire on the workload it was built
+/// for: `jit_method_calls_native_shadowed` seals a method out of the JIT for
+/// CONTAINING the call, and the intrinsic only resolves once the method is
+/// admitted to a compile. Measured on `PSquarePercentileTest`, whose
+/// `--dump-native-registry` census reported 361M invocations of exactly these
+/// two.
+///
+/// `doubleToLongBits` is absent, matching the resolver: it canonicalises NaN,
+/// so no `MOVQ` implements it.
+pub(super) fn jit_native_shadow_is_intrinsified_fp_bits(
+    target_class: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    target_class == "java/lang/Double"
+        && matches!(
+            (method_name, descriptor),
+            ("doubleToRawLongBits", "(D)J") | ("longBitsToDouble", "(J)D")
+        )
+}
+
 pub(super) fn jit_invoke_targets_native_shadow(
+
     shared: &SharedVm,
     caller_class_id: ClassId,
     cp_idx: u16,
@@ -3333,6 +3368,9 @@ pub(super) fn jit_invoke_targets_native_shadow(
     };
 
     if jit_native_shadow_is_final_wrapper_unbox(&target_class, &method_name, &descriptor) {
+        return false;
+    }
+    if jit_native_shadow_is_intrinsified_fp_bits(&target_class, &method_name, &descriptor) {
         return false;
     }
     // A compiled direct call bypasses the interpreter's native-vs-bytecode

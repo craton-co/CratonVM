@@ -1,18 +1,12 @@
 # ZGC's own rewrite pass faults walking a reference array
 
-**Status: STILL OPEN, but it no longer reproduces.** Seventh pass 2026-08-18 —
-**0 SIGSEGV in 52 reps** (26 instrumented, 26 not) in an arm proven to collect
-AND compact; under the documented 3/23 that is a sub-0.1% outcome. Not retired: the
-writer was never identified, both instruments are armed and SILENT rather than
-vindicated, and although the control is now POSITIVE (2/26 on the pre-fix
-tree, against 0/52 on current dev — so the tree changed, not the box), the
-control's crashes symbolize into `chm_collect_all_entries`, NOT the documented
-`reference_slots`/`relocate_stw`. Sixth pass 2026-08-18 — two more bulk writers closed
-by construction, and the evidence re-read: the corrupting value is a *heap
-pointer at offset 0*, which is equally consistent with an unregistered object
-based 16 bytes below the victim. Fifth pass 2026-08-18 — the fourth pass's prescribed
-next step is retired unrun (it cannot fire, see the foot of the page), and the
-candidate it displaced is instrumented but not yet run against the repro.
+**Status: CLOSED 2026-08-19.** Bisected to **`aa4bc7922`** — the reference
+processor wrote through a **pre-GC address** guarded only by `num_fields >= 2`, so
+a `String` passed the test and a queue-head pointer landed on whatever the slide
+had moved into that address. Parent `2fac8c241` crashes 3/38, `aa4bc7922` is clean
+0/38, current `dev` 0/52. See "CLOSED" at the foot of the page for why every audit
+on this page was blind to it: they all watch **mutators**, and the writer was the
+**collector**.
 
 **Reopened 2026-08-15, later the same day.** The
 straddler fix below is real and landed; the crash it was closed against is
@@ -817,7 +811,88 @@ known. The `0/52` on current `dev` is the one figure here that clears the bar
 **Do not narrow the range further on 26-rep steps.** Re-run `175dc1751` at n ≥ 38
 before trusting the bracket above.
 
-## Bisect log — running, 2026-08-19
+# CLOSED 2026-08-19: the writer was the collector's OWN reference processing
+
+## The bisect landed on an adjacent pair
+
+| commit | reps | SIGSEGV |
+|---|---:|---:|
+| `2fac8c241` = `aa4bc7922^` | 38 | **3** |
+| **`aa4bc7922`** | 38 | **0** |
+
+Parent and child. `aa4bc7922` is
+*"fix(gc/refs, locale): retire two H2 known-issues — ReferenceQueue exclusion +
+reference-processor shape guard"*, and it is the only commit in the final
+13-commit bracket that touches GC-relevant code:
+`vm/src/runtime/interpreter/gc_and_alloc.rs` (+169) and
+`native-builtins/src/reference.rs` (+86). Neither is under `gc/`, which is why a
+`git log -- gc/` filter showed the bracket as containing *no* GC change at all.
+
+## The mechanism, in that commit's own words
+
+> the null array was a `java.lang.String` value slot, **written by CratonVM's own
+> reference processing through an address that had been reclaimed and reused**.
+>
+> `process_references_after_gc` and its G1-remark twin tested **only
+> `num_fields >= 2` before writing through a pre-GC address**; a String has four
+> and passes. … **This is what published a String as a queue head.**
+
+And in the diff: `// num_fields >= 2 was the only shape test the two loops had`,
+replaced by real `is_reference_shaped` / `is_cleanable_shaped` class checks.
+
+**That is the writer this page hunted for seven passes**, and it explains every
+observation, including the ones that made it look impossible:
+
+| observation | why this writer produces it |
+|---|---|
+| an **8-byte heap pointer** at a slot | it writes a queue-head *reference* |
+| `w0 = 0x0000_0200_4xxx_xxxx` | that is the heap's own address range |
+| `zgc access audit` = **0** on overlapping runs | it is not `set_field` / `set_array_element` — the collector writes directly |
+| `CRATONVM_DBG_HEAPCOPY` = **0** | not a raw native copy either |
+| the three registry-insert checks = **0** | the allocator and the registry are innocent; nothing was inserted |
+| `CRATONVM_ZGC_RELOCATE=0` **never** reproduced | without a slide the pre-GC address is still correct, so the write lands where it was meant to |
+| `seen_at_slide_exit=true, size_at_slide_exit=96`, header now a pointer | the object at that address **moved**; the stale write then landed on whatever occupied it |
+| `--nojit` required | the JIT arm declines relocation on 64 of 68 cycles, so it barely slides |
+
+The one candidate the elimination table never had a row for was **the collector
+writing through its own stale address** — and every audit on this page was built
+to watch *mutators*.
+
+## What is proven, and what is inference
+
+**Proven by measurement:** `2fac8c241` crashes 3/38, `aa4bc7922` is clean 0/38,
+current `dev` is clean 0/52, and the pre-fix control `7eab6d6c2` crashes 2/26 on
+the same machine and harness. The fix commit is identified.
+
+**Inference:** that the *documented* `reference_slots` / `relocate_stw` fault is
+the same defect. What reproduced here symbolized to
+`chm_collect_all_entries` / `map_state`. Both are readers of a heap whose headers
+have been overwritten, and this writer overwrites headers — but the specific
+frames on this page were never reproduced, so "same corruption, different reader"
+is the reading, not a measurement. `reference_slots` was always one route to the
+SIGSEGV and this page said so from the second pass.
+
+**Retired on that basis.** Both instruments added on 2026-08-18 stay in the tree
+and read zero, which is now the expected state rather than an open question.
+
+## A methodological correction worth keeping
+
+**Midpointing `git rev-list A..B` is not a bisect on a merge-heavy history.** One
+step picked `68d47e766`, which turned out to be on a **parallel branch** —
+`merge-base --is-ancestor` says it and `c69ad84d9` are ancestors of neither. Its
+3/38 was a real measurement of a real commit, but it could not narrow anything,
+because it does not lie between the ends. `git bisect` computes the commit that
+best splits the *reachable set* precisely to avoid this; hand-rolled midpointing
+does not.
+
+The bracket was re-derived from ancestry, and the answer came from an **adjacent
+parent/child pair**, which is immune to the error: no midpoint arithmetic is
+involved in comparing `X^` with `X`.
+
+Cost: 8 builds, ~9 hours of running, 6 measured commits — which tracks the 8–9
+hours priced in step 1 once the crash rate was known.
+
+## Bisect log — 2026-08-19
 
 Every "clean" below is **38 reps**, the power step 1 derived
 (`0.923^38 = 0.047`). Every arm is the same machine, same harness, same

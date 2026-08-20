@@ -2384,6 +2384,82 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 /// `WEPollSelectorImpl` is ever constructed here — and if one were, the default
 /// provider this returns is the same object its own `provider` field would hold,
 /// unless the application installed a custom `SelectorProvider`.
+
+/// `SelectableChannel.register(Selector,int)` -- guarded for a foreign
+/// receiver (see `socket_channel::foreign_nio_receiver`). The JDK's is `final`
+/// on `SelectableChannel`/`AbstractSelectableChannel` and routes to the
+/// SELECTOR's own `register`, which is where barchart-udt's `SelectorUDT`
+/// builds its `SelectionKeyUDT`.
+fn g_channel_register2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "register",
+        "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
+    ) {
+        Some(r) => r,
+        None => channel_register_native(ctx, args),
+    }
+}
+
+/// The 3-arg `register(Selector,int,Object)` spelling -- see [`g_channel_register2`].
+fn g_channel_register3(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "register",
+        "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
+    ) {
+        Some(r) => r,
+        None => channel_register_native(ctx, args),
+    }
+}
+
+/// `keyFor(Selector)` -- `final` on `AbstractSelectableChannel`.
+fn g_channel_key_for(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "keyFor",
+        "(Ljava/nio/channels/Selector;)Ljava/nio/channels/SelectionKey;",
+    ) {
+        Some(r) => r,
+        None => channel_key_for_native(ctx, args),
+    }
+}
+
+/// `Selector.close()` -- `final` on `AbstractSelector`; it calls the
+/// selector's own `implCloseSelector`.
+fn g_selector_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "close", "()V") {
+        Some(r) => r,
+        None => selector_close_native(ctx, args),
+    }
+}
+
+/// `Selector.isOpen()` -- `final` on `AbstractSelector`.
+fn g_selector_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "isOpen", "()Z") {
+        Some(r) => r,
+        None => selector_is_open_native(ctx, args),
+    }
+}
+
+/// `Selector.provider()` -- `final` on `AbstractSelector`, and the answer a
+/// third-party selector gives is its OWN provider (barchart's
+/// `SelectorProviderUDT`), not ours.
+fn g_selector_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "provider",
+        "()Ljava/nio/channels/spi/SelectorProvider;",
+    ) {
+        Some(r) => r,
+        None => selector_provider_native(ctx, args),
+    }
+}
+
 fn selector_provider_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     ctx.invoke(
         "java/nio/channels/spi/SelectorProvider",
@@ -3156,6 +3232,111 @@ fn key_cancel_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // Writable, Connectable, Acceptable} stay as JDK bytecode (final methods
 // that mask readyOps() against OP_*).
 // ---------------------------------------------------------------------------
+
+
+/// `SelectionKey.attach(Object)` -- guarded for a foreign receiver (see
+/// `socket_channel::foreign_nio_receiver`).
+///
+/// `attach`/`attachment` are CONCRETE on `java.nio.channels.SelectionKey`
+/// itself, so the superclass walk's "parent has BOTH bytecode and a native ->
+/// the native wins" rule hands a third-party key to us. Netty's NIO event loop
+/// stores its per-channel registration as the key's attachment and reads it
+/// back in `processSelectedKey`; answered out of OUR key registry that is
+/// always null for a `com.barchart.udt.nio.SelectionKeyUDT`, so no UDT
+/// readiness event was ever dispatched and the connect promise never
+/// completed even though the UDT socket had reached CONNECTED.
+fn g_sk_attach(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "attach",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ) {
+        Some(r) => r,
+        None => sk_attach(ctx, args),
+    }
+}
+
+/// `SelectionKey.attachment()` -- see [`g_sk_attach`].
+fn g_sk_attachment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "attachment", "()Ljava/lang/Object;") {
+        Some(r) => r,
+        None => sk_attachment(ctx, args),
+    }
+}
+
+/// `SelectionKey.isValid()` -- concrete on `AbstractSelectionKey`.
+fn g_sk_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "isValid", "()Z") {
+        Some(r) => r,
+        None => sk_is_valid(ctx, args),
+    }
+}
+
+/// `SelectionKey.cancel()` -- concrete on `AbstractSelectionKey`.
+fn g_sk_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "cancel", "()V") {
+        Some(r) => r,
+        None => sk_cancel_public(ctx, args),
+    }
+}
+
+/// `SelectionKey.channel()` -- abstract in the JDK, so a foreign key declares
+/// its own; guarded for the same reason as its siblings, not because the walk
+/// currently reaches us.
+fn g_sk_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "channel",
+        "()Ljava/nio/channels/SelectableChannel;",
+    ) {
+        Some(r) => r,
+        None => sk_channel(ctx, args),
+    }
+}
+
+/// `SelectionKey.selector()` -- see [`g_sk_channel`].
+fn g_sk_selector(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "selector",
+        "()Ljava/nio/channels/Selector;",
+    ) {
+        Some(r) => r,
+        None => sk_selector(ctx, args),
+    }
+}
+
+/// `SelectionKey.interestOps()` -- see [`g_sk_channel`].
+fn g_sk_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "interestOps", "()I") {
+        Some(r) => r,
+        None => sk_interest_ops(ctx, args),
+    }
+}
+
+/// `SelectionKey.interestOps(int)` -- see [`g_sk_channel`].
+fn g_sk_set_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "interestOps",
+        "(I)Ljava/nio/channels/SelectionKey;",
+    ) {
+        Some(r) => r,
+        None => sk_set_interest_ops(ctx, args),
+    }
+}
+
+/// `SelectionKey.readyOps()` -- see [`g_sk_channel`].
+fn g_sk_ready_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "readyOps", "()I") {
+        Some(r) => r,
+        None => sk_ready_ops(ctx, args),
+    }
+}
 
 fn sk_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
@@ -3990,7 +4171,7 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "java/nio/channels/SelectableChannel",
         "register",
         "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
-        channel_register_native,
+        g_channel_register2,
     );
     // Native dispatch (WP0.1) keys on the receiver's concrete class, and the
     // public `register` methods live on `AbstractSelectableChannel` whose real
@@ -4017,19 +4198,19 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             c,
             "register",
             "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
-            channel_register_native,
+            g_channel_register2,
         );
         r.register(
             c,
             "register",
             "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
-            channel_register_native,
+            g_channel_register3,
         );
         r.register(
             c,
             "keyFor",
             "(Ljava/nio/channels/Selector;)Ljava/nio/channels/SelectionKey;",
-            channel_key_for_native,
+            g_channel_key_for,
         );
     }
 
@@ -4047,26 +4228,26 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             c,
             "channel",
             "()Ljava/nio/channels/SelectableChannel;",
-            sk_channel,
+            g_sk_channel,
         );
-        r.register(c, "selector", "()Ljava/nio/channels/Selector;", sk_selector);
-        r.register(c, "interestOps", "()I", sk_interest_ops);
+        r.register(c, "selector", "()Ljava/nio/channels/Selector;", g_sk_selector);
+        r.register(c, "interestOps", "()I", g_sk_interest_ops);
         r.register(
             c,
             "interestOps",
             "(I)Ljava/nio/channels/SelectionKey;",
-            sk_set_interest_ops,
+            g_sk_set_interest_ops,
         );
-        r.register(c, "readyOps", "()I", sk_ready_ops);
-        r.register(c, "isValid", "()Z", sk_is_valid);
+        r.register(c, "readyOps", "()I", g_sk_ready_ops);
+        r.register(c, "isValid", "()Z", g_sk_is_valid);
         r.register(
             c,
             "attach",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
-            sk_attach,
+            g_sk_attach,
         );
-        r.register(c, "attachment", "()Ljava/lang/Object;", sk_attachment);
-        r.register(c, "cancel", "()V", sk_cancel_public);
+        r.register(c, "attachment", "()Ljava/lang/Object;", g_sk_attachment);
+        r.register(c, "cancel", "()V", g_sk_cancel);
     }
 
     // Selector.selectedKeys / Selector.keys — bytecode in SelectorImpl
@@ -4096,8 +4277,8 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             "()Ljava/nio/channels/Selector;",
             selector_wakeup_public,
         );
-        r.register(c, "close", "()V", selector_close_native);
-        r.register(c, "isOpen", "()Z", selector_is_open_native);
+        r.register(c, "close", "()V", g_selector_close);
+        r.register(c, "isOpen", "()Z", g_selector_is_open);
         // W7-9 §6 / §8.2 — the ninth abstract. See `selector_provider_native`
         // for why this delegates to the real static factory, why the §8.2
         // blocker ("no `NativeContext::invoke_static`") was a false negative,
@@ -4107,7 +4288,7 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             c,
             "provider",
             "()Ljava/nio/channels/spi/SelectorProvider;",
-            selector_provider_native,
+            g_selector_provider,
         );
         // SelectorImpl.lockAndDoSelect bypass: route directly to our select.
         r.register(

@@ -123,24 +123,6 @@ pub(crate) struct JitFrameChainEntry {
     /// has no `JvmThread` to ask, but no interpreter frame can have been pushed
     /// since the entry it nests inside, so the enclosing depth is exact.
     pub interp_depth: u32,
-    /// Whether this entry RESUMES an activation that already has an interpreter
-    /// [`Frame`](crate::runtime::frame::Frame), rather than starting a new one.
-    ///
-    /// True for exactly one caller: on-stack replacement. An ordinary JIT call
-    /// is a new Java activation with no `Frame` of its own, which is the whole
-    /// reason `capture_full_trace` splices this chain in. OSR is the opposite —
-    /// the interpreter was already running the method, its `Frame` is still on
-    /// `thread.frames`, and the compiled body took over the SAME activation
-    /// mid-loop. Reporting both made an OSR'd method appear TWICE in every
-    /// trace taken while it was compiled: `SWCross` read
-    /// `[67] main (Unknown Source)` then `[68] main (SWCross.java:11)` and
-    /// counted 69 frames where HotSpot counts 68.
-    ///
-    /// It only suppresses the entry's own BOUNDARY frame in
-    /// [`active_compiled_frames`]. Activations nested below it are still new
-    /// frames and are still reported, and nothing about the GC root scan
-    /// changes — the compiled frame's spill slots are live either way.
-    pub osr_resumes_interp_frame: bool,
 }
 
 /// Sentinel for [`JitFrameChainEntry::interp_depth`]: resolve at push time from
@@ -743,7 +725,6 @@ pub fn push_jit_entry_at(sp: usize) -> usize {
         entry_sp: sp,
         precise: None,
         interp_depth: INTERP_DEPTH_INHERIT,
-        osr_resumes_interp_frame: false,
     })
 }
 
@@ -1058,27 +1039,6 @@ impl JitEntryGuard {
         cm: &cratonvm_jit::CompiledMethod,
         interp_depth: Option<usize>,
     ) -> Self {
-        Self::enter_with_compiled_at_inner(cm, interp_depth, false)
-    }
-
-    /// [`Self::enter_with_compiled_at`] for an ON-STACK REPLACEMENT entry: the
-    /// compiled body continues an activation the interpreter already has a
-    /// `Frame` for. See [`JitFrameChainEntry::osr_resumes_interp_frame`] for
-    /// what that changes (Java-visible traces only, never the root scan).
-    #[inline(always)]
-    pub fn enter_with_osr_compiled_at(
-        cm: &cratonvm_jit::CompiledMethod,
-        interp_depth: Option<usize>,
-    ) -> Self {
-        Self::enter_with_compiled_at_inner(cm, interp_depth, true)
-    }
-
-    #[inline(always)]
-    fn enter_with_compiled_at_inner(
-        cm: &cratonvm_jit::CompiledMethod,
-        interp_depth: Option<usize>,
-        osr_resumes_interp_frame: bool,
-    ) -> Self {
         // Retain frame metadata even when this method has no oop-map entries.
         // The prologue still records its RBP whenever precise maps are enabled,
         // and the conservative fallback can then scan this compiled frame's
@@ -1098,7 +1058,6 @@ impl JitEntryGuard {
                 exact_rbp: 0,
                 exact_cm_id: 0,
             }),
-            osr_resumes_interp_frame,
         };
         let depth_at_push = push_entry_full(entry);
         Self {
@@ -3389,17 +3348,10 @@ pub fn current_thread_jit_depth() -> usize {
 /// Default ON. `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES=1` restores the historical
 /// one-frame-per-chain-entry answer, so the frame-count difference is an A/B
 /// inside ONE binary instead of a comparison across two builds.
-/// Kill switch for the OSR boundary-frame suppression in
-/// [`active_compiled_frames`] (see
-/// [`JitFrameChainEntry::osr_resumes_interp_frame`]).
-///
-/// Default ON. `CRATONVM_JIT_NO_OSR_FRAME_DEDUP=1` restores the answer that
-/// reported an OSR'd method both as its interpreter frame and as its compiled
-/// chain entry, so the difference is an A/B inside ONE binary.
-fn osr_frame_dedup_enabled() -> bool {
+fn nested_trace_frames_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_FRAME_DEDUP").is_none()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NESTED_TRACE_FRAMES").is_none()
     })
 }
 
@@ -3409,24 +3361,16 @@ fn osr_frame_dedup_enabled() -> bool {
 /// every VM-raised throw. What it prints per chain entry — the recorded
 /// `entry_sp` / `exact_rbp` / published compile id, the boundary method, how
 /// the innermost frame resolved, and the walked activation list — is the dump
-/// that identified BOTH defects this walk had: a frame the mirror named
-/// correctly but no decoder could resolve, and an OSR entry reported beside the
-/// interpreter frame it continues.
+/// that identified the defect this walk had: a frame the mirror named
+/// correctly but no decoder could resolve, because only one of the two
+/// encodings of a direct call was ever decoded.
 fn dbg_swchain_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SWCHAIN").is_some())
 }
 
-fn nested_trace_frames_enabled() -> bool {
-    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NESTED_TRACE_FRAMES").is_none()
-    })
-}
-
-pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
+pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
     let nested_enabled = nested_trace_frames_enabled();
-    let osr_dedup = osr_frame_dedup_enabled();
     let dbg_chain = dbg_swchain_enabled();
     let scanner_sp = current_stack_pointer();
     JIT_ENTRY_CHAIN.with(|c| {
@@ -3445,11 +3389,11 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
         let chain = c.borrow();
         if dbg_chain {
             eprintln!(
-                "[swchain] scanner_sp=0x{scanner_sp:x} entries={} nested={nested_enabled} osr_dedup={osr_dedup}",
+                "[swchain] scanner_sp=0x{scanner_sp:x} entries={} nested={nested_enabled}",
                 chain.len()
             );
         }
-        let mut out: Vec<(u32, String, u32)> = Vec::with_capacity(chain.len());
+        let mut out: Vec<(u32, String, u32, usize)> = Vec::with_capacity(chain.len());
         for (dbg_i, e) in chain.iter().enumerate() {
             let Some(info) = e.precise else {
                 if dbg_chain {
@@ -3463,8 +3407,8 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
                 // the end of this function.
                 let b = unsafe { &*info.compiled_method }.method_label.clone();
                 eprintln!(
-                    "[swchain] e{dbg_i} entry_sp=0x{entry_sp:x} exact_rbp=0x{:x} cm_id={} depth={} osr={} boundary={b}",
-                    info.exact_rbp, info.exact_cm_id, e.interp_depth, e.osr_resumes_interp_frame
+                    "[swchain] e{dbg_i} entry_sp=0x{entry_sp:x} exact_rbp=0x{:x} cm_id={} depth={} boundary={b}",
+                    info.exact_rbp, info.exact_cm_id, e.interp_depth
                 );
             }
             // One chain entry is one interpreter->JIT boundary, but the
@@ -3536,14 +3480,6 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
             if nested.last() != Some(&info.compiled_method) {
                 nested.push(info.compiled_method);
             }
-            // ...with one exception: an OSR entry's boundary frame is not a new
-            // activation, it is the interpreter `Frame` still sitting in
-            // `thread.frames` continued in compiled form. Reporting it here as
-            // well would list the method twice.
-            if osr_dedup && e.osr_resumes_interp_frame && nested.last() == Some(&info.compiled_method)
-            {
-                nested.pop();
-            }
             if dbg_chain {
                 let names: Vec<String> = nested
                     .iter()
@@ -3585,7 +3521,16 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
                 if cm.method_label.is_empty() {
                     continue;
                 }
-                out.push((e.interp_depth, cm.method_label.clone(), cm.owner_class_id));
+                out.push((
+                    e.interp_depth,
+                    cm.method_label.clone(),
+                    cm.owner_class_id,
+                    // The artifact itself, so the trace assembler can ask it
+                    // whether an interpreter frame's pc is one of ITS OSR entry
+                    // points. Valid for exactly as long as the frame is live,
+                    // which is the same window this whole function reads in.
+                    *cm_ptr as usize,
+                ));
             }
         }
         out
@@ -5310,7 +5255,6 @@ mod tests {
                 // carries an unpublished id.
                 exact_cm_id: 0,
             }),
-            osr_resumes_interp_frame: false,
         });
 
         // Stand in for the compiled prologue's `mov gs:[disp], rbp`.

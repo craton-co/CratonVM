@@ -364,7 +364,103 @@ pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<Sta
             .map(|f| entry_from_frame(class_store, f))
             .collect();
     }
+    let jit = drop_osr_continuations(frames, jit);
     interleave_compiled_frames(class_store, frames, &jit)
+}
+
+/// Kill switch for [`drop_osr_continuations`]. Default ON;
+/// `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE=1` restores the duplicate, which is what
+/// makes the frame-count difference an A/B inside one binary.
+fn osr_frame_dedupe_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_FRAME_DEDUPE").is_none()
+    })
+}
+
+/// Drop compiled entries that are the SAME ACTIVATION as an interpreter frame.
+///
+/// An OSR transfer hands control to compiled code part-way through a method
+/// that is already running, and the interpreter's `Frame` for it stays on
+/// `thread.frames`. Both halves then describe one activation, and the trace
+/// reported it twice — `SWCross` read 69 frames where HotSpot reads 68, its
+/// first two entries both `main`.
+///
+/// The decider is **`can_osr_enter` on the frame this entry was pushed from**.
+/// An OSR transfer leaves the interpreter frame parked at the BACK-EDGE it
+/// jumped from, which is by construction one of that artifact's OSR entry
+/// points. An interpreted caller of the same method is parked at an INVOKE,
+/// which is not. All three conditions are required:
+///
+///   * `frames[interp_depth - 1]` exists (the frame the entry was pushed from),
+///   * it names the same class, method and descriptor, and
+///   * `cm.can_osr_enter(frame.pc)`.
+///
+/// **Two discriminators that look right and are not** — both measured wrong on
+/// `probes/SWCross.java`, both cost a build:
+///
+///   * `compiled_via_osr`. The OSR-entered `main` carries `false`: the flag
+///     records how the ARTIFACT was PRODUCED, not how this activation was
+///     ENTERED, and `jit_bridge`'s own comment says a first-call/upgrade
+///     artifact can OSR-enter too. Gating on it makes this function inert.
+///   * `interp_depth` indexing a live frame. An OSR entry records
+///     `interp_depth == frames.len()` exactly like an ordinary call, so the
+///     depth alone separates nothing.
+///
+/// The third condition is what keeps self-recursion safe: an interpreted
+/// `foo` calling a compiled `foo` satisfies the first two, and dropping that
+/// frame would undo the nested-activation walk this file's sibling fix
+/// restored.
+fn drop_osr_continuations(
+    frames: &[Frame],
+    jit: Vec<(u32, String, u32, usize)>,
+) -> Vec<(u32, String, u32, usize)> {
+    if !osr_frame_dedupe_enabled() {
+        return jit;
+    }
+    jit.into_iter()
+        .filter(|(depth, label, _, cm_ptr)| {
+            // The frame this entry was pushed FROM. An OSR continuation was
+            // pushed from the very frame it continues, so that frame is still
+            // there and names the same method.
+            let Some(frame) = (*depth as usize)
+                .checked_sub(1)
+                .and_then(|i| frames.get(i))
+            else {
+                return true;
+            };
+            if !label_names_frame(label, frame) {
+                return true;
+            }
+            if *cm_ptr == 0 {
+                return true;
+            }
+            // SAFETY: the pointer came from a chain entry whose frame is live
+            // on this thread's stack, so the JIT cache still owns the `Arc`;
+            // this read happens on the owning thread during that same capture.
+            let cm = unsafe { &*(*cm_ptr as *const cratonvm_jit::CompiledMethod) };
+            // The decider. An OSR transfer leaves the interpreter frame parked
+            // at the BACK-EDGE it jumped from, which is by construction one of
+            // this artifact's OSR entry points. An interpreted caller of the
+            // same method is parked at an INVOKE, which is not.
+            !cm.can_osr_enter(frame.pc)
+        })
+        .collect()
+}
+
+/// Does `label` (`class/Name.method:descriptor`) name the same method as
+/// `frame`? Compares all three parts: an overload or a same-named method on
+/// another class is a different activation.
+fn label_names_frame(label: &str, frame: &Frame) -> bool {
+    let Some((owner_and_method, descriptor)) = label.rsplit_once(':') else {
+        return false;
+    };
+    let Some((class_name, method_name)) = owner_and_method.rsplit_once('.') else {
+        return false;
+    };
+    &*frame.method_name() == method_name
+        && &*frame.method_descriptor() == descriptor
+        && &*frame.class_name() == class_name
 }
 
 /// Splice the CURRENT thread's active compiled frames into its interpreter
@@ -389,7 +485,7 @@ pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<Sta
 fn interleave_compiled_frames(
     class_store: &ClassStore,
     frames: &[Frame],
-    jit: &[(u32, String, u32)],
+    jit: &[(u32, String, u32, usize)],
 ) -> Vec<StackTraceEntry> {
     let mut out = Vec::with_capacity(frames.len() + jit.len());
     let mut next = 0usize;
@@ -419,7 +515,7 @@ fn interleave_compiled_frames(
 /// optimizing tier), which are always of that shape.
 fn compiled_frame_entry(
     class_store: &ClassStore,
-    (_, label, owner_class_id): &(u32, String, u32),
+    (_, label, owner_class_id, _): &(u32, String, u32, usize),
 ) -> Option<StackTraceEntry> {
     let (owner_and_method, method_descriptor) = label.rsplit_once(':')?;
     let (class_name, method_name) = owner_and_method.rsplit_once('.')?;

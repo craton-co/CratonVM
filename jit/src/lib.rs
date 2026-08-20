@@ -8345,7 +8345,32 @@ pub enum JitIntrinsic {
     Crc32UpdateByte,   // CRC32.update(I)V
     Crc32UpdateBytes,  // CRC32.update([BII)V
                        // ===== INTRINSIC REGION END: CRC32 =====
+
+    // ===== INTRINSIC REGION BEGIN: FP_BITS =====
+    // `Double.doubleToRawLongBits` / `Double.longBitsToDouble` — the two
+    // halves of a bit reinterpretation, one `MOVQ` each.
+    //
+    // Added 2026-08-19 from a `--dump-native-registry` census of
+    // `PSquarePercentileTest`, which reported 466,400,490 native BRIDGE
+    // invocations for the class and named these two as 361M of them:
+    //
+    //     203,434,476  java/lang/Double.doubleToRawLongBits(D)J
+    //     157,756,624  java/lang/Double.longBitsToDouble(J)D
+    //
+    // Both were `kind: "bridge"` -- the checked native funnel -- for an
+    // operation that is a single register move.
+    //
+    // **RAW only, and that is load-bearing.** `doubleToRawLongBits` is
+    // specified to hand back the exact bit pattern, NaN payload included,
+    // which is what `MOVQ` does. Its sibling `doubleToLongBits`
+    // CANONICALISES every NaN to `0x7ff8000000000000` and must NOT be
+    // matched here; the resolver names one method and not the other on
+    // purpose, and a test pins that.
+    DoubleToRawLongBits, // Double.doubleToRawLongBits(D)J
+    LongBitsToDouble,    // Double.longBitsToDouble(J)D
+                         // ===== INTRINSIC REGION END: FP_BITS =====
 }
+
 
 impl JitIntrinsic {
     /// Map this intrinsic onto the `JitDirectCall.entry` sentinel space.
@@ -9419,8 +9444,27 @@ pub fn try_resolve_intrinsic(
     }
     // ===== INTRINSIC REGION END: CRC32 =====
 
+    // ===== INTRINSIC REGION BEGIN: FP_BITS =====
+    // See the enum region of the same tag for the census that motivated this
+    // and for why only the RAW conversion is admitted.
+    if class == "java/lang/Double" {
+        let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+            ("doubleToRawLongBits", "(D)J") => {
+                Some((JitIntrinsic::DoubleToRawLongBits, 1, b'J'))
+            }
+            ("longBitsToDouble", "(J)D") => Some((JitIntrinsic::LongBitsToDouble, 1, b'D')),
+            // `doubleToLongBits` canonicalises NaN and is deliberately absent.
+            _ => None,
+        };
+        if let Some((intrinsic, num_params, ret)) = hit {
+            return Some((intrinsic.as_entry(), num_params, ret));
+        }
+    }
+    // ===== INTRINSIC REGION END: FP_BITS =====
+
     None
 }
+
 
 /// Layout-aware matcher for the `java/lang/String` call-site intrinsics
 /// (the STRING_ACCESS and STRING_SEARCH families).

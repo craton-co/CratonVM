@@ -5619,6 +5619,20 @@ impl SharedVm {
     ///     "jit_fastpath_admissions": 0, "interpreter_bytecode_preferred": 0,
     ///     "interpreter_shadow_unenforced": 0
     ///   },
+    ///   // EVERY key under `refusals` counts something PREVENTED, not
+    ///   // something that happened. `jit_fastpath_admissions` is the one that
+    ///   // reads backwards in isolation: it counts by-name native fast-path
+    ///   // admissions REFUSED, so a LARGE value means strict mode blocked a
+    ///   // lot, not that a lot leaked through. Measured on RJitStringLayout
+    ///   // 2026-08-19: 38 refusals with 0 direct binds and 0 inline-cache
+    ///   // natives — i.e. the JIT's native shortcuts are being denied, which
+    ///   // is the intended posture. See known-issues/jdk-only/G87-1.
+    ///   // A reader checking "is strict mode leaking JIT shortcuts?" would
+    ///   // draw the opposite conclusion from a non-zero value here.
+    ///   //
+    ///   // The block name carries the semantics; the field names do not
+    ///   // repeat it. Renaming would break the schema, so this note is the
+    ///   // fix. If the schema is ever versioned up, rename it then.
     ///   "observation_sink": {
     ///     "recorded": 81, "cap": 256, "saturated": false
     ///   }

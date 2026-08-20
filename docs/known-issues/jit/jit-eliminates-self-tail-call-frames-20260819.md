@@ -7,11 +7,12 @@ Azure Linux host, branch `fix/jit-stackwalk-cross-chain-frames-20260819` off
 `dev` `974471245`, one release binary for every arm below.
 
 Split out of the stack-walking page now retired to
-`fixed-suite-bugs/jit/jit-self-recursive-activations-invisible-to-stack-walks-FIXED-20260819.md`.
-That page was about stack *walking* and its three mechanisms are fixed; this one
-is about frames that are never pushed, which no walk can recover. It is also the
-answer to that page's open question, "which emitter is responsible for the
-pre-fix collapse".
+`retired/jit-self-recursive-activations-invisible-to-stack-walks-RETIRED-20260819.md`,
+whose four mechanisms are all fixed — the last of them recorded in
+`fixed-suite-bugs/jit/jit-compiled-frame-between-chain-entries-FIXED-20260819.md`.
+Those were about stack *walking*; this one is about frames that are never
+pushed, which no walk can recover. It is also the answer to that page's open
+question, "which emitter is responsible for the pre-fix collapse".
 
 ## The measurement
 
@@ -342,7 +343,8 @@ tier lever.
 
 ## Related
 
-- `fixed-suite-bugs/jit/jit-self-recursive-activations-invisible-to-stack-walks-FIXED-20260819.md`
+- `retired/jit-self-recursive-activations-invisible-to-stack-walks-RETIRED-20260819.md`
+  and `fixed-suite-bugs/jit/jit-compiled-frame-between-chain-entries-FIXED-20260819.md`
   — the stack-walking defects this was split out of, all fixed.
 - `jit/src/x64/bytecode_walk.rs` — the tail-JMP arm itself.
 - `jit/src/x64/licm.rs` — `self_tailcall_enabled` (this defect's switch) and

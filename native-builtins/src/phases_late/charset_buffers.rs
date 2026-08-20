@@ -1063,12 +1063,30 @@ fn cb_read_limit(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 /// silent: `encode(CharBuffer.wrap(charChunk))` produces zero bytes and
 /// reports success.
 pub(crate) fn read_wrapped_char_sequence(ctx: &mut dyn NativeContext, seq: ObjectRef) -> String {
-    let direct = ctx.read_string(seq).unwrap_or_default();
+    String::from_utf16_lossy(&read_wrapped_char_sequence_units(ctx, seq))
+}
+
+/// [`read_wrapped_char_sequence`] without the loss.
+///
+/// `CharBuffer.wrap(CharSequence)` STORES what this reads, so a `String`
+/// return type here made `wrap(s).toString()` unable to give back the string it
+/// was handed -- `G63-1` section 3 measured the `char[]` overload and section 6
+/// N2 left this one open as "not native-collections, unowned".
+///
+/// The `String` spelling above is kept, and is still right for its other
+/// callers: they hand the text to a charset encoder or a comparison, where a
+/// Rust `String` is what is wanted and an unpaired surrogate is not
+/// representable in the output anyway.
+pub(crate) fn read_wrapped_char_sequence_units(
+    ctx: &mut dyn NativeContext,
+    seq: ObjectRef,
+) -> Vec<u16> {
+    let direct = ctx.read_string_units(seq).unwrap_or_default();
     if !direct.is_empty() {
         return direct;
     }
     match ctx.invoke_virtual(seq, "toString", "()Ljava/lang/String;", &[]) {
-        Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text).unwrap_or_default(),
+        Ok(Some(Value::Object(Some(text)))) => ctx.read_string_units(text).unwrap_or_default(),
         _ => direct,
     }
 }
@@ -1115,7 +1133,7 @@ pub(crate) fn cb_read_text(ctx: &mut dyn NativeContext, buf: ObjectRef) -> Optio
         _ => 0,
     };
     if let Value::Object(Some(seq)) = ctx.get_field_by_name(buf, "str") {
-        let units: Vec<u16> = read_wrapped_char_sequence(ctx, seq).encode_utf16().collect();
+        let units: Vec<u16> = read_wrapped_char_sequence_units(ctx, seq);
         let n = units.len() as i32;
         let lo = (off + pos).clamp(0, n) as usize;
         let hi = (off + lim).clamp(lo as i32, n) as usize;
@@ -1248,23 +1266,15 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 // 144 Tomcat MessageBytes-conversion failures. Real-JDK mode
                 // needs none of this: `StringCharBuffer` holds the
                 // `CharSequence` itself and indexes it directly.
-                let s = match args.first() {
-                    Some(Value::Object(Some(s))) => {
-                        let direct = ctx.read_string(*s).unwrap_or_default();
-                        if !direct.is_empty() {
-                            direct
-                        } else {
-                            match ctx.invoke_virtual(*s, "toString", "()Ljava/lang/String;", &[]) {
-                                Ok(Some(Value::Object(Some(strref)))) => {
-                                    ctx.read_string(strref).unwrap_or_default()
-                                }
-                                _ => direct,
-                            }
-                        }
-                    }
-                    _ => String::new(),
+                // UNITS, and through the shared reader rather than a fourth
+                // open-coded copy of it. `wrap` STORES what it reads here, so a
+                // Rust `String` in the middle meant `wrap(seq).toString()` could
+                // not give back the sequence it was handed. The comment above
+                // describes exactly this read; it is now one function.
+                let chars: Vec<u16> = match args.first() {
+                    Some(Value::Object(Some(s))) => read_wrapped_char_sequence_units(ctx, *s),
+                    _ => Vec::new(),
                 };
-                let chars: Vec<u16> = s.encode_utf16().collect();
                 let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, chars.len());
                 for (i, &ch) in chars.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(ch as i32));
@@ -1450,8 +1460,10 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => o,
                 _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
             };
-            let text = read_wrapped_char_sequence(ctx, str_obj);
-            let units: Vec<u16> = text.encode_utf16().collect();
+            // Units on the way in AND on the way out (below): this branch lost
+            // them twice, once decoding the wrapped sequence to host text and
+            // once re-encoding the slice with `from_utf16_lossy`.
+            let units: Vec<u16> = read_wrapped_char_sequence_units(ctx, str_obj);
             // StringCharBuffer.toString(int,int) receives absolute buffer
             // indexes (CharBuffer.toString() calls it with position..limit),
             // and StringCharBuffer then adds only `offset` before slicing
@@ -1461,8 +1473,8 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             let len = units.len() as i32;
             let s_lo = abs_start.max(0).min(len);
             let s_hi = abs_end.max(s_lo).min(len);
-            let out = String::from_utf16_lossy(&units[s_lo as usize..s_hi as usize]);
-            return Ok(Some(Value::Object(Some(ctx.create_string(&out)))));
+            let out = &units[s_lo as usize..s_hi as usize];
+            return Ok(Some(Value::Object(Some(ctx.create_string_from_units(out)))));
         }
         let arr = match cb_read_hb(ctx, this) {
             Some(a) => a,

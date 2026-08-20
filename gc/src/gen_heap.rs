@@ -1576,11 +1576,20 @@ pub fn jit_region_bounds_addr() -> usize {
 ///   `[base, end)` pair covers all of them and the three slots are ample. A
 ///   reference field under G1 is a plain pointer, so admitting inline
 ///   reference loads there is sound.
-/// * **ZGC** — **not published, on purpose.** A compact reference slot under
-///   ZGC holds `Z_COLORED_TAG | colour | offset`, not a pointer; inlining a
-///   reference load there would read the un-barriered colored word that
-///   `heap.rs::read_prim_element` panics on by design. ZGC's residual misses
-///   wait for the JIT load barrier, and this table must not land ahead of it.
+/// * **ZGC** — its single arena envelope, in slot 0, **as of 2026-08-19**.
+///   This row previously read "not published, on purpose", on the grounds
+///   that a compact reference slot under ZGC holds
+///   `Z_COLORED_TAG | colour | offset` rather than a pointer. That is true of
+///   the RELOCATING ZGC `feature-designs/zgc-jit-load-barrier.md` designs and
+///   false of the one that runs: `feature-designs/zgc-reference-slot-
+///   representation.md` measured it as *"Reference slots are plain pointers;
+///   nothing in the heap stores a colored word"*, and `set_barrier_color` —
+///   the only writer of the colored state — has no non-test caller. The
+///   publish is coupled to that fact rather than betting on it: arming the
+///   barrier CLEARS this table, which is the only mechanism that can disarm
+///   an inline sequence in already-compiled code. See
+///   `gc/src/zgc.rs::zgc_jit_read_bounds_enabled`, and
+///   `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` to restore helper-only reads.
 ///
 /// All-zero matches nothing, so an unpublished collector degrades to exactly
 /// today's behaviour: every guarded site falls through to the checked helper.
