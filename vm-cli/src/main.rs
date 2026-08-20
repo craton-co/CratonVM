@@ -158,7 +158,7 @@ fn maybe_dump_shutdown_reports() {
         // `[compact-inline] MISS` census under CRATONVM_DBG_COMPACT_INLINE:
         // MISS names the SITES that cannot inline, this names the ACCESSES that
         // paid the helper's `is_object_address` walk. See
-        // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+        // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
         eprintln!(
             "[cratonvm] getfield helper calls: {} (of which trusted-ref: {}) | CALL sites emitted by arm: {}",
             cratonvm_vm::jit::helpers::jit_getfield_helper_calls()

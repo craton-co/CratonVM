@@ -6769,7 +6769,7 @@ unsafe fn jit_getfield_impl(
     // that follows it) fell through: every compiled `getfield` either takes its
     // inline branch or lands here, so this count IS the fast path's miss count.
     //
-    // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md
+    // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md
     // asks for exactly this as its step 1 — "a fix priced on anything but that
     // counter is a guess" — because three separate signals (the gates are
     // default-on, 35 sites were emitted, the codegen arm has unit tests) all

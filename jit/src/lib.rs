@@ -30613,7 +30613,7 @@ mod layout_constant_inventory {
         // branch, `HEADER_SIZE + field_index * SLOT_SIZE` plus the payload bias
         // inside the 16-byte `Value` cell. It is the arm that stopped every
         // legacy-layout receiver from taking `jit_getfield` — see
-        // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md
+        // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md
         // — and it is a disp32 site in all three forms it emits
         // (`48 8B 80 disp32`, `8B 80 disp32`, `48 63 80 disp32`), so it does
         // not share the disp8 hazard either. `SLOT_SIZE` goes 5 -> 6 with it:

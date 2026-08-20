@@ -1110,12 +1110,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "shadow-stack", on_key: Some("CRATONVM_SHADOW_STACK"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "slot-mirror", on_key: None, off_key: Some("CRATONVM_JIT_NO_SLOT_MIRROR"), off_word: None },
     E { group: Group::JIT, token: "sp-coalesce", on_key: None, off_key: Some("CRATONVM_SP_NO_COALESCE"), off_word: None },
-    // All three are default-ON and all three are parsed by an exact `Ok("0")`
-    // match — no other word turns them off, so `off_word` must be exactly
-    // `"0"`. `sp-tailcall` is the SIBLING tail-call (JMP to another method's
-    // entry); `self-tailcall` is a method jumping back into itself.
+    // Both default-ON and both parsed by an exact `Ok("0")` match — no other
+    // word turns them off, so `off_word` must be exactly `"0"`. `sp-tailcall`
+    // is the SIBLING tail-call (a JMP into another method's entry); the
+    // self-recursive form is `self-tailcall` above, which is opt-in.
     E { group: Group::JIT, token: "sp-inline-ic", on_key: Some("CRATONVM_JIT_SP_INLINE_IC"), off_key: None, off_word: Some("0") },
-    E { group: Group::JIT, token: "self-tailcall", on_key: Some("CRATONVM_JIT_SELF_TAILCALL"), off_key: None, off_word: Some("0") },
+    // Opt-in since 2026-08-20: the `JMP`-back form reuses one native frame
+    // per activation, which no other execution mode here does.
+    E { group: Group::JIT, token: "self-tailcall", on_key: Some("CRATONVM_JIT_SELF_TAILCALL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-tailcall", on_key: Some("CRATONVM_JIT_SP_TAILCALL"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "spec-bce", on_key: None, off_key: Some("CRATONVM_JIT_NO_SPEC_BCE"), off_word: None },
     E { group: Group::JIT, token: "stack-bang", on_key: Some("CRATONVM_JIT_STACK_BANG"), off_key: Some("CRATONVM_JIT_NO_STACK_BANG"), off_word: None },
