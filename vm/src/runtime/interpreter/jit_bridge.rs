@@ -3310,7 +3310,38 @@ pub(super) fn jit_native_shadow_is_intrinsified_fp_bits(
         )
 }
 
+/// `java.lang.Enum.ordinal()I` — a `final` method whose registered native is a
+/// pure field read.
+///
+/// Third member of the same exemption family as
+/// [`jit_native_shadow_is_final_wrapper_unbox`], and it carries that family's
+/// argument in full. The seal exists because a compiled direct call bypasses
+/// the interpreter's native-vs-bytecode decision, and here both sides of that
+/// decision do the same thing: `native_enum_ordinal` is literally
+/// `ctx.get_field(this, ENUM_ORDINAL_SLOT)`, and the real JDK's `ordinal()` is
+/// `return ordinal;`. `ordinal()` is `final` on a class every enum extends, so
+/// no override can exist to make the two differ.
+///
+/// What the seal costs when it applies: a `--dump-native-registry` census of
+/// `PSquarePercentileTest` reports 105,171,365 invocations of this one method,
+/// and the same run seals 155 methods out of the JIT for
+/// `calls-native-shadowed-method`. A method is sealed for CONTAINING the call,
+/// so the cost is not the crossing alone -- it is the whole caller staying
+/// interpreted.
+///
+/// `name()` is deliberately absent: its native is not a bare field read (it
+/// degrades a non-reference tag to null, see `native_enum_name`), so the two
+/// sides are not obviously identical and it has no measured traffic here.
+pub(super) fn jit_native_shadow_is_final_enum_ordinal(
+    target_class: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    target_class == "java/lang/Enum" && method_name == "ordinal" && descriptor == "()I"
+}
+
 pub(super) fn jit_invoke_targets_native_shadow(
+
 
     shared: &SharedVm,
     caller_class_id: ClassId,
@@ -3371,6 +3402,9 @@ pub(super) fn jit_invoke_targets_native_shadow(
         return false;
     }
     if jit_native_shadow_is_intrinsified_fp_bits(&target_class, &method_name, &descriptor) {
+        return false;
+    }
+    if jit_native_shadow_is_final_enum_ordinal(&target_class, &method_name, &descriptor) {
         return false;
     }
     // A compiled direct call bypasses the interpreter's native-vs-bytecode
