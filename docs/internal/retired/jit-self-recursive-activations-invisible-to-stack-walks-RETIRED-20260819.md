@@ -1,15 +1,35 @@
-# A JIT-compiled method's self-recursive activations are invisible to every Java stack walk
+# ✅ RETIRED — a JIT-compiled method's self-recursive activations were invisible to Java stack walks
 
-**Status: the headline defect is FIXED 2026-08-18 (`f5e941a4b` + this branch).
-A directly self-recursive method's nested activations are now enumerated from
-the saved-RBP chain, so 64 activations report as 65 frames instead of one —
-exact HotSpot parity on the recursion probes.**
+**RETIRED 2026-08-19.** The defect this page was opened for is fixed, along with
+two more found underneath it. What remained is a different mechanism and has its
+own page:
+`docs/known-issues/jit/jit-compiled-frame-between-chain-entries-is-invisible-20260819.md`.
 
-**A DIFFERENT residual remains OPEN and keeps
-`stackwalker_log4j_deep_repeated_walks_finish_under_jit` red: an INLINED callee
-has no physical frame at all, so it is reported as its caller. That is not the
-mechanism this page was opened for — it needs inline frame records, not a stack
-walk — and it is scoped in "What remains" below.**
+Three fixes came out of this page, each with a kill switch and a regression
+guard:
+
+| # | defect | fix | guard |
+|---|---|---|---|
+| 1 | 64 self-recursive activations reported as ONE frame | walk the saved-RBP chain in `active_compiled_frames` | `self_recursive_activations_survive_tier_up` |
+| 2 | every fast-tier innermost frame wore its CALLER's name | `cm.compile_id = compiler.compile_id` in `x64/driver.rs` | `SWFrames` at HotSpot parity |
+| 3 | an OSR'd method reported twice (interpreter frame + compiled entry) | `drop_osr_continuations`, keyed on `can_osr_enter(frame.pc)` | `an_osr_continuation_is_not_reported_twice` |
+
+Measured, round 39 (post-tier-up), against HotSpot 25:
+
+| probe | before any fix | now | HotSpot 25 |
+|---|---|---|---|
+| `SWShape` tail / non-tail self-recursion | 3 / 3 | **67 / 67** | 67 / 67 |
+| `SWShape` distinct-method chain | 10 | 10 | 10 |
+| `SWMutual` mutual recursion | 67 | 67 | 67 |
+| `SWCross` total / innermost name | 67 / `recurse` | **68 / `helper`** | 68 / `helper` |
+| `SWFrames` (Log4j caller shape) | `false`, n=67 | **`true`, n=68** | `true`, n=68 |
+| `SWValue` computed answers | `VALUES_OK` | `VALUES_OK` | `VALUES_OK` |
+
+Everything below is the page as it stood, including the hypotheses that were
+refuted along the way — kept because two of them look right from the code and
+cost a session each.
+
+---
 
 ## The failure
 
