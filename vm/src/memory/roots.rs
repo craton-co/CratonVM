@@ -159,6 +159,22 @@ fn dbg_jit_rootscan() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some())
 }
 
+/// `CRATONVM_G1_PRECISE_ONLY_ROOTS=1` вЂ” let G1 take the precise-only root
+/// branch again, i.e. skip the conservative JIT scan on a pause whose oop-map
+/// coverage proof passed.
+///
+/// This is the pre-fix behaviour and it is unsound under G1: the pin set that
+/// keeps a JIT-held object from being evacuated is built from the conservative
+/// scan's output, so skipping the scan leaves the pause with no protection at
+/// all rather than with a different one. Kept as an opt-in so the difference
+/// can be A/B'd in one binary.
+fn dbg_g1_precise_only_roots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_PRECISE_ONLY_ROOTS").is_some()
+    })
+}
+
 pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     if scan_marks_enabled() {
         SCAN_MARKS.lock().clear();
@@ -861,7 +877,47 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // `refresh_moving_young_coverage_for_collection`. The per-thread variant
     // remains correct — and remains used — at each mutator's root-snapshot
     // deposit, where per-thread scope is exactly the right question.
+    //
+    // G1 MUST NOT take this branch, and the reason is that the two collectors
+    // protect a JIT-held oop by opposite means.
+    //
+    // Precise-only is sound for a collector whose protection is REWRITING: the
+    // proof says every JIT-held oop sits in a published oop map, the collector
+    // moves it, and `remap_active_jit_frames` writes the new address back into
+    // the slot the map named. The generational collector is that collector.
+    //
+    // G1's protection is PINNING, and the set it pins is built downstream of
+    // this branch from the CONSERVATIVE scan's output alone (the
+    // `add_pinned_jit_root` loop below is `roots[jit_scan_start..]`). Skipping
+    // the scan therefore does not leave G1 with a different protection вЂ” it
+    // leaves G1 with NONE, for every reference the maps do not happen to name.
+    // The pause then reports `pin_addrs=0`, which reads as "there are no JIT
+    // roots" and is consumed as permission to evacuate everything.
+    //
+    // Measured on `PolynomialTest` under `-XX:+UseG1GC --Xmx 1g`, which is one
+    // young pause with two compiled frames on the chain:
+    //
+    //   precise_only=true  (before)  scan_added=0   pin_addrs=0   FAIL 6/6
+    //   precise_only=false (after)   scan_added=42  pin_addrs>0   PASS 3/3
+    //
+    // Forty-two conservative roots on a stack the proof called fully covered,
+    // and `CRATONVM_DBG_VERIFY_OOP_MAPS` reports in-band object addresses that
+    // no map names while the compiled method's `fully_oop_covered` is `true`.
+    // So the proof's guarantee is narrower than "every live reference on this
+    // stack is rewritable" вЂ” which is the guarantee this branch spends. That
+    // gap is a real defect in its own right and is tracked separately; this
+    // term stops G1 depending on it.
+    //
+    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`
+    // states this restriction as though it were already implemented ("requires
+    // `is_generational()`, so under G1 it is false"). It was not; this is the
+    // line that makes the record true.
+    //
+    // `CRATONVM_G1_PRECISE_ONLY_ROOTS=1` restores the old behaviour so the
+    // difference is an A/B inside one binary.
+    let g1_precise_only_roots = dbg_g1_precise_only_roots();
     let moving_young_precise_only = moving_young
+        && (!shared.mem.heap.is_g1() || g1_precise_only_roots)
         && !moving_young_osr_fallback
         && crate::jit::conservative_roots::refresh_moving_young_coverage_for_collection()
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
