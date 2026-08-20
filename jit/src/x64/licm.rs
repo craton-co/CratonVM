@@ -1623,6 +1623,29 @@ pub(super) fn sp_tailcall_enabled() -> bool {
     })
 }
 
+/// Bisect toggle (`CRATONVM_JIT_SELF_TAILCALL=0`) — demote the single-pass
+/// direct SELF tail-call (arguments into the parameter locals, then `JMP` back
+/// to `body_entry_offset`) to the ordinary self-recursive `CALL`, so every
+/// activation gets its own native frame again.
+///
+/// Unlike [`sp_tailcall_enabled`], which governs the SIBLING tail-call, this
+/// one governs a method jumping back into itself. That form is invisible to
+/// every Java stack walk and makes `StackOverflowError` unreachable for a
+/// method the optimizing tier never recompiles — see
+/// `docs/known-issues/jit/jit-eliminates-self-tail-call-frames-20260819.md`,
+/// which had to borrow `CRATONVM_TIER_C2_THRESHOLD` as an A/B lever precisely
+/// because this switch did not exist.
+pub(super) fn self_tailcall_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_TAILCALL").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
 /// Diagnostic (`CRATONVM_SHADOW_OVERFLOW_DIAG`) — on a shadow-stack overflow
 /// bail, also record the compiling method's label so the leak can be named.
 /// The label is a leaked NUL-terminated copy, so it is only produced when this

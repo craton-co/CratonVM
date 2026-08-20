@@ -377,6 +377,7 @@ export inherited from a parent shell.
 | `osr-exit-after` | `CRATONVM_OSR_EXIT_AFTER` |
 | `osr-exit-test` | `CRATONVM_OSR_EXIT_TEST` |
 | `osr-bind` | `CRATONVM_DBG_OSR_BIND` |
+| `osr-frame-dedup` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUP` |
 | `osr-frame-trace` | `CRATONVM_DBG_OSR_FRAME_TRACE` |
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
 | `osr-seed-collision` | `CRATONVM_DBG_OSR_SEED_COLLISION` |
@@ -435,6 +436,7 @@ export inherited from a parent shell.
 | `seedhunt` | `CRATONVM_DBG_SEEDHUNT` |
 | `sel` | `CRATONVM_DBG_SEL` |
 | `selector` | `CRATONVM_DBG_SELECTOR` |
+| `self-tailcall` | `CRATONVM_JIT_SELF_TAILCALL` |
 | `setacc` | `CRATONVM_DBG_SETACC` |
 | `sfi-null-trace` | `CRATONVM_SFI_NULL_TRACE` |
 | `shadow` | `CRATONVM_DBG_SHADOW` |
@@ -469,6 +471,7 @@ export inherited from a parent shell.
 | `stw-expected-ids` | `CRATONVM_DBG_STW_EXPECTED_IDS` |
 | `stw-native-ring` | `CRATONVM_DBG_STW_NATIVE_RING` |
 | `surefire-ipc-dbg` | `CRATONVM_SUREFIRE_IPC_DBG` |
+| `swchain` | `CRATONVM_DBG_SWCHAIN` |
 | `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `sweep-referrers` | `CRATONVM_DBG_SWEEP_REFERRERS` |

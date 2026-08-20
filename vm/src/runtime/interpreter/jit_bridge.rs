@@ -2473,7 +2473,7 @@ pub(super) fn try_osr(
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
     let result_i64 = {
         let _jit_root_guard =
-            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled_at(
+            crate::jit::conservative_roots::JitEntryGuard::enter_with_osr_compiled_at(
                 &*compiled,
                 Some(thread.frames.len()),
             );

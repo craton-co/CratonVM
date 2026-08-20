@@ -123,6 +123,24 @@ pub(crate) struct JitFrameChainEntry {
     /// has no `JvmThread` to ask, but no interpreter frame can have been pushed
     /// since the entry it nests inside, so the enclosing depth is exact.
     pub interp_depth: u32,
+    /// Whether this entry RESUMES an activation that already has an interpreter
+    /// [`Frame`](crate::runtime::frame::Frame), rather than starting a new one.
+    ///
+    /// True for exactly one caller: on-stack replacement. An ordinary JIT call
+    /// is a new Java activation with no `Frame` of its own, which is the whole
+    /// reason `capture_full_trace` splices this chain in. OSR is the opposite —
+    /// the interpreter was already running the method, its `Frame` is still on
+    /// `thread.frames`, and the compiled body took over the SAME activation
+    /// mid-loop. Reporting both made an OSR'd method appear TWICE in every
+    /// trace taken while it was compiled: `SWCross` read
+    /// `[67] main (Unknown Source)` then `[68] main (SWCross.java:11)` and
+    /// counted 69 frames where HotSpot counts 68.
+    ///
+    /// It only suppresses the entry's own BOUNDARY frame in
+    /// [`active_compiled_frames`]. Activations nested below it are still new
+    /// frames and are still reported, and nothing about the GC root scan
+    /// changes — the compiled frame's spill slots are live either way.
+    pub osr_resumes_interp_frame: bool,
 }
 
 /// Sentinel for [`JitFrameChainEntry::interp_depth`]: resolve at push time from
@@ -725,6 +743,7 @@ pub fn push_jit_entry_at(sp: usize) -> usize {
         entry_sp: sp,
         precise: None,
         interp_depth: INTERP_DEPTH_INHERIT,
+        osr_resumes_interp_frame: false,
     })
 }
 
@@ -1039,6 +1058,27 @@ impl JitEntryGuard {
         cm: &cratonvm_jit::CompiledMethod,
         interp_depth: Option<usize>,
     ) -> Self {
+        Self::enter_with_compiled_at_inner(cm, interp_depth, false)
+    }
+
+    /// [`Self::enter_with_compiled_at`] for an ON-STACK REPLACEMENT entry: the
+    /// compiled body continues an activation the interpreter already has a
+    /// `Frame` for. See [`JitFrameChainEntry::osr_resumes_interp_frame`] for
+    /// what that changes (Java-visible traces only, never the root scan).
+    #[inline(always)]
+    pub fn enter_with_osr_compiled_at(
+        cm: &cratonvm_jit::CompiledMethod,
+        interp_depth: Option<usize>,
+    ) -> Self {
+        Self::enter_with_compiled_at_inner(cm, interp_depth, true)
+    }
+
+    #[inline(always)]
+    fn enter_with_compiled_at_inner(
+        cm: &cratonvm_jit::CompiledMethod,
+        interp_depth: Option<usize>,
+        osr_resumes_interp_frame: bool,
+    ) -> Self {
         // Retain frame metadata even when this method has no oop-map entries.
         // The prologue still records its RBP whenever precise maps are enabled,
         // and the conservative fallback can then scan this compiled frame's
@@ -1058,6 +1098,7 @@ impl JitEntryGuard {
                 exact_rbp: 0,
                 exact_cm_id: 0,
             }),
+            osr_resumes_interp_frame,
         };
         let depth_at_push = push_entry_full(entry);
         Self {
@@ -2315,9 +2356,23 @@ fn direct_call_callee(
 /// fabricated a `CompiledMethod` pointer to reach this logic would be reading
 /// a `[u8; N]` as one.
 fn direct_call_target(ret_addr: usize, caller_entry: usize) -> Option<usize> {
+    if caller_entry == 0 {
+        return None;
+    }
+    direct_call_target_rel32(ret_addr, caller_entry)
+        .or_else(|| direct_call_target_abs64(ret_addr, caller_entry))
+}
+
+/// Length of the `MOVABS RAX, imm64` + `CALL RAX` sequence
+/// [`direct_call_target_abs64`] decodes, in bytes.
+const ABS64_CALL_LEN: usize = 12;
+
+/// `E8 rel32` — the near CALL the JIT emits whenever the target is within
+/// +/-2GB of the emit-time buffer position.
+fn direct_call_target_rel32(ret_addr: usize, caller_entry: usize) -> Option<usize> {
     // The call instruction lies between the caller's entry and the return
     // address, so a return address within 5 bytes of it cannot be one.
-    if caller_entry == 0 || ret_addr < caller_entry.saturating_add(5) {
+    if ret_addr < caller_entry.saturating_add(5) {
         return None;
     }
     // SAFETY: `[ret_addr - 5, ret_addr)` lies inside the executable buffer of
@@ -2333,6 +2388,62 @@ fn direct_call_target(ret_addr: usize, caller_entry: usize) -> Option<usize> {
     Some(ret_addr.wrapping_add(rel as usize))
 }
 
+/// `48 B8 <imm64> FF D0` — `MOVABS RAX, imm64` followed by `CALL RAX`, the
+/// OTHER form of the very same direct call.
+///
+/// `x64::emit::emit_call_absolute` picks between two encodings for one call to
+/// one known address: `E8 rel32` when the target is within +/-2GB of the
+/// emit-time buffer position, and this twelve-byte absolute sequence
+/// (`emit_call_imm64_via_rax`) when it is not. Which one a given call site gets
+/// therefore depends on where the staging buffer and the callee's code page
+/// happened to be allocated — the same call, compiled twice, can come out
+/// either way.
+///
+/// Decoding only the first form made the choice observable as a correctness
+/// bug. `stackwalker_log4j_deep_repeated_walks_finish_under_jit` failed in
+/// roughly 10 of 12 runs of the same binary: when `recurse`'s call to
+/// `LoggerFactory.resolveCaller` came out as the absolute form,
+/// [`innermost_frame_method`] could not name the frame it built, returned
+/// `None`, and the whole `resolveCaller` frame vanished from the walk. Log4j2's
+/// caller lookup then answered with `recurse`'s declaring class. Measured on a
+/// failing run, the twelve bytes ending at that return address were
+/// `48 b8 00 70 9c 5b ed 75 00 00 ff d0` — this sequence, targeting
+/// `resolveCaller`'s registered entry point.
+///
+/// This is not a weaker decode than the rel32 one, it is a stronger one: the
+/// target is a literal in the instruction stream rather than a displacement to
+/// add. Every caller still requires the decoded address to equal a registered
+/// method's ENTRY POINT ([`direct_call_callee`]), so an indirect call — the
+/// inline-cache `CALL R11`, the megamorphic stub — decodes to nothing and stays
+/// foreign exactly as before. A bare `FF D0` not preceded by the `MOVABS` half
+/// is rejected here too.
+fn direct_call_target_abs64(ret_addr: usize, caller_entry: usize) -> Option<usize> {
+    // As above: the twelve-byte sequence has to fit between the caller's entry
+    // and the return address, which is what bounds the backward read.
+    if ret_addr < caller_entry.saturating_add(ABS64_CALL_LEN) {
+        return None;
+    }
+    let seq = ret_addr - ABS64_CALL_LEN;
+    // SAFETY: `[seq, ret_addr)` lies inside the executable buffer of the
+    // compiled method `lookup_jit_code_range(ret_addr)` resolved, at or above
+    // its entry point, and that buffer is kept alive by the live frame whose
+    // return address this is. Code pages are readable. Same argument, and the
+    // same bound, as `direct_call_target_rel32` — only the span differs.
+    unsafe {
+        // REX.W + B8+rd with rd = RAX: `MOVABS RAX, imm64`.
+        if (seq as *const u8).read() != 0x48 || ((seq + 1) as *const u8).read() != 0xB8 {
+            return None;
+        }
+        // FF /2 with ModRM mod=11 r/m=RAX: `CALL RAX`.
+        if ((ret_addr - 2) as *const u8).read() != 0xFF
+            || ((ret_addr - 1) as *const u8).read() != 0xD0
+        {
+            return None;
+        }
+        Some(((seq + 2) as *const u64).read_unaligned() as usize)
+    }
+}
+
 /// Whether the five bytes ending at `ret_addr` are `E8 rel32` with the target
 /// `entry_ptr` — i.e. `ret_addr` is the return address of a direct self-call.
 ///
@@ -2342,21 +2453,13 @@ fn direct_call_target(ret_addr: usize, caller_entry: usize) -> Option<usize> {
 fn returned_from_direct_self_call(ret_addr: usize, entry_ptr: usize) -> bool {
     // The call instruction lies between the method entry and the return
     // address, so a return address within 5 bytes of the entry cannot be one.
-    if entry_ptr == 0 || ret_addr < entry_ptr.saturating_add(5) {
-        return false;
-    }
-    // SAFETY: `[ret_addr - 5, ret_addr)` lies inside the executable buffer of
-    // the compiled method that `lookup_jit_code_range(ret_addr)` resolved, at
-    // or above its entry point, and that buffer is kept alive by the live frame
-    // whose return address this is. Code pages are readable.
-    let opcode = unsafe { ((ret_addr - 5) as *const u8).read() };
-    if opcode != 0xE8 {
-        return false;
-    }
-    let rel = unsafe { ((ret_addr - 4) as *const i32).read_unaligned() };
-    // `E8 rel32` targets `next_instruction + rel32`, and `ret_addr` IS the next
-    // instruction.
-    ret_addr.wrapping_add(rel as usize) == entry_ptr
+    // A self-call's caller and callee are the same method, so the method's own
+    // entry both bounds the backward read and IS the target to match. Both
+    // encodings `emit_call_absolute` can produce count: a self-call is subject
+    // to the same rel32-reach coin flip as any other direct call, and reading
+    // only the `E8` form here would call a recursive activation foreign on the
+    // runs that came out absolute (see [`direct_call_target_abs64`]).
+    entry_ptr != 0 && direct_call_target(ret_addr, entry_ptr) == Some(entry_ptr)
 }
 
 fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> bool {
@@ -3286,6 +3389,34 @@ pub fn current_thread_jit_depth() -> usize {
 /// Default ON. `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES=1` restores the historical
 /// one-frame-per-chain-entry answer, so the frame-count difference is an A/B
 /// inside ONE binary instead of a comparison across two builds.
+/// Kill switch for the OSR boundary-frame suppression in
+/// [`active_compiled_frames`] (see
+/// [`JitFrameChainEntry::osr_resumes_interp_frame`]).
+///
+/// Default ON. `CRATONVM_JIT_NO_OSR_FRAME_DEDUP=1` restores the answer that
+/// reported an OSR'd method both as its interpreter frame and as its compiled
+/// chain entry, so the difference is an A/B inside ONE binary.
+fn osr_frame_dedup_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_FRAME_DEDUP").is_none()
+    })
+}
+
+/// Whether [`active_compiled_frames`] dumps the chain it walked to stderr.
+///
+/// `CRATONVM_DBG_SWCHAIN=1`. Off by default and cached, because this runs on
+/// every VM-raised throw. What it prints per chain entry — the recorded
+/// `entry_sp` / `exact_rbp` / published compile id, the boundary method, how
+/// the innermost frame resolved, and the walked activation list — is the dump
+/// that identified BOTH defects this walk had: a frame the mirror named
+/// correctly but no decoder could resolve, and an OSR entry reported beside the
+/// interpreter frame it continues.
+fn dbg_swchain_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SWCHAIN").is_some())
+}
+
 fn nested_trace_frames_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
@@ -3295,6 +3426,8 @@ fn nested_trace_frames_enabled() -> bool {
 
 pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
     let nested_enabled = nested_trace_frames_enabled();
+    let osr_dedup = osr_frame_dedup_enabled();
+    let dbg_chain = dbg_swchain_enabled();
     let scanner_sp = current_stack_pointer();
     JIT_ENTRY_CHAIN.with(|c| {
         // The top entry's `exact_rbp` lives in the `TOP_RBP` mirror between
@@ -3310,12 +3443,30 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
             }
         }
         let chain = c.borrow();
+        if dbg_chain {
+            eprintln!(
+                "[swchain] scanner_sp=0x{scanner_sp:x} entries={} nested={nested_enabled} osr_dedup={osr_dedup}",
+                chain.len()
+            );
+        }
         let mut out: Vec<(u32, String, u32)> = Vec::with_capacity(chain.len());
-        for e in chain.iter() {
+        for (dbg_i, e) in chain.iter().enumerate() {
             let Some(info) = e.precise else {
+                if dbg_chain {
+                    eprintln!("[swchain] e{dbg_i} entry_sp=0x{:x} precise=none", e.entry_sp);
+                }
                 continue;
             };
             let entry_sp = e.entry_sp;
+            if dbg_chain {
+                // SAFETY: the same keep-alive contract as the reporting loop at
+                // the end of this function.
+                let b = unsafe { &*info.compiled_method }.method_label.clone();
+                eprintln!(
+                    "[swchain] e{dbg_i} entry_sp=0x{entry_sp:x} exact_rbp=0x{:x} cm_id={} depth={} osr={} boundary={b}",
+                    info.exact_rbp, info.exact_cm_id, e.interp_depth, e.osr_resumes_interp_frame
+                );
+            }
             // One chain entry is one interpreter->JIT boundary, but the
             // compiled region behind it can be many ACTIVATIONS deep: compiled
             // code calling itself never re-enters from the interpreter, so it
@@ -3384,6 +3535,37 @@ pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
             // entry was pushed for.
             if nested.last() != Some(&info.compiled_method) {
                 nested.push(info.compiled_method);
+            }
+            // ...with one exception: an OSR entry's boundary frame is not a new
+            // activation, it is the interpreter `Frame` still sitting in
+            // `thread.frames` continued in compiled form. Reporting it here as
+            // well would list the method twice.
+            if osr_dedup && e.osr_resumes_interp_frame && nested.last() == Some(&info.compiled_method)
+            {
+                nested.pop();
+            }
+            if dbg_chain {
+                let names: Vec<String> = nested
+                    .iter()
+                    // SAFETY: as the reporting loop below.
+                    .map(|p| unsafe { &**p }.method_label.clone())
+                    .collect();
+                let mut runs: Vec<String> = Vec::new();
+                for n in &names {
+                    match runs.last_mut() {
+                        Some(last) if last.starts_with(&format!("{n} x")) => {
+                            let c: usize = last.rsplit(" x").next().unwrap_or("1").parse().unwrap_or(1);
+                            *last = format!("{n} x{}", c + 1);
+                        }
+                        Some(last) if last == n => *last = format!("{n} x2"),
+                        _ => runs.push(n.clone()),
+                    }
+                }
+                eprintln!(
+                    "[swchain] e{dbg_i} activations={} [{}]",
+                    names.len(),
+                    runs.join(" | ")
+                );
             }
             // `nested` is innermost-first; the splice in
             // `runtime::stackwalker::interleave_compiled_frames` wants
@@ -5128,6 +5310,7 @@ mod tests {
                 // carries an unpublished id.
                 exact_cm_id: 0,
             }),
+            osr_resumes_interp_frame: false,
         });
 
         // Stand in for the compiled prologue's `mov gs:[disp], rbp`.
@@ -5630,17 +5813,91 @@ mod tests {
             None,
             "a return address within 5 bytes of the caller entry is not a call",
         );
-        // `FF /2` (`call rax`) and every other indirect form: the byte five back
-        // is ordinary body filler, and an indirect target is not encoded at all.
-        // This is the inline MIC/PIC cascade and the hashed megamorphic stub —
-        // the case that must stay foreign.
+        // `FF /2` (`call rax`) reached through a REGISTER whose value this code
+        // never wrote — the inline MIC/PIC cascade and the hashed megamorphic
+        // stub — encodes no target and must stay foreign. Filler bytes precede
+        // it here, so neither the `E8` form nor the `MOVABS`+`CALL` pair below
+        // matches.
         assert_eq!(
             direct_call_target(entry + 20, entry),
             None,
-            "a return address whose preceding bytes are not E8 must stay foreign",
+            "a return address whose preceding bytes are neither call form must stay foreign",
         );
         // Keep `body` alive across every read above.
         assert_eq!(body[call_at], 0xE8);
+    }
+
+    /// The SECOND encoding of the same direct call must decode too.
+    ///
+    /// `x64::emit::emit_call_absolute` emits `E8 rel32` when the target is
+    /// within +/-2GB of the emit-time buffer position and
+    /// `MOVABS RAX, imm64` + `CALL RAX` when it is not — one call site, two
+    /// encodings, chosen by where the allocator happened to put things. While
+    /// only the first decoded, `innermost_frame_method` returned `None` for any
+    /// frame built by the second, dropping that frame from every Java-visible
+    /// stack: `stackwalker_log4j_deep_repeated_walks_finish_under_jit` failed in
+    /// 10 of 12 runs of ONE binary, and passed 20 of 20 once this decoded.
+    ///
+    /// The rejections matter as much as the acceptance. Half the sequence — a
+    /// `CALL RAX` whose `MOVABS` is missing, or a `MOVABS` not followed by the
+    /// call — is some other instruction pair, and answering for it would hand a
+    /// caller a frame's worth of the wrong method's oop map.
+    #[test]
+    fn direct_call_target_decodes_the_movabs_rax_call_rax_form() {
+        let mut body = [0x90u8; 48];
+        let entry = body.as_ptr() as usize;
+        let target: u64 = 0x1234_5678_9abc_def0;
+        let seq = 16usize;
+        let ret = entry + seq + ABS64_CALL_LEN;
+        body[seq] = 0x48; // REX.W
+        body[seq + 1] = 0xB8; // MOVABS RAX, imm64
+        body[seq + 2..seq + 10].copy_from_slice(&target.to_le_bytes());
+        body[seq + 10] = 0xFF; // CALL r/m64
+        body[seq + 11] = 0xD0; // ModRM mod=11 reg=/2 r/m=RAX
+
+        assert_eq!(
+            direct_call_target(ret, entry),
+            Some(target as usize),
+            "MOVABS RAX, imm64 + CALL RAX must decode to the baked-in immediate",
+        );
+        // Too close to the caller's entry to hold the twelve-byte sequence, and
+        // the five-byte E8 read finds filler.
+        assert_eq!(
+            direct_call_target(entry + 8, entry),
+            None,
+            "a return address within 12 bytes of the entry cannot be this form",
+        );
+
+        // `CALL RAX` without the `MOVABS` that loaded it: the register was set
+        // somewhere this decoder cannot see, so there is no target to report.
+        let mut lone = [0x90u8; 32];
+        let lone_entry = lone.as_ptr() as usize;
+        lone[20] = 0xFF;
+        lone[21] = 0xD0;
+        assert_eq!(
+            direct_call_target(lone_entry + 22, lone_entry),
+            None,
+            "a bare CALL RAX encodes no target and must stay foreign",
+        );
+
+        // The `MOVABS` half present but the call is something else.
+        let mut half = [0x90u8; 32];
+        let half_entry = half.as_ptr() as usize;
+        half[8] = 0x48;
+        half[9] = 0xB8;
+        half[10..18].copy_from_slice(&target.to_le_bytes());
+        half[18] = 0xFF;
+        half[19] = 0xE0; // JMP RAX, not CALL RAX
+        assert_eq!(
+            direct_call_target(half_entry + 20, half_entry),
+            None,
+            "MOVABS followed by something other than CALL RAX must stay foreign",
+        );
+
+        // Keep every buffer alive across the reads above.
+        assert_eq!(body[seq], 0x48);
+        assert_eq!(lone[20], 0xFF);
+        assert_eq!(half[19], 0xE0);
     }
 
     /// The third arm of the same invariant, and the one that silently voided

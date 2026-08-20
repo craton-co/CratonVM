@@ -965,6 +965,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_STW_CENSUS` | DBG | `CRATONVM_DBG=stw-census` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_STW_EXPECTED_IDS` | DBG | `CRATONVM_DBG=stw-expected-ids` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_STW_NATIVE_RING` | DBG | `CRATONVM_DBG=stw-native-ring` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_SWCHAIN` | DBG | `CRATONVM_DBG=swchain` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_SWEEP_CENSUS` | DBG | `CRATONVM_DBG=sweep-census` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_SWEEP_EDGES` | DBG | `CRATONVM_DBG=sweep-edges` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_SWEEP_LIVENESS` | DBG | `CRATONVM_DBG=sweep-liveness` | opt-in | off | diag | snapshot | types |
@@ -1164,6 +1165,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_IR_RELOC_EMIT` | JIT | `CRATONVM_JIT=ir-reloc-emit` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_SELFREC_DIRECT` | JIT | `CRATONVM_JIT=ir-selfrec-direct` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` | JIT | `CRATONVM_JIT=nested-trace-frames` | opt-out | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_NO_OSR_FRAME_DEDUP` | JIT | `CRATONVM_JIT=osr-frame-dedup` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_KERNEL_REG_LOCALS` | JIT | `CRATONVM_JIT=kernel-reg-locals` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_KERNEL_REG_OSR` | JIT | `CRATONVM_JIT=kernel-reg-osr` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LAMBDA_ADAPTER` | JIT | `CRATONVM_JIT=lambda-adapter` | opt-in | off | behaviour | snapshot | vm |
@@ -1235,6 +1237,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_SAFEPOINT_POLLS` | JIT | `CRATONVM_JIT=safepoint-polls` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SAFEPOINT_REG_SPILL` | JIT | `CRATONVM_JIT=safepoint-reg-spill` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SCALAR_NEW` | JIT | `CRATONVM_JIT=scalar-new` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_SELF_TAILCALL` | JIT | `CRATONVM_JIT=self-tailcall` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SITE_CACHE` | JIT | `CRATONVM_JIT=site-cache` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_SP_IC_DENY` | JIT | `CRATONVM_JIT=sp-ic-deny` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SP_IC_DEOPT_CHECK` | JIT | `CRATONVM_JIT=sp-ic-deopt-check` | opt-in | off | behaviour | snapshot | jit |
