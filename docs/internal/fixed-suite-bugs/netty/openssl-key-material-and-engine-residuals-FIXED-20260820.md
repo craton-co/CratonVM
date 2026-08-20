@@ -1,57 +1,75 @@
-# netty OpenSSL key material: the opaque-key gap, and what is left of it
+# netty OpenSSL key material: the opaque-key gap, and what closed the stall behind it
 
-**Status:** OPEN on **D** only. Sections A (`KEY_VALUES_MISMATCH`) and C
-(`SslContextBuilder` accepting an invalid cipher) closed earlier; **A′** closed
-2026-08-17 (an EKU read as an eligibility filter — see §A′); **B closed
-2026-08-18** — the verifier-time trust check is in, and the 49-test regression
-that withdrew it on 2026-08-17 is gone.
+**Status: CLOSED 2026-08-20**, branch
+`fix/netty-sslctx-spi-and-openssl-keymat-20260820`, Azure Linux host, release
+builds from dev `86b13ed4c`. Sections A (`KEY_VALUES_MISMATCH`) and C
+(`SslContextBuilder` accepting an invalid cipher) closed 2026-08-15; **A′**
+2026-08-17 (an EKU read as an eligibility filter); **B** 2026-08-18 (the
+verifier-time trust check, re-landed as cherry-picks); **D** 2026-08-20 — the
+stall was a recursive read on the process-wide selector registry, not anything
+in the key-material path at all.
 
 **READ §D's environment note before trusting any OPENSSL number from this
-host, including this page's own older ones.** For part of 2026-08-18 this
-suite could not run OpenSSL AT ALL — on HotSpot either — and the way that
-presented was not an error. It was `ParameterizedSslHandlerTest` passing
-**7 of its 63 tests** and reporting success. Anything measured in that window
-is about the JDK provider only.
+host, including this page's own older ones.** With the classpath the fixture
+generates, `OpenSsl.isAvailable()` is FALSE — on HotSpot too — and the way that
+presents is not an error. It is `ParameterizedSslHandlerTest` passing **7 of its
+63 tests** and reporting success. Anything measured without the corrected
+argfile is about the JDK provider only. It is now a script,
+`apps/netty-suite-runner/gen-openssl-args.sh`, plus a probe to check the answer.
 
-**What closed B was not what the handover predicted.** It named its fifth
-blocker "the TrustManager is invoked TWICE" and asked for the invocation count
-to be instrumented as the next measurement. The manager runs ONCE; the engine
-had two sessions where JSSE has three. Reading the failing test cost ten
-minutes and the instrument would have answered a question that was not the
-one to ask. See §B.
+**Two of this page's own instincts were wrong, and both are worth carrying
+forward.** §B named its fifth blocker "the TrustManager is invoked TWICE" and
+asked for the invocation count to be instrumented next; the manager runs ONCE
+and the engine had two sessions where JSSE has three — reading the failing test
+cost ten minutes and the instrument would have answered a question nobody
+needed. §D spent two array-rooting sweeps on a theory its own A/B had already
+refused twice, while the instrument that closed it — a native backtrace of a
+stuck process — sat named in the VM's own watchdog output the whole time.
 
 Measured on Azure host 2 (Linux x86_64, JDK 25), one class per process,
-`-XX:+UseG1GC`, with `netty-tcnative-boringssl-static` on the classpath for
-BOTH VMs. If a class in this suite aborts inside `gc/`, check that first
-rather than reading it as a TLS defect.
+`-XX:+UseG1GC`, `/tmp/ossl.args` (boringssl-static IN, dynamic tcnative OUT).
+If a class in this suite aborts inside `gc/`, check that first rather than
+reading it as a TLS defect.
 
-| class | dev 2026-08-15 | 2026-08-13 page (`e5f4597e6`) | 2026-08-17 | HotSpot 25 |
-|---|---|---|---|---|
-| `JdkSslEngineTest` | 707 / 821, 48 failed | 755 / 821, 0 failed ✅ | — | 755, 0 failed |
-| `JdkDelegatingPrivateKeyMethodTest` | 1 / 27 | 10 / 27 | **27 / 27** ✅ | 27 / 27 |
-| `OpenSslPrivateKeyMethodTest` | 24 / 24 | 24 / 24 | 24 / 24 | 3 / 24 |
-| `SslHandlerTest` | 47 / 54 | 48 / 54 | **53 ok + 1 aborted** (Linux); see §B for the Windows read | 53 ok + 1 aborted |
-| `SslContextBuilderTest` | 21 / 21 | 21 / 21 ✅ | 21 / 21 ✅ | 21 / 21 |
-| `ParameterizedSslHandlerTest` | never finished, or hangs | 61–63 / 63; still stalls intermittently, quiet host or not | not re-measured | 63 / 63 |
+Re-taken 2026-08-20 with `OpenSsl.isAvailable()` genuinely TRUE on every arm,
+which no earlier column on this page can claim. HotSpot is run in the SAME batch
+so a host effect cannot be read as a VM difference.
 
-The 2026-08-17 column is `fix/netty-nio-pcap-tls-residuals-20260817` on this same
-host. `JdkDelegatingPrivateKeyMethodTest` measured 27/27, 26/27, 27/27 across
-three consecutive runs at host load 27 / 21 / 19; the single failure in the
-middle run is a `TimeoutException` against the class's own `@Timeout(30)` on an
-RSA-PSS SHA512 row, and it landed on a DIFFERENT parameterisation each time it
-appeared (`[8] ...true`, then `[19] ...false`), which is load, not a defect. Its
-14 real failures before the fix were exactly the 11 + 3 rows this page attributed
-to "the client sends no certificate".
+| class | HotSpot 25 | dev `86b13ed4c` | this branch |
+|---|---|---|---|
+| `JdkDelegatingPrivateKeyMethodTest` | 27 / 27 | 27 / 27 | **27 / 27** ✅ |
+| `SslContextBuilderTest` | 21 / 21 | 21 / 21 | **21 / 21** ✅ |
+| `SslHandlerTest` | 53 ok + 1 aborted | 53 ok + 1 aborted | **53 ok + 1 aborted** ✅ |
+| `CloseNotifyTest` | 4 / 4 | 4 / 4 | **4 / 4** ✅ |
+| `OpenSslPrivateKeyMethodTest` | ok=4 **failed=20** | 24 / 24 | **24 / 24** |
+| `SniClientTest` | ok=4 **failed=23** | 27 / 27 | **27 / 27** |
+| `ParameterizedSslHandlerTest` | 63 / 63 in 3.4 s | **6 stalls / 8 runs** | **1 stall / 8 runs**, and a different test — §D |
+| `SslErrorTest` | **72 / 72** | ok=60 **failed=12** | ok=60 **failed=12** — filed, see below |
+| `JdkSslEngineTest` | 755 ok + 66 aborted, 97 s | **900 s cap, no result** | **900 s cap, no result** |
 
-`JdkSslEngineTest` is now the oracle exactly and its page is retired — see the
-retired `jdksslenginetest-engine-level-gaps` write-up for the four causes that
-closed it, three of which (PSS parameters, anchor-is-not-path-validated, JCA
-`Signature`) are shared with this page.
+Three rows need reading rather than counting:
 
-`OpenSslPrivateKeyMethodTest` passes 24 where HotSpot passes 3 — that
-direction is a claim to check, not a win to bank. HotSpot's 21 failures on
-this host are netty-tcnative's own; the number is recorded so the next reader
-does not mistake the gap for progress.
+* `OpenSslPrivateKeyMethodTest` and `SniClientTest` fail on HOTSPOT and pass on
+  CratonVM. That direction is netty-tcnative's own behaviour on this host, not a
+  CratonVM win; the numbers are recorded so the next reader does not mistake the
+  gap for progress.
+* **`SslErrorTest` is a genuine CratonVM defect that this page's own environment
+  problem had been hiding**, and it is the sharpest possible illustration of it.
+  The consolidated not-a-CratonVM-bug table carried this class as "identical
+  `found=0 started=0` on both VMs" — a sound cross-check whose conclusion was
+  wrong, because `found=0` on both VMs is not agreement, it is two VMs running
+  nothing. With the classpath corrected the class generates 72 tests and
+  CratonVM fails 12 of them, all `clientProvider = JDK` client-side rejections,
+  all answering `TLSV1_ALERT_ACCESS_DENIED` where a certificate alert is
+  required. Filed as
+  `known-issues/netty/ssl-client-sends-access-denied-for-every-trust-rejection-20260820.md`.
+* `JdkSslEngineTest` now exceeds a 900 s cap on BOTH CratonVM binaries where
+  HotSpot takes 97 s. Both arms, so it is not this branch — but the 755/821 this
+  page's older columns record was measured on a classpath that generated far
+  fewer tests, so it is not comparable either. It is a wall-clock wall, not a
+  correctness result, and it is the reason this table has no ok/failed number
+  for it.
+
 
 ## ~~A′~~ — FIXED 2026-08-17. The client had no alias, because an EKU was read as an eligibility test
 
@@ -295,19 +313,195 @@ were deliberately NOT picked — the three-phase change above supersedes them.
 `IllegalArgumentException` for a name that is not a cipher suite.
 `SslContextBuilderTest` is 21/21.
 
-## D — still open 2026-08-18, and the first blocker was the classpath
+## ~~D~~ — CLOSED 2026-08-20. The stall was a recursive read on the selector registry
+
+For a week this section could say only that `ParameterizedSslHandlerTest`
+**stops** — no failure, no exception, no thread that looks wrong — on both arms
+of every A/B, at `reentryOnHandshakeCompleteNioChannel`, and that load changes
+the rate but not the existence. It is a three-way deadlock on the process-wide
+selector registry, and `gdb -p` on a stuck process names it in one dump.
+
+### The instrument, and why the earlier ones could not see it
+
+`--stack-dump-on-timeout=600` inside the 900 s cap, so a stalled run dumps
+before `timeout` kills it blind. Its verdict on this hang:
+
+```
+=== T19.H1 watchdog: 0 thread(s) dumped; aborting process ===
+=== no Java thread reached an interpreter dispatch point. That is EITHER
+    JIT-compiled code … OR native (Rust) code. …
+    Linux: `gdb -p <pid>` then `thread apply all bt` ===
+```
+
+Zero Java frames is itself the finding: every thread is in Rust. The
+native-call ring it prints alongside narrows it to two threads that entered
+their natives at the same millisecond and never left:
+
+```
+[43] tid=1    STILL-IN-NATIVE(536287ms ago) java/nio/channels/Selector.wakeup()
+[63] tid=1457 STILL-IN-NATIVE(536286ms ago) java/nio/channels/Selector.selectNow()
+```
+
+`sudo gdb -p` on the live process, 26 threads, is the whole story:
+
+```
+Thread 6   sk_cancel_public  :3491 read HELD -> selector_cancel :1041 read -> PARKED
+Thread 3   selector_open     :614  RwLock::write -> wait_for_readers      -> PARKED
+20 others  open_flag :2294 / kernel_select_linux :1339 -> read            -> PARKED
+```
+
+### The defect
+
+`parking_lot::RwLock::read()` is deliberately **not** recursive-safe: it blocks
+whenever a writer is queued, so that writers cannot starve. `sk_cancel_public`
+held the registry read guard across its search loop and called
+`selector_cancel`, which takes the same lock. So a thread that already holds a
+read guard parked behind the queued writer — and that writer is in
+`wait_for_readers`, waiting for the guard the parked thread is still holding.
+Nothing breaks the cycle, and every selector operation in the VM queues behind
+it.
+
+The trigger is a `SelectionKey.cancel()` racing a `Selector.open()`. netty
+cancels keys on channel close and opens a selector per event loop, and this test
+builds and shuts down a `MultiThreadIoEventLoopGroup` four times per invocation
+— so the race is routine but not certain. That is exactly why:
+
+* it is intermittent, and why load changes the RATE rather than the existence
+  (this page retracted "load-only" twice before giving up on it; the batch below
+  contains a stall at load **0.34**, the quietest run in it);
+* it stalls on BOTH arms of any A/B whose two binaries share the registry, which
+  is every A/B this page ever ran;
+* it does not FAIL. HotSpot has no such lock and runs the same 63 tests in
+  **3.4 s**.
+
+`selectors_read()` replaces all 43 read sites: the FIRST acquisition on a thread
+takes the fair `read()`, so writers still cannot starve; a NESTED one takes
+`read_recursive()`, which does not queue behind a waiting writer and — since a
+writer cannot hold the lock while this thread holds a read guard — cannot block
+at all. The depth counter is a thread-local `Cell`, live in RELEASE as well as
+debug: a `#[cfg(debug_assertions)]` check would have said nothing about the
+binary these suites run.
+
+Two call sites were also un-nested rather than merely made survivable:
+`sk_cancel_public`, and the `epoll_wait` error path, where the guard was created
+in an `if` CONDITION — which in Rust lives until the end of the whole `if`
+STATEMENT, so it was still held inside the body that calls
+`finish_in_flight_linux_select`.
+
+### The A/B
+
+Same protocol as the control batch, ABBA within each round, one batch so both
+arms see the same host: `/tmp/ossl.args` (OpenSSL genuinely available — see the
+environment note), `PerTestProgressRunner` so a killed run names the test that
+was in flight, `-Djunit.jupiter.execution.timeout.mode=disabled`,
+`--stack-dump-on-timeout=600`, 900 s cap, load recorded per run.
+
+```
+                                                          in flight when killed
+r=0 base  load=4.99  rc=0    wall=95s   begin=63 end=63   -
+r=0 fix   load=6.98  rc=0    wall=102s  begin=63 end=63   -
+r=0 fix   load=6.14  rc=134  wall=601s  begin=18 end=17   testCloseNotifyNotWaitForResponse #9
+r=0 base  load=2.91  rc=134  wall=605s  begin=23 end=22   reentryOnHandshakeCompleteNioChannel #5
+r=1 base  load=1.53  rc=134  wall=604s  begin=19 end=18   reentryOnHandshakeCompleteNioChannel #1
+r=1 fix   load=0.15  rc=0    wall=65s   begin=63 end=63   -
+r=1 fix   load=1.43  rc=0    wall=64s   begin=63 end=63   -
+r=1 base  load=1.48  rc=134  wall=605s  begin=25 end=24   reentryOnHandshakeCompleteNioChannel #7
+r=2 base  load=0.04  rc=134  wall=604s  begin=23 end=22   reentryOnHandshakeCompleteNioChannel #5
+r=2 fix   load=0.00  rc=0    wall=64s   begin=63 end=63   -
+r=2 fix   load=1.01  rc=0    wall=66s   begin=63 end=63   -
+r=2 base  load=1.42  rc=134  wall=604s  begin=22 end=21   reentryOnHandshakeCompleteNioChannel #4
+r=3 base  load=0.02  rc=134  wall=604s  begin=23 end=22   reentryOnHandshakeCompleteNioChannel #5
+r=3 fix   load=0.00  rc=0    wall=71s   begin=63 end=63   -
+r=3 fix   load=0.99  rc=0    wall=65s   begin=63 end=63   -
+r=3 base  load=1.23  rc=0    wall=71s   begin=63 end=63   -
+
+  base (dev 86b13ed4c)   6 stalls / 8 runs,  ALL at reentryOnHandshakeCompleteNioChannel
+  fix  (this branch)     1 stall  / 8 runs,  at a DIFFERENT test — see below
+```
+
+`rc=134` is the watchdog's own abort at 600 s, inside the 900 s cap;
+`begin = end + 1` means exactly one test was in flight when it fired.
+
+A control batch run first, before the fix existed, put two binaries that differ
+by an unrelated TLS change at **7 stalls / 12 runs**, every one of them at
+`reentryOnHandshakeCompleteNioChannel` — which is what "stalls on BOTH arms"
+always meant: both arms had the deadlock.
+
+**The load story ends here.** Four of the six control stalls above are at load
+**0.02, 0.04, 1.42, 1.48** on an eight-core host that was otherwise idle, and
+`fix` passed at 0.00 twice in the same batch. This page retracted "load-only"
+twice and then said load "changes the RATE, not the existence"; the honest
+statement is simpler — the deadlock needs a `SelectionKey.cancel()` to overlap a
+`Selector.open()`, and load only changes how often two threads overlap.
+
+The passing runs also got FASTER: 64–71 s on `fix` against 71–95 s on `base`,
+because the fair-lock queueing this removes was costing every selector operation
+in the process, not only the ones that deadlocked.
+
+
+### What is left, and it is not this
+
+The one `fix` stall is **not this defect**, and the VM's own watchdog separates
+them without further work:
+
+| | the deadlock (6/8 on `base`) | what is left (1/8 on `fix`) |
+|---|---|---|
+| test in flight | `reentryOnHandshakeCompleteNioChannel` | `testCloseNotifyNotWaitForResponse` |
+| `--stack-dump-on-timeout` | **0 thread(s) dumped** | **1 thread dumped**, with Java frames |
+| native-call ring | two threads `STILL-IN-NATIVE(536s)` | **no thread still in a native** |
+| event loops | parked in Rust on a futex | parked in `NioIoHandler.select`, i.e. working |
+
+One Java thread waiting on a `DefaultChannelPromise` while five event loops sit
+in `NioIoHandler.select` is a completion that never arrives, not a lock. It is
+filed as
+`known-issues/netty/parameterizedsslhandlertest-closenotify-promise-never-completes-20260820.md`,
+with what it would take to close it — starting with a second observation,
+because one is one.
+
+Note what this means for the section's original subject. §D was written as a
+KEY-MATERIAL page: `NO_CERTIFICATE_SET`, "Unable to find key material for auth
+method(s)", "PrivateKey type not supported PKCS#8". **None of those three
+appears in any of the sixteen runs above, on either arm.** They were fixed by
+the array-rooting sweeps recorded below; what remained after them was never a
+key-material problem at all, which is why the sweeps kept not closing it.
+
 
 ### The environment: this host could not run OpenSSL, for either VM
 
-`netty-tcnative-2.0.81.Final-linux-x86_64.jar` — the DYNAMIC artifact the netty
-Maven reactor resolves — bundles a `.so` that needs `OPENSSL_3.2.0`
-(`objdump -p` names the version tag). This host's `libssl.so.3` is OpenSSL
-**3.0.13**. The `netty-tcnative-boringssl-static` in the local m2 repo was
-2.0.78 with an EMPTY `META-INF/native/`, i.e. a stub. So `OpenSsl.isAvailable()`
-was **false**, and stayed false on HotSpot 25 with the identical classpath.
+**Still true on dev today**, and it is now a command rather than a paragraph to
+re-read. Measured 2026-08-20, HotSpot 25, same host:
 
-What that looked like, measured before it was fixed (`--gc g1`, ABBA over two
-binaries, all four arms byte-identical):
+```
+java @common.args OpenSslAvailabilityProbe
+  OpenSsl.isAvailable = false
+  … UnsatisfiedLinkError: no netty_tcnative_linux_x86_64 in java.library.path
+
+java @<generated> OpenSslAvailabilityProbe
+  OpenSsl.isAvailable = true
+  OpenSsl.versionString = BoringSSL
+```
+
+`netty-tcnative-2.0.81.Final-linux-x86_64.jar` — the DYNAMIC artifact the netty
+Maven reactor resolves — bundles a `.so` that needs `OPENSSL_3.2.0` (`objdump
+-p` names the version tag) and this host's `libssl.so.3` is **3.0.13**. The fix
+has two halves and only the first is obvious:
+
+1. put `netty-tcnative-boringssl-static-<ver>-<os>.jar` on the classpath — it
+   links BoringSSL statically, so the host's OpenSSL version stops mattering;
+2. **remove the dynamic `netty-tcnative-<ver>-<os>.jar`.** With both present
+   netty finds the dynamic one and `OpenSsl.isAvailable()` stays false
+   regardless of their order.
+
+`apps/netty-suite-runner/gen-openssl-args.sh` derives that argfile from
+`common.args` itself, so it cannot drift from the reactor, and refuses rather
+than producing a quiet dud when the boringssl artifact is missing OR is a stub
+— the `2.0.78` copy in this host's local repo has an EMPTY `META-INF/native/`,
+which loads and then finds no library, i.e. it fails in the exact shape of the
+problem the script exists to route around.
+
+With `isAvailable()` false the classes that exist to test OpenSSL read as clean
+PASSES while running a fraction of their tests. Measured before it was fixed,
+`--gc g1`, ABBA over two binaries, all four arms byte-identical:
 
 | class | found | started | ok | failed | aborted |
 |---|---:|---:|---:|---:|---:|
@@ -317,229 +511,88 @@ binaries, all four arms byte-identical):
 | `SslContextBuilderTest` | 21 | 21 | 9 | 9 | 3 |
 | `SniClientTest` | 3 | 3 | 3 | 0 | 0 |
 
-`ParameterizedSslHandlerTest` at **7 of 63** is a PASS. This page's own Repro
-section warned about exactly this shape — "these classes read as clean passes
-while running a fraction of their tests" — and this is what it looks like when
-it happens. Every one of `SslHandlerTest`'s 15 failures and
-`SslContextBuilderTest`'s 9 is an `*OpenSsl*` test whose cause chain ends in
-`UnsatisfiedLinkError: no netty_tcnative_linux_x86_64 in java.library.path`.
+`ParameterizedSslHandlerTest` at **7 of 63** is a PASS. Every one of
+`SslHandlerTest`'s 15 failures and `SslContextBuilderTest`'s 9 is an `*OpenSsl*`
+test whose cause chain ends in `UnsatisfiedLinkError`. Print
+`OpenSsl.isAvailable()` before trusting any result from these classes;
+`probes/OpenSslAvailabilityProbe.java` is that check and prints the
+unavailability cause when the answer is no.
 
-The fix has two halves and only the first is obvious:
+### What the array-rooting sweeps contributed, and what they did not
 
-1. fetch `netty-tcnative-boringssl-static:2.0.81.Final:linux-x86_64` — it links
-   BoringSSL statically, so the host's OpenSSL version stops mattering;
-2. **remove the dynamic `netty-tcnative` jar from the classpath.** With both
-   present netty finds the dynamic one and `OpenSsl.isAvailable()` stays false
-   regardless of their order.
+Two sweeps were run against this section before the deadlock was found, on the
+theory that the stall was a rooting defect. **Neither closed it**, and the page
+said so at the time — correctly. They did fix real defects of a real shape, and
+those stand:
 
-Print `OpenSsl.isAvailable()` before trusting any result from these classes.
+* `KeyStore.getCertificateChain`, `KeyStore.aliases`,
+  `SSLSession.getPeerCertificates` and `getLocalCertificates` all built a
+  reference array and then filled it in a loop whose body ALLOCATES, holding the
+  array raw across those allocations. What the live array kept was whatever the
+  collector left there: usually `null` (32 of them — the system trust-anchor
+  count), occasionally a `DerValue` from the certificate parsing the loop had
+  just done, which is why one site produced two unrelated-looking errors
+  (`IllegalArgumentException: Null element in chain: [null × 32]` and
+  `NoSuchMethodError: sun.security.util.DerValue.getEncoded()`).
+* Six more of the same shape, two of them squarely on the OPENSSL key-material
+  path: `x509_manager::materialize_string_array` (the whole of
+  `X509KeyManager.getServerAliases` / `getClientAliases` — a holed alias list is
+  what netty's `OpenSslKeyMaterialProvider` turns into `NO_CERTIFICATE_SET`),
+  `kmf_engine_get_key_managers` / `tmf_engine_get_trust_managers` at length 1 (a
+  one-element array is not exempt: the relocation moves the array, not the
+  element count), and three cipher-suite / protocol name arrays in `t27_tls`.
 
-### With OpenSSL actually available: the stall is still there, on BOTH arms
+`probes/KeyManagerAliasArrayRooting.java` reports `holes=0 shortfalls=0` on the
+UNFIXED binary too, so it pins the contract going forward and is **not** a
+reproduction. The honest reading is the one the page already had: those were
+real defects worth fixing, and none of them was this one.
 
-`probes/PerTestProgressRunner.java` runs the class and prints `@@BEGIN` before
-each individual test, so a run killed at a cap still names what was in flight —
-which is what this section needed, since its symptom is a stall rather than a
-failure. `-Djunit.jupiter.execution.timeout.mode=disabled`, `-XX:+UseG1GC`,
-`-Xmx1500m`, one class per process, alternating binaries, 900 s cap, load
-recorded per run:
-
-```
-r=0 arm=base  load=4.72   rc=0    wall=64s   begin=63 end=63 bad=0
-r=0 arm=fix   load=7.96   rc=0    wall=82s   begin=63 end=63 bad=0
-r=1 arm=base  load=12.85  rc=124  wall=900s  begin=19 end=18 bad=0   <- STALL
-r=1 arm=fix   load=5.26   rc=0    wall=86s   begin=63 end=63 bad=0
-r=2 arm=base  load=7.42   rc=124  wall=900s  begin=26 end=25 bad=0   <- STALL
-r=2 arm=fix   load=3.33   rc=124  wall=900s  begin=23 end=22 bad=0   <- STALL
-r=3 arm=base  load=3.07   rc=0    wall=62s   begin=63 end=63 bad=0
-r=3 arm=fix   load=6.21   rc=124  wall=900s  begin=22 end=21 bad=0   <- STALL
-r=4 arm=base  load=3.62   rc=0    wall=61s   begin=63 end=63 bad=0
-
-  base (dev)   2 stalls / 5 runs      stalled at load 12.85, 7.42
-  fix (branch) 2 stalls / 4 runs      stalled at load  3.33, 6.21
-  passes at load 3.07 3.62 4.72 5.26 7.96 — the two distributions OVERLAP
-```
-
-`rc=124` is the 900 s cap; `begin`/`end` are `@@BEGIN`/`@@END` counts, so
-`begin = end + 1` means exactly one test was in flight when the cap fired.
-**No stalled run reports a single failure.** The class does not fail. It stops.
-
-**Both binaries stall, and the LOWEST-load run in the batch is one of the
-stalls.** The branch arm — the one carrying §D's six extra array-rooting fixes
-— hung at load **3.33**, and the control passed at load **3.07** in the very
-next run. Two conclusions, and the second is the one that costs this page a
-standing assumption:
-
-* §D does **not** close, and this branch's rooting fixes are not its cure.
-  That is the same verdict the earlier sweep got, now with two more sites
-  swept and the same answer.
-* The load story needs correcting a SECOND time. This page already retracted
-  "load-only" once, on a stall at load 5.7. At **3.33 on an eight-core host**,
-  with a pass at 3.07 beside it, load is not the variable — it changes the
-  RATE, not the existence. Keep recording it, but stop treating a quiet host
-  as a clean bill.
-
-Reading only the quiet window would have retired this section: the four
-non-stalled runs are 63/63 in 62-86 s on both binaries, better than anything
-this page had ever recorded. Four samples would have been enough to be wrong.
-
-### What this branch did contribute: six more unpinned arrays
-
-The sweep recorded below converted `KeyStore.getCertificateChain`,
-`KeyStore.aliases`, `SSLSession.getPeerCertificates` and
-`getLocalCertificates`. It missed six sites of the same shape, two of them
-squarely on the OPENSSL key-material path:
-
-* **`x509_manager::materialize_string_array`** — the whole of
-  `X509KeyManager.getServerAliases` / `getClientAliases`. It allocated the
-  `String[]` and then filled it in a loop calling `create_string`, holding the
-  array reference raw across that allocation. A holed alias list is precisely
-  what netty's `OpenSslKeyMaterialProvider` turns into `NO_CERTIFICATE_SET` and
-  "Unable to find key material for auth method(s)" — two of the three errors
-  this section records.
-* `kmf_engine_get_key_managers` / `tmf_engine_get_trust_managers` — the same at
-  length 1. A one-element array is not exempt: the relocation moves the array,
-  not the element count.
-* three cipher-suite / protocol name arrays in `t27_tls`.
-
-All six now use `NativeHandleScope`, the form
-`t27_tls::build_issuer_principals` has carried since 2026-08-01.
-
-**Honest limit on that claim.** `probes/KeyManagerAliasArrayRooting.java` is the
-guard — 64 aliases, a second thread allocating for the whole run,
-`CRATONVM_DBG_GC_STRESS`, under G1, ZGC and generational ZGC — and it reports
-`holes=0 shortfalls=0` on the UNFIXED binary too. So it pins the contract going
-forward; it is **not** a reproduction, and these six are hardening of a proven
-defect shape rather than the demonstrated cure for anything. The page already
-recorded that an array-rooting sweep did not close §D; this is more of that
-sweep, and it does not close it either.
-
-## D (history) — the hang, and a wrong object identity behind it
-
-`ParameterizedSslHandlerTest` finished in **six consecutive runs on a quiet
-host** (114–184 s) at 61–63 of 63 — including one clean 63/63. **It is not
-cured**: two later runs at host load 45–50 gave one stall, killed at the 900 s
-cap, at the same parameterisation the original page named
-(`reentryOnHandshakeCompleteNioChannel`, `5: clientProvider=OPENSSL_REFCNT,
-serverProvider=OPENSSL_REFCNT`). That matches the original characterisation
-exactly ("on a loaded host it hangs instead — 3 of 7 runs"), so the honest
-reading is that the fixes below removed real failures and made the class
-*usually* finish, not that the stall is gone. Any future claim about it needs
-the host's load average recorded beside the result.
-
-**It is not attributable to any VM change on this branch, and there is now an
-A/B that says so (2026-08-16).** At host load 13–30, `pristine dev` stalls at
-`reentryOnHandshakeCompleteNioChannel` after 21 of 63, and the delegated-task
-branch stalls at the same test after 24 and 25 of 63 — three arms, one
-symptom, one of them the control. At load ~4 the same control finishes 63 in
-176 s. Load is the variable; run the control in the same window or the result
-is unreadable. The prior page's two
-contributing findings stand: the `Selector.select() returned prematurely 512
-times in a row` storm came from `nio_selector.rs`'s interest-ops nudge (whose
-Linux premise was false) and is gone, and the storm was a symptom rather than
-the cause.
-
-### What the hang was hiding — an unpinned array, FIXED 2026-08-15
-
-Two intermittent failures shared one call site,
-`ReferenceCountedOpenSslServerContext.newSessionContext` →
-`toBIO(alloc, manager.getAcceptedIssuers())`, and one root cause:
-
-```
-java.lang.NoSuchMethodError: 'byte[] sun.security.util.DerValue.getEncoded()'
-    at io.netty.handler.ssl.PemX509Certificate.append(…:126)
-java.lang.IllegalArgumentException: Null element in chain: [null × 32]
-    at io.netty.handler.ssl.PemX509Certificate.toPEM(…:80)
-    (netty wraps this one as "SSLException: unable to setup trustmanager")
-```
-
-Both `getAcceptedIssuers` implementations —
-`x509_manager::get_accepted_issuers` and the `javax/net/ssl/X509TrustManager`
-one in `t27_tls` — built the result array and then filled it in a loop whose
-body ALLOCATES (a mirror object, two strings, a DER `byte[]`). The array
-reference was held raw, so a moving young collection landing inside the loop
-relocated it and every `set_array_element` after that wrote into the vacated
-slots. What the live array kept was whatever the collector left there: usually
-`null` (32 of them — the system trust-anchor count), occasionally a `DerValue`
-from the certificate parsing the loop had just done, which is why one site
-produced two unrelated-looking errors. Same family as
-`t27_tls::attach_trust_managers_to_ctx`'s documented GC fix: a native local
-held live across an allocation. Both loops now pin and re-read.
-
-A `sun.security.util.DerValue.getEncoded()` alias for `toByteArray()` was
-added alongside — JDK 25's class genuinely has no `getEncoded()` (verified
-with `javap --module java.base`), and a `DerValue` that wraps a parsed
-certificate carries exactly the DER `X509Certificate.getEncoded()` is
-contracted to return, so the alias is value-correct. It is belt-and-braces,
-not the fix: it changes no object's identity, and any other `X509Certificate`
-method asked of such an object would still fail.
-
-**What is left:** 61–62 of 63, and neither error above appears in any run.
-
-### The residual: intermittently unusable OPENSSL key material
-
-One test method, `reentryOnHandshakeCompleteNioChannel`, one failure per run,
-and **three different errors across runs** — all in netty's OPENSSL
-key-material path, all on an `OPENSSL`/`OPENSSL_REFCNT` server:
-
-```
-OpenSslHandshakeException: error:100000ae:…:NO_CERTIFICATE_SET
-SSLHandshakeException:     Unable to find key material for auth method(s):
-                           [ECDHE_ECDSA, ECDHE_RSA, …, RSA]
-SSLException:              PrivateKey type not supported PKCS#8
-```
-
-The third is the informative one. It comes from
-`OpenSslKeyMaterialProvider.validate`, whose `catch` prints
-`key.getFormat()` — so the key DID report `PKCS#8`, and what failed inside the
-`try` was `toBIO(alloc, key)` → `SSL.parsePrivateKey`. A key that answers
-`getFormat()` correctly and then does not parse is a **value** problem, not a
-type one; together with the null/`DerValue` array corruption fixed above, the
-shape to suspect first is another native local held live across an
-allocation — a `byte[]` this time (`getEncoded()`, or the PEM built from it),
-not a reference array.
-
-**An array-rooting sweep did NOT close it.** `KeyStore.getCertificateChain`,
-`KeyStore.aliases`, `SSLSession.getPeerCertificates` and
-`SSLSession.getLocalCertificates` all had the same unpinned-array defect and
-were converted to `util_concurrent_ext::build_rooted_ref_array` (which exists
-now, and is the right thing to reach for). Measured A/B on a quiet host: one
-failure per run on BOTH the control and the fixed build, only the error text
-differing. So those four were real defects worth fixing, and none of them is
-this one.
-
-**Correction to the load story.** The stall is NOT load-only: with the host at
-load 5.7 a run still hung past 8 minutes at the same
-`reentryOnHandshakeCompleteNioChannel` parameterisation. The earlier "finishes
-on a quiet host" reading came from too few samples. Treat the class as
-intermittently hanging, full stop, and record the load average beside any
-result from it.
+**The methodological cost is worth recording.** Two sweeps, ten converted sites,
+and a probe that could not fail were spent on a theory the page's own A/B had
+already refused twice ("an array-rooting sweep did NOT close it"; "§D does not
+close, and this branch's rooting fixes are not its cure"). The instrument that
+did close it — a native backtrace of a stuck process — was named in the VM's own
+watchdog output the whole time, and needed `sudo`, which this host has.
 
 ## Repro
 
+The classpath first, always. Everything else on this page is unreadable
+without it:
+
 ```bash
 cd apps/netty-suite-runner
-printf '%s\n' io.netty.handler.ssl.JdkDelegatingPrivateKeyMethodTest \
-  io.netty.handler.ssl.OpenSslPrivateKeyMethodTest \
-  io.netty.handler.ssl.SslHandlerTest io.netty.handler.ssl.SslContextBuilderTest \
-  io.netty.handler.ssl.ParameterizedSslHandlerTest > /tmp/km.txt
-CV_BIN=bin/cratonvm-netty-zgc bash run-netty-suite.sh --list /tmp/km.txt --gc g1 --shards 1 --timeout 600 --out /tmp/repro
+./gen-openssl-args.sh -o /tmp/ossl.args
+java @/tmp/ossl.args OpenSslAvailabilityProbe        # expect: isAvailable = true
 ```
 
-`common.args` MUST carry `netty-tcnative-boringssl-static-<ver>-<os>.jar`
-**and MUST NOT carry the dynamic `netty-tcnative-<ver>-<os>.jar`** — see §D's
-environment note for why the second half is load-bearing. Without that,
-`OpenSsl.isAvailable()` is false, the OPENSSL parameters are never generated,
-and `ParameterizedSslHandlerTest` reports 7 of 63 tests as a PASS.
-
-The per-test form, which is the only one that names WHICH test a killed run was
-inside:
+Then the class, in the per-test form — the only one that names WHICH test a
+killed run was inside, because the symptom is a stall rather than a failure:
 
 ```bash
-cratonvm --java-home <jdk> -cp <suite-cp-with-boringssl> -XX:+UseG1GC -Djunit.jupiter.execution.timeout.mode=disabled PerTestProgressRunner io.netty.handler.ssl.ParameterizedSslHandlerTest
+<cratonvm> --java-home <jdk> --Xmx 1500m \
+    --stack-dump-on-timeout=600 \
+    @/tmp/ossl.args -XX:+UseG1GC \
+    -Djunit.jupiter.execution.timeout.mode=disabled \
+    PerTestProgressRunner io.netty.handler.ssl.ParameterizedSslHandlerTest
 ```
 
+`--stack-dump-on-timeout` INSIDE the harness cap, not outside it: a run killed
+by `timeout` alone dies blind. When the dump says "0 thread(s) dumped … no Java
+thread reached an interpreter dispatch point", that is the finding, and the
+next instrument is the one it names:
+
 ```bash
-cratonvm --java-home <jdk> -cp <suite-cp> -XX:+UseG1GC KeyManagerAliasArrayRooting 400
+sudo gdb -p <pid> -batch -ex 'set pagination off' -ex 'thread apply all bt'
+```
+
+This host has passwordless `sudo`; an earlier note on this page said `gdb -p`
+"needs sudo here" and stopped there, which is how §D stayed open for a week.
+
+The whole-suite and rooting-guard forms:
+
+```bash
+CV_BIN=bin/<binary> bash run-netty-suite.sh --list /tmp/km.txt --gc g1 --shards 1 --timeout 600 --out /tmp/repro
+<cratonvm> --java-home <jdk> @/tmp/ossl.args -XX:+UseG1GC KeyManagerAliasArrayRooting 400
 ```
 
 `CRATONVM_DBG_TLS_AUTH=1` prints the `KeyManagerFactory.init` keystore id, the
@@ -554,3 +607,8 @@ told apart from a ticket that was never issued.
 - the retired `ssl-suite-test-discovery-undercounts` and
   `ssl-cert-validation-residuals` write-ups — the work that made these
   reachable.
+- the retired `sslcontext-natives-ignore-a-third-party-spi` write-up — closed
+  in the same branch; it is the reason `gen-openssl-args.sh` grew a `--bc18`
+  mode.
+- `known-issues/netty/parameterizedsslhandlertest-closenotify-promise-never-completes-20260820.md`
+  — what is left of §D once the deadlock is gone, and a much narrower thing.
