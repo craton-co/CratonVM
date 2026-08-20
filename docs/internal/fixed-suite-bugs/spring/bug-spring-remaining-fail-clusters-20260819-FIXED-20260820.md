@@ -183,12 +183,20 @@ non-null, i.e. iff `Package.getImplementationVersion()` answers for
 `org.springframework.core`.
 
 **HotSpot answers `7.1.0-SNAPSHOT` too**, on the same classpath, and fails this
-class identically: `found=9 succ=3 fail=6` on both VMs. `probes/` has the
-one-file check (`PkgVersionProbe` shape: the two VMs agree row for row on
+class identically: `found=9 succ=3 fail=6` on both VMs. `probes/PkgVersionProbe.java` + `.expected.txt` is the
+one-file check: the two VMs agree row for row on
 `getImplementationTitle`/`Version`/`Vendor` for a directory entry, a jar entry
-and a java.base class). This is a harness or upstream-test property of running
-these classes outside Gradle, not a VM divergence, and it should not be counted
-against CratonVM in any sweep summary.
+and a java.base class. This is a property of running these classes outside
+Gradle, not a VM divergence, and it should not be counted against CratonVM in
+any sweep summary.
+
+A concurrent session reached the same verdict the same day from the HotSpot
+baseline alone and moved the class to
+`docs/known-issues/spring/not-cratonvm-bugs-consolidated.md`; that page is the
+one to keep, and its entry now carries the mechanism above (it had recorded
+`Unexpected: comment` as a comment token inside a JSON fixture, which is the
+right conclusion from the wrong cause — JSONAssert says `Unexpected: <name>`
+about an extra KEY, and the key is one Spring itself writes).
 
 ## What is still non-OK in those 90, and why it is not in this doc
 

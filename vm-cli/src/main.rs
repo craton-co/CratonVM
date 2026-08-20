@@ -158,13 +158,26 @@ fn maybe_dump_shutdown_reports() {
         // `[compact-inline] MISS` census under CRATONVM_DBG_COMPACT_INLINE:
         // MISS names the SITES that cannot inline, this names the ACCESSES that
         // paid the helper's `is_object_address` walk. See
-        // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+        // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
         eprintln!(
-            "[cratonvm] getfield helper calls: {} | CALL sites emitted by arm: {}",
+            "[cratonvm] getfield helper calls: {} (of which trusted-ref: {}) | CALL sites emitted by arm: {}",
             cratonvm_vm::jit::helpers::jit_getfield_helper_calls()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "<not counted>".to_string()),
+            cratonvm_vm::jit::helpers::jit_getfield_trusted_ref_calls(),
             cratonvm_jit::metrics::getfield_arm_emits()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // JIT-side only: these are the sites `helpers.rs` tags by hand. The
+        // whole-VM per-caller census that used to print beneath this was
+        // retired once it had answered — it cost 3.4x on ZGC, which is how
+        // the getfield page's first round of numbers came out wrong.
+        eprintln!(
+            "[cratonvm] membership walks by JIT site: {}",
+            cratonvm_vm::jit::helpers::membership_walks_by_site()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
                 .collect::<Vec<_>>()
@@ -5037,6 +5050,19 @@ fn run() -> Result<()> {
             "[cratonvm]   of which VarHandle instance-field reads served directly: {}",
             cratonvm_vm::jit::helpers::varhandle_field_read_hit_count()
         );
+        // The same read, reached WITHOUT the funnel — a thin direct call baked
+        // into compiled code by `VARHANDLE_READ_DIRECT_FNS`. The pair is the
+        // engagement evidence for that bind: `served` counts calls that never
+        // entered `jit_invoke_dispatch` at all, `declined` counts the ones that
+        // did. A non-zero bind count in the "thin direct-helper binds" line with
+        // `served=0` here is the specific failure this exists to name — the site
+        // compiled and every execution refused.
+        {
+            let (served, declined) = cratonvm_vm::jit::helpers::varhandle_read_direct_counts();
+            eprintln!(
+                "[cratonvm] VarHandle read thin direct calls: served={served} declined={declined}",
+            );
+        }
         // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of
         // the two above: it is the one by-name fast path that decides per
         // dispatch rather than at cache-fill time. Reported separately because

@@ -27,6 +27,24 @@ set families, 3 failing before, 0 after. Registration guard:
 `set_view_carrier_remove_if_registered` and
 `set_view_carrier_mutators_registered` in native-collections.
 
+## Landed concurrently, twice
+
+`dev` fixed this independently while this branch was measuring it: the
+`native_hs_remove_if` registration arrived through the
+`fix/jetty-jsp-and-groovy-mh-20260819` merge (`82a95f48a`, "…and two more
+gate-without-registration defects"), whose own body is the same shape as this
+branch's — same ordered snapshot, same `native_hs_remove` write-through, a
+closure where this one used a helper function. The merge keeps THAT
+implementation; this branch contributes the two registrar tests
+(`set_view_carrier_remove_if_registered`,
+`set_view_carrier_mutators_registered`), the behavioural oracle
+(`probes/ViewRemoveIfProbe.java`) and the 90-class measurement below.
+
+Worth recording rather than tidying away: two sessions reached the same
+one-line diagnosis from opposite ends — one from a Spring Boot
+`containersFailed=1` with every test passing, one from 67 Spring Framework
+classes — which is what a defect class this quiet looks like from the outside.
+
 ## The bug
 
 ```java

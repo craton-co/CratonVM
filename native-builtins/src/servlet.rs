@@ -4727,7 +4727,7 @@ fn s2_bb_int_byte_off(bs: i32, unit: i32) -> i32 {
 /// byte — costs ~260 ns against HotSpot's 0.29, and `putLong` is ~3.5x that
 /// rather than 8x, which is the shape of "one native call plus a few
 /// name-keyed field reads", not "eight byte stores". See
-/// `docs/known-issues/netty/httpcontentdecompressortest-hang-20260816.md`
+/// `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md`
 /// for the full decomposition and for why this is what makes
 /// `testZipBomb` exceed its wall.
 ///
