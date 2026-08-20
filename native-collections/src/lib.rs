@@ -16205,6 +16205,16 @@ fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/Collection;)Z",
             native_hs_contains_all,
         );
+        // Both force-native gates have listed `removeIf` for these carriers
+        // from the start; without a body behind it the gate declines and
+        // `ConcurrentHashMap$EntrySetView`'s own `return map.removeEntryIf(f)`
+        // runs over a null `map`. See `native_hs_remove_if`.
+        r.register(
+            c,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            native_hs_remove_if,
+        );
     }
     r.set_category(__prev_cat);
 }
@@ -19560,6 +19570,106 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     result
 }
 
+/// `Collection.removeIf(Predicate)` for a `HashSet` and for every one of the
+/// [`SET_VIEW_CARRIERS`].
+///
+/// `force_native_over_real_jdk_bytecode` (and its `vm_exec` twin) have listed
+/// `removeIf` for these carriers since they were introduced, but
+/// `register_set_view_carrier_natives` never registered a body for it — and a
+/// force-native gate with nothing registered behind it does not throw, it
+/// DECLINES (see `admit_forced_native`'s `Ok(None)` arm) and the call proceeds
+/// to the real JDK bytecode. That only bites on the one carrier whose own class
+/// declares `removeIf`: `ConcurrentHashMap$EntrySetView`, whose body is
+/// `return map.removeEntryIf(f)` over a `map` field a CratonVM-minted view
+/// leaves null, so
+///
+/// ```text
+/// chm.entrySet().removeIf(e -> ...)
+///   NPE: Cannot invoke "...ConcurrentHashMap.removeEntryIf(...)"
+///        because "this.map" is null
+/// ```
+///
+/// on the very first call. That single call site is Spring's
+/// `DefaultContextCache.remove()`, reached by every `@DirtiesContext`-driven
+/// test, and it accounted for 66 of the 88 FAIL classes common to all three GC
+/// variants of the 2026-08-19 Spring Framework sweep (see
+/// `docs/internal/fixed-suite-bugs/spring/`). The other six carriers inherit
+/// `Collection`'s default `removeIf`, which walks the native `iterator()` and
+/// so already worked; registering here makes all seven take one path.
+///
+/// Semantics are the JDK's: test every element of the view's ORDERED snapshot,
+/// then delete the matching ones through `native_hs_remove`, which is what
+/// carries the per-family write-through — `map.remove(k)` for a keySet view and
+/// the `map.remove(e.getKey(), e.getValue())` contract for an entrySet one.
+fn native_hs_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, ahead of the route — see the note in `native_al_for_each`.
+    reject_null_functional(args.get(1))?;
+    if let Some(r) = ksv_route(ctx, args, native_ksv_remove_if) {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pred = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    // GC-SAFETY: `resync_view_set`, the snapshot build (`alloc_live_entry` per
+    // entry), `test` and the reentrant `native_hs_remove` all dispatch Java or
+    // allocate, so every one of them can complete a moving young GC. `this` and
+    // the predicate are bare Rust locals across all of it — pin both BEFORE the
+    // first of them and re-read from the handles at each use. The work happens
+    // in a helper so the single `unpin_native_roots(this_pin)` below also
+    // covers the element pins taken above it, including on the `?` paths.
+    let this_pin = ctx.pin_native_root(this);
+    let pred_pin = ctx.pin_native_root(pred);
+    let out = hs_remove_if_pinned(ctx, this, pred, this_pin, pred_pin);
+    ctx.unpin_native_roots(this_pin);
+    out
+}
+
+/// The body of [`native_hs_remove_if`], run with `this` and the predicate
+/// already pinned so an early `?` cannot strand a native root.
+fn hs_remove_if_pinned(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    pred: ObjectRef,
+    this_pin: usize,
+    pred_pin: usize,
+) -> MethodCallResult {
+    let this = ctx.read_native_pin(this_pin, this);
+    resync_view_set(ctx, this)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    // Ordered, and entry-shaped for an entrySet view — the same snapshot
+    // `iterator()`/`forEach()` hand out, so the predicate sees what HotSpot's
+    // does.
+    let elems = collect_view_snapshot_ordered(ctx, backing)?;
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut modified = false;
+    for i in 0..elems.len() {
+        let p = ctx.read_native_pin(pred_pin, pred);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        let verdict = matches!(
+            ctx.invoke_virtual(p, "test", "(Ljava/lang/Object;)Z", &[e])?,
+            Some(Value::Int(1))
+        );
+        if !verdict {
+            continue;
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], elems[i]);
+        if native_hs_remove(ctx, &[Value::Object(Some(this)), e])? == Some(Value::Int(1)) {
+            modified = true;
+        }
+    }
+    Ok(Some(Value::Int(i32::from(modified))))
+}
+
 // ===========================================================================
 // Optional functional methods
 // ===========================================================================
@@ -20869,6 +20979,8 @@ fn register_factory_natives(r: &mut NativeMethodRegistry) {
         native_map_of_entries,
     );
     r.set_category(__prev_cat);
+    // The write and read halves of what the factories above produce.
+    register_immutable_serialization_natives(r);
 }
 
 /// Generic `List.of` for fixed-arity overloads: every positional arg is an
@@ -21351,6 +21463,327 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let k2 = args.get(2).copied().unwrap_or(Value::Object(None));
     let v2 = args.get(3).copied().unwrap_or(Value::Object(None));
     of_map(ctx, &[(k1, v1), (k2, v2)])
+}
+
+// ===========================================================================
+// Serialization of the immutable collection carriers
+// ===========================================================================
+//
+// `List.of`/`Set.of`/`Map.of`/`copyOf` hand back a CratonVM-minted carrier
+// stamped with a `cratonvm/internal/Unmodifiable*` class that `getClass()`
+// aliases to the size-discriminated real JDK class (`ImmutableCollections$
+// List12`/`ListN`/`Set12`/`SetN`/`Map1`/`MapN`) - see `collection_display_kind`
+// in native-builtins. Its state is this crate's `(backing, immutable-marker)`
+// slot pair, NOT the `e0`/`e1`/`elements`/`table` fields those JDK classes
+// declare.
+//
+// Serialization is the one place that difference escaped. `ObjectOutputStream`
+// looks the object's class up by its ALIASED name, finds the real
+// `writeReplace()` those six classes declare, and runs it - over a receiver
+// whose declared fields were never populated. The `java.util.CollSer` it built
+// therefore carried this crate's slots instead of the elements:
+//
+// ```text
+//                       HotSpot        CratonVM (before)
+//   List.of("a")        [a]            [[a], 1]   <- (backing, marker)
+//   Set.of("a","b")     [a, b]         InvalidObjectException: invalid object
+//   Map.of("a","1")     {a=1}          InvalidObjectException: invalid object
+// ```
+//
+// 20 of the 52 rows of `probes/CollectionSerProbe.java` failed this way, and it
+// is why Spring's `AnnotationTransactionAttributeSourceTests.serializable()`
+// died in `CollSer.readResolve` with `InvalidObjectException: invalid object`
+// (its cause an NPE out of `Set.of(array)`, which rejects the null elements a
+// null `elements` field produced).
+//
+// The fix is the pair below: `writeReplace` builds the `CollSer` from the
+// receiver's OWN public surface (`toArray()`, `entrySet()`) so it is correct
+// for a CratonVM carrier and for a genuine JDK instance alike, and
+// `CollSer.readResolve` rebuilds through `of_list`/`of_set`/`of_map` so the
+// result is a CratonVM carrier rather than a real `MapN` whose `table` these
+// natives cannot read. Both need an entry in BOTH force-native gates
+// (`force_native_over_real_jdk_bytecode` and its `vm_exec` twin), because each
+// class declares the method itself and the reflective `Method.invoke` route
+// `ObjectStreamClass` uses has no bytecode PC to key an invoke-cache entry on.
+
+/// `java.util.CollSer`'s tag values (java.base, `ImmutableCollections.java`).
+/// The low 8 bits pick the shape; the high 24 are reserved and written zero.
+const COLLSER_CLASS: &str = "java/util/CollSer";
+const COLLSER_IMM_LIST: i32 = 1;
+const COLLSER_IMM_SET: i32 = 2;
+const COLLSER_IMM_MAP: i32 = 3;
+const COLLSER_IMM_LIST_NULLS: i32 = 4;
+
+/// Snapshot a collection receiver's elements through its own `toArray()`.
+///
+/// Deliberately a virtual dispatch and not a slot read: this native is reached
+/// for a CratonVM-minted carrier AND for a genuine java.base-built instance of
+/// the same class, and only the receiver knows which it is.
+fn collser_elements(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
+    let arr = match ctx.invoke_virtual(this, "toArray", "()[Ljava/lang/Object;", &[])? {
+        Some(Value::Object(Some(a))) => a,
+        _ => return Ok(Vec::new()),
+    };
+    let len = ctx.array_length(arr);
+    Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+}
+
+/// Build the `java.util.CollSer` replacement object for `tag` over `elems`.
+///
+/// GC-SAFETY: `alloc_ref_array` and `new_object` both allocate, so the elements
+/// are pinned before the first of them and the array across the second.
+fn make_collser(ctx: &mut dyn NativeContext, tag: i32, elems: &[Value]) -> MethodCallResult {
+    let (base, handles) = pin_value_slice(ctx, elems);
+    let arr = alloc_ref_array(ctx, elems.len());
+    let arr_pin = ctx.pin_native_root(arr);
+    let base = if base == usize::MAX { arr_pin } else { base };
+    for (i, e) in elems.iter().enumerate() {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let v = read_pinned_elem(ctx, handles[i], *e);
+        ctx.set_array_element(arr, i, v);
+    }
+    let ser = match ctx.new_object(COLLSER_CLASS) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        Ok(_) => {
+            ctx.unpin_native_roots(base);
+            return Ok(Some(Value::Object(None)));
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(base);
+            return Err(e);
+        }
+    };
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(base);
+    // By name, not by slot: `tag`/`array` are java.base's field names and this
+    // is a real JDK object, so a positional guess would be the same class of
+    // mistake this whole fix is about.
+    ctx.set_field_by_name(ser, "tag", Value::Int(tag));
+    ctx.set_field_by_name(ser, "array", Value::Object(Some(arr)));
+    Ok(Some(Value::Object(Some(ser))))
+}
+
+/// `ImmutableCollections$List12.writeReplace()` / `$ListN.writeReplace()`.
+///
+/// `IMM_LIST_NULLS` when any element is null - `List.of` cannot produce one,
+/// but the nulls-allowed lists java.base builds through
+/// `listFromTrustedArrayNullsAllowed` share these carriers, and `List.of(array)`
+/// on the read side rejects nulls with an NPE that surfaces as exactly the
+/// opaque `InvalidObjectException` this fixes.
+fn native_imm_list_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elems = collser_elements(ctx, this)?;
+    let tag = if elems.iter().any(|e| matches!(e, Value::Object(None))) {
+        COLLSER_IMM_LIST_NULLS
+    } else {
+        COLLSER_IMM_LIST
+    };
+    make_collser(ctx, tag, &elems)
+}
+
+/// `ImmutableCollections$Set12.writeReplace()` / `$SetN.writeReplace()`.
+fn native_imm_set_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elems = collser_elements(ctx, this)?;
+    make_collser(ctx, COLLSER_IMM_SET, &elems)
+}
+
+/// `ImmutableCollections$Map1.writeReplace()` / `$MapN.writeReplace()`.
+///
+/// The array is `k0, v0, k1, v1, ...`, so its length is twice the size - the
+/// layout `CollSer.readResolve`'s `IMM_MAP` arm reads back.
+fn native_imm_map_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // `entrySet()` then `getKey`/`getValue` per entry, for the same reason
+    // `native_map_of_entries` does it: the entry objects may be any
+    // `Map.Entry` implementation, and a positional read would assume one.
+    let entries = match ctx.invoke_virtual(this, "entrySet", "()Ljava/util/Set;", &[])? {
+        Some(Value::Object(Some(es))) => collser_elements(ctx, es)?,
+        _ => Vec::new(),
+    };
+    let (base, handles) = pin_value_slice(ctx, &entries);
+    let mut flat: Vec<Value> = Vec::with_capacity(entries.len() * 2);
+    let mut failure = None;
+    for i in 0..entries.len() {
+        // Re-read the entry from its pin before EACH dispatch: `getKey` can
+        // itself allocate and relocate the entry the `getValue` call needs.
+        let e = match read_pinned_elem(ctx, handles[i], entries[i]) {
+            Value::Object(Some(o)) => o,
+            _ => continue,
+        };
+        let k = match ctx.invoke_virtual(e, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
+        let k_pin = pin_value(ctx, k);
+        let e = match read_pinned_elem(ctx, handles[i], entries[i]) {
+            Value::Object(Some(o)) => o,
+            _ => continue,
+        };
+        let v = match ctx.invoke_virtual(e, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
+        flat.push(read_pinned_elem(ctx, k_pin, k));
+        flat.push(v);
+    }
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    make_collser(ctx, COLLSER_IMM_MAP, &flat)
+}
+
+/// `Collections$UnmodifiableRandomAccessList.writeReplace()`.
+///
+/// The JDK body is `new UnmodifiableList<>(list)` - it downgrades the
+/// RandomAccess wrapper to the plain one so the stream never names a class that
+/// exists only to carry the marker interface, and `UnmodifiableList.readResolve`
+/// puts it back. Over a CratonVM carrier `this.list` is unset, so the stream got
+/// a wrapper around null and reading it back threw NPE.
+///
+/// Answering `this` is the whole fix: the plain `Collections$Unmodifiable{List,
+/// Set,Map,Collection,SortedSet,NavigableSet}` carriers declare no
+/// `writeReplace` and already round-trip correctly - `probes/
+/// CollectionSerProbe.java`'s `unmodifiableList(LinkedList)` row, the
+/// non-RandomAccess twin of the failing one, passes - so declining the
+/// replacement puts the RandomAccess list on that same working path.
+fn native_unmod_ral_write_replace(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+}
+
+/// `java.util.CollSer.readResolve()`.
+///
+/// The real body rebuilds through `List.of`/`Set.of` (natives here, fine) but
+/// through `new ImmutableCollections.Map1<>(k, v)` / `new MapN<>(array)` for
+/// maps - real constructors, producing a real `table`-backed object that every
+/// map native in this crate then reads as empty (`NullPointerException: Cannot
+/// read the array length because "this.table" is null`). Rebuilding through
+/// `of_map` keeps the deserialized map a CratonVM carrier, which is what the
+/// rest of the VM - and `getClass()` - already agrees on.
+///
+/// A tag this does not recognise is handed back untouched rather than turned
+/// into an exception of this native's choosing: `readResolve` answering a
+/// `CollSer` is the corrupt-stream case, and inventing a message the JDK does
+/// not use would only obscure it.
+fn native_collser_read_resolve(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let tag = match ctx.get_field_by_name(this, "tag") {
+        Value::Int(t) => t & 0xff,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let arr = match ctx.get_field_by_name(this, "array") {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let len = ctx.array_length(arr);
+    let elems: Vec<Value> = (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+    match tag {
+        COLLSER_IMM_LIST | COLLSER_IMM_LIST_NULLS => of_list_allowing_nulls(ctx, &elems, tag),
+        COLLSER_IMM_SET => of_set(ctx, &elems),
+        COLLSER_IMM_MAP => {
+            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elems.len() / 2);
+            let mut i = 0;
+            while i + 1 < elems.len() {
+                pairs.push((elems[i], elems[i + 1]));
+                i += 2;
+            }
+            of_map(ctx, &pairs)
+        }
+        _ => Ok(Some(Value::Object(Some(this)))),
+    }
+}
+
+/// `of_list`, but honouring `IMM_LIST_NULLS`: that tag exists precisely because
+/// the list is allowed to hold nulls, so `of_list`'s null rejection - correct
+/// for `List.of` - must not run for it.
+fn of_list_allowing_nulls(
+    ctx: &mut dyn NativeContext,
+    elems: &[Value],
+    tag: i32,
+) -> MethodCallResult {
+    if tag == COLLSER_IMM_LIST_NULLS {
+        let r = make_list_of(ctx, elems);
+        return freeze_result(ctx, UNMOD_LIST_CLASS, r);
+    }
+    of_list(ctx, elems)
+}
+
+/// Register the serialization hooks above, from the same registrar that
+/// installs `List.of`/`Set.of`/`Map.of`: these are the write and read halves of
+/// what those factories produce.
+fn register_immutable_serialization_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for c in [
+        "java/util/ImmutableCollections$List12",
+        "java/util/ImmutableCollections$ListN",
+    ] {
+        r.register(
+            c,
+            "writeReplace",
+            "()Ljava/lang/Object;",
+            native_imm_list_write_replace,
+        );
+    }
+    for c in [
+        "java/util/ImmutableCollections$Set12",
+        "java/util/ImmutableCollections$SetN",
+    ] {
+        r.register(
+            c,
+            "writeReplace",
+            "()Ljava/lang/Object;",
+            native_imm_set_write_replace,
+        );
+    }
+    for c in [
+        "java/util/ImmutableCollections$Map1",
+        "java/util/ImmutableCollections$MapN",
+    ] {
+        r.register(
+            c,
+            "writeReplace",
+            "()Ljava/lang/Object;",
+            native_imm_map_write_replace,
+        );
+    }
+    r.register(
+        "java/util/Collections$UnmodifiableRandomAccessList",
+        "writeReplace",
+        "()Ljava/lang/Object;",
+        native_unmod_ral_write_replace,
+    );
+    r.register(
+        COLLSER_CLASS,
+        "readResolve",
+        "()Ljava/lang/Object;",
+        native_collser_read_resolve,
+    );
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -65615,6 +66048,49 @@ mod tests {
             r.find(c, "stream", "()Ljava/util/stream/Stream;").is_some(),
             "AL stream"
         );
+    }
+
+    /// Every [`SET_VIEW_CARRIERS`] entry must have a `removeIf` body.
+    ///
+    /// Both force-native gates (`force_native_over_real_jdk_bytecode` and its
+    /// `vm_exec` twin) list `removeIf` for these classes, and a gate entry with
+    /// nothing registered behind it does not throw — it DECLINES and the call
+    /// runs the real JDK bytecode. On `ConcurrentHashMap$EntrySetView`, the one
+    /// carrier that declares `removeIf` itself, that bytecode is
+    /// `return map.removeEntryIf(f)` over a `map` field a CratonVM-minted view
+    /// leaves null, so every `chm.entrySet().removeIf(...)` threw NPE. It cost
+    /// 66 of the 88 FAIL classes common to all three GC variants of the
+    /// 2026-08-19 Spring Framework sweep. Behavioural oracle:
+    /// `probes/ViewRemoveIfProbe.expected.txt`.
+    #[test]
+    fn set_view_carrier_remove_if_registered() {
+        let r = build_registry();
+        for c in SET_VIEW_CARRIERS {
+            assert!(
+                r.find(c, "removeIf", "(Ljava/util/function/Predicate;)Z")
+                    .is_some(),
+                "{c} has a removeIf force-native gate entry with no body behind it"
+            );
+        }
+    }
+
+    /// The set carriers' remaining mutators, for the same reason — each is
+    /// listed by both gates, so each needs a body or the gate silently hands
+    /// the call back to real JDK bytecode written against a null `this$0`.
+    #[test]
+    fn set_view_carrier_mutators_registered() {
+        let r = build_registry();
+        for c in SET_VIEW_CARRIERS {
+            for (m, d) in [
+                ("remove", "(Ljava/lang/Object;)Z"),
+                ("clear", "()V"),
+                ("addAll", "(Ljava/util/Collection;)Z"),
+                ("removeAll", "(Ljava/util/Collection;)Z"),
+                ("retainAll", "(Ljava/util/Collection;)Z"),
+            ] {
+                assert!(r.find(c, m, d).is_some(), "{c}.{m}{d} unregistered");
+            }
+        }
     }
 
     #[test]

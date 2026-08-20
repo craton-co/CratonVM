@@ -62,5 +62,14 @@ CLS="$1"; shift
 # with `:`, which a Windows JVM reads as part of a drive letter rather than as a
 # separator, and the paths themselves are Git-Bash-style. Windows runs need
 # their own wrapper.
-cd "$MOD" && exec timeout "${HS_TO:-300}" "${HS_JAVA:-/home/victor/jdk25/bin/java}" \
+# `HS_JAVA` wins; otherwise fall back to `JDK25`, the same variable `one.sh`
+# reads, before the historical `/home/victor/jdk25` default. That default is
+# wrong on the second Azure host (user `azureuser`, JDK under
+# `/data/toolchain/jdk-25`), where it made every oracle run exit 127 —
+# `timeout: failed to run command ... No such file or directory` — which the
+# sweep drivers record as `NORESULT`, i.e. indistinguishable from a test that
+# produced nothing. A comparison whose oracle silently did not run is worse
+# than no comparison.
+HS_JAVA_BIN="${HS_JAVA:-${JDK25:+$JDK25/bin/java}}"
+cd "$MOD" && exec timeout "${HS_TO:-300}" "${HS_JAVA_BIN:-/home/victor/jdk25/bin/java}" \
   "${SPRING_JVM_ARGS[@]}" -Xshare:off "$@" -cp "$CP" KRun "$CLS"

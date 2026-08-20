@@ -24503,6 +24503,34 @@ fn invoke_on_class_shared_inner(
                                     | "java/util/LinkedHashMap$LinkedEntryIterator"
                             )
                             && matches!(method_name, "hasNext" | "next" | "remove"))
+                        // The serialization hooks of the immutable-collection
+                        // carriers. `List.of`/`Set.of`/`Map.of`/`copyOf` return
+                        // a CratonVM-minted object whose `getClass()` aliases to
+                        // one of these six real JDK classes, each of which
+                        // declares its own `writeReplace()` - a body over the
+                        // `e0`/`e1`/`elements`/`table` fields the carrier never
+                        // fills, so the `java.util.CollSer` it wrote carried
+                        // this VM's slots and reading it back threw
+                        // `InvalidObjectException: invalid object`.
+                        // `CollSer.readResolve` is here because its `IMM_MAP`
+                        // arm builds a real `MapN` whose `table` no map native
+                        // reads; `Collections$UnmodifiableRandomAccessList` is
+                        // the only `Collections$Unmodifiable*` wrapper that
+                        // declares a `writeReplace`, and its native declines the
+                        // replacement. Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/ImmutableCollections$List12"
+                                    | "java/util/ImmutableCollections$ListN"
+                                    | "java/util/ImmutableCollections$Set12"
+                                    | "java/util/ImmutableCollections$SetN"
+                                    | "java/util/ImmutableCollections$Map1"
+                                    | "java/util/ImmutableCollections$MapN"
+                                    | "java/util/Collections$UnmodifiableRandomAccessList"
+                            )
+                            && method_name == "writeReplace")
+                        || (class_name == "java/util/CollSer" && method_name == "readResolve")
                         // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
                         // getThreadMXBean() — the real-JDK code path delegates
                         // through `getPlatformMXBean(Class)` + PlatformComponent
