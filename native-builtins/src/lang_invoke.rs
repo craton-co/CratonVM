@@ -12136,11 +12136,33 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
 /// between because it resolves the parent-delegation answer for an
 /// ordinary-application lookup where the plain search declines to pick.
 fn mirror_for_descriptor_name(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    // The nine primitive names are not classes; `primitive_class_mirror` is
+    // their canonical factory and no lookup can improve on it.
+    if matches!(
+        name,
+        "int" | "long" | "float" | "double" | "boolean" | "byte" | "char" | "short" | "void"
+    ) {
+        return ctx.primitive_class_mirror(name);
+    }
     if let Some(cid) = ctx.class_id_by_name(name) {
         return ctx.get_class_mirror(cid);
     }
     if let Some(cid) = ctx.class_id_by_name_delegated(name) {
         return ctx.get_class_mirror(cid);
+    }
+    // An array descriptor is the one miss worth acting on: `[Ljava/lang/
+    // Object;` is very often not yet indexed even though every ingredient
+    // for it is, and the stand-in it would otherwise get has no
+    // `componentType`, so `Class.getSimpleName()` renders `Object;` and
+    // `mt.parameterType(0) == Object[].class` is false — the identity
+    // `MethodHandle.asType` and Spring's converter registry both compare on.
+    // Load it on demand, exactly as `native_class_array_type` does for
+    // `Class.arrayType()`, and only then mint a stand-in.
+    if name.starts_with('[') {
+        let _ = ctx.load_class(name);
+        if let Some(cid) = ctx.class_id_by_name(name) {
+            return ctx.get_class_mirror(cid);
+        }
     }
     ctx.primitive_class_mirror(name)
 }
