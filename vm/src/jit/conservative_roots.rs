@@ -4331,56 +4331,250 @@ pub fn uncovered_precise_frame_count() -> usize {
 /// maps and therefore show here as "unmapped" — expected, not a gap. The signal
 /// is sharpest for leaf-ish compiled frames (the register/spill-resident root
 /// class, e.g. the bintrees-`main`-reads-`args` and `codePointAt` families).
+/// Counters for [`verify_precise_covers_conservative`], reported at exit.
+pub mod oop_map_audit {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Frames whose band was walked and whose maps were readable.
+    pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// Verifiable in-band words examined.
+    pub static WORDS: AtomicU64 = AtomicU64::new(0);
+    /// In-band object addresses named by NO oop map of the owning frame.
+    /// **This is the number that says whether the codegen's coverage bit is
+    /// sound**: a live reference in a slot the frame's maps never mention.
+    pub static NEVER_MAPPED: AtomicU64 = AtomicU64::new(0);
+    /// In-band object addresses named by SOME map of the owning frame but not
+    /// by the one its safepoint id selects. Not a codegen coverage gap — a
+    /// map-selection gap, which strands the oop just as effectively.
+    pub static WRONG_MAP: AtomicU64 = AtomicU64::new(0);
+    /// Object addresses BELOW the innermost compiled frame — interpreter,
+    /// native and Rust frames the compiled method called into. Not the oop
+    /// map's responsibility; counted so it can be subtracted rather than
+    /// mistaken for a gap, which is what the previous oracle did.
+    pub static BELOW_JIT: AtomicU64 = AtomicU64::new(0);
+    /// Frames whose safepoint id or maps could not be read, so their band was
+    /// scanned against an EMPTY active set and their words are not counted.
+    pub static UNREADABLE_FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// `never_mapped` hits on a frame whose `fully_oop_covered` is `true` —
+    /// i.e. the codegen bit asserting complete coverage was wrong.
+    pub static NEVER_MAPPED_WHILE_COVERED: AtomicU64 = AtomicU64::new(0);
+
+    pub fn dump() {
+        if FRAMES.load(Ordering::Relaxed) == 0 && WORDS.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        eprintln!(
+            "[cratonvm] oop-map audit: frames={} unreadable_frames={} words={} \
+             never_mapped={} (while_covered={}) wrong_map={} below_jit={}",
+            FRAMES.load(Ordering::Relaxed),
+            UNREADABLE_FRAMES.load(Ordering::Relaxed),
+            WORDS.load(Ordering::Relaxed),
+            NEVER_MAPPED.load(Ordering::Relaxed),
+            NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed),
+            WRONG_MAP.load(Ordering::Relaxed),
+            BELOW_JIT.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// The oop-map slot offsets the ACTIVE safepoint selects for the frame at
+/// `rbp` — the exact set `scan_active_oop_map_at_rbp` would publish.
+///
+/// `None` means the id or its map could not be read, which is a different
+/// finding from "the map is empty" and is counted separately.
+fn active_map_slots(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<Vec<i16>> {
+    let sp_id_slot_off = cm.sp_id_slot_off;
+    if sp_id_slot_off <= 0 || rbp < sp_id_slot_off as usize {
+        return None;
+    }
+    let id_addr = rbp - sp_id_slot_off as usize;
+    if id_addr & 0x7 != 0 {
+        return None;
+    }
+    // SAFETY: the safepoint id lives in the validated frame's reserved local
+    // slot, exactly as `scan_active_oop_map_at_rbp` reads it.
+    let safepoint_id = unsafe { (id_addr as *const usize).read() } as u32;
+    let map = cm.find_oop_map_for_safepoint_id(safepoint_id)?;
+    Some(map.frame_slot_offsets.clone())
+}
+
+/// `CRATONVM_DBG_VERIFY_OOP_MAPS` — does the precise oop map actually cover
+/// every live reference in the compiled frames it claims?
+///
+/// # What the previous version measured, and why it was an upper bound
+///
+/// It built its `mapped` set from ONE method's maps at ONE frame base
+/// (`info.exact_rbp`) and then scanned the WHOLE band `[scanner_sp,
+/// frame_base)`. That band spans every compiled frame in the chain plus the
+/// interpreter, native and Rust frames the compiled code called into, so:
+///
+///   * a nested JIT callee's slots, correctly named by the CALLEE's own map at
+///     the CALLEE's own rbp, counted as unmapped;
+///   * every interpreter/native word counted as unmapped, though no oop map has
+///     ever claimed to describe those — they are published by their own root
+///     mechanisms;
+///   * register images and dead spill slots counted as unmapped, which the band
+///     verifier next door already documents as a false verdict "on every
+///     collection".
+///
+/// It reported 64 hits on the `PolynomialTest` failure and its own header
+/// admitted the ambiguity ("NB band may include nested-JIT-callee slots"), so
+/// the number could not be used to say whether the codegen bit was sound.
+///
+/// # What this measures
+///
+/// The RBP chain is walked exactly as `scan_compiled_frame_bands` walks it, and
+/// each frame is checked against ITS OWN method's maps at ITS OWN rbp, over its
+/// own band only, skipping the slots `band_slot_is_verifiable` excludes. Every
+/// in-band object address is then classified:
+///
+///   * `never_mapped` — named by no map of the owning frame. A live reference
+///     the collector would neither publish nor rewrite. This is the number that
+///     answers whether the coverage bit is sound, and `never_mapped_while_covered`
+///     is the subset where the frame's `fully_oop_covered` asserted otherwise.
+///   * `wrong_map` — named by some map of the frame but not the one its
+///     safepoint id selects. Not a codegen coverage gap; a selection gap.
+///   * `below_jit` — below the innermost frame. The interpreter/native region,
+///     reported so it can be subtracted rather than counted as a gap.
+///
+/// Still conservative in ONE direction, deliberately: a primitive `i64` whose
+/// bits land on a live object header is counted. So a non-zero `never_mapped`
+/// is a lead, and a ZERO is the strong result — it says no verifiable in-band
+/// word went unnamed.
 fn verify_precise_covers_conservative(
     info: PreciseFrameInfo,
     cm: &cratonvm_jit::CompiledMethod,
     heap: &VmHeap,
 ) {
-    // Oop-map offsets are emitted relative to the compiled frame's RBP, not
-    // the Rust caller's approximate stack pointer captured by the guard.  OSR
-    // used to be the sole consumer of `exact_rbp`; ordinary compiled entries
-    // need the identical addressing contract for precise marking and moving-GC
-    // root registration.
-    let slot_base = if info.exact_rbp != 0 {
-        info.exact_rbp
-    } else {
-        info.frame_base
-    };
-    let mut mapped: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for map in &cm.oop_maps {
-        for &off in &map.frame_slot_offsets {
-            mapped.insert((slot_base as isize + off as isize) as usize);
-        }
-    }
+    use oop_map_audit as audit;
+    use std::sync::atomic::Ordering as AOrd;
+
     let scanner_sp = current_stack_pointer();
-    let lo = scanner_sp.min(info.frame_base);
-    let hi = scanner_sp.max(info.frame_base);
-    let mut addr = (lo + 7) & !7usize; // align up to 8
-    while addr + 8 <= hi {
-        // SAFETY: `[scanner_sp, frame_base)` is the calling thread's own live
-        // stack band — the same region `scan_one_frame` reads — and `addr` is
-        // 8-byte aligned and bounded by `hi`.
-        let qword = unsafe { (addr as *const usize).read() };
-        if heap.is_object_address(qword).is_some() && !mapped.contains(&addr) {
-            if STEP3_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEP3_LOG_CAP {
-                let delta = (addr as isize) - (info.frame_base as isize);
-                eprintln!(
-                    "[VERIFY-OOP-MAPS] unmapped in-band oop: code@{:p} frame_base={:#x} slot_base={:#x} \
-                     slot=[rbp{}{:#x}] addr={:#x} val={:#x} maps={} covered={} \
-                     (NB band may include nested-JIT-callee slots)",
-                    info.entry_ptr,
-                    info.frame_base,
-                    slot_base,
-                    if delta >= 0 { "+" } else { "-" },
-                    delta.unsigned_abs(),
-                    addr,
-                    qword,
-                    cm.oop_maps.len(),
-                    cm.fully_oop_covered,
-                );
-            }
+    let entry_sp = info.frame_base;
+    let mut rbp = info.exact_rbp;
+    if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
+        audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+        return;
+    }
+    let Some(innermost) =
+        innermost_frame_method(rbp, info.exact_cm_id, entry_sp, scanner_sp, info.compiled_method)
+    else {
+        // Nothing describes the frame at `exact_rbp`; every offset would be
+        // read against the wrong method. Same fail-closed stance as the band
+        // verifier.
+        audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+        return;
+    };
+    // SAFETY: as in `scan_compiled_frame_bands` — a chain entry's method is
+    // Arc-owned while any of its frames is live, and a resolved callee is kept
+    // alive by the live frame whose return address resolved it.
+    let mut frame_cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost };
+    let _ = cm;
+
+    let mut lowest_band_lo = usize::MAX;
+    let mut frames = 0usize;
+    while frames < 4096 {
+        frames += 1;
+        let frame_size = frame_cm.osr_frame_size;
+        if frame_size <= 0 {
+            audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+            break;
         }
-        addr += 8;
+        let frame_size = frame_size as usize;
+        const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+        if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+            audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+            break;
+        }
+        let band_lo = rbp - frame_size;
+        lowest_band_lo = lowest_band_lo.min(band_lo);
+
+        let active: std::collections::HashSet<i16> = match active_map_slots(rbp, frame_cm) {
+            Some(v) => v.into_iter().collect(),
+            None => {
+                audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+                std::collections::HashSet::new()
+            }
+        };
+        let any: std::collections::HashSet<i16> = frame_cm
+            .oop_maps
+            .iter()
+            .flat_map(|m| m.frame_slot_offsets.iter().copied())
+            .collect();
+
+        audit::FRAMES.fetch_add(1, AOrd::Relaxed);
+        let live_hi = moving_young_frame_live_hi(rbp, frame_cm);
+        let mut off = 8i32;
+        while (off as usize) <= frame_size {
+            if !band_slot_is_verifiable(off, &frame_cm.frame_layout, live_hi) {
+                off += 8;
+                continue;
+            }
+            let addr = rbp - off as usize;
+            if addr & 0x7 == 0 {
+                audit::WORDS.fetch_add(1, AOrd::Relaxed);
+                // SAFETY: `addr` is an 8-aligned address inside this thread's
+                // own live compiled frame band, the same region
+                // `scan_one_frame` reads.
+                let qword = unsafe { (addr as *const usize).read() };
+                if heap.is_object_address(qword).is_some() {
+                    let off16 = i16::try_from(off).unwrap_or(i16::MAX);
+                    if active.contains(&off16) {
+                        // covered by the map the collector will actually scan
+                    } else if any.contains(&off16) {
+                        audit::WRONG_MAP.fetch_add(1, AOrd::Relaxed);
+                    } else {
+                        audit::NEVER_MAPPED.fetch_add(1, AOrd::Relaxed);
+                        if frame_cm.fully_oop_covered {
+                            audit::NEVER_MAPPED_WHILE_COVERED.fetch_add(1, AOrd::Relaxed);
+                        }
+                        if STEP3_LOG_COUNT.fetch_add(1, AOrd::Relaxed) < STEP3_LOG_CAP {
+                            eprintln!(
+                                "[VERIFY-OOP-MAPS] NEVER-MAPPED in-band oop: code@{:p} \
+                                 rbp={rbp:#x} slot=[rbp-{off:#x}] addr={addr:#x} \
+                                 val={qword:#x} frame_size={frame_size} maps={} covered={}",
+                                frame_cm.entry_ptr(),
+                                frame_cm.oop_maps.len(),
+                                frame_cm.fully_oop_covered,
+                            );
+                        }
+                    }
+                }
+            }
+            off += 8;
+        }
+
+        // `[rbp]` / `[rbp + 8]` are the saved caller RBP and return PC; a
+        // non-JIT parent ends the walk.
+        let parent_rbp = unsafe { (rbp as *const usize).read() };
+        let ret_addr = unsafe { ((rbp + 8) as *const usize).read() };
+        let Some(parent_cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+            break;
+        };
+        if parent_rbp <= rbp
+            || parent_rbp & 0x7 != 0
+            || parent_rbp >= entry_sp
+            || parent_rbp < scanner_sp
+        {
+            audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+            break;
+        }
+        frame_cm = unsafe { &*(parent_cm_ptr as *const cratonvm_jit::CompiledMethod) };
+        rbp = parent_rbp;
+    }
+
+    // Everything below the innermost compiled band is interpreter / native /
+    // Rust. Counted, never blamed on an oop map.
+    if lowest_band_lo != usize::MAX && lowest_band_lo > scanner_sp {
+        let mut a = (scanner_sp + 7) & !7usize;
+        while a + 8 <= lowest_band_lo {
+            // SAFETY: 8-aligned address in this thread's own live stack band.
+            let qword = unsafe { (a as *const usize).read() };
+            if heap.is_object_address(qword).is_some() {
+                audit::BELOW_JIT.fetch_add(1, AOrd::Relaxed);
+            }
+            a += 8;
+        }
     }
 }
 

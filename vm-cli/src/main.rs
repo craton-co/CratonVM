@@ -121,6 +121,15 @@ fn maybe_dump_shutdown_reports() {
     // its cost somewhere the compiler statistics do not reach.
     cratonvm_vm::jit::conservative_roots::scan_prof::dump();
 
+    // The oop-map audit's tally, self-gated the same way
+    // (`CRATONVM_DBG_VERIFY_OOP_MAPS`). It answers the one question the
+    // moving-young design rests on and that nothing else reports: does the
+    // precise map name every live reference in the frames it claims to
+    // describe? `never_mapped` is that answer; `below_jit` is the interpreter
+    // and native region the map never claimed, split out so it cannot be
+    // mistaken for a gap the way the previous oracle's single number was.
+    cratonvm_vm::jit::conservative_roots::oop_map_audit::dump();
+
     // How many native-registry probes one invoke cost, self-gated on
     // `CRATONVM_DBG_NATIVE_LOOKUPS=1`. This is the number
     // `performance/vm-per-call-dispatch-cost-RETIRED-20260817.md` §2 asks for
