@@ -6350,6 +6350,21 @@ fn al_or_collection_elements_pinned(
 ) -> Result<Vec<Value>, MethodCallFailed> {
     let mut elems = collect_collection_elements(ctx, this)?;
     let this = ctx.read_native_pin(this_pin, this);
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
+        let cid = ctx.class_id_of_object(this);
+        let nm = ctx
+            .class_name_arc_of_id(cid)
+            .map_or_else(|| "<unknown>".to_string(), |a| a.to_string());
+        let nulls = elems
+            .iter()
+            .filter(|v| matches!(v, Value::Object(None)))
+            .count();
+        let suspect = heuristic_snapshot_is_suspect(ctx, this, &elems);
+        eprintln!(
+            "[DBG_TOARRAY] al_or_collection_elements recv={nm} heuristic_len={} nulls={nulls} suspect={suspect}",
+            elems.len()
+        );
+    }
     if !elems.is_empty() {
         if heuristic_snapshot_is_suspect(ctx, this, &elems) {
             let this = ctx.read_native_pin(this_pin, this);
@@ -6385,6 +6400,17 @@ fn al_or_collection_elements_pinned(
 /// through the bytecode's `Arrays.copyOf(elementData, size, a.getClass())`
 /// path which NPEs on synthetic ArrayLists.
 pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
+        let cls = match args.first() {
+            Some(Value::Object(Some(o))) => {
+                let cid = ctx.class_id_of_object(*o);
+                ctx.class_name_arc_of_id(cid)
+                    .map_or_else(|| "<unknown>".to_string(), |a| a.to_string())
+            }
+            _ => "<null>".to_string(),
+        };
+        eprintln!("[DBG_TOARRAY] native_al_to_array_typed ENTER recv={cls}");
+    }
     if let Some(r) = ksv_route(ctx, args, native_ksv_to_array_typed) {
         return r;
     }
