@@ -1,5 +1,27 @@
 # G67-1 — the fail-fast iterators that do not fail
 
+> **THE RETIREMENT ROUTE IS MEASURED CLOSED — read this before trying it.**
+> The values-view `G63-1`
+> (`G63-1-the-values-view-iterator-is-not-fail-fast-20260817.md` §3.2) built
+> three trial binaries retiring the map-view carrier natives, and each one fixed
+> what the last broke and broke something new: two entries restored fail-fast and
+> broke `values().toArray()`; the whole 28-entry carrier surface fixed `toArray`
+> and broke `map.size()` after a view removal; two more entries fixed `size()`
+> and broke `LinkedHashMap.keySet().iterator().remove()` — that last attributed
+> against a purpose-built BEFORE binary. All reverted, none landed.
+>
+> The diagnosis is `retired_shadow.rs`'s own header rule, now measured rather
+> than asserted: the map families' state is still two sources, so moving any one
+> reader onto real bytecode desynchronises a writer that was pairing with the
+> native it replaced. Fixing `modCount` needs the state unified first
+> (`P2-COLLECTIONS-SHADOWS-20260812.md`), not a table entry.
+>
+> Also worth carrying across: `RJdkMapViews` caught one of those three
+> regressions and was blind to another, and `probes/MapSizeField.java` is the
+> technique that found the blind one — read the collection's REAL field by
+> reflection (`--add-opens java.base/java.util=ALL-UNNAMED`) alongside what its
+> native accessor reports.
+
 **Status:** MEASURED (defect) / NOT FIXED, deliberately — §4 states the scope
 and why it is not a corner of this session. **Provenance:** both VMs, oracle
 HotSpot 25.0.3+9-LTS, CratonVM `C:/craton/target-rel9` under `--jdk-only`.

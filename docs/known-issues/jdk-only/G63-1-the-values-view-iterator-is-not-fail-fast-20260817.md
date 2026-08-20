@@ -84,85 +84,104 @@ measuring a class it was not scoped to, through a registration on an interface.
 stayed verdict-neutral** — so the hold was costing coverage for a reason that
 was never about those triples.
 
-## 3. The fix, located exactly — and half of it MEASURED
+## 3. The fix, located exactly — and MEASURED NOT TO BE A RETIREMENT
 
-§1 named the `java/util/Collection` interface door as the mechanism. **That was
-the wrong registration**, and retiring it proves it: a trial binary with
-`("java/util/Collection", "iterator", ...)` in `retired_shadow.rs` shows the door
-`[JDK-ONLY-REFUSED]` and `values().iterator()` **unchanged** at
-`java.util.ArrayList$Itr`. The corpus stayed verdict-neutral (98/2, 93/7) —
-the entry is inert for this defect and was NOT landed.
+§1 named the `java/util/Collection` interface door as the mechanism. That was
+the wrong registration, and three trial binaries later the whole shape of the
+answer has changed. **Nothing below is landed. The table entries described here
+were built, measured, and reverted.**
 
-The registration that actually answers is a direct one, found by dumping the
-registry rather than by reading:
+### 3.1 The door is innocent
+
+A trial with `("java/util/Collection", "iterator", ...)` in `retired_shadow.rs`
+shows it `[JDK-ONLY-REFUSED]` and `values().iterator()` **unchanged** at
+`java.util.ArrayList$Itr`. Verdict-neutral (98/2, 93/7) and inert for this
+defect.
+
+The registration that answers is a direct one, found by dumping the registry:
+`register_map_view_carrier_natives` (`native-collections/src/lib.rs:4757`) binds
+**14 methods on each of four values carriers** — `HashMap$Values`,
+`LinkedHashMap$LinkedValues`, `TreeMap$Values`,
+`ConcurrentHashMap$ValuesView`. `HashMap$KeySet`/`$EntrySet` come from a
+different registrar (`:15800`) whose native answers the REAL
+`HashMap$KeyIterator`, which is why `keySet()` and `entrySet()` are correct and
+`values()` is not.
+
+### 3.2 Three retirements, three new defects — the state machine is bigger than the entries
+
+Each trial fixed what the last one broke and broke something new. All MEASURED,
+one binary per row, against HotSpot 25.0.4+7:
+
+| trial | what it fixed | what it BROKE |
+|---|---|---|
+| `HashMap$Values.iterator` + `LinkedHashMap$LinkedValues.iterator` (2 entries) | fail-fast: `ValuesIterLive` 5/5, `values.iterator` becomes `HashMap$ValueIterator` | `values().toArray()` length 2 where HotSpot says 3 — `RJdkMapViews` RED |
+| the whole carrier surface (28 entries, 14 × 2) | `toArray` — both probes IDENTICAL to HotSpot, `RJdkMapViews` green again | `map.size()` answers 3 after a view removal where the map holds 2 |
+| plus `LinkedHashMap.size`/`isEmpty` (30 entries) | `map.size()` — every row of `MapStateSplit` HotSpot-identical | **`LinkedHashMap.keySet().iterator().remove()` stops writing through** |
+
+The last one is attributed, not guessed. Same probe, three binaries:
 
 ```text
-  java/util/HashMap$Values                            iterator  bridge  owns_slot
-  java/util/LinkedHashMap$LinkedValues                iterator  bridge  owns_slot
-  java/util/TreeMap$Values                            iterator  bridge  owns_slot
-  java/util/concurrent/ConcurrentHashMap$ValuesView   iterator  bridge  owns_slot
-      all four from native-collections/src/lib.rs:4757,
-      `register_map_view_carrier_natives`, 14 methods per carrier
+  MapSizeField, "after keySet it.remove"     nativeSize / real `size` field
+    HotSpot                                        0 / 0
+    --jdk-only BEFORE (b3562666f)                  0 / 0     correct
+    --jdk-only AFTER  (30 entries)                 1 / 1     REGRESSION
 ```
 
-`HashMap$KeySet`/`$EntrySet` come from a DIFFERENT registrar (`:15800`) whose
-native answers the real `HashMap$KeyIterator` — which is why `keySet()` and
-`entrySet()` are correct and `values()` is not. The door was innocent; the
-values-view carrier family is the defect.
+So the pattern is not "one more entry": every entry moves one reader onto real
+bytecode and desynchronises a writer that was pairing with the native it
+replaced. `retired_shadow.rs`'s header rule is the diagnosis, and this is it
+measured in three steps rather than asserted — **a class's state has to become
+real before its shadow can be retired**, and `java/util/HashMap` /
+`LinkedHashMap` state is still split between the real fields and the natives'
+own bookkeeping.
 
-### 3.1 Retiring the two HashMap-family `iterator` rows FIXES it, and is not enough
+### 3.3 What the real fix is
 
-Trial binary, `HashMap$Values.iterator` + `LinkedHashMap$LinkedValues.iterator`
-retired, MEASURED:
+Not a retirement. Either
 
-```text
-  values.iterator      java.util.HashMap$ValueIterator   <- HotSpot-identical
-  ValuesIterLive       5 of 5, PASS                      <- fail-fast restored
-  Compatible arm       unchanged (still ArrayList$Itr)   <- as required
-  probes/JdkOnlyValuesViewProbe   ONE row red: values.toArray() length 2, want 3
-  --jdk-only corpus    97 / 3 — RJdkMapViews RED
-```
+* give `HashMap$Values` its real `iterator()` specifically — the narrowest
+  change that fixes the filed defect, and the only one measured to fix it
+  without a second defect appearing elsewhere in the SAME trial (trial 1 fixed
+  fail-fast and broke only `toArray`, which is the carrier's own method, not the
+  map's); or
+* unify the map families' state so the carrier natives and the real fields stop
+  being two sources — which is the collections reclassification
+  `P2-COLLECTIONS-SHADOWS-20260812.md` scopes, and is not a `retired_shadow.rs`
+  change at all.
 
-So the defect is fixable, the fix is two lines, and **two lines is the wrong
-unit**. `iterator()` now reads the real map while `toArray()` still reads the
-carrier's VM-side slots, which the retired native used to re-sync. They are one
-state machine, exactly like `LogRecord`'s source pair: the readers move together
-or not at all.
+**Do not reach for the table again without re-reading §3.2.** Three entries'
+worth of "one more line" produced three defects, and two of the three were
+invisible to the 100-vector corpus.
 
-### 3.2 What the next lane should run, and what stopped this one
+## 4. What the corpus can and cannot see here
 
-The unit is the whole carrier surface: **28 entries**, all 14 registrations on
-each of `java/util/HashMap$Values` and `java/util/LinkedHashMap$LinkedValues`
-(`clear`, `contains`, `forEach`, `isEmpty`, `iterator`, `remove`, `removeIf`,
-`size`, `spliterator`, `stream`, `toArray` ×3, `toString`). `TreeMap$Values` and
-`ConcurrentHashMap$ValuesView` are deliberately NOT in that set — those two map
-families keep their entries in Rust side tables, so their real view bytecode
-would iterate an empty map, and they need their own precondition first.
+`RJdkMapViews` **caught** the `toArray` staleness in trial 1 — so the corpus
+adjudicates that half well. It **passed at 74 checks on the 30-entry build that
+had broken `keySet().iterator().remove()`**, and it passes on the baseline, so
+it cannot see that one at all. And no vector asserts fail-fast on a map view,
+which is why the original defect survives in both modes.
 
-That trial was built twice on this host and **OOM-killed both times** (`signal:
-9`, `-C lto=fat -C codegen-units=1`, 31 GB shared with eleven other sessions at
-load average 25). It is a resource limit, not a finding, and it is the only
-reason this record still says NOT FIXED. Everything up to the build is done: the
-entry list is above, the probes exist, and the acceptance criteria are
-`ValuesIterLive` 5/5 plus `RJdkMapViews` green plus a verdict-neutral pair of
-corpora plus an unchanged Compatible arm.
+`probes/MapSizeField.java` is what found the regression, and the technique is
+the reusable part: read the collection's REAL field by reflection
+(`--add-opens java.base/java.util=ALL-UNNAMED`) alongside the value its native
+accessor reports. Where a native keeps its own bookkeeping, those two numbers
+separate, and no black-box assertion can tell you which one moved.
 
-## 4. NOMINATIONS
+## 5. NOMINATIONS
 
-**N1 — ~~measure the strict-mode door retirement~~ SUPERSEDED by §3.** The door
-is not the mechanism. Run the 28-entry carrier retirement in §3.2 instead, on a
-host with memory to spare.
+**N1 — ~~retire the door~~ ~~retire the carrier surface~~ SUPERSEDED by §3.2.**
+Both were measured. Neither is the fix.
 
-**N2 — the same three questions for the other doors.** `Collection.iterator` is
-one of eleven registrations `register_interface_natives` makes
-(`List`/`Set`/`Collection` × `iterator`, plus eight `java/util/Map` triples).
-Retiring the `Collection` one is measured verdict-neutral and inert here, so it
-is available as a cheap tightening if some other lane wants it — but on this
-evidence it buys nothing.
+**N2 — the narrow one, if this defect is worth fixing on its own:** give
+`java/util/HashMap$Values` a real `iterator()` without moving the rest of the
+carrier, and re-run trial 1's acceptance set plus `MapSizeField`. That is the
+only shape with a measured green half.
 
-**N3 — a fail-fast row in the corpus.** No `RJdk*` vector asserts
-`ConcurrentModificationException` on a map view; that is why a defect present in
-BOTH modes survived a 100-vector suite. `probes/ValuesIterLive.java` is the
-vector-shaped version and should be promoted — note that `RJdkMapViews` DID catch
-the half-fix in §3.1, so the corpus is a good adjudicator for the change even
-though it cannot see the defect.
+**N3 — a fail-fast row in the corpus.** `probes/ValuesIterLive.java` is the
+vector-shaped reproduction and should be promoted; a defect present in BOTH
+modes should not need a probe written for it.
+
+**N4 — `MapSizeField`'s technique belongs in more vectors.** Two of the three
+defects above were invisible to a 100-vector suite and visible in one reflective
+read. Wherever a native keeps a counter the JDK also keeps, the suite is
+asserting only that the native agrees with itself.
