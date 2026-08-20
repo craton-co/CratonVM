@@ -10,14 +10,24 @@
 **Oracle** `C:/Program Files/Microsoft/jdk-25.0.3.9-hotspot` — **not** the
 `Eclipse Adoptium` path, see §6.1
 
-Commits: `45d6649ae` (H5-A), `be4c2fbd5` (comment corrections), plus this record.
+Commits: `45d6649ae` (H5-A), `be4c2fbd5` (comment corrections), `d2c3c2258`
+(this record, pre-merge draft), `fb67a921b` (merge of the branch tip
+`59e5fd8d0`), plus the update commit that carries this text.
 
-> **Line numbers.** Everything was measured at the base commit **`26e4b5db4`**,
-> and `native-io/src/lib.rs` line numbers below are that commit's unless a
-> `HEAD` number is given alongside. This lane's own two commits are
-> comment-only but they are ~110 lines of comment, and the shift is **not
-> uniform** — five separate insertion points. Grep the literal, do not trust
-> either number: `[window≠absence]` applies to line numbers too.
+> **Base and merge.** This lane's worktree was cut at **`26e4b5db4`** while
+> `claude/jdk-only-mode-handoff-09b48c` was already at `59e5fd8d0`. Everything
+> in §2 and §3 was measured at `26e4b5db4` and then **re-checked against the
+> merged tree**; §9 says what the gap contained and what of it touches this
+> lane. The short answer: `native-io/` changed by exactly one comment block
+> (`process.rs`, +33 lines, H3-1), no registration in this crate moved, and the
+> census stands. The gap did, however, supply a *stronger* proof for §1.3 and a
+> replacement for a number in §6.4.
+
+> **Line numbers.** `native-io/src/lib.rs` line numbers below are
+> `26e4b5db4`'s unless a `HEAD` number is given alongside. This lane's own two
+> commits are comment-only but they are ~110 lines of comment, and the shift is
+> **not uniform** — five separate insertion points. Grep the literal, do not
+> trust either number: `[window≠absence]` applies to line numbers too.
 
 ---
 
@@ -102,11 +112,24 @@ the slot's `kind` and nothing else.
 - **Kind: `Bridge` → `SyntheticStub`.** Explicitly stated (`set_category`
   inside the block), so `category_chosen` is true and nothing downstream can
   ambient-downgrade it further.
-- **Compatible mode: changed.** `synthetic_stub_kind_should_yield_to_real_bytecode`
-  now arbitrates for this triple, so the real `read([BII)I` bytecode runs — and
-  that bytecode's only real work is `invokevirtual readBytes:([BII)I`, which is
-  the genuine bridge. The behavioural delta is the real wrapper's bounds
-  checking and its `IndexOutOfBoundsException` messages.
+- **Compatible mode: changed, and the mechanism is verified rather than
+  assumed.** `java/io/FileInputStream` is one of the twelve names in
+  `real_protected_stub_class_common`
+  (`vm/src/runtime/interpreter/native_override.rs:6904`, reached from
+  `synthetic_stub_kind_should_yield_to_real_bytecode` at :6795), the list of
+  classes **both** dispatch paths yield to real bytecode for a `SyntheticStub`.
+  So the tag change does not merely *permit* the real `read([BII)I` bytecode to
+  run — an existing, named list makes it run. That bytecode's only real work is
+  `invokevirtual readBytes:([BII)I`, which is the genuine bridge, so the
+  behavioural delta is the real wrapper's bounds checking and its
+  `IndexOutOfBoundsException` messages.
+
+  The list is **not** new — it is present at `26e4b5db4` too, and there is a
+  `#[cfg(test)] REAL_PROTECTED_STUB_CORPUS` beside it whose stated purpose is
+  that deleting a class from it fails a test. I did not look for it until after
+  the merge, and the first draft of this section said the tag change merely
+  "permits" the real bytecode to run. It does more than permit it. Recorded
+  because the understatement was mine, not a record's.
 - **Strict mode: changed.** `SyntheticStub` is not `allowed_in(JdkOnly)`
   (`native-api/src/registry.rs:5384`), so the registration is refused and one
   `native-shadows-bytecode` row disappears.
@@ -153,22 +176,27 @@ order is: `register_socket_channel_real` (6223) → `register_async_socket_real`
 
 | Triple | Sites | Winner | Reading |
 |---|---|---|---|
-| **`sun/nio/ch/UnixDispatcher.close0(Ljava/io/FileDescriptor;)V`** | lib.rs:6694 (`native_fd_close0`), net.rs:4178 (`net_close`) | **net.rs** | **The only cross-function duplicate whose two sites carry DIFFERENT callbacks.** lib.rs's registration is dead and its 10-line comment describes a fix that no longer runs. Already measured in-tree 2026-08-17 (`--dump-native-registry`, `owns_slot: false`, note at lib.rs ~2080) — and that note cites `net.rs:4188`, which has drifted to 4178. Comment corrected in `be4c2fbd5`; the line is left in place, see §8.N3. |
-| `java/io/RandomAccessFile.getFilePointer()J` | lib.rs:15314, random_access_file.rs:579 | random_access_file.rs runs first (called from `register_io_natives` head via `process`/`nio` block ordering — **verify**), lib.rs:15314 is in `register_io_extras_natives` (7359) so **lib.rs wins** | Two implementations of a genuinely `ACC_NATIVE` method. Undocumented. **Open question, §8.N4.** |
+| **`sun/nio/ch/UnixDispatcher.close0(Ljava/io/FileDescriptor;)V`** | lib.rs:6694 (`native_fd_close0`), net.rs:4178 (`net_close`) | **net.rs** | **The only cross-function duplicate whose two sites carry DIFFERENT callbacks.** lib.rs's registration is dead and its 10-line comment describes a fix that no longer runs. Already measured in-tree 2026-08-17 (`--dump-native-registry`, `owns_slot: false`, note at lib.rs ~2080) — and that note cites `net.rs:4188`, which has drifted to 4178. Comment corrected in `be4c2fbd5`; the line is left in place, see §10.N3. |
+| **`java/io/RandomAccessFile.getFilePointer()J`** | lib.rs:15314 (`native_raf_get_file_pointer`), random_access_file.rs:579 (`native_getFilePointer`) | **random_access_file.rs**, always | Different callbacks, and **`CRATONVM_REAL_RAF` cannot reach this triple.** `register_io_extras_natives` (called at lib.rs:7424 `HEAD`) registers its RAF block only `if !real_raf_enabled()`; `register_random_access_file_natives` is called six lines later (7430) and registers `getFilePointer` **unconditionally**. So the synthetic `getFilePointer` is dead in *both* settings of the flag, and the diagnostic gate's own comment — "Default (unset) = synthetic" — is wrong for this one method. `getFilePointer()J` is `public native long` on JDK 25, so the surviving `Bridge` is correct on the merits; the defect is that a flag silently does not cover one of the ten methods it claims to. `[flag≠mode drops it]`. **§10.N4.** |
 | `java/io/Reader.read(Ljava/nio/CharBuffer;)I` | lib.rs:7064, lib.rs:12002 (`register_string_rw_natives`, `SyntheticStub`) | 12002 | 7064 is ambient `Bridge`; 12002 is an explicit `SyntheticStub` — and per the "no-opinion must not overwrite an adjudicated one" rule in `register_inner`, an explicit choice DOES win, so the slot ends `SyntheticStub`. Undocumented but correct. |
 | 9 × `java/nio/channels/AsynchronousChannelGroup.*` | async_socket.rs:3536–3558, nio_native.rs:1799–1815 | nio_native (t16) | Documented at nio_native.rs:1749 — *"called by `register_io_natives` AFTER phase-92 so our entries win"*. Deliberate. |
 | 4 × `java/nio/channels/AsynchronousFileChannel.{open,isOpen,size,close}` | lib.rs:21283–21403, nio_native.rs:1770–1778 | nio_native (t16) | Same deliberate layering. |
 | 4 × `java/nio/channels/AsynchronousSocketChannel.{open×2,isOpen,close}` | async_socket.rs:3385–3398, nio_native.rs:1782–1795 | nio_native (t16) | Same. |
 | 8 × `java/nio/channels/DatagramChannel.*` | lib.rs:23366–23494, nio_native.rs:1834–1861 | **lib.rs** — `register_datagram_channel` is called AGAIN at 7385, after t16 | Documented at lib.rs:7382 and at lib.rs:24741. Deliberate re-application. |
-| `java/util/Scanner.toString()Ljava/lang/String;` | lib.rs:7772 (`register_scanner_natives`), and 7× inside `register_nio_natives` | `register_nio_natives` (9618) runs at 7348, **before** `register_scanner_natives`? No — 7314 registers scanner, 7348 registers nio, so **nio wins** | The seven nio sites are the `Buffer` accessor loops; `java/util/Scanner` reaches them only through a stale binding in my parser? **NO — verified false positive removed; the seven sites are `for c in &["java/nio/…Buffer", …]`.** See §7.2. |
+**That is the whole of list B: 27 triples. Twenty-five are deliberate,
+documented last-wins layering. Two are not: `UnixDispatcher.close0` and
+`RandomAccessFile.getFilePointer`, and both of those are cases where a comment
+elsewhere in the tree describes behaviour the registration order overrules.**
 
-**Correction to my own census:** the `java/util/Scanner.*` rows that a first
-pass of the parser reported inside `register_nio_natives` were an artifact of
-resolving the loop variable `c` against a file-global `let` binding instead of a
-function-scoped one. They are `java/nio/*Buffer` rows. The row above is kept
-only to record the mistake; there is **one** genuine
-`Scanner`-in-two-functions row and it does not exist. A census that silently
-resolves an identifier out of scope invents duplicates, and it invented eight.
+**Correction to my own census, kept because the next person will write the same
+parser.** A first pass reported eight further list-B rows, all
+`java/util/Scanner.*` duplicated between `register_scanner_natives` and
+`register_nio_natives`. They do not exist. `register_nio_natives` registers on a
+loop variable `c` bound by `for c in &["java/nio/ByteBuffer", …]`, and the
+parser resolved `c` against a **file-global** `let c = "java/util/Scanner"`
+hundreds of lines earlier instead of a function-scoped binding. **A census that
+resolves an identifier out of scope invents duplicates, and it invented eight of
+them** — every one of which looked like a serious finding. The fix is in §7.1(b).
 
 ### 2.C Residual blind spot
 
@@ -285,7 +313,7 @@ stated in the file — *"same implementations, different declared class so
 Java-side dispatch lands here either way"* — and a `invokevirtual` whose
 constant-pool class is `Pipe$SourceChannel` is a real dispatch shape. Whether
 CratonVM's `resolve_step1_native` keys on the receiver's class or on the CP
-class decides it, and that is a run, not a source read. §8.N1.
+class decides it, and that is a run, not a source read. §10.N1.
 
 ### 3.4 The family map
 
@@ -305,7 +333,7 @@ has no such class.
 | `sun/nio/ch/NativeSocketAddress` | 12 | 0 | 0 | 0 | 0 | **BRIDGE, clean.** |
 | `java/lang/ProcessImpl` | 10 | 0 | 0 | 1 | 0 | **BRIDGE**, one absent method. |
 | `java/io/FileInputStream` | 9 | 8 | 0 | 0 | 0 | Split: 9 real bridges + the 8-row public surface, correctly `SyntheticStub` after H5-A. |
-| `java/io/FileOutputStream` | 4 | 8 | 0 | 1 | 0 | Same shape as above; the `SyntheticStub` treatment applied to `FileInputStream` has **not** been applied here. §8.N5. |
+| `java/io/FileOutputStream` | 4 | 8 | 0 | 1 | 0 | Same shape as above; the `SyntheticStub` treatment applied to `FileInputStream` has **not** been applied here. §10.N5. |
 | `java/io/RandomAccessFile` | 10 | **17** | 0 | 0 | 0 | Row calls this a "confirmed bridge". It is 10 bridges and **17 shadows**. §4.2. |
 | `sun/nio/ch/SocketDispatcher` | 3 | 2 | 0 | 0 | 0 | Mostly bridge. |
 | `jdk/internal/misc/Unsafe` | 2 | 2 | 0 | 0 | 0 | Mixed. |
@@ -337,7 +365,7 @@ has no such class.
 | **`java/nio/file/WatchKey`** | 0 | 0 | 5 | 0 | 0 | **INTERFACE, fabricated (lib.rs:23013). CANNOT MOVE.** |
 | **`java/nio/file/WatchEvent`** | 0 | 0 | 3 | 0 | 0 | **INTERFACE, fabricated (lib.rs:23120). CANNOT MOVE.** |
 | `java/nio/channels/Pipe` | 0 | 1 | 2 | 0 | 0 | Abstract factory; `open()` shadows real bytecode. §3.3. |
-| `java/nio/channels/Pipe$SourceChannel` | 0 | 0 | 0 | **3** | 0 | Impl rows already exist; these three name absent methods. **Deletion candidate, unproven — §8.N1.** |
+| `java/nio/channels/Pipe$SourceChannel` | 0 | 0 | 0 | **3** | 0 | Impl rows already exist; these three name absent methods. **Deletion candidate, unproven — §10.N1.** |
 | `java/nio/channels/Pipe$SinkChannel` | 0 | 0 | 0 | **3** | 0 | Same. |
 | `java/nio/channels/Selector` | 0 | 1 | 9 | 1 | 0 | Interface; `SelectorImpl` rows registered alongside. |
 | `java/nio/channels/SelectionKey` | 0 | 2 | 7 | 0 | 0 | Abstract; `SelectionKeyImpl` rows alongside. |
@@ -377,7 +405,7 @@ So for any receiver that does reach this native through the bare interface, the
 `[decline masks]` shape. The guard's own comment concedes the bound is a
 premise: *"Interface natives only serve receivers whose resolved declaring class
 IS the interface"* is a claim in a comment, not a compile-time link
-(`[comment≠link]`). §8.N2.
+(`[comment≠link]`). §10.N2.
 
 ---
 
@@ -399,8 +427,11 @@ IS the interface"* is a claim in a comment, not a compile-time link
 The crate header's claim that registrations end up `Bridge` *"through a callee
 that never sets a category of its own"* is stale. Corrected in `be4c2fbd5`.
 
-`register_as` is confirmed absent from this tree (`git grep -n 'register_as'`
-in `native-api/` and `native-io/` returns nothing), as the brief said.
+`register_as` is confirmed absent from this tree — `grep -rn "register_as("
+native-api/src/ native-io/src/ vm/src/` returns nothing (a bare `register_as`
+grep matches `register_async_socket_real`, which is what makes the claim look
+false at a glance). The P0 row that prescribes it prescribes a symbol that has
+never existed here.
 
 ### 4.2 The four "confirmed bridges"
 
@@ -526,12 +557,23 @@ placement. Pipe registers on both.** pipe.rs:1409/1438 register the
 `sun/nio/ch/{Source,Sink}ChannelImpl` rows; pipe.rs:1427/1449 add the abstract
 ones. §3.3.
 
-**6.4 The P1 row's counts are low.** Row: 86 `ACC_NATIVE`, 307 shadowing, 105
-abstract, 91 absent methods, 54 absent classes. Re-derived: **106 / 656 / 222 /
-367**, on **18** absent classes (106 registrations). The 54-vs-18 gap is the
-largest and I cannot reconcile it: the row may be counting registrations,
+**6.4 The P1 row's counts are low, and `H1-1` explains why every count in this
+directory is.** Row: 86 `ACC_NATIVE`, 307 shadowing, 105 abstract, 91 absent
+methods, 54 absent classes. Re-derived from source + `javap`: **106 / 656 /
+222 / 367**, on **18** absent classes (106 registrations). The 54-vs-18 gap is
+the largest and I cannot reconcile it — the row may be counting registrations,
 or a different image set. **Neither figure should be quoted without saying
 which.**
+
+`H1-1` (merged from the branch tip while this lane was running) found the
+mechanism behind the general problem: `--jdk-only-report`'s observation sink
+capped at 256 entries and only a boolean said so, and the strict census over
+104 vectors reports **1403** `native-won` shadows where the P0/P1 rows quote
+943. **Every shadow count in `docs/known-issues/jdk-only/`, including the 307
+in my own row and the 656 in this record, is a floor of unknown depth.** My 656
+is a floor for a different reason — it is a *static* count that cannot see which
+registrations a given boot reaches — so the two numbers are floors of different
+things and must not be subtracted.
 
 **6.5 The P1 row calls `random_access_file` a confirmed bridge.** It is 10
 `ACC_NATIVE` and **17 shadows** (§4.2).
@@ -558,14 +600,20 @@ Fixed in `be4c2fbd5`.
 **6.10 The H5-C brief's premise ("make each registrar's category explicit rather
 than ambient") is satisfied throughout this crate already.** §4.1.
 
-**6.11 A caution about my own numbers, not someone else's.** The absent-class
+**6.11 `native-io/src/lib.rs`'s `CRATONVM_REAL_RAF` gate says "Default (unset) =
+synthetic".** It is not, for `getFilePointer()J` — see §2.B. One of the ten
+methods the gate lists is served by the `Bridge` in `random_access_file.rs` in
+both settings of the flag, because that registrar runs six lines later and
+registers unconditionally.
+
+**6.12 A caution about my own numbers, not someone else's.** The absent-class
 column is measured against a **Windows** JDK image. `sun/nio/fs/UnixWatchService`,
 `sun/nio/fs/PollingWatchService`, `sun/nio/fs/UnixNativeDispatcher`,
 `sun/nio/ch/EPoll`, `EPollPort`, `EPollSelectorProvider`, `EventFD`,
 `KQueuePort` and `UnixDispatcher` are **present** on a Linux JDK 25 image.
 Reading them as "absent classes" on this host is `[false everywhere=absence]`.
 
-**6.12 A census that resolves an identifier out of scope invents duplicates.**
+**6.13 A census that resolves an identifier out of scope invents duplicates.**
 My first parser pass reported eight `java/util/Scanner` triples duplicated
 across `register_nio_natives`; they are `java/nio/*Buffer` rows reached through
 a loop variable named `c`. Recorded in §2.B because the next person will write
@@ -584,7 +632,7 @@ literals or identifiers; resolve identifiers against (a) `for X in [ … ]` loop
 lists in the enclosing top-level function, expanding to every element,
 (b) function-scoped `let`/`const` string bindings, (c) module-level
 `const`/`static` string bindings. **The scoping rule in (b) is load-bearing —
-see §6.12.** 1,113 call sites, 1,098 resolved, expanding to 1,493 registrations
+see §6.13.** 1,113 call sites, 1,098 resolved, expanding to 1,493 registrations
 over 1,457 distinct triples.
 
 **7.2 The adjudicator.** For each distinct `(class, method, descriptor)`, run
@@ -597,7 +645,33 @@ absent-method; `javap` errors → absent-class.
 `.set_category(` / `.with_category(` inside it that is not in a comment; report
 spans that register natives with none.
 
-**7.4 What none of this can see.** Anything decided at run time — which of two
+**7.4 `native-io/src/lib.rs` line numbers, base → merged HEAD.** Only the ones
+a reader is likely to chase; grep the symbol instead where you can.
+
+| Symbol / literal | `26e4b5db4` | `fb67a921b` |
+|---|---:|---:|
+| `pub fn register_io_natives` | 6153 | 6181 |
+| its `set_category(Bridge)` | 6155 | 6183 |
+| the `SyntheticStub` block open / close | 6491 / 6533 | 6519 / 6561 |
+| the deleted duplicate `read([BII)I` | 6584 | *(gone)* |
+| `"sun/nio/ch/UnixDispatcher"` (the registration) | 6694 | 6760 |
+| `fn native_scanner_close` / its receiver guard | 5798 / 5826 | 5798 / 5827 |
+| `fn register_scanner_natives` / its `set_category` | 7674 / 7692 | 7753 / 7771 |
+| `"java/io/Closeable"` / `"java/lang/AutoCloseable"` | 7847 / 7848 | 7926 / 7928 |
+| `fn register_string_rw_natives` | 11879 | 11958 |
+| `fn register_data_stream_natives` / its `set_category` | 12649 / 12674 | 12733 / 12758 |
+| `try_alloc_synthetic(… "java/nio/file/WatchEvent$Kind" …)` | 22730 | 22733 |
+| `… "java/nio/file/Path" …` (two sites) | 22786 / 23401 | 22789 / 23404 |
+| `… "java/nio/file/WatchService" …` | 22835 | 22838 |
+| `… "java/nio/file/WatchKey" …` | 23013 | 23016 |
+| `… "java/nio/file/WatchEvent" …` | 23120 | 23123 |
+| `… "java/nio/channels/DatagramChannel" …` | 24297 | 24300 |
+
+`pipe.rs`, `net.rs`, `nio_native.rs`, `socket_channel.rs`, `async_socket.rs`,
+`random_access_file.rs`, `stream_{de,en}coder.rs`, `watch.rs` and
+`nio_selector.rs` were not edited by this lane; their numbers are unchanged.
+
+**7.5 What none of this can see.** Anything decided at run time — which of two
 registrations a boot actually reaches, `owns_slot`, `invocations`, and whether
 dispatch keys on the receiver's class or the constant-pool class. That is
 `--dump-native-registry` and `--jdk-only-report`, and it is why §3.3 and §3.5
@@ -619,7 +693,25 @@ Windows image declares are reaching `--jdk-only` untagged.
 
 ---
 
-## 9. NOMINATIONS
+## 9. Interaction with the rest of wave H (post-merge re-check)
+
+This lane's worktree was cut at `26e4b5db4`; the branch was at `59e5fd8d0`.
+Merged at `fb67a921b`, clean, no conflicts. What the 48-file gap contained and
+whether it disturbs anything above:
+
+| Gap content | Touches this lane? |
+|---|---|
+| **`native-io/` itself** — one comment block in `process.rs` (+33 lines, `H3-1`): "WHERE `java/lang/Runtime.exec` IS *NOT*" | **No registration changed.** `git diff --stat 26e4b5db4 59e5fd8d0 -- native-io/` is `process.rs \| 33 +++`, comment-only. **The §2 census and the §3.4 map stand unchanged**, re-checked after the merge. |
+| `H3-1`'s correction that the six `java/lang/Runtime.exec` overloads live in `native-builtins/src/lib.rs`, not `process.rs` | Confirmed against the merged tree, and it agrees with my own map: `java/lang/Runtime` appears in **no** `native-io` registration. My §4.2 verdict on `process` (bridge core + already-split synthetic half) is unaffected — `exec` was never part of the 59 rows that registrar owns. |
+| `H2-1` — `native-builtins/src/phases_late/nio_file.rs` FILETIME encoding, and **eight `sun/nio/fs/WindowsFileAttributes` shadows retired** in `native-api/src/retired_shadow.rs` | **No overlap.** `native-io` registers nothing on `sun/nio/fs/WindowsFileAttributes` — its only `sun/nio/fs/*` rows are the four watch-service classes in `watch.rs`, and those are `SyntheticStub`. Checked the other direction too: `retired_shadow.rs` contains **no** `java/io/*` triple, so H5-A's delete is not made redundant by a retirement that already happened. |
+| `H2-1` is a `RFileTimes`-shaped change, and `RFileTimes` is in my §5.3 vector list | **Watch this one.** `RFileTimes` exercises `new FileOutputStream(f)` + `write` + `close` **and** `lastModified`. H2-1 changed the attribute half; H5-A changed a `FileInputStream` tag. If `RFileTimes` moves, **do not attribute it to either lane without an isolated build** — this is exactly the `[fix+fix≠]` shape. |
+| `H1-1` — the 256-entry observation sink, and the 1403-vs-943 correction | Consumed in §6.4. It does not change any measurement here (mine is static), but it invalidates the row's `307` and my `656` as anything other than floors. |
+| merge of `origin/dev` (`d8b40ff8f`) | The orchestrator flagged `nio_selector.rs`, `socket_channel.rs` and `direct_buffer.rs` as touched. **In the range `26e4b5db4..59e5fd8d0` they are not** — the diff for `native-io/` is `process.rs` alone. Those changes were already in `26e4b5db4`. Re-derived rather than taken on trust, per §6's own rule. |
+| `vm/src/vm/vm_exec.rs` (+354), `native_override.rs` (+37) | Consolidated `real_protected_stub_class_common` into one definition with tests that the cold path re-inlines no copy of the allowlist. **Strengthens §1.3** — `java/io/FileInputStream` is on that list, at the tip and at the base. |
+
+---
+
+## 10. NOMINATIONS
 
 **N1 — decide whether CratonVM native dispatch keys on the receiver's class or
 on the constant-pool class.** Everything in §3.3 and §3.5 hangs on it, and so
@@ -644,10 +736,19 @@ asserting the side effect happened. This is `[decline masks]`.
 the behavioural question is open. Does a `java.net.MulticastSocket.close()`
 still release its fd? Probe: open + close a multicast socket, check the fd table.
 
-**N4 — `java/io/RandomAccessFile.getFilePointer()J` has two implementations**
-(lib.rs:15314 and random_access_file.rs:579) with no comment at either site
-saying which is meant to win. `getFilePointer` **is** `ACC_NATIVE` on JDK 25, so
-this is one of the few genuine bridges in the crate with a shadowed twin.
+**N4 — `CRATONVM_REAL_RAF` does not cover `getFilePointer()J`.** The
+`if !real_raf_enabled()` block in `register_io_extras_natives` registers ten
+synthetic `RandomAccessFile` methods; `register_random_access_file_natives`
+runs six lines later and re-registers `getFilePointer` unconditionally, so that
+one method is `Bridge`-served in both settings of the flag. The winning
+implementation is the *right* one (`getFilePointer` is `public native long` on
+JDK 25), which is exactly why nobody noticed. The defect is the gate, not the
+callback: a flag whose stated scope is wider than its actual one, which is the
+shape `H1-1` and `G89-1` both name. **Probe:** set `CRATONVM_REAL_RAF=1`, take
+`--dump-native-registry`, and confirm `getFilePointer` reports
+`site: native-io/src/random_access_file.rs` in *both* arms — then decide whether
+the synthetic ten should be nine, or whether the RAF registrar should skip this
+row when the flag is unset.
 
 **N5 — `java/io/FileOutputStream` has the same public-surface shape
 `FileInputStream` has, and has not had the same treatment.** 4 `ACC_NATIVE`
