@@ -4464,7 +4464,16 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // their own mechanisms. Prefer the bounded JIT frame bands recovered from
     // the live RBP chain; retain the historical sweep as a fail-safe whenever
     // a frame record or its size metadata is not trustworthy.
-    if !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
+    // `CRATONVM_JIT_NO_FRAME_BANDS=1` restores the historical whole-band sweep
+    // so the coverage difference between the two is an A/B inside ONE binary.
+    // The bands cover each compiled frame's own `[rbp - frame_size, rbp)` and
+    // nothing else; the whole-band sweep also covers `[scanner_sp, rbp_inner)`,
+    // i.e. the interpreter / native / Rust frames the compiled method called
+    // INTO. The narrowing rests on "their roots are published by their own
+    // mechanisms", which does not hold for an object that has been allocated
+    // and not yet stored anywhere tracked — see
+    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    if !frame_bands_enabled() || !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
         scan_one_frame(scanner_sp, info.frame_base, heap, out);
     }
     let _ = info.entry_ptr; // reserved for future PC-precise lookup
@@ -4478,6 +4487,15 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
 /// is historical: normal compiled entries populate it too. Nested direct JIT
 /// calls use the normal saved-RBP chain, so this excludes intervening
 /// interpreter/Rust frames without excluding JIT spill space.
+/// `CRATONVM_JIT_NO_FRAME_BANDS` kill switch for the bounded-band scan, so the
+/// whole-band sweep it replaced can be reinstated in the same binary.
+fn frame_bands_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_FRAME_BANDS").is_none()
+    })
+}
+
 fn scan_compiled_frame_bands(
     info: PreciseFrameInfo,
     scanner_sp: usize,

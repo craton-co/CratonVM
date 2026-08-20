@@ -795,6 +795,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "sp-inline-mic", on_key: Some("CRATONVM_JIT_SP_INLINE_MIC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-inline-pic", on_key: Some("CRATONVM_JIT_SP_INLINE_PIC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unreg-memo-gc-reset", on_key: Some("CRATONVM_JIT_UNREG_MEMO_GC_RESET"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "no-frame-bands", on_key: Some("CRATONVM_JIT_NO_FRAME_BANDS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
