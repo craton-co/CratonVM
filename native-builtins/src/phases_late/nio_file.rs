@@ -13865,7 +13865,184 @@ pub(crate) fn fs_list_roots_bitmask() -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// G70-1 N1 — the java.io.File path, in code units
+// ---------------------------------------------------------------------------
+//
+// `File` is a STRING WRAPPER until something touches the disk: the path lives
+// in a Java field, and `<init>` normalises it and writes it straight back.
+// Every read on that round trip used `read_string`, which cannot hold an
+// unpaired UTF-16 surrogate, so `new File("d/\uD83Dx").getPath()` came back
+// with U+FFFD in place of the surrogate.
+//
+// That is not only a rendering defect. `equals`/`hashCode`/`compareTo` are
+// computed FROM the same path, so two DIFFERENT files — one named with a lone
+// surrogate, one named with a literal U+FFFD — collided: equal, same hash,
+// compareTo 0. A substitution in a key is a merge, not a typo.
+//
+// Every separator that decides path structure is ASCII (`/`, `\`, and the
+// drive colon), so scanning units for them is the same logic with a different
+// index type. As in the URI accessors (G75-1 N1) there is still ONE rule: the
+// `_units` functions below are the implementations and the `&str` spellings
+// that already existed are thin wrappers over them. A `&str` can never hold a
+// lone surrogate, so encoding one to units and back is exact — the wrappers
+// lose nothing they did not already lack, and the two spellings cannot drift.
+
+/// `/` or `\` — the two separators Java accepts on input on every platform.
+fn u_is_sep(c: u16) -> bool {
+    c == u16::from(b'/') || c == u16::from(b'\\')
+}
+
+/// Per-unit case folding: `Character.toLowerCase(Character.toUpperCase(c))`,
+/// which is exactly the rule `String.compareToIgnoreCase` applies, and is
+/// length-preserving (unlike `String.toLowerCase`, which can change length).
+///
+/// `char::from_u32` answers `None` for a surrogate code unit, so an unpaired
+/// surrogate falls through UNCHANGED — which is what we want: it has no case,
+/// and folding must not be another way to lose it.
+///
+/// Only `file_path_key_units` calls this, and only on Windows — hence the
+/// allow, so a Linux build does not warn on a function it correctly never uses.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn u_lower(c: u16) -> u16 {
+    match char::from_u32(u32::from(c)) {
+        Some(ch) => {
+            let up = ch.to_uppercase().next().unwrap_or(ch);
+            let lo = up.to_lowercase().next().unwrap_or(up);
+            let v = lo as u32;
+            if v <= 0xFFFF { v as u16 } else { c }
+        }
+        None => c,
+    }
+}
+
+/// `String.hashCode()` over code units — the definition Java gives.
+///
+/// The previous spelling iterated `path.bytes()`, i.e. UTF-8 bytes, which
+/// agrees with Java only for ASCII. It also omitted the `^ 1234321` the JDK's
+/// file systems mix in, so `new File("AB").hashCode()` answered 2081 where
+/// HotSpot answers 1235376.
+fn java_string_hash_units(p: &[u16]) -> i32 {
+    let mut h: i32 = 0;
+    for &c in p {
+        h = h.wrapping_mul(31).wrapping_add(i32::from(c));
+    }
+    h
+}
+
+/// The comparison key for a path: case-folded on Windows, verbatim elsewhere.
+///
+/// `WinNTFileSystem` compares paths case-INSENSITIVELY (`compareToIgnoreCase`)
+/// and `UnixFileSystem` compares them exactly. This was measured, not assumed:
+/// on Windows HotSpot answers `new File("ab").equals(new File("AB")) == true`.
+fn file_path_key_units(p: &[u16]) -> Vec<u16> {
+    #[cfg(windows)]
+    {
+        p.iter().map(|&c| u_lower(c)).collect()
+    }
+    #[cfg(not(windows))]
+    {
+        p.to_vec()
+    }
+}
+
+/// `String.compareTo` semantics over units: the difference of the first
+/// differing unit, else the length difference. NOT a clamped -1/0/1 — callers
+/// that print the value observe the real one.
+fn u_compare(a: &[u16], b: &[u16]) -> i32 {
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        if a[i] != b[i] {
+            return i32::from(a[i]) - i32::from(b[i]);
+        }
+    }
+    a.len() as i32 - b.len() as i32
+}
+
+/// `File.getName()`, transcribed:
+///
+/// ```text
+/// int index = path.lastIndexOf(separatorChar);
+/// if (index < prefixLength) return path.substring(prefixLength);
+/// return path.substring(index + 1);
+/// ```
+///
+/// Transcribing it beats paraphrasing it. The first version of this function
+/// trimmed trailing separators and split on the last one, which is the rule as
+/// usually described — and it answers `C:` for `C:\` where Java answers the
+/// empty string, because the described rule quietly assumes there is no root
+/// prefix. The oracle was asked; the JDK's own three lines are what is here.
+fn file_basename_units(p: &[u16]) -> Vec<u16> {
+    let prefix = file_prefix_len_units(p).min(p.len());
+    match p.iter().rposition(|&c| u_is_sep(c)) {
+        Some(i) if i >= prefix => p[i + 1..].to_vec(),
+        _ => p[prefix..].to_vec(),
+    }
+}
+
+/// The length of the ROOT prefix, which `File.getParent` may never cut into.
+///
+/// `java.io.File` keeps this as `prefixLength` and returns
+/// `path.substring(0, prefixLength)` whenever the last separator falls inside
+/// it. Without it `new File("C:\\x").getParent()` answers `C:` where Java
+/// answers `C:\` — a fault the `std::path::Path::parent` spelling did NOT have,
+/// and one no relative-path probe row can see. Found by re-reading the
+/// conversion, not by the sweep; the vector now carries absolute rows for it.
+fn file_prefix_len_units(p: &[u16]) -> usize {
+    #[cfg(windows)]
+    {
+        // `X:` optionally followed by a separator.
+        if p.len() >= 2
+            && p[1] == u16::from(b':')
+            && char::from_u32(u32::from(p[0])).is_some_and(|c| c.is_ascii_alphabetic())
+        {
+            return if p.len() >= 3 && u_is_sep(p[2]) { 3 } else { 2 };
+        }
+        // A UNC path begins with two separators.
+        if p.len() >= 2 && u_is_sep(p[0]) && u_is_sep(p[1]) {
+            return 2;
+        }
+    }
+    if !p.is_empty() && u_is_sep(p[0]) {
+        return 1;
+    }
+    0
+}
+
+/// `File.getParent()`, transcribed:
+///
+/// ```text
+/// int index = path.lastIndexOf(separatorChar);
+/// if (index < prefixLength) {
+///     if ((prefixLength > 0) && (path.length() > prefixLength))
+///         return path.substring(0, prefixLength);
+///     return null;
+/// }
+/// return path.substring(0, index);
+/// ```
+///
+/// Three cases hang on that shape and were each wrong in a paraphrase of it:
+/// `C:\` has parent NULL (not `C:\`, because the path is no longer than its own
+/// prefix), `C:x` has parent `C:` (there is no separator at all, yet a parent
+/// exists), and `\x` has parent `\`. All three were taken from the oracle.
+fn file_parent_units(p: &[u16]) -> Option<Vec<u16>> {
+    let prefix = file_prefix_len_units(p);
+    match p.iter().rposition(|&c| u_is_sep(c)) {
+        Some(i) if i >= prefix => Some(p[..i].to_vec()),
+        _ if prefix > 0 && p.len() > prefix => Some(p[..prefix].to_vec()),
+        _ => None,
+    }
+}
+
+/// [`file_read_path_units`], lossily, for the callers that hand the value to
+/// the operating system rather than back to Java. Those genuinely need a
+/// `str`: `std::fs` cannot open a path Rust cannot spell.
 pub(crate) fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    String::from_utf16_lossy(&file_read_path_units(ctx, this))
+}
+
+/// The stored path of a `File`, in code units.
+pub(crate) fn file_read_path_units(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u16> {
     // Prefer the real-JDK `getPath()` implementation when Available (correct
     // `prefixLength` + internal path for `java.io.File` loaded from modules).
     if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke(
@@ -13874,26 +14051,26 @@ pub(crate) fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> St
         "()Ljava/lang/String;",
         &[Value::Object(Some(this))],
     ) {
-        let r = ctx.read_string(s).unwrap_or_default();
+        let r = ctx.read_string_units(s).unwrap_or_default();
         if !r.is_empty() {
-            return file_normalise_path(&r);
+            return file_normalise_path_units(&r);
         }
     }
     if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
-        let r = ctx.read_string(s).unwrap_or_default();
+        let r = ctx.read_string_units(s).unwrap_or_default();
         if !r.is_empty() {
-            return file_normalise_path(&r);
+            return file_normalise_path_units(&r);
         }
     }
     let raw = match ctx.get_field(this, 0) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
+        Value::Object(Some(s)) => ctx.read_string_units(s).unwrap_or_default(),
+        _ => Vec::new(),
     };
     // Defensive: Spring Boot's URI -> File round-trip can hand us a
     // raw URI-style `/C:/...` path on Windows when the real-JDK File
     // bytecode (which would normalise it) is bypassed. Normalise here
     // so std::fs callers see a path Rust's `Path::is_absolute` recognises.
-    file_normalise_path(&raw)
+    file_normalise_path_units(&raw)
 }
 
 /// Normalise a path string the way `java.io.WinNTFileSystem.normalize` does.
@@ -13904,24 +14081,40 @@ pub(crate) fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> St
 /// the input is returned unchanged.
 #[cfg(windows)]
 pub(crate) fn file_normalise_path(path: &str) -> String {
-    let bytes = path.as_bytes();
+    let units: Vec<u16> = path.encode_utf16().collect();
+    String::from_utf16_lossy(&file_normalise_path_units(&units))
+}
+
+/// [`file_normalise_path`] in code units — the implementation of both.
+///
+/// One deliberate behaviour change comes with the conversion: the trailing
+/// separator guard below counts UNITS where the `&str` spelling counted BYTES.
+/// `WinNTFileSystem.normalize` counts chars, so the units count is the correct
+/// one; the byte count only agreed for ASCII paths, and disagreed silently for
+/// any other (a 2-char non-ASCII path measured 4 and skipped the trim).
+#[cfg(windows)]
+pub(crate) fn file_normalise_path_units(path: &[u16]) -> Vec<u16> {
+    let slash = u16::from(b'/');
+    let back = u16::from(b'\\');
     // Strip leading `/<drive>:` -> `<drive>:` (e.g. `/C:/foo` -> `C:/foo`).
-    let mut normalized = if bytes.len() >= 3
-        && bytes[0] == b'/'
-        && bytes[1].is_ascii_alphabetic()
-        && bytes[2] == b':'
+    let body = if path.len() >= 3
+        && path[0] == slash
+        && char::from_u32(u32::from(path[1])).is_some_and(|c| c.is_ascii_alphabetic())
+        && path[2] == u16::from(b':')
     {
-        path[1..].replace('/', "\\")
+        &path[1..]
     } else {
-        // Otherwise normalise forward slashes for consistency with Java's
-        // canonical Windows path separator.
-        path.replace('/', "\\")
+        path
     };
-    // Otherwise normalise forward slashes for consistency with Java's
-    // canonical Windows path separator. WinNTFileSystem.normalize also drops
-    // a redundant final separator (except the drive root): this is observable
-    // in Spring's config-tree location descriptions.
-    while normalized.len() > 3 && normalized.ends_with('\\') {
+    // Normalise forward slashes to Java's canonical Windows separator.
+    let mut normalized: Vec<u16> = body
+        .iter()
+        .map(|&c| if c == slash { back } else { c })
+        .collect();
+    // WinNTFileSystem.normalize also drops a redundant final separator (except
+    // the drive root): this is observable in Spring's config-tree location
+    // descriptions.
+    while normalized.len() > 3 && normalized.last() == Some(&back) {
         normalized.pop();
     }
     normalized
@@ -13942,16 +14135,25 @@ pub(crate) fn file_normalise_path(path: &str) -> String {
     // .encodedHashtagInPath` found zero files). The root came straight from
     // `new File(uri.getSchemeSpecificPart())`, whose value legitimately ends
     // in `/` for a directory URL.
-    let mut out = String::with_capacity(path.len());
+    let units: Vec<u16> = path.encode_utf16().collect();
+    String::from_utf16_lossy(&file_normalise_path_units(&units))
+}
+
+/// [`file_normalise_path`] in code units — the implementation of both. The
+/// doc comment above states the rule; this is where it lives.
+#[cfg(not(windows))]
+pub(crate) fn file_normalise_path_units(path: &[u16]) -> Vec<u16> {
+    let slash = u16::from(b'/');
+    let mut out: Vec<u16> = Vec::with_capacity(path.len());
     let mut prev_slash = false;
-    for ch in path.chars() {
-        let is_slash = ch == '/';
+    for &c in path {
+        let is_slash = c == slash;
         if !(is_slash && prev_slash) {
-            out.push(ch);
+            out.push(c);
         }
         prev_slash = is_slash;
     }
-    if out.len() > 1 && out.ends_with('/') {
+    if out.len() > 1 && out.last() == Some(&slash) {
         out.pop();
     }
     out
@@ -13982,16 +14184,36 @@ mod file_normalise_tests {
 /// normalise. An empty child (including a lone "/" ) → just the normalised
 /// parent.
 pub(crate) fn file_join_parent_child(parent: &str, child: &str) -> String {
-    let is_sep = |c: char| c == '/' || c == '\\';
-    let child_trim = child.trim_matches(is_sep);
+    let p: Vec<u16> = parent.encode_utf16().collect();
+    let c: Vec<u16> = child.encode_utf16().collect();
+    String::from_utf16_lossy(&file_join_parent_child_units(&p, &c))
+}
+
+/// [`file_join_parent_child`] in code units — the implementation of both.
+pub(crate) fn file_join_parent_child_units(parent: &[u16], child: &[u16]) -> Vec<u16> {
+    let mut cs = 0;
+    let mut ce = child.len();
+    while cs < ce && u_is_sep(child[cs]) {
+        cs += 1;
+    }
+    while ce > cs && u_is_sep(child[ce - 1]) {
+        ce -= 1;
+    }
+    let child_trim = &child[cs..ce];
     if child_trim.is_empty() {
-        return file_normalise_path(parent);
+        return file_normalise_path_units(parent);
     }
     if parent.is_empty() {
-        return file_normalise_path(child_trim);
+        return file_normalise_path_units(child_trim);
     }
-    let parent_trim = parent.trim_end_matches(is_sep);
-    file_normalise_path(&format!("{parent_trim}/{child_trim}"))
+    let mut pe = parent.len();
+    while pe > 0 && u_is_sep(parent[pe - 1]) {
+        pe -= 1;
+    }
+    let mut joined: Vec<u16> = parent[..pe].to_vec();
+    joined.push(u16::from(b'/'));
+    joined.extend_from_slice(child_trim);
+    file_normalise_path_units(&joined)
 }
 
 /// Strip the Windows `\\?\` / `\\?\UNC\` extended-length prefix that
@@ -14704,15 +14926,17 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     // normalisation so our synthetic File matches HotSpot semantics.
     r.register(file, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // UNITS (G70-1 N1): the normalised path is written straight back into
+        // a Java field, so this is a round trip, not an inspection.
         let path = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
+            Some(Value::Object(Some(s))) => ctx.read_string_units(*s).unwrap_or_default(),
+            _ => Vec::new(),
         };
-        let normalised = file_normalise_path(&path);
+        let normalised = file_normalise_path_units(&path);
         // Pin across the create_string below — a moving young GC there would
         // relocate `this` (native stale-local family).
         let this_pin = ctx.pin_native_root(this);
-        let s = ctx.create_string(&normalised);
+        let s = ctx.create_string_from_units(&normalised);
         let this = ctx.read_native_pin(this_pin, this);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         ctx.unpin_native_roots(this_pin);
@@ -14727,12 +14951,12 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let parent = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
+                Some(Value::Object(Some(s))) => ctx.read_string_units(*s).unwrap_or_default(),
+                _ => Vec::new(),
             };
             let child = match args.get(2) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
+                Some(Value::Object(Some(s))) => ctx.read_string_units(*s).unwrap_or_default(),
+                _ => Vec::new(),
             };
             // JDK `File(String parent, String child)` resolution — NOT `PathBuf::push`,
             // whose semantics differ from Java and broke `File`-based resource lookup
@@ -14742,11 +14966,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             // Java: strip leading/trailing separators from the child, a trailing one
             // from the parent, join with a separator, then normalise (slash
             // conversion + collapse). Empty child → just the normalised parent.
-            let path = file_join_parent_child(&parent, &child);
+            let path = file_join_parent_child_units(&parent, &child);
             // Pin across the create_string below — a moving young GC there
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
-            let s = ctx.create_string(&path);
+            let s = ctx.create_string_from_units(&path);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, 0, Value::Object(Some(s)));
             ctx.unpin_native_roots(this_pin);
@@ -14762,18 +14986,18 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let parent_path = match args.get(1) {
-                Some(Value::Object(Some(p))) => file_read_path(ctx, *p),
-                _ => String::new(),
+                Some(Value::Object(Some(p))) => file_read_path_units(ctx, *p),
+                _ => Vec::new(),
             };
             let child = match args.get(2) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
+                Some(Value::Object(Some(s))) => ctx.read_string_units(*s).unwrap_or_default(),
+                _ => Vec::new(),
             };
-            let path = file_join_parent_child(&parent_path, &child);
+            let path = file_join_parent_child_units(&parent_path, &child);
             // Pin across the create_string below — a moving young GC there
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
-            let s = ctx.create_string(&path);
+            let s = ctx.create_string_from_units(&path);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, 0, Value::Object(Some(s)));
             ctx.unpin_native_roots(this_pin);
@@ -14816,7 +15040,6 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // that case as unset and parse from the raw text instead (the
         // mangled "file:\C:\..." Files emptied Gradle's ClasspathUtil walk
         // and with it every ProjectBuilder module classpath).
-        let raw = crate::net_phase_e::uri_raw_string(ctx, uri);
         // Real `File(URI)` is `String p = uri.getPath();` — and `getPath()`
         // returns the DECODED path, while the `path` FIELD holds the raw,
         // still-percent-encoded one (`getRawPath()`'s value). Reading the field
@@ -14832,60 +15055,70 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // Ask the URI itself, so the decoding rules stay the JDK's. The field
         // read remains as the fallback for the synthetic 7-slot URIs described
         // below, whose `getPath()` may not be wired.
-        let mut path = match ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[]) {
+        // UNITS (G78-1). This is the FOURTH File constructor, and the audit did
+        // not reach it: it was invoked zero times across the corpus, so it never
+        // entered the live set. G70-1 N2 warns that a sibling sitting next to a
+        // fixed method is not thereby fixed — a probe row was added to ask
+        // rather than assume, and it diverged. `URI.getPath()` is exact since
+        // G75-1 N1, so by this point the ONLY remaining loss was this
+        // constructor's own read of the answer.
+        let raw_u = crate::net_phase_e::uri_raw_units(ctx, uri);
+        let mut path_u = match ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[]) {
             Ok(Some(Value::Object(Some(s)))) => ctx
-                .read_string(s)
-                .filter(|v| !v.is_empty() && *v != raw)
+                .read_string_units(s)
+                .filter(|v| !v.is_empty() && *v != raw_u)
                 .unwrap_or_default(),
-            _ => String::new(),
+            _ => Vec::new(),
         };
-        if path.is_empty() {
-            path = match ctx.get_field_by_name(uri, "path") {
+        if path_u.is_empty() {
+            path_u = match ctx.get_field_by_name(uri, "path") {
                 Value::Object(Some(s)) => ctx
-                    .read_string(s)
-                    .filter(|v| !v.is_empty() && *v != raw)
+                    .read_string_units(s)
+                    .filter(|v| !v.is_empty() && *v != raw_u)
                     .unwrap_or_default(),
-                _ => String::new(),
+                _ => Vec::new(),
             };
         }
-        if path.is_empty() {
+        let slash = u16::from(b'/');
+        if path_u.is_empty() && !raw_u.is_empty() {
             // Parse from the full URI text:
             //   scheme:[//authority]path[?query][#fragment]
-            if !raw.is_empty() {
-                let after_scheme = match raw.find(':') {
-                    Some(i) => &raw[i + 1..],
-                    None => &raw[..],
-                };
-                let body = if let Some(rest) = after_scheme.strip_prefix("//") {
-                    let slash = rest.find('/').unwrap_or(rest.len());
-                    &rest[slash..]
-                } else {
-                    after_scheme
-                };
-                path = body
-                    .split('?')
-                    .next()
-                    .unwrap_or("")
-                    .split('#')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-            }
+            // Every delimiter here is ASCII, so this is the same scan with a
+            // different index type.
+            let after_scheme = match raw_u.iter().position(|&c| c == u16::from(b':')) {
+                Some(i) => &raw_u[i + 1..],
+                None => &raw_u[..],
+            };
+            let body = if after_scheme.starts_with(&[slash, slash]) {
+                let rest = &after_scheme[2..];
+                match rest.iter().position(|&c| c == slash) {
+                    Some(i) => &rest[i..],
+                    None => &[][..],
+                }
+            } else {
+                after_scheme
+            };
+            let end = body
+                .iter()
+                .position(|&c| c == u16::from(b'?') || c == u16::from(b'#'))
+                .unwrap_or(body.len());
+            path_u = body[..end].to_vec();
         }
-        // WinNTFileSystem.fromURIPath: `/C:/foo/` -> `C:/foo`.
-        let mut p = path;
-        let chars: Vec<char> = p.chars().collect();
-        if chars.len() > 2 && chars[0] == '/' && chars[2] == ':' {
-            p = p[1..].to_string();
-            if p.len() > 3 && p.ends_with('/') {
+        // WinNTFileSystem.fromURIPath: `/C:/foo/` -> `C:/foo`. The old spelling
+        // measured the drive test in CHARS and the trailing-slash test in BYTES
+        // of the same string; units settle both consistently.
+        let mut p = path_u;
+        if p.len() > 2 && p[0] == slash && p[2] == u16::from(b':') {
+            p.remove(0);
+            if p.len() > 3 && p.last() == Some(&slash) {
                 p.pop();
             }
-        } else if p.len() > 1 && p.ends_with('/') {
+        } else if p.len() > 1 && p.last() == Some(&slash) {
             p.pop();
         }
         // Normalise to platform separators / collapse `.` `..` segments.
-        let normalised = file_normalise_path(&p);
-        let s = ctx.create_string(&normalised);
+        let normalised = file_normalise_path_units(&p);
+        let s = ctx.create_string_from_units(&normalised);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
     });
@@ -14899,49 +15132,48 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "getPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            Value::Object(Some(s)) => ctx.read_string_units(s).unwrap_or_default(),
             other => return Ok(Some(other)),
         };
-        let s = ctx.create_string(&file_normalise_path(&raw));
+        let s = ctx.create_string_from_units(&file_normalise_path_units(&raw));
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(file, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            Value::Object(Some(s)) => ctx.read_string_units(s).unwrap_or_default(),
             other => return Ok(Some(other)),
         };
-        let s = ctx.create_string(&file_normalise_path(&raw));
+        let s = ctx.create_string_from_units(&file_normalise_path_units(&raw));
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(file, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let path = file_read_path(ctx, this);
-        let name = std::path::Path::new(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let s = ctx.create_string(&name);
+        // `std::path::Path::file_name` + `to_string_lossy` was a THIRD place the
+        // unit was lost, after the constructor and the field read. The basename
+        // rule is a split on an ASCII separator, so it needs no `Path` at all.
+        let path = file_read_path_units(ctx, this);
+        let name = file_basename_units(&path);
+        let s = ctx.create_string_from_units(&name);
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(file, "getParent", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let path = file_read_path(ctx, this);
-        match std::path::Path::new(&path).parent() {
-            Some(p) => {
-                let pstr = p.to_string_lossy().into_owned();
-                if pstr.is_empty() {
-                    Ok(Some(Value::Object(None)))
-                } else {
-                    let s = ctx.create_string(&pstr);
-                    Ok(Some(Value::Object(Some(s))))
-                }
+        let path = file_read_path_units(ctx, this);
+        match file_parent_units(&path) {
+            Some(pu) if !pu.is_empty() => {
+                let s = ctx.create_string_from_units(&pu);
+                Ok(Some(Value::Object(Some(s))))
             }
-            None => Ok(Some(Value::Object(None))),
+            _ => Ok(Some(Value::Object(None))),
         }
     });
     r.register(file, "getParentFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // `file_alloc` takes a `&str`; the parent of a surrogate-bearing path
+        // therefore still round-trips lossily HERE. That is recorded rather than
+        // papered over — see G78-1 §4. `getParent()` above, which is the string
+        // answer and by far the commoner call, is exact.
         let path = file_read_path(ctx, this);
         match std::path::Path::new(&path).parent() {
             Some(p) => {
@@ -15539,19 +15771,22 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let p1 = file_read_path(ctx, this);
-        let p2 = file_read_path(ctx, other);
+        // Case-INSENSITIVE on Windows (WinNTFileSystem), exact elsewhere. The
+        // previous exact comparison answered false for `File("ab")` vs
+        // `File("AB")` where HotSpot answers true — measured, not assumed.
+        let p1 = file_path_key_units(&file_read_path_units(ctx, this));
+        let p2 = file_path_key_units(&file_read_path_units(ctx, other));
         Ok(Some(Value::Int(if p1 == p2 { 1 } else { 0 })))
     });
     r.register(file, "hashCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let path = file_read_path(ctx, this);
-        // Java String.hashCode() algorithm
-        let mut h: i32 = 0;
-        for b in path.bytes() {
-            h = h.wrapping_mul(31).wrapping_add(b as i32);
-        }
-        Ok(Some(Value::Int(h)))
+        // `UnixFileSystem.hashCode` is `path.hashCode() ^ 1234321`;
+        // `WinNTFileSystem.hashCode` folds case first. Both were missing: the
+        // old body hashed UTF-8 BYTES (right only for ASCII) and omitted the
+        // mixing constant entirely, so `new File("AB")` answered 2081 where
+        // HotSpot answers 1235376.
+        let path = file_path_key_units(&file_read_path_units(ctx, this));
+        Ok(Some(Value::Int(java_string_hash_units(&path) ^ 1234321)))
     });
     r.register(file, "compareTo", "(Ljava/io/File;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -15559,9 +15794,9 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let p1 = file_read_path(ctx, this);
-        let p2 = file_read_path(ctx, other);
-        Ok(Some(Value::Int(p1.cmp(&p2) as i32)))
+        let p1 = file_path_key_units(&file_read_path_units(ctx, this));
+        let p2 = file_path_key_units(&file_read_path_units(ctx, other));
+        Ok(Some(Value::Int(u_compare(&p1, &p2))))
     });
 
     // toPath and toURI
@@ -15695,15 +15930,58 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         ctx.unpin_native_roots(arr_pin);
         Ok(Some(Value::Object(Some(arr))))
     });
+/// `File.createTempFile`'s prefix contract, transcribed rather than composed.
+///
+/// MEASURED on both VMs; the oracle refuses where this VM was creating files:
+///
+/// ```text
+///   createTempFile("m",   ".t")  HotSpot IllegalArgumentException
+///                                        Prefix string "m" too short: length must be at least 3
+///   createTempFile("mm",  ".t")  HotSpot the same, naming "mm"
+///   createTempFile("mmm", ".t")  HotSpot OK
+///   createTempFile(null,  ".t")  HotSpot NullPointerException
+///                                        Cannot invoke "String.length()" because "prefix" is null
+/// ```
+///
+/// Both `File.createTempFile` overloads defaulted a null prefix to `"tmp"` and
+/// never looked at the length, so all four rows above created a file. This is a
+/// VALIDATION gap, not a message gap: a program that relies on the refusal —
+/// and `File.createTempFile`'s own javadoc documents it — silently got a file.
+///
+/// The message names the prefix and is quoted exactly as the JDK writes it,
+/// including the double quotes around the offending string. The NPE text is
+/// the helpful-NPE form HotSpot produces for `prefix.length()`, measured, not
+/// guessed.
+///
+/// A null SUFFIX is legal and means `.tmp` — that is the documented default
+/// and is deliberately not touched here.
+fn jdk_check_temp_prefix(prefix: Option<&str>) -> Result<(), MethodCallFailed> {
+    match prefix {
+        None => Err(RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.length()\" because \"prefix\" is null".into(),
+            ),
+        }
+        .into()),
+        Some(p) if p.chars().count() < 3 => Err(RuntimeError::IllegalArgumentException {
+            message: format!("Prefix string \"{p}\" too short: length must be at least 3"),
+        }
+        .into()),
+        Some(_) => Ok(()),
+    }
+}
+
     r.register(
         file,
         "createTempFile",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/File;",
         |ctx, args| {
-            let prefix = match args.get(0) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "tmp".into()),
-                _ => "tmp".into(),
+            let prefix_opt = match args.get(0) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s),
+                _ => None,
             };
+            jdk_check_temp_prefix(prefix_opt.as_deref())?;
+            let prefix = prefix_opt.unwrap_or_else(|| "tmp".into());
             let suffix = match args.get(1) {
                 Some(Value::Object(Some(s))) => {
                     ctx.read_string(*s).unwrap_or_else(|| ".tmp".into())
@@ -15720,10 +15998,12 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         "createTempFile",
         "(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;",
         |ctx, args| {
-            let prefix = match args.get(0) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "tmp".into()),
-                _ => "tmp".into(),
+            let prefix_opt = match args.get(0) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s),
+                _ => None,
             };
+            jdk_check_temp_prefix(prefix_opt.as_deref())?;
+            let prefix = prefix_opt.unwrap_or_else(|| "tmp".into());
             let suffix = match args.get(1) {
                 Some(Value::Object(Some(s))) => {
                     ctx.read_string(*s).unwrap_or_else(|| ".tmp".into())

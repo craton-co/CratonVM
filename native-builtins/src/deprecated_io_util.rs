@@ -954,6 +954,40 @@ fn register_string_deprecated(r: &mut NativeMethodRegistry) {
 // T8.2.6 — Class.newInstance()
 // ---------------------------------------------------------------------------
 
+/// Build the real `java.lang.InstantiationException` that `Class.newInstance`
+/// owes its caller, with `None` meaning the JDK's null-message form.
+///
+/// A real throwable rather than a `RuntimeError` carrying the type's NAME in
+/// its text: only the real class makes `catch (InstantiationException)` match.
+/// Falls back to the previous shape only if the exception class itself cannot
+/// be constructed, which would mean the image is unusable anyway.
+fn instantiation_exception(
+    ctx: &mut dyn NativeContext,
+    message: Option<&str>,
+) -> cratonvm_types::error::MethodCallFailed {
+    let built = match message {
+        Some(m) => {
+            let dotted = m.replace('/', ".");
+            let msg = ctx.create_string(&dotted);
+            ctx.new_object_initialized(
+                "java/lang/InstantiationException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(msg))],
+            )
+        }
+        None => ctx.new_object_initialized("java/lang/InstantiationException", "()V", &[]),
+    };
+    if let Ok(Some(Value::Object(Some(exc)))) = built {
+        return cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::UnsupportedOperationException {
+        message: format!(
+            "InstantiationException could not be constructed (message={message:?})"
+        ),
+    }
+    .into()
+}
+
 fn register_class_new_instance(r: &mut NativeMethodRegistry) {
     // newInstance()Ljava/lang/Object; — invoke the no-arg constructor reflectively
     //
@@ -981,6 +1015,20 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
             let this_class = obj_arg(args, 0)?;
             let class_id = match crate::lang_class::mirror_class_id(ctx, this_class) {
                 Some(cid) => cid,
+                // G69-1 closes `G68-1` section 5's residue. A PRIMITIVE mirror
+                // carries no class id -- there is no `int` class to resolve --
+                // so `mirror_class_id` answers `None` and this arm used to
+                // report the receiver as "not a Class mirror". It IS one:
+                // `int.class` is a `Class`, and HotSpot answers
+                // `InstantiationException` with the primitive's name (`int`),
+                // exactly as it does for an interface or an array. The
+                // no-class-id case and the not-a-mirror case had been collapsed
+                // into one message, and only the second of them was true.
+                None if crate::lang_class::mirror_is_primitive(ctx, this_class) => {
+                    let name = crate::lang_class::mirror_class_name(ctx, this_class)
+                        .unwrap_or_default();
+                    return Err(instantiation_exception(ctx, Some(&name)));
+                }
                 None => return Err(RuntimeError::UnsupportedOperationException {
                     message: "Class.newInstance: receiver is not a Class mirror".to_string(),
                 }.into()),
@@ -1004,11 +1052,31 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
                 let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
                 let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;
                 if flags & (abstract_bit | iface_bit) != 0 {
-                    return Err(RuntimeError::UnsupportedOperationException {
-                        message: format!(
-                            "InstantiationException: cannot instantiate abstract/interface type {class_name}"
-                        ),
-                    }.into());
+                    // The comment above says "InstantiationException for
+                    // these" and the code threw UnsupportedOperationException
+                    // with the words "InstantiationException:" in the MESSAGE
+                    // — a stringly-typed exception. A `catch
+                    // (InstantiationException)` does not match it, which is the
+                    // whole point of the type, and this file's own note about
+                    // Spring's `beanDefinitionWithAbstractClass` depends on the
+                    // catch matching.
+                    //
+                    // MEASURED on both VMs; the message rule is not derivable
+                    // and is transcribed:
+                    //
+                    //   abstract class   InstantiationException | null
+                    //   interface        InstantiationException | java.lang.Runnable
+                    //   no no-arg ctor   InstantiationException | PC$NoNoArg
+                    //   int[]            InstantiationException | [I
+                    //   private ctor     SUCCEEDS — not an error at all
+                    //
+                    // So it is `getName()` everywhere EXCEPT an abstract
+                    // non-interface class, where the message is null.
+                    let is_iface = flags & iface_bit != 0;
+                    return Err(instantiation_exception(
+                        ctx,
+                        if is_iface { Some(&class_name) } else { None },
+                    ));
                 }
             }
 
@@ -1016,9 +1084,7 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
             // collapse a Lookup.defineClass helper back to an application-loader
             // class with the same binary name.
             if !ctx.class_declares_method(class_id, "<init>", "()V") {
-                return Err(RuntimeError::UnsupportedOperationException {
-                    message: format!("InstantiationException: no no-arg constructor in {}", class_name),
-                }.into());
+                return Err(instantiation_exception(ctx, Some(&class_name)));
             }
 
             // Create a new instance of the exact mirror class and invoke its

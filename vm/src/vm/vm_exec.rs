@@ -12670,6 +12670,32 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         compact_java_strings_equal(self.shared, a, b)
     }
 
+    fn read_string_units(&self, obj: ObjectRef) -> Option<Vec<u16>> {
+        // Guarded exactly as `read_string` is, and for the same reason its own
+        // comment gives: the structural reader duck-types a String from field
+        // 0, and a CratonVM synthetic `StringBuilder` is also char[]-backed
+        // with an OVER-allocated buffer, so a shape test alone would decode the
+        // buffer's capacity as text. `read_java_string_units` shares
+        // `read_string`'s guards below the surface -- they were factored out of
+        // the `str` reader precisely so the two cannot drift -- but the class
+        // identity test is this layer's, so it is applied here too.
+        if is_real_java_string(&self.shared, obj) {
+            if let Some(units) =
+                super::vm_object::read_java_string_units(&self.shared.mem.heap, obj)
+            {
+                return Some(units);
+            }
+        }
+        // Not a confirmed String, or unreadable as one: fall back to the same
+        // answer the trait default would have given, which is what every
+        // non-String caller of this already expects.
+        self.read_string(obj).map(|s| s.encode_utf16().collect())
+    }
+
+    fn create_string_from_units(&mut self, units: &[u16]) -> ObjectRef {
+        super::create_java_string_from_units(self.shared, units)
+    }
+
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
         let class_id = self.shared.mem.heap.class_id_of(obj);
         // Reference arrays carry their component class ID; a String[] is not

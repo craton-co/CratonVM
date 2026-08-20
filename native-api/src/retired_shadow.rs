@@ -551,6 +551,144 @@
 //! these rows leave, and `scripts/jdk-only-kind-map.py` freezes each row's kind,
 //! so a silent drift in either direction fails a gate rather than a workload.
 
+//! # Five STATELESS subsystems — retired 2026-08-19
+//!
+//! 227 triples, the largest wave so far and two and a half times the table it
+//! joins. They were chosen by the dial and only then by the census, which is
+//! the opposite of the order the first waves used and is the point.
+//!
+//! ## What was measured, and why the dial came first
+//!
+//! The module doc above records the whole-VM result: arming
+//! `CRATONVM_ENFORCE_NATIVE_SHADOW` everywhere takes the strict corpus from 32
+//! passed / 17 failed to 3 / 46, because under `--jdk-only` the surviving
+//! bridges ARE the object model for large parts of `java.base`. That number is
+//! a verdict on the WHOLE population, and it had been read as a verdict on
+//! every part of it.
+//!
+//! It is not. Re-measured 2026-08-19, one prefix at a time, over the 36-vector
+//! `--jdk-only` corpus, one binary, only the dial differing (baseline 36/36):
+//!
+//! ```text
+//!   all                              1 / 36     <- the documented catastrophe
+//!   jdk/internal/access/            22 / 36
+//!   java/security/                  33 / 36
+//!   java/net/  java/nio/channels/  sun/nio/ch/  34 / 36
+//!   java/math/  javax/crypto/  javax/management/  javax/net/ssl/
+//!     sun/security/ssl/  java/awt/image/  java/nio/file/   35 / 36
+//!
+//!   java/text/                      36 / 36  <- clean
+//!   java/util/stream/               36 / 36  <- clean
+//!   java/lang/module/               36 / 36  <- clean
+//!   java/util/concurrent/atomic/    36 / 36  <- clean
+//!   java/util/concurrent/locks/     36 / 36  <- clean
+//!   java/lang/ref/                  36 / 36  <- clean HERE, and NOT clean
+//!   sun/nio/fs/                     36 / 36  <- clean HERE, and NOT clean
+//!
+//!   all seven together              36 / 36  <- and they do not interact
+//! ```
+//!
+//! **Running the seven together was a separate measurement, not an inference.**
+//! Each prefix passing alone does not imply the union passes: a yielded
+//! `Collectors` returning a real collector into a yielded `stream/` pipeline is
+//! a pairing neither single run exercised.
+//!
+//! ## The screen passed two prefixes the ARM rejected — read that first
+//!
+//! `java/lang/ref/` and `sun/nio/fs/` are in the clean column above and are
+//! **not** retired. All seven went into the table, `regression-suite/run.sh`
+//! with `CRATONVM_ARGS=--jdk-only` was run over its 102 vectors, and it came
+//! back **99 / 102** against a 102 / 102 baseline:
+//!
+//! ```text
+//!   RFileTimes            plain.readAttributes.lastModified
+//!                           HotSpot   2021-01-01T00:00:00Z
+//!                           CratonVM  1601-01-02T20:42:25.920Z
+//!   RClassUnloadSweep     payload.class.unloaded
+//!   RClassUnloadSweepGen    HotSpot true / CratonVM false
+//! ```
+//!
+//! Both diffs name their cause exactly. 1601 is the Windows FILETIME epoch:
+//! real `WindowsFileAttributes` bytecode read its own `creationTime` /
+//! `lastModifiedTime` fields and found them at zero, because the VM had been
+//! answering from side state and never populated them. And a `Reference` that
+//! yields to real bytecode stops reporting the clearing that
+//! `RClassUnloadSweep` detects unloading by. Same shape both times, and the
+//! same shape as every dirty prefix above: **the VM owns state that belongs to
+//! the real object.**
+//!
+//! So the 36-vector screen is a filter, not a verdict — the corpus has no
+//! file-attribute vector and no class-unloading vector, so for these two
+//! subsystems it asked nothing and reported a pass. That is a population
+//! narrower than the claim made from it, which is the same defect this session
+//! found in the stub ratchet's CI wiring (`G89-1` §4) and, before that, twice
+//! inside the ratchet file itself. It is cheap to make and it is caught only by
+//! running the wider thing.
+//!
+//! The five that survived the arm are retired. `java/lang/ref/` and
+//! `sun/nio/fs/` are held, with their diffs above as the reason and as the
+//! precondition for revisiting them: populate the real fields first, then
+//! re-run the arm.
+//!
+//! ## Then the census, to say WHICH rows
+//!
+//! The dial yields at dispatch when bytecode is available; retirement drops the
+//! registration outright. Those agree only for rows that HAVE bytecode, so the
+//! table is the census-eligible subset and not everything under the prefixes.
+//! Of 522 registrations on receivers under the seven, 512 `Bridge` and 10
+//! `Intrinsic`:
+//!
+//! ```text
+//!   255  census-eligible  bridge, owns_slot, class loaded, image target has
+//!                       Code, and NOT ACC_NATIVE. 227 of them are retired
+//!                       here; the 28 under `java/lang/ref/` (19) and
+//!                       `sun/nio/fs/` (9) are held on the arm result above
+//!   195  held           loaded, but the image target carries no Code — dropping
+//!                       these replaces a shadow with an UnsatisfiedLinkError
+//!    40  held           class never loaded in 36 vectors, so the census asked
+//!                       no question. `class-not-loaded` is not a verdict
+//!                       (G88-1); it is the absence of one
+//!     7  held           genuinely ACC_NATIVE — §1.5 bridges, correct as they are
+//!    10  held           Intrinsic, out of scope for a §1.4 shadow
+//! ```
+//!
+//! The three "held" reasons are each a trap this project has already fallen
+//! into once, which is why they are counted here rather than filtered silently.
+//!
+//! ## Why these seven and not others — the shape, stated so it can be refuted
+//!
+//! Every retained prefix is a subsystem whose objects carry their state in REAL
+//! Java fields: atomics (`value`, `array`), `ModuleDescriptor` and its nested
+//! `Exports`/`Opens`/`Provides`/`Requires` records, `Collectors`' returned
+//! collector, `LockSupport`'s parked bit, `DecimalFormatSymbols`. Every
+//! rejected one is a subsystem where the VM owns state on the object's behalf
+//! — which is G88-1 §5's finding arrived at from the other direction, by
+//! execution rather than by inspection.
+//!
+//! `java/lang/ref/` and `sun/nio/fs/` are the useful part of that claim,
+//! because they LOOK stateless and are not. A `Reference` is four fields; a
+//! `WindowsFileAttributes` is a handful of longs. Nothing about their shape
+//! says the VM is answering for them — only running a vector that reads those
+//! fields does.
+//!
+//! So treat the pattern as a place to look and never as a rule to apply. The
+//! dial is cheap; run it, and then run the arm.
+//!
+//! ## What would invalidate this
+//!
+//! A vector added to the `--jdk-only` corpus that exercises one of these
+//! subsystems differently, or a JDK image where one of the 255 stops carrying
+//! `Code`. Both fail a gate rather than a workload: `the_stateless_table_is_sorted_and_unique`
+//! and `every_stateless_entry_is_reachable` here,
+//! `regression-suite/bridge-ratchet.sh` on the census, and
+//! `scripts/jdk-only-kind-map.py` on each row's frozen kind.
+//!
+//! The 36-vector screen is the cheap discriminator that says which prefixes
+//! deserve a 20-minute run. `regression-suite/run.sh` with
+//! `CRATONVM_ARGS=--jdk-only` over 102 vectors is the acceptance test, it
+//! rejected two of the seven the screen passed, and the commit that lands this
+//! records both numbers.
+
 /// Every `(class, method, descriptor)` retired as a §1.4 shadow.
 ///
 /// **Sorted, and binary-searched.** An out-of-order entry is not a style
@@ -705,6 +843,295 @@ static RETIRED_SHADOW_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/logging/LoggingPermission", "getName", "()Ljava/lang/String;"),
 ];
 
+/// The 2026-08-19 stateless-subsystem wave: 255 triples over seven prefixes.
+///
+/// A SECOND table rather than 255 entries merged into the first, for two
+/// reasons. The first table's entries carry per-block commentary explaining
+/// individual holdbacks (`Logger.log`'s eighth overload, `Arrays.copyOf` being
+/// load-bearing for the ArrayList five) that a global re-sort would scatter
+/// away from the rows they explain. And these 255 were adjudicated by a
+/// different method — the dial first, the census second — which is worth being
+/// able to see at a glance rather than reconstructing from dates.
+///
+/// **Sorted and binary-searched, exactly like its sibling**, and for the same
+/// reason: an out-of-order entry makes the predicate answer `false` for a row
+/// that is present, which reads as "not retired" and is invisible.
+static RETIRED_SHADOW_STATELESS_TRIPLES: &[(&str, &str, &str)] = &[
+    // java/lang/module/Configuration — 1
+    ("java/lang/module/Configuration", "modules", "()Ljava/util/Set;"),
+    // java/lang/module/ModuleDescriptor — 13
+    ("java/lang/module/ModuleDescriptor", "exports", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "isAutomatic", "()Z"),
+    ("java/lang/module/ModuleDescriptor", "isOpen", "()Z"),
+    ("java/lang/module/ModuleDescriptor", "mainClass", "()Ljava/util/Optional;"),
+    ("java/lang/module/ModuleDescriptor", "modifiers", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "name", "()Ljava/lang/String;"),
+    ("java/lang/module/ModuleDescriptor", "opens", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "packages", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "provides", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "rawVersion", "()Ljava/util/Optional;"),
+    ("java/lang/module/ModuleDescriptor", "requires", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "uses", "()Ljava/util/Set;"),
+    ("java/lang/module/ModuleDescriptor", "version", "()Ljava/util/Optional;"),
+    // java/lang/module/ModuleDescriptor$Exports — 3
+    ("java/lang/module/ModuleDescriptor$Exports", "compareTo", "(Ljava/lang/Object;)I"),
+    ("java/lang/module/ModuleDescriptor$Exports", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/module/ModuleDescriptor$Exports", "hashCode", "()I"),
+    // java/lang/module/ModuleDescriptor$Opens — 3
+    ("java/lang/module/ModuleDescriptor$Opens", "compareTo", "(Ljava/lang/Object;)I"),
+    ("java/lang/module/ModuleDescriptor$Opens", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/module/ModuleDescriptor$Opens", "hashCode", "()I"),
+    // java/lang/module/ModuleDescriptor$Provides — 3
+    ("java/lang/module/ModuleDescriptor$Provides", "compareTo", "(Ljava/lang/Object;)I"),
+    ("java/lang/module/ModuleDescriptor$Provides", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/module/ModuleDescriptor$Provides", "hashCode", "()I"),
+    // java/lang/module/ModuleDescriptor$Requires — 3
+    ("java/lang/module/ModuleDescriptor$Requires", "compareTo", "(Ljava/lang/Object;)I"),
+    ("java/lang/module/ModuleDescriptor$Requires", "equals", "(Ljava/lang/Object;)Z"),
+    ("java/lang/module/ModuleDescriptor$Requires", "hashCode", "()I"),
+    // java/lang/module/ModuleFinder — 1
+    ("java/lang/module/ModuleFinder", "ofSystem", "()Ljava/lang/module/ModuleFinder;"),
+    // java/lang/module/ModuleReference — 1
+    ("java/lang/module/ModuleReference", "descriptor", "()Ljava/lang/module/ModuleDescriptor;"),
+    // java/text/DecimalFormatSymbols — 2
+    ("java/text/DecimalFormatSymbols", "getInstance", "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;"),
+    ("java/text/DecimalFormatSymbols", "initialize", "(Ljava/util/Locale;)V"),
+    // java/text/ParseException — 1
+    ("java/text/ParseException", "<init>", "(Ljava/lang/String;I)V"),
+    // java/util/concurrent/atomic/AtomicBoolean — 1
+    ("java/util/concurrent/atomic/AtomicBoolean", "<init>", "(Z)V"),
+    // java/util/concurrent/atomic/AtomicInteger — 17
+    ("java/util/concurrent/atomic/AtomicInteger", "<init>", "()V"),
+    ("java/util/concurrent/atomic/AtomicInteger", "<init>", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicInteger", "addAndGet", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "compareAndSet", "(II)Z"),
+    ("java/util/concurrent/atomic/AtomicInteger", "decrementAndGet", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "get", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "getAndAdd", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "getAndDecrement", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "getAndIncrement", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "getAndSet", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "incrementAndGet", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "intValue", "()I"),
+    ("java/util/concurrent/atomic/AtomicInteger", "lazySet", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicInteger", "longValue", "()J"),
+    ("java/util/concurrent/atomic/AtomicInteger", "set", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicInteger", "toString", "()Ljava/lang/String;"),
+    ("java/util/concurrent/atomic/AtomicInteger", "weakCompareAndSet", "(II)Z"),
+    // java/util/concurrent/atomic/AtomicIntegerArray — 26
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "<init>", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "addAndGet", "(II)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "compareAndExchange", "(III)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "compareAndExchangeAcquire", "(III)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "compareAndExchangeRelease", "(III)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "compareAndSet", "(III)Z"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "decrementAndGet", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "get", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAcquire", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAndAdd", "(II)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAndDecrement", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAndIncrement", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getAndSet", "(II)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getOpaque", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "getPlain", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "incrementAndGet", "(I)I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "lazySet", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "length", "()I"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "set", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "setOpaque", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "setPlain", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "setRelease", "(II)V"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "weakCompareAndSet", "(III)Z"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "weakCompareAndSetAcquire", "(III)Z"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "weakCompareAndSetPlain", "(III)Z"),
+    ("java/util/concurrent/atomic/AtomicIntegerArray", "weakCompareAndSetRelease", "(III)Z"),
+    // java/util/concurrent/atomic/AtomicLong — 16
+    ("java/util/concurrent/atomic/AtomicLong", "<init>", "()V"),
+    ("java/util/concurrent/atomic/AtomicLong", "<init>", "(J)V"),
+    ("java/util/concurrent/atomic/AtomicLong", "addAndGet", "(J)J"),
+    ("java/util/concurrent/atomic/AtomicLong", "compareAndSet", "(JJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLong", "decrementAndGet", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "get", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(J)J"),
+    ("java/util/concurrent/atomic/AtomicLong", "getAndDecrement", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "getAndIncrement", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "getAndSet", "(J)J"),
+    ("java/util/concurrent/atomic/AtomicLong", "incrementAndGet", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "intValue", "()I"),
+    ("java/util/concurrent/atomic/AtomicLong", "lazySet", "(J)V"),
+    ("java/util/concurrent/atomic/AtomicLong", "longValue", "()J"),
+    ("java/util/concurrent/atomic/AtomicLong", "set", "(J)V"),
+    ("java/util/concurrent/atomic/AtomicLong", "weakCompareAndSet", "(JJ)Z"),
+    // java/util/concurrent/atomic/AtomicLongArray — 26
+    ("java/util/concurrent/atomic/AtomicLongArray", "<init>", "(I)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "addAndGet", "(IJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "compareAndExchange", "(IJJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "compareAndExchangeAcquire", "(IJJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "compareAndExchangeRelease", "(IJJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "compareAndSet", "(IJJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "decrementAndGet", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "get", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAcquire", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAndAdd", "(IJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAndDecrement", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAndIncrement", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getAndSet", "(IJ)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getOpaque", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "getPlain", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "incrementAndGet", "(I)J"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "lazySet", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "length", "()I"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "set", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "setOpaque", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "setPlain", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "setRelease", "(IJ)V"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "weakCompareAndSet", "(IJJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "weakCompareAndSetAcquire", "(IJJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "weakCompareAndSetPlain", "(IJJ)Z"),
+    ("java/util/concurrent/atomic/AtomicLongArray", "weakCompareAndSetRelease", "(IJJ)Z"),
+    // java/util/concurrent/atomic/AtomicMarkableReference — 8
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "<init>", "(Ljava/lang/Object;Z)V"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "attemptMark", "(Ljava/lang/Object;Z)Z"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "compareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;ZZ)Z"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "get", "([Z)Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "getReference", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "isMarked", "()Z"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "set", "(Ljava/lang/Object;Z)V"),
+    ("java/util/concurrent/atomic/AtomicMarkableReference", "weakCompareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;ZZ)Z"),
+    // java/util/concurrent/atomic/AtomicReference — 8
+    ("java/util/concurrent/atomic/AtomicReference", "<init>", "()V"),
+    ("java/util/concurrent/atomic/AtomicReference", "<init>", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/atomic/AtomicReference", "compareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;)Z"),
+    ("java/util/concurrent/atomic/AtomicReference", "get", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicReference", "getAndSet", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicReference", "lazySet", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/atomic/AtomicReference", "set", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/atomic/AtomicReference", "toString", "()Ljava/lang/String;"),
+    // java/util/concurrent/atomic/AtomicStampedReference — 8
+    ("java/util/concurrent/atomic/AtomicStampedReference", "<init>", "(Ljava/lang/Object;I)V"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "attemptStamp", "(Ljava/lang/Object;I)Z"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "compareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;II)Z"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "get", "([I)Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "getReference", "()Ljava/lang/Object;"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "getStamp", "()I"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "set", "(Ljava/lang/Object;I)V"),
+    ("java/util/concurrent/atomic/AtomicStampedReference", "weakCompareAndSet", "(Ljava/lang/Object;Ljava/lang/Object;II)Z"),
+    // java/util/concurrent/atomic/DoubleAdder — 5
+    ("java/util/concurrent/atomic/DoubleAdder", "<init>", "()V"),
+    ("java/util/concurrent/atomic/DoubleAdder", "add", "(D)V"),
+    ("java/util/concurrent/atomic/DoubleAdder", "doubleValue", "()D"),
+    ("java/util/concurrent/atomic/DoubleAdder", "reset", "()V"),
+    ("java/util/concurrent/atomic/DoubleAdder", "sum", "()D"),
+    // java/util/concurrent/atomic/LongAdder — 10
+    ("java/util/concurrent/atomic/LongAdder", "<init>", "()V"),
+    ("java/util/concurrent/atomic/LongAdder", "add", "(J)V"),
+    ("java/util/concurrent/atomic/LongAdder", "decrement", "()V"),
+    ("java/util/concurrent/atomic/LongAdder", "increment", "()V"),
+    ("java/util/concurrent/atomic/LongAdder", "intValue", "()I"),
+    ("java/util/concurrent/atomic/LongAdder", "longValue", "()J"),
+    ("java/util/concurrent/atomic/LongAdder", "reset", "()V"),
+    ("java/util/concurrent/atomic/LongAdder", "sum", "()J"),
+    ("java/util/concurrent/atomic/LongAdder", "sumThenReset", "()J"),
+    ("java/util/concurrent/atomic/LongAdder", "toString", "()Ljava/lang/String;"),
+    // java/util/concurrent/locks/AbstractOwnableSynchronizer — 1
+    ("java/util/concurrent/locks/AbstractOwnableSynchronizer", "setExclusiveOwnerThread", "(Ljava/lang/Thread;)V"),
+    // java/util/concurrent/locks/AbstractQueuedLongSynchronizer — 3
+    ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "compareAndSetState", "(JJ)Z"),
+    ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "getState", "()J"),
+    ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "setState", "(J)V"),
+    // java/util/concurrent/locks/LockSupport — 7
+    ("java/util/concurrent/locks/LockSupport", "getBlocker", "(Ljava/lang/Thread;)Ljava/lang/Object;"),
+    ("java/util/concurrent/locks/LockSupport", "park", "()V"),
+    ("java/util/concurrent/locks/LockSupport", "park", "(Ljava/lang/Object;)V"),
+    ("java/util/concurrent/locks/LockSupport", "parkNanos", "(J)V"),
+    ("java/util/concurrent/locks/LockSupport", "parkNanos", "(Ljava/lang/Object;J)V"),
+    ("java/util/concurrent/locks/LockSupport", "parkUntil", "(Ljava/lang/Object;J)V"),
+    ("java/util/concurrent/locks/LockSupport", "unpark", "(Ljava/lang/Thread;)V"),
+    // java/util/stream/Collectors — 34
+    ("java/util/stream/Collectors", "averagingDouble", "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "averagingInt", "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "averagingLong", "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "collectingAndThen", "(Ljava/util/stream/Collector;Ljava/util/function/Function;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "counting", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "filtering", "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "groupingBy", "(Ljava/util/function/Function;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "groupingBy", "(Ljava/util/function/Function;Ljava/util/function/Supplier;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "groupingBy", "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "joining", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "joining", "(Ljava/lang/CharSequence;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "joining", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "mapping", "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "maxBy", "(Ljava/util/Comparator;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "minBy", "(Ljava/util/Comparator;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "partitioningBy", "(Ljava/util/function/Predicate;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "partitioningBy", "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summarizingDouble", "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summarizingInt", "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summarizingLong", "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summingDouble", "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summingInt", "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "summingLong", "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "teeing", "(Ljava/util/stream/Collector;Ljava/util/stream/Collector;Ljava/util/function/BiFunction;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toCollection", "(Ljava/util/function/Supplier;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toList", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toMap", "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toMap", "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toMap", "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;Ljava/util/function/Supplier;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toSet", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toUnmodifiableList", "()Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toUnmodifiableMap", "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toUnmodifiableMap", "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;"),
+    ("java/util/stream/Collectors", "toUnmodifiableSet", "()Ljava/util/stream/Collector;"),
+    // java/util/stream/DoubleStream — 5
+    ("java/util/stream/DoubleStream", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/stream/DoubleStream", "of", "(D)Ljava/util/stream/DoubleStream;"),
+    ("java/util/stream/DoubleStream", "parallel", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/DoubleStream", "sequential", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/DoubleStream", "spliterator", "()Ljava/util/Spliterator;"),
+    // java/util/stream/IntStream — 7
+    ("java/util/stream/IntStream", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/stream/IntStream", "of", "(I)Ljava/util/stream/IntStream;"),
+    ("java/util/stream/IntStream", "parallel", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/IntStream", "range", "(II)Ljava/util/stream/IntStream;"),
+    ("java/util/stream/IntStream", "rangeClosed", "(II)Ljava/util/stream/IntStream;"),
+    ("java/util/stream/IntStream", "sequential", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/IntStream", "spliterator", "()Ljava/util/Spliterator;"),
+    // java/util/stream/LongStream — 7
+    ("java/util/stream/LongStream", "iterator", "()Ljava/util/Iterator;"),
+    ("java/util/stream/LongStream", "of", "(J)Ljava/util/stream/LongStream;"),
+    ("java/util/stream/LongStream", "parallel", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/LongStream", "range", "(JJ)Ljava/util/stream/LongStream;"),
+    ("java/util/stream/LongStream", "rangeClosed", "(JJ)Ljava/util/stream/LongStream;"),
+    ("java/util/stream/LongStream", "sequential", "()Ljava/util/stream/BaseStream;"),
+    ("java/util/stream/LongStream", "spliterator", "()Ljava/util/Spliterator;"),
+    // java/util/stream/ReferencePipeline — 2
+    ("java/util/stream/ReferencePipeline", "collect", "(Ljava/util/function/Supplier;Ljava/util/function/BiConsumer;Ljava/util/function/BiConsumer;)Ljava/lang/Object;"),
+    ("java/util/stream/ReferencePipeline", "collect", "(Ljava/util/stream/Collector;)Ljava/lang/Object;"),
+    // java/util/stream/Stream — 5
+    ("java/util/stream/Stream", "concat", "(Ljava/util/stream/Stream;Ljava/util/stream/Stream;)Ljava/util/stream/Stream;"),
+    ("java/util/stream/Stream", "empty", "()Ljava/util/stream/Stream;"),
+    ("java/util/stream/Stream", "of", "(Ljava/lang/Object;)Ljava/util/stream/Stream;"),
+    ("java/util/stream/Stream", "of", "([Ljava/lang/Object;)Ljava/util/stream/Stream;"),
+    ("java/util/stream/Stream", "toList", "()Ljava/util/List;"),
+];
+
+/// Class-name prefixes any retired triple must fall under.
+///
+/// A cheap discriminator in front of two binary searches: almost no
+/// registration is under any of these, so the common case costs one failed
+/// prefix compare.
+///
+/// It is NOT the definition of what is retired — the tables are. A prefix here
+/// that no table entry uses retires nothing; a table entry outside every prefix
+/// here is UNREACHABLE and answers `false`, which is the silent failure
+/// `every_entry_is_reachable_through_the_predicate` and its sibling exist to
+/// catch.
+const RETIRED_SHADOW_PREFIXES: &[&str] = &[
+    "java/lang/module/",
+    "java/text/",
+    "java/util/",
+];
+
 /// Is this exact triple a retired §1.4 shadow?
 ///
 /// The class-name prefix test is a cheap discriminator: every entry is under
@@ -721,17 +1148,118 @@ static RETIRED_SHADOW_TRIPLES: &[(&str, &str, &str)] = &[
 /// cost, and `the_held_collection_families_are_not_retired` is the test that
 /// says admitting them changes no answer.
 pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor: &str) -> bool {
-    if !class_name.starts_with("java/util/") {
+    if !RETIRED_SHADOW_PREFIXES
+        .iter()
+        .any(|p| class_name.starts_with(p))
+    {
         return false;
     }
-    RETIRED_SHADOW_TRIPLES
-        .binary_search(&(class_name, method_name, descriptor))
-        .is_ok()
+    let key = (class_name, method_name, descriptor);
+    RETIRED_SHADOW_TRIPLES.binary_search(&key).is_ok()
+        || RETIRED_SHADOW_STATELESS_TRIPLES.binary_search(&key).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stateless table is binary-searched too, so ordering is correctness
+    /// there for the identical reason.
+    #[test]
+    fn the_stateless_table_is_sorted_and_unique() {
+        for w in RETIRED_SHADOW_STATELESS_TRIPLES.windows(2) {
+            assert!(w[0] < w[1], "out of order or duplicated: {:?} then {:?}", w[0], w[1]);
+        }
+    }
+
+    /// Same guard as its sibling: a stateless entry outside every prefix in
+    /// [`RETIRED_SHADOW_PREFIXES`] answers `false`, which reads as "not
+    /// retired" and is invisible in a workload.
+    #[test]
+    fn every_stateless_entry_is_reachable() {
+        for (c, m, d) in RETIRED_SHADOW_STATELESS_TRIPLES {
+            assert!(triple_is_retired_shadow(c, m, d), "unreachable entry: {c}.{m}{d}");
+        }
+    }
+
+    /// The two tables must not both claim a triple. A duplicate is harmless to
+    /// the predicate and NOT harmless to the record: two waves would each
+    /// report having retired it, and the count in either doc would be wrong.
+    #[test]
+    fn the_two_tables_are_disjoint() {
+        for t in RETIRED_SHADOW_STATELESS_TRIPLES {
+            assert!(
+                RETIRED_SHADOW_TRIPLES.binary_search(t).is_err(),
+                "{t:?} is in both tables"
+            );
+        }
+    }
+
+    /// The five prefixes that survived the 102-vector ARM are the five the
+    /// table uses — no more.
+    ///
+    /// This is the gate on scope creep, and it is deliberately keyed to the arm
+    /// rather than to the 36-vector screen: the screen passed `java/lang/ref/`
+    /// and `sun/nio/fs/`, and the arm failed them on `RClassUnloadSweep{,Gen}`
+    /// and `RFileTimes`. `java/nio/file/` and `java/math/` each cost a vector
+    /// on the screen alone and `jdk/internal/access/` cost 14, and nothing in
+    /// the code stops a later entry under any of them being appended to a table
+    /// whose prefix list already admits it. `java/util/` admits the whole
+    /// package tree, so the assertion is per-ENTRY, not per-prefix.
+    #[test]
+    fn the_stateless_table_stays_inside_the_five_measured_prefixes() {
+        const SURVIVED_THE_ARM: &[&str] = &[
+            "java/lang/module/",
+            "java/text/",
+            "java/util/concurrent/atomic/",
+            "java/util/concurrent/locks/",
+            "java/util/stream/",
+        ];
+        for (c, m, d) in RETIRED_SHADOW_STATELESS_TRIPLES {
+            assert!(
+                SURVIVED_THE_ARM.iter().any(|p| c.starts_with(p)),
+                "{c}.{m}{d} is outside the five prefixes that survived the \
+                 102-vector arm on 2026-08-19. Arm CRATONVM_ENFORCE_NATIVE_SHADOW \
+                 on its prefix, run regression-suite/run.sh with \
+                 CRATONVM_ARGS=--jdk-only, and record the number before adding it \
+                 — the 36-vector screen passed two prefixes the arm rejected."
+            );
+        }
+    }
+
+    /// A vacuity floor for the stateless wave, and a shape check: the atomics
+    /// are its largest family and the reason the wave is worth its size.
+    #[test]
+    fn the_stateless_table_is_not_empty() {
+        assert!(
+            RETIRED_SHADOW_STATELESS_TRIPLES.len() >= 220,
+            "expected 227 — the 2026-08-19 census's 255 less the 28 the 102-vector \
+             arm rejected (java/lang/ref/ 19, sun/nio/fs/ 9) — got {}",
+            RETIRED_SHADOW_STATELESS_TRIPLES.len()
+        );
+        assert!(triple_is_retired_shadow(
+            "java/util/concurrent/atomic/AtomicInteger",
+            "incrementAndGet",
+            "()I"
+        ));
+    }
+
+    /// The prefix list is a discriminator, not a definition: widening it must
+    /// not retire anything the tables do not name.
+    #[test]
+    fn a_prefix_alone_retires_nothing() {
+        assert!(!triple_is_retired_shadow("java/text/SimpleDateFormat", "format",
+                                          "(Ljava/util/Date;)Ljava/lang/String;"));
+        assert!(!triple_is_retired_shadow("java/lang/module/ModuleDescriptor",
+                                          "notAMethod", "()V"));
+        // HELD by the arm, and the prefix list no longer even admits them —
+        // belt and braces, because a widening of that list must not silently
+        // re-retire what RClassUnloadSweep and RFileTimes rejected.
+        assert!(!triple_is_retired_shadow("java/lang/ref/Reference", "clear", "()V"));
+        assert!(!triple_is_retired_shadow("sun/nio/fs/WindowsFileAttributes",
+                                          "creationTime",
+                                          "()Ljava/nio/file/attribute/FileTime;"));
+    }
 
     /// The table is binary-searched, so ordering is correctness.
     #[test]

@@ -798,7 +798,29 @@ fn take_stashed_names(ws_id: i32, key: i32) -> Vec<String> {
 ///     gets real OS-level notifications.
 pub fn register_watch_service_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // RETAGGED 2026-08-19 (P0 "wholesale Bridge over-tagging"), and this is the
+    // one retag this session that satisfies ALL THREE verifications in
+    // G85-1 §3b rather than two of them.
+    //
+    // 1. THE TAG MOVES. Censused: 27 `Bridge` registrations here, ZERO of them
+    //    targeting an `ACC_NATIVE` method — mistagged by the same standard
+    //    every other retag used. Under `--jdk-only` all 27 are now dropped.
+    // 2. THE CONTRACTS HOLD. `RJdkWatchService` (13 checks, scheduled) covers
+    //    construction, registration, key lifecycle, the closed-state
+    //    transitions and both argument refusals.
+    // 3. THE SURFACE IS EXERCISED — and this one needed its own measurement.
+    //    The doc comment above says these registrations exist so a caller
+    //    "still gets real OS-level notifications", so the risk was that real
+    //    bytecode would satisfy every contract and silently deliver nothing.
+    //    A vector cannot assert that without depending on filesystem latency,
+    //    so it was measured separately: create a directory, register, create a
+    //    file, poll. HotSpot EVENT / CratonVM EVENT, with these natives
+    //    refused. The real `WatchService` works here on its own.
+    //
+    // That third check is the one 0-invocation retags cannot make, and it is
+    // why `Vector` elsewhere in this tree is recorded as unproven rather than
+    // safe.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let classes = [
         "sun/nio/fs/AbstractWatchService",
         "sun/nio/fs/UnixWatchService",

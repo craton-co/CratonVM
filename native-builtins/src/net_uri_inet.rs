@@ -1817,6 +1817,12 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(o) => ctx.read_string(o).unwrap_or_default(),
         None => String::new(),
     };
+    // Read once, BEFORE the parse allocates: the component correction at the
+    // end of this function needs the units and the object may move.
+    let raw_units: Vec<u16> = match raw_arg {
+        Some(o) => ctx.read_string_units(o).unwrap_or_default(),
+        None => Vec::new(),
+    };
     // Reject a malformed scheme name before any other check — the real JDK
     // parser validates this first (see `uri_scheme_name_fail_index`).
     if let Some((pos, reason)) = uri_scheme_name_fail_index(&url_str) {
@@ -2033,6 +2039,38 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         ctx.set_field_by_name(this, "string", Value::Object(Some(raw_ref)));
         if net_phase_e::uri_has_synthetic_layout(ctx, this) {
             ctx.set_field(this, 6, Value::Object(Some(raw_ref)));
+        }
+        // G75-1 N1 — rewrite the text-carrying COMPONENT fields from the raw
+        // units, using the same splitter the getters use.
+        //
+        // `url_parse` above derived them from `url_str`, which came through
+        // `read_string` and cannot hold an unpaired surrogate. The getters
+        // prefer these fields over their own parse when the field is non-empty,
+        // so a lossy field silently won over an exact parse — which is why
+        // converting the getters alone fixed the multi-argument constructor and
+        // not this one.
+        //
+        // This is a correction pass rather than a conversion of `url_parse`
+        // because it reuses ONE splitter: the same
+        // `uri_select_raw_path_units`/`uri_query_units`/`uri_fragment_units`
+        // the accessors call. Converting the 195-line parser would have been a
+        // second spelling of the same rule for the three components that need
+        // it and no change at all for the ASCII-constrained rest.
+        //
+        // Only written when the splitter answers `Some`: an OPAQUE URI has a
+        // null path and must keep whatever `url_parse` decided, and `getPath`
+        // decides opacity from the raw text anyway.
+        if let Some(path_u) = net_phase_e::uri_select_raw_path_units(&raw_units) {
+            let obj = ctx.create_string_from_units(&path_u);
+            ctx.set_field_by_name(this, "path", Value::Object(Some(obj)));
+        }
+        if let Some(q) = net_phase_e::uri_query_units(&raw_units) {
+            let obj = ctx.create_string_from_units(&q);
+            ctx.set_field_by_name(this, "query", Value::Object(Some(obj)));
+        }
+        if let Some(f) = net_phase_e::uri_fragment_units(&raw_units) {
+            let obj = ctx.create_string_from_units(&f);
+            ctx.set_field_by_name(this, "fragment", Value::Object(Some(obj)));
         }
         ctx.unpin_native_roots(pin);
     }
