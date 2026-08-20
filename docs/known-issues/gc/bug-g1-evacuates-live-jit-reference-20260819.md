@@ -168,6 +168,22 @@ This document already asserted that restriction as though it were implemented �
 "`moving_young_precise_only` requires `is_generational()`, so under G1 it is
 false" — and it was not. The added term is what makes the sentence true.
 
+### Verification
+
+Beyond the ABBA arms above, on azure host 2, `-XX:+UseG1GC --Xmx 1g`, JIT on:
+
+| check | result |
+|---|---|
+| generational (default collector), fix vs pristine base | PASS / PASS — a G1-only term, and the ntru test was never red there |
+| 8 `bcjava-pass-list.txt` classes under G1, fix vs base | **8/8 identical**, same test counts (24, 17, 7, 19, 27, 1, 177, 1) |
+| `cargo test -p cratonvm-vm --lib` | 2576 passed, 0 failed |
+| `cargo test -p cratonvm-gc --lib` | 1684 passed, 0 failed |
+
+An earlier collateral attempt used `org.bouncycastle.{crypto,util}.test.RegressionTest`,
+which are not JUnit-3 suites: both arms reported `No tests found` and the rows
+proved nothing. Recorded because "both arms FAIL identically" reads as evidence
+of no regression and in that case was evidence of no test.
+
 ## Two things the earlier reading got wrong
 
 Both are recorded because each cost a wrong fix, and both were resolved by an
