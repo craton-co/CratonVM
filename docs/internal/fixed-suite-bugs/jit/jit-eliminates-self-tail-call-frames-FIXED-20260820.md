@@ -1,3 +1,63 @@
+# ✅ FIXED — the JIT eliminated self-tail-call frames, so a 4M-deep recursion returned where HotSpot overflows
+
+**CLOSED 2026-08-20.** `CRATONVM_JIT_SELF_TAILCALL` now defaults **OFF**: the
+single-pass backend emits an ordinary self-recursive `CALL`, every activation
+gets its own native frame, and the VM agrees with HotSpot 25 and with its own
+interpreter on every arm this page ever measured.
+
+Measured on the fix, Azure Linux, real JDK 25 backend, one release binary:
+
+| probe | before | after | HotSpot 25 |
+|---|---|---|---|
+| `SWTce` 4 000 000 deep | `RETURNED n=0` | **`STACK_OVERFLOW`** | `STACK_OVERFLOW` |
+| `SWTce3`, all five shapes, default | 5 of 5 overflow | 5 of 5 overflow | 5 of 5 overflow |
+| `SWTce3`, all five shapes, **C1 pinned** | `tailRef` and `tailLong` **RETURNED** | **5 of 5 overflow** | 5 of 5 overflow |
+| `SWFrames` walks #0/#8/#31, default | `n=4` at walk#8 in 7 of 10 runs | **68 / 68 / 68**, 3 of 3 | 68 |
+| `SWFrames`, `CRATONVM_C2_SUPERSEDE=0` | `n=4` at #8 AND #31, 5 of 5 | **68 / 68 / 68**, 3 of 3 | 68 |
+| `SWCross` round#39 | 68 | 68 | 68 |
+| `SWShape` tail / nonTail / chain | 67 / 67 / 10 | 67 / 67 / 10 | 67 / 67 / 10 |
+| `SWMutual` | 67 | 67 | 67 |
+| `SWValue` | `VALUES_OK` | `VALUES_OK` | `VALUES_OK` |
+
+`CRATONVM_JIT_SELF_TAILCALL=1` restores the lowering, and `SWTce` returns from
+the 4 000 000-deep recursion again — so the switch is live in both directions
+and the two behaviours stay A/B-able in one binary.
+
+## Why OFF, when the lowering is worth 5.5x
+
+Because of *who* it is worth 5.5x to. The measurement is below under "What the
+lowering is worth"; the shape of it is:
+
+* a method the C1→C2 supersede claims gets **no benefit at all** — both arms
+  measure 5.4 ns/level, because the optimizing body has replaced the C1 one
+  before the timed loop even starts;
+* a method the supersede refuses — `c2_upgrade_would_engage` rejects anything
+  that allocates — gets the **full 5.5x**, and keeps the C1 body for the life of
+  the process.
+
+That second population is therefore also the one whose `StackOverflowError` can
+never fire and whose every activation is invisible to `StackWalker`,
+`Throwable.getStackTrace()` and `Reflection.getCallerClass`. **There is no
+configuration that buys the speed without the permanent loss**, so the default
+goes to the answer that matches HotSpot and the speed stays reachable for anyone
+who measures their own workload and decides otherwise.
+
+The cost of this decision, stated plainly: a self-tail-recursive method that
+allocates, is hot, and never tiers past C1 is now up to 5.5x slower on its
+recursion than it was on 2026-08-19. No such method was found in a workload —
+the census under "What is NOT established" was never run, and running it is
+still the way to find out.
+
+---
+
+Everything below is the page as it stood while the defect was open, including
+the two wrong turns it took: `ir_lower.rs::emit_self_recursive_call` was the
+obvious suspect and is not the emitter, and the first probe built to isolate the
+shape gate was `(I)I`-shaped, which is the one descriptor that never reaches the
+lowering at all.
+
+---
+
 # The JIT eliminates self-tail-call frames, so a 4M-deep recursion returns where HotSpot overflows
 
 **Status: OPEN — fully characterized, not yet fixed.** Mechanism, shape gate,

@@ -1,3 +1,51 @@
+# ✅ FIXED — every JIT `getfield` took the checked helper, on every collector
+
+**CLOSED 2026-08-20.** Both actionable defects are fixed, the follow-on walk in
+the native-dispatch path is fixed and priced, and the one residual left is not a
+getfield problem at all — it is the ZGC coloured-slot representation, tracked
+where the fix for it lives: `docs/feature-designs/zgc-jit-load-barrier.md` §
+"The getfield residual this blocks".
+
+| # | defect | closed |
+|---|---|---|
+| 2 | **Generational** — `legacy-layout-receiver`: 68 722 450 helper calls -> **0**, 3.07x | 2026-08-18 |
+| 1 | **G1** — `outside-published-bounds`: 56 930 918 helper calls -> **0**, wall clock 1.33x-2.14x over 6 of 6 pinned interleaved pairs | 2026-08-18 |
+| — | **ZGC**, part 1 — stop asking `is_object_address` on a receiver the IR already types `Ref`: 34 470 791 of 34 470 791 helper calls take the proven-oop path, ~1.05x | 2026-08-18 |
+| — | **ZGC**, part 2 — validate ONCE per native accessor call: 64 248 919 -> 38 879 898 walks, **1.07x** on ZGC and **1.11x** on Generational, 5 of 5 interleaved pairs each | 2026-08-20 |
+
+On all three collectors the inline path is engaged for **every primitive field
+read** — 0 primitive misses, measured two independent ways — and the entire
+remainder is **reference** reads.
+
+**What is NOT closed, and is not this page's to close.** ZGC still takes the
+helper for reference reads: 56.9M calls, 100% `outside-published-bounds`, and
+deliberately so. A compact reference slot there holds
+`Z_COLORED_TAG | colour | offset`, not a pointer, so inlining its load is the
+use-after-free that `zgc-jit-load-barrier.md` exists to prevent, and ZGC
+publishes nothing into the read table for exactly that reason. That is a
+property of the slot representation, not of the getfield arms, and it is
+recorded in the design doc so it is found by whoever implements the barrier
+rather than by whoever greps known-issues.
+
+**The instrument that found most of this is retired.** The whole-VM
+`#[track_caller]` per-caller census in `gc/src/vm_heap.rs` is gone: it cost an
+atomic plus an open-addressed probe on every membership walk, which inflated
+every ZGC number on this page by 3.4x before that was caught. `--diag` still
+prints the hand-tagged JIT-site census. See "The census that found this is
+retired" below for what that costs and where to find it again.
+
+**Read the corrections.** This page was wrong three times in ways that each cost
+a session — the title twice, and a whole round of numbers once. The three
+CORRECTION sections are the most transferable part of it and are the reason the
+body is kept in full rather than summarised.
+
+---
+
+Everything below is the page as it stood, including every hypothesis that was
+refuted along the way.
+
+---
+
 # Every JIT `getfield` takes the checked helper — TWO independent guard clauses fail, one per collector family
 
 ## Status

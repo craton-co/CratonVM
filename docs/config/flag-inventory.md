@@ -1238,7 +1238,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_SAFEPOINT_POLLS` | JIT | `CRATONVM_JIT=safepoint-polls` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SAFEPOINT_REG_SPILL` | JIT | `CRATONVM_JIT=safepoint-reg-spill` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SCALAR_NEW` | JIT | `CRATONVM_JIT=scalar-new` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_JIT_SELF_TAILCALL` | JIT | `CRATONVM_JIT=self-tailcall` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_SELF_TAILCALL` | JIT | `CRATONVM_JIT=self-tailcall` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SITE_CACHE` | JIT | `CRATONVM_JIT=site-cache` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_SP_IC_DENY` | JIT | `CRATONVM_JIT=sp-ic-deny` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SP_IC_DEOPT_CHECK` | JIT | `CRATONVM_JIT=sp-ic-deopt-check` | opt-in | off | behaviour | snapshot | jit |

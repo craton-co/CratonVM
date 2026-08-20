@@ -1635,26 +1635,36 @@ pub(super) fn sp_tailcall_enabled() -> bool {
     })
 }
 
-/// Bisect toggle (`CRATONVM_JIT_SELF_TAILCALL=0`) — demote the single-pass
-/// direct SELF tail-call (arguments into the parameter locals, then `JMP` back
-/// to `body_entry_offset`) to the ordinary self-recursive `CALL`, so every
-/// activation gets its own native frame again.
+/// Whether the single-pass backend lowers a direct SELF tail-call by loading
+/// the arguments into the parameter locals and `JMP`ping back to
+/// `body_entry_offset` instead of emitting a `CALL`.
 ///
-/// Unlike [`sp_tailcall_enabled`], which governs the SIBLING tail-call, this
-/// one governs a method jumping back into itself. That form is invisible to
-/// every Java stack walk and makes `StackOverflowError` unreachable for a
-/// method the optimizing tier never recompiles — see
-/// `docs/known-issues/jit/jit-eliminates-self-tail-call-frames-20260819.md`,
-/// which had to borrow `CRATONVM_TIER_C2_THRESHOLD` as an A/B lever precisely
-/// because this switch did not exist.
+/// **Default OFF** (`CRATONVM_JIT_SELF_TAILCALL=1` opts back in). The `JMP`
+/// form reuses one native frame for every activation, which HotSpot and this
+/// VM's own interpreter do not, and the divergence is not cosmetic:
+/// `StackOverflowError` becomes unreachable, and every activation is invisible
+/// to `StackWalker`, `Throwable.getStackTrace()`, `Reflection.getCallerClass`
+/// and anything built on them.
+///
+/// It was defaulted OFF once it was priced, not on principle. Measured, one
+/// binary, interleaved: for a method the C1→C2 supersede claims the lowering is
+/// worth **nothing** — both arms 5.4 ns/level, because the optimizing body has
+/// already replaced the C1 one before the timed loop — and for a method the
+/// supersede refuses (`c2_upgrade_would_engage` rejects any method that
+/// allocates) it is worth **5.5x**. That second population is exactly the one
+/// that keeps the C1 body for the life of the process, so it is also exactly
+/// the one whose `StackOverflowError` can never fire. There is no
+/// configuration that buys the speed without the permanent loss.
+///
+/// Unlike [`sp_tailcall_enabled`], which governs the SIBLING tail-call (a `JMP`
+/// into ANOTHER method's entry), this one governs a method jumping back into
+/// itself. See
+/// `fixed-suite-bugs/jit/jit-eliminates-self-tail-call-frames-FIXED-20260820.md`.
 pub(super) fn self_tailcall_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        !matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_TAILCALL").as_deref(),
-            Ok("0")
-        )
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SELF_TAILCALL").is_some()
     })
 }
 
