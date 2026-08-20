@@ -81,7 +81,7 @@ the entire change.
 
 ## Related
 
-- `known-issues/netty/fail-hang-crash-rerun-20260817.md` — where this cluster
+- `known-issues/netty/not-cratonvm-bugs-consolidated.md` (which absorbed the now-deleted `fail-hang-crash-rerun-20260817.md`) — where this cluster
   was first flagged as untriaged.
 - `known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md` —
   the same "don't read a class's `ABORTED` label without checking the

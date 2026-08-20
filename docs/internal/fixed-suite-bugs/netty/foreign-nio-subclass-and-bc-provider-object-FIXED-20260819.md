@@ -217,7 +217,7 @@ is gitignored, so they are not staged with this fix.
 
 ## Related
 
-- `known-issues/netty/fail-hang-crash-rerun-20260817.md` — where both classes
+- `known-issues/netty/not-cratonvm-bugs-consolidated.md` (which absorbed the now-deleted `fail-hang-crash-rerun-20260817.md`) — where both classes
   were first flagged as untriaged singles.
 - `fixed-suite-bugs/netty/nioeventlooptest-unbound-registration-fd-slot-collision-FIXED-20260817.md`
   — the earlier `testChannelsRegistered` defect, and the reason its remaining
