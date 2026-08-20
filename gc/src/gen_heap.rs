@@ -421,7 +421,7 @@ pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 /// [`clear_all_mark_bits_in_arena`]. Deliberately a SEPARATE counter from
 /// [`SWEEP_ZERO_SPAN_HITS`], which now counts only the runs that still take the
 /// unwind: this shape is normal and frequent (147 per young cycle on the
-/// hibernate-reactive repro), so folding the two together would turn its
+/// hibernate repro), so folding the two together would turn its
 /// arrival into apparent corruption. Like its siblings above it has no printer
 /// — it is read from a debugger or an instrumented repro build.
 pub static SWEEP_ZERO_SPAN_EMPTY_RUNS: AtomicU64 = AtomicU64::new(0);
@@ -439,6 +439,56 @@ pub static EMPTY_RUN_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
 /// Young `used` at the end of the last sweep, so the figure above can be read
 /// as a fraction without a second run.
 pub static EMPTY_RUN_YOUNG_USED_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// Sweeps whose standing empty-object-run retention exceeded
+/// [`EMPTY_RUN_RETENTION_BUDGET_PERMILLE`] of the young generation.
+///
+/// An accepted empty-object run is stepped OVER, not parsed, so each dead empty
+/// object in it stays until a moving cycle resets from-space -- and under a
+/// permanent non-moving sweep there is no moving cycle. The obvious worry is
+/// that this accumulates. Measured across seven heap sizes and 4..27 young
+/// collections it does NOT: the figure is flat at 11.5-29 KB with no trend in
+/// cycle count, a ceiling of 0.045% of the young generation, because every
+/// cycle re-skips the SAME runs rather than adding new ones.
+///
+/// The decision that followed is to keep stepping over rather than reclaim:
+/// pushing the run as a dead region would be the first change in this family
+/// to FREE something the previous code retained, and trading that property for
+/// <=0.045% of young is a bad trade. That decision was correct on the numbers
+/// and would have stayed a remembered opinion.
+///
+/// This counter is what makes it a RATCHET instead. The mechanism's own
+/// prediction -- "re-skipping the same runs, so no growth with cycle count" --
+/// is now checked by the binary on every sweep, and a workload that ever
+/// contradicts it says so in the log rather than waiting to be re-measured by
+/// hand. Non-zero is new evidence and reopens the trade.
+pub static EMPTY_RUN_RETENTION_EXCEEDED: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded report counter for [`EMPTY_RUN_RETENTION_EXCEEDED`].
+static EMPTY_RUN_RETENTION_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// Retention budget for stepped-over empty-object runs, in PERMILLE of the
+/// young generation's `used` bytes.
+///
+/// 10 permille = 1%, against a measured ceiling of 0.45 permille (0.045%) at
+/// the smallest heap tested. The ~22x headroom is deliberate: this is a
+/// trend detector, not a tuning knob, and it must not fire on the ordinary
+/// scatter that six heap sizes already showed.
+const EMPTY_RUN_RETENTION_BUDGET_PERMILLE: u64 = 10;
+
+/// Does this sweep's standing retention exceed the budget?
+///
+/// A tiny young generation makes any fraction noisy, so a floor of 64 KiB
+/// applies: below that the absolute figure is smaller than one TLAB and no
+/// growth trend could be read out of it anyway. Split out from the sweep so
+/// the threshold itself is unit-testable.
+fn empty_run_retention_exceeded(retained: u64, young_used: u64) -> bool {
+    const FLOOR_BYTES: u64 = 64 * 1024;
+    if retained < FLOOR_BYTES {
+        return false;
+    }
+    retained.saturating_mul(1000) > young_used.saturating_mul(EMPTY_RUN_RETENTION_BUDGET_PERMILLE)
+}
 
 /// `CRATONVM_DBG_MARK_WHY_CLASS` straddle reports emitted — the sweep walk
 /// striding OVER the watched base, inside some earlier object's computed
@@ -614,6 +664,16 @@ static SWEEP_PHANTOM_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// zero says the subsumed marks were real bases and the walk really did leave
 /// the object grid.
 pub static SWEEP_PHANTOM_INTERIOR_MARKS: AtomicU64 = AtomicU64::new(0);
+
+/// Raw conservative-candidate side marks the late base-resolution pass PROVED
+/// are object-INTERIOR and therefore cleared (2026-08-16).
+///
+/// This is the producer side of [`SWEEP_PHANTOM_INTERIOR_MARKS`]: every address
+/// counted here would otherwise have entered `side_sorted` as a "live base"
+/// that is not one. Non-zero on a cycle whose `phantom_extents` is zero is the
+/// fix working; the two can no longer both be non-zero for the same address,
+/// because the mark is gone before `side_sorted` is materialised.
+pub static LATE_RESOLVE_RAW_INTERIOR_CLEARED: AtomicU64 = AtomicU64::new(0);
 
 /// H2-CID0 — reclaim spans the sweep refused to publish because they already
 /// overlapped a free block. Publishing one is a double free: the allocator can
@@ -1486,6 +1546,95 @@ pub fn jit_region_bounds_addr() -> usize {
     &JIT_REGION_BOUNDS as *const _ as usize
 }
 
+/// Process-global **read-side** mirror of whatever address range this heap has
+/// mapped — same six-word `[b0, e0, b1, e1, b2, e2]` layout as
+/// [`JIT_REGION_BOUNDS`], so the emitted containment sequence is byte-identical
+/// and only the baked address differs.
+///
+/// # Why a second table rather than filling the first
+///
+/// [`JIT_REGION_BOUNDS`] is doing two jobs. Its *documented* job is the
+/// READ-side question "is this address mapped, so a raw load cannot fault".
+/// Its load-bearing job since `audits/g1-audit.md` §8.1 (G1-2) is the
+/// STORE-side question "may an inline reference store skip the collector's
+/// write barrier" — and G1/ZGC answer that by leaving the table **empty**, so
+/// that under those collectors no inline reference-store fast path is
+/// reachable and a JNI-pinned, CSet-excluded region cannot lose its
+/// remembered-set edge.
+///
+/// One table, two questions, opposite answers: filling it to make *loads*
+/// inline would silently re-enable those *stores*. Hence the sibling. Only
+/// `emit_guarded_getfield_receiver_check` and `ir_lower`'s copy of it read
+/// this one; `region_bounds_are_live` keeps reading [`JIT_REGION_BOUNDS`] and
+/// keeps gating every store path.
+///
+/// # Who publishes, and who deliberately does not
+///
+/// * **Generational** — its three arenas, alongside the store-side publish.
+/// * **G1** — the single contiguous backing arena, in slot 0. G1's N regions
+///   are carved out of one `Box` (`arena_base + i*region_size`), so one
+///   `[base, end)` pair covers all of them and the three slots are ample. A
+///   reference field under G1 is a plain pointer, so admitting inline
+///   reference loads there is sound.
+/// * **ZGC** — its single arena envelope, in slot 0, **as of 2026-08-19**.
+///   This row previously read "not published, on purpose", on the grounds
+///   that a compact reference slot under ZGC holds
+///   `Z_COLORED_TAG | colour | offset` rather than a pointer. That is true of
+///   the RELOCATING ZGC `feature-designs/zgc-jit-load-barrier.md` designs and
+///   false of the one that runs: `feature-designs/zgc-reference-slot-
+///   representation.md` measured it as *"Reference slots are plain pointers;
+///   nothing in the heap stores a colored word"*, and `set_barrier_color` —
+///   the only writer of the colored state — has no non-test caller. The
+///   publish is coupled to that fact rather than betting on it: arming the
+///   barrier CLEARS this table, which is the only mechanism that can disarm
+///   an inline sequence in already-compiled code. See
+///   `gc/src/zgc.rs::zgc_jit_read_bounds_enabled`, and
+///   `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` to restore helper-only reads.
+///
+/// All-zero matches nothing, so an unpublished collector degrades to exactly
+/// today's behaviour: every guarded site falls through to the checked helper.
+#[repr(C)]
+pub struct JitReadBoundsTable {
+    pub words: [AtomicUsize; 6],
+}
+
+pub static JIT_READ_BOUNDS: JitReadBoundsTable = JitReadBoundsTable {
+    words: [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ],
+};
+
+/// Address of [`JIT_READ_BOUNDS`] for the JIT helpers table
+/// (`JitRuntimeHelpers::read_bounds_addr`).
+pub fn jit_read_bounds_addr() -> usize {
+    &JIT_READ_BOUNDS as *const _ as usize
+}
+
+/// Publish one `[base, end)` pair into [`JIT_READ_BOUNDS`] slot `slot` (0..3).
+///
+/// Separate from the generational publisher because G1 has no `store_region_
+/// bounds_locked` and no three arenas — it has one span and publishes once.
+pub fn publish_jit_read_bounds(slot: usize, base: usize, end: usize) {
+    if slot >= 3 {
+        return;
+    }
+    JIT_READ_BOUNDS.words[slot * 2].store(base, Ordering::Release);
+    JIT_READ_BOUNDS.words[slot * 2 + 1].store(end, Ordering::Release);
+}
+
+/// Zero the whole read table — the teardown counterpart, so a dropped heap can
+/// never leave bounds that would admit a load into freed arena memory.
+pub fn clear_jit_read_bounds() {
+    for w in JIT_READ_BOUNDS.words.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
 /// How many identity hash codes a thread claims per global `fetch_add`.
 /// See [`GenerationalHeap::next_hash`] for the trade-off this number sets.
 const IDENTITY_HASH_BLOCK: i32 = 64;
@@ -1539,6 +1688,7 @@ impl Drop for GenerationalHeap {
         for w in JIT_REGION_BOUNDS.words.iter() {
             w.store(0, Ordering::Release);
         }
+        clear_jit_read_bounds();
     }
 }
 
@@ -1978,6 +2128,10 @@ impl GenerationalHeap {
             // getfield bakes as an absolute address (see JIT_REGION_BOUNDS).
             JIT_REGION_BOUNDS.words[i * 2].store(base, Ordering::Release);
             JIT_REGION_BOUNDS.words[i * 2 + 1].store(base.wrapping_add(cap), Ordering::Release);
+            // ...and the read-side sibling. Same values on this backend; the
+            // two tables only diverge on G1 (read-only publish) and ZGC
+            // (neither). See `JIT_READ_BOUNDS`.
+            publish_jit_read_bounds(i, base, base.wrapping_add(cap));
         }
     }
 
@@ -4157,26 +4311,59 @@ impl GenerationalHeap {
     // ----- T10.9.E descriptor-aware field access --------------------------
 
     /// Descriptor-aware get — normalizes the returned `Value` to the declared
-    /// field type. See [`crate::heap::coerce_field_value_by_descriptor`].
+    /// field type. See [`crate::heap::coerce_field_value_for_slot`].
+    ///
+    /// # G45: provenance
+    ///
+    /// These four inherent methods are the direct-`&GenerationalHeap`
+    /// spelling of the four `GarbageCollector` defaults in `collector.rs`,
+    /// which `GenerationalHeap`'s trait impl (`:17200`) does NOT override —
+    /// so a VM run reaches the trait bodies and these are for callers
+    /// holding the concrete heap. They coerced identically and reported
+    /// identically badly (`class_id=-1 index=-1`), so they are repaired
+    /// identically; letting the two spellings disagree about what the
+    /// instrument says would be worse than either answer.
+    ///
+    /// Hot path unchanged: `site` is a three-word `Copy` value that
+    /// `coerce_field_value_for_slot` passes only to the `#[cold]`
+    /// reporter, and [`Self::class_id_of`] is one load from the object
+    /// header that the neighbouring `get_field`/`set_field` dereferences
+    /// in the same call.
     pub fn get_field_as(&self, obj_ref: ObjectRef, index: usize, desc_byte: u8) -> Value {
         let raw = self.get_field(obj_ref, index);
-        crate::heap::coerce_field_value_by_descriptor(raw, desc_byte)
+        crate::heap::coerce_field_value_for_slot(
+            raw,
+            desc_byte,
+            crate::heap::FieldCoercionSite::read(Some(self.class_id_of(obj_ref)), index),
+        )
     }
 
-    /// Volatile descriptor-aware get.
+    /// Volatile descriptor-aware get. Provenance as in [`Self::get_field_as`].
     pub fn get_field_volatile_as(&self, obj_ref: ObjectRef, index: usize, desc_byte: u8) -> Value {
         let raw = self.get_field_volatile(obj_ref, index);
-        crate::heap::coerce_field_value_by_descriptor(raw, desc_byte)
+        crate::heap::coerce_field_value_for_slot(
+            raw,
+            desc_byte,
+            crate::heap::FieldCoercionSite::read(Some(self.class_id_of(obj_ref)), index),
+        )
     }
 
     /// Descriptor-aware set — normalizes the written `Value` to the declared
     /// field type before the underlying slot write.
+    ///
+    /// Reports `access="store"`: a coercing store destroyed something a
+    /// writer meant, where a coercing read is usually a never-initialised
+    /// slot repairing its own tag.
     pub fn set_field_as(&self, obj_ref: ObjectRef, index: usize, value: Value, desc_byte: u8) {
-        let coerced = crate::heap::coerce_field_value_by_descriptor(value, desc_byte);
+        let coerced = crate::heap::coerce_field_value_for_slot(
+            value,
+            desc_byte,
+            crate::heap::FieldCoercionSite::store(Some(self.class_id_of(obj_ref)), index),
+        );
         self.set_field(obj_ref, index, coerced);
     }
 
-    /// Volatile descriptor-aware set.
+    /// Volatile descriptor-aware set. Provenance as in [`Self::set_field_as`].
     pub fn set_field_volatile_as(
         &self,
         obj_ref: ObjectRef,
@@ -4184,7 +4371,11 @@ impl GenerationalHeap {
         value: Value,
         desc_byte: u8,
     ) {
-        let coerced = crate::heap::coerce_field_value_by_descriptor(value, desc_byte);
+        let coerced = crate::heap::coerce_field_value_for_slot(
+            value,
+            desc_byte,
+            crate::heap::FieldCoercionSite::store(Some(self.class_id_of(obj_ref)), index),
+        );
         self.set_field_volatile(obj_ref, index, coerced);
     }
 
@@ -8398,6 +8589,7 @@ impl GenerationalHeap {
         // not reclaim. That is strictly over-retention, the safe direction.
         let mut late_pins: Vec<usize> = Vec::new();
         let mut late_resolved_bases = 0usize;
+        let mut late_interior_cleared = 0usize;
         // H2-CID0-BLOCKED attribution, read by the root-in-dead-span invariant.
         let mut unresolved_snapshot: Vec<usize> = Vec::new();
         let mut dropped_snapshot: Vec<usize> =
@@ -8420,11 +8612,34 @@ impl GenerationalHeap {
             if !unresolved.is_empty() {
                 unresolved.sort_unstable();
                 unresolved.dedup();
-                let (bases, leftover) =
+                let (bases, leftover, interior) =
                     resolve_candidate_bases(from_base, used_bytes, &exact_skips, &unresolved);
                 late_resolved_bases = bases.len();
                 for base in bases {
                     mark_edge_precise(base, &mark_ctx, &side_bits, &mut worklist, "late-base");
+                }
+                // Retire the RAW marks this pass just superseded. Each address
+                // in `interior` was proved to sit strictly inside an object by
+                // the same linear chain the sweep walks, so it is provably not
+                // an object start: the mark retained nothing (the sweep matches
+                // marks against STARTS), and the covering base was marked
+                // above, so the object is retained either way. What the mark
+                // DID do was make `side_sorted` -- which the phantom-extent
+                // guard and the parallel `sweep_chunk` both read as "live
+                // BASES, and live objects never nest" -- carry an address
+                // interior to a valid object. The guard then fires on that
+                // object, unwinds every reclamation since the last anchor
+                // (sequential walk) or abandons the whole parallel attempt
+                // (`chunk_bail(5)`). Clearing them makes the guard's premise
+                // TRUE by construction rather than by assumption, which is what
+                // the 2026-08-13 `phantom_extents` finding turned on.
+                late_interior_cleared = interior
+                    .iter()
+                    .filter(|&&addr| side_bits.unmark(addr))
+                    .count();
+                if late_interior_cleared > 0 {
+                    LATE_RESOLVE_RAW_INTERIOR_CLEARED
+                        .fetch_add(late_interior_cleared as u64, Ordering::Relaxed);
                 }
                 if !worklist.is_empty() {
                     crate::young_mark::drain_parallel(
@@ -8445,6 +8660,7 @@ impl GenerationalHeap {
                             unresolved = unresolved.len(),
                             resolved_bases = late_resolved_bases,
                             pinned = late_pins.len(),
+                            raw_interior_marks_cleared = late_interior_cleared,
                             "young non-moving sweep: the anchor oracle left conservative root \
                              candidate(s) unresolved; they were side-marked at their RAW \
                              address, which retains nothing when the address is object-INTERIOR. \
@@ -10363,14 +10579,9 @@ impl GenerationalHeap {
             // phase already built and sorted — no allocation, no search.
             {
                 let abs = from_base + cursor;
-                while live_probe < side_sorted.len() && side_sorted[live_probe] <= abs {
-                    live_probe += 1;
-                }
-                if side_sorted
-                    .get(live_probe)
-                    .is_some_and(|&a| a < abs + total_size)
+                if let Some(victim) =
+                    mark_strictly_inside(&side_sorted, &mut live_probe, abs, total_size)
                 {
-                    let victim = side_sorted[live_probe];
                     // Are the subsumed marks object BASES? See
                     // `SWEEP_PHANTOM_INTERIOR_MARKS` — this classifies, it does
                     // not gate. Bounded by the marks inside this one extent.
@@ -11624,11 +11835,31 @@ impl GenerationalHeap {
         clear_all_mark_bits_in_arena(&mut young_from, &side_sorted);
         report_phase("clear-marks");
 
-        EMPTY_RUN_BYTES_LAST.store(
-            EMPTY_RUN_BYTES_CYCLE.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        EMPTY_RUN_YOUNG_USED_LAST.store(young_from.used() as u64, Ordering::Relaxed);
+        let empty_run_retained = EMPTY_RUN_BYTES_CYCLE.load(Ordering::Relaxed);
+        let empty_run_young_used = young_from.used() as u64;
+        EMPTY_RUN_BYTES_LAST.store(empty_run_retained, Ordering::Relaxed);
+        EMPTY_RUN_YOUNG_USED_LAST.store(empty_run_young_used, Ordering::Relaxed);
+        // The ratchet on the deliberate deferral -- see
+        // `EMPTY_RUN_RETENTION_EXCEEDED`. Cheap (two loads and a compare, once
+        // per sweep) and unconditional, because the whole point is that it runs
+        // on workloads nobody thought to re-measure.
+        if empty_run_retention_exceeded(empty_run_retained, empty_run_young_used) {
+            EMPTY_RUN_RETENTION_EXCEEDED.fetch_add(1, Ordering::Relaxed);
+            if EMPTY_RUN_RETENTION_REPORTS.fetch_add(1, Ordering::Relaxed) < 4 {
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    retained_bytes = empty_run_retained,
+                    young_used = empty_run_young_used,
+                    budget_permille = EMPTY_RUN_RETENTION_BUDGET_PERMILLE,
+                    "young non-moving sweep: the bytes STEPPED OVER as runs of empty objects \
+                     exceeded their budget as a share of the young generation. Every cycle \
+                     re-skips the same runs, so this figure is a standing retention and was \
+                     measured flat at 11.5-29 KB from 4 to 27 collections; a workload that \
+                     grows it is the new evidence the decision not to reclaim these runs was \
+                     explicitly left open for.",
+                );
+            }
+        }
         let live_bytes = bytes_before.saturating_sub(bytes_swept);
         tracing::debug!(
             "non-moving young sweep: {} live objects ({} bytes), {} dead \
@@ -15781,6 +16012,36 @@ fn scan_young_object(
     }
 }
 
+/// The phantom-extent predicate, shared by the sequential young sweep walk and
+/// the parallel `sweep_chunk`.
+///
+/// `side_sorted` is the cycle's mark set as ASCENDING absolute addresses, and
+/// `live_probe` is a monotone cursor into it that the caller carries across the
+/// whole walk — both walks visit objects in ascending address order, so the
+/// total cost is one index advance per mark, not a search per object.
+///
+/// Answers "is a mark STRICTLY inside `[abs, abs + total_size)`", returning the
+/// first such address. Live objects never nest, so under the premise that every
+/// mark is an object BASE a hit proves the walk left the object grid. That
+/// premise is only true because the late base-resolution pass clears the raw
+/// conservative marks it proves are object-interior — see
+/// `LATE_RESOLVE_RAW_INTERIOR_CLEARED`.
+#[inline]
+fn mark_strictly_inside(
+    side_sorted: &[usize],
+    live_probe: &mut usize,
+    abs: usize,
+    total_size: usize,
+) -> Option<usize> {
+    while *live_probe < side_sorted.len() && side_sorted[*live_probe] <= abs {
+        *live_probe += 1;
+    }
+    side_sorted
+        .get(*live_probe)
+        .filter(|&&a| a < abs + total_size)
+        .copied()
+}
+
 // ---------------------------------------------------------------------------
 // Late conservative-candidate base resolution (H2-CID0, 2026-08-01)
 // ---------------------------------------------------------------------------
@@ -15808,18 +16069,30 @@ fn scan_young_object(
 /// `[from_base, from_base + used)`. `free_blocks` is the merged
 /// free-list + reserved-TLAB-tail skip list, sorted ascending.
 ///
-/// Returns `(bases, unreachable)` — the covering bases it proved (each at most
-/// once, ascending), and the candidates the walk never got to because it
-/// desynced first. The caller marks the former and pins the latter.
+/// Returns `(bases, unreachable, interior)` — the covering bases it proved
+/// (each at most once, ascending), the candidates the walk never got to
+/// because it desynced first, and the candidates it PROVED are object-INTERIOR
+/// (strictly inside an object it parsed, so provably not an object start).
+/// The caller marks the first, pins the second, and clears the raw side marks
+/// of the third.
+///
+/// The third output exists because a raw mark on an interior address is not
+/// merely useless — the sweep matches marks against object STARTS, so it
+/// retains nothing — it is actively harmful: `SWEEP_PHANTOM_EXTENTS` reads
+/// `side_sorted` as a set of live BASES, and an interior mark inside the very
+/// object being sized satisfies "this extent subsumes a live object" exactly,
+/// condemning a valid object and unwinding every reclamation since the last
+/// anchor. See `SWEEP_PHANTOM_INTERIOR_MARKS`.
 fn resolve_candidate_bases(
     from_base: usize,
     used: usize,
     free_blocks: &[(usize, usize)],
     cands: &[usize],
-) -> (Vec<usize>, Vec<usize>) {
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
     let mut bases: Vec<usize> = Vec::new();
+    let mut interior: Vec<usize> = Vec::new();
     if cands.is_empty() {
-        return (bases, Vec::new());
+        return (bases, Vec::new(), interior);
     }
     let mut free_iter = free_blocks.iter().peekable();
     let mut cursor = 0usize;
@@ -15866,12 +16139,17 @@ fn resolve_candidate_bases(
         if ci < cands.len() && cands[ci] < end {
             bases.push(start);
             while ci < cands.len() && cands[ci] < end {
+                // A candidate that is not this object's own start is
+                // object-INTERIOR under the grid the sweep itself walks.
+                if cands[ci] != start {
+                    interior.push(cands[ci]);
+                }
                 ci += 1;
             }
         }
         cursor += total;
     }
-    (bases, cands[ci..].to_vec())
+    (bases, cands[ci..].to_vec(), interior)
 }
 
 // ---------------------------------------------------------------------------
@@ -15980,7 +16258,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
         // legitimately reads zero. Bailing on either was expensive out of all
         // proportion — one `None` makes `parallel_sweep_walk` discard EVERY
         // chunk and re-run the whole arena sequentially, and on the
-        // hibernate-reactive repro that happened on every cycle
+        // hibernate repro that happened on every cycle
         // (`par_attempts=5 par_fails=5`, all five the zero-run branch, so
         // `par_prefix_end` was 0 for the entire run). Anything the predicate
         // does not vouch for still bails; the sequential path still owns the
@@ -16031,14 +16309,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
         // is off the object grid — live objects never nest. The sequential walk
         // owns the report and the re-anchor policy, so just abandon the attempt
         // (this path has written nothing).
-        while live_probe < ctx.side_sorted.len() && ctx.side_sorted[live_probe] <= abs {
-            live_probe += 1;
-        }
-        if ctx
-            .side_sorted
-            .get(live_probe)
-            .is_some_and(|&a| a < abs + total_size)
-        {
+        if mark_strictly_inside(ctx.side_sorted, &mut live_probe, abs, total_size).is_some() {
             return chunk_bail(5);
         }
 
@@ -17068,7 +17339,7 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena, side_sorted: &[usize]) {
         // non-moving sweep treats a set `GC_FLAG_MARKED` as live regardless of
         // reachability (the bug-C5 note at the call site). So the false
         // positive feeds itself — measured at ~800 re-anchors per young cycle
-        // on the hibernate-reactive repro. Step over the run instead: it can
+        // on the hibernate repro. Step over the run instead: it can
         // hold no mark to clear, because a header carrying `GC_FLAG_MARKED` is
         // by definition not all-zero, and the predicate refuses any run with a
         // marked base inside it.
@@ -17947,6 +18218,176 @@ mod tests {
     fn small_gen_heap() -> GenerationalHeap {
         // 4KB young semi-space, 8KB old gen
         GenerationalHeap::with_sizes(4 * 1024, 8 * 1024)
+    }
+
+    /// The empty-object-run retention ratchet must be silent on every figure
+    /// the 2026-08-13 re-measurement produced, and must fire on growth.
+    ///
+    /// The pairs below are the measured `(retained, young_used)` rows at seven
+    /// heap sizes -- the evidence the "step over, do not reclaim" decision was
+    /// taken on. Encoding them as a test is what turns that decision from a
+    /// remembered opinion into a ratchet: if the mechanism's prediction (every
+    /// cycle re-skips the SAME runs, so the figure does not grow with cycle
+    /// count) ever stops holding, the binary says so.
+    #[test]
+    fn the_empty_run_retention_ratchet_is_silent_on_every_measured_figure() {
+        // (retained bytes, young used bytes) -- 1500m/450m/320m/260m/220m/190m
+        // from the original table, and the 2026-08-13 re-measurement.
+        let measured: &[(u64, u64)] = &[
+            (25_216, 326_900_000),
+            (28_992, 117_800_000),
+            (14_400, 83_600_000),
+            (26_720, 68_000_000),
+            (22_848, 57_400_000),
+            (22_080, 49_600_000),
+            (21_728, 96_200_000),
+            (11_520, 96_300_000),
+            (19_072, 52_600_000),
+            (20_768, 68_200_000),
+            (19_040, 57_400_000),
+            (20_256, 49_700_000),
+            (6_144, 96_300_000), // CascadeComplicatedTest at 450m
+        ];
+        for &(retained, used) in measured {
+            assert!(
+                !empty_run_retention_exceeded(retained, used),
+                "the ratchet must not fire on a measured-healthy figure \
+                 ({retained} B retained of {used} B young)",
+            );
+        }
+
+        // A tiny young generation cannot support a trend reading at all, so the
+        // floor keeps it quiet rather than firing on arithmetic.
+        assert!(!empty_run_retention_exceeded(20_000, 100_000));
+
+        // Growth is what it exists to catch: past the floor AND past the
+        // budget share.
+        assert!(
+            empty_run_retention_exceeded(2 * 1024 * 1024, 100 * 1024 * 1024),
+            "2 MiB retained out of 100 MiB young is 2%, twice the budget",
+        );
+        assert!(
+            !empty_run_retention_exceeded(1024 * 1024, 200 * 1024 * 1024),
+            "1 MiB out of 200 MiB is 0.5%, inside the budget",
+        );
+        // Exactly at the budget is not "exceeded".
+        assert!(!empty_run_retention_exceeded(1_000_000, 100_000_000));
+        assert!(empty_run_retention_exceeded(1_000_001, 100_000_000));
+    }
+
+    /// The phantom-extent guard fires on a PERFECTLY VALID object as soon as
+    /// `side_sorted` carries an address interior to it — the leading hypothesis
+    /// for the 2026-08-13 `phantom_extents=224/847` finding, settled here
+    /// rather than by another 25 workload runs.
+    ///
+    /// The producer is real and documented: `mark_young` side-marks EVERY
+    /// conservative candidate, and when the anchor oracle cannot place one it
+    /// marks the RAW candidate address. A conservative candidate is frequently
+    /// an object-INTERIOR word, and the late-resolution pass that marks the
+    /// real base used not to remove the raw mark. `side_sorted` then held both,
+    /// and both consumers of it — this predicate in the sequential walk and
+    /// `chunk_bail(5)` in `sweep_chunk` — read it as "live BASES, and live
+    /// objects never nest".
+    #[test]
+    fn an_interior_mark_makes_the_phantom_guard_condemn_a_valid_object() {
+        // One valid 128-byte object at `base`, with a mark on its base and a
+        // second mark 32 bytes in — exactly the shape the late-resolution pass
+        // used to leave behind (`victim_interior_offset=32` in the field
+        // report).
+        let base = 0x1000usize;
+        let size = 128usize;
+
+        let with_raw_interior = vec![base, base + 32];
+        let mut probe = 0usize;
+        assert_eq!(
+            mark_strictly_inside(&with_raw_interior, &mut probe, base, size),
+            Some(base + 32),
+            "an interior raw mark satisfies the phantom premise exactly — this \
+             is the false positive, not corruption",
+        );
+
+        // With the raw mark retired (what `LATE_RESOLVE_RAW_INTERIOR_CLEARED`
+        // now does), the same object is clean.
+        let bases_only = vec![base];
+        let mut probe = 0usize;
+        assert_eq!(
+            mark_strictly_inside(&bases_only, &mut probe, base, size),
+            None,
+            "with only true bases in the mark set the guard must not fire",
+        );
+
+        // …and it must still catch a REAL phantom: a header claiming an extent
+        // that swallows the next object's base.
+        let two_bases = vec![base, base + size];
+        let mut probe = 0usize;
+        assert_eq!(
+            mark_strictly_inside(&two_bases, &mut probe, base, size * 2),
+            Some(base + size),
+            "the guard must still fire when a header subsumes a real base",
+        );
+    }
+
+    /// `resolve_candidate_bases` must report the interior candidates it proves,
+    /// not just the covering bases — that report is what lets the caller retire
+    /// the raw side mark that would otherwise trip the phantom guard.
+    #[test]
+    fn resolve_candidate_bases_reports_proven_interior_candidates() {
+        let heap = small_gen_heap();
+        // Three real objects, so the walk has a genuine grid to chain.
+        let a = heap.alloc_object(ClassId::new(1), 4);
+        let b = heap.alloc_object(ClassId::new(2), 2);
+        let c = heap.alloc_object(ClassId::new(3), 1);
+        let (a, b, c) = (a.as_ptr() as usize, b.as_ptr() as usize, c.as_ptr() as usize);
+
+        let from_base = heap.young_from.lock().base_ptr() as usize;
+        let used = heap.young_from.lock().used();
+
+        // One candidate AT a base, one strictly inside the same object (a null
+        // reference field's address — the commonest conservative false
+        // positive), one inside a later object.
+        let mut cands = vec![a, a + HEADER_SIZE + SLOT_SIZE, b + HEADER_SIZE, c];
+        cands.sort_unstable();
+
+        let (bases, unreachable, interior) =
+            resolve_candidate_bases(from_base, used, &[], &cands);
+
+        assert!(
+            unreachable.is_empty(),
+            "a healthy grid must be walkable end to end (left {} unreachable)",
+            unreachable.len(),
+        );
+        assert!(bases.contains(&a) && bases.contains(&b) && bases.contains(&c));
+        assert_eq!(
+            interior,
+            vec![a + HEADER_SIZE + SLOT_SIZE, b + HEADER_SIZE],
+            "exactly the candidates that are not their object's own start",
+        );
+        assert!(
+            !interior.contains(&a) && !interior.contains(&c),
+            "a candidate that IS a base must never be reported as interior — \
+             clearing its mark would drop a real retention",
+        );
+    }
+
+    /// The bitmap half: clearing a proven-interior mark must remove it from the
+    /// `side_sorted` view and leave every real base in place.
+    #[test]
+    fn unmarking_a_proven_interior_address_leaves_the_bases_marked() {
+        let bits = crate::young_mark::YoungMarkBits::new(0x2000, 4096);
+        assert!(bits.try_mark(0x2000));
+        assert!(bits.try_mark(0x2000 + 32));
+        assert!(bits.try_mark(0x2000 + 128));
+        assert_eq!(bits.collect_marked(), vec![0x2000, 0x2020, 0x2080]);
+
+        assert!(bits.unmark(0x2000 + 32), "the interior bit was set");
+        assert!(!bits.unmark(0x2000 + 32), "clearing twice is a no-op");
+        assert_eq!(
+            bits.collect_marked(),
+            vec![0x2000, 0x2080],
+            "only the interior mark goes; every base survives",
+        );
+        assert!(bits.contains(0x2000) && bits.contains(0x2080));
+        assert!(!bits.contains(0x2020));
     }
 
     /// A run of swept empty objects must not hide the objects AFTER it.
@@ -20941,6 +21382,7 @@ mod tests {
                     roots_for_matching_owners,
                     remap,
                     prune,
+                    gate_stats: None,
                 },
             );
             OWNER.store(owner.as_ptr() as usize, Ordering::Relaxed);
@@ -22553,6 +22995,133 @@ mod tests {
         drop(young_from);
         for (index, object) in roots.iter().copied().enumerate() {
             assert_eq!(heap.get_field(object, 0), Value::Int(index as i32));
+        }
+    }
+
+    // ----- G45: the four descriptor-aware accessors carry provenance -------
+    //
+    // These pin the inherent-method half of the change. The trait-default
+    // half lives in `collector.rs`, and the two must not drift: Rust
+    // resolves `h.get_field_as(..)` on a `&GenerationalHeap` to the INHERENT
+    // method, so `VmHeap`'s `dispatch!` (`vm_heap.rs:222`) reaches these
+    // bodies on a `-XX:+UseGenerationalGC` run and the trait defaults on a
+    // default (ZGC) run. Both are live; neither is the other's dead twin.
+    //
+    // Counter isolation: nothing here fires a lossy coercion. The
+    // process-global loss counters are asserted with EXACT deltas by
+    // `heap.rs`'s G30 tests under a module-private lock this module cannot
+    // take, so a lossy input here would make those exact deltas flaky from
+    // another module for no gain. What these can test locally is the half
+    // that carries the risk — that the value reaching the slot is byte-for
+    // byte what the descriptor-only helper produced.
+
+    /// G45: a descriptor-aware round trip through the provenance-carrying
+    /// accessors lands and returns exactly what the descriptor-only helper
+    /// would have.
+    ///
+    /// This is the risk assertion. These accessors sit on the allocation and
+    /// collection hot path and 97 of 99 `--jdk-only` vectors run over them,
+    /// so the acceptable behavioural delta from adding provenance is zero.
+    /// It holds by construction —
+    /// [`crate::heap::coerce_field_value_for_slot`] reads its `site`
+    /// argument in exactly one place, as an argument to the `#[cold]`
+    /// reporter — and this pins it against a future edit that makes the site
+    /// load-bearing.
+    #[test]
+    fn descriptor_aware_accessors_land_exactly_what_the_bare_helper_lands() {
+        let heap = GenerationalHeap::with_capacity(256 * 1024);
+        // Normalising and identity arms only: no case here reaches
+        // `note_field_coercion_loss`.
+        let cases: &[(Value, u8)] = &[
+            (Value::Int(-7), b'J'),
+            (Value::Float(1.5), b'J'),
+            (Value::Long(0x0102_0304_0506_0708), b'D'),
+            (Value::Int(3), b'F'),
+            (Value::Long(0x1_0000_0001), b'I'),
+            (Value::Double(2.5), b'S'),
+            (Value::Object(None), b'L'),
+            // Unknown descriptor: the `_ => value` arm, untouched.
+            (Value::Int(99), b'V'),
+        ];
+        for &(value, desc) in cases {
+            let expected = crate::heap::coerce_field_value_by_descriptor(value, desc);
+            let obj = heap.alloc_object(ClassId::new(11), 2);
+
+            heap.set_field_as(obj, 0, value, desc);
+            assert_eq!(
+                heap.get_field(obj, 0),
+                expected,
+                "set_field_as({value:?}, '{}') must land what the \
+                 descriptor-only helper lands",
+                desc as char,
+            );
+            assert_eq!(
+                heap.get_field_as(obj, 0, desc),
+                expected,
+                "get_field_as re-reading a '{}' slot",
+                desc as char,
+            );
+
+            heap.set_field_volatile_as(obj, 1, value, desc);
+            assert_eq!(
+                heap.get_field_volatile(obj, 1),
+                expected,
+                "set_field_volatile_as({value:?}, '{}')",
+                desc as char,
+            );
+            assert_eq!(
+                heap.get_field_volatile_as(obj, 1, desc),
+                expected,
+                "get_field_volatile_as re-reading a '{}' slot",
+                desc as char,
+            );
+        }
+    }
+
+    /// G45: the inherent accessors and the inherited `GarbageCollector`
+    /// defaults must answer identically.
+    ///
+    /// They are two spellings of one operation, reached by two live
+    /// configurations of the same VM, and until 2026-08-17 they were also
+    /// two copies of the same defect. Letting them disagree about what a
+    /// slot receives would make a bug reproduce under one `-XX:+Use…GC` flag
+    /// and not the other, which is the single most expensive shape of
+    /// divergence this collector zoo can produce (see `autobox.rs`'s module
+    /// note on W7-84, where exactly that happened).
+    #[test]
+    fn the_inherent_accessors_and_the_trait_defaults_agree() {
+        use crate::collector::GarbageCollector;
+        let heap = GenerationalHeap::with_capacity(256 * 1024);
+        let cases: &[(Value, u8)] = &[
+            (Value::Int(-7), b'J'),
+            (Value::Long(0x1_0000_0001), b'I'),
+            (Value::Double(2.5), b'S'),
+            (Value::Object(None), b'L'),
+            (Value::Int(99), b'V'),
+        ];
+        for &(value, desc) in cases {
+            let via_inherent = heap.alloc_object(ClassId::new(11), 1);
+            let via_trait = heap.alloc_object(ClassId::new(11), 1);
+
+            heap.set_field_as(via_inherent, 0, value, desc);
+            // Fully qualified: plain method syntax would pick the inherent
+            // method and this test would compare it with itself.
+            GarbageCollector::set_field_as(&heap, via_trait, 0, value, desc);
+
+            assert_eq!(
+                heap.get_field(via_inherent, 0),
+                heap.get_field(via_trait, 0),
+                "the inherent and trait spellings of set_field_as disagree \
+                 for {value:?} at a '{}' slot",
+                desc as char,
+            );
+            assert_eq!(
+                heap.get_field_as(via_inherent, 0, desc),
+                GarbageCollector::get_field_as(&heap, via_trait, 0, desc),
+                "the inherent and trait spellings of get_field_as disagree \
+                 for {value:?} at a '{}' slot",
+                desc as char,
+            );
         }
     }
 }

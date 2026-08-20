@@ -154,12 +154,21 @@ triangulation · `interpreter_tests` 924 · `differential` 14 ·
 
 ## What remains
 
-The analysis declines (poisons) on `jsr`/`ret`, the category-dependent
-`dup2` family (`dup_x2`, `dup2`, `dup2_x1`, `dup2_x2`), and any opcode not in
-its table. Those cost precision, not correctness: such a method keeps the old
-coarse encoding and may still be refused OSR. None appeared in the corpus. If a
+The analysis declines (poisons) on `jsr`/`ret` and any opcode not in its table.
+Those cost precision, not correctness: such a method keeps the old coarse
+encoding and may still be refused OSR. None appeared in the corpus. If a
 workload ever shows one, the fix is to add the arm — with the JVMS clause quoted
 next to it, as the existing arms do.
+
+**Update 2026-08-18.** The category-dependent `dup2` family (`dup_x2`, `dup2`,
+`dup2_x1`, `dup2_x2`) was on that list and is no longer: every form is decided
+by categories this analysis already tracks, so modelling them costs neither
+precision nor correctness, and `Unknown` in a deciding position still poisons.
+The prompt was not OSR precision at all — the single-pass `dup2_x2` codegen arm
+needed a **second-entry width oracle**, and this analysis turned out to be one.
+See fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md,
+which is also where the argument for using a snapshot oracle to pick a codegen
+shape is written down.
 
 ## Reproduction
 

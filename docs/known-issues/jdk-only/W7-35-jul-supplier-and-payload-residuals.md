@@ -1,5 +1,63 @@
 # W7-35 — the JUL residuals: two of the four were mine, one was already fixed, and the two that keep the vector red are the same bug as W7-25 §1
 
+> **MEASURED CLOSED 2026-08-12 (second pass, same day). The vector is no longer
+> the suite's only red — it is green in both modes.**
+>
+> §6 ends "Nothing was rebuilt", and §5's prediction — that the patch takes
+> `--jdk-only` to 63/63 — had never been run. Run now, on a default-feature
+> release binary dated 2026-08-12 15:27, HotSpot 25.0.3+9 as oracle:
+>
+> | arm | §0 said | measured today |
+> |---|---|---|
+> | HotSpot 25.0.3+9 | 63 reachable, 0 failures | `PASS RJdkLogging (79 checks)` |
+> | CratonVM `--real-jdk` | 3 failures (#39, #54, #59) | `PASS RJdkLogging (79 checks)` |
+> | CratonVM `--jdk-only` | 2 failures (#54, #59) | `PASS RJdkLogging (79 checks)` |
+>
+> All twelve `CK` lines byte-identical across the three arms. Specifically:
+>
+> * **#39** (`useParentHandlers=false` must stop the walk) — §1's fix is landed
+>   and **verified**; §6 listed it as reasoned-not-run.
+> * **#54** (`Formatter.formatMessage` must substitute) — closed by W7-43 giving
+>   the row a real body, not by §5's category patch. Confirmed in the tree:
+>   `native-builtins/src/phases_early.rs:20962` registers `formatMessage` inside
+>   a `with_category(Bridge)` block whose comment records that the `Bridge` tag
+>   alone did **not** retire it, and the body is now `jul_formatter_format_message`.
+>   `CK … formatted='one=A two=B'` in all three arms.
+> * **#59** — closed in **both** halves. The strict half went through
+>   `RETIRED_SHADOW_TRIPLES`, as W7-56 said and §5's `with_category` patch did
+>   not: `native-api/src/retired_shadow.rs:371`–`:374` carries all four source-pair
+>   triples, with a comment stating they retire as a SET. `LogRecord.<init>` is
+>   at `:362`. Measured `CK … sourcePair=A_CLASS/a_method halfSetMethod=null bare=LATE`,
+>   identical on HotSpot.
+> * **§2.1's double-inference fix** (the second `capture_stack_trace` on every
+>   published record) is in the tree and its observable — `publishedSource` — is
+>   green in both modes.
+>
+> **What is NOT closed, and it is a `Compatible`-only residual this vector cannot
+> see.** `--real-jdk` prints two console lines HotSpot prints nowhere:
+> `INFO [rjdklogging.handlers] after-removal` and
+> `INFO [rjdklogging.inherit.child] not-up-to-parent`. Counted: HotSpot 0,
+> `--jdk-only` 0, `--real-jdk` 2. Both are records that HotSpot routes to no
+> handler; `jul_log_parameterized`'s console fallback publishes them anyway.
+> §4's anti-silence property is what makes this invisible — every check asserts
+> on a captured record or a byte count, never on stdout, so a spurious *extra*
+> console line is exactly the failure shape the vector was not built to catch.
+> The `not-up-to-parent` case is the same logger §1 fixed: the parent's handler
+> correctly no longer receives, and the record then falls to the console instead
+> of being dropped — so §1's fix is what **exposed** this half, and the two must
+> be read together. Shared with W7-25 as NOMINATION 5; the fix is a
+> discrimination between "no handler configured" and "handlers configured, none
+> took it", plus a stdout assertion in `RJdkLogging` to gate it.
+>
+> **§5's remaining work item stands, narrowed by measurement.** The "24 rows
+> deliberately NOT in the minimal set" are still ambient `Intrinsic` in
+> `register_phase54_logging_extras`. None of them is failing a check today —
+> which §5 already said is an argument for measuring them, not for leaving them
+> mislabelled. The general form of that hazard was found live elsewhere today:
+> `java/lang/Math.min(DD)D` is an ambient `Intrinsic` giving an answer the
+> bytecode would not, invisible to both the retirement and the census
+> (W7-2's 2026-08-12 block).
+
 > **2026-08-12 — both `--jdk-only` survivors now have a landed cause, and §5's
 > patch is superseded.** #54 is FIXED by giving `Formatter.formatMessage` a
 > correct body (W7-43-formatmessage-substitution.md — see §5's own CORRECTION

@@ -34,13 +34,18 @@
   and the *fidelity* variant's three-name candidate list was not taken because
   it would have changed `--real-jdk`, which this record itself said was not this
   lane's to take. **Do not apply the patch below.**
-* **Residual: STILL OPEN, and unmeasurable on a shipping binary.** The
-  `Collections` fidelity residual is structurally confined to `synthetic-jdk` —
-  both shipping modes drop the contested factories and run real
+* **Residual: MEASURED 2026-08-12 (lane A31) — the stated claim is FALSIFIED
+  and the family is wrong at six other members.** See §"The `Collections`
+  fidelity residual, adjudicated" at the foot of this record. The residual is
+  **not retired**: its specific asymmetry does not exist, but the surface it
+  pointed at is worse than it described.
+* **Residual: SUPERSEDED — was "STILL OPEN, and unmeasurable on a shipping
+  binary."** The `Collections` fidelity residual is structurally confined to
+  `synthetic-jdk` — both shipping modes drop the contested factories and run real
   `java.util.Collections` bytecode, and all 37 rows of
   `probes/JdkOnlyCollectionViewProbe` are byte-identical across HotSpot,
-  `--real-jdk` and `--jdk-only`. It is open only in the sense that **no
-  `synthetic-jdk` binary has ever been built to measure it**.
+  `--real-jdk` and `--jdk-only`. It was open only in the sense that **no
+  `synthetic-jdk` binary had ever been built to measure it**. One now has been.
 
   > **AMENDED 2026-08-12 (W7-78-inherited-residual-closeout.md) — the
   > confinement is now proved by construction, and the "never built" half of
@@ -481,3 +486,127 @@ names anything in this area and it exercises `StampedLock` only (lines 327-341:
 `native-builtins` path that was never in contention. That absence is why the
 defect survived, and it is the main reason to treat this fix as unproven until
 someone runs the probe above.
+
+---
+
+## The `Collections` fidelity residual, adjudicated — 2026-08-12 (lane A31)
+
+The residual said, twice (§"the `Collections` fidelity split" and §1 of the
+2026-08-11 re-measurement):
+
+> `Collections.unmodifiableSet(s).add(x)` throws while
+> `Collections.unmodifiableList(l).add(x)` succeeds. **Synthetic-jdk only.**
+
+A `--features synthetic-jdk` binary was built and launched with
+`--synthetic-jdk`. **That claim is false.** Both throw:
+
+```
+--synthetic-jdk:
+  R unmod.set.add  = UnsupportedOperationException (correct)
+  R unmod.list.add = UnsupportedOperationException (correct)
+  R unmod.coll.add = UnsupportedOperationException (correct)
+  R unmod.map.put  = UnsupportedOperationException (correct)
+  R unmod.list.setThrows = UnsupportedOperationException (correct)
+  R unmod.sortedSet.add  = UnsupportedOperationException (correct)
+  R unmod.list.writeThrough = viewSize=2          (HotSpot: 2)
+  R unmod.set.cls  = java.util.Collections$UnmodifiableSet
+  R unmod.coll.cls = java.util.Collections$UnmodifiableCollection
+  R unmod.map.cls  = java.util.Collections$UnmodifiableMap
+```
+
+`unmodifiableList` even returns a real wrapper (`sameObject=false`,
+`java.util.Collections$UnmodifiableList` — HotSpot names the
+`…$UnmodifiableRandomAccessList` subclass, a cosmetic difference), so
+`native_return_first_arg` is **not** what serves it. The whole `unmodifiable*`
+family is correct in the one mode the residual claimed it was broken in.
+
+**But the residual pointed at the right file and the wrong members.** Six other
+rows of the same `Collections` factory surface are wrong in `--synthetic-jdk`,
+and every one of them is green on HotSpot 25, on `--jdk-only`, and on the
+feature binary under `--jdk-only` — so all six are genuinely synthetic-mode
+only, exactly the scoping the residual asserted:
+
+| row | HotSpot / `--jdk-only` | `--synthetic-jdk` |
+|---|---|---|
+| `Collections.emptyList().add("b")` | `UnsupportedOperationException` | **`ADDED size=1`** — the shared empty list is mutable |
+| `Collections.singletonList("a").add("b")` | `UnsupportedOperationException` | **`ADDED size=1`** |
+| `Collections.singletonMap("k","v").put("x","y")` | `UnsupportedOperationException` | **`PUT size=1`** |
+| `Collections.checkedList(new ArrayList<String>(), String.class)` then `.add(Integer)` | `ClassCastException`; wrapper is `…$CheckedRandomAccessList` | **`ADDED size=1`**; wrapper is **`java.util.ArrayList`** — no wrapper at all |
+| `Collections.copy(dst, src)` | `[7, 8, 9]` / `[4, 5]` | **`[0, 0, 0]` / `[0, 0]`** — a silent no-op at both unequal and equal length |
+| `Collections.copy(shortDst, longSrc)` | `IndexOutOfBoundsException` | **`COPIED [0]`** — no bounds check either |
+
+Plus two absences, which are honest failures rather than wrong answers:
+
+```
+R synchronizedList.add ! java.lang.NoSuchMethodError:
+    java.util.Collections$SynchronizedList.<init>(Ljava/util/List;)V
+R singleton.set.add    ! java.lang.NoSuchMethodError:
+    java.util.Collections$SingletonSet.add(Ljava/lang/Object;)Z
+R collections.enumeration ! java.lang.NoSuchMethodError:
+    java.util.Arrays$ArrayList.enumeration(Ljava/util/Collection;)Ljava/util/Enumeration;
+```
+
+(The last one is the argument-0 misnaming trap: `enumeration` is a **static** on
+`java.util.Collections` and `java.util.Arrays$ArrayList` never declared it. The
+class in a synthetic-mode `NoSuchMethodError` is the runtime class of `arg0`
+when the method is genuinely absent — do not chase the named class.)
+
+Green in `--synthetic-jdk`, recorded so the list is not re-derived:
+`rotate`, `replaceAll`, `fill`, `swap`, `reverse`, `min`, `max`, `frequency`,
+`nCopies`, `singletonList` contents, `List.of(...).add` → UOE.
+
+### What this changes
+
+1. **The residual is not retired.** Its literal claim is falsified; the surface
+   it named is worse than it said. It should be rewritten around the six rows
+   above rather than closed.
+2. **`Collections.copy` is the dangerous one** and belongs in the
+   `W7-20`/`W7-1` species, not here: it writes nothing, throws nothing, and
+   returns normally, so a caller that copies-then-reads gets zeros. That is the
+   fabricated-success shape, in a mode with no real bytecode to fall back to.
+3. **`emptyList()` being mutable is a shared-singleton hazard**, not a fidelity
+   nit: `Collections.emptyList()` is process-wide, so one `add` poisons every
+   later caller in the VM.
+4. The residual's *scoping* claim — "synthetic-jdk only" — **held for all six**.
+   That part was right, and the 2026-08-11 re-measurement's argument for it
+   (`SyntheticStub`-tagged factories are dropped at registration under
+   `--jdk-only`) is confirmed by the `--jdk-only` column.
+
+See lane A31's NOMINATION A31-4.
+
+### The W7-78 amendment's prediction is also contradicted
+
+The 2026-08-12 W7-78 block above (in the bullet list at the head of this record)
+makes two forward statements that the run settles:
+
+1. > "a probe run under `--synthetic-jdk` reports
+   > `class=java.util.HashSet add=SUCCEEDED`, which reads exactly like an
+   > unrelated JCA fix having failed to land"
+
+   **Measured: it does not.** `--synthetic-jdk` reports
+   `unmod.set.cls = java.util.Collections$UnmodifiableSet` and
+   `unmod.set.add = UnsupportedOperationException`. The vacuous-green trap
+   written into `native-builtins/src/jca/provider_chain.rs` above
+   `wrap_unmodifiable`, and into W7-63 §8, is **guarding against a shape that
+   does not occur**. Neither comment is harmful, but neither should be cited as
+   a known hazard, and W7-63 §8's reading of a `HashSet`-shaped result should not
+   be trusted as a synthetic-mode signature.
+
+2. > "**The repair, if the measurement confirms it:** delete the five
+   > `unmodifiable*` identity registrations in
+   > `phases_early::register_collections_extras_natives` and the three in
+   > `phases_early::register_core_stdlib_extras`"
+
+   **The measurement does not confirm it.** The `phases_early` identity bindings
+   are not the ones answering in `--synthetic-jdk` — a real wrapper class is
+   returned and it refuses mutation. Deleting them would be a change with no
+   measured effect in any of the three configurations. Do not take that repair
+   on this record's authority; the members that are actually broken are
+   `emptyList`, `singletonList`, `singletonMap`, `checkedList` and
+   `Collections.copy`, and none of them is on that deletion list.
+
+Method note, because it is what made both contradictions visible: **non-null is
+not the contract.** Every row above asserts the thrown type, the wrapper class
+name, and the post-condition contents — `unmod.list.identity` asks
+`sameObject`, `collections.copy.equalLen` reads the destination back. A probe
+that only checked "a Set came back" would have agreed with both predictions.

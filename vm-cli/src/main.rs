@@ -106,6 +106,14 @@ fn maybe_dump_shutdown_reports() {
     // is what proves the lever is live before anyone times it — an inert gate
     // reports `hit=0` here rather than hiding inside a timing wash.
     cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
+    cratonvm_vm::runtime::interpreter::invoke_phases::dump();
+
+    // The G1 live-region memo's tally, self-gated on
+    // `CRATONVM_DBG_G1_LIVE_MEMO`. Same argument as the line above, and it is
+    // the only usable one for that change: this host has no PMU, so a
+    // `perf stat -e instructions` A/B is unavailable, and its load average
+    // moves further in an hour than the effect does.
+    cratonvm_vm::dump_g1_live_region_memo_stats();
 
     // The JIT root-scan tally, self-gated the same way. It answers what the
     // method-stats line below cannot: those counters price the COMPILER, and a
@@ -115,7 +123,7 @@ fn maybe_dump_shutdown_reports() {
 
     // How many native-registry probes one invoke cost, self-gated on
     // `CRATONVM_DBG_NATIVE_LOOKUPS=1`. This is the number
-    // `performance/vm-per-call-dispatch-cost-RETIRED-20260813.md` §2 asks for
+    // `performance/vm-per-call-dispatch-cost-RETIRED-20260817.md` §2 asks for
     // before anyone restructures the dispatch entry points: a profile share can
     // say `slot_for_exact` is 8.5%, but only this says whether a "one lookup
     // per invoke" rewrite would divide it by 1 or by 10.
@@ -129,8 +137,108 @@ fn maybe_dump_shutdown_reports() {
     // nothing incremented it.
     cratonvm_classloading::define_census::dump();
 
+    // The lambda tier-up / inline-cache-thunk census, on
+    // `CRATONVM_DBG=lambda-jit`.
+    //
+    // At exit and not merely periodically, because the periodic report fires
+    // every 200 000 eligible dispatches (or 100 000 direct calls) and no
+    // ordinary application workload comes near either: a census over 24 Tomcat
+    // JUnit classes — 129 s of real work, one of them driving 21 HTTP tests
+    // against a live connector — printed nothing whatsoever, and "no lambda
+    // activity" is not a reading that silence can support. See
+    // `runtime::interpreter::report_lambda_census_at_exit`.
+    cratonvm_vm::runtime::interpreter::report_lambda_census_at_exit();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
+        // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
+        // guarded inline `getfield` is emitted at dozens of sites and can still
+        // never take its inline branch; only this counter distinguishes
+        // "emitted" from "ran". Pair it with the compile-time
+        // `[compact-inline] MISS` census under CRATONVM_DBG_COMPACT_INLINE:
+        // MISS names the SITES that cannot inline, this names the ACCESSES that
+        // paid the helper's `is_object_address` walk. See
+        // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+        eprintln!(
+            "[cratonvm] getfield helper calls: {} | CALL sites emitted by arm: {}",
+            cratonvm_vm::jit::helpers::jit_getfield_helper_calls()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<not counted>".to_string()),
+            cratonvm_jit::metrics::getfield_arm_emits()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // What the SPLICED-CALL emitter actually emitted, per arm. Zeros are
+        // printed: a feature measuring "no different from the arm below it" and
+        // a feature that never fired look identical in a timing table, and this
+        // is the only line that separates them.
+        eprintln!(
+            "[cratonvm] inline call arms: {}",
+            cratonvm_jit::metrics::inline_call_arm_emits()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // The RECEIVER-SHAPE census: which guard clause each helper call
+        // actually failed, counted at EXECUTION on the one path every
+        // fall-through crosses. The two lines above count EMISSIONS, which is
+        // the question that cost this page four dead hypotheses. Needs
+        // `CRATONVM_DBG_GETFIELD_RECEIVERS=1`; all-zero means it was not on.
+        eprintln!(
+            "[cratonvm] getfield receiver shapes: {}",
+            cratonvm_vm::jit::helpers::jit_getfield_receiver_shapes()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        eprintln!(
+            "[cratonvm] getfield out-of-bounds by field kind: {}",
+            cratonvm_vm::jit::helpers::jit_getfield_oob_field_kinds()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // The ALLOCATION side of the same question, from the path
+        // `plan_object_alloc`'s `[compact-legacy]` census cannot see: the TLAB
+        // fast path writes a legacy header unconditionally and serves ~99% of
+        // allocations, so a class can be 100% of the legacy field receivers
+        // above and appear in no allocation census at all. Needs
+        // `CRATONVM_DBG_COMPACT_LEGACY`.
+        let tlab_legacy = cratonvm_vm::runtime::interpreter::tlab_legacy_object_classes();
+        if !tlab_legacy.is_empty() {
+            eprintln!(
+                "[cratonvm] TLAB-allocated legacy objects by class: {}",
+                tlab_legacy
+                    .iter()
+                    .map(|(n, id, c)| format!("{n}(id={id})={c}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
+        let legacy_classes = cratonvm_vm::jit::helpers::jit_getfield_legacy_receiver_classes();
+        if !legacy_classes.is_empty() {
+            eprintln!(
+                "[cratonvm] getfield legacy receivers by class: {}",
+                legacy_classes
+                    .iter()
+                    .map(|(n, id, c)| format!("{n}(id={id})={c}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        eprintln!(
+            "[cratonvm] IR-tier inline-getfield refusals: {}",
+            cratonvm_jit::metrics::ir_getfield_declines()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // The bytecode loop rewriter's admission tally, on the same switch and
         // for the same reason: it is what the compiler did, read at exit. The
         // counters themselves are always collected (they do not consult
@@ -512,7 +620,27 @@ struct Args {
     /// block, unchanged, so the stub ratchet still reads it); `invocations` is
     /// the separate per-kind dispatch total. Use this to verify the default
     /// build is synthetic-stub-free, and (via `invocations`) that no synthetic
-    /// stub was dispatched. Absolute registration-site paths are redacted, and
+    /// stub was dispatched.
+    ///
+    /// **`invocations` is a LOWER BOUND on calls, not a call count.** It counts
+    /// dispatches that resolved the triple by name or id, and misses every
+    /// dispatch served from a pre-resolved function pointer — the interpreter's
+    /// intrinsic table and the JIT's thin direct-call helpers. MEASURED
+    /// 2026-08-17: 100,000 `Math.abs` calls report 1, and the identical run
+    /// under `CRATONVM_DISABLE_INTRINSICS=1` reports 100,000; 100,000
+    /// `HashMap.get` calls report 1,873 with the JIT on and 100,001 under
+    /// `--nojit`. A zero therefore does NOT mean a body is dead. **For a census
+    /// whose `invocations` column is exact, run with `--nojit` and
+    /// `CRATONVM_DISABLE_INTRINSICS=1`.** `owns_slot` is unaffected and remains
+    /// the authoritative answer to "which body would run". Full method,
+    /// controls and causal test:
+    /// docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md.
+    ///
+    /// This flag, like every launcher option, is recognised only BEFORE the
+    /// main class; placed after it, it is a program argument. The launcher now
+    /// warns when that happens.
+    ///
+    /// Absolute registration-site paths are redacted, and
     /// `image_declaring_method` — the per-registration adjudication against the
     /// bytes on the class path, which is what tells a real `ACC_NATIVE` bridge
     /// from a registration nobody adjudicated — is `null`, unless
@@ -1312,6 +1440,147 @@ fn insert_program_args_separator(args: Vec<String>) -> Vec<String> {
         return out;
     }
     out
+}
+
+/// Launcher options that are **silently discarded** when they appear after the
+/// main class, and whose silence is indistinguishable from success.
+///
+/// # Why this list exists and why it is not "every option"
+///
+/// `java` positional semantics are that everything after the program selector
+/// belongs to the program, and [`insert_program_args_separator`] implements
+/// exactly that. For most options a misplacement announces itself: `-cp` in the
+/// tail produces a `ClassNotFoundException`, `-Xmx` in the tail produces an
+/// `ArrayIndexOutOfBoundsException` from a program that did not expect an extra
+/// argument. The options below are the ones where nothing at all happens —
+/// exit 0, no file, no diagnostic — because their entire effect is to write a
+/// diagnostic artefact or to turn a subsystem off.
+///
+/// That silence has cost real time in this campaign. `JDK-ONLY-REPORT-CENSUS-20260812`
+/// closes with "**Flag order matters and is silent when wrong**" as its last
+/// line, and `G33-1` was commissioned partly because it happened again. A
+/// measurement lane that gets an empty result cannot tell "the VM says nothing
+/// happened" from "the VM never heard me".
+///
+/// This is a **warning**, never an error, and the argv is never rewritten. A
+/// Java program is entitled to an argument spelled `--jdk-only-report`, and
+/// silently hoisting it out of the program's own argv would be a far worse bug
+/// than the one being reported. Suppress with
+/// `CRATONVM_NO_MISPLACED_FLAG_WARNING=1` for a program that really does take
+/// one of these names.
+const SILENTLY_IGNORED_IF_MISPLACED: &[&str] = &[
+    // The census/diagnostic dump family (`docs/feature-designs/jdk-only-mode.md`
+    // §9). Every one of these takes a path and its only observable effect is
+    // the file, so a discarded flag looks exactly like a clean run.
+    "--dump-native-registry",
+    "--jdk-only-report",
+    "--dump-class-origins",
+    "--dump-missing-natives",
+    "--dump-missing-natives-grouped",
+    "--dump-phase-report",
+    // The JDK-only mode switches. A discarded `--jdk-only` runs the whole
+    // measurement in Compatible mode, which is the failure that produces a
+    // *confidently wrong* result rather than an empty one.
+    "--jdk-only",
+    "--explain-jdk-only",
+    "--trace-jdk-only",
+    "--XX:AuditMissingNatives",
+    // `--nojit` is on this list for the same reason as `--jdk-only`: a
+    // discarded one silently measures the JIT arm and reports it as the
+    // interpreter arm. `G20-1` §3 is an entire table of paired JIT/`--nojit`
+    // arms; a silent miss there is not recoverable from the output.
+    "--nojit",
+    // Sampling/diagnostic switches whose absence is a quieter run, not an
+    // error.
+    "--stack-dump-on-timeout",
+    "--stack-sample-ms",
+];
+
+/// Environment switch that silences [`misplaced_launcher_flags`]'s warning, for
+/// a Java program that genuinely takes one of those names as its own argument.
+const MISPLACED_FLAG_WARNING_OFF: &str = "CRATONVM_NO_MISPLACED_FLAG_WARNING";
+
+/// Names from [`SILENTLY_IGNORED_IF_MISPLACED`] that appear in `argv` **after**
+/// the program-args separator, i.e. that the launcher will discard.
+///
+/// Pure and order-preserving so it can be tested without a process: takes the
+/// argv as [`insert_program_args_separator`] left it, returns the offending
+/// spellings in the order they appear, each at most once. Both the bare
+/// `--flag` and the inline `--flag=value` forms are recognised; the reported
+/// name is always the bare one, because that is what the user has to move.
+///
+/// Returns empty when there is no separator at all — `java --version` with no
+/// program has no tail, and every token is still a launcher option.
+fn misplaced_launcher_flags(argv: &[String]) -> Vec<&'static str> {
+    let Some(sep) = argv.iter().position(|a| a == "--") else {
+        return Vec::new();
+    };
+    let mut found: Vec<&'static str> = Vec::new();
+    for token in &argv[sep + 1..] {
+        // `--flag=value` and `--flag` both report as `--flag`: the fix is the
+        // same move either way, and naming the value back at the user only
+        // makes the line harder to scan.
+        let name = token.split('=').next().unwrap_or(token.as_str());
+        if let Some(flag) = SILENTLY_IGNORED_IF_MISPLACED
+            .iter()
+            .find(|f| **f == name)
+            .copied()
+        {
+            if !found.contains(&flag) {
+                found.push(flag);
+            }
+        }
+    }
+    found
+}
+
+/// Print the [`misplaced_launcher_flags`] warning, if any, to stderr.
+///
+/// Deliberately loud and deliberately specific: it names each flag, states the
+/// consequence in the tense that matters ("was passed to the Java program and
+/// the launcher ignored it"), and shows the fix. A warning that says only
+/// "check your argument order" leaves the reader doing the work this function
+/// already did.
+fn warn_about_misplaced_launcher_flags(argv: &[String]) {
+    // `std::env::var_os`, deliberately, and this one may NOT be converted.
+    // This function runs from `main` BEFORE `install_flags` latches the
+    // snapshot (the call is ~37 lines earlier), so reading through
+    // `flags::runtime_var_os` here latches it early and `install_flags` then
+    // fails with "runtime flags were read before launcher configuration" —
+    // every run exits 1. Measured, not reasoned: converting it broke `java
+    // Hello`. The name is exempt in `flag_declaration_guard`'s `ALLOWED` as
+    // kind 4 for exactly this reason.
+    if std::env::var_os(MISPLACED_FLAG_WARNING_OFF).is_some() {
+        return;
+    }
+    let misplaced = misplaced_launcher_flags(argv);
+    if misplaced.is_empty() {
+        return;
+    }
+    for flag in &misplaced {
+        eprintln!(
+            "[cratonvm] WARNING: `{flag}` appears AFTER the main class (or after `-jar <jar>`), \
+             so it was passed to the Java program as an argument and the launcher IGNORED it. \
+             This flag has no effect where it is."
+        );
+    }
+    eprintln!(
+        "[cratonvm] WARNING: move {} before the main class. \
+         Launcher options are recognised only ahead of the program selector, exactly as in \
+         `java`. If the program really does take {} as its own argument, set {}=1 to silence \
+         this.",
+        misplaced
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if misplaced.len() == 1 {
+            "that name"
+        } else {
+            "those names"
+        },
+        MISPLACED_FLAG_WARNING_OFF,
+    );
 }
 
 /// Rewrite common HotSpot launcher spellings so clap can parse them.
@@ -2546,6 +2815,81 @@ fn trace_jdk_only_violations(
 /// dies on the violation it was launched to find must still leave the census
 /// behind. Writes at most once per process (first caller wins — the failure
 /// path is the informative one).
+/// The absolute path a dump flag's operand actually names, for printing.
+///
+/// # Why every dump message goes through this
+///
+/// A dump flag's operand is trusted verbatim and resolved by the OS, and on
+/// Windows a POSIX-looking path is neither rejected nor mapped: `/tmp/reg.json`
+/// resolves against the current drive to `C:\tmp\reg.json`. The write then
+/// succeeds and the caller — typically a Git Bash shell, where `/tmp` means
+/// something else entirely — goes looking in the wrong place and reads the
+/// absence of the file as the flag having failed. Printing the resolved
+/// absolute path turns that into a one-glance answer, on the success line as
+/// well as the failure line, because the success case is the one that misleads.
+///
+/// Falls back to the operand as given if the path cannot be made absolute
+/// (empty operand, or a platform error): a diagnostic must never be the thing
+/// that fails.
+fn absolute_dump_path(path: &str) -> String {
+    std::path::absolute(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Why a dump write failed, in the terms that let a caller fix it: the absolute
+/// path attempted, and whether the directory it would have gone in exists.
+///
+/// The OS error alone is not enough. `os error 3` — and its localised text,
+/// which on this host is not English — says "the system cannot find the path",
+/// which is true of a missing parent directory, a typo'd drive letter and a
+/// POSIX path alike. Naming the parent and saying whether it exists separates
+/// those three in one line.
+fn describe_dump_failure(path: &str, error: &impl std::fmt::Display) -> String {
+    let absolute = absolute_dump_path(path);
+    let parent = std::path::Path::new(&absolute)
+        .parent()
+        .map(|p| p.display().to_string());
+    match parent {
+        Some(dir) if !std::path::Path::new(&dir).is_dir() => format!(
+            "{error} (tried to write {absolute}; its directory {dir} does not exist — \
+             create it, or pass a path under an existing directory)"
+        ),
+        Some(dir) => format!("{error} (tried to write {absolute}; its directory {dir} exists)"),
+        None => format!("{error} (tried to write {absolute})"),
+    }
+}
+
+/// The standing caveat on the census's `invocations` column, printed with every
+/// successful `--dump-native-registry`.
+///
+/// MEASURED 2026-08-17 and recorded in
+/// `docs/known-issues/jdk-only/G33-1-the-instrument-that-under-reported-20260817.md`:
+/// the column counts dispatches that resolved the triple by name or id, and
+/// misses every dispatch served from a pre-resolved function pointer — the
+/// interpreter's intrinsic table and the JIT's thin direct-call helpers. 100,000
+/// `Math.abs` calls report 1; the same run under `CRATONVM_DISABLE_INTRINSICS=1`
+/// reports 100,000.
+///
+/// It is printed on the *success* line, next to the number, because that is
+/// where a reader is standing when they decide what the column means. A caveat
+/// that lives only in `--help` or only in a design doc is a caveat that gets
+/// quoted around; a dozen records in `docs/known-issues/jdk-only/` already quote
+/// this tool's output.
+fn census_invocations_caveat(nojit: bool, intrinsics_disabled: bool) -> &'static str {
+    if nojit && intrinsics_disabled {
+        // Both bypass families are off, so the column is a total for
+        // everything measured. Say so — a lane that went to the trouble of
+        // configuring an exact census should be told it got one.
+        "; `invocations` is an exact count in this configuration \
+         (--nojit + CRATONVM_DISABLE_INTRINSICS=1)"
+    } else {
+        "; `invocations` is a LOWER BOUND, not a call count — intrinsic-table and \
+         JIT direct-call dispatches are not counted. For an exact census re-run with \
+         --nojit and CRATONVM_DISABLE_INTRINSICS=1 (see G33-1)"
+    }
+}
+
 fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
     if args.dump_class_origins.is_none()
         && args.dump_native_registry.is_none()
@@ -2572,26 +2916,44 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
     // the census and the violation list so the two describe the same instant.
     if let Some(path) = &args.dump_class_origins {
         match shared.dump_class_origins_json(path, verbose) {
-            Ok(n) => eprintln!("[cratonvm] wrote {n} class-origin rows to {path}"),
-            Err(e) => {
-                eprintln!("[cratonvm] warning: could not write class-origin census to {path}: {e}")
-            }
+            Ok(n) => eprintln!(
+                "[cratonvm] wrote {n} class-origin rows to {}",
+                absolute_dump_path(path)
+            ),
+            Err(e) => eprintln!(
+                "[cratonvm] warning: could not write class-origin census: {}",
+                describe_dump_failure(path, &e)
+            ),
         }
     }
 
     if let Some(path) = &args.dump_native_registry {
         match shared.dump_native_census_json(path, verbose) {
+            // `schema 4`, matching the `"schema_version": 4` the writer in
+            // `cratonvm_vm::vm::vm_init` actually emits and the number
+            // `--help` documents. This line said `schema 3` until 2026-08-17,
+            // which is a bad way for the instrument whose job is to be
+            // believed to introduce itself. If the writer's version moves
+            // again, this literal is the second place to change.
             Ok((intrinsic, bridge, stub)) => eprintln!(
-                "[cratonvm] wrote native registry census (schema 3{}) to {path} \
-                 (intrinsic={intrinsic}, bridge={bridge}, synthetic-stub={stub})",
+                "[cratonvm] wrote native registry census (schema 4{}) to {} \
+                 (intrinsic={intrinsic}, bridge={bridge}, synthetic-stub={stub}){}",
                 if verbose {
                     ", image-adjudicated"
                 } else {
                     ", no image adjudication — pass --explain-jdk-only"
-                }
+                },
+                absolute_dump_path(path),
+                census_invocations_caveat(
+                    cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_JIT")
+                        .is_ok_and(|v| !v.is_empty() && v != "0"),
+                    cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_INTRINSICS")
+                        .is_ok_and(|v| !v.is_empty() && v != "0"),
+                ),
             ),
             Err(e) => eprintln!(
-                "[cratonvm] warning: could not write native registry JSON to {path}: {e}"
+                "[cratonvm] warning: could not write native registry JSON: {}",
+                describe_dump_failure(path, &e)
             ),
         }
     }
@@ -2604,15 +2966,36 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
             // reported alongside it rather than folded in — they are different
             // units (distinct methods versus events) and adding them would
             // produce a number that means nothing.
-            Ok((violations, compatibility_classes)) => eprintln!(
-                "[cratonvm] wrote {} JDK-only report to {path} ({violations} violation(s), \
-                 {compatibility_classes} compatibility class(es), {} refusal event(s))",
-                mode.as_str(),
-                shared.jdk_only_refusal_counts().total(),
-            ),
-            Err(e) => {
-                eprintln!("[cratonvm] warning: could not write JDK-only report to {path}: {e}")
+            Ok((violations, compatibility_classes)) => {
+                eprintln!(
+                    "[cratonvm] wrote {} JDK-only report to {} ({violations} violation(s), \
+                     {compatibility_classes} compatibility class(es), {} refusal event(s))",
+                    mode.as_str(),
+                    absolute_dump_path(path),
+                    shared.jdk_only_refusal_counts().total(),
+                );
+                // The line above is the one number most readers stop at, and
+                // `{violations}` is a floor whenever the observation sink filled
+                // up. Saying so HERE, and not only in the file's
+                // `observation_sink` object, is the difference between a caveat a
+                // reader has to go looking for and one they cannot miss: the
+                // whole failure mode is that a truncated list reads as a
+                // complete one.
+                if cratonvm_vm::vm::jdk_only_native_shadow_sink_saturated() {
+                    eprintln!(
+                        "[cratonvm] warning: the JDK-only observation sink SATURATED at {} \
+                         distinct rows — the shadow rows in violations[] are a FLOOR, not the \
+                         population, and refusals.interpreter_shadow_unenforced stopped \
+                         advancing when it filled. Narrow the workload to read the list as \
+                         exhaustive.",
+                        cratonvm_vm::vm::jdk_only_native_shadow_cap(),
+                    );
+                }
             }
+            Err(e) => eprintln!(
+                "[cratonvm] warning: could not write JDK-only report: {}",
+                describe_dump_failure(path, &e)
+            ),
         }
     }
 }
@@ -3806,7 +4189,16 @@ fn run() -> Result<()> {
     // whatever failure they caused. See `ViolationWatermark` for what this
     // drain still covers now that class-origin violations arrive live.
     let mut jdk_only_watermark = ViolationWatermark::default();
-    if args.trace_jdk_only {
+    // `--explain-jdk-only` is admitted here as well as `--trace-jdk-only`.
+    // `finish_jdk_only` already accepts either (see its gate), so gating the
+    // vm-init drain and the live sink on `trace_jdk_only` ALONE meant
+    // `--jdk-only --explain-jdk-only` on its own got only a shutdown batch:
+    // every mid-run fabrication reported detached from the code that caused it,
+    // which is precisely what `ViolationWatermark`'s own doc says the live sink
+    // exists to prevent. Measured 2026-08-12: none of the nine runtime
+    // fabrication families appears in `--explain-jdk-only` output, while all
+    // thirteen boot-time refusals do.
+    if args.trace_jdk_only || args.explain_jdk_only {
         trace_jdk_only_violations(
             &vm.shared,
             &mut jdk_only_watermark,
@@ -4211,26 +4603,90 @@ fn run() -> Result<()> {
             }
         }
 
-        // WP1.3: initPhase2 / initPhase3 are pure-Java methods on
-        // `java.lang.System` that finalise modules + classpath and
-        // install `ClassLoader.scl`.  We don't run them end-to-end in
-        // cratonvm (the real-JDK module graph resolution pulls in
-        // subsystems we don't implement), but many callers key on
-        // `initLevel() >= 3` to decide whether
-        // `ClassLoader.getSystemClassLoader()` may read the `scl`
-        // field directly.  We leave the level at 2 here — bumping
-        // past it would send those callers down a null-deref path.
-        // The CLI bumps to 4 below, just before `main()`, once the
-        // initPhase2 gate no longer matters.
+        // Initialise the module system. This is HotSpot's `System.initPhase2`
+        // slot in the boot sequence, and it is the only place it belongs.
         //
-        // INTENTIONAL (reviewed): skipping initPhase2/3 here is a deliberate
-        // boot-sequencing choice, NOT a silent wrong-result stub. The
-        // level-management contract is preserved end-to-end (level held at 2
-        // until the gate is moot, then advanced to 3→4 below and the real
-        // `jdk.internal.misc.VM.initLevel(4)` field is set), so observers see a
-        // consistent boot state rather than a fabricated value. Running the
-        // real initPhase2/3 is gated on module-system subsystems we do not yet
-        // implement; if/when those land this skip should be revisited.
+        // WP1.3: initPhase2 / initPhase3 are pure-Java methods on
+        // `java.lang.System`. `initPhase2(boolean, boolean)` is
+        // `ModuleBootstrap.boot()` plus `VM.initLevel(2)`; `initPhase3`
+        // installs `ClassLoader.scl` and sets the TCCL. We do not invoke
+        // either, and the reason for initPhase2 is now a MEASUREMENT rather
+        // than a policy — see docs/known-issues/jdk-only/W7-97-initphase2-skipped.md.
+        //
+        // Measured 2026-08-12, one process per arm, by invoking
+        // `System.initPhase2` reflectively inside the VM under test: it
+        // reaches `ModuleBootstrap.boot()` → `SystemModuleFinders.ofSystem()`
+        // → `ofModuleInfos()` → `ImageReader.getModuleNames()` and dies inside
+        // `ImageReader$SharedImageReader.imageFileAttributes()` with
+        // `UncheckedIOException` / `NoSuchFileException: ` — an EMPTY path —
+        // returning JNI_ERR (-1) and changing NOTHING: the provider counts
+        // below stay at 0. So running it is not a fix we merely have not
+        // written; it is a route that is currently closed.
+        //
+        // WHY it is closed, precisely, because that is the durable part:
+        // `ImageReaderFactory` is boot-loader-defined, so it builds the
+        // runtime-image path with
+        // `sun.nio.fs.DefaultFileSystemProvider.theFileSystem().getPath(...)`
+        // rather than `FileSystems.getDefault()`. In CratonVM those are two
+        // DIFFERENT `WindowsFileSystem` instances (HotSpot: one, identity-equal),
+        // and `Path`s minted by the boot-loader one are inert — `Files.exists`
+        // answers false, `readAttributes` throws `NoSuchFileException`, and
+        // `equals` against the same path from the default filesystem is false,
+        // for a `Path` whose own `toString()` is correct. Repairing that is the
+        // prerequisite for ever running the real `initPhase2`, and it is not in
+        // this file.
+        //
+        // What DOES initialise the module system here is `ModuleLayer.boot()`.
+        // Its native (`register_jboss_jdkspecific`, last-writer-wins over the
+        // `phases_late` stub, both `NativeKind::Bridge` so strict mode keeps
+        // them) runs `build_boot_layer` → `populate_boot_layer_modules` →
+        // `ServicesCatalog.getServicesCatalog(scl).register(module)` for every
+        // registered module. That IS this VM's `ModuleBootstrap.boot()`. Like
+        // the JDK's it runs exactly once, and it runs HERE — before the level
+        // advances below — because `VM.initLevel(4)` wakes every
+        // `awaitInitLevel` waiter, and a thread woken at SYSTEM_BOOTED is
+        // entitled to assume the module system came up at level 2. Its one
+        // externally ordered dependency is `ClassLoader.getSystemClassLoader()`,
+        // which is a native with no init-level gate, so it does not need the
+        // bump that follows.
+        //
+        // Until this runs, `ServiceLoader` returns ZERO module-declared
+        // providers while classpath `META-INF/services` providers keep working
+        // — which is exactly why a `ServiceLoader` probe reads green and this
+        // stayed hidden. Measured under `--jdk-only`:
+        // `java.nio.file.spi.FileSystemProvider` 2 → 0,
+        // `java.util.spi.ToolProvider` 9 → 0, `javax.tools.JavaCompiler` 1 → 0,
+        // and `ToolProvider.getSystemJavaCompiler()` null, which sent H2's
+        // `SourceCompiler` down a `com.sun.tools.javac` path HotSpot never
+        // takes. In `--real-jdk` the `SyntheticStub` `ServiceLoader` natives
+        // covered the gap; `--jdk-only` refuses that kind at registration, so
+        // the same omission stopped being invisible and became a wrong answer.
+        //
+        // The failure is NOT swallowed. HotSpot treats a non-zero `initPhase2`
+        // as fatal to VM creation. We warn rather than abort because this
+        // substitute is narrower than the JDK's phase — an application that
+        // never looks up a service is unharmed — but the operator is told,
+        // because from here on every module-declared provider is silently
+        // absent.
+        match vm.invoke("java/lang/ModuleLayer", "boot", "()Ljava/lang/ModuleLayer;", &[]) {
+            Ok(Some(Value::Object(Some(_)))) => {
+                tracing::info!("module system initialised (ModuleLayer.boot)");
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "module-system init produced no boot layer — every module-declared \
+                     ServiceLoader provider will be missing (HotSpot aborts VM creation \
+                     when System.initPhase2 returns non-zero)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "module-system init failed ({e:?}) — every module-declared \
+                     ServiceLoader provider will be missing (HotSpot aborts VM creation \
+                     when System.initPhase2 returns non-zero)"
+                );
+            }
+        }
     }
 
     // WP1.3: right before `main()` starts, advance to level 4 —
@@ -4265,6 +4721,12 @@ fn run() -> Result<()> {
             &[Value::Int(4)],
         );
     }
+
+    // The boot module layer is materialised in the `System.initPhase2` slot
+    // above, before the level advances — NOT here. It used to be invoked at
+    // this point as a behavioural patch; that placement left a window in which
+    // `VM.initLevel(4)` had already woken every `awaitInitLevel` waiter while
+    // the services catalog was still empty. There is exactly one such call.
 
     // Pre-allocate the singleton java.lang.OutOfMemoryError while the heap is
     // still fresh, so a later 100%-full-heap OOM (in either user code or a
@@ -4532,6 +4994,15 @@ fn run() -> Result<()> {
             "[cratonvm] compiled site-cached native dispatches (non-leaf): {}",
             cratonvm_vm::jit::helpers::site_cached_native_hit_count()
         );
+        // The subset of the line above served as a plain field load rather
+        // than a native call: signature-polymorphic `VarHandle` read modes on
+        // an ordinary instance field. Zero here beside a non-zero site-cached
+        // count means every VarHandle site refused the plan, which is a
+        // different fault from "no VarHandle site was reached".
+        eprintln!(
+            "[cratonvm]   of which VarHandle instance-field reads served directly: {}",
+            cratonvm_vm::jit::helpers::varhandle_field_read_hit_count()
+        );
         // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of
         // the two above: it is the one by-name fast path that decides per
         // dispatch rather than at cache-fill time. Reported separately because
@@ -4564,6 +5035,34 @@ fn run() -> Result<()> {
              IR {ir_sites}/{ir_seen}, OSR {osr_sites}; the two denominators are \
              invokestatic sites those ladders examined)",
             cratonvm_vm::jit::helpers::jit_funnel_bypass_count()
+        );
+        // Why a compiled callee is reached through a Rust helper at all.
+        //
+        // The netty census (`[DISP_CENSUS]`, `CRATONVM_DBG=mic-prof`) says 98.4%
+        // of `jit_invoke_dispatch` calls are `DISPATCH_CACHE` hits — a callee
+        // that IS compiled, entered through the helper on every call. These two
+        // say why: a statically bound site is offered a direct `CALL` exactly
+        // once, while its caller is being compiled, and a callee that is not
+        // compiled yet at that instant leaves the site on the helper forever.
+        let (bind_hits, bind_misses) = cratonvm_jit::direct_callee_bind_counts();
+        eprintln!(
+            "[cratonvm] direct callee binds: {bind_hits} bound, {bind_misses} left on the dispatch helper (statically bound sites where a ladder asked for a direct target)"
+        );
+        // WHICH gate refused. A bare miss total cannot separate a compile-ORDER
+        // accident (the callee simply was not compiled yet — repairable by
+        // re-binding) from a standing policy refusal (an exception table, a
+        // native shadow — which no re-bind touches), and those two want
+        // opposite fixes. `unattributed` is the mutator-side door's arms that
+        // return a bare `None`; a large value there means this list is the one
+        // to extend next, not that the misses are unexplained.
+        let reasons = cratonvm_jit::direct_callee_bind_refusal_reasons();
+        let attributed: u64 = reasons.iter().map(|(_, c)| *c).sum();
+        for (reason, count) in &reasons {
+            eprintln!("[cratonvm]   bind refused, {reason}: {count}");
+        }
+        eprintln!(
+            "[cratonvm]   bind refused, unattributed: {}",
+            bind_misses.saturating_sub(attributed)
         );
     }
 
@@ -4611,7 +5110,14 @@ fn run() -> Result<()> {
     // `--verbose:gc` or the `CRATONVM_GC_STATS` env knob so a gauntlet runner
     // can collect the table without `RUST_LOG`. No-op for the generational
     // collector and when no G1 collection ran.
-    if args.verbose_gc || std::env::var_os("CRATONVM_GC_STATS").is_some() {
+    // `CRATONVM_DBG_G1ACCESSOR` too: the accessor census rides inside
+    // `print_gc_summary`, and a census whose only output path is gated behind a
+    // DIFFERENT flag prints nothing when you ask for it — which reads as
+    // "zero accessor calls" rather than "you never enabled the report".
+    if args.verbose_gc
+        || std::env::var_os("CRATONVM_GC_STATS").is_some()
+        || cratonvm_types::flags::flags().gc.g1_dbg_accessor
+    {
         vm.shared.mem.heap.print_gc_summary();
         {
             // Cross-thread STW peer-scan coverage. A non-zero count means the
@@ -4730,6 +5236,45 @@ fn run() -> Result<()> {
         if joined > 0 {
             tracing::info!("cratonvm: joined {joined} non-daemon thread(s) after main() returned");
         }
+    }
+
+    // W7-92 — the launcher's two exit paths: `main` returned, and `main` threw.
+    // HotSpot runs shutdown hooks on BOTH (measured, 25.0.3+9: the `normal`,
+    // `nondaemon` and `uncaught` rows of the record's oracle table), so this
+    // sits ABOVE the `match` for the same reason the slot-map census at :4361
+    // does. `System.exit` / `Runtime.exit` never reach this line;
+    // `lang_system::native_system_exit` carries the trigger for those.
+    //
+    // AFTER `wait_for_non_daemon_threads`, and that ordering is not cosmetic:
+    // HotSpot's `nondaemon` transcript prints `KEEPER-DONE` BEFORE the hook
+    // output. Shutdown does not begin until the last non-daemon thread ends.
+    //
+    // Called directly rather than through `vm.invoke("java/lang/Shutdown",
+    // "runHooks", "()V", &[])`. The Java route would depend on
+    // `java/lang/Shutdown` resolving, which is a real-JDK-mode assumption —
+    // and a bridge that silently does nothing in synthetic-JDK mode is the
+    // exact failure shape this record is about. The native registration on
+    // that triple still exists for JDK-side callers; both land on the same
+    // drained list, so neither can double-run the hooks.
+    //
+    // KNOWN ORDERING DIVERGENCE, stated rather than discovered: on the
+    // uncaught-exception path HotSpot prints the stack trace and THEN runs the
+    // hooks. Here the trace is rendered by `bail!` and printed by `main()`
+    // after `run()` returns, so CratonVM's hook output lands BEFORE it. Fixing
+    // that means restructuring how the launcher renders a fatal exception,
+    // which is a change to output every harness in this tree reads; W7-92 §7
+    // records it as the follow-up.
+    {
+        let mut ctx = cratonvm_vm::vm::NativeContextImpl {
+            shared: &vm.shared,
+            thread: &mut vm.main_thread,
+        };
+        let trigger = if result.is_ok() {
+            "main-returned"
+        } else {
+            "uncaught"
+        };
+        cratonvm_native_builtins::lang_system::run_shutdown_hooks(&mut ctx, trigger);
     }
 
     match result {
@@ -5413,6 +5958,14 @@ fn main() {
     // ordering boundary.
     let early_argv =
         insert_program_args_separator(expand_argfiles(std::env::args().collect::<Vec<_>>()));
+    // A launcher flag parked in the program-args tail is discarded in silence
+    // — exit 0, no file, no diagnostic. Say so before anything else runs, so
+    // the warning is the first thing on stderr rather than the last, and so it
+    // is emitted even on the paths that exit before `run()` ever parses argv.
+    // This is the ONLY consumer of `early_argv` that does not also change
+    // behaviour: nothing is rewritten, `java` positional semantics are intact,
+    // and the misplaced token still reaches the Java program verbatim.
+    warn_about_misplaced_launcher_flags(&early_argv);
     let mut flag_overrides = cratonvm_types::MapSource::empty();
     if launcher_nojit_requested(&early_argv) {
         flag_overrides = flag_overrides.with("CRATONVM_DISABLE_JIT", "1");
@@ -5808,6 +6361,7 @@ fn main() {
             maybe_dump_shutdown_reports();
             match result {
                 Ok(()) => {
+                    cratonvm_vm::jit::conservative_roots::report_a5_engagement();
                     eprintln!("[cratonvm] main-vm run() returned Ok — VM main exiting normally");
                     let _ = std::io::stderr().flush();
                 }
@@ -5821,6 +6375,25 @@ fn main() {
                     // pasted terminal transcript sufficient for triage.
                     eprintln!("[cratonvm] {}", active_jdk_mode_line());
                     let _ = std::io::stderr().flush();
+                    // G11-1: STDOUT too, and only here — this arm ends in
+                    // `std::process::exit`, which runs no destructors, and the
+                    // fd table's fd-1 entry is a `Mutex<io::Stdout>`, i.e. a
+                    // LINE writer. A Java program whose last `System.out`
+                    // write had no trailing newline (`System.out.print`, a
+                    // partial `write`) and which then died on an uncaught
+                    // exception lost those bytes: the stderr flush three lines
+                    // up never touched them. HotSpot does not lose them —
+                    // MEASURED on Temurin 25.0.3+9, `HookProbe noflush` and
+                    // `haltnoflush`, where an unterminated unflushed
+                    // `System.out.print` survives both `System.exit(0)` and
+                    // `Runtime.halt(6)`.
+                    //
+                    // Deliberately additive: no output is produced, no
+                    // ordering changes (stderr is flushed first, as before),
+                    // and the exit code stays 1. `let _` because a broken pipe
+                    // on stdout must not turn a Java-level failure into a
+                    // different one.
+                    let _ = std::io::stdout().flush();
                     std::process::exit(1);
                 }
             }
@@ -5828,6 +6401,11 @@ fn main() {
         .expect("failed to spawn main-vm thread");
     handler.join().unwrap_or_else(|e| {
         eprintln!("main-vm thread panicked: {:?}", e);
+        // Same reason as the `Err` arm above: this is a `process::exit` path.
+        // A VM panic is the case where buffered application output is most
+        // worth having, since it is the evidence for where the VM was.
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         std::process::exit(1);
     });
 }
@@ -6445,6 +7023,206 @@ mod tests {
             out,
             argv(&["java", "-cp", "bench", "Main", "--", "--help", "0"])
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // misplaced_launcher_flags — the silent-ignore family (G33-1 defect 2).
+    // The detector is pure and reads the argv `insert_program_args_separator`
+    // produced, so these compose the two functions exactly as `main()` does.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn misplaced_dump_flag_after_main_class_is_detected() {
+        // The exact shape that cost this campaign time twice: the census flag
+        // parked behind the main class. The launcher discards it, the VM exits
+        // 0 and writes nothing, and before this warning nothing said so.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-cp",
+            "build",
+            "RJdkHello",
+            "--dump-native-registry",
+            "reg.json",
+        ]));
+        assert_eq!(
+            misplaced_launcher_flags(&out),
+            vec!["--dump-native-registry"]
+        );
+    }
+
+    #[test]
+    fn correctly_placed_flags_are_not_reported() {
+        // The whole family, all ahead of the selector. A detector that fires
+        // here would train every reader to ignore it, which is worse than not
+        // having one.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "--jdk-only",
+            "--nojit",
+            "--dump-native-registry",
+            "reg.json",
+            "--jdk-only-report",
+            "r.json",
+            "-cp",
+            "build",
+            "Main",
+            "5",
+        ]));
+        assert!(misplaced_launcher_flags(&out).is_empty());
+    }
+
+    #[test]
+    fn misplaced_flags_are_reported_once_each_in_argv_order() {
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-cp",
+            "build",
+            "Main",
+            "--nojit",
+            "--jdk-only",
+            "--nojit",
+            "--dump-native-registry=reg.json",
+        ]));
+        assert_eq!(
+            misplaced_launcher_flags(&out),
+            // Order is argv order, not list order, so the message reads in the
+            // order the user typed. Deduplicated, because a repeated flag is
+            // one mistake.
+            vec!["--nojit", "--jdk-only", "--dump-native-registry"],
+            "the inline `--flag=value` form must report as the bare flag"
+        );
+    }
+
+    #[test]
+    fn misplaced_detection_covers_the_jar_form_too() {
+        // `-jar app.jar` is the other program selector, and it is the form a
+        // build tool is most likely to append flags to.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-jar",
+            "app.jar",
+            "--jdk-only-report",
+            "r.json",
+        ]));
+        assert_eq!(misplaced_launcher_flags(&out), vec!["--jdk-only-report"]);
+    }
+
+    #[test]
+    fn a_program_argument_that_merely_resembles_a_flag_is_not_reported() {
+        // Only exact spellings from the list. A program arg that shares a
+        // prefix, or a value that happens to look like one, must not fire —
+        // the warning has to survive contact with real command lines.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-cp",
+            "build",
+            "Main",
+            "--dump-native-registry-v2",
+            "--jdk-only-reporter",
+            "--dump",
+            "-nojit",
+        ]));
+        assert!(misplaced_launcher_flags(&out).is_empty());
+    }
+
+    #[test]
+    fn no_program_selector_means_nothing_is_misplaced() {
+        // `cratonvm --jdk-only --version`: no separator is inserted at all, so
+        // every token is still a launcher option and none is discarded.
+        let out = insert_program_args_separator(argv(&["cratonvm", "--jdk-only", "--version"]));
+        assert!(misplaced_launcher_flags(&out).is_empty());
+    }
+
+    #[test]
+    fn an_explicit_separator_still_delimits_the_tail() {
+        // A caller who writes `--` themselves gets the same treatment: the
+        // tail is the program's, and a launcher flag in it is discarded.
+        let out = insert_program_args_separator(argv(&[
+            "cratonvm",
+            "-cp",
+            "build",
+            "--",
+            "Main",
+            "--trace-jdk-only",
+        ]));
+        assert_eq!(misplaced_launcher_flags(&out), vec!["--trace-jdk-only"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dump-path diagnostics — the other half of G33-1 defect 2: a path the
+    // caller cannot find is as bad as no file at all.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn absolute_dump_path_resolves_a_relative_operand() {
+        let resolved = absolute_dump_path("reg.json");
+        let path = std::path::Path::new(&resolved);
+        assert!(
+            path.is_absolute(),
+            "a relative operand must be reported as the absolute path actually written: {resolved}"
+        );
+        assert!(resolved.ends_with("reg.json"));
+    }
+
+    #[test]
+    fn absolute_dump_path_never_fails_on_a_degenerate_operand() {
+        // A diagnostic that can itself fail is not a diagnostic. The empty
+        // operand is the one input `std::path::absolute` rejects.
+        assert_eq!(absolute_dump_path(""), "");
+    }
+
+    #[test]
+    fn dump_failure_names_the_path_and_the_missing_directory() {
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let message = describe_dump_failure(
+            "no-such-dir-4b7f1e/deeper/reg.json",
+            &format!("{err} (os error 3)"),
+        );
+        assert!(
+            message.contains("no-such-dir-4b7f1e"),
+            "the attempted path must appear: {message}"
+        );
+        assert!(
+            message.contains("does not exist"),
+            "a missing parent directory is the common cause and must be named: {message}"
+        );
+        assert!(
+            message.contains("os error 3"),
+            "the underlying OS error must survive: {message}"
+        );
+    }
+
+    #[test]
+    fn dump_failure_says_so_when_the_directory_does_exist() {
+        // Distinguishing "no such directory" from "the directory is there and
+        // the write still failed" is the whole point — the second is a
+        // permissions or locking problem and sends the reader somewhere else.
+        let dir = std::env::temp_dir();
+        let path = dir.join("g33-1-existing-dir-probe.json");
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = describe_dump_failure(&path.display().to_string(), &err);
+        assert!(
+            message.contains("exists"),
+            "an existing parent must be reported as existing: {message}"
+        );
+        assert!(!message.contains("does not exist"), "{message}");
+    }
+
+    #[test]
+    fn the_census_caveat_is_only_dropped_when_both_bypasses_are_off() {
+        // Three of the four configurations leave at least one bypass family
+        // live, and in all three the column is a floor. Only the fourth may
+        // claim an exact count.
+        for (nojit, no_intrinsics) in [(false, false), (true, false), (false, true)] {
+            let text = census_invocations_caveat(nojit, no_intrinsics);
+            assert!(
+                text.contains("LOWER BOUND"),
+                "nojit={nojit} intrinsics-off={no_intrinsics} must warn: {text}"
+            );
+        }
+        let exact = census_invocations_caveat(true, true);
+        assert!(exact.contains("exact count"), "{exact}");
+        assert!(!exact.contains("LOWER BOUND"), "{exact}");
     }
 
     #[test]

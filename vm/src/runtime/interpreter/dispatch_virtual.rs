@@ -475,7 +475,6 @@ pub(super) fn execute_invokevirtual_vtable_fast(
             // inner one blocks.
             {
                 const MAX_DEPTH: usize = 32;
-                const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
                 let mut current = Some(receiver_class_id);
                 let mut is_proxy = false;
                 for _ in 0..MAX_DEPTH {
@@ -487,7 +486,20 @@ pub(super) fn execute_invokevirtual_vtable_fast(
                         Some(c) => c,
                         None => break,
                     };
-                    if &*class.name == PROXY_INSTANCE {
+                    // `class_name_is_proxy_super`, NOT a local
+                    // `Proxy$Instance` literal. The super of a generated
+                    // `$ProxyN` is `java/lang/reflect/Proxy` by default
+                    // (`CRATONVM_REAL_PROXY_SUPER` is truthy-default-true),
+                    // so a one-name test recognises no shipped proxy and
+                    // this guard never fired between 2026-07-02 and
+                    // 2026-08-13 — see, under docs/known-issues/jdk-only/,
+                    // F32-1-the-proxy-route-and-the-drifted-twin-20260813.md.
+                    // The shared predicate is name-only and takes NO lock,
+                    // which is what makes it callable under the `cm` guard
+                    // this block holds (a nested second read self-deadlocks
+                    // under parking_lot's writer-preferring fairness — the
+                    // original reason this walk was inlined at all).
+                    if class_name_is_proxy_super(&class.name) {
                         is_proxy = true;
                         break;
                     }
@@ -821,13 +833,12 @@ pub(super) fn execute_invokevirtual_vtable_fast(
     // category-2 long arg whose NaN-box bit pattern collides with a tagged
     // sub-tag (BC safegcd 0xFFFC_… accumulators). See
     // gaps/bc-ec-mod-mododdinverse-investigation.md.
-    let arg_desc_byte = |i: usize| -> u8 {
-        if i == 0 {
-            b'L'
-        } else {
-            nth_param_tag_byte(&entry_cached.method_descriptor, i - 1)
-        }
-    };
+    // ONE forward scan for the whole descriptor. This closure used to call
+    // `nth_param_tag_byte` per argument, and that rescans from `(` each time,
+    // so popping N args cost O(N^2) tokenising of a string fixed per call site.
+    let param_tags = ParamTags::of(&entry_cached.method_descriptor);
+    let arg_desc_byte =
+        |i: usize| -> u8 { param_tags.get_with_receiver(&entry_cached.method_descriptor, i) };
     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
     let mut args_vec: Vec<Value> = Vec::new();
     let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {
@@ -1717,13 +1728,13 @@ pub(super) fn execute_invokevirtual_cached(
                     // = 'L'); pop_unchecked()/to_value() dropped the high bits
                     // of collision-pattern long args. See
                     // gaps/bc-ec-mod-mododdinverse-investigation.md.
-                    let arg_desc_byte = |i: usize| -> u8 {
-                        if i == 0 {
-                            b'L'
-                        } else {
-                            nth_param_tag_byte(&cached.method_descriptor, i - 1)
-                        }
-                    };
+                    // ONE forward scan; the per-argument form rescanned from `(` each time.
+
+                    let param_tags = ParamTags::of(&cached.method_descriptor);
+
+                    let arg_desc_byte =
+
+                        |i: usize| -> u8 { param_tags.get_with_receiver(&cached.method_descriptor, i) };
                     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
                     let mut args_vec: Vec<Value> = Vec::new();
                     let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {
@@ -2519,13 +2530,13 @@ pub(super) fn execute_invokevirtual_cached(
             // Decode args bit-exact via parameter descriptors (receiver = 'L');
             // pop_unchecked()/to_value() dropped the high bits of collision-
             // pattern long args. See gaps/bc-ec-mod-mododdinverse-investigation.md.
-            let arg_desc_byte = |i: usize| -> u8 {
-                if i == 0 {
-                    b'L'
-                } else {
-                    nth_param_tag_byte(&cached.method_descriptor, i - 1)
-                }
-            };
+            // ONE forward scan; the per-argument form rescanned from `(` each time.
+
+            let param_tags = ParamTags::of(&cached.method_descriptor);
+
+            let arg_desc_byte =
+
+                |i: usize| -> u8 { param_tags.get_with_receiver(&cached.method_descriptor, i) };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
             let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {
@@ -3031,6 +3042,21 @@ pub(super) fn populate_virtual_invoke_cache(
                 // `VirtualNative` gate binding below.
                 let gate =
                     RedefineGate::snapshot(cm.class_redefine_generation_handle(receiver_class_id));
+                // Census: unlike the `invokestatic` twin in `dispatch_static.rs`,
+                // this block reaches an intrinsic through the CLASS STORE — it
+                // never resolved a `NativeMethodId`, so one has to be looked up
+                // to be declared. The row to mark is the DECLARING class's: the
+                // walk above has already established that no native is
+                // registered strictly below `declaring_id`
+                // (`native_override_below_declaring`), so the declaring triple
+                // is the only registry row this cache fill can shadow.
+                // Resolved before `cm` is dropped, because `declaring_name`
+                // borrows the class store.
+                let bypassed_native_id = shared.natives.native_methods.resolve_id(
+                    declaring_name,
+                    &method_name,
+                    &descriptor,
+                );
                 drop(cm);
                 // Phase 3 — split the descriptor ONCE here so the
                 // steady-state dispatch path never re-resolves or re-parses.
@@ -3038,6 +3064,9 @@ pub(super) fn populate_virtual_invoke_cache(
                 let param_descs: Arc<[Arc<str>]> =
                     pd_vec.iter().map(|s| Arc::from(s.as_str())).collect();
                 let return_type = crate::jit::return_type(&descriptor);
+                if let Some(id) = bypassed_native_id {
+                    mark_intrinsic_cache_bypass(&shared.natives.native_methods, id);
+                }
                 let target = CachedInvokeTarget::Intrinsic {
                     kind,
                     callback: cratonvm_native_builtins::intrinsics::callback_for(kind),
@@ -3691,4 +3720,89 @@ pub(super) const SPRING_MERGED_ANNOTATION_ADAPT: &str =
 #[inline]
 pub(super) fn adapt_isin_seen() -> bool {
     ADAPT_ISIN_SEEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The census half of this file's intrinsic inline-cache fill.
+///
+/// The helpers themselves live in `dispatch_static.rs` (with the rest of the
+/// interpreter intrinsic table) and are unit-tested there. What is specific to
+/// THIS file, and what these tests pin, is **which registry row it marks**:
+/// unlike the `invokestatic` twin, this block reaches its intrinsic through the
+/// class store and never resolved a `NativeMethodId`, so one has to be looked
+/// up — and looking up the wrong one is a silent failure.
+///
+/// Recorded in
+/// `docs/known-issues/jdk-only/G42-1-the-intrinsic-cache-and-the-1999-20260817.md`.
+#[cfg(test)]
+mod intrinsic_census_virtual_tests {
+    use super::mark_intrinsic_cache_bypass;
+    use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
+    use cratonvm_types::error::MethodCallResult;
+    use cratonvm_types::Value;
+
+    fn dummy_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(None)
+    }
+
+    /// Reproduces the exact two-step this file performs — `resolve_id` on the
+    /// **declaring** class while the class-manager read guard is still alive,
+    /// then `mark_intrinsic_cache_bypass` once the guard is dropped — and pins
+    /// that it lands on the declaring row.
+    ///
+    /// The receiver's own class is the tempting wrong answer, and it is wrong
+    /// twice over: the superclass walk above the call site has already
+    /// established that nothing is registered strictly below the declaring
+    /// class (`native_override_below_declaring`, which would have *vetoed* the
+    /// intrinsic if it had found one), so a receiver-keyed lookup would resolve
+    /// nothing and mark nothing — leaving the row that actually loses the calls
+    /// still claiming to be a total.
+    ///
+    /// `java/lang/Object.hashCode()I` is the concrete case: G33-1 §2 measured
+    /// it reporting **1** for 100,000 interpreted calls.
+    #[test]
+    fn the_declaring_classes_row_is_the_one_that_loses_the_calls() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("java/lang/Object", "hashCode", "()I", dummy_native);
+        });
+        // The receiver class in this scenario registers nothing — that is
+        // precisely why the intrinsic was allowed to win.
+        assert!(
+            registry
+                .resolve_id("p/Receiver", "hashCode", "()I")
+                .is_none(),
+            "the walk would have vetoed the intrinsic if the receiver had a native"
+        );
+
+        let declaring_name = "java/lang/Object";
+        let bypassed_native_id = registry.resolve_id(declaring_name, "hashCode", "()I");
+        let id = bypassed_native_id.expect("the declaring class carries the row");
+
+        registry.record_invocation(id);
+        mark_intrinsic_cache_bypass(&registry, id);
+
+        assert_eq!(
+            registry.invocations_of_id(id),
+            Some(1),
+            "the floor survives — this is the measured `Object.hashCode` = 1"
+        );
+        assert_eq!(registry.invocations_complete(id), Some(false));
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+    }
+
+    /// A record's `hashCode`/`equals` intrinsic (`record_object_intrinsic`) is
+    /// not keyed on a fixed class and has no registry row at all, so the
+    /// resolve yields `None` and the fill proceeds unmarked. That is correct:
+    /// a triple with no row has no `invocations` cell to mislead anyone.
+    ///
+    /// It must also not panic — this is the inline-cache fill path for every
+    /// virtual call in the VM.
+    #[test]
+    fn an_intrinsic_with_no_registry_row_leaves_the_census_untouched() {
+        let registry = NativeMethodRegistry::new();
+        assert!(registry
+            .resolve_id("p/SomeRecord", "hashCode", "()I")
+            .is_none());
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+    }
 }

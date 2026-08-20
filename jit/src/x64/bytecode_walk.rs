@@ -13,6 +13,65 @@
 
 use super::*;
 
+/// The int constant pushed by the instruction IMMEDIATELY before `pc`, if that
+/// instruction is a constant push.
+///
+/// E27-1 N2b. The guarded inline `indexOf(I)` scan is only admissible for a
+/// needle in `0..=0xFFFF`, because outside that range the JDK's rule is
+/// `Character.isValidCodePoint` plus a surrogate-PAIR match and the inline
+/// single-code-unit scan is simply a different function. The obvious way to
+/// enforce that is a runtime screen with a deopt on the miss — and it is a
+/// trap: the miss path invalidates the whole compiled method
+/// (`DeoptimizationController::deoptimize`) and `ReceiverTypeChanged` is given
+/// `RecompileAndReinterpret` on EVERY occurrence, then `MakeNotCompilable`. A
+/// supplementary needle is a property of the DATA, so it recurs, and the
+/// method would be recompiled per call and then barred from compilation.
+///
+/// So the screen is here, at COMPILE time, and its miss costs nothing: the
+/// site simply is not intrinsified and takes the dispatch it takes today.
+///
+/// `ldc`/`ldc_w` are deliberately NOT decoded — they need the constant pool,
+/// which this layer does not have. A `char` literal above `0x7FFF` therefore
+/// falls back to dispatch. That is a missed optimisation, never a wrong
+/// answer, and it is the rare shape: `indexOf(',')`, `indexOf('/')`,
+/// `indexOf('=')` are `bipush`/`sipush`.
+///
+/// Scans from 0 rather than keeping a running "previous instruction" — the
+/// callers are `invokevirtual` sites that already resolved to one specific
+/// intrinsic, of which a method has a handful, and a linear scan of a
+/// bytecode array is nothing next to the compile it is part of.
+pub(super) fn prev_insn_int_const(code: &[u8], code_len: usize, pc: usize) -> Option<i32> {
+    if pc == 0 || pc > code_len {
+        return None;
+    }
+    let mut cur = 0usize;
+    let mut prev: Option<usize> = None;
+    while cur < pc {
+        let next = cur + crate::scev::bytecode_len(code, cur, code_len);
+        if next > pc {
+            // `pc` is not an instruction boundary on this linear decode
+            // (a jump target inside a wide/tableswitch pad, say). Decline.
+            return None;
+        }
+        prev = Some(cur);
+        cur = next;
+    }
+    let at = prev?;
+    match code.get(at)? {
+        // iconst_m1 .. iconst_5
+        op @ 0x02..=0x08 => Some(*op as i32 - 0x03),
+        // bipush <i8>
+        0x10 => code.get(at + 1).map(|b| *b as i8 as i32),
+        // sipush <i16>
+        0x11 => {
+            let hi = *code.get(at + 1)? as i16;
+            let lo = *code.get(at + 2)? as i16;
+            Some((((hi << 8) | lo) as i16) as i32)
+        }
+        _ => None,
+    }
+}
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Bytecode compilation
@@ -1761,31 +1820,86 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // aastore — store reference to Object[] array (inline store + barrier-only call)
+                // aastore — store a reference into a reference array.
                 //
-                // R20 / HIGH-5 (see docs/PRESENTATION.md): replace the full `jit_aastore`
-                // helper call with an inline `MOV QWORD [array + index*8 + HEADER_SIZE], val`
-                // followed by a CALL to the much-cheaper `write_barrier` helper. The barrier
-                // helper short-circuits when `val == 0` (null), so we don't need an inline
-                // null check. Array layout is compact 8-byte pointers (matches the already-
-                // inlined `aaload` path).
+                // Lowered INLINE (null check, bounds check, covariance check,
+                // SATB pre-write barrier, store, card mark). The single
+                // call-out is `jit_aastore_type_check` (vm/src/jit/helpers.rs),
+                // because answering the JVMS §6.5 covariance question needs the
+                // class manager. The complete-opcode helper `jit_aastore` is
+                // NOT reached from here.
                 //
-                // ArrayStoreException: enforced here by calling
-                // `jit_aastore_type_check` before the store (see below).
+                // ## Why the covariance check is emitted at all
                 //
                 // This note used to read "the current `jit_aastore` helper does
-                // NOT enforce the ASE check … no regression". That premise was
-                // true when written, and was falsified when the check landed in
-                // `jit_aastore` — silently, because this path had already
-                // stopped calling that helper and a premise in a comment is not
-                // a compile-time link. For the ~day it stood, a JIT-compiled
-                // `aastore` performed the store and raised nothing:
-                // `RExceptions` reads `cold=[java.lang.Integer] hot=[no-throw]`
+                // NOT enforce the ASE check (the interpreter does it via
+                // `set_array_element`). This inline path matches the helper's
+                // behavior exactly — no regression." That premise was TRUE when
+                // R20 / HIGH-5 (docs/PRESENTATION.md) replaced the helper call
+                // with the inline store, and was FALSIFIED later — silently —
+                // when the JVMS §aastore covariance check landed inside
+                // `jit_aastore`, because this path had already stopped calling
+                // that helper and a premise stated in a comment is not a
+                // compile-time link. From that moment the compiled tier
+                // performed every reference array store unconditionally while
+                // the interpreter refused the illegal ones, and nothing failed
+                // to build.
+                //
+                // The consequence is not a wrong answer, it is heap type
+                // confusion: `Object[] a = new String[1]; a[0] = anInteger;`
+                // leaves an `Integer` inside a `String[]`, so a later
+                // `aaload`-and-use reads a `String`-typed reference to an
+                // `Integer` with no cast to catch it. Under a precise GC that
+                // is a memory-safety-relevant corruption, not an etiquette
+                // problem — and it is TIER-DEPENDENT: correct for the first
+                // ~500 executions and wrong once the method tiers up.
+                // `RExceptions` read `cold=[java.lang.Integer] hot=[no-throw]`
                 // at i≈500, i.e. the tier-parity assertion caught it the moment
-                // the method tiered up. The claim that an inline ASE check
-                // "needs type-narrowing infrastructure" is also not so: type
-                // narrowing is what would let a check be ELIDED, not what makes
-                // one correct.
+                // the method tiered up. See
+                // docs/known-issues/jdk-only/W7-38-jit-aastore-never-called-its-own-check.md.
+                //
+                // The claim that an inline ASE check "needs type-narrowing
+                // infrastructure" is also not so: type narrowing is what would
+                // let a check be ELIDED, not what makes one correct. And the
+                // rule now lives in exactly ONE body — `aastore_store_is_refused`
+                // in vm/src/jit/helpers.rs, shared by `jit_aastore_type_check`
+                // and `jit_aastore` — so the inline lowering and the full helper
+                // can never again enforce different rules.
+                //
+                // ## Ordering — JVMS §6.5 is NPE → AIOOBE → ASE
+                //
+                // Not stylistic. Putting the covariance check ahead of the
+                // bounds check reproduces the exact divergence
+                // `RArrayStoreTiers` s15 caught in the interpreter fast path:
+                // ASE reported for a past-the-end index.
+                //
+                // `flush_scratch_registers` first: it rewrites every
+                // register-resident (`Scratch`/`Xmm`) stack slot to a frame
+                // slot, so every `load_slot_to_reg` below reads from memory and
+                // cannot clobber another's source register regardless of ABI
+                // (`ARG_REGS` is RCX/RDX/R8/R9 on Windows, RDI/RSI/RDX/RCX on
+                // SysV).
+                //
+                // A helper call clobbers the caller-saved registers, so
+                // `array_slot` / `index_slot` / `val_slot` are RE-LOADED after
+                // the check and again after the SATB barrier. Hoisting those
+                // loads above either call is silently wrong.
+                //
+                // 0x53 is a one-byte opcode, so
+                // `emit_post_invoke_exception_check` keeps THIS pc as the throw
+                // pc, which is what the handler `[start_pc, end_pc)` range test
+                // needs (see the note at that function).
+                //
+                // ## Why this arm must force the dispatch-aware entry
+                //
+                // `jit_aastore_type_check` builds its `ArrayStoreException`
+                // through `jit_thread_mut()`, which only the dispatch-aware
+                // entry sets (`vm/src/runtime/interpreter/jit_bridge.rs` — the
+                // `!compiled.has_dispatch` arm skips `set_jit_thread`). Without
+                // it the check fails open (its documented last resort) and the
+                // illegal store proceeds. `emitted_aastore_throw` below is what
+                // forces that entry; `x64/driver.rs` reads it alongside
+                // `emitted_checkcast_throw`, for the same reason.
                 0x53 => {
                     self.flush_scratch_registers();
                     let val_slot = self.pop_stack();
@@ -1794,7 +1908,9 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     // Round-8 CRIT fix: NPE on null array (JVMS §aastore).
+                    // Records a null-check stub.
                     self.emit_null_check_array_store_at(code, pc);
+                    // AIOOBE. Records a bounds-check stub.
                     self.emit_bounds_check(pc);
                     // JVMS §aastore covariance check, BEFORE anything mutates:
                     // on a refusal no element may be written and no barrier may
@@ -1823,6 +1939,11 @@ impl Compiler {
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.aastore_type_check);
                     self.emit_oop_map_for_safepoint();
+                    // `b'V'` is the OPCODE's return descriptor, which is what
+                    // this parameter documents; it selects the plain
+                    // `CMP RAX, i64::MIN; JE bail`, correct because the helper
+                    // returns only `0` or the sentinel — RAX here is a defined
+                    // value, not the undefined RAX a `-> ()` helper leaves.
                     self.emit_post_invoke_exception_check(b'V');
                     self.emitted_aastore_throw = true;
                     {
@@ -2006,6 +2127,53 @@ impl Compiler {
                 // pop
                 0x57 => {
                     let _ = self.pop_stack();
+                    pc += 1;
+                }
+
+                // pop2
+                //
+                // Absent until 2026-08-17, and not a rare shape: javac emits
+                // `pop2` whenever a call returning `long`/`double` is used as a
+                // STATEMENT. commons-math's `PSquarePercentile$Markers` has one
+                // in `adjustHeightsOfMarkers` (discarding `estimate(int)`) and
+                // one in `findCellAndUpdateMinMax` (discarding a synthetic
+                // `access$502` setter), and those two methods are called once
+                // per `increment()` — so the whole P-square hot loop refused to
+                // compile over a missing stack-height adjustment. See
+                // bug-commonsmath-accuratemathtest-psquarepercentiletest-interpreter-throughput-cliff-20260816.
+                //
+                // The operand model holds ONE entry per VALUE, not per JVM slot,
+                // so form 2 (a single category-2 value) pops once and form 1
+                // (two category-1 values) pops twice. `dup2_top_cat2` answers
+                // the same width question `dup2` asks, from the producing
+                // instruction.
+                0x58 => {
+                    match self.dup2_top_cat2(code, pc) {
+                        // FORM-2: one category-2 value occupies one entry.
+                        Some(true) => {
+                            let _ = self.pop_stack();
+                        }
+                        // FORM-1: two category-1 values.
+                        Some(false) if self.stack.len() >= 2 => {
+                            let _ = self.pop_stack();
+                            let _ = self.pop_stack();
+                        }
+                        _ => {
+                            // Unprovable top width (or a malformed FORM-1 with
+                            // height < 2). Mirror `dup2`: keep the modelled
+                            // height plausible for the rest of the dispatch loop
+                            // so a later handler does not raise a second,
+                            // misleading failure before the post-loop `failed`
+                            // check discards this compilation.
+                            self.fail("singlepass-codegen/pop2-unprovable-top-width");
+                            for _ in 0..2 {
+                                if self.stack.is_empty() {
+                                    break;
+                                }
+                                let _ = self.pop_stack();
+                            }
+                        }
+                    }
                     pc += 1;
                 }
 
@@ -2242,6 +2410,203 @@ impl Compiler {
                             // plausible stack height until the post-loop `failed`
                             // check discards this compilation.
                             self.fail("singlepass-codegen/dup2-unprovable-top-width");
+                            let _ = self.push_stack();
+                            let _ = self.push_stack();
+                        }
+                    }
+                    pc += 1;
+                }
+
+                // dup2_x1 — FORM-2 `[…, b, w] → […, w, b, w]` (w category-2 =
+                // ONE entry in this value model, b category-1) vs FORM-1
+                // `[…, c, b, a] → […, b, a, c, b, a]` (all three category-1).
+                //
+                // Only FORM-2 is admitted, and proving it needs just the top's
+                // width: a VERIFIED `dup2_x1` whose top is category-2 cannot be
+                // FORM-1 (that form is all category-1), and JVMS requires its
+                // value2 to be category-1 — a category-2 second operand would
+                // have had to be `dup2_x2`. So `dup2_top_cat2` answering `true`
+                // settles the shape on its own.
+                //
+                // In this model FORM-2 is then structurally identical to
+                // `dup_x1` above: push a copy of the top, rotate the top three
+                // entries right by one. FORM-1 needs a different rotate over
+                // five entries and has no witness here, so it stays interpreted
+                // — same conservatism as `dup_x2`.
+                //
+                // What this unsticks: javac emits `dup2_x1` for
+                // `return this.field = value;` on a long/double field, which is
+                // every synthetic outer-class setter of a `double` field.
+                // commons-math's `PSquarePercentile$Marker.access$502` is one,
+                // reached from the P-square min/max update path.
+                0x5d => {
+                    let top_cat2 = self.dup2_top_cat2(code, pc);
+                    if dupx_codegen_disabled()
+                        || dup_x1_codegen_disabled()
+                        || top_cat2 != Some(true)
+                        || self.stack.len() < 2
+                    {
+                        self.fail("singlepass-codegen/dup2_x1-unprovable-form");
+                        let _ = self.push_stack();
+                    } else {
+                        let a_slot = self.peek_stack();
+                        let a_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let before = self.stack.len();
+                        self.load_slot_to_reg(RAX, a_slot);
+                        self.push_from_rax(); // […, b, a, aC]
+                        // `push_from_rax` is silent when it cannot reserve a
+                        // spill slot — it emits nothing and does not grow the
+                        // model, and the rotate below would then reorder the
+                        // WRONG three entries. See the same guard in `dup_x1`.
+                        if self.stack.len() != before + 1 {
+                            self.fail("singlepass-codegen/dup2_x1-copy-not-pushed");
+                            pc += 1;
+                            continue;
+                        }
+                        if a_oop {
+                            self.mark_top_as_oop();
+                        }
+                        let n = self.stack.len();
+                        self.stack[n - 3..].rotate_right(1); // […, aC, b, a]
+                        self.stack_oop_marks[n - 3..].rotate_right(1);
+                        if dupx_eager_canon() {
+                            self.canonicalize_stack();
+                        }
+                    }
+                    pc += 1;
+                }
+
+                // dup2_x2 — the last category-dependent stack shuffle x64
+                // did not lower. `jit_scan` has always ADMITTED it (it just
+                // advances `pc`), so before this arm existed the method reached
+                // the dispatch loop's `_ =>` catch-all and lost its compilation
+                // for the life of the process, with the refusal attributed to
+                // an arm that names nothing. See
+                // fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md.
+                //
+                // Four JVMS forms. In this backend's operand model — one entry
+                // per VALUE, so a category-2 long/double is ONE entry — they
+                // are four different shuffles over two, three or four entries:
+                //
+                //   FORM 4  v1,v2 cat-2   [v2, v1]         -> [v1, v2, v1]
+                //   FORM 2  v1 cat-2      [v3, v2, v1]     -> [v1, v3, v2, v1]
+                //   FORM 3  v3 cat-2      [v3, v2, v1]     -> [v2, v1, v3, v2, v1]
+                //   FORM 1  all cat-1     [v4, v3, v2, v1] -> [v2, v1, v4, v3, v2, v1]
+                //
+                // So the TOP entry's category decides how many entries are
+                // duplicated (one for a cat-2 top, two for a cat-1 pair) and the
+                // entry BELOW the duplicated group decides how deep the copy is
+                // inserted. `dup2_top_cat2` answers only the first question —
+                // which is why this opcode waited for a second-entry oracle.
+                // `stack_entry_categories` is it: the widths come from the
+                // `x64::stack_kinds` forward analysis, admitted only when its
+                // depth and per-entry ref-ness agree with the emitter's own
+                // model AND, for the top entry, with `dup2_top_cat2`'s wholly
+                // independent peephole answer.
+                //
+                // aarch64's arm is NOT the template: it pops four operands
+                // unconditionally, which is FORM 1 only.
+                0x5e => {
+                    let cats = self.stack_entry_categories(pc);
+                    let peephole_top = self.dup2_top_cat2(code, pc);
+                    // Resolve (entries duplicated, insertion depth in entries).
+                    let shape = cats.as_ref().and_then(|cats| {
+                        let n = cats.len();
+                        let top = (*cats.get(n.checked_sub(1)?)?)?;
+                        // Third opinion: when the peephole answers for the top,
+                        // it must agree. A disagreement means one of two
+                        // independent analyses is wrong; use neither.
+                        if matches!(peephole_top, Some(p) if p != top) {
+                            return None;
+                        }
+                        let second = (*cats.get(n.checked_sub(2)?)?)?;
+                        if top {
+                            // FORM 4 (second cat-2, two entries) or FORM 2
+                            // (second cat-1, three entries).
+                            if second {
+                                Some((1usize, 2usize))
+                            } else {
+                                // FORM 2 additionally requires v3 category-1;
+                                // verified bytecode guarantees it, and checking
+                                // costs one lookup.
+                                let third = (*cats.get(n.checked_sub(3)?)?)?;
+                                if third {
+                                    None
+                                } else {
+                                    Some((1, 3))
+                                }
+                            }
+                        } else {
+                            // Two cat-1 entries duplicated. v2 is cat-1 in both
+                            // remaining forms.
+                            if second {
+                                return None;
+                            }
+                            let third = (*cats.get(n.checked_sub(3)?)?)?;
+                            if third {
+                                Some((2, 3)) // FORM 3
+                            } else {
+                                // FORM 1 additionally requires v4 category-1.
+                                let fourth = (*cats.get(n.checked_sub(4)?)?)?;
+                                if fourth {
+                                    None
+                                } else {
+                                    Some((2, 4))
+                                }
+                            }
+                        }
+                    });
+                    let disabled = dupx_codegen_disabled() || dup2_x2_codegen_disabled();
+                    match shape {
+                        Some((dup_entries, depth)) if !disabled => {
+                            // Materialize the copies into fresh frame slots
+                            // (fresh offsets only grow, so no aliasing with the
+                            // live originals), deepest-first so the pushed pair
+                            // ends up in operand order, then rotate the top
+                            // `depth + dup_entries` MODEL entries right by
+                            // `dup_entries` to slide the copies underneath. Only
+                            // the copies cost instructions; the rotate is
+                            // bookkeeping that `canonicalize_stack` resolves as a
+                            // parallel move at the next branch/call boundary.
+                            let n0 = self.stack.len();
+                            let mut ok = true;
+                            for k in (0..dup_entries).rev() {
+                                let src = self.stack[n0 - 1 - k];
+                                let src_oop = self.stack_oop_marks[n0 - 1 - k];
+                                let before = self.stack.len();
+                                self.load_slot_to_reg(RAX, src);
+                                self.push_from_rax();
+                                // `push_from_rax` is SILENT when it cannot
+                                // reserve a spill slot: it emits nothing and does
+                                // not grow the model, and the rotate below would
+                                // then reorder the wrong entries. Same guard as
+                                // `dup_x1`/`dup2_x1`.
+                                if self.stack.len() != before + 1 {
+                                    self.fail("singlepass-codegen/dup2_x2-copy-not-pushed");
+                                    ok = false;
+                                    break;
+                                }
+                                if src_oop {
+                                    self.mark_top_as_oop();
+                                }
+                            }
+                            if ok {
+                                let n = self.stack.len();
+                                let window = depth + dup_entries;
+                                self.stack[n - window..].rotate_right(dup_entries);
+                                self.stack_oop_marks[n - window..].rotate_right(dup_entries);
+                                if dupx_eager_canon() {
+                                    self.canonicalize_stack();
+                                }
+                            }
+                        }
+                        _ => {
+                            // No provable form (or the kill switch) — stay
+                            // interpreted. Push two placeholders so downstream
+                            // handlers keep a plausible height until the
+                            // post-loop `failed` check discards this
+                            // compilation, matching `dup2`.
+                            self.fail("singlepass-codegen/dup2_x2-unprovable-form");
                             let _ = self.push_stack();
                             let _ = self.push_stack();
                         }
@@ -3794,9 +4159,53 @@ impl Compiler {
                     let throw_bci = self.orig_bci(pc);
                     self.emit_mov_imm32_sx(ARG_REGS[1], throw_bci as i32); // Cast: bci fits i32
                     self.emit_call_absolute(self.helpers.throw_exception);
-                    // Helper returned the i64::MIN sentinel in RAX —
+                    // Helper returned the i64::MIN sentinel in RAX -
                     // propagate it as the method's return value.
-                    self.emit_epilogue();
+                    //
+                    // RBC.6 `athrow` admission: inside a protected range the
+                    // sentinel alone is not enough. `jit_throw_exception` has
+                    // stashed the exception and this bci, but nothing has
+                    // recorded where this frame's non-parameter locals live, so
+                    // a handler that reads one would resume it as 0/null. Route
+                    // through the reason-9 stub instead of returning directly:
+                    // it spills the trapping registers, materializes the precise
+                    // exceptional frame from the snapshot recorded here, and
+                    // then runs exactly the epilogue this arm would have run.
+                    // The unconditional `JMP rel32` is patched by
+                    // `emit_deopt_stubs` the same way a `Jcc rel32` guard is -
+                    // both end in the same four displacement bytes.
+                    //
+                    // `flush_scratch_registers` above ran before the call, so
+                    // any local the snapshot places in a caller-saved register
+                    // has already been spilled to its frame slot; this is the
+                    // same ordering `emit_post_invoke_exception_check` relies on.
+                    //
+                    // Keyed on the EMITTER pc, never on `throw_bci`: every
+                    // `*_box_ptr_by_bci` map, `build_and_record_deopt_point`'s
+                    // analysis lookups and `emit_deopt_stubs`' stub sharing are
+                    // all in emitter coordinates, and each applies `orig_bci`
+                    // itself for the value it hands the runtime. Handing an
+                    // already-translated bci in would double-apply it under a
+                    // bytecode loop rewrite (identity, and byte-identical, on an
+                    // ordinary compile).
+                    let precise_athrow_stub =
+                        self.precise_exception_frames && self.pc_is_protected(pc);
+                    if precise_athrow_stub {
+                        if !self.exc_frame_box_ptr_by_bci.contains_key(&pc) {
+                            let box_ptr = self.build_and_record_deopt_point(
+                                pc,
+                                crate::deopt::DeoptReason::PendingException,
+                            );
+                            self.exc_frame_box_ptr_by_bci.insert(pc, box_ptr);
+                        }
+                        // JMP rel32 (E9) - patched to the reason-9 stub.
+                        self.buf.emit_byte(0xE9);
+                        let patch_offset = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((patch_offset, pc, 9));
+                    } else {
+                        self.emit_epilogue();
+                    }
                     self.reset_spills();
                     self.emitted_athrow = true;
                     dead = true;
@@ -4002,7 +4411,7 @@ impl Compiler {
                             !narrow_oops_block_inline_fields()
                                 && (inline_getfield_enabled()
                                     || (guarded_inline_getfield_enabled()
-                                        && self.helpers.region_bounds_addr != 0))
+                                        && self.helpers.read_bounds_addr != 0))
                         })
                     {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
@@ -4051,9 +4460,37 @@ impl Compiler {
                         if !raw_mode {
                             self.flush_scratch_registers();
                         }
-                        let receiver_is_trusted_oop = !self.method_key.is_empty()
-                            && self.stack_oop_marks_exact
-                            && self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let trusted_have_key = !self.method_key.is_empty();
+                        let trusted_marks_exact = self.stack_oop_marks_exact;
+                        let trusted_top_is_oop =
+                            self.stack_oop_marks.last().copied().unwrap_or(false);
+                        let receiver_is_trusted_oop =
+                            trusted_have_key && trusted_marks_exact && trusted_top_is_oop;
+                        // WHICH of the three clauses refused, at EMISSION time.
+                        //
+                        // The trusted-oop shortcut is the difference between a
+                        // bare null test and the six-compare containment check
+                        // that no non-publishing collector can ever pass — i.e.
+                        // between an inline load and a helper call, on the
+                        // hottest path in the VM. The getfield page's open item
+                        // 1 is "why is `stack_oop_marks_exact` false at these
+                        // sites", and until now the only way to ask was to read
+                        // the disassembly and infer. A bare "not trusted" would
+                        // repeat this page's own founding mistake: it names a
+                        // verdict, not a cause, and the three clauses want
+                        // completely different fixes.
+                        if !receiver_is_trusted_oop
+                            && cratonvm_types::flags::runtime_var_os(
+                                "CRATONVM_DBG_COMPACT_INLINE",
+                            )
+                            .is_some()
+                        {
+                            eprintln!(
+                                "[compact-inline] getfield pc={pc} NOT-trusted-oop                                  have_key={trusted_have_key} marks_exact={trusted_marks_exact}                                  top_is_oop={trusted_top_is_oop} depth={} method={}",
+                                self.stack.len(),
+                                self.method_key,
+                            );
+                        }
                         let obj_slot = self.pop_stack();
                         self.load_slot_to_reg(RAX, obj_slot);
                         let (slow_patches, null_patch) = if raw_mode {
@@ -4065,7 +4502,7 @@ impl Compiler {
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
-                                    self.helpers.region_bounds_addr,
+                                    self.helpers.read_bounds_addr,
                                 ),
                                 None,
                             )
@@ -4181,6 +4618,7 @@ impl Compiler {
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                             self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            crate::metrics::note_getfield_arm(1);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
                         }
@@ -4214,7 +4652,7 @@ impl Compiler {
                             (inline_getfield_enabled()
                                 && !cratonvm_types::compact_ref_fields_enabled())
                                 || (guarded_inline_getfield_enabled()
-                                    && self.helpers.region_bounds_addr != 0)
+                                    && self.helpers.read_bounds_addr != 0)
                         })
                     {
                         // Inline field load — the field index and type tag are
@@ -4263,7 +4701,7 @@ impl Compiler {
                         } else {
                             (
                                 self.emit_guarded_getfield_receiver_check(
-                                    self.helpers.region_bounds_addr,
+                                    self.helpers.read_bounds_addr,
                                 ),
                                 None,
                             )
@@ -4326,6 +4764,7 @@ impl Compiler {
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                             self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            crate::metrics::note_getfield_arm(2);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
                         }
@@ -4358,6 +4797,7 @@ impl Compiler {
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+                        crate::metrics::note_getfield_arm(3);
                         self.emit_call_absolute(self.helpers.getfield);
                         // See the inlined-callee getfield site above: the checked
                         // helper's `i64::MIN` sentinel must be caught here, before
@@ -4382,6 +4822,7 @@ impl Compiler {
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                         self.emit_mov_imm32_sx(ARG_REGS[2], 0); // Cast: x86-64 immediate encoding
+                        crate::metrics::note_getfield_arm(4);
                         self.emit_call_absolute(self.helpers.getfield);
                         self.emit_post_invoke_exception_check(b'J');
                         self.push_from_rax();
@@ -4798,6 +5239,24 @@ impl Compiler {
                         }
                         !crate::deopt::despec_contains(&self.method_key, pc as u32)
                     });
+                    // E27-1 N2b: `indexOf(I)` is intrinsified ONLY where the
+                    // needle is a compile-time constant in `0..=0xFFFF`, which
+                    // is the range on which the inline single-code-unit scan
+                    // and `code_point_needle` are the same function. Filtered
+                    // HERE, before the intrinsic ladder, so a declined site
+                    // takes the ordinary dispatch it takes today — the same
+                    // shape as the `ArraycopyPrimitive` despec filter above.
+                    // Deliberately NOT a runtime screen: see
+                    // `prev_insn_int_const` for why that would be a cliff.
+                    let direct = direct.filter(|(entry, _, _, _)| {
+                        if *entry != crate::JitIntrinsic::StringIndexOfChar.as_entry() {
+                            return true;
+                        }
+                        matches!(
+                            prev_insn_int_const(code, code_len, pc),
+                            Some(0..=0xFFFF)
+                        )
+                    });
 
                     if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct
                     {
@@ -5103,6 +5562,43 @@ impl Compiler {
                         // operand stack, computes into EAX and pushes the
                         // result. All emitted code is bit-identical to the
                         // JDK semantics (verified by intrinsic_int_bits.rs).
+                        // --- FP_BITS: Double bit reinterpretation ---
+                        //
+                        // One `MOVQ` each. These replaced 361 million checked
+                        // native-bridge crossings in one run of
+                        // `PSquarePercentileTest`; see the FP_BITS region in
+                        // `jit/src/lib.rs` for the census.
+                        //
+                        // RAW semantics come free: `MOVQ` moves all 64 bits,
+                        // NaN payload included, which is exactly what
+                        // `doubleToRawLongBits` is specified to return. The
+                        // canonicalising `doubleToLongBits` is not matched by
+                        // the resolver and so cannot reach here.
+                        else if callee_entry
+                            == crate::JitIntrinsic::DoubleToRawLongBits.as_entry()
+                        {
+                            // Double.doubleToRawLongBits(d): the argument's
+                            // 64 bits, unchanged, as a long.
+                            let arg = self.pop_stack();
+                            match arg {
+                                StackSlot::Xmm(xmm) => self.emit_movq_rax_from_xmm(xmm),
+                                // A frame slot or GPR already holds the raw
+                                // 64-bit pattern -- the JIT stores a double
+                                // as its bits -- so this is a plain load and
+                                // no XMM round trip is needed.
+                                _ => self.load_slot_to_reg(RAX, arg),
+                            }
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == crate::JitIntrinsic::LongBitsToDouble.as_entry()
+                        {
+                            // Double.longBitsToDouble(bits): the mirror.
+                            let arg = self.pop_stack();
+                            self.flush_xmm0_slots();
+                            self.load_slot_to_reg(RAX, arg);
+                            self.emit_movq_xmm_from_rax(0);
+                            self.stack_push(StackSlot::Xmm(0), false);
+                        }
                         else if callee_entry == crate::JitIntrinsic::IntBitCount.as_entry() {
                             // Integer.bitCount(i): POPCNT EAX, EAX. The
                             // matcher only registers this when has_popcnt()
@@ -5552,14 +6048,57 @@ impl Compiler {
                             // max_stack >= 5). They are scratch-only:
                             // arraycopy pushes nothing, so the next bytecode
                             // re-allocates spill slots from the same base.
-                            if !self.spill_range_fits(self.next_spill_offset, 5) {
+                            //
+                            // The base is pushed BELOW every operand's own
+                            // frame home, so the five stores below cannot land
+                            // on a slot one of them still lives in.
+                            //
+                            // The overlap is real and this is where it comes
+                            // from: `pop_stack` reclaims a Frame slot that sits
+                            // at the top of the spill region, so the five pops
+                            // just above rewound `next_spill_offset` back OVER
+                            // the very homes `flush_scratch_registers` spilled
+                            // the oop operands into. Taking the base from
+                            // `next_spill_offset` therefore aliases them by
+                            // construction.
+                            //
+                            // The emitter used to work around that for its OWN
+                            // reads only, by loading all five into distinct
+                            // GPRs before storing any (kept below — it costs
+                            // nothing and defends the ordering directly). But
+                            // the aliasing has a SECOND consumer that the
+                            // workaround does not reach: the deopt snapshot
+                            // taken above names each operand's ORIGINAL frame
+                            // home, and reads it when the bail actually fires —
+                            // long after `s_src_pos`'s store has overwritten
+                            // `dst`'s home with srcPos. A reference-array
+                            // `arraycopy` (which always bails here, by design)
+                            // then resumed in the interpreter with `Object(1)`
+                            // — the literal srcPos — where `dst` belonged: not
+                            // a plausible heap pointer, degraded to null by
+                            // `CompactValue::to_value`, and `System.arraycopy`
+                            // threw NullPointerException. `RMethodSiteCache`'s
+                            // `mixedRefAndPrimitive` is the witness; the bogus
+                            // payload tracks srcPos exactly (`srcPos=2` gives
+                            // `Object(2)`).
+                            //
+                            // Removing the overlap fixes both consumers at
+                            // once, which is why it is done here rather than by
+                            // teaching the snapshot about the scratch homes.
+                            let mut scratch_base = self.next_spill_offset;
+                            for slot in [src_slot, src_pos_slot, dst_slot, dst_pos_slot, len_slot] {
+                                if let crate::x64::StackSlot::Frame(off) = slot {
+                                    scratch_base = scratch_base.max(off.saturating_add(8));
+                                }
+                            }
+                            if !self.spill_range_fits(scratch_base, 5) {
                                 return false;
                             }
-                            let s_src = self.next_spill_offset;
-                            let s_src_pos = self.next_spill_offset + 8;
-                            let s_dst = self.next_spill_offset + 16;
-                            let s_dst_pos = self.next_spill_offset + 24;
-                            let s_len = self.next_spill_offset + 32;
+                            let s_src = scratch_base;
+                            let s_src_pos = scratch_base + 8;
+                            let s_dst = scratch_base + 16;
+                            let s_dst_pos = scratch_base + 24;
+                            let s_len = scratch_base + 32;
                             // ALIASING HAZARD: these scratch homes can overlap
                             // the operands' OWN frame homes. `flush_scratch_
                             // registers()` above spills any CalleeSaved *oop*
@@ -6615,6 +7154,7 @@ impl Compiler {
                                     info_ptr.is_some(),
                                     service_args_base.is_some(),
                                 );
+                                self.fail_unserviced_java_direct_call(info_ptr, service_args_base);
                             }
 
                             // A directly-called compiled callee that throws
@@ -8102,15 +8642,43 @@ impl Compiler {
                         }
 
                         // --- indexOf(I)I ----------------------------------
+                        // LIVE again as of E27-1 N2b (2026-08-18), for constant
+                        // BMP needles only. The `direct.filter` far above is
+                        // what enforces that; by the time control reaches here
+                        // the needle is known to be a compile-time constant in
+                        // `0..=0xFFFF`.
+                        //
                         // Scan the receiver for the first code unit equal to
-                        // `(ch & 0xFFFF)`, from index 0. Bit-identical to
-                        // `native_string_index_of`, which likewise masks the
-                        // argument to a single UTF-16 code unit — supplementary
-                        // code points therefore match their masked low half
-                        // (no surrogate special-casing, by design of the
-                        // oracle). The deopt stub is reached only for a null
-                        // receiver or a null backing `value` array. Uses only
-                        // caller-saved registers, so no PUSH/POP is needed.
+                        // `(ch & 0xFFFF)`, from index 0. This comment used to
+                        // call that "bit-identical to `native_string_index_of`,
+                        // which likewise masks the argument". BOTH HALVES WERE
+                        // FALSE — the JDK gates on `Character.isValidCodePoint`
+                        // BEFORE any narrowing and matches a supplementary `ch`
+                        // as a surrogate PAIR, and the native side stopped
+                        // masking at E18-1, which put the rule in one place
+                        // (`lang_string.rs`'s `code_point_needle`). It is
+                        // spelled out rather than deleted because E27-1's
+                        // finding is that code reading as a working
+                        // implementation is how four copies of this rule
+                        // survived.
+                        //
+                        // What makes the scan correct now is the RANGE, not the
+                        // mask: on `0..=0xFFFF` the JDK scans for exactly one
+                        // code unit, lone surrogates included, so the mask is
+                        // the identity and this loop is `code_point_needle`'s
+                        // answer. It is left in place rather than folded into a
+                        // baked immediate to keep this change a gate change and
+                        // nothing else — the emitted bytes here are unchanged.
+                        //
+                        // The deopt stub is reached only for a null receiver or
+                        // a null backing `value` array, both genuinely
+                        // once-per-program. It is NOT reached for an
+                        // out-of-range needle: such a site is never
+                        // intrinsified in the first place. That distinction is
+                        // the whole of N2b — see `prev_insn_int_const`.
+                        //
+                        // Uses only caller-saved registers, so no PUSH/POP is
+                        // needed.
                         if self.string_layout.is_some()
                             && callee_entry == crate::JitIntrinsic::StringIndexOfChar.as_entry()
                         {
@@ -8785,6 +9353,7 @@ impl Compiler {
                                     info_ptr.is_some(),
                                     service_args_base.is_some(),
                                 );
+                                self.fail_unserviced_java_direct_call(info_ptr, service_args_base);
                             }
 
                             // A directly-called compiled callee that throws (or
@@ -10700,25 +11269,52 @@ impl Compiler {
                     let dim2_slot = self.pop_stack(); // inner dimension
                     let dim1_slot = self.pop_stack(); // outer dimension
 
-                    // Look up resolved leaf element type for this PC
-                    let leaf_et = self
+                    // The packed `(holder_class_id | cp_idx << 32)` site
+                    // descriptor for this pc. The helper resolves the array
+                    // class from it at run time, loader-faithfully, through the
+                    // same `interpreter::multianewarray_alloc` the interpreter
+                    // uses — so both tiers stamp the same component classes
+                    // into the allocated levels.
+                    //
+                    // This used to be a bare leaf element-type code, which
+                    // carried no class at all; the helper then allocated every
+                    // level with `ClassId(0)` and a compiled `new String[a][b]`
+                    // came back as `[Ljava.lang.Object;`. A site with no entry
+                    // cannot be compiled correctly at all now (there is no
+                    // "default" array class), so bail rather than emit a call
+                    // that would allocate the wrong type.
+                    let Some(&(_, site)) = self
                         .multianewarray_info
                         .iter()
                         .find(|(p, _)| *p == pc)
-                        .map(|(_, et)| *et as i32) // Cast: x86-64 immediate encoding
-                        .unwrap_or(10); // default T_INT
+                    else {
+                        return false;
+                    };
 
-                    // Call jit_multianewarray_2d(heap_ptr, leaf_et, dim1, dim2)
+                    // Call jit_multianewarray_2d(heap_ptr, site, dim1, dim2)
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                    self.emit_mov_imm32_sx(ARG_REGS[1], leaf_et);
+                    self.emit_mov_imm64(ARG_REGS[1], site);
                     self.load_slot_to_reg(ARG_REGS[2], dim1_slot);
                     self.load_slot_to_reg(ARG_REGS[3], dim2_slot);
                     // Round-8 wave-3: defensive callee-saved spill
                     // before any GC-triggering CALL.
                     self.emit_pre_safepoint_spill();
                     self.emit_call_absolute(self.helpers.multianewarray_2d);
+                    // Resolution can run a user `ClassLoader.loadClass`, i.e.
+                    // arbitrary Java on this thread — republish the frame
+                    // afterwards exactly as the `new`/`anewarray` CP-indexed
+                    // arms do.
+                    crate::runtime_lowering::emit_post_call_frame_republish(
+                        &mut self.buf,
+                        self.helpers.frame_record,
+                    );
                     // T1.1.2 — multianewarray is a GC-triggering safepoint.
                     self.emit_oop_map_for_safepoint();
+                    // Negative dimension / OOM / failed resolution all come back
+                    // as the 0/null sentinel with a pending exception; bail into
+                    // the method's exception table instead of pushing the null
+                    // and dereferencing it.
+                    self.emit_post_alloc_oom_check();
                     self.push_from_rax();
                     // The result is a reference array.
                     self.mark_top_as_oop();
@@ -10890,7 +11486,19 @@ impl Compiler {
                 }
 
                 _ => {
-                    // Should not happen — jit_scan should have caught this
+                    // A scan-admitted opcode with no arm here. This is NOT
+                    // unreachable — `jit_scan` and this dispatch loop are two
+                    // hand-maintained opcode tables and nothing forced them to
+                    // agree, so an opcode the scanner advances past but this
+                    // loop does not lower lands here and loses the method's
+                    // compilation for the life of the process, attributed to an
+                    // arm that names nothing. `dup2_x2` (0x5E) sat in exactly
+                    // that gap until 2026-08-18; `pop2` (0x58) and `dup2_x1`
+                    // (0x5D) did before it. The two tables are now compared by
+                    // `x64::tests::scan_admitted_opcodes_are_lowered_or_declared`,
+                    // which fails when a new one appears. Name the opcode here
+                    // so a stray one is at least legible in the bail record.
+                    self.fail("singlepass-codegen/opcode-scan-admitted-but-unlowered");
                     return false;
                 }
             }

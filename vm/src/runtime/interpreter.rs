@@ -230,7 +230,7 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     let soft_free_mb = shared.mem.heap.soft_ref_policy_free_mb();
     let (pairs, soft_pairs) = {
         let mut rp = shared.mem.ref_processor.lock();
-        let weak_phantom = rp.weak_phantom_active_pairs();
+        let weak_phantom = rp.weak_phantom_active_triples();
         // SOFT-CLEAR GAP (2026-08-15). This is the measured answer to the
         // residual left by the retired `zgc-resourceleakdetector-corpse-read`
         // write-up: "the marker traces referents as strong edges; whether the
@@ -267,6 +267,12 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         } else {
             rp.condemn_idle_soft_refs(soft_free_mb, now_ms())
         };
+        // Same stamp column the weak/phantom half carries -- the write loop
+        // below screens both the same way.
+        let soft: Vec<(usize, usize, i32)> = soft
+            .into_iter()
+            .map(|(r, t)| (r, t, rp.identity_stamp(r).unwrap_or(0)))
+            .collect();
         (weak_phantom, soft)
     };
     // RandomizedContext WeakHashMap<Thread,...> fix: publish this cycle's
@@ -329,7 +335,34 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
             soft_pairs.len()
         );
     }
-    for (ref_obj_addr, _referent) in pairs.into_iter().chain(soft_pairs) {
+    // THE PRE-GC PASS WAS THE UNSCREENED WRITE SITE.
+    //
+    // `process_references_after_gc`'s cleared / enqueue / restore loops were
+    // given a class-shape guard on 2026-08-16 (`is_reference_shaped`) after two
+    // measured corruptions -- a `java.lang.String` published as a
+    // `ReferenceQueue` head, and field 0 of a `String` nulled. THIS loop, which
+    // performs the same kind of write through the same kind of address, kept
+    // only the `num_fields >= 2` test, which almost every class passes: an
+    // `org.h2.engine.SessionLocal` passes it, and so does every `org.h2.value.Value`.
+    // So a processor entry whose `Reference` had been reclaimed and its address
+    // re-issued nulled slot 0 of whatever now lived there -- the
+    // `NullPointerException: Cannot invoke "org.h2.value.Value.getValueType()"
+    // because "v" is null` half of the H2 `TestMultiThread` MVStore-writer
+    // report, whose own analysis records that the failure "survives the shape
+    // guard that now screens every reference-processor write". It did, because
+    // this write was not one of the screened ones.
+    //
+    // Screened here with BOTH tests:
+    //
+    //  * the same class-shape guard as the post-GC loops, and
+    //  * the identity stamp, which is the exact version of it: a reclaimed
+    //    `Reference`'s address re-issued to ANOTHER `Reference` is shape-clean
+    //    and identity-wrong, and H2 allocates a `CloseWatcher` (a
+    //    `PhantomReference`) per connection, so same-class reuse is the common
+    //    case rather than the exotic one.
+    let class_manager = shared.classes.class_manager.read();
+    let reference_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/Reference");
+    for (ref_obj_addr, _referent, stamp) in pairs.into_iter().chain(soft_pairs) {
         // The Reference object is live (or dead-but-not-yet-collected) at this
         // point, so its memory is valid; writing its referent slot is safe.
         // SAFETY: `ref_obj_addr` is a current Reference-object address held by
@@ -352,6 +385,26 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         // in SIGSEGV); when it has exactly 1 the write lands SILENTLY on a
         // real field. Requiring >= 2 declines both, and can never skip a
         // genuine Reference.
+        // Not a `Reference` any more ⇒ the address no longer names what this
+        // processor recorded. `None` (class not loaded) admits: no Reference
+        // object can exist yet, so the guard has nothing to judge.
+        if let Some(cid) = reference_cid {
+            if !class_manager.is_subclass_of(shared.mem.heap.class_id_of(ref_obj), cid) {
+                continue;
+            }
+        }
+        // Still a `Reference`, but is it THE Reference? `identity_hash_code`
+        // mints for an object that has none, so a re-issued address answers
+        // with a fresh counter value rather than the recorded one. A `0` answer
+        // is "cannot tell" (the object is thin-locked, so its hash is not in
+        // the mark word) and falls back to the shape guard above rather than
+        // declining a legitimate entry.
+        if stamp != 0 {
+            let now = shared.mem.heap.identity_hash_code(ref_obj);
+            if now != 0 && now != stamp {
+                continue;
+            }
+        }
         if shared.mem.heap.num_fields(ref_obj) >= 2 {
             // Slot 0 = REF_FIELD_REFERENT (matches the real JDK Reference layout
             // and the synthetic constant in native-builtins).
@@ -891,6 +944,38 @@ fn resolve_native_for_dispatch(
         },
         // JdkOnly, §7 step 3: concrete bytecode beats this bridge.
         None => Ok(None),
+    }
+}
+
+/// The concrete class whose registered natives `execute`'s "Path B" borrows
+/// when an interface method resolved to an abstract declaration and the
+/// receiver matched no class in the store — or `""` when this interface has no
+/// such stand-in.
+///
+/// Extracted from the `match` that used to sit inline at the Path B call site
+/// (JDK-ONLY-WAVE2 §8) for one reason: the array refusal immediately after it
+/// has to ask "is this one of the substituted interfaces?", and a second
+/// hard-coded copy of these six names would be a list that can drift from the
+/// list it is supposed to mirror. There is now exactly one copy, and
+/// `g13_array_receiver_tests` pins it.
+///
+/// **Deliberately absent: `java/lang/Cloneable` and `java/io/Serializable`.**
+/// They are the only two interfaces an array type actually implements
+/// (JLS 4.10.3), they declare no methods, and nothing may map them here — that
+/// absence is what makes "canonical is non-empty AND the receiver is an array"
+/// a sound proof of `IncompatibleClassChangeError` rather than a heuristic.
+fn canonical_concrete_for_interface(iface: &str) -> &'static str {
+    match iface {
+        "java/util/Set" | "java/util/Collection" => "java/util/HashSet",
+        // Iterable has no collection shape of its own. Keep synthetic
+        // List-style receivers on the established ArrayList bridge after
+        // lambda proxies have already had a chance to dispatch their SAM
+        // implementation.
+        "java/lang/Iterable" => "java/util/ArrayList",
+        "java/util/List" => "java/util/ArrayList",
+        "java/util/Map" => "java/util/HashMap",
+        "java/util/Iterator" => "java/util/HashMap$KeyItr",
+        _ => "",
     }
 }
 
@@ -1502,18 +1587,80 @@ pub fn execute(
                         // unreachable rather than conditional. NOT deleted this
                         // wave — removing shim mappings has regressed real-JDK
                         // boot before.
-                        let canonical: &'static str = match &*class_name_owned {
-                            "java/util/Set" | "java/util/Collection" => "java/util/HashSet",
-                            // Iterable has no collection shape of its own. Keep
-                            // synthetic List-style receivers on the established
-                            // ArrayList bridge after lambda proxies have already
-                            // had a chance to dispatch their SAM implementation.
-                            "java/lang/Iterable" => "java/util/ArrayList",
-                            "java/util/List" => "java/util/ArrayList",
-                            "java/util/Map" => "java/util/HashMap",
-                            "java/util/Iterator" => "java/util/HashMap$KeyItr",
-                            _ => "",
-                        };
+                        let canonical: &'static str =
+                            canonical_concrete_for_interface(&class_name_owned);
+                        // G13-1, 2026-08-17. An ARRAY receiver cannot be an
+                        // instance of ANY interface this map covers: JLS 4.10.3
+                        // gives an array type exactly two superinterfaces,
+                        // `java.lang.Cloneable` and `java.io.Serializable`, and
+                        // neither is in the list. So for an array the
+                        // substitution is not "a shim that is probably right" —
+                        // it is provably wrong, and it is the shape that hides
+                        // the wrongness best, because every one of the canonical
+                        // natives reads its receiver through an `elementData`/
+                        // bucket layout an array does not have and reports
+                        // **empty** rather than refusing.
+                        //
+                        // MEASURED, 2026-08-17, on the `d87dff06a`+2 binary:
+                        // `LinkedHashMap.values()` mints a real
+                        // `LinkedHashMap$LinkedValues` carrier, whose
+                        // `elementData` slot (absolute 1, from the real
+                        // `java/util/ArrayList` layout) collides with the ONE
+                        // member of that carrier family that declares two
+                        // fields — `LinkedValues` has `reversed` at 0 and
+                        // `this$0` at 1. The view's source-map read then hands
+                        // native-collections the `Object[]` element buffer as
+                        // though it were the backing `Map`, and it arrives here
+                        // as `ctx.invoke("java/util/Map", "isEmpty", "()Z",
+                        // [Object[11]])`. Proven by reflection on both VMs
+                        // (`--add-opens java.base/java.util=ALL-UNNAMED`):
+                        // HotSpot reports `this$0 -> java.util.LinkedHashMap`,
+                        // CratonVM `this$0 -> [Ljava.lang.Object;[len=11]`.
+                        // Under `Compatible` that substitution answered
+                        // `isEmpty() == true` for a three-entry map and the
+                        // whole `values()` view silently came back EMPTY; under
+                        // `--jdk-only` the §8 refusal below turned it into an
+                        // `AbstractMethodError` naming `java/util/Map` — which
+                        // reads as an interface-door defect and is not one.
+                        //
+                        // Refusing here is what makes the two modes agree and
+                        // what puts the receiver's real shape in the message.
+                        // The blast radius is MEASURED, not argued: across all
+                        // 105 corpus main classes, in `--jdk-only` and in
+                        // `Compatible`, `[CANONICAL_CENSUS]` reports this map
+                        // firing exactly ONCE — `java/util/Map -> java/util/
+                        // HashMap isEmpty 1`, in `RJdkMapViews`, the vector this
+                        // record is about. No currently-green vector reaches it.
+                        //
+                        // The root cause is the slot collision, and it lives in
+                        // `native-collections/src/lib.rs` (nominated in
+                        // `G13-1-…-20260817.md`). This site cannot fix it; it
+                        // can stop laundering it into a wrong answer.
+                        if !canonical.is_empty() && recv_kind == cratonvm_types::ObjectKind::Array {
+                            let msg = format!(
+                                "array receiver does not implement the requested interface \
+                                 {class_name_owned} (dispatching \
+                                 {class_name_owned}.{method_name}{method_descriptor})"
+                            );
+                            match super::exceptions::create_exception_object(
+                                shared,
+                                thread,
+                                "java/lang/IncompatibleClassChangeError",
+                                Some(&msg),
+                            ) {
+                                Ok(exc) => {
+                                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                                }
+                                // Same fallback the AbstractMethodError path
+                                // below takes: never lose the diagnostic to a
+                                // heap exhaustion during exception construction.
+                                Err(_) => {
+                                    return Err(MethodCallFailed::InternalError(
+                                        VmError::Internal { message: msg },
+                                    ));
+                                }
+                            }
+                        }
                         // JDK-ONLY-WAVE2 §8, 2026-08-06. The record says: "Under
                         // `JdkOnly` real class bytes make every one of these
                         // interfaces resolvable, so the map should become
@@ -1632,7 +1779,41 @@ pub fn execute(
                             .get_class(rc)
                             .map(|c| c.name.to_string())
                             .unwrap_or_else(|| format!("<cid {rc}>"));
-                        format!("recv_cid={rc} recv_class={rn}")
+                        // G13-1: the KIND matters as much as the class here,
+                        // and it was the missing half. `class_id_of` reports
+                        // `ClassId(0)` for an array as well as for an
+                        // unstamped synthetic object, and `get_class(0)`
+                        // resolves to `java/lang/Object` — so the two shapes
+                        // printed identically ("recv_cid=0
+                        // recv_class=java/lang/Object") and a lane reading
+                        // this line could not tell an `Object[]` receiver
+                        // from a class-less allocation. That is exactly the
+                        // distinction that separates "the interface door is
+                        // missing a row" from "a native handed us the wrong
+                        // object", and this record's whole first hypothesis
+                        // was the wrong one of those two.
+                        //
+                        // `recv_is_declaring` is the second discriminator, and
+                        // it separates the two mechanisms G13-1 measured behind
+                        // one message. `true` means the receiver's runtime
+                        // class IS the abstract/interface class the call
+                        // resolved to — i.e. a native minted an instance of an
+                        // abstract type and the method invoked on it has no
+                        // native either (`HttpRequest.version()`,
+                        // `PathMatcher.matches()`). `false` with
+                        // `recv_kind=Array`, or with a class unrelated to the
+                        // message, means something handed dispatch an object
+                        // that is not an instance of the resolved type at all
+                        // (`Map.isEmpty()` on an `Object[]`). The first needs a
+                        // registration; the second needs the caller fixed. They
+                        // are not the same bug and they print the same
+                        // sentence.
+                        let rk = shared.mem.heap.kind_of(r);
+                        let recv_is_declaring = rc == class_id;
+                        format!(
+                            "recv_cid={rc} recv_class={rn} recv_kind={rk:?} \
+                             recv_is_declaring={recv_is_declaring}"
+                        )
                     }
                     other => format!("recv={other:?}"),
                 };
@@ -1682,6 +1863,11 @@ pub fn execute(
     // dispatch, we stash it here and fall through to the interpreter, which
     // pushes a frame and routes through the exception table.
     let mut jit_early_exception: Option<ObjectRef> = None;
+    // The bci the compiled body stamped at the throw site that produced
+    // `jit_early_exception`, captured at the drain because later work clears the
+    // signal. `-1` means "not stamped"; see the routing site below for why this
+    // sink cannot afford to route without it.
+    let mut jit_early_throw_bci: i64 = -1;
 
     // Try JIT compilation for this method.
     {
@@ -2227,20 +2413,10 @@ pub fn execute(
                         let cm = shared.classes.class_manager.read();
                         let class = cm.get_class(class_id)?;
                         for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-                            let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
-                            let leaf = class_name_ref.trim_start_matches('[');
-                            let leaf_et = match leaf.as_bytes().first() {
-                                Some(b'I') => 10u8,
-                                Some(b'J') => 11,
-                                Some(b'F') => 6,
-                                Some(b'D') => 7,
-                                Some(b'B') => 8,
-                                Some(b'C') => 5,
-                                Some(b'S') => 9,
-                                Some(b'Z') => 4,
-                                _ => 0,
-                            };
-                            mna_info.push((pc, leaf_et));
+                            // A malformed CP entry is still a whole-compile refusal.
+                            let _ = class.constant_pool.get_class_name(cp_idx)?;
+                            mna_info
+                                .push((pc, crate::jit::pack_multianewarray_site(class_id.as_u32(), cp_idx)));
                         }
                     }
                     // Resolve typecheck entries (checkcast/instanceof) if present
@@ -2697,18 +2873,36 @@ pub fn execute(
                                         }
                                     };
                                     if accessible {
-                                        let num_fields = shared
-                                            .classes.class_manager
-                                            .read()
-                                            .get_class(target_id)
-                                            .map(|c| c.num_total_fields)
-                                            .unwrap_or(0);
+                                        // `(true, true)` unless
+                                        // `CRATONVM_JIT_REAL_NEW_SITE_FLAGS`
+                                        // is set. The in-tree TODO that stood
+                                        // here asking for the real flags is
+                                        // answered by
+                                        // `jit_bridge::jit_new_site_flags`,
+                                        // which also records why turning them
+                                        // on by default buys nothing today.
+                                        let (num_fields, has_prim_init, has_finalizer) = {
+                                            let cm = shared.classes.class_manager.read();
+                                            if crate::runtime::env_cache::jit_real_new_site_flags() {
+                                                crate::runtime::interpreter::jit_bridge::jit_new_site_flags(
+                                                    &cm, target_id,
+                                                )
+                                            } else {
+                                                (
+                                                    cm.get_class(target_id)
+                                                        .map(|c| c.num_total_fields)
+                                                        .unwrap_or(0),
+                                                    true,
+                                                    true,
+                                                )
+                                            }
+                                        };
                                         new_info.push((
                                             pc_new,
                                             target_id.as_u32(),
                                             num_fields,
-                                            true,
-                                            true,
+                                            has_prim_init,
+                                            has_finalizer,
                                         ));
                                     } else {
                                         new_deferred_info
@@ -3358,7 +3552,7 @@ pub fn execute(
                                         crate::jit::helpers::peek_jit_athrow_bci(),
                                     );
                                     crate::jit::helpers::clear_jit_athrow_bci();
-                                    if let Some(result) = run_jit_callee_handler(
+                                    if let Ok(result) = run_jit_callee_handler(
                                         shared, thread, &cached, throw_pc, exc, args,
                                     ) {
                                         return result;
@@ -3370,6 +3564,8 @@ pub fn execute(
                                     method_name,
                                     method_descriptor,
                                 );
+                                jit_early_throw_bci = crate::jit::helpers::peek_jit_athrow_bci();
+                                crate::jit::helpers::clear_jit_athrow_bci();
                                 jit_early_exception = Some(exc);
                             } else {
                                 let result = match jit_result {
@@ -3907,7 +4103,35 @@ pub fn execute(
         // past the method (Jetty `start.jar` launcher). Use the PC-unknown
         // search instead: it skips catch-all `finally` entries (unsafe to
         // match without a PC) but matches typed handlers by exception class.
-        match find_exception_handler_pc_unknown(shared, &thread.frames[frame_idx], exc) {
+        // ...unless the compiled body stamped its own throw site, which it does
+        // at every throwing bci inside a protected range. The PC-unknown search
+        // matches typed handlers by exception CLASS ALONE, so a method with two
+        // protected ranges catching the same type gets the FIRST row's handler
+        // whichever range actually threw. bc-java's
+        // `ProvRevocationChecker.check` is exactly that shape — `try { crl }
+        // catch (Recoverable) { ...ocsp... }` and `try { ocsp } catch
+        // (Recoverable) { ...crl... }` — so an OCSP failure ran the CRL branch's
+        // handler, which re-called OCSP, and the exception escaped a method that
+        // was supposed to fall back. The stamp makes the range check possible;
+        // `jit_local_athrow_pc_in_frame` refuses it unless it lands in one of
+        // THIS method's ranges, so a foreign stamp still degrades to the
+        // pc-unknown search rather than picking a handler at random.
+        let found = match jit_local_athrow_pc_in_frame(
+            &thread.frames[frame_idx],
+            jit_early_throw_bci,
+        ) {
+            JitThrowPc::InRange(pc) => {
+                find_exception_handler_any_pc(shared, &thread.frames[frame_idx], pc, exc)
+            }
+            // The compiled body named a throw site of its own that no `try`
+            // covers: nothing here can catch it, and the pc-unknown search
+            // would match a typed row by exception class alone.
+            JitThrowPc::OutsideAllRanges => None,
+            JitThrowPc::Unknown => {
+                find_exception_handler_pc_unknown(shared, &thread.frames[frame_idx], exc)
+            }
+        };
+        match found {
             Some((handler_pc, exc_ref)) => {
                 thread.frames[frame_idx].stack.clear();
                 let _ = thread.frames[frame_idx]
@@ -4137,6 +4361,25 @@ pub(crate) fn execute_prebuilt_frame(
         );
     }
     push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+    run_pushed_frame_to_completion(shared, thread, frames_depth_before_push)
+}
+
+/// The tail of [`execute_prebuilt_frame`], for a caller that has ALREADY
+/// pushed the frame it wants run.
+///
+/// `frames_depth_before_push` is the depth `thread.frames` had before that
+/// push, so the orphaned-inner-frame truncation and the final pop can restore
+/// it exactly. Split out for the deopt-resume / exception-routing sinks, which
+/// build and push their frame themselves and then need it run to completion
+/// synchronously rather than handed to the interpreter's stepping loop — see
+/// `jit_bridge::execute_jit_call_oneshot`, whose whole reason for existing is
+/// that a one-shot dispatch helper has no such loop to hand it to.
+pub(crate) fn run_pushed_frame_to_completion(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frames_depth_before_push: usize,
+) -> MethodCallResult {
+    debug_assert!(thread.frames.len() > frames_depth_before_push);
     if shared
         .mem
         .gc_barrier
@@ -4444,6 +4687,12 @@ pub(crate) enum OsrBackoffOutcome {
     /// OSR didn't fire (either backoff not yet, or `try_osr` rejected and
     /// the rejection has been recorded). Caller falls through to its
     /// post-back-edge work (typically `safepoint_check` then `continue`).
+    ///
+    /// Since the RBC.6b lift this also covers a case where OSR very much DID
+    /// fire: the OSR'd body raised an exception this method catches, and the
+    /// live frame has been left parked at the handler. The caller's action is
+    /// identical — resume interpreting this frame — but no rejection is
+    /// recorded, because nothing was rejected. See `try_osr`'s `committed_out`.
     Skip,
     /// OSR completed and we're back at the root frame of this
     /// `execute_frame` invocation — bubble the return value up to the
@@ -4457,10 +4706,14 @@ pub(crate) enum OsrBackoffOutcome {
     /// `frame_idx` out-parameter (which the helper mutates).
     ContinueDispatch,
     /// The OSR'd code exited with a Java exception in flight that this frame
-    /// cannot catch (an OSR'd method provably declares no exception table —
-    /// see RBC.6b in `compile_osr_artifact`). The caller must hand the
-    /// throwable to the dispatch loop's `pending_java_exception` channel so it
-    /// unwinds from THIS frame, instead of resuming the loop.
+    /// cannot catch. Until the RBC.6b lift that was a property of the whole
+    /// population — an OSR'd method provably declared no exception table — and
+    /// now it is a per-throw verdict reached by
+    /// `route_osr_exception_out_of_artifact`: either no handler covers the
+    /// precise throw bci, or the throw site lies outside every protected range.
+    /// The caller must hand the throwable to the dispatch loop's
+    /// `pending_java_exception` channel so it unwinds from THIS frame, instead
+    /// of resuming the loop.
     ///
     /// The old behaviour here was `Skip` + a re-stashed exception, i.e.
     /// "keep interpreting this frame from where it was". That is correct only
@@ -4509,7 +4762,7 @@ fn loop_work_dbg() -> bool {
 ///     OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
 ///     OsrBackoffOutcome::ContinueDispatch => continue,
 ///     OsrBackoffOutcome::ThrowJava(exc) => {
-///         pending_java_exception = Some((exc, entry_pc));
+///         pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
 ///         continue;
 ///     }
 ///     OsrBackoffOutcome::Skip => {}
@@ -4686,6 +4939,10 @@ pub(crate) fn try_osr_with_backoff(
     // function; a single out-parameter written on exactly one path is the
     // minimal honest channel.
     let mut osr_throw: Option<ObjectRef> = None;
+    // Sibling out-channel: the OSR'd body ran and advanced this frame, but
+    // returned no value and threw nothing out — the RBC.6b lift's handler
+    // entry. See `try_osr`'s parameter doc.
+    let mut osr_committed = false;
     let osr_result = try_osr(
         shared,
         thread,
@@ -4693,12 +4950,23 @@ pub(crate) fn try_osr_with_backoff(
         osr_class_id,
         entry_pc,
         &mut osr_throw,
+        &mut osr_committed,
     );
     // Checked BEFORE the rejection bookkeeping below: the OSR'd body RAN (and
     // committed loop iterations), so this is not a rejected attempt and must
     // not consume the per-pc rejection budget.
     if let Some(exc) = osr_throw {
         return OsrBackoffOutcome::ThrowJava(exc);
+    }
+    // Same rule, same reason, for the path that ran and CAUGHT. `Skip`'s "fall
+    // through to your post-back-edge work" is the right action here — the frame
+    // is parked at a handler with the throwable on its stack, so the dispatch
+    // loop resumes there (after its safepoint check) and re-enters the cached
+    // artifact at the next hot back-edge. What must NOT happen is the rejection
+    // bookkeeping below: charging a caught exception against the per-pc budget
+    // retires OSR after five of them.
+    if osr_committed {
+        return OsrBackoffOutcome::Skip;
     }
     match osr_result {
         Some(osr_val) => {
@@ -4833,6 +5101,13 @@ fn execute_frame_from_index(
     // still re-checked per-bytecode inside `fire_jvmti_single_step` when a listener
     // is active.
     let single_step_active = crate::runtime::jvmti::any_single_step_listener_active();
+    // Hoisted for the same reason as `pgo_enabled` above: the `if_acmpne`
+    // fast-path arm declines while the `CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE`
+    // diagnostic is armed, so the decoded arm (which owns that instrument)
+    // still runs. Reading the cached gate once per `execute_frame` keeps the
+    // arm's admission test to a register compare. Arming it mid-method is
+    // observed on the next call/return, the accepted pgo-style tradeoff.
+    let acmp_identity_trace = crate::runtime::env_cache::active_profiles_identity_trace();
     // When a fast-path bytecode needs to throw a RuntimeError (AIOOBE, NPE, etc.),
     // it sets this to Some(...) and breaks out of the fast-path match instead of
     // returning directly. The main loop then converts it to a catchable Java exception.
@@ -4890,6 +5165,92 @@ fn execute_frame_from_index(
     // the fall-through hint only bought one popcount on the fall-through path
     // at the cost of a compare on every branch, back-edge, handler entry and
     // switch target. `resolve()` is the hint-free form.)
+    // ── Conditional-branch arm, written once ──────────────────────────────
+    //
+    // Each of the interpreter's conditional-branch fast-path arms is the same
+    // twenty lines around a one-line predicate: record the branch outcome for
+    // PGO, take the branch or fall through, and — when the target is BACKWARD
+    // — record the back edge, bump `Frame::backward_count`, and offer the
+    // frame to `try_osr_with_backoff`.
+    //
+    // It is written once here because the copied form had already lost a whole
+    // opcode family. `ifnull` (0xc6), `ifnonnull` (0xc7), `if_acmpeq` (0xa5)
+    // and `if_acmpne` (0xa6) had no fast-path arm at all, so they fell through
+    // to the decoded handler in `opcodes.rs` — which sets `frame.pc` and
+    // nothing else. A loop closed by one of those four therefore:
+    //
+    //   * never recorded a PGO back edge,
+    //   * never incremented `Frame::backward_count`, so it could not reach the
+    //     `OSR_THRESHOLD` and could never enter an OSR-compiled body, and
+    //   * never earned whole-method tier-up credit either, because
+    //     `pop_and_recycle_frame_with_reason` feeds `ProfileStore::add_loop_work`
+    //     from that same counter.
+    //
+    // That is the ordinary shape of `do { … } while (p != null)`, of
+    // `do { … } while (o != sentinel)`, and of every `for`/`while` emitted by a
+    // frontend that puts the loop test at the BOTTOM (ECJ, and the Kotlin and
+    // Scala backends) rather than at the top with a closing `goto` the way
+    // javac does. The comment on `try_osr_with_backoff` calls itself "the one
+    // funnel all fourteen back-edge sites go through" — fourteen was the count
+    // of arms that had been written, not of branches that can close a loop.
+    //
+    // `frame`, `saved_pc`, `b1` and `b2` are parameters rather than captures:
+    // `macro_rules!` gives local-variable identifiers definition-site hygiene
+    // and those four are bound inside the dispatch loop, below this point.
+    // Everything else the body touches (`shared`, `thread`, `frame_idx`,
+    // `initial_frame_idx`, `pgo_enabled`, `pending_java_exception`) is already
+    // in scope here.
+    macro_rules! cond_branch_arm {
+        ($frame:expr, $saved_pc:expr, $b1:expr, $b2:expr, $taken:expr) => {{
+            let taken = $taken;
+            if pgo_enabled {
+                let (cid, mn, md) = method_key_parts($frame);
+                shared
+                    .jit
+                    .profile_store
+                    .record_branch_borrowed(cid, mn, md, $saved_pc, taken);
+            }
+            if taken {
+                // Cast: bytecode operand decoding
+                let offset = (($b1 as i16) << 8) | ($b2 as i16);
+                // Cast: signed branch offset arithmetic
+                $frame.pc = ($saved_pc as isize + offset as isize) as usize;
+                if offset < 0 {
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts($frame);
+                        shared
+                            .jit
+                            .profile_store
+                            .record_backedge_borrowed(cid, mn, md, $saved_pc);
+                    }
+                    $frame.backward_count += 1;
+
+                    let entry_pc = $frame.pc;
+                    let _ = $frame;
+                    match try_osr_with_backoff(
+                        shared,
+                        thread,
+                        &mut frame_idx,
+                        initial_frame_idx,
+                        entry_pc,
+                    ) {
+                        OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                        OsrBackoffOutcome::ContinueDispatch => continue,
+                        OsrBackoffOutcome::ThrowJava(exc) => {
+                            pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                            continue;
+                        }
+                        OsrBackoffOutcome::Skip => {}
+                    }
+                    safepoint_check(shared, thread);
+                }
+            } else {
+                $frame.pc = $saved_pc + 3;
+            }
+            continue;
+        }};
+    }
+
     loop {
         // Route callee-thrown Java exceptions before the safepoint poll below.
         // `pending_java_exception` is only a Rust local between the callee's
@@ -4994,6 +5355,27 @@ fn execute_frame_from_index(
                     );
                 }
             }
+            // Normalize the operand-stack overflow BEFORE throwing, exactly as
+            // the decoded path's conversion does further down.
+            //
+            // That site calls itself "the only point that converts runtime
+            // errors into Java exceptions". It is not, and has not been for as
+            // long as the invoke fast paths have routed through here: this arm
+            // converts too. `ValueStack` reports an overflow as
+            // `NotImplemented { feature: "operand stack overflow" }`, which
+            // `throw_runtime_error` maps to an *uncatchable* internal error, so
+            // a stack overflow arriving through a fast-path arm hard-unwound
+            // the whole call stack instead of surfacing as a catchable
+            // `java.lang.StackOverflowError` that an in-method
+            // `catch (StackOverflowError)` / `catch (Throwable)` can observe.
+            // Two conversion points that disagree is one conversion point too
+            // many; until they are merged they must at least agree.
+            let re = match re {
+                RuntimeError::NotImplemented { feature } if feature == "operand stack overflow" => {
+                    RuntimeError::StackOverflowError
+                }
+                other => other,
+            };
             let exc_result = super::exceptions::throw_runtime_error(shared, thread, re);
             match exc_result {
                 MethodCallFailed::ExceptionThrown(exc) => {
@@ -5169,7 +5551,8 @@ fn execute_frame_from_index(
                                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                             OsrBackoffOutcome::ContinueDispatch => continue,
                                             OsrBackoffOutcome::ThrowJava(exc) => {
-                                                pending_java_exception = Some((exc, entry_pc));
+                                                pending_java_exception =
+                                                    Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                                 continue;
                                             }
                                             OsrBackoffOutcome::Skip => {}
@@ -5461,7 +5844,17 @@ fn execute_frame_from_index(
                 // the prior `Value::Int(_)` match — falling through to the slow
                 // path on type-mismatch is unnecessary because verified
                 // bytecode guarantees Int at this site).
-                0x84 => {
+                // iinc — the local index is the raw bytecode operand and the
+                // accessors below index `frame.locals` without a bounds check,
+                // so this arm needs the same `b1 < max_locals` admission test
+                // its `iload`/`istore`/`astore` neighbours carry. Without it a
+                // per-class `skip_verification` class (which the global
+                // `use_fast_path` gate does NOT cover) reaches
+                // `set_local_int_unchecked` with an out-of-range index and
+                // PANICS on the `Vec` index — the one outcome this module's
+                // zero-panic gate exists to prevent. Out of range falls through
+                // to the bounds-checked decoded handler, unchanged.
+                0x84 if (b1 as usize) < frame.max_locals as usize => {
                     let idx = b1 as usize; // Cast: bytecode operand decoding
                     let inc = b2 as i8 as i32; // Cast: bytecode operand decoding
                     let v = frame.get_local_int_unchecked(idx);
@@ -5497,7 +5890,7 @@ fn execute_frame_from_index(
                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                             OsrBackoffOutcome::ContinueDispatch => continue,
                             OsrBackoffOutcome::ThrowJava(exc) => {
-                                pending_java_exception = Some((exc, entry_pc));
+                                pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
                                 continue;
                             }
                             OsrBackoffOutcome::Skip => {}
@@ -5510,294 +5903,53 @@ fn execute_frame_from_index(
                 0xa2 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va >= vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va >= vb);
                 }
                 // if_icmplt
                 0xa1 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va < vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va < vb);
                 }
                 // if_icmple
                 0xa4 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va <= vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va <= vb);
                 }
                 // if_icmpgt
                 0xa3 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va > vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va > vb);
                 }
                 // if_icmpne
                 0xa0 => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va != vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va != vb);
                 }
                 // if_icmpeq
                 0x9f => {
                     let vb = frame.stack.pop_int_unchecked();
                     let va = frame.stack.pop_int_unchecked();
-                    let taken = va == vb;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, va == vb);
                 }
                 // ireturn / lreturn / freturn / dreturn / areturn
                 0xac..=0xb0 => {
+                    // Calibration: two adjacent reads measuring nothing, so the
+                    // other phases can be corrected for rdtsc latency instead of
+                    // compared against an assumed one.
+                    {
+                        let c0 = crate::runtime::interpreter::invoke_phases::now();
+                        let c1 = crate::runtime::interpreter::invoke_phases::now();
+                        crate::runtime::interpreter::invoke_phases::charge(
+                            crate::runtime::interpreter::invoke_phases::P_CALIB,
+                            c0,
+                            c1,
+                        );
+                    }
+                    let ph_r0 = crate::runtime::interpreter::invoke_phases::now();
                     // Bit-exact return-value transfer. The prior
                     // `pop_unchecked()` + `push_unchecked()` round-tripped the
                     // slot through `to_value()`/`from_value()`, which decoded a
@@ -5948,7 +6100,14 @@ fn execute_frame_from_index(
                     );
                     if frame_idx > initial_frame_idx {
                         // Stackless return: pop child frame, push value to parent.
+                        let ph_r1 = crate::runtime::interpreter::invoke_phases::now();
                         pop_and_recycle_frame(shared, thread);
+                        let ph_r2 = crate::runtime::interpreter::invoke_phases::now();
+                        crate::runtime::interpreter::invoke_phases::charge(
+                            crate::runtime::interpreter::invoke_phases::P_RET_RECYCLE,
+                            ph_r1,
+                            ph_r2,
+                        );
                         frame_idx -= 1;
                         if opcode == 0xb0 {
                             // areturn: push the normalized reference value.
@@ -5974,6 +6133,11 @@ fn execute_frame_from_index(
                             // values, raw copy is sufficient.
                             thread.frames[frame_idx].stack.push_compact(cv);
                         }
+                        crate::runtime::interpreter::invoke_phases::charge(
+                            crate::runtime::interpreter::invoke_phases::P_RET_TOTAL,
+                            ph_r0,
+                            crate::runtime::interpreter::invoke_phases::now(),
+                        );
                         continue;
                     }
                     return Ok(Some(value));
@@ -5997,284 +6161,32 @@ fn execute_frame_from_index(
                 // ifle — AUDIT CRIT-4
                 0x9e => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val <= 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val <= 0);
                 }
                 // ifge
                 0x9c => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val >= 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val >= 0);
                 }
                 // ifgt
                 0x9d => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val > 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val > 0);
                 }
                 // iflt
                 0x9b => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val < 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val < 0);
                 }
                 // ifne
                 0x9a => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val != 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val != 0);
                 }
                 // ifeq
                 0x99 => {
                     let val = frame.stack.pop_int_unchecked();
-                    let taken = val == 0;
-                    if pgo_enabled {
-                        let (cid, mn, md) = method_key_parts(frame);
-                        shared
-                            .jit
-                            .profile_store
-                            .record_branch_borrowed(cid, mn, md, saved_pc, taken);
-                    }
-                    if taken {
-                        let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
-                        frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 {
-                            if pgo_enabled {
-                                let (cid, mn, md) = method_key_parts(frame);
-                                shared
-                                    .jit
-                                    .profile_store
-                                    .record_backedge_borrowed(cid, mn, md, saved_pc);
-                            }
-                            frame.backward_count += 1;
-                            let entry_pc = frame.pc;
-                            let _ = frame;
-                            match try_osr_with_backoff(
-                                shared,
-                                thread,
-                                &mut frame_idx,
-                                initial_frame_idx,
-                                entry_pc,
-                            ) {
-                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
-                                OsrBackoffOutcome::ContinueDispatch => continue,
-                                OsrBackoffOutcome::ThrowJava(exc) => {
-                                    pending_java_exception = Some((exc, entry_pc));
-                                    continue;
-                                }
-                                OsrBackoffOutcome::Skip => {}
-                            }
-                            safepoint_check(shared, thread);
-                        }
-                    } else {
-                        frame.pc = saved_pc + 3;
-                    }
-                    continue;
+                    cond_branch_arm!(frame, saved_pc, b1, b2, val == 0);
                 }
                 // i2l — AUDIT CRIT-4: int-typed pop avoids the 8-arm Value match.
                 0x85 => {
@@ -7023,12 +6935,26 @@ fn execute_frame_from_index(
                     let index = frame.stack.pop_int_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
                     if let Value::Object(Some(arr_ref)) = arr_val {
-                        if index < 0 {
+                        // JVMS 6.5 fixes the order NPE -> AIOOBE -> ASE, and the
+                        // bounds test is TWO-SIDED. This arm checked only
+                        // `index < 0`, so an index PAST THE END fell through to
+                        // the covariance check below and reported
+                        // ArrayStoreException where HotSpot reports
+                        // ArrayIndexOutOfBoundsException (measured:
+                        // RArrayStoreTiers s15, String[] as Object[], index 5
+                        // into length 1).
+                        //
+                        // The slow-path `Instruction::Aastore` arm in opcodes.rs
+                        // received the full two-sided check first. This fast-path
+                        // twin is the one the interpreter actually dispatches, so
+                        // fixing only the other one changed nothing observable --
+                        // the same two-handlers-for-one-opcode drift as the JIT
+                        // emitter that never called `jit_aastore`.
+                        let arr_len = shared.mem.heap.array_length(arr_ref) as i32;
+                        if index < 0 || index >= arr_len {
                             let _ = frame;
-                            pending_runtime_error = Some((
-                                RuntimeError::aioobe(index, shared.mem.heap.array_length(arr_ref) as i32),
-                                saved_pc,
-                            ));
+                            pending_runtime_error =
+                                Some((RuntimeError::aioobe(index, arr_len), saved_pc));
                             continue;
                         }
                         // JVMS §aastore covariance check (mirrors the slow-path
@@ -7044,13 +6970,26 @@ fn execute_frame_from_index(
                                 && !aastore_element_assignable(shared, arr_ref, elem_ref)
                             {
                                 let _ = frame;
-                                let elem_cls = shared
+                                // Name the VALUE'S OWN class, HotSpot-style. On
+                                // a reference array the header class id is the
+                                // COMPONENT's, so the raw lookup answers
+                                // `java.lang.Integer` for an `Integer[]` where
+                                // HotSpot answers `[Ljava.lang.Integer;`
+                                // (`RArrayStoreTiers` s04). `cce_display_class_
+                                // name` is the existing repair for exactly that
+                                // — see the long note on the slow-path
+                                // `Instruction::Aastore` twin in opcodes.rs.
+                                // Separate statements: the helper takes the
+                                // class-manager read lock itself.
+                                let raw_elem_name = shared
                                     .classes
                                     .class_manager
                                     .read()
                                     .get_class(shared.mem.heap.class_id_of(elem_ref))
                                     .map(|c| c.name.to_string())
                                     .unwrap_or_else(|| "?".to_string());
+                                let elem_cls =
+                                    cce_display_class_name(shared, elem_ref, &raw_elem_name);
                                 pending_runtime_error = Some((
                                     RuntimeError::ArrayStoreException { message: elem_cls },
                                     saved_pc,
@@ -7396,6 +7335,421 @@ fn execute_frame_from_index(
                         },
                     }
                 }
+                // ── Fast-path coverage completion (interpreter audit
+                // 2026-08-18) ────────────────────────────────────────────
+                //
+                // Everything below reached the decoded handler until now: the
+                // quickened stream had to resolve `saved_pc` (instruction-start
+                // bitmap + per-block popcount), the ~200-arm `Instruction` match
+                // in `opcodes.rs` had to be entered, and each arm re-indexed
+                // `thread.frames[frame_idx]` — bounds-checked, `imul` by
+                // `size_of::<Frame>()` — once per operand it touched.
+                //
+                // The gaps were not chosen, they are what the fast path grew up
+                // around: `ishl`/`ishr`/`iushr` had arms but `lshl`/`lshr`/`lushr`
+                // did not, `ineg`/`lneg` did but `fneg`/`dneg` did not,
+                // `irem`/`lrem` did but `frem`/`drem` did not, `lcmp` did but
+                // `fcmpl`/`fcmpg`/`dcmpl`/`dcmpg` did not, `i2l`/`i2f`/`i2d`/`l2i`
+                // did but the eight remaining conversions did not, and `dup`/`pop`
+                // did but the six other shuffles did not. The long shifts alone
+                // are the whole of a 64-bit hash mixer (`h ^= h >>> 33`) and of
+                // most of the bit-twiddling in the crypto suites this VM runs.
+
+                // ── Reference comparisons: if_acmpeq / if_acmpne ──────────
+                // These close a loop in `do { … } while (a != b)` and in any
+                // bottom-test frontend's output; see `cond_branch_arm!` for
+                // what having no arm here used to cost such a loop.
+                0xa5 => {
+                    let vb = frame.stack.pop_unchecked();
+                    let va = frame.stack.pop_unchecked();
+                    cond_branch_arm!(frame, saved_pc, b1, b2, refs_equal(&va, &vb));
+                }
+                // The `active_profiles_identity_trace` diagnostic lives on the
+                // decoded `IfAcmpne` arm and prints class names for both
+                // operands. Decline the fast path while it is armed rather than
+                // duplicating it, so turning the flag on still reaches it.
+                0xa6 if !acmp_identity_trace => {
+                    let vb = frame.stack.pop_unchecked();
+                    let va = frame.stack.pop_unchecked();
+                    cond_branch_arm!(frame, saved_pc, b1, b2, !refs_equal(&va, &vb));
+                }
+                // ── Null tests: ifnull / ifnonnull ────────────────────────
+                // `ref_operand_is_null` (not `Value::is_null`) so a JNI jobject
+                // null carried as `Value::Long(0)` reads as null — identical to
+                // the decoded arm this replaces.
+                0xc6 => {
+                    let v = frame.stack.pop_unchecked();
+                    cond_branch_arm!(frame, saved_pc, b1, b2, ref_operand_is_null(&v));
+                }
+                0xc7 => {
+                    let v = frame.stack.pop_unchecked();
+                    cond_branch_arm!(frame, saved_pc, b1, b2, !ref_operand_is_null(&v));
+                }
+
+                // ── Long shifts (JVMS: shift distance masked to 6 bits) ───
+                0x79 => {
+                    let sh = frame.stack.pop_int_unchecked() & 0x3F;
+                    let v = frame.stack.pop_long_unchecked();
+                    frame.stack.push_long_unchecked(v << sh);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x7b => {
+                    let sh = frame.stack.pop_int_unchecked() & 0x3F;
+                    let v = frame.stack.pop_long_unchecked();
+                    frame.stack.push_long_unchecked(v >> sh);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x7d => {
+                    let sh = frame.stack.pop_int_unchecked() & 0x3F;
+                    // Widening: unsigned conversion for the logical shift
+                    let v = frame.stack.pop_long_unchecked() as u64;
+                    // Cast: JIT ABI -- i64 register convention
+                    frame.stack.push_long_unchecked((v >> sh) as i64);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+
+                // ── Float / double negate and remainder ───────────────────
+                // Rust's `%` on floats is fmod, which is exactly what JVMS
+                // §6.5 frem/drem specify (NOT the IEEE 754 remainder).
+                0x72 => {
+                    let vb = frame.stack.pop_float_unchecked();
+                    let va = frame.stack.pop_float_unchecked();
+                    frame.stack.push_float_unchecked(va % vb);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x73 => {
+                    let vb = frame.stack.pop_double_unchecked();
+                    let va = frame.stack.pop_double_unchecked();
+                    frame.stack.push_double_unchecked(va % vb);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x76 => {
+                    let v = frame.stack.pop_float_unchecked();
+                    frame.stack.push_float_unchecked(-v);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x77 => {
+                    let v = frame.stack.pop_double_unchecked();
+                    frame.stack.push_double_unchecked(-v);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+
+                // ── The eight remaining primitive conversions ─────────────
+                // Narrowings to integer defer to the same saturation helpers
+                // the decoded arms use (JVMS §2.8.3: NaN → 0, +inf → MAX,
+                // -inf → MIN); widenings are plain casts.
+                0x89 => {
+                    let v = frame.stack.pop_long_unchecked();
+                    // JVM spec: l2f may lose precision
+                    frame.stack.push_float_unchecked(v as f32);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8a => {
+                    let v = frame.stack.pop_long_unchecked();
+                    // JVM spec: l2d may lose precision above 2^53
+                    frame.stack.push_double_unchecked(v as f64);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8b => {
+                    let v = frame.stack.pop_float_unchecked();
+                    frame.stack.push_int_unchecked(float_to_int(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8c => {
+                    let v = frame.stack.pop_float_unchecked();
+                    frame.stack.push_long_unchecked(float_to_long(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8d => {
+                    let v = frame.stack.pop_float_unchecked();
+                    frame.stack.push_double_unchecked(f64::from(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8e => {
+                    let v = frame.stack.pop_double_unchecked();
+                    frame.stack.push_int_unchecked(double_to_int(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x8f => {
+                    let v = frame.stack.pop_double_unchecked();
+                    frame.stack.push_long_unchecked(double_to_long(v));
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x90 => {
+                    let v = frame.stack.pop_double_unchecked();
+                    // JVM spec: d2f may lose precision
+                    frame.stack.push_float_unchecked(v as f32);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+
+                // ── Float / double comparisons ────────────────────────────
+                // `l` and `g` differ only in the NaN answer.
+                0x95 | 0x96 => {
+                    let vb = frame.stack.pop_float_unchecked();
+                    let va = frame.stack.pop_float_unchecked();
+                    let nan_result = if opcode == 0x95 { -1 } else { 1 };
+                    let result = if va.is_nan() || vb.is_nan() {
+                        nan_result
+                    } else if va > vb {
+                        1
+                    } else if va == vb {
+                        0
+                    } else {
+                        -1
+                    };
+                    frame.stack.push_int_unchecked(result);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x97 | 0x98 => {
+                    let vb = frame.stack.pop_double_unchecked();
+                    let va = frame.stack.pop_double_unchecked();
+                    let nan_result = if opcode == 0x97 { -1 } else { 1 };
+                    let result = if va.is_nan() || vb.is_nan() {
+                        nan_result
+                    } else if va > vb {
+                        1
+                    } else if va == vb {
+                        0
+                    } else {
+                        -1
+                    };
+                    frame.stack.push_int_unchecked(result);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+
+                // ── Operand-stack shuffles ────────────────────────────────
+                // Every one of these moves slot bits AND the kind mark, which
+                // is the whole reason they use `*_with_kind_unchecked` rather
+                // than a `Value` round-trip: `ValueStack::is_cat2_kind` reads
+                // the mark to decide whether a NaN-tag-colliding long is one
+                // logical category-2 value or two category-1 slots, and the GC
+                // reads it to decide whether a pointer-shaped slot is a
+                // reference. Structure mirrors the decoded arms exactly.
+                0x58 => {
+                    let (val, kind) = frame.stack.pop_with_kind_unchecked();
+                    if !crate::runtime::ValueStack::is_cat2_kind(kind, val) {
+                        frame.stack.pop_with_kind_unchecked();
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5a => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                    frame.stack.push_with_kind_unchecked(v1, k1);
+                    frame.stack.push_with_kind_unchecked(v2, k2);
+                    frame.stack.push_with_kind_unchecked(v1, k1);
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5b => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                    if crate::runtime::ValueStack::is_cat2_kind(k2, v2) {
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else {
+                        let (v3, k3) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v3, k3);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5c => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    if crate::runtime::ValueStack::is_cat2_kind(k1, v1) {
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else {
+                        let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5d => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                    if crate::runtime::ValueStack::is_cat2_kind(k1, v1) {
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else {
+                        let (v3, k3) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v3, k3);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                0x5e => {
+                    let (v1, k1) = frame.stack.pop_with_kind_unchecked();
+                    let (v2, k2) = frame.stack.pop_with_kind_unchecked();
+                    let v1c2 = crate::runtime::ValueStack::is_cat2_kind(k1, v1);
+                    let v2c2 = crate::runtime::ValueStack::is_cat2_kind(k2, v2);
+                    if v1c2 && v2c2 {
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else if v1c2 {
+                        let (v3, k3) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v3, k3);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else if v2c2 {
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    } else {
+                        let (v3, k3) = frame.stack.pop_with_kind_unchecked();
+                        let (v4, k4) = frame.stack.pop_with_kind_unchecked();
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                        frame.stack.push_with_kind_unchecked(v4, k4);
+                        frame.stack.push_with_kind_unchecked(v3, k3);
+                        frame.stack.push_with_kind_unchecked(v2, k2);
+                        frame.stack.push_with_kind_unchecked(v1, k1);
+                    }
+                    frame.pc = saved_pc + 1;
+                    continue;
+                }
+                // ── Constant-pool and object opcodes ──────────────────────
+                //
+                // These had no arm, so each paid the quickened `resolve(pc)`,
+                // the frame-pointer hoist and its `code_ptr` compare, a
+                // non-inlined call into `execute_instruction`, the ~200-variant
+                // `Instruction` match and the post-call diagnostic checks —
+                // all before its body ran.
+                //
+                // The bodies are NOT copied here. Each lives in exactly one
+                // `opcodes::op_*` function and BOTH paths call it, so there is
+                // still one implementation per opcode. Two copies of an opcode
+                // is precisely the shape `difftest`'s `interp-decoded` axis
+                // exists to catch — `getfield` alone is 450 lines, and a fix
+                // landing in one copy and not the other is the failure that
+                // axis was built after.
+                //
+                // `pc` is advanced BEFORE the call because the decoded path
+                // does (it writes `next_pc` ahead of dispatch) and several of
+                // these bodies read `frame.pc` back — `monitorenter` and
+                // `monitorexit` snapshot it, and the diagnostic blocks print
+                // it. Advancing after the call would change what they observe.
+                0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xbb | 0xc0 | 0xc1 => {
+                    let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
+                    let _ = frame;
+                    thread.frames[frame_idx].pc = saved_pc + 3;
+                    let outcome = match opcode {
+                        0xb2 => op_getstatic(shared, thread, frame_idx, cp_index),
+                        0xb3 => op_putstatic(shared, thread, frame_idx, cp_index),
+                        0xb4 => op_getfield(shared, thread, frame_idx, cp_index),
+                        0xb5 => op_putfield(shared, thread, frame_idx, cp_index),
+                        0xbb => op_new(shared, thread, frame_idx, cp_index),
+                        0xc0 => op_checkcast(shared, thread, frame_idx, cp_index),
+                        // 0xc1
+                        _ => op_instanceof(shared, thread, frame_idx, cp_index),
+                    };
+                    if let Err(e) = outcome {
+                        // Same classifier the invoke fast paths use: it performs
+                        // the Runtime/Linkage conversions the slow path's
+                        // per-opcode guard would otherwise have done, which is
+                        // the step those arms once skipped and killed the
+                        // process over.
+                        match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        }
+                    }
+                    continue;
+                }
+                // monitorenter / monitorexit — single-byte, so `pc` advances by
+                // one rather than three; otherwise identical to the arm above.
+                0xc2 | 0xc3 => {
+                    let _ = frame;
+                    thread.frames[frame_idx].pc = saved_pc + 1;
+                    let outcome = if opcode == 0xc2 {
+                        op_monitorenter(shared, thread, frame_idx)
+                    } else {
+                        op_monitorexit(shared, thread, frame_idx)
+                    };
+                    if let Err(e) = outcome {
+                        match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        }
+                    }
+                    continue;
+                }
+                // ldc (0x12, 1-byte index) / ldc_w (0x13) / ldc2_w (0x14).
+                // `execute_ldc` / `execute_ldc2w` were already factored out, so
+                // these arms are pure dispatch removal. The `ldc` family also
+                // needs the malformed-constant-pool conversion the decoded arms
+                // apply, so it is applied here too rather than dropped.
+                0x12 | 0x13 | 0x14 => {
+                    let _ = frame;
+                    let (cp_index, width) = if opcode == 0x12 {
+                        (b1 as u16, 2) // Cast: bytecode operand decoding
+                    } else {
+                        (((b1 as u16) << 8) | (b2 as u16), 3) // Cast: bytecode operand decoding
+                    };
+                    thread.frames[frame_idx].pc = saved_pc + width;
+                    let raw = if opcode == 0x14 {
+                        execute_ldc2w(shared, thread, frame_idx, cp_index)
+                    } else {
+                        execute_ldc(shared, thread, frame_idx, cp_index)
+                    };
+                    if let Err(e) = raw {
+                        let e = convert_ldc_class_format_error(shared, thread, e);
+                        match classify_fastpath_invoke_error(shared, thread, e) {
+                            FastPathInvokeError::Runtime(re) => {
+                                pending_runtime_error = Some((re, saved_pc));
+                            }
+                            FastPathInvokeError::Java(exc) => {
+                                pending_java_exception = Some((exc, saved_pc));
+                            }
+                            FastPathInvokeError::Fatal(e) => return Err(e),
+                        }
+                    }
+                    continue;
+                }
                 _ => { /* fall through to slow path */ }
             }
         }
@@ -7648,7 +8002,58 @@ fn execute_frame_from_index(
 
         #[allow(unreachable_patterns)]
         match exec_result {
-            Ok(InstructionResult::Continue) => continue,
+            Ok(InstructionResult::Continue) => {
+                // ── Decoded-path back-edge accounting ───────────────────
+                //
+                // The raw-bytecode arms above account for their own branches.
+                // Anything that reaches the decoded handler and jumps BACKWARDS
+                // had no accounting at all: `goto_w`, `tableswitch`,
+                // `lookupswitch`, `ret`, and — under `-noverify`, where
+                // `use_fast_path` is false — every branch in the instruction
+                // set. A loop closed by one of those was invisible to back-edge
+                // OSR and to the loop-work tier-up credit
+                // `pop_and_recycle_frame_with_reason` computes from
+                // `Frame::backward_count`.
+                //
+                // Testing the resulting pc rather than enumerating opcodes is
+                // deliberate: it is the property that actually matters, it
+                // cannot be forgotten when an opcode is added, and it is one
+                // compare against a value already in hand — on the slow path
+                // only, since a fast-path arm never reaches here.
+                //
+                // `Continue` is the only result this can key off: `FramePushed`
+                // and `Return` change the frame under `frame_idx`, and a thrown
+                // exception leaves through `Err`, so a handler landing pad
+                // below `saved_pc` is not mistaken for a loop back edge.
+                let new_pc = thread.frames[frame_idx].pc;
+                if new_pc < saved_pc {
+                    if pgo_enabled {
+                        let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
+                        shared
+                            .jit
+                            .profile_store
+                            .record_backedge_borrowed(cid, mn, md, saved_pc);
+                    }
+                    thread.frames[frame_idx].backward_count += 1;
+                    match try_osr_with_backoff(
+                        shared,
+                        thread,
+                        &mut frame_idx,
+                        initial_frame_idx,
+                        new_pc,
+                    ) {
+                        OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                        OsrBackoffOutcome::ContinueDispatch => continue,
+                        OsrBackoffOutcome::ThrowJava(exc) => {
+                            pending_java_exception = Some((exc, OSR_FRAME_DECLINED_TO_CATCH));
+                            continue;
+                        }
+                        OsrBackoffOutcome::Skip => {}
+                    }
+                    safepoint_check(shared, thread);
+                }
+                continue;
+            }
             Ok(InstructionResult::FramePushed) => {
                 // A new bytecode frame was pushed — execute it iteratively
                 frame_idx = thread.frames.len() - 1;
@@ -7941,8 +8346,12 @@ pub use field_access::*;
 // The interpreter's resolved constant pool: per-thread, lock-free site caches
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
+pub mod invoke_phases;
 pub mod site_cache;
-pub use site_cache::{FieldSiteCache, MethodSiteCache, MethodSiteInfo};
+pub use site_cache::{
+    CastSiteCache, ClassSiteCache, FieldSiteCache, MethodSiteCache, MethodSiteInfo,
+    ResolvedNewSite,
+};
 // ---------------------------------------------------------------------------
 // Helper: Method invocation
 // ---------------------------------------------------------------------------
@@ -8401,6 +8810,13 @@ fn refs_equal(a: &Value, b: &Value) -> bool {
             (Value::Int(va), Value::Int(vb)) => va == vb,
             (Value::Int(0), Value::Object(None)) | (Value::Object(None), Value::Int(0)) => true,
             (Value::Long(0), Value::Object(None)) | (Value::Object(None), Value::Long(0)) => true,
+            // Both sides a JNI-smuggled null handle. `ref_operand_is_null`
+            // already calls `Value::Long(0)` the null reference, and the arm
+            // above says a `Long(0)` equals an `Object(None)` — so leaving this
+            // pair out made `if_acmpeq(nullHandle, nullHandle)` answer FALSE
+            // while both `if_acmpeq(nullHandle, null)` and `ifnull(nullHandle)`
+            // answered TRUE. Equality on the same value has to be reflexive.
+            (Value::Long(0), Value::Long(0)) => true,
             _ => false,
         },
         _ => false,
@@ -8481,6 +8897,251 @@ fn double_binop(frame: &mut Frame, op: impl FnOnce(f64, f64) -> f64) -> Result<(
 }
 
 // -- Multi-dimensional array allocation --
+
+/// The part of a `multianewarray` site's answer that does not depend on the
+/// dimension VALUES: the leaf element type, the descriptor's bracket count, and
+/// the per-level component class ids.
+///
+/// All three are functions of `(referencing class, cp index, dimensions)` only,
+/// and that triple is fixed for a given bytecode site. Recomputing them per
+/// execution costs a `class_manager` read lock, a `get_class_name`, two `String`
+/// builds and up to two loader-aware class resolutions — measured at +227 ns on
+/// a 300k-iteration `new String[4][4]` loop (418 → 645 ns/op), which is 55% on
+/// top of the allocation itself. Memoized, the site pays that once.
+struct MultiANewArrayPlan {
+    leaf_et: ArrayElementType,
+    total_array_depth: usize,
+    /// Component class id per allocated level, outermost first.
+    component_ids: Box<[ClassId]>,
+}
+
+/// Per-site memo for [`MultiANewArrayPlan`], keyed by
+/// `(referencing_class_id, cp_index, dimensions)`.
+///
+/// Only FULLY resolved plans are inserted (see `plan_is_cacheable`). A level
+/// whose component class did not resolve falls back to `ClassId(0)` — the
+/// pre-existing behaviour — and caching that would make a transient resolution
+/// failure permanent, which is exactly the shape of bug this whole change is
+/// fixing.
+type MultiANewArrayPlanCache =
+    parking_lot::RwLock<rustc_hash::FxHashMap<(u32, u16, u8), Arc<MultiANewArrayPlan>>>;
+
+fn multianewarray_plan_cache() -> &'static MultiANewArrayPlanCache {
+    static CACHE: std::sync::OnceLock<MultiANewArrayPlanCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Drop every memoized [`MultiANewArrayPlan`].
+///
+/// **Class ids are recycled.** `unload_user_classes` can retire `p/X` under a
+/// live loader and let that loader define a fresh `p/X` with the same id — the
+/// exact aliasing `ClassManager::array_class_for` guards against by
+/// re-synthesising rather than trusting its own cache. A plan holds ids on both
+/// sides (the key names the referencing class, the value names each level's
+/// component class), so it is invalidated wholesale from the one place that
+/// already retires the JIT's other class-keyed caches
+/// (`memory::gc`'s unload path). Unloading is rare and batched; refilling a
+/// site costs one resolution.
+pub(crate) fn invalidate_multianewarray_plans() {
+    multianewarray_plan_cache().write().clear();
+}
+
+/// Resolve a `multianewarray` site's array class and allocate the array.
+///
+/// **This is the ONE implementation of JVMS §multianewarray's typing rules in
+/// this VM.** The interpreter's `Instruction::Multianewarray` arm and the JIT's
+/// `jit_multianewarray_2d` helper are both thin callers of it, and that is
+/// deliberate: the two used to be separate transcriptions and only the
+/// interpreter's carried the component-class resolution below. The JIT's copy
+/// allocated every level with `ClassId(0)`, so a JIT-compiled `new String[a][b]`
+/// produced an object whose `getClass()` read back `[Ljava.lang.Object;` — the
+/// `DSCompiler.getCompiler` `ClassCastException` witness.
+///
+/// `sizes` is outermost-first and must be non-empty; its length is the
+/// `dimensions` operand, which JVMS §4.9.1 allows to be SMALLER than the
+/// referenced array class's bracket count (the unspecified inner dimensions
+/// stay null).
+pub(crate) fn multianewarray_alloc(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+    cp_index: u16,
+    sizes: &[usize],
+) -> Result<ObjectRef, MethodCallFailed> {
+    if sizes.is_empty() {
+        return Err(VmError::Internal {
+            message: "multianewarray: dimensions must be >= 1".to_string(),
+        }
+        .into());
+    }
+    // `dimensions` is a single bytecode operand, so it never exceeds u8::MAX;
+    // the guard below rejects anything past the descriptor's bracket count
+    // anyway, and 255 is the JVMS ceiling on that.
+    let dims_key = u8::try_from(sizes.len()).unwrap_or(u8::MAX);
+    let cache_key = (referencing_class_id.as_u32(), cp_index, dims_key);
+
+    // Clone the `Arc` and DROP THE LOCK before allocating. `alloc_multi_array`
+    // can trigger a GC, and the GC's own `unload_user_classes` path is what
+    // calls `invalidate_multianewarray_plans` — i.e. it takes this lock for
+    // WRITE. Holding the read guard across the allocation would let a thread
+    // wait for a collection that is waiting for this reader, through a
+    // `parking_lot::RwLock` that is neither reentrant nor writer-starving. One
+    // refcount bump is the whole cost of not having that edge.
+    let hit = multianewarray_plan_cache().read().get(&cache_key).cloned();
+    if let Some(plan) = hit {
+        return alloc_multi_array(
+            shared,
+            sizes,
+            0,
+            plan.leaf_et,
+            plan.total_array_depth,
+            &plan.component_ids,
+        );
+    }
+
+    // Resolve the leaf element type AND total array depth from the array class
+    // descriptor. The `dimensions` operand may be less than the total `[`
+    // count, in which case the unspecified inner dimensions stay null and the
+    // deepest *allocated* array must hold references (not the leaf type) — see
+    // `alloc_multi_array`.
+    let (leaf_et, total_array_depth, leaf_desc) = {
+        let cm = shared.classes.class_manager.read();
+        let class = cm
+            .get_class(referencing_class_id)
+            .ok_or_else(|| VmError::Internal {
+                message: "current class not found".to_string(),
+            })?;
+        let array_class_name =
+            class
+                .constant_pool
+                .get_class_name(cp_index)
+                .ok_or_else(|| VmError::Internal {
+                    message: format!("invalid class ref at cp#{cp_index}"),
+                })?;
+        // Strip leading '[' to find the leaf type descriptor; the count of
+        // stripped `[`s is the total array depth.
+        let total_depth = array_class_name
+            .as_bytes()
+            .iter()
+            .take_while(|&&b| b == b'[')
+            .count();
+        let leaf = &array_class_name.as_bytes()[total_depth..];
+        let et = match leaf.first() {
+            Some(b'I') => ArrayElementType::Int,
+            Some(b'J') => ArrayElementType::Long,
+            Some(b'F') => ArrayElementType::Float,
+            Some(b'D') => ArrayElementType::Double,
+            Some(b'B') => ArrayElementType::Byte,
+            Some(b'C') => ArrayElementType::Char,
+            Some(b'S') => ArrayElementType::Short,
+            Some(b'Z') => ArrayElementType::Boolean,
+            _ => ArrayElementType::Reference,
+        };
+        (et, total_depth, array_class_name[total_depth..].to_string())
+    };
+
+    // JVMS §4.9.1 static constraint: `dimensions` must not exceed the number of
+    // leading `[` in the referenced array class.
+    //
+    // SECURITY (defense-in-depth, same policy as `execute_ldc`'s
+    // `ClassFormatError` conversion): the type-state verifier does enforce this
+    // (`verify_insn.rs`, `Instruction::Multianewarray`), but that pass does NOT
+    // run for every class. Pass 3 is deferred wholesale for any class defined
+    // by a user-defined loader while `loader_aware_resolution()` is on — which
+    // is the default, and covers every Spring / WildFly / H2 application class
+    // — and the structural-only substitute
+    // (`verifier::verify_method_structural`) never looks at this operand.
+    // `-Xverify:none` removes it too.
+    //
+    // Without this guard `total_array_depth - d - 1` below underflows: in a
+    // release build (overflow-checks off) it wraps to `usize::MAX`, and
+    // `"[".repeat(usize::MAX)` then asks the allocator for `usize::MAX` bytes,
+    // which aborts the process rather than raising anything Java can catch.
+    // It sits in front of the cache insert as well as the subtraction: a site
+    // that throws here must throw every time, never be memoized into a plan.
+    if sizes.len() > total_array_depth {
+        let (cls, mname) = match thread.frames.last() {
+            Some(f) => (f.class_name().to_string(), f.method_name().to_string()),
+            None => (String::new(), String::new()),
+        };
+        return Err(crate::runtime::exceptions::throw_linkage_error(
+            shared,
+            thread,
+            LinkageError::VerifyError {
+                class_name: cls,
+                method_name: mname,
+                message: format!(
+                    "multianewarray: dimensions {} exceeds array bracket count {} \
+                     of type at cp#{cp_index}",
+                    sizes.len(),
+                    total_array_depth
+                ),
+            },
+        ));
+    }
+
+    // Resolve the *component* class id for each allocated array level so the
+    // array objects carry their precise class (e.g. the outer level of
+    // `new String[8][8]` is a `[[Ljava/lang/String;` whose component is
+    // `[Ljava/lang/String;`). Without this every multi-dim array was allocated
+    // with `ClassId(0)` and `getClass().getName()` collapsed to
+    // `[Ljava/lang/Object;`. Each level d's component descriptor is
+    // `[`×(total_depth-d-1) followed by the leaf descriptor; a primitive leaf
+    // (`I`, `C`, …) needs no class (the element type drives naming).
+    let leaf_is_reference = leaf_desc.starts_with('L') && leaf_desc.ends_with(';');
+    let mut component_ids: Vec<ClassId> = Vec::with_capacity(sizes.len());
+    // Every level except a primitive leaf names a class that must resolve; if
+    // any did not, the plan is a fallback and must not be memoized.
+    let mut fully_resolved = true;
+    for d in 0..sizes.len() {
+        let comp_brackets = total_array_depth - d - 1;
+        let cid = if comp_brackets > 0 {
+            // Component is itself an array class — resolve `[…`.
+            //
+            // JVMS §5.3.3: that inner array class is defined by the defining
+            // loader of ITS component, so it must be resolved loader-faithfully.
+            // This `ClassId` is stamped into the allocated array object's header
+            // and is what a later `getClass()` / `getComponentType()` reads back,
+            // so collapsing two loaders' `[Lp/X;` here would make
+            // `new p.X[2][2]` report the wrong loader's element type.
+            let comp_desc = format!("{}{}", "[".repeat(comp_brackets), leaf_desc);
+            resolve_class_or_array_loader_aware(shared, thread, referencing_class_id, &comp_desc)
+                .unwrap_or(ClassId::new(0))
+        } else if leaf_is_reference {
+            // Reference leaf — component is the element class itself.
+            let comp_name = &leaf_desc[1..leaf_desc.len() - 1];
+            resolve_class_loader_aware(shared, thread, referencing_class_id, comp_name)
+                .unwrap_or(ClassId::new(0))
+        } else {
+            // Primitive leaf: element type carries the descriptor.
+            ClassId::new(0)
+        };
+        if cid == ClassId::new(0) && (comp_brackets > 0 || leaf_is_reference) {
+            fully_resolved = false;
+        }
+        component_ids.push(cid);
+    }
+
+    if fully_resolved {
+        multianewarray_plan_cache().write().insert(
+            cache_key,
+            Arc::new(MultiANewArrayPlan {
+                leaf_et,
+                total_array_depth,
+                component_ids: component_ids.clone().into_boxed_slice(),
+            }),
+        );
+    }
+
+    alloc_multi_array(
+        shared,
+        sizes,
+        0,
+        leaf_et,
+        total_array_depth,
+        &component_ids,
+    )
+}
 
 /// Maximum recursion depth for multianewarray to prevent stack overflow.
 /// The JVM spec allows at most 255 dimensions, but we cap at 255 to be safe.
@@ -8767,6 +9428,95 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
             "[imse]   readHolds={:p}: NO ThreadLocalMap entry in current thread's table (len={len}) — the entry is GONE",
             read_holds.as_ptr(),
         );
+    }
+}
+
+/// G13-1 (2026-08-17) — the Path B interface-substitution table, and the
+/// property that makes an ARRAY receiver a refusal rather than a guess.
+///
+/// These live inline rather than in `interpreter/tests.rs` because this lane
+/// owns exactly one file. They are pure-function tests: nothing here builds a
+/// VM, so they run in milliseconds and cannot flake.
+#[cfg(test)]
+mod g13_array_receiver_tests {
+    use super::canonical_concrete_for_interface;
+
+    /// The six names Path B substitutes for, pinned. If a lane adds a seventh,
+    /// this test is where it has to say so — and the array refusal at the call
+    /// site picks it up automatically, because it reads the same function.
+    #[test]
+    fn the_substituted_interfaces_are_exactly_these_six() {
+        let mapped: Vec<(&str, &str)> = [
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/util/List",
+            "java/util/Map",
+            "java/util/Iterator",
+        ]
+        .into_iter()
+        .map(|i| (i, canonical_concrete_for_interface(i)))
+        .collect();
+        assert_eq!(
+            mapped,
+            vec![
+                ("java/util/Set", "java/util/HashSet"),
+                ("java/util/Collection", "java/util/HashSet"),
+                ("java/lang/Iterable", "java/util/ArrayList"),
+                ("java/util/List", "java/util/ArrayList"),
+                ("java/util/Map", "java/util/HashMap"),
+                ("java/util/Iterator", "java/util/HashMap$KeyItr"),
+            ]
+        );
+    }
+
+    /// The load-bearing absence. An array type implements `Cloneable` and
+    /// `java.io.Serializable` and nothing else (JLS 4.10.3). If either ever
+    /// gained a canonical mapping, "canonical is non-empty AND receiver is an
+    /// array" would stop being a proof of `IncompatibleClassChangeError` — so
+    /// the refusal's soundness is asserted here, not just commented.
+    #[test]
+    fn the_two_interfaces_an_array_really_implements_are_never_substituted() {
+        assert_eq!(canonical_concrete_for_interface("java/lang/Cloneable"), "");
+        assert_eq!(canonical_concrete_for_interface("java/io/Serializable"), "");
+    }
+
+    /// The refusal must not swallow ordinary `Object` methods on an array.
+    /// `clone`/`hashCode`/`getClass` on an `Object[]` are legal and reach the
+    /// no-`Code` arm through `java/lang/Object`, which maps to nothing — so
+    /// the array check cannot fire for them.
+    #[test]
+    fn object_and_unrelated_types_are_not_substituted() {
+        for name in [
+            "java/lang/Object",
+            "java/util/Map$Entry",
+            "java/util/SequencedCollection",
+            "java/net/http/HttpRequest",
+            "java/util/stream/Stream",
+            "",
+        ] {
+            assert_eq!(
+                canonical_concrete_for_interface(name),
+                "",
+                "{name} must not be substituted"
+            );
+        }
+    }
+
+    /// The exact triple this record was written about:
+    /// `java/util/Map.isEmpty()Z` on an `Object[]` receiver. `java/util/Map`
+    /// is substituted, so an array receiver at that site is refused.
+    ///
+    /// MEASURED counterpart: `[CANONICAL] java/util/Map java/util/HashMap
+    /// isEmpty 1` — the only row the whole 105-class corpus produces, in
+    /// either policy mode.
+    #[test]
+    fn the_map_is_empty_triple_is_the_substituted_one() {
+        assert_eq!(
+            canonical_concrete_for_interface("java/util/Map"),
+            "java/util/HashMap"
+        );
+        assert!(!canonical_concrete_for_interface("java/util/Map").is_empty());
     }
 }
 

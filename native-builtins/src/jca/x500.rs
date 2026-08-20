@@ -66,9 +66,10 @@ use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use super::asn1;
 
 /// The single declared instance slot of `X500Principal` (`thisX500Name`).
-/// We repurpose it to hold the canonical RFC-4514 DN string; the DER form
-/// is re-derived from it on demand (see `get_der`) since the real JDK
-/// class has no second field to store it in.
+/// We repurpose it to hold the canonical RFC-4514 DN string. The real JDK
+/// class has no second field for the DER, so the encoding a principal was
+/// built from is kept beside the object instead (see `x500_der_table`) —
+/// re-deriving it from this string loses the ASN.1 string types.
 const FIELD_CANONICAL: usize = 0;
 
 // ---------------------------------------------------------------------------
@@ -467,7 +468,8 @@ fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
 /// is never persisted as a field — `get_der` re-derives it on demand by
 /// re-encoding the canonical string, which is byte-stable for the canonical
 /// `Name` form.
-fn populate(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str, _der: &[u8]) {
+fn populate(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str, der: &[u8]) {
+    remember_der(ctx, this, der);
     let s = ctx.create_string(canonical);
     // Write the canonical string into the one declared instance slot.
     // `set_field_by_name` resolves `thisX500Name` to slot 0; the explicit
@@ -518,21 +520,331 @@ fn get_canonical(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String>
     None
 }
 
+/// How many principals' encodings to keep. Bounded because the table is keyed
+/// by identity hash and nothing tells us when a principal dies.
+const X500_DER_MAX_ENTRIES: usize = 4096;
+
+/// The ORIGINAL DER of principals constructed from DER, keyed by identity hash.
+///
+/// `X500Principal` declares one instance field and `populate` needs it for the
+/// canonical string, so there is nowhere on the object to keep the encoding.
+/// It nevertheless has to be kept. The canonical RFC-4514 string does not
+/// carry the ASN.1 STRING TYPE of each attribute value, so re-encoding it is
+/// NOT the identity function — and `get_der` used to do exactly that, under a
+/// comment asserting "the canonical `Name` form is byte-stable, so this
+/// round-trips exactly". It is not, and the difference is interop-visible,
+/// because RFC 5280 name matching is byte equality over the DER.
+///
+/// Measured (`IdpDbg` probe, jdk-25 as the control): BouncyCastle writes
+/// `CN=Root,O=BC` with UTF8String, tag `0c`; re-encoding the canonical string
+/// picks PrintableString, tag `13`, because the characters permit it.
+///
+/// ```text
+/// certGn  ...06035504030c04526f6f74...   from the certificate  (0c = UTF8String)
+/// expGn   ...0603550403 1304526f6f74...  rebuilt via X500Principal (13 = Printable)
+/// equals=false          -- and both print `CN=Root,O=BC,OU=Test+O=Bouncy`
+/// ```
+///
+/// So `X509CRL.getIssuerX500Principal().getEncoded()` disagreed with the CRL's
+/// own issuer bytes, and BouncyCastle's
+/// `PKIXCRLValidator.checkDistributionPointName` compared two `GeneralName`s
+/// that RENDER identically and are not equal. That is `IDPRelativeNameTest`,
+/// where the expanded distribution-point name never matched the certificate's;
+/// the reported failure named a DIFFERENT distribution point, because
+/// `checkCRLs` keeps only the LAST exception and retries with one synthesised
+/// from the issuer.
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both callers evaluate
+/// `ctx.identity_hash_code` into a local BEFORE acquiring, and the bodies under
+/// the guard are map operations on `Vec<u8>` only.
+fn x500_der_table() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<i32, Vec<u8>>> {
+    static T: std::sync::OnceLock<cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<i32, Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+}
+
+/// Record the encoding this principal was built from.
+fn remember_der(ctx: &mut dyn NativeContext, this: ObjectRef, der: &[u8]) {
+    if der.is_empty() {
+        return;
+    }
+    let id = ctx.identity_hash_code(this);
+    let mut t = match x500_der_table().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if t.len() >= X500_DER_MAX_ENTRIES {
+        let target = X500_DER_MAX_ENTRIES / 2;
+        let mut ids: Vec<i32> = t.keys().copied().filter(|&k| k != id).collect();
+        ids.sort_unstable();
+        let to_remove = t.len().saturating_sub(target);
+        for k in ids.into_iter().take(to_remove) {
+            t.remove(&k);
+        }
+    }
+    t.insert(id, der.to_vec());
+}
+
+/// The recorded encoding, but only if it still describes THIS principal.
+///
+/// An identity hash is not a handle: two live objects may share one, and the
+/// table outlives the principal that filled it. Handing back a stranger's DER
+/// from an identity object would be worse than re-encoding, so the entry is
+/// only used when decoding it reproduces the canonical name the object
+/// currently carries. A miss falls back to the previous behaviour.
+fn recall_der(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str) -> Option<Vec<u8>> {
+    let id = ctx.identity_hash_code(this);
+    let der = {
+        let t = match x500_der_table().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        t.get(&id).cloned()?
+    };
+    let rdns = decode_rdns(&der).ok()?;
+    if render_canonical(&rdns) == canonical {
+        Some(der)
+    } else {
+        None
+    }
+}
+
 /// Read the DER encoding of an instance.
 ///
-/// The real JDK `X500Principal` has only one instance field, so there is no
-/// slot to persist the DER bytes in — `populate` stores just the canonical
-/// RFC-4514 string.  The DER is re-derived here by re-encoding that string;
-/// the canonical `Name` form is byte-stable, so this round-trips exactly.
+/// The encoding the principal was BUILT from wins, so `new X500Principal(der)
+/// .getEncoded()` returns `der` — see [`x500_der_table`] for why re-deriving it
+/// from the canonical string is not the same thing. Re-encoding remains the
+/// fallback for principals built from a string (where it is exact, since there
+/// was no original) and for any entry that can no longer be trusted.
 fn get_der(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
-    // Re-encode from the canonical string preserved by `populate`.
     if let Some(canon) = get_canonical(ctx, this) {
+        if let Some(der) = recall_der(ctx, this, &canon) {
+            return der;
+        }
         let groups = parse_grouped_rdns(&canon);
         if !groups.is_empty() {
             return encode_grouped_rdns_to_der(&groups);
         }
     }
     Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// The three JDK string forms
+// ---------------------------------------------------------------------------
+//
+// `X500Principal` has three of them and they are NOT interchangeable:
+//
+// | form      | keywords            | case      | whitespace           |
+// |-----------|---------------------|-----------|----------------------|
+// | RFC2253   | RFC 2253 set        | as-parsed | as-parsed            |
+// | RFC1779   | RFC 1779 set + OID. | as-parsed | as-parsed, quoted    |
+// | CANONICAL | RFC 2253 set, lower | LOWERCASE | trimmed + collapsed  |
+//
+// Every one of them used to answer the RFC2253 string, and `equals` compared
+// THAT — so two DNs that differ only in attribute-name case or in runs of
+// spaces compared UNEQUAL here and EQUAL on HotSpot. That is not cosmetic:
+// PKIX name chaining is defined on the canonical form, so bc-java's PKITS
+// vectors 4.3.3/4.3.4/4.3.5/4.3.11 (whitespace, case and UTF8 name chaining)
+// could not match a CRL to its issuer — `No CRLs found for issuer ...` — and
+// `AttrCertTest` reported `principal[0] for entity names don't match`.
+//
+// `hashCode` is the canonical form's `String.hashCode()`, which is what makes
+// it consistent with the new `equals` (the JDK's own `X500Name.hashCode()` is
+// defined that way, and the two agree value-for-value on every DN in
+// `probes/`).
+
+/// The attribute types RFC 2253 gives a keyword; everything else is written as
+/// its dotted OID in the 2253 and canonical forms.
+fn rfc2253_keyword(oid: &str) -> Option<&'static str> {
+    match oid {
+        "2.5.4.3" => Some("CN"),
+        "2.5.4.7" => Some("L"),
+        "2.5.4.8" => Some("ST"),
+        "2.5.4.10" => Some("O"),
+        "2.5.4.11" => Some("OU"),
+        "2.5.4.6" => Some("C"),
+        "2.5.4.9" => Some("STREET"),
+        "0.9.2342.19200300.100.1.25" => Some("DC"),
+        "0.9.2342.19200300.100.1.1" => Some("UID"),
+        _ => None,
+    }
+}
+
+/// The narrower RFC 1779 keyword set. Anything outside it is spelled
+/// `OID.<dotted>` — measured on HotSpot 25, where `DC=example` renders as
+/// `OID.0.9.2342.19200300.100.1.25=example`.
+fn rfc1779_keyword(oid: &str) -> Option<&'static str> {
+    match oid {
+        "2.5.4.3" => Some("CN"),
+        "2.5.4.7" => Some("L"),
+        "2.5.4.8" => Some("ST"),
+        "2.5.4.10" => Some("O"),
+        "2.5.4.11" => Some("OU"),
+        "2.5.4.6" => Some("C"),
+        "2.5.4.9" => Some("STREET"),
+        _ => None,
+    }
+}
+
+/// Resolve whatever the stored string used as an attribute name (a keyword or
+/// an already-dotted OID) to its dotted OID.
+fn key_to_oid(key: &str) -> String {
+    name_to_oid(key)
+        .map(str::to_string)
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// One AVA in canonical form: lowercase type, escaped + trimmed +
+/// space-collapsed + lowercased value.
+fn canonical_ava(key: &str, value: &str) -> String {
+    let oid = key_to_oid(key);
+    let ty = match rfc2253_keyword(&oid) {
+        Some(k) => k.to_ascii_lowercase(),
+        None => oid.clone(),
+    };
+    // Escapes first, so an escaped separator is not mistaken for one later.
+    // `#` is escaped only in leading position (measured: HotSpot's canonical
+    // for `CN=with#hash` is `cn=with#hash`, unescaped).
+    let mut escaped = String::with_capacity(value.len());
+    for (i, c) in value.chars().enumerate() {
+        match c {
+            ',' | '+' | '"' | '\\' | '<' | '>' | ';' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            '#' if i == 0 => {
+                escaped.push('\\');
+                escaped.push('#');
+            }
+            _ => escaped.push(c),
+        }
+    }
+    // Then trim, collapse runs of SPACE (only U+0020 — HotSpot leaves a TAB
+    // alone: `CN=Tab<TAB>Inside` canonicalises with the tab intact), lowercase.
+    let mut out = String::with_capacity(escaped.len());
+    let mut pending_space = false;
+    for c in escaped.trim().chars() {
+        if c == ' ' {
+            pending_space = true;
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+    }
+    format!("{ty}={}", out.to_lowercase())
+}
+
+/// The RFC 2253 CANONICAL form of a whole DN.
+///
+/// A multi-valued RDN's AVAs are SORTED by their rendered strings, which is
+/// what makes `CN=a+OU=b+O=c` and `O=c+CN=a+OU=b` the same name (HotSpot:
+/// `cn=a+o=c+ou=b`). RDN order itself is significant and preserved.
+fn canonical_form(groups: &[Vec<(String, String)>]) -> String {
+    groups
+        .iter()
+        .map(|group| {
+            let mut avas: Vec<String> =
+                group.iter().map(|(k, v)| canonical_ava(k, v)).collect();
+            avas.sort();
+            avas.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `java.lang.String.hashCode()` over the UTF-16 code units of `s`.
+///
+/// Must be the JAVA hash, not a Rust one: `X500Principal.hashCode()` is
+/// `getName(CANONICAL).hashCode()` on the JDK, and code that keys a `HashMap`
+/// on principals depends on the exact value.
+fn java_string_hash(s: &str) -> i32 {
+    let mut h: i32 = 0;
+    for u in s.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(u as i32);
+    }
+    h
+}
+
+/// One AVA rendered with `keyword`'s type map, quoting the value when RFC 1779
+/// requires it. Shared by the RFC 1779 form and by `toString`, which differ ONLY
+/// in which types get a keyword.
+fn quoted_ava(key: &str, value: &str, keyword: fn(&str) -> Option<&'static str>) -> String {
+    let oid = key_to_oid(key);
+    let ty = match keyword(&oid) {
+        Some(k) => k.to_string(),
+        None => format!("OID.{oid}"),
+    };
+    // Quote when the value has a leading or trailing space, a run of two or
+    // more spaces, or any character RFC 1779 lists as special.
+    let chars: Vec<char> = value.chars().collect();
+    let mut quote = chars.first() == Some(&' ') || chars.last() == Some(&' ');
+    let mut prev_space = false;
+    for &c in &chars {
+        if matches!(c, ',' | '+' | '=' | '"' | '<' | '>' | '#' | ';' | '\n') {
+            quote = true;
+        }
+        if c == ' ' && prev_space {
+            quote = true;
+        }
+        prev_space = c == ' ';
+    }
+    if !quote {
+        return format!("{ty}={value}");
+    }
+    let mut inner = String::with_capacity(value.len() + 2);
+    for c in &chars {
+        if *c == '"' || *c == '\\' {
+            inner.push('\\');
+        }
+        inner.push(*c);
+    }
+    format!("{ty}=\"{inner}\"")
+}
+
+/// A whole DN in one of the two `", "`-separated forms — RDNs separated by
+/// `", "`, AVAs inside one RDN by `" + "`.
+fn quoted_form(
+    groups: &[Vec<(String, String)>],
+    keyword: fn(&str) -> Option<&'static str>,
+) -> String {
+    groups
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|(k, v)| quoted_ava(k, v, keyword))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The RFC 1779 form: only the seven RFC 1779 keywords, everything else
+/// `OID.<dotted>`.
+fn rfc1779_form(groups: &[Vec<(String, String)>]) -> String {
+    quoted_form(groups, rfc1779_keyword)
+}
+
+/// What `X500Principal.toString()` prints. Same layout and quoting as RFC 1779
+/// but the FULL keyword map — measured on HotSpot 25, `EMAILADDRESS=a@b.com`
+/// where `getName(RFC1779)` writes `OID.1.2.840.113549.1.9.1=a@b.com`, and the
+/// same for `T`/`GIVENNAME`/`SURNAME`/`UID`/`DC`/`SERIALNUMBER`. bc-java's
+/// `AttrCertTest` compares this string literally, including the
+/// `EMAILADDRESS=mlorch@vt.edu` tail.
+fn to_string_form(groups: &[Vec<(String, String)>]) -> String {
+    quoted_form(groups, |oid| oid_to_name(oid))
+}
+
+/// The stored RFC 2253 string of `this`, re-parsed into RDN groups.
+fn grouped_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Vec<(String, String)>> {
+    match get_canonical(ctx, this) {
+        Some(text) => parse_grouped_rdns(&text),
+        None => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -724,46 +1036,56 @@ pub fn register(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => ctx.read_string(*f).unwrap_or_default(),
                 _ => String::new(),
             };
-            // Stored canonical is RFC2253 (comma, no space). RFC1779 separates
-            // RDNs with ", " (comma + space); RFC2253/CANONICAL keep no space.
-            let s = get_canonical(ctx, this).unwrap_or_default();
+            // The stored string is the RFC 2253 form. RFC1779 and CANONICAL are
+            // genuinely different renderings of it, not the same string with the
+            // separators swapped: the old `s.replace(',', ", ")` answered an
+            // unquoted RFC2253 string for RFC1779 and the RFC2253 string
+            // verbatim for CANONICAL.
             let s = if fmt.eq_ignore_ascii_case("RFC1779") {
-                s.replace(',', ", ")
+                rfc1779_form(&grouped_of(ctx, this))
+            } else if fmt.eq_ignore_ascii_case("CANONICAL") {
+                canonical_form(&grouped_of(ctx, this))
             } else {
-                s
+                get_canonical(ctx, this).unwrap_or_default()
             };
             let so = ctx.create_string(&s);
             Ok(Some(Value::Object(Some(so))))
         },
     );
 
-    // toString() -> String  (delegates to getName())
+    // toString() -> String. The JDK's is `thisX500Name.toString()`: the `", "`
+    // layout with RFC 1779's quoting, but the FULL keyword map — NOT the RFC
+    // 2253 string this used to answer, and not `getName(RFC1779)` either. See
+    // `to_string_form`.
     r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let s = get_canonical(ctx, this).unwrap_or_default();
+        let s = to_string_form(&grouped_of(ctx, this));
         let so = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(so))))
     });
 
-    // hashCode() -> int  (DER bytes XOR-fold to int).
+    // hashCode() -> int. The JDK's is the CANONICAL name's `String.hashCode()`
+    // (`X500Name.hashCode()`), so it must be that here too — a DER-derived hash
+    // disagrees with the new canonical `equals` for exactly the DN pairs equals
+    // now (correctly) calls equal, which would file two equal principals in
+    // different `HashMap` buckets.
     r.register(cls, "hashCode", "()I", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let der = get_der(ctx, this);
-        let mut h: u32 = 0;
-        for &b in &der {
-            h = h.wrapping_mul(31).wrapping_add(b as u32);
-        }
-        Ok(Some(Value::Int(h as i32)))
+        let canon = canonical_form(&grouped_of(ctx, this));
+        Ok(Some(Value::Int(java_string_hash(&canon))))
     });
 
-    // equals(Object) -> boolean  (compare canonical strings, falling
-    // back to DER bytes if the other side is a different shape).
+    // equals(Object) -> boolean. `X500Principal.equals` is defined on the
+    // CANONICAL form: two DNs are the same name when they differ only in
+    // attribute-name case, value case, or runs of whitespace. Comparing the
+    // stored RFC 2253 strings (and then the DER) answered `false` for exactly
+    // those pairs — see the table above this file's string-form helpers.
     r.register(cls, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -773,17 +1095,17 @@ pub fn register(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let a_canon = get_canonical(ctx, this);
-        let b_canon = get_canonical(ctx, other);
-        if let (Some(a), Some(b)) = (&a_canon, &b_canon) {
-            if a == b {
-                return Ok(Some(Value::Int(1)));
-            }
+        // A non-`X500Principal` argument has no DN to canonicalise; the JDK
+        // answers `false` for it rather than comparing something else.
+        let other_is_principal = ctx
+            .class_name_of_id(ctx.class_id_of_object(other))
+            .is_some_and(|n| n == "javax/security/auth/x500/X500Principal");
+        if !other_is_principal {
+            return Ok(Some(Value::Int(0)));
         }
-        let a_der = get_der(ctx, this);
-        let b_der = get_der(ctx, other);
-        let same = !a_der.is_empty() && a_der == b_der;
-        Ok(Some(Value::Int(if same { 1 } else { 0 })))
+        let a = canonical_form(&grouped_of(ctx, this));
+        let b = canonical_form(&grouped_of(ctx, other));
+        Ok(Some(Value::Int(i32::from(!a.is_empty() && a == b))))
     });
 
     // sun.security.x509.X500Name.asX500Principal() — kcfull #12.

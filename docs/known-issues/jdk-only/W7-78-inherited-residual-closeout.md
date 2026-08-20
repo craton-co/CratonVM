@@ -1,5 +1,60 @@
 # W7-78 — the inherited residuals, closed out: four retirements, one refusal, and five patch blocks that read like work
 
+> # A34 2026-08-12 — RE-ADJUDICATED. The retirements verify, §5.3's vector was
+> # RUN, and §4 — this record's headline finding — is SUPERSEDED IN THE TREE.
+>
+> **§4 is the one to read.** This record's most quoted result is that
+> `service_accepts_type` has *"exactly one caller"* against a feature with two
+> provider paths, and that the missing sibling check is what held `W6-2` back
+> from retirement. Re-counted today, the way §7 says to count:
+> **`service_accepts_type` has TWO callers**, `factory_return_is_subtype` and
+> `constructor_form_is_subtype`, and each of those is applied on BOTH the
+> iterator and the stream path (four call sites in
+> `native-builtins/src/service_loader.rs`). The gap was closed by
+> `f95b6b363` — *fix(serviceloader): W7-85 — apply the factory return-type gate
+> on `stream()` too* — which already carries its own record number, and the
+> constructor-form check §4 downgraded to *"deferred for want of a
+> measurement"* is implemented and wired on both paths as well.
+>
+> So `W6-2` is no longer held back by the row this record held it back on. It
+> may still be held back by something else; that is `W6-2`'s adjudication and
+> not this one's, and it is nominated rather than assumed. **What is settled is
+> that §4's stated blocker is gone.**
+>
+> The irony is worth keeping rather than smoothing over, because it is the
+> generalisation this record itself ends on: §7 says *"ask who calls the fix,
+> and count the answers against the number of paths the feature has"* — and
+> this record's own answer to that question went stale within a day. A caller
+> count is a **timestamp**, not a property. Re-run the `grep` before quoting
+> the number, including when the number is your own.
+>
+> **§5.3 — the vector was run, and the news is good.** §5.3 states the four new
+> nestmate checks *"have never been run on CratonVM"* and that a red would be
+> the useful outcome. Run now on `scratchpad/bin/cratonvm-merged-dev.exe`
+> against Microsoft JDK 25.0.3.9: `PASS RJdkReflect` on HotSpot, `--real-jdk`
+> and `--jdk-only` alike. **`L15`'s landed narrowing is therefore not inert** —
+> and specifically the fourth check, the non-nestmate private-field read that
+> must raise `IllegalAccessException` and is the only one that discriminates a
+> too-permissive gate from a correct one, passes on CratonVM. That was the
+> question nothing had ever asked.
+>
+> One number in §5.3 is already stale: it says the vector goes *"60 → 64"*, and
+> all three arms report **67 checks** today, so it has grown again since. The
+> claim to carry forward is "the four checks are present and green in both
+> modes", not the arithmetic.
+>
+> **Verified unchanged, by re-reading rather than by trusting the record:**
+> `record_boot_loader_library` (§5.1) still has **zero** callers tree-wide —
+> the only other occurrence of the name is inside a doc comment, which a naive
+> grep would have counted as a caller — and the six records §2 retires
+> (`W7-4`, `W7-11`, `W7-28`, `W7-32`, `W3-6`, `W5-2`) are all absent from this
+> directory while `W6-2` is still present, exactly as §1's table claims.
+>
+> **Scheduling:** this record's evidence is the rare kind that *is* scheduled.
+> `RJdkReflect` is a `regression-suite/src` vector, so `run.sh` re-runs it at
+> every `SUITE=` value. Most of this directory's evidence lives under `probes/`,
+> which `run.sh` never names.
+
 **Status: COMPLETE, 2026-08-12.** One test file changed
 (`regression-suite/src/RJdkReflect.java`, +4 checks, +1 helper class); no `.rs`
 file changed; both runtime modes are untouched by every change here. Nothing was
@@ -106,6 +161,17 @@ do not need to.
 ---
 
 ## 4. `W6-2` was not retired, and the row that stopped it is a vacuous green
+
+> **SUPERSEDED 2026-08-12 (A34) — the gap below is CLOSED in the tree; do not
+> apply the fix this section describes.** `service_accepts_type` now has TWO
+> callers (`factory_return_is_subtype`, `constructor_form_is_subtype`), each
+> applied on BOTH the iterator and the `stream()` path. The stream-path gate
+> landed in `f95b6b363` under its own number, `W7-85`. The constructor-form
+> check this section downgrades to "deferred" below is implemented too. The
+> *vacuous-green shape* this section names — a guard installed on one of two
+> siblings, validated by a fixture that only ever satisfies it — remains a
+> correct and useful catalogue entry; only its worked example is spent. Marked
+> here at the finding rather than only in the banner, per this record's own §7.
 
 W7-55 §4 argued `W6-2` was empty because its two *"deliberately NOT done"* items
 are argued refusals. Both were re-read. The row that holds this record back is

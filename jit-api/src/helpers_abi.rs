@@ -106,7 +106,7 @@ use crate::JitRuntimeHelpers;
 /// `build_helpers`) and consumers (the JIT backends) that disagree on this
 /// number disagree on where the helpers live.
 ///
-/// `4` is the revision of the 63-field, 504-byte table shipped today. The
+/// `6` is the revision of the 65-field, 520-byte table shipped today. The
 /// full history is in [`ABI_REVISIONS`], which a const assertion ties to this
 /// constant, to [`NUM_HELPER_FIELDS`] and to [`JIT_HELPERS_ABI_SIZE`] — so
 /// appending a field without bumping this number no longer compiles.
@@ -114,7 +114,7 @@ use crate::JitRuntimeHelpers;
 /// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
 /// append that made it 62 did not bump this constant, because at the time
 /// nothing checked it. `ABI_REVISIONS` is that check.)
-pub const JIT_HELPERS_ABI_VERSION: u32 = 5;
+pub const JIT_HELPERS_ABI_VERSION: u32 = 6;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -681,8 +681,10 @@ helper_fn_slots! {
     // shape as `new_object_cp` and for the same reason; see
     // `JitRuntimeHelpers::ldc_class_cp`.
     HelperFnLdcClassCp, ldc_class_cp, ldc_class_cp_fn, (i64, i64, i64) -> i64;
-    // `(vm_ptr, array_ptr, value_ptr) -> 0 | i64::MIN`. See
-    // `JitRuntimeHelpers::aastore_type_check`.
+    // JVMS §6.5 aastore covariance check ONLY — (vm_ptr, array_ptr, val) ->
+    // `i64::MIN` = refused (ArrayStoreException published) / `0` = proceed.
+    // NOT the store: the caller keeps the inline MOV, the SATB pre-write
+    // barrier and the card mark. See `JitRuntimeHelpers::aastore_type_check`.
     HelperFnAastoreTypeCheck, aastore_type_check, aastore_type_check_fn, (i64, i64, i64) -> i64;
 }
 
@@ -797,7 +799,15 @@ helper_field_table! {
     (monitor_exit,                   Function, false),
     // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site.
     (ldc_class_cp,                   Function, false),
+    // Required: the x64 `0x53` lowering is inline and calls this for the JVMS
+    // §6.5 covariance check, so a `0` slot would be a reference store with no
+    // check at all — the heap-type-confusion defect the slot exists to close.
     (aastore_type_check,             Function, true),
+    // Baked absolute address of the GC's JIT_READ_BOUNDS table, not callable.
+    // A DIFFERENT table from region_bounds_addr above: that one gates inline
+    // reference STORES and G1/ZGC keep it empty on purpose (G1-2); this one
+    // answers the READ question -- is this address mapped -- and G1 does fill it.
+    (read_bounds_addr,               Constant, false),
 }
 
 // ---------------------------------------------------------------------
@@ -818,7 +828,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 64,
+    NUM_HELPER_FIELDS == 65,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -826,8 +836,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 512,
-    "JitRuntimeHelpers size changed (expected 64 * 8 = 512) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 520,
+    "JitRuntimeHelpers size changed (expected 65 * 8 = 520) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -987,6 +997,7 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("monitor_exit", 488),
     ("ldc_class_cp", 496),
     ("aastore_type_check", 504),
+    ("read_bounds_addr", 512),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1082,6 +1093,16 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         version: 5,
         num_fields: 64,
         size: 512,
+    },
+    // v6 -- appended `read_bounds_addr`, the READ-side sibling of
+    // `region_bounds_addr`. The older table cannot answer both questions: since
+    // G1-2 its EMPTINESS is what keeps inline reference stores unreachable under
+    // G1/ZGC, so filling it to make inline field reads reachable would unblock
+    // the stores it exists to block. Two tables, one question each.
+    HelperAbiRevision {
+        version: 6,
+        num_fields: 65,
+        size: 520,
     },
 ];
 
@@ -1298,12 +1319,19 @@ const _: () = {
          really is a displacement and is range-checked by validate_with",
     );
     assert!(
-        constants == 5,
+        constants == 6,
         "the number of baked-address slots changed — a Constant slot is loaded \
          as data and is NOT range-checked by validate_with, so misclassifying \
          a displacement as one silently removes its only sanity check",
     );
     assert!(required == 43, "required-slot count changed");
+    // 13 -> 12 on 2026-08-16, merging `dev`: `aastore_type_check` was promoted
+    // from optional to required, so an optional slot LEFT the set. The check
+    // this guard exists to force -- "does the new optional slot have a zero
+    // check at its emitter call site?" -- has no subject when the count goes
+    // DOWN, and the twelve that remain kept the zero checks they already had.
+    // The runtime test below (`functions - required == 12`) was already on
+    // the new number; this const was the only site still carrying 13.
     assert!(
         optional_fns == 12,
         "the optional-callable count changed — every optional slot MUST have a \
@@ -1650,6 +1678,7 @@ mod tests {
             ("monitor_exit", offset_of!(H, monitor_exit)),
             ("ldc_class_cp", offset_of!(H, ldc_class_cp)),
             ("aastore_type_check", offset_of!(H, aastore_type_check)),
+            ("read_bounds_addr", offset_of!(H, read_bounds_addr)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -1680,15 +1709,15 @@ mod tests {
     /// loudly rather than be absorbed by a computed expression.
     #[test]
     fn helper_table_size_and_align_are_the_literal_abi_numbers() {
-        assert_eq!(core::mem::size_of::<H>(), 512);
+        assert_eq!(core::mem::size_of::<H>(), 520);
         assert_eq!(core::mem::align_of::<H>(), 8);
-        assert_eq!(JIT_HELPERS_ABI_SIZE, 512);
+        assert_eq!(JIT_HELPERS_ABI_SIZE, 520);
         assert_eq!(JIT_HELPERS_ABI_ALIGN, 8);
         assert_eq!(HELPER_FIELD_STRIDE, 8);
-        assert_eq!(NUM_HELPER_FIELDS, 64);
-        assert_eq!(H::NUM_FIELDS, 64);
+        assert_eq!(NUM_HELPER_FIELDS, 65);
+        assert_eq!(H::NUM_FIELDS, 65);
         assert_eq!(H::NUM_HELPER_FN_FIELDS, 55);
-        assert_eq!(JIT_HELPERS_ABI_VERSION, 5);
+        assert_eq!(JIT_HELPERS_ABI_VERSION, 6);
     }
 
     /// The golden table is the only name→offset binding in the crate written
@@ -1713,7 +1742,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "aastore_type_check");
+        assert_eq!(last_name, "read_bounds_addr");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
 
@@ -1726,9 +1755,9 @@ mod tests {
         assert_eq!(
             last,
             HelperAbiRevision {
-                version: 5,
-                num_fields: 64,
-                size: 512,
+                version: 6,
+                num_fields: 65,
+                size: 520,
             },
         );
         // Append-only history: each revision strictly grows the table.
@@ -1919,7 +1948,7 @@ mod tests {
         let required = HELPER_FIELDS.iter().filter(|d| d.required).count();
         assert_eq!(functions, 55, "callable slots");
         assert_eq!(offsets, 4, "displacement slots");
-        assert_eq!(constants, 5, "baked-address slots");
+        assert_eq!(constants, 6, "baked-address slots");
         assert_eq!(required, 43, "required slots");
         assert_eq!(functions - required, 12, "optional callable slots");
         assert_eq!(functions + offsets + constants, H::NUM_FIELDS);
@@ -2075,13 +2104,13 @@ mod tests {
     fn as_words_matches_the_struct_fields() {
         let mut h = H::default();
         h.newarray = 1;
-        // The LAST field, whatever it currently is — `aastore_type_check`
-        // since the aastore element-type check was appended.
-        h.aastore_type_check = 2;
+        // The LAST field, whatever it currently is — `read_bounds_addr`
+        // since the READ-side bounds table was appended.
+        h.read_bounds_addr = 2;
         let w = h.as_words();
         assert_eq!(w[0], 1, "first slot");
         assert_eq!(w[H::NUM_FIELDS - 1], 2, "last slot");
-        assert_eq!(w.len(), 64);
+        assert_eq!(w.len(), 65);
     }
 
     /// Build a table with every *required* slot non-zero and every optional

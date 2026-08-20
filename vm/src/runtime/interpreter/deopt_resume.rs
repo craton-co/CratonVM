@@ -150,9 +150,19 @@ pub(super) fn resume_from_ir_deopt(
         }
         None
     };
-    // Phase-A scope: single non-inlined frame, no held monitors.
+    // An inlined chain materialises every frame it names, outermost first, and
+    // only if EVERY one of them checks out — see `materialise_inlined_chain`.
+    // Before 2026-08-18 this sink refused the chain outright and took the
+    // whole-method re-run, which is what made an inlined body that publishes
+    // deopt metadata unrepresentable and therefore forbidden at the splice.
+    //
+    // A refusal still falls back to that re-run, so the worst case is exactly
+    // the old behaviour.
     if !rframe.caller_frames.is_empty() {
-        return bail("inlined caller chain");
+        return match materialise_inlined_chain(shared, cached, rframe) {
+            Ok(chain) => push_inlined_chain(shared, thread, chain, trace),
+            Err(why) => bail(&format!("inlined caller chain: {why}")),
+        };
     }
     if !rframe.monitors.is_empty() {
         return bail("held monitors");
@@ -219,6 +229,399 @@ pub(super) fn resume_from_ir_deopt(
     crate::threading::thread_state::record_transition(
         crate::threading::thread_state::ThreadExecState::JavaRunning,
         "interpreter::resume_from_ir_deopt",
+    );
+    Some(CachedCallResult::FramePushed)
+}
+
+/// How deep an inlined caller chain this sink will materialise.
+///
+/// HotSpot's own inlining depth limit is 9 and the IR-side
+/// `MAX_INLINE_SCOPE_DEPTH` is 64; this is the *resume* budget, which is a
+/// different question — every frame in the chain is one interpreter frame this
+/// sink must push atomically, and a deopt that half-pushes is unrecoverable.
+/// Refusing a deeper chain costs a whole-method re-run, which is the same
+/// outcome as refusing the chain outright and is what happened before.
+///
+/// Defined as the jit crate's constant rather than repeating the number:
+/// `CompiledMethod::osr_exit_policy` refuses at ADMISSION any chain deeper than
+/// this, so that an OSR entry is never spent reaching a reject this sink was
+/// always going to give. Two copies of the number would let those two drift.
+pub(super) const MAX_INLINE_RESUME_DEPTH: usize =
+    cratonvm_jit::deopt::MAX_OSR_INLINE_RESUME_DEPTH;
+
+/// The bci to park an inlined CALLER frame at.
+///
+/// A caller scope's `bci` names an `invoke` that is **already in progress** —
+/// `ResumeSemantics::for_caller_scope()` is `RESUME`, not `REEXECUTE`. Parking
+/// the interpreter at that bci would call the callee a second time, which is
+/// the double-execution defect the whole deopt-resume contract exists to
+/// prevent, one bytecode instead of one loop iteration. The frame must resume
+/// at the invoke's SUCCESSOR, so that when the frame above it returns, the
+/// interpreter's ordinary return protocol pushes the result onto this frame's
+/// operand stack and carries on.
+///
+/// This is exactly the computation `jit/src/lib.rs` cannot do — its comment on
+/// `ResumeSemantics::RESUME` says "computing the successor bci needs the
+/// method's bytecode, which this crate does not have, so such a point is
+/// refused at admission". The VM has the bytecode, so it is computed here.
+///
+/// Fail-closed on anything that is not an invoke: a caller scope whose bci does
+/// not name a call is a malformed chain, not a resumable frame.
+pub(super) fn caller_resume_pc(code: &[u8], code_len: usize, invoke_bci: usize) -> Result<usize, String> {
+    if invoke_bci >= code_len {
+        return Err(format!(
+            "caller bci {invoke_bci} is past the end of a {code_len}-byte method"
+        ));
+    }
+    // 0xb6 invokevirtual / 0xb7 invokespecial / 0xb8 invokestatic are 3 bytes;
+    // 0xb9 invokeinterface and 0xba invokedynamic are 5. Nothing else may carry
+    // a caller scope.
+    let len = match code[invoke_bci] {
+        0xb6 | 0xb7 | 0xb8 => 3usize,
+        0xb9 | 0xba => 5,
+        other => {
+            return Err(format!(
+                "caller bci {invoke_bci} holds opcode {other:#04x}, which is not an invoke"
+            ))
+        }
+    };
+    let next = invoke_bci + len;
+    if next > code_len {
+        return Err(format!(
+            "the invoke at caller bci {invoke_bci} runs past the end of a {code_len}-byte method"
+        ));
+    }
+    Ok(next)
+}
+
+/// Map one reconstructed scope to the `(locals, stack)` a FRESH interpreter
+/// frame is built from.
+///
+/// The difference from the in-place OSR transfer is `Unsupported`, and it is
+/// the whole reason this is a separate function. That transfer tolerates an
+/// `Unsupported` LOCAL because the live frame already holds a value there and
+/// the verified bytecode proves the slot is dead or re-stored before it is
+/// read. **A materialised frame has no such value** — there is nothing to leave
+/// in place, and every resume sink maps a missing slot to `Value::Int(0)`, so
+/// tolerating it here would resume a caller with silently-zeroed locals. That
+/// is the failure `FrameValue::MaterializationRequired` exists to make
+/// impossible, and `docs/jit/deopt-inline-scopes.md` makes the same point about
+/// an undescribed caller frame: it lowers to `[Unsupported]` precisely so this
+/// consumer refuses it rather than inventing an empty frame.
+pub(super) fn caller_frame_values(
+    rf: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    use cratonvm_jit::deopt::FrameValue;
+    if !rf.monitors.is_empty() {
+        return Err(format!(
+            "caller scope {} holds {} monitor(s)",
+            rf.method_key,
+            rf.monitors.len()
+        ));
+    }
+    if let Some(i) = rf
+        .locals
+        .iter()
+        .position(|v| matches!(v, FrameValue::Unsupported))
+    {
+        return Err(format!(
+            "caller scope {} local {i} is Unsupported, and a materialised frame has no \
+             existing value to leave in place",
+            rf.method_key
+        ));
+    }
+    let locals = ir_deopt_locals(&rf.locals)
+        .ok_or_else(|| format!("caller scope {} has an unmappable local", rf.method_key))?;
+    let stack = ir_deopt_frame_values(&rf.stack)
+        .ok_or_else(|| format!("caller scope {} has an unmappable stack slot", rf.method_key))?;
+    Ok((locals, stack))
+}
+
+/// One materialised frame of an inlined caller chain, ready to push.
+pub(super) struct InlinedChainFrame {
+    pub(super) cached: Arc<CachedBytecodeMethod>,
+    pub(super) locals: Vec<Value>,
+    pub(super) stack: Vec<Value>,
+    /// Where to park: an invoke's successor for a caller scope, and the
+    /// snapshot's own bci for the innermost (trapping) scope.
+    pub(super) resume_pc: usize,
+}
+
+/// Resolve an inlined callee named by a caller scope's `method_key`, in the
+/// loader context of the method that inlined it.
+///
+/// `FrameState::method_key` is a bare `"class.name:descriptor"` string with no
+/// `ClassId`, and a name alone does not identify a class — two loaders can
+/// define the same name. Resolving relative to the ENCLOSING method's declaring
+/// class is not a guess: it is the same context `resolve_inline_site_from` used
+/// when it chose the body to splice, so this walk reaches the same method the
+/// compiler inlined or it reaches nothing.
+fn resolve_inlined_callee(
+    shared: &SharedVm,
+    enclosing_class_id: ClassId,
+    method_key: &str,
+) -> Result<Arc<CachedBytecodeMethod>, String> {
+    let Some((rest, desc)) = method_key.rsplit_once(':') else {
+        return Err(format!("unparseable method key {method_key:?}"));
+    };
+    let Some((class_name, method_name)) = rest.rsplit_once('.') else {
+        return Err(format!("unparseable method key {method_key:?}"));
+    };
+    let cm = shared.classes.class_manager.read();
+    let Some(cid) = cm.find_class_by_name_for_class(class_name, enclosing_class_id) else {
+        return Err(format!(
+            "{class_name} is not resolvable from the class that inlined it"
+        ));
+    };
+    // Through `MemberResolver`, not `find_method_recursive` directly. That is
+    // the one entry point for resolution (`runtime::resolve::guard` enforces
+    // it): it requires a VM identity, so a `ClassId` minted by another VM
+    // cannot be resolved against this one, and it distinguishes NoSuchMethod
+    // from "not cached". Both matter here — `method_key` is a bare string
+    // carrying neither a VM nor a loader, which is exactly the ambiguity this
+    // door exists to close.
+    let resolver = crate::runtime::resolve::MemberResolver::new(shared);
+    let (declaring, index) = resolver
+        .declared_method(&cm, resolver.scope(cid), method_name, desc)
+        .and_then(|scoped| resolver.adopt(scoped))
+        .map_err(|e| format!("{method_key} did not resolve: {e}"))?;
+    let Some(decl_class) = cm.class_store().get(declaring) else {
+        return Err(format!("{method_key} resolved to a class that is not loaded"));
+    };
+    let Some(method) = decl_class.methods.get(index as usize) else {
+        return Err(format!("{method_key} resolved to a method index out of range"));
+    };
+    let Some(code_attr) = method.code() else {
+        return Err(format!("{method_key} has no Code attribute"));
+    };
+    let source_file = cm
+        .get_class(declaring)
+        .and_then(|c| c.source_file.clone());
+    Ok(Arc::new(CachedBytecodeMethod {
+        declaring_class_id: declaring,
+        class_name: Arc::from(class_name),
+        method_name: Arc::from(method_name),
+        method_descriptor: Arc::from(desc),
+        source_file: source_file.map(|s| Arc::from(s.as_str())),
+        code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+        exception_table: Arc::from(code_attr.exception_table.as_slice()),
+        max_stack: code_attr.max_stack,
+        max_locals: code_attr.max_locals,
+        // Widening: parameter count fits u16.
+        num_params: crate::runtime::interpreter::count_method_params(desc) as u16,
+        is_synchronized: method.is_synchronized(),
+        is_static: method.is_static(),
+        force_native_cache: std::sync::OnceLock::new(),
+        intercept_shape_cache: std::sync::OnceLock::new(),
+        native_callback_cache: std::sync::OnceLock::new(),
+        invoc_key: std::sync::OnceLock::new(),
+        jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+        quickened: std::sync::OnceLock::new(),
+    }))
+}
+
+/// Materialise a whole inlined deopt chain, OUTERMOST first, or refuse it.
+///
+/// **Step 1 of the five-step chain in
+/// `docs/known-issues/netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`.**
+/// Every resume sink in this file refuses `caller_frames` outright today, which
+/// is why `try_emit_inline_site` may not splice a body that publishes deopt
+/// metadata, which is why the inliner cannot nest, which is why that class
+/// cannot reach its budget. This is the function that has to exist before any
+/// of that moves.
+///
+/// `rframe` is the innermost (trapping) scope and `rframe.caller_frames` runs
+/// innermost-first, so the chain to push is `caller_frames` reversed, then
+/// `rframe` itself. `outermost` is the compiled method the artifact belongs to,
+/// and the LAST caller scope must name it — an artifact only ever inlines
+/// *into* its own body, so a chain whose outermost scope is some other method
+/// is mis-routed, not deep.
+///
+/// **Nothing is pushed here.** The caller pushes the returned frames, and every
+/// check that can refuse runs first, because a deopt that half-materialises a
+/// chain has no recovery: the safe fallback (a whole-method re-run) is only
+/// available while no frame has been pushed.
+pub(super) fn materialise_inlined_chain(
+    shared: &SharedVm,
+    outermost: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> Result<Vec<InlinedChainFrame>, String> {
+    let depth = rframe.caller_frames.len();
+    if depth > MAX_INLINE_RESUME_DEPTH {
+        return Err(format!(
+            "inlined chain is {depth} deep, past the {MAX_INLINE_RESUME_DEPTH}-frame resume budget"
+        ));
+    }
+    let Some(outer_scope) = rframe.caller_frames.last() else {
+        return Err("no caller frames".to_string());
+    };
+    if !deopt_frame_matches_method(
+        outer_scope,
+        &outermost.class_name,
+        &outermost.method_name,
+        &outermost.method_descriptor,
+    ) {
+        return Err(format!(
+            "outermost caller scope {} does not name the compiled method {}.{}{}",
+            outer_scope.method_key,
+            outermost.class_name,
+            outermost.method_name,
+            outermost.method_descriptor
+        ));
+    }
+
+    let mut out: Vec<InlinedChainFrame> = Vec::with_capacity(depth + 1);
+    // The outermost scope IS the compiled method, so it needs no resolution;
+    // it is built here and every scope beneath it by the shared walk below.
+    let (locals, stack) = caller_frame_values(outer_scope)?;
+    // `cached.code` carries 2 bytes of speculative-read padding.
+    let code_len = outermost.code.len().saturating_sub(2);
+    let resume_pc = caller_resume_pc(&outermost.code, code_len, outer_scope.bci as usize)?;
+    if locals.len() > outermost.max_locals as usize || stack.len() > outermost.max_stack as usize {
+        return Err(format!(
+            "outermost scope {} does not fit its own frame",
+            outer_scope.method_key
+        ));
+    }
+    out.push(InlinedChainFrame {
+        cached: outermost.clone(),
+        locals,
+        stack,
+        resume_pc,
+    });
+    out.extend(materialise_inner_scopes(
+        shared,
+        outermost.declaring_class_id,
+        rframe,
+    )?);
+    Ok(out)
+}
+
+/// Materialise every scope BENEATH the outermost one, outermost-first.
+///
+/// Shared by the two sinks that differ only in what happens to the outermost
+/// frame: the deopt-exit sink pushes it like any other
+/// ([`materialise_inlined_chain`]), while the OSR-exit sink writes it into the
+/// live interpreter frame in place ([`transfer_osr_exit_chain_into_live_frame`])
+/// because that frame is the one OSR replaced and is still on the stack.
+/// Everything below the outermost is identical in both, which is why it is one
+/// function rather than two that must be kept in step.
+///
+/// `enclosing_class_id` is the outermost method's declaring class; each scope is
+/// resolved in the loader context of the scope that encloses it, and the walk
+/// carries that context inward.
+fn materialise_inner_scopes(
+    shared: &SharedVm,
+    enclosing_class_id: ClassId,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> Result<Vec<InlinedChainFrame>, String> {
+    let depth = rframe.caller_frames.len();
+    let mut out: Vec<InlinedChainFrame> = Vec::with_capacity(depth);
+    let mut enclosing = enclosing_class_id;
+    // `caller_frames` is innermost-first and the outermost is handled by the
+    // caller, so this is every scope except the last, walked outermost-inward.
+    for scope in rframe.caller_frames.iter().rev().skip(1) {
+        let cached = resolve_inlined_callee(shared, enclosing, &scope.method_key)?;
+        let (locals, stack) = caller_frame_values(scope)?;
+        let code_len = cached.code.len().saturating_sub(2);
+        let resume_pc = caller_resume_pc(&cached.code, code_len, scope.bci as usize)?;
+        if locals.len() > cached.max_locals as usize || stack.len() > cached.max_stack as usize {
+            return Err(format!(
+                "caller scope {} does not fit its own frame ({} locals / {} stack against {}/{})",
+                scope.method_key,
+                locals.len(),
+                stack.len(),
+                cached.max_locals,
+                cached.max_stack
+            ));
+        }
+        enclosing = cached.declaring_class_id;
+        out.push(InlinedChainFrame {
+            cached,
+            locals,
+            stack,
+            resume_pc,
+        });
+    }
+
+    // The innermost (trapping) scope. Its bci is a REEXECUTE point — the
+    // bytecode there has not taken effect — so it is parked AT its own bci, not
+    // at a successor.
+    let innermost = resolve_inlined_callee(shared, enclosing, &rframe.method_key)?;
+    let (locals, stack) = caller_frame_values(rframe)?;
+    if locals.len() > innermost.max_locals as usize || stack.len() > innermost.max_stack as usize {
+        return Err(format!(
+            "trapping scope {} does not fit its own frame",
+            rframe.method_key
+        ));
+    }
+    out.push(InlinedChainFrame {
+        cached: innermost,
+        locals,
+        stack,
+        resume_pc: rframe.bci as usize,
+    });
+    Ok(out)
+}
+
+/// Push a materialised inlined chain, outermost first.
+///
+/// Separate from [`materialise_inlined_chain`] so the fail-closed split is
+/// structural rather than a convention: everything that can refuse happens
+/// before this function is called, and this function cannot fail in a way that
+/// leaves a partial chain. The only fallible step left is the operand-stack
+/// push, and the frame's own `max_stack` was checked against the snapshot
+/// during materialisation, so it cannot overflow here.
+fn push_inlined_chain(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    chain: Vec<InlinedChainFrame>,
+    trace: bool,
+) -> Option<CachedCallResult> {
+    if trace {
+        let path = chain
+            .iter()
+            .map(|f| format!("{}.{}@{}", f.cached.class_name, f.cached.method_name, f.resume_pc))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        eprintln!("[cratonvm-deopt] PRECISE resume of a {}-frame inlined chain: {path}", chain.len());
+    }
+    for f in chain {
+        thread.refill_pools_from_shared(
+            &shared.mem.operand_stack_pool,
+            &shared.mem.tag_pool,
+            // Widening: small unsigned -> usize (non-negative, fits)
+            f.cached.max_locals as usize,
+            // Widening: small unsigned -> usize (non-negative, fits)
+            (f.cached.max_stack as usize).max(16) + 8,
+        );
+        let mut frame = crate::runtime::frame::Frame::new_pooled(
+            f.cached.declaring_class_id,
+            f.cached.class_name.clone(),
+            f.cached.method_name.clone(),
+            f.cached.method_descriptor.clone(),
+            f.cached.source_file.clone(),
+            f.cached.code.clone(),
+            f.cached.exception_table.clone(),
+            f.cached.max_stack,
+            f.cached.max_locals,
+            &f.locals,
+            &mut thread.locals_pool,
+            &mut thread.stacks_pool,
+        );
+        // Stack and pc BEFORE the push, for the same reason the single-frame
+        // sink does it: `push_frame_and_fire_entry` can fire a JVMTI
+        // MethodEntry callback that allocates, and every reconstructed oop must
+        // already be in a GC-scanned frame slot when it does.
+        for v in f.stack {
+            frame.stack.push(v).ok()?;
+        }
+        frame.pc = f.resume_pc;
+        push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+    }
+    crate::threading::thread_state::record_transition(
+        crate::threading::thread_state::ThreadExecState::JavaRunning,
+        "interpreter::resume_from_ir_deopt(inlined chain)",
     );
     Some(CachedCallResult::FramePushed)
 }
@@ -763,15 +1166,17 @@ pub(super) fn transfer_osr_exit_into_live_frame_checked(
     // never emits virtuals; if a future emitter does, reject until the elided-
     // monitor handling that gates `build_deopt_frame_inner` is wired here too.
     //
-    // The `caller_frames` refusal is deliberate and unchanged: the in-place
-    // transfer is single-frame, so even a *described* caller chain cannot be
-    // resumed here (`docs/jit/deopt-frame-state-interning.md`, and the sibling
-    // sinks at `resume_from_ir_deopt` / `build_deopt_frame_inner`). The
-    // `MaterializationRequired` guard added below is orthogonal to it — it is a
-    // per-SLOT verdict and says nothing about scope depth, so the caller-chain
-    // rule keeps exactly the meaning it had.
+    // A caller chain is no longer refused here — it is transferred by the
+    // multi-frame sibling below. The OUTERMOST scope is the OSR'd method, whose
+    // interpreter frame is the live one this function writes in place; every
+    // scope beneath it is an inlined callee that has to be PUSHED. Step 2 of the
+    // five-step chain in
+    // `docs/known-issues/netty/httpresponsestatustest-exhaustive-loop-timeout-20260816.md`.
+    //
+    // A refusal there still returns `Err`, so the caller's behaviour for any
+    // chain the transfer cannot honour is exactly what it was.
     if !rframe.caller_frames.is_empty() {
-        return Err("inlined caller chain".to_string());
+        return transfer_osr_exit_chain_into_live_frame(shared, thread, frame_idx, rframe, artifact);
     }
     if !rframe.monitors.is_empty() {
         return Err("held monitors".to_string());
@@ -968,6 +1373,329 @@ pub(super) fn transfer_osr_exit_into_live_frame_checked(
         );
     }
     Ok(())
+}
+
+/// The RBC.6b lift's exception exit: transfer a **reason-9**
+/// (`DeoptReason::PendingException`) frame published by an OSR'd body into the
+/// live interpreter frame and park it at `handler_pc`, with `exc` on the
+/// operand stack.
+///
+/// The sibling of [`transfer_osr_exit_into_live_frame_checked`], and it exists
+/// for the same reason that one does: once an OSR'd body has committed loop
+/// iterations, "resume interpretation where the frame was parked" is not a safe
+/// fallback but a silent re-execution of everything since OSR entry (RBC.7).
+/// Until 2026-08-17 that could not arise, because `compile_osr_artifact`
+/// refused every method with an exception table outright; now that it admits
+/// the ones whose protected-range throwing sites all publish a precise frame,
+/// this is the path those exceptions take.
+///
+/// Three things differ from the resume transfer, and each is deliberate:
+///
+///  * **The resume point is a handler, not a re-execute bci.** A reason-9
+///    point's [`cratonvm_jit::deopt::ResumeSemantics`] is `RETHROW`, so
+///    `OsrEntryPlan::resume_after_exit` correctly refuses it — its bci names a
+///    THROWING instruction, not somewhere the interpreter may be parked. The
+///    caller has already run that bci through this frame's own exception table
+///    (`find_exception_handler_any_pc`) and passes the handler it found.
+///
+///  * **The operand stack is not restored.** JVMS §2.10: entering a handler
+///    empties the operand stack and pushes the throwable. Whatever the snapshot
+///    recorded there is discarded by definition, so an unmappable STACK slot —
+///    fatal to the resume transfer, which has to rebuild the stack exactly —
+///    cannot make this transfer wrong. Locals are the whole payload.
+///
+///  * **The bci is checked against a `PendingException` point.** The resume
+///    transfer spends `resume_after_exit` on that check; here it is made
+///    directly. A frame whose bci this artifact recorded no reason-9 point for
+///    is a mis-routed stash, and routing a mis-routed stash into a handler
+///    would enter it with another site's locals.
+///
+/// Fail-closed exactly as the sibling is: every check that can refuse runs
+/// BEFORE the first write to the live frame, so a refusal can never half-write
+/// it. `Err` means the caller must NOT resume this frame — see the exception
+/// drain in `try_osr`, which propagates instead.
+pub(super) fn transfer_osr_exception_exit_into_live_frame(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    artifact: &cratonvm_jit::CompiledMethod,
+    handler_pc: usize,
+    exc: ObjectRef,
+) -> Result<(), String> {
+    use cratonvm_jit::deopt::FrameValue;
+
+    // ── Phase-A scope, same three as the sibling ──────────────────────────
+    if !rframe.caller_frames.is_empty() {
+        return Err("inlined caller chain".to_string());
+    }
+    if !rframe.monitors.is_empty() {
+        return Err("held monitors".to_string());
+    }
+    if rframe.locals.iter().any(|v| {
+        matches!(
+            v,
+            FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
+        )
+    }) {
+        return Err("virtual-object local".to_string());
+    }
+    // `MaterializationRequired` means an optimization DELETED a value that WAS
+    // live and left no rebuild recipe, so the live frame's stale pre-OSR word is
+    // genuinely wrong rather than merely unread. Named here, as its own refusal,
+    // for the reason the sibling names it: falling through to the generic
+    // "unmappable local" reports the wrong cause. Only LOCALS are inspected —
+    // the stack is discarded at handler entry (see the doc comment).
+    if let Some(what) = rframe
+        .locals
+        .iter()
+        .enumerate()
+        .find_map(|(i, v)| match v {
+            FrameValue::MaterializationRequired(ev) => {
+                Some(format!("materialization required (local {i}: {ev})"))
+            }
+            _ => None,
+        })
+    {
+        return Err(what);
+    }
+
+    // ── The stash really is a reason-9 point of THIS artifact ─────────────
+    //
+    // The caller has already checked the frame's baked `method_key` names this
+    // method. That is identity; this is provenance: an ordinary guard deopt
+    // (reason 0-8) reaching here would mean the bci names a re-execute point
+    // and the exception came from somewhere else entirely.
+    if !artifact.deopt_points.iter().any(|dp| {
+        dp.bci == rframe.bci && dp.reason == cratonvm_jit::deopt::DeoptReason::PendingException
+    }) {
+        return Err(format!(
+            "exit bci {} is not a PendingException point of this artifact",
+            rframe.bci
+        ));
+    }
+
+    // ── Oop plausibility, before a garbage address becomes a GC root ──────
+    //
+    // Default-off (`CRATONVM_DEOPT_VERIFY`). The structural sibling check is
+    // deliberately not run: it validates the operand stack against `max_stack`,
+    // and this transfer does not write the operand stack.
+    if cratonvm_jit::deopt_verify_enabled() {
+        if let Err(why) = verify_reconstructed_oops(rframe, shared) {
+            eprintln!(
+                "[DEOPT-VERIFY] OSR exception-exit bci={}: {why} — refusing the transfer",
+                rframe.bci
+            );
+            return Err(format!("deopt-verify: {why}"));
+        }
+    }
+
+    // ── The reconstructed slots must fit the live frame ───────────────────
+    if rframe.locals.len() > thread.frames[frame_idx].locals_len() {
+        return Err("local slot overflow".to_string());
+    }
+
+    // ── Map, then write ───────────────────────────────────────────────────
+    //
+    // `Unsupported` in a LOCAL leaves the live frame's current value alone, for
+    // exactly the argument the sibling makes: `classify_local_kinds` is a coarse
+    // whole-method scan that marks a slot ambiguous at EVERY bci if it is
+    // accessed as two kinds anywhere, and the already-verified bytecode
+    // guarantees such a slot is dead or re-stored before it is read.
+    let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
+    for (i, v) in rframe.locals.iter().enumerate() {
+        if matches!(v, FrameValue::Unsupported) {
+            locals.push(None);
+        } else {
+            match fv_to_value(v) {
+                Some(val) => locals.push(Some(val)),
+                None => return Err(format!("unmappable local ({i}: {v:?})")),
+            }
+        }
+    }
+
+    let frame = &mut thread.frames[frame_idx];
+    for (i, v) in locals.iter().enumerate() {
+        if let Some(val) = v {
+            frame.set_local_unchecked(i, *val);
+        }
+    }
+    // JVMS §2.10 handler entry: empty the operand stack, push the throwable.
+    frame.stack.clear();
+    frame.stack.push_unchecked(Value::Object(Some(exc)));
+    frame.pc = handler_pc;
+
+    if super::osr_frame_trace::enabled() {
+        super::osr_frame_trace::record_exit(frame, handler_pc);
+    }
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        eprintln!(
+            "[cratonvm-deopt] OSR exception-exit TRANSFER: throw bci={} -> handler pc={} \
+             ({} locals)",
+            rframe.bci,
+            handler_pc,
+            locals.len(),
+        );
+    }
+    Ok(())
+}
+
+/// The multi-frame half of the OSR-exit transfer.
+///
+/// **Step 2 of the inliner chain.** The single-frame transfer above writes the
+/// live interpreter frame — the one OSR replaced — and returns. With an inlined
+/// chain there is more than one frame to restore, and they are not alike:
+///
+/// * the **outermost** scope IS the OSR'd method, so its frame already exists
+///   and is the live one. It is written IN PLACE, and parked at the SUCCESSOR of
+///   its invoke, because that invoke is in progress (`RESUME` semantics) — the
+///   same rule [`caller_resume_pc`] enforces for the deopt-exit sink.
+/// * every scope **beneath** it is an inlined callee with no frame at all. Those
+///   are pushed, outermost-first, so the innermost (trapping) one ends up on
+///   top and the interpreter resumes in it.
+///
+/// The innermost scope is parked at its own bci: it is the trapping point, and
+/// its bytecode has not taken effect.
+///
+/// **Fail-closed, and the ordering is the whole safety argument.** Everything
+/// resolvable is resolved and checked BEFORE the live frame is touched, because
+/// once it has been overwritten there is no way back to the caller's safe
+/// reject — and unlike the single-frame case, a partial success here would leave
+/// a live frame describing one method and a pushed frame describing another.
+/// `materialise_inner_scopes` does all of the fallible work up front; the writes
+/// below cannot fail.
+fn transfer_osr_exit_chain_into_live_frame(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    artifact: &cratonvm_jit::CompiledMethod,
+) -> Result<(), String> {
+    use cratonvm_jit::deopt::FrameValue;
+
+    let depth = rframe.caller_frames.len();
+    if depth > MAX_INLINE_RESUME_DEPTH {
+        return Err(format!(
+            "inlined chain is {depth} deep, past the {MAX_INLINE_RESUME_DEPTH}-frame resume budget"
+        ));
+    }
+    let Some(outer_scope) = rframe.caller_frames.last() else {
+        return Err("no caller frames".to_string());
+    };
+
+    // ── the outermost scope must be the live frame's own method ──────────
+    //
+    // An artifact only ever inlines INTO its own body, so a chain whose
+    // outermost scope names some other method is a mis-routed stash rather than
+    // a deep one — the same identity rule the single-frame path applies to
+    // `rframe` itself.
+    let (live_class, live_method, live_desc, live_class_id, live_code, live_max_locals, live_max_stack) = {
+        let f = &thread.frames[frame_idx];
+        (
+            f.class_name().to_string(),
+            f.method_name().to_string(),
+            f.method_descriptor().to_string(),
+            f.class_id,
+            f.code.clone(),
+            f.locals_len(),
+            f.max_stack as usize,
+        )
+    };
+    if !deopt_frame_matches_method(outer_scope, &live_class, &live_method, &live_desc) {
+        return Err(format!(
+            "outermost caller scope {} does not name the live frame {live_class}.{live_method}{live_desc}",
+            outer_scope.method_key
+        ));
+    }
+
+    // ── the outermost scope's own values, and where to park it ───────────
+    //
+    // `caller_frame_values` rather than the tolerant mapping the single-frame
+    // transfer uses: this frame is being rewritten to describe a DIFFERENT point
+    // in its own execution — the invoke it is parked in — so leaving an
+    // `Unsupported` local at whatever the OSR'd body happened to leave there is
+    // not the "provably dead or re-stored" case that rule rests on.
+    let (outer_locals, outer_stack) = caller_frame_values(outer_scope)?;
+    // `frame.code` carries 2 bytes of speculative-read padding.
+    let live_code_len = live_code.len().saturating_sub(2);
+    let outer_resume_pc = caller_resume_pc(&live_code, live_code_len, outer_scope.bci as usize)?;
+    if outer_locals.len() > live_max_locals || outer_stack.len() > live_max_stack {
+        return Err(format!(
+            "outermost scope {} does not fit the live frame ({} locals / {} stack against {}/{})",
+            outer_scope.method_key,
+            outer_locals.len(),
+            outer_stack.len(),
+            live_max_locals,
+            live_max_stack
+        ));
+    }
+
+    // ── every scope beneath it, fully resolved before anything is written ──
+    let inner = materialise_inner_scopes(shared, live_class_id, rframe)?;
+
+    // The artifact must actually have recorded the trapping bci, exactly as
+    // `resume_after_exit` requires for the flat case. Without this a mis-routed
+    // stash whose scopes happen to type-check would be resumed.
+    if !artifact.deopt_points.iter().any(|p| p.bci == rframe.bci) {
+        return Err(format!(
+            "trapping bci {} is not a recorded deopt point of this artifact",
+            rframe.bci
+        ));
+    }
+
+    // `CRATONVM_DEOPT_VERIFY`, before a reconstructed oop becomes a GC root.
+    if cratonvm_jit::deopt_verify_enabled() {
+        if let Err(why) = verify_reconstructed_oops(rframe, shared) {
+            eprintln!(
+                "[DEOPT-VERIFY] OSR-exit chain at bci={}: {why} — refusing the transfer",
+                rframe.bci
+            );
+            return Err(format!("deopt-verify: {why}"));
+        }
+    }
+
+    // Virtual objects have no materializer on this path, in either half.
+    if rframe
+        .caller_frames
+        .iter()
+        .chain(std::iter::once(rframe))
+        .any(|f| {
+            f.locals
+                .iter()
+                .chain(f.stack.iter())
+                .any(|v| matches!(v, FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)))
+        })
+    {
+        return Err("virtual-object slot in an inlined chain".to_string());
+    }
+
+    // ── writes only, from here ───────────────────────────────────────────
+    {
+        let frame = &mut thread.frames[frame_idx];
+        for (i, v) in outer_locals.iter().enumerate() {
+            frame.set_local_unchecked(i, *v);
+        }
+        frame.stack.clear();
+        for v in &outer_stack {
+            frame.stack.push_unchecked(*v);
+        }
+        frame.pc = outer_resume_pc;
+        if super::osr_frame_trace::enabled() {
+            super::osr_frame_trace::record_exit(frame, outer_resume_pc);
+        }
+    }
+    let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some();
+    if trace {
+        eprintln!(
+            "[cratonvm-deopt] OSR-exit CHAIN transfer: {live_class}.{live_method} in place @{outer_resume_pc}, \
+             then {} pushed frame(s), trapping bci={}",
+            inner.len(),
+            rframe.bci
+        );
+    }
+    push_inlined_chain(shared, thread, inner, trace)
+        .map(|_| ())
+        .ok_or_else(|| "pushing the inlined chain failed after the live frame was written".to_string())
 }
 
 /// deopt-osr Step 9 — stamp a freshly compiled artifact with the method's
@@ -2637,23 +3365,71 @@ mod deopt_step3_tests {
         );
     }
 
-    /// The `caller_frames` rule is unchanged by the new variant: a
-    /// `MaterializationRequired` slot is a per-SLOT verdict and says nothing about
-    /// scope depth, so an inlined chain still refuses on its own (older) reason
-    /// even when every slot is describable. (`docs/jit/deopt-frame-state-interning.md`
-    /// records that all three resume sinks refuse a non-empty `caller_frames`.)
+    /// A caller chain no longer refuses for BEING a chain — it refuses for a
+    /// named reason, or it is transferred.
+    ///
+    /// This test used to assert the blanket refusal (`"inlined caller chain"`),
+    /// which was the whole rule until 2026-08-18: all three resume sinks
+    /// declined a non-empty `caller_frames` outright. Step 2 of the inliner
+    /// chain replaced that with `transfer_osr_exit_chain_into_live_frame`, which
+    /// writes the outermost scope into the live frame and pushes the rest, so
+    /// the refusals below are the specific ones that remain.
+    ///
+    /// Its original point survives and is asserted last: a
+    /// `MaterializationRequired` slot is a per-SLOT verdict that says nothing
+    /// about scope depth, so it still refuses on its own reason and is not
+    /// masked by anything the chain work added.
+    ///
+    /// The ACCEPTED path is not exercised here: it needs an inlined callee that
+    /// resolves through `MemberResolver`, i.e. a real loaded class, which is
+    /// more than this fixture builds. It is covered on the jit side by
+    /// `an_inlined_caller_scope_refuses_the_entry_contract_but_not_a_deopt_point`
+    /// and per-rule by `a_caller_scope_resumes_after_its_invoke_not_at_it`.
     #[test]
-    fn materialization_guard_does_not_disturb_the_caller_chain_rule() {
+    fn a_caller_chain_refuses_for_a_named_reason_not_for_being_a_chain() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
         seed_live_frame(&shared, &mut thread, &cached, vec![FrameValue::Int(1)], vec![], 0);
 
+        // The fixture's body is `return`, so bci 0 is not an invoke — which is
+        // exactly one of the malformed shapes the transfer must name rather
+        // than resume. A caller scope's bci ALWAYS names a call in progress.
         let mut inlined = rframe(vec![FrameValue::Int(2)], vec![], 0);
         inlined.caller_frames.push(rframe(vec![], vec![], 0));
-        assert_eq!(
-            transfer_refusal(&shared, &mut thread, &inlined),
-            "inlined caller chain"
+        let why = transfer_refusal(&shared, &mut thread, &inlined);
+        assert!(
+            why.contains("not an invoke") || why.contains("past the end"),
+            "the refusal must name what is wrong with the scope, not that it exists: {why}"
+        );
+        assert!(
+            !why.contains("inlined caller chain"),
+            "a chain is no longer refused for being a chain: {why}"
+        );
+
+        // Past the depth budget, and the budget is the jit crate's so admission
+        // and transfer cannot disagree about it.
+        let mut too_deep = rframe(vec![FrameValue::Int(2)], vec![], 0);
+        for _ in 0..(MAX_INLINE_RESUME_DEPTH + 1) {
+            too_deep.caller_frames.push(rframe(vec![], vec![], 0));
+        }
+        let why = transfer_refusal(&shared, &mut thread, &too_deep);
+        assert!(why.contains("resume budget"), "{why}");
+
+        // The original point: a per-SLOT verdict, unmasked by the chain rules.
+        let mut unmaterialisable = rframe(vec![FrameValue::Int(2)], vec![], 0);
+        let mut scope = rframe(vec![], vec![], 0);
+        scope.locals = vec![FrameValue::MaterializationRequired(
+            cratonvm_jit::deopt::EliminatedValue::new(
+                7,
+                cratonvm_jit::deopt::EliminationCause::EliminatedStore,
+            ),
+        )];
+        unmaterialisable.caller_frames.push(scope);
+        let why = transfer_refusal(&shared, &mut thread, &unmaterialisable);
+        assert!(
+            !why.contains("inlined caller chain"),
+            "the chain is not what is wrong here: {why}"
         );
     }
 }

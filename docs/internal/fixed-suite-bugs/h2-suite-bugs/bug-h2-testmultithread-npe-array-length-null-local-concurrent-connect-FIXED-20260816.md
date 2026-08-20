@@ -182,10 +182,20 @@ calling `toByteArray()` on what should be a `BigInteger` and is a
 `java.lang.ref` frame anywhere in it and survives all three guards above. On the
 pristine arm it is usually pre-empted by the louder reference-queue bug, which is
 why it had not been seen alone before. It is tracked separately as
-`bug-h2-testmultithread-mvstore-writer-object-identity-residual-20260816` in
-`docs/known-issues/h2/`, together with the one part of the reference machinery a
-CLASS-shape guard provably cannot cover: same-class reuse (2–5 references in 3200
-still arrive as a half-constructed instance of the same class).
+bug-h2-testmultithread-mvstore-writer-object-identity-FIXED-20260817, together
+with the one part of the reference machinery a CLASS-shape guard provably cannot
+cover: same-class reuse (2-5 references in 3200 still arrive as a
+half-constructed instance of the same class).
+
+**The same-class hole is CLOSED 2026-08-17** by an identity stamp (the identity
+hash recorded at `discover_reference`), and the producer behind it — H2 keeping
+`CloseWatcher.refs` in a `Collections.synchronizedSet` whose natives never took
+the wrapper's `mutex`, so the racing `HashSet` lost entries and a
+`PhantomReference` died while this processor still tracked it — is fixed too.
+The pre-GC referent-null pass, which had no class-shape guard at all, now
+carries both. **The MVStore-writer residual itself is still open**: it survives
+all of that, and is now measured as a live object the ZGC slide relocated with
+one holder never rewritten.
 
 ## Repro (for a future regression)
 

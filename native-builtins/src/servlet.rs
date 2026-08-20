@@ -4,6 +4,13 @@
 //! NIO, HTTP client, and resource loading natives.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+// The ONE copy of the `hasArray`/`array`/`arrayOffset` three-way rule and of
+// the two one-liners that feed it. `cratonvm-native-builtins` depends on
+// `cratonvm-native-io` (`Cargo.toml`) and not the reverse, so `native-io` is
+// the only crate whose copy this file and `phases_late/charset_buffers.rs` can
+// both import — which is why F14-1 made them `pub` there rather than moving
+// them here. Record: F14-1 N1, landed by F21-1.
+use cratonvm_native_io::{buffer_array_access, BufferArrayAccess};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 // The heap's own object-kind discriminant. `s2_bb_arr` uses it to refuse a
 // `java.nio.Buffer.segment` that is a `MemorySegment` rather than a backing
@@ -2085,7 +2092,14 @@ pub(crate) struct TlsEntry {
     /// Per-stream mutex, deliberately NOT guarded by `s2_registry()`: a
     /// blocking TLS read/write must not hold the process-wide socket
     /// registry lock (see `s2_tls_read`'s doc comment).
-    pub(crate) stream: Arc<parking_lot::Mutex<TlsClientStream>>,
+    ///
+    /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Its two acquisitions
+    /// (`s2_tls_read`, `s2_tls_write`) each hold it across exactly one
+    /// `read`/`write` on the underlying stream and then `drop(guard)`; both
+    /// release `s2_registry()` before taking it, which is the ordering the
+    /// field comment above already required in prose. Nothing under the guard
+    /// touches a `NativeContext`.
+    pub(crate) stream: Arc<cratonvm_types::lock_order::OrderedPlMutex<TlsClientStream>>,
     /// A `try_clone`d handle on the same underlying socket, for fd-level
     /// operations (`shutdownInput/Output`, `set/getSoTimeout`) that must NOT
     /// wait on `stream`'s mutex — `shutdownInput` is exactly how a caller
@@ -2108,8 +2122,19 @@ pub(crate) struct TlsEntry {
 
 pub(crate) enum TlsClientStream {
     Native(native_tls::TlsStream<TcpStream>),
+    /// A raw SChannel stream, the Windows counterpart of [`Self::Openssl`] and
+    /// for the same reason -- see [`s2_schannel_tls_connect_on`].
+    #[cfg(windows)]
+    Schannel(schannel::tls_stream::TlsStream<TcpStream>),
+    /// A raw `openssl` stream. Two callers produce one: the legacy DSA bridge
+    /// (`s2_legacy_dsa_tls_connect_on`) and — since
+    /// `tls-client-captures-only-the-leaf` — the DEFAULT client path
+    /// (`s2_openssl_tls_connect_on`). The variant was called `LegacyDsa` while
+    /// the first was the only one; nothing downstream ever branched on which
+    /// bridge built it, so the two share it rather than duplicating the
+    /// read/write/shutdown arms.
     #[cfg(unix)]
-    LegacyDsa(openssl::ssl::SslStream<TcpStream>),
+    Openssl(openssl::ssl::SslStream<TcpStream>),
 }
 
 impl TlsClientStream {
@@ -2117,7 +2142,9 @@ impl TlsClientStream {
         match self {
             Self::Native(stream) => stream.get_ref(),
             #[cfg(unix)]
-            Self::LegacyDsa(stream) => stream.get_ref(),
+            Self::Openssl(stream) => stream.get_ref(),
+            #[cfg(windows)]
+            Self::Schannel(stream) => stream.get_ref(),
         }
     }
 }
@@ -2280,10 +2307,25 @@ pub(crate) fn s2_tls_connect_on(
     let negotiated_cipher = String::from("TLS_AES_128_GCM_SHA256");
 
     // Capture the peer's leaf certificate DER bytes. native-tls's public API
-    // only exposes the leaf via `peer_certificate()`; the full chain is
-    // validated internally by the backend (SChannel / SecureTransport /
-    // OpenSSL) before `connect` returns, which is why we can rely on a
-    // single-element chain here without weakening security.
+    // only exposes the leaf via `peer_certificate()`; there is no chain
+    // accessor.
+    //
+    // THE REASONING THIS COMMENT USED TO CARRY WAS WRONG, and worth recording
+    // because of HOW it went wrong. It said the full chain "is validated
+    // internally by the backend before `connect` returns, which is why we can
+    // rely on a single-element chain here without weakening security." That
+    // was true when written — the backend WAS the verifier and the captured
+    // leaf was only ever informational. It stopped being true when the
+    // `java_tm_key` path was added to `new13_connect_and_handshake_on`: that
+    // path disables native verification precisely so an application
+    // TrustManager can decide, and it consumes THIS vector. A premise was
+    // invalidated by a later change to a different function and nothing
+    // re-checked it. MEASURED consequence: 20 of 20 live public sites
+    // rejected, every one at `chainLen=1`.
+    //
+    // On Unix the default client path no longer comes through here at all —
+    // see `s2_openssl_tls_connect_on`, which asks OpenSSL for the whole chain.
+    // This arm is what remains: Windows, and `CRATONVM_TLS_OPENSSL_CLIENT=0`.
     let mut peer_cert_chain_der: Vec<Vec<u8>> = Vec::new();
     match tls_stream.peer_certificate() {
         Ok(Some(cert)) => match cert.to_der() {
@@ -2310,7 +2352,7 @@ pub(crate) fn s2_tls_connect_on(
 
     let raw = tls_stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Native(tls_stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Native(tls_stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2387,19 +2429,562 @@ pub(crate) fn s2_legacy_dsa_tls_connect_on(
     let stream = connection.connect(host, tcp).map_err(|e| {
         TlsConnectFailure::Handshake(format!("legacy DSA TLS handshake: {e}"))
     })?;
-    let mut peer_cert_chain_der = Vec::new();
-    if let Some(cert) = stream.ssl().peer_certificate() {
-        peer_cert_chain_der.push(cert.to_der().map_err(|e| hs(&e))?);
-    }
+    let peer_cert_chain_der = openssl_peer_chain_der(stream.ssl()).map_err(|e| hs(&e))?;
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::LegacyDsa(stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Openssl(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol: "TLSv1.2".to_string(),
         negotiated_cipher: "UNKNOWN".to_string(),
         negotiated_alpn: None,
+        peer_cert_chain_der,
+    };
+    let mut reg = s2_registry().lock();
+    let id = s2_next_free_id(&mut reg);
+    reg.tls_streams.insert(id, entry);
+    Ok(id)
+}
+
+
+/// The certificate SECURITY LEVEL the default client connector runs at.
+///
+/// OpenSSL's own default is 2, which requires a >= 2048-bit RSA key and
+/// refuses a SHA-1 signature anywhere in the chain. The JDK's equivalent,
+/// `jdk.certpath.disabledAlgorithms`, draws its line at 1024 bits. That gap is
+/// not theoretical -- MEASURED (`WeakChainProbe`, against an `openssl
+/// s_server` presenting a 1024-bit RSA leaf signed by a 1024-bit CA, with a
+/// JDK image whose `cacerts` trusts that CA):
+///
+/// ```text
+/// HOTSPOT   HANDSHAKE-OK  328 ms
+/// CRATONVM  REFUSED        60 ms   ... (EE certificate key too weak)
+/// ```
+///
+/// Level 1 is OpenSSL's 80-bit tier: RSA/DSA/DH >= 1024, ECC >= 160, SHA-1
+/// permitted -- i.e. the JDK's own floor. It is NOT a blanket relaxation of
+/// the posture: the connector still pins a TLS 1.2 minimum of its own, so the
+/// SSLv3/TLS1.0 suites level 1 would otherwise readmit stay out.
+#[cfg(unix)]
+pub(crate) const CLIENT_SECURITY_LEVEL: u32 = 1;
+
+/// Everything `new13_build_connector` expresses through
+/// `native_tls::TlsConnectorBuilder`, restated for a raw
+/// `openssl::ssl::SslConnector`.
+///
+/// The swap exists because native-tls 0.2 cannot express two things this VM
+/// needs, and no amount of configuration on its side will make it:
+///
+/// * the peer's FULL certificate chain. `TlsStream::peer_certificate()` is the
+///   LEAF and there is no chain accessor, so an application `TrustManager` --
+///   which this VM correctly makes the ONLY verifier -- was handed a
+///   one-element chain and could not build a path to any root. MEASURED across
+///   20 public sites: 20 rejections at `chainLen=1`, against 20 acceptances at
+///   2-4 on HotSpot.
+/// * the certificate security level. See [`CLIENT_SECURITY_LEVEL`].
+#[cfg(unix)]
+pub(crate) struct OpensslClientConfig {
+    /// Trust anchors (DER) to configure on the connector.
+    pub(crate) roots: Vec<Vec<u8>>,
+    /// `true` = `roots` REPLACE the platform set (JSSE's rule for a trust
+    /// store the application named, and for the JDK's own `cacerts`);
+    /// `false` = they are ADDED to it, which is what a per-`SSLContext` custom
+    /// anchor set has always done here.
+    pub(crate) replace_roots: bool,
+    /// Stand OpenSSL's verifier (and its hostname check) DOWN: the caller is
+    /// the verifier and runs immediately after connect, fail-closed. Mirrors
+    /// `danger_accept_invalid_certs` + `danger_accept_invalid_hostnames`.
+    pub(crate) skip_verify: bool,
+    /// Pin the ceiling to TLS 1.2, for a version-specific
+    /// `SSLContext.getInstance("TLSv1.2")`.
+    pub(crate) max_tls12: bool,
+}
+
+/// The peer's certificate chain as DER, leaf first.
+///
+/// `SSL_get_peer_cert_chain` on a CLIENT includes the peer's own certificate
+/// (on a server it does not -- the asymmetry is OpenSSL's, and this is only
+/// ever called on client streams). The `peer_certificate()` fallback is not
+/// belt-and-braces: on a RESUMED session the peer sends no Certificate
+/// message, so the chain is absent while the cached leaf is still there, and
+/// without the fallback a resumed connection would report ZERO certificates
+/// where it used to report one.
+#[cfg(unix)]
+fn openssl_peer_chain_der(
+    ssl: &openssl::ssl::SslRef,
+) -> Result<Vec<Vec<u8>>, openssl::error::ErrorStack> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    if let Some(chain) = ssl.peer_cert_chain() {
+        for cert in chain {
+            out.push(cert.to_der()?);
+        }
+    }
+    if out.is_empty() {
+        if let Some(leaf) = ssl.peer_certificate() {
+            out.push(leaf.to_der()?);
+        }
+    }
+    Ok(out)
+}
+
+/// [`s2_openssl_tls_connect_on`], opening the connection here.
+#[cfg(unix)]
+pub(crate) fn s2_openssl_tls_connect(
+    cfg: &OpensslClientConfig,
+    host: &str,
+    port: u16,
+) -> Result<i32, TlsConnectFailure> {
+    let addr = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&addr).map_err(TlsConnectFailure::Tcp)?;
+    s2_openssl_tls_connect_on(cfg, host, port, tcp)
+}
+
+/// The default `SSLSocket` client bridge, over a raw `openssl::SslConnector`.
+///
+/// Drop-in for [`s2_tls_connect_on`]: same timeouts, same SNI, same hostname
+/// verification, same TLS 1.2 floor, same registry entry shape. What differs
+/// is only what [`OpensslClientConfig`] documents -- the full chain and the
+/// security level -- plus the negotiated protocol / cipher / ALPN, which this
+/// backend can actually be asked for instead of being reported from a
+/// compile-time constant.
+///
+/// `SslConnector::builder` already loads the platform roots
+/// (`SSL_CTX_set_default_verify_paths`) and `configure()` already turns on SNI
+/// and hostname verification, so the unconfigured shape here is native-tls's
+/// shape, not a weaker one.
+#[cfg(unix)]
+pub(crate) fn s2_openssl_tls_connect_on(
+    cfg: &OpensslClientConfig,
+    host: &str,
+    port: u16,
+    tcp: TcpStream,
+) -> Result<i32, TlsConnectFailure> {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+    use openssl::x509::{store::X509StoreBuilder, X509};
+
+    let hs = |e: &dyn std::fmt::Display| TlsConnectFailure::Handshake(e.to_string());
+    // Same 30 s read/write floor `s2_tls_connect_on` sets, and for the same
+    // reason: a hung peer must not deadlock the JVM thread that called
+    // `SSLSocket.getInputStream().read`.
+    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(|e| hs(&e))?;
+    builder.set_security_level(CLIENT_SECURITY_LEVEL);
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .map_err(|e| hs(&e))?;
+    if cfg.max_tls12 {
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(|e| hs(&e))?;
+    }
+    if !cfg.roots.is_empty() {
+        if cfg.replace_roots {
+            let mut store = X509StoreBuilder::new().map_err(|e| hs(&e))?;
+            let mut added = 0usize;
+            for der in &cfg.roots {
+                match X509::from_der(der) {
+                    Ok(cert) => {
+                        // One unparseable anchor must not sink the whole
+                        // connector -- `new13_build_connector` logs and
+                        // continues. But a REPLACING root set that lost every
+                        // anchor that way would trust nothing at all while
+                        // still looking configured, so the count is checked.
+                        if store.add_cert(cert).is_ok() {
+                            added += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "servlet::tls",
+                            "openssl client: skipping unparseable trust anchor DER: {e}"
+                        );
+                    }
+                }
+            }
+            if added == 0 {
+                return Err(TlsConnectFailure::Handshake(
+                    "no usable trust anchor in the configured trust store".to_string(),
+                ));
+            }
+            builder
+                .set_verify_cert_store(store.build())
+                .map_err(|e| hs(&e))?;
+        } else {
+            let store = builder.cert_store_mut();
+            for der in &cfg.roots {
+                match X509::from_der(der) {
+                    Ok(cert) => {
+                        let _ = store.add_cert(cert);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "servlet::tls",
+                            "openssl client: skipping unparseable custom trust anchor DER: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if cfg.skip_verify {
+        builder.set_verify(SslVerifyMode::NONE);
+    }
+    let connector = builder.build();
+    let mut connection = connector.configure().map_err(|e| hs(&e))?;
+    if cfg.skip_verify {
+        connection.set_verify_hostname(false);
+    }
+    let stream = connection
+        .connect(host, tcp)
+        .map_err(|e| TlsConnectFailure::Handshake(format!("TLS handshake failed: {e}")))?;
+
+    let peer_cert_chain_der = openssl_peer_chain_der(stream.ssl()).map_err(|e| hs(&e))?;
+    // The values native-tls forced this path to hard-code. `version_str`
+    // already spells JSSE's names ("TLSv1.3"/"TLSv1.2"), and a cipher's
+    // STANDARD name is the IANA/JSSE one: at TLS 1.3 it coincides with
+    // OpenSSL's own ("TLS_AES_128_GCM_SHA256"), at TLS 1.2 it does not
+    // ("ECDHE-RSA-AES128-GCM-SHA256" vs
+    // "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256").
+    let negotiated_protocol = stream.ssl().version_str().to_string();
+    let negotiated_cipher = stream
+        .ssl()
+        .current_cipher()
+        .map(|c| c.standard_name().unwrap_or_else(|| c.name()).to_string())
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+    let negotiated_alpn = stream
+        .ssl()
+        .selected_alpn_protocol()
+        .map(|p| String::from_utf8_lossy(p).into_owned());
+
+    let raw = stream.get_ref().try_clone().ok();
+    let entry = TlsEntry {
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Openssl(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
+        raw,
+        peer_host: host.to_string(),
+        peer_port: port,
+        negotiated_protocol,
+        negotiated_cipher,
+        negotiated_alpn,
+        peer_cert_chain_der,
+    };
+    let mut reg = s2_registry().lock();
+    let id = s2_next_free_id(&mut reg);
+    reg.tls_streams.insert(id, entry);
+    Ok(id)
+}
+
+
+/// [`OpensslClientConfig`]'s Windows counterpart, minus one field.
+///
+/// There is no `replace_roots` here, and its absence is the design rather than
+/// an omission. On Unix `set_verify_cert_store` genuinely REPLACES the anchor
+/// set, so JSSE's "this store instead of cacerts" is expressible. SChannel has
+/// no such switch: the closest thing native-tls does for
+/// `disable_built_in_roots` is to run the platform's normal verification and
+/// then REJECT anything whose built chain does not touch a configured root.
+/// That is a narrowing, not a replacement -- it can only refuse chains the
+/// platform accepted, never accept one it did not. Applying it to the JDK's
+/// `cacerts` would therefore refuse any site whose root the Windows store
+/// lacks and cacerts has, which is a divergence from HotSpot in the direction
+/// of breaking working connections.
+///
+/// So this connector changes ONE thing about the Windows path: the chain it
+/// captures. Every trust decision is the decision native-tls was already
+/// making, including the two stand-downs. The anchor-set question (Windows
+/// root store vs `cacerts`) is real and is NOT answered here; it is a
+/// different measurement on a different page.
+#[cfg(windows)]
+pub(crate) struct SchannelClientConfig {
+    /// Anchors to ADD to the platform set, as native-tls has always done here.
+    pub(crate) roots: Vec<Vec<u8>>,
+    /// Stand SChannel's verifier and hostname check down: the caller is the
+    /// verifier and runs immediately after connect, fail-closed.
+    pub(crate) skip_verify: bool,
+    /// Pin the ceiling to TLS 1.2, for `SSLContext.getInstance("TLSv1.2")`.
+    pub(crate) max_tls12: bool,
+}
+
+/// [`order_chain_from_leaf`], against the input the live platform declines to
+/// produce.
+///
+/// MEASURED: with the walk skipped, SChannel returned leaf-first on all six
+/// hosts of `PeerChainOrderProbe` — so a probe against the real world cannot
+/// tell the walk from its absence, and the only honest way to exercise it is
+/// to hand it the shuffled set the store is permitted to hand back but
+/// currently does not.
+///
+/// The certificates are two-byte stand-ins and the `names` closure is a lookup
+/// table, deliberately: what is under test is the subject/issuer walk, not the
+/// DER parser, and a fixture built from real certificates would test both at
+/// once and be unbuildable on the platform this code runs on (no `openssl`
+/// crate on Windows).
+#[cfg(test)]
+mod chain_order_tests {
+    use super::order_chain_from_leaf;
+
+    /// leaf <- i1 <- i2 <- root(self-signed)
+    fn names(der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let (subject, issuer): (&[u8], &[u8]) = match der {
+            b"leaf" => (b"L", b"I1"),
+            b"i1__" => (b"I1", b"I2"),
+            b"i2__" => (b"I2", b"RT"),
+            b"root" => (b"RT", b"RT"),
+            b"xxxx" => (b"XX", b"YY"),
+            _ => return None,
+        };
+        Some((subject.to_vec(), issuer.to_vec()))
+    }
+
+    fn v(items: &[&[u8]]) -> Vec<Vec<u8>> {
+        items.iter().map(|b| b.to_vec()).collect()
+    }
+
+    #[test]
+    fn a_shuffled_pool_is_walked_back_into_a_path() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), v(&[b"i2__", b"root", b"i1__"]), names);
+        assert_eq!(out, v(&[b"leaf", b"i1__", b"i2__", b"root"]));
+    }
+
+    /// The order the live store happens to use today must survive unchanged —
+    /// a walk that only works on shuffled input would be worse than none.
+    #[test]
+    fn an_already_ordered_pool_is_left_alone() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), v(&[b"i1__", b"i2__", b"root"]), names);
+        assert_eq!(out, v(&[b"leaf", b"i1__", b"i2__", b"root"]));
+    }
+
+    /// A certificate that is not on the path is APPENDED. Dropping it would
+    /// take a cross-certificate away from `x509_manager::validate_chain`,
+    /// which builds its own path and may need exactly that one.
+    #[test]
+    fn a_certificate_off_the_path_is_kept_at_the_end() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), v(&[b"xxxx", b"i1__"]), names);
+        assert_eq!(out, v(&[b"leaf", b"i1__", b"xxxx"]));
+    }
+
+    /// A self-issued certificate ends the path. Following `subject == issuer`
+    /// one step further would append the root to itself forever.
+    #[test]
+    fn a_self_issued_root_terminates_the_walk() {
+        let out = order_chain_from_leaf(b"root".to_vec(), v(&[b"root"]), names);
+        assert_eq!(out, v(&[b"root", b"root"]));
+    }
+
+    /// An unparseable member cannot stall the walk or vanish.
+    #[test]
+    fn an_unparseable_member_is_kept_and_skipped() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), v(&[b"junk", b"i1__"]), names);
+        assert_eq!(out, v(&[b"leaf", b"i1__", b"junk"]));
+    }
+
+    /// An empty pool is the one-certificate chain, unchanged.
+    #[test]
+    fn an_empty_pool_yields_the_leaf_alone() {
+        let out = order_chain_from_leaf(b"leaf".to_vec(), Vec::new(), names);
+        assert_eq!(out, v(&[b"leaf"]));
+    }
+}
+
+/// Order a certificate SET into a path: `leaf` first, then whichever member of
+/// `pool` issued the one before it, and so on. `names` yields
+/// `(subject, issuer)` for a member.
+///
+/// Not `#[cfg(windows)]`, and not because it might be wanted elsewhere -- so
+/// that its TEST runs everywhere. The logic is about a subject/issuer graph
+/// and has nothing platform-specific in it; only its caller does.
+///
+/// Leftovers are APPENDED, never dropped. A peer may legitimately send a
+/// certificate that is not on the path to the anchor this VM will pick -- a
+/// cross-certificate is the usual case -- and `x509_manager::validate_chain`
+/// builds its own path from the whole set. A certificate it never sees is one
+/// it cannot build with.
+fn order_chain_from_leaf<F>(leaf: Vec<u8>, mut pool: Vec<Vec<u8>>, names: F) -> Vec<Vec<u8>>
+where
+    F: Fn(&[u8]) -> Option<(Vec<u8>, Vec<u8>)>,
+{
+    let mut out = vec![leaf];
+    loop {
+        let issuer_of_last = match names(out.last().expect("chain is never empty")) {
+            Some((_, issuer)) => issuer,
+            None => break,
+        };
+        // A self-issued certificate is the end of the path: continuing past it
+        // would loop on itself.
+        let next = pool.iter().position(|der| {
+            names(der)
+                .map(|(subject, issuer)| subject == issuer_of_last && subject != issuer)
+                .unwrap_or(false)
+        });
+        match next {
+            Some(i) => out.push(pool.remove(i)),
+            None => break,
+        }
+    }
+    out.extend(pool);
+    out
+}
+
+/// The peer's certificate chain as DER, leaf first, from an SChannel stream.
+///
+/// Two Windows facts do the work. `peer_certificate()` is the LEAF, and the
+/// `CertContext` it returns carries an attached store -- SChannel's own words
+/// for it are "a certificate store containing any intermediate certificates
+/// provided by the remote sender" -- reachable as `CertContext::cert_store()`.
+/// So the chain is there; `native_tls` simply never re-exports the stream that
+/// owns it, which is the whole reason this function exists.
+///
+/// WHY THE PATH IS WALKED. `SSLSession.getPeerCertificates()` is ordered --
+/// the peer's own certificate, then each issuer. On Unix that is free: OpenSSL
+/// hands back a LIST, in the order the peer sent it. Here the source is a
+/// `CertStore`, which is a SET; `certs()` enumerates it in whatever order the
+/// store holds, and Windows promises nothing about that order.
+///
+/// MEASURED, and worth stating plainly rather than dressing up: with the walk
+/// SKIPPED, live SChannel already returned leaf-first on all six hosts of
+/// `PeerChainOrderProbe`, output identical to the walk's. So this is not a
+/// repair of an observed defect -- it is the removal of a dependence on an
+/// order the platform does not contract. The unit tests above `order_chain_from_leaf`
+/// are what exercise it, since the live store declines to.
+#[cfg(windows)]
+fn schannel_peer_chain_der(
+    stream: &schannel::tls_stream::TlsStream<TcpStream>,
+) -> Vec<Vec<u8>> {
+    let leaf_ctx = match stream.peer_certificate() {
+        Ok(c) => c,
+        // No peer certificate (PSK / anonymous suite). An empty chain is the
+        // honest answer; `getPeerCertificates` throws
+        // SSLPeerUnverifiedException on it, which is JSSE's behaviour.
+        Err(_) => return Vec::new(),
+    };
+    let leaf = leaf_ctx.to_der().to_vec();
+    let mut pool: Vec<Vec<u8>> = Vec::new();
+    if let Some(store) = leaf_ctx.cert_store() {
+        for cert in store.certs() {
+            let der = cert.to_der().to_vec();
+            if der != leaf && !pool.contains(&der) {
+                pool.push(der);
+            }
+        }
+    }
+    order_chain_from_leaf(leaf, pool, |der| {
+        crate::x509_manager::parse_certificate(der)
+            .ok()
+            .map(|p| (p.subject_der, p.issuer_der))
+    })
+}
+
+/// [`s2_schannel_tls_connect_on`], opening the connection here.
+#[cfg(windows)]
+pub(crate) fn s2_schannel_tls_connect(
+    cfg: &SchannelClientConfig,
+    host: &str,
+    port: u16,
+) -> Result<i32, TlsConnectFailure> {
+    let addr = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&addr).map_err(TlsConnectFailure::Tcp)?;
+    s2_schannel_tls_connect_on(cfg, host, port, tcp)
+}
+
+/// The default `SSLSocket` client bridge on Windows, over the `schannel` crate
+/// directly instead of through `native_tls`.
+///
+/// The backend does not change -- native-tls IS SChannel here, and its
+/// `imp/schannel.rs` is a thin wrapper over exactly the calls below. What
+/// changes is that the stream stays in reach, so the peer's chain can be read
+/// off it (see [`schannel_peer_chain_der`]). Everything the wrapper configured
+/// is configured here: the protocol range, SNI, hostname verification, the
+/// caller-supplied roots, and the two stand-downs.
+///
+#[cfg(windows)]
+pub(crate) fn s2_schannel_tls_connect_on(
+    cfg: &SchannelClientConfig,
+    host: &str,
+    port: u16,
+    tcp: TcpStream,
+) -> Result<i32, TlsConnectFailure> {
+    use schannel::cert_context::CertContext;
+    use schannel::cert_store::{CertAdd, Memory};
+    use schannel::schannel_cred::{Direction, Protocol, SchannelCred};
+    use schannel::tls_stream;
+
+    // Same 30 s floor the other two bridges set, for the same reason.
+    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+
+    let protocols: &[Protocol] = if cfg.max_tls12 {
+        &[Protocol::Tls12]
+    } else {
+        &[Protocol::Tls12, Protocol::Tls13]
+    };
+    let cred = SchannelCred::builder()
+        .enabled_protocols(protocols)
+        .acquire(Direction::Outbound)
+        .map_err(|e| TlsConnectFailure::Handshake(format!("SChannel credentials: {e}")))?;
+
+    let mut roots = Memory::new()
+        .map_err(|e| TlsConnectFailure::Handshake(format!("SChannel root store: {e}")))?
+        .into_store();
+    for der in &cfg.roots {
+        match CertContext::new(der) {
+            Ok(cert) => {
+                let _ = roots.add_cert(&cert, CertAdd::ReplaceExisting);
+            }
+            Err(e) => {
+                // One unparseable anchor must not sink the connector, which is
+                // what `new13_build_connector` does with the same input.
+                tracing::debug!(
+                    target: "servlet::tls",
+                    "schannel client: skipping unparseable trust anchor DER: {e}"
+                );
+            }
+        }
+    }
+
+    let mut builder = tls_stream::Builder::new();
+    builder
+        .cert_store(roots)
+        .domain(host)
+        .use_sni(true)
+        .accept_invalid_hostnames(cfg.skip_verify);
+    if cfg.skip_verify {
+        builder.verify_callback(|_| Ok(()));
+    }
+
+    // `HandshakeError`'s own Display is the generic "failed to perform
+    // handshake"; the certificate error a caller needs is in its source. JSSE
+    // callers read this message (it is the analogue of HotSpot's "PKIX path
+    // building failed: ..."), so unwrap it rather than reporting the wrapper.
+    let stream = builder.connect(cred, tcp).map_err(|e| {
+        TlsConnectFailure::Handshake(match e {
+            schannel::tls_stream::HandshakeError::Failure(io) => {
+                format!("TLS handshake failed: {io}")
+            }
+            other => format!("TLS handshake failed: {other}"),
+        })
+    })?;
+
+    let peer_cert_chain_der = schannel_peer_chain_der(&stream);
+    let negotiated_alpn = stream
+        .negotiated_application_protocol()
+        .ok()
+        .flatten()
+        .map(|p| String::from_utf8_lossy(&p).into_owned());
+    let raw = stream.get_ref().try_clone().ok();
+    let entry = TlsEntry {
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Schannel(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
+        raw,
+        peer_host: host.to_string(),
+        peer_port: port,
+        // SChannel exposes no negotiated-version or ciphersuite accessor
+        // through this crate, so these keep the values the native-tls path
+        // reported -- unchanged, not newly approximate. The OpenSSL bridge
+        // reports the real ones because OpenSSL can be asked.
+        negotiated_protocol: String::from("TLSv1.3"),
+        negotiated_cipher: String::from("TLS_AES_128_GCM_SHA256"),
+        negotiated_alpn,
         peer_cert_chain_der,
     };
     let mut reg = s2_registry().lock();
@@ -2602,7 +3187,9 @@ fn s2_tls_read_direct(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     let result = match &mut *guard {
         TlsClientStream::Native(stream) => stream.read(buf),
         #[cfg(unix)]
-        TlsClientStream::LegacyDsa(stream) => stream.read(buf),
+        TlsClientStream::Openssl(stream) => stream.read(buf),
+        #[cfg(windows)]
+        TlsClientStream::Schannel(stream) => stream.read(buf),
     };
     drop(guard);
     s2_tls_classify_after_block(id, result)
@@ -2678,7 +3265,9 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
     let result = match &mut *guard {
         TlsClientStream::Native(stream) => stream.write(data),
         #[cfg(unix)]
-        TlsClientStream::LegacyDsa(stream) => stream.write(data),
+        TlsClientStream::Openssl(stream) => stream.write(data),
+        #[cfg(windows)]
+        TlsClientStream::Schannel(stream) => stream.write(data),
     };
     drop(guard);
     // Same after-the-fact classification as the read side, and safe for the
@@ -2751,7 +3340,11 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
                     let _ = stream.shutdown();
                 }
                 #[cfg(unix)]
-                TlsClientStream::LegacyDsa(stream) => {
+                TlsClientStream::Openssl(stream) => {
+                    let _ = stream.shutdown();
+                }
+                #[cfg(windows)]
+                TlsClientStream::Schannel(stream) => {
                     let _ = stream.shutdown();
                 }
             }
@@ -2937,8 +3530,44 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Result<Option<ObjectR
     // `gaps/crash-01-arraylist-capacity-oom-abend.md`. Found via
     // H2's `org.h2.test.db.TestOutOfMemory`, whose MVStore-on-memFS workload
     // allocates ~76 MB buffers until the heap is gone.
-    let Some(arr) = ctx.try_new_array(ArrayElementType::Byte, cap) else {
-        return Ok(None);
+    //
+    // RECLAIM AND RETRY, not one shot (H2 `TestBenchmark`, 2026-08-18). Being
+    // *fallible* stopped the abort; it did not make the refusal honest.
+    // `try_new_array` deliberately does not collect -- see
+    // `runtime::native_oom` -- so this native reported `OutOfMemoryError` on
+    // the FIRST refusal, while the two paths that allocate an array from
+    // bytecode (`gc_alloc_array`, `jit_newarray`) both run a ladder: retire
+    // the TLAB, force a collection, retry, `last_ditch_reclaim`, retry again,
+    // and only then throw. `ByteBuffer.allocate` is shadowed by this native in
+    // real-JDK mode too, so its backing array never sees that ladder.
+    //
+    // Measured: MVStore's background writer grows a `WriteBuffer` to
+    // 10,616,832 bytes at `-Xmx1g` on ZGC. The arena has no hole that big at
+    // that instant (498 KiB largest, 348 MB free across 30k spans) and the
+    // request was refused -- with the heap 97% free once the collection nobody
+    // asked for finally ran. Repeating the identical `ByteBuffer.allocate` one
+    // Java statement later succeeded on the first attempt, and the class also
+    // passes under `--nojit`, at `-Xmx2g`, and on the generational collector:
+    // a spurious refusal, not an exhausted heap.
+    //
+    // Calling `reclaim_before_alloc_retry` is legal HERE specifically, and the
+    // precondition is the caller's to prove: this is the native's first
+    // allocation, so it holds no unpinned `ObjectRef` in a Rust local for a
+    // collection to dangle or sweep. Note that the very next allocation below
+    // must NOT do this -- `arr` is live by then, which is exactly why it is
+    // pinned across it.
+    let arr = match ctx.try_new_array(ArrayElementType::Byte, cap) {
+        Some(a) => a,
+        None => {
+            let reclaimed = ctx.reclaim_before_alloc_retry();
+            match reclaimed
+                .then(|| ctx.try_new_array(ArrayElementType::Byte, cap))
+                .flatten()
+            {
+                Some(a) => a,
+                None => return Ok(None),
+            }
+        }
     };
     // GC-safety: `alloc_concurrent_synthetic` below allocates and can
     // trigger a collection that relocates `arr` (read again by
@@ -3006,12 +3635,44 @@ fn s2_bb_alloc_direct(ctx: &mut dyn NativeContext, cap: i32) -> MethodCallResult
 
     // No heap array: `s2_bb_arr` must answer None so `s2_bb_direct_addr` is
     // consulted and the buffer reads as direct.
-    ctx.set_field(buf, BB_ARRAY, Value::Object(None));
-    ctx.set_field(buf, BB_POS, Value::Int(0));
-    ctx.set_field(buf, BB_LIMIT, Value::Int(cap));
-    ctx.set_field(buf, BB_CAP, Value::Int(cap));
-    ctx.set_field(buf, BB_MARK, Value::Long(addr));
-    ctx.set_field(buf, BB_ORDER, Value::Int(0)); // JDK default: BIG_ENDIAN
+    //
+    // By NAME first, then the indexed overlay behind the layout screen — the
+    // same order and the same guard `bb_write_hb` and `s2_bb_as_char_buffer`
+    // already use, and for the same reason (G38-1, closing the last unguarded
+    // member of that family). `alloc_concurrent_synthetic` resolves the REAL
+    // (abstract) `java.nio.ByteBuffer` whenever its class bytes are reachable,
+    // and on that layout the six indices alias
+    // `mark@0/position@1/limit@2/capacity@3/address@4/segment@5`: the old
+    // unconditional block wrote `Object(None)` over `mark` (an `int`, coerced
+    // to 0 where the JDK's own ctor leaves -1) and `Int(0)` over `segment` (a
+    // reference, coerced to null — so the ORDER FLAG WAS DESTROYED and every
+    // such buffer decoded as BIG_ENDIAN whatever `order(LITTLE_ENDIAN)` set).
+    // Both are the species in
+    // G30-1-the-silent-reference-slot-coercion-20260817.md, in both
+    // directions. The by-name writes put each value in the field that actually
+    // holds it — `address` is where `s2_bb_direct_addr` looks FIRST, and
+    // `seed_buffer_byte_order` writes the `bigEndian`/`nativeByteOrder` pair
+    // `s2_bb_order` reads on a real layout — so the direct-buffer convention
+    // is unchanged on both shapes.
+    //
+    // `hb`, `offset` and `isReadOnly` are deliberately NOT written: a fresh
+    // allocation already reads back null/0 for all three, which is exactly the
+    // direct, zero-offset, writable shape, and every name written here is one
+    // more slot to get wrong on a layout this function cannot see.
+    ctx.set_field_by_name(buf, "position", Value::Int(0));
+    ctx.set_field_by_name(buf, "limit", Value::Int(cap));
+    ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
+    ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    ctx.set_field_by_name(buf, "address", Value::Long(addr));
+    cratonvm_native_io::seed_buffer_byte_order(ctx, buf);
+    if s2_bb_synthetic_layout(ctx, buf) {
+        ctx.set_field(buf, BB_ARRAY, Value::Object(None));
+        ctx.set_field(buf, BB_POS, Value::Int(0));
+        ctx.set_field(buf, BB_LIMIT, Value::Int(cap));
+        ctx.set_field(buf, BB_CAP, Value::Int(cap));
+        ctx.set_field(buf, BB_MARK, Value::Long(addr));
+        ctx.set_field(buf, BB_ORDER, Value::Int(0)); // JDK default: BIG_ENDIAN
+    }
 
     ctx.set_field(dealloc, DEALLOC_ID, Value::Long(alloc_id));
     ctx.set_field(cleanable, CLEANABLE_ACTION, Value::Object(Some(dealloc)));
@@ -3071,17 +3732,23 @@ pub(crate) fn bb_write_hb(ctx: &mut dyn NativeContext, buf: ObjectRef, arr: Obje
     // full field layout, so without this seed the named `bigEndian` slot
     // reads back Int(0) — which `s2_bb_order` would decode as
     // LITTLE_ENDIAN by default.
-    ctx.set_field_by_name(buf, "bigEndian", Value::Int(1));
-    ctx.set_field_by_name(
-        buf,
-        "nativeByteOrder",
-        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
-    );
+    //
+    // CONVERGED (F26-1, closing the two-of-five sites of
+    // W7-76-bytebuffer-alias-residuals.md §8.2 that this lane owns). This was
+    // one of five byte-identical transcriptions of the same two writes, with
+    // "nothing to make them agree"; it is now a delegation to
+    // `native_io::seed_buffer_byte_order`, for the same reason and by the same
+    // crate-direction argument as `s2_bb_is_read_only` above. The remaining
+    // three sites are F26-1 §6 nominations.
+    cratonvm_native_io::seed_buffer_byte_order(ctx, buf);
     // Real HeapByteBuffer seeds Buffer.address to ARRAY_BYTE_BASE_OFFSET +
     // offset (16 for a fresh, zero-offset heap buffer). Bulk get/put
     // bytecode routes through ScopedMemoryAccess and expects this
-    // base-offset-relative value when copying from/to hb.
-    ctx.set_field_by_name(buf, "address", Value::Long(16));
+    // base-offset-relative value when copying from/to hb. `bb_write_hb` writes
+    // `offset = 0` four lines up, so the offset term is 0 — spelled through
+    // this file's `ARRAY_BYTE_BASE_OFFSET`, which is now DEFINED AS
+    // native-io's, so the two crates cannot disagree about the value.
+    ctx.set_field_by_name(buf, "address", Value::Long(ARRAY_BYTE_BASE_OFFSET));
     // Synthetic-mode indexed fallback — ONLY for the bare synthetic layout
     // (no real Buffer/ByteBuffer field metadata). On a real-JDK-shaped
     // object these indices alias real fields (mark@0, address@4,
@@ -3267,13 +3934,41 @@ fn s2_bb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, value: i32) {
 /// `s2_typed_buffer_view_fns!`/`s2_view_buf_fn!` stash there (see
 /// `s2_bb_arr`'s `BB_SEGMENT_SLOT` fallback), so every value read through a
 /// typed-buffer view came back zero regardless of what was written.
+///
+/// **This predicate is NARROWER than "the indexed `BB_*` convention applies",
+/// and callers must not read it as the wider claim.** A `--synthetic-jdk`
+/// `java.nio.ByteBuffer` is 10 fields wide (`class_manager::synthetic_stub_fields`
+/// gives `java/nio/ByteBuffer` `instance_fields(6)` over a `java/nio/Buffer`
+/// with `instance_fields(4)`), so it fails the `== 6` screen while its slots
+/// 0..5 still mean array/pos/limit/cap/mark/order. Reading `false` here as
+/// "real JDK layout, so a name-keyed write is safe" is exactly the 2026-08-12
+/// defect in [`s2_bb_set_order`]. Use [`s2_buf_stub_layout`] for the wider
+/// question; the count screen is kept because several call sites below key an
+/// aliasing-vs-copying decision on it, and widening it there would be a
+/// behaviour change unrelated to byte order.
 #[inline]
 fn s2_bb_synthetic_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
     if ctx.object_num_fields(buf) != 6 {
         return false;
     }
+    !s2_is_typed_buffer_view(ctx, buf)
+}
+
+/// The five abstract typed-buffer classes `s2_typed_buffer_view_fns!` /
+/// `s2_view_buf_fn!` stamp on a view built by `ByteBuffer.as<T>Buffer()`.
+///
+/// These are the ONE family whose byte order lives in the indexed `BB_ARRAY`
+/// slot: the view's backing array is stashed at [`BB_SEGMENT_SLOT`] (the only
+/// Object-typed field `java.nio.Buffer` declares), which leaves slot 0 — real
+/// `Buffer.mark`, an `int` — genuinely free for an order flag. Written down
+/// once, here, so the reader (`s2_bb_order`), the writer (`s2_bb_set_order`)
+/// and the layout screen (`s2_bb_synthetic_layout`) cannot drift apart on
+/// which classes they mean; they used to carry three copies of this list
+/// between them, and the discriminator each copy keyed on was different.
+#[inline]
+fn s2_is_typed_buffer_view(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(buf);
-    !matches!(
+    matches!(
         ctx.class_name_arc_of_id(cid).as_deref(),
         Some(
             "java/nio/IntBuffer"
@@ -3283,6 +3978,49 @@ fn s2_bb_synthetic_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
                 | "java/nio/DoubleBuffer"
         )
     )
+}
+
+/// True when `buf`'s class carries **no real `java.nio.Buffer` field
+/// metadata** — i.e. the receiver is a fabricated synthetic-JDK stub (fields
+/// `_f0.._fN`, all `Ljava/lang/Object;`) or a bare synthetic carrier, and its
+/// slots therefore mean what the indexed `BB_*` constants say rather than what
+/// a real JDK layout says.
+///
+/// **This is not the same question as [`s2_bb_synthetic_layout`], and that is
+/// the whole point.** That predicate screens on `object_num_fields == 6`, and
+/// a `--synthetic-jdk` `java.nio.ByteBuffer` is **10 fields wide**: the
+/// fabricated `java/nio/ByteBuffer` stub declares `_f0.._f5` and its
+/// fabricated `java/nio/Buffer` superclass declares `_f0.._f3`. Measured, not
+/// inferred — `Class.forName("java.nio.ByteBuffer").getDeclaredFields()` under
+/// `cratonvm --synthetic-jdk` prints exactly those ten, and the object's slots
+/// 0..5 are the subclass's, so `native-io`'s `alloc_byte_buffer` parks the
+/// backing array in slot 0 and the indexed `BB_*` convention holds unchanged.
+/// The count screen reads that object as REAL-layout, which is how an `int`
+/// order flag came to be written over the backing array (see
+/// [`s2_bb_set_order`]).
+///
+/// The witness is CLASS-SIDE (`resolve_field_index_by_class_id`), the same
+/// idiom `classloader::cl_has_synthetic_layout` uses, and deliberately not a
+/// value-side `get_field_by_name(..) == Object(None)` probe: an absent name's
+/// by-name READ is `Int(0)` under `MockNativeContext`, so a value-side witness
+/// would answer "real layout" for every bare synthetic carrier under test and
+/// the predicate would be untestable in the direction that matters.
+///
+/// `position` is the witness field because `java.nio.Buffer` declares it, so
+/// every real buffer class in the hierarchy inherits it — `ByteBuffer`'s own
+/// `bigEndian` would answer "synthetic" for a real `java.nio.CharBuffer`,
+/// which is a real layout with no `bigEndian` of its own.
+///
+/// The width guard is not belt-and-braces: `native-io`'s `alloc_byte_buffer`
+/// falls back to `alloc_object(ClassId(0), BB_NUM_FIELDS /* = 5 */)` when the
+/// class will not resolve at all, and slot [`BB_ORDER`] is past the end of
+/// that object.
+#[inline]
+fn s2_buf_stub_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    ctx.object_num_fields(buf) > BB_ORDER
+        && ctx
+            .resolve_field_index_by_class_id(ctx.class_id_of_object(buf), "position")
+            .is_none()
 }
 
 #[inline]
@@ -3329,20 +4067,37 @@ fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
                 1
             }
         }
-        // Unresolvable / non-Int on this non-synthetic buffer object: for a
-        // typed-buffer view (IntBuffer/LongBuffer/ShortBuffer/FloatBuffer/
-        // DoubleBuffer — no `bigEndian` field to resolve, unlike ByteBuffer)
-        // the order flag is instead stashed by `s2_bb_set_order` below in
-        // the real `mark: int` slot (index 0 — genuinely free for these
-        // views once the array moved to `BB_SEGMENT_SLOT`; `Int`-into-`int`
-        // is not subject to the descriptor-coercion trap that broke slot 0
-        // as Object storage). Any other non-Int value there (a stray -1
-        // default, or a genuine "no order set yet") falls back to the JDK
-        // default BIG_ENDIAN.
-        _ => match ctx.get_field(buf, BB_ARRAY) {
-            Value::Int(1) => 1,
-            _ => 0,
-        },
+        // Unresolvable / non-Int on this non-synthetic buffer object. Three
+        // distinct shapes land here and they do NOT share a storage slot —
+        // see `s2_bb_set_order`, which must stay the exact mirror of this.
+        _ => {
+            if s2_is_typed_buffer_view(ctx, buf) {
+                // Typed-buffer view: the order flag is stashed in the real
+                // `mark: int` slot (index 0 — genuinely free for these views
+                // once the array moved to `BB_SEGMENT_SLOT`; `Int`-into-`int`
+                // is not subject to the descriptor-coercion trap that broke
+                // slot 0 as Object storage). Any other value there (a stray
+                // -1 default, or a genuine "no order set yet") falls back to
+                // the JDK default BIG_ENDIAN.
+                match ctx.get_field(buf, BB_ARRAY) {
+                    Value::Int(1) => 1,
+                    _ => 0,
+                }
+            } else if s2_buf_stub_layout(ctx, buf) {
+                // Synthetic-JDK stub ByteBuffer/HeapByteBuffer/CharBuffer:
+                // wider than 6 slots (so `s2_bb_synthetic_layout` above said
+                // "real"), no `bigEndian` field to resolve, and slot 0 is the
+                // BACKING ARRAY. The order goes where the name says it goes.
+                ctx.get_field(buf, BB_ORDER).as_int().unwrap_or(0)
+            } else {
+                // A real JDK layout with neither a `bigEndian` field nor a
+                // `ByteBufferAs…{B,L}` class name — e.g. a real
+                // `java.nio.CharBuffer`. Reading slot 0 here would decode
+                // whatever `Buffer.mark` happens to hold as a byte order. The
+                // JDK default is the honest answer.
+                0
+            }
+        }
     }
 }
 
@@ -3350,19 +4105,36 @@ fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 /// `s2_bb_order`, with the same layout discrimination. Used by the
 /// `order(ByteOrder)` native and by slice/view creation when propagating
 /// the source buffer's order.
+///
+/// BUG (found 2026-08-12, `--synthetic-jdk`): the last branch used to be an
+/// UNCONDITIONAL `set_field(buf, BB_ARRAY, Int(ord))`, and its comment stated
+/// the premise it rested on — *"a genuine ByteBuffer … already round-trips
+/// correctly by name"*. That premise is true of the real JDK class and FALSE
+/// of the fabricated one: a synthetic-JDK `java.nio.ByteBuffer` is 10 fields
+/// wide (`_f0.._f5` + `java/nio/Buffer._f0.._f3`, measured), so
+/// `s2_bb_synthetic_layout`'s `== 6` screen called it real-layout, it has no
+/// `bigEndian` field to resolve, and the write landed on slot 0 — the BACKING
+/// ARRAY. `ByteBuffer.allocate(8).order(nativeOrder())` then took the VM down
+/// with `internal error: ByteBuffer missing backing storage (… field 0
+/// returned Int(1) …)`, exit 1, no Java exception.
+///
+/// It was invisible to the obvious probe because the corruption is
+/// SELF-CONSISTENT: `s2_bb_order` read the same slot back, so `order()` still
+/// reported `LITTLE_ENDIAN` over the destroyed buffer. Only the CONTENTS show
+/// it. Assert bytes, never the reported order.
+///
+/// The three storage sites below are now named explicitly and each one is
+/// gated on the shape that owns it, so no configuration reaches a slot whose
+/// meaning it has not established. The unrecognised case REFUSES rather than
+/// guessing: a byte order that silently fails to stick is a wrong value, and a
+/// wrong value is recoverable; a scalar written over a reference slot is not.
 fn s2_bb_set_order(ctx: &mut dyn NativeContext, buf: ObjectRef, ord: i32) {
     if s2_bb_synthetic_layout(ctx, buf) {
         ctx.set_field(buf, BB_ORDER, Value::Int(ord));
         return;
     }
     // Real ByteBuffer (has a genuine `bigEndian` field): write it by name,
-    // as before. Typed-buffer view (IntBuffer/LongBuffer/ShortBuffer/
-    // FloatBuffer/DoubleBuffer — no `bigEndian` field to resolve): the
-    // by-name write is a no-op, so stash the flag in the real `mark: int`
-    // slot instead (index 0 — genuinely free for these views once the
-    // array moved to `BB_SEGMENT_SLOT`). Gated on whether `bigEndian`
-    // actually resolves so this NEVER touches slot 0 — real `mark` — on a
-    // genuine ByteBuffer, which already round-trips correctly by name.
+    // as before.
     let has_big_endian_field =
         !matches!(ctx.get_field_by_name(buf, "bigEndian"), Value::Object(None));
     if has_big_endian_field {
@@ -3374,9 +4146,29 @@ fn s2_bb_set_order(ctx: &mut dyn NativeContext, buf: ObjectRef, ord: i32) {
             "nativeByteOrder",
             Value::Int(if ord == 1 { 1 } else { 0 }),
         );
-    } else {
+    } else if s2_is_typed_buffer_view(ctx, buf) {
+        // Typed-buffer view (IntBuffer/LongBuffer/ShortBuffer/FloatBuffer/
+        // DoubleBuffer — no `bigEndian` field to resolve, unlike ByteBuffer):
+        // the by-name write is a no-op, so stash the flag in the real
+        // `mark: int` slot instead (index 0 — genuinely free for these views
+        // once the array moved to `BB_SEGMENT_SLOT`). This is the ONLY shape
+        // for which slot 0 is not the backing store, which is why it is now
+        // gated on the class name rather than reached by falling through.
         ctx.set_field(buf, BB_ARRAY, Value::Int(ord));
+    } else if s2_buf_stub_layout(ctx, buf) {
+        // Synthetic-JDK stub ByteBuffer/HeapByteBuffer/CharBuffer. Slot 0 is
+        // the backing array (`native-io`'s `alloc_byte_buffer` and
+        // `s2_bb_alloc_direct` both put it there); [`BB_ORDER`] is the slot
+        // this layout reserves for the flag, and it is free — `s2_bb_arr`
+        // never reads it, and `native-io`'s `bb_resolve_heap_array` probes it
+        // only for an `ObjectKind::Array` and falls through on an `Int`.
+        ctx.set_field(buf, BB_ORDER, Value::Int(ord));
     }
+    // Otherwise REFUSE. A real JDK layout with no `bigEndian` (a real
+    // `java.nio.CharBuffer`, or a `ByteBufferAs…{B,L}` whose order is fixed by
+    // its CLASS and cannot be reassigned at all) has no slot here that means
+    // "byte order", and every candidate index aliases a field the real class
+    // declares. Writing one would be the defect above with a different victim.
 }
 #[inline]
 fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
@@ -3494,7 +4286,13 @@ fn s2_bb_heap_base(ctx: &dyn NativeContext, buf: ObjectRef) -> usize {
 /// JDK's own `HeapByteBuffer` ctor adds to its array-base `offset`. Element 0
 /// of a `byte[]` sits at this unsafe offset, so subtracting it turns a
 /// `Buffer.address` back into a plain byte index.
-const ARRAY_BYTE_BASE_OFFSET: i64 = 16;
+///
+/// **DEFINED AS native-io's, not beside it (F26-1).** Two crates screening the
+/// same `Buffer.address` values against two independently-spelled `16`s is the
+/// W7-76 §8.2 shape; a `const` initialised from the other crate's `pub const`
+/// is const-evaluated, costs nothing, leaves all nine use sites in this file
+/// untouched, and makes drift impossible.
+const ARRAY_BYTE_BASE_OFFSET: i64 = cratonvm_native_io::ARRAY_BYTE_BASE_OFFSET;
 
 /// Backing array + byte index of element 0 for a real-JDK
 /// `java/nio/ByteBufferAs<T>Buffer{B,L}` — the concrete view class
@@ -3613,9 +4411,79 @@ fn s2_bb_read_window(
 /// True when the buffer's real-JDK `isReadOnly` flag is set (layouts with
 /// no such field — bare synthetics, typed views — always report writable,
 /// matching this family's historic behaviour).
+///
+/// CONVERGED (F14-1 N1). This was one of THREE byte-identical transcriptions of
+/// the same one-line field read — this, `charset_buffers.rs::cb_is_read_only`,
+/// and `native-io`'s. It is now a delegation to the `native-io` copy: the crate
+/// dependency runs `cratonvm-native-builtins` → `cratonvm-native-io` and not
+/// the reverse, so that is the only one of the three the other two can import.
+/// The local name is kept because it is the name fifteen call sites in this
+/// file already use, and because a delegation is one implementation whichever
+/// name it wears — what F14-1 objected to was three BODIES that can drift, not
+/// three names.
 #[inline]
 fn s2_bb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
-    matches!(ctx.get_field_by_name(buf, "isReadOnly"), Value::Int(v) if v != 0)
+    cratonvm_native_io::buffer_is_read_only(ctx, buf)
+}
+
+/// The WRITE half of [`s2_bb_is_read_only`], for the four view producers.
+///
+/// `slice()`, `slice(int,int)` and `duplicate()` inherit the source's flag and
+/// `asReadOnlyBuffer()` sets it unconditionally — MEASURED across all seven
+/// buffer families on jdk-25.0.3+9
+/// (`scratchpad/f21/F21ViewContagionProbe.java`); read-only-ness is contagious
+/// and `asReadOnlyBuffer()` is one-way with no operation anywhere that clears
+/// it. Each of those four had heap and direct arms that carried `ro`
+/// correctly and a copying fallback arm that did not, and the fallback runs
+/// `bb_write_hb`, which writes `isReadOnly = 0` — so the flag was actively
+/// cleared rather than merely left alone. This exists so the corrected arms
+/// name the operation instead of open-coding a fifth `set_field_by_name`.
+///
+/// Deliberately by NAME and not through `BB_*`: `isReadOnly` is a real-JDK
+/// `ByteBuffer` field with no slot in the bare 6-slot synthetic layout, so on a
+/// carrier that has no such field this is a no-op — which is the same
+/// behaviour, and the same reason, as `bb_write_hb`'s own `isReadOnly` write
+/// one screen up.
+#[inline]
+fn s2_bb_set_read_only(ctx: &mut dyn NativeContext, buf: ObjectRef, read_only: bool) {
+    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(i32::from(read_only)));
+}
+
+/// `throw new UnsupportedOperationException()` — the NO-ARGUMENT constructor,
+/// so `getMessage()` is null exactly as HotSpot's is.
+///
+/// The `array()` / `arrayOffset()` arms below raised this with a
+/// `"direct buffer has no backing array"` detail message. The CLASS was right,
+/// so no `catch` and no class-name assertion could see the difference — only a
+/// message-exact differential can, which is why it survived W7-83 §7.1.
+/// MEASURED on `openjdk 25.0.3 2026-04-21 LTS (25.0.3+9-LTS)`, all four UOE
+/// arms of this family report `getMessage() == null`:
+///
+/// ```text
+/// directByteBuffer.array        java.lang.UnsupportedOperationException  getMessage=null
+/// directByteBuffer.arrayOffset  java.lang.UnsupportedOperationException  getMessage=null
+/// charView.array                java.lang.UnsupportedOperationException  getMessage=null
+/// stringCharBuffer.array        java.lang.UnsupportedOperationException  getMessage=null
+/// new UOE().getMessage          OK null
+/// ```
+///
+/// The EMPTY string is the documented spelling for "no message" in
+/// `types/src/error.rs`, which maps `""` to `None` so the `()V` ctor is used;
+/// `Some("")` would set a non-null empty detail message. Same spelling as
+/// `charset_buffers.rs::cb_no_backing_array` and
+/// `native-io/src/lib.rs::buffer_no_backing_array` — this WAS the third and
+/// last copy in the family. Record: F14-1 N3.
+///
+/// CONVERGED (F14-1 N1): now a delegation to the `native-io` copy, for the same
+/// dependency-edge reason as [`s2_bb_is_read_only`]. The empty-string spelling
+/// is precisely the detail a fourth transcription would get wrong, and the
+/// existing test on this arm matches
+/// `RuntimeError::UnsupportedOperationException { .. }`, which is blind to the
+/// message by construction — the message-reading test lives beside the single
+/// remaining body.
+#[inline]
+fn s2_bb_no_backing_array() -> MethodCallFailed {
+    cratonvm_native_io::buffer_no_backing_array()
 }
 
 /// The canonical `java.nio.ByteOrder` object for `ord` (0=BIG_ENDIAN,
@@ -3625,6 +4493,31 @@ fn s2_bb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
 /// (`order() == ByteOrder.LITTLE_ENDIAN`) and `toString()` behave exactly
 /// like HotSpot. Falls back to a 1-slot synthetic (field 0 = order int)
 /// only when the real class/statics are unavailable (synthetic-jdk mode).
+///
+/// G38-1: the FALLBACK arm was the unrepaired twin of
+/// `phases_late::foreign_ffm::p67_byte_order_object`. Reaching it does not
+/// prove the real class is absent — `ensure_class_initialized` can succeed and
+/// `static_field_index_by_name`/`get_static_field` still miss (a class loaded
+/// but whose `<clinit>` has not published the constants yet, and every
+/// compatibility-mode arm where a synthetic registrar runs against real class
+/// bytes). On that path `alloc_concurrent_synthetic` hands back an object of
+/// the REAL `java.nio.ByteOrder`, whose only instance field is
+/// `private final String name` at slot 0 — so `Value::Int(ord)` was silently
+/// coerced to `null` by `heap::coerce_field_value_by_descriptor`
+/// (G30-1-the-silent-reference-slot-coercion-20260817.md), and BOTH readers
+/// below then decoded the null as BIG_ENDIAN: `LITTLE_ENDIAN.toString()`
+/// printed `BIG_ENDIAN` and `equals` called the two constants equal.
+///
+/// The repair is the correct value in the right slot, not a refusal. The flag
+/// write stays — it is the synthetic-stub layout, and `s2_byte_order_ord`
+/// still falls back to it — and on top of it, when the CLASS actually declares
+/// `name` at a slot this object has, a genuine String goes there. Three
+/// shapes, all covered, exactly as in `p67_byte_order_object`: a fabricated
+/// stub names its fields `_f0..`, so `name` does not resolve and only the flag
+/// lands (byte-identical to before); a real `java.nio.ByteOrder` resolves
+/// `name` to slot 0 and gets the String, which `toString`/`s2_byte_order_ord`
+/// already decode; a resolved index out of range is skipped rather than
+/// written out of bounds.
 pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> Result<ObjectRef, MethodCallFailed> {
     let cid = ctx
         .ensure_class_initialized("java/nio/ByteOrder")
@@ -3644,6 +4537,26 @@ pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> Res
     }
     let bo = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
     ctx.set_field(bo, 0, Value::Int(ord));
+    let bo_cid = ctx.class_id_of_object(bo);
+    // Bound before the `if let` so the immutable reborrow of `ctx` ends here
+    // rather than spanning the block that needs `&mut ctx`.
+    let name_slot = ctx.resolve_field_index_by_class_id(bo_cid, "name");
+    if let Some(slot) = name_slot {
+        if slot < ctx.object_num_fields(bo) {
+            // `create_string` allocates and can move `bo` (native stale-local
+            // family) — pin it across the call.
+            let bo_pin = ctx.pin_native_root(bo);
+            let name = ctx.create_string(if ord == 1 {
+                "LITTLE_ENDIAN"
+            } else {
+                "BIG_ENDIAN"
+            });
+            let bo = ctx.read_native_pin(bo_pin, bo);
+            ctx.unpin_native_roots(bo_pin);
+            ctx.set_field(bo, slot, Value::Object(Some(name)));
+            return Ok(bo);
+        }
+    }
     Ok(bo)
 }
 
@@ -3793,35 +4706,129 @@ fn s2_bb_int_byte_off(bs: i32, unit: i32) -> i32 {
         .unwrap_or(-1)
 }
 
+/// Read `N` bytes starting at logical index `idx`, resolving the buffer's
+/// storage ONCE.
+///
+/// The six multi-byte accessors below used to call [`s2_bb_get_byte`] /
+/// [`s2_bb_put_byte`] once per byte, and each of those re-resolves the whole
+/// storage view from scratch — `get_field_by_name(buf, "hb")`, then `"offset"`,
+/// then possibly `"address"` — i.e. up to three NAME-keyed field lookups per
+/// byte. A `putLong` therefore paid that resolution EIGHT times.
+///
+/// **This was written as a throughput fix and it is NOT one — recorded here so
+/// the next reader does not re-derive the same wrong hypothesis.** Interleaved
+/// before/after on `probes/NioAccessorRate.java` (2026-08-17, real-JDK mode,
+/// G1, two rounds), `direct ByteBuffer.putLong` measured 918 -> 943 and
+/// 864 -> 877 ns/op: no change outside the noise. The per-byte re-resolution
+/// was real, but it is not what the time goes to.
+///
+/// What the time actually goes to is the NATIVE CALL itself. On the same
+/// probe a single-byte `ByteBuffer.put(int,byte)` — one native, one stored
+/// byte — costs ~260 ns against HotSpot's 0.29, and `putLong` is ~3.5x that
+/// rather than 8x, which is the shape of "one native call plus a few
+/// name-keyed field reads", not "eight byte stores". See
+/// `docs/known-issues/netty/httpcontentdecompressortest-hang-20260816.md`
+/// for the full decomposition and for why this is what makes
+/// `testZipBomb` exceed its wall.
+///
+/// The rewrite is kept because it is strictly less work per access and it is
+/// pinned by a differential oracle (`probes/NioAccessorOracle.java`, which
+/// checksums every width x endianness x storage-kind x alignment plus the
+/// out-of-range and read-only contracts, and must print the same TOTAL on
+/// HotSpot and CratonVM). It is not kept on the strength of a measurement.
+///
+/// Semantics are preserved exactly, including the benign out-of-range
+/// behaviour this family documents: a read past the array reads back zero for
+/// the bytes that are out of range, and a write past it drops them, rather
+/// than throwing from this deep a helper. Only the number of storage
+/// resolutions changes.
+fn s2_bb_read_n<const N: usize>(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> [u8; N] {
+    let mut out = [0u8; N];
+    if idx < 0 {
+        return out;
+    }
+    match s2_bb_storage(ctx, buf) {
+        Some(S2BbStorage::Heap { arr, base }) => {
+            let Some(start) = base.checked_add(idx as usize) else {
+                return out;
+            };
+            let len = ctx.array_length(arr);
+            for (k, slot) in out.iter_mut().enumerate() {
+                let Some(i) = start.checked_add(k) else { break };
+                if i >= len {
+                    break;
+                }
+                *slot = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
+            }
+        }
+        Some(S2BbStorage::Direct { addr }) => {
+            // One bulk copy; on failure every byte keeps this family's benign
+            // zero, exactly as the per-byte helper's `else { 0 }` arm did.
+            if !ctx.copy_from_native_memory(addr.saturating_add(idx as i64), &mut out) {
+                out = [0u8; N];
+            }
+        }
+        None => {}
+    }
+    out
+}
+
+/// Write side of [`s2_bb_read_n`] — same single-resolution contract, same
+/// benign drop-on-out-of-range behaviour.
+fn s2_bb_write_n<const N: usize>(
+    ctx: &mut dyn NativeContext,
+    buf: ObjectRef,
+    idx: i32,
+    bytes: [u8; N],
+) {
+    if idx < 0 {
+        return;
+    }
+    match s2_bb_storage(ctx, buf) {
+        Some(S2BbStorage::Heap { arr, base }) => {
+            let Some(start) = base.checked_add(idx as usize) else {
+                return;
+            };
+            let len = ctx.array_length(arr);
+            for (k, &b) in bytes.iter().enumerate() {
+                let Some(i) = start.checked_add(k) else { return };
+                if i >= len {
+                    return;
+                }
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+        }
+        Some(S2BbStorage::Direct { addr }) => {
+            let _ = ctx.copy_to_native_memory(addr.saturating_add(idx as i64), &bytes);
+        }
+        None => {}
+    }
+}
+
 fn s2_bb_read2(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i16 {
-    let b0 = s2_bb_get_byte(ctx, buf, idx) as u8 as u16;
-    let b1 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 1)) as u8 as u16;
+    let bs = s2_bb_read_n::<2>(ctx, buf, idx);
     if s2_bb_order(ctx, buf) == 1 {
-        (b1 << 8 | b0) as i16
+        i16::from_le_bytes(bs)
     } else {
-        (b0 << 8 | b1) as i16
+        i16::from_be_bytes(bs)
     }
 }
 
 fn s2_bb_write2(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, val: i16) {
-    let (b0, b1) = if s2_bb_order(ctx, buf) == 1 {
-        (val as u8, (val >> 8) as u8)
+    let bytes = if s2_bb_order(ctx, buf) == 1 {
+        val.to_le_bytes()
     } else {
-        ((val >> 8) as u8, val as u8)
+        val.to_be_bytes()
     };
-    s2_bb_put_byte(ctx, buf, idx, b0 as i8);
-    s2_bb_put_byte(ctx, buf, s2_bb_off(idx, 1), b1 as i8);
+    s2_bb_write_n::<2>(ctx, buf, idx, bytes);
 }
 
 fn s2_bb_read4(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i32 {
-    let b0 = s2_bb_get_byte(ctx, buf, idx) as u8 as u32;
-    let b1 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 1)) as u8 as u32;
-    let b2 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 2)) as u8 as u32;
-    let b3 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 3)) as u8 as u32;
+    let bs = s2_bb_read_n::<4>(ctx, buf, idx);
     if s2_bb_order(ctx, buf) == 1 {
-        (b3 << 24 | b2 << 16 | b1 << 8 | b0) as i32
+        i32::from_le_bytes(bs)
     } else {
-        (b0 << 24 | b1 << 16 | b2 << 8 | b3) as i32
+        i32::from_be_bytes(bs)
     }
 }
 
@@ -3831,16 +4838,11 @@ fn s2_bb_write4(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, val: i32)
     } else {
         val.to_be_bytes()
     };
-    for (i, &b) in bytes.iter().enumerate() {
-        s2_bb_put_byte(ctx, buf, s2_bb_off(idx, i as i32), b as i8);
-    }
+    s2_bb_write_n::<4>(ctx, buf, idx, bytes);
 }
 
 fn s2_bb_read8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i64 {
-    let mut bs = [0u8; 8];
-    for i in 0..8i32 {
-        bs[i as usize] = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, i)) as u8;
-    }
+    let bs = s2_bb_read_n::<8>(ctx, buf, idx);
     if s2_bb_order(ctx, buf) == 1 {
         i64::from_le_bytes(bs)
     } else {
@@ -3854,9 +4856,7 @@ fn s2_bb_write8(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, val: i64)
     } else {
         val.to_be_bytes()
     };
-    for (i, &b) in bytes.iter().enumerate() {
-        s2_bb_put_byte(ctx, buf, s2_bb_off(idx, i as i32), b as i8);
-    }
+    s2_bb_write_n::<8>(ctx, buf, idx, bytes);
 }
 
 // ---- Socket address helper -------------------------------------------------
@@ -4748,6 +5748,26 @@ macro_rules! s2_view_buf_fn {
             // accessors (the source may be real-layout: order in `bigEndian`).
             let ord = s2_bb_order(ctx, this);
             s2_bb_set_order(ctx, vb, ord);
+            // …and the source's read-only-ness, which is F21-1 N3's other
+            // half and had never been propagated. `ByteBuffer.asIntBuffer()`
+            // &c. are registered HERE AND NOWHERE ELSE (`native-io` registers
+            // no `as<T>Buffer` descriptor), so unlike `$slice`/`$dup` in the
+            // macro below this arm is the LIVE one in every mode.
+            //
+            // MEASURED, jdk-25.0.3+9 (`scratchpad/f37/F37TypedAliasProbe.java`):
+            // `ByteBuffer.allocate(64).asReadOnlyBuffer().asIntBuffer()` is a
+            // `java.nio.ByteBufferAsIntBufferRB` with `isReadOnly() == true`,
+            // its `array()` raises `UnsupportedOperationException` (array-less
+            // is asked FIRST — it is not a `ReadOnlyBufferException` row), and
+            // its `.slice()` is read-only too. Identical for Long/Short/Float/
+            // Double/Char and for the direct twin `DirectIntBufferRS`.
+            //
+            // Without this the typed views' new `$put` guard could be walked
+            // straight around: take a read-only ByteBuffer, ask it for an
+            // `asIntBuffer()` view, and write through the view into the
+            // read-only buffer's own backing array.
+            let src_read_only = s2_bb_is_read_only(ctx, this);
+            s2_bb_set_read_only(ctx, vb, src_read_only);
             Ok(Some(Value::Object(Some(vb))))
         }
     };
@@ -4860,7 +5880,14 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             // back to the ARRAY_BYTE_BASE_OFFSET seeding `bb_write_hb` uses.
             _ => 16,
         };
-        let read_only = matches!(ctx.get_field_by_name(this, "isReadOnly"), Value::Int(1));
+        // Was an open-coded `matches!(…, Value::Int(1))` — the FIFTH
+        // transcription of the `isReadOnly` field read, and the only one that
+        // tested `== 1` rather than `!= 0`, so a flag written as any other
+        // non-zero value made this arm disagree with `hasArray`/`array`/
+        // `arrayOffset` about one receiver. Routed through the converged
+        // `s2_bb_is_read_only` (F14-1 N1 / F21-1 §3). Nothing writes such a
+        // value today: a latent divergence closed, not a flip.
+        let read_only = s2_bb_is_read_only(ctx, this);
         let vb = try_alloc_concurrent_synthetic(ctx, view_cls, 0)?;
         ctx.set_field_by_name(vb, "bb", Value::Object(Some(this)));
         ctx.set_field_by_name(vb, "mark", Value::Int(-1));
@@ -4886,6 +5913,13 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         };
         ctx.set_array_element(chars_arr, i, Value::Int(ch));
     }
+    // Read the source's read-only flag BEFORE the allocation below. `this` is
+    // an `ObjectRef` and `try_alloc_concurrent_synthetic` can trigger a
+    // collection that RELOCATES it; carrying a `bool` across the allocation is
+    // something no collector can move, which is the same reason
+    // `native-io`'s `buf_write_read_only` takes a `bool` rather than the
+    // source. (The `if let` arm above already reads it before its own alloc.)
+    let src_read_only = s2_bb_is_read_only(ctx, this);
     // GC-safety: `alloc_concurrent_synthetic` below allocates and can
     // trigger a collection that relocates `chars_arr` (written into the
     // new CharBuffer's fields further below); pin it and re-read.
@@ -4898,7 +5932,15 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // JDK bytecode reading `hb` / `hasArray` / `array` sees the char[]).
     ctx.set_field_by_name(vb, "hb", Value::Object(Some(chars_arr)));
     ctx.set_field_by_name(vb, "offset", Value::Int(0));
-    ctx.set_field_by_name(vb, "isReadOnly", Value::Int(0));
+    // Was a flat `Int(0)`, i.e. this fallback arm ACTIVELY CLEARED the flag —
+    // the same shape F21-1 §6.2 found in `slice`/`slice(II)`/`duplicate`'s
+    // copying arms, in the one member of the family nobody had re-read.
+    // `roBB.asCharBuffer()` is a `java.nio.ByteBufferAsCharBufferRB` with
+    // `isReadOnly() == true` on HotSpot (MEASURED), and the arm above already
+    // propagates; only this one did not. A copy is not the JDK's shape either
+    // way, but a WRITABLE copy of a read-only buffer's contents is the strictly
+    // worse of the two answers available here.
+    ctx.set_field_by_name(vb, "isReadOnly", Value::Int(i32::from(src_read_only)));
     ctx.set_field_by_name(vb, "position", Value::Int(0));
     ctx.set_field_by_name(vb, "limit", Value::Int(rem_chars as i32));
     ctx.set_field_by_name(vb, "capacity", Value::Int(rem_chars as i32));
@@ -5009,8 +6051,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let cap = requested as usize;
         match s2_bb_alloc(ctx, cap)? {
             Some(buf) => Ok(Some(Value::Object(Some(buf)))),
+            // The message names the site and the size. It used to be a bare
+            // "Java heap space", which is also what the pre-allocated singleton
+            // OOME carries and what three unrelated natives throw -- so the
+            // string identified nothing. Chasing the H2 `TestBenchmark` refusal
+            // cost a run per candidate site purely to find out which of them had
+            // produced it; the two bytecode paths already name themselves
+            // ("alloc_array length N"), and this is the third allocator of
+            // caller-sized arrays.
             None => Err(RuntimeError::OutOfMemoryError {
-                message: "Java heap space".to_string(),
+                message: format!("Java heap space (ByteBuffer.allocate {cap})"),
             }
             .into()),
         }
@@ -5811,23 +6861,25 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     // array / hasArray / isDirect / isReadOnly / arrayOffset — all
     // storage/flag-aware now (previously hardcoded heap-and-writable, so a
     // direct or read-only receiver answered wrong on every one of these).
+    //
+    // CONVERGED (F14-1 N1): the three-way decision is
+    // `cratonvm_native_io::buffer_array_access`, the one copy of it the
+    // dependency edge lets this crate import. The behaviour is unchanged —
+    // `Accessible`/`ReadOnly` are the two arms that were here, and `Absent`
+    // keeps this file's FOURTH arm (the storage-less synthetic's historic
+    // benign null), which is a CratonVM-only state the JDK's two-valued
+    // `hb == null` question has no cell for.
     r.register(bb, "array", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        match s2_bb_arr(ctx, this) {
-            Some(arr) => {
-                if s2_bb_is_read_only(ctx, this) {
-                    return Err(RuntimeError::ReadOnlyBufferException.into());
-                }
-                Ok(Some(Value::Object(Some(arr))))
-            }
-            None if s2_bb_direct_addr(ctx, this).is_some() => {
-                Err(RuntimeError::UnsupportedOperationException {
-                    message: "direct buffer has no backing array".to_string(),
-                }
-                .into())
+        let arr = s2_bb_arr(ctx, this);
+        match buffer_array_access(arr.is_some(), s2_bb_is_read_only(ctx, this)) {
+            BufferArrayAccess::Accessible => Ok(Some(Value::Object(arr))),
+            BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+            BufferArrayAccess::Absent if s2_bb_direct_addr(ctx, this).is_some() => {
+                Err(s2_bb_no_backing_array())
             }
             // Storage-less synthetic: keep the historic benign null.
-            None => Ok(Some(Value::Object(None))),
+            BufferArrayAccess::Absent => Ok(Some(Value::Object(None))),
         }
     });
     // `arrayOffset()` has the SAME two refusals as `array()` eighteen lines
@@ -5852,28 +6904,32 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     // the window's base still has to come through. Record: W7-83 §7.1.
     r.register(bb, "arrayOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        match s2_bb_arr(ctx, this) {
-            Some(_) => {
-                if s2_bb_is_read_only(ctx, this) {
-                    return Err(RuntimeError::ReadOnlyBufferException.into());
-                }
-                Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32)))
-            }
-            None if s2_bb_direct_addr(ctx, this).is_some() => {
-                Err(RuntimeError::UnsupportedOperationException {
-                    message: "direct buffer has no backing array".to_string(),
-                }
-                .into())
+        match buffer_array_access(
+            s2_bb_arr(ctx, this).is_some(),
+            s2_bb_is_read_only(ctx, this),
+        ) {
+            BufferArrayAccess::Accessible => Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32))),
+            BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+            BufferArrayAccess::Absent if s2_bb_direct_addr(ctx, this).is_some() => {
+                Err(s2_bb_no_backing_array())
             }
             // Storage-less synthetic: keep the historic benign zero, for the
             // same reason `array()` keeps its historic benign null.
-            None => Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32))),
+            BufferArrayAccess::Absent => Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32))),
         }
     });
+    // `(hb != null) && !isReadOnly` — the SAME decision as the two arms above,
+    // so it is the same call. Written out as a conjunction here, it was the
+    // fifth transcription of a rule the JDK writes once.
     r.register(bb, "hasArray", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let has = s2_bb_arr(ctx, this).is_some() && !s2_bb_is_read_only(ctx, this);
-        Ok(Some(Value::Int(has as i32)))
+        let access = buffer_array_access(
+            s2_bb_arr(ctx, this).is_some(),
+            s2_bb_is_read_only(ctx, this),
+        );
+        Ok(Some(Value::Int(i32::from(
+            access == BufferArrayAccess::Accessible,
+        ))))
     });
     r.register(bb, "isDirect", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5991,6 +7047,15 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
             bb_write_hb(ctx, buf, new_arr, rem);
             s2_bb_set_order(ctx, buf, ord);
+            // `ro` was computed above and used ONLY by the two aliasing arms
+            // below, so this copying arm dropped it. `bb_write_hb` writes
+            // `isReadOnly = 0` unconditionally, so the flag was not merely
+            // left unset — it was actively cleared, which is the wrong
+            // CAPABILITY: the returned slice answers `hasArray() == true` and
+            // hands its backing array over. MEASURED, jdk-25.0.3+9, all seven
+            // families: `<fam>.ro.slice.isReadOnly OK true`. Written AFTER
+            // `bb_write_hb` for exactly that reason.
+            s2_bb_set_read_only(ctx, buf, ro);
             return Ok(Some(Value::Object(Some(buf))));
         }
         let buf = match s2_bb_storage(ctx, this) {
@@ -6013,6 +7078,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let cls = s2_bb_heap_class(ctx, false);
     let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 bb_write_hb(ctx, buf, new_arr, rem);
+                s2_bb_set_read_only(ctx, buf, ro);
                 Ok(buf)
             }
         };
@@ -6067,6 +7133,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 bb_write_hb(ctx, buf, new_arr, length);
                 s2_bb_set_order(ctx, buf, ord);
+                s2_bb_set_read_only(ctx, buf, ro);
                 Ok(buf)
             }
         };
@@ -6102,6 +7169,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     ctx.set_field(buf, BB_MARK, Value::Int(mark));
                 }
                 ctx.set_field(buf, BB_ORDER, Value::Int(ord));
+                s2_bb_set_read_only(ctx, buf, ro);
                 Ok(buf)
             }
         };
@@ -6133,12 +7201,22 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                         ctx.set_field_by_name(buf, "position", Value::Int(pos));
                         ctx.set_field_by_name(buf, "limit", Value::Int(lim));
                         ctx.set_field_by_name(buf, "mark", Value::Int(mark));
-                        ctx.set_field_by_name(buf, "isReadOnly", Value::Int(1));
                         ctx.set_field(buf, BB_POS, Value::Int(pos));
                         ctx.set_field(buf, BB_LIMIT, Value::Int(lim));
                         ctx.set_field(buf, BB_MARK, Value::Int(mark));
                     }
                     ctx.set_field(buf, BB_ORDER, Value::Int(ord));
+                    // MOVED OUT of the `if let` above, which is the whole
+                    // change on this arm: `asReadOnlyBuffer()` on a receiver
+                    // with no resolvable backing array returned a buffer with
+                    // `isReadOnly` never written — a WRITABLE result from the
+                    // one method whose entire contract is that its result is
+                    // not writable. It still has to follow `bb_write_hb`,
+                    // which writes `isReadOnly = 0`. MEASURED, jdk-25.0.3+9:
+                    // `asReadOnlyBuffer().isReadOnly()` is `true` for every
+                    // receiver in all seven families, and there is no receiver
+                    // for which it is conditional.
+                    s2_bb_set_read_only(ctx, buf, true);
                     Ok(buf)
                 }
             };
@@ -6307,8 +7385,38 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, BB_LIMIT, Value::Int(cap));
             Ok(Some(Value::Object(Some(this))))
         });
-        r.register(cls, "array", "()[I", |ctx, args| {
-            Ok(Some(Value::Object(s2_bb_arr(ctx, obj_arg(args, 0)?))))
+        // The element type differs per family, and this loop registered all
+        // FIVE under `()[I`. Measured with `--dump-native-registry`
+        // (2026-08-13): four PHANTOM rows nothing can dispatch to
+        // (`DoubleBuffer.array()[I` etc.), and for `IntBuffer` — the one whose
+        // descriptor happened to be right — this row OWNED the slot, so
+        // `native-io`'s `native_tb_array` and its F14-1 refusals never ran.
+        //
+        // The body was `Ok(Some(Value::Object(s2_bb_arr(...))))`: a `None`
+        // became a silent Java `null`, so `ByteBuffer.allocate(16)
+        // .asIntBuffer().array().length` raised NullPointerException where
+        // HotSpot throws UnsupportedOperationException. That is the same
+        // wrong-capability shape F14-1 fixed in the twin, in the copy that
+        // actually wins — "diff a family fix against every member".
+        //
+        // `Absent` is UOE here with no fourth arm: unlike `ByteBuffer` above,
+        // every receiver of a typed view is array-less in the JDK, and F37-1
+        // measured views answering UnsupportedOperationException.
+        let array_desc = match cls {
+            "java/nio/LongBuffer" => "()[J",
+            "java/nio/ShortBuffer" => "()[S",
+            "java/nio/FloatBuffer" => "()[F",
+            "java/nio/DoubleBuffer" => "()[D",
+            _ => "()[I",
+        };
+        r.register(cls, "array", array_desc, |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr = s2_bb_arr(ctx, this);
+            match buffer_array_access(arr.is_some(), s2_bb_is_read_only(ctx, this)) {
+                BufferArrayAccess::Accessible => Ok(Some(Value::Object(arr))),
+                BufferArrayAccess::ReadOnly => Err(RuntimeError::ReadOnlyBufferException.into()),
+                BufferArrayAccess::Absent => Err(s2_bb_no_backing_array()),
+            }
         });
         // `isDirect` — IMPLEMENTED wave 4 (2026-07-28). The wave-3 note here
         // claimed "every receiver is a heap view backed by the int[]", which is
@@ -6332,19 +7440,67 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 },
             )))
         });
-        // `isReadOnly` — KEEP, but the wave-3 justification was also wrong:
-        // `asReadOnlyBuffer` IS registered for all five view classes (see the
-        // `s2_typed_buffer_view_fns!` expansions below), it just aliases
-        // `duplicate` and therefore hands back a WRITABLE buffer. So no
-        // read-only view of an s2 buffer can exist, and `false` is exact for
-        // every receiver that can reach here — not because the method is
-        // missing, but because the only producer of a read-only view does not
-        // produce one. FOLLOW-UP for whoever makes `$ro` real: it needs a
-        // read-only flag on the view (the 6-slot synthetic is full — slots
-        // 0..5 are array/pos/limit/cap/byte-start-marker/segment — so this
-        // needs a wider allocation), `put`/`compact` must then throw
-        // `ReadOnlyBufferException`, and THIS registration must read the flag.
-        r.register(cls, "isReadOnly", "()Z", |_, _| Ok(Some(Value::Int(0))));
+        // `isReadOnly` — NO LONGER A CONSTANT (F26-1, closing F21-1's N3).
+        //
+        // The comment this replaces argued the `Int(0)` was EXACT, and its
+        // argument was sound when written: `$ro` aliased `$dup` and so could
+        // not mint a read-only view, therefore no receiver reaching here could
+        // be read-only. **F21 falsified the premise from the other crate.**
+        // `native-io`'s `tb_abstract_view_fns!` `$ro_fn` now stamps
+        // `isReadOnly = 1` by name, and `register_io_natives` runs AFTER
+        // `register_essential_natives_with_shims` in both `vm_init` real-JDK
+        // arms (VERIFIED: `vm/src/vm/vm_init.rs` L2055 < L2252 and L2593 <
+        // L2788; registration is last-write-wins), so it is native-io's
+        // `asReadOnlyBuffer` that answers for these five classes and read-only
+        // typed views DO now exist.
+        //
+        // Left alone the constant reproduced, in the sibling, exactly the
+        // impossible state that got `native_bb_is_read_only` fixed: `array()`
+        // and `arrayOffset()` raise `ReadOnlyBufferException` and `hasArray()`
+        // answers `false` (all three read the flag via
+        // `native_io::buffer_array_access`), while `isReadOnly()` said the
+        // buffer was writable — so a caller that branches on `isReadOnly()`
+        // instead of `hasArray()` is steered straight into the throw.
+        // MEASURED, jdk-25.0.3+9 (`scratchpad/f26/F26AliasProbe.java` §7):
+        // `allocate(32).asReadOnlyBuffer().asIntBuffer()` is a
+        // `java.nio.ByteBufferAsIntBufferRB` with `isReadOnly() == true`, and
+        // the same holds for Long/Short/Float/Double/Char and for the direct
+        // twin (`DirectIntBufferRS`, also `true`).
+        //
+        // **THE WIDTH CLAIM, CHECKED RATHER THAN INHERITED.** The old comment
+        // said this needs "a wider allocation" because "the 6-slot synthetic is
+        // full". That is true of the SYNTHETIC layout and irrelevant to this
+        // registration, in both directions:
+        //
+        //   * Real-JDK mode: `java.nio.IntBuffer` DECLARES `boolean isReadOnly`
+        //     (VERIFIED, `javap -p java.nio.IntBuffer` on 25.0.3+9: `int[] hb;
+        //     int offset; boolean isReadOnly;` — identical on Long/Short/Float/
+        //     Double), and `VmExec::alloc_object` clamps a native allocator's
+        //     requested slot count UP to the resolved class's declared field
+        //     count (VERIFIED, `vm/src/vm/vm_exec.rs` "Layout-mismatch guard").
+        //     So the field is present on every one of these receivers and the
+        //     by-name read resolves. Nothing needs widening.
+        //   * Synthetic-JDK mode: there is no such field, `get_field_by_name`
+        //     yields a non-`Int`, and `s2_bb_is_read_only` answers `false` —
+        //     byte-for-byte the constant this replaces. So this is a no-op in
+        //     the mode the width argument was about.
+        //
+        // Reads the same FIELD through the same converged helper as
+        // `hasArray`/`array`/`arrayOffset`, so the four accessors on one
+        // receiver cannot disagree.
+        //
+        // DISCLOSED RESIDUAL, deliberately not fixed here: the `$put` /
+        // `$put_abs` / `$compact` arms of `s2_typed_buffer_view_fns!` still do
+        // not consult the flag, so a write through a read-only typed view
+        // succeeds where HotSpot raises `ReadOnlyBufferException` (MEASURED:
+        // `allocate(32).asReadOnlyBuffer().asIntBuffer().put(0,1)` →
+        // `java.nio.ReadOnlyBufferException`). Making this accessor honest is
+        // strictly a step toward that and cannot be a step away from it: it
+        // moves one more accessor onto the flag the enforcement will read.
+        r.register(cls, "isReadOnly", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Int(i32::from(s2_bb_is_read_only(ctx, this)))))
+        });
     }
 
     // `order`/`slice`/`slice(int,int)`/`duplicate`/`asReadOnlyBuffer` are
@@ -6400,8 +7556,26 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let raw = $read(ctx, this, off);
                 Ok(Some(($to_value)(raw)))
             }
+            /// `put(x)` — F37-1 §3, landing F26-1 §9.2 / F21-1 N3's residual.
+            ///
+            /// The read-only check is FIRST, before the overflow check, and
+            /// that ordering is MEASURED, not assumed: JDK 25's
+            /// `ByteBufferAsIntBufferRB.put(int)` is a bare
+            /// `throw new ReadOnlyBufferException();` with no bounds test
+            /// above it (`jdk25src/.../ByteBufferAsIntBufferRB.java:166`), so
+            /// a read-only view at `position == limit` answers
+            /// `ReadOnlyBufferException`, not `BufferOverflowException`.
+            ///
+            /// MEASURED, jdk-25.0.3+9 (`scratchpad/f37/F37TypedAliasProbe.java`):
+            /// `allocate(64).asReadOnlyBuffer().asIntBuffer().put(1)` →
+            /// `java.nio.ReadOnlyBufferException`, `getMessage()` null, and the
+            /// same for all five families and for the direct twin
+            /// (`DirectIntBufferRS`).
             fn $put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
                 let v = args.get(1).cloned().unwrap_or(Value::Int(0));
                 let pos = s2_bb_pos(ctx, this);
                 if pos >= s2_bb_limit(ctx, this) {
@@ -6416,8 +7590,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, BB_POS, Value::Int(pos + 1));
                 Ok(Some(Value::Object(Some(this))))
             }
+            /// `put(index, x)` — see `$put`. Same class, same null message.
             fn $put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
                 let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
                 let v = args.get(2).cloned().unwrap_or(Value::Int(0));
                 let bs = s2_typed_view_byte_start(ctx, this);
@@ -6473,6 +7651,23 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(vb, BB_CAP, Value::Int(remaining));
                 let ord = s2_bb_order(ctx, this);
                 s2_bb_set_order(ctx, vb, ord);
+                // Read-only is CONTAGIOUS: `slice()`, `slice(int,int)` and
+                // `duplicate()` INHERIT the source's flag (MEASURED, all seven
+                // families, F21-1 §1.1; `<fam>.ro.slice.isReadOnly` true,
+                // `<fam>.w.slice.isReadOnly` false). Landed together with the
+                // `$put`/`$put_abs`/`$put_bulk`/`$compact` guards above, and it
+                // has to be: a guard on the receiver that a `slice()` one call
+                // later hands back writable is not a guard, it is a delay. Same
+                // "the capability re-opens one call later" shape F21-1 closed
+                // for ByteBuffer, and it would have been re-opened HERE by the
+                // very change that closed the direct route.
+                //
+                // `s2_bb_set_read_only` writes by NAME, so on a bare 6-slot
+                // synthetic carrier — which is what `try_alloc_concurrent_
+                // synthetic($cls, 6)` mints in synthetic-JDK mode — it is a
+                // no-op and nothing observable changes there.
+                let src_read_only = s2_bb_is_read_only(ctx, this);
+                s2_bb_set_read_only(ctx, vb, src_read_only);
                 Ok(Some(Value::Object(Some(vb))))
             }
             fn $slice2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6505,6 +7700,23 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(vb, BB_CAP, Value::Int(length));
                 let ord = s2_bb_order(ctx, this);
                 s2_bb_set_order(ctx, vb, ord);
+                // Read-only is CONTAGIOUS: `slice()`, `slice(int,int)` and
+                // `duplicate()` INHERIT the source's flag (MEASURED, all seven
+                // families, F21-1 §1.1; `<fam>.ro.slice.isReadOnly` true,
+                // `<fam>.w.slice.isReadOnly` false). Landed together with the
+                // `$put`/`$put_abs`/`$put_bulk`/`$compact` guards above, and it
+                // has to be: a guard on the receiver that a `slice()` one call
+                // later hands back writable is not a guard, it is a delay. Same
+                // "the capability re-opens one call later" shape F21-1 closed
+                // for ByteBuffer, and it would have been re-opened HERE by the
+                // very change that closed the direct route.
+                //
+                // `s2_bb_set_read_only` writes by NAME, so on a bare 6-slot
+                // synthetic carrier — which is what `try_alloc_concurrent_
+                // synthetic($cls, 6)` mints in synthetic-JDK mode — it is a
+                // no-op and nothing observable changes there.
+                let src_read_only = s2_bb_is_read_only(ctx, this);
+                s2_bb_set_read_only(ctx, vb, src_read_only);
                 Ok(Some(Value::Object(Some(vb))))
             }
             fn $dup(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6531,13 +7743,61 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(vb, BB_CAP, Value::Int(cap));
                 let ord = s2_bb_order(ctx, this);
                 s2_bb_set_order(ctx, vb, ord);
+                // Read-only is CONTAGIOUS: `slice()`, `slice(int,int)` and
+                // `duplicate()` INHERIT the source's flag (MEASURED, all seven
+                // families, F21-1 §1.1; `<fam>.ro.slice.isReadOnly` true,
+                // `<fam>.w.slice.isReadOnly` false). Landed together with the
+                // `$put`/`$put_abs`/`$put_bulk`/`$compact` guards above, and it
+                // has to be: a guard on the receiver that a `slice()` one call
+                // later hands back writable is not a guard, it is a delay. Same
+                // "the capability re-opens one call later" shape F21-1 closed
+                // for ByteBuffer, and it would have been re-opened HERE by the
+                // very change that closed the direct route.
+                //
+                // `s2_bb_set_read_only` writes by NAME, so on a bare 6-slot
+                // synthetic carrier — which is what `try_alloc_concurrent_
+                // synthetic($cls, 6)` mints in synthetic-JDK mode — it is a
+                // no-op and nothing observable changes there.
+                let src_read_only = s2_bb_is_read_only(ctx, this);
+                s2_bb_set_read_only(ctx, vb, src_read_only);
                 Ok(Some(Value::Object(Some(vb))))
             }
+            /// `asReadOnlyBuffer()` — F37-1 §3, landing F26-1 §9.4 item 1.
+            ///
+            /// **This was a plain `$dup(ctx, args)`**, i.e. the one method
+            /// whose entire contract is that its result cannot be written
+            /// returned a WRITABLE alias. That was self-consistent only while
+            /// nothing on these classes consulted the flag; `$put`/`$put_abs`/
+            /// `$put_bulk`/`$compact` above now do, so leaving it would have
+            /// produced the state F21-1 §6.1 named — a read-only view that
+            /// still accepts writes — in the sibling registrar rather than
+            /// closing it.
+            ///
+            /// `ForceReadOnly`, not `Inherit`: MEASURED, `asReadOnlyBuffer()`
+            /// is unconditional and one-way in all seven families
+            /// (`<fam>.w.aro.isReadOnly` true, `<fam>.ro.aro.isReadOnly` true,
+            /// and there is no `asWritableBuffer` anywhere in java.nio). The
+            /// write goes AFTER `$dup` returns, because `$dup` mints a fresh
+            /// 6-slot carrier and now stamps `Inherit` on it.
             fn $ro(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-                $dup(ctx, args)
+                let result = $dup(ctx, args)?;
+                if let Some(Value::Object(Some(view))) = result {
+                    s2_bb_set_read_only(ctx, view, true);
+                }
+                Ok(result)
             }
+            /// `compact()` — see `$put`. `compact` is a WRITE (it moves the
+            /// remaining elements down to index 0), so a read-only receiver
+            /// refuses it: MEASURED
+            /// `allocate(64).asReadOnlyBuffer().asIntBuffer().compact()` →
+            /// `java.nio.ReadOnlyBufferException`. The sibling
+            /// `ByteBuffer.compact()` registration in this file has had this
+            /// guard since F5; the typed views never did.
             fn $compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
                 let pos = s2_bb_pos(ctx, this);
                 let lim = s2_bb_limit(ctx, this);
                 let cap = s2_bb_cap(ctx, this);
@@ -6600,8 +7860,26 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, BB_POS, Value::Int(pos + len));
                 Ok(Some(Value::Object(Some(this))))
             }
+            /// `put(T[], off, len)` — see `$put`.
+            ///
+            /// **This is the one write path of the four that is NOT shadowed**,
+            /// and therefore the one whose repair is reachable today.
+            /// `register_io_natives` runs after `register_essential_natives_
+            /// with_shims` in every `vm_init` arm (VERIFIED: real-JDK L2252 >
+            /// L2055 and L2834 > L2639; synthetic L1935 > L1934, since
+            /// `register_builtins` reaches essentials through
+            /// `register_essential_natives`), and `native-io` re-registers
+            /// `put(X)` / `put(I X)` / `compact()` for all five classes — but
+            /// NOT the bulk `put([XII)`. So `$put`/`$put_abs`/`$compact` above
+            /// are corrected-but-shadowed and this one is corrected-and-live.
+            /// The three are landed anyway: a family half-fixed is the
+            /// inconsistency, and `native-io`'s registrations are what a future
+            /// reordering would remove.
             fn $put_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
                 let src = obj_arg(args, 1)?;
                 let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
                 let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -7965,6 +9243,227 @@ fn s3_stub_response(ctx: &mut dyn NativeContext, status: i32, msg: &str) -> Meth
 // Web frameworks (Spring Boot, Tomcat, Jetty) work when the VM can execute
 // their bytecode from the real .class files.
 
+
+/// The client-connector tests that the whole existing TLS corpus could not
+/// express.
+///
+/// WHY THIS MODULE EXISTS AT ALL, in the words of the defect it guards: every
+/// TLS fixture in this tree uses a SELF-SIGNED certificate -- H2's baked
+/// identity, the netty test certs, the regression-suite keystores. For a
+/// self-signed peer the leaf IS the trust anchor, so a one-element chain
+/// validates perfectly and "the client captured only the leaf" is invisible to
+/// the entire corpus BY CONSTRUCTION. It took 20 live public sites to see it.
+///
+/// So the fixture here is deliberately the one shape none of those have: a CA
+/// and a leaf SIGNED BY IT, presented as a two-certificate chain. That is the
+/// generalisable part -- a self-signed fixture cannot exercise chain building,
+/// and no number of them adds up to one that can.
+#[cfg(all(test, unix))]
+mod openssl_client_tests {
+    use super::*;
+    use openssl::asn1::Asn1Time;
+    use openssl::bn::{BigNum, MsbOption};
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::{PKey, Private};
+    use openssl::rsa::Rsa;
+    use openssl::ssl::{SslAcceptor, SslMethod};
+    use openssl::x509::extension::{BasicConstraints, SubjectAlternativeName};
+    use openssl::x509::{X509Name, X509};
+
+    /// A self-signed CA of `bits` bits, and a leaf for `localhost` signed by
+    /// it. `bits` is a parameter because the SECOND thing this connector
+    /// changed -- the certificate security level -- is only visible at a key
+    /// size OpenSSL's default level 2 refuses and the JDK's floor allows.
+    fn ca_and_leaf(bits: u32) -> ((X509, PKey<Private>), (X509, PKey<Private>)) {
+        let mk_key = || PKey::from_rsa(Rsa::generate(bits).expect("rsa")).expect("pkey");
+        let mk_name = |cn: &str| {
+            let mut n = X509Name::builder().expect("name builder");
+            n.append_entry_by_text("CN", cn).expect("cn");
+            n.build()
+        };
+        let serial = || {
+            let mut bn = BigNum::new().expect("bn");
+            bn.rand(64, MsbOption::MAYBE_ZERO, false).expect("rand");
+            bn.to_asn1_integer().expect("serial")
+        };
+        let not_before = Asn1Time::days_from_now(0).expect("nb");
+        let not_after = Asn1Time::days_from_now(3650).expect("na");
+
+        let ca_key = mk_key();
+        let ca_name = mk_name("CratonVM Chain Test CA");
+        let mut b = X509::builder().expect("ca builder");
+        b.set_version(2).expect("v3");
+        b.set_serial_number(&serial()).expect("serial");
+        b.set_subject_name(&ca_name).expect("subject");
+        b.set_issuer_name(&ca_name).expect("issuer");
+        b.set_pubkey(&ca_key).expect("pubkey");
+        b.set_not_before(&not_before).expect("nb");
+        b.set_not_after(&not_after).expect("na");
+        b.append_extension(BasicConstraints::new().critical().ca().build().expect("bc"))
+            .expect("bc ext");
+        b.sign(&ca_key, MessageDigest::sha256()).expect("sign ca");
+        let ca = b.build();
+
+        let leaf_key = mk_key();
+        let mut b = X509::builder().expect("leaf builder");
+        b.set_version(2).expect("v3");
+        b.set_serial_number(&serial()).expect("serial");
+        b.set_subject_name(&mk_name("localhost")).expect("subject");
+        b.set_issuer_name(ca.subject_name()).expect("issuer");
+        b.set_pubkey(&leaf_key).expect("pubkey");
+        b.set_not_before(&not_before).expect("nb");
+        b.set_not_after(&not_after).expect("na");
+        b.append_extension(
+            BasicConstraints::new().critical().build().expect("bc"),
+        )
+        .expect("bc ext");
+        let ctx = b.x509v3_context(Some(&ca), None);
+        let san = SubjectAlternativeName::new()
+            .dns("localhost")
+            .ip("127.0.0.1")
+            .build(&ctx)
+            .expect("san");
+        b.append_extension(san).expect("san ext");
+        b.sign(&ca_key, MessageDigest::sha256()).expect("sign leaf");
+        let leaf = b.build();
+
+        ((ca, ca_key), (leaf, leaf_key))
+    }
+
+    /// A one-connection TLS server presenting `leaf` with `ca` as an EXTRA
+    /// CHAIN CERT -- i.e. a real two-certificate chain on the wire, which is
+    /// the whole point. Returns its port and the thread handle.
+    fn serve_once(
+        ca: X509,
+        leaf: X509,
+        leaf_key: PKey<Private>,
+        security_level: u32,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let mut b = SslAcceptor::mozilla_intermediate(SslMethod::tls()).expect("acceptor");
+            b.set_security_level(security_level);
+            b.set_private_key(&leaf_key).expect("key");
+            b.set_certificate(&leaf).expect("cert");
+            b.add_extra_chain_cert(ca).expect("chain cert");
+            let acceptor = b.build();
+            if let Ok((stream, _)) = listener.accept() {
+                // The handshake is all that is under test. A rejected one is
+                // the assertion's business, not this thread's.
+                let _ = acceptor.accept(stream);
+            }
+        });
+        (port, handle)
+    }
+
+    /// The defect, stated as a test: an application TrustManager is handed
+    /// whatever this vector holds, and from ONE certificate it cannot build a
+    /// path to a root. 20 of 20 live public sites were rejected that way.
+    #[test]
+    fn client_captures_the_whole_chain_not_just_the_leaf() {
+        let ((ca, _ca_key), (leaf, leaf_key)) = ca_and_leaf(2048);
+        let ca_der = ca.to_der().expect("ca der");
+        let leaf_der = leaf.to_der().expect("leaf der");
+        let (port, server) = serve_once(ca, leaf, leaf_key, 1);
+
+        let cfg = OpensslClientConfig {
+            roots: vec![ca_der.clone()],
+            replace_roots: true,
+            skip_verify: false,
+            max_tls12: false,
+        };
+        let id = s2_openssl_tls_connect(&cfg, "localhost", port).unwrap_or_else(|e| {
+            panic!("handshake against the two-certificate fixture failed: {e}")
+        });
+        let chain = s2_tls_peer_cert_chain_der(id).expect("registry entry");
+        let _ = s2_tls_close(id);
+        let _ = server.join();
+
+        assert_eq!(
+            chain.len(),
+            2,
+            "peer chain must be leaf + issuing CA; a length of 1 is the defect"
+        );
+        assert_eq!(chain[0], leaf_der, "the LEAF must come first (JSSE order)");
+        assert_eq!(chain[1], ca_der, "the issuer must follow it");
+    }
+
+    /// The residue, stated as a test. A 1024-bit RSA chain is something the
+    /// JDK accepts (`jdk.certpath.disabledAlgorithms` draws its line AT 1024)
+    /// and OpenSSL at its default security level of 2 refuses outright, which
+    /// is what a CratonVM client with no trust store configured used to do:
+    ///
+    /// ```text
+    /// HOTSPOT   HANDSHAKE-OK   CRATONVM  REFUSED (EE certificate key too weak)
+    /// ```
+    ///
+    /// The server is pinned to level 0 so that only the CLIENT's level is
+    /// under test -- otherwise a refusal could be the fixture's own.
+    #[test]
+    fn client_security_level_matches_the_jdks_1024_bit_floor() {
+        let ((ca, _ca_key), (leaf, leaf_key)) = ca_and_leaf(1024);
+        let ca_der = ca.to_der().expect("ca der");
+        let (port, server) = serve_once(ca, leaf, leaf_key, 0);
+
+        let cfg = OpensslClientConfig {
+            roots: vec![ca_der],
+            replace_roots: true,
+            skip_verify: false,
+            max_tls12: false,
+        };
+        let result = s2_openssl_tls_connect(&cfg, "localhost", port);
+        let verdict = match &result {
+            Ok(id) => {
+                let chain = s2_tls_peer_cert_chain_der(*id).unwrap_or_default();
+                let _ = s2_tls_close(*id);
+                Ok(chain.len())
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = server.join();
+        assert_eq!(
+            verdict,
+            Ok(2),
+            "a 1024-bit chain the JDK accepts must not be refused by the \
+             client's security level (see CLIENT_SECURITY_LEVEL)"
+        );
+    }
+
+    /// Fail CLOSED is not weakened by any of the above: a chain that does NOT
+    /// reach the configured anchor is still refused. Without this, a test that
+    /// only ever asserts acceptance passes just as well against a connector
+    /// that verifies nothing at all.
+    #[test]
+    fn client_still_refuses_a_chain_that_reaches_no_configured_anchor() {
+        let ((ca, _ca_key), (leaf, leaf_key)) = ca_and_leaf(2048);
+        // The anchor handed to the client is an UNRELATED CA, so the peer's
+        // chain is well-formed and simply does not reach it.
+        let ((other_ca, _other_key), (_l, _k)) = ca_and_leaf(2048);
+        let other_der = other_ca.to_der().expect("der");
+        let (port, server) = serve_once(ca, leaf, leaf_key, 1);
+
+        let cfg = OpensslClientConfig {
+            roots: vec![other_der],
+            replace_roots: true,
+            skip_verify: false,
+            max_tls12: false,
+        };
+        let result = s2_openssl_tls_connect(&cfg, "localhost", port);
+        let _ = server.join();
+        match result {
+            Ok(id) => {
+                let _ = s2_tls_close(id);
+                panic!("a chain reaching no configured anchor must be refused");
+            }
+            Err(TlsConnectFailure::Handshake(_)) => {}
+            Err(TlsConnectFailure::Tcp(e)) => {
+                panic!("expected a handshake rejection, got a TCP failure: {e}")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
@@ -8176,6 +9675,29 @@ mod tests {
             "a typed buffer view's backing array lives at slot 5 and must \
              still resolve"
         );
+    }
+
+    /// F14-1 N3. The test above matches the UOE variant with `{ .. }`, which is
+    /// precisely why a wrong detail message survived: the CLASS was right, so
+    /// no `catch`, no class-name assertion and no variant-shaped `matches!`
+    /// could see it. This one reads the message.
+    ///
+    /// MEASURED, jdk-25.0.3+9: `ByteBuffer.allocateDirect(8).array()` and
+    /// `.arrayOffset()` both report `getMessage() == null`, as does
+    /// `new UnsupportedOperationException()`.
+    #[test]
+    fn s2_bb_no_backing_array_has_a_null_detail_message() {
+        match s2_bb_no_backing_array() {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                RuntimeError::UnsupportedOperationException { message },
+            )) => assert!(
+                message.is_empty(),
+                "the EMPTY string is what types/src/error.rs maps to the ()V ctor, i.e. a \
+                 null getMessage(). The old \"direct buffer has no backing array\" gave \
+                 getMessage() a value HotSpot does not have. Got {message:?}"
+            ),
+            other => panic!("must be UnsupportedOperationException, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8783,5 +10305,462 @@ mod tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let (le, _, _) = make_real_typed_view(&mut ctx, "java/nio/ByteBufferAsIntBufferL", 0);
         assert_eq!(s2_bb_order(&ctx, le), 1, "…BufferL is LITTLE_ENDIAN");
+    }
+
+    // =======================================================================
+    // `order(ByteOrder)` must never write a scalar over the backing array
+    // (2026-08-12).
+    //
+    // Measured on `cratonvm --synthetic-jdk` before the fix:
+    //
+    //     P8 order-after=LITTLE_ENDIAN
+    //     [cratonvm] main-vm run() returned Err: internal error: ByteBuffer
+    //       missing backing storage (hb/slot5/address absent; field 0 returned
+    //       Int(1), address Object(None))
+    //
+    // — exit 1, no Java exception, on a plain
+    // `ByteBuffer.allocate(8).order(ByteOrder.nativeOrder())`. The corruption
+    // is SELF-CONSISTENT (the reader read the same slot back), so `order()`
+    // still reported LITTLE_ENDIAN over the destroyed buffer. Every assertion
+    // below is therefore about the STORAGE, never about the reported order
+    // alone.
+    // =======================================================================
+
+    /// A `--synthetic-jdk` buffer carrier, as production actually builds one:
+    /// wider than the 6 slots `s2_bb_synthetic_layout` screens for, no real
+    /// `java.nio.Buffer` field metadata, backing array in slot 0.
+    ///
+    /// The class is deliberately NOT named `java/nio/ByteBuffer`, and that is a
+    /// property of the harness rather than of production:
+    /// `MockNativeContext`'s `mock_buffer_field_slot` answers `position` for
+    /// any `java/nio/*ByteBuffer`, so under the mock that name can never
+    /// present as a stub layout. In the VM it does —
+    /// `class_manager::synthetic_stub_fields` gives `java/nio/ByteBuffer`
+    /// `instance_fields(6)` (`_f0.._f5`, all `Ljava/lang/Object;`) over a
+    /// `java/nio/Buffer` with `instance_fields(4)`, which is the ten fields
+    /// `Class.getDeclaredFields()` prints under `--synthetic-jdk`.
+    fn make_stub_layout_buffer(
+        ctx: &mut crate::test_utils::MockNativeContext,
+    ) -> (ObjectRef, ObjectRef) {
+        // Faithful "no such field" answer, so `bigEndian` reports absent the
+        // way `vm_exec.rs` reports it rather than the mock's default `Int(0)`.
+        ctx.set_absent_field_answers_null(true);
+        let class_id = ctx
+            .ensure_class_initialized("craton/test/SyntheticStubByteBuffer")
+            .expect("class init");
+        let buf = ctx.alloc_object(class_id, 10);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
+        // Exactly what `native-io`'s `alloc_byte_buffer` writes.
+        ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
+        ctx.set_field(buf, BB_POS, Value::Int(0));
+        ctx.set_field(buf, BB_LIMIT, Value::Int(8));
+        ctx.set_field(buf, BB_CAP, Value::Int(8));
+        ctx.set_field(buf, BB_MARK, Value::Int(-1));
+        (buf, arr)
+    }
+
+    /// THE DEFECT, stated as the storage question. Not `order()`, which lied.
+    #[test]
+    fn setting_the_order_on_a_stub_layout_bytebuffer_keeps_the_backing_array() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (buf, arr) = make_stub_layout_buffer(&mut ctx);
+        assert!(
+            s2_buf_stub_layout(&ctx, buf),
+            "premise: a 10-field carrier with no real `Buffer` field metadata is a \
+             stub layout, even though `s2_bb_synthetic_layout` (== 6) says otherwise"
+        );
+        assert!(
+            !s2_bb_synthetic_layout(&ctx, buf),
+            "and the narrow screen genuinely does NOT catch it — without this the \
+             test would pass for the wrong reason"
+        );
+
+        s2_bb_set_order(&mut ctx, buf, 1);
+
+        assert_eq!(
+            ctx.get_field(buf, BB_ARRAY),
+            Value::Object(Some(arr)),
+            "slot 0 is the BACKING ARRAY on this layout; an Int written here is the \
+             `ByteBuffer missing backing storage` VM abort"
+        );
+        assert_eq!(
+            s2_bb_arr(&ctx, buf),
+            Some(arr),
+            "and it must still resolve as the buffer's storage, by identity"
+        );
+        assert_eq!(
+            s2_bb_order(&ctx, buf),
+            1,
+            "reader and writer must agree: the order is stored where BB_ORDER says"
+        );
+        assert_eq!(
+            ctx.get_field(buf, BB_ORDER),
+            Value::Int(1),
+            "and that slot is the one named for it, not an incidental free slot"
+        );
+    }
+
+    /// The round trip in both directions, and the default. A one-way check
+    /// would pass against a writer that had simply stopped writing.
+    #[test]
+    fn stub_layout_bytebuffer_order_round_trips_both_ways() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (buf, arr) = make_stub_layout_buffer(&mut ctx);
+
+        assert_eq!(
+            s2_bb_order(&ctx, buf),
+            0,
+            "a fresh buffer is BIG_ENDIAN — the JDK field initialiser"
+        );
+        s2_bb_set_order(&mut ctx, buf, 1);
+        assert_eq!(s2_bb_order(&ctx, buf), 1);
+        s2_bb_set_order(&mut ctx, buf, 0);
+        assert_eq!(
+            s2_bb_order(&ctx, buf),
+            0,
+            "LITTLE_ENDIAN must be reversible; a writer that only ever set the flag \
+             would pass the forward check alone"
+        );
+        assert_eq!(
+            s2_bb_arr(&ctx, buf),
+            Some(arr),
+            "the storage survives every transition, not just the first"
+        );
+    }
+
+    /// The ONE family for which slot 0 is the right home — and the reason the
+    /// fix is a class-name gate rather than a deletion. A typed view parks its
+    /// backing array in `BB_SEGMENT_SLOT`, leaving real `mark` free.
+    #[test]
+    fn a_typed_buffer_view_still_stores_its_order_in_the_mark_slot() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        ctx.set_absent_field_answers_null(true);
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/IntBuffer")
+            .expect("class init");
+        let view = ctx.alloc_object(class_id, 6);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        // `s2_view_buf_fn!`'s layout: array at slot 5, byte-start marker at 4.
+        ctx.set_field(view, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
+        ctx.set_field(view, BB_MARK, Value::Int(-1));
+
+        s2_bb_set_order(&mut ctx, view, 1);
+
+        assert_eq!(
+            ctx.get_field(view, BB_SEGMENT_SLOT),
+            Value::Object(Some(arr)),
+            "the view's backing array lives at BB_SEGMENT_SLOT and must be untouched"
+        );
+        assert_eq!(
+            ctx.get_field(view, BB_ARRAY),
+            Value::Int(1),
+            "slot 0 is real `mark: int` and genuinely free on this shape"
+        );
+        assert_eq!(s2_bb_order(&ctx, view), 1);
+        s2_bb_set_order(&mut ctx, view, 0);
+        assert_eq!(s2_bb_order(&ctx, view), 0);
+    }
+
+    /// A REAL JDK layout that declares no `bigEndian` — `java.nio.CharBuffer`
+    /// is one — must be refused, not guessed at. Every index this function
+    /// could reach for aliases a field the real class declares, so the old
+    /// unconditional fallback wrote an `int` order flag over real
+    /// `Buffer.mark`. Refusing leaves the JDK default, which is a recoverable
+    /// wrong value rather than a corrupted object.
+    #[test]
+    fn a_real_layout_buffer_without_big_endian_refuses_rather_than_writing_slot_zero() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        ctx.set_absent_field_answers_null(true);
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/CharBuffer")
+            .expect("class init");
+        let names = [
+            ("mark", "I"),
+            ("position", "I"),
+            ("limit", "I"),
+            ("capacity", "I"),
+            ("address", "J"),
+            ("segment", "Ljava/lang/foreign/MemorySegment;"),
+            ("hb", "[C"),
+            ("offset", "I"),
+            ("isReadOnly", "Z"),
+        ];
+        ctx.set_declared_fields(
+            class_id,
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, (name, descriptor))| FieldMetadata {
+                    name: (*name).to_string(),
+                    descriptor: (*descriptor).to_string(),
+                    access_flags: 0,
+                    slot_index: i,
+                    declaring_class_id: class_id,
+                    is_static: false,
+                })
+                .collect(),
+        );
+        let buf = ctx.alloc_object(class_id, 9);
+        let chars = ctx.new_array(cratonvm_types::ArrayElementType::Char, 8);
+        let sentinel = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1);
+        ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+        ctx.set_field_by_name(buf, "hb", Value::Object(Some(chars)));
+        // A reference parked in the slot `BB_ORDER` aliases on a real layout,
+        // so the refusal is checked by IDENTITY rather than by "still non-null".
+        ctx.set_field_by_name(buf, "segment", Value::Object(Some(sentinel)));
+
+        assert!(
+            !s2_buf_stub_layout(&ctx, buf),
+            "premise: `position` resolves, so this is a real layout"
+        );
+
+        s2_bb_set_order(&mut ctx, buf, 1);
+
+        assert_eq!(
+            ctx.get_field_by_name(buf, "mark"),
+            Value::Int(-1),
+            "real `Buffer.mark` must not become a byte-order flag"
+        );
+        assert_eq!(
+            ctx.get_field_by_name(buf, "segment"),
+            Value::Object(Some(sentinel)),
+            "and neither may the reference-typed `segment` slot that BB_ORDER \
+             aliases on a real layout"
+        );
+        assert_eq!(
+            ctx.get_field_by_name(buf, "hb"),
+            Value::Object(Some(chars)),
+            "the backing store is still the same array object"
+        );
+        assert_eq!(
+            s2_bb_order(&ctx, buf),
+            0,
+            "the reader agrees with the refusal instead of decoding `mark` as an order"
+        );
+    }
+
+    // ---- G38-1: the reference slot the ByteOrder fallback used to null ------
+    //
+    // `G38-1-the-live-reference-slot-writes-20260817.md`. Reaching the
+    // fallback in `s2_byte_order_object` does NOT prove the real class is
+    // absent — `ensure_class_initialized` can succeed while the statics are
+    // not yet published, and every compatibility-mode arm runs a synthetic
+    // registrar against real class bytes. On that path the object IS a real
+    // `java.nio.ByteOrder`, whose sole instance field is
+    // `private final String name` at slot 0, and `Value::Int(ord)` there was
+    // coerced to `null` by `heap::coerce_field_value_by_descriptor`.
+
+    /// The falsifying half. Before the fix the fallback wrote ONLY the order
+    /// Int, so on a real layout `name` held an `Int` (mock) / `null` (VM) and
+    /// both readers decoded LITTLE_ENDIAN as BIG_ENDIAN.
+    #[test]
+    fn the_byte_order_fallback_names_the_constant_when_the_class_declares_name() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/ByteOrder")
+            .expect("class init");
+        ctx.set_declared_fields(
+            class_id,
+            vec![FieldMetadata {
+                name: "name".to_string(),
+                descriptor: "Ljava/lang/String;".to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: class_id,
+                is_static: false,
+            }],
+        );
+
+        for (ord, expected) in [(0i32, "BIG_ENDIAN"), (1i32, "LITTLE_ENDIAN")] {
+            let bo = s2_byte_order_object(&mut ctx, ord).expect("byte order object");
+            let name = match ctx.get_field_by_name(bo, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                other => panic!(
+                    "`ByteOrder.name` is a String reference; the fallback left {other:?} \
+                     — that is the value the descriptor coercion turns into null"
+                ),
+            };
+            assert_eq!(
+                name, expected,
+                "the constant must name ITSELF, not whichever constant a null decodes to"
+            );
+        }
+    }
+
+    /// The other half, so the fix cannot be "write a String everywhere".
+    /// A shape with no in-range `name` slot keeps the order flag and nothing
+    /// else — that is the synthetic-stub layout, where slot 0 is genuinely an
+    /// untyped field and every reader falls back to the Int.
+    #[test]
+    fn a_byte_order_shape_with_no_in_range_name_slot_keeps_only_the_flag() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let bo = s2_byte_order_object(&mut ctx, 1).expect("byte order object");
+        assert_eq!(
+            ctx.object_num_fields(bo),
+            1,
+            "premise: the fallback allocates the 1-slot stand-in"
+        );
+        assert_eq!(
+            ctx.get_field(bo, 0),
+            Value::Int(1),
+            "no `name` field resolves in range, so only the order flag lands \
+             and the object is byte-identical to the pre-G38 one"
+        );
+    }
+
+    /// And the decode both writers feed: a String at slot 0 must round-trip
+    /// through the SAME `toString`/`equals` natives the Int does, or the fix
+    /// would have moved the defect into the readers.
+    #[test]
+    fn the_byte_order_readers_decode_a_name_string_as_well_as_the_flag() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        register_s2_byteorder(&mut registry);
+        let to_string = registry
+            .find("java/nio/ByteOrder", "toString", "()Ljava/lang/String;")
+            .expect("ByteOrder.toString native");
+        let equals = registry
+            .find("java/nio/ByteOrder", "equals", "(Ljava/lang/Object;)Z")
+            .expect("ByteOrder.equals native");
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/ByteOrder")
+            .expect("class init");
+        ctx.set_declared_fields(
+            class_id,
+            vec![FieldMetadata {
+                name: "name".to_string(),
+                descriptor: "Ljava/lang/String;".to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: class_id,
+                is_static: false,
+            }],
+        );
+        let big = s2_byte_order_object(&mut ctx, 0).expect("BIG_ENDIAN");
+        let little = s2_byte_order_object(&mut ctx, 1).expect("LITTLE_ENDIAN");
+
+        for (obj, expected) in [(big, "BIG_ENDIAN"), (little, "LITTLE_ENDIAN")] {
+            let rendered = match to_string(&mut ctx, &[Value::Object(Some(obj))]) {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                other => panic!("toString returned {other:?}"),
+            };
+            assert_eq!(rendered, expected);
+        }
+        // `MethodCallFailed` is not `PartialEq`, so unwrap rather than compare
+        // the whole `Result`.
+        let eq = |ctx: &mut crate::test_utils::MockNativeContext, a: ObjectRef, b: ObjectRef| {
+            match equals(ctx, &[Value::Object(Some(a)), Value::Object(Some(b))]) {
+                Ok(Some(Value::Int(v))) => v,
+                other => panic!("equals returned {other:?}"),
+            }
+        };
+        assert_eq!(
+            eq(&mut ctx, big, little),
+            0,
+            "two DIFFERENT constants must not compare equal — they did while \
+             both slot-0 values decoded to 0"
+        );
+        assert_eq!(
+            eq(&mut ctx, big, big),
+            1,
+            "and the same constant must still compare equal to itself"
+        );
+    }
+
+    /// `s2_bb_alloc_direct` gained the by-name writes and the layout screen
+    /// (G38-1). On the bare six-slot synthetic layout — the ONLY shape this
+    /// function is reached on today — the screen is open and every indexed
+    /// slot must end byte-identical to the pre-G38 answer.
+    #[test]
+    fn the_direct_buffer_overlay_is_unchanged_on_the_bare_synthetic_layout() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let buf = match s2_bb_alloc_direct(&mut ctx, 16) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("allocateDirect returned {other:?}"),
+        };
+        assert!(
+            s2_bb_synthetic_layout(&ctx, buf),
+            "premise: no real ByteBuffer layout is declared, so the screen is open"
+        );
+        assert_eq!(ctx.get_field(buf, BB_ARRAY), Value::Object(None));
+        assert_eq!(ctx.get_field(buf, BB_POS), Value::Int(0));
+        assert_eq!(ctx.get_field(buf, BB_LIMIT), Value::Int(16));
+        assert_eq!(ctx.get_field(buf, BB_CAP), Value::Int(16));
+        assert!(
+            matches!(ctx.get_field(buf, BB_MARK), Value::Long(_)),
+            "BB_MARK carries the native address on a direct buffer"
+        );
+        assert_eq!(
+            ctx.get_field(buf, BB_ORDER),
+            Value::Int(0),
+            "the order flag still lands in the slot the synthetic readers use"
+        );
+        assert_eq!(s2_bb_order(&ctx, buf), 0);
+        assert!(
+            s2_bb_arr(&ctx, buf).is_none(),
+            "a direct buffer has no backing array"
+        );
+    }
+
+    /// And the screen itself, which is what keeps that overlay off a real
+    /// layout: on the eleven-field JDK 25 `java.nio.ByteBuffer` the six
+    /// indices alias `mark/position/limit/capacity/address/segment`, so
+    /// `BB_ORDER` would land on a REFERENCE and `BB_ARRAY` on an `int`.
+    #[test]
+    fn the_real_byte_buffer_layout_closes_the_direct_overlay_screen() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/ByteBuffer")
+            .expect("class init");
+        let names = [
+            ("mark", "I"),
+            ("position", "I"),
+            ("limit", "I"),
+            ("capacity", "I"),
+            ("address", "J"),
+            ("segment", "Ljava/lang/foreign/MemorySegment;"),
+            ("hb", "[B"),
+            ("offset", "I"),
+            ("isReadOnly", "Z"),
+            ("bigEndian", "Z"),
+            ("nativeByteOrder", "Z"),
+        ];
+        ctx.set_declared_fields(
+            class_id,
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, (name, descriptor))| FieldMetadata {
+                    name: (*name).to_string(),
+                    descriptor: (*descriptor).to_string(),
+                    access_flags: 0,
+                    slot_index: i,
+                    declaring_class_id: class_id,
+                    is_static: false,
+                })
+                .collect(),
+        );
+        let buf = ctx.alloc_object(class_id, names.len());
+        assert!(
+            !s2_bb_synthetic_layout(&ctx, buf),
+            "an eleven-field real layout must never take the indexed overlay"
+        );
+        assert_eq!(
+            ctx.resolve_field_index_by_class_id(class_id, "segment"),
+            Some(BB_ORDER),
+            "BB_ORDER is exactly the reference-typed `segment` slot — that is \
+             why the unconditional write destroyed the order flag"
+        );
+        assert_eq!(
+            ctx.resolve_field_index_by_class_id(class_id, "mark"),
+            Some(BB_ARRAY),
+            "and BB_ARRAY is `mark`, an int, which is the other direction of \
+             the same coercion"
+        );
     }
 }

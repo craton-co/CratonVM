@@ -36,6 +36,32 @@ pub(super) fn dup_x2_codegen_disabled() -> bool {
     *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUP_X2").is_some())
 }
 
+/// Disable ONLY the dup2_x2 (0x5E) codegen arm, restoring the historical
+/// "reach the catch-all and stay interpreted" behaviour. The arm picks its
+/// shuffle shape from the `stack_kinds` width analysis rather than from a
+/// peephole, so it wants its own bisection lever independent of `dup-x1`/
+/// `dup-x2`.
+pub(super) fn dup2_x2_codegen_disabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE
+        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_DUP2_X2").is_some())
+}
+
+/// Kill-switch for the IR tier's trusted-oop receiver shortcut on a PRIMITIVE
+/// inline `getfield` (`CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD=1` restores the
+/// full six-comparison containment guard).
+///
+/// It has its own lever because it is the one thing that makes the inline
+/// `getfield` reachable at all under a collector that publishes no region
+/// bounds — i.e. ZGC, the default since 2026-08-10 — so "is this the cause"
+/// has to be answerable in one run rather than by reading gates.
+pub fn trusted_oop_receiver_getfield_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD").is_none()
+    })
+}
+
 /// Trace what the dup_x1 rotate did to the model: the three slots and their
 /// oop marks, before and after. `CRATONVM_DBG_DUPX_METHODS` says WHICH compiled
 /// methods carry the opcode; this says what happened inside each one.

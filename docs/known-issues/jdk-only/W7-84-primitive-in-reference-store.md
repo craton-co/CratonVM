@@ -6,10 +6,60 @@ behind a process-wide monotone latch, so `gen_heap`'s compact reference-field
 read is **cheaper than it was** while `zgc`, `g1` and `heap` gain the behaviour
 for one predicted branch.
 
-**Nothing here was built or run.** This lane may not invoke `cargo`; the
-orchestrator builds. Every claim about CratonVM is source-level and says so.
-The only thing executed was `rustfmt --check` as a parser on the nine edited
-files — that proves they parse, and nothing else.
+**Nothing in §§1-7 was built or run.** This lane may not invoke `cargo`; the
+orchestrator builds. Every claim about CratonVM in §§1-7 is source-level and
+says so. The only thing executed for those sections was `rustfmt --check` as a
+parser on the nine edited files — that proves they parse, and nothing else.
+
+> **2026-08-12 (lane B8) — §8's identity claim is INDEPENDENTLY CONFIRMED by
+> running, and the warning's own instruction does not work.**
+>
+> §8 named `ClassId(12)` as `java/lang/Class` and slot 0 as `cachedConstructor`.
+> Confirmed on `/c/craton/jdkonly-wave2-target/release/cratonvm.exe --jdk-only`,
+> on an unrelated probe class, i.e. the guard fires on the boot path of *any*
+> program:
+>
+> ```
+> WARN cratonvm::gc::guard: a non-reference value was stored into a slot the class
+> declares as a REFERENCE — boxing it into an AUTOBOX_CLASS_ID wrapper …
+> class_id=ClassId(12) index=0 value=Int(-1) occurrence=0     (… through occurrence=8)
+> ```
+>
+> and `ClassId(12)` resolved from the layout stream, not from the record:
+>
+> ```
+> $ CRATONVM_DBG_LAYOUT=1 cratonvm --jdk-only -cp . W37Probe
+> [layout] java/lang/Class cid=12 body=136 refs=16 fields=19
+> ```
+>
+> Nine occurrences per boot, `value=Int(-1)` every time — consistent with
+> `cachedConstructor` being seeded with a sentinel rather than with a live
+> `ClassId`, which is worth stating because it changes what the repair has to
+> preserve.
+>
+> **The warning text tells the reader to do something that does not work.** It
+> says "Run with `CRATONVM_DBG_TOARRAY=1` to resolve class_id to a name"; run
+> with that variable set, the message is byte-identical and still prints the
+> unresolved `ClassId(12)`. §8.2 already records that the warning's *advice*
+> was falsified; this confirms it is still shipping in the message a reader
+> hits first. `CRATONVM_DBG_LAYOUT=1` is the instruction that actually works.
+> **NOMINATION**: in the `gc::guard` warning body, replace the sentence
+> `Run with CRATONVM_DBG_TOARRAY=1 to resolve class_id to a name.` with
+> `Run with CRATONVM_DBG_LAYOUT=1 to resolve class_id to a name.`
+>
+> **Scheduling: none.** The guard is a `WARN` on stderr with no assertion
+> anywhere; the suite passes with nine of these per run. Nothing fails if the
+> count goes to nine hundred. Record stays **OPEN**.
+>
+> **2026-08-12 — §8 is the first MEASURED section, and it moves this record.**
+> The guard now fires on every boot. `ClassId(12)` is **`java/lang/Class`** and
+> slot 0 is **`cachedConstructor`**; the store is **not a native** — it is the
+> VM's own class-mirror populator in `vm/src/vm/vm_object.rs`. That falsifies
+> the warning's own advice (§8.2), makes §6's population table incomplete in its
+> largest row, and falsifies §4.2's "a process that never boxes" premise (§8.3).
+> **Record stays OPEN**; the repair is in `vm/`, is already prescribed by
+> `internal/audits/jdk-only-object-layout-audit.md`, and its own
+> precondition is already discharged (§8.4).
 
 Branch `fix/primitive-in-reference-slot-store-disagreement-20260812`.
 
@@ -407,3 +457,179 @@ is the right layer.
    validated probe for the rest of its life. A per-heap latch would be tighter
    and would need a heap handle at every read site, which is not free either.
    If a profile ever names this, that is the named place to look.
+   **Superseded 2026-08-12 by §8.3: the latch is armed on every boot, before
+   user code, so "once any wrapper is created" is unconditional.**
+
+---
+
+## 8. MEASURED, 2026-08-12 — the guard fires on every boot, and the store is not a native
+
+This is the first section of this record that rests on a run of the VM rather
+than on reading source. The orchestrator ran an ordinary Java program on the
+current binary (default configuration, i.e. `--real-jdk`, ZGC, compact layout)
+and `cratonvm::gc::guard` emits, repeatedly, from the first milliseconds of
+boot:
+
+```
+WARN cratonvm::gc::guard: a non-reference value was stored into a slot the class
+declares as a REFERENCE — boxing it into an AUTOBOX_CLASS_ID wrapper …
+  class_id=ClassId(12) index=0 value=Int(-1)  occurrence=0
+  … occurrence=1 … 8, then 16, 32, 64, 128 (value=Int(378), Int(12), Int(164), Int(654))
+```
+
+At least 129 boxes before the workload starts. §5.4's "nothing was executed"
+still applies to the tests; **this** is a measurement, and it changes three
+things in this record.
+
+### 8.1 `ClassId(12)` is `java/lang/Class`, and slot 0 is `cachedConstructor`
+
+The identification does not need the boot class order, because the values close
+the loop by themselves.
+
+* `ClassId` is a per-`ClassStore` index handed out in load order —
+  `ClassStore::next_id()` is `ClassId::new(self.classes.len())`
+  (`classloading/src/class.rs:1249`), `add` appends
+  (`:1257`). The `class_id` this guard prints is the **receiver's header class
+  id**: `ZgcRealHeap::set_field` passes `header.class_id`
+  (`gc/src/zgc.rs:5288`), and `gen_heap`/`g1`/`heap` do the same.
+* `Value::Int(-1)` into slot 0 has exactly **one** producer that can be stamped
+  with a `java/lang/Class` header:
+  `vm/src/vm/vm_object.rs:1380`, in `get_or_create_primitive_mirror`, whose own
+  doc says *"Primitive mirrors use ClassId(0) and store Int(-1) in field 0 as a
+  marker"*. The mirror is allocated with
+  `alloc_object(class_class_id, mirror_field_count)` where `class_class_id` is
+  `cm.load_class("java/lang/Class")` (`:1326`, `:1353`).
+* The remaining values are `class_id.as_u32() as i32` from the sibling
+  populator, `get_or_create_class_mirror`
+  (`vm/src/vm/vm_object.rs:1181-1184`):
+  ```rust
+  shared
+      .mem
+      .heap
+      .set_field(mirror, 0, Value::Int(class_id.as_u32() as i32));
+  ```
+  **`Int(12)` in that list is the mirror of `java/lang/Class` itself** — the
+  same number as the header class id of every receiver in the census. A store
+  whose receiver is stamped `ClassId(12)` and whose payload is `ClassId(12)` is
+  `java/lang/Class`'s own mirror, and nothing else in the tree produces that
+  coincidence.
+
+Slot 0 of a real `java.lang.Class` on JDK 25 is
+`private volatile transient Constructor<T> cachedConstructor` — a reference.
+This is **not a new discovery**; it is
+`internal/audits/jdk-only-object-layout-audit.md` rank 6, an *overlay*
+whose verdict was moved from `unknown` to `safe` on 2026-08-10, and the two
+`JDK-ONLY-LAYOUT: safe` markers at `vm_object.rs:1103-1180` and `:1364-1379`
+record that adjudication in place. What is new is that the W7-84 convergence
+turned that overlay into an **allocation**, and that this record's own §6 census
+never listed it.
+
+### 8.2 §6's population table was missing its largest row, and the "type-punning native" framing is wrong
+
+§6 lists eight rows across five classes and calls the writer a native
+throughout; the module doc and the warning text said the same. The measured
+dominant population is **`java/lang/Class` slot 0, once per class mirror and
+once per primitive mirror, written by the VM core.** Corrections:
+
+| §6 as written | corrected |
+|---|---|
+| the mechanical upper bound is `ctx.set_field(...)` across the native crates (3,482) | the bound is not over native crates at all. `vm/src/vm/vm_object.rs` writes through `shared.mem.heap.set_field` directly, so it is in **neither** the 3,482 nor the audited subset |
+| "The store itself is a type-punning native; see the read-side alias census for which one" (the warning text) | the read-side census (`native-api/src/read_alias.rs`) observes **native reads through `NativeContext::get_field`**. It cannot see a `vm/` write, and it is a read instrument in any case. The message sent every reader to an instrument structurally unable to answer. **Corrected in `gc/src/autobox.rs` by this lane**; the replacement names the site and points at `CRATONVM_DBG_TOARRAY=1`, which prints `cid=… name=…` at exactly the mirror site and is how anyone can confirm §8.1 empirically in one command |
+| five rows "were LIVE in Compatible mode until W7-75 landed today" | true and now beside the point: the live population is dominated by a row W7-75 does not touch, is not a native, and is unrepairable by any change in `native-builtins/` |
+
+The one thing §3 gets **right** and this measurement strengthens: §3.3's
+argument against `debug_assert!`/refusal. A refusal would abort every VM boot in
+Compatible mode on the first primitive mirror. That is now a measured fact
+rather than a prediction.
+
+### 8.3 §4.2's performance argument does not survive — the latch is armed on every boot
+
+§4.2 and §4.3 price the read path on the premise that *"a process that never
+boxes — the overwhelming majority — pays one relaxed load … and never touches
+the address validator"*, and conclude *"in a process that never boxes every arm
+is faster than `gen_heap` was"*.
+
+**There is no such process.** `WRAPPER_CREATED` is armed by the class-mirror
+populator before user code runs, in every Compatible-mode run, at boot. So the
+steady state is the *other* branch: every compact reference-field read in every
+run pays `is_object_address` + a header read for the life of the process — the
+cost `gen_heap` used to pay alone, now paid by `zgc`, `g1` and `heap` as well.
+
+The correct statement of the change's cost is therefore:
+
+* `gen_heap` (the pre-2026-08-10 default): **unchanged**, not cheaper.
+* `zgc` (the current default), `g1`, `heap`: **strictly more expensive** on
+  every compact reference-field read, plus one wrapper allocation per class
+  mirror and per primitive mirror at boot.
+
+§7.5's "if a profile ever names this, that is the named place to look" is
+upgraded from a hypothetical to a standing cost. Nothing here is *measured* as a
+throughput number — that needs a build and an A/B this lane cannot run — but the
+premise the §4.2 argument rested on is falsified by the guard's own output.
+
+### 8.3a §7.1's interpreter-vs-JIT residual now has a named, reachable victim
+
+§7.1 records that the JIT field helpers (`vm/src/jit/helpers.rs`'s
+`jit_getfield_*`) call `read_compact_field` directly and therefore **do not
+un-box**, and argues the change "strictly *reduces* the number of disagreeing
+readers". That is true as a count and it understates the consequence, because
+§8.1 names the object the residual lands on.
+
+`java.lang.Class.cachedConstructor` is read in exactly one place in the JDK —
+`Class.newInstance()`, under `if (cachedConstructor == null)`. The comment at
+`vm_object.rs:1104-1106` justifies the overlay on precisely that guard: *"JDK
+bytecode that reads `cachedConstructor` gets an Int which it treats as an
+invalid reference (effectively null) — safe because the field is always read
+under an `if (cachedConstructor == null)` guard."*
+
+After the convergence that sentence is true of the **interpreter** and false of
+the **JIT**: a JIT-compiled `getfield cachedConstructor` reads the compact slot
+raw and gets `Object(Some(wrapper))` — **non-null** — so the guard fails, the
+fast path is taken, and `Constructor.newInstance` is invoked on an
+`AUTOBOX_CLASS_ID` wrapper. Narrow (only `Class.newInstance()`, only once
+compiled) but concrete, and it is a consequence this change introduced rather
+than inherited: under `zgc`/`g1` the slot read back a genuine `null` on both
+routes. Not measured — no build — but it follows from §7.1's own statement of
+what the JIT helpers do.
+
+If the §8.4 nomination is declined, the `vm_object.rs:1104-1106` sentence must
+at minimum be corrected, because it is now the load-bearing safety claim for the
+overlay and it is only half true.
+
+### 8.4 The repair this points at, and it is not in `gc/`
+
+The audit already prescribed it and already discharged its own preconditions.
+`jdk-only-object-layout-audit.md` §4 check (c) asks whether
+`mirror_class_id`'s slot-0 fallback ever fires when the reverse map is
+populated, and says: *"If (c) is zero, the fix is deletion, not relocation."*
+The comment at `vm_object.rs:1162-1170` records the answer — **zero fallback
+hits** over five Spring Framework test classes, 87 tests, under
+`CRATONVM_DBG_OVERLAY=1`. `class_mirrors_reverse` answers every runtime lookup.
+
+So the write is preserved solely for `MockNativeContext`'s test mirrors, which
+encode their `ClassId` at slot 0 and have no reverse map
+(`native-builtins/src/test_utils.rs`, `vm/src/vm/tests.rs`). Deleting the two
+writes and giving those mocks a reverse map removes, at a stroke: the boot-time
+wrapper allocations, the unconditional arming of the latch, the interpreter/JIT
+disagreement of §7.1 on the single most common object in the heap, and the
+`java.lang.Class.cachedConstructor` overlay itself.
+
+**This lane may not edit `vm/`.** The change is nominated rather than made; see
+this campaign's lane report. It is a `vm/` + test-infrastructure change, not a
+`gc/` one, and it is the reason this record should stay open.
+
+### 8.5 What §8 does not establish
+
+1. **Nothing was rebuilt or re-run by this lane.** The transcript in §8 was
+   produced by the orchestrator; the identification in §8.1 is source-level
+   reasoning over that transcript, and the one-command empirical confirmation
+   (`CRATONVM_DBG_TOARRAY=1`, expecting `cid=ClassId(12) name="java/lang/Class"`)
+   has **not** been run.
+2. **Synthetic mode is unmeasured.** There `java/lang/Class` is a compatibility
+   stub sized `CLASS_MIRROR_NUM_FIELDS` (2) and `resolve_class_mirror_slots`
+   takes its stub arm, so slot 0 is very likely not a declared reference and the
+   guard very likely does not fire. Not verified.
+3. **No claim that the boxed `cachedConstructor` is observably wrong.** The
+   audit's checks (1) and (2) measured the overlay as non-destructive on
+   `gen_heap`, which is the arm the convergence restores everywhere. The cost
+   established here is allocation and read-path cost, not a wrong answer.

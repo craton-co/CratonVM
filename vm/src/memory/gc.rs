@@ -195,6 +195,10 @@ pub fn unload_dead_class_metadata(
             .invalidate_unloaded_class(class.id, class.name.as_ref());
     }
     shared.jit.invalidation_manager.lock().clear_all();
+    // Same reason as `jit_alloc_class_cache` above: the multianewarray
+    // per-site plans are keyed by a class id and hold component class ids,
+    // and a recycled id would hand a site the wrong component classes.
+    crate::runtime::interpreter::invalidate_multianewarray_plans();
     shared
         .jit
         .jit_skip_set
@@ -635,6 +639,47 @@ pub(crate) fn remap_thread_object_slots(
     rewritten
 }
 
+/// Remap the proxy-dispatch `Method` cache
+/// (`SharedVm::classes::proxy_method_cache`) through a relocation map.
+///
+/// This is the remap half of `memory/roots.rs` §6b. That section pushes every
+/// cached `Method` as an unconditional root, so the object is kept alive and —
+/// under a MOVING collector — evacuated to a new address. Nothing then wrote
+/// the new address back into the cache: the map is keyed by
+/// `(proxy class, name, descriptor)` and its VALUES are raw `ObjectRef`s, so
+/// the next dispatch for that key served a from-space pointer to running Java
+/// code. Reading `Method.name` off reset from-space memory yields `0`, and
+/// `Method.getName()` returns `null` — which javac's String-switch lowering
+/// (`astore <localN>; aload <localN>; invokevirtual String.hashCode()`) turns
+/// into `NullPointerException: Cannot invoke "String.hashCode()" because
+/// "<localN>" is null` inside any `InvocationHandler` that branches on the
+/// method name. Spring's `SynthesizedMergedAnnotationInvocationHandler.invoke`
+/// is exactly that shape, which is how this reached
+/// `FlywayAutoConfigurationTests` / `IntegrationAutoConfigurationTests` under
+/// `-XX:+UseGenerationalGC` while ZGC (non-moving) and G1 stayed green.
+///
+/// A scan with no matching remap is the standing hazard this file already
+/// names above `remap_thread_object_slots`; `proxy_method_cache` was the one
+/// `shared.*` side table in `roots.rs` that had only the scan half. Factored
+/// out so the pairing is unit-testable without standing up a VM, exactly like
+/// [`remap_handle_slots`]. Returns the number of entries rewritten.
+pub(crate) fn remap_proxy_method_cache<K, S: std::hash::BuildHasher>(
+    cache: &mut std::collections::HashMap<K, ObjectRef, S>,
+    pointer_map: &cratonvm_types::PointerMap,
+) -> usize {
+    let mut rewritten = 0;
+    for obj_ref in cache.values_mut() {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // SAFETY: relocation maps contain live, aligned object addresses.
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
 /// Scans thread frames (locals + operand stacks), static fields, class locks,
 /// and printed values, updating any ObjectRef whose old address appears in
 /// the pointer map.
@@ -708,6 +753,10 @@ pub fn update_all_roots(
         return;
     }
     gcpart_record(shared.mem.heap.collection_count(), pointer_map);
+    // `CRATONVM_DBG_VACATED_FRAMES` — remember what this collection moved
+    // objects away FROM, so the next safepoint's frame audit can name any slot
+    // still holding one. No-op unless the flag is set.
+    cratonvm_gc::gc_quiescence::record_vacated(pointer_map);
     crate::runtime::interpreter::remap_trace_push(
         shared,
         thread,
@@ -826,6 +875,8 @@ pub fn update_all_roots(
         );
     }
     // 1. Thread frames — locals and operand stacks (SoA layout)
+    // See `JvmThread::last_heal_collection`.
+    thread.last_heal_collection = shared.mem.heap.collection_count();
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, &shared.mem.heap);
         frame
@@ -1019,6 +1070,15 @@ pub fn update_all_roots(
         }
     }
 
+    // 6a. Cached proxy-dispatch `Method` objects — the remap half of the
+    //     unconditional root scan in `roots.rs` §6b. See
+    //     [`remap_proxy_method_cache`] for why a rooted-but-unremapped entry
+    //     hands running Java a from-space `Method` whose `name` reads null.
+    {
+        let mut proxy_methods = shared.classes.proxy_method_cache.write();
+        remap_proxy_method_cache(&mut proxy_methods, pointer_map);
+    }
+
     // 6b. VarHandle permanent roots (B-J) — remap the registry entries so the
     //     canonical VarHandle ref tracks the object across a move (the holder
     //     `static final` slot is remapped via the `statics` block above using
@@ -1173,6 +1233,7 @@ pub fn update_all_roots(
     // 9a and 15-22. Paired post-move half of the VM/native root inventory.
     // The historical notes below document the individual registered sources.
     crate::memory::native_roots::remap_all_roots(shared, pointer_map);
+
 
     // 9a. Native upcall table — rewrite each live slot's callback `target` to its
     //     post-relocation address so the legacy `pe_upcall_invoke` dispatch path
@@ -1355,6 +1416,7 @@ pub fn update_all_roots(
         .thread_registry
         .fold_pointer_map_into_blocked_audited(pointer_map, Some(&shared.mem.heap));
 
+
     // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
     //     index (keyed by mirror address). Scanned as roots in roots.rs
     //     step 10b; without the remap the registry serves stale mirrors
@@ -1378,6 +1440,60 @@ pub fn update_all_roots(
     // reclaimed reference fields in OTHER objects (not just this thread's
     // frames) — where the residual ClassLoader/Locale stale-ref actually lives.
     verify_heap_object_fields(shared, pointer_map);
+    // THE SCAN INVENTORY AND THE REMAP INVENTORY ARE TWO LISTS
+    // (`CRATONVM_DBG_ROOT_REMAP_AUDIT=1`).
+    //
+    // `roots.rs` decides what the collector MARKS from; `native_roots.rs`
+    // decides what gets REWRITTEN afterwards. A side table present in the first
+    // and missing from the second keeps its object alive and then keeps naming
+    // the address the collector moved it away from — which is the exact
+    // signature the H2 MVStore-writer residual has left after the heap slots
+    // and both frame-remap sites were verified complete.
+    //
+    // So ask directly: re-run the scan and look for an address this collection
+    // moved. Destinations are excluded for the reason the frame verifier
+    // excludes them — a survivor slides INTO a vacated address, and a root
+    // legitimately naming that survivor is not a finding.
+    //
+    // `CRATONVM_DBG_ROOT_SOURCE=1` alongside this names WHICH source, which is
+    // the fix's address.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_some() {
+        let destinations: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
+        let after = crate::memory::roots::collect_roots(shared, thread);
+        let mut reported = 0usize;
+        for (index, r) in after.iter().enumerate() {
+            let a = r.as_ptr() as usize;
+            if destinations.contains(&a) {
+                continue;
+            }
+            if let Some(&new) = pointer_map.get(&a) {
+                reported += 1;
+                if reported <= 8 {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{a:#x}"),
+                        moved_to = format!("{new:#x}"),
+                        source = crate::memory::native_roots::root_source_of(a)
+                            .unwrap_or("<not-attributed>"),
+                        // Which SECTION of the scan produced it. `root_source_of`
+                        // only covers the uniform native-root registry; this
+                        // covers the other forty.
+                        scan_section = crate::memory::roots::scan_section_of(index),
+                        "a ROOT this collection just scanned still names the address it moved                          the object away from — the scan inventory contains a source the remap                          inventory does not."
+                    );
+                }
+            }
+        }
+        if reported > 0 {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                unremapped_roots = reported,
+                scanned = after.len(),
+                map = pointer_map.len(),
+                "root remap audit: that many scanned roots were left naming a vacated address"
+            );
+        }
+    }
 }
 
 /// Opt-in young-object size validator (`CRATONVM_DBG_VALIDATE_NEW=1`). Walks
@@ -1859,6 +1975,53 @@ mod tests {
         assert_eq!(slots[0].unwrap().as_ptr() as usize, 0x2000);
         assert!(slots[1].is_none());
         assert_eq!(slots[2].unwrap().as_ptr() as usize, 0x3000);
+    }
+
+    /// The remap half of `roots.rs` §6b. The scan half pushes every cached
+    /// proxy-dispatch `Method` as an unconditional root, so under a moving
+    /// young collection the object IS evacuated — and the cache kept serving
+    /// the from-space address to every later dispatch on the same key. The
+    /// object Java then received had a zeroed body, so `Method.getName()`
+    /// returned `null` and Spring's String-switch on it threw
+    /// `NullPointerException: Cannot invoke "String.hashCode()"`.
+    ///
+    /// The third entry is the load-bearing one: an UNMOVED cache value must be
+    /// left exactly as it is. A remap that rewrote every value (rather than
+    /// only pointer-map keys) would corrupt entries the collector pinned.
+    #[test]
+    fn moving_gc_rewrites_the_proxy_method_cache_in_place() {
+        // SAFETY: these aligned non-null addresses are never dereferenced —
+        // the remap is pure address arithmetic against the pointer map.
+        let moved = unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) };
+        let also_moved = unsafe { ObjectRef::from_raw(0x2000usize as *mut u8) };
+        let pinned = unsafe { ObjectRef::from_raw(0x3000usize as *mut u8) };
+
+        let mut cache: std::collections::HashMap<&'static str, ObjectRef> =
+            std::collections::HashMap::new();
+        cache.insert("Api.alpha()Ljava/lang/String;", moved);
+        cache.insert("Api.bravo(Ljava/lang/String;)Ljava/lang/String;", also_moved);
+        cache.insert("Api.charlie(II)I", pinned);
+
+        let pointer_map = cratonvm_types::PointerMap::from_iter([
+            (0x1000usize, 0x8000usize),
+            (0x2000usize, 0x9000usize),
+        ]);
+
+        assert_eq!(remap_proxy_method_cache(&mut cache, &pointer_map), 2);
+        assert_eq!(
+            cache["Api.alpha()Ljava/lang/String;"].as_ptr() as usize,
+            0x8000,
+            "a relocated cached Method must follow the move, or the next              dispatch serves Java a from-space object whose `name` reads null"
+        );
+        assert_eq!(
+            cache["Api.bravo(Ljava/lang/String;)Ljava/lang/String;"].as_ptr() as usize,
+            0x9000,
+        );
+        assert_eq!(
+            cache["Api.charlie(II)I"].as_ptr() as usize,
+            0x3000,
+            "an entry absent from the pointer map did not move and must not be rewritten"
+        );
     }
 
     /// §10 post-move fixup covers ALL three per-thread single-slot references,

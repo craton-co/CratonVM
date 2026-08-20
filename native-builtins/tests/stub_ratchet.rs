@@ -41,6 +41,68 @@
 //! the baseline and fails CI; a change that REMOVES one is welcome and only
 //! requires lowering the baseline (see `stub-ratchet.md`).
 //!
+//! ## 2026-08-19: the count rose 31 and NOT ONE new fake was written
+//!
+//! `dev` was red at 1308 against 1277 (and 1318 against 1287 in the management
+//! configuration — the same +31, measured, not extrapolated). The gate's own
+//! failure text sends the reader to "make the new native a real
+//! Bridge/Intrinsic". For this population that instruction is **exactly
+//! backwards**, and the reason is worth more than the re-freeze.
+//!
+//! Diffing the stub LIST at the freeze commit against `HEAD`
+//! ([`dump_synthetic_stubs`], which exists because of this) gives 33 triples
+//! that are stub rows now and were not then, and 4 that stopped being stub
+//! rows. Of the 33, **30 already existed as registrations and only changed
+//! KIND, `Bridge` -> `SyntheticStub`.** Nothing was added. Every one of the 30
+//! is a deliberate, documented re-label whose PURPOSE is that `--jdk-only`
+//! drops the row so the JDK's own bytecode runs:
+//!
+//! * **14** — `java/util/ArrayList` (twelve), `java/util/Arrays$ArrayList.
+//!   iterator` and `java/util/Collections.synchronizedMap`. These are entries in
+//!   `native-api/src/retired_shadow.rs`'s table: shadows RETIRED after being
+//!   adjudicated one by one, each measured live as an actually-taken
+//!   `native-shadows-bytecode` row.
+//! * **6** — `java/lang/Runtime.exec`, tagged at the site with
+//!   `register_with_kind(.., SyntheticStub)` and the reason beside it: `exec`
+//!   is ordinary bytecode on the image (`acc_native: false, has_code: true`),
+//!   so by contract §1.4 the real method outranks any bridge.
+//! * **7** — `java/util/function/{Predicate,Consumer,BinaryOperator}`'s default
+//!   and static methods, put in an explicit `SyntheticStub` scope in
+//!   `phases_late/streams.rs` so strict drops all of them and `java.base`'s own
+//!   default methods run.
+//! * **3** — `jdk/internal/{access,misc}/SharedSecrets` factories, re-tagged
+//!   because `jdk/internal/misc/SharedSecrets` is in `NO_IMAGE_JDK_RECEIVERS`.
+//!
+//! The other 3 of the 33 are genuinely new triples, and two of them are a
+//! RENAME rather than an addition: `SharedSecrets.getJavaUtilJarAccess` (both
+//! spellings) leaves the list and `javaUtilJarAccess` joins it, which is the
+//! JDK's actual accessor name. The third is
+//! `javax/net/ssl/SSLSocketInputStream.skip(J)J`, on a carrier class with no
+//! image counterpart — the same rule as the SharedSecrets alias.
+//!
+//! **So the gate counted a campaign's success as a regression.** A `Bridge`
+//! that was always a fake is a LIE the audit cannot see; re-tagging it
+//! `SyntheticStub` makes it visible, gateable, and dropped in strict mode. The
+//! count going up is what that improvement looks like from here.
+//!
+//! ### What this gate cannot distinguish, stated so the next reader does not
+//! ### repeat the wrong work
+//!
+//! A number cannot separate "someone wrote a new fake" from "someone correctly
+//! labelled an old one", and those two want opposite responses. Until the gate
+//! freezes a SET rather than a count, the reader has to make that distinction
+//! by hand — which is a two-command job now and was an afternoon of `git blame`
+//! before:
+//!
+//! ```text
+//! git worktree add /tmp/freeze <the commit that last set the baseline>
+//! cargo test -p cratonvm-native-builtins --test stub_ratchet dump_synthetic_stubs -- --nocapture
+//! ```
+//!
+//! run in both trees, and `comm -23` the sorted `@@STUB` lines. Then, for each
+//! added triple, check `native-api/src/retired_shadow.rs` and the registration
+//! site's own comment BEFORE concluding a fake was added.
+//!
 //! Wire into CI with:
 //!
 //! ```text
@@ -326,6 +388,15 @@ use cratonvm_types::compat::CompatibilityMode;
 /// `SyntheticStub` on the way back in. The other 49 restored rows are `Bridge`
 /// and show up on L6's ratchet instead.
 ///
+/// (This paragraph is PROSE, not an assertion — F17-1 read it as a pin blocking
+/// the `AccessController$1` deletion, and F24-1 corrected that. It is history
+/// and stays as written. For the record: two of the sixteen,
+/// `AccessController$1.doIntersectionPrivilege` and `.getProtectDomains`, were
+/// deleted outright on 2026-08-13 — JEP 486 removed the interface, the
+/// implementation class and the accessor, so the restore was correct at the time
+/// and the rows had nothing left to stand in front of. See cause (d) on
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`].)
+///
 /// What the census could not see, in three shapes:
 ///
 ///  * **A stand-in for a bytecode method is `method-nowhere` by construction.**
@@ -487,9 +558,38 @@ use cratonvm_types::compat::CompatibilityMode;
 ///    `bridge_shadows_bytecode` and the kind map — which must be re-frozen in
 ///    ONE commit from ONE Linux census. Do not re-freeze this constant "for"
 ///    the retirement before the retirement exists.
+///  * **(d) F33-1, 2026-08-13: net +2, both halves attributed.** Two changes in
+///    `native-builtins/src/shared_secrets_bridge.rs`, in opposite directions:
 ///
-/// Anything the run reports beyond (a) is a finding to attribute, not slack to
-/// absorb: 182 commits separate the freeze from HEAD.
+///    **+4.** The four `SharedSecrets` accessors whose owner is a
+///    `cratonvm/internal/ss/…$1` stand-in (`javaUtilJarAccess`,
+///    `getJavaNetUriAccess`, `getJavaNetHttpCookieAccess`,
+///    `getJavaIORandomAccessFileAccess`) move `Bridge` → `SyntheticStub` on
+///    `jdk/internal/access/SharedSecrets`, so `--jdk-only` refuses a factory
+///    whose owner it already dropped. Their `jdk/internal/misc/SharedSecrets`
+///    twins move by **zero** — that class is in `NO_IMAGE_JDK_RECEIVERS`, so
+///    `register()` was already re-tagging them. This is the (a) direction: a
+///    fake being *labelled*, not a fake being added.
+///
+///    **−2.** `register_java_security_access` is deleted, taking
+///    `java/security/AccessController$1.doIntersectionPrivilege` and
+///    `.getProtectDomains` out of the population. Those are two of the sixteen
+///    the 923 → 939 note above restored, so that paragraph's arithmetic is now
+///    fourteen; it is left as written because it is history, and rewriting a
+///    recount narrative to match a later tree is how a ratchet's provenance
+///    stops being checkable.
+///
+///    Derived, NOT measured — this lane may not run `cargo`. So **+2 is a
+///    prediction to check against the printed line, not a number to paste**, and
+///    it composes with the +6/+8 of (a) rather than replacing it. (The totals
+///    this paragraph originally named were computed against the pre-re-freeze
+///    constants and are superseded by the merge note at the bottom; the +2
+///    itself is unchanged, because it is a delta and not a total.)
+///    F33-1-a-factory-and-its-owner-must-share-one-kind-20260813.md
+///
+/// Anything the run reports beyond (a), (d) and the re-freeze below is a
+/// finding to attribute, not slack to absorb: 182 commits separate the freeze
+/// from HEAD.
 ///
 /// ## Re-frozen 2026-08-13: 1263 -> 1287, and 1253 -> 1277
 ///
@@ -519,12 +619,55 @@ use cratonvm_types::compat::CompatibilityMode;
 /// them `Bridge` would make them win over the real class and silently drop the
 /// synchronization. See
 /// `fixed-suite-bugs/netty/collection-view-carrier-residuals-FIXED-20260813.md`.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1287;
+///
+/// ## Merge 2026-08-16: the constants below are the re-freeze, and (d) is NOT in them
+///
+/// The `--jdk-only` branch and mainline reached this constant from two
+/// different trees and neither number is the merged tree's number:
+///
+///  * the re-freeze above (1263 → **1287**, 1253 → **1277**) was MEASURED, on a
+///    tree that did not yet contain (d)'s `shared_secrets_bridge.rs` change;
+///  * (d)'s **+2** was DERIVED, on a tree that did not yet contain the 24
+///    `SynchronizedCollection`/`SynchronizedSet` rows.
+///
+/// The two touch disjoint populations — `jdk/internal/access/SharedSecrets`
+/// factories and `java/security/AccessController$1` on one side, the
+/// `Collections$Synchronized*` wrappers on the other — so the merged census
+/// should be their SUM: no-management **1279**, management **1289**.
+///
+/// That sum is arithmetic, not a measurement, so it is deliberately NOT pasted.
+/// The constants stay at the two numbers that were actually measured. Read a
+/// first post-merge run this way: **exactly +2 over these constants is (d)
+/// landing and is the expected result — re-freeze to 1289 / 1279 and delete
+/// this section. Any other delta is a finding to attribute.**
+/// Re-frozen 1287 -> 1318 on 2026-08-19. See the module doc's
+/// "the count rose 31 and NOT ONE new fake was written": 30 of the 33 added
+/// rows are `Bridge` -> `SyntheticStub` re-labels of registrations that already
+/// existed, and every one of them is a documented improvement. MEASURED in this
+/// configuration (`--features management`), not derived from the other one —
+/// the arithmetic-instead-of-measurement trap is recorded immediately above.
+/// Re-frozen 1318 -> 1321 on 2026-08-19 (same day, second move). The three are
+/// `getTrustedAttributes`, `isInitializing` and `entryFor` on
+/// `cratonvm/internal/ss/JavaUtilJarAccess$1` — interface methods that were not
+/// registered AT ALL, so the carrier answered them with an `AbstractMethodError`.
+/// Registering them is case (b) in this gate's own failure message: the carrier
+/// is in `NO_IMAGE_JDK_RECEIVERS`, so every row on it is re-tagged
+/// `SyntheticStub` and dropped under `--jdk-only` whatever the body does. Three
+/// honest rows that strict mode drops beat three abstract methods that throw.
+/// MEASURED with `--features management`.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1321;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1277;
+/// Re-frozen 1277 -> 1308 on 2026-08-19, alongside
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] and for the same reason. Both were
+/// measured; the delta is +31 in each, which is itself the check that the 31
+/// are not in the ten `jmx::*` registrars that separate the two.
+/// Re-frozen 1308 -> 1311 on 2026-08-19 alongside
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`], same three rows, same reason. +3 in
+/// both configurations, both measured.
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1311;
 
 // Both constants are compiled in both configurations on purpose: a reader
 // re-freezing one can see the other, and neither can be edited by accident
@@ -736,6 +879,38 @@ fn census_covers_more_than_the_essentials_registrar() {
     );
 }
 
+/// LIST the synthetic stubs, one `class.method descriptor` per line.
+///
+/// The gate above reports a NUMBER, and a number cannot be paid back: the work
+/// it asks for is per-registration, so the first thing anyone who trips it
+/// needs is the set. Reconstructing that set from `git blame` is worse than it
+/// sounds — a line-ending normalisation commit re-blames whole files, and a
+/// registration can move between registrars without changing.
+///
+/// Run this at the last freeze commit and at `HEAD` and diff the two outputs;
+/// the difference IS the list to fix, exactly, with no attribution step.
+///
+/// ```text
+/// cargo test -p cratonvm-native-builtins --test stub_ratchet dump_synthetic_stubs -- --nocapture
+/// ```
+///
+/// Printing only — it asserts nothing the gate does not already assert, so it
+/// cannot fail independently and cannot go stale.
+#[test]
+fn dump_synthetic_stubs() {
+    let mut stubs: Vec<String> = census_rows()
+        .into_iter()
+        .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
+        .map(|(class, method, descriptor, _)| format!("{class}.{method}{descriptor}"))
+        .collect();
+    stubs.sort();
+    stubs.dedup();
+    println!("@@STUBS {} distinct in [{MEASURED_CONFIG}]", stubs.len());
+    for s in &stubs {
+        println!("@@STUB {s}");
+    }
+}
+
 /// THE GATE: the synthetic-stub count must not exceed the frozen baseline.
 ///
 /// A failure here means a change ADDED one or more synthetic stubs to the
@@ -760,13 +935,29 @@ fn synthetic_stub_count_does_not_regress() {
 
     assert!(
         synthetic <= BASELINE_SYNTHETIC_STUBS,
-        "STUB-RATCHET REGRESSION in the {MEASURED_CONFIG} configuration: {synthetic} \
+        "STUB-RATCHET in the {MEASURED_CONFIG} configuration: {synthetic} \
          SyntheticStub natives now registered, exceeding the frozen baseline of \
-         {BASELINE_SYNTHETIC_STUBS}. A change added a NEW synthetic stub. Make the new \
-         native a real Bridge/Intrinsic (correct behavior) instead of a fake — do NOT \
-         just raise the baseline. If the stub is genuinely, unavoidably needed, \
-         re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
-         {synthetic} + SLACK ({}) and explain why in the PR. See \
+         {BASELINE_SYNTHETIC_STUBS}.\n\
+         \n\
+         FIRST, find out WHICH rows, because this number cannot tell you why it \
+         moved. Run `dump_synthetic_stubs` here and at the commit that last set \
+         `{BASELINE_CONST}`, and diff the sorted `@@STUB` lines.\n\
+         \n\
+         Then read each added triple, because there are TWO causes and they want \
+         opposite responses:\n\
+         \n\
+         (a) a NEW fake was written — implement it as real bytecode, a Bridge or \
+         an Intrinsic. Do NOT just raise the baseline.\n\
+         \n\
+         (b) an EXISTING registration changed kind, `Bridge` -> `SyntheticStub`. \
+         That is a fake being labelled honestly so `--jdk-only` drops it and the \
+         JDK's own bytecode runs — the opposite of a regression, and it raises \
+         this count. Check `native-api/src/retired_shadow.rs` and the \
+         registration site's own comment before assuming (a). On 2026-08-19, 30 \
+         of 33 added rows were (b).\n\
+         \n\
+         Re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
+         {synthetic} + SLACK ({}) only with that account written down. See \
          stub-ratchet.md.",
         synthetic + SLACK,
     );
@@ -1190,5 +1381,142 @@ fn strict_mode_refuses_nothing() {
          Zero refusals is the real end state: it means the stubs were reclassified \
          or deleted at the source, not merely filtered out of the table on the way \
          in. See this test's doc comment for the three steps that must land first."
+    );
+}
+
+/// F24-1 found it, F33-1 fixed it (both 2026-08-13) — **no `SharedSecrets`
+/// factory may outlive the owner `--jdk-only` drops out from under it.**
+///
+/// `register_wp1_4_shared_secrets` sets one ambient kind, `Bridge`, for the
+/// whole registrar (`shared_secrets_bridge.rs`). `NativeMethodRegistry::register`
+/// then re-tags by RECEIVER CLASS, via
+/// `no_image_receiver::receiver_declared_by_no_supported_image` — and the
+/// receiver of a *factory* registration is `SharedSecrets`, not the object the
+/// factory hands out. Those two facts split one registrar down the middle:
+///
+///  * the factories go on `jdk/internal/access/SharedSecrets`, a real JDK class
+///    on no table, so they stayed `Bridge` and **survived `--jdk-only`**;
+///  * the four `cratonvm/internal/ss/…$1` owners are in
+///    `VM_MINTED_STAND_IN_RECEIVERS`, so every method on them is re-tagged
+///    `SyntheticStub` and **is dropped in `--jdk-only`**.
+///
+/// So strict mode kept four natives shadowing real JDK bytecode getters that
+/// handed back a carrier with no implementation on it — and silently, because
+/// `alloc_singleton`'s `Err` arm returns a `ClassId(0)` object rather than
+/// failing. `register_factories` now derives the factory's kind from the OWNER,
+/// so the two halves refuse or survive together.
+///
+/// # What this test pins, and why it is not the unit test
+///
+/// `factory_kind_follows_the_owner_it_hands_out` (in `shared_secrets_bridge.rs`)
+/// checks the same rule against a hand-built registry. This one checks it
+/// against the **boot registry in `CompatibilityMode::JdkOnly`** — the table an
+/// operator's `--jdk-only` run actually holds — so it also covers the ways a row
+/// can come back that a unit test cannot see: a second registrar re-registering
+/// the same triple under a `Bridge` scope (the shape
+/// `no_fake_survives_strict_mode_as_someone_elses_bridge` exists for), or a
+/// `set_compatibility_mode` ordering change. The rule is stated in two places on
+/// purpose, at two scopes; that is not duplication.
+///
+/// The premise is asserted rather than assumed, because this ratchet has had a
+/// scope hole twice: `register_wp1_4_shared_secrets` reaches
+/// [`register_boot_path`] only *transitively*, through
+/// `register_essential_natives_with_shims` (`native-builtins/src/lib.rs:10063`).
+/// A grep of the boot-path replay for `shared_secrets` finds nothing, so the day
+/// that indirection changes, every assertion below would pass on an empty set.
+///
+/// **What replaced what, and why the old shape had to go.** F24-1 froze the
+/// ORPHAN SET — the owners strict mode leaves with no registered method — at
+/// these four, so that growth reddened it and a fix reddened it too. That was
+/// right for a defect nobody could yet fix, and it is wrong now for a reason
+/// worth writing down: **the fix does not change the orphan set.** Refusing the
+/// four factories leaves those four owners exactly as method-less in strict mode
+/// as they were, so the old assertion stays GREEN across the repair and pins
+/// nothing about it. What actually changed is the PAIRING, so the pairing is
+/// what this asserts.
+#[test]
+fn no_shared_secrets_factory_outlives_the_owner_strict_mode_drops() {
+    use std::collections::BTreeSet;
+
+    let rows = strict_rows();
+    let live_classes: BTreeSet<&str> = rows.iter().map(|(c, _, _, _)| c.as_str()).collect();
+
+    assert!(
+        live_classes.contains("jdk/internal/access/SharedSecrets"),
+        "the SharedSecrets factories are not in this ratchet's scope any more, so \
+         this test — and the SyntheticStub count — just went blind to ~250 \
+         registrations. Re-check `register_essential_natives_with_shims`."
+    );
+
+    let owners: Vec<&'static str> =
+        cratonvm_native_builtins::shared_secrets_bridge::owner_classes().collect();
+    assert!(
+        !owners.is_empty(),
+        "owner_classes() is empty; the projection this test reads is gone"
+    );
+
+    // Which factory methods `--jdk-only` still serves, whatever their kind.
+    let live_factories: BTreeSet<&str> = rows
+        .iter()
+        .filter(|(c, _, _, _)| c.as_str() == "jdk/internal/access/SharedSecrets")
+        .map(|(_, m, _, _)| m.as_str())
+        .collect();
+
+    let mut mismatched: Vec<String> = Vec::new();
+    let mut refused_factories: Vec<&'static str> = Vec::new();
+    for (method, owner) in
+        cratonvm_native_builtins::shared_secrets_bridge::factory_methods_and_owners()
+    {
+        let factory_lives = live_factories.contains(method);
+        let owner_lives = live_classes.contains(owner);
+        if factory_lives != owner_lives {
+            mismatched.push(format!(
+                "SharedSecrets.{method}() {} but its owner `{owner}` {}",
+                if factory_lives {
+                    "SURVIVES"
+                } else {
+                    "is refused"
+                },
+                if owner_lives {
+                    "keeps its methods"
+                } else {
+                    "has every method dropped"
+                },
+            ));
+        }
+        if !factory_lives {
+            refused_factories.push(method);
+        }
+    }
+
+    assert!(
+        mismatched.is_empty(),
+        "{} SharedSecrets factory/owner pair(s) disagree about `--jdk-only`. A \
+         surviving factory over a dropped owner shadows the real JDK getter and \
+         returns a carrier with no methods — `alloc_singleton`'s `Err` arm makes \
+         that a WRONG-CLASS RECEIVER, not an error, so nothing reports it. A \
+         refused factory over a live owner removes a working bridge for nothing. \
+         Fix the kind derivation in `register_factories`; do not relax this. See \
+         docs/known-issues/jdk-only/F33-1-a-factory-and-its-owner-must-share-one-kind-20260813.md\n  {}",
+        mismatched.len(),
+        mismatched.join("\n  "),
+    );
+
+    refused_factories.sort_unstable();
+    assert_eq!(
+        refused_factories,
+        [
+            "getJavaIORandomAccessFileAccess",
+            "getJavaNetHttpCookieAccess",
+            "getJavaNetUriAccess",
+            "javaUtilJarAccess",
+        ],
+        "the set of SharedSecrets accessors `--jdk-only` refuses has changed. \
+         GROWTH means a new fabricated owner, or a real owner newly added to \
+         `NO_IMAGE_JDK_RECEIVERS`; the assertion above already forced its factory \
+         to follow, so this line is where you say you meant it. SHRINKAGE means a \
+         carrier was retargeted onto the JDK's own implementation class — a real \
+         fix — and this list shrinks with it. Note `javaUtilJarAccess` has no \
+         `get` prefix; that is the JDK's spelling (F24-1), not a typo."
     );
 }

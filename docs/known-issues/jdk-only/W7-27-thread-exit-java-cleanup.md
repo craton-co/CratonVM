@@ -35,6 +35,48 @@
 >   differently per mode. §9's "the VM's own dispatch … consults a side table, so
 >   it is unaffected" is true of the *dispatch* and false of the *getter*.
 
+> **RE-VERIFIED AGAINST THE TREE 2026-08-12 (later pass, A9 record triage).**
+> Read only — nothing was built or run in that pass. Two of this record's
+> claims have changed and one is now wrong as written. Every line number below
+> is against the **committed** tree at `768ac2de0`; a concurrent lane holds
+> uncommitted edits to `native-builtins/src/lang_system.rs`, but they are all
+> below line 3200 and do not move `native_thread_start0`.
+>
+> * **§13.6's patch IS APPLIED. The closing "What is not claimed" is stale.**
+>   It is at `native-builtins/src/lang_system.rs:1048-1058`, in
+>   `native_thread_start0`, immediately after the `let this = match args.first()`
+>   binding and before the `Round-7 CRIT fix #3` block — byte-for-byte the text
+>   §13.6 wrote, `has_real_jdk_thread_layout` / `thread_run_state` /
+>   `object_num_fields` + slot-2-`Long` arms and all. It landed in commit
+>   `0113f2daf` (2026-08-12), the same commit that carries this record. So §13 is
+>   **applied, still unbuilt and still unrun by this lane**, not "not applied".
+> * **The guard has a false-positive gate that §13.5 did not name, and it is a
+>   checked-in test.** `vm/tests/threadpoolexecutor_prestart_regression.rs`
+>   drives `cratonvm.ThreadPoolExecutorPrestartProbe` for 2000 prestarted
+>   workers and fails if any fresh worker is refused — the Tomcat endpoint
+>   prestart shape §13.5 reasoned about from `javap`, asserted rather than
+>   argued. That is the instrument that goes red if the registry ever
+>   misresolves a fresh mirror.
+> * **The vector now asserts the live half too.** `RJdkExecutors`'s
+>   `threadExitCleanup()` carries §13.1's three rows: the terminated restart
+>   throws (`:427`), `ran` is unchanged after the refusal (`:442`), and
+>   `start()` on a still-RUNNING thread throws (`:463`/`:468`).
+> * **§10C is still the live item and is still unapplied.**
+>   `run_thread_exit_shared` is still `fn` with no `pub`
+>   (`vm/src/vm/vm_exec.rs:4998`) and still has exactly two call sites — `:4630`
+>   and **`:13356`** (§10C's `:13234` has moved). `vm-cli/src/main.rs` contains
+>   no call to it; `begin_main_thread_blocking_region` is at
+>   `vm-cli/src/main.rs:4576`, so §10C's insertion window is still open and its
+>   patch still applies as written.
+> * **§10B is still deliberately not applied** — `CRATONVM_THREAD_EXIT` appears
+>   nowhere in the tree outside this record. **§10A stays applied**
+>   (`types/src/flag_groups.rs:1217`, `types/tests/flag-surface.txt:741`), and
+>   `VM_REMOVES_THREADS_FROM_CONTAINERS` is still `true`
+>   (`native-builtins/src/shared_secrets_bridge.rs:765`), so §8's A/B is still
+>   the run that has not happened.
+> * **§12.2's residual is still live, and its proposed cheap fix is overstated
+>   — see the correction appended to §12.2.**
+
 **Status: landed in `vm/src/vm/vm_exec.rs`, unconditional, in every mode.**
 This is the second half of the pair whose first half —
 `jla_start_in_container`'s container registration in
@@ -672,6 +714,31 @@ strictly safer alternative is to clear the table on a clean death too — one
 `vm/src/vm/vm_exec.rs` — which converges both modes with no priority inversion,
 but that is a third file again.
 
+### 12.3 Correction 2026-08-12 (later pass): "converges both modes" is too strong
+
+Re-read of `native-builtins/src/uncaught_handlers.rs` against today's tree. The
+residual reproduces exactly — `clear_handler` is **private** and has one caller,
+the null-setter arm at `:240`; `take_uncaught_handler` has one caller in the
+whole tree, `vm/src/vm/vm_exec.rs:4804`, inside
+`dispatch_uncaught_exception_shared`, i.e. the abnormal path only. So a clean
+death leaves the entry, and the getter's short-circuit is
+`get_uncaught_handler(...).or_else(|| real_thread_handler(...))` — side table
+first, exactly as §12.2 says.
+
+But §12.2's "cheaper and strictly safer alternative … converges both modes"
+overstates what clearing the table buys. The registered
+`getUncaughtExceptionHandler` native has **no `ThreadGroup` fallback at all**:
+after the side table and the real field it tries `default_uncaught_handler` then
+`real_default_handler` and otherwise answers `null`. HotSpot answers
+`uncaughtExceptionHandler != null ? it : group`. So clearing the table converges
+the *stale-versus-nulled* disagreement — which is the whole of this record's
+residual — and leaves a **second, pre-existing** divergence untouched: in
+`Compatible`/`--real-jdk` a thread with no per-instance handler answers `null`
+where HotSpot answers its `ThreadGroup`, terminated or not. That one is not this
+record's, it is not created by clearing the table, and it should not be smuggled
+into the same edit. The comment on the fix should say so, so the next reader does
+not measure the group case and conclude the clear did not work.
+
 ## 13. Filed 2026-08-12: the vector's restart assertion FAILED, and the state it must read is not the one `Thread.start()` reads
 
 §12.1's vector ended with a fourth assertion — *"restarting a terminated thread
@@ -866,8 +933,14 @@ The same applies to §13, with one difference in its favour: §13.1's two-VM
 divergence, §13.2's `threadStatus` time series and §13.5's 0/2400 misresolution
 count are measurements of the **frozen wave binary**, so the defect and the
 inertness of `holder.threadStatus` are facts, not hypotheses. §13.6's patch is
-**not applied and not compiled** — it is written against read signatures, and
-the `--synthetic-jdk` arm of §13.4 could not be exercised at all because the
-frozen binary is built without that feature. `RJdkExecutors.threadExitCleanup()`
-gained four checks for this (69 on HotSpot, was 65); with the patch unapplied,
-CratonVM still stops at the same first one.
+**SUPERSEDED 2026-08-12 (later pass): APPLIED verbatim at
+`native-builtins/src/lang_system.rs:1048-1058` in commit `0113f2daf`, though
+still not compiled or run by any lane that touched this record. The rest of this
+paragraph is the original argument, kept for its shape.** It was written against
+read signatures, and the `--synthetic-jdk` arm of §13.4 could not be exercised at
+all because the frozen binary is built without that feature.
+`RJdkExecutors.threadExitCleanup()` gained four checks for this (69 on HotSpot,
+was 65); the transcript quoted in §13 predates the patch, so "CratonVM still
+stops at the same first one" describes the pre-patch binary and says nothing
+about today's source. Re-running that vector is the cheapest thing the next lane
+can do with this record.

@@ -281,6 +281,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "bd-debug", on_key: Some("CRATONVM_BD_DEBUG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "blocked-access", on_key: Some("CRATONVM_DBG_BLOCKED_ACCESS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "blockgc", on_key: Some("CRATONVM_DBG_BLOCKGC"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "root-remap-audit", on_key: Some("CRATONVM_DBG_ROOT_REMAP_AUDIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "bufunder", on_key: Some("CRATONVM_DBG_BUFUNDER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "bug03", on_key: Some("CRATONVM_DBG_BUG03"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "bytecode-dump", on_key: Some("CRATONVM_DBG_BYTECODE_DUMP"), off_key: None, off_word: None },
@@ -289,10 +290,18 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "capval", on_key: Some("CRATONVM_DBG_CAPVAL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "catalina", on_key: Some("CRATONVM_DBG_CATALINA"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cause", on_key: Some("CRATONVM_DBG_CAUSE"), off_key: None, off_word: None },
+    // The native-invocation census. Already read through `flags::runtime_var_os`
+    // in `vm_exec.rs`; it was simply never declared, so `CRATONVM_DBG=census-    // exact-invocations` could not reach it.
+    E { group: Group::DBG, token: "census-exact-invocations", on_key: Some("CRATONVM_CENSUS_EXACT_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce", on_key: Some("CRATONVM_DBG_CCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce-bt", on_key: Some("CRATONVM_DBG_CCE_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccecache", on_key: Some("CRATONVM_DBG_CCECACHE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccsprobe", on_key: Some("CRATONVM_DBG_CCSPROBE"), off_key: None, off_word: None },
+    // The per-occurrence, backtrace-carrying arm of the descriptor-coercion
+    // guard. The `gc::guard` WARN text tells operators to set this by name, so
+    // an undeclared spelling of it was a live diagnostic that the grouped form
+    // could not reach.
+    E { group: Group::DBG, token: "coercion", on_key: Some("CRATONVM_DBG_COERCION"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cellcorrupt", on_key: Some("CRATONVM_DBG_CELLCORRUPT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "charset", on_key: Some("CRATONVM_DBG_CHARSET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "class-resource", on_key: Some("CRATONVM_DBG_CLASS_RESOURCE"), off_key: None, off_word: None },
@@ -375,6 +384,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gdm-prof", on_key: Some("CRATONVM_DBG_GDM_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-zero", on_key: Some("CRATONVM_G1_DBG_ZERO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1diag", on_key: Some("CRATONVM_DBG_G1DIAG"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "g1accessor", on_key: Some("CRATONVM_DBG_G1ACCESSOR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-array-guard-bt", on_key: Some("CRATONVM_GC_ARRAY_GUARD_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-fallback-reasons", on_key: Some("CRATONVM_DBG_GC_FALLBACK_REASONS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-overhead", on_key: Some("CRATONVM_DBG_GC_OVERHEAD"), off_key: None, off_word: None },
@@ -385,6 +395,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gcpause", on_key: Some("CRATONVM_DBG_GCPAUSE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcphase", on_key: Some("CRATONVM_DBG_GCPHASE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcwrite", on_key: Some("CRATONVM_DBG_GCWRITE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "getfield-receivers", on_key: Some("CRATONVM_DBG_GETFIELD_RECEIVERS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "getresources", on_key: Some("CRATONVM_DBG_GETRESOURCES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "getstatic-prof", on_key: Some("CRATONVM_DBG_GETSTATIC_PROF"), off_key: None, off_word: None },
     // Per-snapshot trace of the typed operand stack (x64::stack_kinds): what
@@ -436,6 +447,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "irslot", on_key: Some("CRATONVM_DBG_IRSLOT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "isinstance", on_key: Some("CRATONVM_DBG_ISINSTANCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jar", on_key: Some("CRATONVM_DBG_JAR"), off_key: None, off_word: None },
+    // Scalar, not a boolean: `=<n>` raises the `--jdk-only` shadow-observation
+    // sink above its 256-row default so an APPLICATION census is complete
+    // rather than truncated. Diagnostic only — it changes nothing a program can
+    // observe. Declared rather than read through bare `getenv` so it comes from
+    // the latched snapshot like every other knob; see the doc on
+    // `vm::jdk_only_native_shadow_cap`.
+    E { group: Group::DBG, token: "native-shadow-sink-cap", on_key: Some("CRATONVM_NATIVE_SHADOW_SINK_CAP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jetty", on_key: Some("CRATONVM_DBG_JETTY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jetty2", on_key: Some("CRATONVM_DBG_JETTY2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-alloc", on_key: Some("CRATONVM_DBG_JIT_ALLOC"), off_key: None, off_word: None },
@@ -446,10 +464,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-disasm", on_key: Some("CRATONVM_DBG_JIT_DISASM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-dispatch", on_key: Some("CRATONVM_DBG_JIT_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-entry", on_key: Some("CRATONVM_DBG_JIT_ENTRY"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-borrow-sites", on_key: Some("CRATONVM_DBG_JIT_BORROW_SITES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-gen", on_key: Some("CRATONVM_DBG_JIT_GEN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-ldc", on_key: Some("CRATONVM_DBG_JIT_LDC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loop-work", on_key: Some("CRATONVM_DBG_LOOP_WORK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-site", on_key: Some("CRATONVM_DBG_FIELD_SITE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "g1-live-memo", on_key: Some("CRATONVM_DBG_G1_LIVE_MEMO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-method-stats", on_key: Some("CRATONVM_DBG_JIT_METHOD_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-scan-prof", on_key: Some("CRATONVM_DBG_JIT_SCAN_PROF"), off_key: None, off_word: None },
@@ -470,6 +490,7 @@ pub const INVENTORY: &[E] = &[
     // Per-phase timing for `try_lambda_dispatch` (lookup / prep / target /
     // other), printed every 200k dispatches. Arms the timers; an unarmed run
     // pays one relaxed load per dispatch. See `runtime::interpreter::lambda::lambda_prof`.
+    E { group: Group::DBG, token: "lambda-jit", on_key: Some("CRATONVM_DBG_LAMBDA_JIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lambda-prof", on_key: Some("CRATONVM_DBG_LAMBDA_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "layout", on_key: Some("CRATONVM_DBG_LAYOUT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ldc-classref-trace", on_key: Some("CRATONVM_LDC_CLASSREF_TRACE"), off_key: None, off_word: None },
@@ -507,6 +528,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "root-source", on_key: Some("CRATONVM_DBG_ROOT_SOURCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zgc-verify-slide", on_key: Some("CRATONVM_DBG_ZGC_VERIFY_SLIDE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zgc-corpse", on_key: Some("CRATONVM_DBG_ZGC_CORPSE"), off_key: None, off_word: None },
+    // Declared 2026-08-17: both were read by `runtime_var_os` and named nowhere,
+    // so `CRATONVM_DBG=mapgen` could not reach them and a test could not arrange
+    // one with `flags::with_thread_overrides` -- and while the guard was red it
+    // could not catch the NEXT undeclared flag, which is what it is for.
+    // `mapgen` reports a safepoint waiter that resumed on a pointer map from a
+    // different pause generation than the one it arrived for; `vacated-frames`
+    // arms the vacated-address ledger that catches a frame slot still holding an
+    // address the collector moved away from.
+    E { group: Group::DBG, token: "mapgen", on_key: Some("CRATONVM_DBG_MAPGEN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "vacated-frames", on_key: Some("CRATONVM_DBG_VACATED_FRAMES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "atomic-intrinsic", on_key: Some("CRATONVM_DBG_ATOMIC_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "define-filter", on_key: Some("CRATONVM_DBG_DEFINE_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "define-stack-filter", on_key: Some("CRATONVM_DBG_DEFINE_STACK_FILTER"), off_key: None, off_word: None },
@@ -551,6 +582,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "npe-invoke", on_key: Some("CRATONVM_DBG_NPE_INVOKE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-none", on_key: Some("CRATONVM_DBG_NPE_NONE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-match", on_key: Some("CRATONVM_DBG_NPE_MATCH"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "a5-engagement", on_key: Some("CRATONVM_DBG_A5_ENGAGEMENT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "unreg-memo-audit", on_key: Some("CRATONVM_DBG_UNREG_MEMO_AUDIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "redefine-dump", on_key: Some("CRATONVM_DBG_REDEFINE_DUMP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-stack", on_key: Some("CRATONVM_DBG_NPE_STACK"), off_key: None, off_word: None },
@@ -585,9 +617,11 @@ pub const INVENTORY: &[E] = &[
     // JDK. Set `CRATONVM_DBG_OSR_FRAME_TRACE=<substring>` directly. Declared
     // here anyway, because an undeclared name is served from live `getenv`
     // rather than the latched snapshot and is invisible to the override hook.
+    E { group: Group::DBG, token: "osr-bind", on_key: Some("CRATONVM_DBG_OSR_BIND"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-frame-trace", on_key: Some("CRATONVM_DBG_OSR_FRAME_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-seed-collision", on_key: Some("CRATONVM_DBG_OSR_SEED_COLLISION"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "osr-slots", on_key: Some("CRATONVM_DBG_OSR_SLOTS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-bt", on_key: Some("CRATONVM_DBG_OVERLAY_BT"), off_key: None, off_word: None },
@@ -628,6 +662,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "raf-getfd", on_key: Some("CRATONVM_DBG_RAF_GETFD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "raf-init", on_key: Some("CRATONVM_DBG_RAF_INIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "rbc6", on_key: Some("CRATONVM_DBG_RBC6"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "rbc6-emit", on_key: Some("CRATONVM_DBG_RBC6_EMIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "re5", on_key: Some("CRATONVM_DBG_RE5"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "refersto", on_key: Some("CRATONVM_DBG_REFERSTO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "reflection-factory", on_key: Some("CRATONVM_DBG_REFLECTION_FACTORY"), off_key: None, off_word: None },
@@ -793,12 +828,16 @@ pub const INVENTORY: &[E] = &[
     // wants IR codegen for a sieve-shaped method gets it (this term sits
     // AFTER `CRATONVM_JIT_FORCE_C2` in the admission chain).
     E { group: Group::JIT, token: "c1-vector-veto", on_key: Some("CRATONVM_JIT_C1_VECTOR_VETO"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "census-direct-helpers", on_key: Some("CRATONVM_JIT_CENSUS_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "cached-entry-owner-reuse", on_key: Some("CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "c2-first-call", on_key: Some("CRATONVM_JIT_C2_FIRST_CALL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "c2-supersede", on_key: Some("CRATONVM_C2_SUPERSEDE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "callee-oop-flush", on_key: None, off_key: Some("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH"), off_word: None },
     E { group: Group::JIT, token: "code-cache-max-mb", on_key: Some("CRATONVM_JIT_CODE_CACHE_MAX_MB"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "conservative-locals", on_key: None, off_key: Some("CRATONVM_NO_CONSERVATIVE_LOCALS"), off_word: None },
     E { group: Group::JIT, token: "ctor-direct-call", on_key: None, off_key: Some("CRATONVM_NO_CTOR_DIRECT_CALL"), off_word: None },
+    E { group: Group::JIT, token: "osr-ctor-bind", on_key: None, off_key: Some("CRATONVM_NO_OSR_CTOR_BIND"), off_word: None },
+    E { group: Group::JIT, token: "real-new-site-flags", on_key: Some("CRATONVM_JIT_REAL_NEW_SITE_FLAGS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "deny", on_key: Some("CRATONVM_JIT_DENY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "deopt-real", on_key: Some("CRATONVM_DEOPT_REAL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "direct-callee-calls", on_key: Some("CRATONVM_JIT_DIRECT_CALLEE_CALLS"), off_key: None, off_word: None },
@@ -807,8 +846,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "string-intrinsic-pin", on_key: None, off_key: Some("CRATONVM_JIT_NO_STRING_INTRINSIC_PIN"), off_word: None },
     E { group: Group::JIT, token: "dup-x1", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP_X1"), off_word: None },
     E { group: Group::JIT, token: "dup-x2", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP_X2"), off_word: None },
+    E { group: Group::JIT, token: "dup2-x2", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUP2_X2"), off_word: None },
+    E { group: Group::JIT, token: "trusted-oop-getfield", on_key: None, off_key: Some("CRATONVM_JIT_NO_TRUSTED_OOP_GETFIELD"), off_word: None },
     E { group: Group::JIT, token: "dupx", on_key: None, off_key: Some("CRATONVM_JIT_NO_DUPX"), off_word: None },
     E { group: Group::JIT, token: "dupx-eager-canon", on_key: Some("CRATONVM_JIT_DUPX_EAGER_CANON"), off_key: None, off_word: None },
+    // Transitive eager callee compilation, so a body compiled bottom-up binds its
+    // statically bound call sites to raw CALLs instead of the generic dispatch
+    // helper. Default ON; `CRATONVM_JIT='-eager-callee-chain'` restores the
+    // one-level behaviour, which is the A/B control for the ~6.5x measured on a
+    // call-dense loop. Correct either way — the fallback is the checked helper.
+    E { group: Group::JIT, token: "eager-callee-chain", on_key: Some("CRATONVM_JIT_EAGER_CALLEE_CHAIN"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "enable-callee-saved-gpr-locals", on_key: Some("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "enable-inline-new", on_key: Some("CRATONVM_JIT_ENABLE_INLINE_NEW"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "exc-table-c2", on_key: None, off_key: Some("CRATONVM_JIT_NO_EXC_TABLE_C2"), off_word: None },
@@ -850,6 +897,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-call", on_key: Some("CRATONVM_JIT_IR_CALL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-call-special", on_key: Some("CRATONVM_JIT_IR_CALL_SPECIAL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-call-virtual", on_key: Some("CRATONVM_JIT_IR_CALL_VIRTUAL"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "ir-over-intrinsic", on_key: Some("CRATONVM_JIT_IR_OVER_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-deopt-resume", on_key: Some("CRATONVM_IR_DEOPT_RESUME"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-direct-call", on_key: Some("CRATONVM_JIT_IR_DIRECT_CALL"), off_key: None, off_word: None },
     // A/B opt-out: `-ir-buffer-estimate` restores the legacy code-buffer sizing
@@ -883,11 +931,18 @@ pub const INVENTORY: &[E] = &[
     // and only falls through to a live `getenv` for an undeclared one — so
     // this row is the whole fix.
     E { group: Group::JIT, token: "precise-getstatic-checkcast", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST"), off_word: None },
+    E { group: Group::JIT, token: "precise-alloc-athrow", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW"), off_word: None },
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
     E { group: Group::JIT, token: "ir-reloc-emit", on_key: Some("CRATONVM_JIT_IR_RELOC_EMIT"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "ir-selfrec-direct", on_key: Some("CRATONVM_JIT_IR_SELFREC_DIRECT"), off_key: None, off_word: None },
+    // Default-ON: `conservative_roots::nested_trace_frames_enabled` treats the
+    // key's PRESENCE as "restore the one-frame-per-chain-entry answer".
+    E { group: Group::JIT, token: "nested-trace-frames", on_key: None, off_key: Some("CRATONVM_JIT_NO_NESTED_TRACE_FRAMES"), off_word: None },
+    // Default-ON: `stackwalker::osr_frame_dedupe_enabled` treats the key's
+    // PRESENCE as "report the OSR continuation twice again".
+    E { group: Group::JIT, token: "osr-frame-dedupe", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_FRAME_DEDUPE"), off_word: None },
     // Default-ON, `"0"` turns it off — same polarity as `ir-reloc-emit`, and
     // the row must spell it that way round. The consumer refuses to install a
     // compilation stamped older than the last cache flush; setting this to `0`
@@ -911,10 +966,20 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "metrics", on_key: Some("CRATONVM_JIT_METRICS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "metrics-out", on_key: Some("CRATONVM_JIT_METRICS_OUT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "metrics-ring", on_key: Some("CRATONVM_JIT_METRICS_RING"), off_key: None, off_word: None },
-    // The two virtual-MIC levers in `vm::jit::helpers`. `mic-exc-table-publish`
-    // is default-OFF (an expired ban the next person may lift on evidence);
-    // `mic-rust-entry-cache` is default-ON with only an opt-out spelling.
-    E { group: Group::JIT, token: "mic-exc-table-publish", on_key: Some("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH"), off_key: None, off_word: None },
+    // The two virtual-MIC levers in `vm::jit::helpers`. Both are default-ON.
+    // `mic-exc-table-publish` was default-OFF until 2026-08-17: the ban's stated
+    // reason had already expired (`emit_inline_callee_deopt_check` closed the
+    // hole), and lifting it is 8.7x on the exception-table rung of
+    // `probes/NativeFunnelFloorProbe.java` with the control rung unmoved. It is
+    // INTERLOCKED with `sp-ic-deopt-check`: publishing is refused outright when
+    // that check is not being emitted, so `=0` on either one is safe.
+    E { group: Group::JIT, token: "mic-exc-table-publish", on_key: Some("CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH"), off_key: None, off_word: Some("0") },
+    // The statically-bound door's sibling of `mic-exc-table-publish`: may a
+    // baked direct CALL target a callee that declares its own exception table?
+    // Default-OFF pending its own measurement (16 refused binds on netty's
+    // BigEndianHeapByteBufTest against 736 for the native shadow), and
+    // interlocked with `sp-ic-deopt-check` the same way.
+    E { group: Group::JIT, token: "direct-exc-table-publish", on_key: Some("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by
@@ -930,11 +995,29 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "never-free-code", on_key: Some("CRATONVM_JIT_NEVER_FREE_CODE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "old-sweep-jit", on_key: Some("CRATONVM_OLD_SWEEP_JIT"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "osr", on_key: Some("CRATONVM_JIT_OSR"), off_key: None, off_word: None },
+    // Default-ON (RBC.6 lift): `env_cache::osr_athrow_allowed` answers `true`
+    // for `Err(_)` and reads `0`/`false` as the kill switch.
+    E { group: Group::JIT, token: "osr-athrow", on_key: Some("CRATONVM_JIT_OSR_ATHROW"), off_key: None, off_word: Some("0") },
     // Default-ON: `jit::osr_dead_local_entry_allowed` answers `true` for
     // `Err(_)` and reads `0`/`off`/`false`/`no` as the kill switch.
     E { group: Group::JIT, token: "osr-dead-locals", on_key: Some("CRATONVM_JIT_OSR_DEAD_LOCALS"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-19. An OPT-OUT: publishing a per-bci-`Ambiguous` local
+    // as `Undefined` rather than `Unsupported` is the default, and this key
+    // restores the re-run encoding. See
+    // `jit/src/x64/deopt_stubs.rs::osr_ambiguous_dead_enabled`.
+    E { group: Group::JIT, token: "osr-ambiguous-dead", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD"), off_word: None },
+    // Declared 2026-08-19 beside `osr-ambiguous-dead`. Also an OPT-OUT: a
+    // per-bci-`Ref` local at a bci where the oop mask has no opinion is
+    // published as a reference by default. See
+    // `jit/src/x64/deopt_stubs.rs::osr_refined_ref_enabled`.
+    E { group: Group::JIT, token: "osr-refined-ref", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_REFINED_REF"), off_word: None },
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-call-dispatch", on_key: Some("CRATONVM_JIT_INLINE_CALL_DISPATCH"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "inline-splice-devirt", on_key: Some("CRATONVM_JIT_INLINE_SPLICE_DEVIRT"), off_key: None, off_word: None },
     // Default-**OFF**, unlike their neighbour `osr-dead-locals` four rows up —
     // the contrast is the reason these two carry a comment at all.
     // `jit::osr_always_seed_frame_slot` and `jit::osr_single_pc_entry_only`
@@ -994,7 +1077,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "scan-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_SCAN_CACHE"), off_word: None },
     E { group: Group::JIT, token: "self-cache-inherit", on_key: None, off_key: Some("CRATONVM_JIT_NO_SELF_CACHE_INHERIT"), off_word: None },
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
-    E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None },
+    E { group: Group::DBG, token: "invoke-phases", on_key: Some("CRATONVM_DBG_INVOKE_PHASES"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "param-tag-scan", on_key: None, off_key: Some("CRATONVM_JIT_NO_PARAM_TAG_SCAN"), off_word: None },
+    E { group: Group::JIT, token: "ldc-const-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_LDC_CONST_CACHE"), off_word: None },
+    E { group: Group::JIT, token: "new-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_SITE_CACHE"), off_word: None },
     E { group: Group::JIT, token: "site-cache", on_key: Some("CRATONVM_JIT_SITE_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unreg-memo-hiwater", on_key: Some("CRATONVM_JIT_UNREG_MEMO_HIWATER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "field-site-cache-loader", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE_LOADER"), off_key: None, off_word: None },
@@ -1064,6 +1152,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "verify-memory-chain", on_key: Some("CRATONVM_JIT_VERIFY_MEMORY_CHAIN"), off_key: None, off_word: None },
     // Compatibility alias: `check_schedule` was split into the memory-chain and
     // arena-order lanes, and this token still seeds both when neither is set.
+    E { group: Group::JIT, token: "lambda-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_ADAPTER"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "lambda-capture-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "lambda-site", on_key: Some("CRATONVM_JIT_LAMBDA_SITE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "lambda-tierup", on_key: Some("CRATONVM_JIT_LAMBDA_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-schedule", on_key: Some("CRATONVM_JIT_VERIFY_SCHEDULE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-types", on_key: Some("CRATONVM_JIT_VERIFY_TYPES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "virtual-tierup", on_key: Some("CRATONVM_JIT_VIRTUAL_TIERUP"), off_key: None, off_word: None },
@@ -1075,6 +1167,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "xt-peer-deadline-ms", on_key: Some("CRATONVM_XT_PEER_DEADLINE_MS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-peer-total-ms", on_key: Some("CRATONVM_XT_PEER_TOTAL_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
+    // NOTE: `CRATONVM_DBG_MAPGEN` and `CRATONVM_DBG_VACATED_FRAMES` are declared
+    // in the DBG group, which is where their names say they belong and which is
+    // the spelling `the_20260817_gc_diagnostics_expand_from_their_group_spelling`
+    // asserts. They were declared here as well on 2026-08-17, which made
+    // `every_legacy_key_is_claimed_once` red: two tokens claiming one variable
+    // leaves its canonical spelling ambiguous, which is the whole point of that
+    // invariant. Nothing referenced the `CRATONVM_GC=dbg-*` spellings.
     E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "pack-fields-by-width", on_key: Some("CRATONVM_PACK_FIELDS_BY_WIDTH"), off_key: None, off_word: None },
@@ -1094,8 +1193,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "exact-refproc-survival", on_key: None, off_key: Some("CRATONVM_NO_EXACT_REFPROC_SURVIVAL"), off_word: None },
     E { group: Group::GC, token: "g1-coverage-pin", on_key: Some("CRATONVM_G1_COVERAGE_PIN"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-evac-retry", on_key: None, off_key: Some("CRATONVM_G1_NO_EVAC_RETRY"), off_word: None },
+    E { group: Group::GC, token: "g1-live-region-memo", on_key: None, off_key: Some("CRATONVM_G1_NO_LIVE_REGION_MEMO"), off_word: None },
     E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "g1-eager-humongous", on_key: Some("CRATONVM_G1_EAGER_HUMONGOUS"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "g1-young-pause-target", on_key: Some("CRATONVM_G1_YOUNG_PAUSE_TARGET"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-scrub-free", on_key: Some("CRATONVM_G1_SCRUB_FREE"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-narrow-fixup", on_key: Some("CRATONVM_G1_NARROW_FIXUP"), off_key: None, off_word: Some("0") },
+    E { group: Group::DBG, token: "g1-dbg-rset", on_key: Some("CRATONVM_G1_DBG_RSET"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-workers", on_key: Some("CRATONVM_G1_WORKERS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-rset-source-cap", on_key: Some("CRATONVM_G1_RSET_SOURCE_CAP"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-verify-budget", on_key: Some("CRATONVM_G1_VERIFY_BUDGET"), off_key: None, off_word: None },
@@ -1160,6 +1264,40 @@ pub const INVENTORY: &[E] = &[
     // serial; `relocate` reads 0/off/false/no as off.
     E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-19 with the ZGC read-bounds publish. An OPT-OUT, not an
+    // opt-in: ZGC publishing its arena envelope into `JIT_READ_BOUNDS` is the
+    // default, and this key is the kill switch that restores helper-only
+    // reference reads. See `gc/src/zgc.rs::zgc_jit_read_bounds_enabled`.
+    E { group: Group::GC, token: "zgc-jit-read-bounds", on_key: None, off_key: Some("CRATONVM_ZGC_NO_JIT_READ_BOUNDS"), off_word: None },
+    // Declared 2026-08-16 with genuine concurrent marking. `conc-start` is the
+    // percentage of the collection threshold at which a CONCURRENT mark cycle
+    // opens, and its parser reads `0` as "never". It is DEFAULT-OFF (the
+    // default IS 0), so unlike the four rows below it the `off_word` is not
+    // load-bearing -- it is here because the token would otherwise have no way
+    // to be spelled negatively at all, and `CRATONVM_GC=-zgc-conc-start`
+    // should stay meaningful if the default ever flips. `conc-workers` is a
+    // count with no meaningful off state: a concurrent cycle with zero workers
+    // would open and never trace, so `0` is clamped up to 1 and the token
+    // carries no `off_word`.
+    E { group: Group::GC, token: "zgc-conc-start", on_key: Some("CRATONVM_ZGC_CONC_START"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-conc-workers", on_key: Some("CRATONVM_ZGC_CONC_WORKERS"), off_key: None, off_word: None },
+    // Phase G. `zgc-generational` is a boolean with a real `off` word; the other
+    // two are numeric tunables with no negative spelling, like `zgc-parmark`.
+    E { group: Group::GC, token: "zgc-generational", on_key: Some("CRATONVM_ZGC_GENERATIONAL"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-gen-promotion-age", on_key: Some("CRATONVM_ZGC_GEN_PROMOTION_AGE"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "zgc-gen-minors-per-major", on_key: Some("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0") },
+    // G2e/G2f (2026-08-17, widened to every cycle 2026-08-18). Default-ON kill
+    // switches over the sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
+    // `0` restores the previous behaviour byte for byte, so the A/B is a re-run
+    // and not a rebuild.
+    E { group: Group::GC, token: "zgc-sweep-header-zero", on_key: Some("CRATONVM_ZGC_SWEEP_HEADER_ZERO"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-sweep-dead-runs", on_key: Some("CRATONVM_ZGC_SWEEP_DEAD_RUNS"), off_key: None, off_word: Some("0") },
+    // C5 (2026-08-18). Hand the mark coordinator the heap's own `Arc` instead of
+    // a forwarding wrapper -- one fewer indirect call per marked object on the
+    // parallel path. Default-on and `0` restores the wrapper, so the A/B is one
+    // binary; the whole path is already opt-in behind `zgc-parmark`.
+    E { group: Group::GC, token: "zgc-mark-ctx-direct", on_key: Some("CRATONVM_ZGC_MARK_CTX_DIRECT"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
@@ -1279,6 +1417,10 @@ pub const INVENTORY: &[E] = &[
     // Tri-state, like `jit/verify-ir`: unset follows the build profile (armed
     // under `debug_assertions`), any other value arms it, and `0`/`false`/`off`
     // stands it down even in a debug build.
+    // The bound on joining shutdown hooks. Carries a value in milliseconds;
+    // `=0` selects HotSpot's unbounded wait rather than disabling the knob,
+    // which is why there is no `off_word`.
+    E { group: Group::THREADS, token: "shutdown-hook-timeout-ms", on_key: Some("CRATONVM_SHUTDOWN_HOOK_TIMEOUT_MS"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "stress-thread-states", on_key: Some("CRATONVM_STRESS_THREAD_STATES"), off_key: None, off_word: Some("0") },
     // `types::striped_counter` — per-thread stripes instead of one shared
     // counter, the sibling A/B of `jit/activation-global-mutex`. THREADS rather
@@ -1319,6 +1461,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::SECURITY, token: "reflect-export-gate", on_key: None, off_key: Some("CRATONVM_REFLECT_NO_EXPORT_GATE"), off_word: None },
     E { group: Group::SECURITY, token: "require-policy", on_key: Some("CRATONVM_REQUIRE_POLICY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "trust-pem", on_key: Some("CRATONVM_TRUST_PEM"), off_key: None, off_word: None },
+    // Default-ON kill switch for the raw-OpenSSL client connector on the
+    // default `SSLSocket` path (Unix only — `openssl` is a Unix-scoped
+    // dependency). `0` reverts that path to `native_tls::TlsConnector`, which
+    // captures ONLY the peer's leaf certificate and cannot set the
+    // certificate security level. SECURITY rather than IO: what the switch
+    // selects is which verifier sees which chain, and at what strength floor.
+    E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },
@@ -1886,6 +2035,42 @@ mod tests {
             on.overrides().count(),
             1,
             "the ON form clears the opt-out key and touches nothing else",
+        );
+    }
+
+    /// Same for the two GC diagnostics declared on 2026-08-17.
+    ///
+    /// `CRATONVM_DBG_MAPGEN` (`vm/src/threading/gc_barrier.rs`) and
+    /// `CRATONVM_DBG_VACATED_FRAMES` (`gc/src/gc_quiescence.rs`) shipped as
+    /// `runtime_var_os` reads with no row, so each was served by a live
+    /// `getenv`. Both are plain opt-in diagnostics, so the assertion is just
+    /// that the grouped spelling reaches the legacy key — which is the fact a
+    /// consumer depends on and the row's existence alone does not establish.
+    ///
+    /// The wider cost of leaving them undeclared was not the two flags: while
+    /// `flag_declaration_guard` was red it could not catch the NEXT one.
+    #[test]
+    fn the_20260817_gc_diagnostics_expand_from_their_group_spelling() {
+        let c = case(&[("CRATONVM_DBG", "mapgen")]);
+        assert_eq!(
+            c.resolve().get("CRATONVM_DBG_MAPGEN"),
+            Some(OsString::from("1")),
+        );
+
+        let c = case(&[("CRATONVM_DBG", "vacated-frames")]);
+        assert_eq!(
+            c.resolve().get("CRATONVM_DBG_VACATED_FRAMES"),
+            Some(OsString::from("1")),
+        );
+
+        // And together, comma-separated, since that is how two diagnostics for
+        // one investigation actually get set.
+        let c = case(&[("CRATONVM_DBG", "mapgen,vacated-frames")]);
+        let both = c.resolve();
+        assert_eq!(both.get("CRATONVM_DBG_MAPGEN"), Some(OsString::from("1")));
+        assert_eq!(
+            both.get("CRATONVM_DBG_VACATED_FRAMES"),
+            Some(OsString::from("1")),
         );
     }
 

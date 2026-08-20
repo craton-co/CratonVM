@@ -26,8 +26,8 @@ install, no `rt.jar`, one self-contained binary.
   prove complete root coverage diverts to the non-moving sweep rather than
   relocating (see [ARCHITECTURE.md](ARCHITECTURE.md#memory-gc-crate)). Opt-in
   region-based G1 (`-XX:+UseG1GC`).
-- **Real frameworks run** — Spring, Spring Boot, Tomcat, Hibernate, and H2
-  boot and pass large test suites.
+- **Real frameworks run** — Spring, Spring Boot, Tomcat, Netty, Hibernate,
+  Hibernate Reactive, Quarkus, H2 Database boot and pass large test suites.
 - **Rust implementation** — Rust removes many ambient memory hazards, but the
   VM, JIT, GC, FFI, I/O, AWT, CUDA, and JFR contain reviewed and still-being-
   audited `unsafe` regions. See [SECURITY.md](SECURITY.md).
@@ -57,7 +57,7 @@ series aborted and retried if load left the band mid-run. Full methodology in
 | Benchmark               | JDK 25 C2 | CratonVM  | Ratio     | CV (CratonVM) | earlier ratio |
 |-------------------------|-----------|-----------|-----------|---------------|---------------|
 | Arithmetic (2B ops)     | 1,852 ms  | 3,601 ms  | 1.94x     | 0.6% | 2.44x |
-| Fibonacci(44)           | 1,449 ms  | 5,059 ms‡ | 3.49x‡    | 0.6% | 2.79x |
+| Fibonacci(44)           | 1,449 ms  | 5,059 ms  | 3.49x     | 0.6% | 2.79x |
 | Sieve (100K × 20K)      | 2,333 ms† | 2,360 ms  | **1.01x** | 2.0% | 2.28x |
 | Matrix 1280×1280        | 2,106 ms  | 2,094 ms  | **0.99x** | 0.2% | 2.93x |
 | HashMap (10M put/get)   | 983 ms    | 2,049 ms  | 2.08x     | 0.6% | 1.75x |
@@ -127,12 +127,14 @@ those two rows easy to misread. Full results, extra sizes, and methodology notes
 Boots, runs, and passes large real-world test suites:
 
 - **Spring / Spring Boot**
-- **Tomcat** (servlets, NIO, WebSocket, HTTP/2)
-- **Hibernate**
-- **H2** (embedded SQL database)
+- **Apache Tomcat**
+- **Netty** 
+- **Hibernate / Hibernate Reactive**
+- **Quarkus**
+- **H2 DB / PostgreSQL driver**
+- **Apache Commons Math** 
+- **Bouncy Castle Java**
 
-**Coming soon — the reactive stack:** Netty, Quarkus, Hibernate Reactive,
-and real database support (JDBC drivers over live network connections).
 
 ## Java Version Support
 
@@ -241,8 +243,6 @@ Details: [docs/CONFIG.md](docs/CONFIG.md#jdk-only-mode) (flags and modes),
 ## Limitations
 
 - **AWT/Swing** are headless (no on-screen rendering); JavaFX is out of tree.
-- **JDBC / `java.sql`** is not wired yet — real database support is on the
-  roadmap above.
 - **Reflection and JNI** cover the common paths; some edge cases
   (C-varargs JNI forms, full foreign-thread attach) are partial.
 - **Cryptography** is best-effort and not constant-time everywhere — see

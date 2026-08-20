@@ -203,7 +203,9 @@ pub const SYNTHETIC_THREAD_VIRTUAL_SLOT: usize = 5;
 /// W7-77-guarded-slot-maps.md, against `javap -p java.lang.Thread` on Eclipse
 /// Adoptium 25.0.3.9 (19 instance fields, static excluded, declaration order):
 ///
-///     0 eetop  1 tid  2 name  3 interrupted  4 contextClassLoader  5 holder
+/// ```text
+/// 0 eetop  1 tid  2 name  3 interrupted  4 contextClassLoader  5 holder
+/// ```
 ///
 /// so **four** of this run's five slots disagree with the real class, not one:
 /// `NAME`(0) is `eetop`, `PRIORITY`(1) is `tid`, `TARGET`(3) is `interrupted`,
@@ -925,6 +927,36 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             ],
         );
     }
+
+    // G5-1: the worker Thread now exists, so this is its construction moment —
+    // capture the forking thread's `InheritableThreadLocal` values against it
+    // here, before it is started or even tracked.
+    //
+    // Two things are wrong without this call, and only the first is a timing
+    // question:
+    //
+    //  1. `ctx.thread_start(worker)` below goes straight to the VM's thread
+    //     machinery. It does NOT pass through
+    //     `lang_system::native_thread_start0`, which is where every other
+    //     spawn path takes its inheritable-ThreadLocal snapshot — so a forked
+    //     subtask inherited NOTHING at all. HotSpot inherits: MEASURED on
+    //     Temurin 25.0.3+9 (`StsItl`, `--enable-preview`), a subtask forked
+    //     after `ITL.set("scope-parent")` reads back `scope-parent`, because
+    //     `StructuredTaskScope.fork` builds its thread through a
+    //     `Thread.Builder` whose `inheritInheritableThreadLocals` defaults to
+    //     true.
+    //  2. Capturing at construction rather than at start is what HotSpot's
+    //     `Thread.<init>` does (pc 175..201 of the master constructor,
+    //     SOURCE-VERIFIED). For this site the two moments are adjacent, so the
+    //     ordering is not observable HERE — but going through the shared
+    //     construction-time entry point rather than open-coding a snapshot is
+    //     what keeps this path and the `new Thread(...)` paths on one
+    //     definition of when inheritance is decided.
+    //
+    // Placed after BOTH layout arms, because the real-JDK arm's
+    // `Thread.<init>` invoke can allocate and the identity the queue is keyed
+    // by must be the finished object's.
+    crate::lang_system::capture_inheritable_tl_at_construction(ctx, worker);
 
     // Record the (subtask, worker) pair BEFORE starting so a racing fast worker
     // is already tracked when join() runs.
@@ -2135,6 +2167,71 @@ pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- StructuredTaskScope ---
+    //
+    // JDK-ONLY-NOTE (F17-1, 2026-08-13): the W7-18 note further down covers the
+    // `ShutdownOnFailure`/`ShutdownOnSuccess`/`$Config`/`Joiner.policy` block. It
+    // explicitly scopes itself to "every registration between here and the
+    // `Joiner` block below", which leaves the block you are reading now —
+    // `StructuredTaskScope` itself and `$Subtask` — untriaged. It is triaged
+    // here. SEVEN of the fourteen triples below name a member JDK 25 does not
+    // declare, measured on Microsoft 25.0.3+9-LTS:
+    //
+    //   * `<init>()V`, `<init>(String)V`, `<init>(String,ThreadFactory)V` —
+    //     `javap` reports `public interface
+    //     java.util.concurrent.StructuredTaskScope<T,R> extends AutoCloseable`.
+    //     JEP 505 turned the class into an INTERFACE, and an interface has no
+    //     constructors at all; `open()` is the JDK-true way to get one.
+    //   * `isShutdown()Z` and `shutdown()V` — gone. `isCancelled()Z` is the
+    //     replacement predicate and there is no replacement for the mutator:
+    //     cancellation is the `Joiner`'s decision, taken via `onComplete`.
+    //   * `joinUntil(Ljava/time/Instant;)…` — gone. The deadline moved onto the
+    //     scope's configuration, as `Configuration.withTimeout(Duration)`.
+    //   * `join()Ljava/util/concurrent/StructuredTaskScope;` — the NAME is real
+    //     and the DESCRIPTOR is not. JEP 505 changed the return type to `R`, so
+    //     javac emits `()Ljava/lang/Object;`. This is the shape a name-keyed
+    //     search reports as agreement, and it is the reason the pair are two
+    //     separate registrations rather than one being an update of the other.
+    //
+    // and, on `$Subtask` below, `task()Ljava/util/concurrent/Callable;` — `javap
+    // -p …$Subtask` lists exactly three members (`state`, `get`, `exception`)
+    // and `task` is not among them. The seven that ARE JDK-true are `open()`,
+    // `fork(Callable)`, `close()`, and `Subtask.{get,state,exception}`.
+    //
+    // NOT DELETED, on the same two-part test W7-18 applied — and it comes out
+    // the same way here, so the reasoning is inherited rather than re-derived:
+    //
+    //   * It cannot move either shipping mode. TRUE.
+    //     `register_jdk25_concurrency_natives` is reached only from
+    //     `register_synthetic_overrides`, which is `#[cfg(feature =
+    //     "synthetic-jdk")]` and is not a default feature of `cratonvm-vm` or
+    //     `cratonvm-cli`. Under `--jdk-only` and `--real-jdk` the real JDK
+    //     bytecode serves this whole API and none of these bodies is compiled
+    //     in, let alone reached.
+    //   * The deletion is checkable. FALSE without a run — and here the reason
+    //     differs from W7-18's, so check it rather than assuming. These seven
+    //     triples are NOT pinned by `r.find` in this file's test module (unlike
+    //     `Joiner.policy()I`, which is, at two sites). What pins them is the
+    //     other direction: `native_sts_join_until` and `native_subtask_task`
+    //     have direct-call unit tests (`p82_join_until_*`, and the `$Subtask`
+    //     one above `p82_join_until_past_deadline`), so deleting the
+    //     registrations alone leaves the bodies reachable only from `#[cfg(test)]`
+    //     code and turns them into `dead_code` warnings in a release build.
+    //     Deleting bodies and tests together is the right change; doing it blind,
+    //     with no build and no run of the one mode that could observe it, is how
+    //     a divergence gets frozen in rather than removed.
+    //
+    // The deletion is written up as a nomination in
+    // docs/known-issues/jdk-only/F17-1-cds-sharedsecrets-fabrications-20260813.md.
+    //
+    // WHAT IS ALREADY CORRECT, so nobody "fixes" it twice: the JEP 505 spellings
+    // — `join()Ljava/lang/Object;`, `isCancelled()Z`, `fork(Runnable)`,
+    // `open(Joiner,Function)`, `Joiner.allUntil`, `Joiner.onFork`, and
+    // `$Configuration.with{Name,ThreadFactory,Timeout}` — are all registered,
+    // JDK-true, by `phases_late/concurrent.rs::register_p67_structured_task_scope_j25`.
+    // That registrar runs BEFORE this one and `register()` is last-write-wins,
+    // so adding any of those triples here would silently replace a correct body
+    // with a JDK-21-shaped one. `w7_18_jep505_surface_is_not_shadowed_here` is
+    // the ratchet that catches it; re-read it before adding a registration here.
     r.register(CLS_TASK_SCOPE, "<init>", "()V", native_sts_init);
     r.register(
         CLS_TASK_SCOPE,
@@ -2209,6 +2306,12 @@ pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- Subtask.task() ---
+    // F17-1 (2026-08-13): not a member of JDK 25's `$Subtask`. `javap -p
+    // java.util.concurrent.StructuredTaskScope$Subtask` lists three methods —
+    // `state()`, `get()`, `exception()` — and no `task()`. Retained for now for
+    // the reason set out in the JDK-ONLY-NOTE on the `StructuredTaskScope`
+    // registration block above; `native_subtask_task` has a direct-call unit
+    // test, so the registration and the body must go together.
     r.register(
         CLS_SUBTASK,
         "task",

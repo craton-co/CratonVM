@@ -996,81 +996,297 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // getCipherSuite() -> String
+    // getCipherSuite() / getProtocol() -> String
+    //
+    // E31 — THREE separate defects were folded into the two lines these
+    // replace, and the third is the one that matters:
+    //
+    // 1. **The slot was hard-coded.** `SES_CIPHER_SUITE` (0) / `SES_PROTOCOL`
+    //    (1) is this module's own 6-field convention, but this registration is
+    //    on the shared `javax/net/ssl/SSLSession` interface and under
+    //    `--synthetic-jdk` it wins for EVERY shape in the tree — including the
+    //    2-, 3- and 4-field ones, whose order is the other way round
+    //    (protocol first). Route through `t27_tls::session_cipher_slot`, the
+    //    one width->slot table, instead of assuming one shape.
+    // 2. **A `String` slot was read as an `Int`.** Every shape except this
+    //    module's stores the negotiated names as real `String` references. The
+    //    `Value::Int(i)` arm never matched them, so they fell to the default.
+    // 3. **The default was `0`, and index 0 is `TLS_AES_256_GCM_SHA384`.**
+    //    That is a *defaulting reader turning a wrong type into a confident
+    //    wrong answer*: an unconnected socket's session — whose producer had
+    //    just been fixed to write `SSL_NULL_WITH_NULL_NULL`/`NONE` — was
+    //    reported by this accessor as a completed TLS 1.3 handshake on the
+    //    strongest suite in the list. E12-1 §2 is the argument for why THAT
+    //    literal is the dangerous one to invent: it is in
+    //    `getSupportedCipherSuites()`, so no test a caller can write separates
+    //    it from a genuine negotiation, and security-sensitive code branches
+    //    on this string. Every sentinel this family landed was undone here,
+    //    in the mode where this file is the live registrar.
+    //
+    // The `Int` arm stays because it is this module's real encoding (an index
+    // into `TLS13_CIPHERS`, written by `init_ssl_session_fields`), but it is
+    // now the second question rather than the only one, and anything that is
+    // neither a name nor an in-range index answers the sentinel.
     r.register(
         cls,
         "getCipherSuite",
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let idx = match ctx.get_field(this, SES_CIPHER_SUITE) {
-                Value::Int(i) => i as usize,
-                _ => 0,
-            };
-            let suite = TLS13_CIPHERS.get(idx).copied().unwrap_or(TLS13_CIPHERS[0]);
-            let s = ctx.create_string(suite);
-            Ok(Some(Value::Object(Some(s))))
+            // Bound to a `let`: a closure written directly in a match
+            // scrutinee is a temporary whose `&ctx` capture lives to the end
+            // of the match, colliding with the `&mut ctx` the arms need.
+            let raw = crate::t27_tls::session_cipher_slot(ctx.object_num_fields(this))
+                .map(|slot| ctx.get_field(this, slot));
+            match raw {
+                // A producer already wrote the real name (or the sentinel).
+                Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+                Some(Value::Int(i)) => {
+                    let suite = usize::try_from(i)
+                        .ok()
+                        .and_then(|u| TLS13_CIPHERS.get(u).copied())
+                        .unwrap_or(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+                    let s = ctx.create_string(suite);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+                _ => {
+                    let s = ctx
+                        .create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+            }
         },
     );
 
-    // getProtocol() -> String
     r.register(cls, "getProtocol", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let idx = match ctx.get_field(this, SES_PROTOCOL) {
-            Value::Int(i) => i,
-            _ => 0,
-        };
-        let proto = if idx == 0 { "TLSv1.3" } else { "TLSv1.2" };
-        let s = ctx.create_string(proto);
-        Ok(Some(Value::Object(Some(s))))
+        // `let`, not an inline scrutinee — see `getCipherSuite` above.
+        let raw = crate::t27_tls::session_proto_slot(ctx.object_num_fields(this))
+            .map(|slot| ctx.get_field(this, slot));
+        match raw {
+            Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+            // This module's encoding: 0 = TLSv1.3, 1 = TLSv1.2. Anything else
+            // is not a protocol this file ever wrote.
+            Some(Value::Int(0)) => {
+                let s = ctx.create_string("TLSv1.3");
+                Ok(Some(Value::Object(Some(s))))
+            }
+            Some(Value::Int(1)) => {
+                let s = ctx.create_string("TLSv1.2");
+                Ok(Some(Value::Object(Some(s))))
+            }
+            _ => {
+                let s = ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
+                Ok(Some(Value::Object(Some(s))))
+            }
+        }
     });
 
     // isValid() -> boolean
     //
     // SHADOWING (wave 3): this registration and `t27_tls::
     // register_ssl_session_real`'s both key `javax/net/ssl/SSLSession.isValid`;
-    // `register_tls_natives` runs LAST (lib.rs ~23041 vs ~17506), so THIS one
-    // wins for every session shape. Three synthetic shapes reach it:
-    //   * this module's 6-field session          — valid flag at SES_VALID (2)
-    //   * t27's 7-field SSLEngineImpl session    — valid flag also at slot 2
-    //   * t27's 3-field SSLServerSocket.accept() — slot 2 is a *stream id*
-    // Reading slot 2 unconditionally therefore reported `isValid() == false`
-    // for any accept-session whose stream id happened to be 0. Gate on the
-    // field count, mirroring what t27's (shadowed) version did.
+    // `register_tls_natives` runs LAST, so THIS one wins under
+    // `--synthetic-jdk` and t27's wins in the default real-JDK mode.
+    //
+    // E31 — THE SAME BUG THE E22 LANE FIXED IN THE OTHER COPY, still live in
+    // this one. The comment this replaces named three shapes and got two of
+    // their widths wrong (t27's engine session is 8 fields, not 7; its accept
+    // session is 4, not 3), and its `> SES_CREATION_TIME` gate answered
+    // `Int(1)` — VALID — for **every** shape narrower than 6. That is the
+    // width-blind inference: it treats "too narrow to carry a flag" as "was
+    // just negotiated", and the `ssl_security::new13_alloc_null_ssl_session`
+    // shape (`NEW13_SSL_SESS_FIELDS` — 3 fields when this was written, 4 since
+    // E42, and narrower than 6 either way) is minted with `tls_id = -1` for a
+    // socket that was NEVER CONNECTED. So under `--synthetic-jdk` an
+    // unconnected `SSLSocket.getSession().isValid()` still answered `true`
+    // where HotSpot measures `false` (E12-1 §1 arm A) — the E22 fix was live
+    // in one mode only.
+    //
+    // `t27_tls::session_has_negotiated` is the one width-aware predicate and
+    // is now `pub(crate)` so this file calls it rather than growing a fifth
+    // copy of the rule.
+    //
+    // THE SECOND HALF, and why this is not simply that call: HotSpot's
+    // `isValid()` is `isRejoinable()`, which is
+    // `sessionId.length() != 0 && !invalidated && ...`
+    // (`sun/security/ssl/SSLSessionImpl.java:788`) — TWO pieces of state, and
+    // `invalidated` is a plain field only `invalidate()` writes. This file
+    // registers an `invalidate()` (below) that clears `SES_VALID`, and on this
+    // module's own shape `SES_VALID` *is* the slot `session_has_negotiated`
+    // reads. Calling the predicate alone would therefore have been correct for
+    // the narrow shapes and a REGRESSION for this one: `invalidate()` would
+    // have gone inert, because width 6 takes the predicate's
+    // "only minted after a handshake" arm. Compose the two the way the JDK
+    // composes them — negotiated AND not invalidated — instead of picking one.
+    //
+    // F18 — the `invalidated` half is no longer width-limited, and the comment
+    // above that said "a narrower shape has no `invalidate()` writer either" is
+    // no longer true. `t27_tls::session_is_valid` composes negotiated AND
+    // not-invalidated for EVERY width, because the bit now lives in a side
+    // table (`t27_tls::session_invalidated_table`) rather than in a slot the
+    // narrow shapes do not have. That closes F10-1 NOMINATION 3's second half
+    // in this mode too: at width 4 `invalidate()` used to no-op, so
+    // `SSLServerSocket.accept`'s session stayed `isValid() == true` after an
+    // explicit invalidation.
+    //
+    // The wide-shape flag is still read and still wins a `false`. It is a
+    // SECOND writer of the same concept, kept because `init_ssl_session_fields`
+    // seeds `SES_VALID` at construction and other code in this file writes it;
+    // dropping the read here would make those writes silently inert. The two
+    // are composed, not chosen between — the same reasoning the original
+    // comment applied to the two halves of the predicate.
     r.register(cls, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > SES_CREATION_TIME {
-            Ok(Some(ctx.get_field(this, SES_VALID)))
-        } else {
-            // 3-field accept session: no flag slot, and it was just
-            // negotiated — valid.
-            Ok(Some(Value::Int(1)))
+        if !crate::t27_tls::session_is_valid(ctx, this) {
+            return Ok(Some(Value::Int(0)));
         }
+        // The wide shapes' own `invalidated` slot, still honoured.
+        if ctx.object_num_fields(this) > SES_CREATION_TIME {
+            return Ok(Some(ctx.get_field(this, SES_VALID)));
+        }
+        Ok(Some(Value::Int(1)))
     });
 
     // invalidate() -> void
+    //
+    // E31 — this is a THIRD member of the slot-collision family
+    // `t27_tls::sslsess_attrs_slot` documents, and nobody had named it. It
+    // wrote `SES_VALID` (slot 2) on whatever shape it was handed, and slot 2 is
+    // the valid flag on only some of the widths. On the
+    // `ssl_security::new13_alloc_null_ssl_session` shape it is
+    // `NEW13_SESS_TLSID`, so `invalidate()` on an unconnected socket's session
+    // overwrote `Int(-1)` — "never connected" — with `Int(0)`, which
+    // `session_has_negotiated` reads as a valid stream id. The result was
+    // exactly inverted: `isValid()` went from `false` to `true` and `getId()`
+    // from `byte[0]` back to 32 fabricated bytes, **because the caller asked to
+    // invalidate it**. On the accept shape it clobbers the real stream id
+    // with 0.
+    //
+    // E42 did not change this gate and must not be read as having done so.
+    // `NEW13_SSL_SESS_FIELDS` widened 3 -> 4, which is still `<= SES_CREATION_TIME`,
+    // so this stays a no-op for that shape — and it has to, because slot 2
+    // there is STILL the stream id. The widening bought an attribute slot, not
+    // an `invalidated` flag.
+    //
+    // No-op for shapes with no flag slot, on the same reasoning as
+    // `sslsess_attrs_slot`: a quiet miss on a state this VM cannot record beats
+    // a loud corruption of the state it can.
+    //
+    // For the NULL session the no-op is not a miss at all — it is HotSpot's
+    // own behaviour. MEASURED, HotSpot 25.0.3+9-LTS, three byte-identical runs
+    // (`scratchpad/f6/F6Invalidate.java`), on the unconnected `SSLSocket`'s
+    // session and on the pre-handshake `SSLEngine`'s alike:
+    //
+    //   before-invalidate  isValid=false idLen=0 cipher=SSL_NULL_WITH_NULL_NULL
+    //   after-invalidate   isValid=false idLen=0 cipher=SSL_NULL_WITH_NULL_NULL
+    //
+    // `invalidate()` on a session that negotiated nothing changes NOTHING,
+    // because there was nothing to invalidate. So this arm is exactly right
+    // for the shape it governs, and the residual is only a session that DID
+    // negotiate and cannot be invalidated on this width. Measured, that
+    // residual is confined to one accessor: `invalidate()` changes `isValid()`
+    // and nothing else — cipher, protocol, id and certs all survive it (E12-1
+    // §1 arm E) — so it cannot spread to the other twelve. Recording an
+    // `invalidated` bit needs a slot this shape does not have, and widening
+    // again would move slots 0/1/2 under every reader in `t27_tls`.
+    //
+    // F18 — the "recording an `invalidated` bit needs a slot this shape does
+    // not have" paragraph above is now only half true, and the half that
+    // mattered is fixed. The slot is still unavailable at width 4 and widening
+    // is still rejected for the reasons E42-1 §2 gives — so the bit went
+    // OUTSIDE the object, into `t27_tls::session_invalidated_table`, keyed the
+    // same GC-stable way this file's sibling cert tables already are. No width
+    // moves, no reader retargets, and `invalidate()` stops being a silent
+    // no-op on the two width-4 shapes.
+    //
+    // The slot write is KEPT for the wide shapes. It is not redundant: other
+    // code in this file reads `SES_VALID` directly, and the `isValid()`
+    // registration above still consults it. Writing both keeps this door's
+    // effect visible to both readers.
+    //
+    // The narrow-shape no-op that HotSpot itself performs is unchanged in
+    // effect and now for the right reason. MEASURED (this lane,
+    // `scratchpad/f18/F18SessionContract.java`; independently reproducing
+    // `scratchpad/f6/F6Invalidate.java`): on a session that negotiated nothing,
+    // `invalidate()` changes NOTHING, because there was nothing to invalidate —
+    // and `session_mark_invalidated` declines to record a bit for exactly that
+    // session, so the two agree by construction rather than by coincidence.
     r.register(cls, "invalidate", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, SES_VALID, Value::Int(0));
+        crate::t27_tls::session_mark_invalidated(ctx, this);
+        if ctx.object_num_fields(this) > SES_CREATION_TIME {
+            ctx.set_field(this, SES_VALID, Value::Int(0));
+        }
         Ok(None)
     });
 
     // getId() -> byte[]
+    //
+    // E31 — the twin of the fabrication E22 removed from `t27_tls`'s copy,
+    // still live in this one. A session that negotiated nothing has NO id, and
+    // JSSE says so with `byte[0]` rather than 32 plausible bytes (measured,
+    // E12-1 §1 arm A / §4; reproduced by `scratchpad/e31/
+    // E31HandshakeSessionSocket.java` — `id=0B` on the unconnected socket,
+    // `id=32B` after a handshake). The named consumer is Tomcat's
+    // `JSSESupport.getSessionId`, which tests `ssl_session.length == 0`
+    // exactly, so 32 fabricated bytes are precisely the value that defeats it
+    // and makes an unhandshaked session present as a trackable one.
+    //
+    // DELIBERATELY GATED ON `session_has_negotiated` ALONE, NOT on `isValid()`
+    // above: measured (E12-1 §1 arm E), `invalidate()` changes `isValid()` and
+    // NOTHING else — cipher, protocol and id all survive it. Tying the id to
+    // the valid flag would have made `invalidate()` erase the id, which is a
+    // new divergence in exchange for fixing an old one. This is the same split
+    // HotSpot has: `isRejoinable()` reads the id AND `invalidated`; the id
+    // reads neither.
+    //
+    // Also fixed here: the loop ran `0..4`, so 28 of the 32 bytes were always
+    // zero — an id whose entropy is 4 bytes of an identity hash collides far
+    // more readily than its length advertises, and callers hash or compare it.
     r.register(cls, "getId", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Build a 32-byte session ID derived from object identity
-        let hash = ctx.identity_hash_code(this);
+        if !crate::t27_tls::session_has_negotiated(ctx, this) {
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
+        // `identity_hash_code`, not the raw `ObjectRef` pointer: this VM's
+        // young-gen GC moves objects, so a pointer-derived id is not stable
+        // across the session's own lifetime.
         let id_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
-        for i in 0..4 {
-            let byte_val = ((hash >> (i * 8)) & 0xFF) as i8;
-            ctx.set_array_element(id_arr, i, Value::Int(byte_val as i32));
+        let mut x = (ctx.identity_hash_code(this) as u32 as u64) | 1;
+        for i in 0..32 {
+            // SplitMix64-style fill, same as `t27_tls`'s copy, so the 32 bytes
+            // are stable per session and not 28 zeroes.
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+            x ^= x >> 27;
+            ctx.set_array_element(id_arr, i, Value::Int((x & 0xff) as i8 as i32));
         }
         Ok(Some(Value::Object(Some(id_arr))))
     });
 
-    // getPeerHost() -> String
+    // getPeerHost() / getPeerPort() / getCreationTime()
+    //
+    // E31 — these three read slots 3, 4 and 5 with NO width test at all, which
+    // on this shared interface registration is a stronger version of the same
+    // defect as a width-blind one. Only the 6- and 8-field shapes have those
+    // slots; on the 4-field `SSLServerSocket.accept` shape slot 3 is the
+    // ATTRIBUTE MAP, so `getPeerHost()` returned a `java.util.HashMap`
+    // reference through a `()Ljava/lang/String;` descriptor once any caller had
+    // done a `putValue` (Jetty's `SecureRequestCustomizer` does, on every
+    // request), and slots 4/5 are off the end of the object entirely on the 2-,
+    // 3- and 4-field shapes.
+    //
+    // The fallbacks are HotSpot's own measured answers for a session that
+    // negotiated nothing (E12-1 §1 arm A): `getPeerHost()` = `null`,
+    // `getPeerPort()` = `-1`, `getCreationTime()` = a real epoch value — never
+    // 0, which is the value application code reads as "there is no session".
     r.register(cls, "getPeerHost", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) <= SES_CREATION_TIME {
+            return Ok(Some(Value::Object(None)));
+        }
         let field = ctx.get_field(this, SES_PEER_HOST);
         match field {
             Value::Object(_) => Ok(Some(field)),
@@ -1081,12 +1297,18 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     // getPeerPort() -> int
     r.register(cls, "getPeerPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) <= SES_CREATION_TIME {
+            return Ok(Some(Value::Int(-1)));
+        }
         Ok(Some(ctx.get_field(this, SES_PEER_PORT)))
     });
 
     // getCreationTime() -> long
     r.register(cls, "getCreationTime", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) <= SES_CREATION_TIME {
+            return Ok(Some(Value::Long(epoch_millis())));
+        }
         Ok(Some(ctx.get_field(this, SES_CREATION_TIME)))
     });
 
@@ -1097,16 +1319,45 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
 
     // getApplicationBufferSize() / getPacketBufferSize()
     //
-    // KEEP: spec-correct protocol constants, not placeholders. RFC 8446 §5.1
-    // caps a TLSPlaintext fragment at 2^14 = 16384 bytes, and JSSE reports
-    // 16709 = 16384 + 325 bytes of record overhead (5-byte header + up to 256
-    // padding + 68 MAC/IV) — the same pair a stock JDK returns, and both are
-    // session- and layout-independent.
+    // 16709 for the packet size is CORRECT in every state. 16384 for the
+    // application buffer size is a deliberate under-report, and the paragraph
+    // that used to stand here — "the same pair a stock JDK returns", "real
+    // `SSLSessionImpl` varies these only via `SSLParameters
+    // .setMaximumPacketSize` and only for DTLS" — was measurably false in both
+    // clauses. It is corrected rather than deleted because a confident
+    // "KEEP: correct" is precisely what stops the next reader from measuring.
     //
-    // Real `SSLSessionImpl` varies these only via
-    // `SSLParameters.setMaximumPacketSize` and only for DTLS; CratonVM models
-    // neither (`git grep maximumPacketSize` — no hits), so the real JDK
-    // behaviour is constant here too.
+    // MEASURED, HotSpot 25.0.3+9-LTS (`scratchpad/e31/
+    // E31HandshakeSessionSocket.java`, reproducing E12-1 §1):
+    //
+    //     null session (unconnected SSLSocket)  app=16704  packet=16709
+    //     after a TLS 1.3 handshake             app=16676  packet=16709
+    //                                           suite=TLS_AES_256_GCM_SHA384
+    //
+    // Never 16384, in either state. DERIVED, from the oracle's source rather
+    // than only from the measurement — `getApplicationBufferSize()` is not a
+    // constant, it is two branches:
+    //
+    //   * with no `maximumPacketSize` and no negotiated max-fragment-length,
+    //     `sun/security/ssl/SSLSessionImpl.java:1297` returns
+    //     `SSLRecord.maxRecordSize - SSLRecord.headerSize`, and `headerSize`
+    //     is 5 (`SSLRecord.java:35`) — 16709 - 5 = **16704**, the measured
+    //     null-session value;
+    //   * once a suite is negotiated it returns
+    //     `cipherSuite.calculateFragSize(...)` (`CipherSuite.java:1051-1076`),
+    //     which subtracts the header and then, for an AEAD cipher, the tag
+    //     size and the explicit-IV remainder — 16676 for TLS 1.3 AES-GCM.
+    //     That is why the real answer VARIES WITH THE SUITE and cannot be a
+    //     constant in real JSSE.
+    //
+    // `SSLRecord.maxDataSize` (= 16384), the constant the old text named, is
+    // reached by this method only on the DTLS branch.
+    //
+    // The VALUE stays at 16384 on purpose: it is a safe under-report against
+    // this VM's own engine, which never emits a larger fragment than it
+    // advertises, and raising it without auditing every `BUFFER_OVERFLOW` path
+    // is how a constant becomes an outage. What was wrong was the assertion,
+    // not the number.
     //
     // REACHABILITY + SHADOWING (wave 4 correction — the wave-3 note was wrong):
     // `register_tls_natives` is reached ONLY from
@@ -1455,10 +1706,15 @@ fn trust_store_keystore_id(ctx: &mut dyn NativeContext, allow_jdk_cacerts: bool)
     // Keyed by (path, password) so repeated `init(null)` calls — every
     // `SSLContext` build in a long-running app — parse the file once and
     // reuse one registry id instead of leaking a fresh keystore per call.
+    // ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0). Two acquisitions, both
+    // in this function: a `get(..).copied()` whose `if let` body is a bare
+    // `return`, and the `insert` at the end. The file read and parse happen
+    // between them, with no guard held and no `ctx` in this function at all.
     static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<(String, String), i32>>,
+        cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<(String, String), i32>>,
     > = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let cache =
+        CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch));
     let key = (path.clone(), password.clone());
     if let Some(id) = cache.lock().get(&key).copied() {
         return id;
@@ -3072,12 +3328,18 @@ pub(crate) fn is_tls13_allowed_suite_name(name: &str) -> bool {
 /// `t19_9_consolidation_no_duplicate_registrations` test trivial to
 /// express.
 fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
-    // SyntheticStub: SSLSessionImpl methods are synthetic placeholders
-    // (getId derived from pointer, getPeerCertificates returns empty, cipher/
-    // protocol hardcoded, isValid()=true) and engineInit just flips a flag.
-    // The setEnabledCipherSuitesStrict allowlist gate is the only real check,
-    // but the dominant surface here is placeholder. Real session data comes
-    // from the rustls path in t27_tls.rs / phases_late.rs.
+    // SyntheticStub: these are thin shims and `engineInit` just flips a flag.
+    // The setEnabledCipherSuitesStrict allowlist gate is the only real check.
+    // Real session data comes from the rustls path in t27_tls.rs /
+    // phases_late.rs.
+    //
+    // E31: the sentence that used to stand here — "getId derived from pointer,
+    // cipher/protocol hardcoded, isValid()=true" — was an accurate inventory
+    // of four defects, written as though listing them retired them. Each is
+    // the drifted twin of a `javax/net/ssl/SSLSession` accessor above that has
+    // since been fixed, and this class ALIASES that layout (its own `<init>`
+    // calls `init_ssl_session_fields`), so nothing about the shape justified
+    // the divergence. All four now go through the same shared predicates.
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // --- sun.security.ssl.SSLSessionImpl ------------------------------------
@@ -3099,17 +3361,33 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
         init_ssl_session_fields(ctx, this);
         Ok(None)
     });
+    // E31 — the THIRD copy of `getId`, and it had both defects the other two
+    // have now shed:
+    //
+    //   * unconditional 32 bytes for a session that negotiated nothing (see
+    //     the `javax/net/ssl/SSLSession` copy above for the measurement and
+    //     the named Tomcat consumer);
+    //   * seeded from `this.as_ptr()` — the raw `ObjectRef` — which is the
+    //     exact GC-unstable identity `gc_stable_objref_key` exists to replace.
+    //     This VM's young-gen GC moves objects, so the "deterministic buffer
+    //     so callers can compare equality across invocations" the old comment
+    //     promised is not deterministic at all: the same session answers a
+    //     DIFFERENT id after a young collection moves it, and a later,
+    //     unrelated object allocated at the same address answers the SAME one.
+    //     `identity_hash_code` is pinned for an object's lifetime.
     r.register(sess_impl, "getId", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Allocate a 32-byte session id derived from the object identity.
-        // Real rustls sessions hand back the server-assigned id; for
-        // synthetic native-only paths we emit a 32-byte deterministic
-        // buffer so callers can compare equality across invocations.
+        if !crate::t27_tls::session_has_negotiated(ctx, this) {
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
-        let addr = this.as_ptr() as u64;
+        let mut x = (ctx.identity_hash_code(this) as u32 as u64) | 1;
         for i in 0..32 {
-            let b = ((addr >> ((i % 8) * 8)) & 0xFF) as u8;
-            ctx.set_array_element(arr, i, Value::Int(b as i32));
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+            x ^= x >> 27;
+            ctx.set_array_element(arr, i, Value::Int((x & 0xff) as i8 as i32));
         }
         Ok(Some(Value::Object(Some(arr))))
     });
@@ -3130,39 +3408,129 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
         sess_impl,
         "getCipherSuite",
         "()Ljava/lang/String;",
-        |ctx, _args| {
-            // Default to TLS 1.3 MTI cipher — callers can swap in a
-            // real suite after a successful handshake. Picked over
-            // TLS_AES_256_GCM_SHA384 so Keycloak's "is this a modern
-            // suite?" heuristic (name starts with "TLS_AES_128_GCM_") passes.
-            let s = ctx.create_string("TLS_AES_128_GCM_SHA256");
-            Ok(Some(Value::Object(Some(s))))
+        // E31 — this ignored `this` entirely and answered
+        // `TLS_AES_128_GCM_SHA256` for every session in every state, with a
+        // comment saying "callers can swap in a real suite after a successful
+        // handshake" for a body that could not read one if they had. It is the
+        // fabrication E12-1 §2 is about, in its purest form: a real, strong,
+        // OFFERABLE suite name asserted about a session that may never have
+        // handshaked, indistinguishable by any test a caller can write from a
+        // genuine negotiation.
+        //
+        // THE STATED REASON FOR THE LITERAL DOES NOT EXIST. The comment said
+        // `TLS_AES_128_GCM_SHA256` was "picked over TLS_AES_256_GCM_SHA384 so
+        // Keycloak's 'is this a modern suite?' heuristic (name starts with
+        // TLS_AES_128_GCM_) passes". Keycloak IS checked out on this host
+        // (`C:\craton\apps\keycloak`, 8035 `.java` files) and contains **zero**
+        // occurrences of `getCipherSuite` and **zero** of `TLS_AES_128_GCM`.
+        // The heuristic this value was tuned for is not there, so the literal
+        // was pinned against a consumer nobody can point to — which is also
+        // why nobody noticed that it CONTRADICTS the sibling door: for one and
+        // the same object (both registrations serve the layout
+        // `init_ssl_session_fields` seeds, `SES_CIPHER_SUITE = Int(0)`),
+        // `javax/net/ssl/SSLSession.getCipherSuite()` answered
+        // `TLS13_CIPHERS[0]` = `TLS_AES_256_GCM_SHA384` while this one
+        // answered `TLS_AES_128_GCM_SHA256`. Two doors, one session, two
+        // suites. Reading the state makes them agree; the door that changes is
+        // this one, from `..._128_...` to `..._256_...`, and the measured
+        // denominator for that change is 0.
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // `let`, not an inline scrutinee — see the `javax/net/ssl/
+            // SSLSession` copy for the borrow it avoids.
+            let raw = crate::t27_tls::session_cipher_slot(ctx.object_num_fields(this))
+                .map(|slot| ctx.get_field(this, slot));
+            match raw {
+                Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+                Some(Value::Int(i)) => {
+                    let suite = usize::try_from(i)
+                        .ok()
+                        .and_then(|u| TLS13_CIPHERS.get(u).copied())
+                        .unwrap_or(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+                    let s = ctx.create_string(suite);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+                _ => {
+                    let s = ctx
+                        .create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+            }
         },
     );
     r.register(
         sess_impl,
         "getProtocol",
         "()Ljava/lang/String;",
-        |ctx, _args| {
-            let s = ctx.create_string("TLSv1.3");
-            Ok(Some(Value::Object(Some(s))))
+        // E31: the twin of the above — a hardcoded `"TLSv1.3"` for a session
+        // that may have negotiated nothing.
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let raw = crate::t27_tls::session_proto_slot(ctx.object_num_fields(this))
+                .map(|slot| ctx.get_field(this, slot));
+            match raw {
+                Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+                Some(Value::Int(0)) => {
+                    let s = ctx.create_string("TLSv1.3");
+                    Ok(Some(Value::Object(Some(s))))
+                }
+                Some(Value::Int(1)) => {
+                    let s = ctx.create_string("TLSv1.2");
+                    Ok(Some(Value::Object(Some(s))))
+                }
+                _ => {
+                    let s =
+                        ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+            }
         },
     );
     // isValid() — read the session's own valid flag instead of answering a
     // constant `true`. `<init>` above seeds the same 6-slot layout as the
     // `javax/net/ssl/SSLSession` shim (`init_ssl_session_fields` sets
     // SES_VALID=1), so anything that invalidates a session by writing that
-    // slot is now honoured; a hardcoded `true` reported invalidated and
+    // slot is honoured; a hardcoded `true` reported invalidated and
     // expired sessions as still usable.
+    //
+    // E31 — THE DRIFTED TWIN. The `javax/net/ssl/SSLSession.isValid` above
+    // carries a comment explaining that slot 2 is a STREAM ID on the narrow
+    // shapes and gating on the field count for exactly that reason; this copy,
+    // registered ~1,900 lines later in the same file, kept the naive
+    // `> SES_VALID` (i.e. 3+ fields) test the other one was written to
+    // replace. On the `new13_alloc_null_ssl_session` shape that reads
+    // `Int(-1)` — the "never connected" stream id — and returns it through a
+    // `()Z` descriptor, so an unconnected socket's session answers `isValid()`
+    // with a non-zero int. On the accept shape it returns the stream id, so a
+    // genuinely negotiated session reports INVALID whenever its id happens to
+    // be 0. Both directions wrong, from one width-blind test. (E42 made those
+    // two shapes the same width, 4, which is why no width test can ever
+    // separate them — only the VALUE in slot 2 can.)
+    //
+    // Same composition as the other copy: negotiated (the one shared
+    // width-aware predicate) AND not invalidated. See that copy for why the
+    // two halves must not collapse into one.
+    //
+    // F18 — and "same composition" now means the same FUNCTION, not a second
+    // hand-assembled copy of the rule. This copy said it matched its twin and
+    // then spelled the composition out again, which is how the twin drifted
+    // last time. `t27_tls::session_is_valid` is the one place both halves are
+    // combined; this door adds only the wide-shape slot read, exactly as the
+    // `javax/net/ssl/SSLSession` copy above does.
+    //
+    // No `invalidate` is registered on THIS class name and none is needed: the
+    // invalidated bit is keyed on the session OBJECT, not on the class name it
+    // was reached through, so an `invalidate()` made through the
+    // `javax/net/ssl/SSLSession` door is visible here on the same object.
     r.register(sess_impl, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > SES_VALID {
-            Ok(Some(ctx.get_field(this, SES_VALID)))
-        } else {
-            // Too short to carry the flag (foreign allocation) — a session
-            // handed to us with no state is one that was just negotiated.
-            Ok(Some(Value::Int(1)))
+        if !crate::t27_tls::session_is_valid(ctx, this) {
+            return Ok(Some(Value::Int(0)));
         }
+        if ctx.object_num_fields(this) > SES_CREATION_TIME {
+            return Ok(Some(ctx.get_field(this, SES_VALID)));
+        }
+        Ok(Some(Value::Int(1)))
     });
 
     // --- sun.security.ssl.SSLContextImpl.engineInit ------------------------

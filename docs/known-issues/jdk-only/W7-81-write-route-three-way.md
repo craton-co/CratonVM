@@ -6,6 +6,20 @@ stated as measured was measured — on HotSpot 25.0.3.9 (Eclipse Adoptium), by
 running `probes/CloseFlushSwallowProbe.java`. What is stated as read-from-source
 was read from source. The two are kept apart on purpose.
 
+> **Re-verified 2026-08-12 (lane A12), source-level, nothing run.** The landed
+> source is present as described: `DelegatedWrite` with `classify` / `routed` /
+> `delivered` and `classify_write_failure` in
+> `native-api/src/print_error_state.rs`, re-exported from `native-api/src/lib.rs`;
+> `routed()` is read at exactly **three** call sites in
+> `native-builtins/src/logging_shims.rs`, matching the three bodies this record
+> claims it changed (`native_printwriter_write_string`, `…_range`, and
+> `native_printwriter_printf`'s retry gate). **Still UNVERIFIED against a VM** —
+> `probes/CloseFlushSwallowProbe.java` has a measured HotSpot column and no
+> CratonVM column, and the two console-echo tokens
+> (`W781-IO-MUST-NOT-ECHO`, `W781-ERR-MUST-ECHO`) are the only observable of the
+> behaviour change; nobody has read them off a CratonVM run in either mode.
+> Disposition: **still open on verification, not on source.**
+
 Ships the design W7-70-printstream-close-noop.md wrote down under
 **`route_write_through_out`'s call sites — decided, and NOT threaded** and
 deliberately did not ship, for a reason it stated plainly: shipping it blind is

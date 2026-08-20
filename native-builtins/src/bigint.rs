@@ -297,6 +297,14 @@ impl BigInt {
         }
     }
 
+    /// `BigInteger.abs()` — the magnitude with a non-negative sign.
+    pub(crate) fn abs_value(&self) -> BigInt {
+        BigInt {
+            neg: false,
+            mag: self.mag.clone(),
+        }
+    }
+
     pub(crate) fn neg_value(&self) -> BigInt {
         if self.is_zero() {
             BigInt::zero()
@@ -399,6 +407,20 @@ impl BigInt {
             n -= 1;
         }
         debug_assert!(n > 0, "divmod_mag: zero divisor");
+        // TOTAL on a zero divisor (lane G10, 2026-08-16). The `debug_assert`
+        // above is compiled out of `--release`, and the very next use of `n` is
+        // `v[n - 1]`: `0usize - 1` wraps to `usize::MAX` and the slice index
+        // PANICS. A Rust panic in a native is not a Java throwable — it takes
+        // the VM down where HotSpot throws `ArithmeticException: BigInteger
+        // divide by zero`. All four public callers (`div`, `rem`, `divmod`,
+        // `modulo`) short-circuit `o.is_zero()` first, so this is a landmine
+        // and not a live defect; it is removed rather than documented because
+        // the cost is one comparison on a path that already trims both
+        // operands. The answer matches those wrappers' own zero-divisor
+        // convention: `(0, 0)`.
+        if n == 0 {
+            return (Vec::new(), Vec::new());
+        }
         let a = &a_in[..alen];
         let v = &b_in[..n];
 
@@ -547,35 +569,71 @@ impl BigInt {
         }
     }
 
-    /// `self^exp mod modulus`, all magnitudes; `exp` must be non-negative and
-    /// `modulus` positive (the native layer handles negative exponents via
-    /// modInverse and a zero/negative modulus separately). Square-and-multiply
-    /// with word-based mul + non-negative `modulo` — no decimal anywhere.
+    /// `self^exp mod modulus`, all magnitudes; `exp` is used by magnitude (the
+    /// native layer handles a genuinely negative exponent via modInverse) and a
+    /// zero/negative modulus is reduced against `|modulus|`, matching
+    /// [`BigInt::modulo`].
+    ///
+    /// **Odd modulus — the whole crypto hot path (RSA, DH, Miller-Rabin) —
+    /// takes windowed Montgomery** ([`crate::montgomery`]): the per-step full
+    /// Knuth-D division is replaced by a multiply and a limb shift, and the
+    /// multiplies are cut by a factor of the window width against a precomputed
+    /// table. Even moduli have no Montgomery form and fall back to
+    /// [`Self::modpow_classic`]. Retires
+    /// `perf/biginteger-modpow-has-no-montgomery-reduction-20260817`.
     pub(crate) fn modpow(&self, exp: &BigInt, modulus: &BigInt) -> BigInt {
         if modulus.is_zero() {
             return BigInt::zero();
         }
         let one = Self::small(1);
-        if modulus.cmp(&one) == Ordering::Equal {
+        // Reduce against |modulus|, as `modulo` does.
+        let m_pos = BigInt {
+            neg: false,
+            mag: modulus.mag.clone(),
+        };
+        if m_pos.cmp(&one) == Ordering::Equal {
             return BigInt::zero(); // anything mod 1 == 0
         }
-        let mut result = one; // 1, already < modulus since modulus > 1
-        let mut base = self.modulo(modulus);
-        let ebits = exp.mag.len() * 32;
-        for i in 0..ebits {
+        let Some(mont) = crate::montgomery::Montgomery::new(&m_pos.mag) else {
+            // Even modulus (or a degenerate one already handled above).
+            return self.modpow_classic(exp, &m_pos);
+        };
+        let n = mont.limbs();
+        let base = self.modulo(&m_pos);
+        // R mod m and R^2 mod m. Two divisions, once, instead of one per step.
+        let mut r1 = one.shl(32 * n as u32).modulo(&m_pos).mag;
+        r1.resize(n, 0);
+        let mut r2 = one.shl(64 * n as u32).modulo(&m_pos).mag;
+        r2.resize(n, 0);
+        let mag = crate::montgomery::modpow_odd(&mont, &base.mag, &exp.mag, &r1, &r2);
+        Self::normalize(mag, false)
+    }
+
+    /// Division-based square-and-multiply — the fallback for an **even**
+    /// modulus, which has no Montgomery form. `modulus` must be positive and
+    /// greater than 1.
+    ///
+    /// Left-to-right over `exp.bit_length()` bits rather than
+    /// `exp.mag.len() * 32`: the old bound squared up to 31 leading zero bits of
+    /// the top word for nothing.
+    fn modpow_classic(&self, exp: &BigInt, modulus: &BigInt) -> BigInt {
+        let mut result = Self::small(1);
+        let base = self.modulo(modulus);
+        let ebits = crate::montgomery::bit_len(&exp.mag);
+        for i in (0..ebits).rev() {
+            result = result.mul(&result).modulo(modulus);
             if (exp.mag[i / 32] >> (i % 32)) & 1 == 1 {
                 result = result.mul(&base).modulo(modulus);
-            }
-            if i + 1 < ebits {
-                base = base.mul(&base).modulo(modulus);
             }
         }
         result
     }
 
-    /// Strong-probable-prime (Miller-Rabin) test with fixed small-prime bases —
-    /// mirrors the decimal `bi_is_probable_prime_str` (trial division < 1000,
-    /// then 13 fixed bases), but on words so the inner `modPow` is fast.
+    /// `BigInteger.modInverse(m)` — the extended Euclidean inverse of `self`
+    /// mod `m`, or `None` when `gcd(self, m) != 1`. `m` must be positive.
+    ///
+    /// (This doc comment used to describe `is_probable_prime`, which is the
+    /// *next* function down; the two had drifted apart.)
     pub(crate) fn mod_inverse(&self, modulus: &BigInt) -> Option<BigInt> {
         if modulus.signum() <= 0 {
             return None;
@@ -608,6 +666,9 @@ impl BigInt {
         Some(t)
     }
 
+    /// Strong-probable-prime (Miller-Rabin) test with fixed small-prime bases —
+    /// mirrors the decimal `bi_is_probable_prime_str` (trial division < 1000,
+    /// then 13 fixed bases), but on words so the inner `modPow` is fast.
     pub(crate) fn is_probable_prime(&self) -> bool {
         if self.neg || self.is_zero() {
             return false;
@@ -685,6 +746,24 @@ impl BigInt {
             None => 0,
             Some(&top) => (mag.len() - 1) * 32 + (32 - top.leading_zeros() as usize),
         }
+    }
+
+    /// This value's MAGNITUDE bit length — the single owner of that rule.
+    ///
+    /// It is **not** [`Self::bit_length`]: `BigInteger.bitLength()` subtracts
+    /// the sign bit for a negative exact power of two, and every range guard in
+    /// this family needs the magnitude. MEASURED by lane F2
+    /// (`scratchpad/f2/BiProbe.java`, Microsoft OpenJDK 25.0.3+9):
+    /// `(-2).shiftLeft(Integer.MAX_VALUE - 2)` is LEGAL and reports
+    /// `bitLength=2147483646`, one less than its 2_147_483_647 magnitude bits —
+    /// so a guard written on `bit_length()` admits exactly one bit too many for
+    /// that family of operands, which is where a 256 MB allocation comes back.
+    ///
+    /// Exposed because the same three lines had been copied into
+    /// `math_bignum::bi_mag_bits` and `phases_late::p71_bi_mag_bits`; callers
+    /// should use this instead of a fourth copy.
+    pub(crate) fn magnitude_bits(&self) -> u64 {
+        Self::mag_bits(&self.mag) as u64
     }
 
     /// Two's-complement representation in exactly `len` words (little-endian),
@@ -779,12 +858,59 @@ impl BigInt {
         }
     }
 
-    /// `BigInteger.testBit(n)`.
+    /// The `n`th least-significant word of the **infinite** two's-complement
+    /// representation — JDK 25 `BigInteger.getInt` (`BigInteger.java:4838`):
+    ///
+    /// ```text
+    ///     if (n >= mag.length) return signInt();          // 0, or -1 when negative
+    ///     int magInt = mag[mag.length-n-1];
+    ///     return (signum >= 0 ? magInt :
+    ///             (n <= numberOfTrailingZeroInts() ? -magInt : ~magInt));
+    /// ```
+    ///
+    /// `mag` there is big-endian, so `mag[mag.length-n-1]` is our little-endian
+    /// `mag[n]`, and `numberOfTrailingZeroInts()` is the index of the lowest
+    /// non-zero limb. Words at or below that index are negated; the ones above
+    /// it are complemented — the borrow out of the low words has already been
+    /// consumed. **Allocates nothing**, which is the whole point: `n` is an
+    /// argument, so anything sized by it is reachable denial of service.
+    fn get_int(&self, n: usize) -> u32 {
+        if n >= self.mag.len() {
+            return if self.neg { u32::MAX } else { 0 };
+        }
+        let m = self.mag[n];
+        if !self.neg {
+            return m;
+        }
+        let lowest_nonzero = self.mag.iter().position(|&w| w != 0).unwrap_or(0);
+        if n <= lowest_nonzero {
+            m.wrapping_neg()
+        } else {
+            !m
+        }
+    }
+
+    /// `BigInteger.testBit(n)` — `(getInt(n >>> 5) & (1 << (n & 31))) != 0`,
+    /// JDK 25 `BigInteger.java:3747`. The caller rejects a negative `n` with
+    /// `ArithmeticException("Negative bit address")` before widening to `u32`.
+    ///
+    /// This used to materialize the two's complement out to `n`'s word:
+    ///
+    /// ```text
+    ///     let len = self.mag.len().max(word + 1) + 1;
+    ///     let tw = self.to_twos(len);
+    /// ```
+    ///
+    /// The answers were right, but `BigInteger.ONE.testBit(Integer.MAX_VALUE)`
+    /// — one line of ordinary bytecode, in EVERY jdk mode — allocated
+    /// `vec![0u32; 67_108_866]`, ~256 MB, to read one bit that is a function of
+    /// the sign alone. HotSpot answers the same call in 0 ms (MEASURED,
+    /// `scratchpad/f7/TestBit.java`, Microsoft OpenJDK 25.0.3+9), and the
+    /// transliteration of the body below agrees with `java.math.BigInteger` on
+    /// 371,547 (operand, bit) pairs — including every bit index up to 400 and
+    /// `Integer.MAX_VALUE` itself — with zero diffs.
     pub(crate) fn test_bit(&self, n: u32) -> bool {
-        let word = (n / 32) as usize;
-        let len = self.mag.len().max(word + 1) + 1;
-        let tw = self.to_twos(len);
-        (tw[word] >> (n % 32)) & 1 == 1
+        (self.get_int((n / 32) as usize) >> (n % 32)) & 1 == 1
     }
 
     /// `BigInteger.getLowestSetBit()` — index of the rightmost set bit, or -1
@@ -820,6 +946,18 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         *state
+    }
+
+    /// Random positive odd `BigInt` of exactly `bits` bits (top bit set, low
+    /// bit set). `bits >= 1`; `bits == 1` yields 1.
+    fn rand_bits_odd(state: &mut u64, bits: u32) -> BigInt {
+        let words = bits.div_ceil(32) as usize;
+        let mut mag: Vec<u32> = (0..words).map(|_| lcg(state) as u32).collect();
+        let top = (bits - 1) % 32;
+        mag[words - 1] &= (1u32 << top) | ((1u32 << top) - 1);
+        mag[words - 1] |= 1u32 << top;
+        mag[0] |= 1;
+        BigInt::normalize(mag, false)
     }
 
     /// Random signed decimal string, 1..=48 digits, ~half negative.
@@ -1025,6 +1163,138 @@ mod tests {
                 bi_mod_pow_str(&ba, &e, &m),
                 "rand modpow({ba}^{e} mod {m})"
             );
+        }
+    }
+
+    /// The Montgomery rewrite's safety net.
+    ///
+    /// `modpow` dispatches on the parity of the modulus: odd goes to windowed
+    /// Montgomery, even to `modpow_classic`. This drives both arms across
+    /// operand sizes with a *third*, independent oracle — the decimal
+    /// `bi_mod_pow_str` — so neither arm is checked only against itself, and
+    /// then cross-checks the two arms against each other on odd moduli (where
+    /// both are defined). A Montgomery bug that produced plausible-looking
+    /// wrong residues would have to fool all three to survive.
+    #[test]
+    fn modpow_montgomery_and_classic_agree_with_decimal() {
+        let mut state = 0x1bad_c0de_5eed_0007u64;
+
+        // Structural cases first: the shapes that break window/limb bookkeeping.
+        let structural: &[(&str, &str, &str)] = &[
+            // modulus 1 -> everything is 0
+            ("123456789", "987654321", "1"),
+            // odd single-limb moduli at the word boundary
+            ("4294967295", "4294967295", "4294967295"),
+            ("4294967296", "4294967296", "4294967295"),
+            ("1", "0", "3"),
+            ("0", "0", "3"),
+            ("0", "1", "3"),
+            // exponent whose top word has 31 leading zero bits (the old
+            // `mag.len() * 32` bound squared all of them for nothing)
+            ("7", "4294967296", "1000000007"),
+            ("7", "18446744073709551616", "1000000007"),
+            // even moduli, including powers of two (the fallback arm)
+            ("123456789", "65537", "2"),
+            ("123456789", "65537", "4294967296"),
+            ("123456789", "65537", "340282366920938463463374607431768211456"),
+            ("123456789", "65537", "1000000008"),
+            (
+                "99999999999999999999999999",
+                "123456789",
+                "618970019642690137449562112",
+            ),
+            // negative base: BigInteger.modPow is always non-negative
+            ("-2", "3", "5"),
+            ("-2", "2", "5"),
+            ("-123456789012345678901234567890", "65537", "1000000007"),
+            ("-123456789012345678901234567890", "65537", "1000000008"),
+            // large odd modulus, RSA-ish exponent
+            (
+                "123456789012345678901234567890123456789012345678901234567890",
+                "65537",
+                "115792089237316195423570985008687907853269984665640564039457584007913129639747",
+            ),
+        ];
+        for &(ba, e, m) in structural {
+            let got = b(ba).modpow(&b(e), &b(m)).to_decimal();
+            assert_eq!(got, bi_mod_pow_str(ba, e, m), "modpow({ba}^{e} mod {m})");
+        }
+
+        // Random sweep across operand widths. `bits` is the modulus width, so
+        // this walks 1-limb moduli up through multi-limb ones; the exponent and
+        // base are independently sized so the window code sees short and long
+        // exponents against both narrow and wide moduli.
+        for &bits in &[1u32, 2, 8, 31, 32, 33, 64, 65, 127, 128, 200, 256] {
+            // The decimal oracle is O(digits^2) per squaring, so it dominates
+            // at the wide end; taper the repeat count rather than the widths.
+            let repeats = if bits >= 128 { 2 } else { 8 };
+            for _ in 0..repeats {
+                let m_odd = rand_bits_odd(&mut state, bits);
+                // Same magnitude made even, so both arms see comparable sizes.
+                let m_even = m_odd.add(&BigInt::small(1));
+                for m in [&m_odd, &m_even] {
+                    if m.cmp(&BigInt::small(1)) != Ordering::Greater {
+                        continue;
+                    }
+                    for &ebits in &[1u32, 5, 17, 24, 70, 197, bits.max(1)] {
+                        let base = rand_bits_odd(&mut state, bits.max(1));
+                        let base = if lcg(&mut state) & 1 == 0 {
+                            base.neg_value()
+                        } else {
+                            base
+                        };
+                        let exp = rand_bits_odd(&mut state, ebits);
+                        let (bs, es, ms) = (base.to_decimal(), exp.to_decimal(), m.to_decimal());
+                        assert_eq!(
+                            base.modpow(&exp, m).to_decimal(),
+                            bi_mod_pow_str(&bs, &es, &ms),
+                            "modpow({bs}^{es} mod {ms})"
+                        );
+                        // Odd moduli: the two arms must agree bit for bit.
+                        if m.mag[0] & 1 == 1 {
+                            assert_eq!(
+                                base.modpow(&exp, m),
+                                base.modpow_classic(&exp, m),
+                                "montgomery vs classic ({bs}^{es} mod {ms})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// RSA is the failure mode the doc names: a subtly wrong modPow produces
+    /// plausible-looking wrong signatures that still round-trip through the
+    /// encoding layers. Check the algebra directly — `(m^e)^d == m (mod n)` for
+    /// a real keypair, plus the CRT half-exponentiations — so a wrong residue
+    /// cannot hide behind a self-consistent implementation.
+    #[test]
+    fn modpow_round_trips_an_rsa_keypair() {
+        // p, q distinct primes; n = p*q, e = 65537, d = e^-1 mod phi.
+        let p = b("177250851143413106261106096231831452933");
+        let q = b("329539864610483636976818094878219646841");
+        assert!(p.is_probable_prime(), "p prime");
+        assert!(q.is_probable_prime(), "q prime");
+        let n = p.mul(&q);
+        let e = b("65537");
+        let phi = p.sub(&BigInt::small(1)).mul(&q.sub(&BigInt::small(1)));
+        let d = e.mod_inverse(&phi).expect("e invertible mod phi");
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..12 {
+            let msg = rand_bits_odd(&mut state, 200).modulo(&n);
+            let c = msg.modpow(&e, &n);
+            let back = c.modpow(&d, &n);
+            assert_eq!(back, msg, "RSA round trip");
+            assert_ne!(c, msg, "ciphertext is not the plaintext");
+            // The signing direction, and CRT halves against the direct result.
+            let sig = msg.modpow(&d, &n);
+            assert_eq!(sig.modpow(&e, &n), msg, "RSA sign/verify round trip");
+            let dp = d.modulo(&p.sub(&BigInt::small(1)));
+            let dq = d.modulo(&q.sub(&BigInt::small(1)));
+            assert_eq!(msg.modpow(&dp, &p), sig.modulo(&p), "CRT half mod p");
+            assert_eq!(msg.modpow(&dq, &q), sig.modulo(&q), "CRT half mod q");
         }
     }
 
@@ -1234,6 +1504,54 @@ mod tests {
         positive_bit_ops_match_decimal_cases(150, 25);
     }
 
+    /// `test_bit` must answer a huge bit address from the sign alone, without
+    /// materializing the two's complement out to that word. The old body built
+    /// `vec![0u32; (n/32)+2]`, so every row here allocated ~256 MB; this test
+    /// would have taken minutes and ~4 GB.
+    ///
+    /// Expected values MEASURED on Microsoft OpenJDK 25.0.3+9
+    /// (`scratchpad/f7/TestBit.java`), each `[0 ms]`:
+    ///
+    /// ```text
+    /// ONE.testBit(Integer.MAX_VALUE)  = false      (-1).testBit(Integer.MAX_VALUE) = true
+    /// ZERO.testBit(Integer.MAX_VALUE) = false      (-1).testBit(0)                 = true
+    /// (-2).testBit(0) = false                      (-2).testBit(1)                 = true
+    /// (2^64).testBit(0)     = false                (-(2^64)).testBit(0)  = false
+    /// (-(2^64)).testBit(64) = true                 (-(2^64)).testBit(65) = true
+    /// (-(2^64+1)).testBit(0) = true                (-(2^64+1)).testBit(1) = true
+    /// ```
+    ///
+    /// The full transliteration of this body agrees with `java.math.BigInteger`
+    /// on 371,547 (operand, bit) pairs with zero diffs.
+    #[test]
+    fn test_bit_is_allocation_free_at_huge_addresses() {
+        const MAX: u32 = i32::MAX as u32;
+        assert!(!b("1").test_bit(MAX));
+        assert!(b("-1").test_bit(MAX));
+        assert!(!b("0").test_bit(MAX));
+        assert!(b("-1").test_bit(0));
+        assert!(!b("-2").test_bit(0));
+        assert!(b("-2").test_bit(1));
+        // 2^64 == mag [0, 0, 1]: the low limbs are zero, which is what
+        // separates `-magInt` from `~magInt` in the JDK's `getInt`.
+        let p64 = b("18446744073709551616");
+        let n64 = b("-18446744073709551616");
+        assert!(!p64.test_bit(0));
+        assert!(!n64.test_bit(0));
+        assert!(n64.test_bit(64));
+        assert!(n64.test_bit(65));
+        assert!(n64.test_bit(MAX));
+        let n64p1 = b("-18446744073709551617");
+        assert!(n64p1.test_bit(0));
+        assert!(n64p1.test_bit(1));
+        // A positive value is 0 above its magnitude, a negative one is 1 —
+        // for every address past the top limb, not just the huge ones.
+        for &n in &[96u32, 97, 1000, 1 << 20, 1 << 26, MAX - 1, MAX] {
+            assert!(!p64.test_bit(n), "positive bit {n}");
+            assert!(n64.test_bit(n), "negative bit {n}");
+        }
+    }
+
     #[test]
     fn shifts_match_decimal() {
         let mut state = 0xfeed_face_dead_beefu64;
@@ -1257,5 +1575,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **No-panic pin (lane G10, 2026-08-16).** `divmod_mag`'s zero-divisor
+    /// guard was a `debug_assert!`, which is compiled out of `--release`; the
+    /// next line indexes `v[n - 1]` and `0usize - 1` is a slice-index panic.
+    /// A panic in a native is a VM abort, not a Java exception.
+    ///
+    /// The four public wrappers short-circuit first, so the assertions here are
+    /// on their documented convention (zero out) AND on the fact that every one
+    /// of them RETURNS. `divmod_mag` itself is private, so it is reached
+    /// through them; a zero-length magnitude is what `BigInt::zero()` carries.
+    #[test]
+    fn division_by_zero_returns_instead_of_panicking() {
+        let zero = BigInt::zero();
+        for v in ["0", "1", "-1", "255", "-9007199254740993", "10"] {
+            let x = b(v);
+            assert_eq!(x.div(&zero).to_decimal(), "0", "{v} / 0");
+            assert_eq!(x.rem(&zero).to_decimal(), "0", "{v} rem 0");
+            assert_eq!(x.modulo(&zero).to_decimal(), "0", "{v} mod 0");
+            let (q, r) = x.divmod(&zero);
+            assert_eq!((q.to_decimal(), r.to_decimal()), ("0".into(), "0".into()));
+            // modpow with a zero modulus is the same shape one level up.
+            assert_eq!(x.modpow(&b("3"), &zero).to_decimal(), "0");
+        }
+        // `from_le_words` normalizes, so an all-zero-limb divisor arrives at
+        // `divmod_mag` already trimmed to `n == 0` — the exact input the
+        // `debug_assert!` was the only thing standing in front of.
+        let padded_zero = BigInt::from_le_words(false, vec![0, 0, 0]);
+        assert!(padded_zero.is_zero());
+        assert_eq!(b("12345").div(&padded_zero).to_decimal(), "0");
+        assert_eq!(b("12345").rem(&padded_zero).to_decimal(), "0");
     }
 }

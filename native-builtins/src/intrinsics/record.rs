@@ -143,7 +143,25 @@ fn record_hash_code_at(
     for index in first_slot..first_slot + num_components {
         let current = ctx.read_native_pin(pin, this);
         let component = ctx.get_field(current, index);
-        match component_hash(ctx, &component, depth) {
+        // G9-1: a `boolean` component hashes 1231/1237, not 1/0. The class
+        // lookup is behind the `0 | 1` guard because those are the only two
+        // values at which `Boolean.hashCode` and `Integer.hashCode` differ,
+        // and a `boolean` field cannot hold any other.
+        let mut boolean_hash: Option<i32> = None;
+        if let Value::Int(v) = component {
+            if (v == 0 || v == 1) && is_boolean_component(ctx, class_id, index - first_slot) {
+                boolean_hash = Some(if v == 1 {
+                    BOOLEAN_HASH_TRUE
+                } else {
+                    BOOLEAN_HASH_FALSE
+                });
+            }
+        }
+        let hashed = match boolean_hash {
+            Some(h) => Ok(h),
+            None => component_hash(ctx, &component, depth),
+        };
+        match hashed {
             Ok(component_hash) => {
                 hash = Ok(hash
                     .unwrap_or(0)
@@ -430,14 +448,130 @@ fn component_fast_path(ctx: &mut dyn NativeContext, obj: ObjectRef) -> u8 {
     ctx.object_method_fast_path(ctx.class_id_of_object(obj)).0
 }
 
+/// Which components of a record class are declared `boolean`, memoised.
+///
+/// G9-1. `Value::Int` is the JVM's carrier for `boolean`, `byte`, `char`,
+/// `short` and `int`, and four of those five hash to the value itself. The
+/// fifth does not: measured on OpenJDK 25.0.3+9, `record Z(boolean b) {}` gives
+/// `new Z(false).hashCode() == 1237` and `new Z(true).hashCode() == 1231`,
+/// because the generated body calls `Boolean.hashCode`. The direct
+/// implementation answered `0` and `1`.
+///
+/// The declared type is not on the component value, so it has to come from the
+/// class — and `NativeContext::record_components` is far too expensive to call
+/// per hash: it takes the class-manager read lock and clones a `String` pair
+/// per component. Hence the memo, and hence the guard at the ONE call site:
+/// it is consulted only when a component reads back as `Int(0)` or `Int(1)`,
+/// the only two values at which `Boolean.hashCode` and `Integer.hashCode` can
+/// possibly disagree. A `boolean` field cannot hold anything else.
+///
+/// Keyed on the raw `ClassId` index. Classes are not unloaded in this VM, so a
+/// stale entry is not reachable; the map is read-mostly after warmup.
+///
+/// The better home for this is the same memo slot
+/// `NativeContext::object_method_fast_path` already occupies on the VM side —
+/// it is computed once per class there and would cost nothing. That is
+/// nominated rather than taken here: `native-api` and `vm` are not this lane's
+/// files.
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. The read copies a `bool`
+/// out and the write inserts an already-built `Box<[bool]>`; the one
+/// `NativeContext` call in this function (`record_components`) runs BETWEEN
+/// them, with no guard held.
+///
+/// Still a `LazyLock`: `OrderedPlRwLock::new` IS `const`, but
+/// `HashMap::new` is not, so the pair cannot initialise a `static`.
+static BOOLEAN_COMPONENTS: std::sync::LazyLock<
+    cratonvm_types::lock_order::OrderedPlRwLock<std::collections::HashMap<u32, Box<[bool]>>>,
+> = std::sync::LazyLock::new(|| {
+    cratonvm_types::lock_order::OrderedPlRwLock::new(
+        std::collections::HashMap::new(),
+        cratonvm_types::lock_order::LockLevel::Scratch,
+    )
+});
+
+/// `true` if component `component_index` of `class_id` is declared `boolean`.
+fn is_boolean_component(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    component_index: usize,
+) -> bool {
+    let key = class_id.as_u32();
+    if let Some(hit) = {
+        let map = BOOLEAN_COMPONENTS.read();
+        map.get(&key)
+            .map(|flags| flags.get(component_index).copied().unwrap_or(false))
+    } {
+        return hit;
+    }
+    let flags: Box<[bool]> = ctx
+        .record_components(class_id)
+        .iter()
+        .map(|(_, descriptor)| descriptor == "Z")
+        .collect();
+    let answer = flags.get(component_index).copied().unwrap_or(false);
+    BOOLEAN_COMPONENTS.write().insert(key, flags);
+    answer
+}
+
+/// `Boolean.hashCode` — the two constants the JDK has used since 1.0.
+const BOOLEAN_HASH_TRUE: i32 = 1231;
+/// See [`BOOLEAN_HASH_TRUE`].
+const BOOLEAN_HASH_FALSE: i32 = 1237;
+
+/// `Float.floatToIntBits` — NOT `floatToRawIntBits`.
+///
+/// G9-1, measured on OpenJDK 25.0.3+9. The generated record body hashes a
+/// `float` component with `Float.hashCode(f)`, which is `floatToIntBits`, and
+/// that COLLAPSES every NaN to the canonical `0x7FC00000`. `f32::to_bits` is
+/// `floatToRawIntBits` and keeps the payload:
+///
+/// ```text
+///   record F(float v) {}                       HotSpot      was
+///   new F(Float.intBitsToFloat(0x7F800001))
+///       .hashCode()                            2143289344   2139095041
+/// ```
+///
+/// Reachable from ordinary bytecode — `Float.intBitsToFloat` is the way in,
+/// and a signalling NaN out of native code is another. Every non-NaN input,
+/// including both zeros and both infinities, is unaffected: the two functions
+/// differ on NaN and nowhere else.
+#[inline]
+fn float_to_int_bits(f: f32) -> i32 {
+    if f.is_nan() {
+        0x7FC0_0000u32 as i32
+    } else {
+        f.to_bits() as i32
+    }
+}
+
+/// [`float_to_int_bits`]'s twin — `Double.doubleToLongBits`. Canonical NaN is
+/// `0x7FF8000000000000`. Measured: `new D(Double.longBitsToDouble(
+/// 0x7FF0000000000001L)).hashCode()` is `2146959360` on HotSpot.
+#[inline]
+fn double_to_long_bits(d: f64) -> u64 {
+    if d.is_nan() {
+        0x7FF8_0000_0000_0000u64
+    } else {
+        d.to_bits()
+    }
+}
+
 /// `Objects.hashCode` for a non-reference (or null) component value.
+///
+/// **This function cannot see a `boolean`.** `Value::Int` carries `boolean`,
+/// `byte`, `char`, `short` and `int` alike, and the wrapper hash agrees for
+/// four of the five: `Byte`/`Short`/`Character`/`Integer.hashCode` are all the
+/// value itself, while `Boolean.hashCode` is `1231`/`1237`. So the answer is
+/// wrong exactly when the declared component type is `Z` — see
+/// [`boolean_component_mask`], which supplies the missing bit, and which is
+/// consulted only for the two `int` values where it can possibly matter.
 fn primitive_hash(value: &Value) -> i32 {
     match value {
         Value::Int(n) => *n,
         Value::Long(n) => (*n ^ (*n >> 32)) as i32,
-        Value::Float(f) => f.to_bits() as i32,
+        Value::Float(f) => float_to_int_bits(*f),
         Value::Double(d) => {
-            let bits = d.to_bits();
+            let bits = double_to_long_bits(*d);
             (bits ^ (bits >> 32)) as i32
         }
         // `Objects.hashCode(null)` is 0.
@@ -450,11 +584,22 @@ fn primitives_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Long(x), Value::Long(y)) => x == y,
-        // `Float.equals`/`Double.equals` bit semantics: NaN equals NaN and
-        // +0.0 does not equal -0.0, which is what the generated record
-        // `equals` uses for float/double components.
-        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
-        (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
+        // The generated body compares a `float`/`double` component with
+        // `Float.compare(a, b) == 0` / `Double.compare(a, b) == 0`, which goes
+        // through `floatToIntBits` — so NaN equals NaN (including two NaNs
+        // with DIFFERENT payloads) and `+0.0` does not equal `-0.0`.
+        //
+        // G9-1: the raw-bit form this replaced got the second rule right and
+        // the first one only half right. Measured on OpenJDK 25.0.3+9 with
+        // `record F(float v) {}`:
+        //
+        // ```text
+        //   F(0.0f).equals(F(-0.0f))                       false   false  ok
+        //   F(NaN).equals(F(NaN))                          true    true   ok
+        //   F(intBitsToFloat(0x7F800001)).equals(F(NaN))    true   FALSE  wrong
+        // ```
+        (Value::Float(x), Value::Float(y)) => float_to_int_bits(*x) == float_to_int_bits(*y),
+        (Value::Double(x), Value::Double(y)) => double_to_long_bits(*x) == double_to_long_bits(*y),
         (Value::Object(None), Value::Object(None)) => true,
         _ => false,
     }
@@ -503,5 +648,69 @@ mod tests {
             &Value::Object(None)
         ));
         assert!(!primitives_equal(&Value::Int(1), &Value::Long(1)));
+    }
+
+    /// Every expectation below is the verbatim OpenJDK 25.0.3+9 answer for the
+    /// javac-generated body, captured by the `RecProbe` differential (G9-1).
+    ///
+    /// The discriminating input is a NaN with a NON-canonical payload, which is
+    /// the only place `floatToIntBits` and `floatToRawIntBits` differ. Reached
+    /// from ordinary bytecode through `Float.intBitsToFloat`.
+    #[test]
+    fn a_nan_component_hashes_and_compares_by_canonical_bits() {
+        // record F(float v) {}  new F(intBitsToFloat(0x7F800001)).hashCode()
+        let odd_nan = f32::from_bits(0x7F80_0001);
+        assert!(odd_nan.is_nan());
+        assert_eq!(primitive_hash(&Value::Float(odd_nan)), 2_143_289_344);
+        assert_eq!(primitive_hash(&Value::Float(f32::NAN)), 2_143_289_344);
+        // record D(double v) {}  new D(longBitsToDouble(0x7FF0000000000001L))
+        let odd_dnan = f64::from_bits(0x7FF0_0000_0000_0001);
+        assert!(odd_dnan.is_nan());
+        assert_eq!(primitive_hash(&Value::Double(odd_dnan)), 2_146_959_360);
+        assert_eq!(primitive_hash(&Value::Double(f64::NAN)), 2_146_959_360);
+
+        // Two NaNs with different payloads ARE equal components on HotSpot.
+        assert!(primitives_equal(
+            &Value::Float(odd_nan),
+            &Value::Float(f32::NAN)
+        ));
+        assert!(primitives_equal(
+            &Value::Double(odd_dnan),
+            &Value::Double(f64::NAN)
+        ));
+
+        // Controls: the non-NaN answers must not have moved. `-0.0` keeps its
+        // sign bit in both the hash and the comparison.
+        assert_eq!(primitive_hash(&Value::Float(1.5f32)), 1_069_547_520);
+        assert_eq!(primitive_hash(&Value::Float(-0.0f32)), i32::MIN);
+        assert_eq!(primitive_hash(&Value::Double(-0.0f64)), i32::MIN);
+        assert!(!primitives_equal(
+            &Value::Float(0.0f32),
+            &Value::Float(-0.0f32)
+        ));
+        assert!(!primitives_equal(&Value::Double(0.0), &Value::Double(-0.0)));
+    }
+
+    /// `Boolean.hashCode`'s two constants, which is what a `boolean` record
+    /// component hashes to — measured, `new Z(false).hashCode() == 1237`.
+    ///
+    /// The full path needs a live class (`is_boolean_component` reads the
+    /// record's descriptors), which a leaf-crate unit test cannot build; what
+    /// is pinned here is the constant pair and the guard's own arithmetic,
+    /// i.e. that `primitive_hash` is still the INT answer for `0`/`1` so the
+    /// two are genuinely different values and the branch is not a no-op.
+    #[test]
+    fn boolean_component_hash_constants() {
+        assert_eq!(BOOLEAN_HASH_TRUE, 1231);
+        assert_eq!(BOOLEAN_HASH_FALSE, 1237);
+        assert_eq!(primitive_hash(&Value::Int(1)), 1);
+        assert_eq!(primitive_hash(&Value::Int(0)), 0);
+        assert_ne!(primitive_hash(&Value::Int(1)), BOOLEAN_HASH_TRUE);
+        assert_ne!(primitive_hash(&Value::Int(0)), BOOLEAN_HASH_FALSE);
+        // Every other int value is the same under both wrappers, which is why
+        // the guard is `0 | 1` and not "every Int component".
+        for v in [-1i32, 2, 7, i32::MIN, i32::MAX] {
+            assert_eq!(primitive_hash(&Value::Int(v)), v);
+        }
     }
 }

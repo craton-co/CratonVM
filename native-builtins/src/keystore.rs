@@ -848,6 +848,230 @@ fn extend_chain_by_issuer(
     certs_by_local_id.retain(|_, group| !group.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// BER -> DER normalisation
+// ---------------------------------------------------------------------------
+//
+// PKCS#12 is a **BER** format, not a DER one, and the `p12` crate this module
+// parses with accepts only DER. That is not a theoretical gap: BouncyCastle
+// writes indefinite-length constructions, so every PKCS#12 file written by the
+// most widely deployed third-party JCA provider was unreadable here.
+//
+// `openssl asn1parse` on the two, same certificate, same password:
+//
+// ```text
+// BouncyCastle            JDK
+//   0:d=0 hl=2 l=inf        0:d=0 hl=4 l= 786   SEQUENCE
+//  20:d=3 hl=2 l=inf       26:d=3 hl=4 l= 681   OCTET STRING  (BC's is CONSTRUCTED)
+// 669:d=4 hl=2 l=  0                            EOC
+// ```
+//
+// Two BER features are in play and both are handled below:
+//
+// 1. **Indefinite lengths** - `80` in place of the length, terminated by an
+//    end-of-contents `00 00`. Rewritten to the definite form.
+// 2. **Segmented strings** - a CONSTRUCTED OCTET STRING whose children are the
+//    pieces of one string. DER requires the primitive form, so the pieces are
+//    concatenated. This matters beyond parsing: the PKCS#12 MAC is computed
+//    over the *contents* of the authSafe OCTET STRING, which is exactly that
+//    concatenation.
+//
+// This is deliberately a LENGTH normalisation and not a general BER-to-DER
+// canonicaliser: SET OF ordering and primitive-value canonicalisation are left
+// alone, because the parser does not depend on them and rewriting them would
+// change bytes the MAC is taken over.
+
+/// The BER indefinite-length marker.
+const BER_INDEFINITE: u8 = 0x80;
+
+/// Bound on nesting, so a corrupt or hostile file cannot recurse without end.
+const BER_MAX_DEPTH: usize = 64;
+
+struct BerHeader<'a> {
+    /// The identifier octets, re-emitted verbatim.
+    ident: &'a [u8],
+    constructed: bool,
+    /// `None` is the indefinite form.
+    len: Option<usize>,
+}
+
+fn ber_header<'a>(src: &'a [u8], pos: &mut usize) -> Result<BerHeader<'a>, String> {
+    let ident_start = *pos;
+    let first = *src
+        .get(*pos)
+        .ok_or_else(|| "truncated identifier".to_string())?;
+    *pos += 1;
+    if first & 0x1f == 0x1f {
+        // High-tag-number form: continues while the top bit is set.
+        loop {
+            let b = *src
+                .get(*pos)
+                .ok_or_else(|| "truncated high-tag-number identifier".to_string())?;
+            *pos += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+    let ident = &src[ident_start..*pos];
+    let l0 = *src.get(*pos).ok_or_else(|| "truncated length".to_string())?;
+    *pos += 1;
+    let len = if l0 == BER_INDEFINITE {
+        None
+    } else if l0 & 0x80 == 0 {
+        Some(l0 as usize)
+    } else {
+        let n = (l0 & 0x7f) as usize;
+        if n == 0 || n > 8 {
+            return Err(format!("unsupported long-form length 0x{l0:02x}"));
+        }
+        let mut v: usize = 0;
+        for _ in 0..n {
+            let b = *src
+                .get(*pos)
+                .ok_or_else(|| "truncated long-form length".to_string())?;
+            *pos += 1;
+            v = v
+                .checked_mul(256)
+                .and_then(|x| x.checked_add(b as usize))
+                .ok_or_else(|| "length overflows usize".to_string())?;
+        }
+        Some(v)
+    };
+    Ok(BerHeader {
+        ident,
+        constructed: first & 0x20 != 0,
+        len,
+    })
+}
+
+/// Append `len` in the DER definite form (shortest encoding).
+fn der_length(len: usize, out: &mut Vec<u8>) {
+    if len < 0x80 {
+        out.push(len as u8);
+        return;
+    }
+    let mut be = Vec::new();
+    let mut v = len;
+    while v > 0 {
+        be.push((v & 0xff) as u8);
+        v >>= 8;
+    }
+    be.reverse();
+    out.push(0x80 | (be.len() as u8));
+    out.extend_from_slice(&be);
+}
+
+/// A universal OCTET STRING (tag 4), primitive or constructed.
+fn ber_is_octet_string(ident: &[u8]) -> bool {
+    ident.len() == 1 && ident[0] & 0xc0 == 0x00 && ident[0] & 0x1f == 0x04
+}
+
+fn ber_rewrite_one(
+    src: &[u8],
+    pos: &mut usize,
+    out: &mut Vec<u8>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > BER_MAX_DEPTH {
+        return Err(format!("nesting deeper than {BER_MAX_DEPTH}"));
+    }
+    let header = ber_header(src, pos)?;
+    let is_octet_string = ber_is_octet_string(header.ident);
+
+    if !header.constructed {
+        let len = header
+            .len
+            .ok_or_else(|| "primitive value with indefinite length".to_string())?;
+        let end = pos
+            .checked_add(len)
+            .ok_or_else(|| "content length overflows".to_string())?;
+        let content = src
+            .get(*pos..end)
+            .ok_or_else(|| "truncated primitive content".to_string())?;
+        out.extend_from_slice(header.ident);
+        der_length(len, out);
+        out.extend_from_slice(content);
+        *pos = end;
+        return Ok(());
+    }
+
+    // Constructed: rewrite the children first, so the length emitted is the
+    // length of the REWRITTEN body rather than the original one.
+    let mut inner = Vec::new();
+    match header.len {
+        Some(len) => {
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| "content length overflows".to_string())?;
+            if end > src.len() {
+                return Err("truncated constructed content".to_string());
+            }
+            while *pos < end {
+                ber_rewrite_one(src, pos, &mut inner, depth + 1)?;
+            }
+            if *pos != end {
+                return Err("child value overran its parent".to_string());
+            }
+        }
+        None => loop {
+            let a = *src
+                .get(*pos)
+                .ok_or_else(|| "truncated indefinite-length value".to_string())?;
+            let b = *src
+                .get(*pos + 1)
+                .ok_or_else(|| "truncated end-of-contents".to_string())?;
+            if a == 0x00 && b == 0x00 {
+                *pos += 2;
+                break;
+            }
+            ber_rewrite_one(src, pos, &mut inner, depth + 1)?;
+        },
+    }
+
+    if is_octet_string {
+        // Segments of one string: DER wants them joined and primitive. Every
+        // child is primitive by now, because a nested constructed OCTET STRING
+        // took this same branch.
+        let mut joined = Vec::new();
+        let mut p = 0usize;
+        while p < inner.len() {
+            let child = ber_header(&inner, &mut p)?;
+            let len = child
+                .len
+                .ok_or_else(|| "rewritten segment still indefinite".to_string())?;
+            let end = p
+                .checked_add(len)
+                .ok_or_else(|| "segment length overflows".to_string())?;
+            joined.extend_from_slice(
+                inner
+                    .get(p..end)
+                    .ok_or_else(|| "truncated segment".to_string())?,
+            );
+            p = end;
+        }
+        out.push(header.ident[0] & !0x20);
+        der_length(joined.len(), out);
+        out.extend_from_slice(&joined);
+    } else {
+        out.extend_from_slice(header.ident);
+        der_length(inner.len(), out);
+        out.extend_from_slice(&inner);
+    }
+    Ok(())
+}
+
+/// Rewrite one BER value into the equivalent definite-length encoding.
+///
+/// A file that is already DER comes back byte-identical, which is what makes
+/// this safe as a fallback: the DER path is unchanged.
+pub(crate) fn ber_to_definite_length(src: &[u8]) -> Result<Vec<u8>, String> {
+    let mut pos = 0usize;
+    let mut out = Vec::with_capacity(src.len());
+    ber_rewrite_one(src, &mut pos, &mut out, 0)?;
+    Ok(out)
+}
+
 pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
     load_pkcs12_ex(bytes, password, true)
 }
@@ -866,7 +1090,23 @@ pub(crate) fn load_pkcs12_ex(
     password: &[u8],
     verify_mac: bool,
 ) -> Result<LoadedKeyStore, KeyStoreError> {
-    let pfx = p12::PFX::parse(bytes).map_err(|e| KeyStoreError::Pkcs12Parse(format!("{e:?}")))?;
+    // DER first, so a conforming file takes exactly the path it always did.
+    // A BER one (BouncyCastle writes indefinite lengths and segmented OCTET
+    // STRINGs) is normalised and retried - see `ber_to_definite_length`. Both
+    // errors are reported if the retry also fails, because "the file is BER"
+    // and "the file is corrupt" are different answers.
+    let normalised: Vec<u8>;
+    let pfx = match p12::PFX::parse(bytes) {
+        Ok(pfx) => pfx,
+        Err(der_err) => {
+            normalised = ber_to_definite_length(bytes).map_err(|ber_err| {
+                KeyStoreError::Pkcs12Parse(format!("{der_err:?}; not valid BER either: {ber_err}"))
+            })?;
+            p12::PFX::parse(&normalised).map_err(|e| {
+                KeyStoreError::Pkcs12Parse(format!("{e:?} (after BER normalisation)"))
+            })?
+        }
+    };
 
     // p12 takes the password as &str (it internally converts to UTF-16BE for
     // PBE-key derivation, matching the PKCS#12 spec). We ask the caller for
@@ -2009,6 +2249,77 @@ fn hex_lower(b: &[u8]) -> String {
 // Native registration
 // ---------------------------------------------------------------------------
 
+/// Every class the provider table advertises as a `KeyStore` implementation,
+/// so the guard below and the registrations above cannot drift apart silently.
+#[cfg(test)]
+const ADVERTISED_KEYSTORE_CLASSES: &[&str] = &[
+    "sun/security/provider/JavaKeyStore$DualFormatJKS",
+    "sun/security/provider/JavaKeyStore$CaseExactJKS",
+    "sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12",
+    "sun/security/provider/DomainKeyStore$DKS",
+    "sun/security/pkcs12/PKCS12KeyStore",
+];
+
+#[cfg(test)]
+mod advertised_keystore_registration_tests {
+    use super::ADVERTISED_KEYSTORE_CLASSES;
+
+    /// A `KeyStore` row the provider table advertises must resolve to a class
+    /// this module actually serves.
+    ///
+    /// The two are joined only by a string, and dispatch here is by CLASS NAME
+    /// with no inheritance walk — so correcting a row to the real JDK class
+    /// name, which is exactly the right thing to do, silently unregisters the
+    /// engine surface. That happened: SUN's `KeyStore.PKCS12` was corrected
+    /// from `PKCS12KeyStore` to `PKCS12KeyStore$DualFormatPKCS12`, the JKS
+    /// twin of the same change WAS registered, and the PKCS12 one was not.
+    /// `KeyStore.getInstance("PKCS12")` — the default — then loaded nothing,
+    /// and netty's `JdkSslEngineTest` went from 754 passing to 563.
+    ///
+    /// Nothing in the build said so. The provider table was right, the
+    /// registration list was right for what it listed, and the gap was between
+    /// them. This test is that gap.
+    #[test]
+    fn every_advertised_keystore_class_has_an_engine_surface() {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        super::register_keystore_real(&mut registry);
+        let mut missing = Vec::new();
+        for fqn in ADVERTISED_KEYSTORE_CLASSES {
+            // `engineLoad` stands for the whole surface: `register_engine_surface`
+            // registers them together or not at all.
+            if registry
+                .find(fqn, "engineLoad", "(Ljava/io/InputStream;[C)V")
+                .is_none()
+            {
+                missing.push(*fqn);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the provider table advertises these KeyStore classes and this module \
+             registers no engine surface for them, so every engineLoad on one is a \
+             method with no body: {missing:?}"
+        );
+    }
+
+    /// …and the list the guard walks must be the list the provider table
+    /// actually publishes, or the guard checks a fiction. Compared against the
+    /// SOURCE of `provider_chain`'s SUN/SunJSSE rows rather than a copy.
+    #[test]
+    fn the_advertised_list_matches_the_provider_table() {
+        let src = include_str!("jca/provider_chain.rs");
+        for fqn in ADVERTISED_KEYSTORE_CLASSES {
+            let dotted = fqn.replace('/', ".");
+            assert!(
+                src.contains(&format!("\"{dotted}\"")),
+                "{dotted} is in ADVERTISED_KEYSTORE_CLASSES but no longer appears in \
+                 provider_chain.rs — drop it here, or the guard is checking a class \
+                 nothing advertises"
+            );
+        }
+    }
+}
+
 /// FQNs we register on. PKCS12 + JKS share the same `engine*` surface; we
 /// register on each FQN explicitly because dispatch is keyed by class name
 /// (no Java-inheritance walk on the native side — `java/security/KeyStore`
@@ -2018,6 +2329,35 @@ const PKCS12_FQN: &str = "sun/security/pkcs12/PKCS12KeyStore";
 const JKS_FQN: &str = "sun/security/provider/JavaKeyStore";
 const JKS_INNER_JKS_FQN: &str = "sun/security/provider/JavaKeyStore$JKS";
 const JKS_INNER_DUAL_FQN: &str = "sun/security/provider/JavaKeyStore$DualFormatJKS";
+/// `KeyStore.getInstance("PKCS12")` — the DEFAULT, and the one netty, Tomcat
+/// and every `SslContextBuilder` reach for.
+///
+/// Registered late, and the omission cost 191 tests. When the SUN provider's
+/// `KeyStore.PKCS12` row was corrected to name the real JDK class
+/// (`…$DualFormatPKCS12`, a `KeyStoreDelegator` that sniffs the stream), the
+/// row started naming a class this file does not register — and dispatch here
+/// is keyed by CLASS NAME with no inheritance walk, as the comment above says.
+/// So the engine surface silently went missing: every `engineLoad` on the
+/// platform-default PKCS#12 store did nothing, netty's key material came back
+/// empty, and `JdkSslEngineTest` went 754 ok / 1 failed to 563 / 192, with
+/// `IOException: setNeedClientAuth(true) requires javax.net.ssl.trustStore`
+/// among the wreckage — an engine falling back to `default_engine_server_config`
+/// because its `SSLContext` never got an identity.
+///
+/// The JKS half of that same change WAS registered (`JKS_INNER_DUAL_FQN`
+/// above). Only its twin was missed, which is why
+/// `every_advertised_keystore_class_has_an_engine_surface` now exists.
+const PKCS12_INNER_DUAL_FQN: &str = "sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12";
+/// `KeyStore.getInstance("CaseExactJKS")` — advertised long before the row
+/// correction and never registered either, so this one is not a regression,
+/// just the same hole one door along.
+const JKS_INNER_CASE_EXACT_FQN: &str = "sun/security/provider/JavaKeyStore$CaseExactJKS";
+/// `KeyStore.getInstance("DKS")`. A domain keystore is a different FORMAT
+/// (a policy file naming other stores), so serving it through this engine
+/// surface is not right in the long run — but an unregistered class answers
+/// nothing at all, and answering a `KeyStoreException` from a real
+/// `engineLoad` is strictly closer to the JDK than a method with no body.
+const DKS_FQN: &str = "sun/security/provider/DomainKeyStore$DKS";
 
 const SUN_KEYSTORE_FQN: &str = "java/security/KeyStore";
 
@@ -2031,6 +2371,9 @@ pub fn register_keystore_real(r: &mut NativeMethodRegistry) {
     register_engine_surface(r, JKS_FQN);
     register_engine_surface(r, JKS_INNER_JKS_FQN);
     register_engine_surface(r, JKS_INNER_DUAL_FQN);
+    register_engine_surface(r, PKCS12_INNER_DUAL_FQN);
+    register_engine_surface(r, JKS_INNER_CASE_EXACT_FQN);
+    register_engine_surface(r, DKS_FQN);
 
     // The `java.security.KeyStore` shim's `load`/`getKey`/`getCertificate`
     // engine surface is registered by `phases_early.rs` — we don't override
@@ -2941,6 +3284,23 @@ pub(crate) fn engine_set_key_entry(
         // No PKCS#8 encoding available (e.g. a PKCS#11/HSM-backed key with
         // getEncoded() == null) -- nothing we can stage natively. Lenient,
         // matches the same leniency engine_set_certificate_entry takes.
+        //
+        // But not SILENT: an opaque key is the normal case for a delegating
+        // provider (`MockAlternativeKeyProvider` in netty's
+        // `JdkDelegatingPrivateKeyMethodTest`, any PKCS#11 or HSM key), and
+        // dropping its entry with no trace means the alias simply is not there
+        // later — indistinguishable from a keystore that was never populated.
+        // the openssl-key-material-and-engine-residuals write-up (now retired)
+        // asked for exactly this line. The store keeps working through the
+        // live-keystore enumeration path
+        // (`x509_manager::build_key_manager_state_from_live_keystore`), which
+        // holds such a key BY REFERENCE, so this is a note about the NATIVE
+        // staging only, not necessarily a broken handshake.
+        eprintln!(
+            "[keystore] setKeyEntry store_id={id} alias={alias:?} NOT staged natively: the key              reports no encoding (getEncoded() == null / empty), which is normal for an opaque              provider key. algorithm={:?} format={:?}; the live-KeyStore enumeration path keeps              it by reference instead.",
+            string_from_virtual(ctx, key, "getAlgorithm", "()Ljava/lang/String;"),
+            string_from_virtual(ctx, key, "getFormat", "()Ljava/lang/String;"),
+        );
         return Ok(None);
     }
     let mut chain: Vec<Vec<u8>> = Vec::new();
@@ -4129,6 +4489,66 @@ mod tests {
         let mac = jks_password_mac(password, &body);
         body.extend_from_slice(&mac);
         body
+    }
+
+    // -- BER -> DER length normalisation -----------------------------------
+
+    #[test]
+    fn der_input_is_returned_unchanged() {
+        // SEQUENCE { INTEGER 5 }, already definite-length.
+        let der = [0x30u8, 0x03, 0x02, 0x01, 0x05];
+        assert_eq!(ber_to_definite_length(&der).expect("rewrite"), der.to_vec());
+    }
+
+    #[test]
+    fn indefinite_length_becomes_definite() {
+        // SEQUENCE (indefinite) { INTEGER 5 } EOC
+        let ber = [0x30u8, 0x80, 0x02, 0x01, 0x05, 0x00, 0x00];
+        assert_eq!(
+            ber_to_definite_length(&ber).expect("rewrite"),
+            vec![0x30, 0x03, 0x02, 0x01, 0x05]
+        );
+    }
+
+    #[test]
+    fn nested_indefinite_lengths_are_rewritten_innermost_first() {
+        // SEQ(indef){ SEQ(indef){ INTEGER 5 } } - the outer length can only be
+        // known once the inner one has been rewritten.
+        let ber = [
+            0x30u8, 0x80, 0x30, 0x80, 0x02, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            ber_to_definite_length(&ber).expect("rewrite"),
+            vec![0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x05]
+        );
+    }
+
+    #[test]
+    fn segmented_octet_string_is_joined_and_made_primitive() {
+        // constructed OCTET STRING (indef) { OCTET STRING AA BB, OCTET STRING CC }
+        let ber = [
+            0x24u8, 0x80, 0x04, 0x02, 0xAA, 0xBB, 0x04, 0x01, 0xCC, 0x00, 0x00,
+        ];
+        assert_eq!(
+            ber_to_definite_length(&ber).expect("rewrite"),
+            vec![0x04, 0x03, 0xAA, 0xBB, 0xCC]
+        );
+    }
+
+    #[test]
+    fn long_form_lengths_survive_the_round_trip() {
+        // A 200-byte OCTET STRING needs the long form (0x81 0xC8) both ways.
+        let mut der = vec![0x04u8, 0x81, 0xC8];
+        der.extend(std::iter::repeat(0x41).take(200));
+        assert_eq!(ber_to_definite_length(&der).expect("rewrite"), der);
+    }
+
+    #[test]
+    fn truncated_input_is_an_error_not_a_silent_short_read() {
+        // SEQUENCE claiming 3 content bytes but carrying one.
+        assert!(ber_to_definite_length(&[0x30u8, 0x03, 0x02]).is_err());
+        // Indefinite length with no end-of-contents.
+        assert!(ber_to_definite_length(&[0x30u8, 0x80, 0x02, 0x01, 0x05]).is_err());
     }
 
     #[test]

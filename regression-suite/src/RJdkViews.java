@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.ConcurrentModificationException;
+import java.util.DoubleSummaryStatistics;
 import java.util.IntSummaryStatistics;
 import java.util.Iterator;
 import java.util.List;
@@ -489,6 +490,112 @@ public class RJdkViews {
         System.out.println("CK RJdkViews baseStreamIterator=" + seen + "," + isum);
     }
 
+    // Raw bit patterns of the two zeros. `-0.0 == 0.0` is TRUE in Java, so an
+    // equality-shaped check on a signed zero passes against an implementation
+    // that loses the sign; only the bits can see it.
+    private static final long NEG_ZERO_BITS = 0x8000000000000000L;
+    private static final long POS_ZERO_BITS = 0x0000000000000000L;
+
+    /**
+     * {@code DoubleSummaryStatistics} on the two inputs a {@code <}-based
+     * min/max cannot represent: {@code NaN} and the sign of zero.
+     *
+     * <p>The accumulator is specified in terms of {@code Math.min}/{@code
+     * Math.max} ("returns... {@code Double.NaN} if any recorded value was
+     * NaN"), so it inherits their contract exactly. Measured on the 2026-08-12
+     * pre-fix binary in BOTH modes, after {@code accept(1.0)},
+     * {@code accept(NaN)}, {@code accept(3.0)}:
+     *
+     * <pre>
+     *   count=3  min=1.0  max=3.0  sum=NaN
+     * </pre>
+     *
+     * Three fields that cannot have come from the same three values — the sum
+     * saw the NaN and the extrema did not. That is the shape this block exists
+     * to catch, and it is why {@code getSum} is asserted BESIDE the extrema
+     * rather than instead of them: a reader seeing only {@code sum=NaN} would
+     * conclude the NaN was recorded.
+     *
+     * <p>Both zero rows are asserted BY RAW BITS and in BOTH accept orders.
+     * The order matters: a body built on {@code a < b} returns whichever
+     * operand the comparison leaves standing, so it can be right one way round
+     * and wrong the other. Measured pre-fix, it was exactly that — with
+     * {@code accept(-0.0)} then {@code accept(0.0)} the minimum came back
+     * {@code +0.0}, and with the accepts reversed the maximum came back
+     * {@code -0.0}.
+     *
+     * <p>The last four rows take the same statistics through a SYNTHETIC
+     * stream instead of {@code accept}. They were already green pre-fix, which
+     * is the finding: {@code DoubleStream.summaryStatistics()} computes its
+     * extrema by a different route than {@code DoubleSummaryStatistics.accept}
+     * does, so neither covers the other and a fix to one leaves the other
+     * free to drift.
+     */
+    static void doubleSummaryStatisticsSpecialValues() {
+        DoubleSummaryStatistics poisoned = new DoubleSummaryStatistics();
+        poisoned.accept(1.0);
+        poisoned.accept(Double.NaN);
+        poisoned.accept(3.0);
+        check(poisoned.getCount() == 3, "DoubleSummaryStatistics must record all three values");
+        check(Double.isNaN(poisoned.getMin()),
+                "DoubleSummaryStatistics.getMin must be NaN once NaN was accepted, was "
+                        + poisoned.getMin());
+        check(Double.isNaN(poisoned.getMax()),
+                "DoubleSummaryStatistics.getMax must be NaN once NaN was accepted, was "
+                        + poisoned.getMax());
+        check(Double.isNaN(poisoned.getSum()),
+                "DoubleSummaryStatistics.getSum must be NaN once NaN was accepted");
+        check(Double.isNaN(poisoned.getAverage()),
+                "DoubleSummaryStatistics.getAverage must be NaN once NaN was accepted");
+
+        DoubleSummaryStatistics negFirst = new DoubleSummaryStatistics();
+        negFirst.accept(-0.0);
+        negFirst.accept(0.0);
+        check(Double.doubleToRawLongBits(negFirst.getMin()) == NEG_ZERO_BITS,
+                "getMin over {-0.0, 0.0} must be -0.0 (bits 0x8000000000000000)");
+        check(Double.doubleToRawLongBits(negFirst.getMax()) == POS_ZERO_BITS,
+                "getMax over {-0.0, 0.0} must be +0.0 (bits 0x0)");
+
+        DoubleSummaryStatistics posFirst = new DoubleSummaryStatistics();
+        posFirst.accept(0.0);
+        posFirst.accept(-0.0);
+        check(Double.doubleToRawLongBits(posFirst.getMin()) == NEG_ZERO_BITS,
+                "getMin over {0.0, -0.0} must be -0.0 (bits 0x8000000000000000)");
+        check(Double.doubleToRawLongBits(posFirst.getMax()) == POS_ZERO_BITS,
+                "getMax over {0.0, -0.0} must be +0.0 (bits 0x0)");
+
+        // The empty seeds, which are what the accumulator's first Math.min /
+        // Math.max are applied to. An implementation that seeds from the first
+        // accepted value instead passes everything above and fails here.
+        DoubleSummaryStatistics empty = new DoubleSummaryStatistics();
+        check(Double.doubleToRawLongBits(empty.getMin())
+                        == Double.doubleToRawLongBits(Double.POSITIVE_INFINITY),
+                "empty DoubleSummaryStatistics.getMin must be +Infinity");
+        check(Double.doubleToRawLongBits(empty.getMax())
+                        == Double.doubleToRawLongBits(Double.NEGATIVE_INFINITY),
+                "empty DoubleSummaryStatistics.getMax must be -Infinity");
+
+        // Same contract, reached through a synthetic DoubleStream. `mapToDouble`
+        // on `rangeClosed` mints the interface-stamped stream this section is
+        // about; `DoubleStream.of` would hand back a real IntPipeline$Head and
+        // measure the JDK.
+        DoubleSummaryStatistics streamed = IntStream.rangeClosed(1, 3)
+                .mapToDouble(i -> i == 2 ? Double.NaN : (double) i).summaryStatistics();
+        check(streamed.getCount() == 3, "DoubleStream.summaryStatistics must record three values");
+        check(Double.isNaN(streamed.getMin()),
+                "DoubleStream.summaryStatistics().getMin must be NaN, was " + streamed.getMin());
+        check(Double.isNaN(streamed.getMax()),
+                "DoubleStream.summaryStatistics().getMax must be NaN, was " + streamed.getMax());
+        DoubleSummaryStatistics streamedZeros = IntStream.rangeClosed(1, 2)
+                .mapToDouble(i -> i == 1 ? -0.0 : 0.0).summaryStatistics();
+        check(Double.doubleToRawLongBits(streamedZeros.getMin()) == NEG_ZERO_BITS,
+                "DoubleStream.summaryStatistics().getMin over {-0.0, 0.0} must be -0.0");
+        check(Double.doubleToRawLongBits(streamedZeros.getMax()) == POS_ZERO_BITS,
+                "DoubleStream.summaryStatistics().getMax over {-0.0, 0.0} must be +0.0");
+
+        System.out.println("CK RJdkViews doubleStats=15");
+    }
+
     // ---- W7-36 residuals: refusals the sorted containers never made --------
 
     /**
@@ -637,6 +744,7 @@ public class RJdkViews {
         // of the primitive-stream surface fails the same way, so it goes with it.
         streams();
         primitiveStreamSurface();
+        doubleSummaryStatisticsSpecialValues();
         System.out.println("CK RJdkViews checks=" + checks);
         System.out.println("PASS RJdkViews (" + checks + " checks)");
     }

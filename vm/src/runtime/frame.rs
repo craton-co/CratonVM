@@ -189,15 +189,76 @@ fn effective_max_locals(declared: u16, args: &[Value]) -> u16 {
 /// For cached calls, storing a single Arc<CachedBytecodeMethod> avoids cloning
 /// 5 separate Arc fields per call (class_name, method_name, descriptor, source_file,
 /// exception_table), saving ~10 atomic ops per call cycle (clone + drop).
+
+/// How many frames of each kind have been constructed, for
+/// `CRATONVM_DBG_INVOKE_PHASES=1`.
+///
+/// Boxing `OwnedFrameMeta` trades one heap allocation per `Owned` frame for 64
+/// bytes off EVERY frame. That trade is only correct if `Owned` frames are rare
+/// on real workloads, which is a claim about execution frequency — and the
+/// static evidence is ambiguous, since `Frame::new` has ~74 call sites against
+/// `new_pooled_cached`'s 8. So it is counted rather than argued.
+static FRAMES_OWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAMES_CACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn count_frame_kind(owned: bool) {
+    if !crate::runtime::interpreter::invoke_phases::on() {
+        return;
+    }
+    let c = if owned { &FRAMES_OWNED } else { &FRAMES_CACHED };
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(owned, cached)` frame construction counts. Printed by
+/// `invoke_phases::dump()`.
+pub fn frame_kind_counts() -> (u64, u64) {
+    (
+        FRAMES_OWNED.load(std::sync::atomic::Ordering::Relaxed),
+        FRAMES_CACHED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+/// The identity a frame carries when it is NOT backed by a
+/// `CachedBytecodeMethod` — five fat pointers, boxed.
+///
+/// Boxed because an enum is sized by its LARGEST variant. Inline, these five
+/// made `FrameInner` 80 bytes and `Frame` 296, so every frame on the hot
+/// interpreted path paid 80 bytes for a variant it never uses — its own
+/// `Cached` payload is a single 8-byte `Arc`. `Frame` is built and then MOVED
+/// by value into the frame stack on every call, so those bytes are memory
+/// traffic per invocation, and again on pop.
+///
+/// The trade is one heap allocation per `Owned` frame, and the frequency of
+/// those was MEASURED rather than reasoned about, because reasoning about it
+/// gave the wrong answer twice. Call-site counts suggest `Owned` dominates
+/// (~74 `Frame::new` sites against 8 for `new_pooled_cached`); two small runs
+/// then reported near-identical absolute counts (466 over 8M calls, 478 over
+/// ~1.6k), which reads as a fixed bootstrap cost. Both were wrong. Scaling the
+/// workload shows `Owned` frames growing at exactly ONE PER REFLECTIVE INVOKE:
+///
+/// ```text
+///   plain calls   owned=242   1.2%   (bootstrap only)
+///   lambdas/indy  owned=242   1.2%   (bootstrap only — indy builds NONE)
+///   throw/catch   owned=244          (bootstrap only — unwinding builds NONE)
+///   reflection    owned=20241 97.5%  (one per `Method.invoke`)
+/// ```
+///
+/// So the allocation lands on reflection alone. It is invisible there: a
+/// reflective invoke costs ~9us in this interpreter, against ~25ns for the
+/// malloc — 0.3%, and a reflection-dominated A/B measured no regression.
+/// `CRATONVM_DBG_INVOKE_PHASES=1` reports the split so this stays checked.
+#[derive(Clone)]
+pub struct OwnedFrameMeta {
+    pub class_name: Arc<str>,
+    pub method_name: Arc<str>,
+    pub method_descriptor: Arc<str>,
+    pub source_file: Option<Arc<str>>,
+    pub exception_table: Arc<[ExceptionTableEntry]>,
+}
+
 enum FrameInner {
-    /// Non-cached frame: owns all metadata Arcs individually.
-    Owned {
-        class_name: Arc<str>,
-        method_name: Arc<str>,
-        method_descriptor: Arc<str>,
-        source_file: Option<Arc<str>>,
-        exception_table: Arc<[ExceptionTableEntry]>,
-    },
+    /// Non-cached frame: owns all metadata Arcs, behind one pointer.
+    Owned(Box<OwnedFrameMeta>),
     /// Cached frame: all cold metadata derived from a single Arc.
     Cached(Arc<CachedBytecodeMethod>),
 }
@@ -205,12 +266,8 @@ enum FrameInner {
 impl std::fmt::Debug for FrameInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FrameInner::Owned {
-                class_name,
-                method_name,
-                ..
-            } => {
-                write!(f, "Owned({}.{})", class_name, method_name)
+            FrameInner::Owned(o) => {
+                write!(f, "Owned({}.{})", o.class_name, o.method_name)
             }
             FrameInner::Cached(cm) => {
                 write!(f, "Cached({}.{})", cm.class_name, cm.method_name)
@@ -876,13 +933,13 @@ impl Frame {
             code,
             max_stack,
             max_locals: eff_max_locals,
-            inner: FrameInner::Owned {
+            inner: { count_frame_kind(true); FrameInner::Owned(Box::new(OwnedFrameMeta {
                 class_name: Arc::from(class_name.as_str()),
                 method_name: Arc::from(method_name.as_str()),
                 method_descriptor: Arc::from(method_descriptor.as_str()),
                 source_file: source_file.map(|s| Arc::from(s.as_str())),
                 exception_table: Arc::from(exception_table.into_boxed_slice()),
-            },
+            }))},
             // The caller passes loose parts, not a resolved method; use
             // `set_method_index` where the slot is known.
             method_index: None,
@@ -950,13 +1007,13 @@ impl Frame {
             code,
             max_stack,
             max_locals: eff_max_locals,
-            inner: FrameInner::Owned {
+            inner: { count_frame_kind(true); FrameInner::Owned(Box::new(OwnedFrameMeta {
                 class_name,
                 method_name,
                 method_descriptor,
                 source_file,
                 exception_table,
-            },
+            }))},
             // Same as `Frame::new`: loose Arcs, no resolved method slot.
             method_index: None,
             backward_count: 0,
@@ -1001,13 +1058,13 @@ impl Frame {
             code,
             max_stack,
             max_locals: eff_max_locals,
-            inner: FrameInner::Owned {
+            inner: { count_frame_kind(true); FrameInner::Owned(Box::new(OwnedFrameMeta {
                 class_name,
                 method_name,
                 method_descriptor,
                 source_file,
                 exception_table,
-            },
+            }))},
             // Same as `Frame::new`: loose Arcs, no resolved method slot.
             method_index: None,
             backward_count: 0,
@@ -1048,7 +1105,7 @@ impl Frame {
             code,
             max_stack,
             max_locals: eff_max_locals,
-            inner: FrameInner::Cached(cached),
+            inner: { count_frame_kind(false); FrameInner::Cached(cached) },
             // CR-CLO-2 cached half: `CachedBytecodeMethod` does not yet carry a
             // method slot (see the field doc — its 38 struct literals live in
             // four crates and none has a `..` tail, so the field cannot be
@@ -1089,13 +1146,14 @@ impl Frame {
         let eff_max_locals = effective_max_locals(max_locals, args);
         self.max_locals = eff_max_locals;
         // Update inner metadata so class_name(), method_name(), exception_table() are correct
-        self.inner = FrameInner::Owned {
+        count_frame_kind(true);
+        self.inner = FrameInner::Owned(Box::new(OwnedFrameMeta {
             class_name,
             method_name,
             method_descriptor: descriptor,
             source_file,
             exception_table,
-        };
+        }));
         // CR-CLO-2 — MUST be cleared alongside `class_id` and `inner`. A tail
         // call replaces the method executing in this frame while reusing the
         // allocation, so an index left over from the *caller* would be read
@@ -1216,7 +1274,7 @@ impl Frame {
     #[inline]
     pub fn class_name(&self) -> &str {
         match &self.inner {
-            FrameInner::Owned { class_name, .. } => class_name,
+            FrameInner::Owned(o) => &o.class_name,
             FrameInner::Cached(cm) => &cm.class_name,
         }
     }
@@ -1229,7 +1287,7 @@ impl Frame {
     #[inline]
     pub(crate) fn cached_method(&self) -> Option<&Arc<CachedBytecodeMethod>> {
         match &self.inner {
-            FrameInner::Owned { .. } => None,
+            FrameInner::Owned(_) => None,
             FrameInner::Cached(cm) => Some(cm),
         }
     }
@@ -1238,7 +1296,7 @@ impl Frame {
     #[inline]
     pub fn method_name(&self) -> &str {
         match &self.inner {
-            FrameInner::Owned { method_name, .. } => method_name,
+            FrameInner::Owned(o) => &o.method_name,
             FrameInner::Cached(cm) => &cm.method_name,
         }
     }
@@ -1247,9 +1305,7 @@ impl Frame {
     #[inline]
     pub fn method_descriptor(&self) -> &str {
         match &self.inner {
-            FrameInner::Owned {
-                method_descriptor, ..
-            } => method_descriptor,
+            FrameInner::Owned(o) => &o.method_descriptor,
             FrameInner::Cached(cm) => &cm.method_descriptor,
         }
     }
@@ -1258,7 +1314,7 @@ impl Frame {
     #[inline]
     pub fn source_file(&self) -> Option<&str> {
         match &self.inner {
-            FrameInner::Owned { source_file, .. } => source_file.as_deref(),
+            FrameInner::Owned(o) => o.source_file.as_deref(),
             FrameInner::Cached(cm) => cm.source_file.as_deref(),
         }
     }
@@ -1267,9 +1323,7 @@ impl Frame {
     #[inline]
     pub fn exception_table(&self) -> &[ExceptionTableEntry] {
         match &self.inner {
-            FrameInner::Owned {
-                exception_table, ..
-            } => exception_table,
+            FrameInner::Owned(o) => &o.exception_table,
             FrameInner::Cached(cm) => &cm.exception_table,
         }
     }
@@ -1277,7 +1331,7 @@ impl Frame {
     /// Clone class_name as Arc<str> for stack trace capture (cold path).
     pub fn class_name_arc(&self) -> Arc<str> {
         match &self.inner {
-            FrameInner::Owned { class_name, .. } => class_name.clone(),
+            FrameInner::Owned(o) => o.class_name.clone(),
             FrameInner::Cached(cm) => cm.class_name.clone(),
         }
     }
@@ -1293,7 +1347,7 @@ impl Frame {
     /// borrow is actually consumed.
     pub fn method_name_arc_ref(&self) -> &Arc<str> {
         match &self.inner {
-            FrameInner::Owned { method_name, .. } => method_name,
+            FrameInner::Owned(o) => &o.method_name,
             FrameInner::Cached(cm) => &cm.method_name,
         }
     }
@@ -1307,9 +1361,7 @@ impl Frame {
     /// rationale as `method_name_arc_ref`.
     pub fn method_descriptor_arc_ref(&self) -> &Arc<str> {
         match &self.inner {
-            FrameInner::Owned {
-                method_descriptor, ..
-            } => method_descriptor,
+            FrameInner::Owned(o) => &o.method_descriptor,
             FrameInner::Cached(cm) => &cm.method_descriptor,
         }
     }
@@ -1317,7 +1369,7 @@ impl Frame {
     /// Clone source_file as Option<Arc<str>> for stack trace capture (cold path).
     pub fn source_file_arc(&self) -> Option<Arc<str>> {
         match &self.inner {
-            FrameInner::Owned { source_file, .. } => source_file.clone(),
+            FrameInner::Owned(o) => o.source_file.clone(),
             FrameInner::Cached(cm) => cm.source_file.clone(),
         }
     }
@@ -1385,6 +1437,47 @@ impl Frame {
     pub fn set_local(&mut self, index: u16, value: Value) {
         let i = index as usize;
         if i < self.locals.len() {
+            // `CRATONVM_DBG_VACATED_FRAMES`: catch a stale reference AS IT
+            // ENTERS a frame, which is the one moment the Rust producer is
+            // still on the stack. Every frame this VM builds sets its incoming
+            // arguments through here, so this covers the invoke paths that keep
+            // arguments in a Rust buffer between the pop and the frame build —
+            // the fast/cached dispatchers pin nothing and repair with
+            // `refresh_stale_object_args`, i.e. with `load_and_forward`, which
+            // cannot repair anything on a collector that leaves no forwarding
+            // word (see `VmHeap::load_and_forward`).
+            //
+            // The ledger is exact: `gc_quiescence::note_allocated` drops an
+            // address the moment the allocator re-issues it, so a hit here is a
+            // reference to memory the collector moved an object out of and
+            // nothing has been allocated into since.
+            if cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+                if let Value::Object(Some(o)) = value {
+                    cratonvm_gc::gc_quiescence::check_stale_use(
+                        o.as_ptr() as usize,
+                        "frame local store",
+                    );
+                    if let Some(moved_to) =
+                        cratonvm_gc::gc_quiescence::was_vacated(o.as_ptr() as usize)
+                    {
+                        static N: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                            tracing::error!(
+                                target: "cratonvm::gc::guard",
+                                obj = format!("{:#x}", o.as_ptr() as usize),
+                                moved_to = format!("{moved_to:#x}"),
+                                class = %self.class_name(),
+                                method = %self.method_name(),
+                                pc = self.pc,
+                                slot = i,
+                                backtrace = %std::backtrace::Backtrace::force_capture(),
+                                "a STALE reference is being stored into a frame local — the                                  collector moved this object and nothing has been allocated at                                  the old address since. The backtrace names the VM code that                                  still held it.",
+                            );
+                        }
+                    }
+                }
+            }
             self.note_local_write();
             self.locals[i] = CompactValue::from_value(value);
             let k = lkind_of_value(&value);
@@ -1586,9 +1679,7 @@ impl Frame {
     /// Clone the exception table Arc (cold path — for continuation freeze).
     pub fn exception_table_arc(&self) -> Arc<[ExceptionTableEntry]> {
         match &self.inner {
-            FrameInner::Owned {
-                exception_table, ..
-            } => exception_table.clone(),
+            FrameInner::Owned(o) => o.exception_table.clone(),
             FrameInner::Cached(cm) => cm.exception_table.clone(),
         }
     }
@@ -1700,13 +1791,13 @@ impl Frame {
             code,
             max_stack,
             max_locals,
-            inner: FrameInner::Owned {
+            inner: { count_frame_kind(true); FrameInner::Owned(Box::new(OwnedFrameMeta {
                 class_name: Arc::from(frozen.class_name.as_str()),
                 method_name: Arc::from(frozen.method_name.as_str()),
                 method_descriptor: Arc::from(frozen.descriptor.as_str()),
                 source_file: frozen.source_file.map(|s| Arc::from(s.as_str())),
                 exception_table,
-            },
+            }))},
             // CR-CLO-2 — explicit, not incidental. `FrozenFrame` carries no
             // method slot (it round-trips names and a descriptor, and lives in
             // `threading/virtual_threads.rs`), so a thawed frame has no
@@ -1838,6 +1929,28 @@ impl Frame {
         };
         for (i, cv) in self.locals.iter().enumerate() {
             if i < 64 && live_mask & (1u64 << i) == 0 {
+                // `CRATONVM_DBG_VACATED_FRAMES`: remember what the filter
+                // dropped. Its contract is that this slot can never be read
+                // again; if the address turns up later as a failing receiver,
+                // that contract was broken for this exact method and slot.
+                if cratonvm_gc::gc_quiescence::vacated_frames_enabled()
+                    && self.local_kinds[i] != LKIND_LONG
+                    && self.local_kinds[i] != LKIND_DOUBLE
+                {
+                    if cv.is_object() {
+                        if let Some(ptr) = cv.as_object_ptr() {
+                            cratonvm_gc::gc_quiescence::note_liveness_filtered(ptr as usize, || {
+                                format!(
+                                    "{}.{} pc={} local[{}]",
+                                    self.class_name(),
+                                    self.method_name(),
+                                    self.pc,
+                                    i
+                                )
+                            });
+                        }
+                    }
+                }
                 continue;
             }
             // A primitive `long` / `double` is never a heap reference — not
@@ -4078,5 +4191,78 @@ mod tests {
         assert!(f1.code.len() >= 2);
         assert_eq!(f1.code[f1.code.len() - 1], 0);
         assert_eq!(f1.code[f1.code.len() - 2], 0);
+    }
+}
+
+#[cfg(test)]
+mod frame_size_probe {
+    use super::*;
+
+    /// Not an assertion — a measurement printed so the fixed per-call cost can
+    /// be reasoned about with a number instead of an estimate. `Frame` is moved
+    /// by value into `FrameStack::push` on EVERY call, so its size is memory
+    /// traffic paid per invocation.
+    #[test]
+    fn report_frame_size() {
+        eprintln!("size_of::<Frame>()      = {}", std::mem::size_of::<Frame>());
+        eprintln!("size_of::<FrameInner>() = {}", std::mem::size_of::<FrameInner>());
+        eprintln!("size_of::<ValueStack>() = {}", std::mem::size_of::<ValueStack>());
+        eprintln!("align_of::<Frame>()     = {}", std::mem::align_of::<Frame>());
+    }
+}
+
+#[cfg(test)]
+mod value_size_probe {
+    #[test]
+    fn report_value_size() {
+        eprintln!("size_of::<Value>()        = {}", std::mem::size_of::<cratonvm_types::Value>());
+        eprintln!("16-slot args_buf bytes    = {}", 16 * std::mem::size_of::<cratonvm_types::Value>());
+        eprintln!("size_of::<CompactValue>() = {}", std::mem::size_of::<cratonvm_types::CompactValue>());
+    }
+}
+
+#[cfg(test)]
+mod ic_entry_size_probe {
+    /// `InvokeCache::get` hands back `&CachedInvokeTarget` and every caller
+    /// immediately `.clone()`s it, so this is bytes copied per invoke on top of
+    /// the Arc refcount traffic.
+    #[test]
+    fn report_ic_entry_size() {
+        eprintln!(
+            "size_of::<CachedInvokeTarget<RetainedCode>>() = {}",
+            std::mem::size_of::<
+                cratonvm_classloading::resolution::CachedInvokeTarget<cratonvm_jit::RetainedCode>,
+            >()
+        );
+        eprintln!(
+            "size_of::<RetainedCode>() = {}",
+            std::mem::size_of::<cratonvm_jit::RetainedCode>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_layout_probe {
+    use super::*;
+
+    /// Field-by-field accounting of the 296-byte `Frame`, which is built and
+    /// then moved by value into the frame stack on EVERY interpreted call.
+    #[test]
+    fn report_frame_layout() {
+        eprintln!("Frame                 = {}", std::mem::size_of::<Frame>());
+        eprintln!("  FrameInner          = {}", std::mem::size_of::<FrameInner>());
+        eprintln!("  ValueStack          = {}", std::mem::size_of::<ValueStack>());
+        eprintln!("  Vec<CompactValue>   = {}", std::mem::size_of::<Vec<CompactValue>>());
+        eprintln!("  Vec<u8>             = {}", std::mem::size_of::<Vec<u8>>());
+        eprintln!("  Vec<(usize,u32)>    = {}", std::mem::size_of::<Vec<(usize, u32)>>());
+        eprintln!("  Arc<[u8]>           = {}", std::mem::size_of::<Arc<[u8]>>());
+        eprintln!("  Option<ObjectRef>   = {}", std::mem::size_of::<Option<ObjectRef>>());
+        eprintln!("--- FrameInner variants ---");
+        eprintln!("  Arc<CachedBytecodeMethod> (Cached payload) = {}",
+            std::mem::size_of::<Arc<CachedBytecodeMethod>>());
+        eprintln!("  Owned payload (5 fat ptrs)                 = {}",
+            std::mem::size_of::<Arc<str>>() * 3
+                + std::mem::size_of::<Option<Arc<str>>>()
+                + std::mem::size_of::<Arc<[ExceptionTableEntry]>>());
     }
 }

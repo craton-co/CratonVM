@@ -1769,6 +1769,41 @@ mod tests {
 
     #[test]
     fn test_fd_leak_opens_closes_pair_check() {
+        // FIX(test-determinism): this test was flaky under parallel `cargo test`
+        // — red in the full run, green 3/3 run alone. Same root cause as
+        // `test_runner_days_scaled_passes_on_flat_heap` below: collection is
+        // wall-clock-gated, so under CPU load a *timing-dependent subset* of the
+        // series is collected. Not a race over a shared counter — `ReplayCollector`
+        // is per-test state.
+        //
+        // `fd_growth` is `last.fd_count - first.fd_count`, and the smallest
+        // subset the gate can produce is the initial and final samples alone,
+        // i.e. ONE step. The step used to be 1 against a `max_fd_leak_count` of
+        // 5, so the assertion needed at least seven samples to survive — and on
+        // a loaded host a thread can be off-CPU for the whole 30 ms window and
+        // take exactly two.
+        //
+        // The invariant that makes it deterministic, and the one every sibling
+        // here already satisfies (`test_runner_detects_fd_leak` pairs a step of
+        // 2 with a threshold of 0): **the per-sample step must exceed
+        // `max_fd_leak_count`**, so every subset of two or more samples already
+        // shows the leak. The subject of this test is the leak ANALYSIS, not the
+        // sampling cadence, so nothing it exists to check is weakened by that.
+        //
+        // To reproduce the starved case deliberately — no host load needed, and
+        // this is how the fix was proven rather than argued — set this arm's
+        // `sample_interval` LONGER than its `duration` (e.g. 1000 ms against
+        // 30 ms). The gate then fires never, so the run collects exactly the two
+        // samples it is guaranteed: the initial one and the final one. With
+        // `FD_STEP` back at 1 that fails, and says why —
+        //     samples collected=2 fd first=Some(20) last=Some(21) (threshold 5)
+        // — and with `FD_STEP` at 6 the same forced worst case passes.
+        const FD_STEP: u32 = 6;
+        const MAX_FD_LEAK: u32 = 5;
+        assert!(
+            FD_STEP > MAX_FD_LEAK,
+            "the step must exceed the threshold or this test is timing-dependent again"
+        );
         // Simulate FD count growing monotonically (unbalanced opens).
         let mut samples = Vec::new();
         for i in 0..30 {
@@ -1777,7 +1812,7 @@ mod tests {
                 heap_used_bytes: 1_000_000,
                 heap_committed_bytes: 2_000_000,
                 thread_count: 5,
-                fd_count: 20 + i as u32, // 1 leaked FD per second
+                fd_count: 20 + i as u32 * FD_STEP, // FD_STEP leaked FDs per second
                 gc_count: 0,
                 gc_pause_total_ms: 0.0,
                 cpu_percent: 10.0,
@@ -1789,16 +1824,21 @@ mod tests {
             sample_interval: Duration::from_millis(1),
             max_heap_growth_percent: 100.0,
             max_thread_leak_count: 100,
-            max_fd_leak_count: 5,
+            max_fd_leak_count: MAX_FD_LEAK,
             report_path: None,
             days_scaled: None,
         };
         let mut runner = SoakTestRunner::new(cfg, Box::new(ReplayCollector::new(samples)));
         runner.add_workload(Box::new(NoOpWorkload::new("noop")));
         let report = runner.run().unwrap();
+        // Report what was actually collected, so a future failure here says
+        // whether the analysis broke or the sampling did.
         assert!(
             report.fd_leak_detected,
-            "fd leak must be flagged when opens/closes are unbalanced"
+            "fd leak must be flagged when opens/closes are unbalanced;              samples collected={} fd first={:?} last={:?} (threshold {MAX_FD_LEAK})",
+            report.samples.len(),
+            report.samples.first().map(|s| s.fd_count),
+            report.samples.last().map(|s| s.fd_count),
         );
         assert_eq!(report.verdict, Verdict::Fail);
     }

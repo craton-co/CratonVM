@@ -10,6 +10,12 @@ Branch: `fix/methodhandles-compatible-residuals-20260811`.
 Files changed: `native-builtins/src/lang_invoke.rs`,
 `regression-suite/src/RJdkHandles.java`, and this record. Nothing else.
 
+> **THIRD PASS 2026-08-12 (lane A16) — VERIFICATION ONLY, still not rebuilt.**
+> Every source claim in this record was re-read against today's tree and all of
+> them hold; the one out-of-file line (§5.2.3 / "Out-of-file patch") is **still
+> not applied**, and the check/step arithmetic in §5's preamble is now measured
+> rather than argued. See **§7** at the end.
+
 > **SECOND PASS 2026-08-12, also NOT REBUILT.** Two of the three residuals this
 > record filed in §5 are now fixed in source — `isVarargsCollector()` (§5.2) and
 > the getter / array-getter `type()` narrowing (§5.3) — and §5.1 is declined with
@@ -770,3 +776,94 @@ this family today.
 `JDKONLY_CLASSES`, it takes no per-class arguments from `class_args` or
 `class_cv_args`, and the rewrite keeps the `PASS RJdkHandles ` prefix and the
 non-zero exit on failure that the harness keys on.
+
+---
+
+## 7. Verification pass 2026-08-12 (lane A16) — what was re-read, and what moved
+
+**Nothing was built or run in this pass either.** Everything below is a source
+read against today's worktree, with today's line numbers. It exists because a
+record's *hypothesis* can be wrong and not merely stale, and because two of the
+three counts this file printed were.
+
+### 7.1 Every source claim in §2, §3, §5.2 and §5.3 is present, at these anchors
+
+| claim | where it is today | verdict |
+|---|---|---|
+| `MH_VARARGS = MH_BASE + 5` | `native-builtins/src/lang_invoke.rs:6991` | present |
+| width-guarded read / write | `:6996`–`:7006` (`object_num_fields(mh) > MH_VARARGS`) | present, exactly as §5.2.1 prescribed |
+| both allocators widened to `MH_VARARGS + 1` | `:7553` (`alloc_method_handle`), `:7720` (`alloc_string_concat_method_handle`) | present |
+| the slot is never left unwritten | `:7578`, `:7739` — explicit `Int(0)` | present |
+| `asVarargsCollector` sets / `asFixedArity` clears | `:6451`, `:6462` | present |
+| `isVarargsCollector` registered and reading it | `:6482`–`:6486` | present |
+| `bindTo`'s syntactic leading-parameter guard, read from the `type` field only | `:10392`–`:10406` | present; §3.3's safety argument is written in place at `:10366`–`:10375` |
+| §5.3's accessor-kind narrowing | `:10471`–`:10476` (`MH_KIND_STATIC \|\| GETTER \|\| SETTER \|\| ARRAY_GET \|\| ARRAY_SET`) | present |
+| §5.1's decline, as a **mechanism** | `:10377`–`:10391`, in-file beside the guard | present, and it is the argument §5.1.1 makes, not a budget note |
+
+§5.1 is therefore still correctly open: there is no assignability test anywhere
+in the `bindTo` registration, and `NativeContext` still offers no
+never-false-refuse `cast`-shaped predicate. **Disposition: still open, blocker
+unchanged (capability gap, not time).**
+
+### 7.2 The out-of-file line is STILL NOT APPLIED
+
+`vm/src/vm/vm_exec.rs:23339`–`:23346` still lists four names. The patch under
+"Out-of-file patch (not applied)" is reproduced verbatim there and remains the
+whole of what is wanted. It is a completeness edit, not a correctness one — the
+vector runs on the cold interpreter path where the native already wins — so
+this record is **not blocked on it**; leaving it out leaves the cold/warm split
+§5.2.3 describes.
+
+### 7.3 The three circulating check counts, settled by counting
+
+Measured today on `regression-suite/src/RJdkHandles.java`:
+
+| | occurrences | minus the definition | green-run value |
+|---|---|---|---|
+| `step(` | 41 | 40 (definition at `:86`) | **40 steps** |
+| `check(` | 133 | 132 (definition at `:65`) | **128 checks** (4 are `check(false, …)` inside a `try` a correct VM never reaches) |
+
+So **"40 steps / 128 checks" is right** and is now arithmetic rather than a
+claim. §5's preamble sentence — *"the file has 132 `check(` call sites, four of
+which are `check(false, …)` … so a green run counted 116 before this pass"* —
+runs an AFTER count into a BEFORE conclusion: 132 − 4 = **128**, which is the
+after value; the 116 was measured on the smaller pre-pass file (120 call sites).
+Read that sentence as two separate facts. README §2.6's "54 checks" and §4's
+"316 checks" are both still wrong and are still not this lane's files.
+
+### 7.4 §5.2.1's `classloader.rs` row: line numbers rotted, the finding did not
+
+The disagreeing `MethodHandle` map is now at
+`native-builtins/src/classloader.rs:9089`–`:9107`, not `:9084`–`:9090`. It is
+otherwise exactly as described — `MH_BASE = 16` with `MH_KIND`(16),
+`MH_TARGET_CLASS`(17), `MH_NAME`(18), `MH_TYPE`(19), `MH_CLASS_ID`(20), under a
+comment still claiming it *"Matches the layout used by
+lang_invoke::alloc_method_handle"*, which it does not.
+
+**One thing this record did not state and should have: the width guard is
+provably sufficient against it.** `classloader.rs`'s allocator asks for
+`MH_FIELD_COUNT = MH_BASE + 5 = 21` slots (`:9107`, `:9116`), i.e. valid indices
+`0..=20`. `MH_VARARGS` is `21`. `object_num_fields(mh) > MH_VARARGS` is
+therefore **false** for every handle that allocator mints, so
+`mh_is_varargs_collector` answers `false` and `mh_set_varargs_collector` is a
+no-op on them — the pre-fix behaviour, which is the documented fallback. The
+same holds for the 17-slot `empty`/`zero` handles. The disagreeing map still
+wants a `--dump-native-registry` diff and a deletion; it is not a hazard to
+§5.2.
+
+### 7.5 The adjacent live gap, and why it is not this record's
+
+A 33-probe reachability screen run today on the current binary reports
+`MethodHandleProxies.asInterfaceInstance` failing with
+**`ClassFormatError: ldc: unsupported constant pool entry type at #26`**. That
+is a class-file **decoder** gap — the class is refused before any bytecode in it
+executes — so it is upstream of every `MH_KIND_*` shim and of §5.2's marking. It
+neither causes nor is caused by anything here. The consequence for this record
+is narrow and worth writing down: **`MethodHandleProxies` cannot be used as an
+end-to-end exerciser of the varargs marking or of `bindTo`**, because the class
+never loads. `RJdkHandles` remains the only instrument.
+
+The same screen's passing rows (`Proxy.newProxyInstance`, `ServiceLoader`,
+direct `ByteBuffer`, `MXBean`, `AccessController.doPrivileged`) touch none of
+this record's claims in either direction. **No claim in this record is
+contradicted by them.**

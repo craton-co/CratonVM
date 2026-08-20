@@ -1,5 +1,86 @@
 # StructuredTaskScope is a JEP 505 interface now, and the interesting defect was not the stale names
 
+> ## RE-VERIFIED 2026-08-12 (lane A14). The API surface reproduces exactly. **A's gate has since FLIPPED ON and this record still describes it as off.**
+>
+> Re-measured against Microsoft OpenJDK 25.0.3.9 (this host's `java.home`;
+> `javap -version` → 25.0.3), not the Adoptium build §1 used. Nothing was built
+> or run on CratonVM.
+>
+> **1. §1's measured surface reproduces, byte for byte, on a different vendor's
+> JDK 25.** `javap` gives exactly the eight members §1 lists, in that order, and
+> `javap -v` confirms `PermittedSubclasses: java/util/concurrent/StructuredTaskScopeImpl`
+> — so `isSealed=true` and `constructors=0` both hold. The nested-type table is
+> right in every row, including the three that must be ABSENT:
+> `$ShutdownOnSuccess`, `$ShutdownOnFailure` and `$Config` all answer
+> `Error: class not found`. `$Joiner` is a plain `public interface` with no
+> `PermittedSubclasses` attribute — **not** sealed, as §1 says, so user code may
+> implement it. `$Subtask` and `$Configuration` *are* sealed
+> (`…$SubtaskImpl`, `…$ConfigImpl`). `$Joiner`'s five statics and its two
+> `default` methods + one abstract `result()` are all present as described.
+> `$Subtask$State` declares `UNAVAILABLE, SUCCESS, FAILED` in that order.
+>
+> This record is **not** stale on the API shape, which was the first thing worth
+> checking given how many times JEP 428/437/453/462/499/505 reshaped it.
+>
+> **2. A has moved since this record was written, and the status block above is
+> now wrong about it.** The block says A landed "in this record's *fallback*
+> form, **gated**", which reads as off-by-default. It is on by default now:
+>
+> ```rust
+> const VM_REMOVES_THREADS_FROM_CONTAINERS: bool = true;   // shared_secrets_bridge.rs
+> ```
+>
+> and `thread_container_registration_enabled()` falls through to that constant
+> unless `CRATONVM_THREAD_CONTAINERS` is `0`/`1`. So on the default
+> configuration `jla_start_in_container` now **does** pass the container:
+> it reads `args.get(2)`, and when that is a non-null object it calls
+> `Thread.start(Ljdk/internal/vm/ThreadContainer;)V`, falling back to
+> `start()V` only when the container is null or the flag is `0`. The function's
+> own doc comment says so — *"It is no longer dropped by default"* — and cites
+> W7-23. **Both registrations survive**, as the block requires.
+>
+> That means the 15 divergent lines of §5 and the "three CratonVM runs are not
+> byte-identical" finding are measurements of a configuration the VM no longer
+> ships. They are not refuted — nobody has re-run the probe — but they must not
+> be quoted as current. The falsifier in A is now a *regression* check, not a
+> pending one.
+>
+> **All four line references in the status block have drifted** and are wrong as
+> written: the function is at `:819` (not 796-816), the gate at `:777` (not
+> `:757`), the two registrations at `:1581` and `:1698` (not `:1558`/`:1675`).
+> Line numbers in this tree have drifted within a single day; the symbols are
+> the durable references and are the ones used above.
+>
+> **3. B and C are exactly as this record leaves them.** Re-checked by symbol:
+> `util_concurrent_ext.rs::register_pd_structured_concurrency` is an empty
+> tombstone (`pub(crate) fn …(_r: &mut NativeMethodRegistry) {}`) and is still
+> called from `lib.rs`, so the retirement holds and did not orphan its call
+> site. `w7_18_jep505_surface_is_not_shadowed_here` is present in
+> `jdk25_concurrency.rs`'s test module. C's premise is intact:
+> `class_manager.rs` still fabricates `StructuredTaskScope` at
+> `instance_fields(8)` and still has a `$Config` row (`instance_fields(3)`), a
+> name no JDK ships. **C stays DECLINED for the reasons it already gives** —
+> none of the three has changed.
+>
+> **4. New, found while checking C: `$Subtask`'s fabricated width and its own
+> comment disagree.** `class_manager.rs` reads
+> `// StructuredTaskScope$Subtask: 4 fields (state=0, result=1, exception=2, callable=3)`
+> over `… => instance_fields(5)`. The code is presumably right and the comment
+> stale, but this is the exact contract C calls "a *contract* between three
+> modules", and a reader auditing slot indices against the comment would count
+> four. Comment-only fix **nominated**, not applied — this lane does not own
+> `classloading/`. It does not change C's verdict: C is about widening
+> `StructuredTaskScope` itself from 8 to 9, not `$Subtask`.
+>
+> **5. Scope is unchanged and still bounds everything.** All three registrars
+> remain reachable only from `register_synthetic_overrides`, so B and C can
+> still only move `--synthetic-jdk` mode, which has never been executed. **The
+> one thing this record needs is still one run**, and it is now a *different*
+> run from the one A needs: A's falsifier wants `probes/StructuredTaskScopeProbe`
+> on `--real-jdk`/`--jdk-only` against a current binary to confirm the flipped
+> gate closed the 15 lines; B and C want a `--features synthetic-jdk` binary in
+> `--synthetic-jdk` **mode**. Neither was available to this lane.
+
 > **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md).** Of the three
 > out-of-file patches: **A** is **APPLIED, but in this record's *fallback* form,
 > gated** — commit `4c9482908` made `jla_start_in_container` read `args.get(2)`
@@ -791,3 +872,93 @@ HotSpot oracle, the two CratonVM baselines, the strict census and the
 names are gone, that the deletion is behaviourally inert, and where the real
 defect lives. They do not establish that the edited source compiles, that the
 added synthetic triples behave, or that the out-of-file patch works.
+
+---
+
+## B and C adjudicated in `--synthetic-jdk` — 2026-08-12 (lane A31)
+
+This record says, five times, that B and C "can still only move `--synthetic-jdk`
+mode, which has never been executed", and that it is "the record in the directory
+most dependent on a run". The run was done: `--features synthetic-jdk` binary
+built from clean HEAD, `probes/StructuredTaskScopeProbe` compiled
+`--release 25 --enable-preview`, launched
+`cratonvm --synthetic-jdk --enable-preview -cp … StructuredTaskScopeProbe`.
+
+**Verdict: B and C are UNREACHABLE even in `--synthetic-jdk`. Not "wrong" — not
+runnable.** Every probe row is a setup failure, and they are all the same two:
+
+```
+--synthetic-jdk:
+  openDefault.threw            = java.lang.NullPointerException: Cannot invoke
+      "java.lang.reflect.Method.invoke(Object, Object[])" because
+      "StructuredTaskScopeProbe.M_OPEN0" is null
+  joinWaits.threw              = (same)
+  forkRunnable.threw           = (same)
+  ownerThread.threw            = (same)
+  subtaskCarrier.threw         = (same)
+  state.*.setup                = (same, ×5)
+  joinerAwaitAll.threw         = java.lang.NoSuchMethodException: awaitAll
+  awaitAllSuccessful.happyPath.threw = java.lang.NoSuchMethodException: awaitAllSuccessfulOrThrow
+  awaitAllSuccessful.failPath.threw  = java.lang.NoSuchMethodException: awaitAllSuccessfulOrThrow
+  allSuccessful.threw          = java.lang.NoSuchMethodException: allSuccessfulOrThrow
+  anySuccessful.threw          = java.lang.NoSuchMethodException: anySuccessfulResultOrThrow
+  anySuccessful.allFail.threw  = java.lang.NoSuchMethodException: anySuccessfulResultOrThrow
+  allUntil.threw               = java.lang.NoSuchMethodException: allUntil
+  configuration.threw          = java.lang.NoSuchMethodException: awaitAll
+  timeout.threw                = java.lang.NoSuchMethodException: awaitAll
+```
+
+`M_OPEN0` is `StructuredTaskScope.class.getMethod("open")`
+(`StructuredTaskScopeProbe.java:253`). It resolves to null, so **no scope object
+can be constructed at all**, so:
+
+* **C is moot in practice.** C is about widening the fabricated
+  `StructuredTaskScope` from `instance_fields(8)` to 9 so two `Joiner`s can be
+  served. No instance is ever allocated, so no slot is ever read or written. C's
+  DECLINED verdict stands, and can now be stated more strongly: it is declined
+  *and* unobservable.
+* **B's kept JDK-21-shaped registrations in `jdk25_concurrency.rs` are
+  unreachable from bytecode in all three configurations.** The record's reason
+  for keeping them — "~20 `#[test]`s in a blocking gate pin them and the only
+  mode they can be observed in has never been run" — now reads differently: that
+  mode has been run, and it does not reach them either. The tests pin code no
+  Java caller can enter. That is not an argument to delete them blind, but it
+  removes the "it might be load-bearing in synthetic mode" half of the argument
+  for keeping them.
+
+HotSpot 25 (`--enable-preview`) is the negative control and answers all 26 rows,
+e.g. `state.joinTwice=java.lang.IllegalStateException:Already joined or scope is
+closed`, `subtask.state.declaringClass=java.util.concurrent.StructuredTaskScope$Subtask$State`,
+`ownerThread.forkFromOther=java.lang.WrongThreadException:Current thread not owner`.
+
+### One thing the run found that this record predicted structurally and never measured
+
+`Class.forName` **succeeds for every name the probe asks for** in
+`--synthetic-jdk`, including names JDK 25 does not ship:
+
+```
+--synthetic-jdk:                                    HotSpot 25:
+  forName.jdk.incubator.concurrent.StructuredTaskScope
+      = jdk.incubator.concurrent.StructuredTaskScope     ClassNotFoundException
+  forName.jdk.incubator.concurrent.StructuredTaskScope$Subtask
+      = …$Subtask                                        ClassNotFoundException
+  forName.jdk.incubator.concurrent.StructuredTaskScope$ShutdownOnSuccess
+      = …$ShutdownOnSuccess                              ClassNotFoundException
+  forName.jdk.incubator.concurrent.StructuredTaskScope$ShutdownOnFailure
+      = …$ShutdownOnFailure                              ClassNotFoundException
+  forName.java.util.concurrent.StructuredTaskScope$Config
+      = …$Config                                         (a name no JDK ships)
+```
+
+C's complaint — *"`class_manager.rs` still has a `$Config` row, a name no JDK
+ships"* — is confirmed from the outside: the name resolves. And the JDK-21
+*incubator* package, deleted in JDK 25, resolves too, along with its three
+nested types. This is the `Ok≠use` shape at full strength: **every metadata query
+answers yes and every use fails.** A census or a `forName`-based feature probe
+run in this mode will report the JEP 505 surface as present and complete.
+
+**Nothing here is a work item for this record.** It is the run the record asked
+for, with the answer that the run cannot discriminate B or C. What it does
+settle is that this record should stop describing itself as blocked on a
+`--synthetic-jdk` run — it is blocked on `StructuredTaskScope.open()` being
+registered, which is a prior and much larger question.

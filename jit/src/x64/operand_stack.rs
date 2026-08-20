@@ -232,10 +232,13 @@ impl Compiler {
     /// `dup2_category_safe` scan: only here are field/invoke descriptors
     /// resolved.
     pub(super) fn dup2_top_cat2(&self, code: &[u8], dup2_pc: usize) -> Option<bool> {
-        // Find the instruction boundary immediately before `dup2_pc`.
+        // Find the instruction boundary immediately before `dup2_pc`, and the
+        // one before THAT (see the store rule below).
         let mut p = 0usize;
         let mut prev: Option<usize> = None;
+        let mut prev2: Option<usize> = None;
         while p < dup2_pc {
+            prev2 = prev;
             prev = Some(p);
             let len = bytecode_len_at(code, p);
             if len == 0 {
@@ -247,6 +250,44 @@ impl Compiler {
             return None; // dup2_pc is not on an instruction boundary
         }
         let prev = prev?;
+
+        // A STORE consumed the value it stored, so it did not produce the value
+        // now on top and the producer table below cannot classify it. One shape
+        // is still provable, and it is the one javac emits for every chained
+        // assignment `a = b = c = 0.0`:
+        //
+        //     dconst_0 / dup2 / dstore A / dup2 / dstore B / dup2 / dstore C
+        //
+        // After `<t>store`, what is left on top is the ORIGINAL that the
+        // preceding `dup`/`dup2` copied, and the store's own width names it: a
+        // `dstore`/`lstore` consumed a category-2 copy, so the original is
+        // category-2 too.
+        //
+        // BOTH instructions are required. Skipping any store and looking
+        // further back is NOT sound — `iload_0; dload_1; dstore_3` leaves an
+        // INT on top behind a category-2 store. Only the dup-then-store pair
+        // proves the survivor's width.
+        //
+        // `AccurateMath.tanQ` is 999 invocations of a large method that stayed
+        // interpreted for want of this: its first `dup2` follows `dconst_0` and
+        // compiled, the second and third follow a `dstore` and did not.
+        if let Some(prev2) = prev2 {
+            let store_cat2 = match code[prev] {
+                // lstore / dstore, wide-index and _0..3 forms
+                0x37 | 0x39 | 0x3f..=0x42 | 0x47..=0x4a => Some(true),
+                // istore / fstore / astore, wide-index and _0..3 forms
+                0x36 | 0x38 | 0x3a | 0x3b..=0x3e | 0x43..=0x46 | 0x4b..=0x4e => Some(false),
+                _ => None,
+            };
+            if let Some(cat2) = store_cat2 {
+                // 0x59 dup, 0x5c dup2 — the only producers that leave a copy of
+                // the stored value behind.
+                if matches!(code[prev2], 0x59 | 0x5c) {
+                    return Some(cat2);
+                }
+                return None;
+            }
+        }
         let cat2 = match code[prev] {
             // --- category-2 producers (result is long or double) ---
             0x09 | 0x0a | 0x0e | 0x0f          // lconst_*/dconst_*
@@ -310,6 +351,60 @@ impl Compiler {
             _ => return None,
         };
         Some(cat2)
+    }
+
+    /// The JVM category of the live operand-stack entries at `pc`, as an
+    /// index-aligned vector of `Some(true)` = category-2, `Some(false)` =
+    /// category-1, `None` = the analysis declined to type that entry.
+    ///
+    /// This is the **second-entry width oracle** that `dup2_top_cat2` is not:
+    /// that helper reads the one instruction before the dup and so can only
+    /// ever answer for the TOP entry, whereas `dup2_x2` needs the width of the
+    /// entry below it (and, for a category-1 top, the one below that) to know
+    /// how many compact entries its four JVM slots occupy.
+    ///
+    /// The source is `x64::stack_kinds`, the forward abstract interpretation
+    /// already computed for the deopt snapshot encoder. Using it to pick a
+    /// CODEGEN SHAPE is a stronger use than typing a snapshot, so it is
+    /// admitted only under the same two independent cross-checks the snapshot
+    /// encoder applies, plus a third:
+    ///
+    ///   * DEPTH — the analysis derives it from JVMS stack effects, the
+    ///     emitter from running its own opcode handlers. A modelling error
+    ///     that shifts the stack changes the depth.
+    ///   * REF-NESS — every entry the analysis calls a reference must be one
+    ///     the emitter's own oop mark also calls a reference. The marks are
+    ///     maintained for the GC, so this is a second opinion with a different
+    ///     provenance, and it catches an off-by-one that preserves depth.
+    ///   * THE TOP ENTRY, when `dup2_top_cat2` answers — a third, wholly
+    ///     independent peephole opinion. Disagreement means one of the two is
+    ///     wrong and neither may be used. (Checked by the caller, which is the
+    ///     only place that knows the dup's pc.)
+    ///
+    /// Any disagreement returns `None` and the caller stays interpreted.
+    pub(super) fn stack_entry_categories(&self, pc: usize) -> Option<Vec<Option<bool>>> {
+        let kinds = self.stack_kinds.get(pc)?;
+        if kinds.len() != self.stack.len() {
+            return None;
+        }
+        if self.stack_oop_marks.len() != self.stack.len() {
+            return None;
+        }
+        for (i, k) in kinds.iter().enumerate() {
+            let cat = k.is_category_2();
+            if cat.is_some() {
+                let says_ref = k.is_ref();
+                if self.stack_oop_marks[i] != says_ref {
+                    return None;
+                }
+            }
+        }
+        Some(
+            kinds
+                .iter()
+                .map(|k| k.is_category_2())
+                .collect(),
+        )
     }
 
     /// Peek at the top of the simulated stack.

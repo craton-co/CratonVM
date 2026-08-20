@@ -383,6 +383,61 @@ impl ValueStack {
         (compact_vec_to_u64(slots), kinds)
     }
 
+    /// `CRATONVM_DBG_VACATED_FRAMES`: catch a stale reference as it is PUSHED.
+    ///
+    /// `Frame::set_local`'s twin, and the one that matters for the residual the
+    /// H2 MVStore-writer page is chasing: a value returned by a method or a
+    /// native goes onto the operand stack and is consumed by the very next
+    /// `checkcast`, so it never reaches a local and `set_local` reports nothing.
+    /// The Rust backtrace is the point — it names the producer while it is
+    /// still on the stack.
+    #[cold]
+    fn report_vacated_push(value: &Value, moved_to: usize) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 12 {
+            return;
+        }
+        let addr = match value {
+            Value::Object(Some(o)) => o.as_ptr() as usize,
+            _ => 0,
+        };
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = format!("{addr:#x}"),
+            moved_to = format!("{moved_to:#x}"),
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "a STALE reference is being pushed onto the operand stack — the collector moved              this object and nothing has been allocated at the old address since. The              backtrace names the VM code that produced it."
+        );
+    }
+
+    #[inline(always)]
+    fn check_vacated_compact(cv: &CompactValue) {
+        if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+            return;
+        }
+        if cv.is_object() {
+            if let Some(ptr) = cv.as_object_ptr() {
+                cratonvm_gc::gc_quiescence::check_stale_use(ptr as usize, "operand stack push");
+                if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(ptr as usize) {
+                    Self::report_vacated_push(&Value::Object(None), moved_to);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn check_vacated_push(value: &Value) {
+        if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+            return;
+        }
+        if let Value::Object(Some(o)) = value {
+            cratonvm_gc::gc_quiescence::check_stale_use(o.as_ptr() as usize, "operand stack push");
+            if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(o.as_ptr() as usize) {
+                Self::report_vacated_push(value, moved_to);
+            }
+        }
+    }
+
     pub fn push(&mut self, value: Value) -> Result<(), RuntimeError> {
         if self.len >= self.max_size {
             // B4 (audit `vm-runtime.md`): an operand-stack overflow is a
@@ -396,6 +451,7 @@ impl ValueStack {
             // (`exceptions.rs` map + `interpreter.rs` runtime-error routing).
             return Err(RuntimeError::StackOverflowError);
         }
+        Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
@@ -427,6 +483,7 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_unchecked(&mut self, value: Value) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_unchecked");
+        Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
@@ -442,6 +499,7 @@ impl ValueStack {
                 message: "operand stack overflow".to_string(),
             });
         }
+        Self::check_vacated_push(&value);
         self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
@@ -466,6 +524,11 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_compact(&mut self, cv: CompactValue) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_compact");
+        // Same check as the `Value` pushes, decoded from the compact form. This
+        // is the path `dup`, a local reload and the cached field/return
+        // producers take, so leaving it out would blind the instrument to
+        // exactly the values that reach a `checkcast` without touching a local.
+        Self::check_vacated_compact(&cv);
         // Raw compact push: the bits alone cannot distinguish a collision-long
         // from a tagged value, so mark UNKNOWN (safe fallback). Genuine long/
         // double producers call push_long/push_double instead.
@@ -598,6 +661,49 @@ impl ValueStack {
         self.kinds[self.len] = kind;
         self.len += 1;
         Ok(())
+    }
+
+    /// Verifier-trusted sibling of [`Self::pop_with_kind`] for the raw-bytecode
+    /// fast path (`pop2`, `dup_x1`, `dup2`, `dup_x2`, `dup2_x1`, `dup2_x2`).
+    ///
+    /// # Panics
+    /// Panics if the stack is empty.
+    #[inline(always)]
+    pub fn pop_with_kind_unchecked(&mut self) -> (CompactValue, u8) {
+        debug_assert!(self.len > 0, "stack underflow in pop_with_kind_unchecked");
+        self.len -= 1;
+        (self.slots[self.len], self.kinds[self.len])
+    }
+
+    /// Verifier-trusted sibling of [`Self::peek_with_kind`].
+    ///
+    /// # Panics
+    /// Panics if the stack is empty.
+    #[inline(always)]
+    pub fn peek_with_kind_unchecked(&self) -> (CompactValue, u8) {
+        debug_assert!(self.len > 0, "stack underflow in peek_with_kind_unchecked");
+        (self.slots[self.len - 1], self.kinds[self.len - 1])
+    }
+
+    /// Verifier-trusted sibling of [`Self::push_with_kind`].
+    ///
+    /// Copies the slot bits AND the kind mark verbatim, which is what makes the
+    /// shuffle opcodes bit-exact: a `Value` round-trip would re-encode a
+    /// NaN-payload double through [`CompactValue::double`] and lose the payload,
+    /// and would drop the `KIND_LONG` mark that tells the GC a pointer-shaped
+    /// long slot is a primitive.
+    ///
+    /// # Panics
+    /// Panics if the stack is full.
+    #[inline(always)]
+    pub fn push_with_kind_unchecked(&mut self, cv: CompactValue, kind: u8) {
+        debug_assert!(
+            self.len < self.max_size,
+            "stack overflow in push_with_kind_unchecked"
+        );
+        self.slots[self.len] = cv;
+        self.kinds[self.len] = kind;
+        self.len += 1;
     }
 
     /// Category-2 (long/double) test that honors the slot's kind mark. A

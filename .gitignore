@@ -112,9 +112,18 @@ probes/out/
 # …including a probe compiled in place: the rule above only covers `out/`, so
 # `javac probes/Foo.java` left a `probes/Foo.class` that `git add -A` tracked.
 probes/*.class
+# Same rule for the perf probes that live beside their harness under
+# regression-suite/perf/: the .java sources are the artifact, the .class files
+# a javac by-product.
+regression-suite/perf/**/*.class
 
 # local run artifacts
 dim4-*.log*
 build-win.log
 cv-url.txt
 hs-url.txt
+
+# H2 corpus runs write their database here (regression-suite/corpus).
+# Test output, not source.
+data/
+scratchpad/

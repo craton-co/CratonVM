@@ -188,6 +188,58 @@ unsafe fn read_num_slots(obj_ptr: *const u8) -> u32 {
     std::ptr::read(obj_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32)
 }
 
+/// Records what the last `stub_invoke_dispatch` call received.
+///
+/// A spliced call is emitted, not executed, by most of these tests — and an
+/// assertion that machine code "contains a CALL" proves very little about
+/// whether the ARGUMENTS reached it in the right buffer, in the right order.
+/// This lets a test actually run the code and read back what the helper saw.
+///
+/// Thread-local because the test harness calls compiled code on the test's own
+/// thread and several inline tests run concurrently under `cargo test`.
+thread_local! {
+    static LAST_DISPATCH: std::cell::RefCell<Option<(String, String, String, Vec<i64>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test stand-in for `jit_invoke_dispatch`.
+///
+/// The real helper's contract, and all this reproduces: read `num_jit_args`
+/// i64s from `args` (arg[0] at the LOWEST address), and return the callee's
+/// result in RAX. It returns the SUM of the arguments, which is a value a test
+/// can predict exactly and which changes if the buffer is built in the wrong
+/// order with any argument set that is not symmetric.
+///
+/// SAFETY: called from JIT-compiled code that passes the `JitInvokeInfo`
+/// pointer this compile interned and an `args` buffer of exactly `num_args`
+/// i64 slots, per `emit_inline_invoke`.
+unsafe extern "C" fn stub_invoke_dispatch(
+    _vm_ptr: i64,
+    info: *const crate::JitInvokeInfo,
+    args: *const i64,
+    num_args: i32,
+) -> i64 {
+    let mut seen = Vec::new();
+    let mut sum: i64 = 0;
+    for i in 0..num_args.max(0) {
+        let v = std::ptr::read(args.add(i as usize)); // Cast: ABI buffer index
+        seen.push(v);
+        sum = sum.wrapping_add(v);
+    }
+    let (c, m, d) = if info.is_null() {
+        (String::new(), String::new(), String::new())
+    } else {
+        let r = &*info;
+        (
+            r.class_name.to_string(),
+            r.method_name.to_string(),
+            r.descriptor.to_string(),
+        )
+    };
+    LAST_DISPATCH.with(|slot| *slot.borrow_mut() = Some((c, m, d, seen)));
+    sum
+}
+
 // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
 // and a field index that is bounds-checked within the function body before any dereference.
 unsafe extern "C" fn stub_getfield(_vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
@@ -344,7 +396,11 @@ fn test_helpers() -> JitRuntimeHelpers {
         instanceof_check: sentinel,
         throw_aioobe: sentinel,
         throw_arithmetic: sentinel,
-        invoke_dispatch: sentinel,
+        // Was `sentinel`. Nothing executed it then — a test that did would
+        // have jumped to a bogus address — so wiring a real stub changes no
+        // existing test's behaviour and lets the spliced-call tests below
+        // run the code instead of merely inspecting it.
+        invoke_dispatch: stub_invoke_dispatch as *const () as usize, // Cast: address arithmetic
         invoke_virtual_mic: sentinel,
         lambda_int_to_double: sentinel,
         write_barrier: sentinel,
@@ -376,6 +432,7 @@ fn test_helpers() -> JitRuntimeHelpers {
         // with no stack guard, keeping these tests byte-identical.
         self_call_stack_guard: 0,
         region_bounds_addr: 0,
+        read_bounds_addr: 0,
         native_stack_floor_fn: 0,
         ldc_string: sentinel,
         // Unwired (0) — CRATONVM_JIT_SAFEPOINT_POLLS is off by default,
@@ -399,6 +456,10 @@ fn test_helpers() -> JitRuntimeHelpers {
         // Unwired (0) — these tests build no class-`ldc` site, and 0 makes
         // the backend refuse one rather than emit a null CALL.
         ldc_class_cp: 0,
+        // Wired to the panicking sentinel: the `0x53` arm is unconditionally
+        // inline and always emits a CALL to this slot, and the slot is
+        // `required` in `jit-api`, so 0 would fail `validate()` rather than
+        // select a different lowering.
         aastore_type_check: sentinel,
     }
 }
@@ -3948,7 +4009,7 @@ fn test_getfield_int() {
 }
 
 /// Guarded inline getfield (perf/throughput-20260710): with a non-zero
-/// `region_bounds_addr` the default arm emits the inline receiver guard +
+/// `read_bounds_addr` the default arm emits the inline receiver guard +
 /// raw field load, falling back to the checked helper only for receivers
 /// that fail the guard. Uses a test-local bounds table so the pass/fail
 /// routing is deterministic (the process-global table is owned by
@@ -3991,7 +4052,8 @@ fn test_getfield_guarded_inline_fast_and_fallback() {
     let field_info = vec![(1usize, 0usize, b'I')];
     let mut helpers = test_helpers();
     helpers.getfield = marker_getfield as *const () as usize;
-    helpers.region_bounds_addr = TEST_BOUNDS.as_ptr() as usize;
+    // READ side: the guarded getfield arm bakes `read_bounds_addr`.
+    helpers.read_bounds_addr = TEST_BOUNDS.as_ptr() as usize;
     let compiled = compile(
         &code,
         code_len,
@@ -11811,7 +11873,698 @@ fn make_inline_site(
         method_name: "inlined".to_string(),
         descriptor,
         elided_invoke_pcs: Vec::new(),
+        invoke_targets: Vec::new(),
+        resolved_invoke_infos: Vec::new(),
+        nested_sites: Vec::new(),
     }
+}
+
+// -----------------------------------------------------------------------
+// Steps 4 and 5 — a call inside a spliced body, and a splice inside a splice
+// -----------------------------------------------------------------------
+
+/// `compile_with_inlines` with the VM-context slot established.
+///
+/// A spliced call passes the context as `jit_invoke_dispatch`'s first
+/// argument, and with `needs_heap == false` there is no slot holding it
+/// (`heap_local_offset` is 0, i.e. the saved `rbp`). Harmless for a stub that
+/// ignores the pointer, but the tests below should exercise the shape the VM
+/// actually compiles.
+fn compile_with_inlines_heap(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    max_locals: usize,
+    inline_sites: HashMap<usize, crate::InlineSite>,
+) -> Option<CompiledMethod> {
+    compile(
+        code,
+        code_len,
+        num_params,
+        max_locals,
+        true, // needs_heap — the dispatch helper takes the context
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        inline_sites,
+        None, // string_layout
+    )
+}
+
+/// A `JitInvokeInfo` with the lifetime the emitter's baked immediate needs.
+///
+/// `try_compile_inner` interns these into the compile's own arena; a unit test
+/// at this layer has no arena, so it leaks. One per call, deliberately: the
+/// address is what `resolved_invoke_infos` carries and two sites must not
+/// alias.
+fn resolved_invoke(
+    callee_pc: usize,
+    class_name: &'static str,
+    method_name: &'static str,
+    descriptor: &'static str,
+    num_jit_args: usize,
+    return_type: u8,
+    invoke_kind: u8,
+) -> crate::ResolvedInlineInvoke {
+    let info: &'static crate::JitInvokeInfo = Box::leak(Box::new(crate::JitInvokeInfo {
+        class_name,
+        method_name,
+        descriptor,
+        num_jit_args,
+        return_type,
+        invoke_kind,
+        declaring_class_id: 0,
+    }));
+    crate::ResolvedInlineInvoke {
+        callee_pc,
+        info_addr: info as *const crate::JitInvokeInfo as usize, // Cast: address parked in a Send-able plan
+        // 0 = "no direct bind", i.e. the dispatch-helper form. The direct form
+        // needs a real compiled entry to CALL, which this layer has no way to
+        // produce; `a_spliced_direct_call_is_registered_for_keep_alive` covers
+        // that half on the data instead.
+        direct_entry: 0,
+        direct_needs_context: false,
+        num_jit_args,
+        return_type,
+    }
+}
+
+fn take_last_dispatch() -> Option<(String, String, String, Vec<i64>)> {
+    LAST_DISPATCH.with(|slot| slot.borrow_mut().take())
+}
+
+/// STEP 4. A callee that CALLS is spliceable, and the call it makes reaches the
+/// dispatch helper with the right target and the right arguments in the right
+/// order.
+///
+/// This is the whole point of the step: every `invoke*` used to reject the
+/// enclosing site outright, so a body like `leaf(a)` below was never a
+/// candidate no matter how small it was. Nothing here is about making the CALL
+/// cheaper — it is the same `jit_invoke_dispatch` an un-spliced body would use.
+///
+/// Self-proving three ways, each of which fails on a different mistake:
+///   * the return value (15) is wrong if the call is not emitted, or if its
+///     result is not pushed as the spliced body's value;
+///   * the recorded argument vector `[5, 10]` is wrong — reversed — if the
+///     args buffer is built in the wrong direction, which a symmetric argument
+///     set would hide;
+///   * the recorded name triple is wrong if the emitter baked a different
+///     `JitInvokeInfo` than `resolved_invoke_infos` named.
+#[test]
+fn a_call_inside_a_spliced_body_reaches_the_dispatch_helper() {
+    // callee: `static int leaf(int a) { return target(a, 10); }`
+    //   0: iload_0
+    //   1: bipush 10
+    //   3: invokestatic #3   -> resolved target
+    //   6: ireturn
+    let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
+    let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/Target", "target", "(II)I", 2, b'I', 3)];
+
+    // caller: `static int f(int a) { return leaf(a); }`
+    //   0: iload_0
+    //   1: invokestatic #1   -> the inline site
+    //   4: ireturn
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a callee containing a call must now splice");
+
+    let _ = take_last_dispatch();
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap; the
+    // dispatch helper is `stub_invoke_dispatch`, which only reads the argument
+    // buffer the emitted code just built.
+    let got = unsafe { compiled.call_with_heap(0, &[5]) };
+    assert_eq!(got, 15, "the spliced call's result must be the body's value");
+
+    let (class_name, method_name, descriptor, args) =
+        take_last_dispatch().expect("the spliced body must have called the dispatch helper");
+    assert_eq!(
+        (class_name.as_str(), method_name.as_str(), descriptor.as_str()),
+        ("pkg/Target", "target", "(II)I"),
+        "the emitter must bake the JitInvokeInfo `resolved_invoke_infos` named",
+    );
+    assert_eq!(
+        args,
+        vec![5, 10],
+        "arg[0] must be at the lowest address — a reversed buffer swaps these",
+    );
+}
+
+/// A spliced call site with no resolved target must REFUSE the splice.
+///
+/// The emitter cannot invent a dispatch target: `InlineSite::invoke_targets` is
+/// resolved against the CALLEE's constant pool, and the enclosing method's
+/// `invoke_info` is keyed by CALLER pc — a different bytecode space, where the
+/// same integer names an unrelated call. Guessing there is how you get a body
+/// that calls the wrong method.
+///
+/// Same site as the test above with `resolved_invoke_infos` emptied. Refusing
+/// is not the same as failing: the compile still succeeds (the site falls back
+/// to whatever the caller's own pc resolves to, which in this harness is
+/// nothing), and what must NOT appear is a dispatch emitted against a target
+/// the emitter does not have. A splice that ran anyway would have to bake some
+/// address as `jit_invoke_dispatch`'s second argument, and every address
+/// available to it here is wrong.
+#[test]
+fn a_spliced_call_with_no_resolved_target_refuses_the_splice() {
+    let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
+    // resolved_invoke_infos deliberately left empty.
+    let callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("refusing the splice must not fail the whole compile");
+    assert_eq!(
+        calls_to(&compiled, test_helpers().invoke_dispatch),
+        0,
+        "the callee's call must not be emitted against an un-interned target",
+    );
+}
+
+/// `invokeinterface` is FIVE bytes inside a spliced body, like everywhere else.
+///
+/// The other three invoke forms are three. Advancing by three over an
+/// `invokeinterface` lands the walk on its `count` operand, and a `count` of 2
+/// decodes as `iconst_m1` (0x02) — so the body would push -1, `nop` over the
+/// trailing zero, and return -1 instead of the call's result. Silent wrong
+/// answer, no bail, no diagnostic: exactly the failure mode the width guard
+/// exists for.
+#[test]
+fn an_invokeinterface_inside_a_splice_is_five_bytes_wide() {
+    // callee: `static int leaf(int a) { return iface.m(a, 10); }` — shaped so
+    // the operands are the same two the test above uses.
+    //   0: iload_0
+    //   1: bipush 10
+    //   3: invokeinterface #3, count=2, 0
+    //   8: ireturn
+    let callee_body: [u8; 9] = [0x1a, 0x10, 0x0a, 0xb9, 0x00, 0x03, 0x02, 0x00, 0xac];
+    let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/Iface", "m", "(II)I", 2, b'I', 2)];
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("an invokeinterface-carrying callee must splice");
+
+    let _ = take_last_dispatch();
+    // SAFETY: as above.
+    let got = unsafe { compiled.call_with_heap(0, &[5]) };
+    assert_eq!(
+        got, 15,
+        "a 3-byte advance would decode the count operand as iconst_m1 and return -1",
+    );
+    assert!(
+        take_last_dispatch().is_some(),
+        "the interface call must still have gone through the dispatch helper",
+    );
+}
+
+/// STEP 5. A call inside a spliced body that is itself spliced emits NO call.
+///
+/// The nested body computes `a - b`, while the dispatch stub returns `a + b`.
+/// The two disagree for the arguments used, so the returned value alone says
+/// which path ran — an arithmetic body that agreed with the stub (an `iadd`)
+/// would have made this test pass whether nesting worked or not.
+#[test]
+fn a_nested_splice_replaces_the_call_entirely() {
+    // innermost: `static int inner(int a, int b) { return a - b; }`
+    //   0: iload_0; 1: iload_1; 2: isub; 3: ireturn
+    let inner = make_inline_site(&[0x1a, 0x1b, 0x64, 0xac], 2, 2, true, b'I');
+
+    // middle: `static int leaf(int a) { return inner(a, 10); }`
+    let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
+    let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+    // ADDITIVE by design: the pc carries both a nested body and a dispatch
+    // target, so a nested bail falls back to the call instead of failing the
+    // outer splice. The next test relies on exactly this.
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/Inner", "inner", "(II)I", 2, b'I', 3)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: 0,
+        site: inner,
+    }];
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a nested splice must compile");
+
+    let _ = take_last_dispatch();
+    // SAFETY: as above.
+    let got = unsafe { compiled.call_with_heap(0, &[5]) };
+    assert_eq!(got, -5, "5 - 10; the dispatch stub would have answered 15");
+    assert!(
+        take_last_dispatch().is_none(),
+        "a nested splice must emit no dispatch at all",
+    );
+    assert_eq!(
+        calls_to(&compiled, test_helpers().invoke_dispatch),
+        0,
+        "and no CALL to the helper may be left in the code",
+    );
+}
+
+/// A nested splice that BAILS falls back to the ordinary call.
+///
+/// This is why `nested_sites` and `resolved_invoke_infos` both carry the pc.
+/// If a nested body could only succeed or fail the outer splice, one
+/// unmodellable opcode three levels down would cost the whole chain.
+///
+/// `arraylength` (0xbe) is the bail: the inline mini-emitter has no arm for it
+/// (bounds-checked array access is refused at this layer), so the nested
+/// attempt rolls back and the pc takes its dispatch entry — answering 15 (the
+/// stub's sum) rather than the nested body's -5.
+#[test]
+fn a_nested_splice_that_bails_falls_back_to_the_call() {
+    // innermost, but unspliceable: `arraylength` has no inline arm.
+    let inner = make_inline_site(&[0x1a, 0x1b, 0xbe, 0xac], 2, 2, true, b'I');
+
+    let callee_body: [u8; 7] = [0x1a, 0x10, 0x0a, 0xb8, 0x00, 0x03, 0xac];
+    let mut callee = make_inline_site(&callee_body, 1, 1, true, b'I');
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/Inner", "inner", "(II)I", 2, b'I', 3)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: 0,
+        site: inner,
+    }];
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("the outer splice must survive a nested bail");
+
+    let _ = take_last_dispatch();
+    // SAFETY: as above.
+    let got = unsafe { compiled.call_with_heap(0, &[5]) };
+    assert_eq!(got, 15, "the nested bail must fall back to the dispatch call");
+    let (_, _, _, args) =
+        take_last_dispatch().expect("the fallback dispatch must have run");
+    assert_eq!(args, vec![5, 10], "with the same arguments the nested body would have had");
+}
+
+/// A VALUE-PRODUCING BRANCH MERGE splices, and both paths answer correctly.
+///
+/// This is the shape that blocked the whole netty inlining line of work.
+/// `AssertionUtils.objectsAreEqual` — the first rung past `assertEquals` — is
+/// exactly it:
+///
+/// ```text
+///    8: iconst_1     9: goto 13    12: iconst_0    13: ireturn
+/// ```
+///
+/// Two paths reach pc 13 with the same value in different places, and the
+/// emitter's symbolic operand stack can only name one, so commit 419a6f5
+/// refused every such body outright. Measured 2026-08-18, that refusal is what
+/// made `nested-splice=0` and `outer-splice-rolled-back=2`: the call the
+/// devirtualisation work was aimed at, one instruction later at pc 16, was
+/// never emitted at all.
+///
+/// One compiled body, both paths, and the two answers differ — which is the
+/// only way to show the merge carries a VALUE rather than happening to agree.
+#[test]
+fn a_value_producing_branch_merge_splices_and_both_paths_are_right() {
+    // callee: `static int f(int a) { return a != 0 ? 0 : 1; }`, emitted as the
+    // objectsAreEqual diamond.
+    //   0: iload_0
+    //   1: ifne 8
+    //   4: iconst_1
+    //   5: goto 9
+    //   8: iconst_0
+    //   9: ireturn      <-- merge, one value live
+    let callee = make_inline_site(
+        &[0x1a, 0x9a, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
+
+    // caller: `static int g(int a) { return f(a); }`
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a diamond-shaped callee must now splice");
+
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap.
+    unsafe {
+        assert_eq!(
+            compiled.call_with_heap(0, &[0]),
+            1,
+            "fall-through path: iconst_1 must survive the goto to the merge",
+        );
+        assert_eq!(
+            compiled.call_with_heap(0, &[7]),
+            0,
+            "taken path: iconst_0 must be what the merge reads",
+        );
+    }
+    assert_eq!(
+        calls_to(&compiled, test_helpers().invoke_dispatch),
+        0,
+        "and the body must be spliced, not called",
+    );
+}
+
+/// The two paths leave the value in DIFFERENT slots, which is what the merge
+/// region is actually for — and what makes the spill's ORDER observable.
+///
+/// The other two merge tests do not discriminate that order, and it is worth
+/// saying why rather than leaving it implied: in a constant-vs-constant
+/// diamond both paths push into the same operand slot (each starts from an
+/// empty callee stack and the emitter allocates deterministically from
+/// `save_spill`), so re-running one path's store on the other path reads the
+/// slot that path already wrote. Idempotent — correct by accident. Verified by
+/// mutation: recording the label BEFORE the fall-through spill leaves both of
+/// them passing.
+///
+/// `iload` is the discriminator. It pushes `StackSlot::Frame(local_offset)` —
+/// the LOCAL's slot, not a fresh operand slot — so here the taken path's value
+/// lives in the merge region's source at one address and the fall-through's at
+/// another. If the fall-through's stores are emitted after the label, the
+/// branch path re-runs them against a slot it never wrote.
+#[test]
+fn a_merge_whose_paths_use_different_slots_pins_the_spill_order() {
+    // callee: `static int f(int a) { return a != 0 ? a : 1; }`
+    //   0: iload_0
+    //   1: ifeq 8        (a == 0 -> 8)
+    //   4: iload_0       <-- pushes the LOCAL's slot
+    //   5: goto 9
+    //   8: iconst_1      <-- pushes a fresh operand slot
+    //   9: ireturn       <-- merge; the two sources are different addresses
+    let callee = make_inline_site(
+        &[0x1a, 0x99, 0x00, 0x07, 0x1a, 0xa7, 0x00, 0x04, 0x04, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a merge over two different slots must splice");
+
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap.
+    unsafe {
+        assert_eq!(
+            compiled.call_with_heap(0, &[5]),
+            5,
+            "the branch path must read the local it stored, not the \
+             fall-through's operand slot",
+        );
+        assert_eq!(compiled.call_with_heap(0, &[0]), 1);
+    }
+}
+
+/// Two values live across the merge, and two merges at different depths in one
+/// body.
+///
+/// Depth 1 is the common case and could pass by accident — a single value that
+/// both paths happen to leave in the same slot proves nothing about the
+/// canonical-home machinery. Here `iconst_5` stays live UNDER the diamond, so
+/// the `goto`'s merge carries two values while the branch target above it
+/// carries one; the two depths must be tracked per target rather than globally.
+#[test]
+fn two_merges_at_different_depths_in_one_body() {
+    //   0: iconst_5          [5]
+    //   1: iload_0
+    //   2: ifne 9            -> target 9 with depth 1
+    //   5: iconst_1          [5, 1]
+    //   6: goto 10           -> target 10 with depth 2
+    //   9: iconst_0          [5, 0]
+    //  10: iadd              <-- merge, depth 2
+    //  11: ireturn
+    let callee = make_inline_site(
+        &[0x08, 0x1a, 0x9a, 0x00, 0x07, 0x04, 0xa7, 0x00, 0x04, 0x03, 0x60, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
+
+    let caller: [u8; 7] = [0x1a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a two-deep merge must splice");
+
+    // SAFETY: as above.
+    unsafe {
+        assert_eq!(compiled.call_with_heap(0, &[0]), 6, "5 + 1");
+        assert_eq!(compiled.call_with_heap(0, &[7]), 5, "5 + 0");
+    }
+}
+
+/// DEVIRTUALISATION INSIDE A SPLICE. Both edges of the receiver guard, from one
+/// compiled body.
+///
+/// The hot edge is a spliced body that returns 42; the cold edge is the
+/// ordinary call, which this harness answers with the argument sum. So the
+/// SAME machine code returns 42 for a receiver whose class id matches the
+/// guard and takes the dispatch for one that does not — which is the only way
+/// to show that the guard is a guard and not a constant.
+///
+/// What each assertion would catch:
+///   * hit returning something other than 42 — the guard fell through to the
+///     call, or the spliced body was never emitted;
+///   * a recorded dispatch on the hit path — the JMP over the miss edge is
+///     missing, so both arms run;
+///   * miss NOT recording a dispatch — the guard is never false, i.e. the
+///     class-id compare is against the wrong operand or the wrong offset;
+///   * the miss dispatch seeing arguments other than `[receiver, 10]` — the
+///     miss arm did not pop what the hit arm popped, which is the operand-stack
+///     disagreement the emitter restores its symbolic state to prevent.
+#[test]
+fn a_guarded_nested_splice_takes_the_body_on_a_hit_and_the_call_on_a_miss() {
+    const GUARD_CLASS_ID: u32 = 0x4242;
+
+    // The devirtualised target: `int m(int) { return 42; }` — a constant, so
+    // the returned value alone says which arm ran.
+    let inner = make_inline_site(&[0x10, 0x2a, 0xac], 2, 2, false, b'I');
+
+    // The spliced body: `static int leaf(Object o) { return o.m(10); }`
+    //   0: aload_0
+    //   1: bipush 10
+    //   3: invokevirtual #3
+    //   6: ireturn
+    let mut callee = make_inline_site(&[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac], 1, 1, true, b'I');
+    // A guarded pc KEEPS its dispatch entry: the miss edge has to go
+    // somewhere, and a virtual site has no direct bind to send it to.
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: GUARD_CLASS_ID,
+        site: inner,
+    }];
+
+    let caller: [u8; 7] = [0x2a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a guarded nested splice must compile");
+
+    // Two receivers, one compiled body. Class id lives in the first four bytes
+    // of the object header, which is what `CMP [rax+0], imm32` reads.
+    let mut hit = Box::new([0u64; 8]);
+    let mut miss = Box::new([0u64; 8]);
+    hit[0] = GUARD_CLASS_ID as u64;
+    miss[0] = (GUARD_CLASS_ID + 1) as u64;
+    let hit_addr = hit.as_mut_ptr() as i64; // Cast: receiver address
+    let miss_addr = miss.as_mut_ptr() as i64; // Cast: receiver address
+
+    let _ = take_last_dispatch();
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap; the
+    // receiver is a live 64-byte buffer shaped like an object header, and the
+    // only helper reachable is `stub_invoke_dispatch`, which reads the argument
+    // buffer and nothing else.
+    let got_hit = unsafe { compiled.call_with_heap(0, &[hit_addr]) };
+    assert_eq!(got_hit, 42, "a guard hit must run the spliced body");
+    assert!(
+        take_last_dispatch().is_none(),
+        "and must not also fall into the miss edge",
+    );
+
+    // SAFETY: as above.
+    let got_miss = unsafe { compiled.call_with_heap(0, &[miss_addr]) };
+    let (_, _, _, args) =
+        take_last_dispatch().expect("a guard miss must take the ordinary call");
+    assert_eq!(
+        args,
+        vec![miss_addr, 10],
+        "the miss arm must pop exactly the operands the hit arm popped",
+    );
+    assert_eq!(
+        got_miss,
+        miss_addr.wrapping_add(10),
+        "and its result must be the call's, not the body's",
+    );
+}
+
+/// A null receiver fails the guard rather than dereferencing it.
+///
+/// `CMP DWORD [RAX+0], guard` on a null receiver is a segfault, so the null
+/// test has to come FIRST and branch to the same miss edge. Nothing else in
+/// this construct would catch that: a null receiver is exactly the case a
+/// profile never records, and the ordinary call reproduces the NPE correctly.
+#[test]
+fn a_null_receiver_takes_the_guarded_splices_miss_edge() {
+    const GUARD_CLASS_ID: u32 = 0x4242;
+    let inner = make_inline_site(&[0x10, 0x2a, 0xac], 2, 2, false, b'I');
+    let mut callee = make_inline_site(&[0x2a, 0x10, 0x0a, 0xb6, 0x00, 0x03, 0xac], 1, 1, true, b'I');
+    callee.resolved_invoke_infos =
+        vec![resolved_invoke(3, "pkg/T", "m", "(I)I", 2, b'I', 0)];
+    callee.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 3,
+        guard_class_id: GUARD_CLASS_ID,
+        site: inner,
+    }];
+
+    let caller: [u8; 7] = [0x2a, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+    let compiled = compile_with_inlines_heap(&caller, 5, 1, 1, sites)
+        .expect("a guarded nested splice must compile");
+
+    let _ = take_last_dispatch();
+    // SAFETY: JIT-compiled code from valid bytecode; a null receiver must not
+    // be dereferenced by the guard, which is the property under test.
+    let got = unsafe { compiled.call_with_heap(0, &[0]) };
+    let (_, _, _, args) = take_last_dispatch()
+        .expect("a null receiver must reach the ordinary call, not the body");
+    assert_eq!(args, vec![0, 10]);
+    assert_eq!(got, 10);
+}
+
+/// The interning pass fills `resolved_invoke_infos` from `invoke_targets`, for
+/// nested bodies as well as the top one.
+///
+/// A nested body whose calls were left uninterned would bail at the emitter's
+/// "no resolved target" arm and quietly degrade to a dispatch — a regression
+/// that costs only speed, and so would never fail a correctness test. Asserted
+/// on the DATA rather than on emitted code, because that is where the bug
+/// would live.
+#[test]
+fn interning_reaches_nested_bodies_too() {
+    let mut inner = make_inline_site(&[0x1a, 0x1b, 0x60, 0xac], 2, 2, true, b'I');
+    inner.invoke_targets = vec![(
+        1,
+        crate::InlineInvokeTarget {
+            class_name: "pkg/Deep".to_string(),
+            method_name: "deep".to_string(),
+            descriptor: "()I".to_string(),
+            num_jit_args: 0,
+            return_type: b'I',
+            invoke_kind: 3,
+            declaring_class_id: 7,
+            direct_entry: None,
+        },
+    )];
+    let mut outer = make_inline_site(&[0x1a, 0xac], 1, 1, true, b'I');
+    outer.invoke_targets = vec![(
+        0,
+        crate::InlineInvokeTarget {
+            class_name: "pkg/Inner".to_string(),
+            method_name: "inner".to_string(),
+            descriptor: "(II)I".to_string(),
+            num_jit_args: 2,
+            return_type: b'I',
+            invoke_kind: 3,
+            declaring_class_id: 9,
+            direct_entry: Some((0xfeed_0000, true)),
+        },
+    )];
+    outer.nested_sites = vec![crate::NestedInlineSite {
+        callee_pc: 0,
+        guard_class_id: 0,
+        site: inner,
+    }];
+    // Stale pointers from a hypothetical earlier compile must be REPLACED, not
+    // appended to: an `InlineSite` can be cloned out of a cached plan.
+    outer.resolved_invoke_infos = vec![crate::ResolvedInlineInvoke {
+        callee_pc: 999,
+        info_addr: 0xdead_beef,
+        ..Default::default()
+    }];
+
+    let mut strings: Vec<Box<str>> = Vec::new();
+    let mut infos: Vec<Box<crate::JitInvokeInfo>> = Vec::new();
+    let mut direct_entries: Vec<usize> = Vec::new();
+    crate::intern_inline_invoke_targets(&mut outer, &mut strings, &mut infos, &mut direct_entries);
+
+    assert_eq!(outer.resolved_invoke_infos.len(), 1);
+    assert_eq!(outer.resolved_invoke_infos[0].callee_pc, 0);
+    let deep = &outer.nested_sites[0].site;
+    assert_eq!(
+        deep.resolved_invoke_infos.len(),
+        1,
+        "a nested body's own calls must be interned too",
+    );
+    // SAFETY: the pointee is `infos[1]`, alive for the rest of this test.
+    let deep_info =
+        unsafe { &*(deep.resolved_invoke_infos[0].info_addr as *const crate::JitInvokeInfo) };
+    assert_eq!(deep_info.class_name, "pkg/Deep");
+    assert_eq!(deep_info.declaring_class_id, 7);
+    // Six boxed strs (two triples), two infos.
+    assert_eq!(strings.len(), 6);
+    assert_eq!(infos.len(), 2);
+
+    // THE KEEP-ALIVE. A baked direct-call address that never reaches
+    // `_direct_callee_entries` is a use-after-free with no symptom until the
+    // callee tiers up: nothing pins the callee artifact
+    // (`prepare_for_publication`) and the invalidation reverse closure has no
+    // way to find this caller. The outer target carries one bind, the nested
+    // one carries none, so exactly one address must come out — and it must be
+    // the one that was bound, not a placeholder.
+    assert_eq!(
+        direct_entries,
+        vec![0xfeed_0000],
+        "every baked direct-call entry must be registered for keep-alive",
+    );
+    assert_eq!(
+        outer.resolved_invoke_infos[0].direct_entry, 0xfeed_0000,
+        "and the emitter must be handed the same address that was registered",
+    );
+    assert!(outer.resolved_invoke_infos[0].direct_needs_context);
+    assert_eq!(
+        deep.resolved_invoke_infos[0].direct_entry, 0,
+        "a target with no bind stays on the dispatch form",
+    );
 }
 
 #[test]
@@ -13929,4 +14682,371 @@ fn test_branch_target_mid_instruction_bails() {
         !try_compile_int_body(&code, code_len),
         "branch into the middle of an instruction must bail, not compile"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `dup2_x2` (0x5E) — all four JVMS forms, executed.
+//
+// This opcode was admitted by `jit_scan` and lowered by neither x64 backend
+// from the first day both existed, so every method containing one reached the
+// dispatch loop's `_ =>` catch-all and stayed interpreted for the life of the
+// process — the refusal attributed to an arm that names nothing. See
+// fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md.
+//
+// Each case below RUNS the compiled body and checks a value that a
+// wrong-width shuffle cannot produce, because the failure mode this opcode
+// invites is not a crash: it is duplicating an unrelated slot. `.expect(...)`
+// alone would pass against a shuffle that compiles and computes nonsense.
+//
+// Local numbering follows this harness's convention (see
+// `test_compile_math_min_max_long_intrinsic`): every parameter, `long`
+// included, is ONE local slot.
+// ---------------------------------------------------------------------------
+
+/// FORM 4 — `[v2, v1] -> [v1, v2, v1]`, both operands category-2. Two entries
+/// in this backend's one-entry-per-value model, structurally `dup_x1`.
+///
+/// `long f(long a, long b) { ... }` computing `a + 2b`: any shuffle that
+/// duplicated two entries instead of one, or inserted the copy at the wrong
+/// depth, gives a different sum.
+#[test]
+fn dup2_x2_form4_two_category_2_operands() {
+    // 0: lload_0     [a]
+    // 1: lload_1     [a, b]
+    // 2: dup2_x2     [b, a, b]
+    // 3: ladd        [b, a+b]
+    // 4: ladd        [a+2b]
+    // 5: lreturn
+    let code = [0x1e, 0x1f, 0x5e, 0x61, 0x61, 0xad];
+    let compiled = compile_probe_method(&code, 2, 2)
+        .expect("FORM-4 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[3, 5]).expect("test JIT call") };
+    assert_eq!(r, 3 + 2 * 5, "a + 2b for a=3 b=5");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[-7, 11]).expect("test JIT call") };
+    assert_eq!(r, -7 + 2 * 11, "a + 2b for a=-7 b=11");
+}
+
+/// FORM 2 — `[v3, v2, v1] -> [v1, v3, v2, v1]`, a category-2 top over two
+/// category-1 values. Three entries; structurally `dup_x2`.
+///
+/// This is the form javac actually emits: `longArr[i] = otherArr[j] = v`
+/// leaves `[arrayref, index, longvalue]` and has to slide the value under the
+/// two category-1 slots.
+#[test]
+fn dup2_x2_form2_category_2_over_two_category_1() {
+    // 0: iload_1     [i]
+    // 1: iload_2     [i, j]
+    // 2: lload_0     [i, j, a]
+    // 3: dup2_x2     [a, i, j, a]
+    // 4: l2i         [a, i, j, (int)a]
+    // 5: iadd        [a, i, j+(int)a]
+    // 6: iadd        [a, i+j+(int)a]
+    // 7: i2l         [a, (long)(i+j+(int)a)]
+    // 8: ladd        [2a+i+j]
+    // 9: lreturn
+    let code = [0x1b, 0x1c, 0x1e, 0x5e, 0x88, 0x60, 0x60, 0x85, 0x61, 0xad];
+    let compiled = compile_probe_method(&code, 3, 3)
+        .expect("FORM-2 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[10, 3, 4]).expect("test JIT call") };
+    assert_eq!(r, 2 * 10 + 3 + 4, "2a + i + j for a=10 i=3 j=4");
+}
+
+/// FORM 3 — `[v3, v2, v1] -> [v2, v1, v3, v2, v1]`, two category-1 values
+/// duplicated over one category-2. Three entries; the copy goes three deep,
+/// not four, because those four JVM slots are a single entry here.
+#[test]
+fn dup2_x2_form3_two_category_1_over_a_category_2() {
+    //  0: lload_0    [a]
+    //  1: iload_1    [a, i]
+    //  2: iload_2    [a, i, j]
+    //  3: dup2_x2    [i, j, a, i, j]
+    //  4: iadd       [i, j, a, i+j]
+    //  5: i2l        [i, j, a, (long)(i+j)]
+    //  6: ladd       [i, j, a+i+j]
+    //  7: lstore_3   [i, j]
+    //  8: iadd       [i+j]
+    //  9: i2l        [(long)(i+j)]
+    // 10: lload_3    [(long)(i+j), a+i+j]
+    // 11: ladd       [a+2i+2j]
+    // 12: lreturn
+    let code = [
+        0x1e, 0x1b, 0x1c, 0x5e, 0x60, 0x85, 0x61, 0x42, 0x60, 0x85, 0x21, 0x61, 0xad,
+    ];
+    let compiled = compile_probe_method(&code, 3, 4)
+        .expect("FORM-3 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[10, 3, 4]).expect("test JIT call") };
+    assert_eq!(r, 10 + 2 * 3 + 2 * 4, "a + 2i + 2j for a=10 i=3 j=4");
+}
+
+/// FORM 1 — `[v4, v3, v2, v1] -> [v2, v1, v4, v3, v2, v1]`, all four
+/// category-1. The only form aarch64's unconditional four-pop arm ever
+/// handled correctly, and the deepest of the four.
+#[test]
+fn dup2_x2_form1_four_category_1_operands() {
+    // 0: iload_0   [a]
+    // 1: iload_1   [a,b]
+    // 2: iload_2   [a,b,c]
+    // 3: iload_3   [a,b,c,d]
+    // 4: dup2_x2   [c,d,a,b,c,d]
+    // 5: iadd      [c,d,a,b,c+d]
+    // 6: iadd      [c,d,a,b+c+d]
+    // 7: iadd      [c,d,a+b+c+d]
+    // 8: iadd      [c,a+b+c+2d]
+    // 9: iadd      [a+b+2c+2d]
+    // 10: ireturn
+    let code = [
+        0x1a, 0x1b, 0x1c, 0x1d, 0x5e, 0x60, 0x60, 0x60, 0x60, 0x60, 0xac,
+    ];
+    let compiled = compile_probe_method(&code, 4, 4)
+        .expect("FORM-1 dup2_x2 must JIT-compile, not reach the catch-all");
+    // SAFETY: JIT-compiled machine code produced from valid bytecode in-test.
+    let r = unsafe { compiled.try_call(&[1, 2, 3, 4]).expect("test JIT call") };
+    assert_eq!(r, 1 + 2 + 2 * 3 + 2 * 4, "a + b + 2c + 2d for 1,2,3,4");
+}
+
+/// The conservative half of the contract: when the width analysis cannot type
+/// the entries under the dup, the method stays interpreted and says so under
+/// its own name — not under whatever opcode the walk reached afterwards.
+///
+/// `dup2_x2` at pc 0 has no operands at all, so no oracle can answer.
+#[test]
+fn dup2_x2_without_a_provable_form_bails_under_its_own_name() {
+    let code = [0x5e, 0xac]; // dup2_x2; ireturn
+    let _ = crate::take_jit_bail_site(); // clear anything a prior test left
+    assert!(compile_probe_method(&code, 0, 1).is_none());
+    let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
+    assert_eq!(site, "singlepass-codegen/dup2_x2-unprovable-form");
+}
+
+/// The catch-all is no longer anonymous. `wide` (0xC4) is unlowered in this
+/// walk; `jit_scan` also rejects it, so in production it never gets this far,
+/// but `compile` does not re-run the scan — which is exactly what lets this
+/// test drive the walk onto the catch-all and pin the reason string it now
+/// records. Before, every opcode that landed here reported the bare
+/// `singlepass-codegen` site, naming nothing.
+#[test]
+fn the_unlowered_opcode_catch_all_names_itself() {
+    let code = [0xc4, 0x15, 0x00, 0x01, 0xac]; // wide iload 1; ireturn
+    let _ = crate::take_jit_bail_site();
+    assert!(compile_probe_method(&code, 0, 2).is_none());
+    let (site, _, _) = crate::take_jit_bail_site().expect("a refusal records a site");
+    assert_eq!(
+        site, "singlepass-codegen/opcode-scan-admitted-but-unlowered",
+        "the catch-all must name itself rather than claim it cannot happen"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The opcode-coverage guard.
+//
+// `jit_scan` (admission) and the single-pass dispatch loop (codegen) are two
+// hand-maintained match statements over the same 202 opcode values, and until
+// this test nothing forced them to agree. An opcode the scanner advances past
+// but the walk has no arm for does not fail loudly: it falls into the walk's
+// catch-all and the method is bail-listed for the life of the process, with
+// the refusal attributed to an arm that names nothing.
+//
+// That gap has now cost three opcodes — `pop2` (0x58) and `dup2_x1` (0x5D),
+// found by the commons-math throughput work, and `dup2_x2` (0x5E), found by
+// hand-enumerating the arms of all four walkers. Each had been asserted away
+// for years by the comment "should not happen — jit_scan should have caught
+// this". A "should not happen" arm is a CLAIM, and claims about opcode
+// coverage are checkable.
+// ---------------------------------------------------------------------------
+
+/// Opcodes `jit_scan` admits on purpose despite the single-pass walk having
+/// no arm for them, each with the reason it is not the `dup2_x2` shape.
+///
+/// The bar for an entry here is a SECOND HOME: some other backend must lower
+/// the opcode, so admitting it buys a compilation the scanner would otherwise
+/// refuse. "Nobody lowers it anywhere" is the `dup2_x2` shape and belongs in
+/// an arm, not on this list.
+const SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM: &[(u8, &str)] = &[
+    (
+        0x72,
+        "frem — the optimizing IR backend lowers it via a call to the jit_frem \
+         fmod helper, so admitting it lets the IR pipeline see the method",
+    ),
+    (
+        0x73,
+        "drem — same as frem, via jit_drem",
+    ),
+];
+
+/// Every opcode value the top-level dispatch `match op` in `bytecode_walk.rs`
+/// has an arm for.
+///
+/// Parsed from the source at COMPILE time (`include_str!`), because the set is
+/// a property of that match statement and nothing else — there is no runtime
+/// handle on it. Only arms at the match's own brace depth count, so the
+/// nested `match op` statements inside the branch arms (which re-dispatch on
+/// the same variable to pick a condition code) cannot forge coverage.
+fn single_pass_dispatch_arms() -> std::collections::BTreeSet<u8> {
+    let src = include_str!("bytecode_walk.rs");
+    // The dispatch loop's own `match op {`. Anchored on the two lines that
+    // immediately precede it so a nested `match op {` cannot be picked up.
+    let anchor = "self.dbg_last_op = op;\n            match op {\n";
+    let start = src
+        .find(anchor)
+        .expect("the single-pass dispatch `match op` must be findable")
+        + anchor.len();
+
+    let mut arms = std::collections::BTreeSet::new();
+    let mut depth = 0i32; // brace depth relative to the match body
+    for line in src[start..].lines() {
+        if depth == 0 {
+            if let Some(set) = parse_opcode_arm(line) {
+                arms.extend(set);
+            }
+            // The catch-all closes the enumeration.
+            if line.trim_start().starts_with("_ => {") {
+                break;
+            }
+        }
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth < 0 {
+            break; // the match's own closing brace
+        }
+    }
+    arms
+}
+
+/// `0x5e => {`, `0xC2 | 0xC3 => {`, `0x1a..=0x1d => {` — and nothing else.
+/// Returns `None` for any line that is not an opcode match arm, including
+/// comments and emitted byte literals.
+fn parse_opcode_arm(line: &str) -> Option<Vec<u8>> {
+    let t = line.trim();
+    if t.starts_with("//") {
+        return None;
+    }
+    let head = t.split("=>").next()?;
+    if head == t {
+        return None; // no `=>` on this line
+    }
+    let head = head.trim();
+    if head.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for alt in head.split('|') {
+        let alt = alt.trim();
+        let bytes: Vec<u8> = if let Some((lo, hi)) = alt.split_once("..=") {
+            let lo = parse_hex_byte(lo.trim())?;
+            let hi = parse_hex_byte(hi.trim())?;
+            (lo..=hi).collect()
+        } else {
+            vec![parse_hex_byte(alt)?]
+        };
+        out.extend(bytes);
+    }
+    Some(out)
+}
+
+fn parse_hex_byte(tok: &str) -> Option<u8> {
+    let hex = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X"))?;
+    if hex.len() != 2 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
+}
+
+/// The parser must actually find the dispatch arms — a `single_pass_dispatch_arms`
+/// that silently returned an empty set would make the guard below vacuously
+/// green, which is precisely how the `dup2_x2` gap survived so long.
+#[test]
+fn the_dispatch_arm_parser_reads_the_real_match() {
+    let arms = single_pass_dispatch_arms();
+    assert!(
+        arms.len() > 150,
+        "the single-pass walk lowers most of the opcode space; parsed only {}",
+        arms.len()
+    );
+    // Spot checks across the shapes the parser has to handle.
+    for (op, what) in [
+        (0x00u8, "nop, a bare single arm"),
+        (0x5eu8, "dup2_x2, the arm this guard was written for"),
+        (0x1bu8, "iload_1, inside a `..=` range arm"),
+        (0xc2u8, "monitorenter, inside an alternation arm"),
+        (0xacu8, "ireturn"),
+    ] {
+        assert!(arms.contains(&op), "dispatch arm for 0x{op:02x} ({what})");
+    }
+    // And it must not invent coverage for opcodes nobody lowers here.
+    for (op, what) in [
+        (0xa8u8, "jsr — unlowered in both walkers"),
+        (0xc4u8, "wide — unlowered in both walkers"),
+        (0x72u8, "frem — deliberately IR-only"),
+    ] {
+        assert!(
+            !arms.contains(&op),
+            "0x{op:02x} ({what}) must not read as lowered"
+        );
+    }
+}
+
+/// The guard itself: no opcode may be admitted by `jit_scan` and lowered by
+/// nothing.
+///
+/// Admission is probed BEHAVIOURALLY — a one-instruction body per opcode,
+/// handed to the real `jit_scan` — so the scanner's own table is never
+/// transcribed here and cannot drift from what it actually does.
+#[test]
+fn scan_admitted_opcodes_are_lowered_or_declared() {
+    let arms = single_pass_dispatch_arms();
+    let declared: std::collections::BTreeMap<u8, &str> = SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM
+        .iter()
+        .copied()
+        .collect();
+
+    let mut offenders = Vec::new();
+    for op in 0x00u8..=0xc9u8 {
+        // A body of just this opcode plus operand padding and a `return`. The
+        // scanner walks opcode widths and never simulates the stack, so this
+        // is enough to ask it the only question that matters: does it advance
+        // past this opcode, or refuse the method?
+        let mut code = vec![op, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        code.push(0xb1); // return
+        let admitted = super::bytecode_compat::jit_scan(&code, code.len(), "()V").is_some();
+        if !admitted || arms.contains(&op) {
+            continue;
+        }
+        if declared.contains_key(&op) {
+            continue;
+        }
+        offenders.push(op);
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these opcodes are admitted by `jit_scan` and lowered by no single-pass \
+         arm, so every method containing one silently never compiles: {}. \
+         Either add an arm in `bytecode_walk.rs`, stop admitting them in \
+         `jit_scan`, or — only if some OTHER backend lowers them — add them to \
+         SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM with the reason.",
+        offenders
+            .iter()
+            .map(|op| format!("0x{op:02x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // The allowlist is a ratchet in both directions: an entry that has since
+    // grown an arm must be removed, or it hides the next real gap behind a
+    // stale exemption.
+    for (op, reason) in SCAN_ADMITTED_WITHOUT_A_SINGLE_PASS_ARM {
+        assert!(
+            !arms.contains(op),
+            "0x{op:02x} now HAS a single-pass arm; drop its exemption ({reason})"
+        );
+    }
 }

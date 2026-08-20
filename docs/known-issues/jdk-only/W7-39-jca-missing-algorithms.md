@@ -1,5 +1,49 @@
 # W7-39 — the JCA algorithms that refused, and the advertised/implemented reconciliation
 
+> ## Re-verified in source 2026-08-12 (lane A3) — STILL "SOURCE LANDED, NOT RE-MEASURED"
+>
+> **This pass did not build or run anything either**, so the header's status is
+> unchanged and no CratonVM column in the body has been promoted to a
+> measurement. What was done is a check that the source this record claims to
+> have landed is actually in the tree, because this campaign has repeatedly
+> found records claiming a patch was never applied when it was, and the
+> converse.
+>
+> Present, by symbol:
+>
+> | claim | symbol | file |
+> |---|---|---|
+> | Blowfish/RC4 route to the real SunJCE SPI through a second, ECB-shaped driver | `drive_real_ecb_cipher`, `real_spi_ecb_route` | `native-builtins/src/jca/cipher.rs` |
+> | one `cipher_block_size` answers `getBlockSize` and `getOutputSize` | `cipher_block_size` | `native-builtins/src/jca/cipher.rs` |
+> | the `Mac` ratchet | `every_advertised_sunjce_mac_is_computable` | `native-builtins/src/jca/provider_chain.rs` |
+> | the `KeyGenerator` ratchet | `every_keygenerator_the_engine_implements_is_advertised` | `native-builtins/src/jca/provider_chain.rs` |
+> | the `Cipher` ratchet (pre-existing, extended) | `every_advertised_sunjce_cipher_is_serviceable` | `native-builtins/src/jca/provider_chain.rs` |
+> | `keygen_default_bits` is the `--synthetic-jdk` half the ratchet holds | `keygen_default_bits` | `native-builtins/src/{jca/provider_chain,phases_early}.rs` |
+>
+> **The record's own self-assessment still stands and should not be softened.**
+> Its weakest row is `keygen.Blowfish` — thirteen seeded rows whose correctness
+> depends on real JDK classes loading and running inside CratonVM, argued from
+> shape rather than measured. Nothing on this pass touched that, and a symbol
+> check cannot strengthen it: the ratchet holds the `keygen_default_bits` side
+> only, exactly as the record says, and the other direction is not a Rust
+> test's to make. **`KeyGenerator.getInstance` over all thirteen names remains
+> the single most valuable thing to run against a built binary**, and it is
+> still unrun.
+>
+> **NOT RETIRED.** Everything in "Re-taking this" is still outstanding: the
+> whole record is a set of source claims awaiting one run of
+> `probes/CryptoTrioProbe.java` in both arms, plus the six additions that
+> section lists. A symbol being present is not the same as an algorithm being
+> correct — this record's own W7-38 predecessor exists because Blowfish and RC4
+> both *returned bytes*, and the bytes were AES's.
+>
+> **No JCA behaviour was changed by this lane.** The only edit lane A3 made in
+> this area is `CertificateFactory.getInstance`'s fallback writing `type` by
+> name instead of over raw slot 0 — see
+> `W7-29-jca-advertise-implement-gaps.md`'s 2026-08-12 section. It touches no
+> `Cipher`, `Mac`, `KeyGenerator` or digest path and none of the four rows
+> above.
+
 **Status: SOURCE LANDED, NOT RE-MEASURED.** Nothing in this record was produced by a
 CratonVM binary built from this branch. The tree was not rebuilt (the lane may not run
 `cargo build`), so every CratonVM column below is the state *before* the change, and every

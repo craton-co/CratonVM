@@ -503,6 +503,25 @@ pub(crate) fn native_random_next_bytes(
     };
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
+        // `Random.nextBytes` is specified `@throws NullPointerException if the
+        // byte array is null` (`Random.java:458`) and its body opens
+        // `bytes.length`. A `Value::Object(None)` here IS that null, and this
+        // arm used to swallow it: `new Random(42).nextBytes(null)` returned
+        // normally, which `RJdkIntrinsics2 --only=random` check 41 reports as
+        // "got none". Message measured on OpenJDK 25.0.3+9.
+        Some(Value::Object(None)) => {
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some(
+                        "Cannot read the array length because \"bytes\" is null".to_string(),
+                    ),
+                }
+                .into(),
+            );
+        }
+        // A missing or non-reference argument is an arity/marshalling bug, not
+        // a Java null — keep the defensive return rather than reporting an NPE
+        // the program did not cause.
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr);
@@ -1011,6 +1030,17 @@ pub(crate) fn native_secure_random_init(
 ) -> MethodCallResult {
     // Per the JDK SecureRandom contract the no-arg ctor selects a default
     // provider; we always select "OS-CSPRNG", the strongest source available.
+    //
+    // This body is registered for BOTH `<init>()V` and `<init>([B)V`, so the
+    // null check is arity-gated: `new SecureRandom((byte[]) null)` NPEs on
+    // HotSpot 25 (measured) — `SecureRandom.java:266` is
+    // `Objects.requireNonNull(seed)`, reached before `getDefaultPRNG` can
+    // discard the seed. `<init>()V` has no second argument and is unaffected.
+    if args.len() >= 2 && matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        );
+    }
     secure_random_record_algorithm(ctx, args)?;
     Ok(None)
 }
@@ -1060,6 +1090,15 @@ pub(crate) fn native_secure_random_set_seed_bytes(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // The null check precedes the receiver check: `setSeed(null)` NPEs on
+    // HotSpot 25 (measured) regardless of algorithm, and the SHA1PRNG-only
+    // early return below would otherwise swallow it for every other algorithm.
+    // `SecureRandom.java:724` is `Objects.requireNonNull(seed)` — no message.
+    if matches!(args.get(1), Some(Value::Object(None))) {
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        );
+    }
     let Some(this) = secure_random_receiver(args) else {
         return Ok(None);
     };
@@ -1081,10 +1120,56 @@ pub(crate) fn native_secure_random_set_seed_bytes(
     Ok(None)
 }
 
+/// Does this receiver supply its own `nextBytes`?
+///
+/// `SecureRandom` overrides none of `nextInt`/`nextLong`/`nextBoolean`/
+/// `nextFloat`/`nextDouble`/`nextGaussian`: it inherits `java.util.Random`'s,
+/// and every one of them funnels through `SecureRandom.next(int)`, which is
+/// `nextBytes(new byte[n])` — a VIRTUAL call. Serving them from the OS CSPRNG
+/// is right for a plain `SecureRandom` and wrong for any subclass that supplies
+/// its own bytes, because the override then never runs at all.
+///
+/// That is not a niche. Deterministic test doubles are built exactly this way
+/// (bc-java's `FixedSecureRandom` replays a fixed stream through `nextBytes`),
+/// and BouncyCastle's `ISO10126d2Padding` / `X923Padding` fill their padding
+/// with `random.nextInt()` — so `DES/CBC/ISO10126Padding` drew its padding from
+/// the OS CSPRNG instead of the caller's random and could not reproduce a
+/// single known-answer vector (`BlockCipherTest`, index 6). Measured: HotSpot
+/// makes six four-byte `nextBytes` draws through the caller's random where this
+/// VM made none.
+///
+/// The walk stops at `java.security.SecureRandom` itself: its own `nextBytes`
+/// is the one these natives are entitled to replace.
+fn secure_random_bytes_overridden(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut class_id = ctx.class_id_of_object(this);
+    loop {
+        match ctx.class_name_arc_of_id(class_id).as_deref() {
+            Some("java/security/SecureRandom") | None => return false,
+            _ => {}
+        }
+        if ctx.class_declares_method(class_id, "nextBytes", "([B)V") {
+            return true;
+        }
+        match ctx.superclass_of(class_id) {
+            Some(parent) => class_id = parent,
+            None => return false,
+        }
+    }
+}
+
 pub(crate) fn native_secure_random_next_int(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // A subclass that supplies its own bytes owns every derived value too;
+    // see `secure_random_bytes_overridden`. Handing the call back to the
+    // bytecode reaches `java.util.Random.nextInt` -> `SecureRandom.next(int)` ->
+    // the override, which is what the JDK does and what this cannot fake.
+    if let Some(this) = secure_random_receiver(args) {
+        if secure_random_bytes_overridden(ctx, this) {
+            return ctx.invoke_virtual_bytecode_only(this, "nextInt", "()I", &args[1..]);
+        }
+    }
     if let Some(this) = secure_random_receiver(args) {
         if let Some(v) = sha1prng_next(ctx, this, 32) {
             return Ok(Some(Value::Int(v)));
@@ -1108,6 +1193,15 @@ pub(crate) fn native_secure_random_next_int_bound(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // A subclass that supplies its own bytes owns every derived value too;
+    // see `secure_random_bytes_overridden`. Handing the call back to the
+    // bytecode reaches `java.util.Random.nextInt` -> `SecureRandom.next(int)` ->
+    // the override, which is what the JDK does and what this cannot fake.
+    if let Some(this) = secure_random_receiver(args) {
+        if secure_random_bytes_overridden(ctx, this) {
+            return ctx.invoke_virtual_bytecode_only(this, "nextInt", "(I)I", &args[1..]);
+        }
+    }
     let bound = match args.get(1) {
         Some(Value::Int(b)) => *b,
         _ => 1,
@@ -1154,6 +1248,15 @@ pub(crate) fn native_secure_random_next_long(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // A subclass that supplies its own bytes owns every derived value too;
+    // see `secure_random_bytes_overridden`. Handing the call back to the
+    // bytecode reaches `java.util.Random.nextLong` -> `SecureRandom.next(int)` ->
+    // the override, which is what the JDK does and what this cannot fake.
+    if let Some(this) = secure_random_receiver(args) {
+        if secure_random_bytes_overridden(ctx, this) {
+            return ctx.invoke_virtual_bytecode_only(this, "nextLong", "()J", &args[1..]);
+        }
+    }
     if let Some(this) = secure_random_receiver(args) {
         if let Some(hi) = sha1prng_next(ctx, this, 32) {
             // `Random.nextLong()`: ((long)next(32) << 32) + next(32) — the low
@@ -1193,6 +1296,19 @@ pub(crate) fn native_secure_random_next_bytes(
 ) -> MethodCallResult {
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
+        // `SecureRandom.nextBytes(null)` NPEs on HotSpot 25 (measured), same as
+        // the `java.util.Random` parent — see `native_random_next_bytes`. The
+        // source is `Objects.requireNonNull(bytes)` with no message argument
+        // (`SecureRandom.java:774`), so the message is genuinely null here and
+        // `message: None` is the faithful answer, not a shortcut.
+        Some(Value::Object(None)) => {
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: None,
+                }
+                .into(),
+            );
+        }
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr);
@@ -1238,6 +1354,15 @@ pub(crate) fn native_secure_random_next_double(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // A subclass that supplies its own bytes owns every derived value too;
+    // see `secure_random_bytes_overridden`. Handing the call back to the
+    // bytecode reaches `java.util.Random.nextDouble` -> `SecureRandom.next(int)` ->
+    // the override, which is what the JDK does and what this cannot fake.
+    if let Some(this) = secure_random_receiver(args) {
+        if secure_random_bytes_overridden(ctx, this) {
+            return ctx.invoke_virtual_bytecode_only(this, "nextDouble", "()D", &args[1..]);
+        }
+    }
     if let Some(this) = secure_random_receiver(args) {
         if let Some(d) = sha1prng_next_double(ctx, this) {
             return Ok(Some(Value::Double(d)));
@@ -1264,6 +1389,15 @@ pub(crate) fn native_secure_random_next_boolean(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // A subclass that supplies its own bytes owns every derived value too;
+    // see `secure_random_bytes_overridden`. Handing the call back to the
+    // bytecode reaches `java.util.Random.nextBoolean` -> `SecureRandom.next(int)` ->
+    // the override, which is what the JDK does and what this cannot fake.
+    if let Some(this) = secure_random_receiver(args) {
+        if secure_random_bytes_overridden(ctx, this) {
+            return ctx.invoke_virtual_bytecode_only(this, "nextBoolean", "()Z", &args[1..]);
+        }
+    }
     if let Some(this) = secure_random_receiver(args) {
         if let Some(b) = sha1prng_next(ctx, this, 1) {
             return Ok(Some(Value::Int(i32::from(b != 0))));
@@ -1287,6 +1421,15 @@ pub(crate) fn native_secure_random_next_float(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // A subclass that supplies its own bytes owns every derived value too;
+    // see `secure_random_bytes_overridden`. Handing the call back to the
+    // bytecode reaches `java.util.Random.nextFloat` -> `SecureRandom.next(int)` ->
+    // the override, which is what the JDK does and what this cannot fake.
+    if let Some(this) = secure_random_receiver(args) {
+        if secure_random_bytes_overridden(ctx, this) {
+            return ctx.invoke_virtual_bytecode_only(this, "nextFloat", "()F", &args[1..]);
+        }
+    }
     if let Some(this) = secure_random_receiver(args) {
         if let Some(b) = sha1prng_next(ctx, this, 24) {
             return Ok(Some(Value::Float(b as f32 / ((1u32 << 24) as f32))));
@@ -1313,6 +1456,15 @@ pub(crate) fn native_secure_random_next_gaussian(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // A subclass that supplies its own bytes owns every derived value too;
+    // see `secure_random_bytes_overridden`. Handing the call back to the
+    // bytecode reaches `java.util.Random.nextGaussian` -> `SecureRandom.next(int)` ->
+    // the override, which is what the JDK does and what this cannot fake.
+    if let Some(this) = secure_random_receiver(args) {
+        if secure_random_bytes_overridden(ctx, this) {
+            return ctx.invoke_virtual_bytecode_only(this, "nextGaussian", "()D", &args[1..]);
+        }
+    }
     if let Some(this) = secure_random_receiver(args) {
         if let Some(g) = sha1prng_next_gaussian(ctx, this) {
             return Ok(Some(Value::Double(g)));
@@ -1376,7 +1528,10 @@ pub(crate) fn native_secure_random_generate_seed(
     if n < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "numBytes must be non-negative".to_string(),
+                // `SecureRandom.java:878` verbatim. "must be non-negative" is
+                // `RandomSupport.BAD_SIZE`, which is a DIFFERENT method's
+                // message (`ints`/`longs`/`doubles` stream size).
+                message: "numBytes cannot be negative".to_string(),
             }
             .into(),
         );
@@ -1446,18 +1601,26 @@ pub(crate) fn native_secure_random_get_instance(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // Two different answers, not one. `getInstance(null)` is
+    // `Objects.requireNonNull(algorithm, "null algorithm name")`
+    // (`SecureRandom.java:391`) — a NullPointerException. `getInstance("")` is
+    // a NoSuchAlgorithmException whose message is `" SecureRandom not
+    // available"`, which the `secure_random_algorithm_supported` branch below
+    // already produces for the empty string. Both were collapsed into one
+    // IllegalArgumentException, so the type was wrong for null and the type and
+    // the wording were wrong for "". Measured on OpenJDK 25.0.3+9.
     let algo = match args.first() {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        Some(Value::Object(None)) | None => {
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("null algorithm name".to_string()),
+                }
+                .into(),
+            );
+        }
         _ => String::new(),
     };
-    if algo.is_empty() {
-        return Err(
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "null algorithm name".to_string(),
-            }
-            .into(),
-        );
-    }
     // Real JDK dead-ends an unknown name in `GetInstance` with
     // `NoSuchAlgorithmException("<algo> SecureRandom not available")`. Because
     // this native bypasses the provider search entirely it used to fabricate a
@@ -1482,10 +1645,36 @@ pub(crate) fn native_secure_random_get_instance_with_provider(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // ORDER IS OBSERVABLE, and it was backwards. All three 2-arg overloads
+    // OPEN with `Objects.requireNonNull(algorithm, "null algorithm name")`
+    // (`SecureRandom.java:439` for the `String` provider, `:481` for the
+    // `Provider` one) — before any provider resolution. So a null algorithm
+    // beats a bad provider, and the provider is resolved first only among
+    // NON-null algorithm names. Measured on OpenJDK 25.0.3+9:
+    //
+    //   getInstance(null, "SUN")           -> NPE "null algorithm name"
+    //   getInstance(null, "NOPE")          -> NPE "null algorithm name"
+    //   getInstance(null, (String) null)   -> NPE "null algorithm name"
+    //   getInstance(null, (Provider) null) -> NPE "null algorithm name"
+    //   getInstance("SHA1PRNG", (String) null) -> IAE "missing provider"
+    //
+    // Running the provider checks first answered rows 2–4 with
+    // NoSuchProviderException / IllegalArgumentException instead. Hoisting the
+    // null-algorithm check here rather than relying on the 1-arg body it
+    // delegates to is the whole fix: that body is reached only AFTER both
+    // provider checks have already had their chance to throw.
+    if matches!(args.first(), Some(Value::Object(None)) | None) {
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("null algorithm name".to_string()),
+            }
+            .into(),
+        );
+    }
     // The provider argument is otherwise discarded (every algorithm here is
-    // served by the OS CSPRNG regardless), but real JDK still resolves the
-    // named provider first and rejects one that was never registered — see
-    // `check_named_provider_arg`.
+    // served by the OS CSPRNG regardless), but real JDK does resolve the named
+    // provider before looking the algorithm up, and rejects one that was never
+    // registered — see `check_named_provider_arg`.
     crate::jca::provider_chain::check_named_provider_arg(
         ctx,
         args,

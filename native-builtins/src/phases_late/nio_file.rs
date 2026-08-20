@@ -60,6 +60,34 @@ pub(crate) const P57_FS_JAR_FIELD: usize = 1;
 /// the separator, field 1 the mounted-JAR path; these are mutually exclusive.
 pub(crate) const P57_FS_JRT_FIELD: usize = 2;
 
+/// Field index on a synthetic `java/nio/file/FileSystem` holding the single
+/// `FileSystemProvider` object that `FileSystem.provider()` hands out for THIS
+/// filesystem. Lazily populated by `p57_fs_provider`.
+///
+/// Why the provider lives on the FileSystem rather than in a Rust-side cache:
+/// a `OnceLock<ObjectRef>` would be both process-global (surviving across VMs
+/// in-process) and invisible to the GC as a root. The owning FileSystem is
+/// already a GC root by virtue of the `FileSystems$DefaultFileSystemHolder.
+/// defaultFileSystem` static stash that `p57_default_filesystem_singleton`
+/// writes, so hanging the provider off it inherits correct rooting and correct
+/// VM scoping for free.
+///
+/// HotSpot's contract, measured (`scratchpad/c14/FsIdentity.java` on Temurin
+/// 25.0.3.9): `getDefault().provider() == getDefault().provider()`,
+/// `== DefaultFileSystemProvider.instance()`, and
+/// `== FileSystemProvider.installedProviders().get(0)` are all `true`. Before
+/// this field existed every one of those minted a fresh object and every one
+/// of those identities was false.
+/// docs/known-issues/jdk-only/W8-C14-2-default-provider-singleton.md
+pub(crate) const P57_FS_PROVIDER_FIELD: usize = 3;
+
+/// Instance-slot count of a synthetic `java/nio/file/FileSystem`:
+/// 0 = separator, 1 = mounted-JAR path, 2 = mounted jrt `java.home`,
+/// 3 = the provider singleton. Named so the three allocation sites cannot
+/// drift from each other or from `P57_FS_PROVIDER_FIELD` (a synthetic class's
+/// width being declared in several places is a recorded defect family).
+pub(crate) const P57_FS_SLOTS: usize = 4;
+
 /// Native equivalent of `java.nio.file.Path.toString()`, tuned for synthetic
 /// and real `java/nio/file/Path` values used by Javac/ZipFS and JRT paths.
 /// This avoids going back through virtual `Path.toString` dispatch, keeping
@@ -791,6 +819,107 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(fs))))
         },
     );
+
+    // --- sun.nio.fs.DefaultFileSystemProvider.theFileSystem() → FileSystem ---
+    //
+    // The SECOND door to the same singleton. `getDefault()` above was
+    // intercepted and this one was not, so the two disagreed: the real
+    // `DefaultFileSystemProvider.<clinit>` ran and built its own
+    // `WindowsFileSystem`, and the `jdk_concrete_getclass_alias` mapping
+    // (FileSystem -> sun.nio.fs.WindowsFileSystem) made both objects report the
+    // same class name, which is what hid the split.
+    //
+    // This is NOT a niche door. Verbatim callers in java.base (JDK 25 src.zip):
+    //   * java.util.zip.ZipFile$Source.builtInFS  -- static final, then
+    //     `Files.readAttributes(builtInFS.getPath(file.getPath()), ...)` on
+    //     EVERY zip/jar open.
+    //   * java.io.FilePermission.builtInFS -- static final, plus the derived
+    //     `here` / EMPTY_PATH / DASH_PATH / DOTDOT_PATH constants.
+    //   * java.io.WinNTFileSystem.isInvalid() -- the Windows `File` path
+    //     validity check.
+    //   * java.nio.file.FileSystems.getDefault() itself, on the
+    //     `!VM.isModuleSystemInited()` branch -- i.e. for the whole of early
+    //     boot, `getDefault()` IS `theFileSystem()`.
+    //   * jdk.internal.jimage.ImageReaderFactory.<clinit>, reflectively.
+    //
+    // Every `Path` the second filesystem minted was a real-bytecode
+    // `WindowsPath` whose field 0 is a `WindowsFileSystem` OBJECT (javap: the
+    // first instance field is `private final WindowsFileSystem fs`; the String
+    // `path` is field 3). `p57_read_path` reads field 0, `read_string`
+    // correctly refuses a non-String, the documented `toString()` fallback
+    // re-enters this same native because dispatch is receiver-aware, and the
+    // `IN_TOSTRING_FALLBACK` guard then returns "". Downstream every file-IO
+    // native saw an EMPTY path -- the empty-message `NoSuchFileException` that
+    // kills `System.initPhase2`.
+    //
+    // HotSpot 25 returns one shared object through both doors, measured:
+    // `theFileSystem==getDefault|true` (scratchpad/c14/FsIdentity.java). The
+    // mutation control (FsIdentityMutant.java) builds a second provider by hand
+    // and that row flips to false, so the row is load-bearing rather than
+    // vacuously green.
+    //
+    // Descriptor read off the image, not recalled -- `javap -p --module
+    // java.base sun.nio.fs.DefaultFileSystemProvider` on Temurin 25.0.3.9:
+    //   public static java.nio.file.FileSystem theFileSystem();
+    // It returns the INTERFACE type on every platform, so this descriptor is
+    // portable. Static, so `args` carries no receiver.
+    // docs/known-issues/jdk-only/W8-C14-1-default-filesystem-second-door.md
+    r.register(
+        "sun/nio/fs/DefaultFileSystemProvider",
+        "theFileSystem",
+        "()Ljava/nio/file/FileSystem;",
+        |ctx, _args| {
+            let fs = p57_default_filesystem_singleton(ctx)?;
+            Ok(Some(Value::Object(Some(fs))))
+        },
+    );
+
+    // --- sun.nio.fs.DefaultFileSystemProvider.instance() → the provider ---
+    //
+    // Registered TOGETHER with `theFileSystem` above and with the
+    // `FileSystem.provider()` / `installedProviders()` repairs below, because
+    // this door is only half a fix on its own: `sun.nio.ch.UnixDomainSockets.
+    // generateTempName()` compares
+    //   path.getFileSystem().provider() != DefaultFileSystemProvider.instance()
+    // with `!=`, so unifying one side while the other still mints a fresh
+    // object per call leaves the comparison exactly as broken as before.
+    //
+    // Leaving it unregistered is not neutral either: `instance()` compiles to a
+    // bare `getstatic INSTANCE`, and that getstatic triggers
+    // `DefaultFileSystemProvider.<clinit>`, whose whole body is
+    // `INSTANCE = new WindowsFileSystemProvider()` -- and
+    // `WindowsFileSystemProvider.<init>` does
+    // `theFileSystem = new WindowsFileSystem(this, StaticProperty.userDir())`.
+    // So an un-intercepted `instance()` reconstructs the very second filesystem
+    // the registration above exists to eliminate.
+    // `java.nio.file.FileSystems$DefaultFileSystemHolder.getDefaultProvider()`
+    // calls it directly.
+    //
+    // PLATFORM-SPECIFIC DESCRIPTOR. Unlike `theFileSystem`, `instance()`
+    // returns the CONCRETE provider type, which differs per platform. The
+    // Windows arm is verified by javap on Temurin 25.0.3.9 windows/x64:
+    //   public static sun.nio.fs.WindowsFileSystemProvider instance();
+    // The other two arms are UNVERIFIED -- javap the corresponding image before
+    // trusting them. The failure mode if an arm is wrong is a registration that
+    // never matches (a dead registration), which is today's behaviour, not a
+    // crash; that is why guessing here is acceptable and guessing in the
+    // returned VALUE would not be.
+    let instance_desc: &'static str = if cfg!(windows) {
+        "()Lsun/nio/fs/WindowsFileSystemProvider;"
+    } else if cfg!(target_os = "macos") {
+        "()Lsun/nio/fs/MacOSXFileSystemProvider;"
+    } else {
+        "()Lsun/nio/fs/LinuxFileSystemProvider;"
+    };
+    r.register(
+        "sun/nio/fs/DefaultFileSystemProvider",
+        "instance",
+        instance_desc,
+        |ctx, _args| {
+            let p = p57_default_provider_singleton(ctx)?;
+            Ok(Some(Value::Object(Some(p))))
+        },
+    );
     r.register(
         file_systems,
         "newFileSystem",
@@ -919,37 +1048,22 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "provider",
         "()Ljava/nio/file/spi/FileSystemProvider;",
         |ctx, args| {
-            // Report the scheme matching this FileSystem so callers that check
-            // `fs.provider().getScheme()` see "jrt"/"jar" for a mounted virtual
-            // FS, "file" otherwise.
-            let scheme_str = match obj_arg(args, 0) {
-                Ok(this)
-                    if matches!(
-                        ctx.get_field(this, P57_FS_JRT_FIELD),
-                        Value::Object(Some(_))
-                    ) =>
-                {
-                    "jrt"
-                }
-                Ok(this)
-                    if matches!(
-                        ctx.get_field(this, P57_FS_JAR_FIELD),
-                        Value::Object(Some(_))
-                    ) =>
-                {
-                    "jar"
-                }
-                _ => "file",
+            // One provider object per FileSystem, cached in
+            // P57_FS_PROVIDER_FIELD. This used to allocate a FRESH provider on
+            // every call, which made even `fs.provider() == fs.provider()`
+            // false; HotSpot answers true (measured, `provider==provider|true`
+            // in scratchpad/c14/FsIdentity.java). `p57_fs_provider` still
+            // reports the scheme matching this FileSystem, so callers that
+            // check `fs.provider().getScheme()` keep seeing "jrt"/"jar" for a
+            // mounted virtual FS and "file" otherwise.
+            //
+            // A receiver we cannot read (no arg 0) has no field to cache in;
+            // fall back to the default provider rather than inventing one, so
+            // the answer is still the singleton.
+            let provider = match obj_arg(args, 0) {
+                Ok(this) => p57_fs_provider(ctx, this)?,
+                Err(_) => p57_default_provider_singleton(ctx)?,
             };
-            let provider =
-                try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
-            // Pin across the create_string below — a moving young GC there
-            // would relocate the fresh provider (native stale-local family).
-            let provider_pin = ctx.pin_native_root(provider);
-            let scheme = ctx.create_string(scheme_str);
-            let provider = ctx.read_native_pin(provider_pin, provider);
-            ctx.set_field(provider, 0, Value::Object(Some(scheme)));
-            ctx.unpin_native_roots(provider_pin);
             Ok(Some(Value::Object(Some(provider))))
         },
     );
@@ -2009,28 +2123,29 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "()Ljava/util/List;",
         |ctx, _args| {
             use cratonvm_types::ArrayElementType;
-            let mk_provider = |ctx: &mut dyn NativeContext,
-                               scheme: &str|
-             -> Result<ObjectRef, MethodCallFailed> {
-                let p = try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
-                // Pin across the create_string below — a moving young GC there
-                // would relocate the fresh provider (native stale-local family).
-                let p_pin = ctx.pin_native_root(p);
-                let s = ctx.create_string(scheme);
-                let p = ctx.read_native_pin(p_pin, p);
-                ctx.set_field(p, 0, Value::Object(Some(s)));
-                ctx.unpin_native_roots(p_pin);
-                Ok(p)
-            };
+            // The jar/jrt entries stay per-call allocations (see the residual
+            // note in W8-C14-2); `p57_alloc_provider` is now the single
+            // implementation, replacing a byte-identical private `mk_provider`
+            // closure that used to live here.
+            //
             // "jrt" lets `FileSystems.getFileSystem(URI.create("jrt:/"))` resolve
             // (the real-JDK static iterates installedProviders by scheme) so the
             // in-process compiler can read platform classes from the runtime
             // image (HIB-CV-27).
-            let file_p = mk_provider(ctx, "file")?;
+            //
+            // Element 0 MUST BE the very object `FileSystems.getDefault()
+            // .provider()` returns: the `FileSystemProvider.installedProviders`
+            // javadoc makes the default provider the first element of this
+            // list, and HotSpot answers
+            // `installedProviders.get0==getDefault.provider|true` (measured,
+            // scratchpad/c14/FsIdentity.java). This was `mk_provider(ctx,
+            // "file")` — a fresh object per call — so the identity was false,
+            // and false again between two consecutive calls to this method.
+            let file_p = p57_default_provider_singleton(ctx)?;
             let file_pin = ctx.pin_native_root(file_p);
-            let jar_p = mk_provider(ctx, "jar")?;
+            let jar_p = p57_alloc_provider(ctx, "jar")?;
             let jar_pin = ctx.pin_native_root(jar_p);
-            let jrt_p = mk_provider(ctx, "jrt")?;
+            let jrt_p = p57_alloc_provider(ctx, "jrt")?;
             let jrt_pin = ctx.pin_native_root(jrt_p);
             let arr = ctx.new_array(ArrayElementType::Reference, 3);
             let arr_pin = ctx.pin_native_root(arr);
@@ -2077,7 +2192,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let fs = p57_alloc_jrt_filesystem(ctx, &jh)?;
                 return Ok(Some(Value::Object(Some(fs))));
             }
-            let fs = p57_alloc_default_filesystem(ctx)?;
+            // The default filesystem, NOT a fresh one. `FileSystems
+            // .getFileSystem(URI.create("file:///"))` resolves the "file"
+            // provider and calls this; HotSpot returns the same object as
+            // `getDefault()` (measured: `getFileSystem(file:///)==getDefault
+            // |true`). `p57_alloc_default_filesystem` here handed back a second
+            // filesystem — the same two-doors defect as
+            // `DefaultFileSystemProvider.theFileSystem`, one level down, and
+            // `FileSystems$DefaultFileSystemHolder.getDefaultFileSystem()`
+            // reaches it via exactly this call
+            // (`provider.getFileSystem(URI.create("file:///"))`).
+            let fs = p57_default_filesystem_singleton(ctx)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -4634,6 +4759,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
+            // `Files.list` is `newDirectoryStream(dir)` wrapped in a Stream, and
+            // it inherits that method's refusals: a missing path is a
+            // `NoSuchFileException` and a regular file a `NotDirectoryException`,
+            // both raised HERE, at construction, before any element is produced
+            // (measured on HotSpot 25.0.3+9 — `Files.list(missing)` throws from
+            // the `Files.list(...)` call itself, not from the terminal op).
+            // `vfs_or_host_list` answers BOTH conditions with an empty Vec, so
+            // this used to hand back an empty Stream and the caller's
+            // `.forEach(...)` did nothing at all, successfully.
+            // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+            if let Some(refused) = p57_dir_listing_refusal(ctx, &p, true)? {
+                return Err(refused);
+            }
             let entries = vfs_or_host_list(&p);
             let mut vals = Vec::with_capacity(entries.len());
             for e in &entries {
@@ -4651,6 +4789,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         follow_links: bool,
     ) -> MethodCallResult {
         let p = p57_read_path(ctx, path_obj);
+        // `Files.walk(missing)` throws `NoSuchFileException` at CONSTRUCTION on
+        // HotSpot (measured 2026-08-16: both `Files.walk(missing)` and
+        // `Files.walk(missing).count()` throw it) because `FileTreeWalker`
+        // reads the start element's attributes before yielding anything. This
+        // walker instead pushed the start path unconditionally
+        // (`out.push(p.to_string())`) and then found no children, so a walk over
+        // a path that is not there returned a one-element Stream containing the
+        // path that is not there. A regular file IS a legal start element and
+        // yields exactly itself (measured: `Files.walk(<file>).count() == 1`),
+        // so the directory requirement is off here.
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        if let Some(refused) = p57_dir_listing_refusal(ctx, &p, false)? {
+            return Err(refused);
+        }
         let mut paths = Vec::new();
         vfs_or_host_walk(&p, 0, max_depth, follow_links, &mut paths);
         let mut vals = Vec::with_capacity(paths.len());
@@ -4680,6 +4832,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let follow = p57_visit_options_follow_links(ctx, args.get(2));
             let path_obj = obj_arg(args, 0)?;
+            // A negative depth is the one value the JDK refuses, and the arm
+            // below promoted it to `usize::MAX` — an UNBOUNDED walk where the
+            // caller asked for a bounded one. See `p57_max_depth_refusal`.
+            if let Some(refused) = p57_max_depth_refusal(args.get(1)) {
+                return Err(refused);
+            }
             let max_depth = match args.get(1) {
                 Some(Value::Int(n)) if *n >= 0 => *n as usize,
                 _ => usize::MAX,
@@ -4696,6 +4854,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let follow = p57_visit_options_follow_links(ctx, args.get(3));
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
+            // Same two refusals as `walk` — `Files.find` is `walk` with a
+            // predicate and shares both contracts (measured 2026-08-16:
+            // `Files.find(missing,1,…)` -> NoSuchFileException,
+            // `Files.find(dir,-1,…)` -> IllegalArgumentException).
+            if let Some(refused) = p57_max_depth_refusal(args.get(1)) {
+                return Err(refused);
+            }
+            if let Some(refused) = p57_dir_listing_refusal(ctx, &p, false)? {
+                return Err(refused);
+            }
             let max_depth = match args.get(1) {
                 Some(Value::Int(n)) if *n >= 0 => *n as usize,
                 _ => usize::MAX,
@@ -5611,10 +5779,33 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            // 2 fields: slot 0 = materialised Object[] of Paths, slot 1 = the
-            // closed flag `close()` sets (see the `close`/`iterator`
-            // registrations below).
-            let stream = try_alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 2)?;
+            // TWO fabricated successes used to live in this body, and both
+            // reported the operation as having been performed when it had not:
+            //
+            //   1. the host arm's `Err(_) => vec![]` answered a MISSING
+            //      directory, a REGULAR FILE and an unreadable directory with
+            //      an empty listing, so every caller was told "this directory
+            //      is empty" and proceeded;
+            //   2. the `DirectoryStream$Filter` in slot 2 was never read, so a
+            //      filtered stream — `Files.newDirectoryStream(dir, "*.txt")`
+            //      builds one, and so does every `Files.newDirectoryStream(dir,
+            //      filter)` caller — handed back EVERY entry in the directory.
+            //      A `for (Path q : ds) Files.delete(q);` over a glob deleted
+            //      the files the glob excluded.
+            //
+            // Refuse before anything is allocated, exactly where the JDK does
+            // (measured on Adoptium 25.0.3+9, 2026-08-16:
+            // `provider.newDirectoryStream(<missing>, …)` -> NoSuchFileException,
+            // `provider.newDirectoryStream(<regular file>, …)` ->
+            // NotDirectoryException).
+            // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+            if let Some(refused) = p57_dir_listing_refusal(ctx, &p, true)? {
+                return Err(refused);
+            }
+            // 3 fields: slot 0 = materialised Object[] of Paths, slot 1 = the
+            // closed flag `close()` sets, slot 2 = the "an Iterator has already
+            // been handed out" latch (see the `iterator` registration below).
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 3)?;
             // Pin across the array/Path allocs below — a moving young GC there
             // would relocate the fresh stream/array (native stale-local family).
             let stream_pin = ctx.pin_native_root(stream);
@@ -5635,7 +5826,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         .filter_map(|e| e.ok())
                         .map(|e| e.path().to_string_lossy().replace('\\', "/"))
                         .collect(),
-                    Err(_) => vec![],
+                    // `p57_dir_listing_refusal` above has already established
+                    // that `p` exists and is a directory, so a failure here is a
+                    // genuine I/O condition (permissions, a racing unlink) and
+                    // must not be laundered into "the directory is empty".
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        return Err(p57_access_denied(ctx, &p)?)
+                    }
+                    Err(e) => return Err(p57_io_error(&e)),
                 }
             };
             use cratonvm_types::ArrayElementType;
@@ -5646,9 +5844,89 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_array_element(arr, i, Value::Object(Some(ep)));
             }
+            // Apply the filter. Nothing is held across `accept` except the two
+            // pinned arrays and the pinned filter — every `ObjectRef` is re-read
+            // from its pin after the call, because `accept` runs arbitrary
+            // bytecode and can move all three. `Files.find`'s `BiPredicate`
+            // loop, a few hundred lines above, is the worked example.
+            //
+            // Deviation stated rather than hidden: the JDK applies the filter
+            // LAZILY, in `hasNext()`, and wraps a filter `IOException` in a
+            // `DirectoryIteratorException` (measured). This listing is eager —
+            // it always has been — so a throwing filter surfaces here, from
+            // `newDirectoryStream`, with its own exception rather than the
+            // wrapper. Both are loud; neither is the silent "filter ignored"
+            // this replaces.
+            let filter = match args.get(2).copied() {
+                Some(Value::Object(Some(f))) => Some(f),
+                _ => None,
+            };
+            let arr = if let Some(filter) = filter {
+                let filter_pin = ctx.pin_native_root(filter);
+                let n = {
+                    let arr = ctx.read_native_pin(arr_pin, arr);
+                    ctx.array_length(arr)
+                };
+                let mut accepted: Vec<usize> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let arr = ctx.read_native_pin(arr_pin, arr);
+                    let elem = match ctx.get_array_element(arr, i) {
+                        Value::Object(Some(e)) => e,
+                        _ => continue,
+                    };
+                    let f = ctx.read_native_pin(filter_pin, filter);
+                    let verdict = ctx.invoke_virtual(
+                        f,
+                        "accept",
+                        "(Ljava/lang/Object;)Z",
+                        &[Value::Object(Some(elem))],
+                    )?;
+                    match verdict {
+                        Some(Value::Int(v)) => {
+                            if v != 0 {
+                                accepted.push(i);
+                            }
+                        }
+                        // Answering `false` here — which is what the sibling
+                        // `Files.find` matcher does — would DROP the entry, i.e.
+                        // shorten the listing on a dispatch fault. That is the
+                        // same species this whole body is being repaired for.
+                        _ => {
+                            ctx.unpin_native_roots(filter_pin);
+                            ctx.unpin_native_roots(arr_pin);
+                            ctx.unpin_native_roots(stream_pin);
+                            return Err(RuntimeError::IOException {
+                                message:
+                                    "DirectoryStream.Filter.accept did not return a boolean"
+                                        .to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+                let filtered = ctx.new_array(ArrayElementType::Reference, accepted.len());
+                let filtered_pin = ctx.pin_native_root(filtered);
+                for (dst, src) in accepted.iter().enumerate() {
+                    let arr = ctx.read_native_pin(arr_pin, arr);
+                    let elem = ctx.get_array_element(arr, *src);
+                    let filtered = ctx.read_native_pin(filtered_pin, filtered);
+                    ctx.set_array_element(filtered, dst, elem);
+                }
+                // Read back UNDER the pin and hand the ref straight to the
+                // `set_field` below without unpinning first — nothing between
+                // here and the store allocates, but leaving the pin in place
+                // until `stream_pin` is released means that stays true even if
+                // something is inserted later.
+                ctx.read_native_pin(filtered_pin, filtered)
+            } else {
+                ctx.read_native_pin(arr_pin, arr)
+            };
             let stream = ctx.read_native_pin(stream_pin, stream);
-            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
+            ctx.set_field(stream, 1, Value::Int(0));
+            ctx.set_field(stream, 2, Value::Int(0));
+            // `stream_pin` is the OUTERMOST watermark, so releasing it also
+            // releases `arr_pin`, `filter_pin` and `filtered_pin` above it.
             ctx.unpin_native_roots(stream_pin);
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -5667,12 +5945,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // which IS an `IllegalStateException` (that is its declared supertype),
         // so this is the same class of failure real `UnixDirectoryStream`
         // raises — not a substitute for it.
+        //
+        // The MESSAGE is transcribed, not invented: HotSpot 25.0.3+9 says
+        // `Directory stream is closed` (measured 2026-08-16). This body said
+        // `directory stream is closed`, lower-case, which is the sort of
+        // one-character divergence that fails a differential with every
+        // assertion passing.
         if matches!(ctx.get_field(this, 1), Value::Int(v) if v != 0) {
             return Err(RuntimeError::IllegalStateException {
-                message: "directory stream is closed".to_string(),
+                message: "Directory stream is closed".to_string(),
             }
             .into());
         }
+        // `DirectoryStream` is single-use: "@throws IllegalStateException if
+        // this directory stream is closed or the iterator has already been
+        // returned". Measured on HotSpot: a SECOND `iterator()` raises
+        // `IllegalStateException: Iterator already obtained`. This body handed
+        // out a fresh iterator over the same listing every time, so a caller
+        // that iterated twice by mistake silently processed every entry twice
+        // and never learned it had done so. The closed test above runs FIRST,
+        // matching the JDK (measured: after `close()` the answer is the closed
+        // message even when an iterator had already been obtained).
+        // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
+        if matches!(ctx.get_field(this, 2), Value::Int(v) if v != 0) {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Iterator already obtained".to_string(),
+            }
+            .into());
+        }
+        ctx.set_field(this, 2, Value::Int(1));
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
             _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
@@ -6809,13 +7110,186 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // "out-of-bounds field write dropped ... class_name=java/nio/file/
     // WatchService real_field_count=Some(0)".
 
+    // `FileSystem.getPathMatcher(String)` and the ONE method the returned
+    // interface declares. Until 2026-08-17 the body below was
+    //
+    //     |ctx, _args| { alloc(java/nio/file/PathMatcher, 0 fields) }
+    //
+    // — it ignored the pattern entirely and handed back an object stamped with
+    // the INTERFACE, carrying no state, and `PathMatcher.matches` had no
+    // registration anywhere in the VM. That is an object with zero usable
+    // methods: `0 of 1`. MEASURED consequence (`scratchpad/g22/GlobProbe`-class
+    // census, 292 rows on both VMs): every `matches()` answered
+    // `AbstractMethodError: java/nio/file/PathMatcher.matches(Ljava/nio/file/
+    // Path;)Z has no Code attribute`, and every one of the ~50 rows where
+    // HotSpot REFUSES the pattern (`getPathMatcher(null)`, `"*.txt"` with no
+    // syntax prefix, `"foo:…"`, `glob:[abc`, `glob:{a,b`, `glob:abc\`,
+    // `regex:[a-`) built a matcher happily instead, because nothing parsed.
+    // `RCrypto` reaches it from inside java.base — `JceSecurity.
+    // setupJurisdictionPolicies` -> `Files.newDirectoryStream(dir, glob)`,
+    // whose real JDK bytecode is `matcher.matches(entry.getFileName())`.
+    //
+    // Deleting the registration is NOT the fix, even though the real
+    // `sun.nio.fs.WindowsFileSystem.getPathMatcher` is a complete
+    // implementation: `FileSystems.getDefault()` returns CratonVM's own
+    // synthetic `java/nio/file/FileSystem` (`p57_default_filesystem_singleton`;
+    // its `sun.nio.fs.WindowsFileSystem` getClass() answer is the
+    // `jdk_concrete_getclass_alias` mapping, not its real class), and
+    // `java.nio.file.FileSystem.getPathMatcher` is ABSTRACT — so unregistering
+    // moves the `AbstractMethodError` one call earlier rather than removing it.
+    //
+    // Nor may the fix be to make `newDirectoryStream`'s glob overload skip the
+    // matcher: that is exactly the fabricated success `d378eee51` removed, and
+    // it made `RCrypto` green over a filter that was never invoked.
     r.register(
         fsys,
         "getPathMatcher",
         "(Ljava/lang/String;)Ljava/nio/file/PathMatcher;",
-        |ctx, _args| {
-            let pm = try_alloc_concurrent_synthetic(ctx, "java/nio/file/PathMatcher", 0)?;
+        |ctx, args| {
+            let sai = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                // HotSpot's is a helpful-NPE synthesized by the JVM from
+                // `syntaxAndInput.indexOf(':')`, transcribed verbatim
+                // (MEASURED — it cannot be derived).
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some(
+                            "Cannot invoke \"String.indexOf(int)\" because \
+                             \"syntaxAndInput\" is null"
+                                .into(),
+                        ),
+                    }
+                    .into())
+                }
+            };
+            let sai = ctx.read_string(sai).unwrap_or_default();
+            // `int pos = syntaxAndInput.indexOf(':'); if (pos <= 0) throw` —
+            // note `<= 0`, so a LEADING colon is refused too, and only the
+            // FIRST colon splits (`glob:a:b` is the glob `a:b`).
+            let split = match sai.find(':') {
+                None | Some(0) => None,
+                Some(b) => Some((sai[..b].to_string(), sai[b + 1..].to_string())),
+            };
+            let (syntax, input) = match split {
+                Some(pair) => pair,
+                None => return Err(p57_bare_illegal_argument(ctx)),
+            };
+            // `syntax.equalsIgnoreCase(GLOB_SYNTAX)` — `GLOB:` and `Glob:` are
+            // accepted, ` glob:` and `glob :` are not (no trimming). MEASURED.
+            let expr = if syntax.eq_ignore_ascii_case("glob") {
+                let units: Vec<u16> = input.encode_utf16().collect();
+                match p57_globs_to_regex(&units, cfg!(windows)) {
+                    Ok(u) => String::from_utf16_lossy(&u),
+                    Err((desc, idx)) => {
+                        return Err(p57_throw_pattern_syntax(ctx, desc, &input, idx))
+                    }
+                }
+            } else if syntax.eq_ignore_ascii_case("regex") {
+                // No translation at all: the string goes to `Pattern.compile`
+                // untouched, so the caller owns its own separator escaping.
+                input
+            } else {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("Syntax '{syntax}' not recognized"),
+                }
+                .into());
+            };
+            let expr_obj = ctx.create_string(&expr);
+            // CASE_INSENSITIVE | UNICODE_CASE, applied on Windows to `regex:`
+            // patterns as well as `glob:` ones — MEASURED: `regex:A.TXT`
+            // matches `a.txt`, `regex:(?-i)A\.TXT` does not, and `regex:Ä`
+            // matches `ä`.
+            let pattern = ctx.invoke(
+                "java/util/regex/Pattern",
+                "compile",
+                "(Ljava/lang/String;I)Ljava/util/regex/Pattern;",
+                &[Value::Object(Some(expr_obj)), Value::Int(P57_MATCHER_FLAGS)],
+            )?;
+            let pattern = match pattern {
+                Some(Value::Object(Some(p))) => p,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!("Pattern.compile returned no Pattern for {expr}"),
+                    }
+                    .into())
+                }
+            };
+            // The carrier allocation can move the just-compiled Pattern.
+            let pat_pin = ctx.pin_native_root(pattern);
+            let pm = try_alloc_concurrent_synthetic(ctx, "java/nio/file/PathMatcher", 1)?;
+            let pattern = ctx.read_native_pin(pat_pin, pattern);
+            ctx.set_field(pm, P57_MATCHER_PATTERN_FIELD, Value::Object(Some(pattern)));
+            ctx.unpin_native_roots(pat_pin);
             Ok(Some(Value::Object(Some(pm))))
+        },
+    );
+
+    // The receiver's runtime class IS `java/nio/file/PathMatcher` (see above),
+    // so this registration is what the receiver-own-class lookup finds. A
+    // one-field object stamped with an interface is the same shape the
+    // `Path.iterator` body a few hundred lines up already uses for
+    // `java/util/Iterator`.
+    r.register(
+        "java/nio/file/PathMatcher",
+        "matches",
+        "(Ljava/nio/file/Path;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some(
+                            "Cannot invoke \"java.nio.file.Path.toString()\" \
+                             because \"path\" is null"
+                                .into(),
+                        ),
+                    }
+                    .into())
+                }
+            };
+            let pattern = match ctx.get_field(this, P57_MATCHER_PATTERN_FIELD) {
+                Value::Object(Some(p)) => p,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "PathMatcher carries no compiled Pattern".into(),
+                    }
+                    .into())
+                }
+            };
+            // `pattern.matcher(path.toString()).matches()` — the WHOLE
+            // normalized path string, fully anchored (`Matcher.matches`, plus
+            // the `^`/`$` the glob translation adds). There is no basename-only
+            // mode; `Files.newDirectoryStream(dir, glob)` gets basename
+            // semantics by passing `entry.getFileName()`, not by anything here.
+            let pat_pin = ctx.pin_native_root(pattern);
+            let s = ctx.invoke_virtual(path, "toString", "()Ljava/lang/String;", &[])?;
+            let pattern = ctx.read_native_pin(pat_pin, pattern);
+            let s = match s {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => Value::Object(None),
+            };
+            let matcher = ctx.invoke(
+                "java/util/regex/Pattern",
+                "matcher",
+                "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+                &[Value::Object(Some(pattern)), s],
+            );
+            ctx.unpin_native_roots(pat_pin);
+            let matcher = match matcher? {
+                Some(Value::Object(Some(m))) => m,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let verdict = ctx.invoke(
+                "java/util/regex/Matcher",
+                "matches",
+                "()Z",
+                &[Value::Object(Some(matcher))],
+            )?;
+            Ok(Some(Value::Int(match verdict {
+                Some(Value::Int(v)) => i32::from(v != 0),
+                _ => 0,
+            })))
         },
     );
 
@@ -8960,6 +9434,136 @@ pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Resu
     Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
+/// Build a *typed* `java.nio.file.NotDirectoryException` for `path` (mirrors
+/// [`p57_no_such_file`]).
+///
+/// `NotDirectoryException extends FileSystemException extends IOException`, so
+/// the thrown object matches `catch (NotDirectoryException)` and every
+/// supertype. Measured on Eclipse Adoptium 25.0.3+9 (2026-08-16):
+///
+/// ```text
+/// Files.list(<regular file>)                       -> NotDirectoryException: <path>
+/// provider.newDirectoryStream(<regular file>, all) -> NotDirectoryException: <path>
+/// Files.newDirectoryStream(<regular file>)         -> NotDirectoryException: <path>
+/// ```
+///
+/// The message is the path alone, which is what `FileSystemException.getMessage`
+/// builds from the `file` field, so `detailMessage` is deliberately left null —
+/// same convention as [`p57_no_such_file`], for the same reason (a populated
+/// `detailMessage` renders as `<path>: <path>`).
+pub(crate) fn p57_not_directory(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/NotDirectoryException", 4)?;
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh exception (native stale-local family).
+    let exc_pin = ctx.pin_native_root(exc);
+    let file_str = p57_exception_path_string(ctx, path);
+    let exc = ctx.read_native_pin(exc_pin, exc);
+    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    ctx.unpin_native_roots(exc_pin);
+    Ok(MethodCallFailed::ExceptionThrown(exc))
+}
+
+/// The refusal every directory-listing entry point owes a path it cannot list.
+///
+/// **This is the fix for the largest fabricated-success row on the shipping
+/// `java.nio.file` surface.** `newDirectoryStream`, `Files.list`, `Files.walk`
+/// and `Files.find` all reached the host through
+/// [`vfs_or_host_list`], whose host arm ends
+///
+/// ```text
+/// match std::fs::read_dir(p) { Ok(rd) => …, Err(_) => vec![] }
+/// ```
+///
+/// — so a directory that does not exist, a path that is a *regular file*, and a
+/// directory the process may not read were all answered with an **empty
+/// listing**. Nothing threw; the caller was told the directory is empty. That is
+/// the worst shape in this species, because "empty" is a legal answer that every
+/// scan/backup/clean loop accepts and acts on: a `Files.list(dir)` over a
+/// mistyped path deletes nothing, copies nothing and reports success.
+///
+/// Measured on Eclipse Adoptium 25.0.3+9 (2026-08-16), all three entry points
+/// agree:
+///
+/// ```text
+/// Files.list(<missing>)      -> NoSuchFileException:   <path>
+/// Files.list(<regular file>) -> NotDirectoryException: <path>
+/// Files.walk(<missing>)      -> NoSuchFileException:   <path>   (at construction)
+/// Files.find(<missing>, …)   -> NoSuchFileException:   <path>
+/// provider.newDirectoryStream(<missing>, …)      -> NoSuchFileException
+/// provider.newDirectoryStream(<regular file>, …) -> NotDirectoryException
+/// ```
+///
+/// The classification is taken from `symlink_metadata`/`metadata` rather than
+/// from `read_dir`'s `ErrorKind`, deliberately: `ErrorKind::NotADirectory` is a
+/// recent addition and Windows reports the same condition as a raw OS error
+/// code, so keying on it would make this check platform- and toolchain-
+/// dependent. An explicit stat answers the same question on every host.
+///
+/// Returns `Some(exception)` when the listing must be refused and `None` when it
+/// may proceed. `require_directory` is false for the callers that are allowed to
+/// name a non-directory — `Files.walk`/`Files.find` accept a regular file and
+/// yield exactly that one element (measured: `Files.walk(<file>).count() == 1`).
+pub(crate) fn p57_dir_listing_refusal(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+    require_directory: bool,
+) -> Result<Option<MethodCallFailed>, MethodCallFailed> {
+    // jar:/jrt: namespaces are decoded, not stat-ed. `vfs_classify` is the one
+    // authority there and it already distinguishes the three cases.
+    if let Some(kind) = vfs_classify(path) {
+        return Ok(match kind {
+            JarFsKind::Absent => Some(p57_no_such_file(ctx, path)?),
+            JarFsKind::File if require_directory => Some(p57_not_directory(ctx, path)?),
+            _ => None,
+        });
+    }
+    // `symlink_metadata` first so a DANGLING symlink is reported as the
+    // NoSuchFileException the JDK raises (an `lstat` succeeds on it, a `stat`
+    // does not) rather than being mistaken for "not a directory".
+    if std::fs::symlink_metadata(path).is_err() {
+        return Ok(Some(p57_no_such_file(ctx, path)?));
+    }
+    match std::fs::metadata(path) {
+        // A link whose target is gone: the JDK's open fails, and it fails with
+        // the missing-file answer.
+        Err(_) => Ok(Some(p57_no_such_file(ctx, path)?)),
+        Ok(m) if require_directory && !m.is_dir() => Ok(Some(p57_not_directory(ctx, path)?)),
+        Ok(_) => Ok(None),
+    }
+}
+
+/// The refusal `Files.walk` / `Files.find` owe a negative `maxDepth`.
+///
+/// Measured on Eclipse Adoptium 25.0.3+9 (2026-08-16):
+///
+/// ```text
+/// Files.walk(dir, -1)          -> IllegalArgumentException: 'maxDepth' is negative
+/// Files.find(dir, -1, (p,a)->…) -> IllegalArgumentException: 'maxDepth' is negative
+/// ```
+///
+/// The quoting is HotSpot's own (`FileTreeIterator` builds the message as
+/// `"'maxDepth' is negative"`), so it is transcribed rather than derived.
+///
+/// This is not a cosmetic row. Both call sites read the depth as
+/// `Some(Value::Int(n)) if *n >= 0 => *n as usize, _ => usize::MAX`, so a
+/// **negative** depth — the one input the JDK refuses outright — was silently
+/// promoted to an **unbounded** walk. The caller asked for a bounded traversal,
+/// was given the opposite, and got no diagnostic.
+pub(crate) fn p57_max_depth_refusal(depth: Option<&Value>) -> Option<MethodCallFailed> {
+    match depth {
+        Some(Value::Int(n)) if *n < 0 => Some(
+            RuntimeError::IllegalArgumentException {
+                message: "'maxDepth' is negative".to_string(),
+            }
+            .into(),
+        ),
+        _ => None,
+    }
+}
+
 /// Build a *typed* `java.nio.channels.ClosedChannelException`.
 ///
 /// Every `FileChannel` operation below is specified to raise this — not a bare
@@ -10837,9 +11441,11 @@ pub(crate) fn p57_parent_of(path: &str) -> String {
 pub(crate) fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // Field 0 = separator; field 1 (P57_FS_JAR_FIELD) = mounted-JAR path (or
     // null); field 2 (P57_FS_JRT_FIELD) = mounted runtime-image java.home (or
-    // null). The jrt field exists on every FS object so the jrt-aware
-    // FileSystem.getPath/getRootDirectories natives can read it unconditionally.
-    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3)?;
+    // null); field 3 (P57_FS_PROVIDER_FIELD) = the provider singleton for this
+    // FS (or null until first `provider()` call). The jrt field exists on every
+    // FS object so the jrt-aware FileSystem.getPath/getRootDirectories natives
+    // can read it unconditionally.
+    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", P57_FS_SLOTS)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh FileSystem (native stale-local family).
     let fs_pin = ctx.pin_native_root(fs);
@@ -10870,7 +11476,7 @@ pub(crate) fn p57_alloc_jar_filesystem(ctx: &mut dyn NativeContext, jar_path: &s
 /// `getPath`/`readAttributes`/`newDirectoryStream` route through the jrt helpers
 /// when they see the P57_FS_JRT_FIELD / a `JRTFS`-encoded path.
 pub(crate) fn p57_alloc_jrt_filesystem(ctx: &mut dyn NativeContext, java_home: &str) -> Result<ObjectRef, MethodCallFailed> {
-    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3)?;
+    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", P57_FS_SLOTS)?;
     // Pin across the create_strings below — a moving young GC there would
     // relocate the fresh FileSystem (native stale-local family).
     let fs_pin = ctx.pin_native_root(fs);
@@ -11467,6 +12073,296 @@ pub(crate) fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> R
 /// collections), and the holder's real `<clinit>` never runs because
 /// `FileSystems.getDefault()` is intercepted. Falls back to a fresh
 /// allocation only if the holder class is unavailable.
+// ---------------------------------------------------------------------------
+// FileSystem.getPathMatcher / PathMatcher.matches — the glob and regex syntaxes
+// ---------------------------------------------------------------------------
+
+/// Field 0 of the one-field synthetic `java/nio/file/PathMatcher`: the compiled
+/// `java.util.regex.Pattern`.
+pub(crate) const P57_MATCHER_PATTERN_FIELD: usize = 0;
+
+/// `Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE` = 2 | 64 = 66, the flag
+/// word `sun.nio.fs.WindowsFileSystem.getPathMatcher` compiles with — for the
+/// `regex:` syntax as well as `glob:`. MEASURED on HotSpot 25.0.3+9 (Windows):
+/// `regex:A.TXT` matches `a.txt` and `regex:(?-i)A\.TXT` does not, which is
+/// only possible if the flag is on the compiled Pattern; `regex:Ä` matching
+/// `ä` is the `UNICODE_CASE` half.
+const P57_MATCHER_FLAGS: i32 = 0x02 | 0x40;
+
+/// `sun.nio.fs.Globs.globMetaChars`, verbatim.
+const P57_GLOB_META: &str = "\\*?[{";
+
+/// `sun.nio.fs.Globs.regexMetaChars`, verbatim. Note what is ABSENT and must
+/// stay absent: `*`, `?`, `-`, `}`, `,`, `&`, `:`, `/`, `\` — each is either
+/// handled by its own case below or is not a regex metacharacter outside a
+/// character class. Adding any of them would escape a character HotSpot leaves
+/// bare and change the compiled pattern.
+const P57_REGEX_META: &str = ".^$+{[]|()";
+
+#[inline]
+fn p57_is_glob_meta(c: u16) -> bool {
+    c < 0x80 && P57_GLOB_META.as_bytes().contains(&(c as u8))
+}
+
+#[inline]
+fn p57_is_regex_meta(c: u16) -> bool {
+    c < 0x80 && P57_REGEX_META.as_bytes().contains(&(c as u8))
+}
+
+/// `sun.nio.fs.Globs.next(glob, i)`: the unit at `i`, or `EOL` (0) past the end.
+#[inline]
+fn p57_glob_next(g: &[u16], i: usize) -> u16 {
+    if i < g.len() {
+        g[i]
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn p57_push_ascii(out: &mut Vec<u16>, s: &str) {
+    out.extend(s.as_bytes().iter().map(|b| u16::from(*b)));
+}
+
+/// `sun.nio.fs.Globs.toRegexPattern(globPattern, isDos)`, ported statement for
+/// statement from the JDK 25.0.3+9 source (`lib/src.zip`,
+/// `java.base/sun/nio/fs/Globs.java`).
+///
+/// `Err((desc, index))` is the argument pair of the `PatternSyntaxException`
+/// the JDK raises; [`p57_throw_pattern_syntax`] turns it into the real Java
+/// object so `getMessage()` — which appends `" near index N"`, the pattern and
+/// a caret line, using the platform line separator — is composed by the JDK
+/// itself rather than reproduced here.
+///
+/// Operates on UTF-16 code units, not `char`s, so every index in an error
+/// message is the same index `String.charAt` would have produced. The six
+/// refusals, all MEASURED on HotSpot and all with their quoting exactly as
+/// written (two of them carry an unbalanced apostrophe, which is not a typo
+/// here): `No character to escape`, `Explicit 'name separator' in class`,
+/// `Missing ']`, `Invalid range`, `Cannot nest groups`, `Missing '}`.
+///
+/// The Windows branch (`is_dos`) is the one this VM takes. Its consequences,
+/// each MEASURED: `*` is `[^\\]*` and `?` is `[^\\]`, so neither crosses a
+/// separator; `**` is `.*` and does; a `/` in the PATTERN is the separator
+/// while a lone `\` is the ESCAPE character (so the glob `sub\a.txt` matches
+/// the file name `suba.txt`, not a directory — the single likeliest place a
+/// port goes wrong); and a class is emitted as `[[^\\]&&[...]]`, an
+/// intersection that excludes the separator, which is why the Java regex engine
+/// has to do the matching and a Rust regex crate cannot.
+fn p57_globs_to_regex(glob: &[u16], is_dos: bool) -> Result<Vec<u16>, (&'static str, usize)> {
+    let mut in_group = false;
+    let mut regex: Vec<u16> = Vec::with_capacity(glob.len() * 2 + 2);
+    p57_push_ascii(&mut regex, "^");
+
+    let mut i = 0usize;
+    while i < glob.len() {
+        let c = glob[i];
+        i += 1;
+        // Non-ASCII cannot be any of the cases below; 0xFF is a sentinel that
+        // falls through to the default arm, which reads `c` and not this.
+        let cb = if c < 0x80 { c as u8 } else { 0xFF };
+        match cb {
+            b'\\' => {
+                if i == glob.len() {
+                    return Err(("No character to escape", i - 1));
+                }
+                let next = glob[i];
+                i += 1;
+                if p57_is_glob_meta(next) || p57_is_regex_meta(next) {
+                    p57_push_ascii(&mut regex, "\\");
+                }
+                regex.push(next);
+            }
+            b'/' => {
+                if is_dos {
+                    p57_push_ascii(&mut regex, "\\\\");
+                } else {
+                    regex.push(c);
+                }
+            }
+            b'[' => {
+                // Do not match the name separator inside a class.
+                if is_dos {
+                    p57_push_ascii(&mut regex, "[[^\\\\]&&[");
+                } else {
+                    p57_push_ascii(&mut regex, "[[^/]&&[");
+                }
+                if p57_glob_next(glob, i) == u16::from(b'^') {
+                    // `^` is a LITERAL in a glob class, never negation — it is
+                    // escaped through. `[!…]` is the negation form.
+                    p57_push_ascii(&mut regex, "\\^");
+                    i += 1;
+                } else {
+                    if p57_glob_next(glob, i) == u16::from(b'!') {
+                        p57_push_ascii(&mut regex, "^");
+                        i += 1;
+                    }
+                    // A hyphen is allowed at the start.
+                    if p57_glob_next(glob, i) == u16::from(b'-') {
+                        p57_push_ascii(&mut regex, "-");
+                        i += 1;
+                    }
+                }
+                let mut has_range_start = false;
+                let mut last: u16 = 0;
+                // Seeded with `[` exactly as the JDK's `c` is: an EMPTY class
+                // body leaves it unchanged and the `!= ']'` test below then
+                // reports `Missing '] near index 0` for the glob `[`.
+                let mut cc = c;
+                while i < glob.len() {
+                    cc = glob[i];
+                    i += 1;
+                    if cc == u16::from(b']') {
+                        break;
+                    }
+                    if cc == u16::from(b'/') || (is_dos && cc == u16::from(b'\\')) {
+                        return Err(("Explicit 'name separator' in class", i - 1));
+                    }
+                    // Escape `\`, `[` or `&&` for the regex class.
+                    if cc == u16::from(b'\\')
+                        || cc == u16::from(b'[')
+                        || (cc == u16::from(b'&') && p57_glob_next(glob, i) == u16::from(b'&'))
+                    {
+                        p57_push_ascii(&mut regex, "\\");
+                    }
+                    regex.push(cc);
+
+                    if cc == u16::from(b'-') {
+                        if !has_range_start {
+                            return Err(("Invalid range", i - 1));
+                        }
+                        cc = p57_glob_next(glob, i);
+                        i += 1;
+                        if cc == 0 || cc == u16::from(b']') {
+                            break;
+                        }
+                        if cc < last {
+                            return Err(("Invalid range", i.saturating_sub(3)));
+                        }
+                        regex.push(cc);
+                        has_range_start = false;
+                    } else {
+                        has_range_start = true;
+                        last = cc;
+                    }
+                }
+                if cc != u16::from(b']') {
+                    return Err(("Missing ']", i - 1));
+                }
+                p57_push_ascii(&mut regex, "]]");
+            }
+            b'{' => {
+                if in_group {
+                    return Err(("Cannot nest groups", i - 1));
+                }
+                p57_push_ascii(&mut regex, "(?:(?:");
+                in_group = true;
+            }
+            b'}' => {
+                if in_group {
+                    p57_push_ascii(&mut regex, "))");
+                    in_group = false;
+                } else {
+                    // `}` is not in `regexMetaChars`, so a stray one is a plain
+                    // literal: the glob `a}b` matches the file name `a}b`.
+                    regex.push(c);
+                }
+            }
+            b',' => {
+                if in_group {
+                    p57_push_ascii(&mut regex, ")|(?:");
+                } else {
+                    regex.push(c);
+                }
+            }
+            b'*' => {
+                if p57_glob_next(glob, i) == u16::from(b'*') {
+                    // Crosses directory boundaries.
+                    p57_push_ascii(&mut regex, ".*");
+                    i += 1;
+                } else if is_dos {
+                    p57_push_ascii(&mut regex, "[^\\\\]*");
+                } else {
+                    p57_push_ascii(&mut regex, "[^/]*");
+                }
+            }
+            b'?' => {
+                if is_dos {
+                    p57_push_ascii(&mut regex, "[^\\\\]");
+                } else {
+                    p57_push_ascii(&mut regex, "[^/]");
+                }
+            }
+            _ => {
+                if p57_is_regex_meta(c) {
+                    p57_push_ascii(&mut regex, "\\");
+                }
+                regex.push(c);
+            }
+        }
+    }
+
+    if in_group {
+        return Err(("Missing '}", i - 1));
+    }
+    p57_push_ascii(&mut regex, "$");
+    Ok(regex)
+}
+
+/// The `java.util.regex.PatternSyntaxException` the glob translator refuses
+/// with, built through its real `(String desc, String regex, int index)`
+/// constructor so `getMessage()` is composed by the JDK.
+///
+/// Reproducing that message here would be a transcription with three moving
+/// parts (the `" near index N"` suffix, the platform line separator — CRLF on
+/// this host — and a caret line that is OMITTED when `index == pattern
+/// .length()`); letting the real class compose it removes all three.
+fn p57_throw_pattern_syntax(
+    ctx: &mut dyn NativeContext,
+    desc: &str,
+    pattern: &str,
+    index: usize,
+) -> MethodCallFailed {
+    let d = ctx.create_string(desc);
+    // `create_string` allocates and can move the first string.
+    let d_pin = ctx.pin_native_root(d);
+    let p = ctx.create_string(pattern);
+    let d = ctx.read_native_pin(d_pin, d);
+    let built = ctx.new_object_initialized(
+        "java/util/regex/PatternSyntaxException",
+        "(Ljava/lang/String;Ljava/lang/String;I)V",
+        &[
+            Value::Object(Some(d)),
+            Value::Object(Some(p)),
+            Value::Int(index as i32),
+        ],
+    );
+    ctx.unpin_native_roots(d_pin);
+    match built {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalArgumentException {
+            message: format!("{desc} near index {index}"),
+        }
+        .into(),
+    }
+}
+
+/// `throw new IllegalArgumentException()` — the BARE one
+/// `FileSystem.getPathMatcher` raises when the argument carries no syntax
+/// prefix. Its `getMessage()` is **null**, which
+/// `RuntimeError::IllegalArgumentException { message: String }` cannot express,
+/// so the object is built directly. MEASURED: HotSpot reports a null message
+/// for `"*.txt"`, `""`, `":"` and `":glob"` alike.
+fn p57_bare_illegal_argument(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object_initialized("java/lang/IllegalArgumentException", "()V", &[]) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalArgumentException {
+            message: String::new(),
+        }
+        .into(),
+    }
+}
+
 pub(crate) fn p57_default_filesystem_singleton(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     const HOLDER: &str = "java/nio/file/FileSystems$DefaultFileSystemHolder";
     // `class_id_by_name` is lookup-only and nothing else loads the private
@@ -11490,20 +12386,186 @@ pub(crate) fn p57_default_filesystem_singleton(ctx: &mut dyn NativeContext) -> R
     Ok(p57_alloc_default_filesystem(ctx)?)
 }
 
+/// The URI scheme this synthetic FileSystem serves: "jrt" / "jar" / "file".
+/// Reads only, allocates nothing, so callers may use it before pinning.
+pub(crate) fn p57_fs_scheme(ctx: &dyn NativeContext, fs: ObjectRef) -> &'static str {
+    if matches!(ctx.get_field(fs, P57_FS_JRT_FIELD), Value::Object(Some(_))) {
+        "jrt"
+    } else if matches!(ctx.get_field(fs, P57_FS_JAR_FIELD), Value::Object(Some(_))) {
+        "jar"
+    } else {
+        "file"
+    }
+}
+
+/// The ONE `FileSystemProvider` object belonging to `fs` — allocated on first
+/// use, then stored in `P57_FS_PROVIDER_FIELD` and returned unchanged forever.
+///
+/// `FileSystem.provider()` and `FileSystemProvider.installedProviders()` both
+/// minted a FRESH provider on every call before this helper existed, so even
+/// `fs.provider() == fs.provider()` — a self-comparison — was false. HotSpot
+/// guarantees a singleton: `WindowsFileSystemProvider` is created exactly once,
+/// in `DefaultFileSystemProvider.<clinit>`, and every door returns that object.
+///
+/// The identity is load-bearing in java.base itself, not just in applications:
+/// `sun.nio.ch.UnixDomainSockets.generateTempName()` reads, verbatim,
+/// `if (path.getFileSystem().provider() != DefaultFileSystemProvider.instance())`
+/// and throws `UnsupportedOperationException` when that holds — a raw `!=`
+/// between the two doors this helper unifies. (Deliberately not a fenced code
+/// block: rustdoc collects doctests from private items and would try to compile
+/// Java as Rust.)
+pub(crate) fn p57_fs_provider(
+    ctx: &mut dyn NativeContext,
+    fs: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // SLOT-WIDTH GUARD — do not remove, and do not read slot 3 above it.
+    //
+    // Only CratonVM's own synthetic `java/nio/file/FileSystem` has
+    // P57_FS_SLOTS slots. A REAL `sun.nio.fs.WindowsFileSystem` has exactly
+    // THREE instance fields (javap: `provider`, `defaultDirectory`,
+    // `defaultRoot`), so `P57_FS_PROVIDER_FIELD` is one past its end, and
+    // dispatch has been receiver-aware since 2026-07 — a real FileSystem
+    // subtype receiver's `provider()` call routes into this native. An
+    // unguarded read here would be an out-of-bounds field read on a real JDK
+    // class, which is a genuine defect in this VM and not a cosmetic one.
+    //
+    // The same width mismatch is also why the scheme sniff must NOT run on a
+    // real receiver: `p57_fs_scheme` reads slots 1 and 2 looking for our
+    // jar/jrt markers, but on a real `WindowsFileSystem` those slots hold
+    // `defaultDirectory` and `defaultRoot` — both non-null Strings — so it
+    // would report "jrt" for the platform's own file system. (The
+    // per-call-allocating code this helper replaced had exactly that bug, and
+    // answered `fs.provider().getScheme()` = "jrt" for a real receiver.)
+    if ctx.object_num_fields(fs) > P57_FS_PROVIDER_FIELD {
+        if let Value::Object(Some(p)) = ctx.get_field(fs, P57_FS_PROVIDER_FIELD) {
+            return Ok(p);
+        }
+        let scheme_str = p57_fs_scheme(ctx, fs);
+        // Pin `fs` across BOTH allocations below: either can trigger a moving
+        // young GC that relocates it, and we still have to write slot 3
+        // afterwards (native stale-local family).
+        let fs_pin = ctx.pin_native_root(fs);
+        let provider = p57_alloc_provider(ctx, scheme_str)?;
+        let fs = ctx.read_native_pin(fs_pin, fs);
+        ctx.set_field(fs, P57_FS_PROVIDER_FIELD, Value::Object(Some(provider)));
+        ctx.unpin_native_roots(fs_pin);
+        return Ok(provider);
+    }
+
+    // Undersized receiver: a real FileSystem, with nowhere to cache. The only
+    // real one that reaches here is the platform default, whose provider on
+    // HotSpot IS `DefaultFileSystemProvider.instance()` — so answer with the
+    // default singleton rather than minting a per-call object.
+    //
+    // Terminates: the default filesystem singleton is always allocated with
+    // P57_FS_SLOTS, so the recursive call takes the branch above and returns
+    // without recursing again.
+    let dfs = p57_default_filesystem_singleton(ctx)?;
+    if ctx.object_num_fields(dfs) > P57_FS_PROVIDER_FIELD {
+        return p57_fs_provider(ctx, dfs);
+    }
+    // Last resort only if even the singleton came back undersized (it cannot
+    // today). Uncached, so identity is not guaranteed — but never OOB.
+    p57_alloc_provider(ctx, "file")
+}
+
+/// Allocate a fresh 1-field synthetic `FileSystemProvider` carrying `scheme`.
+/// Callers are responsible for caching it; use `p57_fs_provider` unless you
+/// specifically need an uncached one (the jar/jrt entries of
+/// `installedProviders`).
+pub(crate) fn p57_alloc_provider(
+    ctx: &mut dyn NativeContext,
+    scheme_str: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let provider = try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh provider (native stale-local family).
+    let provider_pin = ctx.pin_native_root(provider);
+    let scheme = ctx.create_string(scheme_str);
+    let provider = ctx.read_native_pin(provider_pin, provider);
+    ctx.set_field(provider, 0, Value::Object(Some(scheme)));
+    ctx.unpin_native_roots(provider_pin);
+    Ok(provider)
+}
+
+/// The default filesystem's provider — the object HotSpot calls
+/// `DefaultFileSystemProvider.instance()` and `FileSystems.getDefault()
+/// .provider()`, and which is element 0 of `installedProviders()`.
+pub(crate) fn p57_default_provider_singleton(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let fs = p57_default_filesystem_singleton(ctx)?;
+    p57_fs_provider(ctx, fs)
+}
+
+/// Fallback slot of `java.lang.Enum`'s own `name` field — the slot
+/// `Enum.name()`/`Enum.toString()` read.
+///
+/// `Enum` declares `name` then `ordinal`, and inherited fields come first in
+/// the layout, so `0`/`1` hold for any enum subclass whatever fields IT
+/// declares. These two constants are a local copy of
+/// `lang_misc::ENUM_NAME_SLOT`/`ENUM_ORDINAL_SLOT` only because those are
+/// private to that module; promoting them to `pub(crate)` and deleting this
+/// pair is nominated in `E36-1-inverted-enum-fallbacks-and-dead-field-rows.md`.
+///
+/// **Order is load-bearing and has been got wrong here.** Until this change
+/// `posix_file_permission_stub_clinit` fell back to `name → 1, ordinal → 0`,
+/// i.e. it wrote the ORDINAL where `name()` looks. That produces a NAMELESS
+/// enum constant: non-null, every null check passes, `toString()` answers
+/// null, `compareTo` calls every pair equal, and `Enum.valueOf` matches
+/// nothing. One nameless constant in one JDK enum zeroed fifteen netty
+/// classes earlier in this session, so this is a paid-for trap, not a
+/// hypothetical.
+pub(crate) const ENUM_NAME_SLOT: usize = 0;
+
+/// Fallback slot of `java.lang.Enum`'s own `ordinal` field. See
+/// [`ENUM_NAME_SLOT`] — the pair must not be swapped.
+pub(crate) const ENUM_ORDINAL_SLOT: usize = 1;
+
+/// Resolve `(name_slot, ordinal_slot)` for an enum constant's two `Enum`
+/// fields — the single place in this file where those slots are decided.
+///
+/// **Resolved against `java/lang/Enum`, never against the receiver's class.**
+/// `resolve_field_index_by_class_id` returns the MOST-DERIVED declaration, and
+/// an enum may declare its own field called `name`, which shadows `Enum`'s:
+/// Spring Boot's `WebEndpointTest.Infrastructure` does exactly that
+/// (`JERSEY("Jersey")`), which made `name()` answer `"Jersey"` instead of
+/// `"JERSEY"` and took the whole test class down with a
+/// `PreconditionViolationException`. `lang_misc::native_enum_name` carries the
+/// full account; this helper exists so no site in this file can reach for a
+/// literal or for the receiver again.
+pub(crate) fn enum_name_ordinal_slots(ctx: &mut dyn NativeContext) -> (usize, usize) {
+    // `Enum` must be loaded before its layout can be resolved; on the
+    // synthetic side this is what materialises the two-field stub model.
+    let _ = ctx.ensure_class_initialized("java/lang/Enum");
+    let name_slot = ctx
+        .resolve_field_index("java/lang/Enum", "name")
+        .unwrap_or(ENUM_NAME_SLOT);
+    let ordinal_slot = ctx
+        .resolve_field_index("java/lang/Enum", "ordinal")
+        .unwrap_or(ENUM_ORDINAL_SLOT);
+    (name_slot, ordinal_slot)
+}
+
 pub(crate) fn p57_alloc_enum(
     ctx: &mut dyn NativeContext,
     class: &str,
     name: &str,
     ordinal: i32,
 ) -> MethodCallResult {
+    // Was two hard-coded literals (`0`/`1`). They happened to be the right way
+    // round, which is exactly why they were dangerous: the sibling copy of the
+    // same two lines in `posix_file_permission_stub_clinit` was INVERTED and
+    // nothing connected the two. One resolver, one order.
+    let (name_slot, ordinal_slot) = enum_name_ordinal_slots(ctx);
     let obj = try_alloc_concurrent_synthetic(ctx, class, 2)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh enum (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
     let n = ctx.create_string(name);
     let obj = ctx.read_native_pin(obj_pin, obj);
-    ctx.set_field(obj, 0, Value::Object(Some(n)));
-    ctx.set_field(obj, 1, Value::Int(ordinal));
+    ctx.set_field(obj, name_slot, Value::Object(Some(n)));
+    ctx.set_field(obj, ordinal_slot, Value::Int(ordinal));
     ctx.unpin_native_roots(obj_pin);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -14691,30 +15753,37 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(file, "separator", "Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string(std::path::MAIN_SEPARATOR_STR);
-        Ok(Some(Value::Object(Some(s))))
-    });
-    // KEEP: `File.separatorChar` is a compile-time platform constant in the
-    // real JDK too; `MAIN_SEPARATOR` is the genuine host value, not a stand-in.
-    r.register(file, "separatorChar", "C", |_ctx, _args| {
-        Ok(Some(Value::Int(std::path::MAIN_SEPARATOR as i32)))
-    });
-    r.register(file, "pathSeparator", "Ljava/lang/String;", |ctx, _args| {
-        #[cfg(windows)]
-        let sep = ";";
-        #[cfg(not(windows))]
-        let sep = ":";
-        let s = ctx.create_string(sep);
-        Ok(Some(Value::Object(Some(s))))
-    });
-    r.register(file, "pathSeparatorChar", "C", |_ctx, _args| {
-        #[cfg(windows)]
-        let sep = ';' as i32;
-        #[cfg(not(windows))]
-        let sep = ':' as i32;
-        Ok(Some(Value::Int(sep)))
-    });
+    // DELETED 2026-08-13 (lane E36): the four `java/io/File` separator
+    // constants — `separator` `Ljava/lang/String;`, `separatorChar` `C`,
+    // `pathSeparator` `Ljava/lang/String;`, `pathSeparatorChar` `C` — were
+    // registered as METHODS carrying a FIELD descriptor. That triple is one no
+    // dispatch can produce: every native-registry lookup originates at an
+    // INVOKE, whose descriptor starts with '(', and none of this VM's three
+    // static-read paths consults the registry —
+    // `interpreter/opcodes.rs Instruction::Getstatic`, `jit/helpers.rs
+    // jit_getstatic`, and `ir_lower.rs emit_inline_getstatic`, which bakes the
+    // statics base as an immediate and emits two `mov`s with no call at all.
+    //
+    // The comment that stood over `separatorChar` said to KEEP it because it
+    // is "a compile-time platform constant in the real JDK too". That is the
+    // one claim here that is measurable, and it is FALSE: in the JDK these are
+    // `public static final char separatorChar = fs.getSeparator();` — a method
+    // call, not a constant expression — so javac does NOT inline them.
+    // Measured on this host (Microsoft build 25.0.3+9-LTS), all four compile
+    // to a real read:
+    //
+    //     getstatic java/io/File.separator:Ljava/lang/String;
+    //     getstatic java/io/File.separatorChar:C
+    //     getstatic java/io/File.pathSeparator:Ljava/lang/String;
+    //     getstatic java/io/File.pathSeparatorChar:C
+    //
+    // So they are genuinely read at runtime, and these rows still could never
+    // answer one. The thing that DOES answer is `vm/src/vm/vm_util.rs`'s
+    // post-clinit fixup for `java/io/File`, which sets all four statics by
+    // name (plus `FS`) from the same host values — so this deletion changes no
+    // behaviour, it removes a second, unreachable publisher.
+    // `jdk-only-dead-everywhere.tsv` already carries `separatorChar` as
+    // `method-nowhere`. No test in the tree calls any of the four.
     r.set_category(__prev_cat);
     ()
 }
@@ -16925,7 +17994,7 @@ fn posix_permission_set(ctx: &mut dyn NativeContext, mode: i32) -> Option<Object
         _ => return None,
     };
     let set_pin = ctx.pin_native_root(set);
-    let pfp = "java/nio/file/attribute/PosixFilePermission";
+    let pfp = POSIX_FILE_PERMISSION;
     let _ = ctx.ensure_class_initialized(pfp);
     let cid = ctx.class_id_by_name(pfp);
     for i in 0..9 {
@@ -19170,47 +20239,45 @@ pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
     // the two layouts are not interchangeable, so the losing side's objects
     // are garbage to the winning side's natives. That is exactly how the
     // Spring Boot `FileWatcher` failure arose (a placeholder `newWatchService`
-    // displacing the real one). Only the `StandardWatchEventKinds` constants
-    // stay here: they are plain named singletons, not a second implementation.
-
-    // StandardWatchEventKinds
-    let swek = "java/nio/file/StandardWatchEventKinds";
-    r.register(
-        swek,
-        "ENTRY_CREATE",
-        "Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _args| {
-            let s = ctx.create_string("ENTRY_CREATE");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
-    r.register(
-        swek,
-        "ENTRY_MODIFY",
-        "Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _args| {
-            let s = ctx.create_string("ENTRY_MODIFY");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
-    r.register(
-        swek,
-        "ENTRY_DELETE",
-        "Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _args| {
-            let s = ctx.create_string("ENTRY_DELETE");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
-    r.register(
-        swek,
-        "OVERFLOW",
-        "Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _args| {
-            let s = ctx.create_string("OVERFLOW");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    // displacing the real one).
+    //
+    // AS OF 2026-08-13 (lane F9) THIS REGISTRAR REGISTERS NOTHING AT ALL, and
+    // the four `StandardWatchEventKinds` rows it used to hold are DELETED —
+    // E36-1 table row 5's verdict, unblocked by E40-1 §1a deleting the one
+    // caller. What was here, and why it is gone rather than converted:
+    //
+    //   * `ENTRY_CREATE`, `ENTRY_MODIFY`, `ENTRY_DELETE`, `OVERFLOW`, each
+    //     registered with `Ljava/nio/file/WatchEvent$Kind;` in the DESCRIPTOR
+    //     slot — a field name in the method slot, not a method descriptor.
+    //   * No `getstatic` path in this VM consults the native registry. There
+    //     are three of them (`interpreter/opcodes.rs Instruction::Getstatic`,
+    //     `jit/helpers.rs jit_getstatic`, `ir_lower.rs
+    //     emit_inline_getstatic` — the last bakes the statics base as an
+    //     immediate and emits two `mov`s with no call at all), and
+    //     `StandardWatchEventKinds.ENTRY_CREATE` compiles to
+    //     `getstatic ...ENTRY_CREATE:Ljava/nio/file/WatchEvent$Kind;`
+    //     (measured on HotSpot 25.0.3+9), so it was a real read no row here
+    //     could ever answer.
+    //   * Each body returned `ctx.create_string("…")` — a `java/lang/String`
+    //     where its own descriptor names a `WatchEvent$Kind`. On the oracle
+    //     the constant's class is
+    //     `java.nio.file.StandardWatchEventKinds$StdWatchEventKind`, `name()`
+    //     is `"ENTRY_CREATE"` and `type()` is `interface java.nio.file.Path`;
+    //     a bare String has none of that. `vm/src/vm/tests.rs`'s
+    //     `watch_event_kinds_p66` asserted `read_java_string(...) ==
+    //     "ENTRY_CREATE"`, i.e. it pinned the wrong TYPE as correct. That test
+    //     is deleted (E40-1 §1a) and this deletion is its pair.
+    //
+    // The behaviour DOES have an owner and now has coverage: `native-io`'s
+    // `watch_event_kind_bit` / `watch_event_kind_object` read the class's
+    // STATIC (`static_field_index_by_name` + `get_static_field`) and fall back
+    // to a synthetic one-field `WatchEvent$Kind` carrying the bit. Do not
+    // re-add rows here: a `<clinit>` conversion belongs in the crate that owns
+    // the WatchService surface and its layout.
+    //
+    // The registrar itself is kept (it is called from `phases_late.rs`) so the
+    // history above stays attached to the name a future author will search
+    // for. If it is ever deleted, move this comment, not just the call.
 
     r.set_category(__prev_cat);
 }
@@ -19320,6 +20387,36 @@ pub(crate) fn apply_unix_mode(p: &str, mode: Option<u32>) {
     }
 }
 
+/// The one spelling of the class name, so the `<clinit>`, `values()`,
+/// `valueOf` and the mode-bit walker cannot drift apart.
+pub(crate) const POSIX_FILE_PERMISSION: &str = "java/nio/file/attribute/PosixFilePermission";
+
+/// `java.nio.file.attribute.PosixFilePermission`'s constants **in declaration
+/// order**.
+///
+/// The index into this slice IS the ordinal, so the order is load-bearing:
+/// `Enum.compareTo` is `this.ordinal - other.ordinal`, `EnumMap`/`EnumSet` key
+/// on it, `values()` must hand it back in the same order, and
+/// `posix_permission_bits_from_set`'s `BITS` table is positionally paired with
+/// it. Measured on the oracle, not assumed —
+/// `javap -p java.nio.file.attribute.PosixFilePermission` on this host
+/// (Microsoft build 25.0.3+9-LTS) declares them in exactly this order and a
+/// run reports `values()[8].ordinal() == 8`. Note it is neither alphabetical
+/// nor sorted by mode bit; a plausible-looking reordering silently changes
+/// `compareTo`, `EnumSet` iteration and every permission mask this file
+/// computes.
+pub(crate) const POSIX_FILE_PERMISSION_CONSTANTS: &[&str] = &[
+    "OWNER_READ",
+    "OWNER_WRITE",
+    "OWNER_EXECUTE",
+    "GROUP_READ",
+    "GROUP_WRITE",
+    "GROUP_EXECUTE",
+    "OTHERS_READ",
+    "OTHERS_WRITE",
+    "OTHERS_EXECUTE",
+];
+
 /// Convert a `Set<PosixFilePermission>` (the 9 canonical singleton constants
 /// from `posix_file_permission_stub_clinit`/the real enum) into a Unix
 /// permission-bits mode (e.g. for `std::fs::Permissions::from_mode`). Walks
@@ -19328,27 +20425,21 @@ pub(crate) fn apply_unix_mode(p: &str, mode: Option<u32>) {
 /// `Set` implementation the caller passes in, not just our synthetic
 /// `HashSet`).
 pub(crate) fn posix_permission_bits_from_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> u32 {
-    const NAMES: [&str; 9] = [
-        "OWNER_READ",
-        "OWNER_WRITE",
-        "OWNER_EXECUTE",
-        "GROUP_READ",
-        "GROUP_WRITE",
-        "GROUP_EXECUTE",
-        "OTHERS_READ",
-        "OTHERS_WRITE",
-        "OTHERS_EXECUTE",
-    ];
+    // Positionally paired with `POSIX_FILE_PERMISSION_CONSTANTS`: index i is
+    // the mode bit of constant i. The two used to be a private 9-element
+    // `NAMES` here plus a second private `NAMES` inside the `<clinit>`, which
+    // is two chances for the declaration order to drift.
     const BITS: [u32; 9] = [
         0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001,
     ];
-    let pfp = "java/nio/file/attribute/PosixFilePermission";
+    let pfp = POSIX_FILE_PERMISSION;
     let _ = ctx.ensure_class_initialized(pfp);
     let cid = ctx.class_id_by_name(pfp);
     let mut mode = 0u32;
-    for i in 0..9 {
+    for i in 0..BITS.len().min(POSIX_FILE_PERMISSION_CONSTANTS.len()) {
         let Some(c) = cid else { break };
-        let Some(slot) = ctx.static_field_index_by_name(c, NAMES[i]) else {
+        let Some(slot) = ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i])
+        else {
             continue;
         };
         let constant = ctx.get_static_field(c, slot);
@@ -19362,55 +20453,201 @@ pub(crate) fn posix_permission_bits_from_set(ctx: &mut dyn NativeContext, set: O
     mode
 }
 
+/// `java.nio.file.attribute.PosixFilePermission.<clinit>` — the guarded entry
+/// point. The body is [`posix_publish_constants`].
+///
+/// The split is deliberate: `is_class_synthetic_stub` answers the trait
+/// default `false` under `MockNativeContext`, so a test driven through this
+/// function measures the guard and never reaches a single field write. With
+/// the body factored out, the part that can be wrong is the part that is
+/// tested.
 pub(crate) fn posix_file_permission_stub_clinit(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    const P: &str = "java/nio/file/attribute/PosixFilePermission";
-    if !ctx.is_class_synthetic_stub(P) {
+    if !ctx.is_class_synthetic_stub(POSIX_FILE_PERMISSION) {
         return Ok(None);
     }
-    let Some(cid) = ctx.class_id_by_name(P) else {
+    posix_publish_constants(ctx)
+}
+
+/// Mint and publish `PosixFilePermission`'s nine constants the way its real
+/// `<clinit>` does, then publish `$VALUES`.
+///
+/// Three obligations, each silent when dropped:
+///
+/// 1. **`name` and `ordinal` must be written, in that order.** This function
+///    used to resolve both against `P` — the RECEIVER class — with the
+///    fallbacks INVERTED (`ordinal → 0`, `name → 1`). It was latent only
+///    because `class_manager.rs` gives the stub `java/lang/Enum` as its
+///    superclass so the lookup succeeds; one missing superclass row, or one
+///    enum copied from this model without that row, and every constant is
+///    NAMELESS — non-null, `valueOf` matching nothing. Both slots now come
+///    from [`enum_name_ordinal_slots`], which resolves against
+///    `java/lang/Enum` and cannot be got the wrong way round at one site
+///    without being wrong at all of them.
+/// 2. **Declaration order is the ordinal.** Measured, not assumed:
+///    `javap -p java.nio.file.attribute.PosixFilePermission` on this host
+///    (Microsoft build 25.0.3+9-LTS) declares OWNER_{READ,WRITE,EXECUTE},
+///    GROUP_{…}, OTHERS_{…}, and a run reports `values()[8].ordinal() == 8`.
+///    `compareTo`, `EnumMap` and `EnumSet` all key on it.
+/// 3. **`$VALUES` is re-READ out of the statics**, not filled from the refs
+///    minted in pass one: `new_ref_array` allocates and can move them. That
+///    re-read is also what makes `values()[i] == CONSTANT`, the identity
+///    `Enum.valueOf`, `Class.getEnumConstants` and `EnumSet` rely on.
+///
+/// KNOWN GAP, unfixed here: `class_manager.rs` declares the nine constants for
+/// this stub but NOT `$VALUES`, and `set_static_field_by_name` resolves a
+/// DECLARED static and is a silent no-op otherwise. So the `$VALUES` publish
+/// below currently goes nowhere on the synthetic side and
+/// `PosixFilePermission.values()` falls back to reading the nine statics one
+/// by one (which works). The declaration is nominated; the publish is written
+/// now so it starts working the moment that lands, and `values()` does not
+/// depend on it either way.
+pub(crate) fn posix_publish_constants(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let p = POSIX_FILE_PERMISSION;
+    let Some(cid) = ctx.class_id_by_name(p) else {
         return Ok(None);
     };
-    if let Some(slot) = ctx.static_field_index_by_name(cid, "OWNER_READ") {
+    // Idempotence: `<clinit>` runs once per class by construction, but a
+    // second entry through any path must not replace live constants with
+    // fresh objects that fail `==`.
+    if let Some(slot) = ctx.static_field_index_by_name(cid, POSIX_FILE_PERMISSION_CONSTANTS[0]) {
         if matches!(ctx.get_static_field(cid, slot), Value::Object(Some(_))) {
             return Ok(None);
         }
     }
-    const NAMES: &[&str] = &[
-        "OWNER_READ",
-        "OWNER_WRITE",
-        "OWNER_EXECUTE",
-        "GROUP_READ",
-        "GROUP_WRITE",
-        "GROUP_EXECUTE",
-        "OTHERS_READ",
-        "OTHERS_WRITE",
-        "OTHERS_EXECUTE",
-    ];
-    let _ = ctx.ensure_class_initialized("java/lang/Enum");
-    let ord_idx = ctx.resolve_field_index(P, "ordinal").unwrap_or(0);
-    let name_idx = ctx.resolve_field_index(P, "name").unwrap_or(1);
+    let (name_idx, ord_idx) = enum_name_ordinal_slots(ctx);
     let nfields = ctx.class_num_total_fields(cid).max(2);
-    for (ord, &name) in NAMES.iter().enumerate() {
+    for (ord, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
         let obj = ctx.alloc_object(cid, nfields);
-        ctx.set_field(obj, ord_idx, Value::Int(ord as i32));
+        // Pin across `create_string` — a moving young GC there would relocate
+        // the fresh constant while this frame still holds `obj` (the native
+        // stale-local family). Nothing allocates between the field writes and
+        // the publish to the static, which is a GC root, so the constant is
+        // never unreachable-but-live.
+        let obj_pin = ctx.pin_native_root(obj);
         let name_obj = ctx.create_string(name);
+        let obj = ctx.read_native_pin(obj_pin, obj);
+        ctx.unpin_native_roots(obj_pin);
         ctx.set_field(obj, name_idx, Value::Object(Some(name_obj)));
-        ctx.set_static_field_by_name(P, name, Value::Object(Some(obj)));
+        // Cast: nine constants is far inside `i32`.
+        ctx.set_field(obj, ord_idx, Value::Int(ord as i32));
+        ctx.set_static_field_by_name(p, name, Value::Object(Some(obj)));
     }
+    let values_array = ctx.new_ref_array(cid, POSIX_FILE_PERMISSION_CONSTANTS.len());
+    for (idx, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+        let published = match ctx.static_field_index_by_name(cid, name) {
+            Some(slot) => ctx.get_static_field(cid, slot),
+            None => Value::Object(None),
+        };
+        // `set_array_element` does not allocate, so `values_array` cannot move
+        // underneath this loop.
+        ctx.set_array_element(values_array, idx, published);
+    }
+    ctx.set_static_field_by_name(p, "$VALUES", Value::Object(Some(values_array)));
+    // `stack_walker.rs`'s model publishes both spellings and `vm_util.rs`'s
+    // post-clinit fixup falls back from one to the other; a write to an
+    // undeclared static is a no-op, so writing both costs nothing.
+    ctx.set_static_field_by_name(p, "ENUM$VALUES", Value::Object(Some(values_array)));
     Ok(None)
+}
+
+/// `PosixFilePermission.values()` — a FRESH array each call, holding the
+/// interned constants.
+///
+/// Freshness is measured, not stylistic: on the oracle
+/// `PosixFilePermission.values() != PosixFilePermission.values()` (the real
+/// method is `$VALUES.clone()`, javap-confirmed) while
+/// `values()[0] == OWNER_READ`. Handing back one shared array would let a
+/// single caller's `values()[0] = null` corrupt every later caller.
+///
+/// Reads through the nine STATICS rather than through `$VALUES` so it answers
+/// correctly in both modes and before the nominated `$VALUES` declaration
+/// lands: in real-JDK mode the statics hold the JDK's own interned constants,
+/// so this returns those.
+pub(crate) fn posix_file_permission_values(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION)?;
+    let arr = ctx.new_ref_array(cid, POSIX_FILE_PERMISSION_CONSTANTS.len());
+    for (idx, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+        let published = match ctx.static_field_index_by_name(cid, name) {
+            Some(slot) => ctx.get_static_field(cid, slot),
+            None => Value::Object(None),
+        };
+        ctx.set_array_element(arr, idx, published);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `PosixFilePermission.valueOf(String)` — resolved THROUGH the static field,
+/// so the answer is the same object `GETSTATIC` yields
+/// (`valueOf("GROUP_WRITE") == GROUP_WRITE`, measured on the oracle).
+///
+/// Both failure shapes are the oracle's, quoted from this host:
+/// `valueOf(null)` → `NullPointerException: Name is null`;
+/// `valueOf("nope")` → `IllegalArgumentException: No enum constant
+/// java.nio.file.attribute.PosixFilePermission.nope`. The `$` replacement is
+/// carried from the shared idiom for nested enums; this class is top-level so
+/// it never fires here.
+pub(crate) fn posix_file_permission_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let requested = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    let Some(requested) = requested else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Name is null".to_string()),
+        }
+        .into());
+    };
+    let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION)?;
+    if POSIX_FILE_PERMISSION_CONSTANTS.contains(&requested.as_str()) {
+        if let Some(slot) = ctx.static_field_index_by_name(cid, &requested) {
+            let published = ctx.get_static_field(cid, slot);
+            if matches!(published, Value::Object(Some(_))) {
+                return Ok(Some(published));
+            }
+        }
+    }
+    Err(RuntimeError::IllegalArgumentException {
+        message: format!(
+            "No enum constant {}.{requested}",
+            POSIX_FILE_PERMISSION.replace('/', ".").replace('$', ".")
+        ),
+    }
+    .into())
 }
 
 pub(crate) fn register_posix_file_permission_stub_clinit(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
-        "java/nio/file/attribute/PosixFilePermission",
+        POSIX_FILE_PERMISSION,
         "<clinit>",
         "()V",
         posix_file_permission_stub_clinit,
+    );
+    // `values()`/`valueOf(String)` are `invokestatic` against the ENUM class,
+    // and a synthetic stub declares neither — `PosixFilePermission.values()`
+    // was a `NoSuchMethodError`, and `EnumSet.allOf` / `Class
+    // .getEnumConstants` had nothing to read. Unlike the `<clinit>` these two
+    // are NOT gated on `is_class_synthetic_stub`: both answer by reading the
+    // class's own statics, so on a real JDK class they return the JDK's own
+    // interned constants and agree with the bytecode they shadow.
+    r.register(
+        POSIX_FILE_PERMISSION,
+        "values",
+        "()[Ljava/nio/file/attribute/PosixFilePermission;",
+        |ctx, _args| posix_file_permission_values(ctx),
+    );
+    r.register(
+        POSIX_FILE_PERMISSION,
+        "valueOf",
+        "(Ljava/lang/String;)Ljava/nio/file/attribute/PosixFilePermission;",
+        posix_file_permission_value_of,
     );
     r.set_category(__prev_cat);
 }
@@ -19535,38 +20772,29 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
         ctx.invoke_virtual(inst, "toString", "()Ljava/lang/String;", &[])
     });
 
-    // PosixFilePermission enum
-    let pfp = "java/nio/file/attribute/PosixFilePermission";
-    // Register each individually (NativeCallback = fn ptr, no captures)
-
-    r.register(
-        pfp,
-        "values",
-        "()[Ljava/nio/file/attribute/PosixFilePermission;",
-        |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 9);
-            // Can't iterate/capture — just return the array (elements are null but array exists)
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
+    // PosixFilePermission.values() — REMOVED here, and this note is the whole
+    // reason to read the code rather than the comment. It was:
+    //
+    //     let arr = ctx.new_array(Reference, 9);
+    //     // Can't iterate/capture — just return the array (elements are null
+    //     // but array exists)
+    //
+    // i.e. nine NULLS with the difficulty stated as the excuse. Anything that
+    // walked it — `EnumSet.allOf`, `Class.getEnumConstants`, a `for (var p :
+    // values())` loop — got nine nulls, and every `p.name()` on one NPEs. The
+    // replacement is `posix_file_permission_values`, registered from
+    // `register_posix_file_permission_stub_clinit` at the bottom of this
+    // function alongside `valueOf`; it reads the nine statics, so it answers
+    // in BOTH modes. Both rows named the same triple, so this was also a
+    // last-write-wins race that the fabricated one only lost by ordering.
 
     // PosixFilePermissions utility
     let pfps = "java/nio/file/attribute/PosixFilePermissions";
-    // The 9 PosixFilePermission constants in canonical "rwxrwxrwx" order, with
-    // the rwx char expected at each position. The constants are stable singletons
-    // (PosixFilePermission stub_clinit / real enum), so a HashSet of them works
-    // with Set.contains(OWNER_READ) downstream.
-    const PFP_NAMES: [&str; 9] = [
-        "OWNER_READ",
-        "OWNER_WRITE",
-        "OWNER_EXECUTE",
-        "GROUP_READ",
-        "GROUP_WRITE",
-        "GROUP_EXECUTE",
-        "OTHERS_READ",
-        "OTHERS_WRITE",
-        "OTHERS_EXECUTE",
-    ];
+    // `PFP_PAT` is positionally paired with `POSIX_FILE_PERMISSION_CONSTANTS`:
+    // the rwx char expected at each position of a canonical "rwxrwxrwx"
+    // string. The name list used to be a third private copy here (after the
+    // `<clinit>`'s and `posix_permission_bits_from_set`'s); it is now the one
+    // shared constant, so the pairing cannot drift.
     const PFP_PAT: [char; 9] = ['r', 'w', 'x', 'r', 'w', 'x', 'r', 'w', 'x'];
     r.register(
         pfps,
@@ -19579,13 +20807,13 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(Some(ctx.create_string("---------"))))),
             };
-            let pfp = "java/nio/file/attribute/PosixFilePermission";
+            let pfp = POSIX_FILE_PERMISSION;
             let _ = ctx.ensure_class_initialized(pfp);
             let cid = ctx.class_id_by_name(pfp);
             let mut out = String::with_capacity(9);
             for i in 0..9 {
                 let present = if let Some(c) = cid {
-                    match ctx.static_field_index_by_name(c, PFP_NAMES[i]) {
+                    match ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i]) {
                         Some(slot) => {
                             let constant = ctx.get_static_field(c, slot);
                             matches!(
@@ -19631,7 +20859,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 &[Value::Object(Some(set))],
             );
             let chars: Vec<char> = perms.chars().collect();
-            let pfp = "java/nio/file/attribute/PosixFilePermission";
+            let pfp = POSIX_FILE_PERMISSION;
             // Pin across the clinit / add() invokes below — a moving young GC
             // there would relocate the fresh set (native stale-local family).
             let set_pin = ctx.pin_native_root(set);
@@ -19640,7 +20868,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             for i in 0..9 {
                 if chars.get(i).copied() == Some(PFP_PAT[i]) {
                     if let Some(c) = cid {
-                        if let Some(slot) = ctx.static_field_index_by_name(c, PFP_NAMES[i]) {
+                        if let Some(slot) = ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i]) {
                             let constant = ctx.get_static_field(c, slot);
                             if matches!(constant, Value::Object(Some(_))) {
                                 let set = ctx.read_native_pin(set_pin, set);
@@ -19717,6 +20945,319 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     register_posix_file_permission_stub_clinit(r);
     r.set_category(__prev_cat);
     ()
+}
+
+/// The enum-constant minting laws this file has already broken once.
+///
+/// Every one of these drives a real function through `MockNativeContext`; none
+/// asserts only that an object is non-null, because a NAMELESS enum constant
+/// is non-null and passes every null check — that is the whole failure mode.
+#[cfg(test)]
+mod e36_enum_constant_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    // The accessor traits must be in scope for `get_field` /
+    // `ensure_class_initialized` / `read_string` to resolve on the mock.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        FieldMetadata, NativeClassAccess, NativeContext, NativeExceptionAccess, NativeHeapAccess,
+        NativeSystemAccess,
+    };
+
+    /// Declare `class_name`'s statics at slots `0..n` so
+    /// `set_static_field_by_name` has something to resolve. The mock's
+    /// `static_field_index_by_name` reads exactly this table, and the VM's
+    /// resolves a DECLARED static and is a silent no-op otherwise — so a test
+    /// that skips this measures the mock's emptiness, not the native.
+    fn declare_statics(ctx: &MockNativeContext, class_id: ClassId, names: &[&str], desc: &str) {
+        let fields = names
+            .iter()
+            .enumerate()
+            .map(|(slot_index, name)| FieldMetadata {
+                name: (*name).to_string(),
+                descriptor: desc.to_string(),
+                access_flags: 0,
+                slot_index,
+                declaring_class_id: class_id,
+                is_static: true,
+            })
+            .collect();
+        ctx.set_declared_fields(class_id, fields);
+    }
+
+    /// The fallback pair is `name → 0, ordinal → 1` and NOT the other way
+    /// round.
+    ///
+    /// This is the assertion that would have failed on
+    /// `posix_file_permission_stub_clinit` before 2026-08-13, where the two
+    /// were `ordinal → 0, name → 1`. Inverted, the ordinal lands in the slot
+    /// `Enum.name()` reads and every constant is nameless: `toString()` null,
+    /// `compareTo` calling every pair equal, and `Enum.valueOf` matching
+    /// nothing. One such constant in one JDK enum zeroed fifteen netty classes.
+    #[test]
+    fn the_enum_slot_fallbacks_are_name_then_ordinal() {
+        assert_eq!(
+            (ENUM_NAME_SLOT, ENUM_ORDINAL_SLOT),
+            (0, 1),
+            "Enum declares name then ordinal; swapping these mints nameless constants"
+        );
+        let mut ctx = MockNativeContext::new();
+        assert_eq!(enum_name_ordinal_slots(&mut ctx), (0, 1));
+    }
+
+    /// The slots are RESOLVED, not hard-coded — the mutation half.
+    ///
+    /// `java/lang/Enum` is declared here with its two fields in the opposite
+    /// order, which is the only way to tell a resolver from a literal: an
+    /// implementation that returned `(0, 1)` unconditionally passes the test
+    /// above and fails this one.
+    #[test]
+    fn the_enum_slots_follow_the_declared_layout_not_a_literal() {
+        let mut ctx = MockNativeContext::new();
+        let enum_cid = ctx.ensure_class_initialized("java/lang/Enum").unwrap();
+        ctx.set_declared_fields(
+            enum_cid,
+            vec![
+                FieldMetadata {
+                    name: "ordinal".to_string(),
+                    descriptor: "I".to_string(),
+                    access_flags: 0,
+                    slot_index: 0,
+                    declaring_class_id: enum_cid,
+                    is_static: false,
+                },
+                FieldMetadata {
+                    name: "name".to_string(),
+                    descriptor: "Ljava/lang/String;".to_string(),
+                    access_flags: 0,
+                    slot_index: 1,
+                    declaring_class_id: enum_cid,
+                    is_static: false,
+                },
+            ],
+        );
+        assert_eq!(
+            enum_name_ordinal_slots(&mut ctx),
+            (1, 0),
+            "the slots must come from Enum's layout, not from the fallback literals"
+        );
+    }
+
+    /// `p57_alloc_enum` writes the NAME as a String and the ORDINAL as an int,
+    /// each in the slot the layout says — not "a non-null object exists".
+    ///
+    /// The receiver's own layout is deliberately not consulted: `java/lang/Enum`
+    /// is declared inverted again, so a constant minted through the receiver
+    /// (or through literals) puts the String where `ordinal()` reads.
+    #[test]
+    fn an_alloc_enum_constant_carries_a_readable_name() {
+        let mut ctx = MockNativeContext::new();
+        let v = p57_alloc_enum(&mut ctx, "java/nio/file/FileVisitResult", "TERMINATE", 3)
+            .expect("alloc enum")
+            .expect("a value");
+        let obj = match v {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected an enum constant, got {other:?}"),
+        };
+        let (name_slot, ordinal_slot) = enum_name_ordinal_slots(&mut ctx);
+        let name_ref = match ctx.get_field(obj, name_slot) {
+            Value::Object(Some(s)) => s,
+            other => panic!("name slot {name_slot} holds {other:?}, not a String — NAMELESS"),
+        };
+        assert_eq!(ctx.read_string(name_ref).as_deref(), Some("TERMINATE"));
+        assert_eq!(ctx.get_field(obj, ordinal_slot), Value::Int(3));
+    }
+
+    /// The nine constants are published with a populated `name`, the ordinal
+    /// is the DECLARATION index, and `$VALUES[i]` is the same object as the
+    /// static.
+    ///
+    /// Driven through `posix_publish_constants`, not through
+    /// `posix_file_permission_stub_clinit`: the latter's first act is
+    /// `is_class_synthetic_stub`, which answers the trait default `false`
+    /// under the mock, so a test aimed there would measure the guard and reach
+    /// no field write at all.
+    #[test]
+    fn every_posix_permission_constant_is_published_with_its_name() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION).unwrap();
+        let mut statics: Vec<&str> = POSIX_FILE_PERMISSION_CONSTANTS.to_vec();
+        statics.push("$VALUES");
+        declare_statics(
+            &ctx,
+            cid,
+            &statics,
+            "Ljava/nio/file/attribute/PosixFilePermission;",
+        );
+
+        posix_publish_constants(&mut ctx).expect("publish");
+
+        let (name_slot, ordinal_slot) = enum_name_ordinal_slots(&mut ctx);
+        for (ord, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+            let slot = ctx
+                .static_field_index_by_name(cid, name)
+                .unwrap_or_else(|| panic!("{name} was not declared"));
+            let constant = match ctx.get_static_field(cid, slot) {
+                Value::Object(Some(o)) => o,
+                other => panic!("{name} published as {other:?}"),
+            };
+            let name_ref = match ctx.get_field(constant, name_slot) {
+                Value::Object(Some(s)) => s,
+                other => panic!("{name} has a nameless constant: name slot holds {other:?}"),
+            };
+            assert_eq!(
+                ctx.read_string(name_ref).as_deref(),
+                Some(name),
+                "name() must answer the constant's own name"
+            );
+            assert_eq!(
+                ctx.get_field(constant, ordinal_slot),
+                Value::Int(ord as i32),
+                "{name}'s ordinal is its declaration index"
+            );
+        }
+
+        let values_slot = ctx.static_field_index_by_name(cid, "$VALUES").unwrap();
+        let values = match ctx.get_static_field(cid, values_slot) {
+            Value::Object(Some(a)) => a,
+            other => panic!("$VALUES is {other:?}"),
+        };
+        assert_eq!(ctx.array_length(values), 9);
+        for (idx, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+            let slot = ctx.static_field_index_by_name(cid, name).unwrap();
+            assert_eq!(
+                ctx.get_array_element(values, idx),
+                ctx.get_static_field(cid, slot),
+                "$VALUES[{idx}] must be == the {name} static, not a second object"
+            );
+        }
+    }
+
+    /// A second entry does not replace live constants with fresh objects that
+    /// fail `==`.
+    #[test]
+    fn publishing_twice_keeps_the_first_constants() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION).unwrap();
+        declare_statics(
+            &ctx,
+            cid,
+            POSIX_FILE_PERMISSION_CONSTANTS,
+            "Ljava/nio/file/attribute/PosixFilePermission;",
+        );
+        posix_publish_constants(&mut ctx).expect("publish");
+        let slot = ctx
+            .static_field_index_by_name(cid, "OWNER_READ")
+            .expect("declared");
+        let first = ctx.get_static_field(cid, slot);
+        posix_publish_constants(&mut ctx).expect("publish again");
+        assert_eq!(first, ctx.get_static_field(cid, slot));
+    }
+
+    /// `values()` hands back a FRESH array holding the interned constants.
+    ///
+    /// Both halves are the oracle's, measured on this host:
+    /// `values() != values()` (the real method is `$VALUES.clone()`) while
+    /// `values()[0] == OWNER_READ`. Returning one shared array would let a
+    /// single caller's `values()[0] = null` corrupt every later caller.
+    #[test]
+    fn values_is_a_fresh_array_of_the_interned_constants() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION).unwrap();
+        declare_statics(
+            &ctx,
+            cid,
+            POSIX_FILE_PERMISSION_CONSTANTS,
+            "Ljava/nio/file/attribute/PosixFilePermission;",
+        );
+        posix_publish_constants(&mut ctx).expect("publish");
+
+        let first = posix_file_permission_values(&mut ctx).unwrap().unwrap();
+        let second = posix_file_permission_values(&mut ctx).unwrap().unwrap();
+        assert_ne!(first, second, "values() must clone, not share $VALUES");
+        let (a, b) = match (first, second) {
+            (Value::Object(Some(a)), Value::Object(Some(b))) => (a, b),
+            other => panic!("values() answered {other:?}"),
+        };
+        assert_eq!(ctx.array_length(a), 9);
+        for (idx, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+            let slot = ctx.static_field_index_by_name(cid, name).unwrap();
+            let published = ctx.get_static_field(cid, slot);
+            assert_eq!(ctx.get_array_element(a, idx), published);
+            assert_eq!(ctx.get_array_element(b, idx), published);
+        }
+    }
+
+    /// `valueOf` resolves THROUGH the static, and both failure shapes are the
+    /// oracle's — quoted, not invented:
+    /// `valueOf(null)` → `NullPointerException: Name is null`;
+    /// `valueOf("nope")` → `IllegalArgumentException: No enum constant
+    /// java.nio.file.attribute.PosixFilePermission.nope`.
+    #[test]
+    fn value_of_returns_the_interned_constant_and_the_jdks_two_failures() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION).unwrap();
+        declare_statics(
+            &ctx,
+            cid,
+            POSIX_FILE_PERMISSION_CONSTANTS,
+            "Ljava/nio/file/attribute/PosixFilePermission;",
+        );
+        posix_publish_constants(&mut ctx).expect("publish");
+
+        let wanted = ctx.create_string("GROUP_WRITE");
+        let got = posix_file_permission_value_of(&mut ctx, &[Value::Object(Some(wanted))])
+            .unwrap()
+            .unwrap();
+        let slot = ctx.static_field_index_by_name(cid, "GROUP_WRITE").unwrap();
+        assert_eq!(
+            got,
+            ctx.get_static_field(cid, slot),
+            "valueOf must answer the same object GETSTATIC yields"
+        );
+
+        match posix_file_permission_value_of(&mut ctx, &[Value::Object(None)]) {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { message },
+            ))) => assert_eq!(message.as_deref(), Some("Name is null")),
+            other => panic!("valueOf(null) answered {other:?}"),
+        }
+
+        let bogus = ctx.create_string("nope");
+        match posix_file_permission_value_of(&mut ctx, &[Value::Object(Some(bogus))]) {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::IllegalArgumentException { message },
+            ))) => assert_eq!(
+                message,
+                "No enum constant java.nio.file.attribute.PosixFilePermission.nope"
+            ),
+            other => panic!("valueOf(\"nope\") answered {other:?}"),
+        }
+    }
+
+    /// The constant order IS the ordinal, so it is pinned against a
+    /// plausible-looking reordering. Taken from
+    /// `javap -p java.nio.file.attribute.PosixFilePermission` on this host
+    /// (Microsoft build 25.0.3+9-LTS) — it is neither alphabetical nor sorted
+    /// by mode bit, and `posix_permission_bits_from_set`'s `BITS` table is
+    /// positionally paired with it.
+    #[test]
+    fn the_constant_order_is_the_jdk_declaration_order() {
+        assert_eq!(
+            POSIX_FILE_PERMISSION_CONSTANTS,
+            &[
+                "OWNER_READ",
+                "OWNER_WRITE",
+                "OWNER_EXECUTE",
+                "GROUP_READ",
+                "GROUP_WRITE",
+                "GROUP_EXECUTE",
+                "OTHERS_READ",
+                "OTHERS_WRITE",
+                "OTHERS_EXECUTE",
+            ]
+        );
+    }
 }
 
 // =============================================================================
@@ -20097,4 +21638,154 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__prev_cat);
     ()
+}
+
+#[cfg(test)]
+mod g22_glob_translation_tests {
+    use super::{p57_globs_to_regex, P57_MATCHER_FLAGS};
+
+    /// Translate a Windows-branch glob, or panic with the refusal.
+    fn dos(glob: &str) -> String {
+        let units: Vec<u16> = glob.encode_utf16().collect();
+        match p57_globs_to_regex(&units, true) {
+            Ok(u) => String::from_utf16_lossy(&u),
+            Err(e) => panic!("unexpected refusal for {glob:?}: {e:?}"),
+        }
+    }
+
+    /// The refusal `(desc, index)` for a glob that must not translate.
+    fn dos_err(glob: &str) -> (&'static str, usize) {
+        let units: Vec<u16> = glob.encode_utf16().collect();
+        match p57_globs_to_regex(&units, true) {
+            Ok(u) => panic!(
+                "{glob:?} translated to {:?} but HotSpot refuses it",
+                String::from_utf16_lossy(&u)
+            ),
+            Err(e) => e,
+        }
+    }
+
+    /// Every expectation here is the regex the JDK's own `Globs
+    /// .toWindowsRegexPattern` produces, cross-checked against the MEASURED
+    /// match/no-match answers of HotSpot 25.0.3+9 on Windows (G22-1 §Glob).
+    ///
+    /// That claim was false for the first block until 2026-08-18: ten
+    /// expectations spelled the separator class with ONE backslash where the
+    /// JDK emits two — and one backslash is not even a legal Java character
+    /// class, because it escapes the closing bracket and the class never
+    /// closes. The rest of this function already had it right, which is what a
+    /// partial hand-edit looks like.
+    ///
+    /// Re-derived rather than reasoned about: `Globs.toWindowsRegexPattern`
+    /// called by reflection on JDK 25 under `--add-opens java.base/sun.nio.fs`,
+    /// against this VM's `p57_globs_to_regex` over the same inputs. They agree
+    /// on all 21 patterns, so the translator was right and only these strings
+    /// were wrong.
+    ///
+    /// A line asserting that the escaped form translates BOTH to `^suba'\'.txt$`
+    /// and to `^sub'\'a'\'.txt$`, two lines apart, is also gone: no
+    /// implementation can satisfy both, so this test could never have passed.
+    /// The JDK gives the first.
+    #[test]
+    fn windows_translation_matches_the_jdk() {
+        // `*` and `?` stop at the separator; `**` crosses it.
+        assert_eq!(dos("*.txt"), r"^[^\\]*\.txt$");
+        assert_eq!(dos("a?c"), r"^a[^\\]c$");
+        assert_eq!(dos("**.txt"), r"^.*\.txt$");
+        assert_eq!(dos("**/*.txt"), r"^.*\\[^\\]*\.txt$");
+        assert_eq!(dos("src/**"), r"^src\\.*$");
+        // A `/` in the PATTERN is the separator; a lone `\` is the ESCAPE, so
+        // `sub\a.txt` is the file name `suba.txt` and matches no directory.
+        assert_eq!(dos("sub/a.txt"), r"^sub\\a\.txt$");
+        assert_eq!(dos(r"sub\a.txt"), r"^suba\.txt$");
+        // Alternation, and a stray `}` / `,` outside a group is a literal.
+        assert_eq!(dos("*.{java,class}"), r"^[^\\]*\.(?:(?:java)|(?:class))$");
+        assert_eq!(dos("a}b"), "^a}b$");
+        assert_eq!(dos("a,b"), "^a,b$");
+        // Classes: `!` negates, `^` is a LITERAL, a leading `-` is literal.
+        assert_eq!(dos("[abc].txt"), r"^[[^\\]&&[abc]]\.txt$");
+        assert_eq!(dos("[!a-z].txt"), r"^[[^\\]&&[^a-z]]\.txt$");
+        assert_eq!(dos("[^abc].txt"), r"^[[^\\]&&[\^abc]]\.txt$");
+        assert_eq!(dos("[a-]"), r"^[[^\\]&&[a-]]$");
+        assert_eq!(dos("[-a]"), r"^[[^\\]&&[-a]]$");
+        // `regexMetaChars` is escaped, and nothing outside it is.
+        assert_eq!(dos("a+b"), r"^a\+b$");
+        assert_eq!(dos("a-b"), "^a-b$");
+        assert_eq!(dos("a&b"), "^a&b$");
+        assert_eq!(dos("a(b)c"), r"^a\(b\)c$");
+        // Escaping a non-meta is a no-op; escaping a meta emits it literally.
+        assert_eq!(dos(r"\a"), "^a$");
+        assert_eq!(dos(r"\*.txt"), r"^\*\.txt$");
+        // The empty glob is legal and matches only the empty path.
+        assert_eq!(dos(""), "^$");
+        // `&&` inside a class is escaped so it is not regex-class
+        // intersection; `[` inside a class is escaped too.
+        assert_eq!(dos("[a&&b]"), r"^[[^\\]&&[a\&&b]]$");
+        assert_eq!(dos("[[]"), r"^[[^\\]&&[\[]]$");
+        // A doubled `/` becomes two literal separators — a pattern no path
+        // `Paths.get` produces can ever match, because the parser collapses
+        // separator runs. Faithful, not useful.
+        assert_eq!(dos("a//b"), r"^a\\\\b$");
+        // An empty alternative and an empty group are both legal.
+        assert_eq!(dos("{a,}"), "^(?:(?:a)|(?:))$");
+        assert_eq!(dos("{}"), "^(?:(?:))$");
+        // `***` is `**` followed by `*`, not a third wildcard.
+        assert_eq!(dos("***.txt"), r"^.*[^\\]*\.txt$");
+        assert_eq!(dos("a**b"), "^a.*b$");
+        assert_eq!(dos("C:/**"), r"^C:\\.*$");
+        // A `]` as the first class member closes the class; the next one is a
+        // literal handled by the DEFAULT arm, which escapes it.
+        assert_eq!(dos("[!]"), r"^[[^\\]&&[^]]$");
+        assert_eq!(dos("[]]"), r"^[[^\\]&&[]]\]$");
+    }
+
+    /// The Unix branch differs in exactly the four separator sites.
+    #[test]
+    fn unix_branch_uses_the_forward_slash() {
+        let unix = |g: &str| {
+            let units: Vec<u16> = g.encode_utf16().collect();
+            String::from_utf16_lossy(&p57_globs_to_regex(&units, false).unwrap())
+        };
+        assert_eq!(unix("*.txt"), r"^[^/]*\.txt$");
+        assert_eq!(unix("a?c"), "^a[^/]c$");
+        assert_eq!(unix("a/b"), "^a/b$");
+        assert_eq!(unix("[abc]"), "^[[^/]&&[abc]]$");
+    }
+
+    /// The six refusals `Globs` raises, with the exact `desc` and the exact
+    /// index HotSpot reports. The unbalanced apostrophes in `Missing ']` and
+    /// `Missing '}` are the JDK's, transcribed — not typos.
+    #[test]
+    fn the_six_refusals_carry_the_jdk_text_and_index() {
+        assert_eq!(dos_err(r"abc\"), ("No character to escape", 3));
+        assert_eq!(dos_err(r"\"), ("No character to escape", 0));
+        assert_eq!(dos_err("[/]"), ("Explicit 'name separator' in class", 1));
+        assert_eq!(dos_err("[a/b]"), ("Explicit 'name separator' in class", 2));
+        assert_eq!(dos_err(r"[a\b]"), ("Explicit 'name separator' in class", 2));
+        assert_eq!(dos_err("[abc"), ("Missing ']", 3));
+        assert_eq!(dos_err("["), ("Missing ']", 0));
+        assert_eq!(dos_err("[z-a]"), ("Invalid range", 1));
+        assert_eq!(dos_err("[a-c-e]"), ("Invalid range", 4));
+        assert_eq!(dos_err("{a,{b,c}}.txt"), ("Cannot nest groups", 3));
+        assert_eq!(dos_err("{a,b"), ("Missing '}", 3));
+        assert_eq!(dos_err("{"), ("Missing '}", 0));
+    }
+
+    /// `glob:[]` and `glob:{a}{b}` are NOT refused by `Globs` — the first is
+    /// refused later, by `Pattern.compile`, and the second is legal. Getting
+    /// this wrong would move an exception between two different classes.
+    #[test]
+    fn globs_defers_two_cases_to_the_regex_engine() {
+        // `[]` translates; `Pattern.compile` then reports
+        // "Unclosed character class near index 12" over THIS string.
+        assert_eq!(dos("[]"), r"^[[^\\]&&[]]$");
+        // Sequential groups are legal; only NESTING is banned.
+        assert_eq!(dos("{a}{b}"), "^(?:(?:a))(?:(?:b))$");
+    }
+
+    /// `Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE`.
+    #[test]
+    fn matcher_flags_are_case_insensitive_plus_unicode_case() {
+        assert_eq!(P57_MATCHER_FLAGS, 66);
+    }
 }

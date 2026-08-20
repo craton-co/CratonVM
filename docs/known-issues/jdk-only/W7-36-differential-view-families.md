@@ -586,3 +586,99 @@ must NOT refuse — a null-permitting comparator, a valid bound, a valid
 positive half on its own, which is `W6-5-vacuous-tests`' shape. The
 present-with-null row is asserted too: it is not a change, it locks 5.1's
 correction so the next reader does not "fix" it.
+
+---
+
+## Part 6 — which of these rows has a scheduled witness, 2026-08-12 (doc-only lane)
+
+Checked against the tree. No cargo, no Rust; this section adjudicates
+**scheduling**, not correctness, and the distinction is the point — a row can be
+correct in source and still have nothing that will ever tell you it stopped
+being correct.
+
+### 6.1 Covered, and the coverage really runs
+
+`RJdkViews` is in `CORE_CLASSES` at `regression-suite/run.sh:106` — verified,
+including the file's own comment explaining why an `RJdk*`-named vector sits in
+the CORE list. `sortedContainerRefusals()` is present at
+`RJdkViews.java:506` and called at `:633`. So the sorted-container refusals of
+Part 2 and Part 5.2, R1's `PriorityQueue.add(null)`, and 5.1's
+present-with-null lock are all on a default invocation.
+
+R2's pair is covered from the other side as well: `RExceptions` is also in
+`CORE_CLASSES` and asserts both `Stack.pop()` and `Stack.peek()` **by exception
+type**, with a `NoSuchElementException` arm that makes it non-vacuous. The
+`--synthetic-jdk` follow-up Part 1 recorded and 5.3 left open **has since been
+applied** — both arms are in `classloading/src/class_manager.rs` today
+(`| "java/util/EmptyStackException"` in `jdk_superclass` at `:10673`, and in
+`synthetic_stub_fields` at `:12116`). Part 5.3's *"still recorded, still not
+made"* is therefore **stale**; it is made. It remains unobservable in-tree for
+the reason both records give — no suite runs `--synthetic-jdk` MODE — and that
+is a property of the mode, not of the change.
+
+### 6.2 Not covered by anything, and the number is the finding
+
+Every row in Part 1 R3 (`CHM.reduceValues` / `searchKeys`), all of Part 3
+(`unmodifiableList` identity, the nested `subList`, `TreeSet.descendingSet()`),
+and Part 4's `stream.reuseThrows` have **no scheduled witness**. Their sole
+observable is `probes/ShadowDifferentialProbe.java`, and:
+
+* the string `probes` appears **zero** times in `regression-suite/run.sh`, at
+  any `SUITE=` value;
+* the only scheduled consumer of `probes/` is
+  `scripts/jdk-only-strict-probes.sh` (`.github/workflows/ci.yml:315`, `:1404`),
+  and its `PROBE_LIST` default is three names —
+  `JdkOnlyCensusLoadProbe JdkOnlyBreadthProbe JdkOnlyPlatformProbe` — out of
+  **449 `.java` files in `probes/`**;
+* `ShadowDifferentialProbe` is named by no `.sh` and no `.yml` anywhere in the
+  tree.
+
+So this record's "before" column can never be re-taken by CI, and its "after"
+column — every row of which is explicitly a claim about source — has nothing
+scheduled that would convert it into a measurement. **A green suite run is not
+evidence for any Part 3 row.** Part 3's own most load-bearing sentence, *"this
+view is live in ONE direction only"*, is exactly the kind of half-fix that a
+later well-meaning edit silently completes or silently breaks, and nothing here
+would notice either.
+
+The cheapest repair is not to schedule the probe — a 1,400-line HotSpot
+differential is the wrong shape for a gate, for the reason `run.sh`'s
+`extract()` filter exists (W7-60) — but to give the three Part 3 rows the same
+treatment 5.4 gave the refusals: three `check()` triples in `RJdkViews`, each
+paired with the case that must NOT change. Concretely, and each is a handful of
+lines:
+
+* `Collections.unmodifiableList(u) == u` for an already-unmodifiable `u`, paired
+  with `Collections.unmodifiableList(List.of(1,2)) != that list` — the JDK does
+  wrap `ImmutableCollections$ListN`, so the negative half is what stops the
+  positive half from being satisfied by "always return the argument";
+* `base.subList(1,4).subList(0,2).clear()`, then assert the **base**'s contents
+  and the enclosing view's contents — the enclosing-view assertion is the one
+  that fails if `ASL_FIELD_VIEW_PARENT` is dropped, and it must be paired with a
+  SIBLING view that **must still** raise `ConcurrentModificationException`,
+  because a chain-walk that updated siblings too would pass the first assertion;
+* `ts.descendingSet().pollFirst()`, then assert `ts` shrank — paired with the
+  known one-directional limit stated as a comment so the next reader does not
+  read the missing reverse assertion as an oversight and "fix" it into a red.
+
+### 6.3 A better instrument for the unregistered list
+
+Part 1 R3 ends with a long list of bulk operations *"deliberately still
+unregistered, and still silently answering null / doing nothing"* —
+`reduceKeys` (both arities), `reduceEntries`, `searchValues`, `searchEntries`,
+the `reduce*To{Int,Long,Double}` family, the three-argument transform overloads,
+and `forEachKey`/`forEachValue`/`forEachEntry`. That list was compiled by
+reading registrations, which is the method this campaign has repeatedly caught
+out — a triple can be registered in a second file, and `register()` is
+last-write-wins, so a source audit predicts the wrong answer.
+
+There is now a direct instrument and it needs no differential:
+`cratonvm --jdk-only --explain-jdk-only --jdk-only-report r.json -cp <cp> <Main>`
+emits `native-shadows-bytecode` rows carrying class, method, descriptor and the
+requester's `file:line`. Whether a `java/util/concurrent/ConcurrentHashMap`
+triple is shadowed on **this build** is one query against that JSON. Two
+cautions for whoever runs it: the flags are **silently ignored if placed after
+the main class** — no file, no warning, exit 0 — and the census
+**over**-reports, because a requested-and-refused row is not a failure (callers
+recover onto real bytecode). Only the intersection of the census and a probe
+that actually exercises the method is the blocking set.

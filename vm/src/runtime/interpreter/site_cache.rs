@@ -259,12 +259,96 @@ pub struct MethodSiteInfo {
     pub num_params: u16,
 }
 
+/// Everything the interpreter's `new` (0xbb) opcode needs after resolution.
+///
+/// `Instruction::New` re-derived all of this on EVERY execution: a
+/// `class_manager` read plus `get_class_name(cp_index).to_string()` (a fresh
+/// `String` per allocation), a full `resolve_class_loader_aware`, a second
+/// `class_manager` read for `check_class_access`, an
+/// `ensure_class_initialized_shared` (a third), and a fourth for
+/// `num_total_fields`. None of it can change for a site that this table admits
+/// — see [`ClassSiteCache`] for which sites those are.
+#[derive(Clone, Copy)]
+pub struct ResolvedNewSite {
+    /// The class `new` allocates.
+    pub class_id: ClassId,
+    /// `Class::num_total_fields` as of the fill. A layout replacement moves it
+    /// — and bumps `resolution_epoch`, which is one half of the entry's tag.
+    pub num_fields: u32,
+}
+
+/// Per-thread resolved `new`-site cache.
+///
+/// # Which sites are admissible
+///
+/// Only those whose referencing class has **no loader namespace**: no entry in
+/// the defining-loader side table, and a class-manager loader id that is not
+/// `UserDefined`. For such a class `resolve_class_loader_aware` reduces to the
+/// global name → `ClassId` mapping plus the resolution memo, which is exactly
+/// what this module's two epochs cover. The field arm draws the same line, and
+/// puts its loader-sensitive half behind a separate flag for the same reason.
+///
+/// That property is **immutable per class**, not merely current: a defining
+/// loader is fixed when the class is defined, so an app- or bootstrap-defined
+/// referencing class can never later acquire one. Checking it at FILL time is
+/// therefore a complete guard, and the hit path needs no re-check.
+///
+/// # What a hit is allowed to skip
+///
+/// The access check (JVMS §5.4.4) is a function of the (accessor, target) pair
+/// alone, and neither class's identity or modifiers change once defined — so a
+/// site that passed once passes forever.
+///
+/// Class initialization is monotonic (JVMS §5.5): an entry is only filled after
+/// `ensure_class_initialized_shared` has returned `Ok`, so a hit cannot be the
+/// first touch. This is the one skip worth naming, because
+/// `ensure_class_initialized_shared`'s own "fast path" still takes a
+/// `class_manager` read lock — the hit would otherwise keep paying a lock for a
+/// question already answered. A redefinition latches the whole table off
+/// (`any_class_redefined`) and class unloading bumps `class_definition_epoch`,
+/// so neither can strand an entry describing an uninitialized class.
+pub type ClassSiteCache = SiteCache<ResolvedNewSite>;
+
 /// Per-thread resolved-field sites. Stores the whole `ResolvedField` — it is
 /// plain data (ids, an index and four flag bytes), so a hit clones no `Arc`.
 pub type FieldSiteCache = SiteCache<cratonvm_classloading::resolution::ResolvedField>;
 
 /// Per-thread resolved-method sites; see [`MethodSiteInfo`].
 pub type MethodSiteCache = SiteCache<MethodSiteInfo>;
+
+/// Per-thread resolved **cast** sites — the target `ClassId` of a `checkcast`
+/// or `instanceof`.
+///
+/// # Why this is not [`ClassSiteCache`]
+///
+/// It stores less and it would be tempting to share the `new` table, since both
+/// map `(referencing class, cp index)` to a resolved class. **They must not
+/// share it.** The same `CONSTANT_Class` entry can be referenced by a `new` and
+/// by a `checkcast` in one class, so one table would let a `checkcast` fill
+/// answer a `new` — and [`ClassSiteCache`]'s hit path deliberately skips the
+/// initialization check on the grounds that a fill only happens after
+/// `ensure_class_initialized_shared` returned `Ok`. A `checkcast` must NOT
+/// initialize its target (JVMS §6.5 `checkcast` performs resolution, not
+/// initialization), so a `checkcast` fill cannot carry that guarantee, and a
+/// `new` served from one would allocate an uninitialized class.
+///
+/// Separate tables keep each cache's precondition its own.
+///
+/// # What a hit is allowed to answer
+///
+/// Only the resolution. The assignability test still runs on every execution —
+/// a hit removes the `String` for the class name, the loader-aware
+/// `resolve_class_loader_aware`, and one of the two `class_manager` read
+/// acquisitions, and nothing else.
+///
+/// A hit is taken only when the receiver is not an array (arrays answer through
+/// descriptor-based assignability, which needs the name) and only when
+/// `is_subclass_of` says yes. A negative `is_subclass_of` falls through to the
+/// full path, because the five fail-open fallbacks after it
+/// (`loader_aware_name_assignable`, `synthetic_implements`,
+/// `proxy_instance_satisfies_target`, …) are name-based. So the cache
+/// accelerates the assignable case and leaves every refusal exactly as it was.
+pub type CastSiteCache = SiteCache<ClassId>;
 
 /// `CRATONVM_DBG=field-site` — prove the site caches are actually firing before
 /// anyone times them.
@@ -285,8 +369,48 @@ pub mod site_stats {
     pub const METHOD_HIT: usize = 4;
     pub const METHOD_MISS: usize = 5;
     pub const METHOD_FILL: usize = 6;
+    pub const NEW_HIT: usize = 7;
+    pub const NEW_MISS: usize = 8;
+    pub const NEW_FILL: usize = 9;
+    /// A `new` site refused a fill because its referencing class has a loader
+    /// namespace. A workload whose whole `new` traffic lands here is one the
+    /// cache cannot help, and saying so is the difference between "measured no
+    /// effect" and "never fired".
+    pub const NEW_REJECT_LOADER: usize = 10;
+    pub const CAST_HIT: usize = 11;
+    pub const CAST_MISS: usize = 12;
+    pub const CAST_FILL: usize = 13;
+    /// A cast site refused a FILL: a loader-namespaced referencing class or an
+    /// array target, whose answer is not a property of the (class, index) pair
+    /// alone. Same reason the `new` counterpart exists — it separates "measured
+    /// no effect" from "never fired".
+    pub const CAST_REJECT_LOADER: usize = 14;
+    /// A cast site HIT whose answer could not be used: `is_subclass_of` said no
+    /// (or the receiver was an array), so the full name-based path ran anyway.
+    ///
+    /// This is deliberately NOT counted as a loader rejection. It dominates any
+    /// workload that asks negative `instanceof` questions — a torture probe
+    /// here reports 26,446 of these against 34 fills — and folding the two
+    /// together would read as "the cache is being refused for loader reasons"
+    /// when what is actually happening is that the cache is answering, and the
+    /// answer is `false`. A counter whose name implies the wrong cause is the
+    /// same defect as a counter that does not fire.
+    pub const CAST_UNUSABLE: usize = 15;
+    /// An `ldc` answered from the recorded-resolution store — the whole
+    /// instruction, before the class_manager lock.
+    pub const LDC_HIT: usize = 16;
+    /// An `ldc` that had to resolve. Non-zero with `LDC_HIT` at zero would
+    /// mean the store is never being written, which is a different defect
+    /// from a cache that is written and never read.
+    pub const LDC_MISS: usize = 17;
+    /// An `ldc` result written to the store. Every tag `ldc` can push records,
+    /// including `Integer`/`Float`: an unrecorded tag would MISS the probe on
+    /// every execution and then resolve anyway, so the probe would be pure
+    /// added cost for it. `ldc2_w` does not probe or record — see
+    /// `constants::execute_ldc2w`.
+    pub const LDC_FILL: usize = 18;
 
-    const N: usize = 7;
+    const N: usize = 19;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -312,7 +436,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -321,6 +445,18 @@ pub mod site_stats {
             COUNTS[METHOD_HIT].load(Ordering::Relaxed),
             COUNTS[METHOD_MISS].load(Ordering::Relaxed),
             COUNTS[METHOD_FILL].load(Ordering::Relaxed),
+            COUNTS[NEW_HIT].load(Ordering::Relaxed),
+            COUNTS[NEW_MISS].load(Ordering::Relaxed),
+            COUNTS[NEW_FILL].load(Ordering::Relaxed),
+            COUNTS[NEW_REJECT_LOADER].load(Ordering::Relaxed),
+            COUNTS[CAST_HIT].load(Ordering::Relaxed),
+            COUNTS[CAST_MISS].load(Ordering::Relaxed),
+            COUNTS[CAST_FILL].load(Ordering::Relaxed),
+            COUNTS[CAST_REJECT_LOADER].load(Ordering::Relaxed),
+            COUNTS[CAST_UNUSABLE].load(Ordering::Relaxed),
+            COUNTS[LDC_HIT].load(Ordering::Relaxed),
+            COUNTS[LDC_MISS].load(Ordering::Relaxed),
+            COUNTS[LDC_FILL].load(Ordering::Relaxed),
         );
     }
 

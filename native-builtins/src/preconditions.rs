@@ -40,10 +40,37 @@
 //!
 //! The *success* path. `String.charAt` → `StringLatin1.charAt` →
 //! `String.checkIndex` → `Preconditions.checkIndex(index, length, SIOOBE_FORMATTER)`
-//! on every single character read. Handing that to the interpreter costs a
-//! Java frame per `charAt`. So the natives keep the in-bounds arithmetic in
-//! Rust and allocate nothing, and only the (cold) out-of-bounds path builds an
+//! is the JDK 25 call chain, so in principle this native carries every single
+//! character read. The natives keep the in-bounds arithmetic in Rust and
+//! allocate nothing, and only the (cold) out-of-bounds path builds an
 //! exception.
+//!
+//! ## The per-character claim is FALSE of the shipping binary — MEASURED
+//!
+//! It used to say, without a denominator, that a Java `Preconditions` frame
+//! was paid "on every single character read", and that sentence is why this
+//! module was treated as hot. It is not. Measured 2026-08-17 on the release
+//! binary built from `d2e127930`, HotSpot 25.0.3+9-LTS as the oracle
+//! (`docs/known-issues/jdk-only/G20-1-the-first-performance-profile-of-this-branch-20260817.md`
+//! §5), over a **1,000,000-iteration** `String.charAt` loop:
+//!
+//! | instrument | reading |
+//! |---|---|
+//! | `--dump-native-registry`, `--nojit` arm | `checkIndex(IIL..BiFunction;)I` **invocations = 1** — not 1,000,000. Whole-process native dispatches: **1,540** |
+//! | wall time, JIT arm, median of 5 | **5 ns/call**, against HotSpot's 6 ns |
+//! | the native-call boundary on the same host | **~141 ns/call** (`System.identityHashCode`, 167 ns, less a 26 ns interpreted-call control) |
+//!
+//! 5 ns is a factor of 28 *below* the cost of crossing into Rust once, so on
+//! the arm that ships `charAt` provably does not enter this module per
+//! character. Two independent instruments agree. Do **not** spend optimisation
+//! effort here on the strength of the sentence above it; the three success
+//! paths are already branch-and-return and allocate nothing, and the measured
+//! hot natives on this branch are elsewhere (record §4, §6).
+//!
+//! This does not argue for deleting the module: its reason to exist is
+//! *correctness* — honouring the exception formatter, which is a control-flow
+//! contract three families of caller depend on — and that reason is unaffected
+//! by how often the success path runs.
 //!
 //! Only the `int` overloads are registered. The `long` ones
 //! (`MemorySegment`/`ByteBuffer` scale checks) are not on a per-character path,

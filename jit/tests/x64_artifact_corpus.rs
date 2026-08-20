@@ -158,7 +158,7 @@ struct Case {
     max_locals: usize,
     needs_heap: bool,
     inline_tlab: bool,
-    multianewarray_info: Vec<(usize, u8)>,
+    multianewarray_info: Vec<(usize, i64)>,
     field_info: Vec<(usize, usize, u8)>,
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
     new_info: Vec<(usize, u32, usize, bool, bool)>,
@@ -213,7 +213,7 @@ impl Case {
         self.anewarray_info = v;
         self
     }
-    fn multis(mut self, v: Vec<(usize, u8)>) -> Case {
+    fn multis(mut self, v: Vec<(usize, i64)>) -> Case {
         self.multianewarray_info = v;
         self
     }
@@ -770,6 +770,36 @@ fn corpus() -> Vec<Case> {
         2,
         vec![0x1a, 0x1b, 0x58, 0x03, 0xac],
     ));
+    // FORM-2: a single category-2 value discarded. This is the shape javac
+    // emits for a `long`/`double`-returning call used as a statement, and the
+    // one that kept commons-math's P-square hot loop interpreted while
+    // `pop2` was unimplemented — the cat-1 case above recorded REFUSED for just
+    // as long, but a differ only reports, it does not fail.
+    // lload_0 / pop2 / iconst_0 / ireturn
+    c.push(Case::new("stack/pop2_cat2", 2, 2, vec![0x1e, 0x58, 0x03, 0xac]));
+    // dup2_x1 FORM-2, the `return this.doubleField = value;` shape, minus the
+    // putfield so the case needs no constant pool:
+    // aload_0 / dload_1 / dup2_x1 / dreturn
+    // Returning with operands still on the stack is legal and keeps the case to
+    // the one opcode under test — an earlier draft ended in `pop / pop2`, and
+    // it was the trailing `pop2` (whose width oracle cannot classify a `pop`)
+    // that recorded REFUSED, not the dup2_x1 the case is named for.
+    c.push(Case::new(
+        "stack/dup2_x1_cat2",
+        3,
+        4,
+        vec![0x2a, 0x18, 0x01, 0x5d, 0xaf],
+    ));
+    // The chained-assignment shape `a = b = 0.0` — the second `dup2` follows a
+    // STORE, which the width oracle can only classify via the dup-then-store
+    // pair rule.
+    // dconst_0 / dup2 / dstore_1 / dup2 / dstore_3 / dreturn
+    c.push(Case::new(
+        "stack/dup2_after_store",
+        2,
+        5,
+        vec![0x0e, 0x5c, 0x48, 0x5c, 0x4a, 0xaf],
+    ));
     c.push(Case::new(
         "stack/dup2_x1",
         3,
@@ -976,7 +1006,7 @@ fn corpus() -> Vec<Case> {
             vec![0x05, 0x06, 0xc5, 0x00, 0x07, 0x02, 0x4b, 0x2a, 0xbe, 0xac],
         )
         .heap()
-        .multis(vec![(2, 2)]),
+        .multis(vec![(2, cratonvm_jit::pack_multianewarray_site(1, 7))]),
     );
     // array sum loop (BCE / SIMD candidate)
     {

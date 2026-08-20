@@ -1489,6 +1489,49 @@ pub static UNREG_MEMO_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
 /// Times the memo short-circuited a scan at all (the audit's denominator — a
 /// zero numerator is only meaningful beside a non-zero denominator).
 pub static UNREG_MEMO_SHORTCIRCUITS: AtomicUsize = AtomicUsize::new(0);
+
+/// ENGAGEMENT census for the A5 band probe, printed at exit under
+/// `CRATONVM_DBG_A5_ENGAGEMENT=1`.
+///
+/// Four earlier attempts to make this probe cheaper were judged inert from a
+/// profile that did not move. That is an inference, not a measurement: a memo
+/// that never engages and a memo that engages but saves nothing look identical
+/// in a flat profile. These say which. Counted per CALL of the coverage probe.
+pub static A5_PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Calls where the memo would have answered "already clean" (no scan needed).
+pub static A5_PROBE_MEMO_CLEAN: AtomicUsize = AtomicUsize::new(0);
+/// Calls where the memo could bound the scan to an incremental band.
+pub static A5_PROBE_MEMO_BANDED: AtomicUsize = AtomicUsize::new(0);
+/// Calls that fell through to a FULL scan because the code-range set changed.
+pub static A5_PROBE_FULL_RESCAN: AtomicUsize = AtomicUsize::new(0);
+/// Total band words the probe was asked to scan (the quantity a memo shrinks).
+pub static A5_PROBE_WORDS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn a5_engagement_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A5_ENGAGEMENT").is_some()
+    })
+}
+
+/// Print the A5 engagement census. Called from the VM's shutdown path.
+pub fn report_a5_engagement() {
+    if !a5_engagement_enabled() {
+        return;
+    }
+    let calls = A5_PROBE_CALLS.load(Ordering::Relaxed);
+    if calls == 0 {
+        eprintln!("[a5-engagement] calls=0 (probe never ran)");
+        return;
+    }
+    eprintln!(
+        "[a5-engagement] calls={calls} memo_clean={} memo_banded={} full_rescan={} words={}",
+        A5_PROBE_MEMO_CLEAN.load(Ordering::Relaxed),
+        A5_PROBE_MEMO_BANDED.load(Ordering::Relaxed),
+        A5_PROBE_FULL_RESCAN.load(Ordering::Relaxed),
+        A5_PROBE_WORDS.load(Ordering::Relaxed),
+    );
+}
 /// H2-CID0 (2026-08-06) — suppressions on a scan a collector CONSUMES.
 ///
 /// The number that judges the fix. Total suppressions are dominated by
@@ -3037,6 +3080,34 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
             .unwrap_or(scanner_sp);
         let search_lo = scanner_sp.max(cover_hi);
         let high = current_thread_stack_high();
+        // OBSERVATION ONLY — ask the memo what it WOULD have said, without
+        // acting on it. Routing this call site through the memo measured inert
+        // (reverted); this says whether that is because the memo never engages
+        // or because engaging saves nothing. A flat profile cannot tell those
+        // apart, and four attempts were judged on a flat profile.
+        if a5_engagement_enabled() {
+            A5_PROBE_CALLS.fetch_add(1, Ordering::Relaxed);
+            A5_PROBE_WORDS.fetch_add(high.saturating_sub(search_lo) / 8, Ordering::Relaxed);
+            let code_ranges = cratonvm_jit::jit_code_range_count();
+            let hiwater_on = unreg_memo_hiwater_enabled();
+            let would = UNREG_JIT_MEMO.with(|c| {
+                let mut m = c.get();
+                let d = m.observe(search_lo, code_ranges, hiwater_on);
+                // Do NOT store: this is an observer, and `observe` mutates the
+                // hiwater mark. Put the memo back exactly as it was.
+                let _ = m;
+                d
+            });
+            match would {
+                UnregScan::AlreadyClean => A5_PROBE_MEMO_CLEAN.fetch_add(1, Ordering::Relaxed),
+                UnregScan::Detect { hi: Some(_) } => {
+                    A5_PROBE_MEMO_BANDED.fetch_add(1, Ordering::Relaxed)
+                }
+                UnregScan::Detect { hi: None } => {
+                    A5_PROBE_FULL_RESCAN.fetch_add(1, Ordering::Relaxed)
+                }
+            };
+        }
         let hit = if high > search_lo {
             native_stack_has_jit_frame(search_lo, high)
         } else {
@@ -3210,26 +3281,141 @@ pub fn current_thread_jit_depth() -> usize {
 /// Entries with no label are skipped rather than reported as an unnamed frame:
 /// the only artifacts with an empty `method_label` are the legacy/test compile
 /// wrapper's, and inventing a frame for one would be worse than omitting it.
-pub fn active_compiled_frames() -> Vec<(u32, String, u32)> {
+/// Kill switch for the nested-activation walk in [`active_compiled_frames`].
+///
+/// Default ON. `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES=1` restores the historical
+/// one-frame-per-chain-entry answer, so the frame-count difference is an A/B
+/// inside ONE binary instead of a comparison across two builds.
+fn nested_trace_frames_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NESTED_TRACE_FRAMES").is_none()
+    })
+}
+
+pub fn active_compiled_frames() -> Vec<(u32, String, u32, usize)> {
+    let nested_enabled = nested_trace_frames_enabled();
+    let scanner_sp = current_stack_pointer();
     JIT_ENTRY_CHAIN.with(|c| {
-        c.borrow()
-            .iter()
-            .filter_map(|e| {
-                let info = e.precise.as_ref()?;
+        // The top entry's `exact_rbp` lives in the `TOP_RBP` mirror between
+        // push/pop boundaries; the walk below needs the LIVE innermost RBP, so
+        // flush it exactly as `remap_active_jit_frames` does. `try_borrow_mut`
+        // rather than `borrow_mut`: a stack capture is reachable from paths
+        // that may already hold the chain borrow, and a stale (higher)
+        // `exact_rbp` only shortens the walk — it degrades this function to the
+        // answer it gave before, and never walks past a bound.
+        if nested_enabled {
+            if let Ok(mut v) = c.try_borrow_mut() {
+                flush_top_rbp_cache_to_chain(v.as_mut_slice());
+            }
+        }
+        let chain = c.borrow();
+        let mut out: Vec<(u32, String, u32, usize)> = Vec::with_capacity(chain.len());
+        for e in chain.iter() {
+            let Some(info) = e.precise else {
+                continue;
+            };
+            let entry_sp = e.entry_sp;
+            // One chain entry is one interpreter->JIT boundary, but the
+            // compiled region behind it can be many ACTIVATIONS deep: compiled
+            // code calling itself never re-enters from the interpreter, so it
+            // pushes no further chain entry. Reporting only the boundary method
+            // made 64 nested activations read as ONE frame to
+            // `Throwable.getStackTrace()` and `StackWalker` alike — Log4j2's
+            // caller lookup then walked past the frame it wanted and answered
+            // with the enclosing class
+            // (`stackwalker_log4j_deep_repeated_walks_finish_under_jit`).
+            // Walk the saved-RBP chain the way `remap_active_jit_frames`'
+            // Stage 5 already does, and report every activation.
+            let mut nested: Vec<*const cratonvm_jit::CompiledMethod> = Vec::new();
+            if nested_enabled {
+                if let Some(innermost) = innermost_frame_method(
+                    info.exact_rbp,
+                    info.exact_cm_id,
+                    entry_sp,
+                    scanner_sp,
+                    info.compiled_method,
+                ) {
+                    nested.push(innermost);
+                }
+                // JIT frames use `push rbp; mov rbp,rsp`, so `[rbp]` is the
+                // caller RBP and `[rbp+8]` the return address INTO that caller.
+                // Same bound checks, same order and the same 4096 guard as the
+                // Stage 5 walk — this one only READS, where that one rewrites
+                // oop slots.
+                let mut child_rbp = info.exact_rbp;
+                let mut guard = 0usize;
+                while guard < 4096 {
+                    guard += 1;
+                    if child_rbp == 0 || child_rbp & 0x7 != 0 {
+                        break;
+                    }
+                    if child_rbp < scanner_sp || child_rbp >= entry_sp {
+                        break;
+                    }
+                    // SAFETY: `child_rbp` is an aligned address inside this
+                    // thread's own live JIT stack region, bounded by
+                    // `scanner_sp` (this frame) and `entry_sp` (the boundary
+                    // that pushed the chain entry), and validated before use
+                    // exactly as the other rbp-chain walks in this file do.
+                    let parent_rbp = unsafe { (child_rbp as *const usize).read() };
+                    let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+                    if parent_rbp <= child_rbp
+                        || parent_rbp & 0x7 != 0
+                        || parent_rbp < scanner_sp
+                        || parent_rbp >= entry_sp
+                    {
+                        break;
+                    }
+                    match cratonvm_jit::lookup_jit_code_range(ret_addr) {
+                        Some(cm_ptr) => {
+                            nested.push(cm_ptr as *const cratonvm_jit::CompiledMethod)
+                        }
+                        // The parent is the interpreter / Rust boundary: this
+                        // entry has no further compiled ancestors.
+                        None => break,
+                    }
+                    child_rbp = parent_rbp;
+                }
+            }
+            // Never report FEWER frames than the pre-walk answer. A walk cut
+            // short by a bound, one that never started (`exact_rbp == 0`), and
+            // the kill-switch path all still owe the boundary method the chain
+            // entry was pushed for.
+            if nested.last() != Some(&info.compiled_method) {
+                nested.push(info.compiled_method);
+            }
+            // `nested` is innermost-first; the splice in
+            // `runtime::stackwalker::interleave_compiled_frames` wants
+            // outermost-first, and entries sharing an `interp_depth` keep their
+            // push order.
+            for cm_ptr in nested.iter().rev() {
                 // SAFETY: exactly the contract documented on
                 // `PreciseFrameInfo::compiled_method` — the JIT cache holds an
                 // owning `Arc` for as long as the body is registered, and the
                 // chain entry is popped the moment the call returns or unwinds,
                 // so there is no stale-pointer window. This read happens on the
                 // owning thread, from a Java-level stack capture, i.e. strictly
-                // inside that window.
-                let cm = unsafe { &*info.compiled_method };
+                // inside that window. Pointers added by the walk came from
+                // `lookup_jit_code_range`, which only answers for a code range
+                // still registered in the cache.
+                let cm = unsafe { &**cm_ptr };
                 if cm.method_label.is_empty() {
-                    return None;
+                    continue;
                 }
-                Some((e.interp_depth, cm.method_label.clone(), cm.owner_class_id))
-            })
-            .collect()
+                out.push((
+                    e.interp_depth,
+                    cm.method_label.clone(),
+                    cm.owner_class_id,
+                    // The artifact itself, so the trace assembler can ask it
+                    // whether an interpreter frame's pc is one of ITS OSR entry
+                    // points. Valid for exactly as long as the frame is live,
+                    // which is the same window this whole function reads in.
+                    *cm_ptr as usize,
+                ));
+            }
+        }
+        out
     })
 }
 
@@ -3491,6 +3677,22 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                 c.set(m);
                 d
             });
+            // ENGAGEMENT census for the site that actually runs. The coverage
+            // probe's counter reported `calls=0` on the StackWalker workload,
+            // so this is where the 17.9% comes from; counting the verdict here
+            // says whether the memo saves the scan or merely observes it.
+            if a5_engagement_enabled() {
+                A5_PROBE_CALLS.fetch_add(1, Ordering::Relaxed);
+                match decision {
+                    UnregScan::AlreadyClean => A5_PROBE_MEMO_CLEAN.fetch_add(1, Ordering::Relaxed),
+                    UnregScan::Detect { hi: Some(_) } => {
+                        A5_PROBE_MEMO_BANDED.fetch_add(1, Ordering::Relaxed)
+                    }
+                    UnregScan::Detect { hi: None } => {
+                        A5_PROBE_FULL_RESCAN.fetch_add(1, Ordering::Relaxed)
+                    }
+                };
+            }
             let already_clean = decision == UnregScan::AlreadyClean;
             // Consume the authoritative marker: this scan is the one the
             // preceding `invalidate_scan_cache_for_gc` was announcing.

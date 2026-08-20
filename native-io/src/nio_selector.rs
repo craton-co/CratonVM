@@ -267,10 +267,32 @@ struct KeyState {
     handle: SelectableHandle,
 }
 
+/// First pseudo-fd handed to a registration whose channel has no OS socket
+/// yet. Real `tcp_registry` / `FdTable` ids are POSITIVE and `-1` is the
+/// "no fd" sentinel `channel_net_fd` answers with, so the placeholder space
+/// starts well below both and grows downwards.
+const UNRESOLVED_FD_BASE: i32 = -1000;
+
 struct SelectorState {
     open: bool,
-    /// Map from net_fd -> key state.
+    /// Map from registration key -> key state.
+    ///
+    /// The key is the channel's `net_fd` once the channel HAS an OS socket,
+    /// and a per-selector unique pseudo-fd (see `alloc_unresolved_fd`) until
+    /// then. It must NOT be the bare `-1` that `channel_net_fd` answers for an
+    /// unbound / unconnected channel: netty registers a channel BEFORE binding
+    /// it (`doRegister()` then `doBind()`), so two unbound channels registered
+    /// on one selector both hashed to `-1` and the second `insert` REPLACED the
+    /// first — `keys()` reported one registration where there were two,
+    /// `numRegistered()` undercounted by exactly the number of collisions, and
+    /// `keyFor()` handed the first channel the second channel's SelectionKey.
+    /// `NioEventLoopTest.testChannelsRegistered` measures this directly
+    /// (`expected: <2> but was: <1>`). `refresh_selector_handles` re-keys a
+    /// placeholder to the real fd once the channel resolves, so a placeholder
+    /// is only ever the key while there is nothing to poll.
     keys: HashMap<i32, KeyState>,
+    /// Next pseudo-fd for an unresolved registration; decremented per use.
+    next_unresolved_fd: i32,
     /// UDP socket pair for wakeup (used on Windows; also used as fallback
     /// on platforms without epoll). `wakeup_peer` is the address of the
     /// receiver socket so the sender knows where to deliver.
@@ -304,6 +326,7 @@ impl SelectorState {
         Self {
             open: true,
             keys: HashMap::new(),
+            next_unresolved_fd: UNRESOLVED_FD_BASE,
             wakeup_sender: None,
             wakeup_receiver: None,
             wakeup_peer: None,
@@ -316,6 +339,25 @@ impl SelectorState {
             pending_accepted: VecDeque::new(),
             woken: false,
             in_flight_selects: 0,
+        }
+    }
+
+    /// Hand out a unique map key for a registration whose channel has no OS
+    /// socket yet. Two unbound channels must not share a slot; see the
+    /// `keys` field doc for what sharing one cost.
+    fn alloc_unresolved_fd(&mut self) -> i32 {
+        // Walk down past any placeholder still in use (a wrap would need
+        // ~2^31 unresolved registrations on one selector, but the loop makes
+        // the invariant "the returned key is free" hold unconditionally).
+        loop {
+            let candidate = self.next_unresolved_fd;
+            self.next_unresolved_fd = self.next_unresolved_fd.saturating_sub(1);
+            if !self.keys.contains_key(&candidate) {
+                return candidate;
+            }
+            if self.next_unresolved_fd == i32::MIN {
+                self.next_unresolved_fd = UNRESOLVED_FD_BASE;
+            }
         }
     }
 
@@ -758,6 +800,28 @@ pub fn selector_register(
     if !st.open {
         return Err(closed_selector());
     }
+    // A channel with no OS socket yet (`channel_net_fd` answered -1) gets a
+    // per-selector unique pseudo-fd instead of sharing the -1 slot with every
+    // other unresolved registration. See `SelectorState::keys`.
+    //
+    // A re-register of the SAME key object must still land on the SAME slot,
+    // or `NioIoHandler.rebuildSelector` (which re-registers every key) would
+    // leak one entry per rebuild. Reuse the existing placeholder when the key
+    // object matches.
+    let net_fd = if net_fd < 0 {
+        let existing = key_obj.and_then(|k| {
+            st.keys
+                .iter()
+                .find(|(fd, ks)| **fd < 0 && ks.key_obj == Some(k))
+                .map(|(fd, _)| *fd)
+        });
+        match existing {
+            Some(fd) => fd,
+            None => st.alloc_unresolved_fd(),
+        }
+    } else {
+        net_fd
+    };
     if sel_dbg_enabled() {
         sel_dbg(format!(
             "REGISTER id={id} net_fd={net_fd} interest_ops={interest_ops}"
@@ -827,6 +891,29 @@ pub fn selector_register(
         }
     }
     Ok(())
+}
+
+/// Locate the (selector id, map key) slot holding `key_obj`, if any.
+///
+/// The map key is NOT derivable from the channel once a registration can be
+/// filed under a placeholder pseudo-fd (see `SelectorState::keys`): the channel
+/// answers -1 while unresolved and its real fd afterwards, and neither is the
+/// slot. Every caller that has the SelectionKey in hand must resolve through
+/// the key object, which is stable for the life of the registration.
+fn slot_of_key_obj(key_obj: ObjectRef) -> Option<(i32, i32)> {
+    let regs = selectors().read();
+    for (sel_id, sel) in regs.iter() {
+        let st = sel.lock();
+        if let Some(fd) = st
+            .keys
+            .iter()
+            .find(|(_, k)| k.key_obj == Some(key_obj))
+            .map(|(fd, _)| *fd)
+        {
+            return Some((*sel_id, fd));
+        }
+    }
+    None
 }
 
 /// Update interestOps on an already-registered key.
@@ -981,6 +1068,56 @@ pub fn deregister_fd_everywhere(net_fd: i32) {
     for (_sel_id, sel) in regs.iter() {
         let mut st = sel.lock();
         st.keys.remove(&net_fd);
+    }
+}
+
+/// Drop every registration this channel still owns, including one filed under a
+/// placeholder pseudo-fd.
+///
+/// `deregister_fd_everywhere` can only find a registration whose slot IS the
+/// channel's fd. A channel that was registered before it had a socket and then
+/// closed without ever resolving (`SocketChannel.open(); register(sel, 0);
+/// close()`) keeps its placeholder slot forever, so `keys()` reports a
+/// registration for a closed channel. Called alongside the fd form from the
+/// channel-close path.
+pub fn deregister_channel_everywhere(ctx: &mut dyn NativeContext, channel: ObjectRef) {
+    // Collect first, then match outside the selector lock: `identity_hash_code`
+    // and `sk_table()` must not be reached under `sel.lock()` (the canonical
+    // order is selectors() before sk_table(), and the hash call can allocate).
+    let candidates: Vec<(i32, ObjectRef)> = {
+        let regs = selectors().read();
+        regs.iter()
+            .flat_map(|(sel_id, sel)| {
+                let st = sel.lock();
+                st.keys
+                    .iter()
+                    .filter(|(fd, _)| **fd < 0)
+                    .filter_map(|(_, k)| k.key_obj.map(|key| (*sel_id, key)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    for (sel_id, key) in candidates {
+        let hash = ctx.identity_hash_code(key);
+        let owns = {
+            let t = sk_table().read();
+            sk_find(&t, key, hash).is_some_and(|row| row.channel == channel)
+        };
+        if !owns {
+            continue;
+        }
+        let regs = selectors().read();
+        if let Some(sel) = regs.get(&sel_id) {
+            let mut st = sel.lock();
+            let slot = st
+                .keys
+                .iter()
+                .find(|(_, k)| k.key_obj == Some(key))
+                .map(|(fd, _)| *fd);
+            if let Some(fd) = slot {
+                st.keys.remove(&fd);
+            }
+        }
     }
 }
 
@@ -2165,27 +2302,6 @@ fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
     ctx.get_field(obj, SI_OPEN_FLAG).as_int().unwrap_or(0) != 0
 }
 
-fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
-    // C27: side-table is now keyed by GC-stable identity hash code; the
-    // stored `channel` is an `ObjectRef`, not a raw pointer.
-    let hash = ctx.identity_hash_code(key_obj);
-    let table = sk_table().read();
-    let channel = sk_find(&table, key_obj, hash)?.channel;
-    // The channel's registry id lives in the socket_channel side-table now
-    // (its F_REG_ID object slot collides with a real-JDK reference field).
-    crate::socket_channel::channel_net_fd(ctx, channel)
-        .or_else(|| crate::datagram_channel_fd(ctx, channel))
-}
-
-fn key_selector_id(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
-    // C27: identity-hash-code key + stored `ObjectRef` value (no
-    // from_raw resurrection).
-    let hash = ctx.identity_hash_code(key_obj);
-    let table = sk_table().read();
-    let s = sk_find(&table, key_obj, hash)?.selector;
-    Some(selector_id_from_obj(ctx, s))
-}
-
 // ---------------------------------------------------------------------------
 // Native method impls — SelectorImpl
 // ---------------------------------------------------------------------------
@@ -2268,6 +2384,82 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 /// `WEPollSelectorImpl` is ever constructed here — and if one were, the default
 /// provider this returns is the same object its own `provider` field would hold,
 /// unless the application installed a custom `SelectorProvider`.
+
+/// `SelectableChannel.register(Selector,int)` -- guarded for a foreign
+/// receiver (see `socket_channel::foreign_nio_receiver`). The JDK's is `final`
+/// on `SelectableChannel`/`AbstractSelectableChannel` and routes to the
+/// SELECTOR's own `register`, which is where barchart-udt's `SelectorUDT`
+/// builds its `SelectionKeyUDT`.
+fn g_channel_register2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "register",
+        "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
+    ) {
+        Some(r) => r,
+        None => channel_register_native(ctx, args),
+    }
+}
+
+/// The 3-arg `register(Selector,int,Object)` spelling -- see [`g_channel_register2`].
+fn g_channel_register3(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "register",
+        "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
+    ) {
+        Some(r) => r,
+        None => channel_register_native(ctx, args),
+    }
+}
+
+/// `keyFor(Selector)` -- `final` on `AbstractSelectableChannel`.
+fn g_channel_key_for(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "keyFor",
+        "(Ljava/nio/channels/Selector;)Ljava/nio/channels/SelectionKey;",
+    ) {
+        Some(r) => r,
+        None => channel_key_for_native(ctx, args),
+    }
+}
+
+/// `Selector.close()` -- `final` on `AbstractSelector`; it calls the
+/// selector's own `implCloseSelector`.
+fn g_selector_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "close", "()V") {
+        Some(r) => r,
+        None => selector_close_native(ctx, args),
+    }
+}
+
+/// `Selector.isOpen()` -- `final` on `AbstractSelector`.
+fn g_selector_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "isOpen", "()Z") {
+        Some(r) => r,
+        None => selector_is_open_native(ctx, args),
+    }
+}
+
+/// `Selector.provider()` -- `final` on `AbstractSelector`, and the answer a
+/// third-party selector gives is its OWN provider (barchart's
+/// `SelectorProviderUDT`), not ours.
+fn g_selector_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "provider",
+        "()Ljava/nio/channels/spi/SelectorProvider;",
+    ) {
+        Some(r) => r,
+        None => selector_provider_native(ctx, args),
+    }
+}
+
 fn selector_provider_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     ctx.invoke(
         "java/nio/channels/spi/SelectorProvider",
@@ -2320,7 +2512,7 @@ fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// `DefaultPromise` LISTENER. A listener that throws is logged and DROPPED, so
 /// Vert.x's `VertxImpl$2.operationComplete` never finished shutting down the
 /// remaining event-loop groups and its close promise never completed —
-/// `vertx.close()` blocked forever. In the hibernate-reactive suite that
+/// `vertx.close()` blocked forever. In the hibernate suite that
 /// surfaced as classes timing out in `RunTestOnContext.cleanUp`, one leaked
 /// Postgres container each, with the actual `IOException` swallowed by the
 /// logger delegate.
@@ -2915,23 +3107,47 @@ fn channel_key_for_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if sel_id == 0 {
         return Ok(Some(Value::Object(None)));
     }
-    // The channel's net fd (tcp_registry id) is the per-selector key into the
-    // registration map — exactly what `channel_register_native` stored under.
-    let Some(net_fd) = crate::socket_channel::channel_net_fd(ctx, channel)
-        .or_else(|| crate::datagram_channel_fd(ctx, channel))
-    else {
-        // Not bound / connected → no live registration to find.
-        return Ok(Some(Value::Object(None)));
-    };
-    let key_obj = selectors().read().get(&sel_id).and_then(|s| {
+    // The channel's net fd is the map key only once the channel HAS a socket;
+    // an unbound / unconnected registration is filed under a placeholder
+    // pseudo-fd (see `SelectorState::keys`). So try the fd first, then fall
+    // back to matching the registration's `sk_table` row on the channel — which
+    // is what actually identifies it. Answering from the fd alone made
+    // `keyFor()` return null for a registered-but-unbound channel and, while
+    // every unresolved registration shared the `-1` slot, return ANOTHER
+    // channel's SelectionKey.
+    let net_fd = crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel));
+    let candidates: Vec<(i32, ObjectRef)> = {
+        let regs = selectors().read();
+        let Some(s) = regs.get(&sel_id) else {
+            return Ok(Some(Value::Object(None)));
+        };
         let guard = s.lock();
+        if let Some(fd) = net_fd {
+            if let Some(k) = guard.keys.get(&fd).filter(|k| !k.cancelled) {
+                if let Some(key) = k.key_obj {
+                    return Ok(Some(Value::Object(Some(key))));
+                }
+            }
+        }
         guard
             .keys
-            .get(&net_fd)
-            .filter(|k| !k.cancelled)
-            .and_then(|k| k.key_obj)
-    });
-    Ok(Some(Value::Object(key_obj)))
+            .iter()
+            .filter(|(fd, k)| **fd < 0 && !k.cancelled)
+            .filter_map(|(fd, k)| k.key_obj.map(|key| (*fd, key)))
+            .collect()
+    };
+    for (_, key) in candidates {
+        let hash = ctx.identity_hash_code(key);
+        let owns = {
+            let t = sk_table().read();
+            sk_find(&t, key, hash).is_some_and(|row| row.channel == channel)
+        };
+        if owns {
+            return Ok(Some(Value::Object(Some(key))));
+        }
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2997,10 +3213,12 @@ fn key_cancel_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         s.cancelled = true;
         s.ready_ops = 0;
     });
-    let Some(fd) = key_fd(ctx, key) else {
-        return Ok(None);
-    };
-    let Some(sel_id) = key_selector_id(ctx, key) else {
+    // Resolve the slot through the KEY, not through the channel's fd: a
+    // registration made before the channel had a socket is filed under a
+    // placeholder pseudo-fd, and `key_fd` (which asks the channel) would then
+    // name a slot that does not exist — leaving the key live in the selector
+    // and still polled after cancel(). See `SelectorState::keys`.
+    let Some((sel_id, fd)) = slot_of_key_obj(key) else {
         return Ok(None);
     };
     selector_cancel(sel_id, fd);
@@ -3014,6 +3232,111 @@ fn key_cancel_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // Writable, Connectable, Acceptable} stay as JDK bytecode (final methods
 // that mask readyOps() against OP_*).
 // ---------------------------------------------------------------------------
+
+
+/// `SelectionKey.attach(Object)` -- guarded for a foreign receiver (see
+/// `socket_channel::foreign_nio_receiver`).
+///
+/// `attach`/`attachment` are CONCRETE on `java.nio.channels.SelectionKey`
+/// itself, so the superclass walk's "parent has BOTH bytecode and a native ->
+/// the native wins" rule hands a third-party key to us. Netty's NIO event loop
+/// stores its per-channel registration as the key's attachment and reads it
+/// back in `processSelectedKey`; answered out of OUR key registry that is
+/// always null for a `com.barchart.udt.nio.SelectionKeyUDT`, so no UDT
+/// readiness event was ever dispatched and the connect promise never
+/// completed even though the UDT socket had reached CONNECTED.
+fn g_sk_attach(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "attach",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+    ) {
+        Some(r) => r,
+        None => sk_attach(ctx, args),
+    }
+}
+
+/// `SelectionKey.attachment()` -- see [`g_sk_attach`].
+fn g_sk_attachment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "attachment", "()Ljava/lang/Object;") {
+        Some(r) => r,
+        None => sk_attachment(ctx, args),
+    }
+}
+
+/// `SelectionKey.isValid()` -- concrete on `AbstractSelectionKey`.
+fn g_sk_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "isValid", "()Z") {
+        Some(r) => r,
+        None => sk_is_valid(ctx, args),
+    }
+}
+
+/// `SelectionKey.cancel()` -- concrete on `AbstractSelectionKey`.
+fn g_sk_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "cancel", "()V") {
+        Some(r) => r,
+        None => sk_cancel_public(ctx, args),
+    }
+}
+
+/// `SelectionKey.channel()` -- abstract in the JDK, so a foreign key declares
+/// its own; guarded for the same reason as its siblings, not because the walk
+/// currently reaches us.
+fn g_sk_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "channel",
+        "()Ljava/nio/channels/SelectableChannel;",
+    ) {
+        Some(r) => r,
+        None => sk_channel(ctx, args),
+    }
+}
+
+/// `SelectionKey.selector()` -- see [`g_sk_channel`].
+fn g_sk_selector(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "selector",
+        "()Ljava/nio/channels/Selector;",
+    ) {
+        Some(r) => r,
+        None => sk_selector(ctx, args),
+    }
+}
+
+/// `SelectionKey.interestOps()` -- see [`g_sk_channel`].
+fn g_sk_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "interestOps", "()I") {
+        Some(r) => r,
+        None => sk_interest_ops(ctx, args),
+    }
+}
+
+/// `SelectionKey.interestOps(int)` -- see [`g_sk_channel`].
+fn g_sk_set_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(
+        ctx,
+        args,
+        "interestOps",
+        "(I)Ljava/nio/channels/SelectionKey;",
+    ) {
+        Some(r) => r,
+        None => sk_set_interest_ops(ctx, args),
+    }
+}
+
+/// `SelectionKey.readyOps()` -- see [`g_sk_channel`].
+fn g_sk_ready_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match crate::socket_channel::foreign_nio_delegate(ctx, args, "readyOps", "()I") {
+        Some(r) => r,
+        None => sk_ready_ops(ctx, args),
+    }
+}
 
 fn sk_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
@@ -3848,7 +4171,7 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "java/nio/channels/SelectableChannel",
         "register",
         "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
-        channel_register_native,
+        g_channel_register2,
     );
     // Native dispatch (WP0.1) keys on the receiver's concrete class, and the
     // public `register` methods live on `AbstractSelectableChannel` whose real
@@ -3875,19 +4198,19 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             c,
             "register",
             "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
-            channel_register_native,
+            g_channel_register2,
         );
         r.register(
             c,
             "register",
             "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
-            channel_register_native,
+            g_channel_register3,
         );
         r.register(
             c,
             "keyFor",
             "(Ljava/nio/channels/Selector;)Ljava/nio/channels/SelectionKey;",
-            channel_key_for_native,
+            g_channel_key_for,
         );
     }
 
@@ -3905,26 +4228,26 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             c,
             "channel",
             "()Ljava/nio/channels/SelectableChannel;",
-            sk_channel,
+            g_sk_channel,
         );
-        r.register(c, "selector", "()Ljava/nio/channels/Selector;", sk_selector);
-        r.register(c, "interestOps", "()I", sk_interest_ops);
+        r.register(c, "selector", "()Ljava/nio/channels/Selector;", g_sk_selector);
+        r.register(c, "interestOps", "()I", g_sk_interest_ops);
         r.register(
             c,
             "interestOps",
             "(I)Ljava/nio/channels/SelectionKey;",
-            sk_set_interest_ops,
+            g_sk_set_interest_ops,
         );
-        r.register(c, "readyOps", "()I", sk_ready_ops);
-        r.register(c, "isValid", "()Z", sk_is_valid);
+        r.register(c, "readyOps", "()I", g_sk_ready_ops);
+        r.register(c, "isValid", "()Z", g_sk_is_valid);
         r.register(
             c,
             "attach",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
-            sk_attach,
+            g_sk_attach,
         );
-        r.register(c, "attachment", "()Ljava/lang/Object;", sk_attachment);
-        r.register(c, "cancel", "()V", sk_cancel_public);
+        r.register(c, "attachment", "()Ljava/lang/Object;", g_sk_attachment);
+        r.register(c, "cancel", "()V", g_sk_cancel);
     }
 
     // Selector.selectedKeys / Selector.keys — bytecode in SelectorImpl
@@ -3954,8 +4277,8 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             "()Ljava/nio/channels/Selector;",
             selector_wakeup_public,
         );
-        r.register(c, "close", "()V", selector_close_native);
-        r.register(c, "isOpen", "()Z", selector_is_open_native);
+        r.register(c, "close", "()V", g_selector_close);
+        r.register(c, "isOpen", "()Z", g_selector_is_open);
         // W7-9 §6 / §8.2 — the ninth abstract. See `selector_provider_native`
         // for why this delegates to the real static factory, why the §8.2
         // blocker ("no `NativeContext::invoke_static`") was a false negative,
@@ -3965,7 +4288,7 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             c,
             "provider",
             "()Ljava/nio/channels/spi/SelectorProvider;",
-            selector_provider_native,
+            g_selector_provider,
         );
         // SelectorImpl.lockAndDoSelect bypass: route directly to our select.
         r.register(
@@ -4251,6 +4574,55 @@ mod tests {
         let id = selector_open();
         assert!(id > 0);
         assert_eq!(selector_key_count(id), 0);
+        selector_close(id);
+    }
+
+    /// Two registrations whose channel has no OS socket yet must occupy two
+    /// slots. They both answered `net_fd == -1`, shared one HashMap entry, and
+    /// the second `insert` silently replaced the first —
+    /// `NioEventLoopTest.testChannelsRegistered` saw `keys().size() == 1` for
+    /// two successfully-registered `NioServerSocketChannel`s (netty registers
+    /// before it binds). Guards `SelectorState::alloc_unresolved_fd`.
+    #[test]
+    fn unresolved_registrations_do_not_share_one_slot() {
+        let id = selector_open();
+        // -1 is exactly what `channel_net_fd` answers for an unbound channel.
+        selector_register(id, -1, 0, None, 0x1111, None).unwrap();
+        assert_eq!(selector_key_count(id), 1);
+        selector_register(id, -1, 0, None, 0x2222, None).unwrap();
+        assert_eq!(
+            selector_key_count(id),
+            2,
+            "two unbound registrations collapsed into one slot"
+        );
+        selector_register(id, -1, 0, None, 0x3333, None).unwrap();
+        assert_eq!(selector_key_count(id), 3);
+        // A resolved registration still keys on its real fd, and does not
+        // collide with the placeholder space.
+        let fd = fake_fd();
+        selector_register(id, fd, OP_READ, None, 0x4444, None).unwrap();
+        assert_eq!(selector_key_count(id), 4);
+        selector_close(id);
+    }
+
+    /// A re-register of the SAME key object must reuse its slot rather than
+    /// allocate a second placeholder: `NioIoHandler.rebuildSelector` re-registers
+    /// every key, so allocating per call would leak one entry per rebuild and
+    /// `numRegistered()` would then OVER-count.
+    #[test]
+    fn re_registering_the_same_unresolved_key_reuses_its_slot() {
+        // A stand-in for the Java SelectionKey: `selector_register` only ever
+        // compares `key_obj` for equality, never dereferences it.
+        let key = fake_ref(0x5150);
+        let id = selector_open();
+        selector_register(id, -1, 0, Some(key), 0x5150, None).unwrap();
+        assert_eq!(selector_key_count(id), 1);
+        selector_register(id, -1, OP_READ, Some(key), 0x5150, None).unwrap();
+        assert_eq!(
+            selector_key_count(id),
+            1,
+            "re-register of the same key allocated a second placeholder slot"
+        );
         selector_close(id);
     }
 
@@ -4576,18 +4948,24 @@ mod tests {
         selector_close(id);
     }
 
+    /// The `i64::MAX` (indefinite) arm of the LOW-LEVEL `selector_select` is
+    /// short-circuited by a pre-existing wakeup.
+    ///
+    /// Scope note: this test does NOT cover the `0 -> i64::MAX` translation in
+    /// `selector_select_native`, which is the actual BUGFIX [nio-selector]
+    /// change — it starts one level below it, at `selector_select(id,
+    /// i64::MAX)`, so deleting the translation leaves it green.
+    /// `select_zero_maps_to_the_indefinite_wait_not_a_poll` below is the test
+    /// for the translation itself.
+    ///
+    /// (The historical comment here claimed an un-woken
+    /// `selector_select(id, i64::MAX)` "would block the test forever". That has
+    /// not been true since the self-healing `select_infinite_cap_ms()` cap
+    /// landed: an indefinite wait now returns 0 after `DEFAULT_SELECT_CAP_MS`.
+    /// The pre-armed wakeup is still the point of THIS test, which is that the
+    /// short-circuit fires before the syscall.)
     #[test]
     fn nio_selector_indefinite_block_path_honors_wakeup() {
-        // BUGFIX [nio-selector] regression: the public `Selector.select(0)`
-        // overload maps argument 0 to *block indefinitely* (i64::MAX) in
-        // `selector_select_native`. The low-level `selector_select` proves
-        // that the indefinite-block path (timeout == i64::MAX → timeout_c -1)
-        // is reachable and is correctly short-circuited by a pre-existing
-        // wakeup — i.e. it blocks until wakeup rather than busy-spinning, the
-        // exact property `select(0)` event loops rely on. (We can't call
-        // `selector_select(id, i64::MAX)` without a prior wakeup here because
-        // it would block the test forever — which is the whole point of the
-        // fix.)
         let id = selector_open();
         selector_wakeup(id).unwrap();
         let start = Instant::now();
@@ -4599,6 +4977,85 @@ mod tests {
             "indefinite block must short-circuit on a pending wakeup, got {elapsed:?}"
         );
         selector_close(id);
+    }
+
+    /// BUGFIX [nio-selector]: `Selector.select(0)` must BLOCK, not poll.
+    ///
+    /// The JDK contract is that only `selectNow()` polls; `select(0)` blocks
+    /// until a channel is ready or `wakeup()` fires. `selector_select_native`
+    /// implements that with one line — `if timeout == 0 { i64::MAX }` — and
+    /// without it an idiomatic `while (running) selector.select(0);` event loop
+    /// spins at 100% CPU.
+    ///
+    /// This test drives `selector_select_native` itself, so the translation is
+    /// on the call path. The only observable difference between the two
+    /// timeouts is TIME (both return 0 ready keys), so the signal is amplified
+    /// over `ITERS` calls and checked against a floor derived from the
+    /// production cap itself (`select_infinite_cap_ms()`), so retuning the cap
+    /// retunes the test.
+    ///
+    /// The assertion is deliberately a LOWER bound and nothing else: a loaded
+    /// host can only push a blocking measurement further into the passing
+    /// region, never out of it. The genuine poll is timed too, but only to
+    /// print alongside the failure — a ratio between the two would be an upper
+    /// bound in disguise and would flake when the poll loop hits a scheduler
+    /// stall.
+    ///
+    /// Mutation this catches: delete `let timeout = if timeout == 0 { i64::MAX
+    /// } else { timeout };` from `selector_select_native`. Each call then costs
+    /// a non-blocking poll (microseconds) instead of one capped block, and the
+    /// floors below are missed by more than an order of magnitude.
+    #[test]
+    fn select_zero_maps_to_the_indefinite_wait_not_a_poll() {
+        const ITERS: u32 = 8;
+
+        let id = selector_open();
+        let mut ctx = crate::test_support::MockNativeContext::new();
+        // Legacy synthetic-layout selector object: `selector_id_from_obj` falls
+        // back to the indexed slots when the object is not in `sel_obj_ids`.
+        let obj = ctx.alloc_object(SI_OPEN_FLAG + 1);
+        ctx.set_field(obj, SI_ID, Value::Int(id));
+        ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(1));
+
+        // Baseline: the genuine non-blocking probe. This is the path
+        // `selectNow0` takes, and it is what `select(0)` WRONGLY took before
+        // the fix.
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            assert_eq!(
+                selector_select(id, 0).unwrap(),
+                0,
+                "a poll of an empty selector reports no ready keys"
+            );
+        }
+        let poll_total = t0.elapsed();
+
+        // The public `select(0)` overload, through the native that owns the
+        // translation.
+        let t1 = Instant::now();
+        for _ in 0..ITERS {
+            match selector_select_native(&mut ctx, &[Value::Object(Some(obj)), Value::Long(0)]) {
+                Ok(Some(Value::Int(0))) => {}
+                other => panic!("select(0) on an empty selector must return 0, got {other:?}"),
+            }
+        }
+        let blocking_total = t1.elapsed();
+
+        selector_close(id);
+
+        // Half the nominal blocked time, so scheduler jitter and an early
+        // return on the last iteration cannot trip it.
+        let cap_ms = select_infinite_cap_ms().max(0) as u64;
+        let floor = Duration::from_millis(cap_ms * u64::from(ITERS) / 2);
+        assert!(
+            blocking_total >= floor,
+            "select(0) must map to the indefinite wait (capped at {cap_ms} ms per \
+             call), so {ITERS} calls must take at least {floor:?}; took \
+             {blocking_total:?} against {poll_total:?} for the same number of \
+             genuine polls. A poll-sized figure here means the `0 -> i64::MAX` \
+             translation in selector_select_native is gone and every \
+             `while (running) selector.select(0);` loop is spinning at 100% CPU."
+        );
     }
 
     #[test]

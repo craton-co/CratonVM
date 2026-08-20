@@ -153,13 +153,56 @@ pub(crate) fn resolve_field_ref(
 /// global store. Behaviour is unchanged whenever the referencing class is
 /// NOT user-loader-owned (gate off, or a built-in defining loader) — that
 /// case still resolves via the same global `load_class_concurrent` path.
-/// `CRATONVM_JIT=field-site-cache` — enable the per-thread resolved-field site
-/// cache ([`FieldSiteCache`]). Read once and cached; this sits on the
-/// interpreter's field path. Default-OFF → behaviour byte-for-byte unchanged.
+/// `CRATONVM_JIT=field-site-cache` — the per-thread resolved-field site cache
+/// ([`FieldSiteCache`]). Read once and cached; this sits on the interpreter's
+/// field path.
+///
+/// # Default-ON since 2026-08-18; `CRATONVM_JIT_FIELD_SITE_CACHE=0` opts out
+///
+/// It shipped default-OFF on 2026-08-05 and stayed there, which made it a
+/// feature that could not be measured by anyone who did not already know the
+/// variable's name. `site_stats` reports the state plainly: over 38 million
+/// interpreted `getfield`s the field counters read `hit=0 miss=0 fill=0` — not
+/// a cache that missed, a cache never CONSULTED. The module docs anticipated
+/// exactly this reading ("an inert gate shows up here immediately as `hit=0`").
+///
+/// What the default was costing, marginal ns per opcode over an `iadd`
+/// control, one binary, `--nojit`, arms interleaved (`probes/InterpDecodedOpcodeCostProbe.java`):
+///
+/// | opcode      | OFF       | ON        |
+/// |-------------|-----------|-----------|
+/// | `getfield`  | 549 / 720 | 251 / 245 |
+/// | `putfield`  | 557 / 653 | 222 / 240 |
+/// | `getstatic` | 474 / 545 | 174 / 200 |
+/// | `putstatic` | 424 / 505 | 176 / 180 |
+///
+/// That reproduces the Azure figures the lever was accepted on
+/// (1.9-2.7x per pass, and 12.7% off the real Tomcat annotation scan; see
+/// known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md),
+/// which is why the default moved rather than the measurement being retaken.
+///
+/// The correctness argument is unchanged and lives in `site_cache`'s module
+/// docs — three epochs, checked per entry on every hit and every fill, any of
+/// which wipes the entry. Nothing here relaxes it; only the default moved.
+/// `field-site-cache-loader` (the wider-surface arm that also admits
+/// loader-sensitive sites) stays opt-in, and so does `method-site-cache`,
+/// which measured nothing and is kept on that footing.
 fn field_site_cache_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FIELD_SITE_CACHE").is_some()
+        // Same opt-out spelling as `CRATONVM_JIT_OSR` (`env_cache`), so one
+        // kill switch reads the same way across the interpreter's default-ON
+        // levers. Unset → enabled.
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_FIELD_SITE_CACHE")
+            .ok()
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0"
+                    || v.eq_ignore_ascii_case("false")
+                    || v.eq_ignore_ascii_case("off")
+                    || v.eq_ignore_ascii_case("no"))
+            })
+            .unwrap_or(true)
     })
 }
 
@@ -1121,8 +1164,10 @@ pub(super) fn pop_coerced_invoke_args_virtual(
         b'L',
         tmp_cv[0].0.decode_by_descriptor(b'L'),
     ));
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&method_descriptor);
     for i in 0..num_params {
-        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
+        let pd_byte = param_tags.get(&method_descriptor, i);
         let (cv, is_long) = tmp_cv[i + 1];
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
@@ -1162,8 +1207,10 @@ pub(super) fn pop_coerced_invoke_args_static(
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&method_descriptor);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
+        let pd_byte = param_tags.get(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }

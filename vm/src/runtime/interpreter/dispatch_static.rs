@@ -354,8 +354,10 @@ pub(super) fn execute_invokestatic(
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
+    // ONE forward scan, hoisted out of the per-argument loop below.
+    let param_tags = ParamTags::of(&method_descriptor);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
+        let pd_byte = param_tags.get(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
@@ -550,6 +552,88 @@ pub(super) static INTRINSIC_HITS: std::sync::atomic::AtomicU64 = std::sync::atom
 /// Number of interpreter intrinsic fast-path dispatches since process start.
 pub fn intrinsic_hit_count() -> u64 {
     INTRINSIC_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Declare that filling an inline cache with `CachedInvokeTarget::Intrinsic`
+/// has taken this native's registry slot **off the counted path**, so
+/// `--dump-native-registry`'s `invocations` column reports a floor for it and
+/// says so.
+///
+/// # Why this is needed at all
+///
+/// An `Intrinsic` entry holds a raw `fn` pointer resolved once, at cache-fill
+/// time. Every later dispatch through that entry runs the callback directly and
+/// **never consults the registry again**, so
+/// [`record_invocation`](cratonvm_native_api::NativeMethodRegistry::record_invocation)
+/// is never reached. MEASURED (`G33-1` §2, causal, one variable): 100,000
+/// `Math.abs` calls report `invocations: 1`; the identical run with
+/// `CRATONVM_DISABLE_INTRINSICS=1` reports **100,000**.
+///
+/// This bypass is **arm-independent** — it is just as blind under `--nojit` as
+/// with the JIT on — which makes it invisible to the paired-arm cross-check
+/// (`G37-1` §5) that is the first thing a reader reaches for. It is the largest
+/// of the four known families.
+///
+/// # Bind time, never per call
+///
+/// A hot-path counter measured **+9.2 ns/call** against a 1.25 ns baseline
+/// (`G33-1` §5) — plausibly the entire margin the intrinsic cache exists to
+/// buy, since the whole point of an `Intrinsic` entry is to skip the `RwLock`,
+/// the descriptor parse and the registry probe. So this is called **once per
+/// cache fill**, on the cold populate path, and never from the steady-state
+/// dispatch arm. It is `#[cold]` and it is one relaxed store.
+///
+/// # What the bit claims
+///
+/// That a bypassing path is **wired** for the slot, not that a bypassing
+/// dispatch has happened. That is the statically true statement, and it is the
+/// one a report-time reader can act on: it converts `invocations: N` from a
+/// claimed total into an admitted floor.
+///
+/// Sticky, by the registry's design — see
+/// [`mark_invocations_incomplete`](cratonvm_native_api::NativeMethodRegistry::mark_invocations_incomplete).
+#[cold]
+pub(super) fn mark_intrinsic_cache_bypass(
+    registry: &cratonvm_native_api::NativeMethodRegistry,
+    id: cratonvm_native_api::NativeMethodId,
+) {
+    registry.mark_invocations_incomplete(id);
+}
+
+/// [`mark_intrinsic_cache_bypass`] for the two install sites that hold the
+/// triple but **no** `NativeMethodId`: `dispatch_virtual.rs`'s
+/// `populate_invoke_cache` intrinsic block, which resolves its intrinsic
+/// through the class store rather than through the registry, and the
+/// `Thread.onSpinWait` install in this file, which deliberately fires without
+/// requiring a registered native at all.
+///
+/// Returns `true` if a registry row existed and was marked.
+///
+/// **A `false` is not a failure.** Several intrinsics have no registry row in
+/// this VM — `String.charAt` and `String.length` are registered nowhere in the
+/// `--jdk-only` binary (`G33-1` §2, checked directly in the dump, *absent* and
+/// not zero-valued) — and a triple with no row has no `invocations` cell that
+/// could mislead anyone. Marking is only meaningful where a row exists to be
+/// read.
+///
+/// One `resolve_id` — a class prefilter hit plus one hash — paid once per cache
+/// fill on the cold populate path, in a block that has just taken the class
+/// manager's read lock and walked the superclass chain. It is not measurable
+/// against that.
+#[cold]
+pub(super) fn mark_intrinsic_cache_bypass_by_triple(
+    registry: &cratonvm_native_api::NativeMethodRegistry,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    match registry.resolve_id(class_name, method_name, descriptor) {
+        Some(id) => {
+            mark_intrinsic_cache_bypass(registry, id);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Dispatch a resolved intrinsic: count the hit, run the callback through the
@@ -789,6 +873,19 @@ pub(super) fn populate_invoke_cache(
         drop(cm);
         let kind = cratonvm_native_api::InterpIntrinsic::ThreadOnSpinWait;
         let param_descs: Arc<[Arc<str>]> = Arc::from(Vec::new());
+        // Census: the blindest of the three intrinsic installs — the matching
+        // arm in `execute_invokestatic_cached` answers this call site WITHOUT
+        // running the callback at all, so a registered `Thread.onSpinWait`
+        // native is bypassed completely. There is no row to mark in real-JDK
+        // mode (the census lists none, which is this branch's whole premise);
+        // there IS one when the builtins registrar has run, and that is the
+        // configuration in which the count would otherwise lie.
+        mark_intrinsic_cache_bypass_by_triple(
+            &shared.natives.native_methods,
+            &class_name,
+            &method_name,
+            &descriptor,
+        );
         thread.invoke_cache.put(
             caller_class_id,
             cp_index,
@@ -948,6 +1045,11 @@ pub(super) fn populate_invoke_cache(
                 let param_descs: Arc<[Arc<str>]> =
                     pd_vec.iter().map(|s| Arc::from(s.as_str())).collect();
                 let return_type = crate::jit::return_type(&descriptor);
+                // Census: this site is about to be bound to a raw `fn` pointer
+                // and will never consult the registry again. `native_id` is the
+                // row that would have carried the count, resolved a few lines
+                // above — declare the slot a floor before the entry exists.
+                mark_intrinsic_cache_bypass(&shared.natives.native_methods, native_id);
                 let target = CachedInvokeTarget::Intrinsic {
                     kind,
                     callback: cratonvm_native_builtins::intrinsics::callback_for(kind),
@@ -1207,10 +1309,17 @@ pub(super) fn execute_invokestatic_cached(
     // Thread-local invoke cache — no locking needed. invokestatic uses
     // is_special=false since static calls never collide cp_index with
     // invokespecial in the same class (different CP entries semantically).
+    let ph_t0 = crate::runtime::interpreter::invoke_phases::now();
     let target = match thread.invoke_cache.get(caller_class_id, cp_index, false) {
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
+    let ph_t1 = crate::runtime::interpreter::invoke_phases::now();
+    crate::runtime::interpreter::invoke_phases::charge(
+        crate::runtime::interpreter::invoke_phases::P_IC_LOOKUP,
+        ph_t0,
+        ph_t1,
+    );
     // JVMTI redefine guard (static): never serve a cached native/intrinsic
     // SHADOW for a static method whose declaring class an agent has redefined
     // (e.g. Mockito `mockStatic(X)` woves X's static methods) — evict and
@@ -1401,11 +1510,17 @@ pub(super) fn execute_invokestatic_cached(
                 &cached,
             )
         }
+        // Bound BY VALUE, not `ref`: the entry `Arc` cloned out of the invoke
+        // cache above is owned by `target`, which dies at the end of this arm,
+        // so the frame can take it by MOVE. Bound by reference it had to be
+        // cloned again — two atomic refcount bumps per call (and two matching
+        // decrements on pop) where one is the minimum, since the cache keeps
+        // its own and the frame needs its own.
         CachedInvokeTarget::Bytecode {
-            ref cached,
-            gate: ref entry_gate,
+            cached,
+            gate: entry_gate,
         } => {
-            if cached_static_owner_stale(shared, caller_class_id, cached) {
+            if cached_static_owner_stale(shared, caller_class_id, &cached) {
                 thread.invoke_cache.evict(caller_class_id, cp_index, false);
                 return Ok(CachedCallResult::CacheMiss);
             }
@@ -1617,7 +1732,7 @@ pub(super) fn execute_invokestatic_cached(
                     // declaring class, so a future `redefine_class` must
                     // invalidate this JIT entry too.
                     let upgrade_result =
-                        try_jit_upgrade_with_gate(shared, cached, entry_gate.clone());
+                        try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone());
                     if upgrade_result.is_none() && crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
                             "[cratonvm-jitc] upgrade-FAIL {}.{}{} invoc_count={}",
@@ -1678,24 +1793,51 @@ pub(super) fn execute_invokestatic_cached(
             // dropping the high bits before it reached the callee's locals.
             // The non-cached `execute_invokestatic` path already decodes this
             // way. See gaps/bc-ec-mod-mododdinverse-investigation.md.
-            const MAX_INLINE_ARGS: usize = 16;
+            // 8, not 16. `args_buf` is `[Value; MAX_INLINE_ARGS]` and `Value`
+            // is 16 bytes, so at 16 this initialised 256 BYTES on every call
+            // regardless of how many arguments the callee actually takes. The
+            // phase instrument charged 60.9 cyc/call to argument handling on a
+            // workload of nothing but ZERO-argument calls, which is what that
+            // initialisation costs. Eight covers essentially every method and
+            // wider ones still spill to `args_vec` exactly as before.
+            const MAX_INLINE_ARGS: usize = 8;
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
-            let pd_byte = |i: usize| -> u8 { nth_param_tag_byte(&cached.method_descriptor, i) };
-            let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
+            let ph_t2 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_GUARDS,
+                ph_t1,
+                ph_t2,
+            );
+            // A zero-argument call builds no buffer and scans no descriptor at
+            // all. `invokestatic` of a no-arg method is a very common shape and
+            // it was paying for both. `args_buf` is deliberately declared
+            // WITHOUT an initialiser so the 128 bytes are written only on the
+            // path that uses them.
+            let mut args_buf: [Value; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
-            let args_slice: &mut [Value] = if num_params <= MAX_INLINE_ARGS {
+            let args_slice: &mut [Value] = if num_params == 0 {
+                &mut []
+            } else if num_params <= MAX_INLINE_ARGS {
+                // ONE forward scan; the per-argument form rescanned from `(` each time.
+                let param_tags = ParamTags::of(&cached.method_descriptor);
+                args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
                 for i in (0..num_params).rev() {
                     args_buf[i] = thread.frames[frame_idx]
                         .stack
-                        .pop_arg_for_descriptor_checked(pd_byte(i))?;
+                        .pop_arg_for_descriptor_checked(
+                            param_tags.get(&cached.method_descriptor, i),
+                        )?;
                 }
                 &mut args_buf[..num_params]
             } else {
+                let param_tags = ParamTags::of(&cached.method_descriptor);
                 args_vec.resize(num_params, Value::Uninitialized);
                 for i in (0..num_params).rev() {
                     args_vec[i] = thread.frames[frame_idx]
                         .stack
-                        .pop_arg_for_descriptor_checked(pd_byte(i))?;
+                        .pop_arg_for_descriptor_checked(
+                            param_tags.get(&cached.method_descriptor, i),
+                        )?;
                 }
                 &mut args_vec
             };
@@ -1737,8 +1879,14 @@ pub(super) fn execute_invokestatic_cached(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 (cached.max_stack as usize).max(16) + 8,
             );
+            let ph_t3 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_ARGS,
+                ph_t2,
+                ph_t3,
+            );
             let mut frame = Frame::new_pooled_cached(
-                cached.clone(),
+                cached,
                 args_slice,
                 &mut thread.locals_pool,
                 &mut thread.stacks_pool,
@@ -1753,7 +1901,20 @@ pub(super) fn execute_invokestatic_cached(
                     frame.method_descriptor()
                 );
             }
+            let ph_t4 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_FRAME_BUILD,
+                ph_t3,
+                ph_t4,
+            );
             push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+            let ph_t5 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_PUSH,
+                ph_t4,
+                ph_t5,
+            );
+            crate::runtime::interpreter::invoke_phases::count_call();
             Ok(CachedCallResult::FramePushed)
         }
         _ => Ok(CachedCallResult::CacheMiss),
@@ -1870,5 +2031,216 @@ mod dynamic_dispatch_slot_tests {
                 assert_eq!(pic[0].0, 27);
             }
         }
+    }
+}
+
+/// The census half of the intrinsic inline cache: `mark_intrinsic_cache_bypass`
+/// and `mark_intrinsic_cache_bypass_by_triple`, which are what stop
+/// `--dump-native-registry`'s `invocations` column from claiming a total it
+/// cannot have.
+///
+/// Recorded in
+/// `docs/known-issues/jdk-only/G42-1-the-intrinsic-cache-and-the-1999-20260817.md`.
+#[cfg(test)]
+mod intrinsic_census_tests {
+    use super::{
+        mark_intrinsic_cache_bypass, mark_intrinsic_cache_bypass_by_triple, OSR_THRESHOLD,
+    };
+    use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodId, NativeMethodRegistry};
+    use cratonvm_types::error::MethodCallResult;
+    use cratonvm_types::Value;
+
+    fn dummy_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(None)
+    }
+
+    fn dummy_native_2(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(42)))
+    }
+
+    /// The core contract: marking turns a claimed total into an admitted floor
+    /// WITHOUT disturbing the number, is per slot, and is idempotent.
+    ///
+    /// Idempotence is not decoration. `populate_invoke_cache` runs once per
+    /// (caller class, cp index) call site and there are many call sites per
+    /// triple, plus the promoted-resolution cache re-publishes entries across
+    /// threads — so this mark fires repeatedly for the same slot by design.
+    #[test]
+    fn marking_an_intrinsic_install_turns_its_row_into_a_floor() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Intrinsic, |r| {
+            r.register("java/lang/Math", "abs", "(I)I", dummy_native);
+            r.register(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+                dummy_native_2,
+            );
+        });
+        let abs = registry
+            .resolve_id("java/lang/Math", "abs", "(I)I")
+            .expect("registered");
+        // The control that stayed exact in every configuration G33-1 measured.
+        let control = registry
+            .resolve_id(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+            )
+            .expect("registered");
+
+        // Before any cache fill both rows claim to be totals.
+        assert_eq!(registry.invocations_complete(abs), Some(true));
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+
+        // The first call at a site goes down the counted path; the cache fill
+        // then binds every later call to a raw `fn` pointer.
+        registry.record_invocation(abs);
+        mark_intrinsic_cache_bypass(&registry, abs);
+
+        assert_eq!(
+            registry.invocations_of_id(abs),
+            Some(1),
+            "marking must not disturb the tally — the floor is the number a \
+             reader falls back on, and this is the measured `Math.abs` = 1"
+        );
+        assert_eq!(registry.invocations_complete(abs), Some(false));
+        assert_eq!(
+            registry.invocations_complete(control),
+            Some(true),
+            "the bit is per slot: an intrinsic install must not cast doubt on \
+             a native that is still dispatched through the counted path"
+        );
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+
+        // Many call sites, one slot.
+        mark_intrinsic_cache_bypass(&registry, abs);
+        mark_intrinsic_cache_bypass(&registry, abs);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+        assert_eq!(registry.invocations_of_id(abs), Some(1));
+
+        // And the doubt has to survive the trip into the census, which is the
+        // only place a reader ever sees it.
+        let census = registry.census();
+        let abs_row = census
+            .iter()
+            .find(|r| r.class == "java/lang/Math" && r.owns_slot)
+            .expect("slot owner");
+        assert!(!abs_row.invocations_complete);
+        let control_row = census
+            .iter()
+            .find(|r| r.class == "java/lang/System" && r.owns_slot)
+            .expect("slot owner");
+        assert!(control_row.invocations_complete);
+    }
+
+    /// `dispatch_virtual.rs` reaches its intrinsic through the CLASS STORE and
+    /// marks the **declaring** class's row. Pin that choice: `Object.hashCode`
+    /// and a subclass's own `hashCode` are two different registry slots, and
+    /// marking the wrong one would leave the row that actually loses the calls
+    /// still claiming to be a total — a silent failure in the one direction
+    /// this instrument must never err in.
+    #[test]
+    fn the_by_triple_helper_marks_only_the_named_classes_row() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("java/lang/Object", "hashCode", "()I", dummy_native);
+            r.register("p/Sub", "hashCode", "()I", dummy_native_2);
+        });
+        let declaring = registry
+            .resolve_id("java/lang/Object", "hashCode", "()I")
+            .expect("registered");
+        let other = registry
+            .resolve_id("p/Sub", "hashCode", "()I")
+            .expect("registered");
+
+        assert!(
+            mark_intrinsic_cache_bypass_by_triple(&registry, "java/lang/Object", "hashCode", "()I"),
+            "a triple with a registry row reports that it marked one"
+        );
+        assert_eq!(registry.invocations_complete(declaring), Some(false));
+        assert_eq!(
+            registry.invocations_complete(other),
+            Some(true),
+            "same method name and descriptor, different class, different slot"
+        );
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+    }
+
+    /// A `false` from the by-triple helper is the NORMAL case for several live
+    /// intrinsics and is not a failure.
+    ///
+    /// `String.charAt` and `String.length` are registered nowhere in the
+    /// `--jdk-only` binary — G33-1 §2 checked the dump directly and found them
+    /// *absent*, not zero-valued — and `Thread.onSpinWait` has no row in
+    /// real-JDK mode either, which is the premise of the branch that installs
+    /// it. A triple with no row has no `invocations` cell that could mislead
+    /// anyone, so there is nothing to mark and nothing to report.
+    ///
+    /// It must also not panic: this runs on the inline-cache fill path for
+    /// every call in the VM.
+    #[test]
+    fn a_triple_with_no_registry_row_is_a_silent_no_op() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("java/lang/Object", "hashCode", "()I", dummy_native);
+        });
+
+        assert!(!mark_intrinsic_cache_bypass_by_triple(
+            &registry,
+            "java/lang/String",
+            "charAt",
+            "(I)C"
+        ));
+        assert!(!mark_intrinsic_cache_bypass_by_triple(
+            &registry,
+            "java/lang/Thread",
+            "onSpinWait",
+            "()V"
+        ));
+        assert_eq!(
+            registry.slots_with_incomplete_invocations(),
+            0,
+            "an absent triple must not manufacture doubt on some other slot"
+        );
+
+        // The empty-registry case: `register_collections_natives` and
+        // `register_essential_natives` are separate registrars, so a cache fill
+        // can run against a registry that has not been populated yet.
+        let empty = NativeMethodRegistry::new();
+        assert!(!mark_intrinsic_cache_bypass_by_triple(
+            &empty,
+            "java/lang/Math",
+            "abs",
+            "(I)I"
+        ));
+        assert_eq!(empty.slots_with_incomplete_invocations(), 0);
+
+        // And the foreign/stale-handle contract, inherited from
+        // `record_invocation`: ignored, never a panic.
+        mark_intrinsic_cache_bypass(&registry, NativeMethodId::from_u32(9_999));
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+    }
+
+    /// Pins the constant the measured **1,999** is derived from, so that a
+    /// future retune of the loop threshold makes the record's headline number
+    /// visibly stale instead of quietly wrong.
+    ///
+    /// MEASURED on `9ae371468` (G42-1 §2): a `Method.invoke` loop in `main`
+    /// reports `invocations: 1,999` in the JIT arm and 99,999 under `--nojit`.
+    /// The arithmetic is
+    /// `OSR_THRESHOLD × 2 (the first backoff retry) × 1 call per iteration − 1
+    /// (the reflection deficit at the first call)`. It is a **transition
+    /// count** — how many calls were made before the compiled artifact was
+    /// installed — not a cap: with four invoke sites in one loop body the same
+    /// run reports **7,999**, four times as many, at the same back-edge count.
+    #[test]
+    fn the_measured_1999_is_two_osr_thresholds_of_interpreted_calls() {
+        assert_eq!(OSR_THRESHOLD, 1_000);
+        let first_retry_backedges = OSR_THRESHOLD * 2;
+        assert_eq!(first_retry_backedges - 1, 1_999);
+        // Four call sites in one loop body: same back-edges, four times the
+        // calls, and the measurement scaled exactly.
+        assert_eq!(first_retry_backedges * 4 - 1, 7_999);
     }
 }

@@ -170,7 +170,7 @@ claim.
 
 ### 3.2 How a green record froze the divergence
 
-docs/internal/fixed-suite-bugs/elasticsearch-suite/stackwalker-option-enum-constants-null-blocks-es-suite-FIXED.md
+fixed-suite-bugs/elasticsearch-suite/stackwalker-option-enum-constants-null-blocks-es-suite-FIXED.md
 closed this area on 2026-07-10 by adding `$VALUES` to the same native, and its
 Verification section records, as evidence of success:
 
@@ -467,3 +467,101 @@ them actually catch the defect rather than assuming all three do.
    census asserting that no real JDK enum's `values`/`valueOf`/`<clinit>` triple
    is registered under `--jdk-only` would close the species, not just its two
    known members.
+
+---
+
+# 9. Verification pass, 2026-08-12 — both fixes are present and they DO assert identity
+
+**Read-only. Nothing built, nothing run.** This section re-checks the *claims*
+of §5 and §8.3 against the tree rather than the dates on them, because a
+record's hypothesis can be wrong and not merely stale. Three of the four checks
+confirm the record; the fourth finds a live hole in the coverage §6 claims.
+
+## 9.1 The landed code matches what §5 and §8.3 describe
+
+* `native-builtins/src/stack_walker.rs::option_constant_names` derives the
+  constant list from `ctx.declared_fields(class_id)` filtered by
+  `f.is_static && f.descriptor == format!("L{class_name};")`, in declaration
+  order, and falls back to the historical three names **only** when the class
+  is unresolvable or declares none. `native_option_clinit` writes `name` and
+  `ordinal` into the two slots resolved against `java/lang/Enum` (never the
+  receiver), and builds `$VALUES` by **re-reading each published static**, so
+  `values()[i] == <the constant>` holds by construction rather than by a cached
+  reference. §5 is accurate line for line.
+* `native-builtins/src/lang_system.rs` carries `canonical_enum_constant` and
+  `canonical_enum_values` with the gating §8.3 states: `canonical_enum_values`
+  returns `None` unless the class declares at least one constant **and every
+  one reads back `Value::Object(Some(_))`**, so no array with null holes is
+  ever built, and `ensure_class_initialized`'s `Ok` is explicitly not treated
+  as proof a real class answered. `phases_late/concurrent.rs` calls both, for
+  `java/lang/Thread$State`, ahead of the old minting bodies. §8.3 is accurate.
+* One naming correction for anyone searching: there is no
+  `OPTION_FALLBACK_CONSTANTS` symbol. The fallback is a three-element array
+  literal inside `option_constant_names`; the derivation is the function.
+
+## 9.2 The fixture asserts IDENTITY, not non-null — checked, and it holds
+
+This is the check the record most needed, because two defects survived this
+year behind `!= null` and `values().length == 3`. `realEnumsAreSelfConsistent()`
+in `regression-suite/src/RJdkStrict.java` asserts, per declared constant `c` at
+index `i` — where the declared list comes from the class's **own**
+`getDeclaredFields()` filtered by `f.getType() == k`, so nothing is named or
+counted in the fixture:
+
+```java
+check(values[i] == c, ...);            // reference identity
+check(shared[i] == c, ...);            // getEnumConstants() identity
+check(valueOf.invoke(null, n) == c, ...);
+check(n.equals(((Enum<?>) c).name()), ...);
+check(((Enum<?>) c).ordinal() == i, ...);
+```
+
+Those are `==` on object references, over both accessors and `valueOf`. They
+are exactly the shapes §8.1 measures as the *only* detectors of the
+`Thread$State` defect — a `switch` and an `EnumSet` both pass over minted
+constants. So the answer to "does the landed fix assert identity" is **yes, and
+in the direction that catches the harder half**, plus the two null-check-passing
+shapes (`name()`, `ordinal()`) that catch §2's nameless constants.
+`java.lang.Thread.State` and `java.lang.StackWalker.Option` are both in the
+class list.
+
+## 9.3 The RESIDUAL: the Rust unit test cannot fail if the fix is reverted
+
+`option_clinit_populates_enum_values_array`
+(`native-builtins/src/stack_walker.rs`, test module) does now assert `name`,
+`ordinal` and `$VALUES`-vs-static identity, as §6 says. But its fixture
+declares exactly
+
+```text
+RETAIN_CLASS_REFERENCE, SHOW_HIDDEN_FRAMES, SHOW_REFLECT_FRAMES, $VALUES
+```
+
+— **the same three names, in the same order, as the hard-coded fallback list**
+`option_constant_names` returns when it can read nothing. Delete the entire
+`declared_fields` derivation and this test stays green: both paths produce the
+identical three constants, and the test then asserts `array_length == 3`
+against a hard-coded 3.
+
+So the test covers the `name`/`ordinal`/identity half of the fix and is
+**mutation-blind to the version-proofing half**, which is the half §5 argues is
+the point ("adding `DROP_METHOD_INFO` as a fourth hard-coded name would have
+re-armed the same trap"). The fixture that read green through this whole defect
+was a `length == 3` (§3.2); this one is a different assertion with the same
+blind spot in it.
+
+**Fix (nominated, not applied — the file is not this pass's):** give the mock
+fixture a **fourth** constant, `DROP_METHOD_INFO`, between
+`RETAIN_CLASS_REFERENCE` and `SHOW_REFLECT_FRAMES` (the real JDK 25 declaration
+order), and assert the array length against the fixture's own declared count
+rather than a literal. The fallback list cannot produce four names or that
+order, so the derivation becomes the only way the test can pass — and the
+ordinals then differ between the two paths, which is the second thing the
+current fixture cannot see.
+
+## 9.4 What this pass did not check
+
+No build and no run, so nothing here observes the repaired native's output;
+§7.3 and §8.5.1 remain the open items they were. The `--jdk-only` question in
+§7.4 — whether a native fabricating enum constants over a real, loaded,
+runnable JDK class should be refused outright rather than repaired — is
+untouched and is still the right question.

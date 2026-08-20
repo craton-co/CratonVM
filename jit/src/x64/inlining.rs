@@ -14,6 +14,44 @@
 
 use super::*;
 
+/// Record what a branch leaves at its target, or check it against what an
+/// earlier branch to the same target already left.
+///
+/// Returns `false` on a disagreement, which refuses the splice. Verified
+/// bytecode cannot produce one — the JVM's own verifier requires every path to
+/// a merge to agree on stack depth and types — so this is a ratchet against the
+/// walk having mis-modelled something, not a case that is expected to fire.
+fn record_merge_state(
+    states: &mut [Option<(usize, Vec<bool>)>],
+    target: usize,
+    depth: usize,
+    marks: &[bool],
+) -> bool {
+    match states.get_mut(target) {
+        None => false,
+        Some(slot) => match slot {
+            Some((recorded_depth, recorded_marks)) => {
+                *recorded_depth == depth && recorded_marks.as_slice() == marks
+            }
+            None => {
+                *slot = Some((depth, marks.to_vec()));
+                true
+            }
+        },
+    }
+}
+
+/// How deep the CALLEE's operand stack may be at a branch or a merge point.
+///
+/// Each live value costs one reserved frame slot for the whole splice plus a
+/// load/store pair per incoming path, so this is a real cost and not just a
+/// safety bound. Java's own expression stack at a merge is almost always 1 —
+/// the `cond ? a : b` diamond and the null-guard shape
+/// (`iconst_1; goto L; iconst_0; L: ireturn`) both merge exactly one value.
+/// Four leaves room for nested conditionals without letting an unusual body
+/// reserve an unbounded region.
+const MAX_INLINE_MERGE_DEPTH: usize = 4;
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Object headers, fields, allocation, string layout
@@ -107,7 +145,14 @@ impl Compiler {
         self.slot_mirror = None;
         self.slot_mirror_suppressed = true;
         let deopt_points_checkpoint = self.deopt_points.len();
+        // The scope for this splice — the ENCLOSING method's frame at the
+        // invoke, captured before the callee's body is emitted. See
+        // `push_inline_scope`; popped on BOTH exits below, because a scope left
+        // behind by a bailed splice would attach a caller frame to every later
+        // point in the enclosing method.
+        self.push_inline_scope(pc, site.callee_num_args);
         let inline_ok = self.try_emit_inline_body(pc, site);
+        self.pop_inline_scope();
         self.slot_mirror_suppressed = mirror_suppressed_checkpoint;
         self.slot_mirror = None;
         // PGO-02 §3, enforced rather than argued.
@@ -125,12 +170,52 @@ impl Compiler {
         // The safety argument used to be a claim about the source ("the
         // emitter contains no `build_and_record_deopt_point` on this path").
         // That claim is one future edit away from being false, and nothing
-        // would fail when it became false. Check the postcondition instead: if
-        // the body published any deopt metadata, refuse the splice and take
-        // the real call. A refusal costs one dispatch; the alternative costs a
-        // wrong stack.
-        let published_deopt_metadata = self.deopt_stubs.len() > deopt_stubs_checkpoint
-            || self.deopt_points.len() > deopt_points_checkpoint;
+        // would fail when it became false. Check the postcondition instead.
+        //
+        // **What it checks changed 2026-08-18; why it exists did not.** The old
+        // check refused any published metadata at all, because an inlined scope
+        // was not representable — `FrameState::caller` had no producer, so a
+        // point published here would have named the CALLER's method with the
+        // CALLEE's bci. There is a producer now (`push_inline_scope`), so the
+        // question is no longer "was anything published" but "does what was
+        // published SAY it came from inside a splice". A point without a caller
+        // scope is exactly the malformed frame the old rule was protecting
+        // against, so that one still refuses.
+        //
+        // Checked over the points this body added, not over the whole vector:
+        // an enclosing method's own earlier points legitimately have no caller
+        // scope, and scanning them would refuse every splice in any method that
+        // publishes anything at all.
+        let published_unscoped_point = self.deopt_points[deopt_points_checkpoint..]
+            .iter()
+            .any(|p| p.frame_state.caller.is_none());
+        // A raw stub with no matching point is metadata this check cannot read,
+        // and it is what `force_inline_deopt_publication` injects. Refuse it as
+        // before rather than assume it is well-formed.
+        let published_unreadable_stub = self.deopt_stubs.len() > deopt_stubs_checkpoint
+            && self.deopt_points.len() == deopt_points_checkpoint;
+        let published_deopt_metadata = published_unscoped_point || published_unreadable_stub;
+        // Is this population non-empty? A relaxation nobody can see is
+        // indistinguishable from no relaxation, and the only splices affected
+        // are the ones that publish — which the old rule refused, so there is
+        // no prior count of them anywhere. Named per splice under
+        // `CRATONVM_DBG_JITC` rather than guessed at.
+        if (self.deopt_points.len() > deopt_points_checkpoint || published_unreadable_stub)
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+        {
+            eprintln!(
+                "[cratonvm-jitc] inline-splice {}.{}{} at pc={pc} published {} point(s): {}",
+                site.class_name,
+                site.method_name,
+                site.descriptor,
+                self.deopt_points.len() - deopt_points_checkpoint,
+                if published_deopt_metadata {
+                    "REFUSED (a point with no caller scope)"
+                } else {
+                    "admitted, every point carries its caller scope"
+                },
+            );
+        }
         if inline_ok && !published_deopt_metadata {
             true
         } else {
@@ -157,6 +242,7 @@ impl Compiler {
             self.null_check_store_stubs
                 .truncate(null_check_store_stubs_checkpoint);
             self.deopt_points.truncate(deopt_points_checkpoint);
+            crate::metrics::note_inline_call_arm(6);
             false
         }
     }
@@ -252,6 +338,21 @@ impl Compiler {
         // Map callee PC → native offset for branch targets
         let mut callee_pc_to_native: Vec<i64> = vec![-1; callee_len + 1];
 
+        // The canonical home for values live across a branch. Reserved BELOW
+        // the callee's operand area (`save_spill`, taken immediately after), so
+        // storing into it can never alias the operand slot being read from.
+        // Costs `MAX_INLINE_MERGE_DEPTH` slots for the whole splice whether or
+        // not the body branches; that is the price of not having to know
+        // whether it does before walking it.
+        let Some(merge_base) = self.reserve_spill_slots(MAX_INLINE_MERGE_DEPTH) else {
+            self.next_spill_offset = callee_local_base;
+            return false;
+        };
+        // What each branch target's incoming paths agreed on: `(depth, marks)`.
+        // Every branch in a spliced body is FORWARD (`target <= cpc` bails), so
+        // a target's entry is always written before the walk arrives at it.
+        let mut merge_states: Vec<Option<(usize, Vec<bool>)>> = vec![None; callee_len + 1];
+
         let mut cpc: usize = 0;
         let save_spill = self.next_spill_offset;
         // Operand-stack depth belonging to the CALLER; the callee's operands
@@ -271,25 +372,64 @@ impl Compiler {
         let mut prev_was_terminator = false;
 
         while cpc < callee_len {
-            callee_pc_to_native[cpc] = self.buf.pos() as i64; // Cast: address arithmetic
             let op = callee_code[cpc];
 
-            // Merge-point handling: at a branch target the callee operand
-            // stack must be the canonical empty state (caller_base_depth). A
-            // live path arriving with a value is a value-producing merge the
-            // spill-slot model can't represent soundly -> bail. A dead fall-
-            // through (previous instr was a terminator) only left stale slots;
-            // reset them so the target starts from the empty state every
-            // branch into it also guarantees (branches require empty stack).
+            // Merge-point handling.
+            //
+            // A live path arriving with a value used to REFUSE the splice: two
+            // paths put the same value in different places and the symbolic
+            // model can only name one. Now both sides store to the merge region
+            // and the target reads from there, so a value-producing merge is
+            // representable and the `iconst_1; goto L; iconst_0; L: ireturn`
+            // diamond splices.
+            //
+            // ORDER IS LOAD-BEARING. The fall-through's spill is emitted BEFORE
+            // `callee_pc_to_native[cpc]` records the label. Emitted after, the
+            // taken branch — which already stored its own values on its way
+            // here — would land on the label and re-run the fall-through's
+            // stores over slots holding whatever that path last left there.
+            // Silent wrong values on exactly one of the two paths, which is the
+            // failure this whole construct exists to avoid.
             if callee_branch_targets.get(cpc).copied().unwrap_or(false) {
-                if !prev_was_terminator && self.stack.len() != caller_base_depth {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                let recorded = merge_states[cpc].clone();
+                if prev_was_terminator {
+                    // A dead fall-through: nothing arrives here except the
+                    // branches, so adopt what they agreed on and emit nothing.
+                    match recorded {
+                        Some((depth, marks)) => {
+                            self.adopt_merge_slots(caller_base_depth, merge_base, depth, &marks)
+                        }
+                        None => {
+                            self.stack.truncate(caller_base_depth);
+                            self.stack_oop_marks.truncate(caller_base_depth);
+                        }
+                    }
+                } else {
+                    let Some((depth, marks)) = self.spill_callee_stack_to_merge_slots(
+                        caller_base_depth,
+                        merge_base,
+                        R11,
+                    ) else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    // The paths must agree on how many values are live and on
+                    // which of them are references. Verified bytecode
+                    // guarantees both, so a disagreement means this walk has
+                    // mis-modelled something — refuse rather than pick one.
+                    // Marks in particular: calling a non-reference an oop hands
+                    // a moving collector a word it will try to relocate.
+                    if let Some((rec_depth, rec_marks)) = &recorded {
+                        if *rec_depth != depth || *rec_marks != marks {
+                            self.next_spill_offset = callee_local_base;
+                            return false;
+                        }
+                    }
+                    self.adopt_merge_slots(caller_base_depth, merge_base, depth, &marks);
                 }
-                self.stack.truncate(caller_base_depth);
-                self.stack_oop_marks.truncate(caller_base_depth);
                 self.next_spill_offset = save_spill;
             }
+            callee_pc_to_native[cpc] = self.buf.pos() as i64; // Cast: address arithmetic
 
             match op {
                 // nop
@@ -983,7 +1123,22 @@ impl Compiler {
                         return false;
                     }
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1020,7 +1175,22 @@ impl Compiler {
                     }
                     let top = self.pop_stack();
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1055,7 +1225,22 @@ impl Compiler {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1125,6 +1310,7 @@ impl Compiler {
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                        crate::metrics::note_getfield_arm(0);
                         self.emit_call_absolute(self.helpers.getfield);
                         // The checked helper returns the `i64::MIN` deopt/NPE
                         // sentinel on a bad (stale/corrupt) receiver instead of a
@@ -1372,7 +1558,22 @@ impl Compiler {
                     }
                     let top = self.pop_stack();
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1401,7 +1602,22 @@ impl Compiler {
                         return false;
                     }
                     self.pop_to_rax();
-                    if self.stack.len() != caller_base_depth {
+                    // Store anything live across this branch to the merge
+                    // region, and record what the target must agree with. R11
+                    // rather than RAX: the comparison operands are already
+                    // loaded and must survive to the `Jcc` below.
+                    let Some((merge_depth, merge_marks)) = self
+                        .spill_callee_stack_to_merge_slots(caller_base_depth, merge_base, R11)
+                    else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !record_merge_state(
+                        &mut merge_states,
+                        target,
+                        merge_depth,
+                        &merge_marks,
+                    ) {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
@@ -1423,13 +1639,78 @@ impl Compiler {
                 // stack-model adjustment, no machine code — and continue.
                 // This is what admits CONSTRUCTOR bodies to inlining. Any
                 // other invokespecial bails to the dispatch fallback.
-                0xb7 => {
-                    if cpc + 2 >= callee_len || !site.elided_invoke_pcs.contains(&cpc) {
+                //
+                // Everything else — and every 0xb6/0xb8/0xb9 — is either
+                // SPLICED IN TURN (`site.nested_sites`) or emitted as the
+                // ordinary dispatch call (`site.resolved_invoke_infos`). A pc
+                // in neither map still bails, which is what the whole arm did
+                // before either map existed.
+                0xb6 | 0xb7 | 0xb8 | 0xb9 => {
+                    // invokeinterface is 5 bytes; the rest are 3.
+                    let width = if op == 0xb9 { 5 } else { 3 };
+                    if cpc + width > callee_len {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
-                    let _ = self.pop_stack();
-                    cpc += 3;
+                    if op == 0xb7 && site.elided_invoke_pcs.contains(&cpc) {
+                        let _ = self.pop_stack();
+                        cpc += width;
+                        prev_was_terminator = false;
+                        continue;
+                    }
+
+                    // Nesting first: a body is strictly better than a call,
+                    // and a nested bail falls back to the call below because
+                    // `try_emit_nested_inline` rolls itself back completely.
+                    let nested = site.nested_sites.iter().find(|n| n.callee_pc == cpc);
+                    if let Some(nested) = nested {
+                        if nested.guard_class_id == 0 {
+                            if self.try_emit_nested_inline(&nested.site) {
+                                crate::metrics::note_inline_call_arm(2);
+                                cpc += width;
+                                prev_was_terminator = false;
+                                continue;
+                            }
+                            crate::metrics::note_inline_call_arm(5);
+                        } else if let Some(&resolved) = site
+                            .resolved_invoke_infos
+                            .iter()
+                            .find(|r| r.callee_pc == cpc)
+                        {
+                            // Devirtualised splice: the receiver class the
+                            // CALLEE's own profile says dominates this site,
+                            // certified by an exact class-id compare, with the
+                            // miss edge taking the ordinary call. Needs the
+                            // resolved record for that miss edge, which is why
+                            // the resolver keeps a guarded pc's dispatch entry.
+                            if self.emit_guarded_nested_inline(nested, &resolved) {
+                                crate::metrics::note_inline_call_arm(3);
+                                cpc += width;
+                                prev_was_terminator = false;
+                                continue;
+                            }
+                            crate::metrics::note_inline_call_arm(4);
+                        }
+                    }
+
+                    let Some(&resolved) = site
+                        .resolved_invoke_infos
+                        .iter()
+                        .find(|r| r.callee_pc == cpc)
+                    else {
+                        // No resolved target: either the gate is off (the
+                        // resolver refused the site and this is unreachable) or
+                        // an `InlineSite` reached the emitter without passing
+                        // through `try_compile_inner`'s interning step. Bail to
+                        // the real call rather than guess a target.
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    if !self.emit_inline_invoke(&resolved) {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    cpc += width;
                 }
 
                 // Unsupported opcode in inline context — bail out
@@ -1489,5 +1770,518 @@ impl Compiler {
         self.next_spill_offset = next_spill;
 
         true
+    }
+
+    /// Spill the CALLEE's live operand stack into the merge region, so a
+    /// branch and its target agree on where those values live.
+    ///
+    /// The inline emitter models the operand stack symbolically: a value may be
+    /// in a frame slot, a scratch GPR or an XMM register, and WHICH depends on
+    /// the path taken to get there. At a merge point two paths arrive with the
+    /// same values in different places, and the model can only name one — which
+    /// is why `try_emit_inline_body` refused a branch with a non-empty callee
+    /// stack outright (419a6f5, the `iconst_1; goto L; iconst_0; L: ireturn`
+    /// diamond).
+    ///
+    /// The fix is the standard one: give every merge a CANONICAL home. Each
+    /// path stores its values to `merge_base + i*8` before transferring
+    /// control, and the target's model reads them from exactly there. The
+    /// region is reserved BELOW the callee's operand area, so a store into it
+    /// can never alias the slot it is reading from.
+    ///
+    /// `scratch` must be a register the caller is not holding a live value in.
+    /// The conditional-branch arms have already loaded their comparison
+    /// operands into RAX (and RCX), so they pass R11.
+    ///
+    /// Returns `(depth, oop marks)` — what the target must agree with — or
+    /// `None` when the stack is deeper than the reserved region, which refuses
+    /// the splice rather than writing past it. Does NOT change the model: the
+    /// branching path is about to leave, and the fall-through continues with
+    /// its values where they already are.
+    fn spill_callee_stack_to_merge_slots(
+        &mut self,
+        caller_base_depth: usize,
+        merge_base: i32,
+        scratch: u8,
+    ) -> Option<(usize, Vec<bool>)> {
+        let depth = self.stack.len().checked_sub(caller_base_depth)?;
+        if depth > MAX_INLINE_MERGE_DEPTH {
+            return None;
+        }
+        for i in 0..depth {
+            let slot = self.stack[caller_base_depth + i];
+            self.load_slot_to_reg(scratch, slot);
+            self.emit_store_local(merge_base + (i as i32) * 8, scratch); // Cast: x86-64 immediate encoding
+        }
+        let marks = self.stack_oop_marks[caller_base_depth..].to_vec();
+        Some((depth, marks))
+    }
+
+    /// Point the model at the merge region — the other half of
+    /// [`Self::spill_callee_stack_to_merge_slots`].
+    ///
+    /// Called at the target once every incoming path has stored its values
+    /// there, so from here on the emitter reads them from one place regardless
+    /// of which path an execution actually took.
+    fn adopt_merge_slots(
+        &mut self,
+        caller_base_depth: usize,
+        merge_base: i32,
+        depth: usize,
+        marks: &[bool],
+    ) {
+        self.stack.truncate(caller_base_depth);
+        self.stack_oop_marks.truncate(caller_base_depth);
+        for i in 0..depth {
+            self.stack
+                .push(StackSlot::Frame(merge_base + (i as i32) * 8)); // Cast: x86-64 immediate encoding
+            self.stack_oop_marks
+                .push(marks.get(i).copied().unwrap_or(false));
+        }
+    }
+
+    /// Emit a call the SPLICED body makes, as the ordinary
+    /// `jit_invoke_dispatch` sequence.
+    ///
+    /// `info_addr` is a `*const JitInvokeInfo` parked as a `usize` in
+    /// [`crate::InlineSite::resolved_invoke_infos`] — resolved against the
+    /// CALLEE's constant pool and interned into this compile's own arena by
+    /// `try_compile_inner`, so the address stays valid for as long as the
+    /// emitted code that bakes it.
+    ///
+    /// This is deliberately the *plain* dispatch, not the MIC/PIC ladder the
+    /// top-level `invokevirtual` arm uses: an inline cache slot is allocated
+    /// per CALLER pc, and a callee-internal pc has none. The win being bought
+    /// here is not a cheaper call — it is that the ENCLOSING body becomes
+    /// inlineable at all, which it never was while any `invoke*` refused the
+    /// whole site.
+    ///
+    /// Mirrors the top-level `invokestatic` dispatch site instruction for
+    /// instruction: contiguous args buffer built at the pre-pop spill cursor,
+    /// four-argument helper call, oop map for the safepoint, post-invoke
+    /// exception check, cursor reclaimed to the popped-args depth, then the
+    /// result pushed. Returns `false` (having emitted nothing that matters —
+    /// the caller rolls back) when the spill region cannot hold the buffer.
+    ///
+    /// EXCEPTION ROUTING. `emit_post_invoke_exception_check` keys the shared
+    /// sentinel exit on `dbg_last_pc`, which is assigned only by the OUTER
+    /// bytecode walk and therefore still holds the CALLER's invoke pc for the
+    /// whole splice. That is the correct attribution, not an accident of
+    /// bookkeeping: an exception escaping an inlined body belongs to the call
+    /// site in the enclosing method, and the enclosing method's exception table
+    /// is the one that must be searched. The already-shipped spliced `getfield`
+    /// / `getstatic` / `arraycopy` sites rely on exactly the same thing.
+    fn emit_inline_invoke_into_rax(&mut self, resolved: &crate::ResolvedInlineInvoke) -> bool {
+        // SAFETY: see the doc comment — the pointee is owned by this compile's
+        // `_jit_invoke_infos` arena and outlives the code being emitted.
+        let info = resolved.info_addr as *const crate::JitInvokeInfo;
+        if info.is_null() {
+            return false;
+        }
+        let num_args = resolved.num_jit_args;
+        let return_type = resolved.return_type;
+
+        // A call boundary: no caller-live value may sit in a scratch GPR or an
+        // XMM temporary across it. Same reason `try_emit_inline_body` flushes
+        // on entry.
+        self.flush_scratch_registers();
+
+        if self.stack.len() < num_args {
+            return false;
+        }
+        // Deliberately NO `snapshot_pre_intrinsic_call` here, unlike the
+        // top-level dispatch sites. That snapshot publishes a deopt point keyed
+        // by BCI, and inside a splice the only bci available is the callee's —
+        // a different bytecode space from the one the enclosing artifact's
+        // metadata is indexed by. Publishing one would also trip
+        // `try_emit_inline_site`'s postcondition and refuse the splice. The
+        // cost of omitting it is reach, not correctness: a trap that would have
+        // resumed at this site instead leaves the whole method to the
+        // interpreter.
+        let pre_pop_spill = self.next_spill_offset;
+        let mut arg_slots = Vec::with_capacity(num_args);
+        for _ in 0..num_args {
+            arg_slots.push(self.pop_stack());
+        }
+        arg_slots.reverse();
+        let post_pop_spill = self.next_spill_offset;
+
+        if resolved.direct_entry != 0 {
+            if !self.emit_inline_direct_call(resolved, info, &arg_slots, pre_pop_spill) {
+                return false;
+            }
+            crate::metrics::note_inline_call_arm(0);
+        } else if !self.emit_inline_dispatch_call(info, &arg_slots, pre_pop_spill) {
+            return false;
+        } else {
+            crate::metrics::note_inline_call_arm(1);
+        }
+        self.emit_post_invoke_exception_check(return_type);
+        self.next_spill_offset = post_pop_spill;
+        true
+    }
+
+    /// Push a call's result from RAX onto the operand stack, per the descriptor.
+    ///
+    /// Separate from [`Self::emit_inline_invoke_into_rax`] because a guarded
+    /// splice has TWO arms producing the result and must push exactly once,
+    /// after they join — see `emit_guarded_nested_inline`. Pushing inside each
+    /// arm would give the two paths different frame slots while the emitter's
+    /// model named only one of them, which is a silent wrong value on whichever
+    /// path the model does not describe.
+    fn push_call_result(&mut self, return_type: u8) {
+        if return_type == b'V' {
+            return;
+        }
+        if matches!(return_type, b'D' | b'F') {
+            self.push_from_rax_as_xmm0();
+        } else {
+            self.push_from_rax();
+            if return_type == b'L' || return_type == b'[' {
+                self.mark_top_as_oop();
+            }
+        }
+    }
+
+    /// [`Self::emit_inline_invoke_into_rax`] followed by the result push — the
+    /// ordinary, unguarded form.
+    fn emit_inline_invoke(&mut self, resolved: &crate::ResolvedInlineInvoke) -> bool {
+        if !self.emit_inline_invoke_into_rax(resolved) {
+            return false;
+        }
+        self.push_call_result(resolved.return_type);
+        true
+    }
+
+    /// The spliced call as a raw `CALL` to the callee's compiled entry — the
+    /// same sequence the top-level `direct_calls` arm emits, and the thing that
+    /// makes a call-carrying splice worth doing at all.
+    ///
+    /// Every piece here has a reason the top-level arm already documents, and
+    /// two of them are the difference between this and the dispatch form:
+    ///
+    ///  * **the service copy.** A baked direct call has no dispatch-helper
+    ///    frame to recover its arguments from when the callee deopts, so the
+    ///    arguments are copied into a contiguous frame range ABOVE the argument
+    ///    slots (`reserve_direct_call_service_slots` refuses an overlap — copy
+    ///    into the range it is reading and the callee gets arg0 in every slot)
+    ///    and `emit_inline_callee_deopt_check` recovers them from there. A
+    ///    direct call to a Java callee without one is a compile failure at the
+    ///    top level and is refused here too, rather than emitted unserviced.
+    ///  * **`emit_post_call_rbp_republish`.** The callee may have re-entered
+    ///    the VM and moved the frame record.
+    ///
+    /// The keep-alive for `resolved.direct_entry` is registered at INTERNING
+    /// time (`intern_inline_invoke_targets` -> `_direct_callee_entries`), not
+    /// here — the emitter must not be the only thing that knows an address was
+    /// baked, because a rolled-back splice would then leave a pin nothing
+    /// removes, and a bailed compile would leave one nothing adds.
+    fn emit_inline_direct_call(
+        &mut self,
+        resolved: &crate::ResolvedInlineInvoke,
+        info: *const crate::JitInvokeInfo,
+        arg_slots: &[super::StackSlot],
+        args_frame_top: i32,
+    ) -> bool {
+        let Some(service_args_base) =
+            self.reserve_direct_call_service_slots(args_frame_top, arg_slots)
+        else {
+            // No room for the deopt-service copy. Refusing the splice is the
+            // only safe answer: an unserviced direct call to a Java callee
+            // cannot recover its arguments if the callee deopts.
+            return false;
+        };
+        for (i, slot) in arg_slots.iter().enumerate() {
+            self.load_slot_to_reg(R11, *slot);
+            let off = service_args_base + ((arg_slots.len() - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
+            self.emit_store_local(off, R11);
+        }
+        let total_sub = self.emit_stack_arg_setup(arg_slots, resolved.direct_needs_context);
+        self.emit_pre_safepoint_spill();
+        self.emit_call_absolute(resolved.direct_entry);
+        self.emit_post_call_rbp_republish();
+        // A direct call to a compiled callee is still a safepoint: the callee
+        // may allocate and trigger GC transitively. The caller's operand stack
+        // below the splice is covered precisely by its oop marks; the callee
+        // locals this splice reserved live in the frame's spill area and are
+        // covered by the same conservative frame sweep as every other spill
+        // slot — over-approximate, hence pinned by a moving collector.
+        self.emit_oop_map_for_safepoint();
+        self.emit_stack_arg_cleanup(total_sub);
+        self.emit_inline_callee_deopt_check(info, arg_slots.len(), service_args_base);
+        true
+    }
+
+    /// The spliced call through the blind `jit_invoke_dispatch` helper.
+    ///
+    /// Only reachable with `CRATONVM_JIT_INLINE_CALL_DISPATCH` on: measured
+    /// 2026-08-18, emitting an admitted call this way took the JUnit assertion
+    /// chain from 47 to 163-266 ns/iter (`disp_calls` 3 870 -> 2 003 361 over
+    /// 2 000 000 iterations), because the call it replaced was already
+    /// direct-bound. Kept because it is the arm that reproduces that result.
+    ///
+    /// Mirrors the top-level `invokestatic` dispatch site: contiguous args
+    /// buffer built at the pre-pop spill cursor, four-argument helper call, oop
+    /// map for the safepoint.
+    fn emit_inline_dispatch_call(
+        &mut self,
+        info: *const crate::JitInvokeInfo,
+        arg_slots: &[super::StackSlot],
+        args_base_offset: i32,
+    ) -> bool {
+        let num_args = arg_slots.len();
+        if num_args > 0 {
+            let Some(args_end) = self.checked_spill_range_end(args_base_offset, num_args) else {
+                return false;
+            };
+            self.next_spill_offset = args_end;
+            // Descending offsets = ascending addresses, because
+            // `modrm_rbp_disp` negates the offset: arg[0] must end up at the
+            // LOWEST address for the helper to read the buffer in order.
+            for (i, slot) in arg_slots.iter().enumerate() {
+                let buf_offset = args_base_offset + ((num_args - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
+                self.load_slot_to_reg(RAX, *slot);
+                self.emit_store_local(buf_offset, RAX);
+            }
+        }
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.emit_mov_imm64(ARG_REGS[1], info as i64); // Cast: function pointer for JIT call target
+        if num_args > 0 {
+            let buf_start = args_base_offset + ((num_args as i32) - 1) * 8; // Cast: x86-64 immediate encoding
+            self.emit_lea_frame_slot(ARG_REGS[2], buf_start);
+        } else {
+            self.emit_xor_reg_self(ARG_REGS[2]);
+        }
+        self.emit_mov_imm32_sx(ARG_REGS[3], num_args as i32); // Cast: x86-64 immediate encoding
+        self.emit_pre_safepoint_spill();
+        self.emit_call_absolute(self.helpers.invoke_dispatch);
+        self.emit_oop_map_for_safepoint();
+        true
+    }
+
+    /// A devirtualised splice inside a splice: guard on the receiver's exact
+    /// class, splice the body it dispatches to, and send the miss edge to the
+    /// ordinary call.
+    ///
+    /// Shape, which is PGO-02's one level down:
+    ///
+    /// ```text
+    ///     load receiver (deepest of the call's operands)   ; PEEKED, not popped
+    ///     TEST rax, rax ; JZ  miss                          ; null fails every guard
+    ///     CMP DWORD [rax+0], guard_class_id ; JNE miss
+    ///     <spliced body>                                    ; consumes the operands
+    ///     JMP done
+    /// miss:
+    ///     <ordinary call>                                   ; consumes the same operands
+    /// done:
+    /// ```
+    ///
+    /// The receiver is PEEKED because both arms consume the operands
+    /// themselves, and the compiler's SYMBOLIC stack is restored between them
+    /// so the second arm pops the same slots the first did. Whichever machine
+    /// path a given execution takes, the operand stack the emitter goes on to
+    /// model is the same — the invariant the top-level guarded-virtual arm
+    /// documents at length, and the one a rewind here must not disturb.
+    ///
+    /// Returns `false` having emitted nothing (the buffer is rewound) when
+    /// either arm refuses, so the caller falls through to the unguarded call.
+    fn emit_guarded_nested_inline(
+        &mut self,
+        nested: &crate::NestedInlineSite,
+        resolved: &crate::ResolvedInlineInvoke,
+    ) -> bool {
+        let recv_depth = resolved.num_jit_args;
+        // A virtual/interface call always has a receiver; without one there is
+        // nothing to guard on and the plan is malformed.
+        if recv_depth == 0 || self.stack.len() < recv_depth {
+            return false;
+        }
+        self.flush_scratch_registers();
+
+        let buf_checkpoint = self.buf.pos();
+        let stack_checkpoint = self.stack.clone();
+        let oop_marks_checkpoint = self.stack_oop_marks.clone();
+        let spill_checkpoint = self.next_spill_offset;
+        let exception_check_stubs_checkpoint = self.exception_check_stubs.len();
+        let deopt_stubs_checkpoint = self.deopt_stubs.len();
+        let deopt_points_checkpoint = self.deopt_points.len();
+        let forward_patches_checkpoint = self.forward_patches.len();
+        let jump_table_patches_checkpoint = self.jump_table_patches.len();
+        let self_call_patches_checkpoint = self.self_call_patches.len();
+        let bounds_check_stubs_checkpoint = self.bounds_check_stubs.len();
+        let null_check_store_stubs_checkpoint = self.null_check_store_stubs.len();
+
+        let recv_slot = self.stack[self.stack.len() - recv_depth];
+        self.load_slot_to_reg(RAX, recv_slot);
+        self.emit_test_r64_r64(RAX);
+        let null_miss = self.emit_jcc_rel32_patch(0x84); // JZ miss
+        // CMP DWORD [RAX+0], guard_class_id — the same encoding the top-level
+        // guarded-virtual arm and the String/CRC32 intrinsic guards use
+        // (81 /7 id, ModRM 0x78 = mod00 /7 rm=RAX).
+        self.buf.emit(&[0x81, 0x78, 0x00]);
+        self.buf.emit(&nested.guard_class_id.to_le_bytes());
+        let class_miss = self.emit_jcc_rel32_patch(0x85); // JNE miss
+
+        if !self.try_emit_nested_inline(&nested.site) {
+            self.buf.rewind_to(buf_checkpoint);
+            self.stack = stack_checkpoint;
+            self.stack_oop_marks = oop_marks_checkpoint;
+            self.next_spill_offset = spill_checkpoint;
+            self.exception_check_stubs
+                .truncate(exception_check_stubs_checkpoint);
+            self.deopt_stubs.truncate(deopt_stubs_checkpoint);
+            self.deopt_points.truncate(deopt_points_checkpoint);
+            self.forward_patches.truncate(forward_patches_checkpoint);
+            self.jump_table_patches
+                .truncate(jump_table_patches_checkpoint);
+            self.self_call_patches.truncate(self_call_patches_checkpoint);
+            self.bounds_check_stubs
+                .truncate(bounds_check_stubs_checkpoint);
+            self.null_check_store_stubs
+                .truncate(null_check_store_stubs_checkpoint);
+            return false;
+        }
+        // JOIN THE TWO ARMS IN RAX, and push once below.
+        //
+        // This is the subtle part, and getting it wrong is invisible: the two
+        // arms park their result in DIFFERENT frame slots. The spliced body
+        // reserved callee locals before popping, so its `ireturn` pushes above
+        // them; the call pops and pushes below them. Both are internally
+        // consistent, and the emitter's model can only name one — so the other
+        // path computes with a slot nothing wrote. Draining the hit arm's value
+        // into RAX here makes the two agree on a location the ABI already
+        // guarantees, and `push_call_result` after the join is then the single
+        // writer of the operand slot the model names.
+        //
+        // Total over every return kind: `pop_to_rax` handles a Frame,
+        // CalleeSaved, Scratch or Xmm slot, and `push_call_result` reverses the
+        // Xmm case for a `D`/`F` descriptor.
+        if resolved.return_type != b'V' {
+            if self.stack.len() != stack_checkpoint.len() - recv_depth + 1 {
+                // The body did not leave exactly one value where the call
+                // would. Refuse rather than guess which slot is live.
+                self.buf.rewind_to(buf_checkpoint);
+                self.stack = stack_checkpoint;
+                self.stack_oop_marks = oop_marks_checkpoint;
+                self.next_spill_offset = spill_checkpoint;
+                self.exception_check_stubs
+                    .truncate(exception_check_stubs_checkpoint);
+                self.deopt_stubs.truncate(deopt_stubs_checkpoint);
+                self.deopt_points.truncate(deopt_points_checkpoint);
+                self.forward_patches.truncate(forward_patches_checkpoint);
+                self.jump_table_patches
+                    .truncate(jump_table_patches_checkpoint);
+                self.self_call_patches.truncate(self_call_patches_checkpoint);
+                self.bounds_check_stubs
+                    .truncate(bounds_check_stubs_checkpoint);
+                self.null_check_store_stubs
+                    .truncate(null_check_store_stubs_checkpoint);
+                return false;
+            }
+            self.pop_to_rax();
+        }
+        let done = self.emit_jmp_rel32_patch();
+
+        self.patch_rel32_to_here(null_miss);
+        self.patch_rel32_to_here(class_miss);
+        self.stack = stack_checkpoint.clone();
+        self.stack_oop_marks = oop_marks_checkpoint.clone();
+        self.next_spill_offset = spill_checkpoint;
+        if !self.emit_inline_invoke_into_rax(resolved) {
+            // The miss edge cannot be emitted, so the guard has nowhere to land
+            // and the whole construct is unusable. Rewind everything, including
+            // the hit body, and let the caller take the plain call.
+            self.buf.rewind_to(buf_checkpoint);
+            self.stack = stack_checkpoint;
+            self.stack_oop_marks = oop_marks_checkpoint;
+            self.next_spill_offset = spill_checkpoint;
+            self.exception_check_stubs
+                .truncate(exception_check_stubs_checkpoint);
+            self.deopt_stubs.truncate(deopt_stubs_checkpoint);
+            self.deopt_points.truncate(deopt_points_checkpoint);
+            self.forward_patches.truncate(forward_patches_checkpoint);
+            self.jump_table_patches
+                .truncate(jump_table_patches_checkpoint);
+            self.self_call_patches.truncate(self_call_patches_checkpoint);
+            self.bounds_check_stubs
+                .truncate(bounds_check_stubs_checkpoint);
+            self.null_check_store_stubs
+                .truncate(null_check_store_stubs_checkpoint);
+            return false;
+        }
+        self.patch_rel32_to_here(done);
+
+        // One push, after the join, from the one location both arms agree on.
+        // The operand stack the emitter goes on to model is therefore the same
+        // whichever machine path an execution took — which is the property the
+        // whole construct rests on, and the one a later merge point would
+        // expose if it did not hold.
+        self.push_call_result(resolved.return_type);
+        true
+    }
+
+    /// Splice a body into a body: `try_emit_inline_site`'s rollback contract,
+    /// for a call site whose pc lives in a CALLEE's bytecode space.
+    ///
+    /// Two things differ from the outer wrapper, both because the pc is a
+    /// callee pc:
+    ///
+    ///  * no `push_inline_scope`. A scope is built by `build_frame_state_at`,
+    ///    which reads the ENCLOSING method's locals at a bci — and a callee pc
+    ///    indexes a different bytecode. There is no honest frame to record
+    ///    here, so none is recorded.
+    ///  * consequently the postcondition stays the STRICT one the outer
+    ///    wrapper used before inline scopes existed: any deopt metadata at all
+    ///    refuses the nested splice. Nothing on this path publishes (the
+    ///    invoke arm deliberately omits `snapshot_pre_intrinsic_call`, precise
+    ///    exception frames and inlining are mutually exclusive, and every
+    ///    trap-carrying opcode is refused by the resolver), so the rule is
+    ///    inert — which is exactly why it is cheap to keep as a ratchet
+    ///    against a future edit that starts publishing.
+    ///
+    /// A `false` return leaves the emitter byte-identical to before the
+    /// attempt, so the invoke arm falls through to the ordinary dispatch call.
+    fn try_emit_nested_inline(&mut self, site: &crate::InlineSite) -> bool {
+        let buf_checkpoint = self.buf.pos();
+        let stack_checkpoint = self.stack.clone();
+        let oop_marks_checkpoint = self.stack_oop_marks.clone();
+        let spill_checkpoint = self.next_spill_offset;
+        let exception_check_stubs_checkpoint = self.exception_check_stubs.len();
+        let deopt_stubs_checkpoint = self.deopt_stubs.len();
+        let deopt_points_checkpoint = self.deopt_points.len();
+        let forward_patches_checkpoint = self.forward_patches.len();
+        let jump_table_patches_checkpoint = self.jump_table_patches.len();
+        let self_call_patches_checkpoint = self.self_call_patches.len();
+        let bounds_check_stubs_checkpoint = self.bounds_check_stubs.len();
+        let null_check_store_stubs_checkpoint = self.null_check_store_stubs.len();
+
+        // `try_emit_inline_body` reads no per-pc state off `self` for the
+        // OUTER pc it is handed — it uses it only for the `CRATONVM_DBG_JITC`
+        // trace — so passing the enclosing splice's pc keeps that trace
+        // pointing at the caller-visible call site.
+        let outer_pc = self.dbg_last_pc;
+        let inline_ok = self.try_emit_inline_body(outer_pc, site);
+        let published = self.deopt_stubs.len() > deopt_stubs_checkpoint
+            || self.deopt_points.len() > deopt_points_checkpoint;
+        if inline_ok && !published {
+            return true;
+        }
+        self.buf.rewind_to(buf_checkpoint);
+        self.stack = stack_checkpoint;
+        self.stack_oop_marks = oop_marks_checkpoint;
+        self.next_spill_offset = spill_checkpoint;
+        self.exception_check_stubs
+            .truncate(exception_check_stubs_checkpoint);
+        self.deopt_stubs.truncate(deopt_stubs_checkpoint);
+        self.deopt_points.truncate(deopt_points_checkpoint);
+        self.forward_patches.truncate(forward_patches_checkpoint);
+        self.jump_table_patches
+            .truncate(jump_table_patches_checkpoint);
+        self.self_call_patches.truncate(self_call_patches_checkpoint);
+        self.bounds_check_stubs
+            .truncate(bounds_check_stubs_checkpoint);
+        self.null_check_store_stubs
+            .truncate(null_check_store_stubs_checkpoint);
+        false
     }
 }

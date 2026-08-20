@@ -44,11 +44,24 @@ const CR_UNMAPPABLE: i32 = 3;
 
 /// Read the UTF-16 code units from a Java `String` object.  Returns the
 /// empty vec if the object isn't a String.
+///
+/// W7-95a. This used to be `ctx.read_string(s).encode_utf16()`, which is a
+/// round trip through a Rust `String` — and a Rust `str` cannot hold an
+/// unpaired surrogate, so `String::from_utf16_lossy` silently substituted
+/// U+FFFD for one. That is exactly the wrong answer for this function's only
+/// caller, `Charset.encode(String)`: a lone surrogate is *malformed input*
+/// that a real `CharsetEncoder` must report, and U+FFFD is a perfectly
+/// encodable character, so the malformed unit was laundered into three valid
+/// UTF-8 bytes (`EF BF BD`) before the encoder ever saw it.
+///
+/// `lang_string::read_string_chars` is the tree's existing lossless reader:
+/// it decodes the String's own `value` array (legacy `char[]`, compact
+/// LATIN-1 `byte[]`, or compact UTF-16 `byte[]`) straight to code units and
+/// never constructs a `str`. For every well-formed String the two agree
+/// exactly; they differ only on the inputs this function is supposed to be
+/// able to see.
 pub(crate) fn read_string_utf16(ctx: &dyn NativeContext, s: ObjectRef) -> Vec<u16> {
-    match ctx.read_string(s) {
-        Some(t) => t.encode_utf16().collect(),
-        None => Vec::new(),
-    }
+    crate::lang_string::read_string_chars(ctx, s)
 }
 
 /// Read a Rust `String` from a Java `String` slot of an object.  Used
@@ -243,7 +256,20 @@ pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> R
     // ByteBuffer default order is BIG_ENDIAN (`bigEndian=true`); a 0 default
     // would make multi-byte views little-endian. Harmless for byte get/array
     // but kept correct for `asCharBuffer`/`getInt` consumers.
-    ctx.set_field_by_name(obj, "bigEndian", Value::Int(1));
+    //
+    // CONVERGED (F37-1 §4, landing F26-1's N2 and closing the third of W7-76
+    // §8.2's five sites). This site wrote `bigEndian` and **not**
+    // `nativeByteOrder` — the drift §8.2 predicted, and it was already here
+    // before anyone looked. `java.nio.CharBuffer`'s field initialisers are
+    // `bigEndian = true` and `nativeByteOrder = (ByteOrder.nativeOrder() ==
+    // BIG_ENDIAN)`; javac compiles BOTH into every constructor and this
+    // allocator runs no constructor, so the missing one stayed at the Java
+    // default `false`. That is the same value a little-endian host wants, so
+    // the omission was inert HERE and would stop being inert the moment a
+    // reader consults `nativeByteOrder` (as `ByteBuffer`'s bulk paths do) or a
+    // big-endian target appears. Closed by construction rather than by a fourth
+    // literal: one helper, one pair of writes, no site that can drift again.
+    cratonvm_native_io::seed_buffer_byte_order(ctx, obj);
     Ok(obj)
 }
 

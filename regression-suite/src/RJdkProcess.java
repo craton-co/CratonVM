@@ -414,7 +414,12 @@ public class RJdkProcess {
             throw new AssertionError("check count moved: expected " + EXPECTED_CHECKS
                     + ", ran " + checks + "; skipped=" + skipped);
         }
-        System.out.println("CK RJdkProcess checks=" + checks + " skipped=" + skipped);
+        // The count MUST stand alone: `harness_check_count` parses the rest of
+        // the line as part of the number, so a combined `checks=N skipped=[]`
+        // returned the string "55 skipped=[]" and guard G3 silently no-opped —
+        // this vector's count has never been compared across the two VMs.
+        System.out.println("CK RJdkProcess skipped=" + skipped);
+        System.out.println("CK RJdkProcess checks=" + checks);
         System.out.println("PASS RJdkProcess (" + checks + " checks)");
     }
 }

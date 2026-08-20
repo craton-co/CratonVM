@@ -27,12 +27,15 @@
 //!   1. `class_for_name_native_registered` /
 //!      `class_get_declared_methods_native_registered` — registry pins
 //!      for the reflection plumbing the WP7.2 surface depends on.
-//!   2. `each_jdbc_core_type_has_registered_natives` (synthetic-jdk
-//!      only) — registry pins for one canonical native per WP7.2 SPI
-//!      type. The load-bearing acceptance proof for "non-empty
-//!      reflective surface" because synthetic stub method tables omit
-//!      the public API methods that ordinary javac-emitted bytecode
-//!      references.
+//!   2. `each_jdbc_core_type_has_registered_natives` — registry pins for
+//!      one canonical native per WP7.2 SPI type, split by REGISTRAR
+//!      rather than by cargo feature: the five rows `register_p68_jdbc`
+//!      puts on the real-JDK path must be present, and the one
+//!      `DriverManager` row `register_p68_jdbc_driver_manager` keeps off
+//!      it must be absent. The load-bearing acceptance proof for
+//!      "non-empty reflective surface". Its
+//!      `…_under_synthetic_jdk` companion asserts all six under
+//!      `--features synthetic-jdk`, where `java.sql.*` has no bytecode.
 //!   3. `jdbc_core_types_load_and_reflect` /
 //!      `jdbc_core_class_literals_resolve_at_runtime` — Java fixture
 //!      probes that every `T.class` literal LDCs successfully and
@@ -49,6 +52,11 @@
 
 use cratonvm_native_api::NativeMethodRegistry;
 use cratonvm_vm::config::VmConfig;
+// Only the synthetic-jdk arm of `each_jdbc_core_type_has_registered_natives_*`
+// uses this; in the default build it resolves to a no-op shim
+// (`vm/src/native/builtins.rs`), so importing it unconditionally left an unused
+// import in the configuration CI actually builds.
+#[cfg(feature = "synthetic-jdk")]
 use cratonvm_vm::native::register_builtins;
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::Vm;
@@ -157,81 +165,194 @@ fn class_get_declared_methods_native_registered() {
 /// exists in the WP7.1 / NEW-14 / P68 JDBC native wiring.
 ///
 /// Mirrors the WP7.1 anchor `jdbc_driver_natives_export_service_loader`.
+///
+/// Which registrar carries a row. Not a decoration: it is the two-sided half
+/// of the guard, and it is why the guard now runs in the default build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JdbcPath {
+    /// Registered by `register_p68_jdbc`, which `register_essential_natives`
+    /// calls directly on the real-JDK path (`native-builtins/src/lib.rs`, in
+    /// `register_essential_natives_with_shims`) AND which
+    /// `register_synthetic_overrides` reaches via `register_phase68_natives`.
+    /// Present in every configuration; its absence is a dropped registration.
+    EssentialAndSynthetic,
+    /// Registered only by `register_p68_jdbc_driver_manager`, reached only
+    /// from `register_phase68_natives -> register_synthetic_overrides`.
+    /// `DriverManager` is a CONCRETE class, so a native on it INTERCEPTS: the
+    /// registrar's own doc records that putting it on the real-JDK path made
+    /// `DriverManager.getConnection(url)` hand back a rusqlite connection for
+    /// every URL, shadowing whatever driver the application registered.
+    /// On the real-JDK path this row must be ABSENT, and that absence is
+    /// asserted, not assumed.
+    SyntheticOnly,
+}
+
+/// (label, class, canonical method, descriptor, which path carries it).
+///
+/// Each tuple proves reachability of `label` either by registering a native ON
+/// it (Connection/Statement/PreparedStatement/ResultSet/DatabaseMetaData) or by
+/// registering a method whose signature *references* it (Driver — only
+/// implemented by user-supplied driver classes, never directly stubbed; the
+/// registry path through `DriverManager.registerDriver` pins its FQN
+/// reachability).
+const ANCHOR_NATIVES: &[(&str, &str, &str, &str, JdbcPath)] = &[
+    // Connection: createStatement is the SPI entry point.
+    (
+        "java.sql.Connection",
+        "java/sql/Connection",
+        "createStatement",
+        "()Ljava/sql/Statement;",
+        JdbcPath::EssentialAndSynthetic,
+    ),
+    // Statement: execute is the canonical executor.
+    (
+        "java.sql.Statement",
+        "java/sql/Statement",
+        "execute",
+        "(Ljava/lang/String;)Z",
+        JdbcPath::EssentialAndSynthetic,
+    ),
+    // PreparedStatement: setInt is a typical bind.
+    (
+        "java.sql.PreparedStatement",
+        "java/sql/PreparedStatement",
+        "setInt",
+        "(II)V",
+        JdbcPath::EssentialAndSynthetic,
+    ),
+    // ResultSet: next is the iterator method.
+    (
+        "java.sql.ResultSet",
+        "java/sql/ResultSet",
+        "next",
+        "()Z",
+        JdbcPath::EssentialAndSynthetic,
+    ),
+    // Driver: not implemented as a stub class (driver implementations
+    // are user-supplied). Reachability is pinned by `DriverManager.
+    // registerDriver(Ljava/sql/Driver;)V` — the descriptor itself
+    // names the type, so `java.sql.Driver` is reachable to any
+    // bytecode that references DriverManager.
+    (
+        "java.sql.Driver",
+        "java/sql/DriverManager",
+        "registerDriver",
+        "(Ljava/sql/Driver;)V",
+        JdbcPath::SyntheticOnly,
+    ),
+    // DatabaseMetaData: getDatabaseProductName is the standard probe.
+    (
+        "java.sql.DatabaseMetaData",
+        "java/sql/DatabaseMetaData",
+        "getDatabaseProductName",
+        "()Ljava/lang/String;",
+        JdbcPath::EssentialAndSynthetic,
+    ),
+];
+
+/// WHY THE `#[cfg]` CAME OFF, 2026-08-13.
+///
+/// This test carried `#[cfg(feature = "synthetic-jdk")]`. No CI job runs
+/// `vm/tests/*` with that feature: the `synthetic-jdk` job only *checks*
+/// integration targets (`cargo check --all-targets --features synthetic-jdk`)
+/// and *runs* `--lib` scopes, while the blocking `cargo test --workspace` job
+/// uses default features, where this function did not exist. A test that is
+/// compiled in no executing configuration is not a test — it was counted as
+/// coverage for the WP7.2 acceptance claim and could not report anything.
+/// (E25 sweep, `docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md`
+/// section 4.1, row 33.)
+///
+/// The `#[cfg]` was also stale. Its stated reason — "the registry-only
+/// `register_essential_natives` does not include phase68" — is false in this
+/// tree: `register_essential_natives_with_shims` calls `register_p68_jdbc`
+/// directly, deliberately, with a comment explaining that the `java/sql/*`
+/// INTERFACE registrations do not intercept a driver's implementation class.
+/// Five of the six anchors are therefore live on the real-JDK path, which is
+/// exactly the path an application with a real JDBC driver takes.
+///
+/// So the guard is split by REGISTRAR rather than by feature. This half runs
+/// everywhere and is two-sided: the five `EssentialAndSynthetic` rows must be
+/// present, and the one `SyntheticOnly` row must be ABSENT — the latter is the
+/// `DriverManager` interception the registrar's own doc says must not happen on
+/// the real-JDK path. `each_jdbc_core_type_has_registered_natives_under_synthetic_jdk`
+/// covers the other configuration.
 #[test]
-#[cfg(feature = "synthetic-jdk")]
 fn each_jdbc_core_type_has_registered_natives() {
     let mut r = NativeMethodRegistry::new();
-    // Use `register_builtins` (essential + synthetic overrides) — the
-    // JDBC SPI natives ship via `register_synthetic_overrides ->
-    // register_phase68_natives -> register_p68_jdbc`. Synthetic mode
-    // is the configuration the open-sourced revision targets, and the
-    // VM's `vm_init.rs` uses the same entry point under
-    // `use_synthetic_jdk = true` (the default). The registry-only
-    // `register_essential_natives` does not include phase68.
-    register_builtins(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
 
-    // (class, canonical method, descriptor) — each tuple proves
-    // reachability of `class` either by registering a native ON it
-    // (Connection/Statement/PreparedStatement/ResultSet/DatabaseMetaData)
-    // or by registering a method whose signature *references* it
-    // (Driver — only implemented by user-supplied driver classes,
-    // never directly stubbed; the registry path through
-    // DriverManager.registerDriver pins its FQN reachability).
-    const ANCHOR_NATIVES: &[(&str, &str, &str, &str)] = &[
-        // Connection: createStatement is the SPI entry point.
-        (
-            "java.sql.Connection",
-            "java/sql/Connection",
-            "createStatement",
-            "()Ljava/sql/Statement;",
-        ),
-        // Statement: execute is the canonical executor.
-        (
-            "java.sql.Statement",
-            "java/sql/Statement",
-            "execute",
-            "(Ljava/lang/String;)Z",
-        ),
-        // PreparedStatement: setInt is a typical bind.
-        (
-            "java.sql.PreparedStatement",
-            "java/sql/PreparedStatement",
-            "setInt",
-            "(II)V",
-        ),
-        // ResultSet: next is the iterator method.
-        ("java.sql.ResultSet", "java/sql/ResultSet", "next", "()Z"),
-        // Driver: not implemented as a stub class (driver implementations
-        // are user-supplied). Reachability is pinned by `DriverManager.
-        // registerDriver(Ljava/sql/Driver;)V` — the descriptor itself
-        // names the type, so `java.sql.Driver` is reachable to any
-        // bytecode that references DriverManager.
-        (
-            "java.sql.Driver",
-            "java/sql/DriverManager",
-            "registerDriver",
-            "(Ljava/sql/Driver;)V",
-        ),
-        // DatabaseMetaData: getDatabaseProductName is the standard probe.
-        (
-            "java.sql.DatabaseMetaData",
-            "java/sql/DatabaseMetaData",
-            "getDatabaseProductName",
-            "()Ljava/lang/String;",
-        ),
-    ];
+    // Anti-vacuity: an empty registry passes the "must be absent" half for the
+    // wrong reason, and would make the "must be present" half the only signal.
+    assert!(
+        r.len() > 100,
+        "register_essential_natives produced only {} registrations — this test \
+         would be measuring an empty registry",
+        r.len()
+    );
 
     let mut missing: Vec<String> = Vec::new();
-    for (label, class, method, descriptor) in ANCHOR_NATIVES {
-        if r.find(class, method, descriptor).is_none() {
-            missing.push(format!("{label} -> {class}::{method}{descriptor}"));
+    let mut leaked: Vec<String> = Vec::new();
+    for (label, class, method, descriptor, path) in ANCHOR_NATIVES {
+        // `kind_of` is the EXACT-triple lookup; `find` also matches through the
+        // registry's descriptor-compatibility rewriting, which would let a
+        // near-miss registration answer for a row that is really gone.
+        let present = r.kind_of(class, method, descriptor).is_some();
+        match (*path, present) {
+            (JdbcPath::EssentialAndSynthetic, false) => {
+                missing.push(format!("{label} -> {class}::{method}{descriptor}"));
+            }
+            (JdbcPath::SyntheticOnly, true) => {
+                leaked.push(format!("{label} -> {class}::{method}{descriptor}"));
+            }
+            _ => {}
         }
     }
     assert!(
         missing.is_empty(),
-        "WP7.2 acceptance: each JDBC core type must have a canonical \
-         native registered (directly or via a DriverManager-side anchor). \
-         Missing:\n  {}",
+        "WP7.2 acceptance: each JDBC core type must have a canonical native \
+         registered on the real-JDK path. Missing:\n  {}",
+        missing.join("\n  ")
+    );
+    assert!(
+        leaked.is_empty(),
+        "A synthetic-only JDBC native reached the real-JDK path:\n  {}\n\n\
+         `java/sql/DriverManager` is a concrete class, so a native on it \
+         intercepts. `register_p68_jdbc_driver_manager` was split out of \
+         `register_p68_jdbc` for precisely this reason: on the real-JDK path it \
+         made `DriverManager.getConnection(url)` return a rusqlite connection \
+         for every URL. If this is now intentional, move the row to \
+         `JdbcPath::EssentialAndSynthetic` and say why in the same edit.",
+        leaked.join("\n  ")
+    );
+}
+
+/// The other configuration: under `--features synthetic-jdk` there is no
+/// `java.sql.*` bytecode at all, so EVERY row above — including the
+/// `SyntheticOnly` `DriverManager` anchor — must be registered.
+///
+/// This half is compiled only under the feature, and today only the
+/// `synthetic-jdk` CI job's `cargo check --all-targets` looks at it. That is a
+/// real residual and it is nominated (NOM E33-2): the feature job runs `--lib`
+/// scopes only, so no job EXECUTES `vm/tests/*` under this feature. The sibling
+/// above is what makes the WP7.2 claim falsifiable in the meantime.
+#[test]
+#[cfg(feature = "synthetic-jdk")]
+fn each_jdbc_core_type_has_registered_natives_under_synthetic_jdk() {
+    let mut r = NativeMethodRegistry::new();
+    register_builtins(&mut r);
+
+    let missing: Vec<String> = ANCHOR_NATIVES
+        .iter()
+        .filter(|(_, class, method, descriptor, _)| r.kind_of(class, method, descriptor).is_none())
+        .map(|(label, class, method, descriptor, _)| {
+            format!("{label} -> {class}::{method}{descriptor}")
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "WP7.2 acceptance under synthetic-jdk: each JDBC core type must have a \
+         canonical native registered (directly or via a DriverManager-side \
+         anchor). Missing:\n  {}",
         missing.join("\n  ")
     );
 }
@@ -251,11 +372,18 @@ fn each_jdbc_core_type_has_registered_natives() {
 /// SQLite-JDBC). `Driver` is omitted because its surface is by
 /// definition supplied by user code; its reachability is pinned by
 /// the DriverManager-side anchor above.
+///
+/// 2026-08-13: the `#[cfg(feature = "synthetic-jdk")]` came off for the same
+/// reason as on `each_jdbc_core_type_has_registered_natives` — no CI job
+/// executes `vm/tests/*` under that feature, so this ran nowhere. Every one of
+/// the 16 anchors below is registered by `register_p68_jdbc`, which
+/// `register_essential_natives_with_shims` calls on the real-JDK path, so the
+/// real-JDK registry is both a valid and a stricter subject than
+/// `register_builtins` (which is essential PLUS the synthetic overrides).
 #[test]
-#[cfg(feature = "synthetic-jdk")]
 fn each_jdbc_core_type_has_multiple_anchor_natives() {
     let mut r = NativeMethodRegistry::new();
-    register_builtins(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
 
     // (label, class, method, descriptor) — at least 3 per type.
     const WIDE_ANCHORS: &[(&str, &str, &str, &str)] = &[
@@ -392,11 +520,16 @@ fn each_jdbc_core_type_has_multiple_anchor_natives() {
 /// broken, frameworks that hold `Statement` references but receive
 /// PreparedStatement instances (Spring JDBC, Hibernate connection
 /// proxies) get NoSuchMethodError at the first invokeinterface.
+///
+/// 2026-08-13: `#[cfg(feature = "synthetic-jdk")]` removed. The three
+/// `alias_class` calls are in the tail of `register_p68_jdbc` itself, and
+/// `alias_class` physically copies each matching registration onto the target
+/// class at call time (`native-api/src/registry.rs`), so the alias chain exists
+/// on whichever path called the registrar — including the real-JDK one.
 #[test]
-#[cfg(feature = "synthetic-jdk")]
 fn statement_subtype_alias_chain_resolves() {
     let mut r = NativeMethodRegistry::new();
-    register_builtins(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
 
     // `Statement.execute(String)Z` is registered against `java/sql/Statement`.
     // Aliasing means looking up the same descriptor against the subtype

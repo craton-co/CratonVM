@@ -12,8 +12,10 @@ fixture, where a `spring-data-redis` SNAPSHOT drifted ahead of the pinned
 `jedis-7.4.1.jar` and made *both* VMs raise this error. The failure was shared,
 so the natural triage is "not our bug" — but the messages differed, and that
 difference was a real CratonVM defect. See
-`data-redis-fixture-jedis-snapshot-skew-20260813.md` under
-`known-issues/springboot/`.
+`data-redis-fixture-jedis-alignment-FIXED-20260818.md` under
+`internal/fixed-suite-bugs/springboot/` (retired there 2026-08-18 once the
+fixture's Jedis alignment was restored; the module is green on both VMs now, so
+this probe's unit tests are the ONLY thing pinning the message shape).
 
 ## Run
 

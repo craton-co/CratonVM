@@ -399,6 +399,199 @@ pub fn osr_newarray_allowed() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_OSR_ATHROW` — back-edge OSR for a method that contains a bare
+/// `athrow` (0xbf) and declares **no** local exception handlers. **Default: ON**
+/// (RBC.6 lift, 2026-08-17).
+///
+/// RBC.6 refused every `athrow`-containing method outright, because the OSR
+/// bail path's only move was to re-stash the throwable and resume the live
+/// interpreter frame at the STALE pre-OSR back-edge pc — re-running every
+/// iteration the OSR'd code had already committed (RBC.7's silent-corruption
+/// shape). With no handlers declared, the throwable provably cannot be caught
+/// by the OSR'd frame, so `propagate_osr_exception` unwinds it out of the frame
+/// instead and there is no resume left to be stale. A method that DOES declare
+/// handlers is still refused here, for a reason RBC.6b's own lift does not
+/// cover — see the gate itself, in `compile_osr_artifact`, for that argument.
+///
+/// Set `CRATONVM_JIT_OSR_ATHROW=0` to restore the blanket refusal so ONE binary
+/// can A/B the lift (a cross-binary A/B is not an A/B). Read once and cached.
+#[inline]
+pub fn osr_athrow_allowed() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_ATHROW") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_OSR_EXC_TABLE` — back-edge OSR for a method with a non-empty
+/// exception table. **Default: ON** (2026-08-17, this is the RBC.6b lift).
+///
+/// RBC.6b refused every such method outright. Because OSR is the ONLY door out
+/// of the interpreter for a method invoked once — a `@Test` body, a `main`, any
+/// one-shot driver — that made "a hot loop with a try/catch in it" run
+/// interpreted for its whole life: netty's two `HttpHeaderValidationUtilTest`
+/// exhaustive loops measured 19 242 and 309 423 ns/iteration against HotSpot's
+/// 8.2 and 9.4.
+///
+/// The lift stages the method-entry path's precise-exception-frame contract for
+/// the OSR compile and admits only methods where every throwing site inside a
+/// protected range publishes a reason-9 frame
+/// (`first_unsupported_precise_frame_site`). Set `=0` to restore the blanket
+/// refusal, so one binary can A/B the lift — the arm that answers "did this
+/// change the answer, or only the speed?". Read once and cached.
+///
+/// See fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md.
+#[inline]
+pub fn osr_exception_table_allowed() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_EXC_TABLE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_INLINE_CALLS` — allow a call INSIDE a spliced (inlined) body.
+/// **Default: OFF.**
+///
+/// Until this existed, `resolve_inline_site_from` rejected any callee
+/// containing an `invoke*`, so inlining reached only call-free leaves. That is
+/// what made a JUnit assertion chain un-collapsible: every rung of
+/// `assertEquals(int,int)` -> `assertEquals(Object,Object)` -> `objectsAreEqual`
+/// is small enough to splice, but each one CALLS the next, so none of them was
+/// ever eligible and every rung paid a full dispatch round trip.
+///
+/// With the gate on, such a call is emitted as the ordinary
+/// `jit_invoke_dispatch` sequence — the same helper, the same post-invoke
+/// exception check, the same oop map — resolved against the CALLEE's constant
+/// pool (`InlineSite::invoke_targets`). It is not a cheaper call; the win is
+/// that the ENCLOSING body becomes inlineable at all.
+///
+/// Default-OFF because the inline emitter's failure mode is a silent wrong
+/// answer, and because the gate is what makes a bisect possible: one binary,
+/// two arms. Read once and cached.
+#[inline]
+pub fn jit_inline_calls() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_CALLS"),
+            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
+        )
+    })
+}
+
+/// `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` — devirtualise a `invokevirtual` /
+/// `invokeinterface` INSIDE a spliced body, behind a receiver class-id guard.
+/// **Default: OFF.**
+///
+/// Nesting on its own reaches only statically bound calls, which is why it
+/// recovered the step-4 regression without beating the baseline: the JUnit
+/// chain's terminal `UNKNOWN.equals(k)` is an `invokevirtual`, and so are
+/// `HttpStatusClass.valueOf`'s five `contains` calls.
+///
+/// The profile this needs already existed and nobody had looked for it there.
+/// Receiver types are recorded by the interpreter against the bci of the method
+/// that is EXECUTING, so a call inside `objectsAreEqual` is profiled under
+/// `objectsAreEqual`'s own [`MethodKey`](crate::jit::profile::MethodKey) at its
+/// own bci — exactly the (method, pc) pair a nested site names. Re-keying the
+/// ENCLOSING method's profile by (caller pc, callee pc), which is what the
+/// netty pages predicted would be needed, would have been the wrong shape: that
+/// profile never had the information.
+///
+/// Same 80% dominance bar as the top-level guarded-virtual planner, and the
+/// same bargain — the hot edge is a spliced body, the cold edge is the ordinary
+/// call. It is only a bargain while the guard holds, which is what the bar is
+/// for. Requires [`jit_inline_nest`]. Read once and cached.
+#[inline]
+pub fn jit_inline_splice_devirt() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_SPLICE_DEVIRT"),
+            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
+        )
+    })
+}
+
+/// `CRATONVM_JIT_INLINE_CALL_DISPATCH` — let a call inside a spliced body fall
+/// back to the blind `jit_invoke_dispatch` helper. **Default: OFF, and the
+/// default is a MEASURED one.**
+///
+/// The first cut of [`jit_inline_calls`] emitted every admitted call that way.
+/// Measured on `probes/AssertChainProbe`, Azure Linux, release, one binary,
+/// three interleaved rounds:
+///
+/// | arm | `assertFull` ns/iter |
+/// |---|---:|
+/// | base | 47.2 / 45.3 / 47.9 |
+/// | + main inline | 50.3 / 79.8 / 58.9 |
+/// | + inline calls (dispatch fallback) | **163.3 / 266.6 / 172.2** |
+/// | + nesting | 47.3 / 59.6 / 80.2 |
+///
+/// and the counter that names the mechanism, `CRATONVM_DBG=mic-prof` over
+/// 2 000 000 iterations: `disp_calls` **3 870 -> 2 003 361**, `cyc_disp_total`
+/// **1.86M -> 1 049M cycles**. One blind dispatch per iteration, ~524 cycles
+/// each.
+///
+/// The reason is structural, not a tuning miss. The chain this was built for is
+/// already DIRECT-BOUND: each rung is a raw `CALL` to a compiled entry, a few
+/// nanoseconds. Splicing the enclosing body removes one frame and converts its
+/// inner call from that direct call into the blind helper, which resolves by
+/// name on every execution. The frame saved is worth ~4 ns; the call downgraded
+/// costs ~175. **Splicing a body is only worth it when the call inside it does
+/// not get worse.**
+///
+/// So with this off, a callee containing a call is admitted ONLY when every one
+/// of those calls is itself spliced (`InlineSite::nested_sites`), and the
+/// dispatch fallback is not merely unused but not planned — `invoke_targets` is
+/// cleared, so a nested splice that bails at emission time bails the enclosing
+/// splice too rather than silently degrading to the helper.
+///
+/// Kept as a flag rather than deleted because it is the arm that REPRODUCES the
+/// measurement above, and because it is what a direct-binding follow-up (give a
+/// spliced call the `direct_calls` treatment the top level already has) would
+/// replace rather than remove. Read once and cached.
+#[inline]
+pub fn jit_inline_call_dispatch() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_CALL_DISPATCH"),
+            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
+        )
+    })
+}
+
+/// `CRATONVM_JIT_INLINE_NEST` — splice a call that is itself inside a spliced
+/// body, up to `cratonvm_jit::MAX_INLINE_NEST_DEPTH` levels. **Default: OFF.**
+///
+/// Requires [`jit_inline_calls`]: nesting resolves its candidates out of
+/// `InlineSite::invoke_targets`, which stays empty with that gate off. Kept
+/// SEPARATE from it so a regression can be bisected to "calls inside splices"
+/// versus "splices inside splices" — two different emitter paths with two
+/// different failure modes.
+///
+/// Only statically-bound calls (`invokestatic`, `invokespecial`) nest; a
+/// virtual or interface call inside a spliced body keeps the dispatch helper,
+/// because selecting its body needs a runtime receiver and the receiver
+/// profile is keyed by the ENCLOSING method's bci, not a callee-internal pc.
+/// Read once and cached.
+#[inline]
+pub fn jit_inline_nest() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_NEST"),
+            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
+        )
+    })
+}
+
 /// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
 /// from ever populating a `CachedInvokeTarget::Intrinsic` inline-cache entry,
 /// forcing every call through the ordinary native/bytecode dispatch path.
@@ -840,6 +1033,116 @@ pub fn jit_virtual_tierup() -> bool {
         }
     })
 }
+
+/// `CRATONVM_JIT_LAMBDA_TIERUP` — count invocations of a lambda SAM
+/// implementation, and enter its compiled body directly once one exists.
+///
+/// A lambda impl reached through `try_lambda_dispatch` used to touch neither
+/// `profile_store.increment_invocation` nor `jit.jit_cache`, so it could never
+/// be nominated for compilation no matter how hot: confirmed with
+/// `CRATONVM_DBG_JITC=1` against `probes/SamDispatchDecompositionProbe.java` —
+/// a lambda's synthetic `lambda$...` method never once appears in the
+/// tiered-enqueue/bg-compile log, while the identical body on a named or
+/// anonymous class compiles normally within a few hundred calls and runs ~40x
+/// faster. See
+/// known-issues/perf/lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md.
+///
+/// Default ON. Off-switch for diagnosis/bisection, and the kill switch a
+/// same-binary A/B needs: `CRATONVM_JIT_LAMBDA_TIERUP=0`.
+#[inline]
+pub fn jit_lambda_tierup() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LAMBDA_TIERUP") {
+            // Explicit opt-out only: `0` / `false` disable; unset or any other
+            // value enables.
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+/// `CRATONVM_JIT_LAMBDA_ADAPTER` — let a SAM call site keep an inline-cache
+/// entry of its own.
+///
+/// A lambda receiver was the one receiver the monomorphic inline cache could
+/// not hold, and the obstacle was an argument shuffle rather than anything
+/// about caching: the cascade passes `(proxy, samArgs…)` and a non-capturing
+/// lambda's impl wants `(samArgs…)`. With this on, a small thunk performs the
+/// shuffle and tail-jumps to the impl, and the slot holds the thunk — so the
+/// dispatch happens in machine code with no Rust on the path, exactly as it
+/// does for a named class.
+///
+/// Default ON. `CRATONVM_JIT_LAMBDA_ADAPTER=0` keeps the Rust fast path
+/// (`try_lambda_site_direct_call`) and is the kill switch a same-binary A/B of
+/// the thunk needs; `CRATONVM_JIT_LAMBDA_SITE=0` disables that arm too, and
+/// `CRATONVM_JIT_LAMBDA_TIERUP=0` disables the whole feature.
+#[inline]
+pub fn jit_lambda_adapter() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LAMBDA_ADAPTER") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER` — extend that inline-cache entry to a
+/// lambda that CAPTURES.
+///
+/// A capturing lambda's impl wants `(captures…, samArgs…)`, so its thunk has to
+/// read the captured values out of the proxy object before it jumps. That is the
+/// one part of the thunk that touches memory, and the only part whose
+/// preconditions are not purely about registers — the proxy's field layout, the
+/// capture types, and, for a reference capture, the collector's read-barrier
+/// state.
+///
+/// It gets its own switch for that reason, and because a same-binary A/B of
+/// "capturing lambdas too" against "non-capturing only" is otherwise impossible:
+/// [`jit_lambda_adapter`]`=0` turns off both at once and would measure the wrong
+/// difference.
+///
+/// Default ON. `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER=0` leaves capturing sites on
+/// the Rust fast path (`try_lambda_site_direct_call`) while non-capturing ones
+/// keep their thunks.
+#[inline]
+pub fn jit_lambda_capture_adapter() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
+/// compiled caller's SAM call served straight from the call site's own cached
+/// target (`jit::helpers::try_lambda_site_direct_call`).
+///
+/// Default ON, and separate from [`jit_lambda_tierup`] on purpose. The two
+/// halves of this feature serve DIFFERENT callers — this one a compiled caller,
+/// the interpreter's one-shot (`execute_jit_call_oneshot`) an interpreted one —
+/// and a workload reaches whichever its callers happen to be. Turning this one
+/// off routes a compiled caller's SAM call back through the generic path and
+/// therefore through the interpreted half, which is what makes each half
+/// separately measurable, separately bisectable, and separately TESTABLE: see
+/// `vm/tests/lambda_jit_oneshot_tests.rs`, which exists because the correctness
+/// suite otherwise never reaches the interpreted half at all.
+///
+/// `CRATONVM_JIT_LAMBDA_SITE=0` disables it; `CRATONVM_JIT_LAMBDA_TIERUP=0`
+/// disables both halves.
+#[inline]
+pub fn jit_lambda_site() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LAMBDA_SITE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_NATIVE_STRING_REGEX` — route `String.replaceAll` / `replaceFirst`
 /// / `matches` and the literal `String.replace(CharSequence,CharSequence)` to
 /// CratonVM's fast cached Rust natives instead of the real JDK bytecode. The
@@ -936,6 +1239,42 @@ cached_is_set!(ctor_direct_call_disabled, "CRATONVM_NO_CTOR_DIRECT_CALL");
 /// elision (which ctor sites are deferred / resolved elidable). Read only at
 /// JIT compile time.
 cached_is_set!(ctor_fix_dbg, "CRATONVM_DBG_CTOR_FIX");
+/// `CRATONVM_NO_OSR_CTOR_BIND` — opt OUT of routing a NON-elidable
+/// `invokespecial …<init>()V` site in the **OSR** compile door through the
+/// eager-compile + direct-bind path every other statically-bound site there
+/// already takes. When set, such sites fall back to the per-allocation
+/// `jit_invoke_dispatch` slow path.
+///
+/// The off-switch exists because this exact reroute was tried on 2026-08-13
+/// and reverted: it made `compile_with_param_slots` refuse the enclosing
+/// method, and an OSR refusal marks the method OSR-denied for the process, so
+/// the hot loop interpreted forever (4.5x SLOWER). The cause was a
+/// direct-bound site with no `JitInvokeInfo` — a hole this door has since
+/// closed for its sibling non-`()V` admission. Read only at JIT compile time.
+cached_is_set!(osr_ctor_bind_disabled, "CRATONVM_NO_OSR_CTOR_BIND");
+/// `CRATONVM_JIT_REAL_NEW_SITE_FLAGS` — put the REAL `has_prim_init` /
+/// `has_finalizer` at a `new` site compiled through the interpreter's
+/// first-call door or the OSR door, instead of the conservative
+/// `(true, true)` those two doors hard-code.
+///
+/// OPT-IN, and the reason is a measurement rather than a doubt about
+/// correctness. Setting the real flags is what makes `bytecode_walk`'s
+/// `skip_helper` reachable at all from those doors, which is the in-tree TODO
+/// the `fastthreadlocal-2e9-iteration-throughput-wall` page investigated. It
+/// works — and it buys nothing, because `emit_inline_tlab_new` does not
+/// actually allocate inline: its own comment records that the raw compiled
+/// cursor bump was routed back through the checked runtime helper after it
+/// left a malformed young-space span under Elasticsearch merge churn. Only
+/// the header writes are inline, so `skip_helper` removes a
+/// `jit_post_tlab_init` call and leaves the allocation cost where it was.
+///
+/// Measured (Azure Linux, interleaved, same binary, `probes/CtorShapeRateProbe`):
+/// `new Object()` 111.4 ns/op with the inline arm off, 118.0 ns/op with it on;
+/// the real `new FastThreadLocal<Boolean>()` loop was no better in 3 of 4
+/// rounds. Turn this on again when the JIT-emitted bump can share
+/// `Tlab::alloc_initialized`'s publication contract — at that point it is the
+/// switch that makes the inline path worth having.
+cached_is_set!(jit_real_new_site_flags, "CRATONVM_JIT_REAL_NEW_SITE_FLAGS");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────
 
@@ -1267,6 +1606,29 @@ pub fn jit_native_shadow_interface_blind() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND")
+            .map_or(true, |v| v != "0" && v != "false")
+    })
+}
+
+/// Transitive eager callee compilation (default-ON).
+///
+/// A statically bound call site can only be bound to a raw `CALL` if the callee is
+/// compiled ALREADY. `try_jit_compile_callee_slow`'s resolver used to answer only
+/// from `jit_cache`, so a caller compiled one moment before its callee bound that
+/// site to the generic `jit_invoke_dispatch` helper — and a compiled body never
+/// re-binds. Measured on `probes/org/junit/jupiter/api/CompileOrderProbe.java`:
+/// 478 ns/iter when the chain compiles top-down against 73 when it compiles
+/// bottom-up, entirely accounted for by ~1 helper round trip per iteration
+/// (`CRATONVM_DBG_MIC_PROF=1`: `disp_calls` 2 003 538 against 3 926).
+///
+/// `CRATONVM_JIT='-eager-callee-chain'` (or `CRATONVM_JIT_EAGER_CALLEE_CHAIN=0`)
+/// restores the one-level behaviour. Correct either way: the fallback is the
+/// checked dispatch helper.
+#[inline]
+pub fn jit_eager_callee_chain() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_EAGER_CALLEE_CHAIN")
             .map_or(true, |v| v != "0" && v != "false")
     })
 }

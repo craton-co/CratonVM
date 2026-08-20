@@ -505,10 +505,43 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
 pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let hash = ctx.identity_hash_code(this);
     if crate::nbflags().dbg_sttrace {
+        // The throwable's CLASS, not just its identity. Counting captures tells
+        // you a workload throws a lot; only the class tells you what. Naming it
+        // here is what separated "Quartz leaks memory" from "Quartz throws the
+        // same exception 25,000 times" — see
+        // known-issues/springboot/quartz-endpoint-web-jit-only-spin-loop-20260818.
         eprintln!("STTRACE_DBG_CTOR_CAP this={:?} hash={hash}", this.as_ptr());
     }
     let trace = ctx.capture_throwable_stack_trace(this);
     let depth = trace.len() as i32;
+    if crate::nbflags().dbg_sttrace {
+        // The top frames of THIS throwable's own trace, in order, on one line.
+        // Printing frames from a separate site and pairing them up afterwards
+        // is not sound — captures from several threads interleave in the log,
+        // and reading "the deepest frame" out of a merged group names a throw
+        // site that never existed. One line per throwable cannot be mispaired.
+        // Captured traces are OUTERMOST-first, so the throw site is the LAST
+        // entry, not the first. Print both ends labelled — an unlabelled
+        // "top=" that is really the thread entry point reads as a perfectly
+        // plausible answer, which is how the first version of this line sent
+        // the investigation at `TaskThread.run`.
+        let fmt = |f: &cratonvm_native_api::registry::StackTraceEntry| {
+            format!("{}.{}:{}", f.class_name, f.method_name, f.line_number)
+        };
+        let innermost: Vec<String> = trace.iter().rev().take(5).map(&fmt).collect();
+        // Class AND frames on ONE line. They were two `eprintln!`s, and
+        // `eprintln!` from several threads interleaves, so pairing "the last
+        // class line" with "the next frame line" attributes frames to the
+        // wrong throwable — the same unsound pairing this file already fixed
+        // once, reintroduced by splitting the print. One line, one throwable.
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_else(|| "?".to_string());
+        eprintln!(
+            "STTRACE_DBG_TOP hash={hash} class={cls} depth={depth} innermost={}",
+            innermost.join(" <- ")
+        );
+    }
     // `getOurStackTrace()` only materialises frames when `backtrace != null`;
     // park a self-reference as the non-null marker (the real frame data lives
     // in the identity-hash-keyed trace store).
@@ -719,19 +752,28 @@ pub(crate) fn native_assertion_error_init_object(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let Some(Value::Object(Some(this))) = args.first().copied() else {
+    let Some(Value::Object(Some(mut this))) = args.first().copied() else {
         return Ok(None);
     };
-    let detail = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut detail = args.get(1).copied().unwrap_or(Value::Object(None));
     // `String.valueOf(Object)` — through the JDK so a custom `toString()` is
     // honoured, exactly as the real constructor does.
+    //
+    // GC-safety: this is the `assert` failure path, so it runs at whatever
+    // allocation pressure the program had reached, and the `toString()`
+    // bytecode below allocates and can relocate BOTH `this` and the argument.
+    // Pin the two across the call and REBIND them to the forwarded references —
+    // every write below targets `this`, and the Throwable-cause test below
+    // reads `detail`, so a stale local here corrupts the object it is building.
     let message = match detail {
         Value::Object(Some(obj)) => {
             let this_pin = ctx.pin_native_root(this);
+            let detail_pin = ctx.pin_native_root(obj);
             let rendered = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
-            let this = ctx.read_native_pin(this_pin, this);
+            this = ctx.read_native_pin(this_pin, this);
+            detail = Value::Object(Some(ctx.read_native_pin(detail_pin, obj)));
+            // Releases from `this_pin` onward, i.e. both handles.
             ctx.unpin_native_roots(this_pin);
-            let _ = this;
             match rendered {
                 Ok(Some(v @ Value::Object(Some(_)))) => v,
                 _ => Value::Object(None),
@@ -786,28 +828,16 @@ fn scalar_to_string(kind: ScalarKind, value: Option<&Value>) -> String {
         (ScalarKind::Int, Some(Value::Int(v))) => v.to_string(),
         (ScalarKind::Long, Some(Value::Long(v))) => v.to_string(),
         (ScalarKind::Long, Some(Value::Int(v))) => (*v as i64).to_string(),
-        // Java renders 1.5f as "1.5" and 1.0f as "1.0"; Rust's `{}` agrees for
-        // both, and `{:?}` would not.
-        (ScalarKind::Float, Some(Value::Float(v))) => format_java_float(*v as f64),
-        (ScalarKind::Double, Some(Value::Double(v))) => format_java_float(*v),
+        // Java's float/double text rules are NOT Rust's `to_string`:
+        // `Float.toString(0.1f)` is "0.1", but widening that f32 to f64 and
+        // printing gives "0.10000000149011612", and `Double.toString(1e7)` is
+        // "1.0E7" where Rust prints "10000000". `format_float`/`format_double`
+        // in `lang_string` ARE the in-tree implementations of Java's rules
+        // (both delegate to the shared `cratonvm_types` formatter); a second
+        // local copy here would drift away from them.
+        (ScalarKind::Float, Some(Value::Float(v))) => crate::lang_string::format_float(*v),
+        (ScalarKind::Double, Some(Value::Double(v))) => crate::lang_string::format_double(*v),
         _ => String::new(),
-    }
-}
-
-/// Java's `Double.toString`/`Float.toString` always carry a decimal point;
-/// Rust's `Display` prints `1` for `1.0`.
-fn format_java_float(v: f64) -> String {
-    if v.is_nan() {
-        return "NaN".to_string();
-    }
-    if v.is_infinite() {
-        return if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
-    }
-    let s = v.to_string();
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        s
-    } else {
-        format!("{s}.0")
     }
 }
 
@@ -818,7 +848,11 @@ fn assertion_error_init_scalar(
 ) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first().copied() {
         let text = scalar_to_string(kind, args.get(1));
-        let message = ctx.create_string(&text);
+        // Uninterned, like every `String.valueOf` native in `lang_string`: the
+        // JDK hands back a fresh String, so `new AssertionError(42).getMessage()
+        // == "42"` is false, and interning one object per distinct value would
+        // pin an unbounded set of messages in the intern table forever.
+        let message = ctx.create_string_uninterned(&text);
         write_throwable_detail_message(ctx, this, Value::Object(Some(message)));
         write_throwable_cause(ctx, this, Value::Object(Some(this)));
         capture_throwable_trace(ctx, this);
@@ -845,7 +879,9 @@ fn index_exception_init_index(
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        let message = ctx.create_string(&format!("{prefix}{index}"));
+        // Uninterned: one distinct message per index, and the JDK's is a fresh
+        // String built by concatenation, never an interned constant.
+        let message = ctx.create_string_uninterned(&format!("{prefix}{index}"));
         write_throwable_detail_message(ctx, this, Value::Object(Some(message)));
         write_throwable_cause(ctx, this, Value::Object(Some(this)));
         capture_throwable_trace(ctx, this);
@@ -3073,6 +3109,12 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
         // here — `()V`, `(String)V`, `(String,Throwable)V`, `(Throwable)V` —
         // for EVERY class in the list, which is 103 descriptors the real JDK
         // class does not declare and 16 it does that nobody registered.
+        //
+        // Older still, and worth keeping: audit-2026-05-16 replaced a generic
+        // `native_noop_with_this` behind those four descriptors that left
+        // `cause` un-initialised. The (String) ctor writes the JDK sentinel
+        // `cause = this`, so a later `initCause()` succeeded after a (String)
+        // ctor and failed after the no-arg one.
 
         // getMessage()Ljava/lang/String; — read slot 0 (detailMessage).
         r.register(

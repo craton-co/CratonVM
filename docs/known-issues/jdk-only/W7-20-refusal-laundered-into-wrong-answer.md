@@ -1,5 +1,122 @@
 # W7-20 — a refusal laundered into a wrong answer, and the paired mint that stops producing them
 
+> **RUN AND VERIFIED 2026-08-12 (lane A32, record triage). `al.equals(ll)` IS
+> `true` UNDER `--jdk-only`. THE PREDICTED CENSUS MOVEMENT IS CONFIRMED
+> EXACTLY, INCLUDING THE PART THAT WAS PREDICTED *NOT* TO MOVE.**
+>
+> This record's status line says NOT REBUILT and its Part 1 table was taken on a
+> binary that predates W2-1. Measured here on `cratonvm-merged-dev.exe` against
+> `jdk-25.0.3.9-hotspot`, HotSpot 25 as the same-session oracle.
+>
+> **Part 1's table, re-taken. `--jdk-only` is now identical to HotSpot on every
+> row but the one this record exempts:**
+>
+> | row | HotSpot 25 | `--jdk-only` |
+> |---|---|---|
+> | `al.equals(ll)` **(THE ROW)** | `true` | **`true`** |
+> | `ll.equals(al)` | `true` | `true` |
+> | `al.hashCode()==ll.hashCode()` | `true` | `true` |
+> | `al.containsAll(ll)` | `true` | `true` |
+> | `ll.listIterator().getClass()` | `java.util.LinkedList$ListItr` | `cratonvm.internal.LinkedListSnapshotListItr` |
+> | `al.toString()` / `ll.toString()` | `[a, b, c]` | `[a, b, c]` |
+> | `new ArrayList<>(ll)` / `new HashMap<>(tm)` | `[a, b, c]` / `{k=v}` | same |
+>
+> The `NoClassDefFoundError`s that filled the strict column are gone, and the
+> one remaining difference is the carrier's name — exactly the exemption
+> *Verification, once this is built* names ("identical … on every row except
+> `ll.listIterator().getClass()`").
+>
+> **Part 3(b) is closed by run.** `listIterator() instanceof ListIterator` is
+> `true`, and an erased-type `(ListIterator) x` cast through `Object` succeeds
+> and iterates. The `jdk_interfaces` arm landed.
+>
+> **The error channels behave in the direction intended, checked with a
+> throwing element rather than only with a refusal** — an element whose own
+> `toString`/`hashCode` raise:
+>
+> ```text
+> HotSpot 25 / --jdk-only  (identical)
+> list.toString()  IllegalStateException: boom-toString     <- propagates
+> list.hashCode()  IllegalStateException: boom-hashCode     <- propagates
+> ```
+>
+> Neither truncates to `[]`, neither fabricates a `ClassName@hash`, and neither
+> substitutes an identity hash. That is the `Compatible`-mode half of the change
+> — the one this record says is its only regression risk — behaving as HotSpot
+> does.
+>
+> **The census moved exactly as predicted, and the negative prediction is the
+> load-bearing one.** From `--jdk-only --explain-jdk-only --jdk-only-report`:
+>
+> * the `compatibility-class-requested` row for
+>   `cratonvm/internal/LinkedListSnapshotListItr` is **gone** — the string does
+>   not occur anywhere in the census;
+> * the nine `synthetic-native-registered` rows have **left** that population;
+> * **the four `native-shadows-bytecode` rows stay**, and they are precisely the
+>   four named: `java/util/LinkedList` `<init>(Ljava/util/Collection;)V`,
+>   `iterator()`, `listIterator()`, `toString()`.
+>
+> Do not read the green rows as "the gap is closed" — this record already says
+> so, and the census now proves it from the tree rather than predicting it.
+> `java/util/LinkedList$Itr` is **still** requested and refused under
+> `--jdk-only` (it is one of the 14 surviving `compatibility-class-requested`
+> rows), yet `hashCode` and `containsAll` answer correctly anyway. That is the
+> deferred-refusal shape this record files under *Not fixed, with the verdict*
+> for `alloc_real_snapshot_iterator_of` — the refusal is routed, not lost —
+> and it is W2-1's family, not this one's.
+>
+> **Source audit, every claim checked individually rather than sampled:**
+>
+> * **All fourteen helpers carry an error channel.** Each signature was read.
+>   `collection_elements_generic` (`native-collections/src/lib.rs:3950`),
+>   `collect_via_real_iterator` (`:5246`), `collect_via_real_iterator_once`
+>   (`:5281`), `al_or_collection_elements` (`:5378`),
+>   `collect_collection_elements_or_real` (`:36773`), `collect_entries_any`
+>   (`:11616`), `collect_entries_via_iterator` (`:11725`) and `_inner`
+>   (`:11747`), `prim_stream_values` (`:19595`), `stream_source_elems`
+>   (`:18136`), `group_key_equal` (`:3589`), `list_element_matches` (`:3641`),
+>   `element_hash_code` (`:7405`), `obj_to_display_string` (`:3326`) — every one
+>   returns `Result<_, MethodCallFailed>`. The two companions are converted too:
+>   `pinned_array_search` (`:3679`) and `ll_pinned_find` (`:32798`).
+> * **Both gates are open.** `cratonvm/internal/LinkedListSnapshotListItr` is in
+>   `VM_SERVICE_RECEIVERS` at `native-api/src/no_image_receiver.rs:267`, in
+>   correct sort position (between `cratonvm/Wp71JdbcSpi` and
+>   `cratonvm/internal/SystemLogger`), and is **absent** from
+>   `VM_MINTED_STAND_IN_RECEIVERS` — line 198 there is a tombstone comment. The
+>   `binary_search` this record warns can fail silently will find it.
+> * All nine natives use `register_with_kind(…, NativeKind::Bridge)`
+>   (`native-collections/src/lib.rs:31913-31972`), and the mint calls
+>   `ensure_vm_internal_class` **inside** the `rooted_across` closure
+>   (`:32036`, `:32062`) — the GC-safety correction this record makes to W7-16's
+>   recorded hunk was applied as written.
+> * `jdk_interfaces` arm present at `classloading/src/class_manager.rs:11198`.
+>
+> **Three corrections to this record's own text:**
+>
+> 1. **The prose says "Nine helpers"; its own table lists fourteen**, and
+>    fourteen (plus two companions) are what the tree has. The table is right.
+> 2. **§(a) cites `jdk-only-kind-map-25-linux.tsv` lines 283–291; the nine rows
+>    are at 379–387**, and they now read **`bridge`**, not `synthetic-stub`. The
+>    re-freeze §(a) demands has happened. Its header discloses the rows were
+>    hand-edited and records why `kind_stated` stayed `1` — because the nine
+>    registrations moved to `register_with_kind` in the same change.
+> 3. **`probes/LaunderProbe.java` is still NOT in the tree.** Confirmed against
+>    `git ls-files`, a repo-wide glob and a full-text grep: the only occurrences
+>    of the name are in this record and W7-62. The *Probes* section at the end
+>    still says it was "written for this record" without the caveat the inline
+>    note carries. **This record's Part 1 evidence is therefore unscheduled and
+>    unreproducible from the tree** — the table above was re-taken from a
+>    reconstruction, held in a scratch directory outside the worktree so it does
+>    not trip the source-witness gates. `probes/` is not run by
+>    `regression-suite/run.sh` at any `SUITE=` value in any case;
+>    `probes/ListItrInterfaceProbe.java`, which W7-62 added, does exist.
+>
+> **Disposition: FIXED, verified by execution.** The open items are the ones
+> this record already scopes out — the `listIterator` shadow retirement (a
+> collections reclassification), and the Linux-only ratchet re-freeze in §(a),
+> which cannot be settled on this Windows host: both artefacts are keyed
+> `25/linux`, so both look up `25/windows`, find nothing and exit 2.
+
 **Status: DIAGNOSED and FIXED IN SOURCE 2026-08-11, NOT REBUILT. Both
 out-of-file items taken 2026-08-12 — see the block above "Out-of-file patch"
 and W7-62-ratchets-and-dead-code.md.** Nine

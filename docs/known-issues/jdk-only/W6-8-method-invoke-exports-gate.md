@@ -200,7 +200,7 @@ java.base detector is `RJdkStrict`.
 | record component accessor | `RecordComponent.getAccessor()` returns a `Method`; invocation goes through `Method.invoke` | inherits the fix | correct |
 | `MethodHandles.Lookup.findVirtual` / `findStatic` / `findGetter` / … | `lang_invoke.rs` (`lookup_find_*` → `lk_enforce_find_access`) | no module check; **lookup-mode check since W4-1** | mode half correct; module half is W4-1's stated one-directional residual |
 | `MethodHandles.Lookup.unreflect` / `unreflectSpecial` / `unreflectGetter` / `unreflectSetter` / `unreflectVarHandle` / `unreflectConstructor` | `lang_invoke.rs` (`lookup_unreflect` &co. → `lk_enforce_unreflect_access`) | no module check; **lookup-mode check added 2026-08-11** | **FIXED here** — see below |
-| `Class.newInstance()` (deprecated) | `lang_class::native_class_new_instance` | no check at all (not even the caller check) | **OPEN**, but synthetic-jdk only — it is registered exclusively in `register_synthetic_overrides`; under `--real-jdk` the real bytecode routes to `Constructor.newInstance` |
+| `Class.newInstance()` (deprecated) | `lang_class::native_class_new_instance` | no check at all (not even the caller check) | **CONFIRMED LIVE 2026-08-12 (lane A31), and WIDER than this row says** — it skips the JVMS *instantiability* checks too, not only the access ones. See §"`Class.newInstance()` measured in `--synthetic-jdk`" below. Scoping claim (synthetic-jdk only) **holds**. |
 
 ### The `Field.get` row — ADJUDICATED 2026-08-11: it was already fixed
 
@@ -429,3 +429,51 @@ misconception this page fixes. The test does not run today (`#[ignore]`, for an
 unrelated synthetic-JDK `getDeclaredMethods` linkage gap), so nothing goes red,
 but the expectation must be flipped before the ignore is lifted. `vm/**` is not
 this lane's file; the patch is in the lane report.
+
+---
+
+## `Class.newInstance()` measured in `--synthetic-jdk` — 2026-08-12 (lane A31)
+
+The §"Residual: STILL OPEN" table row for `Class.newInstance()` was recorded as
+unmeasured because the only mode it is registered in had never been launched. A
+`--features synthetic-jdk` binary was built and run with `--synthetic-jdk`.
+
+**The scoping claim holds** — the row is synthetic-mode only — **and the defect
+is wider than "no access check".** `native_class_new_instance` also skips the
+two JVMS *instantiability* preconditions, so it will construct things that
+cannot be constructed:
+
+```
+                             HotSpot 25              --jdk-only (both binaries)          --synthetic-jdk
+newInstance on abstract      InstantiationException  UnsupportedOperationException:      CONSTRUCTED
+                                                     "InstantiationException: cannot     A31$AbstractThing
+                                                      instantiate abstract/interface
+                                                      type A31$AbstractThing"
+newInstance, no nullary      InstantiationException  UnsupportedOperationException:      CONSTRUCTED
+                                                     "InstantiationException: no no-arg  A31$NoNullary
+                                                      constructor in A31$NoNullary"
+newInstance, ctor throws     IllegalStateException   IllegalStateException: boom         IllegalStateException: boom
+                             : boom                                                      (correct)
+```
+
+An instance of an **abstract class** now exists on the heap, with no
+implementation for its abstract methods. That is a strictly worse outcome than
+the missing module check this row was filed for: a missing access check hands a
+caller an object it should not have had; this hands it an object the JVM
+specification says cannot exist.
+
+Two notes so the next reader does not re-derive them:
+
+* **The access half could not be discriminated by the obvious probe.**
+  `PrivCtor.class.newInstance()` on a *nested* private-constructor class reads
+  `CONSTRUCTED` on **HotSpot too** — nestmates make that constructor genuinely
+  accessible from the enclosing class since Java 11. Testing this row needs a
+  private constructor in a **separate top-level class in another package**, or a
+  non-exported `java.base` type. Not done here; the access half of this row
+  remains **unadjudicated**.
+* **Both shipping modes throw the wrong exception TYPE**, which is a separate
+  defect and not synthetic-only: `java.lang.UnsupportedOperationException`
+  wrapping the words "InstantiationException", where HotSpot throws
+  `java.lang.InstantiationException`. A `catch (InstantiationException e)` — the
+  idiom every reflective factory uses — does **not** catch it under `--jdk-only`.
+  Out of this record's lane; filed as lane A31's NOMINATION A31-5.

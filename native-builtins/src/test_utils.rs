@@ -319,7 +319,93 @@ fn mock_field_slot(class_name: Option<&str>, field_name: &str) -> Option<usize> 
         .or_else(|| mock_liquibase_field_slot(class_name, field_name))
         .or_else(|| mock_stamped_lock_field_slot(class_name, field_name))
         .or_else(|| mock_undertow_exchange_field_slot(class_name, field_name))
+        .or_else(|| mock_foreign_segment_field_slot(class_name, field_name))
+        .or_else(|| mock_enum_field_slot(class_name, field_name))
         .or_else(|| mock_jdk_field_slot(field_name))
+}
+
+/// `java.lang.Enum` carriers: `name` is slot 0 and `ordinal` slot 1.
+///
+/// Needed because the class-agnostic `mock_jdk_field_slot` fallback below is
+/// the Field/Method/Constructor MIRROR namespace, where `clazz` is 0 and
+/// `name` is 1. An enum reaching that fallback resolves `name` to slot 1 —
+/// `ordinal`'s slot — so a decoder that asks
+/// `resolve_field_index_by_class_id(cid, "name")` reads the ordinal, misses
+/// the string, and silently falls back to the ordinal path. That is precisely
+/// the name-before-ordinal precedence `http2.rs`'s decoder exists to
+/// implement, so the mock could only ever fail a test of it.
+///
+/// Listed by name rather than detected: the mock has no notion of "is an
+/// enum", so a carrier has to be added here when a test starts using it.
+fn mock_enum_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    const ENUM_CARRIERS: &[&str] = &[
+        "java/net/http/HttpClient$Version",
+        "java/net/http/HttpClient$Redirect",
+    ];
+    if !ENUM_CARRIERS.contains(&class_name?) {
+        return None;
+    }
+    match name {
+        "name" => Some(0),
+        "ordinal" => Some(1),
+        _ => None,
+    }
+}
+
+/// The real-JDK `jdk.internal.foreign` segment carriers.
+///
+/// `panama.rs` and `panama_libffi.rs` read these carriers BY NAME on purpose —
+/// `segment_address` looks for `min`, `segment_byte_size` for `length`,
+/// `heap_segment_view` for `base`/`offset`/`readOnly` — precisely because the
+/// three classes do NOT share a slot layout, so reading "field 0" answers a
+/// different thing for each. Without the family in this table every one of
+/// those lookups missed, each reader fell through to its by-index fallback,
+/// and the fallback answered the neighbouring field: `segment_byte_size` read
+/// `readOnly` and returned 0, `segment_address` read `length` and returned the
+/// byte size as an address, and `heap_segment_view` could not find `base` at
+/// all and refused every heap access as unresolvable. That is the exact class
+/// of bug these tests were written to pin, so the mock could only ever fail
+/// them.
+///
+/// Layouts are javap's, 25.0.3+9-LTS. `AbstractMemorySegmentImpl` declares
+/// `long length`, `boolean readOnly`, `MemorySessionImpl scope`; its two
+/// subclasses are SIBLINGS and add different fields after those three:
+///
+/// * `HeapMemorySegmentImpl` (and its `$Of*` subclasses) — `long offset`,
+///   `Object base`. No `min`: a heap segment has no machine address.
+/// * `NativeMemorySegmentImpl` — `long min`.
+/// * `MappedMemorySegmentImpl` — `long min`, then `Unmapper unmapper`.
+///
+/// `base` is deliberately absent from the two native rows: it is the field
+/// `is_real_heap_segment` uses to recognise a heap carrier by shape, so
+/// answering it for a native segment would misclassify it.
+fn mock_foreign_segment_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    let class_name = class_name?;
+    let abstract_slot = match name {
+        "length" => Some(0),
+        "readOnly" => Some(1),
+        "scope" => Some(2),
+        _ => None,
+    };
+    if class_name.contains("HeapMemorySegmentImpl") {
+        return abstract_slot.or(match name {
+            "offset" => Some(3),
+            "base" => Some(4),
+            _ => None,
+        });
+    }
+    match class_name {
+        "jdk/internal/foreign/NativeMemorySegmentImpl" => abstract_slot.or(match name {
+            "min" => Some(3),
+            _ => None,
+        }),
+        "jdk/internal/foreign/MappedMemorySegmentImpl" => abstract_slot.or(match name {
+            "min" => Some(3),
+            "unmapper" => Some(4),
+            _ => None,
+        }),
+        _ => None,
+    }
 }
 
 fn mock_parameter_field_slot(name: &str) -> Option<usize> {
@@ -2243,7 +2329,13 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
                 _ => chars.push(0),
             }
         }
-        String::from_utf16(&chars).ok()
+        // LOSSY, like production: an unpaired surrogate becomes U+FFFD rather
+        // than turning the whole read into `None`. `String::from_utf16(..).ok()`
+        // was the divergence — it made a string carrying a lone surrogate
+        // unreadable under the mock, so `read_string_chars`, whose entire
+        // purpose is to carry the units `read_string` cannot, could not be
+        // contrasted against `read_string` at all.
+        Some(String::from_utf16_lossy(&chars))
     }
 
     fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef {
@@ -2536,12 +2628,19 @@ impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {
 
 impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
 
-    // Mirror the production NativeContext memory bridge for REAL pointers:
-    // vm_exec falls through to a raw copy when the address is not a tagged
-    // Unsafe-arena handle. The t27_tls direct-buffer tests hand this mock
-    // genuine malloc pointers (Vec backing stores), so the arena-aware
-    // accessors (bb_get_byte & co.) must be able to reach them here too.
+    // Mirror the production NativeContext memory bridge, BOTH halves:
+    // `vm_exec` routes a TAGGED `Unsafe.allocateMemory` handle to the arena
+    // store and only falls through to a raw copy for an untagged address. This
+    // mock used to do the raw copy unconditionally, so a test that handed it an
+    // arena handle dereferenced the tag bit as an address — an access violation
+    // on the first byte, which is how `set_memory_off_heap_fills_in_bulk_and_
+    // stays_in_bounds` found this. The t27_tls direct-buffer tests still hand
+    // this mock genuine malloc pointers (Vec backing stores), and those keep
+    // taking the raw path.
     fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        if crate::unsafe_arena_addr_is_tagged(addr) {
+            return crate::unsafe_arena_copy_out(addr, out);
+        }
         if addr <= 0 {
             return false;
         }
@@ -2552,6 +2651,9 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
     }
 
     fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if crate::unsafe_arena_addr_is_tagged(addr) {
+            return crate::unsafe_arena_copy_in(addr, data);
+        }
         if addr <= 0 {
             return false;
         }

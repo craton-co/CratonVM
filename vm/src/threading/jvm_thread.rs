@@ -366,6 +366,17 @@ pub struct JvmThread {
     /// `*mut Frame` across the dispatch loop instead of re-indexing
     /// `thread.frames[frame_idx]` on every access. See the `FrameStack` docs
     /// for the aliasing rules that come with the raw-pointer API.
+    /// The heap collection count as of the last time SOMETHING remapped this
+    /// thread's frames: the initiator's own `update_all_roots`, the
+    /// safepoint-arrival `apply_pointer_map_to_thread`, or the blocked-region
+    /// wake write-back.
+    ///
+    /// `CRATONVM_DBG_VACATED_FRAMES` prints it beside the heap's current count.
+    /// The two disagreeing at a slot that still names a vacated address is the
+    /// difference between "a heal path ran and missed this slot" and "no heal
+    /// path ran for this thread at all", which want completely different fixes.
+    pub last_heal_collection: u64,
+
     pub frames: FrameStack,
 
     /// Pool of reusable locals (values, tags) pairs (avoids allocation on recursive calls).
@@ -534,6 +545,24 @@ pub struct JvmThread {
     /// `resolution_cache` read lock, a hash probe and three `Arc<str>`
     /// clone/drop pairs per invoke.
     pub method_sites: crate::runtime::interpreter::MethodSiteCache,
+
+    /// Per-thread resolved `new`-site cache — the same "resolved constant pool"
+    /// for the class an allocation site allocates.
+    ///
+    /// The interpreter's `new` handler re-derived its answer on every single
+    /// execution: a `String` allocated for the class name, a full
+    /// `resolve_class_loader_aware`, and FOUR `class_manager` read
+    /// acquisitions (name, access check, initialization, field count). At
+    /// netty's `AdaptivePoolingAllocator` allocation rate that is the
+    /// per-allocation cost the throughput page asked to explain. See
+    /// [`crate::runtime::interpreter::site_cache::ClassSiteCache`] for which
+    /// sites are admissible and what a hit is allowed to skip.
+    pub class_sites: crate::runtime::interpreter::ClassSiteCache,
+
+    /// Per-thread resolved `checkcast`/`instanceof` target classes. Separate
+    /// from `class_sites` on purpose — see `CastSiteCache`'s docs for why a
+    /// shared table would let a `checkcast` fill answer a `new`.
+    pub cast_sites: crate::runtime::interpreter::CastSiteCache,
 
     /// Thread-local cache for the vtable-fast native-shadow guard.
     ///
@@ -733,6 +762,7 @@ impl JvmThread {
         Self {
             thread_id,
             name: name.to_string(),
+            last_heal_collection: 0,
             frames: FrameStack::new(),
             locals_pool: Vec::new(),
             stacks_pool: Vec::new(),
@@ -760,6 +790,8 @@ impl JvmThread {
             invoke_cache: InvokeCache::new(),
             field_sites: crate::runtime::interpreter::FieldSiteCache::new(),
             method_sites: crate::runtime::interpreter::MethodSiteCache::new(),
+            class_sites: crate::runtime::interpreter::ClassSiteCache::new(),
+            cast_sites: crate::runtime::interpreter::CastSiteCache::new(),
             native_shadow_cache: FxHashMap::default(),
             kind: ThreadKind::Platform,
             pin_count: 0,

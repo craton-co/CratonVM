@@ -164,11 +164,14 @@ fn sig_payload_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigK
 /// `PSSParameterSpec`s installed via `Signature.setParameter`, same
 /// `(vm_identity, identity_hash)` key discipline as the tables above and the
 /// same reason: plain Rust data, GC-stable key, no heap refs to scan.
-fn sig_pss_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, PssParams>> {
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — both sites (`get_sig_pss` and
+/// `setParameter`) compute `sig_key(ctx, ..)` first and then do one
+/// `get(..).copied()` / `insert(..)` under a temporary guard.
+fn sig_pss_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, PssParams>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, PssParams>>> =
+    static T: OnceLock<cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, PssParams>>> =
         OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(rustc_hash::FxHashMap::default(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn get_sig_pss(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<PssParams> {
@@ -183,13 +186,15 @@ fn get_sig_pss(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<PssParams
 /// every operation on this `Signature` is forwarded to the application's own
 /// `SignatureSpi` object (slot `SIG_OFF_SPIOBJ`) rather than to the native
 /// dispatch tables — the whole point of the application having registered it.
-fn sig_user_spi_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, (String, String)>>
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — same shape and the same
+/// key-before-guard discipline as [`sig_pss_table`].
+fn sig_user_spi_table() -> &'static cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, (String, String)>>
 {
     use std::sync::OnceLock;
     static T: OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<SigKey, (String, String)>>,
+        cratonvm_types::lock_order::OrderedPlMutex<rustc_hash::FxHashMap<SigKey, (String, String)>>,
     > = OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+    T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(rustc_hash::FxHashMap::default(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 fn get_sig_user_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(String, String)> {
@@ -847,46 +852,52 @@ fn dsa_real_spi_class(alg: i32) -> Option<&'static str> {
 /// `None` → sign (returns the DER `byte[]`); `Some(sig)` → verify (returns
 /// `Int(0/1)`). The real key is read from `SIG_OFF_KEYOBJ`; the payload from the
 /// identity-hash-keyed side table via `take_data`.
-fn drive_real_signature_spi(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    spi_class: &'static str,
-    verify_sig: Option<Vec<u8>>,
-) -> MethodCallResult {
-    let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let key = match ctx.get_field(this, base + SIG_OFF_KEYOBJ) {
-        Value::Object(Some(o)) => o,
-        _ => {
-            return Err(refuse_uninitialized(
-                ctx,
-                "object not initialized for signature or verification (no EC key)",
-            ))
+/// The algorithm string this `Signature` was created for, as the caller spelled
+/// it. `algo_name(idx)` answers `"Unknown"` for anything outside this engine's
+/// own table, which is exactly the case a chain fallback has to name.
+fn sig_algorithm_name(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "algorithm") {
+        if let Some(text) = ctx.read_string(s) {
+            if !text.is_empty() {
+                return text;
+            }
         }
-    };
-    let data = take_data(ctx, this)?;
-    let verifying = verify_sig.is_some();
-    // Pin the EC key across the (allocating) SPI construction + calls.
+    }
+    get_sig_algo(ctx, this).map(algo_name).unwrap_or("Unknown").to_string()
+}
+
+/// Construct `spi_class`, init it with `key`, feed it `data`, and sign or
+/// verify. The body `drive_real_signature_spi` used to inline, lifted out so a
+/// fallback can run it against a different class without re-taking the data
+/// (`take_data` is destructive — a second call would sign an empty buffer).
+fn drive_spi_class_with(
+    ctx: &mut dyn NativeContext,
+    spi_class: &str,
+    key: ObjectRef,
+    data: &[u8],
+    verify_sig: Option<&[u8]>,
+) -> MethodCallResult {
     let key_pin = ctx.pin_native_root(key);
     let result = (|| {
         let spi = match ctx.new_object_initialized(spi_class, "()V", &[])? {
             Some(Value::Object(Some(o))) => o,
             _ => {
                 return Err(RuntimeError::NotImplemented {
-                    feature: spi_class.into(),
+                    feature: spi_class.to_string(),
                 }
                 .into())
             }
         };
         let spi_pin = ctx.pin_native_root(spi);
         let key = ctx.read_native_pin(key_pin, key);
-        let (init_m, init_desc) = if verifying {
+        let (init_m, init_desc) = if verify_sig.is_some() {
             ("engineInitVerify", "(Ljava/security/PublicKey;)V")
         } else {
             ("engineInitSign", "(Ljava/security/PrivateKey;)V")
         };
         ctx.invoke_virtual(spi, init_m, init_desc, &[Value::Object(Some(key))])?;
         let spi = ctx.read_native_pin(spi_pin, spi);
-        let arr = alloc_byte_array(ctx, &data);
+        let arr = alloc_byte_array(ctx, data);
         let spi = ctx.read_native_pin(spi_pin, spi);
         ctx.invoke_virtual(
             spi,
@@ -901,7 +912,7 @@ fn drive_real_signature_spi(
         let spi = ctx.read_native_pin(spi_pin, spi);
         match verify_sig {
             Some(sig_bytes) => {
-                let sigarr = alloc_byte_array(ctx, &sig_bytes);
+                let sigarr = alloc_byte_array(ctx, sig_bytes);
                 let spi = ctx.read_native_pin(spi_pin, spi);
                 let ok = ctx.invoke_virtual(
                     spi,
@@ -909,9 +920,8 @@ fn drive_real_signature_spi(
                     "([B)Z",
                     &[Value::Object(Some(sigarr))],
                 )?;
-                // Normalize to Int(0/1) so the caller's Z return is well-formed.
                 Ok(match ok {
-                    Some(Value::Int(n)) => Some(Value::Int(if n != 0 { 1 } else { 0 })),
+                    Some(Value::Int(n)) => Some(Value::Int(i32::from(n != 0))),
                     _ => Some(Value::Int(0)),
                 })
             }
@@ -920,6 +930,87 @@ fn drive_real_signature_spi(
     })();
     ctx.unpin_native_roots(key_pin);
     result
+}
+
+/// The JDK's delayed provider selection, applied where this engine can observe
+/// the refusal.
+///
+/// `java.security.Signature.getInstance(alg)` does NOT bind a provider: the
+/// returned `Signature$Delegate` picks one at `initSign`/`initVerify` time and
+/// moves to the next provider whenever the current one refuses the key. This VM
+/// binds eagerly — a JDK SPI for the algorithm name — so a key minted by another
+/// provider reaches an SPI that will not take it and the call dies there. Two
+/// measured shapes, both from bc-java:
+///
+/// * `its` — BouncyCastle's `ECDSA` generator mints keys whose `getAlgorithm()`
+///   is `"ECDSA"`, and `sun.security.ec.ECKeyFactory.checkKey` requires exactly
+///   `"EC"`: `InvalidKeyException: Not an EC key: ECDSA`.
+/// * `tsp`/`eac` — an algorithm this engine has no table entry for at all, so
+///   `sign()`/`verify()` refused with "could not be performed for Unknown"
+///   while BouncyCastle implements it.
+///
+/// Returns `None` when no installed third-party provider offers the name, in
+/// which case the caller's own refusal stands unchanged.
+fn try_chain_signature_spi(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: Option<ObjectRef>,
+    data: &[u8],
+    verify_sig: Option<&[u8]>,
+) -> Option<MethodCallResult> {
+    let key = key?;
+    let alg = sig_algorithm_name(ctx, this);
+    let classes = crate::jca::provider_chain::chain_third_party_service_classes("Signature", &alg);
+    for spi_class in classes {
+        let pin = ctx.pin_native_root(key);
+        let key_now = ctx.read_native_pin(pin, key);
+        let attempt = drive_spi_class_with(ctx, &spi_class, key_now, data, verify_sig);
+        ctx.unpin_native_roots(pin);
+        if attempt.is_ok() {
+            return Some(attempt);
+        }
+    }
+    None
+}
+
+/// The key object stashed at `init` time, if any.
+fn sig_key_object(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    match ctx.get_field(this, base + SIG_OFF_KEYOBJ) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+fn drive_real_signature_spi(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    spi_class: &'static str,
+    verify_sig: Option<Vec<u8>>,
+) -> MethodCallResult {
+    let Some(key) = sig_key_object(ctx, this) else {
+        return Err(refuse_uninitialized(
+            ctx,
+            "object not initialized for signature or verification (no EC key)",
+        ));
+    };
+    let data = take_data(ctx, this)?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = ctx.pin_native_root(key);
+    let attempt = drive_spi_class_with(ctx, spi_class, key, &data, verify_sig.as_deref());
+    let this = ctx.read_native_pin(this_pin, this);
+    let key = ctx.read_native_pin(key_pin, key);
+    ctx.unpin_native_roots(this_pin);
+    match attempt {
+        Ok(v) => Ok(v),
+        // The bound JDK SPI refused. Do what the JDK's own delayed provider
+        // selection does and offer the key to the next provider that claims the
+        // algorithm — see `try_chain_signature_spi`.
+        Err(refusal) => match try_chain_signature_spi(ctx, this, Some(key), &data, verify_sig.as_deref()) {
+            Some(result) => result,
+            None => Err(refusal),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,13 +1467,35 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Object(Some(k))) => Value::Object(Some(*k)),
             _ => Value::Object(None),
         };
-        user_spi_call(
-            ctx,
-            spi,
-            "engineInitSign",
-            "(Ljava/security/PrivateKey;)V",
-            &[key],
-        )?;
+        // `initSign(key, random)` and `initSign(key)` share this native, and the
+        // random is not decoration: `SignatureSpi.engineInitSign(key, random)`
+        // stores it as `appRandom`, and that is where a signer takes its
+        // per-signature nonce from. Dropping it left BouncyCastle's ECDSA
+        // drawing `k` from its own source, so a test that pins `k` with a
+        // deterministic random got a DIFFERENT `r` on every run —
+        // `DSATest.testECDSA239bitPrime`, "r component wrong", where HotSpot
+        // reproduces the published J.3.2 vector exactly.
+        match args.get(2) {
+            Some(Value::Object(Some(random))) => {
+                let random = Value::Object(Some(*random));
+                user_spi_call(
+                    ctx,
+                    spi,
+                    "engineInitSign",
+                    "(Ljava/security/PrivateKey;Ljava/security/SecureRandom;)V",
+                    &[key, random],
+                )?;
+            }
+            _ => {
+                user_spi_call(
+                    ctx,
+                    spi,
+                    "engineInitSign",
+                    "(Ljava/security/PrivateKey;)V",
+                    &[key],
+                )?;
+            }
+        }
         set_sig_state(ctx, this, STATE_SIGN);
         clear_data(ctx, this);
         return Ok(None);
@@ -1550,6 +1663,63 @@ fn sig_init_verify_cert(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     sig_init_verify(ctx, &[Value::Object(Some(this)), key])
 }
 
+/// Route an `update()` payload: straight to an application `SignatureSpi` when
+/// this `Signature` wraps one, otherwise into the accumulator that
+/// `drive_real_signature_spi` / `drive_user_spi` flush at `sign()`/`verify()`.
+///
+/// A provider's SPI has to SEE the updates as they happen. `SignatureSpi`
+/// implementations key real behaviour off "am I in the middle of a message":
+/// BouncyCastle's ML-DSA and SLH-DSA services refuse `engineSetParameter` with
+/// `ProviderException: cannot call setParameter in the middle of update`, and
+/// with every byte withheld until `sign()` the signer never was in the middle
+/// of one, so the refusal never came
+/// (`SignatureSetParameterTest.testSetParameterMidUpdateStillRejected`).
+///
+/// Buffering stays for this VM's own engines, where nothing can observe the
+/// difference. The two paths compose rather than race: which one a payload
+/// takes is decided by whether an SPI is attached, an SPI is attached at
+/// `initSign`/`initVerify` and never detached, and `drive_user_spi` flushes
+/// any accumulator content BEFORE asking the SPI for the answer — so bytes
+/// buffered before an SPI existed still reach it in order.
+fn sig_append_or_forward(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    bytes: &[u8],
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let Some(spi) = sig_user_spi_obj(ctx, this) else {
+        append_data(ctx, this, bytes);
+        return Ok(());
+    };
+    // Record an EMPTY payload rather than nothing at all. `take_data` reads the
+    // accumulator's presence as "this receiver was initialised through this
+    // registrar" and raises `SignatureException: object not initialized` on a
+    // miss, and for the paths where `clear_data` does not run at init time the
+    // entry was being created as a side effect of the first `append_data`.
+    // Forwarding without this left `sign()` on an otherwise healthy delegated
+    // signer refusing itself — measured as five `RuntimeOperatorException:
+    // exception obtaining signature` in `cms`.
+    append_data(ctx, this, &[]);
+    let pin = ctx.pin_native_root(spi);
+    let arr = alloc_byte_array(ctx, bytes);
+    let spi = ctx.read_native_pin(pin, spi);
+    let result = user_spi_call(
+        ctx,
+        spi,
+        "engineUpdate",
+        "([BII)V",
+        &[
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(bytes.len() as i32),
+        ],
+    );
+    ctx.unpin_native_roots(pin);
+    result.map(|_| ())
+}
+
 fn sig_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     // `Signature.update` DECLARES `SignatureException`, and HotSpot raises it
@@ -1563,7 +1733,7 @@ fn sig_update_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Int(v)) => *v as u8,
         _ => 0,
     };
-    append_data(ctx, this, &[b]);
+    sig_append_or_forward(ctx, this, &[b])?;
     Ok(None)
 }
 
@@ -1578,7 +1748,7 @@ fn sig_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     require_initialized_for_update(ctx, this)?;
     if let Some(Value::Object(Some(arr))) = args.get(1) {
         let buf = read_byte_array_full(ctx, *arr);
-        append_data(ctx, this, &buf);
+        sig_append_or_forward(ctx, this, &buf)?;
     }
     Ok(None)
 }
@@ -1602,7 +1772,7 @@ fn sig_update_bytes_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             _ => 0,
         };
         let buf = read_byte_array_range(ctx, *arr, off, len);
-        append_data(ctx, this, &buf);
+        sig_append_or_forward(ctx, this, &buf)?;
     }
     Ok(None)
 }
@@ -1705,7 +1875,17 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // successful `sign()` and ships an unsigned artefact.
     let sig_bytes = match sign_dispatch_with(alg, key_id, &data, get_sig_pss(ctx, this)) {
         Some(bytes) => bytes,
-        None => return Err(refuse_unanswerable(ctx, alg, "sign()")),
+        None => {
+            // No native implementation for this name. Before refusing, offer it
+            // to any installed third-party provider that DOES implement it —
+            // the anonymous `getInstance` promised "whatever the chain gives
+            // me", and this engine's table is not the whole chain.
+            let key = sig_key_object(ctx, this);
+            if let Some(result) = try_chain_signature_spi(ctx, this, key, &data, None) {
+                return result;
+            }
+            return Err(refuse_unanswerable(ctx, alg, "sign()"));
+        }
     };
     let arr = alloc_byte_array(ctx, &sig_bytes);
     Ok(Some(Value::Object(Some(arr))))
@@ -1856,7 +2036,14 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // so an unusable key was reported as a bad signature.
     let ok = match verify_dispatch_with(alg, key_id, &data, &provided, get_sig_pss(ctx, this)) {
         Some(answer) => answer,
-        None => return Err(refuse_unanswerable(ctx, alg, "verify()")),
+        None => {
+            // See the `sign()` sibling — ask the chain before refusing.
+            let key = sig_key_object(ctx, this);
+            if let Some(result) = try_chain_signature_spi(ctx, this, key, &data, Some(&provided)) {
+                return result;
+            }
+            return Err(refuse_unanswerable(ctx, alg, "verify()"));
+        }
     };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
@@ -1898,6 +2085,24 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn sig_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // The name the CALLER asked for, which `sig_get_instance` wrote into the
+    // real `algorithm` field. `algo_name(idx)` is this engine's own canonical
+    // spelling and answers `"Unknown"` for every name outside its table, which
+    // is not a name any caller can use: BouncyCastle's
+    // `X509SignatureUtil.setSignatureParameters` feeds `signature.getAlgorithm()`
+    // straight back to `AlgorithmParameters.getInstance(..)` and got
+    // `NoSuchAlgorithmException: no AlgorithmParameters Unknown implementation
+    // for provider BC` while verifying an RSASSA-PSS certificate. It also
+    // rewrote `SHA256withRSA/PSS` to `SHA256withRSAandMGF1`, where HotSpot
+    // echoes the request verbatim.
+    if let Value::Object(Some(name)) = ctx.get_field_by_name(this, "algorithm") {
+        if let Some(text) = ctx.read_string(name) {
+            if !text.is_empty() {
+                let s = ctx.create_string(&text);
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
+    }
     // `getAlgorithm()` is a benign accessor — keep the slot-read fallback
     // so callers that only invoke it after a state-eroding bug elsewhere
     // still get *some* answer instead of an exception cascade.  The loud
@@ -2152,6 +2357,53 @@ pub fn register(r: &mut NativeMethodRegistry) {
         "getProvider",
         "()Ljava/security/Provider;",
         sig_get_provider_null,
+    );
+
+    // `getParameters()` / `getParameter(String)`. Neither was registered, so
+    // both fell through to the real `java.security.Signature` bytecode, which
+    // calls `this.engineGetParameters()` — and `this` is a synthetic
+    // `java.security.Signature`, whose inherited `SignatureSpi.engineGetParameters`
+    // is `throw new UnsupportedOperationException()`. Every bc-java
+    // `SignatureSetParameterTest` case that reads back the context it had just
+    // set died there. The application SPI, when there is one, is the only thing
+    // that knows the answer; without one there are no parameters to report and
+    // `null` is the value the method is declared to return.
+    r.register(
+        cls,
+        "getParameters",
+        "()Ljava/security/AlgorithmParameters;",
+        |ctx, args| {
+            let this = this_arg(args)?;
+            if let Some(spi) = sig_user_spi_obj(ctx, this) {
+                return user_spi_call(
+                    ctx,
+                    spi,
+                    "engineGetParameters",
+                    "()Ljava/security/AlgorithmParameters;",
+                    &[],
+                );
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        cls,
+        "getParameter",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = this_arg(args)?;
+            if let Some(spi) = sig_user_spi_obj(ctx, this) {
+                let name = args.get(1).copied().unwrap_or(Value::Object(None));
+                return user_spi_call(
+                    ctx,
+                    spi,
+                    "engineGetParameter",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    &[name],
+                );
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
 
     r.register(

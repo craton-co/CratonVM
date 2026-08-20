@@ -82,12 +82,27 @@ fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
          `aastore` and `Array.set` now accept every reference store",
     );
 
-    // Documented lenience 1: an INTERFACE component. Proving a value implements
-    // an interface is unreliable here (dynamic/annotation proxies, synthetic
-    // classes implement them at runtime), so the predicate declines to throw.
+    // NO LONGER a documented lenience. An interface component used to `return
+    // true` unconditionally, which made this the assertion that pinned the
+    // blanket in place; HotSpot 25.0.3 throws `ArrayStoreException` for
+    // `Runnable[] <- String` and `Comparable[] <- Object`, and the predicate
+    // permitted both. An unrelated concrete value must now be REFUSED against
+    // an interface component exactly as against a concrete one.
+    // docs/known-issues/jdk-only/W7-101-aastore-interface-component-blanket.md
     assert!(
-        aastore_element_assignable(&shared, iface_arr, beta_obj),
-        "an interface component must fail open",
+        !aastore_element_assignable(&shared, iface_arr, beta_obj),
+        "AastoreBeta implements nothing, so storing it into an AastoreIface[] \
+         must be refused — an interface component is not a reason to fail open",
+    );
+
+    // …and the fail-open population the blanket was WRITTEN for is still served,
+    // now by the arm that can actually tell a proxy from an `Object`: the
+    // `$Proxy` name test below `is_subclass_of`. Without this assertion the one
+    // above would also pass against a predicate that had started refusing
+    // everything with an interface component.
+    assert!(
+        aastore_element_assignable(&shared, iface_arr, proxy_obj),
+        "a $Proxy-named value must still fail open against an interface component",
     );
 
     // Documented lenience 2: a `$Proxy`-named value. This is the arm that
@@ -2494,6 +2509,93 @@ fn ir_deopt_frame_values_maps_object_and_int() {
         ir_deopt_frame_values(&[FrameValue::Unsupported]).is_none(),
         "an Unsupported slot must re-run, not resume"
     );
+}
+
+/// A caller scope parks at the invoke's SUCCESSOR, never at the invoke.
+///
+/// `ResumeSemantics::for_caller_scope()` is `RESUME`: the call at that bci is
+/// already in progress, so parking the interpreter there would run it a second
+/// time — the double-execution defect the deopt contract exists to prevent, one
+/// bytecode instead of one loop iteration. `jit/src/lib.rs` refuses `RESUME`
+/// points precisely because "computing the successor bci needs the method's
+/// bytecode, which this crate does not have"; the VM does, and this is it.
+#[test]
+fn a_caller_scope_resumes_after_its_invoke_not_at_it() {
+    use super::deopt_resume::caller_resume_pc;
+    // 0xb8 invokestatic is 3 bytes; 0xb9 invokeinterface is 5.
+    let code = [0x2a, 0xb8, 0x00, 0x07, 0xb9, 0x00, 0x0b, 0x02, 0x00, 0x57];
+    assert_eq!(caller_resume_pc(&code, code.len(), 1).unwrap(), 4);
+    assert_eq!(caller_resume_pc(&code, code.len(), 4).unwrap(), 9);
+
+    // A bci that is not an invoke is a malformed chain, not a resume point.
+    let err = caller_resume_pc(&code, code.len(), 0).unwrap_err();
+    assert!(err.contains("not an invoke"), "{err}");
+    let err = caller_resume_pc(&code, code.len(), 9).unwrap_err();
+    assert!(err.contains("not an invoke"), "{err}");
+
+    // Past the end, and an invoke whose operands run off the end, both refuse
+    // rather than reading padding as bytecode.
+    assert!(caller_resume_pc(&code, code.len(), 99).is_err());
+    let truncated = [0xb9u8, 0x00, 0x0b];
+    assert!(caller_resume_pc(&truncated, truncated.len(), 0).is_err());
+}
+
+/// `Unsupported` in a caller scope's locals must REFUSE, where the in-place OSR
+/// transfer tolerates it.
+///
+/// The difference is the whole reason `caller_frame_values` is not the same
+/// function as the transfer's mapping loop. That transfer leaves an
+/// `Unsupported` local at the live frame's existing value, sound because the
+/// verified bytecode proves the slot is dead or re-stored before it is read. A
+/// MATERIALISED frame has no existing value — every sink maps a missing slot to
+/// `Value::Int(0)` — so tolerating it would resume a caller with silently
+/// zeroed locals, which is exactly what `docs/jit/deopt-inline-scopes.md`
+/// describes when it says an undescribed caller frame lowers to
+/// `[FrameValue::Unsupported]` so that this consumer refuses it.
+#[test]
+fn an_unsupported_caller_local_refuses_where_the_in_place_transfer_tolerates_it() {
+    use super::deopt_resume::caller_frame_values;
+    use cratonvm_jit::deopt::FrameValue;
+
+    let scope = |locals: Vec<FrameValue>, stack: Vec<FrameValue>| {
+        cratonvm_jit::deopt::ReconstructedFrame {
+            method_key: "p/C.m:()V".to_string(),
+            bci: 4,
+            locals,
+            stack,
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        }
+    };
+
+    // The describable case is accepted, so the refusals below cannot be passing
+    // for some unrelated reason.
+    let (locals, stack) = caller_frame_values(&scope(
+        vec![FrameValue::Int(7), FrameValue::Long(9)],
+        vec![FrameValue::Int(1)],
+    ))
+    .expect("a fully described caller scope must be accepted");
+    assert_eq!(locals.len(), 2, "the cat-2 upper half is compacted away");
+    assert_eq!(stack.len(), 1);
+
+    let err = caller_frame_values(&scope(vec![FrameValue::Unsupported], Vec::new())).unwrap_err();
+    assert!(err.contains("Unsupported"), "{err}");
+    assert!(
+        err.contains("no existing value to leave in place"),
+        "the refusal must say WHY a materialised frame differs: {err}"
+    );
+
+    // An unmappable STACK slot refuses too, as it does everywhere.
+    assert!(caller_frame_values(&scope(Vec::new(), vec![FrameValue::Unsupported])).is_err());
+
+    // A held monitor in a caller scope is out of scope for this sink.
+    let mut with_monitor = scope(Vec::new(), Vec::new());
+    with_monitor.monitors = vec![cratonvm_jit::deopt::MonitorInfo {
+        object: FrameValue::Int(0),
+        lock_depth: 1,
+    }];
+    let err = caller_frame_values(&with_monitor).unwrap_err();
+    assert!(err.contains("monitor"), "{err}");
 }
 
 /// `ir_deopt_locals` produces a COMPACT arg list: the JVM-slot-indexed
@@ -5228,15 +5330,19 @@ fn b3_gate_scans_full_production_body_of_interpreter() {
 /// way a fixed line band would.
 #[test]
 fn multianewarray_arm_guards_the_component_bracket_subtraction() {
+    // The arm's body was extracted into `interpreter::multianewarray_alloc` so
+    // the JIT's `jit_multianewarray_2d` helper could stop carrying a second,
+    // component-class-less transcription of it. The guard travelled with the
+    // subtraction it protects, so this witness follows it there.
     let src = std::fs::read_to_string(format!(
-        "{}/src/runtime/interpreter/opcodes.rs",
+        "{}/src/runtime/interpreter.rs",
         env!("CARGO_MANIFEST_DIR")
     ))
-    .expect("read opcodes.rs");
+    .expect("read interpreter.rs");
 
     let arm = src
-        .find("Instruction::Multianewarray { index, dimensions } =>")
-        .expect("the multianewarray arm must still exist");
+        .find("pub(crate) fn multianewarray_alloc(")
+        .expect("the shared multianewarray allocator must still exist");
     // Anchor on the whole binding, not the bare expression: the guard's own
     // explanatory comment quotes `total_array_depth - d - 1`, and matching that
     // would find the comment (which sits *before* the guard) instead of the code.
@@ -5265,5 +5371,21 @@ fn multianewarray_arm_guards_the_component_bracket_subtraction() {
         guarded.contains("LinkageError::VerifyError"),
         "the multianewarray depth guard must raise a catchable VerifyError, \
          not clamp the dimension count or fall through"
+    );
+
+    // And the opcode arm must still route through it rather than growing a
+    // second copy: the whole reason the body moved is that two copies drifted.
+    let opcodes = std::fs::read_to_string(format!(
+        "{}/src/runtime/interpreter/opcodes.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read opcodes.rs");
+    let opcode_arm = opcodes
+        .find("Instruction::Multianewarray { index, dimensions } =>")
+        .expect("the multianewarray arm must still exist");
+    assert!(
+        opcodes[opcode_arm..opcode_arm + 2000].contains("multianewarray_alloc("),
+        "the interpreter's multianewarray arm must call the shared \
+         `multianewarray_alloc`, not re-implement the component-class resolution"
     );
 }

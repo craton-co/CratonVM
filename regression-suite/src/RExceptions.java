@@ -14,6 +14,29 @@ public class RExceptions {
     // harness reads off the PASS line.
     static void must(boolean c, String m) { if (!c) throw new AssertionError(m); }
 
+    // B11. Counted like `check`, but RECORDS the divergence and prints it
+    // instead of throwing at the first one.
+    //
+    // This exists because of what happened to row 7 of W7-37: the only cast
+    // shape this fixture asserted was `String` -> `Integer`, the one shape that
+    // works, so a whole family stayed broken while the record said "fixed". The
+    // fix is to assert the whole family — but a family of assertions that dies
+    // on its first member gives a taker one member per rebuild, and a rebuild
+    // of this VM is not cheap. Every `expect` row therefore reports on stdout
+    // in the SAME run, and `drainDivergences()` throws once at the end with all
+    // of them. A red here is still a red; it is just a red that says everything
+    // it knows the first time.
+    static final List<String> DIVERGENCES = new ArrayList<>();
+    static void expect(boolean c, String m) {
+        checks++;
+        if (!c) { DIVERGENCES.add(m); System.out.println("DIVERGENCE " + m); }
+    }
+    static void drainDivergences() {
+        if (!DIVERGENCES.isEmpty()) {
+            throw new AssertionError(DIVERGENCES.size() + " divergence(s): " + DIVERGENCES);
+        }
+    }
+
     // HotSpot 25 (jdk-25.0.3.9-hotspot), measured. Both operands live in the
     // same module, so `SharedRuntime::generate_class_cast_message` emits one
     // JOINT clause rather than two `; `-separated ones, and both operands carry
@@ -41,6 +64,112 @@ public class RExceptions {
     interface Animal {}
     static class Cat implements Animal {}
     static class Dog implements Animal {}
+
+    // ---------------------------------------------------------------------
+    // B11 — the `aastore` covariance rule, one shape per store site.
+    //
+    // `arrayStoreMessage()` above is a single site with a single shape, and a
+    // single shape cannot tell "the check is gone" from "the check is wrong for
+    // this one pair". These eleven cover the rule: five that MUST raise
+    // ArrayStoreException and six that MUST NOT, including the two the JVMS
+    // singles out (a `null` element is always storable; `Object[]` accepts any
+    // reference). Each store is in its OWN method so each gets its own compiled
+    // site — a shared helper would give all eleven one megamorphic site and
+    // would measure the wrong thing.
+    //
+    // Operands are static fields read at their widest type, so javac emits a
+    // plain `aastore` with no compile-time narrowing and nothing here folds.
+    // ---------------------------------------------------------------------
+    static final Object[] AS_STR_ARR    = new String[1];
+    static final Object[] AS_NUM_ARR    = new Number[1];
+    static final Object[] AS_IFACE_ARR  = new Animal[1];
+    static final Object[] AS_OBJ_ARR    = new Object[1];
+    static final Object[] AS_ARR_ARR    = new String[1][1];   // String[][] as Object[]
+    static final Object[] AS_CAT_ARR    = new Cat[1];
+    static final Object AS_V_INTEGER = Integer.valueOf(1);
+    static final Object AS_V_STRING  = "s";
+    static final Object AS_V_CAT     = new Cat();
+    static final Object AS_V_DOG     = new Dog();
+    static final Object AS_V_INTARR  = new Integer[1];
+    static final Object AS_V_STRARR  = new String[1];
+    static final Object AS_V_NULL    = null;
+
+    // MUST raise ArrayStoreException.
+    static String as1() { try { AS_STR_ARR[0]   = AS_V_INTEGER; return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    static String as2() { try { AS_NUM_ARR[0]   = AS_V_STRING;  return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    static String as3() { try { AS_IFACE_ARR[0] = AS_V_STRING;  return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    static String as4() { try { AS_ARR_ARR[0]   = AS_V_INTARR;  return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    static String as5() { try { AS_CAT_ARR[0]   = AS_V_DOG;     return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    // MUST NOT raise.
+    static String as6()  { try { AS_OBJ_ARR[0] = AS_V_INTEGER; return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    static String as7()  { try { AS_STR_ARR[0] = AS_V_NULL;    return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    static String as8()  { try { AS_IFACE_ARR[0] = AS_V_CAT;   return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    static String as9()  { try { AS_NUM_ARR[0] = AS_V_INTEGER; return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    static String as10() { try { AS_ARR_ARR[0] = AS_V_STRARR;  return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+    static String as11() { try { AS_STR_ARR[0] = AS_V_STRING;  return "no-throw"; } catch (ArrayStoreException e) { return "ASE"; } }
+
+    // The bulk twin of the same JVMS rule. `System.arraycopy` between two
+    // reference arrays must raise ArrayStoreException on the first element that
+    // is not assignable to the destination's component type. Measured green on
+    // both VMs in both tiers — it is scheduled anyway, because `aastore`,
+    // `Array.set` and `arraycopy` are one rule implemented three times, two of
+    // the three are currently correct, and the way a shared predicate gets
+    // weakened to fix the third is with nothing watching the other two.
+    static final Object[] AC_SRC = { Integer.valueOf(1) };
+    static final Object[] AC_DST = new String[1];
+    static String arrayCopyCovariant() {
+        try { System.arraycopy(AC_SRC, 0, AC_DST, 0, 1); return "no-throw"; }
+        catch (ArrayStoreException e) { return "ASE"; }
+    }
+
+    static String asShape(int k) {
+        switch (k) {
+            case 0: return as1();  case 1: return as2();  case 2: return as3();
+            case 3: return as4();  case 4: return as5();  case 5: return as6();
+            case 6: return as7();  case 7: return as8();  case 8: return as9();
+            case 9: return as10(); default: return as11();
+        }
+    }
+    static final String[] AS_NAMES = {
+        "String[]<-Integer", "Number[]<-String", "Animal[]<-String",
+        "String[][]<-Integer[]", "Cat[]<-Dog",
+        "Object[]<-Integer", "String[]<-null", "Animal[]<-Cat",
+        "Number[]<-Integer", "String[][]<-String[]", "String[]<-String",
+    };
+    // Index < 5 must throw; index >= 5 must not.
+    static final int AS_FIRST_LEGAL = 5;
+
+    // ---------------------------------------------------------------------
+    // B11 / W7-37 row 7 — the four cast shapes with an ARRAY operand.
+    //
+    // Measured on HotSpot 25 (jdk-25.0.3.9-hotspot), 2026-08-12. All four
+    // operands are in java.base under the bootstrap loader, so all four take
+    // the JOINT parenthetical, exactly like the `String` -> `Integer` row
+    // above. `HOTSPOT_CCE` is the *non-array* control that already passes; the
+    // point of these four is that the rewrite which produces it is skipped
+    // whenever EITHER operand is an array.
+    // ---------------------------------------------------------------------
+    static final String HS_CCE_OBJ_TO_REFARR =
+        "class java.lang.String cannot be cast to class [Ljava.lang.String; "
+        + "(java.lang.String and [Ljava.lang.String; are in module java.base of loader 'bootstrap')";
+    static final String HS_CCE_PRIMARR_TO_OBJ =
+        "class [I cannot be cast to class java.lang.String "
+        + "([I and java.lang.String are in module java.base of loader 'bootstrap')";
+    static final String HS_CCE_PRIMARR_TO_REFARR =
+        "class [I cannot be cast to class [Ljava.lang.String; "
+        + "([I and [Ljava.lang.String; are in module java.base of loader 'bootstrap')";
+    static final String HS_CCE_REFARR_TO_REFARR =
+        "class [Ljava.lang.Integer; cannot be cast to class [Ljava.lang.String; "
+        + "([Ljava.lang.Integer; and [Ljava.lang.String; are in module java.base of loader 'bootstrap')";
+
+    static final Object CAST_INTARR  = new int[1];
+    static final Object CAST_INTGARR = new Integer[1];
+    static Object CAST_SINK;
+
+    static String castObjToRefArr()     { try { CAST_SINK = (String[]) CAST_SOURCE;  return "no-throw"; } catch (ClassCastException e) { return String.valueOf(e.getMessage()); } }
+    static String castPrimArrToObj()    { try { CAST_SINK = (String)   CAST_INTARR;  return "no-throw"; } catch (ClassCastException e) { return String.valueOf(e.getMessage()); } }
+    static String castPrimArrToRefArr() { try { CAST_SINK = (String[]) CAST_INTARR;  return "no-throw"; } catch (ClassCastException e) { return String.valueOf(e.getMessage()); } }
+    static String castRefArrToRefArr()  { try { CAST_SINK = (String[]) CAST_INTGARR; return "no-throw"; } catch (ClassCastException e) { return String.valueOf(e.getMessage()); } }
 
     static class Res implements AutoCloseable {
         final String id; final List<String> log;
@@ -148,6 +277,71 @@ public class RExceptions {
         // is evaluated eagerly, and 2400 string concatenations inside the very
         // loop whose job is to tier these two helpers up is warm-up the loop
         // does not want to be doing.
+        // ---- B11: the four ARRAY-operand cast shapes (W7-37 row 7) ----
+        // These run BEFORE the tier-parity loop below, and report via `expect`
+        // rather than throwing, so a single run shows every one of them
+        // alongside whatever the loop does. Row 7 was recorded as fixed twice
+        // while only the one working shape was scheduled; four shapes that all
+        // report is what makes it adjudicable.
+        //
+        // Read in BOTH tiers, and that is not belt-and-braces. Measured
+        // 2026-08-12, CratonVM emits THREE different strings for an array
+        // operand depending on tier and on whether the array class happens to
+        // be in the definition index at that moment: the bare
+        // `X cannot be cast to Y`, a prefix-only `class X cannot be cast to
+        // class Y` with no parenthetical, and (for one shape, reproducibly)
+        // HotSpot's full string. A single cold reading would have called some
+        // of these fixed. Applications regex this text, so a message that is
+        // not a function of the cast alone is the defect, not a symptom of it.
+        String[] ccName = { "String->String[]", "int[]->String", "int[]->String[]", "Integer[]->String[]" };
+        String[] ccWant = { HS_CCE_OBJ_TO_REFARR, HS_CCE_PRIMARR_TO_OBJ,
+                            HS_CCE_PRIMARR_TO_REFARR, HS_CCE_REFARR_TO_REFARR };
+        String[] ccCold = { castObjToRefArr(), castPrimArrToObj(),
+                            castPrimArrToRefArr(), castRefArrToRefArr() };
+        String[] ccHot = new String[4];
+        for (int i = 0; i < 1200; i++) {
+            ccHot[0] = castObjToRefArr();     ccHot[1] = castPrimArrToObj();
+            ccHot[2] = castPrimArrToRefArr(); ccHot[3] = castRefArrToRefArr();
+        }
+        for (int k = 0; k < 4; k++) {
+            expect(ccWant[k].equals(ccCold[k]),
+                   "CCE " + ccName[k] + " interpreted matches HotSpot, got: " + ccCold[k]);
+            expect(ccWant[k].equals(ccHot[k]),
+                   "CCE " + ccName[k] + " JIT-compiled matches HotSpot, got: " + ccHot[k]
+                   + " (interpreted reading was: " + ccCold[k] + ")");
+        }
+
+        // ---- B11: the `aastore` covariance rule, all eleven shapes, both tiers ----
+        // The single-shape `arrayStoreMessage()` assertion below can only say
+        // that SOMETHING is wrong. This says which shapes, and — because each
+        // shape is read once cold and once past the JIT threshold — whether the
+        // interpreter or only the compiler is at fault. On a correct VM every
+        // cell reads its MUST value in both tiers; that is trivially true on
+        // HotSpot, so this cannot flake the oracle arm.
+        String[] asCold = new String[AS_NAMES.length];
+        String[] asHot  = new String[AS_NAMES.length];
+        for (int k = 0; k < AS_NAMES.length; k++) asCold[k] = asShape(k);
+        for (int i = 0; i < 1200; i++) {
+            for (int k = 0; k < AS_NAMES.length; k++) {
+                String r = asShape(k);
+                if (i == 1199) asHot[k] = r;
+            }
+        }
+        String acCold = arrayCopyCovariant(), acHot = null;
+        for (int i = 0; i < 1200; i++) acHot = arrayCopyCovariant();
+        expect("ASE".equals(acCold), "arraycopy Object[]{Integer}->String[] interpreted: want ASE, got " + acCold);
+        expect("ASE".equals(acHot),  "arraycopy Object[]{Integer}->String[] JIT-compiled: want ASE, got " + acHot);
+        check(AC_DST[0] == null, "a refused arraycopy leaves the destination element untouched");
+
+        for (int k = 0; k < AS_NAMES.length; k++) {
+            String want = k < AS_FIRST_LEGAL ? "ASE" : "no-throw";
+            expect(want.equals(asCold[k]),
+                   "aastore " + AS_NAMES[k] + " interpreted: want " + want + ", got " + asCold[k]);
+            expect(want.equals(asHot[k]),
+                   "aastore " + AS_NAMES[k] + " JIT-compiled: want " + want + ", got " + asHot[k]
+                   + " (interpreted reading was " + asCold[k] + ")");
+        }
+
         for (int i = 0; i < 1200; i++) {
             String aseHot = arrayStoreMessage();
             if (!aseCold.equals(aseHot)) {
@@ -219,6 +413,10 @@ public class RExceptions {
         catch (NoSuchElementException e) { esePeekWrongType = true; }
         check(esePeek && !esePeekWrongType, "Stack.peek() on empty throws EmptyStackException");
 
+        // Every `expect` divergence recorded above becomes one AssertionError
+        // here, listing all of them. Nothing reaches this line unless the
+        // throwing `check`s all passed, so a PASS still means PASS.
+        drainDivergences();
         System.out.println("PASS RExceptions (" + checks + " checks)");
     }
 

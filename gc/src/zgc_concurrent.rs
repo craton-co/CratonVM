@@ -249,21 +249,31 @@ use crate::zgc::mark::{ZMarkCoordinator, ZMarkEndResult, ZMarkHandle, ZNonStrong
 /// Bounded park interval for the driver thread while it waits for the mark
 /// pool to reach a fixed point.
 ///
-/// Kept at the value (and, up to the rename, the name) the simulation-era
-/// controller used, for the same reason: every wait in this family is a
-/// `wait_for`, never a bare `wait`, so a lost notification costs one poll
-/// interval instead of a hang. This codebase diagnoses GC hangs often enough
-/// that "cannot hang even if the signalling is wrong" is worth 200 wakeups a
-/// second on one thread.
+/// **RETIRED 2026-08-17, and the reasoning it carried was wrong about the API it
+/// described.** It said:
 ///
-/// The cost of polling rather than waiting on the pool's own condvar is up to
-/// one interval of added latency at the end of the concurrent phase.
-/// [`ZMarkTerminator`](crate::zgc::mark::ZMarkTerminator) does expose a
-/// blocking `wait_for_fixed_point`, but it can only be released by the
-/// *pool's* stop flag, not by this controller's — so waiting on it would make
-/// `request_stop_and_join` unable to interrupt a cycle, which is precisely
-/// the hang this module must not have.
-const DRIVER_POLL_MS: u64 = 5;
+/// > [`ZMarkTerminator`] does expose a blocking `wait_for_fixed_point`, but it
+/// > can only be released by the *pool's* stop flag, not by this controller's —
+/// > so waiting on it would make `request_stop_and_join` unable to interrupt a
+/// > cycle.
+///
+/// `ZMarkTerminator::wait_for_fixed_point(&self, should_stop: &AtomicBool)`
+/// **takes the stop flag as a parameter**. It is `ZMarkCoordinator`'s no-argument
+/// *wrapper* that hardwires the pool's flag, and the comment described the
+/// wrapper while the driver had the terminator in hand. So the driver polled a
+/// 5 ms grid to avoid a hazard the API it was avoiding does not have — and the
+/// condvar it polled instead (`ZgcConcurrentMarkState::done_cvar`) had no
+/// notifier on any ZGC path at all, so every wait ran to its full timeout.
+///
+/// `await_fixed_point` now passes `state.should_stop` to the terminator's method:
+/// completion is immediate, and the stop flag is still re-read every
+/// `Z_MARK_PARK_POLL_MS` *and* kicked directly by
+/// `ZMarkTerminator::wake_blocked_waiters`, so interruption is faster than it
+/// was rather than slower. `stopping_the_driver_mid_cycle_does_not_hang` is the
+/// proof, and it was run against a deliberately wedged pool.
+///
+/// Left as a doc comment with no constant because the constant had one use.
+const _DRIVER_POLL_MS_RETIRED: () = ();
 
 /// Default ceiling on mark-end restarts within one cycle.
 ///
@@ -496,13 +506,6 @@ pub struct ZgcConcurrentMarkState {
     /// Telemetry: reference-processing re-drains. `Relaxed`, as above.
     pub resurrection_redrains: AtomicU64,
 
-    /// Park flag protected by the mutex: the driver sets it `true` before
-    /// waiting on the cvar, so a wake racing with the park is not lost
-    /// (parking_lot's lock-then-wait discipline).
-    pub parked: Mutex<bool>,
-    /// Wake condition for the parked driver.
-    pub done_cvar: Condvar,
-
     /// The finished cycle's report. `None` until the driver publishes it,
     /// which it does as its last act before the thread exits. A mutex rather
     /// than a pile of atomics so the whole report is published as one value
@@ -517,50 +520,26 @@ impl ZgcConcurrentMarkState {
             passes_performed: AtomicU64::new(0),
             restarts_performed: AtomicU64::new(0),
             resurrection_redrains: AtomicU64::new(0),
-            parked: Mutex::new(false),
-            done_cvar: Condvar::new(),
+
             outcome: Mutex::new(None),
         }
     }
 
-    /// Wake the driver if it is parked waiting for the fixed point, so it
-    /// re-checks immediately instead of sleeping out its poll interval.
+    /// Coordinator -> driver: stop ASAP.
     ///
-    /// **This does not wake the mark workers.** Publishing work into a stripe
-    /// or the ingress notifies them through
-    /// [`ZMarkTerminator::note_work_published`](crate::zgc::mark::ZMarkTerminator::note_work_published),
-    /// which the engine calls for itself; that is the responsibility this
-    /// method used to carry against the simulation and no longer does.
-    pub fn notify_work_available(&self) {
-        let mut parked = self.parked.lock();
-        if *parked {
-            *parked = false;
-            self.done_cvar.notify_one();
-        }
-    }
-
-    /// Coordinator -> driver: stop ASAP. Also kicks the cvar so a parked
-    /// driver wakes to observe the flag.
+    /// Sets the flag only. The driver waits on the **terminator's** condvar and
+    /// re-reads this flag every `Z_MARK_PARK_POLL_MS`, so the flag alone bounds
+    /// interruption; `request_stop_and_join` additionally kicks that condvar
+    /// through `ZMarkTerminator::wake_blocked_waiters` so the usual case is
+    /// immediate.
+    ///
+    /// It used to also notify a condvar of its own, which existed so a *polling*
+    /// driver could be woken early. Both are gone — see
+    /// `_DRIVER_POLL_MS_RETIRED`: nothing on any ZGC path ever notified that
+    /// condvar for the normal completion case, so the poll interval was paid in
+    /// full on every pass of every cycle.
     pub fn request_stop(&self) {
         self.should_stop.store(true, Ordering::Release);
-        let mut parked = self.parked.lock();
-        *parked = false;
-        self.done_cvar.notify_all();
-    }
-
-    /// Driver: park with timeout. Returns on a notification or on the
-    /// `DRIVER_POLL_MS` timeout; either way the caller re-checks both the
-    /// fixed-point flag and the stop flag.
-    fn park_for_work(&self) {
-        let mut parked = self.parked.lock();
-        if self.should_stop.load(Ordering::Acquire) {
-            return;
-        }
-        *parked = true;
-        let _ = self
-            .done_cvar
-            .wait_for(&mut parked, Duration::from_millis(DRIVER_POLL_MS));
-        *parked = false;
     }
 
     /// The finished cycle's report, or `None` while it is still running.
@@ -605,9 +584,10 @@ impl std::fmt::Debug for ZgcConcurrentMarkState {
 /// detached driver holds its own `Arc<ZMarkCoordinator>`, so the pool cannot
 /// be freed underneath it. Production callers should always join explicitly.
 pub struct ZgcConcurrentMarkController {
-    /// Shared driver state. Public for the same reason the G1 controller's
-    /// is: callers poll telemetry off it and the load barrier may want to
-    /// nudge a parked driver.
+    /// Shared driver state. Public for the same reason the G1 controller's is:
+    /// callers poll telemetry off it. (It no longer carries a park flag or a
+    /// condvar of its own — the driver waits on the terminator's, see
+    /// `_DRIVER_POLL_MS_RETIRED`.)
     pub state: Arc<ZgcConcurrentMarkState>,
     coordinator: Arc<ZMarkCoordinator>,
     handle: Option<JoinHandle<()>>,
@@ -847,9 +827,31 @@ impl ZgcConcurrentMarkController {
     /// Wait for the mark pool to reach a fixed point. Returns `false` iff the
     /// controller was told to stop first.
     ///
-    /// Polls rather than blocking on the pool's condvar; see the
-    /// `DRIVER_POLL_MS` comment for why that is the stop-responsiveness
-    /// price.
+    /// **Blocks on the terminator's own condvar**, which the termination edge
+    /// notifies under the same lock this waits on
+    /// (`worker_idle` sets `terminated` and calls `notify_all`). So the driver
+    /// learns the mark has converged at the moment it converges.
+    ///
+    /// # What this used to do, and why it was invisible
+    ///
+    /// It polled `ZgcConcurrentMarkState`'s *own* condvar on a
+    /// `DRIVER_POLL_MS` (5 ms) grid, and the only thing that ever notified that
+    /// condvar outside a stop was `notify_work_available` -- which had **zero
+    /// callers on any ZGC path** (`vm_heap`'s one call site is G1's controller).
+    /// So every pass of every cycle waited out the full 5 ms before noticing a
+    /// fixed point the workers had often reached immediately, and nothing said
+    /// so: a wait that always times out behaves exactly like a notified one,
+    /// only slower. `ZMarkTerminator::park_timeouts` now counts the expiries so
+    /// a recurrence is a number rather than a slowdown someone has to attribute.
+    ///
+    /// This is **not** the whole of C5. §3c measured one worker at +98% against
+    /// zero, and at `Z_PARMARK_RESTART_BUDGET = 1` this path costs at most two
+    /// intervals -- ~5-10 ms of a ~100 ms gap. What it removes is a *floor*
+    /// under the parallel-mark pause that no amount of worker scaling could
+    /// reach, and a 5 ms quantum inside the loop that any per-cycle timing would
+    /// otherwise have carried as instrument noise. Fix the instrument, then
+    /// measure.
+    ///
     /// [`ZMarkTerminator::is_terminated`](crate::zgc::mark::ZMarkTerminator::is_terminated)
     /// is the authoritative read (it takes the terminator's state lock); the
     /// lock-free `is_terminated_hint` deliberately is not used, because it can
@@ -859,14 +861,21 @@ impl ZgcConcurrentMarkController {
         params: &ZgcConcurrentMarkParams,
         state: &ZgcConcurrentMarkState,
     ) -> bool {
+        let terminator = params.coordinator.shared().terminator();
         loop {
-            if params.coordinator.shared().terminator().is_terminated() {
+            if terminator.is_terminated() {
                 return true;
             }
             if state.should_stop.load(Ordering::Acquire) {
                 return false;
             }
-            state.park_for_work();
+            // Blocks on the terminator's condvar; returns on either predicate.
+            // The loop shape is kept deliberately: this must NEVER return `true`
+            // on anything but an authoritative `terminated`, because `true` is
+            // what takes the mark-end safepoint, and taking it while workers are
+            // still inside `visit_refs` is a sweep against an incomplete mark
+            // set.
+            terminator.wait_for_fixed_point(&state.should_stop);
         }
     }
 
@@ -881,13 +890,6 @@ impl ZgcConcurrentMarkController {
     /// handed the coordinator over and kept only the controller.
     pub fn handle(&self) -> ZMarkHandle {
         self.coordinator.handle()
-    }
-
-    /// Wake the driver if it is parked. See
-    /// [`ZgcConcurrentMarkState::notify_work_available`] for what this does
-    /// and — importantly — what it no longer does.
-    pub fn notify_work_available(&self) {
-        self.state.notify_work_available();
     }
 
     /// Wait for the cycle to finish and take its report.
@@ -908,16 +910,25 @@ impl ZgcConcurrentMarkController {
 
     /// Abandon the cycle: signal stop and join the driver.
     ///
-    /// The driver leaves at its next loop head — between concurrent phases,
-    /// or out of the fixed-point park within one `DRIVER_POLL_MS` interval.
-    /// It cannot be interrupted while inside a [`ZgcMarkSafepoint`] callback,
-    /// which is why that trait's contract forbids blocking indefinitely.
+    /// The driver leaves at its next loop head — between concurrent phases, or
+    /// out of the fixed-point wait as soon as the kick below reaches it. It
+    /// cannot be interrupted while inside a [`ZgcMarkSafepoint`] callback, which
+    /// is why that trait's contract forbids blocking indefinitely.
     ///
     /// The resulting mark set is incomplete
     /// ([`ZgcMarkCycleOutcome::stopped_early`]); the caller must discard it,
     /// not sweep against it.
     pub fn request_stop_and_join(mut self) -> std::thread::Result<()> {
         self.state.request_stop();
+        // THE FLAG ALONE IS ENOUGH, and this makes it prompt. The driver's wait
+        // re-reads the flag every `Z_MARK_PARK_POLL_MS`, so a missing kick costs
+        // an interval rather than a hang; the kick changes no state, and a
+        // spurious wake is always safe because every waiter re-checks its
+        // predicate under the lock.
+        self.coordinator
+            .shared()
+            .terminator()
+            .wake_blocked_waiters();
         if let Some(h) = self.handle.take() {
             return h.join();
         }
@@ -965,6 +976,12 @@ impl Drop for ZgcConcurrentMarkController {
         // the "detached worker outliving its heap" hazard that
         // `ZMarkCoordinator::drop` joins to avoid does not arise here.
         self.state.request_stop();
+        // Same kick as `request_stop_and_join`, for the same reason: the driver
+        // is detached here rather than joined, but it still has to LEAVE.
+        self.coordinator
+            .shared()
+            .terminator()
+            .wake_blocked_waiters();
         if let Some(h) = self.handle.take() {
             std::mem::drop(h);
         }
@@ -1128,6 +1145,77 @@ mod tests {
             "every begin_mark_end_safepoint must be paired with an end"
         );
         assert_eq!(safepoint.flushes.load(Ordering::Relaxed), 1);
+    }
+
+    /// **The driver's fixed-point wait is NOTIFIED, not polled.**
+    ///
+    /// # Why this is a count and not a timing
+    ///
+    /// The failure it guards is invisible by construction. Every wait in the
+    /// marker is a `wait_for` and never a bare `wait`, so a missing notification
+    /// does not hang — it costs a poll interval and behaves in every other way
+    /// exactly like a working one. That is what was true here until 2026-08-17:
+    /// the driver waited on `ZgcConcurrentMarkState`'s own condvar, which no ZGC
+    /// path ever notified for the completion case, so every pass of every cycle
+    /// ran the full 5 ms out before noticing a fixed point the workers had
+    /// already reached. A wall-clock assertion could catch that and would be the
+    /// wrong instrument: flaky on a loaded machine, and silent about why.
+    ///
+    /// # Why the mark is deliberately made SLOW
+    ///
+    /// `park_timeouts == 0` would be satisfied by a wait that was never entered,
+    /// and that is exactly what a fast mark produces — the driver arrives after
+    /// the workers have converged and takes the `is_terminated` fast path. So the
+    /// hook holds the first visit for 37 ms, which guarantees the driver is
+    /// inside the wait, and the assertion is on
+    /// `park_termination_wakes`: the wait was released by the termination edge
+    /// itself. Timeouts *during* those 37 ms are expected and are not asserted
+    /// on.
+    ///
+    /// 37 and not 35 or 40: the interval is 5 ms, so a sleep at a multiple of it
+    /// puts termination and a timeout in the same microseconds, and the test
+    /// would flake on which won. 37 leaves the driver 3 ms into a fresh wait when
+    /// the mark converges.
+    #[test]
+    fn the_drivers_fixed_point_wait_is_woken_by_the_termination_edge() {
+        let g = graph(&[(1, &[2, 3]), (2, &[4]), (3, &[4, 5]), (4, &[]), (5, &[])]);
+        let slept = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&slept);
+        let ctx = Arc::new(TestMarkContext::new(g).with_visit_hook(Box::new(move |_| {
+            // FIRST VISIT ONLY, so the mark takes ~37 ms rather than 37 ms per
+            // object -- the point is to be slower than one poll interval, not to
+            // be slow.
+            if !s2.swap(true, Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(37));
+            }
+        })));
+        let pool = Arc::new(ZMarkCoordinator::new(ctx.clone(), 2));
+        pool.begin_cycle();
+        pool.push_roots(&[1]);
+
+        let safepoint = Arc::new(ScriptedSafepoint::new(Vec::new()));
+        let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+            Arc::clone(&pool),
+            safepoint,
+        ));
+        let outcome = controller.join_cycle().expect("driver joined");
+
+        assert!(outcome.mark_set_complete, "{outcome:?}");
+        assert_eq!(ctx.marked_sorted(), vec![1, 2, 3, 4, 5]);
+        assert!(
+            slept.load(Ordering::Relaxed),
+            "the hook must have run, or the mark was not slowed and the driver \
+             may never have entered its wait"
+        );
+        assert!(
+            pool.shared().terminator().park_termination_wakes() >= 1,
+            "the driver's wait must be released by the TERMINATION EDGE, not by a \
+             timeout. Zero here is the 5 ms-per-pass floor coming back, and it \
+             would otherwise show up only as a slower pause that somebody has to \
+             attribute. timeouts={}",
+            pool.shared().terminator().park_timeouts()
+        );
+        pool.end_cycle();
     }
 
     /// A cycle with no roots converges without marking anything, and the
@@ -1428,9 +1516,18 @@ mod tests {
     /// The pool is deliberately wedged: a visit hook holds a worker inside
     /// `visit_refs`, so the fixed point cannot be reached and the driver is
     /// parked in `await_fixed_point`. `request_stop_and_join` must still
-    /// return — the driver's park is bounded and it re-reads the stop flag
-    /// every interval. If it waited on the pool's own condvar instead, this
-    /// would deadlock, which is the whole reason `await_fixed_point` polls.
+    /// return — the driver's wait is bounded and it re-reads the stop flag every
+    /// interval.
+    ///
+    /// **This doc used to end "if it waited on the pool's own condvar instead,
+    /// this would deadlock, which is the whole reason `await_fixed_point`
+    /// polls". That was wrong, and since 2026-08-17 the driver DOES wait on the
+    /// terminator's condvar** — so this test is now the proof of the change
+    /// rather than the reason against it. It cannot deadlock, because
+    /// `ZMarkTerminator::wait_for_fixed_point` takes the *caller's* stop flag as
+    /// a parameter and re-checks it under a bounded `wait_for`. See
+    /// `_DRIVER_POLL_MS_RETIRED` for the API confusion that produced the
+    /// original claim.
     ///
     /// Nothing here asserts on elapsed time; the test simply cannot pass
     /// without the join returning.

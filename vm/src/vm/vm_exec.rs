@@ -395,10 +395,80 @@ static JDK_ONLY_NATIVE_SHADOW_UNENFORCED: std::sync::atomic::AtomicU64 =
 /// [`cratonvm_native_api::NativeKind`] spelling — the kind is always `Bridge`
 /// here, and what the row has to say is that this one DISPATCHED in front of
 /// real bytes. Same convention as the JIT's `"jit-thin-direct-helper"`.
-pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str = "bridge-ran-over-bytecode";
+///
+/// **Now an alias**, not a definition. The tag is the discriminator between the
+/// two opposite outcomes a `NativeShadowsBytecode` row can carry, and `types` is
+/// the crate that writes those rows' `summary`, `reason` and JSON — so `types`
+/// owns the spelling and both sides cannot drift. See
+/// [`cratonvm_types::error::NATIVE_SHADOW_RAN_TAG`], which records what the split
+/// spelling cost the first time somebody read the report without it.
+pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str =
+    cratonvm_types::error::NATIVE_SHADOW_RAN_TAG;
 
-/// Maximum number of distinct structured observations retained.
+/// Maximum number of distinct structured observations retained, by default.
+///
+/// Read through [`jdk_only_native_shadow_cap`], never directly: an operator can
+/// raise it, and a site that reads this constant would report the default while
+/// the sink obeyed something else.
 pub const JDK_ONLY_NATIVE_SHADOW_CAP: usize = 256;
+
+/// Ceiling on the operator override below. 65,536 distinct triples is more than
+/// twice the whole registry, so it cannot be reached by a real workload — it is
+/// there so a mistyped value cannot turn a diagnostic sink into a memory leak.
+const JDK_ONLY_NATIVE_SHADOW_CAP_MAX: usize = 65_536;
+
+/// The cap this process is actually using.
+///
+/// # Why this is an override and not a bigger constant
+///
+/// 256 is right for the workload the sink was designed against — a probe or a
+/// regression vector, where the population fits and the list is the answer. It
+/// is **not enough for an application**, and that is measured rather than
+/// argued: embedded Tomcat booting, serving one GET and one 404, and shutting
+/// down under `--jdk-only` saturates it, with 188 distinct `native-won` triples
+/// recorded before the sink stopped learning — against 58 for the reflection
+/// vector G60-1 §1 counted. So the record's §5 N3 ("run this report against an
+/// application, not a vector") cannot be *completed* at 256: the answer arrives
+/// truncated, and narrowing the workload until it fits is the opposite of what
+/// N3 asks for.
+///
+/// Raising the default instead was the alternative and is worse. The cap bounds
+/// a process-global `Vec` that every strict dispatch can push to, on a VM whose
+/// contract §2 forbids new process globals for compatibility state and whose
+/// existing two are already logged as violations to remove. A default nobody
+/// asked for that costs every strict run more memory is a change to the shipping
+/// configuration; an override is a change to the instrument.
+///
+/// Read once, at the first observation. `CRATONVM_NATIVE_SHADOW_SINK_CAP=0`, a
+/// non-numeric value, or anything above
+/// [`JDK_ONLY_NATIVE_SHADOW_CAP_MAX`] leaves the default in place — a
+/// diagnostic must never be the thing that fails, and a cap of zero would
+/// silently report an empty population as a complete one, which is the exact
+/// failure this whole area exists to remove.
+///
+/// **The filter is deliberately NOT resized with it.**
+/// [`JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS`] stays 512, so above that the filter
+/// stops absorbing most repeats and each new triple costs one extra mutex
+/// acquisition on a cold path. That is a throughput cost on a census run, paid
+/// only by a run that asked for a bigger sink, and `Vec::contains` keeps the
+/// buffer correct regardless — the filter's own doc says correctness never
+/// depends on it.
+pub fn jdk_only_native_shadow_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        // `runtime_var`, not `std::env::var`: the flag is DECLARED
+        // (`flag_groups::INVENTORY`, `CRATONVM_DBG=native-shadow-sink-cap`), and a
+        // declared name read through bare `getenv` comes from a different source
+        // than the latched snapshot every other knob is served from ---
+        // `types/tests/flag_declaration_guard.rs` documents that split, and it is
+        // the reason an undeclared read site is a defect rather than untidiness.
+        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_SHADOW_SINK_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0 && *n <= JDK_ONLY_NATIVE_SHADOW_CAP_MAX)
+            .unwrap_or(JDK_ONLY_NATIVE_SHADOW_CAP)
+    })
+}
 
 /// Slots in the lock-free "already recorded" filter. A power of two so the
 /// index is a mask, and larger than the cap so a saturated buffer still
@@ -471,6 +541,44 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
 /// counters never describe the same event twice.
 pub fn jdk_only_native_shadow_unenforced() -> u64 {
     JDK_ONLY_NATIVE_SHADOW_UNENFORCED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Did the bounded observation sink SATURATE -- i.e. was at least one distinct
+/// observation dropped for want of room?
+///
+/// The one question `--jdk-only-report`'s violation list could not answer about
+/// itself. `violations[]` is one row per distinct triple, capped at
+/// [`JDK_ONLY_NATIVE_SHADOW_CAP`], and a truncated list is identical in SHAPE to
+/// a complete one -- so a reader who took the list as the population got a floor
+/// and could not tell. G60-1 §4 states the hazard exactly: *a saturated buffer
+/// looks exactly like a complete one from the JSON*.
+///
+/// **Not `recorded.len() == CAP`.** That test is wrong in the one place it
+/// matters: a run whose last distinct observation is the 256th fills the buffer
+/// exactly and drops nothing, and would be reported truncated. The flag below is
+/// set by [`offer_native_shadow_observation`] only when an offer arrives and
+/// finds no room, so it means "something WAS dropped", which is the fact a
+/// reader needs. Reading it costs one relaxed load and is never hot.
+///
+/// Once it is true the sink teaches nothing further and
+/// [`jdk_only_shadow_already_observed`] answers `true` for every triple, which
+/// is also what freezes [`jdk_only_native_shadow_unenforced`] -- so this flag is
+/// simultaneously the "the list is a floor" and the "the counter is a floor"
+/// signal. Both facts, one bit.
+pub fn jdk_only_native_shadow_sink_saturated() -> bool {
+    JDK_ONLY_NATIVE_SHADOW_FULL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many distinct observations the sink is holding right now.
+///
+/// The denominator for [`jdk_only_native_shadow_sink_saturated`], and cheaper
+/// than [`jdk_only_native_shadow_observations`] for a caller that only wants the
+/// count: it clones nothing. Both recorders share this one sink -- the
+/// bytecode-won rows and the `bridge-ran-over-bytecode` rows -- so this is the
+/// number to compare against [`JDK_ONLY_NATIVE_SHADOW_CAP`], not the count of
+/// either kind on its own.
+pub fn jdk_only_native_shadow_sink_len() -> usize {
+    jdk_only_native_shadows().lock().len()
 }
 
 /// Has this triple already been offered to the observation buffer?
@@ -560,7 +668,7 @@ fn offer_native_shadow_observation(
         native_kind: kind_tag,
     };
     let mut recorded = jdk_only_native_shadows().lock();
-    if recorded.len() >= JDK_ONLY_NATIVE_SHADOW_CAP {
+    if recorded.len() >= jdk_only_native_shadow_cap() {
         JDK_ONLY_NATIVE_SHADOW_FULL.store(true, Ordering::Relaxed);
         return;
     }
@@ -1067,6 +1175,250 @@ pub fn record_native_dispatch(
     if let Some(id) = registry.resolve_id(class_name, method_name, descriptor) {
         registry.record_invocation(id);
     }
+}
+
+// ───────────────────── the general resolver's census arm (G47-1) ───────────
+//
+// `invoke_or_native` is the VM's *general* native resolver: the arm every
+// dispatch falls to that an inline cache did not serve. `G42-1` §3 measured
+// what that means for the census and named it the fourth bypass family, the
+// largest one: a compiled `invokevirtual` emits `jit_invoke_virtual_mic`, the
+// leaf/native site cache **refuses** any site whose method name is on
+// `site_name_is_special_cased` (`"invoke"` is), no MIC/PIC entry can be
+// published for a registered native, and the site falls to bare
+// `invoke_or_native` — which resolves with `find_with_kind`, holds no
+// `NativeMethodId`, and calls `safe_native_call`. Nothing counts.
+//
+// It is **not** a JIT-only family and not a reflection one. `invoke_or_native`
+// is also called from `dispatch_static.rs`, `lambda.rs`, `agent_loader.rs` and
+// `debug/mod.rs`, so the `--nojit` arm loses these calls too — it simply loses
+// far fewer of them, because the interpreter's cached-native target carries an
+// id and counts. Any native can land here; the set is not a fixed table whose
+// contents can be inspected the way `G33-1` §4 inspected the intrinsic table
+// and the direct-helper list.
+//
+// # Why this is not "mark at bind time", and why that decision was not open
+//
+// `G37-1` and `G42-1` both chose bind-time marking over a per-call counter,
+// on `G33-1` §5's +9.2 ns/call measurement. Both had a **bind point**: a call
+// site being wired to a pre-resolved callback (a JIT direct helper, an
+// intrinsic inline-cache fill), where one cold store buys silence forever.
+//
+// This site has none. `invoke_or_native` re-resolves the triple on every call
+// and wires nothing, so "mark once at bind" does not exist here; the cheapest
+// honest thing available is "mark on dispatch". And a mark needs a
+// `NativeMethodId`, which means `resolve_id` — the *same* lookup a count needs.
+// So the two options cost the same lookup and differ only by a relaxed
+// `fetch_add` versus a relaxed `store`, and the mark tells you strictly less.
+// Marking is not the free option here; it is the same-price, less-informative
+// one. That reframes the choice, and it is the one thing about this site that
+// could be settled from source without a build.
+//
+// # What is actually done, and why it is affordable unmeasured
+//
+// Default: **declare, at most once per (thread, VM, registry generation,
+// callback)**. A one-entry-deep pair of memo slots turns the steady state — a
+// loop calling the same native, which is exactly the shape `G42-1` §2 measured
+// — into a thread-local load and two compares, with `resolve_id` paid only on
+// the first dispatch of a callback. The census then says the row is a floor,
+// which is what schema 5 exists to print.
+//
+// On request (`CRATONVM_CENSUS_EXACT_INVOCATIONS`): **count exactly**, one
+// `resolve_id` plus one relaxed `fetch_add` per dispatch. That is the arm
+// `G42-1` §6 N2 wanted and could not cost; it is off by default precisely
+// because nobody has run the interleaved A/B the brief requires — and the one
+// run that *needs* it, a census run, is the one run where a few ns on the
+// native boundary buys the entire point of the file.
+//
+// This is the shape the capability gate ~16,300 lines above already argues for
+// on this same path and for this same reason ("re-deriving it with `resolve_id`
+// would pay a *second* full 128-bit hash per dispatch … the id is resolved only
+// after step 2 has said this native is capability-relevant, in the `#[cold]`
+// half"). It also inherits that gate's stated trade: under the default arm the
+// dump **under-reports `invocations` and says so**, rather than reporting a
+// number it cannot stand behind.
+//
+// # What would make this exact for free
+//
+// The in-source comment at the `find_with_kind` hit already prescribes it: "a
+// `find_with_kind`-shaped lookup that also returns the slot id". That is a
+// `native-api` edit and it is nominated, not done here.
+//
+// NOTE for whoever writes it: `G42-1` §6 N2 glosses the fix as `resolve_id` +
+// `callback_of` + **`kind_of_id`**, and that gloss is wrong. `find_with_kind`'s
+// own doc records that its cold descriptor-quirk arm looks the kind up with the
+// ORIGINAL descriptor, misses, and **deliberately** falls back to `Bridge`;
+// `kind_of_id` would return the slot's true kind instead. On a quirky
+// descriptor that flips `synthetic_stub_native`, which is the input to the
+// real-JDK `SyntheticStub` drop and to `resolve_native_dispatch_wave1` — a
+// dispatch-semantics change, in `--jdk-only`, which is the mode all 99
+// regression vectors run in. `find_with_kind` is left untouched here for
+// exactly that reason.
+
+/// Whether this run was asked for an **exact** `invocations` column on the
+/// general-resolver arm (`CRATONVM_CENSUS_EXACT_INVOCATIONS`), at the price of
+/// one `resolve_id` per native dispatch that reaches `invoke_or_native`.
+///
+/// Off by default. `OnceLock` and one relaxed load after the first call, the
+/// same shape `registry::lookup_census::enabled` uses on this very path — the
+/// disabled case is a load and a not-taken branch.
+#[inline]
+fn census_exact_general_dispatch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(v) = ENABLED.get() {
+        return *v;
+    }
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_CENSUS_EXACT_INVOCATIONS").is_some()
+    })
+}
+
+std::thread_local! {
+    /// `(vm_identity, registry generation, two callback addresses already
+    /// declared)` for this thread.
+    ///
+    /// A `Cell` of a `Copy` payload, mirroring `PERMISSIVE_DISPATCH_MEMO`
+    /// directly above: no `RefCell` borrow flag, no `Arc` clone, no allocation.
+    ///
+    /// Two slots rather than one because the measured shape is a loop over a
+    /// small set of natives, and rather than four because every extra slot is a
+    /// compare on the VM's general native path. A miss costs one `resolve_id`
+    /// and a relaxed store, never a wrong answer:
+    /// `mark_invocations_incomplete` is idempotent and sticky by contract, so
+    /// thrash re-declares an already-declared slot and changes nothing.
+    ///
+    /// Keyed on the **registry generation** as well as the VM, so a
+    /// `RegisterNatives` that introduces new slots invalidates the memo instead
+    /// of letting a stale callback address vouch for a slot it no longer names.
+    /// A callback address is never 0, so the all-zero initial value cannot
+    /// collide with a real entry — the same reasoning `PERMISSIVE_DISPATCH_MEMO`
+    /// records for `vm_identity`.
+    static GENERAL_DISPATCH_CENSUS_MEMO: std::cell::Cell<(usize, u32, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+
+/// Whether this thread has already declared the slot behind `callback`
+/// incomplete for this VM and registry generation — and record it if not.
+///
+/// Insert-at-front, evict-the-older: a two-entry direct-mapped cache with no
+/// hashing.
+#[inline]
+fn general_dispatch_census_already_declared(
+    vm_identity: usize,
+    generation: u32,
+    callback: usize,
+) -> bool {
+    GENERAL_DISPATCH_CENSUS_MEMO.with(|memo| {
+        let (memo_vm, memo_gen, first, second) = memo.get();
+        if memo_vm == vm_identity && memo_gen == generation {
+            if first == callback || second == callback {
+                return true;
+            }
+            memo.set((memo_vm, memo_gen, callback, first));
+        } else {
+            // Different VM, or the registry grew: start over rather than
+            // inherit an answer that was about other slots.
+            memo.set((vm_identity, generation, callback, 0));
+        }
+        false
+    })
+}
+
+/// Drop this thread's [`GENERAL_DISPATCH_CENSUS_MEMO`], so the next dispatch of
+/// every callback is declared again. For the tests that pin the memo's shape.
+#[cfg(test)]
+fn reset_general_dispatch_census_memo() {
+    GENERAL_DISPATCH_CENSUS_MEMO.with(|memo| memo.set((0, 0, 0, 0)));
+}
+
+/// Resolve the slot this dispatch is about to run and either **count** it or
+/// **declare it uncounted**, per [`census_exact_general_dispatch_enabled`].
+///
+/// `#[cold]` and out of line: on the default arm it runs once per callback per
+/// thread, and on the exact arm the caller is about to pay the ~141 ns
+/// `safe_native_call` funnel anyway.
+///
+/// # The verification, and why it is not paranoia
+///
+/// `resolve_id` and `find_with_kind` agree on the fast exact-hash path by
+/// construction, and both fall back to a descriptor-quirk rewrite — but through
+/// *different* functions (`resolve_id_with_descriptor_quirks` versus
+/// `find_with_descriptor_quirks`). Rather than assume the two rewrites always
+/// land on the same slot, this checks that the resolved slot's callback **is
+/// the one about to run**, by address, and does nothing otherwise. Marking or
+/// counting a neighbouring slot would put a wrong number on a row that looks
+/// authoritative, which is worse than the silence it replaced.
+///
+/// Compared as `usize` rather than as function pointers: `==` on `fn` pointers
+/// draws `unpredictable_function_pointer_comparisons`, and the address is the
+/// identity this memo already keys on.
+#[cold]
+#[inline(never)]
+fn census_general_dispatch_cold(
+    registry: &crate::native::registry::NativeMethodRegistry,
+    callback: cratonvm_native_api::NativeCallback,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    exact: bool,
+) {
+    let Some(id) = registry.resolve_id(class_name, method_name, descriptor) else {
+        return;
+    };
+    if registry.callback_of(id).map(|cb| cb as usize) != Some(callback as usize) {
+        return;
+    }
+    if exact {
+        registry.record_invocation(id);
+    } else {
+        registry.mark_invocations_incomplete(id);
+    }
+}
+
+/// The census hook every native-dispatching arm of [`invoke_or_native`] calls
+/// immediately before `safe_native_call`.
+///
+/// Purely additive: it reads the registry, writes only census state, returns
+/// nothing and cannot change which callback runs. Deliberately placed at the
+/// dispatch — not at the `find_with_kind` hit — for the reason the capability
+/// gate states one line away: the arms between the lookup and here can still
+/// route the call to real bytecode, and a slot that did not run must not be
+/// declared to have bypassed anything.
+#[inline]
+fn census_general_native_dispatch(
+    shared: &SharedVm,
+    callback: cratonvm_native_api::NativeCallback,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) {
+    let registry = &shared.natives.native_methods;
+    if census_exact_general_dispatch_enabled() {
+        census_general_dispatch_cold(
+            registry,
+            callback,
+            class_name,
+            method_name,
+            descriptor,
+            true,
+        );
+        return;
+    }
+    if general_dispatch_census_already_declared(
+        shared.vm_identity,
+        registry.generation(),
+        callback as usize,
+    ) {
+        return;
+    }
+    census_general_dispatch_cold(
+        registry,
+        callback,
+        class_name,
+        method_name,
+        descriptor,
+        false,
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -1900,6 +2252,65 @@ fn varhandle_reference_return_mismatch(
     Some(actual)
 }
 
+/// The descriptors a signature-polymorphic `MethodHandle` / `VarHandle`
+/// native is actually registered under.
+///
+/// A polymorphic call site names its OWN descriptor (`(LFoo;)I`), which is
+/// never the registration descriptor, so a registry lookup by the call-site
+/// triple always misses. The dispatch tail below re-probes with these three,
+/// in this order, and so does the JIT's per-call-site native cache
+/// (`jit::helpers::resolve_native_owner_for_receiver`) — the constant is
+/// shared so the two cannot drift.
+pub(crate) const SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS: [&str; 3] = [
+    "([Ljava/lang/Object;)Ljava/lang/Object;",
+    "([Ljava/lang/Object;)V",
+    "([Ljava/lang/Object;)Z",
+];
+
+/// Is this one of the method names JVMS §5.4.3.4's signature-polymorphic rule
+/// covers? Extracted from the dispatch tail below so the JIT site cache asks
+/// exactly the same question.
+pub(crate) fn is_signature_polymorphic_method_name(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "invoke"
+            | "invokeExact"
+            | "invokeWithArguments"
+            | "invokeBasic"
+            | "get"
+            | "set"
+            | "getVolatile"
+            | "setVolatile"
+            | "getOpaque"
+            | "setOpaque"
+            | "getAcquire"
+            | "setRelease"
+            | "compareAndSet"
+            | "compareAndExchange"
+            | "compareAndExchangeAcquire"
+            | "compareAndExchangeRelease"
+            | "weakCompareAndSet"
+            | "weakCompareAndSetPlain"
+            | "weakCompareAndSetAcquire"
+            | "weakCompareAndSetRelease"
+            | "getAndSet"
+            | "getAndSetAcquire"
+            | "getAndSetRelease"
+            | "getAndAdd"
+            | "getAndAddAcquire"
+            | "getAndAddRelease"
+            | "getAndBitwiseOr"
+            | "getAndBitwiseOrAcquire"
+            | "getAndBitwiseOrRelease"
+            | "getAndBitwiseAnd"
+            | "getAndBitwiseAndAcquire"
+            | "getAndBitwiseAndRelease"
+            | "getAndBitwiseXor"
+            | "getAndBitwiseXorAcquire"
+            | "getAndBitwiseXorRelease"
+    )
+}
+
 fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/MethodHandle"
         || class_name.starts_with("java/lang/invoke/MethodHandle")
@@ -1907,7 +2318,7 @@ fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
         || class_name == "java/lang/foreign/DowncallHandle"
 }
 
-fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
+pub(crate) fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/VarHandle"
         || class_name.starts_with("java/lang/invoke/VarHandle")
         || (class_name.starts_with("java/lang/invoke/") && class_name.contains("VarHandle"))
@@ -2346,6 +2757,84 @@ struct NativeDiagState {
     ring_idx: Option<usize>,
     /// Whether the straystack thread-local was pushed and must be popped.
     straystack_pushed: bool,
+}
+
+/// Forward one `Value` crossing the native-API boundary through the read
+/// barrier.
+///
+/// Natives hold `ObjectRef`s in Rust locals, which are in no root set, across
+/// operations that can collect — that is precisely why every entry point of
+/// this API already forwards its RECEIVER. The VALUES they hand back were not
+/// forwarded, so a native that read an object before a callback and stored it
+/// afterwards wrote a stale pointer straight into the heap, where the next
+/// reader `checkcast`s it and gets whatever now occupies the address.
+///
+/// Cheap and confined: this is the native boundary, not the interpreter's
+/// `putfield`, and the barrier short-circuits on anything that is not a moved
+/// object.
+#[inline]
+fn forward_boundary_value(heap: &crate::memory::VmHeap, value: Value) -> Value {
+    match value {
+        Value::Object(Some(obj)) => Value::Object(Some(heap.load_and_forward(obj))),
+        other => other,
+    }
+}
+
+/// Forward every reference ARGUMENT a native hands to a callback.
+///
+/// The companion to [`forward_boundary_value`], and the gap it leaves. Every
+/// `NativeContext` entry point forwards its RECEIVER, and the write entry points
+/// were taught to forward their VALUE; the `invoke_*` family passed `args`
+/// straight through. So a native that read an object, called back into Java, and
+/// then passed that object to a second callback handed a **stale pointer into a
+/// Java frame** — from where it is stored, compared, or `checkcast`-ed with
+/// nothing on the path to repair it.
+///
+/// This is the generic form of a defect fixed one native at a time five times
+/// over (`h2_comparison_compare`, `h2_comparison_get_value`,
+/// `h2_parser_test_token_fast`, `h2_condition_and_or_get_value`,
+/// `h2_coalesce_function_get_value` — see
+/// `known-issues/h2/bug-h2-testmultithread-mvstore-writer-object-identity-20260816.md`).
+/// A native may hold raw `ObjectRef`s across its own Rust code — the STW census
+/// waits for `NativeRunning` — but a callback into Java ends that protection,
+/// and this is the one boundary every such argument must cross.
+///
+/// **It does not make per-site pinning unnecessary.** It repairs the value ON
+/// THE WAY IN; the native's own Rust local stays stale, so anything that
+/// compares it by identity, reads a field off it, or passes it somewhere else
+/// still needs a pin and a re-read. What it removes is the worst outcome — the
+/// stale pointer escaping into the heap.
+///
+/// Allocates only when something actually moved: the common case walks the
+/// arguments, finds every one already current, and returns the caller's slice
+/// untouched.
+#[inline]
+fn forward_boundary_args<'a>(
+    heap: &crate::memory::VmHeap,
+    args: &'a [Value],
+    buf: &'a mut Vec<Value>,
+) -> &'a [Value] {
+    let mut forwarded = false;
+    for (index, value) in args.iter().enumerate() {
+        let Value::Object(Some(obj)) = value else {
+            continue;
+        };
+        let moved = heap.load_and_forward(*obj);
+        if moved == *obj {
+            continue;
+        }
+        if !forwarded {
+            buf.clear();
+            buf.extend_from_slice(args);
+            forwarded = true;
+        }
+        buf[index] = Value::Object(Some(moved));
+    }
+    if forwarded {
+        buf.as_slice()
+    } else {
+        args
+    }
 }
 
 pub fn safe_native_call(
@@ -2993,28 +3482,27 @@ fn safe_native_call_impl(
     // the early returns below it. A native that opened a blocking region and
     // came back is left in whatever `end_blocking_region` recorded until this
     // guard restores the caller's state — both are tabled edges.
-    struct NativeStateGuard(ThreadExecState);
+    //
+    // ONE thread-local access for the pair, not three. This was
+    // `current_state()` + `record_transition(NativeRunning)` + a `Drop` that
+    // recorded the prior state, and `native_funnel_profile::funnel_cost_
+    // breakdown` prices that trio at 10.8-14.4 ns of a 29-36 ns funnel — the
+    // largest single component, with `current_state()` alone at 0.9 ns, which
+    // is what says the cost was the repetition rather than the read.
+    // `NativeStateSpan` takes the cell once and restores through a raw pointer;
+    // the `Starting` correction the old code did here moved into
+    // `enter_native_state`, where every caller gets it.
+    struct NativeStateGuard(Option<thread_state::NativeStateSpan>);
     impl Drop for NativeStateGuard {
         fn drop(&mut self) {
-            thread_state::record_transition(self.0, "vm_exec::safe_native_call_impl:return");
+            if let Some(span) = self.0.take() {
+                span.restore("vm_exec::safe_native_call_impl:return");
+            }
         }
     }
-    let _native_state_guard = NativeStateGuard(match thread_state::current_state() {
-        // `Starting` is ALSO the recorder's answer for a thread it has never
-        // observed (`current_state`'s doc), and this funnel is often the first
-        // thing a carrier records. Restoring it would assert the one thing the
-        // table says cannot be true of a thread that just ran a native
-        // (`Starting -> NativeRunning` is deliberately absent), and would then
-        // repeat on that thread's every later native call. Resume as
-        // `JavaRunning`: the state such a thread demonstrably reached, and the
-        // tabled return edge from a native.
-        ThreadExecState::Starting => ThreadExecState::JavaRunning,
-        prior => prior,
-    });
-    thread_state::record_transition(
-        ThreadExecState::NativeRunning,
+    let _native_state_guard = NativeStateGuard(Some(thread_state::enter_native_state(
         "vm_exec::safe_native_call_impl",
-    );
+    )));
 
     let result = {
         // Heap-exhaustion unwind permission. The callback below runs directly
@@ -6153,6 +6641,8 @@ impl<'a> NativeContextImpl<'a> {
             crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
+        // See `JvmThread::last_heal_collection`.
+        self.thread.last_heal_collection = self.shared.mem.heap.collection_count();
         // cceres3 FIX: exact per-slot write-back for the blocked window.
         // Runs after the chain application above — any slot the chain already
         // healed reads back != orig and is skipped; any slot the chain MISSED
@@ -6221,12 +6711,19 @@ impl<'a> NativeContextImpl<'a> {
         // the wake-time fixup application — catches both "chain key missing"
         // (was_key=false) and "frame held an intermediate address" desyncs at
         // the exact wake where they surface.
+        // Predicate: the FIXUP CHAIN's keys, not a forwarding word. Same
+        // correction as the arrival-site ARRIVE-STALE verifier — the forwarding
+        // word does not exist on the default collector (ZGC's slide leaves
+        // none), so this reported zero whatever the truth was. The chain's keys
+        // are exactly the pre-move addresses this thread slept through, and the
+        // write-back above has just run, so a frame slot still holding one is a
+        // slot the write-back did not reach.
         if blockgc_dbg() {
             for (fi, fr) in self.thread.frames.iter().enumerate() {
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
+                        if let Some(new) = fixup.get(&a).copied() {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -6240,7 +6737,7 @@ impl<'a> NativeContextImpl<'a> {
                 for si in 0..fr.stack.len() {
                     if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
+                        if let Some(new) = fixup.get(&a).copied() {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -8724,6 +9221,15 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .module_names()
     }
 
+    fn module_is_class_path_only(&self, module_name: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .is_class_path_only(module_name)
+    }
+
     fn module_exports(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
         self.shared
             .classes
@@ -9427,6 +9933,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+                let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_shared(
             self.shared,
             self.thread,
@@ -9445,6 +9953,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+                let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_by_class_id_shared(
             self.shared,
             self.thread,
@@ -9466,6 +9976,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // `class_name` with no virtual dispatch and no iface/abstract retarget
         // to the receiver's concrete class. Required for `Lookup.findSpecial`
         // private-to-private calls and default-method super-call patterns.
+                let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_shared(
             self.shared,
             self.thread,
@@ -9489,6 +10001,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // `Method.invoke` dispatch of private / cross-package package-private
         // instance methods, which has the identical loader-identity
         // requirement. See the trait method's doc comment.
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_shared_on_class(
             self.shared,
             self.thread,
@@ -9507,6 +10021,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_bytecode_only_shared(
             self.shared,
             self.thread,
@@ -9629,6 +10145,11 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        // Arguments as well as the receiver: see `forward_boundary_args`. This
+        // is the entry point the H2 natives use, and the one whose unforwarded
+        // `session` argument is the MVStore-writer page's headline verdict.
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         let mut receiver = self.shared.mem.heap.load_and_forward(receiver);
         let mut receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
         if let Some(recovered) = recover_stale_lambda_receiver_from_native_pins(
@@ -10413,6 +10934,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // infinite recursion (confirmed via a depth-counter probe: `execute`
         // called itself on the same receiver until the native stack
         // overflowed) instead of actually reaching bytecode.
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         let receiver = self.shared.mem.heap.load_and_forward(receiver);
         let class_id = self.shared.mem.heap.class_id_of(receiver);
         let declaring_class_id = {
@@ -11190,6 +11713,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         // DIAGNOSTIC-ONLY (cce0079 tree-key tail): decisive probe - capture
         // the minor-GC epoch at entry and compare at exit. A delta proves a
         // GC completed INSIDE a plain ref store (and names the stack);
@@ -11321,6 +11845,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         let class_id = self.shared.mem.heap.class_id_of(obj);
         let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
@@ -11439,6 +11964,26 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             .mem
             .heap
             .try_alloc_array_full(ClassId::new(0), element_type, length)
+    }
+
+    fn reclaim_before_alloc_retry(&mut self) -> bool {
+        // The same ladder `gc_alloc_array` (interpreter) and `jit_newarray`
+        // (JIT) run between their failed attempts. See the trait method for the
+        // precondition the CALLER is responsible for — this function cannot
+        // check it, because the locals at risk are the caller's.
+        //
+        // Order matches the interpreter's exactly, and the overhead-limit check
+        // sits between the two reclaim steps for the reason it does there: once
+        // consecutive forced collections stop freeing anything, more of them are
+        // a death spiral, and OOM is the honest answer. Reporting `false` there
+        // rather than `true` is what keeps this from becoming that spiral.
+        self.thread.tlab.retire();
+        crate::runtime::interpreter::maybe_gc_forced_pub(self.shared, self.thread);
+        if crate::runtime::interpreter::gc_overhead_limit_exceeded(self.shared) {
+            return false;
+        }
+        crate::runtime::interpreter::last_ditch_reclaim(self.shared, self.thread);
+        true
     }
 
     fn array_component_class_id(&self, class_id: ClassId) -> Option<ClassId> {
@@ -11594,6 +12139,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     /// already suppressed by the time we see the result.
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         // Deliberate discard: `NativeContext::set_array_element` is `-> ()`
         // and its contract is "no-op or VM error, never an out-of-bounds heap
         // write". The caller range-checks; `native-builtins`'s
@@ -11717,6 +12263,90 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             }
         }
         n
+    }
+
+    fn read_int_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [i32]) -> usize {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
+            return 0;
+        }
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+            return 0;
+        }
+        let len = self.shared.mem.heap.array_length(arr);
+        if src_off > len {
+            return 0;
+        }
+        let available = len - src_off;
+        let n = available.min(dst.len());
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: bounds checked above. Int arrays are a flat 4-bytes-per-element
+        // payload (`element_byte_size`), so `n * 4` bytes from `base + src_off*4`
+        // is exactly elements `src_off..src_off+n`, in host order — the same
+        // convention the char twin above relies on. `dst` is caller-owned and
+        // cannot alias the heap arena.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    base.add(src_off * 4),
+                    dst.as_mut_ptr() as *mut u8,
+                    n * 4,
+                );
+            },
+            // G1 humongous int[]: region-safe per-element read, same fallback
+            // shape as the byte/char twins.
+            None => {
+                for (i, slot) in dst.iter_mut().take(n).enumerate() {
+                    match self.shared.mem.heap.get_array_element(arr, src_off + i) {
+                        Ok(Value::Int(x)) => *slot = x,
+                        _ => return i,
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    fn write_int_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[i32]) -> bool {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
+            return false;
+        }
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+            return false;
+        }
+        let len = self.shared.mem.heap.array_length(arr);
+        if dst_off.checked_add(src.len()).map_or(true, |end| end > len) {
+            return false;
+        }
+        if src.is_empty() {
+            return true;
+        }
+        // SAFETY: bounds checked above; see `read_int_array_into` for the
+        // 4-bytes-per-element layout argument.
+        match self.shared.mem.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr() as *const u8,
+                    base.add(dst_off * 4),
+                    src.len() * 4,
+                );
+            },
+            None => {
+                for (i, v) in src.iter().enumerate() {
+                    if self
+                        .shared
+                        .mem
+                        .heap
+                        .set_array_element(arr, dst_off + i, Value::Int(*v))
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn read_char_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u16]) -> usize {
@@ -12483,6 +13113,17 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         Some(self.thread.tlab.thread_allocated_bytes())
     }
 
+    fn total_allocated_bytes(&self) -> Option<u64> {
+        // Every thread's RETIRED total, plus this thread's live TLAB span. A
+        // peer's in-flight cursor may not be read while its owner runs, so the
+        // under-count is bounded by one TLAB per running thread — and the value
+        // stays monotonic, which the occupancy gauge this replaced was not.
+        Some(
+            cratonvm_gc::tlab::process_allocated_bytes()
+                .saturating_add(self.thread.tlab.thread_allocated_bytes()),
+        )
+    }
+
     fn committed_heap_bytes(&self) -> usize {
         self.shared.mem.heap.committed_bytes()
     }
@@ -12893,12 +13534,18 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // the synthetic `Cleaner$Cleanable` shape, whose slot 0 is its action
         // rather than a referent, so it must never reach the pre-GC
         // referent-nulling pass. See `ReferenceEntry::runs_cleaner`.
+        // THE IDENTITY STAMP (see `ReferenceProcessor::identity_stamps`).
+        // Minted here because it needs the heap: `identity_hash_code` installs
+        // a value from a monotonic counter into the object's own mark word when
+        // it has none and returns the existing one otherwise. It travels with
+        // the object across a relocation, so it identifies the OBJECT rather
+        // than its address -- which is what every guard downstream of this
+        // registry has been approximating with a class-shape test.
+        let stamp = self.shared.mem.heap.identity_hash_code(reference_obj);
         if ref_type == 4 {
-            self.shared
-                .mem
-                .ref_processor
-                .lock()
-                .discover_phantom_cleaner(ref_addr, referent_addr, queue_addr);
+            let mut rp = self.shared.mem.ref_processor.lock();
+            rp.discover_phantom_cleaner(ref_addr, referent_addr, queue_addr);
+            rp.stamp_reference(ref_addr, stamp);
             return;
         }
         let rt = match ref_type {
@@ -12908,12 +13555,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             3 => ReferenceType::Cleaner,
             _ => return,
         };
-        self.shared.mem.ref_processor.lock().discover_reference(
-            rt,
-            ref_addr,
-            referent_addr,
-            queue_addr,
-        );
+        let mut rp = self.shared.mem.ref_processor.lock();
+        rp.discover_reference(rt, ref_addr, referent_addr, queue_addr);
+        rp.stamp_reference(ref_addr, stamp);
     }
 
     /// PGJDBC-PHANTOM-GHOST (2026-08-07): see the trait doc and
@@ -14213,6 +14857,32 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         let Some(tid) = tid else {
             return Vec::new();
         };
+        // A RUNNING target has published nothing worth reading.
+        //
+        // The deposit points are the BLOCKING ones, so the snapshot below
+        // answers "where is this thread parked" and nothing else. Ask about a
+        // thread that is not parked and the answer is an empty array (it never
+        // blocked) or the call site where it blocked LAST — a confident wrong
+        // answer. Measured against HotSpot on a spin loop through three named
+        // methods, sampled every 2 ms: HotSpot named the running method on all
+        // ~840 samples; this returned `<empty>` on 1471 of 1495 and the running
+        // method on none. Every in-process sampling profiler, thread dump and
+        // hang diagnostic that inspects another thread was reading that.
+        //
+        // So ask the target to publish, by taking the pause that makes it —
+        // another thread cannot walk `JvmThread::frames`, which its own thread
+        // owns. Skipped when the target is parked: that is both the common case
+        // for a thread dump and the one whose deposit is ALREADY current, so the
+        // pause would stop the world to re-derive a stack we already have.
+        // Skipped too when another STW owns the world
+        // (`stw_publish_frame_traces` returns false), where this read degrades
+        // to exactly the behaviour it had before.
+        if !self.shared.threads.thread_registry.is_blocked(tid) {
+            crate::runtime::interpreter::stw_publish_frame_traces(
+                self.shared,
+                self.thread.thread_id,
+            );
+        }
         // CR-CLO-1 (`arch-2026-07-26/cross-owner-closeout.md` §6).
         //
         // Two stale comments used to sit here. The first claimed line numbers
@@ -16376,6 +17046,7 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
+        let value = forward_boundary_value(&self.shared.mem.heap, value);
         super::set_static_shared(self.shared, class_id, field_index, value);
     }
 
@@ -17360,6 +18031,13 @@ pub fn invoke_or_native(
                     "type",
                     "()Ljava/lang/invoke/MethodType;",
                 ) {
+                    census_general_native_dispatch(
+                        shared,
+                        callback,
+                        "java/lang/foreign/DowncallHandle",
+                        "type",
+                        "()Ljava/lang/invoke/MethodType;",
+                    );
                     return safe_native_call(shared, thread, callback, args)
                         .map(|value| coerce_native_return(value, descriptor));
                 }
@@ -17382,6 +18060,13 @@ pub fn invoke_or_native(
                     method_name,
                     "([Ljava/lang/Object;)Ljava/lang/Object;",
                 ) {
+                    census_general_native_dispatch(
+                        shared,
+                        callback,
+                        "java/lang/foreign/DowncallHandle",
+                        method_name,
+                        "([Ljava/lang/Object;)Ljava/lang/Object;",
+                    );
                     return safe_native_call(shared, thread, callback, args)
                         .map(|value| coerce_native_return(value, descriptor));
                 }
@@ -17474,6 +18159,13 @@ pub fn invoke_or_native(
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, descriptor)
         {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "java/lang/ClassLoader",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17505,6 +18197,13 @@ pub fn invoke_or_native(
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, descriptor)
         {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "java/lang/ClassLoader",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17529,6 +18228,13 @@ pub fn invoke_or_native(
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, descriptor)
         {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "java/lang/ClassLoader",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17550,6 +18256,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/jar/ManifestInfo",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17564,6 +18277,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/jar/NestedJarFile",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17582,6 +18302,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17596,6 +18323,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/net/protocol/jar/UrlJarFile",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17612,6 +18346,13 @@ pub fn invoke_or_native(
             method_name,
             descriptor,
         ) {
+            census_general_native_dispatch(
+                shared,
+                callback,
+                "org/springframework/boot/loader/zip/ZipContent$SignatureFiles",
+                method_name,
+                descriptor,
+            );
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17827,6 +18568,13 @@ pub fn invoke_or_native(
                         method_name,
                         descriptor,
                     )?;
+                    census_general_native_dispatch(
+                        shared,
+                        callback,
+                        effective_class,
+                        method_name,
+                        descriptor,
+                    );
                     return safe_native_call(shared, thread, callback, args)
                         .map(|v| coerce_native_return(v, descriptor));
                 }
@@ -17849,6 +18597,7 @@ pub fn invoke_or_native(
                 .native_methods
                 .find(class_name, method_name, descriptor)
         {
+            census_general_native_dispatch(shared, callback, class_name, method_name, descriptor);
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -17894,6 +18643,13 @@ pub fn invoke_or_native(
                                 method_name,
                                 descriptor,
                             ) {
+                                census_general_native_dispatch(
+                                    shared,
+                                    callback,
+                                    &parent.name,
+                                    method_name,
+                                    descriptor,
+                                );
                                 drop(cm);
                                 return safe_native_call(shared, thread, callback, args)
                                     .map(|v| coerce_native_return(v, descriptor));
@@ -17911,6 +18667,13 @@ pub fn invoke_or_native(
                                     parent.name
                                 );
                             }
+                            census_general_native_dispatch(
+                                shared,
+                                callback,
+                                &parent.name,
+                                method_name,
+                                descriptor,
+                            );
                             drop(cm);
                             return safe_native_call(shared, thread, callback, args)
                                 .map(|v| coerce_native_return(v, descriptor));
@@ -19023,7 +19786,10 @@ pub(super) fn proxy_invoke_handler(
             // return contract) into a fresh wrapper's raw-value slot,
             // corrupting the value (observed: `Bean.getAge()` through two
             // nested JDK proxies returned an unrelated int instead of 5).
-            return proxy_unbox_primitive_return(ctx.shared, descriptor, Ok(result));
+            // G24-1: this is a USER handler's value, so it takes the strict
+            // contract (null -> NPE, wrong type -> CCE), not the annotation
+            // arm's lenient unbox.
+            return proxy_coerce_handler_return(ctx.shared, descriptor, Ok(result));
         }
         return Err(MethodCallFailed::InternalError(VmError::Linkage(
             LinkageError::AbstractMethodError {
@@ -19066,7 +19832,14 @@ pub(super) fn proxy_invoke_handler(
     // (confirmed: double-nested `Proxy.newProxyInstance` around a plain
     // pass-through `InvocationHandler`, `int getAge()` returned garbage
     // instead of the real value; a single proxy layer was unaffected).
-    proxy_unbox_primitive_return(
+    //
+    // G24-1 promoted this from the lenient unbox to the strict contract: the
+    // value here is whatever the user's `InvocationHandler` chose, so `null`
+    // for a primitive return is an NPE and a mismatched wrapper is a CCE. The
+    // nested-proxy case above still works, because a nested dispatch hands back
+    // an already-raw value and every arm of the strict helper passes those
+    // through untouched.
+    proxy_coerce_handler_return(
         ctx.shared,
         descriptor,
         proxy_wrap_undeclared_if_needed(
@@ -19146,7 +19919,7 @@ fn class_name_is(shared: &SharedVm, obj: ObjectRef, name: &str) -> bool {
 /// the boundary here (rather than in the individual callers) so native and
 /// interpreter proxy dispatch cannot accidentally hand an `Integer` reference
 /// to code expecting an `int`.
-fn proxy_unbox_primitive_return(
+pub(crate) fn proxy_unbox_primitive_return(
     shared: &SharedVm,
     descriptor: &str,
     result: MethodCallResult,
@@ -19171,6 +19944,284 @@ fn proxy_unbox_primitive_return(
         }
         _ => Ok(Some(value)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// G24-1 — the InvocationHandler return contract on the LIVE proxy path
+// ---------------------------------------------------------------------------
+//
+// HotSpot's generated `$ProxyN` body does not merely *read* the handler's
+// `Object` result — it emits a `checkcast` to the declared return type and, for
+// a primitive return, a `checkcast` to the wrapper followed by the wrapper's
+// `xxxValue()` call. Both bytecodes can fail, and the two failures are the
+// whole of `RJdkProxy` checks 32 and 33:
+//
+//   * `null` for a primitive return -> `NullPointerException`, whose text is
+//     the helpful-NPE for the `xxxValue()` call site and so names a DIFFERENT
+//     wrapper per return type (G24-1 §2);
+//   * any object that is not exactly the declared type -> `ClassCastException`.
+//     There is **no widening**: an `Integer` returned for a `long`-declared
+//     method is a CCE on HotSpot, not a conversion (G24-1 §3, MEASURED — the
+//     row a careful reading of the JDK gets wrong).
+//
+// `proxy_unbox_primitive_return` above stays as it was, deliberately: it is the
+// ANNOTATION arm's coercion, where the values are the VM's own recorded member
+// data rather than something a user handler chose, and refusing one of those
+// would turn a CratonVM bookkeeping gap into a thrown exception on a path
+// `RJdkStrict` (359 checks) drives hard. The strict contract below is applied
+// one level in — at the three points inside `proxy_invoke_handler{,_shared}`
+// where the USER's `InvocationHandler` result comes back — so the annotation
+// arm, which returns earlier, never reaches it.
+
+/// The wrapper class and the unboxing accessor HotSpot's generated `$ProxyN`
+/// body calls for each primitive return descriptor.
+///
+/// The accessor name is not decoration: it is quoted verbatim in the NPE
+/// message, and it is the half that varies per type. TRANSCRIBED from the
+/// oracle (`PRet` probe, HotSpot 25.0.3+9-LTS), not composed from a template.
+fn proxy_primitive_return_wrapper(ret: char) -> Option<(&'static str, &'static str)> {
+    Some(match ret {
+        'Z' => ("java/lang/Boolean", "booleanValue"),
+        'B' => ("java/lang/Byte", "byteValue"),
+        'C' => ("java/lang/Character", "charValue"),
+        'S' => ("java/lang/Short", "shortValue"),
+        'I' => ("java/lang/Integer", "intValue"),
+        'J' => ("java/lang/Long", "longValue"),
+        'F' => ("java/lang/Float", "floatValue"),
+        'D' => ("java/lang/Double", "doubleValue"),
+        _ => return None,
+    })
+}
+
+/// The return descriptor of `descriptor` — everything after the last `)`.
+///
+/// Spelled out rather than reusing the `rsplit(')')` idiom above because that
+/// one answers the WHOLE string for a descriptor with no `)` at all, which
+/// would make `proxy_coerce_handler_return` read a malformed descriptor's first
+/// character as a return kind.
+fn proxy_return_descriptor(descriptor: &str) -> &str {
+    match descriptor.rfind(')') {
+        Some(idx) => &descriptor[idx + 1..],
+        None => "",
+    }
+}
+
+/// HotSpot's `Klass::external_name()` for a cast-message operand: dotted, with
+/// arrays left in descriptor form. The `(… are in module …)` parenthetical is
+/// appended later by `runtime::exceptions::throw_runtime_error`, the single
+/// funnel every VM-raised `RuntimeError` passes through — so the message built
+/// here is deliberately the bare two-operand form that funnel recognises.
+fn proxy_cast_display_name(internal: &str) -> String {
+    internal.replace('/', ".")
+}
+
+/// HotSpot's helpful-NPE for the `xxxValue()` call the generated `$ProxyN` body
+/// makes on a `null` handler result.
+///
+/// A separate function only so the text can be asserted without a VM: it is
+/// TRANSCRIBED, and it is the half of this change that no amount of reading the
+/// JDK would produce. The `because` clause is invariant — the receiver is
+/// always the handler's return value — while the `Cannot invoke` half names the
+/// wrapper and accessor for the declared return type.
+fn proxy_null_return_npe_message(wrapper_internal: &str, accessor: &str) -> String {
+    format!(
+        "Cannot invoke \"{}.{accessor}()\" because the return value of \
+         \"java.lang.reflect.InvocationHandler.invoke(Object, \
+         java.lang.reflect.Method, Object[])\" is null",
+        proxy_cast_display_name(wrapper_internal)
+    )
+}
+
+/// The bare two-operand cast refusal `runtime::exceptions::throw_runtime_error`
+/// recognises and decorates with the module/loader parenthetical.
+fn proxy_cast_refusal_message(from_internal: &str, to_internal: &str) -> String {
+    format!(
+        "class {} cannot be cast to class {}",
+        proxy_cast_display_name(from_internal),
+        proxy_cast_display_name(to_internal)
+    )
+}
+
+/// Can this VM state, with confidence, what `obj`'s type is *not*?
+///
+/// `true` means "no opinion" and the caller must fail open. The strict contract
+/// can only ever REFUSE, so every uncertainty has to answer `true` here: a
+/// wrong refusal turns a working proxy into a thrown `ClassCastException`,
+/// which is strictly worse than the missing refusal it replaces.
+///
+/// Four populations are opaque:
+///
+/// * **Arrays.** `class_id_of` on an array header carries the COMPONENT class
+///   (see the `Thread.clone` H2-CID0 note in `interpreter/invoke.rs`), so a
+///   `String[]` would answer `is_assignable_to_name("java/lang/String")` —
+///   true, for the wrong reason. Two measured rows (`String[]` -> `int[]`,
+///   `int[]` -> `Object[]`) are left diverging by this and nothing asserts
+///   them.
+/// * **Lambda proxies.** Their `ClassId` is synthetic and absent from the class
+///   store, so their SAM interface is on no `interfaces` list to walk. Costs
+///   the measured `lambda` -> `String` row.
+/// * **Anything on a proxy superclass chain** (`Proxy$Instance` or the real
+///   `java/lang/reflect/Proxy`). A fabricated `$ProxyN` records
+///   `GeneratedProxy { interfaces: [] }` — "no record", not "implements
+///   nothing" — the same distinction `recorded_proxy_interface_set` in
+///   `interpreter/typecheck.rs` exists to make.
+/// * **A class the class manager cannot produce at all.**
+fn proxy_return_type_is_opaque(shared: &SharedVm, obj: ObjectRef) -> bool {
+    if shared.mem.heap.kind_of(obj) == ObjectKind::Array {
+        return true;
+    }
+    let class_id = shared.mem.heap.class_id_of(obj);
+    if shared.classes.lambda_proxies.read().contains_key(&class_id) {
+        return true;
+    }
+    if crate::runtime::interpreter::class_chain_reaches_proxy_instance(shared, class_id) {
+        return true;
+    }
+    shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .is_none()
+}
+
+/// The runtime class name to quote in a cast refusal, or `None` when
+/// [`proxy_return_type_is_opaque`] says we must not refuse at all.
+fn proxy_refusable_class_name(shared: &SharedVm, obj: ObjectRef) -> Option<String> {
+    if proxy_return_type_is_opaque(shared, obj) {
+        return None;
+    }
+    let class_id = shared.mem.heap.class_id_of(obj);
+    shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .map(|c| c.name.to_string())
+}
+
+/// `Some(runtime_class_name)` when `obj` must be refused for a method whose
+/// declared reference return descriptor is `ret_desc`; `None` to accept.
+///
+/// Assignability is answered by `Class::is_assignable_to_name`, which walks the
+/// superclass chain AND the interface DAG comparing NAMES — so it needs no
+/// `ClassId` for the declared type and therefore triggers no class loading on
+/// a dispatch path. That matters: this runs once per proxy call with a
+/// reference return, and a `load_class` here would put classloading behind
+/// every such dispatch.
+///
+/// Two gates before a refusal, both measured-neutral, both there to keep a
+/// refusal from being invented out of a lookup failure:
+///
+/// * `Ljava/lang/Object;` — by far the most common proxy return descriptor —
+///   short-circuits before any lock is taken;
+/// * the declared type must itself be a class this VM has a unique definition
+///   for. If it is not loaded, "not assignable" is a statement about the class
+///   store rather than about the value.
+fn proxy_reference_return_refusal(
+    shared: &SharedVm,
+    obj: ObjectRef,
+    ret_desc: &str,
+) -> Option<String> {
+    if ret_desc == "Ljava/lang/Object;" {
+        return None;
+    }
+    // Array return types fail open together with array values: see
+    // `proxy_return_type_is_opaque`.
+    let target = ret_desc.strip_prefix('L')?.strip_suffix(';')?;
+    if proxy_return_type_is_opaque(shared, obj) {
+        return None;
+    }
+    let class_id = shared.mem.heap.class_id_of(obj);
+    let name = {
+        let cm = shared.classes.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        if class.is_assignable_to_name(target, &cm.class_store) {
+            return None;
+        }
+        // The declared type must itself be a class this VM has a unique
+        // definition for — otherwise "not assignable" is a statement about the
+        // class store rather than about the value.
+        cm.find_unique_class_by_name(target)?;
+        class.name.to_string()
+    };
+    // The two admit-only heuristics `aastore_element_assignable` reaches for at
+    // the same point, after its own by-name walk has already declined. Both can
+    // only ADMIT, and both cover populations whose real supertypes are not on
+    // any `interfaces` list: a class this VM fabricated, and an annotation
+    // proxy whose annotation interface lives on the heap object rather than in
+    // its class entry. Borrowed rather than reimplemented so this predicate
+    // cannot drift away from the one `aastore` and `checkcast` already use.
+    if crate::runtime::interpreter::synthetic_implements_public(shared, class_id, target)
+        || crate::runtime::interpreter::annotation_proxy_satisfies_target(shared, obj, target)
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Apply the `InvocationHandler` return contract to the value a USER handler
+/// produced, exactly as HotSpot's generated `$ProxyN` body would.
+///
+/// A raw (already-unboxed) `Value` passes through untouched on every arm. That
+/// is not laxity — it is the re-entrancy valve. A proxy whose handler
+/// reflectively re-invokes through a NESTED proxy gets that inner dispatch's
+/// result back already coerced here, and `Method.invoke` re-boxes it per the
+/// inner method's own descriptor, so the outer coercion sees a wrapper again.
+/// A raw value at this boundary can therefore only be the VM's own, and
+/// refusing it would refuse a value no Java code ever chose.
+pub(crate) fn proxy_coerce_handler_return(
+    shared: &SharedVm,
+    descriptor: &str,
+    result: MethodCallResult,
+) -> MethodCallResult {
+    let Some(value) = result? else {
+        return Ok(None);
+    };
+    let ret_desc = proxy_return_descriptor(descriptor);
+    let ret = ret_desc.chars().next().unwrap_or('L');
+
+    if let Some((wrapper, accessor)) = proxy_primitive_return_wrapper(ret) {
+        return match value {
+            // The `because` clause is fixed text — the generated body's
+            // receiver is always the handler's return value; the `Cannot
+            // invoke` half names the wrapper for THIS return type.
+            Value::Object(None) => Err(RuntimeError::NullPointerException {
+                message: Some(proxy_null_return_npe_message(wrapper, accessor)),
+            }
+            .into()),
+            Value::Object(Some(obj)) => {
+                if class_name_is(shared, obj, wrapper) {
+                    return Ok(Some(shared.mem.heap.get_field(obj, 0)));
+                }
+                match proxy_refusable_class_name(shared, obj) {
+                    // The wrapper checkcast. NOT a widening site: an `Integer`
+                    // for a `J` return refuses here rather than converting.
+                    Some(actual) => Err(RuntimeError::ClassCastException {
+                        message: proxy_cast_refusal_message(&actual, wrapper),
+                    }
+                    .into()),
+                    // Opaque: keep the pre-G24 read of slot 0 verbatim.
+                    None => Ok(Some(shared.mem.heap.get_field(obj, 0))),
+                }
+            }
+            other => Ok(Some(other)),
+        };
+    }
+
+    if ret == 'V' {
+        return Ok(Some(value));
+    }
+    if let Value::Object(Some(obj)) = value {
+        if let Some(actual) = proxy_reference_return_refusal(shared, obj, ret_desc) {
+            let target = ret_desc.trim_start_matches('L').trim_end_matches(';');
+            return Err(RuntimeError::ClassCastException {
+                message: proxy_cast_refusal_message(&actual, target),
+            }
+            .into());
+        }
+    }
+    Ok(Some(value))
 }
 
 /// Dispatch a real JDK `$ProxyN` annotation method through its synthetic
@@ -19486,7 +20537,14 @@ pub(crate) fn proxy_invoke_handler_shared(
             }
         };
         if let Some(result) = dispatch {
-            return Ok(result);
+            // G24-1: a `(proxy, m, a) -> …` handler passed straight to
+            // `newProxyInstance` is the common shape — it is what `RJdkProxy`
+            // uses — and its result is a user value, so it takes the same
+            // strict contract as the object-handler tail below. This arm
+            // returned verbatim before, leaving the coercion entirely to the
+            // caller in `interpreter/invoke.rs`, whose `else { value }` arm is
+            // what pushed a handler's `null` as `0`.
+            return proxy_coerce_handler_return(shared, descriptor, Ok(result));
         }
         // Fell through unexpectedly вЂ” surface as a clearer error than
         // "no Code attribute".
@@ -19520,7 +20578,19 @@ pub(crate) fn proxy_invoke_handler_shared(
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         &invoke_args,
     );
-    proxy_wrap_undeclared_if_needed(shared, thread, proxy, method_name, descriptor, result)
+    // G24-1: the object-handler tail. Everything reaching here came out of a
+    // real `InvocationHandler.invoke` body, so the return contract applies —
+    // `null` for a primitive return is an NPE and a value that is not the
+    // declared type is a CCE, with no widening. The AnnotationProxy arm
+    // returned long before this point, which is what keeps annotation member
+    // data (and `RJdkStrict`) out of the blast radius; the exception wrap
+    // stays innermost so an undeclared checked throw is still rewrapped before
+    // the coercion sees `Err` and passes it straight through.
+    proxy_coerce_handler_return(
+        shared,
+        descriptor,
+        proxy_wrap_undeclared_if_needed(shared, thread, proxy, method_name, descriptor, result),
+    )
 }
 
 /// proxy-real-classfile increment 6 — `UndeclaredThrowableException` parity for
@@ -20205,7 +21275,27 @@ fn adapt_annotation_value_for_map(
 
 /// Read element-name + element-value parallel arrays from an annotation proxy.
 /// Returns `(name, value)` pairs in the order they were stored at proxy build
-/// time (which is the source-declaration order from the .class file).
+/// time.
+///
+/// **That order is the class file's `element_value_pairs` order, and this is
+/// load-bearing** — `annotation_proxy_to_string` prints it verbatim rather
+/// than sorting, because HotSpot does. Established twice, 2026-08-12:
+///
+/// * by reading the whole pipeline, which is `Vec`-to-`Vec` with no map or set
+///   anywhere — `decode_annotation_depth` (`reader/src/attribute.rs`) pushes
+///   the pairs in file order, `convert_annotation` (this file) re-pushes them
+///   in that order, `create_annotation_proxy_with_type`
+///   (`native-builtins/src/lang_class.rs`) clones them into `all_elements`,
+///   appends any `AnnotationDefault` members AFTER them, and writes both
+///   parallel arrays by `enumerate()` index. That function holds the only
+///   write to `ANN_PROXY_ELEM_NAMES` in the tree;
+/// * by running it. `CRATONVM_IAE_TRACE2=1` makes that builder emit one
+///   `ANN-ELEM` line per element as it stores them. A use site written
+///   `mike, yankee, alpha, bravo, zulu` against an interface declaring
+///   `zulu, alpha, mike, bravo, yankee` traced in USE-SITE order, which is
+///   what HotSpot prints for it.
+///
+/// Do not introduce a `HashMap` anywhere on that path.
 fn annotation_proxy_elements(shared: &SharedVm, proxy: ObjectRef) -> Vec<(String, Value)> {
     let names_arr = match shared.mem.heap.get_field(proxy, 2) {
         Value::Object(Some(a)) => a,
@@ -20264,16 +21354,120 @@ fn internal_to_dotted(name: &str) -> String {
     name.replace('/', ".")
 }
 
-/// Format an annotation member value the way HotSpot's
-/// `AnnotationInvocationHandler.toString()` does:
+/// The annotation type's CANONICAL name (JLS 6.7) — what HotSpot's
+/// `AnnotationInvocationHandler.toString()` prints. It formats
+/// `annotationType().getCanonicalName()`, not `getName()`, so a member
+/// annotation type renders with `.` where the binary name has `$`. Measured
+/// on JDK 25.0.3.9: HotSpot prints `@AnnToString.Multi(...)` for the type
+/// whose binary name is `AnnToString$Multi`.
 ///
-/// * `String` в†’ `"text"` (Java-string-literal-escaped quoted form)
-/// * `Class` в†’ `TypeName.class`
-/// * Annotation proxy в†’ recursive `@TypeName(...)`
-/// * Reference array в†’ `[a, b, c]`
-/// * Primitive array в†’ element-list joined by `, ` inside `[ ... ]`
-/// * boxed Integer/Long/etc. (from element-value pairs) в†’ underlying numeric
-/// * Enum в†’ constant name (annotation enum element renders without type qualifier)
+/// Resolved from the annotation type's own `InnerClasses` attribute
+/// (JVMS §4.7.6), **not** by rewriting every `$` in the binary name: `$` is a
+/// legal Java identifier character, so a top-level `@interface A$B` has
+/// canonical name `A$B`, and a member type may legally be named `Inner$Class`
+/// — the same distinction `native_class_get_canonical_name` /
+/// `own_inner_class_entry` draw in `native-builtins/src/lang_class.rs`, and
+/// the one its `class_get_canonical_name_preserves_literal_dollar_in_member_name`
+/// test pins. javac records the whole nesting chain in the nested type's own
+/// attribute, so one class lookup resolves an arbitrarily deep `A$B$C`.
+///
+/// Total for an annotation type, with no `null` case to render: JLS 9.6 admits
+/// only top-level and member annotation types — never local, never anonymous
+/// — so the "has no canonical name" branch is unreachable here. It is still
+/// written, and falls back to the dotted binary name rather than inventing a
+/// `null` this caller has no rendering for. Every other miss (no mirror, no
+/// class id, class not loaded) takes the same fallback, which is exactly the
+/// string this function used to return unconditionally.
+fn annotation_type_canonical_name(shared: &SharedVm, proxy: ObjectRef, internal: &str) -> String {
+    let dotted_binary = internal_to_dotted(internal);
+    // Slot 1 is `ANN_PROXY_TYPE_MIRROR` (see the `annotationType` arm of
+    // `annotation_proxy_dispatch_impl`, which returns this same field). The
+    // builder can never leave it null — `create_annotation_proxy_with_type`
+    // falls back to the admitted `ClassId` precisely so that callers may
+    // dereference it without a null check — so a miss means a proxy minted by
+    // some other route, and the binary name is the honest answer for it.
+    let mirror = match shared.mem.heap.get_field(proxy, 1) {
+        Value::Object(Some(m)) => m,
+        _ => return dotted_binary,
+    };
+    let class_id = match super::class_id_from_mirror(shared, mirror) {
+        Some(id) => id,
+        None => return dotted_binary,
+    };
+    let guard = shared.classes.class_manager.read();
+    let class = match guard.get_class(class_id) {
+        Some(c) => c,
+        None => return dotted_binary,
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    let mut name: &str = internal;
+    // Bounded walk: a real nesting chain is short, and the bound stops a
+    // malformed `InnerClasses` table whose entries cycle from spinning here.
+    for _ in 0..64 {
+        let entry = match class.inner_classes.iter().find(|e| e.inner_class == name) {
+            Some(e) => e,
+            // No entry under this name: a top-level type. Its dotted binary
+            // name IS its canonical name, `$` characters included.
+            None => {
+                let mut out = internal_to_dotted(name);
+                for seg in segments.iter().rev() {
+                    out.push('.');
+                    out.push_str(seg);
+                }
+                return out;
+            }
+        };
+        // The JVMS §4.7.6 index-0 cases arrive as empty strings: an empty
+        // `inner_name` is an ANONYMOUS class, an empty `outer_class` a LOCAL
+        // one. Neither has a canonical name, and neither can be an annotation
+        // type.
+        if entry.inner_name.is_empty() || entry.outer_class.is_empty() {
+            return dotted_binary;
+        }
+        segments.push(&entry.inner_name);
+        name = &entry.outer_class;
+    }
+    dotted_binary
+}
+
+/// Format an annotation member value:
+///
+/// * `String` -> `"text"` (Java-string-literal-escaped quoted form)
+/// * `Class` -> `TypeName.class`
+/// * Annotation proxy -> recursive `@TypeName(...)`
+/// * Reference array -> `[a, b, c]`
+/// * Primitive array -> element-list joined by `, ` inside `[ ... ]`
+/// * boxed Integer/Long/etc. (from element-value pairs) -> underlying numeric
+/// * Enum -> constant name (annotation enum element renders without type qualifier)
+///
+/// **This is NOT yet HotSpot's rendering, and this comment used to say it
+/// was.** `sun/reflect/annotation/AnnotationInvocationHandler.memberValueToString`
+/// was diffed against it on 2026-08-12 (Microsoft OpenJDK 25.0.3.9, same class
+/// file, same session). Six members render differently, `want` being HotSpot:
+///
+/// ```text
+///   boolean        got off=0                  want off=false
+///   char           got ch=113                 want ch='q'
+///   byte           got b=3                    want b=(byte)0x03
+///   any array      got [a, b]                 want {a, b}
+///   String         got the non-ASCII chars    want them as \\uXXXX escapes
+///   nested @Ann    got $Proxy0                want @Outer.Inner(n=5)
+/// ```
+///
+/// The JDK's rules, for whoever closes these: `toSourceString(byte)` is
+/// `String.format("(byte)0x%02x", b)`; `toSourceString(char)` quotes with
+/// `\b \f \n \r \t \' \\` and `\\u%04x` for anything outside printable ASCII
+/// (`' '..'~'`), and the String form is the same escape set with `"` escaped
+/// and `'` not; arrays are `Collectors.joining(", ", "{", "}")`; a `Class`
+/// member is `getCanonicalName() + ".class"`, so a `Class[]` member should
+/// print `java.lang.String[].class`, not `[Ljava.lang.String;.class`.
+///
+/// The nested-annotation row is the severe one and is a different shape from
+/// the rest: with real annotation proxies enabled (the default) a nested
+/// member's value is a generated `$ProxyN`, not an `AnnotationProxy`, so the
+/// carrier-class test below misses it and the whole nested annotation is lost.
+/// Closing it needs the proxy's invocation handler, which this function has no
+/// route to today.
 fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
     match val {
         Value::Object(None) => "null".to_string(),
@@ -20359,38 +21553,63 @@ fn format_annotation_array(shared: &SharedVm, arr: ObjectRef) -> String {
 
 /// Recursive `Annotation.toString()` helper.
 ///
-/// Members are emitted in alphabetical order by element name, matching
-/// HotSpot's `AnnotationInvocationHandler.toString()` reference output
-/// (where multi-member annotations render with members sorted by name).
+/// Members are emitted in **class-file `element_value_pairs` order** — the
+/// order they were parsed in, which is the order `annotation_proxy_elements`
+/// hands back. They are NOT sorted.
+///
+/// This used to sort them alphabetically, and this comment used to claim the
+/// sort matched HotSpot. It does not. Measured 2026-08-12 against Microsoft
+/// OpenJDK 25.0.3.9, same class file, same session:
+///
+/// ```text
+/// HotSpot   @AnnToString.Multi(zeta="Z", mid="M", alpha=9)
+/// was       @AnnToString$Multi(alpha=9, mid="M", zeta="Z")
+/// ```
+///
+/// HotSpot's `AnnotationInvocationHandler` iterates `memberValues`, the
+/// `LinkedHashMap` `AnnotationParser.parseAnnotation2` fills by `put`-ing each
+/// `element_value_pair` in file order (`sun/reflect/annotation/
+/// AnnotationParser.java:268-287`), so declaration order in the class file is
+/// what it prints. That was confirmed by scrambling the use site relative to
+/// the interface's declaration order and watching the rendering follow the use
+/// site, not the interface and not the alphabet.
+///
+/// **The one case that still diverges, and why it is not chased here.** For a
+/// member left at its `AnnotationDefault`, HotSpot seeds that same map from
+/// `AnnotationType.memberDefaults()`, which is a plain `java.util.HashMap`
+/// (`AnnotationType.java:111`) — so defaulted members print FIRST, in String
+/// hash order. Measured: five all-defaulted members declared
+/// `zulu, alpha, mike, bravo, yankee` print `bravo, yankee, mike, zulu,
+/// alpha`. That is `HashMap` bucket order, not a contract, and it is not
+/// reproducible from this side; this VM appends its defaults after the
+/// explicit members instead. The alphabetical sort did not match it either,
+/// so nothing that was right is being given up.
 pub(crate) fn annotation_proxy_to_string(shared: &SharedVm, proxy: ObjectRef) -> String {
     let desc = annotation_proxy_type_descriptor(shared, proxy);
     let class_name = descriptor_to_class_name(&desc);
-    let dotted = internal_to_dotted(&class_name);
-    let mut elems = annotation_proxy_elements(shared, proxy);
-    elems.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut s = String::with_capacity(64);
-    s.push('@');
-    s.push_str(&dotted);
-    s.push('(');
-    let omit_single_value_name = elems.len() == 1 && elems[0].0 == "value";
-    let mut first = true;
-    for (name, val) in &elems {
-        if !first {
-            s.push_str(", ");
-        }
-        first = false;
-        // The JDK's AnnotationInvocationHandler elides `value=` for a
-        // single-member annotation whose sole element is conventionally named
-        // `value`, e.g. `@Qualifier("alpha")`, while retaining names for every
-        // multi-member annotation.
-        if !omit_single_value_name {
-            s.push_str(name);
-            s.push('=');
-        }
-        s.push_str(&format_annotation_value(shared, *val));
-    }
-    s.push(')');
-    s
+    let dotted = annotation_type_canonical_name(shared, proxy, &class_name);
+    // NOT sorted: class-file `element_value_pairs` order is what HotSpot prints.
+    let elems = annotation_proxy_elements(shared, proxy);
+    let members: Vec<(String, String)> = elems
+        .into_iter()
+        .map(|(name, val)| (name, format_annotation_value(shared, val)))
+        .collect();
+    // Assembly — separators plus the JDK's `value=` elision for a sole `value`
+    // member — is SHARED with this function's twin,
+    // `ctx_annotation_proxy_to_string` in `native-builtins/src/lang_class.rs`,
+    // which serves the SAME method on the SAME objects through
+    // `native_proxy_dispatch_invoke`. The two had drifted three ways at once
+    // (2026-08-12) and one process printed two different strings for one
+    // annotation object on consecutive calls. Which copy answers a given call
+    // is not under the caller's control and is NOT a tier question — measured
+    // with `-Xint`, the split persists; it varies by call shape.
+    //
+    // `vm` depends on `native-builtins`, never the reverse, so the half that
+    // needs no VM handle lives there. Do not re-inline it. The three
+    // VM-touching steps (member extraction, type-name canonicalisation, value
+    // rendering) stay twinned because the two callers hold different handles
+    // (`&SharedVm` vs `&mut dyn NativeContext`) in different crates.
+    cratonvm_native_builtins::lang_class::render_annotation_to_string(&dotted, &members)
 }
 
 /// Java-string-literal escape: backslash, quotes, and control chars.
@@ -21357,8 +22576,101 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
 /// `Method.invoke`/reflection unbox throws `IllegalArgumentException: cannot
 /// convert java/lang/Integer to Z` (e.g. `Connection.setAutoCommit(boolean)`
 /// through Hibernate's `JdbcSpies` proxy — 17 CV-only suite classes).
+///
+/// # Identity, and the one arm that has an observable contract
+///
+/// This is the FOURTH independent boxing implementation in the tree
+/// (`lang_class::box_value`, `lang_class::box_value_canonical`,
+/// `lib.rs::native_array_get`, and this) — and it is not even the only one
+/// that boxes a PROXY's arguments. `classloading/src/proxy_gen.rs` emits a
+/// real `X.valueOf` `invokestatic` per parameter into every generated
+/// `$ProxyN` (see its `DescKind::Int` / `Long` / `Float` / `Double` arms), so
+/// that path is canonical by construction: it does not implement boxing, it
+/// delegates to Java. Which of the two answers is a ROUTE question, not a
+/// code-reading one — `is_proxy_dispatch` in
+/// `runtime/interpreter/invoke.rs` and the `class_chain_reaches_proxy_instance`
+/// check above intercept ANY receiver whose chain reaches
+/// `java/lang/reflect/Proxy`, which includes a real generated `$ProxyN`, and
+/// they fire before that class's own bytecode runs. So on the interpreted path
+/// this function is expected to be the live one and the emitted `valueOf`
+/// calls unreached, but that has NOT been run and is not asserted here.
+/// `RJdkReflBox --only=proxy` is the discriminator: it is red on the fresh
+/// route and green on either correct one.
+///
+/// Measured on Microsoft OpenJDK 25.0.3+9
+/// (`scratchpad/f19/ReflBoxOracle.java`, §2 of
+/// `docs/known-issues/jdk-only/F19-1-*.md`), a JDK dynamic proxy's `args[]`
+/// holds the CANONICAL wrapper on every primitive parameter type:
+///
+/// ```text
+/// proxy.int  proxy.char  proxy.bool  proxy.long  proxy.byte  proxy.short = true
+/// proxy.boolTRUE                                                         = true
+/// proxyoob.int1000                                                       = false
+/// ```
+///
+/// because HotSpot's generated proxy class boxes each argument with a
+/// `valueOf` invocation in its own bytecode. Everything here allocates
+/// unconditionally instead, so every one of those rows is `false` on this VM.
+///
+/// **The `Z` arm is the one that is not merely an allocation.** `alloc_object`
+/// + `set_field(0, …)` produces a `Boolean` that is not `Boolean.TRUE`, and
+/// `fFeatures.get(…) == Boolean.TRUE` is exactly the identity test
+/// `native_boolean_value_of`'s own comment documents for Xerces'
+/// `XML11Configuration.configurePipeline()`. The documentation of that bug and
+/// a live instance of it coexisted in this tree: the native was fixed, this
+/// copy one layer up was not, and nothing connects the two files. So the `Z`
+/// arm now resolves the real `Boolean.TRUE`/`FALSE` statics, the same way the
+/// native does — see [`proxy_canonical_boolean`].
+///
+/// The other five arms (`C B S I`, and `J` via [`proxy_box_value`]) used to be
+/// fresh, for a reason that was true when it was written and is not any more:
+/// the canonical instances live in `lang_math`'s caches, which were reachable
+/// only through a `&mut dyn NativeContext` this function does not have.
+/// `lang_math::canonical_wrapper_if_cached` (F29-1 §3) is now a `pub` probe
+/// keyed on `vm_identity`, so the five arms read those SAME six caches instead
+/// of minting a second `IntegerCache` here. There is exactly ONE boxing cache
+/// in this VM and it is not in this file.
+///
+/// **The probe cannot allocate and cannot run `<clinit>`, and that is a
+/// correctness property rather than a performance one** — populating a cache
+/// needs `alloc_wrapper` → `ensure_class_initialized` → `<clinit>`, and a
+/// proxy invocation is not a legal place to trigger class initialisation. A
+/// miss is `None` and the caller keeps its existing allocation. `Z` is not
+/// routed through it (the probe declines `Z` deliberately): `Boolean.valueOf`
+/// answers with the live `TRUE`/`FALSE` STATICS, which `proxy_canonical_boolean`
+/// above resolves directly. `F`/`D` are not routed either, because HotSpot
+/// caches neither — `neg.floatValueOf` = false — so a fresh `Float` is the
+/// right answer there and not a fallback.
 pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &str) -> Value {
     if let Value::Int(v) = value {
+        // `Z` before the generic wrapper table: a `boolean` argument has a
+        // canonical answer and the table below cannot produce it.
+        if pdesc == "Z" {
+            if let Some(canonical) = proxy_canonical_boolean(shared, v != 0) {
+                return canonical;
+            }
+            // Fall through to the allocating path — never to `null`. A boxing
+            // failure that becomes a null argument is a defect already
+            // recorded above `lang_class::create_method_object`.
+        }
+        // `C B S I`: the canonical instance IF one is already cached, read out
+        // of the six caches in `lang_math.rs`. Read-only — it cannot allocate
+        // and cannot run `<clinit>`, which is what makes it legal here.
+        // Measured canonical on HotSpot: `proxy.char` / `byte` / `short` /
+        // `int` all true (F19-1 §2). A miss falls through to the allocating
+        // table below, never to `null`.
+        //
+        // `Z` reaches this line only when `proxy_canonical_boolean` above
+        // could not resolve the statics; the probe declines `Z` (F29-1 §3.2),
+        // so this is a pass-through for that arm and the table below still
+        // does the `val != 0` normalisation.
+        if let Some(obj) = cratonvm_native_builtins::lang_math::canonical_wrapper_if_cached(
+            shared.vm_identity,
+            pdesc,
+            Value::Int(v),
+        ) {
+            return Value::Object(Some(obj));
+        }
         let wrapper = match pdesc {
             "Z" => Some("java/lang/Boolean"),
             "C" => Some("java/lang/Character"),
@@ -21368,6 +22680,16 @@ pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &
             _ => None,
         };
         if let Some(wname) = wrapper {
+            // Normalise the payload for `Z`. The raw slot can carry any
+            // non-zero int, and a `Boolean` whose slot holds 5 is a wrong
+            // ANSWER, not just a wrong identity: `booleanValue()` and every
+            // `Boolean.toString` path read that slot. `native_boolean_value_of`
+            // applies the same `val != 0` normalisation.
+            let stored = if pdesc == "Z" {
+                Value::Int(i32::from(v != 0))
+            } else {
+                Value::Int(v)
+            };
             let class_id = shared
                 .classes
                 .class_manager
@@ -21375,12 +22697,90 @@ pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &
                 .load_class(wname)
                 .unwrap_or(ClassId::new(0));
             let obj = shared.mem.heap.alloc_object(class_id, 1);
-            shared.mem.heap.set_field(obj, 0, Value::Int(v));
+            shared.mem.heap.set_field(obj, 0, stored);
+            return Value::Object(Some(obj));
+        }
+    }
+    // `J` has no `Value::Int` arm above, so it is taken here rather than in
+    // the wrapper table. Measured `proxy.long` = true. `F`/`D` are NOT taken:
+    // HotSpot caches neither (`neg.floatValueOf` = false), so
+    // `canonical_wrapper_if_cached` declines them and `proxy_box_value`'s
+    // fresh allocation is the correct answer, not a fallback.
+    //
+    // `value`, NOT `Value::Int(v)`. This is outside the `if let Value::Int(v)`
+    // block on purpose: a `long` slot can present as a compact `Value::Int`,
+    // and a descriptor-only lookup would answer `("J", Value::Int(5))` with
+    // the cached `Long.valueOf(0)` — an identity fix converted into a WRONG
+    // ANSWER. The probe's own variant guard is the second half of that
+    // defence; this line is the first. F29-1 §3 records that the pair has
+    // already caught two lanes.
+    if pdesc == "J" {
+        if let Some(obj) = cratonvm_native_builtins::lang_math::canonical_wrapper_if_cached(
+            shared.vm_identity,
+            pdesc,
+            value,
+        ) {
             return Value::Object(Some(obj));
         }
     }
     // Long/Float/Double and reference values: descriptor-independent.
     proxy_box_value(shared, value)
+}
+
+/// The live `java.lang.Boolean.TRUE` / `FALSE` instance, or `None`.
+///
+/// `Boolean.valueOf(boolean)` is literally `return b ? TRUE : FALSE` in the
+/// JDK, so those two static fields — not a private mirror of them — ARE the
+/// canonical instances. `native_boolean_value_of` resolves them exactly this
+/// way; this is the same resolution on the `&SharedVm` side of the boundary,
+/// because `vm_exec` cannot reach the native's `&mut dyn NativeContext`.
+///
+/// Returns `None`, never a fabricated object, when:
+///
+///   * `java/lang/Boolean` will not load (synthetic-JDK arms where the class
+///     is absent), or
+///   * the class is loaded but `<clinit>` has not run, so the static slot
+///     still holds its default rather than an object.
+///
+/// The second case is why the value is match-checked for `Object(Some(_))`
+/// instead of being unwrapped: `get_static_shared`'s miss answer is
+/// `Value::Int(0)`, and a caller that trusted it would put an `Int` into an
+/// `Object[]` slot. This function does not RUN `<clinit>` — it has no thread —
+/// which is correct as well as necessary: a proxy invocation is not a legal
+/// place to trigger class initialisation, and the caller's fallback is a
+/// perfectly valid `Boolean`, merely a non-canonical one.
+fn proxy_canonical_boolean(shared: &SharedVm, truthy: bool) -> Option<Value> {
+    let class_id = shared
+        .classes
+        .class_manager
+        .write()
+        .load_class("java/lang/Boolean")
+        .ok()?;
+    let want = if truthy { "TRUE" } else { "FALSE" };
+    // Static field INDEX, not slot: `get_static_shared` is indexed by position
+    // among the class's static fields only. Same walk as
+    // `NativeContext::static_field_index_by_name` above; the guard is dropped
+    // before `get_static_shared` reacquires anything.
+    let field_index = {
+        let cm = shared.classes.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        let mut static_idx = 0usize;
+        let mut found: Option<usize> = None;
+        for f in &class.fields {
+            if f.is_static() {
+                if &*f.name == want {
+                    found = Some(static_idx);
+                    break;
+                }
+                static_idx += 1;
+            }
+        }
+        found?
+    };
+    match super::get_static_shared(shared, class_id, field_index) {
+        v @ Value::Object(Some(_)) => Some(v),
+        _ => None,
+    }
 }
 
 pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
@@ -24743,42 +26143,7 @@ fn invoke_on_class_shared_inner(
                 // MethodHandle.invoke / invokeExact / invokeWithArguments and
                 // VarHandle.get / set / compareAndSet etc. are called with the
                 // call-site descriptor, but registered with a generic one.
-                if method_name == "invoke"
-                    || method_name == "invokeExact"
-                    || method_name == "invokeWithArguments"
-                    || method_name == "invokeBasic"
-                    || method_name == "get"
-                    || method_name == "set"
-                    || method_name == "getVolatile"
-                    || method_name == "setVolatile"
-                    || method_name == "getOpaque"
-                    || method_name == "setOpaque"
-                    || method_name == "getAcquire"
-                    || method_name == "setRelease"
-                    || method_name == "compareAndSet"
-                    || method_name == "compareAndExchange"
-                    || method_name == "compareAndExchangeAcquire"
-                    || method_name == "compareAndExchangeRelease"
-                    || method_name == "weakCompareAndSet"
-                    || method_name == "weakCompareAndSetPlain"
-                    || method_name == "weakCompareAndSetAcquire"
-                    || method_name == "weakCompareAndSetRelease"
-                    || method_name == "getAndSet"
-                    || method_name == "getAndSetAcquire"
-                    || method_name == "getAndSetRelease"
-                    || method_name == "getAndAdd"
-                    || method_name == "getAndAddAcquire"
-                    || method_name == "getAndAddRelease"
-                    || method_name == "getAndBitwiseOr"
-                    || method_name == "getAndBitwiseOrAcquire"
-                    || method_name == "getAndBitwiseOrRelease"
-                    || method_name == "getAndBitwiseAnd"
-                    || method_name == "getAndBitwiseAndAcquire"
-                    || method_name == "getAndBitwiseAndRelease"
-                    || method_name == "getAndBitwiseXor"
-                    || method_name == "getAndBitwiseXorAcquire"
-                    || method_name == "getAndBitwiseXorRelease"
-                {
+                if is_signature_polymorphic_method_name(method_name) {
                     // Check if receiver is a MethodHandle or VarHandle.
                     // DirectMethodHandle / BoundMethodHandle / DelegatingMethodHandle
                     // and their inner species (e.g. DirectMethodHandle$Constructor,
@@ -24841,11 +26206,7 @@ fn invoke_on_class_shared_inner(
                         //
                         // Try all possible registered descriptors for signature-polymorphic methods.
                         // These methods are registered with generic Object[] params but varying return types.
-                        let poly_descs = [
-                            "([Ljava/lang/Object;)Ljava/lang/Object;",
-                            "([Ljava/lang/Object;)V",
-                            "([Ljava/lang/Object;)Z",
-                        ];
+                        let poly_descs = SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS;
                         let prefer_exact =
                             prefers_exact_signature_polymorphic_receiver(&class_name);
                         // The resolved owner of invokeExact is MethodHandle, not
@@ -26774,6 +28135,12 @@ mod native_funnel_profile {
             thread_state::record_transition(ThreadExecState::NativeRunning, "funnel-profile");
             thread_state::record_transition(prior, "funnel-profile");
         });
+        // What the funnel does instead since 2026-08-17: the same pair of
+        // transitions, one thread-local access. The row above is the control
+        // and stays, because "the new one is fast" is only a claim next to it.
+        rung("component:   ... as one NativeStateSpan", || {
+            thread_state::enter_native_state("funnel-profile").restore("funnel-profile");
+        });
         rung("component:   ... current_state() alone", || {
             black_box(thread_state::current_state());
         });
@@ -28355,6 +29722,194 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // proxy_box_value_for_desc — the `Z` arm.
+    //
+    // Measured on Microsoft OpenJDK 25.0.3+9 (scratchpad/f19/ReflBoxOracle):
+    // `proxy.boolTRUE` = true — an `InvocationHandler`'s `args[i]` for a
+    // `boolean` parameter IS `Boolean.TRUE`, because the generated proxy class
+    // boxes with a `valueOf` invocation. This VM allocated instead, which is
+    // the identity failure `native_boolean_value_of`'s own comment documents
+    // for Xerces' `XML11Configuration.configurePipeline()` — one layer up, in
+    // a file that cannot see that fix.
+    //
+    // The POSITIVE half (the returned object is the very object in
+    // `java.lang.Boolean.TRUE`) is not asserted here: it needs a bootstrapped
+    // `java/lang/Boolean` whose `<clinit>` has run, which a `SharedVm::new`
+    // test fixture does not have. It is asserted end-to-end instead, by
+    // `regression-suite/src/RJdkReflBox.java`'s `proxy.boolTRUE` row against
+    // the HotSpot oracle. What IS asserted here is the half a running VM
+    // cannot easily show: that the fallback stays a valid `Boolean` and never
+    // becomes `null`, and that the arm is still WIRED to the canonical route.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_boolean_proxy_arg_is_never_null_even_with_no_canonical_instance() {
+        // `test_shared()` has no initialised `java/lang/Boolean`, so
+        // `proxy_canonical_boolean` answers `None` and the allocating path is
+        // taken. The contract that must survive that is "still an object":
+        // mapping a boxing miss onto `Value::Object(None)` would put a null
+        // into an `Object[]` argument slot, which is the defect already
+        // recorded above `lang_class::create_method_object`.
+        let shared = test_shared();
+        for raw in [0, 1] {
+            match proxy_box_value_for_desc(&shared, Value::Int(raw), "Z") {
+                Value::Object(Some(_)) => {}
+                other => panic!("Z arg boxed to {other:?}, which is not an object"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_boolean_proxy_arg_carries_0_or_1_and_never_the_raw_slot() {
+        // Not an identity question: the raw slot can hold any non-zero int,
+        // and a `Boolean` carrying 5 is a wrong ANSWER — `booleanValue()` and
+        // every `toString` path read that slot. `native_boolean_value_of`
+        // normalises with the same `val != 0`. Holds on both routes: a
+        // canonical `Boolean.TRUE` carries 1 by construction, and the
+        // fallback now normalises before storing.
+        let shared = test_shared();
+        for (raw, want) in [(0, 0), (1, 1), (5, 1), (-1, 1), (i32::MIN, 1)] {
+            let obj = match proxy_box_value_for_desc(&shared, Value::Int(raw), "Z") {
+                Value::Object(Some(o)) => o,
+                other => panic!("Z arg boxed to {other:?}"),
+            };
+            assert_eq!(
+                shared.mem.heap.get_field(obj, 0),
+                Value::Int(want),
+                "a boolean argument whose raw slot held {raw} must box to \
+                 {want}, not to the slot verbatim"
+            );
+        }
+        // The contrast that keeps the normalisation from over-reaching: an
+        // `int` parameter carrying 5 is still 5.
+        let obj = match proxy_box_value_for_desc(&shared, Value::Int(5), "I") {
+            Value::Object(Some(o)) => o,
+            other => panic!("I arg boxed to {other:?}"),
+        };
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Int(5));
+    }
+
+    #[test]
+    fn the_boolean_proxy_arm_still_routes_through_the_canonical_resolver() {
+        // A SOURCE WITNESS, because the two behavioural tests above pass
+        // unchanged if the `Z` arm is reverted to a plain `alloc_object` —
+        // the fallback they exercise IS that code. Only this test can see the
+        // difference between "the canonical route was tried and missed" and
+        // "there is no canonical route".
+        //
+        // The needles are assembled with `format!` at runtime: spelled as
+        // literals they would match this test's own source text and assert
+        // nothing, since the file being searched is this file. The `\r` strip
+        // is load-bearing on a CRLF checkout.
+        // Whitespace is stripped before matching: every needle below is part
+        // of a method chain or a signature that rustfmt is free to re-wrap,
+        // and a witness that breaks on a reformat is a witness that gets
+        // deleted rather than fixed.
+        let src = include_str!("vm_exec.rs");
+        let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let resolver = format!("proxy_canonical_{}", "boolean");
+        for (needle, why) in [
+            (
+                format!("fn{resolver}(shared:&SharedVm,truthy:bool)"),
+                "the canonical Boolean resolver is gone, so a proxy's boolean \
+                 argument can no longer be `Boolean.TRUE` (measured true on \
+                 HotSpot 25.0.3+9: proxy.boolTRUE)",
+            ),
+            (
+                format!("ifletSome(canonical)={resolver}(shared,v!=0)"),
+                "`proxy_box_value_for_desc`'s Z arm no longer consults the \
+                 resolver — it allocates a Boolean that `== Boolean.TRUE` \
+                 answers false for, the Xerces \
+                 `XML11Configuration.configurePipeline()` shape",
+            ),
+            (
+                format!(".load_class(\"java/lang/{}\").ok()?", "Boolean"),
+                "the resolver no longer reads `java/lang/Boolean`'s own \
+                 statics; `Boolean.valueOf` is `return b ? TRUE : FALSE`, so \
+                 those two fields ARE the canonical instances and a private \
+                 mirror of them is not",
+            ),
+        ] {
+            assert!(squashed.contains(&needle), "{why} (`{needle}` is gone)");
+        }
+    }
+
+    #[test]
+    fn a_cache_miss_on_c_b_s_i_j_still_boxes_and_never_becomes_null() {
+        // `canonical_wrapper_if_cached`'s contract is "the canonical instance
+        // IF one is already cached", and `test_shared()` has cached NOTHING —
+        // no `Integer.valueOf` runs in this crate's test binary — so every
+        // call below takes the MISS path. What must survive a miss is the
+        // thing the record above `lang_class::create_method_object` names: an
+        // object, carrying its own value, never a `null` in an `Object[]`
+        // argument slot. This is the half of the probe a behavioural test in
+        // this module CAN see; the wiring itself needs the witness below.
+        let shared = test_shared();
+        for (pdesc, arg) in [
+            ("C", Value::Int(97)),
+            ("B", Value::Int(3)),
+            ("S", Value::Int(9)),
+            ("I", Value::Int(7)),
+            // `J` is the arm that is taken past the wrapper table rather than
+            // inside it, and the one whose value a descriptor-only lookup
+            // would replace with a cached `Long.valueOf(0)`.
+            ("J", Value::Long(5)),
+        ] {
+            let obj = match proxy_box_value_for_desc(&shared, arg, pdesc) {
+                Value::Object(Some(o)) => o,
+                other => panic!("`{pdesc}` arg boxed to {other:?}, which is not an object"),
+            };
+            assert_eq!(
+                shared.mem.heap.get_field(obj, 0),
+                arg,
+                "a `{pdesc}` argument must still carry its own value; a miss \
+                 that answers with some other cached wrapper is a WRONG \
+                 ANSWER, not merely a non-canonical one"
+            );
+        }
+    }
+
+    #[test]
+    fn the_five_fresh_proxy_arms_now_read_the_one_boxing_cache() {
+        // A SOURCE WITNESS, and nothing else in this module can be one. The
+        // behavioural test above exercises the MISS path, which is byte-for-
+        // byte the pre-existing allocating code — so deleting the probe
+        // entirely would not move a single assertion here. Populating the
+        // caches to force a HIT is not available either: population runs
+        // through `alloc_wrapper` → `ensure_class_initialized` → `<clinit>`,
+        // i.e. a bootstrapped VM, which `test_shared()` is not.
+        //
+        // Needles are assembled with `format!` at runtime for the reason the
+        // witness above gives: spelled as literals they would match this
+        // test's own source text, since the file being searched IS this file.
+        // Whitespace is stripped so a rustfmt re-wrap cannot break them.
+        let src = include_str!("vm_exec.rs");
+        let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let probe = format!("canonical_wrapper_if_{}", "cached");
+        let call = format!("cratonvm_native_builtins::lang_math::{probe}");
+        for (needle, why) in [
+            (
+                format!("ifletSome(obj)={call}(shared.vm_identity,pdesc,Value::Int(v),)"),
+                "the `C B S I` arms no longer consult the one boxing cache, so \
+                 a proxy's `char`/`byte`/`short`/`int` argument is a fresh box \
+                 again (measured true on HotSpot 25.0.3+9: proxy.char, \
+                 proxy.byte, proxy.short, proxy.int)",
+            ),
+            (
+                format!("ifpdesc==\"J\"{{ifletSome(obj)={call}(shared.vm_identity,pdesc,value,)"),
+                "the `J` arm is gone, or — far worse — it no longer passes the \
+                 raw `value`. A `long` slot can present as a compact \
+                 `Value::Int`, and a descriptor-only lookup answers \
+                 (\"J\", Value::Int(5)) with the cached `Long.valueOf(0)`: an \
+                 identity fix converted into a WRONG ANSWER. F29-1 §3 records \
+                 that this exact pair has already caught two lanes",
+            ),
+        ] {
+            assert!(squashed.contains(&needle), "{why} (`{needle}` is gone)");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // resolve_library_path
     // -----------------------------------------------------------------------
 
@@ -29712,5 +31267,417 @@ mod tests {
         assert_ne!(strict.vm_identity, lax.vm_identity);
         assert!(capabilities_for(VmId::from_raw(strict.vm_identity)).is_some());
         assert!(capabilities_for(VmId::from_raw(lax.vm_identity)).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // G24-1 — the proxy return contract
+    // -----------------------------------------------------------------------
+
+    /// The eight NPE texts, TRANSCRIBED from HotSpot 25.0.3+9-LTS (the `PRet`
+    /// probe of G24-1 §2), asserted one at a time rather than generated from a
+    /// template.
+    ///
+    /// They differ only in the wrapper and the accessor, which is exactly why
+    /// the test is written out: a template would encode the guess that they
+    /// differ only there, and the guess is what the record says to stop making.
+    /// If a future edit derives `charValue` from `Character` by lowercasing,
+    /// this still passes — but if it derives the wrapper from the descriptor
+    /// with `B`/`S` transposed, or spells `Object[]` as
+    /// `java.lang.Object[]` in the `because` clause, this fails.
+    #[test]
+    fn the_null_return_npe_text_is_transcribed_per_primitive() {
+        let expected = [
+            ('Z', "Cannot invoke \"java.lang.Boolean.booleanValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('B', "Cannot invoke \"java.lang.Byte.byteValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('C', "Cannot invoke \"java.lang.Character.charValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('S', "Cannot invoke \"java.lang.Short.shortValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('I', "Cannot invoke \"java.lang.Integer.intValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('J', "Cannot invoke \"java.lang.Long.longValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('F', "Cannot invoke \"java.lang.Float.floatValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+            ('D', "Cannot invoke \"java.lang.Double.doubleValue()\" because the return value of \"java.lang.reflect.InvocationHandler.invoke(Object, java.lang.reflect.Method, Object[])\" is null"),
+        ];
+        for (ret, want) in expected {
+            let (wrapper, accessor) = proxy_primitive_return_wrapper(ret)
+                .unwrap_or_else(|| panic!("'{ret}' must be a primitive return"));
+            assert_eq!(
+                proxy_null_return_npe_message(wrapper, accessor),
+                want,
+                "NPE text for return descriptor '{ret}'"
+            );
+        }
+    }
+
+    /// Only the eight JVMS primitive return descriptors take the unboxing arm.
+    /// `V` in particular must not: a `void` proxy method whose handler returns
+    /// `null` is legal on HotSpot (MEASURED, `null->void | NO-THROW`), so
+    /// letting `V` into the wrapper table would invent an NPE.
+    #[test]
+    fn only_the_eight_primitive_returns_have_a_wrapper() {
+        for ret in ['Z', 'B', 'C', 'S', 'I', 'J', 'F', 'D'] {
+            assert!(proxy_primitive_return_wrapper(ret).is_some(), "'{ret}'");
+        }
+        for ret in ['V', 'L', '[', 'X', 'i', 'z'] {
+            assert!(proxy_primitive_return_wrapper(ret).is_none(), "'{ret}'");
+        }
+    }
+
+    /// Each primitive maps to its OWN wrapper — the whole content of "there is
+    /// no widening". `Integer` for a `J` return is a refusal, not a conversion,
+    /// so no two descriptors may share a wrapper.
+    #[test]
+    fn each_primitive_return_has_a_distinct_wrapper() {
+        let mut seen: Vec<&'static str> = Vec::new();
+        for ret in ['Z', 'B', 'C', 'S', 'I', 'J', 'F', 'D'] {
+            let (wrapper, _) = proxy_primitive_return_wrapper(ret).unwrap();
+            assert!(!seen.contains(&wrapper), "{wrapper} claimed twice");
+            seen.push(wrapper);
+        }
+        assert_eq!(
+            proxy_primitive_return_wrapper('J').unwrap().0,
+            "java/lang/Long"
+        );
+        assert_eq!(
+            proxy_primitive_return_wrapper('I').unwrap().0,
+            "java/lang/Integer"
+        );
+    }
+
+    /// The return-descriptor split, including the malformed input the previous
+    /// `rsplit(')')` spelling answered wrongly.
+    #[test]
+    fn the_return_descriptor_is_everything_after_the_last_paren() {
+        assert_eq!(proxy_return_descriptor("()I"), "I");
+        assert_eq!(proxy_return_descriptor("(Ljava/lang/String;)V"), "V");
+        assert_eq!(
+            proxy_return_descriptor("(II)Ljava/lang/String;"),
+            "Ljava/lang/String;"
+        );
+        assert_eq!(
+            proxy_return_descriptor("()[Ljava/lang/String;"),
+            "[Ljava/lang/String;"
+        );
+        assert_eq!(proxy_return_descriptor("()[[I"), "[[I");
+        // No `)` at all: answer nothing rather than reading the first
+        // character of the parameter list as a return kind. `rsplit(')')`
+        // would have handed back `"Ljava/lang/String;"` here, whose first
+        // character is `L` — harmless — but `"I"` for a stray `"I"` would have
+        // put a malformed descriptor onto the primitive arm.
+        assert_eq!(proxy_return_descriptor("I"), "");
+        assert_eq!(proxy_return_descriptor(""), "");
+    }
+
+    /// The cast refusal must be in the exact bare two-operand shape
+    /// `runtime::exceptions::split_cast_operands` accepts, or the funnel that
+    /// adds HotSpot's `(… are in module …)` parenthetical silently declines and
+    /// the message ships half-built. That splitter requires both operands to be
+    /// whitespace-free with nothing else in the message.
+    #[test]
+    fn the_cast_refusal_is_in_the_shape_the_message_funnel_rewrites() {
+        let msg = proxy_cast_refusal_message("java/lang/Integer", "java/lang/String");
+        assert_eq!(
+            msg,
+            "class java.lang.Integer cannot be cast to class java.lang.String"
+        );
+        let (lhs, rhs) = msg.split_once(" cannot be cast to ").expect("two operands");
+        let lhs = lhs.strip_prefix("class ").expect("class-prefixed lhs");
+        let rhs = rhs.strip_prefix("class ").expect("class-prefixed rhs");
+        assert!(!lhs.contains(char::is_whitespace), "lhs {lhs:?}");
+        assert!(!rhs.contains(char::is_whitespace), "rhs {rhs:?}");
+        // Arrays keep descriptor form, matching `Klass::external_name()` —
+        // MEASURED: `class [Ljava.lang.String; cannot be cast to class [I`.
+        assert_eq!(
+            proxy_cast_refusal_message("[Ljava/lang/String;", "[I"),
+            "class [Ljava.lang.String; cannot be cast to class [I"
+        );
+    }
+
+    /// The three arms of the strict coercion that need no heap object:
+    /// a `void`/absent result, a `null` over a primitive return, a `null` over
+    /// a reference return, and an already-raw value.
+    #[test]
+    fn the_strict_coercion_refuses_null_only_for_a_primitive_return() {
+        let shared = test_shared();
+
+        // Void / no value at all — nothing to coerce.
+        assert!(matches!(
+            proxy_coerce_handler_return(&shared, "()V", Ok(None)),
+            Ok(None)
+        ));
+
+        // `null` over a reference return is the legal case and must survive.
+        assert!(matches!(
+            proxy_coerce_handler_return(
+                &shared,
+                "()Ljava/lang/String;",
+                Ok(Some(Value::Object(None)))
+            ),
+            Ok(Some(Value::Object(None)))
+        ));
+
+        // `null` over a primitive return is the defect this record closes.
+        for (desc, want_wrapper) in [
+            ("()I", "java.lang.Integer"),
+            ("()J", "java.lang.Long"),
+            ("()D", "java.lang.Double"),
+            ("()Z", "java.lang.Boolean"),
+        ] {
+            match proxy_coerce_handler_return(&shared, desc, Ok(Some(Value::Object(None)))) {
+                Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::NullPointerException { message: Some(m) },
+                ))) => assert!(
+                    m.contains(want_wrapper) && m.ends_with("is null"),
+                    "{desc}: {m}"
+                ),
+                other => panic!("{desc} must NPE, got {other:?}"),
+            }
+        }
+
+        // An already-raw value is the VM's own and passes through untouched —
+        // the re-entrancy valve the nested-proxy path depends on.
+        assert!(matches!(
+            proxy_coerce_handler_return(&shared, "()I", Ok(Some(Value::Int(7)))),
+            Ok(Some(Value::Int(7)))
+        ));
+        match proxy_coerce_handler_return(&shared, "()D", Ok(Some(Value::Double(1.5)))) {
+            Ok(Some(Value::Double(d))) => assert_eq!(d, 1.5),
+            other => panic!("a raw double must pass through, got {other:?}"),
+        }
+
+        // An `Err` is threaded through unchanged, so the
+        // `UndeclaredThrowableException` wrap that runs INSIDE this call
+        // stays authoritative.
+        let failed = proxy_coerce_handler_return(
+            &shared,
+            "()I",
+            Err(RuntimeError::NullPointerException { message: None }.into()),
+        );
+        assert!(matches!(
+            failed,
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { message: None }
+            )))
+        ));
+    }
+
+    /// `Ljava/lang/Object;` — the most common proxy return descriptor — is
+    /// accepted before any class-manager lock is taken, and an array return
+    /// descriptor fails open. Both are load-bearing narrowings rather than
+    /// omissions: see `proxy_reference_return_refusal`.
+    #[test]
+    fn an_object_return_and_an_array_return_never_refuse() {
+        let shared = test_shared();
+        // SAFETY: never dereferenced — both arms answer before touching the
+        // heap. `Ljava/lang/Object;` short-circuits on the descriptor, and the
+        // array arm fails the `strip_prefix('L')`.
+        let obj = unsafe { ObjectRef::from_raw(8usize as *mut u8) };
+        assert!(proxy_reference_return_refusal(&shared, obj, "Ljava/lang/Object;").is_none());
+        assert!(proxy_reference_return_refusal(&shared, obj, "[Ljava/lang/String;").is_none());
+        assert!(proxy_reference_return_refusal(&shared, obj, "[I").is_none());
+    }
+
+    // ─────────── the general resolver's census arm (G47-1, assignment B) ────
+    //
+    // `G42-1` §3 measured `invoke_or_native` as the fourth and largest bypass
+    // family and prescribed the fix in an in-source comment. These pin what
+    // landed: the declaration, the exact arm, the guard that keeps either from
+    // touching a neighbouring slot, and the memo that keeps the default arm
+    // off the triple-hash path.
+
+    fn census_probe_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> cratonvm_types::error::MethodCallResult {
+        Ok(None)
+    }
+
+    fn census_probe_native_2(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> cratonvm_types::error::MethodCallResult {
+        Ok(Some(Value::Int(7)))
+    }
+
+    fn census_probe_registry() -> cratonvm_native_api::NativeMethodRegistry {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+            r.register(
+                "java/lang/reflect/Method",
+                "invoke",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+                census_probe_native,
+            );
+            r.register(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+                census_probe_native_2,
+            );
+        });
+        registry
+    }
+
+    const METHOD_INVOKE: (&str, &str, &str) = (
+        "java/lang/reflect/Method",
+        "invoke",
+        "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+
+    /// **The default arm turns the row into an admitted floor and moves no
+    /// number.**
+    ///
+    /// `Method.invoke` is the measured subject: `G42-1` §2 read 1,999 in the
+    /// JIT arm against 99,999 under `--nojit`, from this exact dispatch. The
+    /// mark does not repair the count — nothing here can — it makes the row say
+    /// the count is a floor, which is the difference between an instrument that
+    /// says "at least N" and one that says "N" and means "at least N".
+    #[test]
+    fn a_general_resolver_dispatch_declares_its_row_a_floor_without_moving_the_tally() {
+        let registry = census_probe_registry();
+        let (c, m, d) = METHOD_INVOKE;
+        let id = registry.resolve_id(c, m, d).expect("registered");
+        let control = registry
+            .resolve_id(
+                "java/lang/System",
+                "identityHashCode",
+                "(Ljava/lang/Object;)I",
+            )
+            .expect("registered");
+
+        // A few calls did reach the counted path before the site went compiled.
+        registry.record_invocation(id);
+        registry.record_invocation(id);
+        assert_eq!(registry.invocations_complete(id), Some(true));
+
+        census_general_dispatch_cold(&registry, census_probe_native, c, m, d, false);
+
+        assert_eq!(
+            registry.invocations_of_id(id),
+            Some(2),
+            "declaring must not disturb the tally: the floor is the number a \
+             reader falls back on"
+        );
+        assert_eq!(registry.invocations_complete(id), Some(false));
+        assert_eq!(
+            registry.invocations_complete(control),
+            Some(true),
+            "the bit is per slot — a bypass on one native must not cast doubt \
+             on one still dispatched through the counted path"
+        );
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+
+        // Sticky and idempotent: this fires once per callback per thread, but
+        // a memo miss re-enters it and every re-entry must be a no-op.
+        census_general_dispatch_cold(&registry, census_probe_native, c, m, d, false);
+        assert_eq!(registry.slots_with_incomplete_invocations(), 1);
+        assert_eq!(registry.invocations_of_id(id), Some(2));
+
+        // And the doubt has to survive into `census()`, which is the only place
+        // a reader ever sees it — and, since schema 5, the only place it is
+        // written down.
+        let census = registry.census();
+        let row = census
+            .iter()
+            .find(|r| r.class == c && r.owns_slot)
+            .expect("slot owner");
+        assert!(!row.invocations_complete);
+        assert_eq!(row.invocations, 2);
+    }
+
+    /// **The exact arm counts and leaves the completeness claim alone.**
+    ///
+    /// `CRATONVM_CENSUS_EXACT_INVOCATIONS` buys a real count on this arm at the
+    /// price of one `resolve_id` per dispatch. When it is on, the row is a
+    /// total *for this family* and must not be labelled a floor by it — the
+    /// label would then be describing a bypass that is not happening.
+    #[test]
+    fn the_exact_arm_counts_the_dispatch_instead_of_declaring_it_uncounted() {
+        let registry = census_probe_registry();
+        let (c, m, d) = METHOD_INVOKE;
+        let id = registry.resolve_id(c, m, d).expect("registered");
+
+        for _ in 0..3 {
+            census_general_dispatch_cold(&registry, census_probe_native, c, m, d, true);
+        }
+
+        assert_eq!(registry.invocations_of_id(id), Some(3));
+        assert_eq!(
+            registry.invocations_complete(id),
+            Some(true),
+            "the exact arm is not a bypass; labelling it one would report a \
+             floor where there is a total"
+        );
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+    }
+
+    /// **Nothing is ever recorded against a slot whose callback is not the one
+    /// about to run.**
+    ///
+    /// `resolve_id` and `find_with_kind` agree on the exact-hash path but reach
+    /// their descriptor-quirk fallbacks through different functions. A wrong
+    /// number on a row that looks authoritative is worse than the silence this
+    /// replaced, so the resolved slot's callback is checked by address first.
+    #[test]
+    fn a_callback_that_is_not_the_resolved_slots_touches_no_census_state() {
+        let registry = census_probe_registry();
+        let (c, m, d) = METHOD_INVOKE;
+        let id = registry.resolve_id(c, m, d).expect("registered");
+
+        // Right triple, wrong callback — the shape a quirk-rewritten resolution
+        // would produce.
+        census_general_dispatch_cold(&registry, census_probe_native_2, c, m, d, false);
+        census_general_dispatch_cold(&registry, census_probe_native_2, c, m, d, true);
+        assert_eq!(registry.invocations_complete(id), Some(true));
+        assert_eq!(registry.invocations_of_id(id), Some(0));
+        assert_eq!(registry.slots_with_incomplete_invocations(), 0);
+
+        // A triple with no row at all is a silent no-op, not a panic. This runs
+        // on the VM's general native path, so "does not panic" is an assertion.
+        census_general_dispatch_cold(
+            &registry,
+            census_probe_native,
+            "java/lang/String",
+            "charAt",
+            "(I)C",
+            false,
+        );
+        let empty = cratonvm_native_api::NativeMethodRegistry::new();
+        census_general_dispatch_cold(&empty, census_probe_native, c, m, d, false);
+        census_general_dispatch_cold(&empty, census_probe_native, c, m, d, true);
+        assert_eq!(empty.slots_with_incomplete_invocations(), 0);
+    }
+
+    /// **The memo keeps the default arm off the triple-hash path**, holds two
+    /// callbacks, and cannot let a stale entry vouch across a registry change.
+    ///
+    /// The memo is what makes "declare on dispatch" affordable without a build:
+    /// it turns the measured shape — a loop calling the same native — into a
+    /// thread-local load and two compares. Correctness never depends on it,
+    /// because the mark is sticky and idempotent; only the cost does.
+    #[test]
+    fn the_dispatch_memo_declares_once_per_callback_and_resets_with_the_registry() {
+        reset_general_dispatch_census_memo();
+        let (a, b, c) = (0x1000usize, 0x2000usize, 0x3000usize);
+
+        assert!(!general_dispatch_census_already_declared(1, 7, a));
+        assert!(general_dispatch_census_already_declared(1, 7, a));
+
+        // Two slots, so an alternating pair of natives does not thrash.
+        assert!(!general_dispatch_census_already_declared(1, 7, b));
+        assert!(general_dispatch_census_already_declared(1, 7, a));
+        assert!(general_dispatch_census_already_declared(1, 7, b));
+
+        // A third evicts the older of the two.
+        assert!(!general_dispatch_census_already_declared(1, 7, c));
+        assert!(general_dispatch_census_already_declared(1, 7, c));
+        assert!(general_dispatch_census_already_declared(1, 7, b));
+
+        // A `RegisterNatives` that grows the registry invalidates the memo
+        // rather than letting a callback address vouch for a slot it may no
+        // longer name.
+        assert!(!general_dispatch_census_already_declared(1, 8, c));
+        // So does a different VM in the same process.
+        assert!(!general_dispatch_census_already_declared(2, 8, c));
+        reset_general_dispatch_census_memo();
+        assert!(!general_dispatch_census_already_declared(2, 8, c));
     }
 }

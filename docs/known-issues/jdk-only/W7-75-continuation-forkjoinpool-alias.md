@@ -1,5 +1,79 @@
 # W7-75 — the two unguarded LIVE read-side aliases: `Continuation` and `ForkJoinPool`
 
+> ## RE-VERIFIED 2026-08-12 (lane A14). Both layout censuses reproduce independently. The repair is in the tree. Still unrun.
+>
+> §1 says its tables were re-derived rather than copied, and that four censuses
+> in this area were each wrong about some rows on the same day. So they were
+> re-derived a third time, on a **different vendor's** JDK 25 — Microsoft
+> OpenJDK 25.0.3.9, this host's `java.home`, where §1 used Adoptium — with
+> `javap -p`, statics excluded, in declaration order.
+>
+> **Both tables are correct in every row.**
+>
+> * `jdk/internal/vm/Continuation`: `target scope parent child tail done
+>   mounted yieldInfo preempted scopedValueCache` at 0–9. So the synthetic
+>   map's swapped `scope`/`target`, its `state` landing on `parent`, and its
+>   `pin` landing on `child` all reproduce exactly as §1 and §3.1 state.
+> * `java/util/concurrent/ForkJoinPool`: sixteen instance fields,
+>   `termination` at 0, `saturate` at 1, **`parallelism` at 15**.
+> * `java.util.concurrent.AbstractExecutorService` declares **no instance
+>   field** — its only member is the static `$assertionsDisabled`. This is the
+>   number §1 flags as "the one a careless count would get wrong", and it is
+>   right: ForkJoinPool's own sixteen are the whole chain, so `parallelism` is
+>   15 and not 15-plus-something.
+>
+> **The repair is present**, checked by symbol rather than line (every line
+> number in this record has since drifted): `ContSlots` / `cont_slots`,
+> `FjpSlots` / `fjp_slots`, `NEW15_CONT_SLOT_MAP` / `NEW15_FJP_SLOT_MAP`, both
+> `read_alias::declare_slot_map` calls, and the named unit tests
+> (`cont_slots_resolves_the_real_layout_by_name`,
+> `cont_slots_falls_back_to_the_synthetic_map_on_an_anonymous_class`,
+> `fjp_slots_falls_back_to_the_synthetic_map_on_an_anonymous_class`) are all
+> in `native-builtins/src/phases_late/concurrent.rs`.
+>
+> **§2's liveness verdict reproduces**, which matters because it is what makes
+> the `ForkJoinPool` half a live wrong answer rather than dead code. The
+> real-ForkJoinPool filter's `keep_real_forkjoinpool_bridge` in
+> `native-api/src/registry.rs` still begins
+> `self.effective_category() == NativeKind::Bridge` and its match list contains
+> `("getParallelism", "()I")`, `commonPool`, `getCommonPoolParallelism` and
+> `getFactory` — and **still does not contain `getActiveThreadCount`**, so §8.3
+> holds: that one is dropped on the default path. `is_forkjoin_native_override`
+> in `vm/src/runtime/interpreter/native_override.rs` also lists
+> `("getParallelism", "()I")`, so the native is forced ahead of real bytecode
+> at every dispatch site, exactly as §2 says.
+>
+> **Nothing is refuted and nothing is discharged.** §8.5 is still the operative
+> line: the probe's CratonVM column is unrun and this lane cannot run it. What
+> this pass adds is that the two censuses the whole repair rests on now have
+> two independent derivations on two vendors' JDK 25 images, which is the part
+> that was most exposed to the "four censuses were each wrong" hazard.
+>
+> **One caution for whoever runs the probe**, stated because it is the shape
+> that has produced false REDs elsewhere in this campaign: the common pool's
+> parallelism **legitimately** differs between the two VMs. CratonVM clamps it
+> to 1 for determinism (`NEW15_COMMON_POOL_PARALLELISM`); HotSpot uses
+> `max(1, availableProcessors() - 1)`, which is 31 in §5.1's transcript and
+> will be whatever this host reports elsewhere. §5.1 already says the
+> comparable assertion is `agree=true` and not the value — that is not a
+> nicety, it is the difference between reading a green run and filing a
+> phantom defect. The same rule forbids ever printing that number from a
+> `regression-suite` fixture, since `run.sh` diffs the two runs' `CK` lines in
+> one session.
+>
+> **New, small, and filed rather than fixed:** `class_manager.rs` fabricates
+> `"java/util/concurrent/ForkJoinPool" => instance_fields(1)` — width **one** —
+> while `NEW15_FJP_SLOT_MAP` declares **two** synthetic slots
+> (`parallelism`=0, `active`=1). On a fabricated receiver that reaches the
+> fallback, slot 1 is past the declared width. §3.2 notes `commonPool()`
+> allocates through `try_alloc_concurrent_synthetic`, which clamps up to the
+> loaded class's width, so on the real-JDK path the object is genuinely 16
+> slots and this cannot bite; the exposure is the synthetic path, which is also
+> where `active` is only reachable under `CRATONVM_SYNTHETIC_FORKJOINPOOL`
+> (§8.3). Recorded so the next reader of the published map does not have to
+> re-derive it; not fixed, because it needs the run §8.5 wants and it touches
+> a file this lane does not own.
+
 Status: both repaired by resolving the fields by NAME on the receiver's own
 class, with the legacy slot map kept as the fallback and **published** through
 `cratonvm_native_api::read_alias::declare_slot_map`. The completed-continuation

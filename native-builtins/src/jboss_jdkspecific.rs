@@ -373,6 +373,16 @@ fn build_boot_layer(
 /// A failure to build any one module is not fatal to the layer: the module is
 /// skipped and the rest are inserted. A layer missing one module is strictly
 /// better than no layer at all, which is what propagating would produce.
+///
+/// # What it does NOT populate
+///
+/// It walks the whole `ModuleRegistry` minus the modules whose only source is
+/// the application CLASS path (`module_is_class_path_only`). Those are modular
+/// jars on `-cp`, which a real JVM treats as unnamed-module citizens whose
+/// `module-info` it ignores outright — so they are in neither `ModuleLayer.boot()`
+/// nor the system loader's `ServicesCatalog` on HotSpot, and putting them in
+/// either here handed `ServiceLoader` the same provider twice. The gate is at
+/// the top of the loop with the measurement that motivated it.
 fn populate_boot_layer_modules(
     ctx: &mut dyn NativeContext,
     layer: ObjectRef,
@@ -383,6 +393,44 @@ fn populate_boot_layer_modules(
     }
     let layer_pin = ctx.pin_native_root(layer);
     for name in names {
+        // A module whose ONLY source is the application CLASS path must not
+        // enter the boot layer, and above all must not be registered in the
+        // system loader's `ServicesCatalog` below.
+        //
+        // `ClassManager::new` scans the app class path for `module-info.class`
+        // and registers what it finds (class_manager.rs, `automatic = true`);
+        // `vm_init` re-registers genuine `--module-path` modules with
+        // `automatic = false` right afterwards, so `automatic` here means
+        // exactly "reached only through -cp". A real JVM ignores such a
+        // `module-info` outright — a modular jar on the class path is an
+        // unnamed-module citizen — and `service_loader.rs` already states that
+        // rule as the reason ITS module source is skipped for a class-path
+        // loader.
+        //
+        // Promoting one here gave `ServiceLoader` the SAME provider through
+        // both of its doors: `ModuleServicesLookupIterator` reads this
+        // catalog, and `LazyClassPathLookupIterator` reads
+        // `META-INF/services`. The JDK's only cross-source guard is
+        // `clazz.getModule().isNamed()`, which is FALSE for the class-path
+        // copy, so nothing de-duplicates. Measured: four bc-java corpus
+        // classes died with `JUnitException: Cannot create Launcher for
+        // multiple engines with the same ID 'junit-jupiter'` before running a
+        // test — junit-jupiter-engine.jar ships both a `provides` clause and a
+        // `META-INF/services` descriptor naming one class.
+        //
+        // Skipping is the only arm that matches HotSpot in BOTH sub-cases. A
+        // `-cp` jar that ships both forms must yield ONE provider (the
+        // descriptor's); a `-cp` jar whose `module-info` declares `provides`
+        // with no `META-INF/services` must yield ZERO. Suppressing the
+        // descriptor side instead would answer 1 and 1 — right once, wrong
+        // once — and would additionally require `getResources` to hide a
+        // resource that genuinely is on the class path, which HotSpot returns.
+        //
+        // See docs/known-issues/jdk-only/D1-R11-SERVICELOADER-DOUBLE-SOURCE-20260813.md
+        // and docs/known-issues/jdk-only/E4-R11-CLASS-PATH-MODULE-BOOT-LAYER-FIX-20260813.md.
+        if ctx.module_is_class_path_only(&name) {
+            continue;
+        }
         let layer = ctx.read_native_pin(layer_pin, layer);
         let Ok(module) = build_module(ctx, &name, layer) else {
             continue;

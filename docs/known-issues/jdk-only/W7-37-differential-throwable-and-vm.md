@@ -1,6 +1,106 @@
 # W7-37 — `Throwable`'s state machine, and the module/loader clause on a VM-minted cast refusal
 
-**Status: EIGHT DIVERGENCES MEASURED AND FIXED IN SOURCE 2026-08-12, NOT REBUILT.**
+> **RECONCILED 2026-08-16 (merge of `dev`).** Every `aastore_check`,
+> `jit_aastore_check` and `HelperFnAastoreCheck` below names the spelling that
+> was current when this record was written. The merge of `dev` into
+> `claude/jdk-only-mode-completion-1351c0` settled on **`aastore_type_check`**
+> (ABI field), **`jit_aastore_type_check`** (helper) and
+> **`aastore_store_is_refused`** (the predicate the helper and the x64 inline
+> lowering now share), and the slot is `required: true` -- the old
+> `aastore_check == 0` fallback that routed the whole opcode to
+> `helpers.aastore` no longer exists. `grep -rn 'aastore_check' --include=*.rs`
+> returns nothing in the tree. The names here are kept as written; read them as
+> history, not as a pointer to live code.
+
+**Status: REBUILT AND RUN 2026-08-12 (lane B8). SIX OF EIGHT ROWS VERIFIED FIXED.
+TWO ARE STILL DIVERGENT, AND ONE OF THOSE THIS RECORD CLAIMED AS FIXED.**
+
+**Part 5 / lane B11 added 2026-08-12 — both remaining rows re-measured shape by
+shape, and both are bigger than recorded.** Row 8 loses the covariance check for
+**five distinct store shapes**, not one, and one of the five
+(`Animal[] <- String`) is wrong **in the interpreter too**, so it is not a JIT
+row at all. Row 7 is not "the array branch never executes": CratonVM emits
+**three different strings** for an array-operand cast depending on tier and on
+definition-index state. The A/B the codegen fix was blocked on is now run:
+**a Rust-boundary type check per reference store costs 3.4x on this VM's own
+store loop**, which is why §B11.4 designs a cache rather than proposing the
+plain call. See Part 5.
+
+> ## B8 — the first run of this record's own table against a binary
+>
+> Every previous pass on this record was source-level: the table's "after"
+> column was a *claim about source*, said so, and stayed unverified. It is now
+> executed. Binary `/c/craton/jdkonly-wave2-target/release/cratonvm.exe`
+> `--jdk-only`, oracle Temurin `jdk-25.0.3.9-hotspot`, one probe class file run
+> on both arms and the two stdouts diffed.
+>
+> ```
+> $ diff hs37.txt cv37.txt
+> 8c8
+> < checkcastToArray=class [I cannot be cast to class [Ljava.lang.String; ([I and [Ljava.lang.String; are in module java.base of loader 'bootstrap')
+> ---
+> > checkcastToArray=[I cannot be cast to [Ljava.lang.String;
+> 10c10
+> < arrayStoreHot=java.lang.Integer
+> ---
+> > arrayStoreHot=no-throw
+> ```
+>
+> **Six rows are byte-identical to HotSpot and are RETIRED**: all five
+> `Throwable` rows (`initCauseAfterCtorThrows`, `initCauseTwiceThrows` — cause
+> `c` survives, `selfCauseThrows`, `addSuppressedSelfThrows`,
+> `suppressionDisabled=0:0`) plus `VM.classCast`, whose parenthetical matches
+> including the joint module/loader clause. `addSuppressed(null)` →
+> `NullPointerException` agrees too. Part 1 and Part 2 are done.
+>
+> **Row 7 `VM.checkcastToArray` is NOT fixed** — the table's "after" cell says
+> "HotSpot's string" and the binary prints the bare two-operand form. This is a
+> correction to this record, not a stale line number.
+>
+> **Row 8 hot / Part 4 is CONFIRMED LIVE on today's binary**, not merely on the
+> frozen wave binary Part 4 measured. `RExceptions` is RED at exactly the
+> predicted assertion:
+> `AssertionError: ArrayStoreException text moved during warm-up at i=500:
+> cold=[java.lang.Integer] hot=[no-throw]`, against
+> `PASS RExceptions (25 checks)` on HotSpot. Part 4's diagnosis stands
+> unaltered: the JIT lowers `aastore` inline and never calls `jit_aastore`, so
+> the compiled tier performs the store. The heap type confusion is real today.
+>
+> ### Row 7's mechanism, isolated by experiment rather than inferred
+>
+> A six-case probe varying only whether each operand is an array:
+>
+> | case | operands | CratonVM |
+> |---|---|---|
+> | `D_obj_to_obj` | `String` → `Integer` | **byte-identical to HotSpot** |
+> | `F_app_to_bootstrap` | `CastProbe` → `String` | **byte-identical**, split two-clause form and all |
+> | `A_obj_to_refarr` | `String` → `[Ljava.lang.String;` | bare form |
+> | `B_primarr_to_obj` | `[I` → `String` | bare form |
+> | `C_primarr_to_refarr` | `[I` → `[Ljava.lang.String;` | bare form |
+> | `E_refarr_to_refarr` | `[Ljava.lang.Integer;` → `[Ljava.lang.String;` | bare form |
+>
+> The rewrite is correct whenever **neither** operand is an array and fails
+> whenever **either** is — including the split-clause path, which is the harder
+> case and works. So `hotspot_class_cast_message` is not at fault;
+> `klass_origin` (`vm/src/runtime/exceptions.rs`) returns `None` for an array
+> display name, and one `None` collapses the whole message via `?`.
+>
+> The cause is an ordering one, and it makes existing code dead:
+> `klass_origin` opens with `find_unique_class_by_name(display_name)?` — a
+> lookup of *the array class itself* — and only *afterwards* parses the `[`
+> prefix to find the component's module. That descriptor-parsing block, which
+> is written correctly and even carries HotSpot's `bottom_klass` rationale, can
+> only ever run for an array class already in the definition index, and the
+> measurements above show none are. **The array support in this function has
+> never executed.** Nomination in §B8.1 below.
+>
+> ### Scheduling: row 7 is invisible to this record's own vector
+>
+> `regression-suite/src/RExceptions.java` asserts the CCE text only for
+> `String` → `Integer` — the one shape that works. Four of the six cast shapes
+> above have no scheduled witness at all, which is why row 7 could be recorded
+> as fixed and stay wrong. Row 8 *is* scheduled and is red. Nominated vector in
+> §B8.2.
 
 Every measurement below was taken by running the already-built binary at
 `C:/craton/CratonVM/target/release/cratonvm.exe` against Temurin
@@ -46,8 +146,8 @@ shaped every fail-open arm below).
 | `Throwable.addSuppressedSelfThrows` | `java.lang.IllegalArgumentException` | `no-throw` | `IllegalArgumentException` |
 | `Throwable.suppressionDisabled` | `0:0` | `1:0` | `0:0` |
 | `VM.classCast` | `java.lang.ClassCastException: class java.lang.String cannot be cast to class java.lang.Integer (java.lang.String and java.lang.Integer are in module java.base of loader 'bootstrap')` | `java.lang.ClassCastException: java.lang.String cannot be cast to java.lang.Integer` | HotSpot's string |
-| `VM.checkcastToArray` | `java.lang.ClassCastException: class [I cannot be cast to class [Ljava.lang.String; ([I and [Ljava.lang.String; are in module java.base of loader 'bootstrap')` | `java.lang.ClassCastException: [I cannot be cast to [Ljava.lang.String;` | HotSpot's string |
-| `VM.arrayStore` | `java.lang.ArrayStoreException: java.lang.Integer` | `java.lang.ArrayStoreException: java/lang/Integer` | `java.lang.Integer` |
+| `VM.checkcastToArray` | `java.lang.ClassCastException: class [I cannot be cast to class [Ljava.lang.String; ([I and [Ljava.lang.String; are in module java.base of loader 'bootstrap')` | `java.lang.ClassCastException: [I cannot be cast to [Ljava.lang.String;` | **NOT FIXED — see §B11.1** |
+| `VM.arrayStore` | `java.lang.ArrayStoreException: java.lang.Integer` | `java.lang.ArrayStoreException: java/lang/Integer` | **interpreter only; the JIT does not throw at all — §B11.2** |
 
 Note the second row: the divergence is not only the missing throw. Because the
 second `initCause` silently succeeded, CratonVM's *cause* was `c2` where
@@ -594,3 +694,463 @@ The field-state and message tables above came from two throwaway probes run the
 same way with `--add-opens java.base/java.lang=ALL-UNNAMED` on both sides; the
 `--add-opens` is required or `Field.setAccessible` on `Throwable.cause` throws
 `InaccessibleObjectException` on HotSpot.
+
+---
+
+## §B8.1 — NOMINATION: `klass_origin` must parse the descriptor before it looks up
+
+`vm/src/runtime/exceptions.rs`. The array branch is currently unreachable
+because the function demands the array *class* be in the definition index
+before it will look at the component. Resolve the component instead, and take
+the loader from it.
+
+OLD (exact, from `fn klass_origin`):
+
+```rust
+    let cm = shared.classes.class_manager.read();
+    let class_id = cm.find_unique_class_by_name(display_name).or_else(|| {
+        let frame_class = thread.frames.last()?.class_id;
+        cm.find_class_by_name_for_class(display_name, frame_class)
+    })?;
+```
+
+NEW:
+
+```rust
+    let cm = shared.classes.class_manager.read();
+    // An array's own class need not be in the definition index — measured: no
+    // array display name resolves, which made the `dims` block below dead code
+    // and dropped every array-operand cast message back to the bare form
+    // (W7-37 §B8). HotSpot reads module and loader off the BOTTOM klass, so
+    // resolve that directly and let the primitive case answer without a lookup
+    // at all.
+    let dims = display_name.bytes().take_while(|b| *b == b'[').count();
+    let lookup_name = match display_name[dims..].strip_prefix('L') {
+        Some(component) => component.trim_end_matches(';'),
+        // Primitive-component array (`[I`) — java.base / bootstrap, per
+        // HotSpot's "klass is an array of primitives, module is java.base".
+        None if dims > 0 => {
+            return Some(KlassOrigin {
+                module: Some("java.base".to_string()),
+                loader: "'bootstrap'",
+                loader_id: cratonvm_types::ClassLoaderId::Bootstrap,
+            })
+        }
+        None => display_name,
+    };
+    let class_id = cm.find_unique_class_by_name(lookup_name).or_else(|| {
+        let frame_class = thread.frames.last()?.class_id;
+        cm.find_class_by_name_for_class(lookup_name, frame_class)
+    })?;
+```
+
+With `lookup_name` resolving the component, the existing `dims`/`strip_prefix`
+block further down becomes redundant and should be deleted along with its
+`let name = class.name.to_string();` — the module it computes is now the module
+of the class just resolved. **Do not** delete the `bottom_klass` comment; move
+it to the new block, which is where it is now load-bearing.
+
+Verification is the six-case probe in §B8: all six rows must go byte-identical
+to HotSpot, and `D`/`F` must not regress.
+
+## §B8.2 — NOMINATION: schedule the four unwitnessed cast shapes
+
+`regression-suite/src/RExceptions.java` covers only `String` → `Integer`. Add
+the four array shapes beside it — `A_obj_to_refarr`, `B_primarr_to_obj`,
+`C_primarr_to_refarr`, `E_refarr_to_refarr` from §B8 — asserting full byte
+parity with the HotSpot strings quoted there. They are trivially true on
+HotSpot, so they cannot flake on the oracle arm, and they are the difference
+between row 7 being adjudicable and being re-recorded as fixed a third time.
+
+**Done in Part 5** (§B11.7), with one change: each shape is read in BOTH tiers,
+because a single cold reading would have recorded two of them as fixed. See
+§B11.1 for why.
+
+---
+
+# Part 5 — lane B11: both remaining rows, shape by shape, and the A/B
+
+Binary `/c/craton/jdkonly-wave2-target/release/cratonvm.exe --jdk-only`, oracle
+Temurin `jdk-25.0.3.9-hotspot`, same class files on both arms, all measured
+2026-08-12. Probes are throwaway (`AastoreShapes`, `CastMsgs2/3`, `AastoreAB`);
+the durable versions of the assertions are now in
+`regression-suite/src/RExceptions.java`.
+
+## §B11.1 — Row 7 is not a dead branch. It is three different strings.
+
+§B8 concluded that `klass_origin`'s array support "has never executed". That is
+too strong, and the weaker true statement is worse. Five cast shapes, each read
+interpreted and again past the JIT threshold:
+
+| shape | interpreted | JIT-compiled |
+|---|---|---|
+| `String` → `String[]` | bare | bare **in one program, HotSpot's FULL string in another** |
+| `int[]` → `String` | bare | `class [I cannot be cast to class java.lang.String` — prefixes, **no parenthetical** |
+| `int[]` → `String[]` | bare | prefixes, no parenthetical |
+| `Integer[]` → `String[]` | bare | prefixes, no parenthetical |
+| `String` → `Long[]` (array class never instantiated) | bare | bare |
+
+So there are **three** wordings in play for one JVMS rule — the bare
+two-operand form, a prefix-only form with the module/loader clause missing, and
+(sometimes) HotSpot's exact string — and which one you get is a function of the
+tier and of whether the array class happens to be in the definition index at
+that moment, not of the cast.
+
+The `String` → `String[]` row is the demonstration. In a program whose only
+`[Ljava.lang.String;` is `main`'s own parameter it reads bare in both tiers; in
+one that calls the same site in a tight 1200-iteration loop it reads HotSpot's
+full string once compiled, reproducibly, three runs out of three. In
+`RExceptions` it now **passes** — because that fixture's own
+`static final Object AS_V_STRARR = new String[1]` puts `[Ljava.lang.String;`
+into the definition index before `main` runs.
+
+That is exactly the mechanism §B8.1 nominated, seen from the other side.
+`find_unique_class_by_name(display_name)` on the array class does not *never*
+resolve; it resolves iff something already defined that array class. Which means
+row 7 does not fail deterministically, and **a probe that happens to allocate the
+array type it is about will report it fixed.** Two of this record's three
+"recorded as fixed" events are explained by that and by nothing else. §B8.1's
+patch is still the right fix and its rationale is unaffected — resolving the
+*component* removes the dependence on incidental index state — but its
+justification should read "the array branch is reachable only by accident",
+not "never executes".
+
+Under `--nojit` all five shapes are stable across the 1200 iterations, which
+locates the tier half of the instability in the JIT `checkcast` helper rather
+than in the funnel.
+
+## §B11.2 — Row 8 is five shapes, and one of them is not a JIT bug
+
+Eleven `aastore` shapes, each with its own store site in its own method, each
+read interpreted and again past the JIT threshold. HotSpot is correct on all
+eleven in both tiers.
+
+| shape | must | CratonVM interpreted | CratonVM JIT |
+|---|---|---|---|
+| `String[] <- Integer` | ASE | ASE | **no-throw** |
+| `Number[] <- String` | ASE | ASE | **no-throw** |
+| `Animal[] <- String` (interface component) | ASE | **no-throw** | **no-throw** |
+| `String[][] <- Integer[]` (array of arrays) | ASE | ASE | **no-throw** |
+| `Cat[] <- Dog` (sibling subclasses) | ASE | ASE | **no-throw** |
+| `Object[] <- Integer` | no-throw | no-throw | no-throw |
+| `String[] <- null` | no-throw | no-throw | no-throw |
+| `Animal[] <- Cat` | no-throw | no-throw | no-throw |
+| `Number[] <- Integer` | no-throw | no-throw | no-throw |
+| `String[][] <- String[]` | no-throw | no-throw | no-throw |
+| `String[] <- String` | no-throw | no-throw | no-throw |
+
+Two readings, and they need separating.
+
+**The JIT loses the check for every shape, without exception.** All five
+throw-shapes read `no-throw` once compiled. This is not selective and there is
+no shape that survives, because the compiled path contains no check to be
+selective with — the store is unconditional. The six legal shapes are unaffected
+for the same reason, so the fix has **no false-positive risk to remove**: today's
+compiled path already accepts everything, and the guard can only ever move a
+store from "accepted" to "refused".
+
+**`Animal[] <- String` is wrong in the interpreter too**, and that is a separate
+defect this record did not have. It is not an oversight but a deliberate blanket:
+`vm/src/runtime/interpreter/typecheck.rs:711` fails open for **every** interface
+component, on the stated grounds that dynamic proxies, annotation proxies and
+synthetic classes implement interfaces invisibly to the static hierarchy. The
+grounds are real; the scope is not. The three escape hatches that actually
+handle those cases (`$Proxy`/`AnnotationProxy` by name, `class_chain_reaches_
+proxy_instance`, `synthetic_implements`) all sit **below** this early return and
+are therefore unreachable for interface components — the blanket makes its own
+justification dead code, the same shape of mistake as row 7. Nomination §B11.6-N3.
+
+## §B11.3 — Where the guard goes: one site, and the others are already closed
+
+`jit/src/x64/bytecode_walk.rs`, the `0x53` arm (opens at line 1778, in the
+comment block beginning line 1764). The guard belongs **after
+`self.emit_bounds_check(pc)` and before `self.emit_ref_aload_regs()`** — that
+is, after the null and bounds checks (whose stubs and dataflow elision must be
+preserved, and which the helper's own header reads depend on) and before the
+SATB pre-write barrier, because on the exception path no element is read and
+none is written.
+
+The other three lowerings need nothing, and this was checked rather than assumed:
+
+* `jit/src/ir.rs` — the IR builder's array-store arm is `0x4f | 0x50 | 0x54 | 0x55 | 0x56`. `0x53` is **absent by design**, with the reason stated in place (a reference store needs the SATB and card barriers the IR tier does not emit). An unhandled opcode refuses the method.
+* `jit/src/ir_lower.rs:4780` — belt and braces on the same point: `Op::ArrayStore(MemKind::Ref)` latches a `Bailout` rather than emitting a barrier-less store.
+* `jit/src/aarch64_backend.rs` — `0x53` is in the unsupported set, and `object_model_opcodes_are_all_unsupported` is a test that fails if anyone implements it without updating the table.
+
+So there is exactly one emission site to change, and two of the three other
+backends carry a test that will tell their author to come back here.
+
+**The `has_dispatch` objection is mostly already paid.** Part 4 warned that
+wiring the helper "forces `has_dispatch` on nearly every compiled method" via
+`emitted_checkcast_throw`. But `has_dispatch` (`jit/src/x64/driver.rs:1901`) is
+already true whenever `bounds_check_stubs` or `null_check_store_stubs` is
+non-empty — and the `0x53` arm pushes into **both** on the very lines above
+where the guard would go (`jit/src/x64/arrays.rs:239` and `:417`). Any method
+containing a compiled `aastore` therefore already has `has_dispatch == true`.
+The residual exposure is only the method where *both* checks are elided — BCE
+put the pc in `bounds_safe_pcs`, and `is_local_nonnull` proved the array
+non-null — which is a hot counted loop over a known-non-null array, i.e. exactly
+the case the inline cache below is designed for anyway.
+
+## §B11.4 — The inline cache, and what it costs when it hits
+
+The key insight is a layout one, and it makes the cache much cheaper than the
+"walk the class hierarchy" framing suggests:
+
+> "The `class_id` on a Reference array holds the **component** class id."
+> — `vm/src/runtime/interpreter/typecheck.rs:409`
+
+and `class_id_offset_in_obj` is **0 by contract** (`jit-api/src/lib.rs:2502`),
+with `ARRAY_LENGTH_OFFSET = 4`. So for a reference array, the single 8-byte word
+at `[array + 0]` holds the component class id in its low half and the array
+length in its high half — and the bounds check immediately above already loads
+`[RAX + 4]`, so that word is in L1 by construction.
+
+The question `aastore_element_assignable` answers is a pure function of exactly
+two `u32`s: the array's component class id and the value's class id. That pair
+fits in one 64-bit word, so the cache is **one word and one compare**, not two.
+
+Per-site cache: `#[repr(C)] struct JitAastoreIC { key: AtomicU64 }` — the packed
+`(component_class_id << 32) | value_class_id` pair the helper last **accepted**.
+Rejects are never cached (a reject must throw every time, and throwing goes to
+the helper regardless).
+
+```text
+    ; RAX = array, RCX = index, RDX = value — all three already loaded here
+    test  rdx, rdx
+    jz    .store               ; JVMS: null is always storable, never consult
+    mov   r10, imm64(ic)       ; per-site cache address
+    mov   r11, [rax]           ; component class id (low 32) | length (high 32)
+    shl   r11, 32              ; component id -> high half
+    mov   r8d, [rdx]           ; value class id, zero-extended
+    or    r11, r8              ; the accepted-pair key
+    cmp   r11, [r10]
+    jne   .miss
+.store:
+    <SATB pre-write barrier, MOV [RAX+RCX*8+16], RDX, card mark — unchanged>
+    jmp   .done
+.miss:
+    <helper ABI>  call jit_aastore_check(vm, array, val, ic)
+    <sentinel check via self.helpers.dispatch_threw, as Part 4 describes>
+    jmp   .store               ; helper updated the key; no throw pending
+.done:
+```
+
+**Hit-path cost: 9 instructions, ~26 bytes, one taken-never branch.** Both loads
+are ordinarily already resident — `[rax]` is the word the bounds check just
+touched, and `[rdx]` is the header of an object the caller has just produced.
+The `shl`/`or` dependency chain is 2 cycles on top of the load, and it overlaps
+the SATB barrier's own work. There is one conditional branch that can mispredict,
+not two; that is why the key is packed rather than compared as two `u32`s.
+
+The `mov r10, imm64` can be dropped (10 of the 26 bytes) by placing the cache
+word within `±2GB` of the code buffer and using `cmp r11, [rip+disp32]`. Worth
+doing only if the code cache and the IC arena are already co-allocated.
+
+Three correctness obligations that are **not** optional:
+
+1. **Invalidation.** The cached verdict is a claim about a class hierarchy that
+   redefinition can change. The IC must hang off the same invalidation path
+   `JitMICSlot`/`JitPICSlot` already use; a stale accept is a silently wrong
+   store, which is the bug we are fixing.
+2. **Class-id reuse.** If a `ClassId` is recycled after unload, a stale key can
+   match the wrong pair. The MIC/PIC carry identical exposure, so whatever they
+   rely on applies — but it must be stated, not inherited by accident.
+3. **The key is meaningful only for a `Reference`-element array.** This adds no
+   new exposure: today's inline lowering already does an unconditional 8-byte
+   reference store and so already assumes exactly that, on the verifier's
+   guarantee. The guard assumes strictly less than the code it is guarding.
+
+What the IC does **not** fix is the megamorphic site — a store loop whose value
+type genuinely rotates misses every time and pays the full helper. Whether that
+needs a 4-way cascade (the `JitPICSlot` shape, already built) is a question for
+after the 1-entry form is measured, not before.
+
+## §B11.5 — The A/B, run
+
+Both arms of the real decision cannot be run on one binary: the guarded arm does
+not exist without a rebuild, which this lane may not do. So the harness measures
+the two things that are on today's binary and that bracket the answer.
+
+* **BASE** — `Object[] <- String`, monomorphic, 2M stores. Exactly today's inline lowering.
+* **CHK** — the identical loop with an explicit `(String)` cast before the store. `checkcast` **does** call its Rust helper on this binary, so CHK = BASE + one Rust-boundary type check per reference store. This is the shape of Part 4's naive patch.
+* **POLY** — BASE with a 4-way rotating value type, bounding the megamorphic case.
+
+ABBA-interleaved within each repetition, 9 repetitions, first 3 discarded, and
+the **minimum** reported: on this shared host the minimum is the only statistic
+that is not a measurement of the other tenants. Four independent process
+launches:
+
+| run | BASE ns/store | CHK ns/store | CHK/BASE |
+|---|---|---|---|
+| 1 | 106.4 | 349.1 | **3.28** |
+| 2 | 114.2 | 388.8 | **3.40** |
+| 3 | 105.0 | 369.3 | **3.52** |
+| 4 | 111.6 | 393.0 | **3.52** |
+| HotSpot 25 (reference) | 4.9 | 7.0 | 1.43 |
+
+**The number is trustworthy and the caveat is narrow.** The absolute values
+drift with host load — within a single run the max/min spread is 1.3x, and under
+`--nojit` it is 1.8x — but the *ratio* reproduces to within 7% across four
+launches, because ABBA interleaving puts both arms under the same drift. The
+per-repetition medians and maxima are noise and are not quoted.
+
+Control that the measurement is a JIT measurement at all: `--nojit` gives BASE
+2389 ns/store against 106 ns/store here, a **22x** gap, so the loop is compiled.
+CHK is compiled too (349 vs 4034 ns/store interpreted), so CHK is genuinely
+"compiled code making a helper call per store" and not a partial-interpretation
+artefact.
+
+**CHK is a LOWER bound on Part 4's naive patch, not an upper one.**
+`jit_checkcast` takes the class name as a `(ptr, len)` from the site and does one
+lookup. `aastore_element_assignable` calls `array_descriptor_of`, which
+`format!`s a **fresh `String` on every single store**, then `to_string()`s the
+component name, then takes `class_manager.read()` two or three times. Routing
+every `aastore` through it would cost more than 3.4x, and would put two heap
+allocations on the hottest reference-store path in the VM.
+
+So: **the objection that held Part 4 back was correct, and is now quantified.**
+The plain call is not landable on the store path. The 9-instruction cache is.
+
+## §B11.6 — NOMINATIONS
+
+### N1 (literal, `jit/src/x64/bytecode_walk.rs`, in the `0x53` comment block at line 1773) — the premise is falsified, and it is the only thing telling the next reader this is fine
+
+OLD (exact):
+
+```rust
+                // ArrayStoreException note: the current `jit_aastore` helper does NOT enforce
+                // the ASE check (the interpreter does it via `set_array_element`). This inline
+                // path matches the helper's behavior exactly — no regression. Wiring an inline
+                // ASE check is a follow-up that needs type-narrowing infrastructure (not yet
+                // tracked in this JIT).
+```
+
+NEW:
+
+```rust
+                // ArrayStoreException: THIS PATH IS NOT JVMS-CONFORMANT. It performs the
+                // store unconditionally, so a JIT-compiled `String[] <- Integer` succeeds and
+                // leaves an Integer in a slot the verifier proved is a String — a live heap
+                // type confusion, not a message-wording difference. Measured 2026-08-12: all
+                // five ArrayStoreException shapes read `no-throw` once compiled
+                // (W7-37 §B11.2).
+                //
+                // The note this replaces said the inline path "matches the helper's behavior
+                // exactly — no regression". That was true when written and was falsified,
+                // silently, when the JVMS §aastore covariance check was later added to
+                // `jit_aastore` in a different crate: a premise stated in a comment is not a
+                // compile-time link. `jit_aastore` now has the check and has had NO CALLER
+                // since R20 / HIGH-5.
+                //
+                // The fix is not to restore the call — a Rust-boundary type check per
+                // reference store measures 3.4x on this VM's own store loop (W7-37 §B11.5).
+                // It is the 9-instruction per-site inline cache in W7-37 §B11.4, keyed on the
+                // packed (array component class id, value class id) pair. Insert it after the
+                // bounds check and before the SATB barrier below.
+```
+
+### N2 (design, same arm) — the guard itself
+
+Emit the sequence in §B11.4 between `self.emit_bounds_check(pc)` and
+`self.emit_ref_aload_regs()`. Needs: a `JitAastoreIC` per site (mirror
+`JitPICSlot`'s `#[repr(C)]` + layout-assertion discipline in `jit/src/lib.rs`,
+including its invalidation wiring), a `jit_aastore_check(vm, array, val, ic)`
+helper in `vm/src/jit/helpers.rs` that reuses `aastore_element_assignable` and
+the `throw_runtime_error` funnel `jit_aastore` already routes through, and the
+`self.helpers.dispatch_threw` + `SHL RAX, 63` sentinel mapping Part 4 spells out
+for the void return. Part 4's `has_dispatch` note can be relaxed per §B11.3.
+
+Verification is `RExceptions`: all eleven `aastore` shapes must read their MUST
+value in both tiers. Do not accept a green that comes from `arrayStoreMessage()`
+alone — that is the single shape that hid this for two rounds.
+
+### N3 (literal, `vm/src/runtime/interpreter/typecheck.rs:711`) — the interface blanket buries its own justification
+
+`Animal[] <- String` does not throw on CratonVM in **either** tier. The cause is
+a fail-open for every interface component, placed **above** the three escape
+hatches that handle the cases it cites, which makes them unreachable for exactly
+the component kind they were written for.
+
+OLD (exact):
+
+```rust
+        // Component is an INTERFACE → fail open. Proving a value implements an
+        // interface is unreliable in this VM (dynamic proxies, annotation
+        // proxies, and synthetic classes implement interfaces at runtime / by
+        // name, invisibly to the static hierarchy). A genuine ArrayStoreException
+        // essentially always involves a concrete-class component (Number[],
+        // String[], …); for an interface[] we don't risk a spurious throw.
+        if cm.get_class(comp_id).map_or(false, |c| c.is_interface()) {
+            return true;
+        }
+```
+
+NEW:
+
+```rust
+        // An INTERFACE component is NOT a reason to fail open on its own. This
+        // used to return `true` for every interface component, on the grounds
+        // that dynamic proxies, annotation proxies and synthetic classes
+        // implement interfaces invisibly to the static hierarchy. Those grounds
+        // are real — but each of them already has its own escape hatch BELOW
+        // (the `$Proxy`/`AnnotationProxy` name test,
+        // `class_chain_reaches_proxy_instance`, `synthetic_implements`), and
+        // this early return sat ABOVE them, so for interface components those
+        // three could never run. The blanket made its own justification dead
+        // code, and cost the whole rule: `Animal[] <- String` did not throw
+        // (W7-37 §B11.2). `is_subclass_of` handles interfaces directly
+        // (`classloading/src/class.rs`, `is_subclass_of_interface`), so a
+        // statically-declared implementor still passes below; a proxy or
+        // synthetic still fails open, one hatch further down, on the specific
+        // ground that applies to it.
+```
+
+i.e. delete the early return and keep the comment as the record of why it is
+gone. Verification: `Animal[] <- Cat` and the annotation-proxy `arraycopy` row
+already in `RExceptions` must stay green, the `aastore_fails_open_across_a_
+split_loaders_two_copies_of_one_name` unit test must stay green, and
+`Animal[] <- String` must go red-to-green. If the hibernate-smoke annotation
+regression the comment cites reappears, the right answer is to widen the
+proxy hatch below, not to restore the blanket.
+
+### N4 — §B8.1 stands; amend its rationale
+
+The `klass_origin` patch in §B8.1 is correct and should land as written. Its
+justification needs one word changed: the array branch is not code that "has
+never executed", it is code that executes **only when the array class was
+already in the definition index for some unrelated reason** (§B11.1). That is
+why the row has been recorded as fixed twice — a probe that allocates the array
+type it is asking about reports it fixed. Resolving the *component* rather than
+the array is exactly what removes the dependence.
+
+## §B11.7 — What landed in `RExceptions.java`, and what it now reads
+
+Added, all verified on HotSpot 25 first: **`PASS RExceptions (58 checks)`**, up
+from 25.
+
+* The eleven-shape `aastore` matrix of §B11.2, each store in its own method so each gets its own compiled site, each read cold and hot.
+* The four array-operand cast shapes of §B8.2, each read cold and hot.
+* The `System.arraycopy` covariance row of §B11.8-4, cold and hot, plus the destination-untouched claim. Green on both VMs today.
+* `expect()` / `drainDivergences()` — counted like `check()`, but **records and prints** the divergence instead of throwing at the first one, then throws once at the end with all of them. This is a direct response to how row 7 stayed wrong: a family of assertions that dies on its first member gives a taker one member per rebuild of this VM.
+
+On today's CratonVM binary the fixture prints **12 `DIVERGENCE` lines in a single
+run** before dying at the pre-existing row-8 tier-parity `must`, which is
+unchanged and still fires. The 12 are: 6 cast rows (3 shapes x 2 tiers; the
+`String` → `String[]` pair passes, see §B11.1) and 6 `aastore` rows (5 JIT +
+`Animal[] <- String` interpreted).
+
+**Two independent fixes are needed to clear this file**, and a taker should not
+expect either one alone to go green:
+
+| divergences | cleared by |
+|---|---|
+| 5 `aastore` JIT rows + the row-8 `must` | §B11.6-N2 (the guard) |
+| 1 `aastore` interpreted row | §B11.6-N3 (the interface blanket) |
+| 6 cast rows | §B8.1 (`klass_origin`) |
+
+## §B11.8 — Residuals
+
+1. **The `String` → `String[]` cast row passes in `RExceptions` for an incidental reason** — the fixture's own `new String[1]` static indexes `[Ljava.lang.String;`. It is left in because it is one of §B8's four named shapes and because the pass is itself evidence for §B11.1, but it is not load-bearing: after §B8.1 lands it should pass for the right reason, and the way to confirm that is the `String` → `Long[]` shape (an array class the fixture never instantiates), which reads bare in both tiers today.
+2. **The megamorphic `aastore` site is unmeasured against a guard.** POLY was measured on the unguarded binary only (169-192 ms/2M stores, i.e. *faster* than BASE, since it stores into a different array). A 1-entry IC's miss rate on real polymorphic store sites — `ArrayList.add` across a heterogeneous list, `HashMap` resize — is the open question, and the answer decides 1-entry vs the existing 4-way `JitPICSlot` shape. It cannot be answered without the guarded build.
+3. **The JIT `checkcast` helper emits a fourth wording** (`class X cannot be cast to class Y`, prefixes present, parenthetical absent) that no part of this record previously described. §B8.1 fixes `klass_origin`, which is the *source* of the missing clause; whether that alone makes the JIT arm byte-identical is untested, because the JIT arm reaches the funnel by a different route. Re-run §B11.1's five-shape cold/hot table after §B8.1 lands, not just §B8's six-case cold table.
+4. **Not a residual — closed.** The same JVMS rule has a third implementation, `System.arraycopy` into a covariantly-typed destination, and `RExceptions` previously exercised it only in the always-legal direction. Measured: `arraycopy(Object[]{Integer}, 0, String[], 0, 1)` throws `ArrayStoreException` on CratonVM **in both tiers**, byte-for-byte agreeing with HotSpot, and leaves the destination element `null`. So of the three implementations of the covariance rule, the reflective one (`Array.set`, Part 4) and the bulk one (`arraycopy`) are correct and only the `aastore` opcode is not. A scheduled row for it is now in `RExceptions` — it is green today, and it is there so that a taker implementing §B11.6-N2 cannot fix the opcode by weakening a shared predicate without hearing about it.

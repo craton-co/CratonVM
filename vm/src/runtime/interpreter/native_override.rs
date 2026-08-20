@@ -1501,6 +1501,16 @@ pub(crate) fn is_bc_crypto_math_native_override(
             (method_name == "G" && descriptor == "(IIIIII)V")
                 || (method_name == "compress" && descriptor == "([BI)V")
         }
+        // LMS/HSS hashes through this class directly (its `DigestUtil` builds
+        // `new SHA256Digest()`), never through `MessageDigest`, so the native
+        // JCA SHA-256 is on a path that workload cannot reach. `processBlock`
+        // is the compression leaf; everything around it stays real bytecode.
+        // `SHA256Digest` has no BouncyCastle subclass, so the superclass walk
+        // in `intercept_force_registered_native` cannot divert another digest's
+        // `processBlock` here.
+        "org/bouncycastle/crypto/digests/SHA256Digest" => {
+            method_name == "processBlock" && descriptor == "()V"
+        }
         "org/bouncycastle/crypto/digests/KeccakDigest" => matches!(
             (method_name, descriptor),
             ("KeccakPermutation" | "KeccakExtract", "()V") | ("KeccakAbsorb", "([BI)V")
@@ -1791,6 +1801,40 @@ pub(crate) fn is_ffm_group_layout_native_override(
         )
 }
 
+/// FFM `java.lang.foreign.MemoryLayout` — the layout factories and the two
+/// instance methods `foreign_ffm.rs` answers on the interface itself.
+///
+/// **Descriptors javac cannot emit are not listed** (F27, 2026-08-13). Four
+/// entries spelling the four factories with a `…)Ljava/lang/foreign/MemoryLayout;`
+/// return were deleted here and at the inline copy of this table further down
+/// `force_native_over_real_jdk_bytecode`. `javap java.lang.foreign.MemoryLayout`
+/// on 25.0.3+9-LTS:
+///
+/// ```text
+///   public static java.lang.foreign.PaddingLayout  paddingLayout(long);
+///   public static java.lang.foreign.SequenceLayout sequenceLayout(long, MemoryLayout);
+///   public static java.lang.foreign.StructLayout   structLayout(MemoryLayout...);
+///   public static java.lang.foreign.UnionLayout    unionLayout(MemoryLayout...);
+/// ```
+///
+/// A call site's descriptor comes from the resolved method's own descriptor, so
+/// no classfile can name the erased-return spellings, and — measured — no
+/// registration anywhere in the workspace answers them either: they were
+/// `panama.rs`'s, and F16 deleted those rows on 2026-08-13. Their only remaining
+/// occurrences in the tree were the two copies of this table.
+///
+/// Removing a force-route entry IS a behaviour change: it decides whether a
+/// registered native shadows real JDK bytecode. Here it cannot be, because the
+/// triple has no call site AND no registration — the predicate could only ever
+/// have cost a fruitless registry probe for a call that cannot occur. The
+/// JDK-true spellings beside them are untouched and still registered
+/// (`foreign_ffm.rs::structLayout`/`sequenceLayout`/`unionLayout`/
+/// `paddingLayout`), which is what keeps the bootstrap-cycle escape the inline
+/// copy's comment describes.
+///
+/// `withName(String)Ljava/lang/foreign/MemoryLayout;` STAYS: `javap` shows
+/// `public abstract java.lang.foreign.MemoryLayout withName(java.lang.String);`,
+/// so that one is the real descriptor, not an erased twin.
 pub(crate) fn is_ffm_memory_layout_native_override(
     class_name: &str,
     method_name: &str,
@@ -1803,22 +1847,12 @@ pub(crate) fn is_ffm_memory_layout_native_override(
                 "sequenceLayout",
                 "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;"
             ) | (
-                "sequenceLayout",
-                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | (
                 "structLayout",
                 "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;"
             ) | (
-                "structLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | (
                 "unionLayout",
                 "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;"
-            ) | (
-                "unionLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
             ) | ("paddingLayout", "(J)Ljava/lang/foreign/PaddingLayout;")
-                | ("paddingLayout", "(J)Ljava/lang/foreign/MemoryLayout;")
                 | (
                     "varHandle",
                     "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
@@ -2350,7 +2384,18 @@ pub(crate) mod hotpath_counts {
     pub static RESOLVE_METHOD_REF_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static LOOKUP_LOADER_INITIATED_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static RETARGET_FIELD_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static TOTAL_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+    /// Bytecodes dispatched through the **decoded** handler
+    /// (`opcodes::execute_instruction`) — NOT the total executed.
+    ///
+    /// It was called `TOTAL_INSTRUCTIONS`, and it never counted one. Its only
+    /// bump site is the top of `execute_instruction`, which the raw-bytecode
+    /// fast path in `execute_frame_from_index` reaches only when it has no arm
+    /// for the opcode. Read as a total it under-reports by the fast path's
+    /// share — which is the large majority of executed bytecodes — so any
+    /// ratio taken against it (per-opcode cost, native-call frequency) came out
+    /// inflated by exactly the factor nobody had measured. The name now states
+    /// the population it actually samples.
+    pub static DECODED_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 
     pub fn bump(counter: &AtomicU64) {
         if !crate::runtime::env_cache::dbg_hotpath_counts() {
@@ -2360,12 +2405,12 @@ pub(crate) mod hotpath_counts {
         if n.is_power_of_two() || n % 1_000_000 == 0 {
             eprintln!(
                 "[hotpath-counts] force_native={} resolve_method_ref={} \
-                 lookup_loader_initiated={} retarget_field={} total_instr={}",
+                 lookup_loader_initiated={} retarget_field={} decoded_instr={}",
                 FORCE_NATIVE_CALLS.load(Ordering::Relaxed),
                 RESOLVE_METHOD_REF_CALLS.load(Ordering::Relaxed),
                 LOOKUP_LOADER_INITIATED_CALLS.load(Ordering::Relaxed),
                 RETARGET_FIELD_CALLS.load(Ordering::Relaxed),
-                TOTAL_INSTRUCTIONS.load(Ordering::Relaxed),
+                DECODED_INSTRUCTIONS.load(Ordering::Relaxed),
             );
         }
     }
@@ -2439,6 +2484,64 @@ pub(crate) fn is_undertow_native_override(
 /// their own: the `java/lang/String` exclusion (paired with the positive form in
 /// `vm/src/vm/vm_exec.rs`'s `check_override`) and the `ThreadPoolExecutor`
 /// family.
+///
+/// # THIS LIST IS NOT WHAT DECIDES NATIVE-VS-BYTECODE. Read this before adding
+/// a class to it.
+///
+/// The paragraph above is true of `resolve_dispatch` and **false** as a
+/// statement about `--jdk-only` as a whole, and the difference has cost several
+/// lanes a wrong inference — `G29-1` §6 called it "the thing most likely to be
+/// wrong in my fix". `resolve_dispatch` is not the first site to answer.
+/// `try_stackless_invoke` step 1 is, for nearly every call in the VM, and it
+/// goes through [`resolve_step1_native`], which passes
+/// `resolve_native_dispatch_wave1` a hard-coded `compat_native_wins: true` and
+/// a `bytecode_available` of `shadows_bytecode && enforce`, where `enforce` is
+/// `env_cache::jdk_only_enforce_shadow_for(class_name)` — **off unless
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` is set, and off by default because arming
+/// it takes the corpus from 32/17 to 3/46**. With it off, `bytecode_available`
+/// is `false`, the `NativeKind::Bridge` arm returns `Some(NativeBridge(..))`,
+/// and the registered native runs *in front of real JDK bytecode* — for any
+/// class, on or off this list. Existing bytecode buys one `#[cold]`
+/// observation (`record_native_shadow_ran_over_bytecode`) and nothing else.
+///
+/// So the operative rule is: **under `--jdk-only`, registering a `Bridge` for a
+/// triple is by itself sufficient for it to preempt real JDK bytecode.** This
+/// list is a *second, later* gate, consulted only by the sites that already
+/// resolved a bytecode `Method` without asking the registry — the vtable
+/// inline-cache (`dispatch_virtual.rs:767` and `:3432`) and the JIT
+/// (`jit_bridge.rs:2748`) — where it converts a would-be `Bytecode` cache entry
+/// into a `VirtualNative` one. It is a cache-shape override, not the policy.
+///
+/// MEASURED 2026-08-17 on `C:/craton/target-rel2/release/cratonvm.exe`
+/// (`9964ca733`) against HotSpot 25.0.3+9-LTS, and this is why
+/// `java/net/http/HttpHeaders` is deliberately **absent** below:
+///
+/// * `HttpHeaders` is a real, final JDK class; all five of its readers have
+///   `Code`; `net_phase_e.rs` registers all five as `Bridge`; none is on this
+///   list. All five run anyway, cold and after 300,000 warm iterations at one
+///   call site (inline cache + JIT tier-up): `owns_slot=true`,
+///   `overwrote=null`, `invocations=300002`, and `--jdk-only-report` tags every
+///   one `bridge-ran-over-bytecode`.
+/// * Three independent signatures separate "the native ran" from "the bytecode
+///   ran", on a receiver built by the REAL `HttpHeaders.of(Map, BiPredicate)`:
+///   `map().getClass()` is `java.util.LinkedHashMap` (the native mints one)
+///   where HotSpot says `java.util.Collections$UnmodifiableMap`; `map() ==
+///   map()` is `false` (the native mints a fresh one per call) where HotSpot
+///   says `true`; and `map().put(..)` is ACCEPTED where HotSpot throws
+///   `UnsupportedOperationException`.
+///
+/// **Adding a real, widely-used JDK class here is therefore not a fix for "my
+/// native does not run" — it already does.** The blast radius if you add one
+/// anyway: this function is called on every vtable miss and every JIT bind, its
+/// result is memoized per `CachedBytecodeMethod`, and a new entry converts that
+/// call site's inline cache to `VirtualNative` for **every** receiver of the
+/// class, including genuinely real ones the native was never written for. That
+/// is the failure the `java/lang/String` arm was deleted for on 2026-08-04 (a
+/// method's behaviour started depending on how many times its call site had
+/// run) and the one the `ThreadPoolExecutor` arm was deleted for on 2026-08-06.
+///
+/// Full derivation, both directions of the census, and the probes:
+/// `docs/known-issues/jdk-only/G34-1-who-wins-native-or-bytecode-20260817.md`.
 pub(super) fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -3007,10 +3110,61 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     if class_name == "javax/management/MBeanServer" {
         return true;
     }
-    // The real Collections.emptyList() returns the class's pre-built static
-    // singleton. During the Brave bootstrap that slot can retain a polluted
-    // ArrayList, so use the registered constructor-backed empty-list native
-    // instead of exposing that stale shared state.
+    // `java/util/Collections.emptyList()`.
+    //
+    // The comment that stood here said: "The real Collections.emptyList()
+    // returns the class's pre-built static singleton. During the Brave
+    // bootstrap that slot can retain a polluted ArrayList, so use the
+    // registered constructor-backed empty-list native instead of exposing that
+    // stale shared state."
+    //
+    // Only its first sentence is still true, and the rest is self-refuting
+    // against the native it routes to. `native_collections_empty_list`
+    // (`native-collections/src/lib.rs`) begins with
+    // `collections_empty_singleton(ctx, "EMPTY_LIST")`, which is a
+    // `get_static_field(java/util/Collections, EMPTY_LIST)` — it READS the very
+    // slot the comment claims this arm exists to avoid. If that slot held a
+    // polluted `ArrayList`, this arm would hand the pollution straight back. It
+    // cannot deliver the protection it advertised, and could not on the day it
+    // was written unless the native looked different then.
+    //
+    // The hazard itself was real and was fixed AT ITS SOURCE, elsewhere:
+    // `ensure_collections_empty_singletons` used to seed `EMPTY_LIST` with an
+    // ordinary MUTABLE synthetic `java/util/ArrayList`, so
+    // `emptyList() instanceof ArrayList` was true, kotlin-reflect's shaded
+    // protobuf `SmallSortedMap.ensureEntryArrayMutable` skipped its replacement
+    // step on the strength of that, and mutated the process-wide singleton. It
+    // now seeds the real immutable `Collections$Empty*` instances. That is where
+    // "a polluted ArrayList in the slot" was closed; this arm never closed it.
+    //
+    // WHAT THE ARM ACTUALLY DOES TODAY is the native's SECOND half: when
+    // `EMPTY_LIST` is not yet initialised, fabricate a fresh empty list rather
+    // than returning null. Note that fallback diverges from the oracle on all
+    // three properties measured on HotSpot 25.0.3:
+    //     class            = java.util.Collections$EmptyList   (fallback: ArrayList)
+    //     add("x")         = UnsupportedOperationException     (fallback: ACCEPTED)
+    //     two calls same   = true                              (fallback: fresh each call)
+    // so the arm buys bootstrap-order robustness and pays for it in fidelity.
+    //
+    // DO NOT DELETE THIS AS A ONE-LINER. Two things have to be established
+    // first, and neither is done:
+    //
+    // 1. Whether this arm decides anything at all. `resolve_step1_native`
+    //    resolves the triple in the registry and dispatches what it finds
+    //    BEFORE this function runs — that is exactly why the twelve-shape
+    //    forced-native `java/lang/String` policy above turned out to be
+    //    measured inert and was deleted. `Collections.emptyList` is a live
+    //    `Bridge` registration (`native-collections/src/lib.rs`,
+    //    `register_collections_utility_natives`), so the same question applies
+    //    and has not been asked.
+    // 2. Removing it is a PAIR, not a line. Handing the method back to real JDK
+    //    bytecode also needs the triple in `RETIRED_SHADOW_TRIPLES`
+    //    (`native-api/src/retired_shadow.rs`) — it is not there today. Dropping
+    //    this arm alone leaves the registered native winning by ordinary
+    //    dispatch and changes nothing; adding the table entry alone leaves this
+    //    arm forcing the native over the bytecode. Neither half is useful on
+    //    its own, and that file's own rule applies: a class's state has to
+    //    become real before its shadow can be retired.
     if class_name == "java/util/Collections"
         && method_name == "emptyList"
         && method_descriptor == "()Ljava/util/List;"
@@ -3904,44 +4058,25 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
-    // FFM layout factories: JDK 25's real `MemoryLayout.sequenceLayout` runs
-    // through `jdk/internal/foreign/Utils` while `SharedUtils.<clinit>` is still
-    // building its `C_POINTER` constant. That circular path re-enters
-    // `SharedUtils` before `ValueLayout.JAVA_BYTE` has been populated and
+    // FFM layout factories: THE SECOND COPY OF THIS TABLE IS GONE (F27,
+    // 2026-08-13). What stood here was an inline `matches!` over the same
+    // `java/lang/foreign/MemoryLayout` triples that
+    // `is_ffm_memory_layout_native_override` lists — nine of them verbatim,
+    // inside the SAME function that calls that helper a few hundred lines below.
+    // Both arms returned `true`, so the duplication was invisible; it was also
+    // the only reason the four stale erased-return descriptors had to be deleted
+    // twice. The helper is a strict superset (it adds `name` and `withName`), so
+    // deleting this block changes no triple's answer.
+    //
+    // The rationale it carried, kept because it is the reason the routing exists
+    // at all: JDK 25's real `MemoryLayout.sequenceLayout` runs through
+    // `jdk/internal/foreign/Utils` while `SharedUtils.<clinit>` is still building
+    // its `C_POINTER` constant. That circular path re-enters `SharedUtils` before
+    // `ValueLayout.JAVA_BYTE` has been populated and
     // `Objects.requireNonNull(elementLayout)` throws a bare NPE. The registered
     // native factories are bytecode-equivalent for CratonVM's supported Panama
     // layout model and avoid that bootstrap cycle.
-    if class_name == "java/lang/foreign/MemoryLayout"
-        && matches!(
-            (method_name, method_descriptor),
-            (
-                "sequenceLayout",
-                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;"
-            ) | (
-                "sequenceLayout",
-                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | (
-                "structLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;"
-            ) | (
-                "structLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | (
-                "unionLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;"
-            ) | (
-                "unionLayout",
-                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
-            ) | ("paddingLayout", "(J)Ljava/lang/foreign/PaddingLayout;")
-                | ("paddingLayout", "(J)Ljava/lang/foreign/MemoryLayout;")
-                | (
-                    "varHandle",
-                    "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
-                )
-        )
-    {
-        return true;
-    }
+
     // FFM ValueLayout subinterfaces are abstract/covariant in the real JDK
     // surface. CratonVM backs the supported layouts with small synthetic
     // objects, so calls such as `ValueLayout$OfFloat.withByteAlignment(J)`
@@ -5377,6 +5512,35 @@ fn redefine_immune_synthetic_collection_native(class_name: &str) -> bool {
 /// A subclass that overrides `initialValue()` is unaffected either way — that
 /// override is the subclass's own bytecode and dispatch resolves to it before
 /// reaching this gate.
+///
+/// # `--jdk-only` reads this table too (G5-1, 2026-08-16)
+///
+/// It is easy to read the paragraphs above as a `Compatible`-mode story. It is
+/// not. `register_thread_local_natives` (`native-builtins/src/phases_early.rs`)
+/// wraps all six registrations in `set_category(NativeKind::Intrinsic)`, and
+/// `resolve_native_dispatch_wave1` (`vm/src/vm/vm_exec.rs`) admits an
+/// `Intrinsic` over concrete bytecode under `--jdk-only` as well — §1.4's
+/// reviewed exception. So under `--jdk-only`, exactly as under `Compatible`,
+/// `Thread.threadLocals` and `Thread.inheritableThreadLocals` are never
+/// written by anything in the process.
+///
+/// That is not only a storage detail. It silently disables three real-JDK
+/// behaviours that live in `java.lang.Thread`'s and `java.lang.ThreadLocal`'s
+/// own bytecode and have no analogue in `TL_MAP`:
+///
+/// * the construction-time inheritance copy at pc 175..201 of the master
+///   `Thread(ThreadGroup, String, int, Runnable, long)` constructor — its
+///   `ifnull` at pc 182 always takes the skip branch;
+/// * the `characteristics & 4` opt-out that `Thread(g, r, n, ss, false)` sets;
+/// * `InheritableThreadLocal.childValue(T)` overrides, which the JDK applies
+///   inside `createInheritedMap`.
+///
+/// All three are MEASURED divergences on Temurin 25.0.3+9 and are written up,
+/// with the demotion nomination that would restore them, in
+/// `docs/known-issues/jdk-only/G5-1-inheritable-threadlocal-captures-at-
+/// construction-20260816.md`. Do not "fix" the ITL timing anywhere downstream
+/// without reading §5 there first: the workaround it describes lives in
+/// `native-builtins/src/lang_system.rs::native_thread_start0`, not here.
 fn redefine_immune_thread_local_native(class_name: &str) -> bool {
     matches!(
         class_name,
@@ -8003,5 +8167,104 @@ mod intercept_shape_tests {
             "org/example/MyHttpURLConnection"
         ));
         assert!(!http_carrier_declaring_class("java/net/URL"));
+    }
+}
+
+/// G34-1 — the deliberate ABSENCES from [`force_native_over_real_jdk_bytecode`].
+///
+/// A test module for things that are not there needs a reason to exist, and
+/// this is it: `G29-1` §6 recorded that its author could not tell whether the
+/// newly registered `java/net/http/HttpHeaders` readers would ever run, because
+/// the class is a real one with real bytecode and is not on the force list. The
+/// answer (MEASURED, see the banner on that function) is that they run anyway —
+/// the force list is not the gate. Someone who re-derives the question from
+/// reading alone will reach for "add HttpHeaders to the list" as the fix, and
+/// that would convert every `HttpHeaders` inline cache in the VM to
+/// `VirtualNative` for real receivers too. These tests make the absence
+/// deliberate rather than accidental.
+#[cfg(test)]
+mod force_list_deliberate_absences_tests {
+    use super::force_native_over_real_jdk_bytecode as force;
+
+    /// MEASURED 2026-08-17 (`target-rel2`, `--jdk-only`, vs HotSpot
+    /// 25.0.3+9-LTS): all five readers are registered `Bridge` by
+    /// `net_phase_e.rs`, all five have real `Code`, none is here, and all five
+    /// run — `invocations=300002` after a 300,000-iteration warm loop at one
+    /// call site, every one tagged `bridge-ran-over-bytecode` by
+    /// `--jdk-only-report`. `RJdkOptionalShape` is `checks=1418 PASS` on that
+    /// binary, which is the same fact stated end to end.
+    ///
+    /// If this test ever fails, the entry that was added did NOT make a
+    /// non-running native run; it changed which body real `HttpHeaders`
+    /// receivers get on warm call sites. Read the banner before keeping it.
+    #[test]
+    fn http_headers_readers_are_deliberately_absent() {
+        for (name, descriptor) in [
+            ("map", "()Ljava/util/Map;"),
+            ("firstValue", "(Ljava/lang/String;)Ljava/util/Optional;"),
+            ("allValues", "(Ljava/lang/String;)Ljava/util/List;"),
+            (
+                "firstValueAsLong",
+                "(Ljava/lang/String;)Ljava/util/OptionalLong;",
+            ),
+            ("toString", "()Ljava/lang/String;"),
+        ] {
+            assert!(
+                !force("java/net/http/HttpHeaders", name, descriptor),
+                "java/net/http/HttpHeaders.{name}{descriptor} is on the force \
+                 list. It does not need to be: MEASURED, its registered Bridge \
+                 already preempts the real JDK body at try_stackless_invoke \
+                 step 1, cold and warm. See the banner on \
+                 force_native_over_real_jdk_bytecode and G34-1."
+            );
+        }
+    }
+
+    /// `java/util/Optional` is the family `G29-1` reasoned FROM, and its
+    /// reasoning was right for the wrong reason: it inferred from
+    /// `invocations=244` that a native on a real-bytecode class wins. It does —
+    /// but not because `Optional` is special, and not because anything about
+    /// `Optional` is on this list. Twenty `Optional` triples are registered by
+    /// `native-collections/src/lib.rs`, every one with
+    /// `real_declaring_method.has_code = true`, and not one of them is here.
+    #[test]
+    fn optional_is_deliberately_absent_too() {
+        for (name, descriptor) in [
+            ("isPresent", "()Z"),
+            ("get", "()Ljava/lang/Object;"),
+            ("orElse", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("toString", "()Ljava/lang/String;"),
+            ("empty", "()Ljava/util/Optional;"),
+        ] {
+            assert!(
+                !force("java/util/Optional", name, descriptor),
+                "java/util/Optional.{name}{descriptor} was added to the force \
+                 list. Its native already wins without it (MEASURED, G34-1); \
+                 adding it only changes warm-call-site behaviour."
+            );
+        }
+    }
+
+    /// The negative control for the two tests above: this list is not empty and
+    /// they are not passing because `force` answers `false` for everything.
+    ///
+    /// `java/util/ArrayList.size()I` is on it, and its comment says why — a
+    /// `Map.values()` view is minted as an `ArrayList` that must re-sync
+    /// against its source map on read, which the real `ArrayList` body cannot
+    /// do. That is the shape of a justified entry: the native is not a
+    /// duplicate of the JDK body, it services a receiver the JDK body cannot.
+    #[test]
+    fn the_list_is_not_vacuously_empty() {
+        assert!(
+            force("java/util/ArrayList", "size", "()I"),
+            "the ArrayList map-view family must still be forced; without it the \
+             two absence tests above prove nothing"
+        );
+        assert!(force("java/util/ArrayList", "get", "(I)Ljava/lang/Object;"));
+        assert!(force(
+            "java/util/HashMap$KeySet",
+            "iterator",
+            "()Ljava/util/Iterator;"
+        ));
     }
 }

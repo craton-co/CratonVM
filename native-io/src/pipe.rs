@@ -732,19 +732,133 @@ fn pipe_write_close_aware(id: i32, raw: u64, data: &[u8]) -> std::io::Result<isi
     }
 }
 
-/// Pipe channel layout (3 fields):
-///   slot 0: id          (Int)  — index into pipe_table
-///   slot 1: open_flag   (Int)  — 1 = open, 0 = closed
-///   slot 2: is_sink     (Int)  — 1 = sink, 0 = source
+/// This crate's **private** slot map for a pipe channel, expressed RELATIVE to
+/// the base [`channel_private_base`] resolves — never as absolute slot 0..3.
+///
+/// ```text
+///   base + 0: id          (Int)  — index into pipe_table
+///   base + 1: open_flag   (Int)  — 1 = open, 0 = closed
+///   base + 2: is_sink     (Int)  — 1 = sink, 0 = source
+///   base + 3: blocking    (Int)  — 1 = blocking (write-only bookkeeping)
+/// ```
+///
+/// # Why it is not indexed from 0 any more (G46-1, 2026-08-17)
+///
+/// Until this fix the four writes went to absolute slots 0..3, which is a
+/// STATEMENT ABOUT THE LAYOUT and is true only of a fabricated stub. Against
+/// the real image the receiver's class is `sun.nio.ch.SourceChannelImpl` /
+/// `SinkChannelImpl`, and `javap -p` over Adoptium 25.0.3+9 gives the real
+/// transitive layout (superclass first, statics excluded):
+///
+/// ```text
+///   0 closeLock          : Ljava/lang/Object;                 AbstractInterruptibleChannel
+///   1 closed             : Z
+///   2 interruptor        : Lsun/nio/ch/Interruptible;
+///   3 interruptedTarget  : Ljava/lang/Object;
+///   4 provider           : Ljava/nio/channels/spi/SelectorProvider;   AbstractSelectableChannel
+///   5 keys               : [Ljava/nio/channels/SelectionKey;
+///   6 keyCount           : I
+///   7 keyLock            : Ljava/lang/Object;
+///   8 regLock            : Ljava/lang/Object;
+///   9 nonBlocking        : Z
+///  10 sc                 : L…SocketChannel;                   S{ource,ink}ChannelImpl
+/// ```
+///
+/// So three of the four writes landed on REFERENCE slots and
+/// `heap::coerce_field_value_by_descriptor` nulled every one of them
+/// (`G30-1-the-silent-reference-slot-coercion-20260817.md`). MEASURED on
+/// `target-rel3` (`9ae371468`), `--jdk-only`, `CRATONVM_DBG_COERCION=1`, one
+/// `Pipe.open()`: six `primitive-into-reference` events, `descriptor=L`, at
+/// the three lines below — and the *pipe id* was one of them, so the first
+/// `sink.write(…)` died with `java.io.IOException: SinkChannel.write: missing
+/// pipe id`. The open flag, meanwhile, aliased `closed : boolean` with the
+/// polarity INVERTED: a fresh channel was `closed = true` and `close()` set
+/// `closed = false`, i.e. exactly the `java.net.ServerSocket.bound` shape
+/// G16-1/G38-1 record ("close() made the socket become bound").
+///
+/// The remedy is the one `native-io/src/lib.rs`'s `MBB_PRIVATE_*` map already
+/// uses (W7-68) and that `cratonvm_native_api::appended_slots` exists for:
+/// start the private map ABOVE every field the real class declares, and
+/// collapse the base to 0 exactly when the class is a fabricated stub, where
+/// the private map IS the layout.
+///
+/// # Sound as a per-class base
+///
+/// `appended_slots` cannot make a native safe against a receiver it did not
+/// allocate (W7-49 §8). Every receiver that reaches these slots is one
+/// [`alloc_channel`] produced: MEASURED with `--dump-native-registry` on the
+/// same binary, `native-io/src/pipe.rs` OWNS every `Pipe.open`/`source`/`sink`
+/// row and every `read`/`write`/`isOpen`/`close` row on both the
+/// `sun/nio/ch/*ChannelImpl` classes and the abstract `Pipe$*Channel` ones;
+/// the twin registrations in `native-builtins/src/phases_late/net_channels.rs`
+/// all report `owns_slot=false` except the two `configureBlocking` rows, and
+/// those are an identity that writes no field. [`channel_private_base`]'s
+/// width guard covers the remainder.
 const PIPE_FIELD_ID: usize = 0;
 const PIPE_FIELD_OPEN: usize = 1;
 const PIPE_FIELD_KIND: usize = 2;
+const PIPE_FIELD_BLOCKING: usize = 3;
+/// How many private slots [`alloc_channel`] appends above the real layout.
+const PIPE_CHANNEL_PRIVATE_SLOTS: usize = 4;
 
 /// Pipe wrapper layout (2 fields):
 ///   slot 0: source  (Object) — SourceChannelImpl
 ///   slot 1: sink    (Object) — SinkChannelImpl
+///
+/// These two stay at absolute 0/1 ON PURPOSE, and the reason is measured, not
+/// assumed: `javap -p java.nio.channels.Pipe` on Adoptium 25.0.3+9 declares
+/// ZERO instance fields, so `appended_slots::base_for_class` would answer 0
+/// and applying it here would move nothing. The pair also holds only
+/// `Value::Object` references, which the `b'L'` coercion arm passes through
+/// untouched — and indeed the `Pipe.open()` measurement above attributes none
+/// of its six events to the wrapper writes. Leaving them put also keeps this
+/// model byte-identical to the twin at `net_channels.rs:2242`, which indexes
+/// the same wrapper from 0.
 const PIPE_WRAPPER_FIELD_SOURCE: usize = 0;
 const PIPE_WRAPPER_FIELD_SINK: usize = 1;
+
+/// Where this crate's private slot map starts on `class_name`.
+///
+/// One function, called the same way by the allocator and by every accessor,
+/// is what keeps the two from ever disagreeing — the reason
+/// `cratonvm_native_api::appended_slots` deliberately exposes only one of
+/// these.
+fn channel_base_for_class(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
+    cratonvm_native_api::appended_slots::base_for_class(ctx, class_name)
+}
+
+/// [`channel_base_for_class`] for an accessor, which holds the receiver rather
+/// than the class name.
+///
+/// The width guard is load-bearing in both directions:
+///
+///   * a receiver this crate did NOT allocate (a real `SourceChannelImpl`
+///     built by JDK bytecode, or a stub-mode object) is too narrow for
+///     `base + 4`, so the base collapses to 0 and the accessor reads the same
+///     slots it read before this fix — the pre-existing answer, never a new
+///     refusal and never an out-of-range access;
+///   * [`alloc_channel`]'s class-resolution-FAILED arm allocates against
+///     `ClassId::new(0)`, which `NativeContextImpl::alloc_object` substitutes
+///     with `cratonvm/synthetic/AnonymousObject$4`. That substitute declares
+///     four fields, so a later `base_for_class` on the receiver would answer
+///     4 and disagree with the 0 the allocator used. The width check
+///     (`4 < 4 + 4`) sends it back to 0, which is the base that was used.
+fn channel_private_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+    let class_id = ctx.class_id_of_object(this);
+    // Bound to a local before the match: the arm needs `ctx` mutably, and a
+    // `match ctx.class_name_of_id(..)` keeps the scrutinee's shared reborrow
+    // alive for the whole match.
+    let class_name = ctx.class_name_of_id(class_id);
+    let base = match class_name {
+        Some(name) => channel_base_for_class(ctx, &name),
+        None => 0,
+    };
+    if ctx.object_num_fields(this) >= base + PIPE_CHANNEL_PRIVATE_SLOTS {
+        base
+    } else {
+        0
+    }
+}
 
 fn alloc_channel(
     ctx: &mut dyn NativeContext,
@@ -752,20 +866,39 @@ fn alloc_channel(
     is_sink: bool,
     id: i32,
 ) -> ObjectRef {
+    // Resolved BEFORE the allocation, so no GC can run between deciding the
+    // base and writing through it.
+    let base = channel_base_for_class(ctx, class_name);
     let cid = ctx
         .ensure_class_initialized(class_name)
         .unwrap_or_else(|_| ClassId::new(0));
-    // 4 fields gives us a couple of spare slots for potential
-    // SelectableChannel state added later — keeps layout forgiving.
-    let obj = ctx.alloc_object(cid, 4);
-    ctx.set_field(obj, PIPE_FIELD_ID, Value::Int(id));
-    ctx.set_field(obj, PIPE_FIELD_OPEN, Value::Int(1));
+    // `base + 4`, not a flat 4: on the real class the four private slots must
+    // sit above `closeLock`/`closed`/`interruptor`/`interruptedTarget`.
+    // `alloc_object` clamps the count UP to the class's declared width, so on
+    // a stub (`base == 0`) this is the historic four-slot object unchanged.
+    let obj = ctx.alloc_object(cid, base + PIPE_CHANNEL_PRIVATE_SLOTS);
+    ctx.set_field(obj, base + PIPE_FIELD_ID, Value::Int(id));
+    ctx.set_field(obj, base + PIPE_FIELD_OPEN, Value::Int(1));
     ctx.set_field(
         obj,
-        PIPE_FIELD_KIND,
+        base + PIPE_FIELD_KIND,
         Value::Int(if is_sink { 1 } else { 0 }),
     );
-    ctx.set_field(obj, 3, Value::Int(1)); // blocking = true
+    ctx.set_field(obj, base + PIPE_FIELD_BLOCKING, Value::Int(1));
+    // …and the REAL field, by name, with the polarity the JDK declares.
+    // `AbstractInterruptibleChannel.isOpen()` is `return !closed`, so a fresh
+    // channel is `closed = false`. This is the write the indexed open flag was
+    // accidentally making with the sign reversed; it is a correct value in the
+    // slot the class actually declares for it, and it is a no-op on any layout
+    // that does not declare the name.
+    //
+    // `closeLock`, `interruptor`, `provider` and `keyLock`/`regLock` are
+    // deliberately NOT written: this crate has no correct value for any of
+    // them (a fresh `java.lang.Object` for `closeLock` would need an
+    // allocation between the writes above, i.e. a GC point over a receiver
+    // held in a bare local), and they read back null either way. NOMINATED
+    // rather than guessed — see G46-1 §5.
+    ctx.set_field_by_name(obj, "closed", Value::Int(0));
     obj
 }
 
@@ -929,7 +1062,8 @@ fn sink_write_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let Some(this) = arg_obj(args, 0) else {
         return Err(io_error("SinkChannel.write: null this"));
     };
-    let id = match ctx.get_field(this, PIPE_FIELD_ID) {
+    let base = channel_private_base(ctx, this);
+    let id = match ctx.get_field(this, base + PIPE_FIELD_ID) {
         Value::Int(v) => v,
         _ => return Err(io_error("SinkChannel.write: missing pipe id")),
     };
@@ -1006,7 +1140,8 @@ fn source_read_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let Some(this) = arg_obj(args, 0) else {
         return Err(io_error("SourceChannel.read: null this"));
     };
-    let id = match ctx.get_field(this, PIPE_FIELD_ID) {
+    let base = channel_private_base(ctx, this);
+    let id = match ctx.get_field(this, base + PIPE_FIELD_ID) {
         Value::Int(v) => v,
         _ => return Err(io_error("SourceChannel.read: missing pipe id")),
     };
@@ -1085,7 +1220,8 @@ fn sink_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let Some(this) = arg_obj(args, 0) else {
         return Err(io_error("SinkChannel.write[bytes]: null this"));
     };
-    let id = match ctx.get_field(this, PIPE_FIELD_ID) {
+    let base = channel_private_base(ctx, this);
+    let id = match ctx.get_field(this, base + PIPE_FIELD_ID) {
         Value::Int(v) => v,
         _ => return Err(io_error("SinkChannel.write[bytes]: missing pipe id")),
     };
@@ -1133,7 +1269,8 @@ fn source_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let Some(this) = arg_obj(args, 0) else {
         return Err(io_error("SourceChannel.read[bytes]: null this"));
     };
-    let id = match ctx.get_field(this, PIPE_FIELD_ID) {
+    let base = channel_private_base(ctx, this);
+    let id = match ctx.get_field(this, base + PIPE_FIELD_ID) {
         Value::Int(v) => v,
         _ => return Err(io_error("SourceChannel.read[bytes]: missing pipe id")),
     };
@@ -1187,8 +1324,9 @@ fn channel_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let Some(this) = arg_obj(args, 0) else {
         return Ok(Some(Value::Int(0)));
     };
-    if ctx.object_num_fields(this) > PIPE_FIELD_OPEN {
-        return Ok(Some(ctx.get_field(this, PIPE_FIELD_OPEN)));
+    let base = channel_private_base(ctx, this);
+    if ctx.object_num_fields(this) > base + PIPE_FIELD_OPEN {
+        return Ok(Some(ctx.get_field(this, base + PIPE_FIELD_OPEN)));
     }
     Ok(Some(Value::Int(1)))
 }
@@ -1197,10 +1335,17 @@ fn channel_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let Some(this) = arg_obj(args, 0) else {
         return Ok(None);
     };
-    if ctx.object_num_fields(this) > PIPE_FIELD_OPEN {
-        ctx.set_field(this, PIPE_FIELD_OPEN, Value::Int(0));
+    let base = channel_private_base(ctx, this);
+    if ctx.object_num_fields(this) > base + PIPE_FIELD_OPEN {
+        ctx.set_field(this, base + PIPE_FIELD_OPEN, Value::Int(0));
     }
-    if let Value::Int(id) = ctx.get_field(this, PIPE_FIELD_ID) {
+    // The real field, by name and with the JDK's polarity —
+    // `AbstractInterruptibleChannel.close()` is `if (!closed) { closed = true;
+    // … }` and `isOpen()` is `return !closed`. Before G46-1 the indexed write
+    // above aliased this very field and set it to FALSE here, so a closed pipe
+    // channel told real bytecode it was open: the `ServerSocket.bound` shape.
+    ctx.set_field_by_name(this, "closed", Value::Int(1));
+    if let Value::Int(id) = ctx.get_field(this, base + PIPE_FIELD_ID) {
         close_pipe_end(id);
     }
     Ok(None)
@@ -1211,9 +1356,20 @@ fn channel_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         return Ok(Some(Value::Object(None)));
     };
     let blocking = arg_int(args, 1);
-    if ctx.object_num_fields(this) > 3 {
-        ctx.set_field(this, 3, Value::Int(blocking));
+    let base = channel_private_base(ctx, this);
+    if ctx.object_num_fields(this) > base + PIPE_FIELD_BLOCKING {
+        ctx.set_field(this, base + PIPE_FIELD_BLOCKING, Value::Int(blocking));
     }
+    // `AbstractSelectableChannel.isBlocking()` is `return !nonBlocking`, so the
+    // real field is the NEGATION of the argument. Same by-name rule as
+    // `closed`: a correct value in the slot the class declares, a no-op on a
+    // layout that does not declare the name. Before G46-1 the indexed write
+    // above landed on `interruptedTarget : Object` and was nulled.
+    ctx.set_field_by_name(
+        this,
+        "nonBlocking",
+        Value::Int(if blocking == 0 { 1 } else { 0 }),
+    );
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1652,5 +1808,212 @@ mod tests {
         let r = read_pipe(read_end.raw, &mut buf).expect("read at EOF");
         assert_eq!(r, 0, "expected EOF");
         close_raw(read_end.raw);
+    }
+
+    // -----------------------------------------------------------------------
+    // G46-1 (2026-08-17) — the private slot map, and the two real fields it
+    // used to alias.
+    //
+    // MEASURED BEFORE, `target-rel3` (`9ae371468`), `--jdk-only`,
+    // `CRATONVM_DBG_COERCION=1`, one `Pipe.open()`: six
+    // `primitive-into-reference` events with `descriptor=L` at the three
+    // `alloc_channel` lines, and `G46PipeProbe` died at the first write with
+    // `java.io.IOException: SinkChannel.write: missing pipe id`.
+    // -----------------------------------------------------------------------
+
+    /// The real JDK 25 transitive instance layout of
+    /// `sun.nio.ch.SourceChannelImpl` / `SinkChannelImpl`, from `javap -p`
+    /// against Adoptium 25.0.3+9 — superclass first, statics excluded.
+    ///
+    /// This is the table the pre-G46 slot map collided with, written down so
+    /// the collision is a property the test can state rather than a fact in a
+    /// comment.
+    const REAL_CHANNEL_LAYOUT: [(&'static str, &'static str); 11] = [
+        ("closeLock", "Ljava/lang/Object;"),
+        ("closed", "Z"),
+        ("interruptor", "Lsun/nio/ch/Interruptible;"),
+        ("interruptedTarget", "Ljava/lang/Object;"),
+        ("provider", "Ljava/nio/channels/spi/SelectorProvider;"),
+        ("keys", "[Ljava/nio/channels/SelectionKey;"),
+        ("keyCount", "I"),
+        ("keyLock", "Ljava/lang/Object;"),
+        ("regLock", "Ljava/lang/Object;"),
+        ("nonBlocking", "Z"),
+        ("sc", "Ljava/nio/channels/SocketChannel;"),
+    ];
+
+    /// The arithmetic half: on the real class the private map starts above
+    /// every declared field, so no private slot can land on a reference the
+    /// class declares — which is the entire defect.
+    ///
+    /// RED against the pre-G46 tree, where the map was the absolute 0..3 this
+    /// test's first assertion now forbids.
+    #[test]
+    fn the_private_slot_map_clears_every_declared_reference_slot() {
+        let base = REAL_CHANNEL_LAYOUT.len();
+        let private = [
+            PIPE_FIELD_ID,
+            PIPE_FIELD_OPEN,
+            PIPE_FIELD_KIND,
+            PIPE_FIELD_BLOCKING,
+        ];
+        assert_eq!(
+            private.len(),
+            PIPE_CHANNEL_PRIVATE_SLOTS,
+            "the width must cover every private slot the allocator writes"
+        );
+        for p in private {
+            let absolute = base + p;
+            assert!(
+                REAL_CHANNEL_LAYOUT.get(absolute).is_none(),
+                "private slot {p} lands on {:?}, which the class declares",
+                REAL_CHANNEL_LAYOUT.get(absolute)
+            );
+        }
+        // And the three that the coercion actually destroyed are reference
+        // slots — the reason a primitive there became null rather than merely
+        // being in the wrong place.
+        for slot in [PIPE_FIELD_ID, PIPE_FIELD_KIND, PIPE_FIELD_BLOCKING] {
+            let (name, desc) = REAL_CHANNEL_LAYOUT[slot];
+            assert!(
+                desc.starts_with('L') || desc.starts_with('['),
+                "{name} was expected to be a reference slot, got {desc}"
+            );
+        }
+        // …and the fourth aliased `closed`, which is the same WIDTH but the
+        // opposite MEANING: `isOpen()` is `!closed`.
+        assert_eq!(REAL_CHANNEL_LAYOUT[PIPE_FIELD_OPEN], ("closed", "Z"));
+    }
+
+    /// A fresh channel must read back `closed = false` on the field the class
+    /// declares, not `true`.
+    ///
+    /// RED against the pre-G46 tree: nothing wrote `closed` by name there, and
+    /// the indexed open flag put `Int(1)` on that very slot — so a brand-new
+    /// pipe channel told real `AbstractInterruptibleChannel.isOpen()` bytecode
+    /// that it was already closed.
+    #[test]
+    fn a_fresh_channel_is_not_closed_on_the_field_the_class_declares() {
+        let mut ctx = MockNativeContext::new();
+        let obj = alloc_channel(&mut ctx, "sun/nio/ch/SourceChannelImpl", false, 41);
+        assert_eq!(
+            ctx.get_field_by_name(obj, "closed"),
+            Value::Int(0),
+            "a fresh channel is open, i.e. closed == false"
+        );
+        let base = channel_private_base(&mut ctx, obj);
+        assert_eq!(ctx.get_field(obj, base + PIPE_FIELD_ID), Value::Int(41));
+        assert_eq!(ctx.get_field(obj, base + PIPE_FIELD_OPEN), Value::Int(1));
+        assert_eq!(ctx.get_field(obj, base + PIPE_FIELD_KIND), Value::Int(0));
+        assert_eq!(
+            ctx.get_field(obj, base + PIPE_FIELD_BLOCKING),
+            Value::Int(1)
+        );
+    }
+
+    /// The other end of the same inversion, and the `ServerSocket.bound` shape
+    /// this record is about: `close()` must set `closed = true`.
+    ///
+    /// RED against the pre-G46 tree, where `channel_close` wrote `Int(0)` at
+    /// the slot the real class declares as `closed` — so closing the channel
+    /// told the JDK it had just become OPEN.
+    #[test]
+    fn closing_a_channel_sets_the_real_closed_field_true() {
+        let (read_end, write_end) = create_anonymous_pipe().expect("pipe");
+        let read_id = register_pipe_end(read_end);
+        let mut ctx = MockNativeContext::new();
+        let obj = alloc_channel(&mut ctx, "sun/nio/ch/SourceChannelImpl", false, read_id);
+        assert_eq!(
+            channel_is_open(&mut ctx, &[Value::Object(Some(obj))]).unwrap(),
+            Some(Value::Int(1))
+        );
+        channel_close(&mut ctx, &[Value::Object(Some(obj))]).expect("close");
+        assert_eq!(
+            ctx.get_field_by_name(obj, "closed"),
+            Value::Int(1),
+            "close() must set closed = true, not false"
+        );
+        assert_eq!(
+            channel_is_open(&mut ctx, &[Value::Object(Some(obj))]).unwrap(),
+            Some(Value::Int(0)),
+            "isOpen() must answer false after close()"
+        );
+        close_raw(write_end.raw);
+    }
+
+    /// `AbstractSelectableChannel.isBlocking()` is `return !nonBlocking`, so
+    /// the real field is the NEGATION of `configureBlocking`'s argument.
+    ///
+    /// RED against the pre-G46 tree, which wrote the argument verbatim at
+    /// absolute slot 3 — `interruptedTarget : Object` — where the coercion
+    /// nulled it, and never touched `nonBlocking` at all.
+    #[test]
+    fn configure_blocking_records_the_negation_on_the_real_field() {
+        let mut ctx = MockNativeContext::new();
+        let obj = alloc_channel(&mut ctx, "sun/nio/ch/SinkChannelImpl", true, 5);
+        channel_configure_blocking(&mut ctx, &[Value::Object(Some(obj)), Value::Int(0)])
+            .expect("configureBlocking(false)");
+        assert_eq!(ctx.get_field_by_name(obj, "nonBlocking"), Value::Int(1));
+        let base = channel_private_base(&mut ctx, obj);
+        assert_eq!(
+            ctx.get_field(obj, base + PIPE_FIELD_BLOCKING),
+            Value::Int(0)
+        );
+
+        channel_configure_blocking(&mut ctx, &[Value::Object(Some(obj)), Value::Int(1)])
+            .expect("configureBlocking(true)");
+        assert_eq!(ctx.get_field_by_name(obj, "nonBlocking"), Value::Int(0));
+        assert_eq!(
+            ctx.get_field(obj, base + PIPE_FIELD_BLOCKING),
+            Value::Int(1)
+        );
+    }
+
+    /// The width guard. A receiver this crate did not allocate — anything too
+    /// narrow for `base + PIPE_CHANNEL_PRIVATE_SLOTS` — must fall back to the
+    /// legacy base rather than index past the object.
+    ///
+    /// This is what keeps the fix from turning a foreign receiver into an
+    /// out-of-range access, and it is also what reconciles the
+    /// `AnonymousObject$4` substitution the allocator's failure arm produces.
+    #[test]
+    fn a_receiver_too_narrow_for_the_private_map_uses_the_legacy_base() {
+        let mut ctx = MockNativeContext::new();
+        let narrow = ctx.alloc_object_with_class(1, "sun/nio/ch/SourceChannelImpl");
+        assert_eq!(channel_private_base(&mut ctx, narrow), 0);
+        // And every accessor must still answer rather than panic or refuse in
+        // a new way: no pipe id at slot 0 is the pre-existing IOException.
+        let r = source_read_buffer(&mut ctx, &[Value::Object(Some(narrow))]);
+        assert!(
+            r.is_err(),
+            "a receiver with no pipe id still raises IOException"
+        );
+    }
+
+    /// Source tripwire: every private access must go through the resolved
+    /// base. Scans only what is ABOVE this test module, because the needles
+    /// appear verbatim in the assertions here.
+    #[test]
+    fn every_private_pipe_slot_access_is_base_relative() {
+        let src = include_str!("pipe.rs")
+            .split("mod tests {")
+            .next()
+            .expect("split always yields a first element");
+        for needle in [
+            "ctx.get_field(this, PIPE_FIELD_ID)",
+            "ctx.set_field(obj, PIPE_FIELD_ID",
+            "ctx.get_field(this, PIPE_FIELD_OPEN)",
+            "ctx.set_field(this, PIPE_FIELD_OPEN",
+        ] {
+            assert!(
+                !src.contains(needle),
+                "`{needle}` indexes the private map from 0, which on the real \
+                 sun.nio.ch.*ChannelImpl layout is closeLock/closed (G46-1)"
+            );
+        }
+        assert!(
+            src.contains("let base = channel_private_base(ctx, this);"),
+            "the accessors must resolve the private base from the receiver"
+        );
     }
 }

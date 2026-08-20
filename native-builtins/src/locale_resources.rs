@@ -444,11 +444,15 @@ type CldrTable = std::sync::Arc<std::collections::BTreeMap<String, CldrValue>>;
 /// `(simple-name, language, country)` → the merged table, or `None` when not a
 /// single candidate class loaded. The `None` is cached too: a miss costs a
 /// `find_resource` probe per candidate and there is no point repeating it.
-fn cldr_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<CldrTable>>> {
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — two acquisition sites, both in
+/// `cldr_table_for`: the hit check, whose innermost body is a bare `return`,
+/// and the store. The `ctx.find_resource` probing that builds the table runs
+/// between them, after the read guard has been dropped.
+fn cldr_cache() -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<CldrTable>>> {
     static INSTANCE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Option<CldrTable>>>,
+        cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<CldrTable>>>,
     > = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    INSTANCE.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The two packages that hold a `LocaleData` base name's CLDR classes: the
@@ -722,6 +726,129 @@ fn arg_locale(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> (String, Stri
         }
         _ => (String::new(), String::new()),
     }
+}
+
+/// A locale display NAME out of the JDK image's own CLDR `LocaleNames` bundles.
+///
+/// `code` is the thing being named — a language subtag (`"tr"`) or a region
+/// subtag (`"US"`) — and `display_*` is the locale to name it IN. CLDR keys
+/// both kinds into one bundle, languages lowercase and regions uppercase, so
+/// one lookup serves `getDisplayLanguage` and `getDisplayCountry` alike.
+///
+/// This is the table H2's `CompareMode.getName` round-trips through: it asks
+/// every collation locale for its ENGLISH display name and matches the answer
+/// against the requested collation. Returning the subtag instead — which is
+/// what the display-name overrides in `locale_bootstrap.rs` used to do, on the
+/// reasoning that any caller "just wants a non-null human-readable string" —
+/// makes `SET COLLATION TURKISH` unresolvable, because nothing in the table
+/// ever answers `TURKISH`.
+pub(crate) fn cldr_locale_display_name(
+    ctx: &mut dyn NativeContext,
+    code: &str,
+    display_lang: &str,
+    display_country: &str,
+) -> Option<String> {
+    if code.is_empty() {
+        return None;
+    }
+    let table = load_cldr_table(
+        ctx,
+        "sun.util.resources.cldr.LocaleNames",
+        display_lang,
+        display_country,
+    )?;
+    match table.get(code) {
+        Some(CldrValue::Str(name)) if !name.is_empty() => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The collation TAILORING for a locale — the rule fragment the JDK's
+/// `CollatorProviderImpl` concatenates onto `CollationRules.DEFAULTRULES`.
+///
+/// This family does NOT live under a `cldr` package, so `load_cldr_table`
+/// cannot reach it: the real classes are `sun/text/resources/ext/CollationData_XX`
+/// (47 of them in a JDK 25 image, `_tr` and `_da` and `_sv` among them). Same
+/// reader, different package, and no ROOT candidate — an absent tailoring means
+/// "the default rules are already right for this locale", which is true for
+/// English and most others, so returning `None` is the correct answer rather
+/// than a fallback.
+///
+/// Without this the synthetic `CollationData` bundle is EMPTY, the provider
+/// reads `""` for its rules, and every locale gets a collator built from the
+/// default rules alone — `Collator.getInstance(new Locale("tr"))` really is a
+/// `java.text.RuleBasedCollator` on this VM, it just is not a Turkish one.
+pub(crate) fn cldr_collation_rule(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    country: &str,
+) -> Option<String> {
+    if lang.is_empty() {
+        return None;
+    }
+    // Cache like `load_cldr_table` does, and for the same reason: the rule
+    // string is read by instantiating the bundle class and walking its
+    // `getContents()` array, which is far too expensive to repeat. A collation
+    // rule is asked for once per `Collator.getInstance`, and callers that build
+    // one per comparison are common.
+    let cache_key = format!("CollationRule|{lang}|{country}");
+    if let Ok(cache) = collation_rule_cache().lock() {
+        if let Some(hit) = cache.get(&cache_key) {
+            return hit.clone();
+        }
+    }
+    let found = cldr_collation_rule_uncached(ctx, lang, country);
+    if let Ok(mut cache) = collation_rule_cache().lock() {
+        cache.insert(cache_key, found.clone());
+    }
+    found
+}
+
+fn collation_rule_cache(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<String, Option<String>>>
+{
+    static INSTANCE: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedMutex<
+            std::collections::HashMap<String, Option<String>>,
+        >,
+    > = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedMutex::new(
+            std::collections::HashMap::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
+}
+
+fn cldr_collation_rule_uncached(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    country: &str,
+) -> Option<String> {
+    // Most specific first: a `_tr_TR` tailoring wins over `_tr`. Unlike the
+    // CLDR chain there is nothing to merge — a bundle either carries the whole
+    // `Rule` for that locale or does not exist.
+    let mut candidates = Vec::new();
+    if !country.is_empty() {
+        candidates.push(format!("sun/text/resources/ext/CollationData_{lang}_{country}"));
+    }
+    candidates.push(format!("sun/text/resources/ext/CollationData_{lang}"));
+    for cand in candidates {
+        if ctx.find_resource(&format!("{cand}.class")).is_none() {
+            continue;
+        }
+        let mut merged: std::collections::BTreeMap<String, CldrValue> =
+            std::collections::BTreeMap::new();
+        if !read_cldr_contents(ctx, &cand, &mut merged) {
+            continue;
+        }
+        if let Some(CldrValue::Str(rule)) = merged.get("Rule") {
+            if !rule.is_empty() {
+                return Some(rule.clone());
+            }
+        }
+    }
+    None
 }
 
 /// The FormatData table for a locale. One name for the base string so the six
@@ -999,6 +1126,16 @@ fn build_bundle(
         {
             let map_now = ctx.read_native_pin(map_pin, map);
             populate_currency_names_en(ctx, map_now);
+        } else if bundle_name.starts_with("sun.text.resources.CollationData")
+            || bundle_name.starts_with("sun.text.resources.ext.CollationData")
+        {
+            // `LocaleResources.getCollationData()` reads exactly one key from
+            // this bundle and hands it to `new RuleBasedCollator(DEFAULTRULES +
+            // rule)`. An empty bundle is not a degraded collator, it is the
+            // wrong language's collator with no way for the caller to tell.
+            if let Some(rule) = cldr_collation_rule(ctx, lang, country) {
+                crate::phases_late::text_intl::put_str(ctx, map_pin, map, "Rule", &rule);
+            }
         }
 
         // W7-80: overlay the JDK image's own CLDR data for the REQUESTED
@@ -3308,14 +3445,32 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // java.text.Normalizer.Form ordinals: NFD=0, NFC=1, NFKD=2, NFKC=3
             // (declaration order in the JDK enum — NOT alphabetical).
             let form_ordinal = normalizer_form_ordinal(ctx, args.get(1));
-            let normalized = match form_ordinal {
-                0 => input.nfd().collect::<String>(),  // NFD
-                1 => input.nfc().collect::<String>(),  // NFC
-                2 => input.nfkd().collect::<String>(), // NFKD
-                3 => input.nfkc().collect::<String>(), // NFKC
-                _ => input,
+            let one = |run: &str| -> String {
+                match form_ordinal {
+                    0 => run.nfd().collect::<String>(),  // NFD
+                    1 => run.nfc().collect::<String>(),  // NFC
+                    2 => run.nfkd().collect::<String>(), // NFKD
+                    3 => run.nfkc().collect::<String>(), // NFKC
+                    _ => run.to_string(),
+                }
             };
-            let s = ctx.create_string(&normalized);
+            // `unicode_normalization` takes `&str`, which cannot hold an
+            // unpaired surrogate, so the whole input used to be decoded and
+            // every lone unit became U+FFFD. MEASURED on both VMs:
+            //
+            //   Normalizer.normalize("a<U+D800>b", NFC)
+            //     HotSpot   61,d800,62      CratonVM   61,fffd,62
+            //
+            // Splitting at each unpaired surrogate is CORRECT rather than
+            // approximate: an unpaired surrogate is an unassigned code point
+            // with combining class 0 that composes with nothing, so it is a
+            // normalization boundary — no composition or reordering can cross
+            // it, and the runs either side normalize independently.
+            //
+            // Input with no unpaired surrogate is a single run, so the common
+            // path is exactly what it was.
+            let out = normalize_units_by_run(&input, one);
+            let s = crate::lang_string::sb_string_from_units(ctx, &out)?;
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -3333,13 +3488,19 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             };
             // Form ordinals: NFD=0, NFC=1, NFKD=2, NFKC=3 (JDK enum order).
             let form_ordinal = normalizer_form_ordinal(ctx, args.get(1));
-            let normalized = match form_ordinal {
-                0 => is_nfd_quick(input.chars()) == IsNormalized::Yes,
-                1 => is_nfc_quick(input.chars()) == IsNormalized::Yes,
-                2 => is_nfkd_quick(input.chars()) == IsNormalized::Yes,
-                3 => is_nfkc_quick(input.chars()) == IsNormalized::Yes,
-                _ => true,
-            };
+            // Run-wise, for the same reason `normalize` is: an unpaired
+            // surrogate is a normalization boundary, and it is itself
+            // normalized under every form (unassigned, combining class 0), so
+            // the answer is "every representable run is normalized".
+            let normalized = normalizer_runs(&input).into_iter().all(|run| {
+                match form_ordinal {
+                    0 => is_nfd_quick(run.chars()) == IsNormalized::Yes,
+                    1 => is_nfc_quick(run.chars()) == IsNormalized::Yes,
+                    2 => is_nfkd_quick(run.chars()) == IsNormalized::Yes,
+                    3 => is_nfkc_quick(run.chars()) == IsNormalized::Yes,
+                    _ => true,
+                }
+            });
             Ok(Some(Value::Int(if normalized { 1 } else { 0 })))
         },
     );
@@ -3357,16 +3518,93 @@ pub fn register(registry: &mut NativeMethodRegistry) {
 /// `ArrayIndexOutOfBoundsException` in `Character.codePointAt` on the
 /// now-empty array. Real `String` is read directly; everything else goes
 /// through its own `toString()`, which every `CharSequence` must provide.
-fn normalizer_read_char_sequence(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
+/// A `CharSequence` argument's raw UTF-16 code units.
+///
+/// Units rather than a `String` because a Rust `str` cannot hold an unpaired
+/// surrogate and this is the reader every `Normalizer` entry point uses; see
+/// the `normalize` registration for the measured rows.
+fn normalizer_read_char_sequence(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<u16> {
     if ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(obj)) {
-        if let Some(s) = ctx.read_string(obj) {
-            return s;
-        }
+        return crate::lang_string::read_string_chars(&*ctx, obj);
     }
     match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
-        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
+        Ok(Some(Value::Object(Some(s)))) => crate::lang_string::read_string_chars(&*ctx, s),
+        _ => Vec::new(),
     }
+}
+
+/// Normalize `units` by applying `one` to each maximal run of representable
+/// text, passing every unpaired surrogate through untouched.
+///
+/// See the `normalize` registration for why an unpaired surrogate is a
+/// normalization boundary and this is exact rather than a best effort. A run
+/// contains no unpaired surrogate by construction, so `from_utf16_lossy` over
+/// it is lossless.
+/// The maximal representable runs of `units`, with every unpaired surrogate
+/// acting as a separator. Shared by `normalize` and `isNormalized` so the two
+/// cannot disagree about where a run ends.
+fn normalizer_runs(units: &[u16]) -> Vec<String> {
+    let mut runs: Vec<String> = Vec::new();
+    let mut run: Vec<u16> = Vec::new();
+    let mut i = 0usize;
+    while i < units.len() {
+        let u = units[i];
+        let high = (0xD800..=0xDBFF).contains(&u);
+        let low = (0xDC00..=0xDFFF).contains(&u);
+        if high && i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
+            run.push(u);
+            run.push(units[i + 1]);
+            i += 2;
+            continue;
+        }
+        if high || low {
+            if !run.is_empty() {
+                runs.push(String::from_utf16_lossy(&run));
+                run.clear();
+            }
+            i += 1;
+            continue;
+        }
+        run.push(u);
+        i += 1;
+    }
+    if !run.is_empty() {
+        runs.push(String::from_utf16_lossy(&run));
+    }
+    runs
+}
+
+fn normalize_units_by_run(units: &[u16], one: impl Fn(&str) -> String) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut run: Vec<u16> = Vec::new();
+    let mut flush = |run: &mut Vec<u16>, out: &mut Vec<u16>| {
+        if !run.is_empty() {
+            out.extend(one(&String::from_utf16_lossy(run)).encode_utf16());
+            run.clear();
+        }
+    };
+    let mut i = 0usize;
+    while i < units.len() {
+        let u = units[i];
+        let high = (0xD800..=0xDBFF).contains(&u);
+        let low = (0xDC00..=0xDFFF).contains(&u);
+        if high && i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
+            run.push(u);
+            run.push(units[i + 1]);
+            i += 2;
+            continue;
+        }
+        if high || low {
+            flush(&mut run, &mut out);
+            out.push(u);
+            i += 1;
+            continue;
+        }
+        run.push(u);
+        i += 1;
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 /// Read a `java.text.Normalizer.Form` enum argument's ordinal (NFC=0, NFD=1,

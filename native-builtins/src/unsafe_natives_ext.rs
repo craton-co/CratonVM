@@ -4160,13 +4160,41 @@ mod unsafe_arena {
     pub(super) struct ArenaStore {
         inner: RwLock<BTreeMap<i64, Arena>>,
         next_addr: Mutex<i64>,
+        /// Blocks whose REAL pointer has been handed to native code, and how
+        /// many times. See [`ArenaStore::real_ptr`].
+        ///
+        /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Every acquisition
+        /// is a single statement over a `BTreeMap<i64, u64>` with no
+        /// `NativeContext` in scope.
+        ///
+        /// It is safely `Scratch` only BECAUSE the enclosing lock is
+        /// unordered: `real_ptr` holds `inner.write()` across this
+        /// acquisition. Same caveat the JFR tables carry — if `inner` is ever
+        /// given a level it must be a HIGHER one than this, never an equal.
+        translated: cratonvm_types::lock_order::OrderedPlMutex<BTreeMap<i64, u64>>,
     }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Real pointers handed to native code — see [`ArenaStore::real_ptr`].
+    pub(super) static TRANSLATIONS: AtomicU64 = AtomicU64::new(0);
+    /// Reallocations of a block whose real pointer was already handed out.
+    ///
+    /// **`Vec::resize` may MOVE the buffer**, so every pointer handed out before
+    /// this call is now dangling and points at memory the process allocator has
+    /// taken back. Nonzero here means native code is holding at least one such
+    /// pointer.
+    pub(super) static STALE_ON_REALLOC: AtomicU64 = AtomicU64::new(0);
+    /// Frees of a block whose real pointer was already handed out. Same hazard:
+    /// the `Vec` is dropped and its memory returned to the allocator.
+    pub(super) static STALE_ON_FREE: AtomicU64 = AtomicU64::new(0);
 
     impl ArenaStore {
         fn new() -> Self {
             Self {
                 inner: RwLock::new(BTreeMap::new()),
                 next_addr: Mutex::new(ARENA_BASE),
+                translated: cratonvm_types::lock_order::OrderedPlMutex::new(BTreeMap::new(), cratonvm_types::lock_order::LockLevel::Scratch),
             }
         }
 
@@ -4186,7 +4214,23 @@ mod unsafe_arena {
             addr
         }
 
+        #[cfg(test)]
+        pub(super) fn block_is_translated(&self, addr: i64) -> bool {
+            self.translated.lock().contains_key(&addr)
+        }
+
         pub(super) fn reallocate(&self, addr: i64, new_size: usize) -> i64 {
+            // BEFORE the resize, which is what may move the buffer.
+            if let Some(n) = self.translated.lock().get(&addr).copied() {
+                STALE_ON_REALLOC.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "cratonvm::unsafe_arena",
+                    handle = format!("{addr:#x}"),
+                    translations = n,
+                    new_size,
+                    "Unsafe-arena block is being RESIZED while native code holds a                      real pointer into it -- `Vec::resize` may move the buffer,                      after which that pointer names memory the allocator has                      reclaimed"
+                );
+            }
             let mut inner = self.inner.write();
             let old = inner.remove(&addr);
             let mut bytes = old.map(|a| a.bytes).unwrap_or_default();
@@ -4196,6 +4240,15 @@ mod unsafe_arena {
         }
 
         pub(super) fn free(&self, addr: i64) {
+            if let Some(n) = self.translated.lock().remove(&addr) {
+                STALE_ON_FREE.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "cratonvm::unsafe_arena",
+                    handle = format!("{addr:#x}"),
+                    translations = n,
+                    "Unsafe-arena block is being FREED while native code holds a                      real pointer into it -- the `Vec` is dropped and its memory                      returned to the process allocator"
+                );
+            }
             self.inner.write().remove(&addr);
         }
 
@@ -4362,6 +4415,14 @@ mod unsafe_arena {
             // SAFETY: `locate` established `offset < arena.bytes.len()`, so the
             // offset is in bounds of the block's own allocation.
             let ptr = unsafe { arena.bytes.as_mut_ptr().add(offset) };
+            // A RAW POINTER INTO A `Vec<u8>` IS NOW IN NATIVE HANDS, and both
+            // call sites (`jni_long_arg_bits`, `direct_buffer_native_address`)
+            // discard `remaining` -- so the callee has a pointer and no bound.
+            // Record the block so `reallocate`/`free` can say whether anyone was
+            // still holding one when the buffer moved or died. See
+            // `unsafe_arena_translation_stats`.
+            TRANSLATIONS.fetch_add(1, Ordering::Relaxed);
+            *self.translated.lock().entry(base).or_insert(0) += 1;
             Some((ptr, remaining))
         }
 
@@ -4513,6 +4574,52 @@ pub fn unsafe_arena_real_ptr(addr: i64) -> Option<(*mut u8, usize)> {
     unsafe_arena::store().real_ptr(addr)
 }
 
+/// `(translations, stale_on_realloc, stale_on_free)` — the lifetime audit for
+/// real pointers handed out of the Unsafe arena.
+///
+/// # Why this exists
+///
+/// `unsafe_arena_real_ptr` is the one place the arena's backing store is exposed
+/// rather than copied, and it has two production callers, both in `jni.rs`:
+/// `jni_long_arg_bits` (a tagged handle arriving as a JNI `jlong` argument —
+/// netty-tcnative's `SSL.bioWrite(long bio, long address, int len)` is the named
+/// case) and `direct_buffer_native_address`. **Both discard the `remaining`
+/// bound**, so the callee receives a bare pointer into a `Vec<u8>` with no
+/// length, and nothing checks what it writes.
+///
+/// Two ways that becomes a write into unrelated memory:
+///
+/// * the callee writes past the block — nothing bounds it;
+/// * the block is `reallocate`d or `free`d while the pointer is outstanding.
+///   `reallocate` is `Vec::resize`, which may MOVE the buffer; `free` drops it.
+///   Either way the pointer then names memory the process allocator has taken
+///   back.
+///
+/// `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` is looking for a
+/// writer that puts an **8-byte arena-pointer-shaped value onto a live object's
+/// header**, and has eliminated every managed store path, the allocator, the
+/// slide and `copy_to_native_memory`. This path was not in that table: its last
+/// row is a write *through* a tagged handle, which `ArenaStore::copy_in` bounds
+/// into the block's own `Vec` and which therefore cannot reach the Java heap at
+/// all. The hazard is the mirror image — the handle being TRANSLATED and the
+/// bound dropped.
+///
+/// **Nonzero `stale_on_*` means the mechanism is live on this workload.** Zero
+/// does not clear the path, because the unbounded-write half leaves no trace
+/// here.
+#[cfg(test)]
+pub(crate) fn unsafe_arena_block_is_translated(addr: i64) -> bool {
+    unsafe_arena::store().block_is_translated(addr)
+}
+
+pub fn unsafe_arena_translation_stats() -> (u64, u64, u64) {
+    (
+        unsafe_arena::TRANSLATIONS.load(std::sync::atomic::Ordering::Relaxed),
+        unsafe_arena::STALE_ON_REALLOC.load(std::sync::atomic::Ordering::Relaxed),
+        unsafe_arena::STALE_ON_FREE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Copy bytes out of the Unsafe arena (arena → `out`). Returns false if the
 /// range isn't fully inside one live arena block. See [`unsafe_arena_contains`].
 pub fn unsafe_arena_copy_out(addr: i64, out: &mut [u8]) -> bool {
@@ -4636,7 +4743,12 @@ pub(crate) fn native_unsafe_object_field_offset1(
     let resolved_cid: Option<cratonvm_types::ClassId> = ctx
         .class_id_from_mirror(class_mirror)
         .or_else(|| match ctx.get_field(class_mirror, 0) {
-            Value::Int(cid) => Some(cratonvm_types::ClassId::new(cid as u32)),
+            // `cid >= 0` matters: a PRIMITIVE mirror carries `Int(-1)` in slot 0
+            // as its marker, and without this guard that decodes to
+            // `ClassId(0xFFFF_FFFF)` — a plausible-looking id for a class that
+            // does not exist. `mirror_class_id` in lang_class.rs has always had
+            // the guard; this copy did not.
+            Value::Int(cid) if cid >= 0 => Some(cratonvm_types::ClassId::new(cid as u32)),
             _ => None,
         });
     if let Some(class_id) = resolved_cid {
@@ -4944,6 +5056,72 @@ pub(crate) fn native_unsafe_compare_and_exchange_reference(
 #[cfg(test)]
 mod unsafe_arena_real_ptr_tests {
     use super::*;
+
+    /// **A block resized or freed while native code holds its real pointer is
+    /// reported.**
+    ///
+    /// This is the hazard `unsafe_arena_translation_stats` exists for, and it can
+    /// only be asserted on bookkeeping: the dangling pointer is in a native
+    /// library's hands, the write happens outside this process's Rust code, and
+    /// by the time anything notices, the evidence is an unrelated object's
+    /// corrupted header a collection later. That is the trail
+    /// `zgc-rewrite-pass-walks-off-a-reference-array-20260815.md` follows
+    /// backwards.
+    ///
+    /// # Asserted PER BLOCK, not on the counters
+    ///
+    /// The counters and the arena store are process-global and cargo runs tests
+    /// in parallel threads, so a sibling test translating or freeing its own
+    /// block moves them between any baseline and any assertion. The first
+    /// version of this asserted exact counter deltas, passed alone, and failed in
+    /// the full suite -- the ordinary shape of a global-state test, and worth the
+    /// note. Per-block queries are race-free.
+    #[test]
+    fn resizing_or_freeing_a_translated_block_is_reported() {
+        // A block nobody has translated must NOT be recorded -- a detector that
+        // fires on every free names nothing.
+        let quiet = unsafe_arena_allocate(64);
+        assert!(
+            !unsafe_arena_block_is_translated(quiet),
+            "an untranslated block must not be recorded"
+        );
+        unsafe_arena_reallocate(quiet, 128);
+        assert!(
+            !unsafe_arena_block_is_translated(quiet),
+            "and resizing it must not make it recorded"
+        );
+        unsafe_arena_free(quiet);
+
+        // Handing the pointer out records it, and the bound EXISTS here -- both
+        // production callers drop it, which is the defect this instruments.
+        let held = unsafe_arena_allocate(64);
+        let (_p, remaining) = unsafe_arena_real_ptr(held).expect("live handle translates");
+        assert_eq!(remaining, 64, "the bound exists at the source");
+        assert!(
+            unsafe_arena_block_is_translated(held),
+            "handing a real pointer to native code must be recorded -- otherwise              `reallocate` cannot tell that it is about to move a buffer somebody              is holding"
+        );
+
+        // Resizing it is the hazard: `Vec::resize` may move the buffer.
+        let (_t, r_before, _f) = unsafe_arena_translation_stats();
+        unsafe_arena_reallocate(held, 4096);
+        let (_t2, r_after, _f2) = unsafe_arena_translation_stats();
+        assert!(
+            r_after > r_before,
+            "resizing a block whose real pointer is outstanding must be reported"
+        );
+
+        // Freeing clears the record, so a recycled handle does not inherit it.
+        let doomed = unsafe_arena_allocate(64);
+        let _ = unsafe_arena_real_ptr(doomed).expect("translates");
+        unsafe_arena_free(doomed);
+        assert!(
+            !unsafe_arena_block_is_translated(doomed),
+            "the record must be dropped with the block, or a later handle at the              same address inherits a warning that is not about it"
+        );
+
+        unsafe_arena_free(held);
+    }
 
     #[test]
     fn a_live_handle_translates_to_a_pointer_that_aliases_the_arena() {

@@ -151,7 +151,7 @@ pub use bytecode_compat::*;
 // declared visibility, so nothing here became more public than it was.
 mod licm;
 pub use licm::*;
-mod stack_kinds;
+pub(crate) mod stack_kinds;
 // ---------------------------------------------------------------------------
 // HIGH-1 / Fix 1 — null-check elimination helper
 // ---------------------------------------------------------------------------
@@ -207,6 +207,17 @@ pub use driver::*;
 mod loop_rewrite;
 pub use loop_rewrite::*;
 mod bytecode_walk;
+/// Test-only view of the E27-1 N2b compile-time needle screen.
+///
+/// The screen decides which `String.indexOf(int)` sites the backend will
+/// inline, and it is the reason N2b is not a deopt cliff — so it is worth a
+/// test, and a test needs a way in. See
+/// `bytecode_walk::prev_insn_int_const` for the reasoning.
+#[doc(hidden)]
+pub fn prev_insn_int_const_for_test(code: &[u8], code_len: usize, pc: usize) -> Option<i32> {
+    bytecode_walk::prev_insn_int_const(code, code_len, pc)
+}
+
 mod inlining;
 mod objects;
 mod arrays;
@@ -383,6 +394,23 @@ struct Compiler {
     /// This method uses frame-preserving exception exits for handlers that
     /// read non-parameter locals (RBC.6 precise-handler continuation).
     precise_exception_frames: bool,
+    /// The inlined-splice scope stack — one entry per splice currently being
+    /// emitted, outermost first.
+    ///
+    /// `docs/jit/deopt-frame-state-interning.md` §5.1 named this as the
+    /// remaining producer edit for the single-pass backend: "it needs one
+    /// pushed at the splice and popped at the callee's return". Each entry is
+    /// the CALLER's frame captured at the invoke — a `FrameState` whose `bci`
+    /// names the call in progress and whose operand stack has already had the
+    /// callee's arguments removed, which is what
+    /// `ResumeSemantics::for_caller_scope()` (`RESUME`) means and what the VM's
+    /// `caller_resume_pc` requires.
+    ///
+    /// Empty on every compile that splices nothing, so `inline_caller_chain`
+    /// answers `None` and the published metadata is byte-identical to what it
+    /// was before this existed.
+    pub(super) inline_scope_stack: Vec<crate::deopt::FrameState>,
+
     /// `[start_pc, end_pc)` ranges covered by this method's exception table.
     /// Empty when the method has no handlers. Consulted only by
     /// [`Compiler::pc_is_protected`]; see `PROTECTED_RANGES_REQUEST`.
@@ -475,7 +503,7 @@ struct Compiler {
     /// Frame offset of the first XMM save slot (from RBP).
     xmm_saved_base: i32,
     /// Resolved multianewarray metadata: (bytecode_pc, leaf_element_type_code).
-    multianewarray_info: Vec<(usize, u8)>,
+    multianewarray_info: Vec<(usize, i64)>,
     /// Resolved field access metadata: (bytecode_pc, field_index, type_tag).
     /// type_tag is b'I', b'J', b'F', b'D', b'L', or b'['.
     field_info: Vec<(usize, usize, u8)>,
@@ -706,7 +734,7 @@ struct Compiler {
     /// constant-pool tag the resolver already read; without it `x64::stack_kinds`
     /// answered `Unknown` for every numeric `ldc`, the snapshot recorded
     /// `Unsupported`, and `osr_exit_policy` then refused OSR entry for the whole
-    /// artifact. See `osr-refused-for-a-loop-inline-in-main-20260810`.
+    /// artifact. See `osr-refused-for-a-loop-inline-in-main-FIXED-20260818`.
     ldc_fp_pcs: FxHashSet<usize>,
     /// Runtime helper function pointers for JIT callbacks.
     helpers: JitRuntimeHelpers,
@@ -889,7 +917,16 @@ struct Compiler {
     /// the pre-OSR-entry frame, silently re-executing every loop iteration
     /// the OSR-compiled code already committed
     /// (`fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`).
+    /// (`regalloc::live_locals_per_pc_all`) — `local_liveness[pc *
+    /// local_liveness_words + w]` covers slots `[w*64, w*64+64)`. Read through
+    /// [`Compiler::local_live_at`], never directly: a method with more than 64
+    /// locals has more than one word per pc, and indexing this by `pc` alone
+    /// silently reads window 0 of the wrong instruction.
     local_liveness: Vec<u64>,
+    /// Words per pc in [`Self::local_liveness`] — `ceil(num_locals / 64)`, and
+    /// `1` for the overwhelming majority of methods. Zero while the vector is
+    /// empty (the ungated compile), which `local_live_at` reads as "no answer".
+    local_liveness_words: usize,
     /// Parallel coverage bitmap for [`Self::local_liveness`]: `false` at a pc
     /// no basic block covers, where the liveness answer is the `0` default
     /// ("nothing live") rather than a computed result. Treating that as "every
@@ -1572,6 +1609,59 @@ mod deopt_snapshot_tests {
         assert_eq!(kinds[7], LocalKind::Unknown);
     }
 
+    /// A method with MORE THAN 64 LOCALS gets NO oop mask at all — and
+    /// `classify_local_kinds` is what covers for it.
+    ///
+    /// `compute_local_oop_masks` returns empty vectors for `max_locals > 64`, so
+    /// `build_and_record_deopt_point`'s `is_oop` reads false for EVERY local in
+    /// such a method (slot 0 included, not just the ones above 63). The only
+    /// thing that then publishes a reference local as a reference rather than as
+    /// a truncating `StackSlot` is the `LocalKind::Ref` arm — and that is sound
+    /// exactly because this classifier is a per-slot `Vec`, with no bitset and
+    /// no cap.
+    ///
+    /// Both halves are asserted together on purpose. Either one alone reads as a
+    /// property of a helper; together they are the invariant a reader of that
+    /// call site needs, and the pairing is what fails if someone "optimises"
+    /// `classify_local_kinds` into a `u64` to match its neighbours.
+    ///
+    /// Witnessed end-to-end by `probes/HighLocalOopProbe.java` (84 locals,
+    /// references at slots 74/75/76, OSR-entered, 100 forced collections):
+    /// `oop_reached=false oop_mask=0x0` while those three slots published
+    /// `StackSlotRef`. Its `probes/LowLocalOopProbe.java` twin, identical but
+    /// under 64 locals, reports `oop_reached=true oop_mask=0x700000e`.
+    #[test]
+    fn classify_local_kinds_types_a_reference_above_slot_63() {
+        // wide astore 74; wide aload 74; wide istore 70; return
+        let code = [
+            0xc4, 0x3a, 0x00, 0x4a, // wide astore 74 -> Ref@74
+            0xc4, 0x19, 0x00, 0x4a, // wide aload  74 -> Ref@74
+            0xc4, 0x36, 0x00, 0x46, // wide istore 70 -> Int@70
+            0xb1, // return
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 84);
+        assert_eq!(
+            kinds[74],
+            LocalKind::Ref,
+            "a reference local above slot 63 must still be classified Ref — it is the              ONLY thing that publishes it as a reference in a >64-local method, because              `compute_local_oop_masks` gives that method no mask at all"
+        );
+        assert_eq!(kinds[70], LocalKind::Int);
+        assert_eq!(kinds[83], LocalKind::Unknown);
+
+        // The other half of the invariant: the mask really is absent, so there
+        // is no second opinion to fall back on.
+        let (masks, reached) = crate::x64::licm::compute_local_oop_masks(&code, code.len(), 84, 0);
+        assert!(
+            masks.is_empty() && reached.is_empty(),
+            "compute_local_oop_masks must answer NOTHING above 64 locals; if it ever              starts answering, the deopt snapshot's `is_oop` gains a second source and              this test's premise needs rewriting rather than deleting"
+        );
+
+        // And the same method one local smaller DOES get a mask, so the cliff is
+        // the local count and not something about `wide` encodings.
+        let (masks64, reached64) = crate::x64::licm::compute_local_oop_masks(&code, code.len(), 64, 0);
+        assert!(!masks64.is_empty() && !reached64.is_empty());
+    }
+
     /// The `RowDataType.read` shape: slot 1 is an `int` in one arm of a branch
     /// and a `ref` in the other, so the whole-method classifier must call it
     /// `Ambiguous` — but at a pc only the `istore` arm reaches, the refinement
@@ -1876,7 +1966,7 @@ impl Compiler {
         num_params: usize,
         max_stack: usize,
         needs_heap: bool,
-        multianewarray_info: Vec<(usize, u8)>,
+        multianewarray_info: Vec<(usize, i64)>,
         field_info: Vec<(usize, usize, u8)>,
         typecheck_info: Vec<(usize, *const u8, usize)>,
         static_field_info: Vec<(usize, u32, usize, u8, bool)>,
@@ -2289,6 +2379,7 @@ impl Compiler {
             emitted_athrow: false,
             emitted_monitor_call: false,
             precise_exception_frames,
+            inline_scope_stack: Vec::new(),
             protected_ranges,
             // Installed after construction by `compile_with_param_slots`, and
             // only when it decided to compile rewritten bytecode.
@@ -2377,6 +2468,7 @@ impl Compiler {
             local_kinds: Vec::new(),
             local_kinds_refined: AmbiguousLocalKinds::default(),
             local_liveness: Vec::new(),
+            local_liveness_words: 0,
             local_liveness_covered: Vec::new(),
             exception_ranges_dbg_len: 0,
             uses_long_float_double: false,

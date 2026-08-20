@@ -209,6 +209,169 @@ pub(super) fn stw_takeover_should_scan(rounds: u32, jit_hint: bool) -> bool {
     }
 }
 
+/// Raised for the duration of a [`stw_publish_frame_traces`] pause; read by
+/// `safepoint_check` on the arriving side.
+///
+/// Process-global rather than per-thread because the request is scoped to one
+/// stop-the-world, and only one of those runs at a time — a second requester
+/// finds `request_stw` already taken and gives up. A per-thread flag would buy
+/// nothing and cost a registry lookup at every safepoint park.
+static FRAME_TRACE_WANTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Is a cross-thread stack dump in flight? See [`stw_publish_frame_traces`].
+#[inline]
+pub(crate) fn frame_trace_wanted() -> bool {
+    FRAME_TRACE_WANTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Take a stop-the-world pause whose only purpose is to make every mutator
+/// publish its live call stack into `JvmThread::frame_trace`, so a cross-thread
+/// `Thread.getStackTrace()` / `Thread.dumpThreads()` can read where the target
+/// thread ACTUALLY is.
+///
+/// # Why a safepoint is needed at all
+///
+/// `frame_trace` is deposited at the blocking deposit points, which is exactly
+/// right for a parked thread and says nothing about a running one. A thread that
+/// has never blocked has published nothing (cross-thread `getStackTrace()`
+/// returned a zero-length array — measured against HotSpot on a spin loop:
+/// HotSpot named the running method on every one of ~840 samples, this VM
+/// returned `<empty>` on 1471 of 1495 and the real method on none), and a thread
+/// that HAS blocked publishes where it blocked last, which is worse than
+/// nothing: it is a confident wrong answer. Another thread cannot walk a running
+/// thread's frames from outside — `JvmThread::frames` is owned by its own
+/// thread — so the only way to get a truthful stack is to ask that thread to
+/// publish one at a point where it is not mid-instruction. That is what a
+/// safepoint is.
+///
+/// This is HotSpot's answer too; it uses a per-thread handshake rather than a
+/// global pause, which is cheaper but needs a per-thread poll word this VM's
+/// JIT does not emit (`emit_safepoint_poll` tests exactly one byte, the GC
+/// barrier's `stw_requested`, and widening that test costs every back-edge in
+/// every compiled method). Reusing the existing pause keeps the change off the
+/// hot path entirely, at the cost of making a thread dump as expensive as a GC
+/// pause. Callers should skip it when the target is parked — see
+/// `NativeContextImpl::thread_stack_trace`, which does.
+///
+/// Returns `false` when no pause was taken (another STW already owns the
+/// world); the caller then reads whatever was last deposited, i.e. the
+/// behaviour that predates this function.
+pub(crate) fn stw_publish_frame_traces(shared: &SharedVm, initiator: crate::ThreadId) -> bool {
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    // Raised BEFORE the request, and lowered by `Drop` on every path out.
+    //
+    // A guard rather than two `store(false)` calls because the failure mode of
+    // missing one is silent and permanent: the flag left raised makes EVERY
+    // safepoint park — i.e. every mutator on every GC pause, forever after —
+    // capture and allocate a frame trace nobody asked for. That is a cost with
+    // no symptom, which is the kind this codebase keeps finding late.
+    struct WantedGuard;
+    impl Drop for WantedGuard {
+        fn drop(&mut self) {
+            FRAME_TRACE_WANTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // Before the request, not after: a mutator that reaches its poll in between
+    // would otherwise park without publishing, and this pause gets no second
+    // chance to ask it.
+    FRAME_TRACE_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _wanted = WantedGuard;
+
+    let stw_taken = shared
+        .mem
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(initiator, || {
+            let (n, blocked, tids, blocked_tids) = shared
+                .threads
+                .thread_registry
+                .alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
+            (
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
+            )
+        });
+    if !stw_taken {
+        return false;
+    }
+    // `stw_take_over_and_wait`, not the plain `wait_for_all()`: a peer spinning
+    // in compiled code that never reaches a poll is FROZEN and scanned in place
+    // rather than waited on forever. Such a peer never runs `safepoint_check`
+    // and so publishes nothing — its trace stays as last deposited, which is
+    // the pre-existing answer and never worse than it.
+    let mut xt_roots: Vec<ObjectRef> = Vec::new();
+    let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+    // Nothing to do in the pause itself: the work is what the ARRIVING threads
+    // did on their way in. Nothing moves, so there is no pointer map.
+    crate::jit::xt_root_scan::resume(taken);
+    shared
+        .mem
+        .gc_barrier
+        .complete_gc(cratonvm_types::PointerMap::default());
+    true
+}
+
+#[cfg(test)]
+mod frame_trace_request_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The request flag must read `false` when nobody is dumping.
+    ///
+    /// This is the whole cost argument for gating the publish in
+    /// `safepoint_check`: raised, every mutator captures and allocates a frame
+    /// trace on every GC pause. A flag that latched on would not fail any test
+    /// — it would just quietly make every pause more expensive — so assert the
+    /// resting state explicitly.
+    #[test]
+    fn the_request_flag_rests_low() {
+        assert!(
+            !frame_trace_wanted(),
+            "FRAME_TRACE_WANTED must rest low; raised, every safepoint park pays \
+             for a frame-trace capture nobody asked for"
+        );
+    }
+
+    /// And it must come back down when the pause ends — including the path
+    /// where no pause was taken.
+    ///
+    /// `stw_publish_frame_traces` needs a live `SharedVm` and cannot run here,
+    /// so this exercises the guard that owns the discipline rather than the
+    /// function around it. Breaking `Drop` (or replacing the guard with a
+    /// hand-written `store(false)` that an early `return` can skip) fails this.
+    #[test]
+    fn the_request_guard_lowers_the_flag_on_every_path() {
+        struct WantedGuard;
+        impl Drop for WantedGuard {
+            fn drop(&mut self) {
+                FRAME_TRACE_WANTED.store(false, Ordering::Relaxed);
+            }
+        }
+        fn take(early_out: bool) -> bool {
+            FRAME_TRACE_WANTED.store(true, Ordering::Relaxed);
+            let _wanted = WantedGuard;
+            if early_out {
+                return false;
+            }
+            true
+        }
+        for early_out in [true, false] {
+            let raised_during = {
+                FRAME_TRACE_WANTED.store(true, Ordering::Relaxed);
+                frame_trace_wanted()
+            };
+            assert!(raised_during, "the flag must be observable while raised");
+            let _ = take(early_out);
+            assert!(
+                !frame_trace_wanted(),
+                "the flag stayed raised after the early_out={early_out} path"
+            );
+        }
+    }
+}
+
 pub(super) fn stw_take_over_and_wait(
     shared: &SharedVm,
     xt_roots: &mut Vec<ObjectRef>,
@@ -817,6 +980,20 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
 
+    // ZGC: open a CONCURRENT mark cycle once allocation crosses the start
+    // threshold, so the transitive closure is traced with the mutators
+    // running instead of inside the collection pause. Checked before
+    // `needs_gc` because the two are mutually exclusive by construction:
+    // `should_start_concurrent_mark` refuses at or above the collection
+    // threshold, where a cycle would get no concurrent phase at all.
+    //
+    // Costs one `match` and two relaxed loads per allocation that reaches
+    // here, and exactly that on the other two backends (their arm is a
+    // compile-time `false`).
+    if shared.mem.heap.zgc_should_start_concurrent_mark() {
+        zgc_concurrent_mark_cycle(shared, thread);
+    }
+
     if shared.mem.heap.needs_gc()
         || shared
             .mem
@@ -1195,6 +1372,16 @@ pub(super) fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) ->
 
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
     maybe_gc_forced(shared, thread);
+}
+
+/// `zgc_concurrent_mark_cycle` for the JIT allocation helpers.
+///
+/// Same reason `maybe_gc_forced_pub` exists: `vm/src/jit/helpers.rs` is a
+/// sibling module and the cycle opener is `pub(super)`. See
+/// `jit_maybe_start_zgc_concurrent_mark` for why the JIT needs its own call
+/// site at all -- a fully compiled allocation loop reaches `maybe_gc` never.
+pub fn zgc_concurrent_mark_cycle_pub(shared: &SharedVm, thread: &mut JvmThread) {
+    zgc_concurrent_mark_cycle(shared, thread);
 }
 
 /// Allocate a dynamically-produced `java.lang.String` under the SAME
@@ -2354,6 +2541,38 @@ pub(super) fn process_references_after_gc(
         }
     };
 
+    // THE IDENTITY STAMP -- the exact test the two shape guards above
+    // approximate. See `ReferenceProcessor::identity_stamps`: a shape guard
+    // cannot tell a reclaimed `Reference` whose address was re-issued to
+    // ANOTHER `Reference` from the entry it recorded, and H2 allocates a
+    // `CloseWatcher` (a `PhantomReference`) per connection, so that case is the
+    // common one rather than the exotic one. The stamp is the identity hash the
+    // object carried at `discover_reference` time; it lives in the object's own
+    // mark word and travels with it across a relocation.
+    //
+    // `pre_gc_addr` is the key the processor's table is still on at this point
+    // (`update_after_gc` runs at the very end of this function), `obj` is the
+    // post-relocation object the write would land on.
+    //
+    // Both `0` cases mean "cannot tell" and fall through to the shape guards
+    // rather than declining: an unstamped entry (every in-tree test constructs
+    // those) and a thin-locked object, whose hash is displaced out of the mark
+    // word, must not lose their reference processing.
+    //
+    // Snapshotted rather than read through `ref_proc`: the loops below drain
+    // the processor (`take_newly_cleared`, `remove_collected`), so a live
+    // borrow of it here would not compile.
+    let identity_stamps = ref_proc.identity_stamps_snapshot();
+    let identity_matches = |pre_gc_addr: usize, obj: ObjectRef| -> bool {
+        match identity_stamps.get(&pre_gc_addr) {
+            Some(&stamp) if stamp != 0 => {
+                let now = shared.mem.heap.identity_hash_code(obj);
+                now == 0 || now == stamp
+            }
+            _ => true,
+        }
+    };
+
     // Null referent field (field 0) on cleared weak/soft references.
     // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
     // `cleared_ref_objects()` re-emitted every ever-cleared Reference on
@@ -2410,6 +2629,15 @@ pub(super) fn process_references_after_gc(
         if !is_reference_shaped(obj_ref) {
             if straystack_enabled() {
                 eprintln!("[refproc] SKIP reshaped CLEARED ref @0x{actual_addr:x} (not a Reference)");
+            }
+            continue;
+        }
+        // Shape-clean but a DIFFERENT `Reference` -- see `identity_matches`.
+        if !identity_matches(ref_addr, obj_ref) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP reidentified CLEARED ref @0x{actual_addr:x} (identity stamp mismatch)"
+                );
             }
             continue;
         }
@@ -2485,6 +2713,19 @@ pub(super) fn process_references_after_gc(
             if straystack_enabled() {
                 eprintln!(
                     "[refproc] SKIP reshaped ENQUEUE ref @0x{actual_ref:x} into q@0x{actual_q:x} (not Reference/ReferenceQueue)"
+                );
+            }
+            continue;
+        }
+        // The loop that published a re-issued object as a queue head: a
+        // same-class re-issue is shape-clean here, and linking one into a queue
+        // hands it to `ReferenceQueue.poll()` as if it were the reference that
+        // died. Only the Reference is stamped -- a `ReferenceQueue` is not
+        // discovered through this registry, so it has no stamp to check.
+        if !identity_matches(*ref_addr, ref_obj) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP reidentified ENQUEUE ref @0x{actual_ref:x} into q@0x{actual_q:x} (identity stamp mismatch)"
                 );
             }
             continue;
@@ -2672,6 +2913,18 @@ pub(super) fn process_references_after_gc(
                 }
                 continue;
             }
+            // This pass writes an OBJECT into slot 0, not a null, so a
+            // shape-clean re-issue here installs an unrelated reference in a
+            // live object's first field -- the `java.lang.String` receiver
+            // shape the H2 `TestMultiThread` MVStore-writer report opens with.
+            if !identity_matches(ref_obj_old, ro) {
+                if straystack_enabled() {
+                    eprintln!(
+                        "[refproc] SKIP reidentified weak/phantom RESTORE ref @0x{ref_obj_new:x} (identity stamp mismatch)"
+                    );
+                }
+                continue;
+            }
             // Slot 0 = REF_FIELD_REFERENT. `set_field` fires the write barrier,
             // so a young referent restored into a promoted (old-gen) Reference
             // re-marks the old→young card.
@@ -2754,24 +3007,131 @@ pub(super) fn gc_alloc_object(
         shared.register_finalizable(obj.as_ptr() as usize); // Cast: GC object pointer to address
     }
 
-    // Initialize primitive-typed instance fields to their JVM default values.
-    // Zero-initialized memory reads as Object(None) due to Rust enum layout,
-    // which is correct for reference fields (null). But int/long/float/double
-    // fields need explicit initialization to Int(0)/Long(0)/Float(0.0)/Double(0.0).
+    // Write the JVM default (JVMS §2.3 / §4.12.5) into EVERY instance field --
+    // reference fields included. Zero-initialized memory does not read back as
+    // any of those defaults: after `Value::Object` gained its `NonNull` niche
+    // the all-zero 16-byte slot decodes as `Int(0)`, so `null` has to be
+    // written just as `Int(0)`/`Long(0)`/`Float(0.0)`/`Double(0.0)` do.
+    // (The function keeps its historical name; see its doc comment.)
     init_primitive_fields(shared, obj, class_id);
 
     Ok(obj)
 }
 
-/// Initialize primitive-typed instance fields to their JVM default values.
+/// The JVM default value (JVMS §2.3 table, §4.12.5) for a field whose
+/// descriptor starts with `desc_first`.
 ///
-/// Zero-initialized heap memory decodes as `Object(None)` via `std::ptr::read::<Value>()`.
-/// This is correct for reference-typed fields (default null per JVM spec §2.3), but
-/// int/boolean/byte/char/short fields must be `Int(0)`, long fields `Long(0)`,
-/// float fields `Float(0.0)`, and double fields `Double(0.0)`.
+/// Total, by construction: an unrecognised or malformed byte answers `null`,
+/// which is the same fall-open
+/// `cratonvm_gc::heap::default_value_for_descriptor` +
+/// `alloc_object_with_descriptors` take together
+/// (`.unwrap_or(Value::Object(None))`), so the two allocation entry points
+/// cannot disagree about a broken descriptor.
 ///
-/// We walk the class hierarchy to find all primitive instance fields and write
-/// the proper typed zero value to their heap slots.
+/// Split out of [`init_primitive_fields`]' hot loop so the mapping is
+/// testable without a `SharedVm` and a populated class store, and so the
+/// JIT's byte-for-byte duplicate of that loop
+/// (`vm/src/jit/helpers.rs::jit_init_primitive_fields`) can be collapsed onto
+/// one table — see `G56-1` NOMINATION 1. `#[inline]`, so the split costs the
+/// allocation path nothing.
+#[inline]
+pub fn jvm_default_for_descriptor(desc_first: u8) -> Value {
+    match desc_first {
+        b'I' | b'B' | b'C' | b'S' | b'Z' => Value::Int(0),
+        b'J' => Value::Long(0),
+        b'F' => Value::Float(0.0),
+        b'D' => Value::Double(0.0),
+        // Reference (`L`), array (`[`), and every malformed or unrecognised
+        // descriptor byte: null, WRITTEN. See `init_primitive_fields` for why
+        // this cannot be left to the allocator's zero fill.
+        _ => Value::Object(None),
+    }
+}
+
+/// Write the JVM default value (JVMS §2.3, §4.12.5) into every *instance*
+/// field of a freshly allocated object: `Int(0)` for `I B C S Z`, `Long(0)`
+/// for `J`, `Float(0.0)` for `F`, `Double(0.0)` for `D`, and
+/// **`Object(None)` for `L`/`[` and for any descriptor byte this match does
+/// not recognise**.
+///
+/// The name is historical — it predates the reference arm and is spelled at
+/// eleven call sites outside this file, so renaming it is a wider edit than
+/// the fix deserves. Read it as `init_default_fields`.
+///
+/// # Why the reference arm is a WRITE and not a skip (G56-1)
+///
+/// Until 2026-08-17 the `L`/`[` arm was `_ => None` carrying the comment
+/// *"Reference types: already `Object(None)` from zero memory"*. That premise
+/// was true when it was written and has been false since `Value::Object`
+/// gained its `NonNull` niche. `Value` is `#[repr(u32)]` with `Int = 0` and
+/// `Object = 4` (`types/src/value.rs`), so:
+///
+/// | slot bytes | decodes as |
+/// |---|---|
+/// | all zero | `Value::Int(0)` — tag word 0 |
+/// | tag word 4, payload64 0 | `Value::Object(None)` |
+///
+/// `gen_heap::read_slot` says the same thing in its own doc: *"there is no
+/// 'zeroed slot reads as null' shortcut"*. So a `null` default cannot be
+/// obtained from the allocator's zero fill; the tag word has to be stored.
+/// This is not an optimisation that was skipped, it is the one write that
+/// makes the slot mean what the class declares.
+///
+/// MEASURED, `target-rel4` (`cb2ade4fd`), `--jdk-only`,
+/// `CRATONVM_DBG_COERCION=1`, 16 vectors: **1,105 of 1,120** descriptor-
+/// coercion events were `primitive-into-reference`/`read`/`L`|`[`/`Int(0)`,
+/// i.e. the first descriptor-aware read of a reference field this loop had
+/// left as raw zero. Two clusters that were opened as suspected defects —
+/// `ReferenceQueue.head` (736) and `Properties.defaults` (243) — are that
+/// shape and nothing else (`G49-1`).
+///
+/// # Every reader already agrees on the answer, which is why this is safe
+///
+/// SOURCE-VERIFIED, all four readers of a never-written reference slot:
+///
+/// * the interpreter's own `getfield` (`opcodes.rs`) carries a local fixup,
+///   `Value::Int(0) | Value::Long(0) => value = Value::Object(None)`, for
+///   exactly this slot shape; an `Object(None)` falls through its `_ => {}`;
+/// * the JIT's inline `getfield` (`jit/src/x64/bytecode_walk.rs`) loads the
+///   8-byte payload at `FIELD_CELL_PAYLOAD64_OFFSET` and never looks at the
+///   tag — zero either way;
+/// * the descriptor-aware pair (`heap::coerce_field_value_for_slot`) turns
+///   `Int(0)` at an `L` slot into `Object(None)` *and reports the loss*;
+///   handed an `Object(None)` it passes it through silently;
+/// * `values_equal_for_cas` (`vm_exec.rs`) equates `Object(None)` and
+///   `Int(0)` in **both** directions, so no CAS loop changes outcome.
+///
+/// The collector agrees too: `gen_heap::for_each_ref_slot`'s legacy arm
+/// matches `Value::Object(Some(_))`, which neither shape satisfies.
+///
+/// So the write changes no answer anywhere — it removes a mis-tagged
+/// intermediate state that four separate readers were each repairing
+/// locally, and with it 98.7% of the G30 instrument's population.
+///
+/// # Cost
+///
+/// One extra `VmHeap::set_field` per reference instance field per object.
+/// This lane may not build and so cannot measure the after-cost; the bound is
+/// stated instead. The added store is the *cheapest* store this function
+/// makes: `write_barrier` returns on its first tag test for anything that is
+/// not `Object(Some(_))` (`gen_heap.rs`), there is no SATB pre-barrier on
+/// this path, the class-manager read lock is held once for the whole walk,
+/// and the object body was bump-allocated microseconds earlier so it is
+/// L1-resident. MEASURED (static, `javap -p -s` over the 494 classes
+/// `RJdkHello --jdk-only` loads): instance fields split 361 primitive /
+/// 613 reference, so the store count rises by ~1.7x on that mix. The
+/// *cheaper* option — filling the object body with the `Object(None)`
+/// pattern in the allocator instead of zeroing it — is a `gc/` change and is
+/// nominated in `G56-1`, not taken here.
+///
+/// # Callers
+///
+/// Every one of the eleven call sites (`gc_and_alloc.rs`, `vm_exec.rs` ×8,
+/// `vm_init.rs` ×2) invokes this immediately after `alloc_object` /
+/// `try_alloc_object_full` on an object nothing has written yet. That is now
+/// load-bearing: called on a *populated* object this would null every
+/// reference field. It was harmless before only because the reference arm
+/// did nothing.
 pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassId) {
     let cm = shared.classes.class_manager.read();
     let store = &cm.class_store;
@@ -2784,16 +3144,10 @@ pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassI
                     continue;
                 }
                 let desc_first = f.descriptor.as_bytes().first().copied().unwrap_or(b'L');
-                let default = match desc_first {
-                    b'I' | b'B' | b'C' | b'S' | b'Z' => Some(Value::Int(0)),
-                    b'J' => Some(Value::Long(0)),
-                    b'F' => Some(Value::Float(0.0)),
-                    b'D' => Some(Value::Double(0.0)),
-                    _ => None, // Reference types: already Object(None) from zero memory
-                };
-                if let Some(val) = default {
-                    shared.mem.heap.set_field(obj, inst_idx, val);
-                }
+                shared
+                    .mem
+                    .heap
+                    .set_field(obj, inst_idx, jvm_default_for_descriptor(desc_first));
                 inst_idx += 1;
             }
             cid = class.superclass;
@@ -3427,6 +3781,89 @@ pub(super) fn tlab_alloc_shaped_inner(
     None
 }
 
+/// Per-class tally of TLAB allocations that produced a LEGACY header while a
+/// matching compact layout was registered.
+///
+/// The blind spot this closes: `plan_object_alloc`'s `[compact-legacy]` census
+/// reports every legacy allocation **that goes through the planner**, and this
+/// path does not go through the planner. A class could therefore allocate
+/// legacy on the hottest path in the program and be entirely absent from the
+/// only report that names legacy allocations — which is exactly what happened
+/// to `org/bouncycastle/crypto/digests/SHA256Digest`, 100% of `jit_getfield`'s
+/// receivers on Generational and nowhere in the census. See
+/// known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+///
+/// Sixteen slots, linear scan, first-come, and only touched under
+/// `CRATONVM_DBG_COMPACT_LEGACY`: the registry lookup it performs is far too
+/// expensive for the allocation fast path in a measured configuration.
+static TLAB_LEGACY_CLASSES: [(
+    std::sync::atomic::AtomicU32,
+    std::sync::atomic::AtomicU64,
+    std::sync::OnceLock<String>,
+); 16] = [
+    const {
+        (
+            std::sync::atomic::AtomicU32::new(u32::MAX),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::OnceLock::new(),
+        )
+    };
+    16
+];
+
+/// `(description, class id, count)` for every class this path allocated legacy.
+pub fn tlab_legacy_object_classes() -> Vec<(String, u32, u64)> {
+    use std::sync::atomic::Ordering;
+    TLAB_LEGACY_CLASSES
+        .iter()
+        .filter_map(|(cid, count, name)| {
+            let cid = cid.load(Ordering::Relaxed);
+            if cid == u32::MAX {
+                return None;
+            }
+            Some((
+                name.get().cloned().unwrap_or_else(|| "<unnamed>".to_string()),
+                cid,
+                count.load(Ordering::Relaxed),
+            ))
+        })
+        .collect()
+}
+
+/// Record that this TLAB allocation of `class_id` produced a legacy header.
+/// Names the class and whether a compact layout existed for its field count —
+/// "a layout was registered and we ignored it" and "no layout exists" are
+/// different problems and the census must not conflate them.
+#[cold]
+#[inline(never)]
+fn note_tlab_legacy_object(class_id: ClassId, num_fields: usize) {
+    use std::sync::atomic::Ordering;
+    let cid = class_id.as_u32();
+    for (slot_cid, count, name) in TLAB_LEGACY_CLASSES.iter() {
+        let cur = slot_cid.load(Ordering::Relaxed);
+        if cur == cid {
+            count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if cur == u32::MAX
+            && slot_cid
+                .compare_exchange(u32::MAX, cid, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let registered = cratonvm_types::class_layout(cid).map(|l| l.field_count());
+            let matches = registered == Some(num_fields);
+            let _ = name.set(format!(
+                "{} num_fields={num_fields} registered_layout_fields={registered:?}                  compact_layout_was_available={matches}",
+                cratonvm_gc::gc::resolve_class_info(cid)
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| "<unresolved>".to_string()),
+            ));
+            count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
 /// Initialize an object header at the given pointer.
 ///
 /// H1: `identity_hash_code` is now eagerly assigned at allocation time
@@ -3455,6 +3892,15 @@ pub(super) fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: us
     );
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+    // Every header this function writes is LEGACY — `array_length = 0`, no
+    // `GC_FLAG_COMPACT` — regardless of whether the class has a registered
+    // compact layout, because this path never consults `plan_object_alloc`.
+    // That is a deliberate property of the fast path and not a defect on its
+    // own; what WAS a defect is that nothing reported it. See
+    // `note_tlab_legacy_object`.
+    if cratonvm_types::flags().gc.dbg_compact_legacy {
+        note_tlab_legacy_object(class_id, num_fields);
+    }
     // A2 breadcrumb (CRATONVM_DBG_A2): the interpreter TLAB fast path bypasses
     // gen_heap, so record the legacy-layout object header it writes here.
     cratonvm_gc::a2dbg::record(
@@ -4527,6 +4973,26 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
             let snap = thread.root_snapshot.lock().clone();
             deposit_gap_diff(thread, &snap, "publish");
         }
+        // Publish this thread's LIVE call stack, when — and only when — some
+        // other thread is at this moment taking a cross-thread
+        // `Thread.getStackTrace()` / `dumpThreads()` (see
+        // [`stw_publish_frame_traces`]).
+        //
+        // `frame_trace` is otherwise written at the BLOCKING deposit points
+        // only, which is the right place for a parked thread (it shows the
+        // blocking call site) and useless for a running one: a thread that has
+        // never blocked publishes nothing, and one that has publishes where it
+        // blocked LAST. That is what made cross-thread `getStackTrace()` return
+        // an empty array for any thread actually executing Java code.
+        //
+        // Gated on the request flag rather than unconditional: this runs inside
+        // every safepoint park, i.e. on every mutator on every GC pause, and the
+        // capture allocates a `Vec` per thread. A thread dump is rare; a GC
+        // pause is not. Unset, this is one relaxed load.
+        if frame_trace_wanted() {
+            let trace = crate::runtime::stackwalker::capture_frames_no_lines(&thread.frames);
+            *thread.frame_trace.lock() = trace;
+        }
 
         // Arrive at barrier and wait for GC to complete. Census-aware (auto):
         // a genuine safepoint arrival is normally counted, but if this pause's
@@ -4613,6 +5079,8 @@ pub(crate) fn apply_pointer_map_to_thread(
             pointer_map.len()
         );
     }
+    // See `JvmThread::last_heal_collection`.
+    thread.last_heal_collection = heap.collection_count();
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);
@@ -4642,12 +5110,39 @@ pub(crate) fn apply_pointer_map_to_thread(
     }
     // DIAGNOSTIC-ONLY (cceres3): mirror of the wake-time WAKE-STALE verifier;
     // catches a frame slot left stale right after a safepoint-arrival remap.
+    //
+    // THE PREDICATE IS THE POINTER MAP, NOT THE FORWARDING WORD (2026-08-17).
+    // `debug_forwarded_target` reads a forwarding word at the old address, and
+    // ZGC's slide leaves none — `compact_low_to` zeroes what it vacated and the
+    // memmove overwrites the rest — so on the DEFAULT collector this verifier
+    // reported zero whatever the truth was, which is how it stayed silent while
+    // the H2 MVStore-writer residual reproduced under it. `pointer_map` is the
+    // authoritative record of this collection's moves and is right here in
+    // hand.
+    //
+    // This is also the only EXACT place to ask the question. Every address-keyed
+    // instrument outside the pause cannot tell an old reference to the moved
+    // object from a new reference to whatever the allocator has since put at
+    // that address; here, the remap has just run and no mutator on this thread
+    // has resumed, so a frame slot holding a map KEY is unambiguously a slot the
+    // remap did not reach.
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        // A source address this slide also wrote a SURVIVOR to is not evidence:
+        // survivors slide down into the space vacated objects left, so a slot
+        // legitimately holding that survivor names an address that is also a
+        // map key. Excluding destinations is what separates "the remap missed
+        // this slot" from "this slot holds the object that moved INTO the
+        // address" — the same distinction that made the first vacated-frames
+        // instrument report eight findings a run that were all correct code.
+        let destinations: rustc_hash::FxHashSet<usize> = pointer_map.values().copied().collect();
         for (fi, fr) in thread.frames.iter().enumerate() {
             for li in 0..fr.locals_len() {
                 if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = heap.debug_forwarded_target(a) {
+                    if destinations.contains(&a) {
+                        continue;
+                    }
+                    if let Some(new) = pointer_map.get(&a).copied() {
                         eprintln!(
                             "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -4659,7 +5154,10 @@ pub(crate) fn apply_pointer_map_to_thread(
             for si in 0..fr.stack.len() {
                 if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = heap.debug_forwarded_target(a) {
+                    if destinations.contains(&a) {
+                        continue;
+                    }
+                    if let Some(new) = pointer_map.get(&a).copied() {
                         eprintln!(
                             "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -5141,6 +5639,100 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 // ---------------------------------------------------------------------------
 // G1 concurrent marking cycle
 // ---------------------------------------------------------------------------
+
+/// Phase 1 of a ZGC concurrent cycle: **mark start**, at a brief STW pause.
+///
+/// Opens the cycle and returns. The transitive closure is then traced by
+/// `ZMarkCoordinator`'s worker threads while every mutator in this VM runs;
+/// the cycle is closed inside the next `collect_garbage`, which replays the
+/// SATB ingress, re-scans the roots, and only then sweeps.
+///
+/// # Why this is shaped exactly like `g1_concurrent_mark_cycle`
+///
+/// Because the constraint is the VM's, not the collector's: a stop-the-world
+/// pause in this VM can only be initiated by a thread that is in the thread
+/// registry, holds a `JvmThread`, and can drive `stw_take_over_and_wait` for
+/// in-JIT peers. A GC background thread is none of those. So the two phase
+/// boundaries a concurrent collector needs — mark start and mark end — are
+/// both taken by mutators, and the collector's own threads do only the part
+/// that needs no safepoint: the tracing.
+///
+/// The open-coded `request → takeover-wait → work → complete` (rather than
+/// `brief_stw_counted_with_live_blocked`) is INT-3's residual fix, copied
+/// deliberately: that helper's internal plain `wait_for_all()` stalls forever
+/// on a peer spinning in compiled code, and its root set covers such a peer
+/// only through a STALE deposit snapshot. A missed root here is an object the
+/// concurrent phase never traces.
+///
+/// Mark-only pause: nothing moves, so there is no pointer map, no pin set and
+/// no root rewrite — the frozen peers' conservative roots are simply extra
+/// mark roots.
+pub(super) fn zgc_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
+    let mut counted_os_tids: Vec<u32> = Vec::new();
+    let stw_taken = shared
+        .mem
+        .gc_barrier
+        .request_stw_counted_with_live_blocked(thread.thread_id, || {
+            let (n, blocked, tids, blocked_tids) = shared
+                .threads
+                .thread_registry
+                .alive_count_blocked_and_os_tids();
+            counted_os_tids = tids;
+            (
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
+            )
+        });
+    if !stw_taken {
+        // Another STW is in progress. Nothing has been done, so there is
+        // nothing to unwind: the next allocation re-tests the threshold and
+        // re-opens the cycle. If that other STW is a collection, the threshold
+        // will have dropped and the cycle correctly does not open.
+        return;
+    }
+    {
+        let mut xt_roots: Vec<ObjectRef> = Vec::new();
+        let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
+
+        // SAFETY: `stw_take_over_and_wait` above has parked every other mutator
+        // at a safepoint (or forcibly stopped and conservatively scanned it),
+        // and `taken` is still held, so this thread is the only mutator for the
+        // whole block below.
+        let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
+
+        let roots =
+            cratonvm_gc::gc_quiescence::with_class_unload_marking(|| collect_roots(shared, thread));
+        let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
+        let all_roots: Vec<ObjectRef> = roots
+            .into_iter()
+            .chain(snapshot_roots.into_iter())
+            // INT-3 — frozen in-JIT peers' conservative register/stack roots.
+            .chain(xt_roots.into_iter())
+            .collect();
+
+        let opened = shared
+            .mem
+            .heap
+            .zgc_start_concurrent_mark(&stw, &all_roots);
+
+        // Clear TLAB skip regions + resume frozen peers BEFORE reopening the
+        // world — same race rationale as `maybe_gc`'s epilogue.
+        shared.mem.heap.clear_jit_tlab_skip_regions();
+        crate::jit::xt_root_scan::resume(taken);
+        shared
+            .mem
+            .gc_barrier
+            .complete_gc(cratonvm_types::PointerMap::default());
+
+        if opened {
+            tracing::debug!(
+                "[ZGC] concurrent mark started: {} roots seeded",
+                all_roots.len()
+            );
+        }
+    }
+}
 
 /// Execute a full G1 concurrent marking cycle:
 /// 1. Initial Mark (brief STW) — mark roots, activate SATB
@@ -5820,4 +6412,205 @@ pub(super) fn run_cleaner_actions_forced(shared: &SharedVm, thread: &mut JvmThre
         None
     });
     run_cleaner_actions_impl(shared, thread, true);
+}
+
+#[cfg(test)]
+mod default_field_init_tests {
+    //! G56-1 — the premise `init_primitive_fields` used to rest on, and the
+    //! behaviours the new reference arm must not move.
+    //!
+    //! The heap tests pin `GcAlgorithm::Generational` deliberately, exactly as
+    //! `root_snapshot_screen_tests` does and for a related reason: the claim
+    //! under test is about the LEGACY 16-byte `Value` cell's decode rule, which
+    //! is a property of `gen_heap::read_slot`. Whether ZGC's and G1's own slot
+    //! encodings answer the same way is a real and separate question, and this
+    //! fixture cannot ask it.
+
+    use super::*;
+    use crate::config::{GcAlgorithm, VmConfig};
+    use crate::vm::SharedVm;
+    use cratonvm_types::ClassId;
+
+    fn generational_vm() -> SharedVm {
+        SharedVm::new(VmConfig {
+            gc_algorithm: GcAlgorithm::Generational,
+            ..VmConfig::default()
+        })
+    }
+
+    /// The JVMS §2.3 default table, spelled out. Byte for byte, so a future
+    /// edit that (say) folds `Z` in with `J` is red here and not in a vector.
+    #[test]
+    fn every_jvm_field_descriptor_gets_its_spec_default() {
+        for b in [b'I', b'B', b'C', b'S', b'Z'] {
+            assert_eq!(
+                jvm_default_for_descriptor(b),
+                Value::Int(0),
+                "the int family (JVMS 2.3.1) all live in Value::Int"
+            );
+        }
+        assert_eq!(jvm_default_for_descriptor(b'J'), Value::Long(0));
+        assert_eq!(jvm_default_for_descriptor(b'F'), Value::Float(0.0));
+        assert_eq!(jvm_default_for_descriptor(b'D'), Value::Double(0.0));
+        // The arm this record exists for. Before 2026-08-17 both of these
+        // answered "no write needed" and the slot kept its raw zero.
+        assert_eq!(
+            jvm_default_for_descriptor(b'L'),
+            Value::Object(None),
+            "a reference field's default is null, and null has to be WRITTEN"
+        );
+        assert_eq!(
+            jvm_default_for_descriptor(b'['),
+            Value::Object(None),
+            "an array field is a reference field"
+        );
+    }
+
+    /// The whole byte space, against the `gc` crate's own table.
+    ///
+    /// `alloc_object_with_descriptors` is the other allocation entry point that
+    /// writes defaults, and it composes `heap::default_value_for_descriptor(b)`
+    /// with `.unwrap_or(Value::Object(None))`. If the two ever disagree, an
+    /// object's field defaults depend on which allocator ran — the class of
+    /// divergence this record was opened to close. Sweeping all 256 bytes also
+    /// covers the malformed-descriptor fall-open, which
+    /// `f.descriptor.as_bytes().first()` can genuinely produce.
+    #[test]
+    fn the_two_allocation_entry_points_agree_on_all_256_descriptor_bytes() {
+        for b in 0u8..=255 {
+            let theirs =
+                cratonvm_gc::heap::default_value_for_descriptor(b).unwrap_or(Value::Object(None));
+            assert_eq!(
+                jvm_default_for_descriptor(b),
+                theirs,
+                "descriptor byte {b:#04x}: init_primitive_fields and \
+                 alloc_object_with_descriptors must not disagree"
+            );
+        }
+    }
+
+    /// The expired premise, asserted directly.
+    ///
+    /// The comment this record removes said reference slots were "already
+    /// Object(None) from zero memory". `Value` is `#[repr(u32)]` with `Int = 0`
+    /// and `Object = 4`, so the all-zero cell decodes as `Int(0)`. If the first
+    /// assertion below ever fails in the direction of null, the niche was
+    /// reverted and the reference write becomes redundant rather than
+    /// load-bearing — which is worth being told.
+    #[test]
+    fn zero_memory_does_not_decode_as_null_which_is_why_the_write_exists() {
+        let shared = generational_vm();
+        let heap = &shared.mem.heap;
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+
+        assert_eq!(
+            heap.get_field(obj, 0),
+            Value::Int(0),
+            "a freshly allocated, never-written slot reads as Int(0) -- the \
+             R-niche decode rule (gen_heap::read_slot), and the entire reason \
+             1,105 of 1,120 instrument events existed"
+        );
+        assert_ne!(
+            heap.get_field(obj, 0),
+            Value::Object(None),
+            "if this ever passes, the zero-bits-are-null shortcut is back"
+        );
+
+        heap.set_field(obj, 0, Value::Object(None));
+        assert_eq!(
+            heap.get_field(obj, 0),
+            Value::Object(None),
+            "and an EXPLICIT null is a different bit pattern that reads back as \
+             null -- so the two states are distinguishable, and writing one is \
+             not a no-op"
+        );
+    }
+
+    /// ...and the fix changes no answer, which is why it is safe.
+    ///
+    /// The descriptor-aware read is the one that was reporting the loss. Both
+    /// slot shapes answer `Object(None)` through it; only one of them fires the
+    /// G30 instrument on the way. That is the whole delta: signal, not
+    /// behaviour.
+    #[test]
+    fn a_raw_zero_and_an_explicit_null_read_identically_through_the_descriptor() {
+        let shared = generational_vm();
+        let heap = &shared.mem.heap;
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+
+        // slot 0: left as the allocator produced it (the BEFORE state).
+        // slot 1: written the way init_primitive_fields now writes it (AFTER).
+        heap.set_field(obj, 1, Value::Object(None));
+
+        for (slot, what) in [(0usize, "raw zero"), (1usize, "explicit null")] {
+            for desc in [b'L', b'['] {
+                assert_eq!(
+                    heap.get_field_as(obj, slot, desc),
+                    Value::Object(None),
+                    "{what} at a '{}' slot must read as null either way",
+                    desc as char,
+                );
+            }
+        }
+    }
+
+    /// `HashMap.table` must still degrade to null.
+    ///
+    /// Pinned in `gc/src/heap.rs` by
+    /// `the_hashmap_table_degrade_to_null_is_pinned` against the test-only
+    /// `Heap`; this is the same three values through the LIVE `VmHeap`
+    /// dispatch, so the guarantee is also asserted on the path a running VM
+    /// takes. `HashMap.resize()` reads `(oldTab == null) ? 0 : oldTab.length`,
+    /// so refusing or boxing the store breaks resize outright.
+    #[test]
+    fn the_hashmap_table_degrade_to_null_still_holds_through_vmheap() {
+        let shared = generational_vm();
+        let heap = &shared.mem.heap;
+        let map = heap.alloc_object(ClassId::new(0), 3);
+
+        for capacity in [Value::Int(16), Value::Int(1), Value::Long(64)] {
+            heap.set_field_as(map, 2, capacity, b'[');
+            assert_eq!(
+                heap.get_field(map, 2),
+                Value::Object(None),
+                "a capacity written at an array-descriptor slot must degrade to \
+                 null; {capacity:?} did not"
+            );
+            assert_eq!(heap.get_field_as(map, 2, b'['), Value::Object(None));
+        }
+    }
+
+    /// The `Int(1)` enqueued sentinel must survive default-initialisation.
+    ///
+    /// `Reference.isEnqueued` was just repaired to accept BOTH the synthetic
+    /// `Int(1)` sentinel and a live `ReferenceQueue.ENQUEUED` object (G49-1
+    /// §4). The GC's auto-enqueue in this file writes that sentinel through the
+    /// RAW setter, and default-initialisation now writes `Object(None)` into
+    /// the same slot — earlier, at allocation. This pins the ordering: the
+    /// sentinel is written second and wins, and a reference that was never
+    /// enqueued reads as null rather than as the sentinel.
+    #[test]
+    fn the_enqueued_int_sentinel_outlives_the_default_null_written_at_alloc() {
+        let shared = generational_vm();
+        let heap = &shared.mem.heap;
+        let reference = heap.alloc_object(ClassId::new(0), 3);
+
+        // What init_primitive_fields now does for `queue : LReferenceQueue;`.
+        heap.set_field(reference, 1, jvm_default_for_descriptor(b'L'));
+        assert_ne!(
+            heap.get_field(reference, 1),
+            Value::Int(1),
+            "a never-enqueued reference must not read as enqueued"
+        );
+
+        // What the post-GC auto-enqueue above does.
+        heap.set_field(reference, 1, Value::Int(1));
+        assert_eq!(
+            heap.get_field(reference, 1),
+            Value::Int(1),
+            "the raw sentinel write must still win over the allocation-time \
+             default -- un-fixing isEnqueued's synthetic arm is the failure \
+             this guards"
+        );
+    }
 }

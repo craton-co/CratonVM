@@ -1,0 +1,75 @@
+# jdk-baseline	2
+# kind	class
+# name	sun.management.ManagementFactoryHelper
+# module	java.management
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.management/sun/management/ManagementFactoryHelper.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	22
+# protected-methods	0
+# declared-methods	32
+# declared-fields	23
+# rows	59
+# columns	kind	name	descriptor	flags
+CLASS	sun.management.ManagementFactoryHelper		public
+EXTENDS	java.lang.Object		
+SUPERTYPE	java.lang.Object		
+METHOD	<clinit>	()V	static
+METHOD	<init>	()V	private
+METHOD	addMBean	(Ljavax/management/MBeanServer;Ljava/lang/Object;Ljava/lang/String;)V	private,static
+METHOD	createBufferPoolMXBean	(Ljdk/internal/misc/VM$BufferPool;)Ljava/lang/management/BufferPoolMXBean;	private,static
+METHOD	createGarbageCollector	(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/management/GarbageCollectorMXBean;	private,static
+METHOD	createMemoryManager	(Ljava/lang/String;)Ljava/lang/management/MemoryManagerMXBean;	private,static
+METHOD	createMemoryPool	(Ljava/lang/String;ZJJ)Ljava/lang/management/MemoryPoolMXBean;	private,static
+METHOD	getAllMemoryPoolNames	()[Ljava/lang/String;	public,static
+METHOD	getBufferPoolMXBeans	()Ljava/util/List;	public,static
+METHOD	getClassLoadingMXBean	()Ljava/lang/management/ClassLoadingMXBean;	public,static,synchronized
+METHOD	getCompilationMXBean	()Ljava/lang/management/CompilationMXBean;	public,static,synchronized
+METHOD	getGarbageCollectorMXBeans	()Ljava/util/List;	public,static
+METHOD	getHotspotClassLoadingMBean	()Lsun/management/HotspotClassLoadingMBean;	public,static,synchronized
+METHOD	getHotspotCompilationMBean	()Lsun/management/HotspotCompilationMBean;	public,static,synchronized
+METHOD	getHotspotMemoryMBean	()Lsun/management/HotspotMemoryMBean;	public,static,synchronized
+METHOD	getHotspotRuntimeMBean	()Lsun/management/HotspotRuntimeMBean;	public,static,synchronized
+METHOD	getHotspotThreadMBean	()Lsun/management/HotspotThreadMBean;	public,static,synchronized
+METHOD	getMemoryMXBean	()Ljava/lang/management/MemoryMXBean;	public,static,synchronized
+METHOD	getMemoryManagerMXBeans	()Ljava/util/List;	public,static
+METHOD	getMemoryPoolMXBeans	()Ljava/util/List;	public,static
+METHOD	getOperatingSystemMXBean	()Ljava/lang/management/OperatingSystemMXBean;	public,static,synchronized
+METHOD	getPlatformLoggingMXBean	()Ljava/lang/management/PlatformLoggingMXBean;	public,static
+METHOD	getRuntimeMXBean	()Ljava/lang/management/RuntimeMXBean;	public,static,synchronized
+METHOD	getThreadMXBean	()Ljava/lang/management/ThreadMXBean;	public,static,synchronized
+METHOD	getVMManagement	()Lsun/management/VMManagement;	public,static
+METHOD	isPlatformLoggingMXBeanAvailable	()Z	public,static
+METHOD	isThreadRunningNative	(I)Z	public,static
+METHOD	isThreadSuspended	(I)Z	public,static
+METHOD	lambda$getAllMemoryPoolNames$0	(I)[Ljava/lang/String;	private,static,synthetic
+METHOD	registerInternalMBeans	(Ljavax/management/MBeanServer;)V	static
+METHOD	toThreadState	(I)Ljava/lang/Thread$State;	public,static
+METHOD	unregisterInternalMBeans	(Ljavax/management/MBeanServer;)V	static
+METHOD	unregisterMBean	(Ljavax/management/MBeanServer;Ljava/lang/String;)V	private,static
+FIELD	BUFFER_POOL_MXBEAN_NAME	Ljava/lang/String;	private,static,final
+FIELD	HOTSPOT_CLASS_LOADING_MBEAN_NAME	Ljava/lang/String;	private,static,final
+FIELD	HOTSPOT_COMPILATION_MBEAN_NAME	Ljava/lang/String;	private,static,final
+FIELD	HOTSPOT_MEMORY_MBEAN_NAME	Ljava/lang/String;	private,static,final
+FIELD	HOTSPOT_RUNTIME_MBEAN_NAME	Ljava/lang/String;	private,static,final
+FIELD	HOTSPOT_THREAD_MBEAN_NAME	Ljava/lang/String;	private,static,final
+FIELD	JMM_THREAD_STATE_FLAG_MASK	I	private,static,final
+FIELD	JMM_THREAD_STATE_FLAG_NATIVE	I	private,static,final
+FIELD	JMM_THREAD_STATE_FLAG_SUSPENDED	I	private,static,final
+FIELD	LOGGING_MXBEAN_NAME	Ljava/lang/String;	static,final
+FIELD	bufferPools	Ljava/util/List;	private,static,volatile
+FIELD	classMBean	Lsun/management/ClassLoadingImpl;	private,static
+FIELD	compileMBean	Lsun/management/CompilationImpl;	private,static
+FIELD	hsClassMBean	Lsun/management/HotspotClassLoading;	private,static
+FIELD	hsCompileMBean	Lsun/management/HotspotCompilation;	private,static
+FIELD	hsMemoryMBean	Lsun/management/HotspotMemory;	private,static
+FIELD	hsRuntimeMBean	Lsun/management/HotspotRuntime;	private,static
+FIELD	hsThreadMBean	Lsun/management/HotspotThread;	private,static
+FIELD	jvm	Lsun/management/VMManagement;	private,static,final
+FIELD	memoryMBean	Lsun/management/MemoryImpl;	private,static
+FIELD	osMBean	Lsun/management/BaseOperatingSystemImpl;	private,static
+FIELD	runtimeMBean	Lsun/management/RuntimeImpl;	private,static
+FIELD	threadMBean	Lsun/management/ThreadImpl;	private,static

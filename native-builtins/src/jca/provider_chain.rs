@@ -36,6 +36,14 @@
 //! `getVersion()` D-typed return path keeps working; `getVersionStr()`
 //! formats it as `"<int(version)>"` to match JDK 25's HotSpot output
 //! (`"25"` not `"25.0"`).
+//!
+//! **That table describes the SYNTHETIC layout only, and since G43-1 it is
+//! only written when the receiver actually has it.** On a real image
+//! `java.security.Provider extends java.util.Properties extends
+//! java.util.Hashtable`, so slots 0/1/2 are the inherited `table` /
+//! `count` / `threshold` and writing this table onto one corrupts a live
+//! hash map. `make_provider` decides per instance, by reading back its own
+//! `set_field_by_name("name", …)` — see `provider_has_named_layout`.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
@@ -132,6 +140,16 @@ fn provider_chain() -> &'static parking_lot::Mutex<Vec<(String, f64, &'static st
 
 fn snapshot() -> Vec<(String, f64, &'static str)> {
     provider_chain().lock().clone()
+}
+
+/// The installed providers' names, in chain (preference) order.
+///
+/// Exists so an engine whose own `getInstance` interception cannot serve a name
+/// can do what `ProviderList.getService` does — ask each installed provider in
+/// turn — instead of refusing outright. `getinstance_get_service_search` already
+/// walked this list; nothing outside this module could.
+pub(crate) fn chain_provider_names() -> Vec<String> {
+    snapshot().into_iter().map(|(name, _, _)| name).collect()
 }
 
 pub(crate) fn find(name: &str) -> Option<(f64, &'static str)> {
@@ -241,6 +259,50 @@ fn resolve_real_provider(ctx: &mut dyn NativeContext, name: &str) -> Option<Obje
 // Provider synthetic — slot layout documented at module top.
 // ---------------------------------------------------------------------------
 
+/// Did the `set_field_by_name("versionStr", …)` write in [`make_provider`]
+/// actually land — i.e. does this `Provider` have the REAL JDK layout rather
+/// than CratonVM's synthetic one?
+///
+/// Exactly the read-back predicate `service_has_named_layout` uses for
+/// `Provider$Service`, for exactly the same reason: it answers the question
+/// the caller actually has ("did my named write take?") in both modes, with no
+/// new `NativeContext` surface, and it is per-instance where a registration is
+/// global.
+///
+/// `versionStr` and not `name`, for two reasons that happen to agree.
+/// Substantively: `versionStr` is declared by `java.security.Provider` itself
+/// and by nothing above it, so a receiver that satisfies it has Provider's own
+/// layout, not merely some superclass's. Mechanically: the unit-test mock
+/// resolves the bare name `name` through a class-blind mirror table
+/// (`test_utils::mock_jdk_field_slot`), so a `name`-based predicate would
+/// answer "real layout" under every test in this file and the synthetic arm
+/// would be untestable — the DIVERGENCE hazard `MockNativeContext::
+/// get_field_by_name` documents, met head-on rather than papered over.
+///
+/// G43-1 — why the answer matters. `java.security.Provider extends
+/// java.util.Properties extends java.util.Hashtable extends java.util.Dictionary`,
+/// so on a real image slots 0/1/2 of a `Provider` are not Provider's own
+/// fields at all; they are `Hashtable.table:[Ljava/util/Hashtable$Entry;`,
+/// `Hashtable.count:I` and `Hashtable.threshold:I`. (The comment on the
+/// accessors below used to say slot 0+1 was `serialVersionUID` and slot 2 was
+/// `debug`. Both of those are STATIC — `javap -p java.security.Provider`, JDK
+/// 25.0.3+9 — so they occupy no instance slot, and the real occupants are the
+/// inherited `Hashtable` ones.) The legacy mirror therefore wrote a `String`
+/// over the hash table, a `Double` over `count`, and a heap ADDRESS over
+/// `threshold` — the last of which is the `pointer-into-primitive` coercion
+/// species `G30-1` §4.1 declared could not occur, MEASURED firing twice per
+/// `RCrypto` run at `make_provider`.
+fn provider_has_named_layout(
+    ctx: &mut dyn NativeContext,
+    provider: ObjectRef,
+    version_str_obj: ObjectRef,
+) -> bool {
+    matches!(
+        ctx.get_field_by_name(provider, "versionStr"),
+        Value::Object(Some(got)) if got == version_str_obj
+    )
+}
+
 /// Materialise a fresh `java.security.Provider` synthetic with name +
 /// numeric version. Used by every read-side path
 /// (`getProviders`, `getProvider`); we never cache `ObjectRef` values
@@ -309,12 +371,55 @@ pub(crate) fn make_provider(
     // defaults) instead of a hard failure.
     ctx.set_field_by_name(p, "initialized", Value::Int(1));
 
-    // Synthetic fallback — populate the legacy slots 0/1/2 too so
-    // `phases_early::register_phase53_security` callers that haven't
-    // migrated to the real-JDK accessors still see consistent state.
-    ctx.set_field(p, 0, Value::Object(Some(n)));
-    ctx.set_field(p, 1, Value::Double(version));
-    ctx.set_field(p, 2, Value::Object(Some(info)));
+    // Synthetic fallback — populate the legacy slots 0/1/2 so the readers that
+    // have not migrated to the real-JDK accessors still see consistent state:
+    // `provider_get_name` (slot 0), `provider_get_version` /
+    // `provider_get_version_str` / `provider_to_string` (slot 1) and
+    // `provider_get_info` (slot 2) in this file, plus the `getName` / `getVersion`
+    // Bridges `phases_early::register_phase53_security` registers, which read
+    // slots 0 and 1.
+    //
+    // G43-1 — ONLY in synthetic mode, and the guard is the whole change.
+    //
+    // The two modes genuinely need different answers, and the trap named in
+    // the previous lane's note is real: "correct the indices to the real JDK
+    // layout" is not available, because there is nothing to correct them TO.
+    // Slots 0/1/2 on a real `Provider` are inherited `Hashtable` state
+    // (`table` / `count` / `threshold` — see `provider_has_named_layout`),
+    // and Provider's own `name` / `version` / `info` already have the four
+    // `set_field_by_name` writes above. Relocating the mirror to the real
+    // `name`/`version`/`info` slots would just repeat those writes; pointing
+    // it anywhere else corrupts a live `Hashtable`. The synthetic layout, in
+    // turn, HAS no `Hashtable` and its readers are the slot-indexed ones. So
+    // the correct value at slot 2 in synthetic mode and the correct value at
+    // slot 2 in real-JDK mode are different values in different fields, and
+    // the only reconciliation is to write the mirror only where it is the
+    // truth.
+    //
+    // Skipping it in real-JDK mode is observationally inert on the read side:
+    // every reader in this file consults `get_field_by_name` FIRST and only
+    // falls through to the slot when the named read comes back absent, and the
+    // named reads are exactly the writes we just made. `register_phase53_security`
+    // is reached solely from `register_synthetic_overrides`, which is
+    // `#[cfg(feature = "synthetic-jdk")]`, so its slot-indexed Bridges do not
+    // exist in real-JDK mode at all — a 10,691-row `--jdk-only` registry dump
+    // has zero rows for `java/security/Provider` from that registrar.
+    //
+    // What it removes is not inert: it stops publishing a heap address into
+    // `Hashtable.threshold` and a `Double`'s raw bit pattern into
+    // `Hashtable.count` on an object that IS a live `Hashtable` and that we
+    // deliberately mark `initialized = 1` a few lines up so that real
+    // `keys()` / `entrySet()` / `getAlgorithms` bytecode RUNS over it. Today
+    // that survives only by luck — `Double(25.0).to_bits() as i32` is 0, so
+    // `count == 0` and `Hashtable.getEnumeration` early-returns before it can
+    // dereference the `String` sitting in `table`. Any provider version with a
+    // fractional part (`1.8` → low 32 bits `0xCCCCCCCD`) makes `count` nonzero
+    // and the next `keys()` walks a `String` as an `Entry[]`.
+    if !provider_has_named_layout(ctx, p, ver_str) {
+        ctx.set_field(p, 0, Value::Object(Some(n)));
+        ctx.set_field(p, 1, Value::Double(version));
+        ctx.set_field(p, 2, Value::Object(Some(info)));
+    }
     Ok(p)
 }
 
@@ -324,15 +429,24 @@ pub(crate) fn make_provider(
 
 // WP6.5: Provider field accessors must be layout-aware. The synthetic
 // Provider allocated by `make_provider` stores `name`/`version`/`info` in
-// slots 0/1/2.  Real-JDK `java.security.Provider`, however, declares
-// `serialVersionUID` (long, slot 0+1 — category 2), `debug` (slot 2),
-// `name` (slot 3), `info` (slot 4), `version` (double, slot 5+6),
-// `versionStr` (slot 7), etc.  Reading slot 0 from a real-JDK Provider
-// returns the high half of `serialVersionUID`, which appears to callers
-// as `null` (or whatever junk happens to be there) and made every
-// `Provider.getName()` / `getVersionStr()` call lie about the receiver,
-// which in turn broke `BouncyCastleProvider.setup()` (it queries its
-// own name from inside `loadServiceClass` to build cache keys).
+// slots 0/1/2.  Real-JDK `java.security.Provider` puts something else there
+// entirely, so reading slot 0 from a real-JDK Provider returned junk that
+// appeared to callers as `null` and made every `Provider.getName()` /
+// `getVersionStr()` call lie about the receiver, which in turn broke
+// `BouncyCastleProvider.setup()` (it queries its own name from inside
+// `loadServiceClass` to build cache keys).
+//
+// G43-1 CORRECTION. This comment used to say the real-JDK occupants were
+// `serialVersionUID` (long, slot 0+1), `debug` (slot 2), `name` (slot 3),
+// `info` (slot 4), `version` (double, slot 5+6), `versionStr` (slot 7).
+// That is wrong twice over and the wrongness was load-bearing — it is why
+// the legacy mirror in `make_provider` looked harmless. `javap -p
+// java.security.Provider` on JDK 25.0.3+9: `serialVersionUID` and `debug`
+// are both `static`, so they occupy no instance slot at all; and `Provider
+// extends java.util.Properties extends java.util.Hashtable`, so the low
+// slots belong to the SUPERCLASSES. The real occupants of 0/1/2 are
+// `Hashtable.table:[Ljava/util/Hashtable$Entry;`, `Hashtable.count:I` and
+// `Hashtable.threshold:I` — see `provider_has_named_layout`.
 //
 // Fix: prefer `get_field_by_name`, which resolves the slot from the
 // receiver's actual class layout.  Fall back to slots 0/1/2 only when
@@ -348,7 +462,16 @@ fn provider_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if matches!(&by_name, Value::Object(Some(_))) {
         return Ok(Some(by_name));
     }
-    Ok(Some(ctx.get_field(this, 0)))
+    // G43-1: the slot fallback is only meaningful on a synthetic. On a real
+    // Provider slot 0 is `Hashtable.table`, and an unwritten reference slot
+    // reads back as `Int(0)` (field_read.rs's niche-0 note), so return the
+    // slot only when it actually holds a reference — the descriptor here is
+    // `()Ljava/lang/String;` and handing the interpreter an `Int` back is a
+    // guaranteed type error at the call site.
+    match ctx.get_field(this, 0) {
+        v @ Value::Object(_) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
+    }
 }
 
 fn provider_get_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -458,7 +581,17 @@ fn provider_get_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if matches!(&by_name, Value::Object(Some(_))) {
         return Ok(Some(by_name));
     }
-    Ok(Some(ctx.get_field(this, 2)))
+    // G43-1: same rule as `provider_get_name`, and here it is not theoretical.
+    // Slot 2 on a real `Provider` is `Hashtable.threshold:I`, so this fallback
+    // could return an `Int` from a `()Ljava/lang/String;` native. It is also
+    // the only reader of slot 2 anywhere in the tree — `register_phase53_security`'s
+    // `getInfo` Bridge synthesises its string from slot 0 and never touches
+    // slot 2 — which is what makes `make_provider`'s slot-2 write purely a
+    // synthetic-mode obligation.
+    match ctx.get_field(this, 2) {
+        v @ Value::Object(_) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
+    }
 }
 
 fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -642,10 +775,93 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         "keystore.type" => "PKCS12",
         "ssl.KeyManagerFactory.algorithm" => "SunX509",
         "ssl.TrustManagerFactory.algorithm" => "PKIX",
-        _ => return Ok(Some(Value::Object(None))),
+        // Not one of this VM's four deliberate answers: ask the JDK's own
+        // `conf/security/java.security`, which is right here, rather than
+        // reporting "no such property" for the whole file.
+        //
+        // This arm was written and left UNWIRED for one release cycle, because
+        // turning it on is not free: the stock file sets
+        // `keystore.type.compat=true`, the gate BouncyCastle's
+        // `AdaptingKeyStoreSpi` uses to probe a stream for JKS, and that path
+        // then builds a PKCS#12 MAC through
+        // `Mac.getInstance(name, providerObject)` — an overload that refused
+        // every BouncyCastle name. Enabling the file first took `cert.test`
+        // from PASS to FAIL. That overload is fixed now (see
+        // `phases_late::ssl_security`, the `(String, Provider)` registration),
+        // so the gate opens onto a path that works.
+        _ => {
+            return Ok(match java_security_file_property(ctx, &key) {
+                Some(v) => {
+                    let s = ctx.create_string(&v);
+                    Some(Value::Object(Some(s)))
+                }
+                None => Some(Value::Object(None)),
+            })
+        }
     };
     let s = ctx.create_string(val);
     Ok(Some(Value::Object(Some(s))))
+}
+
+/// `Security.getProperty` for a key this VM does not answer itself, read from
+/// the configured JDK's `conf/security/java.security`.
+///
+/// The four hardcoded answers above are deliberate (an unblocking
+/// `securerandom.source`, in particular) and still win. Everything else used to
+/// be `null`, which is not "no such property" — it is a whole configuration
+/// file this VM declined to read, and library code reads it through
+/// `Security.getProperty` all the time.
+///
+/// Measured: BouncyCastle's `AdaptingKeyStoreSpi` gates its JKS-compatibility
+/// path on `Properties.isOverrideSet("keystore.type.compat")`, which resolves
+/// through `Security.getProperty` first, and the stock file says
+/// `keystore.type.compat=true`. Answering null took the PKCS12 path for a JKS
+/// stream and threw `IOException: stream does not represent a PKCS12 key
+/// store` — `PKCS12StoreTest.testJKS`, which HotSpot passes.
+///
+/// Parsed once. `java.security` is `key=value` with `#` comments and no
+/// sections; a continuation-free read is enough for the lookups callers make,
+/// and a file that cannot be read leaves every key unanswered exactly as before.
+fn java_security_file_property(ctx: &mut dyn NativeContext, key: &str) -> Option<String> {
+    // LOCK LEVEL (lock-discipline ratchet): `Scratch`. That level is a claim
+    // that no call back into the VM happens under this guard, and the parse
+    // below calls `ctx.get_system_property`. So the parse runs OUTSIDE the
+    // lock and only the publish is taken under it.
+    //
+    // Two threads that miss together both parse; `get_or_insert` keeps the
+    // first and drops the second. Behaviour-preserving — the file is read-only
+    // and both parses produce the same map — and strictly cheaper than the
+    // alternative of holding a lock across a filesystem read.
+    static FILE_PROPS: std::sync::OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<Option<std::collections::HashMap<String, String>>>,
+    > = std::sync::OnceLock::new();
+    let cell = FILE_PROPS.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(None, cratonvm_types::lock_order::LockLevel::Scratch));
+    if let Some(answer) = {
+        let guard = cell.lock();
+        guard.as_ref().map(|m| m.get(key).cloned())
+    } {
+        return answer;
+    }
+    let mut parsed = std::collections::HashMap::new();
+    if let Some(home) = ctx.get_system_property("java.home") {
+        let path = std::path::Path::new(&home)
+            .join("conf")
+            .join("security")
+            .join("java.security");
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    parsed.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+        }
+    }
+    let mut guard = cell.lock();
+    guard.get_or_insert(parsed).get(key).cloned()
 }
 
 /// Process-wide overrides written by `Security.setProperty`.
@@ -974,6 +1190,11 @@ struct ServiceEntry {
     /// "Cipher.AES/GCM/NoPadding"), retained so `getService` /
     /// debugging can render it verbatim.
     key: String,
+    /// The service's attributes, as `("SupportedCurves", "...")` pairs — the
+    /// `Type.Algorithm AttrName` legacy rows. Kept in insertion order rather
+    /// than a map because there are a handful per service and the order is
+    /// what a provider's own listing shows.
+    attributes: Vec<(String, String)>,
 }
 
 /// Process-wide service map, keyed `(provider_name → (type, algo) → entry)`.
@@ -1131,6 +1352,55 @@ pub(crate) fn canonical_service_algorithm(
             })
         }
     }
+}
+
+/// [`canonical_if_unrecognised`] for the ANONYMOUS overloads, where the rewrite
+/// may only come from a provider this VM implements natively.
+///
+/// An alias row is owned by the provider that registered it, and it means that
+/// provider's implementation. `Alg.Alias.Mac.2.16.840.1.101.3.4.2.1` is
+/// BouncyCastle's, and it names BouncyCastle's `SHA256$HashMac` — a PKCS#12
+/// capable MAC that derives its key from a `PKCS12Key` plus a
+/// `PBEParameterSpec`. Rewriting the caller's OID to `HmacSHA256` on the
+/// strength of that row and then serving it from this crate's plain HMAC
+/// borrows one provider's NAME to reach another's IMPLEMENTATION, and the two
+/// are not the same function — measured, they disagree on every byte.
+///
+/// The cost was silent and asymmetric. BouncyCastle's
+/// `JcePKCS12MacCalculatorBuilder` builds its MAC through the ANONYMOUS
+/// `Mac.getInstance(oid)` while `JcePKCS12MacCalculatorBuilderProvider` names
+/// BC, so a PKCS#12 file got a MAC from this engine and was then verified
+/// against BouncyCastle's: `PfxPduTest.testCreateAES256andSHA256`, where the
+/// stored and recomputed MacData differed for SHA-256 and agreed for SHA-1
+/// (SunJCE owns neither OID; the SHA-1 one simply had no rewrite this engine
+/// accepted).
+///
+/// A provider outside `NATIVELY_SERVICED_PROVIDERS` therefore does not get to
+/// rename anything here; the caller's own spelling goes to the chain instead,
+/// which hands the call to the provider that owns it.
+pub(crate) fn canonical_if_unrecognised_native_only(
+    type_str: &str,
+    algo: &str,
+    recognised: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    if recognised(algo) {
+        return None;
+    }
+    let type_n = normalize_engine(type_str);
+    let algo_n = normalize_algo(algo);
+    let names = snapshot();
+    let table = aliases().lock();
+    let canonical = names.into_iter().find_map(|(name, _, _)| {
+        if !NATIVELY_SERVICED_PROVIDERS
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(&name))
+        {
+            return None;
+        }
+        table.get(&(name, type_n.clone(), algo_n.clone())).cloned()
+    })?;
+    drop(table);
+    recognised(&canonical).then_some(canonical)
 }
 
 /// `algo` rewritten to the canonical name a native engine recognises, or `None`
@@ -1502,18 +1772,55 @@ fn parse_legacy_key(key: &str) -> Option<(String, String, String, Option<String>
 /// the mechanism `provider_put_native` and `provider_parse_legacy_put_native`
 /// both funnel through.
 fn put_service(provider: &str, type_str: &str, algorithm: &str, value: &str) {
+    let type_n = normalize_engine(type_str);
+    let algo_n = normalize_algo(algorithm);
+    let mut s = services().lock();
+    let map = s.entry(provider.to_string()).or_default();
+    // A provider may `put` the attribute rows before the primary row (the
+    // order inside `Provider.putAll` is a HashMap iteration order), so the
+    // primary must not wipe attributes already recorded under the same key.
+    let attributes = map
+        .get(&(type_n.clone(), algo_n.clone()))
+        .map(|e| e.attributes.clone())
+        .unwrap_or_default();
     let entry = ServiceEntry {
         type_str: type_str.to_string(),
         algorithm: algorithm.to_string(),
         class_name: value.to_string(),
         key: format!("{type_str}.{algorithm}"),
+        attributes,
     };
+    map.insert((type_n, algo_n), entry);
+}
+
+/// Record a `Type.Algorithm AttrName` legacy row against its service.
+///
+/// The service itself may not have been `put` yet, so a placeholder entry with
+/// an empty class name is created and later filled in by `put_service` — which
+/// carries the attributes over.
+fn put_service_attribute(provider: &str, type_str: &str, algorithm: &str, attr: &str, value: &str) {
     let type_n = normalize_engine(type_str);
     let algo_n = normalize_algo(algorithm);
     let mut s = services().lock();
-    s.entry(provider.to_string())
-        .or_default()
-        .insert((type_n, algo_n), entry);
+    let map = s.entry(provider.to_string()).or_default();
+    let entry = map
+        .entry((type_n, algo_n))
+        .or_insert_with(|| ServiceEntry {
+            type_str: type_str.to_string(),
+            algorithm: algorithm.to_string(),
+            class_name: String::new(),
+            key: format!("{type_str}.{algorithm}"),
+            attributes: Vec::new(),
+        });
+    if let Some(slot) = entry
+        .attributes
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case(attr))
+    {
+        slot.1 = value.to_string();
+    } else {
+        entry.attributes.push((attr.to_string(), value.to_string()));
+    }
 }
 
 /// Seed ownership data for the direct-native KeyFactory, Signature,
@@ -2163,6 +2470,50 @@ fn seed_sunjce_pbe_services() {
         "PBES2",
         "com.sun.crypto.provider.PBES2Parameters$General",
     );
+    // SunJCE's SYMMETRIC `AlgorithmParameters` services. Enumerated from
+    // `Security.getProvider("SunJCE").getServices()` on JDK 25, not guessed —
+    // the block-cipher rows were missing here entirely, so
+    // `AlgorithmParameters.getInstance("AES", "SunJCE")` answered
+    // `no such algorithm: AES for provider SunJCE` while HotSpot serves it.
+    // BouncyCastle's `EnvelopedDataHelper.createAlgorithmParameters` asks by
+    // exactly that (name, provider) pair to decode a CMS content-encryption
+    // AlgorithmIdentifier, so every `SunProviderTest`/`NullProviderTest` KeyTrans
+    // case in bc-java's `cms` suite lost the IV and failed to decrypt.
+    //
+    // Note `GCM` lives in `sun.security.util`, not `com.sun.crypto.provider` —
+    // the one row whose package differs from its siblings.
+    for (algo, cls) in [
+        ("AES", "com.sun.crypto.provider.AESParameters"),
+        ("GCM", "sun.security.util.GCMParameters"),
+        ("DESede", "com.sun.crypto.provider.DESedeParameters"),
+        ("DES", "com.sun.crypto.provider.DESParameters"),
+        ("Blowfish", "com.sun.crypto.provider.BlowfishParameters"),
+        ("RC2", "com.sun.crypto.provider.RC2Parameters"),
+        (
+            "ChaCha20-Poly1305",
+            "com.sun.crypto.provider.ChaCha20Poly1305Parameters",
+        ),
+        ("DiffieHellman", "com.sun.crypto.provider.DHParameters"),
+    ] {
+        put_service(P, "AlgorithmParameters", algo, cls);
+    }
+    // The PKCS#12 / PKCS#5 v1.5 PBE rows, which all share one SPI class.
+    for algo in [
+        "PBEWithMD5AndDES",
+        "PBEWithMD5AndTripleDES",
+        "PBEWithSHA1AndDESede",
+        "PBEWithSHA1AndRC2_40",
+        "PBEWithSHA1AndRC2_128",
+        "PBEWithSHA1AndRC4_40",
+        "PBEWithSHA1AndRC4_128",
+    ] {
+        put_service(
+            P,
+            "AlgorithmParameters",
+            algo,
+            "com.sun.crypto.provider.PBEParameters",
+        );
+    }
     const HASHES: &[&str] = &[
         "SHA1",
         "SHA224",
@@ -2196,6 +2547,27 @@ fn seed_sunjce_pbe_services() {
 /// `new_object_initialized(cls, "()V", &[])` runs real provider bytecode.
 fn seed_sunjsse_services() {
     const J: &str = "SunJSSE";
+    // SunJSSE registers `KeyStore.PKCS12` in its OWN table as well as SUN's,
+    // pointing at the plain (non-dual-format) implementation. Applications ask
+    // for it by name to read a PKCS#12 written elsewhere with the platform's
+    // own store rather than the writer's — `PKCS12StoreTest`'s
+    // `checkNoDuplicateOracleTrustedCertAttribute` writes with BouncyCastle and
+    // then does exactly that:
+    //
+    // ```java
+    // KeyStore.getInstance("PKCS12", "SunJSSE")
+    // ```
+    //
+    // Without this row the provider resolved, the ownership check refused, and
+    // the call was `NoSuchAlgorithmException: no such algorithm: PKCS12 for
+    // provider SunJSSE` — a JDK provider being told it does not implement the
+    // one KeyStore it is best known for.
+    put_service(
+        J,
+        "KeyStore",
+        "PKCS12",
+        "sun.security.pkcs12.PKCS12KeyStore",
+    );
     // KeyManagerFactory
     put_service(
         J,
@@ -2291,13 +2663,32 @@ fn seed_sunjsse_services() {
     put_alias(J, "SSLContext", "SSL", "TLS");
     // `Alg.Alias.SSLContext.SSLv3 -> TLSv1` on the platform JDK — NOT to TLS.
     put_alias(J, "SSLContext", "SSLv3", "TLSv1");
-    // KeyStore lives in the SUN provider (JKS/CaseExactJKS) and PKCS12 too.
+    // KeyStore lives in the SUN provider (JKS/CaseExactJKS/PKCS12/DKS).
+    //
+    // These five rows are transcribed from the platform JDK, not from memory —
+    // every one of them was wrong before, and each wrong in a way that is
+    // invisible until something asks the exact question (`KsOwner` probe,
+    // measured on jdk-25 on this host):
+    //
+    // ```text
+    // SUN     KeyStore.PKCS12 -> sun.security.pkcs12.PKCS12KeyStore$DualFormatPKCS12
+    // SUN     KeyStore.JKS    -> sun.security.provider.JavaKeyStore$DualFormatJKS
+    // SUN     KeyStore.DKS    -> sun.security.provider.DomainKeyStore$DKS
+    // SunJSSE KeyStore.PKCS12 -> sun.security.pkcs12.PKCS12KeyStore
+    // KeyStore.getInstance("PKCS#12") -> KeyStoreException: PKCS#12 not found
+    // ```
+    //
+    // The `DualFormat*` classes are the point of the SUN rows: they are
+    // `KeyStoreDelegator`s that sniff the stream and accept EITHER format,
+    // which is what makes `keystore.type.compat` mean anything. Naming the
+    // plain `PKCS12KeyStore` under SUN quietly removed that, so a JKS stream
+    // handed to the platform default failed instead of being detected.
     const S: &str = "SUN";
     put_service(
         S,
         "KeyStore",
         "JKS",
-        "sun.security.provider.JavaKeyStore$JKS",
+        "sun.security.provider.JavaKeyStore$DualFormatJKS",
     );
     put_service(
         S,
@@ -2309,9 +2700,19 @@ fn seed_sunjsse_services() {
         S,
         "KeyStore",
         "PKCS12",
-        "sun.security.pkcs12.PKCS12KeyStore",
+        "sun.security.pkcs12.PKCS12KeyStore$DualFormatPKCS12",
     );
-    put_alias(S, "KeyStore", "PKCS#12", "PKCS12");
+    put_service(
+        S,
+        "KeyStore",
+        "DKS",
+        "sun.security.provider.DomainKeyStore$DKS",
+    );
+    // NO `PKCS#12` alias. The JDK does not register one and
+    // `KeyStore.getInstance("PKCS#12")` is a `KeyStoreException` there —
+    // measured. This VM invented the alias, so a spelling the platform refuses
+    // silently succeeded here, which is the wrong-accept direction: code that
+    // works on this VM and dies on every real JDK.
     // CertificateFactory X.509 (SUN provider) — needed by the real
     // X509CertImpl/Validator path: the SunX509 KeyManager + PKIX TrustManager
     // build/validate cert chains via `CertificateFactory.getInstance("X.509")`.
@@ -2512,11 +2913,16 @@ fn apply_legacy_put(provider: &str, key: &str, value: &str) -> bool {
             true
         }
         "attr" => {
-            // Attribute on an existing service.  Ignore here — attribute
-            // semantics (`SupportedModes`, `SupportedKeyClasses`, …) are
-            // queried by `Service.supportsParameter` which we don't
-            // intercept.  Returning true so callers can distinguish
-            // "ignored shape" (false) from "recognized but no-op" (true).
+            // Attribute on a service. These used to be DROPPED, on the reading
+            // that only `Service.supportsParameter` consumes them — but
+            // `Service.getAttribute` is public and applications read it
+            // directly: bc-java's `ECAlgorithmParametersTest` asks
+            // `getService("AlgorithmParameters", "EC").getAttribute("SupportedCurves")`
+            // and NPE'd on the null, and `BouncyCastleProviderTest` asserts an
+            // attribute is visible through an ALIAS as well.
+            if let Some(attr) = parsed.3.as_deref() {
+                put_service_attribute(provider, &parsed.1, &parsed.2, attr, value);
+            }
             true
         }
         _ => false,
@@ -2717,8 +3123,25 @@ fn provider_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Int(0))),
     };
-    let ihash = ctx.identity_hash_code(this) as i64;
-    let found = provider_instance_keys().lock().contains(&(ihash, key));
+    // Answers from the same rows `keySet`/`size`/`entrySet` project — see
+    // `provider_map_rows`, which is where the scoping rule is explained.
+    //
+    // Instance scope is LOAD-BEARING and not an accident. BouncyCastle's
+    // `BouncyCastleProvider.addAlgorithm` is:
+    //
+    // ```java
+    // if (containsKey(key)) {
+    //     throw new IllegalStateException("duplicate provider key (" + key + ") found");
+    // }
+    // ```
+    //
+    // so a process-global answer makes the SECOND `new BouncyCastleProvider()`
+    // throw on its first registration. On HotSpot each provider instance owns
+    // its own map and sees none of the first one's keys. Making this
+    // name-keyed to match `get` was tried and did exactly that:
+    // `cannot create instance of ...GOST3411$Mappings : duplicate provider key
+    // (MessageDigest.GOST3411) found`.
+    let found = provider_row_present(ctx, this, &key);
     Ok(Some(Value::Int(if found { 1 } else { 0 })))
 }
 
@@ -2749,6 +3172,20 @@ fn provider_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// object slot can go stale across the `getService` -> `newInstance` window and
 /// read back empty. Keying on an integer id (primitives are never relocated)
 /// makes className retrieval robust.
+/// `Provider$Service` identity hash -> its attribute rows.
+///
+/// Same reasoning as [`service_classname_table`]: the synthetic
+/// `Provider$Service`'s own reference slots are not a reliable place to hang
+/// state, and the JDK's `getAttribute` reads a map keyed by its private
+/// `UString` wrapper, which we cannot populate from here.
+fn service_attributes_table(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i64, Vec<(String, String)>>> {
+    static T: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<i64, Vec<(String, String)>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
 fn service_classname_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i64, String>> {
     use std::sync::OnceLock;
     static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i64, String>>> = OnceLock::new();
@@ -2815,6 +3252,9 @@ fn make_service(
     service_classname_table()
         .lock()
         .insert(ih, entry.class_name.clone());
+    service_attributes_table()
+        .lock()
+        .insert(ih, entry.attributes.clone());
     ctx.unpin_native_roots(prov_pin);
     Ok(svc)
 }
@@ -2870,6 +3310,371 @@ fn provider_get_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `getService(type, algorithm)`. The early bootstrap fallback returns an empty
 /// set; BouncyCastle JSSE needs the populated set while constructing the FIPS
 /// provider so it can discover TLS key/trust manager algorithms.
+/// Every `(key, value)` this provider's Map surface must show.
+///
+/// `java.security.Provider` is a `Properties`, and applications read it as one
+/// — `for (Object k : provider.keySet())` is an ordinary idiom, and
+/// BouncyCastle's own `BouncyCastleProviderTest.testRegisteredClasses` does
+/// exactly that. Before this, the Map surface had **three** disagreeing views:
+///
+/// | | HotSpot | CratonVM (before) |
+/// |---|---|---|
+/// | `keySet().size()` | 5153 | 4 |
+/// | `get("Provider.id name")` | `BC` | `null` |
+/// | `containsKey(k)` after `put(k, v)` | true | true |
+/// | `size()` after that `put` | 5 | **4** |
+///
+/// `put`, `parseLegacyPut` and `putService` all record into
+/// `provider_properties` (name-keyed, with the value) and
+/// `provider_instance_keys` (identity-keyed), and `get`/`containsKey` read
+/// those — but `size`/`keySet`/`entrySet`/`values` were never registered at
+/// all, so they fell through to the inherited `Properties` map, which only
+/// `putId`'s four `Provider.id *` rows had ever reached. Three stores, three
+/// answers, no error anywhere.
+///
+/// Everything now projects the two tables every writer maintains together:
+/// `provider_instance_keys` for WHICH keys this instance has, and
+/// `provider_properties` for their values.
+///
+/// Scoped to the INSTANCE, because that is what a real `Provider` is — its own
+/// `Properties` map — and because BouncyCastle depends on it: `addAlgorithm`
+/// refuses a key `containsKey` already reports, so a process-global answer
+/// makes the second `new BouncyCastleProvider()` throw. See
+/// `provider_contains_key`.
+///
+/// The fallback covers the VM's own stand-ins: `make_provider` mints a fresh
+/// synthetic `Provider` per call, which never ran a `put` and so owns no
+/// instance keys, but must still show the rows registered under its name.
+/// An instance that has put SOMETHING is authoritative about its own contents;
+/// only one that has put NOTHING defers to its name.
+///
+/// Sorted so `keySet`, `values` and `entrySet` agree with each other
+/// positionally and the order is stable between calls. HotSpot's is a hash
+/// order and is unspecified, so a defined order is not a divergence.
+fn provider_map_rows(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(String, String)> {
+    let name = provider_name_of(ctx, this);
+    let ihash = ctx.identity_hash_code(this) as i64;
+    let own: Vec<String> = provider_instance_keys()
+        .lock()
+        .iter()
+        .filter(|(instance, _)| *instance == ihash)
+        .map(|(_, key)| key.clone())
+        .collect();
+    let properties = provider_properties().lock();
+    let mut rows: Vec<(String, String)> = if own.is_empty() {
+        properties
+            .iter()
+            .filter(|((provider, _), _)| provider == &name)
+            .map(|((_, key), value)| (key.clone(), value.clone()))
+            .collect()
+    } else {
+        own.into_iter()
+            .map(|key| {
+                let value = properties
+                    .get(&(name.clone(), key.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                (key, value)
+            })
+            .collect()
+    };
+    drop(properties);
+    rows.sort_unstable();
+    rows
+}
+
+/// Is `key` one of this provider's rows, under the same scoping rule
+/// [`provider_map_rows`] projects? Answered without materialising every row.
+fn provider_row_present(ctx: &mut dyn NativeContext, this: ObjectRef, key: &str) -> bool {
+    let ihash = ctx.identity_hash_code(this) as i64;
+    let (has_own_key, has_any_own) = {
+        let instance_keys = provider_instance_keys().lock();
+        (
+            instance_keys.contains(&(ihash, key.to_string())),
+            instance_keys.iter().any(|(instance, _)| *instance == ihash),
+        )
+    };
+    if has_any_own {
+        return has_own_key;
+    }
+    let name = provider_name_of(ctx, this);
+    provider_properties()
+        .lock()
+        .contains_key(&(name, key.to_string()))
+}
+
+/// Build an unmodifiable `Set` of the strings produced by `pick`.
+///
+/// Each string is pinned across the `add` that follows it: the set, the string
+/// and every node allocated on the way can trigger a moving collection, and a
+/// raw `ObjectRef` held only in this Rust frame would be stale afterwards.
+/// This is the same discipline `provider_get_services_native` uses.
+fn provider_string_set(
+    ctx: &mut dyn NativeContext,
+    rows: &[(String, String)],
+    pick: fn(&(String, String)) -> &String,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
+    let set_pin = ctx.pin_native_root(set);
+    for row in rows {
+        let element = ctx.create_string(pick(row));
+        let element_pin = ctx.pin_native_root(element);
+        let set_now = ctx.read_native_pin(set_pin, set);
+        let element_now = ctx.read_native_pin(element_pin, element);
+        let added = ctx.invoke(
+            "java/util/HashSet",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[
+                Value::Object(Some(set_now)),
+                Value::Object(Some(element_now)),
+            ],
+        );
+        ctx.unpin_native_roots(element_pin);
+        if let Err(e) = added {
+            ctx.unpin_native_roots(set_pin);
+            return Err(e);
+        }
+    }
+    let set = ctx.read_native_pin(set_pin, set);
+    let view = wrap_unmodifiable(ctx, set);
+    ctx.unpin_native_roots(set_pin);
+    Ok(view)
+}
+
+/// `Provider.size()` — the number of registered rows, not the four the
+/// inherited map happened to hold.
+fn provider_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let n = provider_map_rows(ctx, this).len();
+    Ok(Some(Value::Int(n as i32)))
+}
+
+fn provider_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let empty = provider_map_rows(ctx, this).is_empty();
+    Ok(Some(Value::Int(i32::from(empty))))
+}
+
+/// `Provider.keySet()` — unmodifiable, as the real `Provider` returns.
+fn provider_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let rows = provider_map_rows(ctx, this);
+    let set = provider_string_set(ctx, &rows, |(key, _)| key)?;
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// `Properties.stringPropertyNames()` — every row here has a String key and a
+/// String value, so it is the same set as `keySet`.
+fn provider_string_property_names(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    provider_key_set(ctx, args)
+}
+
+/// `Provider.values()` — a `Collection`, and duplicates are meaningful here
+/// (many algorithms map to one implementation class), so this is a List and
+/// NOT a Set.
+fn provider_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let rows = provider_map_rows(ctx, this);
+    let list = ctx.new_object_initialized("java/util/ArrayList", "()V", &[])?;
+    let list = match list {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let list_pin = ctx.pin_native_root(list);
+    for (_, value) in &rows {
+        let element = ctx.create_string(value);
+        let element_pin = ctx.pin_native_root(element);
+        let list_now = ctx.read_native_pin(list_pin, list);
+        let element_now = ctx.read_native_pin(element_pin, element);
+        let added = ctx.invoke(
+            "java/util/ArrayList",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[
+                Value::Object(Some(list_now)),
+                Value::Object(Some(element_now)),
+            ],
+        );
+        ctx.unpin_native_roots(element_pin);
+        if let Err(e) = added {
+            ctx.unpin_native_roots(list_pin);
+            return Err(e);
+        }
+    }
+    let list = ctx.read_native_pin(list_pin, list);
+    let view = match ctx.invoke(
+        "java/util/Collections",
+        "unmodifiableCollection",
+        "(Ljava/util/Collection;)Ljava/util/Collection;",
+        &[Value::Object(Some(list))],
+    ) {
+        Ok(Some(Value::Object(Some(v)))) => v,
+        _ => list,
+    };
+    ctx.unpin_native_roots(list_pin);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// `Provider.entrySet()` — unmodifiable, of real `Map.Entry` objects, so
+/// `entry.getKey()` / `entry.getValue()` work on the result.
+fn provider_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let rows = provider_map_rows(ctx, this);
+    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
+    let set_pin = ctx.pin_native_root(set);
+    for (key, value) in &rows {
+        let k = ctx.create_string(key);
+        let k_pin = ctx.pin_native_root(k);
+        let v = ctx.create_string(value);
+        let v_pin = ctx.pin_native_root(v);
+        let k_now = ctx.read_native_pin(k_pin, k);
+        let v_now = ctx.read_native_pin(v_pin, v);
+        let entry = ctx.new_object_initialized(
+            "java/util/AbstractMap$SimpleEntry",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[Value::Object(Some(k_now)), Value::Object(Some(v_now))],
+        );
+        ctx.unpin_native_roots(v_pin);
+        ctx.unpin_native_roots(k_pin);
+        let entry = match entry {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            Ok(_) => continue,
+            Err(e) => {
+                ctx.unpin_native_roots(set_pin);
+                return Err(e);
+            }
+        };
+        let entry_pin = ctx.pin_native_root(entry);
+        let set_now = ctx.read_native_pin(set_pin, set);
+        let entry_now = ctx.read_native_pin(entry_pin, entry);
+        let added = ctx.invoke(
+            "java/util/HashSet",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(set_now)), Value::Object(Some(entry_now))],
+        );
+        ctx.unpin_native_roots(entry_pin);
+        if let Err(e) = added {
+            ctx.unpin_native_roots(set_pin);
+            return Err(e);
+        }
+    }
+    let set = ctx.read_native_pin(set_pin, set);
+    let view = wrap_unmodifiable(ctx, set);
+    ctx.unpin_native_roots(set_pin);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// `Hashtable.keys()` / `Hashtable.elements()` — the Enumeration surface, built
+/// from a real `Vector` so the returned object is a genuine JDK Enumeration
+/// rather than a synthetic stand-in.
+fn provider_enumeration_of(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    values_not_keys: bool,
+) -> MethodCallResult {
+    let rows = provider_map_rows(ctx, this);
+    let vector = ctx.new_object_initialized("java/util/Vector", "()V", &[])?;
+    let vector = match vector {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let vector_pin = ctx.pin_native_root(vector);
+    for (key, value) in &rows {
+        let element = ctx.create_string(if values_not_keys { value } else { key });
+        let element_pin = ctx.pin_native_root(element);
+        let vector_now = ctx.read_native_pin(vector_pin, vector);
+        let element_now = ctx.read_native_pin(element_pin, element);
+        let added = ctx.invoke(
+            "java/util/Vector",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[
+                Value::Object(Some(vector_now)),
+                Value::Object(Some(element_now)),
+            ],
+        );
+        ctx.unpin_native_roots(element_pin);
+        if let Err(e) = added {
+            ctx.unpin_native_roots(vector_pin);
+            return Err(e);
+        }
+    }
+    let vector = ctx.read_native_pin(vector_pin, vector);
+    let out = ctx.invoke(
+        "java/util/Vector",
+        "elements",
+        "()Ljava/util/Enumeration;",
+        &[Value::Object(Some(vector))],
+    );
+    ctx.unpin_native_roots(vector_pin);
+    out
+}
+
+fn provider_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    provider_enumeration_of(ctx, this, false)
+}
+
+fn provider_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    provider_enumeration_of(ctx, this, true)
+}
+
+/// `Provider.putId()` — the four `Provider.id *` rows.
+///
+/// The real one writes them with `super.put`, which is an `invokespecial` on
+/// `Properties` and therefore bypasses the `Provider.put` native entirely. That
+/// is why those four rows were the ONLY thing the inherited map ever held, and
+/// why `get("Provider.id name")` answered null while `keySet().size()` was
+/// exactly 4. Recording them the way every other writer does puts them in the
+/// one store, so all the views above show them.
+///
+/// The real `super.put` calls are deliberately NOT reproduced. Routing them
+/// back through `Properties.put` threw inside `Provider.<init>` — the synthetic
+/// `Provider` layout this VM allocates does not carry a usable `Properties`
+/// backing map — and with every Map view registered above there is no longer a
+/// reader for the inherited map. One store, and it is this one.
+fn provider_put_id(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = provider_name_of(ctx, this);
+    let version = match ctx.get_field_by_name(this, "versionStr") {
+        Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let info = match ctx.get_field_by_name(this, "info") {
+        Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_else(|| "java.security.Provider".to_string())
+        .replace('/', ".");
+
+    let rows = [
+        ("Provider.id name", name.clone()),
+        ("Provider.id version", version),
+        ("Provider.id info", info),
+        ("Provider.id className", class_name),
+    ];
+    let ihash = ctx.identity_hash_code(this) as i64;
+    for (key, value) in &rows {
+        provider_properties()
+            .lock()
+            .insert((name.clone(), (*key).to_string()), value.clone());
+        provider_instance_keys()
+            .lock()
+            .insert((ihash, (*key).to_string()));
+    }
+
+    let _ = ihash;
+    Ok(None)
+}
+
 fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let prov_name = provider_name_of(ctx, this);
@@ -2963,6 +3768,41 @@ fn provider_service_class_name_from_registry(
 /// implementation class name.  Required by the BC fallback path and by
 /// `Cipher.getInstance(algo, providerName)` to render diagnostics when
 /// resolution fails.  Reads slot 3 (populated in `make_service`).
+/// `Provider.Service.getAttribute(String)` — answered from the attribute rows
+/// the provider actually `put`, case-insensitively as the JDK's own `UString`
+/// key is.
+fn provider_service_get_attribute(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(svc))) = args.first() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let name = match args.get(1) {
+        Some(Value::Object(Some(n))) => ctx.read_string(*n).unwrap_or_default(),
+        // `getAttribute(null)` is a `NullPointerException` on the JDK.
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("attribute name is null".to_string()),
+            }
+            .into())
+        }
+    };
+    let ih = ctx.identity_hash_code(*svc) as i64;
+    let found = service_attributes_table().lock().get(&ih).and_then(|rows| {
+        rows.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+            .map(|(_, v)| v.clone())
+    });
+    match found {
+        Some(v) => {
+            let s = ctx.create_string(&v);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
 fn provider_service_get_class_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3308,6 +4148,64 @@ fn throw_missing_provider(
 /// unconditionally and so ignored any `KeyManagerFactory` service a caller
 /// registered on their own `Provider` via `Security.addProvider` +
 /// `Provider.put("KeyManagerFactory.<algo>", ...)`.
+/// Every THIRD-PARTY provider's implementation class for `(type_str, algo)`, in
+/// chain order.
+///
+/// [`third_party_service_class`] answers only the FIRST provider on the chain
+/// and then discards it if that provider is one this VM services natively — so
+/// a name that SunEC also registers hides every third-party implementation
+/// behind it. That is fine for choosing a default and wrong for a fallback,
+/// which needs the candidates the JDK's own delayed provider selection would
+/// walk (`Signature$Delegate.chooseProvider` moves to the next provider when
+/// the current one refuses the key).
+pub(crate) fn chain_third_party_service_classes(type_str: &str, algo: &str) -> Vec<String> {
+    snapshot()
+        .into_iter()
+        .filter(|(name, _, _)| {
+            !NATIVELY_SERVICED_PROVIDERS
+                .iter()
+                .any(|b| b.eq_ignore_ascii_case(name))
+        })
+        .filter_map(|(name, _, _)| get_service_entry(&name, type_str, algo))
+        .map(|e| e.class_name.replace('.', "/"))
+        .filter(|c| !c.trim().is_empty())
+        .collect()
+}
+
+/// A third-party provider that owns one of `algos` and sits AHEAD of `before`
+/// in the installed chain.
+///
+/// `getInstance(algorithm)` with no provider named is defined by chain ORDER:
+/// the first installed provider that has the service wins. This engine answers
+/// as one particular provider (`SunJCE` for `Cipher`), so serving a name it can
+/// compute is right only while nothing ahead of that provider owns the name
+/// too. An application that calls `Security.insertProviderAt(p, 2)` has said
+/// exactly that it wants `p` consulted first, and bc-java's `SlotTwoTest` does
+/// it and then asserts `decrypt.getProvider().getName()` is `BC` — it got
+/// `SunJCE`, for `DESede/ECB/PKCS7Padding`, a padding spelling SunJCE does not
+/// even register.
+///
+/// Deliberately narrow: providers at or after `before` are not consulted, so a
+/// third-party provider left at its default position (the end of the chain,
+/// where `Security.addProvider` puts it) changes nothing. Only an explicit
+/// insertion ahead of this engine's own identity does.
+pub(crate) fn third_party_owner_before(
+    type_str: &str,
+    algos: &[String],
+    before: &str,
+) -> Option<String> {
+    let names: Vec<String> = snapshot().into_iter().map(|(name, _, _)| name).collect();
+    let limit = names.iter().position(|n| n.eq_ignore_ascii_case(before))?;
+    names.into_iter().take(limit).find(|name| {
+        !NATIVELY_SERVICED_PROVIDERS
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(name))
+            && algos
+                .iter()
+                .any(|algo| get_service_entry(name, type_str, algo).is_some())
+    })
+}
+
 pub(crate) fn find_service_provider(type_str: &str, algo: &str) -> Option<String> {
     snapshot()
         .into_iter()
@@ -3797,6 +4695,106 @@ fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) ->
     }
 }
 
+/// `Provider.getService(String, String)`, as the JDK declares it.
+const PROVIDER_GET_SERVICE_DESC: &str =
+    "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Provider$Service;";
+
+/// Resolve `(type, algorithm)` through a Provider OBJECT that declares its own
+/// `getService`, exactly as `sun.security.jca.GetInstance` does: call the
+/// override, then `newInstance(null)` on whatever `Provider$Service` it hands
+/// back — both virtually, so a `Provider$Service` SUBCLASS runs its own
+/// instantiation logic. Returns `Ok(None)` when this provider does not override
+/// `getService` (our own synthetics never do) or when the override answers
+/// null, leaving the caller on its side-table path.
+///
+/// Why this exists: a provider that overrides `getService` may register a
+/// legacy `put` value that is a MARKER, not a loadable class name, and keep the
+/// real factory somewhere only its own `Service` subclass can see. BouncyCastle's
+/// JSSE provider is exactly that shape — `addAlgorithmImplementation` puts
+/// `"org.bouncycastle.jsse.provider.SSLContext.TLSv1_3"` under the legacy key
+/// `SSLContext.TLSv1.3` and stashes the real factory in a private `creatorMap`
+/// that only `BouncyCastleJsseProvider$BcJsseService.newInstance` consults.
+/// Resolving it out of OUR service map instead reached `Class.forName` on that
+/// marker, so `SSLContext.getInstance("TLSv1.3", new BouncyCastleJsseProvider())`
+/// died with `ClassNotFoundException: org.bouncycastle.jsse.provider
+/// .SSLContext.TLSv1_3` where HotSpot ran BC's creator (netty's
+/// `BouncyCastleEngineAlpnTest`).
+///
+/// The side-table path is still the default for everything else: it hands back a
+/// `GetInstance$Instance` built from the Rust-side `ServiceEntry` without a
+/// `Provider$Service` round-trip, whose synthetic's className slot is not
+/// GC-stable (see `build_jca_instance`).
+fn provider_declared_service_instance(
+    ctx: &mut dyn NativeContext,
+    provider: ObjectRef,
+    type_str: &str,
+    algo: &str,
+) -> Result<Option<MethodCallResult>, MethodCallFailed> {
+    let cid = ctx.class_id_of_object(provider);
+    if !ctx.class_declares_method(cid, "getService", PROVIDER_GET_SERVICE_DESC) {
+        return Ok(None);
+    }
+    // Every `create_string` below can move the receiver, so pin first and
+    // re-read through the pin after each allocation.
+    let prov_pin = ctx.pin_native_root(provider);
+    let type_s0 = ctx.create_string(type_str);
+    let type_pin = ctx.pin_native_root(type_s0);
+    let algo_s0 = ctx.create_string(algo);
+    let algo_pin = ctx.pin_native_root(algo_s0);
+    let provider = ctx.read_native_pin(prov_pin, provider);
+    let type_s = ctx.read_native_pin(type_pin, type_s0);
+    let algo_s = ctx.read_native_pin(algo_pin, algo_s0);
+    let svc = match ctx.invoke_virtual(
+        provider,
+        "getService",
+        PROVIDER_GET_SERVICE_DESC,
+        &[Value::Object(Some(type_s)), Value::Object(Some(algo_s))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        // Null is the JDK's "this provider does not offer that algorithm"
+        // answer; the caller turns it into NoSuchAlgorithmException itself.
+        Ok(_) => {
+            ctx.unpin_native_roots(prov_pin);
+            return Ok(None);
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(prov_pin);
+            return Err(e);
+        }
+    };
+    let svc_pin = ctx.pin_native_root(svc);
+    let svc = ctx.read_native_pin(svc_pin, svc);
+    // A throw here (BC's `ProvSSLContextSpi.<clinit>` raising on a mismatched
+    // bcprov, for one) is the provider's own failure and must reach the caller
+    // unchanged — that IS the HotSpot behaviour.
+    let impl_ref = match ctx.invoke_virtual(
+        svc,
+        "newInstance",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(None)],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        Ok(_) => {
+            ctx.unpin_native_roots(prov_pin);
+            return Ok(None);
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(prov_pin);
+            return Err(e);
+        }
+    };
+    let impl_pin = ctx.pin_native_root(impl_ref);
+    let provider = ctx.read_native_pin(prov_pin, provider);
+    let impl_ref = ctx.read_native_pin(impl_pin, impl_ref);
+    let inst = ctx.new_object_initialized(
+        "sun/security/jca/GetInstance$Instance",
+        "(Ljava/security/Provider;Ljava/lang/Object;)V",
+        &[Value::Object(Some(provider)), Value::Object(Some(impl_ref))],
+    );
+    ctx.unpin_native_roots(prov_pin);
+    Ok(Some(inst))
+}
+
 fn getinstance_instance_provider_obj(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3804,12 +4802,23 @@ fn getinstance_instance_provider_obj(
     // (String type, Class clazz, String algorithm, Provider provider)
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 2);
-    let provider = match args.get(3) {
-        Some(Value::Object(Some(p))) => read_provider_name_version(ctx, *p)
+    // Read the name BEFORE anything allocates: `provider_declared_service_instance`
+    // pins its own receiver, but `p` here would go stale across it otherwise.
+    let prov_ref = match args.get(3) {
+        Some(Value::Object(Some(p))) => Some(*p),
+        _ => None,
+    };
+    let provider = match prov_ref {
+        Some(p) => read_provider_name_version(ctx, p)
             .map(|(n, _)| n)
             .unwrap_or_default(),
-        _ => String::new(),
+        None => String::new(),
     };
+    if let Some(p) = prov_ref {
+        if let Some(r) = provider_declared_service_instance(ctx, p, &type_str, &algo)? {
+            return r;
+        }
+    }
     match build_jca_instance(ctx, &provider, &type_str, &algo)? {
         Some(r) => r,
         None => Err(throw_no_such_algorithm(
@@ -4309,6 +5318,24 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         provider_get_object,
     );
+    // The Map surface. `java.security.Provider` IS a `Properties`, and these
+    // were the methods nothing here registered — so they read the inherited
+    // map while `get`/`containsKey` read the side table, and the two never
+    // agreed. See `provider_map_rows`.
+    r.register(prov, "size", "()I", provider_size);
+    r.register(prov, "isEmpty", "()Z", provider_is_empty);
+    r.register(prov, "keySet", "()Ljava/util/Set;", provider_key_set);
+    r.register(prov, "entrySet", "()Ljava/util/Set;", provider_entry_set);
+    r.register(prov, "values", "()Ljava/util/Collection;", provider_values);
+    r.register(prov, "keys", "()Ljava/util/Enumeration;", provider_keys);
+    r.register(prov, "elements", "()Ljava/util/Enumeration;", provider_elements);
+    r.register(
+        prov,
+        "stringPropertyNames",
+        "()Ljava/util/Set;",
+        provider_string_property_names,
+    );
+    r.register(prov, "putId", "()V", provider_put_id);
 
     // Provider$Service accessors — `getClassName()` is consumed by both
     // `Cipher.getInstance` (to instantiate the SPI) and by callers
@@ -4322,6 +5349,18 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "getClassName",
         "()Ljava/lang/String;",
         provider_service_get_class_name,
+    );
+
+    // `getAttribute` is public API, not just `supportsParameter` plumbing —
+    // see `provider_service_get_attribute`. The JDK's own body reads a map
+    // keyed by its private `UString` wrapper, which nothing outside
+    // `java.security` can populate, so answering it here is the only way the
+    // attribute rows a provider `put` become visible.
+    r.register(
+        svc,
+        "getAttribute",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        provider_service_get_attribute,
     );
 
     r.register(
@@ -4667,6 +5706,148 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::test_utils::MockNativeContext;
+
+    // -----------------------------------------------------------------
+    // G43-1 — `make_provider`'s legacy slot mirror is synthetic-mode-only.
+    //
+    // The two arms below are the whole decision. Under `--jdk-only` the
+    // receiver is a real `java.security.Provider`, whose slots 0/1/2 are the
+    // inherited `Hashtable.table` / `count` / `threshold`; the slot-2 write
+    // published a heap ADDRESS into an `I` field, MEASURED twice per `RCrypto`
+    // run by `CRATONVM_DBG_COERCION=1` as species `pointer-into-primitive` at
+    // `provider_chain.rs:317`. Under `--synthetic-jdk` the same three slots
+    // ARE name/version/info and `provider_get_name` / `provider_get_version` /
+    // `provider_get_info` read them.
+    // -----------------------------------------------------------------
+
+    /// Declare `java.security.Provider`'s OWN instance fields at slots that do
+    /// not overlap the legacy mirror, which is what a real-JDK layout looks
+    /// like from a native's point of view: the named writes resolve, and 0/1/2
+    /// belong to somebody else (`Hashtable`).
+    fn declare_real_provider_layout(ctx: &MockNativeContext, cid: cratonvm_types::ClassId) {
+        let fields = ["name", "info", "version", "versionStr", "initialized"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| cratonvm_native_api::FieldMetadata {
+                name: (*n).to_string(),
+                descriptor: "Ljava/lang/Object;".to_string(),
+                access_flags: 0,
+                // Slot 3 upward — 0/1/2 are the inherited Hashtable fields.
+                slot_index: i + 3,
+                declaring_class_id: cid,
+                is_static: false,
+            })
+            .collect();
+        ctx.set_declared_fields(cid, fields);
+    }
+
+    #[test]
+    fn g43_1_make_provider_writes_the_legacy_slots_only_in_synthetic_mode() {
+        let mut ctx = MockNativeContext::new();
+        // No declared layout → every `set_field_by_name` for a Provider-only
+        // name is a no-op, which is exactly what production does when the real
+        // class has no bytes. `versionStr` cannot read back, so the mirror runs.
+        let p = make_provider(&mut ctx, "SUN", 25.0, "test coverage").expect("alloc");
+
+        assert!(
+            matches!(ctx.get_field(p, 0), Value::Object(Some(_))),
+            "synthetic slot 0 must carry the name String (provider_get_name reads it)"
+        );
+        assert_eq!(
+            ctx.get_field(p, 1),
+            Value::Double(25.0),
+            "synthetic slot 1 must carry the numeric version (provider_get_version reads it)"
+        );
+        assert!(
+            matches!(ctx.get_field(p, 2), Value::Object(Some(_))),
+            "synthetic slot 2 must carry the info String (provider_get_info reads it)"
+        );
+        // The two Strings are distinct objects — a mirror that wrote the same
+        // ref twice would satisfy the two assertions above vacuously.
+        assert_ne!(
+            ctx.get_field(p, 0),
+            ctx.get_field(p, 2),
+            "name and info must be different objects"
+        );
+    }
+
+    #[test]
+    fn g43_1_make_provider_does_not_publish_an_address_into_a_real_provider_int_slot() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx
+            .ensure_class_initialized("java/security/Provider")
+            .expect("mock registers the class");
+        declare_real_provider_layout(&ctx, cid);
+
+        let p = make_provider(&mut ctx, "SUN", 25.0, "test coverage").expect("alloc");
+
+        // The named writes landed where the class says they go...
+        assert!(
+            matches!(ctx.get_field_by_name(p, "name"), Value::Object(Some(_))),
+            "real-layout `name` must be written by name"
+        );
+        assert!(
+            matches!(
+                ctx.get_field_by_name(p, "versionStr"),
+                Value::Object(Some(_))
+            ),
+            "real-layout `versionStr` must be written by name"
+        );
+        assert!(
+            matches!(ctx.get_field_by_name(p, "info"), Value::Object(Some(_))),
+            "real-layout `info` must be written by name"
+        );
+
+        // ...and the legacy mirror did NOT run. Slot 2 is `Hashtable.threshold:I`
+        // on a real Provider; a reference there is the `pointer-into-primitive`
+        // coercion, and slot 0 is `Hashtable.table`, whose occupant a live
+        // `Hashtable.keys()` walks as an `Entry[]`.
+        assert!(
+            !matches!(ctx.get_field(p, 2), Value::Object(Some(_))),
+            "slot 2 is Hashtable.threshold on a real Provider — writing a \
+             reference there is the pointer-into-primitive coercion this fixes"
+        );
+        assert!(
+            !matches!(ctx.get_field(p, 0), Value::Object(Some(_))),
+            "slot 0 is Hashtable.table on a real Provider — a String there is \
+             walked as an Entry[] by any live keys()/entrySet()"
+        );
+        assert_ne!(
+            ctx.get_field(p, 1),
+            Value::Double(25.0),
+            "slot 1 is Hashtable.count on a real Provider — a Double there \
+             decodes to the low half of its IEEE-754 bit pattern"
+        );
+    }
+
+    #[test]
+    fn g43_1_provider_get_info_never_returns_a_primitive_from_the_slot_fallback() {
+        // `provider_get_info`'s descriptor is `()Ljava/lang/String;`. On a real
+        // Provider slot 2 is an `int`, and an unwritten reference slot reads
+        // back as `Int(0)` besides — either way, handing the interpreter an
+        // `Int` from a reference-returning native is a type error at the call
+        // site, so the fallback must degrade to null instead.
+        let mut ctx = MockNativeContext::new();
+        let p = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(p, 2, Value::Int(12));
+
+        let got = provider_get_info(&mut ctx, &[Value::Object(Some(p))])
+            .expect("getInfo must not fail")
+            .expect("getInfo returns a value");
+        assert_eq!(
+            got,
+            Value::Object(None),
+            "an `I` slot must not become a String"
+        );
+
+        // The reference case still passes through unchanged.
+        let info = ctx.create_string("SUN security provider");
+        ctx.set_field(p, 2, Value::Object(Some(info)));
+        let got = provider_get_info(&mut ctx, &[Value::Object(Some(p))])
+            .expect("getInfo must not fail")
+            .expect("getInfo returns a value");
+        assert_eq!(got, Value::Object(Some(info)));
+    }
 
     /// Helper: allocate a synthetic Provider$Service heap entry sized
     /// large enough for the slot fallback (synthetic getters at 0/1/2)

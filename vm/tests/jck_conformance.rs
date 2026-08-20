@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-#![cfg(feature = "synthetic-jdk")]
-// This corpus targets the legacy synthetic-JDK support surface. The default VM
-// build uses real JDK bytecode and must not run this long synthetic harness.
-
 //! NEW-16: JCK-style java.base conformance harness.
 //!
 //! Runs the curated `Tck*` test corpus under `tests/resources/cratonvm/` through
@@ -12,18 +8,55 @@
 //! Net, Security, Reflect, Loading, ClassFile, Instructions, Jdbc). Produces a
 //! machine-checkable summary and a regression gate.
 //!
-//! The baseline report lives at `gaps/jdk-regression-baseline.md`. Each category
-//! has a floor — CI fails if the pass count drops below the committed floor.
+//! The baseline report lives at `internal/gaps/jdk-regression-baseline.md`.
+//! Each category has a floor — CI fails if the pass count drops below the
+//! committed floor.
 //!
 //! Convention for the corpus:
 //!   - Every test is `public static int testName()` returning 1 on pass, 0 on fail.
 //!   - Tests must not take arguments, perform I/O, or depend on external state.
 //!
-//! Prerequisites: javac on PATH (see `build.rs`). If class files are missing at
-//! runtime, the harness is skipped — it does not fail the build.
+//! # Two layers, and why the file-level `#[cfg]` came off (2026-08-13)
+//!
+//! Line 4 of this file used to be `#![cfg(feature = "synthetic-jdk")]`, so the
+//! entire harness — including the thing named `jck_regression_gate`, whose own
+//! message says it "enforces the committed baseline" — **did not exist in the
+//! configuration CI builds**. No job runs `vm/tests/*` with that feature: the
+//! `synthetic-jdk` job only `cargo check --all-targets`s them and runs `--lib`
+//! scopes, while the blocking `cargo test --workspace` job uses default
+//! features. Behind that, `jck_regression_gate` opened with
+//! `if !class_files_available() { eprintln!("Skipping…"); return; }`, so even
+//! with the feature it returned green in 0.00 s on a machine with no corpus.
+//! Two dark layers over a gate. This document's own "How to run" section still
+//! recommends `cargo test -p cratonvm-vm --test jck_conformance` with default
+//! features — a command that ran zero tests. (E25 sweep,
+//! `docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md`
+//! section 4.1, row 32.)
+//!
+//! The harness is now split by what it needs, not by cargo feature:
+//!
+//!   * **The tables** — `CORPUS` and `BASELINE_FLOORS` — need no VM and no
+//!     `.class` files, so the checks over them are UNGATED and run in
+//!     `cargo test --workspace`. They cross-check the two tables against each
+//!     other and against the committed baseline document, which is a file
+//!     outside this crate that a person edits by hand.
+//!   * **The corpus run** needs a VM built against synthetic-JDK stubs and a
+//!     `javac`-produced corpus. That stays behind
+//!     `#[cfg(feature = "synthetic-jdk")]` — the original comment's reason is a
+//!     good one ("the default VM build uses real JDK bytecode and must not run
+//!     this long synthetic harness") — and its skip is now LOUD and promotable
+//!     to a failure through `CRATONVM_REQUIRE_E2E` (`vm/tests/common/mod.rs`).
+//!
+//! Prerequisites for the gated half: javac on PATH (see `build.rs`).
 
+// Every VM-touching item in this file carries the same gate. It is applied
+// per-item rather than as a `#![cfg]` on the file so that the table checks
+// below stay in the default build.
+#[cfg(feature = "synthetic-jdk")]
 use cratonvm_vm::config::VmConfig;
+#[cfg(feature = "synthetic-jdk")]
 use cratonvm_vm::types::Value;
+#[cfg(feature = "synthetic-jdk")]
 use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
@@ -607,9 +640,10 @@ const fn tck(category: Category, class: &'static str, method: &'static str) -> T
 }
 
 // ---------------------------------------------------------------------------
-// Execution + classification
+// Execution + classification — needs a VM and a `javac`-produced corpus.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "synthetic-jdk")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Pass,
@@ -617,6 +651,7 @@ enum Outcome {
     Error,
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn run_one(t: &TckTest) -> Outcome {
     // Use a fresh VM per test. Sharing one VM across the full corpus
     // causes accumulated state (e.g. cached class-loader errors) to bleed
@@ -631,21 +666,60 @@ fn run_one(t: &TckTest) -> Outcome {
     }
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     format!("{manifest_dir}/tests/resources")
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
     std::path::Path::new(&format!("{dir}/cratonvm/TckClassFile.class")).exists()
 }
 
+/// The skip note both corpus-running tests print, and the switch that turns it
+/// into a failure.
+///
+/// Until 2026-08-13 the two call sites read
+/// `eprintln!("Skipping …"); return;` — in cargo's output that is
+/// `test jck_regression_gate ... ok` in 0.00 s, byte-for-byte identical to a
+/// gate that ran the whole 424-test corpus and passed. `CRATONVM_REQUIRE_E2E`
+/// is this suite's existing answer to exactly that (`vm/tests/common/mod.rs`,
+/// `require_fixture`): unset, the behaviour is the historical skip, but now
+/// loud; set, a missing corpus is a panic, so at least one configuration cannot
+/// go green by having no inputs.
+#[cfg(feature = "synthetic-jdk")]
+fn skip_or_fail_without_corpus(test_name: &str) -> bool {
+    if class_files_available() {
+        return false;
+    }
+    let require = std::env::var("CRATONVM_REQUIRE_E2E")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    let dir = test_resources_dir();
+    if require {
+        panic!(
+            "{test_name}: the Tck corpus is not compiled ({dir}/cratonvm/TckClassFile.class \
+             is missing) and CRATONVM_REQUIRE_E2E is set. This gate enforces the committed \
+             baseline in internal/gaps/jdk-regression-baseline.md; with no corpus it \
+             enforces nothing, and would have reported `ok` in 0.00s."
+        );
+    }
+    eprintln!(
+        "[jck] SKIPPING {test_name} — {dir}/cratonvm/TckClassFile.class is missing, so THIS \
+         TEST ASSERTED NOTHING. Set CRATONVM_REQUIRE_E2E=1 to make this a failure."
+    );
+    true
+}
+
+#[cfg(feature = "synthetic-jdk")]
 fn test_vm() -> Vm {
     let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
     Vm::new(config)
 }
 
+#[cfg(feature = "synthetic-jdk")]
 #[derive(Debug, Default, Clone, Copy)]
 struct Tally {
     pass: u32,
@@ -653,6 +727,7 @@ struct Tally {
     error: u32,
 }
 
+#[cfg(feature = "synthetic-jdk")]
 impl Tally {
     fn total(&self) -> u32 {
         self.pass + self.fail + self.error
@@ -667,6 +742,7 @@ impl Tally {
 }
 
 /// Run the full corpus and return a map of category -> tally.
+#[cfg(feature = "synthetic-jdk")]
 fn run_corpus() -> std::collections::BTreeMap<&'static str, Tally> {
     let mut tallies: std::collections::BTreeMap<&'static str, Tally> =
         std::collections::BTreeMap::new();
@@ -681,46 +757,281 @@ fn run_corpus() -> std::collections::BTreeMap<&'static str, Tally> {
 }
 
 // ---------------------------------------------------------------------------
-// Baseline report (committed under gaps/jdk-regression-baseline.md)
+// Baseline report (committed under internal/gaps/jdk-regression-baseline.md)
 // ---------------------------------------------------------------------------
 
-/// Per-category pass floors. CI fails if the current pass count drops below
-/// any of these values. Raise the floor only after a deliberate improvement
-/// has landed AND the new number is reproducible on a clean build.
+/// Per-category `(name, pass floor, corpus population)`.
 ///
-/// These numbers must match `gaps/jdk-regression-baseline.md`.
-const BASELINE_FLOORS: &[(&str, u32)] = &[
-    // Updated 2026-04-16 after T4.2-T4.6 corpus expansion.
-    // Total corpus: 421 tests, 109 pass on first run.
-    ("ClassFile", 4),    // 4/5 pass
-    ("Concurrent", 8),   // 8/19 — AtomicInteger/Long basic ops pass
-    ("Http", 0),         // 0/10 — java.net.http not yet wired
-    ("Instructions", 9), // 9/13
-    ("Io", 18),          // 18-20/37 — BAOS, BAIS, File I/O, StringWriter (slight variance)
-    ("Jdbc", 0),         // 0/11 — JDBC wired but not through TCK path
-    ("Lang", 34),        // 34/109 — core types, wrappers, math, system
-    ("Loading", 4),      // 4/5
-    ("Management", 0),   // 0/9 — MXBeans not yet wired
-    ("Math", 3),         // 3/15 — BigInteger basic ops
-    ("Net", 0),          // 0/10 — URL/URI constructors
-    ("Nio", 11),         // 11/25 — ByteBuffer core ops
-    ("Reflect", 5),      // 5/21 — Class metadata basics
-    ("Regex", 0),        // 0/11 — Pattern/Matcher not through TCK path
-    ("Security", 0),     // 0/19 — crypto not through TCK path
-    ("Sql", 8),          // 8/12 — java.sql constants pass
-    ("Text", 0),         // 0/16 — DecimalFormat/MessageFormat
-    ("Time", 0),         // 0/31 — java.time not yet wired
-    ("Util", 3),         // 3/43 — basic collections
+/// The third column used to be a trailing `// 4/5` comment. It is data now,
+/// because it is the only thing that ties this table to `CORPUS`: a category
+/// that gains or loses a test changes its population, and
+/// `every_category_population_matches_the_corpus` says so. As a comment it said
+/// nothing, and it had already rotted — `Lang` and `Util` are 110 and 45 here,
+/// not the 109 and 43 the committed baseline document still records.
+///
+/// The floors themselves must match the Floor column of
+/// `internal/gaps/jdk-regression-baseline.md`; that is asserted, against
+/// the file, by `the_committed_baseline_document_and_this_table_agree`.
+const BASELINE_FLOORS: &[(&str, u32, u32)] = &[
+    // Floors updated 2026-04-16 after T4.2-T4.6 corpus expansion.
+    // Populations re-counted from CORPUS on 2026-08-13.
+    ("ClassFile", 4, 5),
+    ("Concurrent", 8, 19), // AtomicInteger/Long basic ops pass
+    ("Http", 0, 10),       // java.net.http not yet wired
+    ("Instructions", 9, 13),
+    ("Io", 18, 37),    // BAOS, BAIS, File I/O, StringWriter (slight variance)
+    ("Jdbc", 0, 11),   // JDBC wired but not through TCK path
+    ("Lang", 34, 110), // core types, wrappers, math, system
+    ("Loading", 4, 5),
+    ("Management", 0, 9), // MXBeans not yet wired
+    ("Math", 3, 15),      // BigInteger basic ops
+    ("Net", 0, 10),       // URL/URI constructors
+    ("Nio", 11, 25),      // ByteBuffer core ops
+    ("Reflect", 5, 21),   // Class metadata basics
+    ("Regex", 0, 11),     // Pattern/Matcher not through TCK path
+    ("Security", 0, 19),  // crypto not through TCK path
+    ("Sql", 8, 12),       // java.sql constants pass
+    ("Text", 0, 16),      // DecimalFormat/MessageFormat
+    ("Time", 0, 31),      // java.time not yet wired
+    ("Util", 3, 45),      // basic collections
 ];
 
 // ---------------------------------------------------------------------------
-// Tests
+// Table checks — no VM, no corpus, no cargo feature. These run in
+// `cargo test --workspace`, which is the configuration CI actually executes.
+// ---------------------------------------------------------------------------
+
+/// The committed baseline document, and where it was found.
+///
+/// Two candidates because the harness doc comment said `gaps/…` for a long time
+/// while the file has lived under `internal/gaps/…`, and `docs/internal` is
+/// being removed from history by a separate effort. A gate whose committed
+/// baseline cannot be located enforces nothing, so this panics rather than
+/// skipping — the whole subject of this file's 2026-08-13 rewrite.
+fn baseline_document() -> (String, String) {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let candidates = [
+        format!("{manifest_dir}/../docs/internal/gaps/jdk-regression-baseline.md"),
+        format!("{manifest_dir}/../gaps/jdk-regression-baseline.md"),
+    ];
+    for c in &candidates {
+        if let Ok(text) = std::fs::read_to_string(c) {
+            return (c.clone(), text);
+        }
+    }
+    panic!(
+        "the committed JCK baseline document was not found. Searched:\n  {}\n\n\
+         `jck_regression_gate`'s failure message names this document as the \
+         thing it enforces, and BASELINE_FLOORS is supposed to mirror its Floor \
+         column. If the document MOVED, update the candidate list here in the \
+         same commit; if it was DELETED, delete the claim as well, because a \
+         regression gate with no committed baseline is not one.",
+        candidates.join("\n  ")
+    );
+}
+
+/// `(category, floor, total)` rows of the baseline table, plus the `TOTAL` row.
+///
+/// Deliberately tolerant of the surrounding prose: it accepts any pipe table
+/// row whose first cell is a bare alphabetic word and whose next two cells parse
+/// as integers, so the `## History` table (first cell is a date) and the
+/// `## Categories added` table (second cell is prose) are skipped without
+/// needing to know where they are.
+fn baseline_rows(md: &str) -> Vec<(String, u32, u32)> {
+    md.lines()
+        .filter(|l| l.trim_start().starts_with('|'))
+        .filter_map(|l| {
+            let cells: Vec<&str> = l.split('|').map(|c| c.trim().trim_matches('*')).collect();
+            if cells.len() < 5 {
+                return None;
+            }
+            let name = cells[1];
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphabetic()) {
+                return None;
+            }
+            let floor = cells[2].parse::<u32>().ok()?;
+            let total = cells[3].parse::<u32>().ok()?;
+            Some((name.to_string(), floor, total))
+        })
+        .collect()
+}
+
+/// Rows where this file and the committed document disagree TODAY, named.
+///
+/// `(category-or-"TOTAL", field, value here, value in the document)`.
+///
+/// This is an exemption list, and it expires the moment it stops being true:
+/// `the_committed_baseline_document_and_this_table_agree` fails if a listed row
+/// starts agreeing (delete the row), if the disagreement changes shape
+/// (re-measure it), or if an unlisted row starts disagreeing. There is no way
+/// to add a row without stating both numbers, and no way for a row to outlive
+/// the discrepancy it excuses — which is what happened to the `already_triaged`
+/// list E20 found, where 3 of 6 rows had rotted into standing permission.
+///
+/// Measured 2026-08-13 by counting `CORPUS` and parsing the document. All four
+/// are the document being stale, not this file: the corpus grew by 3 tests
+/// (Lang +1, Util +2) after the document's last update on 2026-04-16, and the
+/// `Io` floor was lowered here from 20 to 18 with the reason recorded only in a
+/// trailing comment ("slight variance"). Fixing them means editing a document
+/// this lane does not own — see NOM E33-3.
+const BASELINE_DOC_DRIFT: &[(&str, &str, u32, u32)] = &[
+    ("Io", "floor", 18, 20),
+    ("Lang", "total", 110, 109),
+    ("Util", "total", 45, 43),
+    ("TOTAL", "total", 424, 421),
+];
+
+#[test]
+fn every_category_population_matches_the_corpus() {
+    let mut wrong: Vec<String> = Vec::new();
+    for (cat, floor, total) in BASELINE_FLOORS {
+        let actual = CORPUS.iter().filter(|t| t.category.0 == *cat).count() as u32;
+        if actual != *total {
+            wrong.push(format!(
+                "{cat}: BASELINE_FLOORS says {total} tests, CORPUS has {actual}"
+            ));
+        }
+        if floor > total {
+            wrong.push(format!(
+                "{cat}: floor {floor} exceeds the population {total}, so the gate can never pass"
+            ));
+        }
+    }
+    // Two-sided: a category present in one table and not the other.
+    for t in CORPUS {
+        if !BASELINE_FLOORS.iter().any(|(c, _, _)| *c == t.category.0) {
+            wrong.push(format!(
+                "{}: CORPUS has tests in this category and BASELINE_FLOORS has no row, so its \
+                 pass count is floored by nothing",
+                t.category.0
+            ));
+        }
+    }
+    for (cat, _, _) in BASELINE_FLOORS {
+        if !CORPUS.iter().any(|t| t.category.0 == *cat) {
+            wrong.push(format!(
+                "{cat}: BASELINE_FLOORS has a row and CORPUS has no test in it — \
+                 `tallies.get(cat).unwrap_or_default()` makes that row a permanent no-op"
+            ));
+        }
+    }
+    wrong.sort();
+    wrong.dedup();
+    assert!(
+        wrong.is_empty(),
+        "BASELINE_FLOORS and CORPUS have drifted apart:\n  {}",
+        wrong.join("\n  ")
+    );
+    // Anti-vacuity: an empty CORPUS would pass every loop above.
+    assert!(
+        CORPUS.len() > 400,
+        "CORPUS has only {} entries; the checks above would be near-vacuous",
+        CORPUS.len()
+    );
+}
+
+#[test]
+fn the_corpus_lists_no_test_twice() {
+    let mut seen: Vec<(&str, &str)> = CORPUS.iter().map(|t| (t.class, t.method)).collect();
+    let before = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        before,
+        "CORPUS lists the same (class, method) more than once. A duplicate inflates a \
+         category's population and its pass count together, so the floor still passes \
+         while the corpus covers less than it claims."
+    );
+}
+
+/// The one check in this file whose expectation lives OUTSIDE the crate: a
+/// markdown file a person edits by hand, in a different directory, which
+/// `jck_regression_gate`'s own failure text names as the thing it enforces.
+#[test]
+fn the_committed_baseline_document_and_this_table_agree() {
+    let (path, md) = baseline_document();
+    let rows = baseline_rows(&md);
+    assert!(
+        rows.len() >= 20,
+        "parsed only {} rows out of {path} — the document's table format changed and this \
+         check has stopped reading it. Fix the parser; do not delete the check.",
+        rows.len()
+    );
+
+    // Build every (category, field) comparison, then subtract the named drift.
+    let mut disagreements: Vec<(String, String, u32, u32)> = Vec::new();
+    for (cat, floor, total) in BASELINE_FLOORS {
+        match rows.iter().find(|(name, _, _)| name.as_str() == *cat) {
+            None => disagreements.push((cat.to_string(), "row".into(), 1, 0)),
+            Some((_, doc_floor, doc_total)) => {
+                if floor != doc_floor {
+                    disagreements.push((cat.to_string(), "floor".into(), *floor, *doc_floor));
+                }
+                if total != doc_total {
+                    disagreements.push((cat.to_string(), "total".into(), *total, *doc_total));
+                }
+            }
+        }
+    }
+    let corpus_len = CORPUS.len() as u32;
+    match rows.iter().find(|(name, _, _)| name.as_str() == "TOTAL") {
+        None => disagreements.push(("TOTAL".into(), "row".into(), 1, 0)),
+        Some((_, _, doc_total)) => {
+            if corpus_len != *doc_total {
+                disagreements.push(("TOTAL".into(), "total".into(), corpus_len, *doc_total));
+            }
+        }
+    }
+
+    let mut unexpected: Vec<String> = Vec::new();
+    for (cat, field, here, there) in &disagreements {
+        if !BASELINE_DOC_DRIFT.iter().any(|(c, f, h, t)| {
+            *c == cat.as_str() && *f == field.as_str() && h == here && t == there
+        }) {
+            unexpected.push(format!(
+                "{cat}.{field}: this file says {here}, {path} says {there}"
+            ));
+        }
+    }
+    let mut stale: Vec<String> = Vec::new();
+    for (cat, field, here, there) in BASELINE_DOC_DRIFT {
+        if !disagreements.iter().any(|(c, f, h, t)| {
+            c.as_str() == *cat && f.as_str() == *field && h == here && t == there
+        }) {
+            stale.push(format!(
+                "{cat}.{field}: BASELINE_DOC_DRIFT still excuses \"{here} here vs {there} in the \
+                 document\", but that is no longer the disagreement"
+            ));
+        }
+    }
+
+    assert!(
+        unexpected.is_empty(),
+        "this file and the committed baseline document disagree, and the disagreement is not \
+         in BASELINE_DOC_DRIFT:\n  {}\n\n\
+         Update {path} and this table in the same commit — that is what its \"Regression \
+         floors\" section asks for. If the divergence is deliberate and cannot be fixed here, \
+         add it to BASELINE_DOC_DRIFT with BOTH numbers and a reason.",
+        unexpected.join("\n  ")
+    );
+    assert!(
+        stale.is_empty(),
+        "BASELINE_DOC_DRIFT has rows that no longer describe a real disagreement:\n  {}\n\n\
+         Delete them. An exemption that outlives its exception is standing permission, which \
+         is the failure mode this whole file was rewritten for on 2026-08-13.",
+        stale.join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Corpus-running tests (need `--features synthetic-jdk` AND a javac corpus)
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "synthetic-jdk")]
 fn jck_full_corpus_runs() {
-    if !class_files_available() {
-        eprintln!("Skipping jck_full_corpus_runs: .class files not available");
+    if skip_or_fail_without_corpus("jck_full_corpus_runs") {
         return;
     }
     let tallies = run_corpus();
@@ -759,15 +1070,15 @@ fn jck_full_corpus_runs() {
 }
 
 #[test]
+#[cfg(feature = "synthetic-jdk")]
 fn jck_regression_gate() {
-    if !class_files_available() {
-        eprintln!("Skipping jck_regression_gate: .class files not available");
+    if skip_or_fail_without_corpus("jck_regression_gate") {
         return;
     }
     let tallies = run_corpus();
 
     let mut failures: Vec<String> = Vec::new();
-    for (cat, floor) in BASELINE_FLOORS {
+    for (cat, floor, _total) in BASELINE_FLOORS {
         let current = tallies.get(cat).copied().unwrap_or_default().pass;
         if current < *floor {
             failures.push(format!(
@@ -780,9 +1091,11 @@ fn jck_regression_gate() {
         failures.is_empty(),
         "NEW-16 regression gate tripped:\n  {}\n\n\
          The regression gate enforces the committed baseline in \
-         gaps/jdk-regression-baseline.md. If a regression is intentional \
-         (e.g. a test was removed), update BASELINE_FLOORS and the baseline \
-         doc together in the same commit.",
+         internal/gaps/jdk-regression-baseline.md. If a regression is \
+         intentional (e.g. a test was removed), update BASELINE_FLOORS and the \
+         baseline doc together in the same commit — \
+         `the_committed_baseline_document_and_this_table_agree` will tell you \
+         if you update only one of them.",
         failures.join("\n  ")
     );
 }

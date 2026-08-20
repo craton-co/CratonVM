@@ -93,6 +93,10 @@ const ALLOWED: &[(&str, &str)] = &[
          `the_scanner_only_matches_whole_string_literals` pins that.",
     ),
     (
+        "CRATONVM_DBG_FLAGREADS",
+        "kind 2: read by the flag machinery ITSELF. `types/src/flags.rs` traces          every flag read, so it consults this one with a raw          `std::env::var_os` rather than `runtime_var_os` — routing it through          the latched snapshot would mean asking the tracer to trace the read          that decides whether tracing is on. It therefore cannot be served by          `VmFlags`, which is the property every other entry in the inventory          asserts, so it is exempt rather than declared.",
+    ),
+    (
         "CRATONVM_COMPATIBILITY_JDK_ONLY",
         "kind 1: the name of a `libcratonvm` C ABI integer constant, matched \
          here only because a unit test asserts the diagnostic message names it",
@@ -101,6 +105,10 @@ const ALLOWED: &[(&str, &str)] = &[
     // deliberately *not* here: it only ever appears inside prose, which
     // `is_comment_line` already drops, and a row for it would be dead on
     // arrival under `the_allowlist_has_no_dead_rows`.
+    (
+        "CRATONVM_DBG_FLAGREADS",
+        "kind 3: the one flag that CANNOT be served from the snapshot, because          it instruments the snapshot's own reads. `types/src/flags.rs` reads it          with `std::env::var_os` directly and says why on the line above:          `reading through this module would recurse`. Declaring it would make          the flag machinery call itself to decide whether to trace a call to          itself.",
+    ),
     (
         "CRATONVM_NONEXISTENT_VAR_12345",
         "kind 2: `vm.rs`'s System.getenv coverage needs a name that is \
@@ -164,6 +172,21 @@ const ALLOWED: &[(&str, &str)] = &[
          knob could not be in the snapshot at the moment it is needed. A \
          scalar is not available either: the surface is pinned at fifteen \
          names by `the_whole_surface_is_fifteen_variables`.",
+    ),
+    (
+        "CRATONVM_NO_MISPLACED_FLAG_WARNING",
+        "kind 4: `vm-cli/src/main.rs` - silences the warning that a launcher \
+         option was passed AFTER the main class and therefore ignored. \
+         `warn_about_misplaced_launcher_flags` is called from `main` about \
+         thirty-seven lines BEFORE `install_flags` latches the snapshot, \
+         because the warning is about argv and has to be reachable whatever \
+         the configuration turns out to be. Reading it through \
+         `flags::runtime_var_os` therefore latches the snapshot early and \
+         `install_flags` fails with `runtime flags were read before launcher \
+         configuration` - every run then exits 1, which is how this row was \
+         arrived at rather than by argument. The two lines that establish the \
+         ordering are the `warn_about_misplaced_launcher_flags(&early_argv)` \
+         call and the `install_flags(runtime_flags)` check below it.",
     ),
     (
         "CRATONVM_TEST_JAVA_HOME",

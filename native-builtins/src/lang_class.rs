@@ -1725,8 +1725,63 @@ pub(crate) fn native_class_get_primitive_class(
 /// map first (populated by `get_or_create_class_mirror`).  Falls back to
 /// reading field 0 as Int(class_id) for legacy/synthetic compatibility.
 ///
-/// Returns `None` for primitive mirrors (not in the reverse map and
-/// field 0 is no longer Int(-1) вЂ” it's Object(None) in real-JDK mode).
+/// Returns `None` for primitive mirrors (not in the reverse map, and their
+/// slot-0 overlay is the `Int(-1)` sentinel, which the `v >= 0` guard rejects).
+///
+/// # What the slot-0 fallback actually does in real-JDK mode (G46-1, MEASURED)
+///
+/// This is the READ half of W7-84, and `G30-1` §6 pinned the write half without
+/// examining it. The write, in `vm/src/vm/vm_object.rs`, is the DESCRIPTOR-LESS
+/// `heap.set_field(mirror, 0, Value::Int(class_id))`; every collector's
+/// reference arm boxes that into an `AUTOBOX_CLASS_ID` wrapper so the value
+/// survives, and G30 §6's table concludes *"…a wrapper that `get_field`
+/// un-boxes back to `Int`"*. That is true of `Heap::get_field`. **It is not
+/// true of the accessor on this line.**
+///
+/// `NativeContextImpl::get_field` (`vm/src/vm/vm_exec.rs`) is DESCRIPTOR-AWARE:
+/// it resolves the receiver's declared descriptor for the slot and routes the
+/// read through `VmHeap::get_field_as`. `javap -p java.lang.Class` on Adoptium
+/// 25.0.3+9 declares instance field 0 as
+/// `private volatile transient Constructor<T> cachedConstructor`, i.e. `L`. So
+/// the collector un-boxes the wrapper back to `Int(v)` and
+/// `heap::coerce_field_value_for_slot`'s `b'L'` arm then maps that `Int` to
+/// `Value::Object(None)` two frames later. **The `if let Value::Int(v)` below
+/// therefore cannot match for any receiver whose class is the real
+/// `java.lang.Class`**, whatever the overlay holds — and each attempt is one
+/// `primitive-into-reference` event in the `CRATONVM_DBG_COERCION` log.
+///
+/// The fallback is still live where it was written for: a synthetic-stub
+/// `java/lang/Class` (and `MockNativeContext`) carries no usable descriptor, so
+/// `resolve_field_descriptor_byte_cached` short-circuits, the raw read reaches
+/// this line, and the `Int` matches. It is a MODE-dependent path, which nothing
+/// said before.
+///
+/// # Why this is nonetheless the right answer, and is left alone
+///
+/// MEASURED on `C:/craton/target-rel3/release/cratonvm.exe` (`9ae371468`),
+/// `--jdk-only`, `CRATONVM_DBG_COERCION=1`, 36 vectors: **378 events at this
+/// line, and every single one is `descriptor=L value=Int(-1)`**. `Int(-1)` is
+/// `get_or_create_primitive_mirror`'s sentinel — a PRIMITIVE class mirror,
+/// which that function deliberately never registers in `class_mirrors_reverse`
+/// — and `-1` fails the `v >= 0` guard on the next line. So on the whole
+/// measured population the coercion changes nothing: `None` is the answer with
+/// or without it, and `None` is the CORRECT answer for a primitive mirror.
+///
+/// Confirmed by a controlled A/B (`G46MirrorProbe`, same binary and flags):
+/// ten `getName()` calls plus one `Array.newInstance` over PRIMITIVE mirrors
+/// produce 21 events here; the identical program over ORDINARY class mirrors
+/// produces **0**, because `class_id_from_mirror` answers first for those and
+/// this line is never reached.
+///
+/// Making the fallback live again would change what 157 call sites of this
+/// function see, in a mode where it has answered `None` for the whole life of
+/// `--jdk-only`, for a measured beneficiary population of zero. And the
+/// tempting spelling — `get_field_typed(mirror, 0, b'I')` — is actively
+/// dangerous: on a mirror whose `cachedConstructor` holds a genuine
+/// `Constructor` the `b'I'` arm publishes the object's own ADDRESS as an `Int`
+/// (`pointer-into-primitive`), which would sail past `v >= 0` and hand out a
+/// fabricated ClassId. `a_reference_at_slot_zero_is_never_decoded_as_a_class_id`
+/// pins that it must not.
 pub(crate) fn mirror_class_id(
     ctx: &dyn NativeContext,
     mirror: cratonvm_types::ObjectRef,
@@ -1734,28 +1789,36 @@ pub(crate) fn mirror_class_id(
     if let Some(cid) = ctx.class_id_from_mirror(mirror) {
         return Some(cid);
     }
-    if let Value::Int(v) = ctx.get_field(mirror, 0) {
-        if v >= 0 {
-            // JDK-ONLY-LAYOUT evidence item 3, for the `unknown` verdict on the
-            // slot-0 write in `vm/src/vm/vm_object.rs`. That write is an
-            // *overlay*: a VM-internal `Int` deliberately stored on top of
-            // `java.lang.Class`'s instance field 0, which JDK 25 declares as
-            // `Constructor<T> cachedConstructor` — a **reference** slot.
-            //
-            // The marker's question is not "is this the right slot" but "does
-            // anything still depend on it", and this line is the only reader of
-            // the overlay outside the VM — a fallback behind the reverse map.
-            // If a real-JDK run never reaches here, the wave-2 fix is to delete
-            // the overlay outright rather than relocate it, which is strictly
-            // better than either. Nothing in the tree could answer that, so:
-            // say it, once, under the flag the marker already nominates.
-            //
-            // Free when the flag is unset, and this is already the slow half of
-            // a two-step lookup when it is.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some() {
-                static REPORTED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    let slot0 = ctx.get_field(mirror, 0);
+    // JDK-ONLY-LAYOUT evidence item 3, for the `unknown` verdict on the slot-0
+    // write in `vm/src/vm/vm_object.rs`. That write is an *overlay*: a
+    // VM-internal `Int` deliberately stored on top of `java.lang.Class`'s
+    // instance field 0, which JDK 25 declares as `Constructor<T>
+    // cachedConstructor` — a **reference** slot.
+    //
+    // The marker's question is not "is this the right slot" but "does anything
+    // still depend on it", and this line is the only reader of the overlay
+    // outside the VM — a fallback behind the reverse map.
+    //
+    // G46-1 moved this report OUT of the `v >= 0` arm, and that is the whole
+    // point of the change. Inside it the line could not fire in real-JDK mode
+    // for either of two independent reasons (the descriptor coercion above, and
+    // the fact that the only measured population is the `-1` sentinel), so it
+    // was an unfalsifiable guard whose silence was read as "the fallback is
+    // never used" when it in fact means "the fallback can never SUCCEED".
+    // Reporting the MISS as well is what tells those two apart, and it is what
+    // a future lane needs before it deletes or relocates the overlay.
+    //
+    // Free when the flag is unset, and this is already the slow half of a
+    // two-step lookup when it is.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY").is_some() {
+        static REPORTED_HIT: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        static REPORTED_MISS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        match slot0 {
+            Value::Int(v) if v >= 0 => {
+                if !REPORTED_HIT.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!(
                         "[cratonvm][overlay] class-mirror slot-0 fallback HIT (ClassId {v}): \
                          `class_id_from_mirror` missed and this read the Int overlay at \
@@ -1764,6 +1827,22 @@ pub(crate) fn mirror_class_id(
                     );
                 }
             }
+            other => {
+                if !REPORTED_MISS.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[cratonvm][overlay] class-mirror slot-0 fallback MISS (slot 0 read \
+                         back as {other:?}): `class_id_from_mirror` missed AND the overlay \
+                         did not decode as a non-negative Int, so this answers None. \
+                         `Int(-1)` is the primitive-mirror sentinel and is the expected \
+                         reading; `Object(None)` means the descriptor-aware read nulled the \
+                         overlay (G46-1) or nothing ever wrote it."
+                    );
+                }
+            }
+        }
+    }
+    if let Value::Int(v) = slot0 {
+        if v >= 0 {
             return Some(cratonvm_types::ClassId::new(v as u32));
         }
     }
@@ -4640,9 +4719,26 @@ pub(crate) fn parse_descriptor_param_and_return(desc: &str) -> (Vec<String>, Str
     (params, ret_type)
 }
 
-/// Box a VM Value into a wrapper object for reflection returns.
+/// Box a VM Value into a **FRESH** wrapper object.
 ///
-/// e.g. Value::Int(42) with type "I" в†’ Integer.valueOf(42) object
+/// e.g. `Value::Int(42)` with type `"I"` produces a `new Integer(42)`-shaped
+/// object. It is **not** `Integer.valueOf(42)`, whatever this comment used to
+/// claim: the body below calls [`alloc_wrapper`] on every arm and has never
+/// consulted a cache. The distinction is observable (`==` on two boxes of the
+/// same in-cache value) and it is the entire reason [`box_value_canonical`]
+/// exists beside this function.
+///
+/// This is the correct helper for a caller whose HotSpot counterpart allocates
+/// unconditionally — HotSpot's `java_lang_boxing_object::create`, which is what
+/// `Reflection::array_get` and the `MethodHandleNatives` VM-info shapes reach.
+/// `Array.get` is the archetype and is measured fresh on **both** VMs (it does
+/// not call through here at all; `lib.rs::native_array_get` inlines its own
+/// `alloc_wrapper` per component type, which is why routing this function
+/// wholesale through the caches would *not* have broken it — and why "it
+/// would break `Array.get`" is not by itself the reason for the split).
+///
+/// `"V"` boxes to `null`; anything else is already a reference and passes
+/// through untouched.
 pub(crate) fn box_value(ctx: &mut dyn NativeContext, value: Value, type_desc: &str) -> Value {
     match type_desc {
         "I" => {
@@ -4687,6 +4783,90 @@ pub(crate) fn box_value(ctx: &mut dyn NativeContext, value: Value, type_desc: &s
         }
         "V" => Value::Object(None), // void в†’ null
         _ => value,                 // already an object reference
+    }
+}
+
+/// Box a VM Value the way the JDK's **reflective accessors** do: through
+/// `X.valueOf`, i.e. through the wrapper caches.
+///
+/// [`box_value`]'s cached sibling. The two are NOT interchangeable and the
+/// choice per call site is a measurement, not a preference. Every row below
+/// was measured on Microsoft OpenJDK 25.0.3+9 with `scratchpad/f11/
+/// BoxCallers.java` / `BoxCallers2.java`, which compare the object a path
+/// hands back against `X.valueOf(v)` by `==` (all values inside every bound:
+/// int 7, char 'a', byte 3, short 9, long 5, `true`):
+///
+/// | reflective path | HotSpot 25 | helper |
+/// |---|---|---|
+/// | `Field.get` (instance + static, I J Z B S C) | CANONICAL | this one |
+/// | `Method.invoke` primitive return | CANONICAL | this one |
+/// | `MethodHandle` return adaptation (`asType`/`invoke`/`invokeWithArguments`) | CANONICAL | this one |
+/// | `VarHandle.get` — field, array element, byte-array view, FFM layout | CANONICAL | this one |
+/// | `SerializedLambda.getCapturedArg` | CANONICAL | this one |
+/// | `InvocationHandler` `args[]` (proxy parameter boxing) | CANONICAL | this one |
+/// | `Array.get` | **FRESH** | [`box_value`] |
+/// | `Field.get` / `Method.invoke` of `float`/`double` | **FRESH** | [`box_value`] |
+/// | any value outside its type's cache bound | **FRESH** | either — the natives' own uncached arm |
+///
+/// The JDK's reason for the asymmetry is an implementation detail that is
+/// nonetheless observable, and therefore is behaviour: `Field.get` and
+/// `Method.invoke` run through `MethodHandle`-based accessors
+/// (`MethodHandleIntegerFieldAccessorImpl` etc.), whose boxing step is a
+/// direct handle to `Integer.valueOf` — so they inherit the cache. `Array.get`
+/// is a VM native (`Reflection::array_get`) that boxes with
+/// `java_lang_boxing_object::create`, which allocates and never looks at
+/// `IntegerCache`. **Do not "unify" them.** Both directions are asserted by
+/// tests below, and the fresh direction is the one no equality-shaped check
+/// can see (every "fresh" row above is still `.equals`-equal).
+///
+/// `F` and `D` deliberately fall through to [`box_value`]: `Float`/`Double`
+/// have no cache at all on HotSpot (`Float.valueOf(0f) == Float.valueOf(0f)`
+/// is `false`, measured), so "completing the family" to eight is a regression.
+///
+/// Three implementation notes:
+///
+/// 1. The descriptor arm is entered only when the `Value` variant MATCHES the
+///    descriptor. `native_long_value_of` reads `Some(Value::Long(v))` and
+///    **defaults to 0** for anything else, so handing it a `Value::Int` would
+///    convert an identity bug into a wrong-value bug. On a mismatch this falls
+///    back to [`box_value`], which stores the raw slot verbatim — i.e. exactly
+///    today's behaviour for those shapes.
+/// 2. A failing or empty native result also falls back to [`box_value`],
+///    never to `Value::Object(None)`. Mapping a boxing failure onto `null` is
+///    the defect already recorded above `create_method_object` — a reference
+///    return silently becoming `null` — and there is no reason to reintroduce
+///    it here.
+/// 3. No new cached storage is added: this routes callers into the SIX caches
+///    that already live in `lang_math.rs` and are already reported by
+///    `gc_scan_value_of_cache_roots` **and** remapped by
+///    `gc_update_value_of_cache_refs` (both hooks list the same six
+///    `*_cache()` accessors, and `vm/src/memory/native_roots.rs` registers
+///    them as one `VmRootSource { scan, remap }` pair, so the two cannot be
+///    wired independently). A cache that is rooted but not remapped is a
+///    use-after-move.
+pub(crate) fn box_value_canonical(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    type_desc: &str,
+) -> Value {
+    // Note 1: the `Value` variant is part of the match. A `("J", Value::Int)`
+    // shape must NOT reach `native_long_value_of`.
+    let cached = match (type_desc, value) {
+        ("I", Value::Int(_)) => crate::lang_math::native_integer_value_of(ctx, &[value]),
+        ("J", Value::Long(_)) => crate::lang_math::native_long_value_of(ctx, &[value]),
+        ("Z", Value::Int(_)) => crate::lang_math::native_boolean_value_of(ctx, &[value]),
+        ("B", Value::Int(_)) => crate::lang_math::native_byte_value_of(ctx, &[value]),
+        ("S", Value::Int(_)) => crate::lang_math::native_short_value_of(ctx, &[value]),
+        ("C", Value::Int(_)) => crate::lang_math::native_character_value_of(ctx, &[value]),
+        // "F" / "D" (no cache on HotSpot), "V" (void в†’ null), reference
+        // descriptors (pass through), and every mismatched variant.
+        _ => return box_value(ctx, value, type_desc),
+    };
+    // Note 2: only a real object is taken from the native; anything else
+    // degrades to the allocating path rather than to `null`.
+    match cached {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => box_value(ctx, value, type_desc),
     }
 }
 
@@ -6520,7 +6700,13 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // wrapper. Otherwise Long.longValue() later receives the raw compact-Int
     // bits (0xfffc...) as a supposed long.
     let boxed_value = coerce_reflective_field_value(raw_value, &descriptor);
-    let result = box_value(ctx, boxed_value, &descriptor);
+    // CANONICAL, not fresh. Measured on HotSpot 25.0.3+9: `f.get(o) ==
+    // Character.valueOf('a')` is true for a `char` field holding 'a', and the
+    // same for I/J/Z/B/S in their cache bounds — `Field.get` boxes through a
+    // `MethodHandle` field accessor whose boxing step IS `X.valueOf`. The
+    // `float`/`double` and out-of-bound arms stay fresh; `box_value_canonical`
+    // routes those back to `box_value` itself.
+    let result = box_value_canonical(ctx, boxed_value, &descriptor);
     Ok(Some(result))
 }
 
@@ -6530,7 +6716,38 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// otherwise cross `Field.get(Object)` as the wrong `Value` variant. The
 /// ordinary numeric-wrapper paths already handle the one-word primitive
 /// descriptors directly.
-fn coerce_reflective_field_value(value: Value, descriptor: &str) -> Value {
+///
+/// # Two callers, one rule
+///
+/// `pub(crate)` because the VarHandle field path in `lang_invoke.rs` needs
+/// exactly this and nothing weaker. `ctx.get_static_field` and `ctx.get_field`
+/// are as raw there as they are here, and MEASURED on OpenJDK 25.0.3+9
+/// (`scratchpad/f29/VhLong.java`, identical under `-Xint`) the two paths agree
+/// row for row:
+///
+/// ```text
+/// field.long        = java.lang.Long,   value 5,   id true
+/// vh.fieldLong      = java.lang.Long,   value 5,   id true
+/// vh.getAndSetLong  = java.lang.Long,   value 5,   id true
+/// vh.fieldDouble    = java.lang.Double, value 1.5, id FALSE
+/// ```
+///
+/// The direction is this one: **widen first, box canonically second.** The
+/// reverse has no meaning, and "box canonically without widening" produces a
+/// `Long` wrapper whose slot holds compact-`Int` bits — a wrong ANSWER rather
+/// than a wrong identity.
+///
+/// # The lookalike in `lang_invoke.rs` that must NOT be substituted
+///
+/// That file has its own `widen_primitive_to_descriptor`, and the two are not
+/// interchangeable. It converts NUMERICALLY —
+/// `(DESC_DOUBLE, Value::Long(l)) => Value::Double(l as f64)` — where a field
+/// slot must be REINTERPRETED: a `double` field holding `1.5` presents its
+/// raw bits as `Value::Long(4_609_434_218_613_702_656)`, which this function
+/// answers `1.5` and the numeric widener answers `4.609e18`. Same shape,
+/// different operation, and the wrong one is silent. That is why the VarHandle
+/// arms call across to here instead of growing a second widener locally.
+pub(crate) fn coerce_reflective_field_value(value: Value, descriptor: &str) -> Value {
     match descriptor.as_bytes().first().copied() {
         Some(b'J') => match value {
             Value::Long(_) => value,
@@ -8697,7 +8914,11 @@ fn build_serialized_lambda(
     for (i, tc) in capture_chars.iter().enumerate() {
         let proxy = ctx.read_native_pin(proxy_pin, proxy);
         let raw = ctx.get_field(proxy, i);
-        let boxed = box_value(ctx, raw, &tc.to_string());
+        // CANONICAL: measured on HotSpot, `SerializedLambda.getCapturedArg(i)`
+        // for a captured `int`/`char`/`long` is identical to `X.valueOf(v)` —
+        // the spun `writeReplace` boxes the capture fields with `valueOf`
+        // bytecode, so this side table inherits the caches too.
+        let boxed = box_value_canonical(ctx, raw, &tc.to_string());
         let captured = ctx.read_native_pin(captured_pin, captured);
         ctx.set_array_element(captured, i, boxed);
     }
@@ -9397,10 +9618,15 @@ pub(crate) fn native_method_invoke(
         }
     }
 
-    // Box the return value
+    // Box the return value — CANONICAL. Measured on HotSpot 25.0.3+9:
+    // `m.invoke(null) == Integer.valueOf(7)` for a `()I` returning 7, and the
+    // same for C/B/S/Z/J in bound; `()F`/`()D` and out-of-bound values come
+    // back fresh, which is what `box_value_canonical` delegates for. Since
+    // JDK 18 `Method.invoke` runs through a `MethodHandle` accessor whose
+    // return adaptation is a direct handle to `X.valueOf`.
     match result {
         Some(val) => {
-            let boxed = box_value(ctx, val, &ret_desc);
+            let boxed = box_value_canonical(ctx, val, &ret_desc);
             Ok(Some(boxed))
         }
         None => Ok(Some(Value::Object(None))), // void method returns null
@@ -13212,6 +13438,23 @@ fn wrap_annotation_in_real_proxy(
 // AnnotationProxy, boxed wrappers, arrays, enum-like objects). Keep in sync
 // with the vm_exec.rs originals if annotation `Object`-method semantics
 // change.
+//
+// "Keep in sync" was not enough, and this is what it cost: on 2026-08-12 the
+// `toString` pair had drifted three ways at once (member ordering, binary vs
+// canonical type name, `value=` elision), so ONE CratonVM run printed TWO
+// different strings for the SAME annotation — `@AnnTwin$Single("v")` from the
+// vm_exec copy and `@AnnTwin$Single(value="v")` from this one, neither being
+// HotSpot's `@AnnTwin.Single("v")`. Which copy answers is not something a
+// caller controls: measured, the first `toString()` on a fresh proxy can take
+// the vm_exec hook and every later one this route, and it is not a JIT
+// question — `-Xint` still shows both.
+//
+// The pure, VM-context-free half of `toString` therefore no longer lives in
+// two places: `render_annotation_to_string` (below, `pub`) does the assembly
+// and vm_exec.rs calls it. `vm` depends on `native-builtins`, never the
+// reverse, so that is the only direction available; the extraction and
+// value-rendering halves genuinely cannot be shared, because the two callers
+// hold different VM handles from different crates.
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ctx_class_name_of(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
@@ -13380,12 +13623,27 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
                 return Ok(sx == sy);
             }
             if xname == "java/lang/Class" && yname == "java/lang/Class" {
-                let xcid_field = ctx.get_field(x, 0);
-                let ycid_field = ctx.get_field(y, 0);
-                return Ok(matches!(
-                    (xcid_field, ycid_field),
-                    (Value::Int(a), Value::Int(b)) if a == b
-                ));
+                // Identity, not slot 0. `mirror_class_id` asks
+                // `class_id_from_mirror` FIRST and falls back to slot 0 only if
+                // that misses, so this works in synthetic mode and keeps working
+                // in real-JDK mode, where the slot-0 `ClassId` overlay is no
+                // longer written (`vm/src/vm/vm_object.rs`, 2026-08-12 — slot 0
+                // of a real `java.lang.Class` is `Constructor cachedConstructor`,
+                // a declared REFERENCE field, and writing an `Int` there made
+                // every collector box it).
+                //
+                // This site was the ONLY Class-mirror reader with no reverse-map
+                // path — the 2026-08-10 sweep that fixed the others grepped the
+                // token `mirror` and this function's variables are `x`/`y`. So
+                // it was already wrong wherever the overlay was absent, and
+                // would have become wrong everywhere.
+                //
+                // Two unresolvable mirrors must NOT compare equal merely by both
+                // answering `None`; fall back to reference identity.
+                return Ok(match (mirror_class_id(ctx, x), mirror_class_id(ctx, y)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => x.as_ptr() == y.as_ptr(),
+                });
             }
             if ctx_wrapper_class_to_primitive(&xname).is_some()
                 && ctx_wrapper_class_to_primitive(&yname).is_some()
@@ -13504,6 +13762,24 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Resul
                 }
             }
             if cname == "java/lang/Class" {
+                // HotSpot's `AnnotationInvocationHandler.memberValueToString`
+                // renders a `Class`-valued member as `getCanonicalName() +
+                // ".class"`, so a member type prints `Outer.Inner.class` — not
+                // the binary `Outer$Inner.class` a blind `$` rewrite yields, and
+                // not `Dollar$Ann.class` turned into `Dollar.Ann.class`. Same
+                // reasoning, same helper, and the same fallbacks as
+                // `ctx_annotation_type_canonical_name` above; see its doc.
+                if let Some(class_id) = ctx.class_id_from_mirror(obj) {
+                    if let Some(slashed) = ctx.class_name_of_id(class_id) {
+                        let canonical = canonical_class_name(ctx, class_id, &slashed);
+                        if !canonical.is_empty() {
+                            return Ok(format!("{}.class", &*canonical));
+                        }
+                        return Ok(format!("{}.class", slashed.replace('/', ".")));
+                    }
+                }
+                // No class id behind the mirror (primitive and synthetic
+                // mirrors among others): fall back to the mirror's name field.
                 if let Value::Object(Some(name_ref)) = ctx.get_field(obj, 1) {
                     if let Some(cls_name) = ctx.read_string(name_ref) {
                         return Ok(format!("{}.class", cls_name.replace('/', ".")));
@@ -13549,7 +13825,118 @@ fn ctx_format_annotation_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> R
     Ok(s)
 }
 
-/// Mirrors `annotation_proxy_to_string` in vm_exec.rs.
+/// Assemble an `Annotation.toString()` from an ALREADY-canonicalised annotation
+/// type name and its members with their values ALREADY rendered, in class-file
+/// `element_value_pairs` order.
+///
+/// **This is the shared half of a rule that is implemented twice.** The other
+/// implementation is `annotation_proxy_to_string` in `vm/src/vm/vm_exec.rs`
+/// (the interpreter's primary `AnnotationProxy` dispatch hook); this file's
+/// [`ctx_annotation_proxy_to_string`] is the `NativeContext` re-implementation
+/// reached from `native_proxy_dispatch_invoke`. On 2026-08-12 the two disagreed
+/// in a single run — the same annotation rendered `@AnnTwin$Single("v")` from
+/// one and `@AnnTwin$Single(value="v")` from the other — so the assembly step,
+/// which is pure and needs no VM context at all, now lives here and both sides
+/// call it. `vm` depends on `native-builtins` (never the reverse), so this
+/// direction is the only one available.
+///
+/// What is NOT shared, and why: extracting the members, canonicalising the type
+/// name, and rendering each value all need a VM handle, and the two callers hold
+/// different ones (`&SharedVm` vs `&mut dyn NativeContext`) from different
+/// crates. Those steps are still duplicated; keep them in sync deliberately.
+///
+/// Two rules are baked in here:
+///
+/// * **Order is the caller's, and is NOT sorted.** HotSpot's
+///   `AnnotationInvocationHandler` iterates the `LinkedHashMap` that
+///   `AnnotationParser.parseAnnotation2` fills in class-file order, so the
+///   class file's `element_value_pairs` order is what prints.
+/// * **`value=` is elided for a single-member annotation whose sole member is
+///   named `value`** — `@Qualifier("alpha")`, not `@Qualifier(value="alpha")`.
+///   Any multi-member annotation keeps every name, `value` included.
+pub fn render_annotation_to_string(
+    canonical_type_name: &str,
+    members: &[(String, String)],
+) -> String {
+    let mut s = String::with_capacity(32 + canonical_type_name.len());
+    s.push('@');
+    s.push_str(canonical_type_name);
+    s.push('(');
+    let omit_single_value_name = members.len() == 1 && members[0].0 == "value";
+    for (i, (name, rendered)) in members.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        if !omit_single_value_name {
+            s.push_str(name);
+            s.push('=');
+        }
+        s.push_str(rendered);
+    }
+    s.push(')');
+    s
+}
+
+/// The annotation type's CANONICAL name (JLS 6.7) — what HotSpot's
+/// `AnnotationInvocationHandler.toString()` prints. It formats
+/// `annotationType().getCanonicalName()`, not `getName()`, so a member
+/// annotation type renders with `.` where the binary name has `$`. Measured on
+/// Microsoft OpenJDK 25.0.3.9: `@AnnA40.Multi(...)` for the type whose binary
+/// name is `AnnA40$Multi`, and `@AnnA40.Nest.Deep(...)` two levels down.
+///
+/// Resolved through [`canonical_class_name`] — i.e. the annotation type's own
+/// `InnerClasses` attribute (JVMS §4.7.6) — and **not** by rewriting every `$`
+/// in the binary name: `$` is a legal Java identifier character, so a top-level
+/// `@interface Dollar$Ann` has canonical name `Dollar$Ann` and a member type may
+/// legally be named `Inner$Class`. That is the distinction
+/// `native_class_get_canonical_name` / `own_inner_class_entry` already draw, and
+/// which `class_get_canonical_name_preserves_literal_dollar_in_member_name`
+/// pins; going through the same helper also shares its per-`ClassId` cache.
+///
+/// [`canonical_class_name`]'s empty-string sentinel means "no canonical name"
+/// (local/anonymous, JLS 6.7). JLS 9.6 admits only top-level and member
+/// annotation types, so that branch is unreachable for a real annotation type;
+/// it is still handled, falling back to the dotted binary name rather than
+/// rendering a `null` this caller has no form for. Every other miss (no mirror,
+/// no class id) takes the same fallback, which is exactly the string this
+/// function's caller used to produce unconditionally.
+fn ctx_annotation_type_canonical_name(
+    ctx: &mut dyn NativeContext,
+    proxy: ObjectRef,
+    internal: &str,
+) -> String {
+    let dotted_binary = internal.replace('/', ".");
+    // Slot 1 is `ANN_PROXY_TYPE_MIRROR`; `create_annotation_proxy_with_type`
+    // falls back to the admitted `ClassId` precisely so callers may dereference
+    // it without a null check, so a miss means a proxy minted by some other
+    // route and the binary name is the honest answer for it.
+    let mirror = match ctx.get_field(proxy, ANN_PROXY_TYPE_MIRROR) {
+        Value::Object(Some(m)) => m,
+        _ => return dotted_binary,
+    };
+    let class_id = match ctx.class_id_from_mirror(mirror) {
+        Some(id) => id,
+        None => return dotted_binary,
+    };
+    // Pass the class's OWN name, not the descriptor-derived one: the canonical
+    // cache is keyed by `ClassId` and this argument only feeds a cache MISS, so
+    // handing it a name that disagreed with the class would poison the entry
+    // `Class.getCanonicalName()` reads.
+    let slashed = match ctx.class_name_of_id(class_id) {
+        Some(n) => n,
+        None => return dotted_binary,
+    };
+    let canonical = canonical_class_name(ctx, class_id, &slashed);
+    if canonical.is_empty() {
+        dotted_binary
+    } else {
+        (*canonical).to_string()
+    }
+}
+
+/// Mirrors `annotation_proxy_to_string` in `vm/src/vm/vm_exec.rs`. The two must
+/// render identically — see [`render_annotation_to_string`], which is the part
+/// of the rule they share, for why there are two of these at all.
 pub(crate) fn ctx_annotation_proxy_to_string(
     ctx: &mut dyn NativeContext,
     proxy: ObjectRef,
@@ -13566,25 +13953,16 @@ pub(crate) fn ctx_annotation_proxy_to_string(
         } else {
             desc.clone()
         };
-    let dotted = class_name.replace('/', ".");
-    let mut elems = ctx_annotation_proxy_elements(ctx, proxy)?;
-    elems.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut s = String::with_capacity(64);
-    s.push('@');
-    s.push_str(&dotted);
-    s.push('(');
-    let mut first = true;
+    let dotted = ctx_annotation_type_canonical_name(ctx, proxy, &class_name);
+    // NOT sorted: `ctx_annotation_proxy_elements` hands these back in class-file
+    // `element_value_pairs` order, which is the order HotSpot prints.
+    let elems = ctx_annotation_proxy_elements(ctx, proxy)?;
+    let mut members = Vec::with_capacity(elems.len());
     for (name, val) in elems {
-        if !first {
-            s.push_str(", ");
-        }
-        first = false;
-        s.push_str(&name);
-        s.push('=');
-        s.push_str(&ctx_format_annotation_value(ctx, val)?);
+        let rendered = ctx_format_annotation_value(ctx, val)?;
+        members.push((name, rendered));
     }
-    s.push(')');
-    Ok(s)
+    Ok(render_annotation_to_string(&dotted, &members))
 }
 
 /// Build a `java.lang.TypeNotPresentException(typeName, cause)` to store as a
@@ -21779,6 +22157,108 @@ mod tests {
         mirror
     }
 
+    // -----------------------------------------------------------------------
+    // G46-1 — the READ half of W7-84: `mirror_class_id`'s slot-0 fallback.
+    //
+    // These four pin the guard that makes the 378 MEASURED
+    // `primitive-into-reference` events at that line a benign read rather than
+    // a lost answer. Every one of those events is `Int(-1)` at
+    // `java.lang.Class.cachedConstructor` — `get_or_create_primitive_mirror`'s
+    // sentinel — and `None` is the correct answer for a primitive mirror with
+    // or without the coercion. See the function's own doc comment.
+    // -----------------------------------------------------------------------
+
+    /// `Int(-1)` is `vm_object.rs::get_or_create_primitive_mirror`'s "this is a
+    /// primitive mirror, it has no ClassId" sentinel, and it is the ONLY value
+    /// the 378 measured events carry. It must answer `None`, not
+    /// `ClassId(0xFFFF_FFFF)`.
+    #[test]
+    fn the_primitive_mirror_sentinel_is_rejected_by_the_slot_zero_fallback() {
+        let mut ctx = mock_ctx();
+        let mirror = ctx.alloc_object(ClassId::new(0), 2);
+        ctx.set_field(mirror, 0, Value::Int(-1));
+        assert_eq!(
+            mirror_class_id(&ctx, mirror),
+            None,
+            "the primitive-mirror sentinel must not become a ClassId"
+        );
+    }
+
+    /// The hazard the doc comment names, pinned so nobody closes G46-1 by
+    /// reading the slot with an `I` descriptor.
+    ///
+    /// On a real `java.lang.Class` slot 0 is `Constructor<T> cachedConstructor`,
+    /// so it can legitimately hold a live reference. A `get_field_typed(.., b'I')`
+    /// would take `heap::coerce_field_value_for_slot`'s `pointer-into-primitive`
+    /// arm and publish that object's own ADDRESS as an `Int` — a large positive
+    /// number that sails past `v >= 0` and yields a fabricated ClassId. The
+    /// descriptor-aware read this function uses cannot do that, and this test
+    /// fails the moment one that can is substituted.
+    #[test]
+    fn a_reference_at_slot_zero_is_never_decoded_as_a_class_id() {
+        let mut ctx = mock_ctx();
+        let mirror = ctx.alloc_object(ClassId::new(0), 2);
+        let ctor = ctx.alloc_object(ClassId::new(0), 1);
+        ctx.set_field(mirror, 0, Value::Object(Some(ctor)));
+        assert_eq!(
+            mirror_class_id(&ctx, mirror),
+            None,
+            "a genuine cachedConstructor reference is not a ClassId"
+        );
+    }
+
+    /// What the descriptor-aware read leaves behind in real-JDK mode after
+    /// `coerce_field_value_for_slot`'s `b'L'` arm has nulled the overlay.
+    ///
+    /// The answer must be `None`. It must specifically NOT be `ClassId(0)`,
+    /// which is `java/lang/Object` — the exact aliasing that produced
+    /// ByteBuddy's *"Failed to resolve super class class java.lang.Object"* and
+    /// that `native_class_get_name`'s strict-name-first ordering exists to
+    /// avoid.
+    #[test]
+    fn a_nulled_slot_zero_overlay_answers_none_not_class_id_zero() {
+        let mut ctx = mock_ctx();
+        let mirror = ctx.alloc_object(ClassId::new(0), 2);
+        ctx.set_field(mirror, 0, Value::Object(None));
+        assert_eq!(mirror_class_id(&ctx, mirror), None);
+    }
+
+    /// The other half, so the three refusals above cannot be satisfied by a
+    /// function that always answers `None`: a non-negative overlay still maps
+    /// to exactly that ClassId. This is the arm that is still live wherever the
+    /// receiver's class carries no usable field descriptor — a synthetic-stub
+    /// `java/lang/Class`, and `MockNativeContext`.
+    #[test]
+    fn a_non_negative_slot_zero_overlay_is_still_that_class_id() {
+        let mut ctx = mock_ctx();
+        let mirror = ctx.alloc_object(ClassId::new(0), 2);
+        ctx.set_field(mirror, 0, Value::Int(7));
+        assert_eq!(mirror_class_id(&ctx, mirror), Some(ClassId::new(7)));
+    }
+
+    /// Source tripwire for the repair that must NOT be made.
+    ///
+    /// Scans only what is ABOVE this test module: the needles appear verbatim
+    /// in the assertions below, so scanning the whole file would find each one
+    /// inside itself and the test would pass whatever the real code said.
+    #[test]
+    fn the_mirror_slot_zero_overlay_is_read_through_the_descriptor_aware_accessor() {
+        let src = include_str!("lang_class.rs")
+            .split("mod tests {")
+            .next()
+            .expect("split always yields a first element");
+        assert!(
+            src.contains("let slot0 = ctx.get_field(mirror, 0);"),
+            "mirror_class_id must read slot 0 through the descriptor-aware \
+             `get_field`, which answers Object(None) for a reference slot"
+        );
+        assert!(
+            !src.contains("ctx.get_field_typed(mirror, 0"),
+            "a descriptor hint at this slot re-types `cachedConstructor`; with \
+             b'I' it publishes a heap ADDRESS as a ClassId (G46-1)"
+        );
+    }
+
     fn jspecify_nullable_annotation() -> cratonvm_native_api::AnnotationData {
         cratonvm_native_api::AnnotationData {
             type_descriptor: "Lorg/jspecify/annotations/Nullable;".to_string(),
@@ -26447,6 +26927,20 @@ Implementation-Title: opensaml-core-api\r\n\
 
 #[cfg(test)]
 mod protection_domain_layout_tests {
+    // The boxing-identity tests appended at the end of this module need the
+    // parent's items (`box_value`, `box_value_canonical`, `Value`,
+    // `ObjectRef`) and a mock receiver; the ProtectionDomain tests above
+    // predate them and spell every path in full, so nothing was imported.
+    #[allow(unused_imports)]
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeContext, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+
     /// Real JDK 21–25 `java.security.ProtectionDomain`, instance fields in
     /// DECLARATION order — not the constructor's argument order, which is
     /// `(CodeSource, PermissionCollection, ClassLoader, Principal[])` and is
@@ -26512,6 +27006,214 @@ mod protection_domain_layout_tests {
                 !body.contains(&needle),
                 "`{needle}` addresses ProtectionDomain by raw index; resolve on \
                  the receiver by name instead"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `box_value` vs `box_value_canonical` — the split, and BOTH directions.
+    //
+    // Measured on Microsoft OpenJDK 25.0.3+9 (`scratchpad/f11/BoxCallers.java`
+    // and `BoxCallers2.java`, which print rather than assert): `Field.get`,
+    // `Method.invoke`, MethodHandle return adaptation, every `VarHandle.get`
+    // shape, `SerializedLambda`'s captured args and a proxy's `args[]` all
+    // hand back the CANONICAL box, while `Array.get` hands back a FRESH one on
+    // both VMs. Every "fresh" row above is still `.equals`-equal to the
+    // canonical instance, so these tests assert on `ObjectRef` identity and
+    // never on the payload alone — an equality-shaped assertion cannot see
+    // this defect in either direction.
+    //
+    // The caches are process-global and keyed by `vm_identity()`, whose mock
+    // default is `0` and is therefore shared with every other test in this
+    // suite; entries dangle once a mock heap drops, so each test below claims
+    // its own identity rather than handing a stale ref to an unrelated test.
+    // -----------------------------------------------------------------------
+
+    fn boxed_ref(v: Value) -> ObjectRef {
+        match v {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected a boxed object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn box_value_canonical_returns_the_cached_instance_for_the_six_cached_types() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f11);
+        for (desc, v) in [
+            ("I", Value::Int(7)),
+            ("J", Value::Long(5)),
+            ("Z", Value::Int(1)),
+            ("B", Value::Int(3)),
+            ("S", Value::Int(9)),
+            ("C", Value::Int('a' as i32)),
+        ] {
+            let a = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            let b = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            assert_eq!(
+                a, b,
+                "box_value_canonical({desc}, {v:?}) must return THE canonical \
+                 instance — this is what makes `Field.get`/`Method.invoke` \
+                 agree with `X.valueOf` as they do on HotSpot"
+            );
+            assert_eq!(
+                ctx.get_field(a, 0),
+                v,
+                "a canonical box that carries the wrong value passes every \
+                 identity row above"
+            );
+        }
+
+        // Identity with the VM's own `valueOf` native, not merely with itself.
+        // A private-but-self-consistent cache would satisfy the loop above and
+        // still fail HotSpot's `f.get(o) == Character.valueOf('a')`.
+        let via_helper = boxed_ref(box_value_canonical(&mut ctx, Value::Int('a' as i32), "C"));
+        let via_native = boxed_ref(
+            crate::lang_math::native_character_value_of(&mut ctx, &[Value::Int('a' as i32)])
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            via_helper, via_native,
+            "the cached sibling must delegate to the registered `valueOf` \
+             native, not mint a second canonical instance"
+        );
+    }
+
+    #[test]
+    fn box_value_must_stay_fresh_even_for_values_that_are_in_every_cache() {
+        // NEGATIVE CONTROL, and the reason this is a split rather than a
+        // one-line fix. HotSpot's `Reflection::array_get` boxes with
+        // `java_lang_boxing_object::create`, which never consults a cache:
+        // `Array.get(new int[]{7}, 0) == Integer.valueOf(7)` is FALSE, and
+        // `Array.get` twice is not even identical to itself (both measured).
+        // A lane that "unifies" the pair by routing this half through the
+        // caches breaks that, and nothing equality-shaped would notice.
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f12);
+        for (desc, v) in [
+            ("I", Value::Int(7)),
+            ("J", Value::Long(5)),
+            ("Z", Value::Int(1)),
+            ("B", Value::Int(3)),
+            ("S", Value::Int(9)),
+            ("C", Value::Int('a' as i32)),
+        ] {
+            let a = boxed_ref(box_value(&mut ctx, v, desc));
+            let b = boxed_ref(box_value(&mut ctx, v, desc));
+            assert_ne!(
+                a, b,
+                "box_value({desc}, {v:?}) is the FRESH half of the split and \
+                 must allocate — `Array.get`'s contract depends on it"
+            );
+            assert_eq!(ctx.get_field(a, 0), v);
+        }
+        assert_eq!(
+            box_value(&mut ctx, Value::Int(0), "V"),
+            Value::Object(None),
+            "a void return has no value and boxes to null"
+        );
+    }
+
+    #[test]
+    fn box_value_canonical_caches_neither_float_double_nor_out_of_bound_values() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f13);
+
+        // `Float`/`Double` cache NOTHING. Measured: `Float.valueOf(0f) ==
+        // Float.valueOf(0f)` is false on HotSpot 25 while `.equals` is true,
+        // and `Field.get`/`Method.invoke` of a `float` come back fresh even
+        // though every integral sibling comes back canonical. Completing the
+        // family to eight here is a regression, not a completion.
+        for (desc, v) in [
+            ("F", Value::Float(0.0)),
+            ("F", Value::Float(1.0)),
+            ("D", Value::Double(0.0)),
+            ("D", Value::Double(1.0)),
+        ] {
+            let a = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            let b = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            assert_ne!(
+                a, b,
+                "box_value_canonical({desc}, {v:?}) must NOT be canonical — \
+                 there is no FloatCache and no DoubleCache"
+            );
+        }
+
+        // And each cached type keeps its own uncached arm, with its own bound.
+        // `Byte` is absent from this list on purpose: `ByteCache` covers all
+        // 256 values and has no fresh arm at all, so no `Byte` row belongs
+        // here — the four bounds in this family are genuinely different.
+        for (desc, v) in [
+            ("I", Value::Int(1000)),
+            ("J", Value::Long(1000)),
+            ("S", Value::Int(1000)),
+            ("C", Value::Int(200)),
+        ] {
+            let a = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            let b = boxed_ref(box_value_canonical(&mut ctx, v, desc));
+            assert_ne!(
+                a, b,
+                "{desc} {v:?} is outside its cache bound; HotSpot's \
+                 `Field.get` is fresh there too"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mismatched_value_variant_falls_back_instead_of_being_defaulted_to_zero() {
+        // `native_long_value_of` reads `Some(Value::Long(v))` and DEFAULTS TO
+        // 0 for every other variant. A raw `long` field slot can legitimately
+        // present as a compact `Value::Int` — `native_wrapper_long_value`
+        // exists to widen exactly that shape — so a canonical route that
+        // ignored the variant would turn an identity question into a wrong
+        // ANSWER: the cached `Long.valueOf(0)` returned for a field holding 5.
+        // That is why the descriptor arm matches on the variant too.
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5f14);
+        let obj = boxed_ref(box_value_canonical(&mut ctx, Value::Int(5), "J"));
+        assert_eq!(
+            ctx.get_field(obj, 0),
+            Value::Int(5),
+            "a (\"J\", Value::Int) pair must fall back to the verbatim \
+             allocating path — never be defaulted to 0 by the cached native"
+        );
+        let again = boxed_ref(box_value_canonical(&mut ctx, Value::Int(5), "J"));
+        assert_ne!(obj, again, "that fallback is `box_value`, which allocates");
+    }
+
+    #[test]
+    fn the_reflection_call_sites_still_take_the_cached_sibling() {
+        // A source witness, because every behavioural test above exercises the
+        // HELPERS and all of them would still pass if a CALL SITE were put
+        // back to `box_value` — which is precisely the defect the split
+        // exists to fix. The needles are assembled at runtime: spelled out as
+        // literals they would match this test's own source text and assert
+        // nothing (the file being searched is this file).
+        //
+        // The `\r` strip is load-bearing on a CRLF checkout; same reason as
+        // `the_populator_writes_no_raw_slot_indices` above.
+        let src = include_str!("lang_class.rs").replace("\r\n", "\n");
+        let canon = format!("box_value_{}", "canonical");
+        for (site, anchor) in [
+            (
+                "Field.get",
+                format!("let result = {canon}(ctx, boxed_value, &descriptor);"),
+            ),
+            (
+                "SerializedLambda capturedArgs",
+                format!("let boxed = {canon}(ctx, raw, &tc.to_string());"),
+            ),
+            (
+                "Method.invoke return",
+                format!("let boxed = {canon}(ctx, val, &ret_desc);"),
+            ),
+        ] {
+            assert!(
+                src.contains(&anchor),
+                "{site} no longer boxes through the cached sibling — on \
+                 HotSpot 25 that path returns the canonical instance \
+                 (measured); `{anchor}` is gone"
             );
         }
     }

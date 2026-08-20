@@ -17,7 +17,28 @@
 
 use super::*;
 
+/// Default-ON: a per-bci `Ambiguous` local in an exception-free method is
+/// published `Undefined` rather than `Unsupported`. See the call site for the
+/// JVMS argument. `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD=1` is the kill switch.
+/// Default-ON: a per-bci `Ref` local at a bci where the oop mask has no
+/// opinion is published as a reference rather than `Unsupported`. See the call
+/// site. `CRATONVM_JIT_NO_OSR_REFINED_REF=1` is the kill switch.
+fn osr_refined_ref_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_REFINED_REF").is_none()
+    })
+}
+
+fn osr_ambiguous_dead_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD").is_none()
+    })
+}
+
 impl Compiler {
+
     /// deopt-osr Step 1: record a precise deopt-exit snapshot (the interpreter
     /// frame state — locals + operand stack as `FrameValue`s — reconstructable
     /// from live machine state) at an eligible guard whose loop-header/canonical
@@ -201,15 +222,155 @@ impl Compiler {
         })
     }
 
+    /// The `local_liveness` word covering local `i` at `bci`.
+    ///
+    /// `local_liveness` is `regalloc::live_locals_per_pc_all`'s flat row-major
+    /// table — `words` bitsets per pc, window `w` covering slots
+    /// `[w*64, w*64+64)` — so a caller must select BOTH the pc and the window.
+    /// Reading it as one word per pc (which is what it was before methods with
+    /// more than 64 locals could drop a dead high local) silently returns
+    /// window 0 of the wrong instruction.
+    ///
+    /// Answers `u64::MAX` — "assume everything live", the conservative
+    /// direction — when the table is absent (the ungated compile) or the index
+    /// is out of range.
+    fn local_liveness_word(&self, bci: usize, i: usize) -> u64 {
+        let words = self.local_liveness_words;
+        if words == 0 {
+            return u64::MAX;
+        }
+        self.local_liveness
+            .get(bci.saturating_mul(words).saturating_add(i / 64))
+            .copied()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// The caller chain for a point published from inside a spliced body, or
+    /// `None` when nothing is being spliced.
+    ///
+    /// `FrameState::caller` is a linked list from the innermost scope OUTWARD,
+    /// while `inline_scope_stack` is outermost-first, so this walks the stack in
+    /// reverse and nests as it goes. An empty stack answers `None`, which is
+    /// every compile that splices nothing.
+    pub(super) fn inline_caller_chain(&self) -> Option<Box<crate::deopt::FrameState>> {
+        let mut chain: Option<Box<crate::deopt::FrameState>> = None;
+        for scope in self.inline_scope_stack.iter() {
+            let mut fs = scope.clone();
+            fs.caller = chain;
+            chain = Some(Box::new(fs));
+        }
+        chain
+    }
+
+    /// Capture the enclosing method's frame at `invoke_bci` and push it as the
+    /// scope for a splice about to be emitted.
+    ///
+    /// `arg_slots` is the number of operand-stack slots the callee's arguments
+    /// occupy — `InlineSite::callee_num_args`, which is exactly how many
+    /// `pop_stack()` calls `try_emit_inline_body` makes. They are dropped here
+    /// because a caller scope is parked mid-`invoke`: the arguments have been
+    /// consumed and the result is not yet pushed. Capturing the stack *with* the
+    /// arguments still on it would describe a frame that resumes by pushing the
+    /// return value on top of its own arguments.
+    ///
+    /// Taking the snapshot at the splice — rather than rebuilding it at each
+    /// deopt point inside the callee — is sound because this backend is
+    /// memory-homed: a caller local lives at a fixed `[rbp - (idx+1)*8]`, and
+    /// `try_emit_inline_body` allocates the callee's locals ABOVE the caller's
+    /// live stack (`callee_local_base = next_spill_offset`), so nothing the
+    /// splice emits can move a slot this snapshot names.
+    pub(super) fn push_inline_scope(&mut self, invoke_bci: usize, arg_slots: usize) {
+        let mut fs = self.build_frame_state_at(invoke_bci, None);
+        // `bci` names the invoke ITSELF, not its successor: the VM computes the
+        // successor (`caller_resume_pc`), because that needs the method's
+        // bytecode, which the consumer has and this crate does not.
+        let keep = fs.stack.len().saturating_sub(arg_slots);
+        fs.stack.truncate(keep);
+        self.inline_scope_stack.push(fs);
+    }
+
+    /// Pop the scope pushed by [`Self::push_inline_scope`].
+    ///
+    /// Called on BOTH exits from a splice — the successful one and the rollback
+    /// — because a scope left on the stack after a bailed splice would be
+    /// attached to every later point in the enclosing method, describing a
+    /// caller frame for a call that is not in progress.
+    pub(super) fn pop_inline_scope(&mut self) {
+        self.inline_scope_stack.pop();
+    }
+
     pub(super) fn build_and_record_deopt_point(
         &mut self,
         bci: usize,
         reason: crate::deopt::DeoptReason,
     ) -> *const crate::deopt::DeoptimizationPoint {
-        use crate::deopt::{DeoptAction, DeoptimizationPoint, FrameState, FrameValue};
-
+        use crate::deopt::{DeoptAction, DeoptimizationPoint};
         // Cast: buffer position/length to encoding offset (i32/u32)
         let native_offset = self.buf.pos() as u32;
+        // Cast: bytecode index to u32 (non-negative, fits)
+        let resume_bci = self.orig_bci(bci) as u32;
+        let mut frame_state = self.build_frame_state_at(bci, Some(reason));
+        // The inlined caller chain, if this point is being published from
+        // inside a spliced body. `caller: None` was hard-coded here until
+        // 2026-08-18 — `docs/jit/deopt-frame-state-interning.md` §5.1 listed
+        // exactly this as the remaining producer edit: "the single-pass backend
+        // … has no scope stack at all; it needs one pushed at the splice and
+        // popped at the callee's return". Empty stack ⇒ `None` ⇒ byte-identical
+        // metadata for every non-inlined compile, which is all of them until a
+        // splice publishes.
+        frame_state.caller = self.inline_caller_chain();
+        let point = DeoptimizationPoint {
+            native_offset,
+            // Interpreter-bci space; see "THE COORDINATE CHANGE" in
+            // `build_frame_state_at`.
+            bci: resume_bci,
+            reason,
+            action: DeoptAction::Reinterpret,
+            // Behaviour-preserving: `for_reason` is exactly the per-`DeoptReason`
+            // prose convention this site already relied on, now written down in
+            // one place instead of being inferred by each resume sink.
+            semantics: crate::deopt::ResumeSemantics::for_reason(reason),
+            speculation_id: 0,
+            frame_state,
+        };
+        // Record a stable boxed copy (the frame-deopt stub bakes it as arg0) and
+        // the by-value point (find_deopt_point / iteration). The Box payload does
+        // not move when `deopt_boxes` reallocs or when it is moved into
+        // `CompiledMethod::_deopt_point_boxes` at finalize (and is leaked on
+        // Drop), so a baked imm64 of this pointer outlives the emitted code.
+        // Capture the heap payload's address with `addr_of!` BEFORE moving the
+        // Box into the Vec — pushing the Box (a pointer) does not relocate its
+        // payload, so this is the same address `&**deopt_boxes.last()` would
+        // yield, without a `.unwrap()` (keeps this hot codegen path panic-free).
+        let boxed = Box::new(point.clone());
+        let box_ptr: *const crate::deopt::DeoptimizationPoint = std::ptr::addr_of!(*boxed);
+        self.deopt_boxes.push(boxed);
+        self.deopt_points.push(point);
+        // The emitter pc this point was recorded at, kept in step with
+        // `deopt_points` so the coordinate change can be re-derived and
+        // checked at finalize rather than trusted.
+        self.deopt_point_pcs.push(bci);
+        box_ptr
+    }
+
+    /// This method's own frame state at `bci` — locals, operand stack and held
+    /// monitors, with no caller chain.
+    ///
+    /// Split out of [`Self::build_and_record_deopt_point`] 2026-08-18 so an
+    /// inlined splice can capture the CALLER's frame with the same code that
+    /// builds the trapping one. Two producers of one frame shape, built two
+    /// ways, is how the caller scopes end up describing something the resume
+    /// sinks then reject.
+    /// `reason` is `None` when this is a CALLER scope captured at a splice
+    /// rather than a trapping point: a caller frame is parked mid-`invoke` and
+    /// has no deopt reason of its own. It reaches only the `CRATONVM_DBG_EXCFRAME`
+    /// trace, which says so rather than printing a borrowed one.
+    fn build_frame_state_at(
+        &mut self,
+        bci: usize,
+        reason: Option<crate::deopt::DeoptReason>,
+    ) -> crate::deopt::FrameState {
+        use crate::deopt::{FrameState, FrameValue};
 
         // ── THE COORDINATE CHANGE ────────────────────────────────────────
         //
@@ -251,9 +412,44 @@ impl Compiler {
         let mut sr_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         // Locals: oop-ness from the intersection-dataflow mask (only when the
-        // forward dataflow reached this PC; otherwise treat as non-oop). A slot
-        // beyond bit 63, or in an unmapped method, reads as non-oop here — sound
-        // only because `can_deopt_resume` (later) gates such methods off.
+        // forward dataflow reached this PC; otherwise treat as non-oop).
+        //
+        // In a method with MORE THAN 64 LOCALS this mask is not merely truncated
+        // at bit 63 — `compute_local_oop_masks` returns EMPTY vectors for
+        // `max_locals > 64`, so `oop_reached` is `false`, `oop_mask` is `0`, and
+        // `is_oop` below reads FALSE FOR EVERY LOCAL, slot 0 included. Measured
+        // on an 84-local probe: `oop_reached=false oop_mask=0x0` while three
+        // reference locals were live.
+        //
+        // This comment used to say that was "sound only because
+        // `can_deopt_resume` (later) gates such methods off". That is not what
+        // gates it — `can_deopt_resume` is
+        // `!deopt_points.is_empty() && !has_elided_monitor` and says nothing
+        // about the local count. Audited 2026-08-18 (see
+        // fixed-suite-bugs/jit/bobyqa-hot-loop-refused-osr-because-of-a-bare-athrow-FIXED-20260817.md,
+        // "Residuals"); what actually holds is three other things, and a reader
+        // about to widen or delete any of them should know which:
+        //
+        //   1. **`classify_local_kinds` has no 64-slot cap**, and
+        //      `deopt_real_enabled()` defaults ON, so `local_kinds` is populated
+        //      in production and its `LocalKind::Ref` arm below publishes
+        //      `RegisterRef`/`StackSlotRef` at ANY slot index. It — not this
+        //      mask — is the reference authority above slot 63. A slot the
+        //      classifier calls `Ambiguous` publishes `Unsupported`, which is
+        //      fail-closed (`osr_exit_policy` refuses the entry).
+        //   2. **The two gates move together.** With `CRATONVM_DEOPT_REAL=0`,
+        //      `local_kinds` is empty — and so is this snapshot: no deopt point
+        //      is recorded for the method at all, and `osr_exit_points` /
+        //      `can_osr_exit` are empty/false, so nothing consumes one.
+        //   3. **The GC side refuses explicitly.**
+        //      `moving_young_safepoint_coverage_complete` has its own
+        //      `num_locals > 64 => false`, which diverts moving-young to the
+        //      non-moving sweep for that cycle; and `color_graph` caps at 64, so
+        //      a local above slot 63 is always frame-resident and the
+        //      conservative sweep (which pins) sees it.
+        //
+        // `classify_local_kinds_types_a_reference_above_slot_63` pins (1), which
+        // is the leg with no other guard behind it.
         let oop_reached = self.local_oop_reached.get(bci).copied().unwrap_or(false);
         let oop_mask = if oop_reached {
             self.local_oop_masks.get(bci).copied().unwrap_or(0)
@@ -274,9 +470,16 @@ impl Compiler {
             // Only act on a COMPUTED liveness answer. An uncovered pc (no
             // basic block reaches it) reads as 0 = "nothing live", and acting
             // on that would drop every local in the frame.
-            if i < 64 && self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
-                let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
-                if live_here & (1u64 << i) == 0 {
+            // No `i < 64` bound here any more. It used to be one, because
+            // `local_liveness` held a single `u64` per pc — so a method with
+            // more than 64 locals could not drop a DEAD local above slot 63,
+            // and an `Ambiguous`-kind slot up there therefore published
+            // `Unsupported`, which made every deopt point's frame unresumable
+            // and cost the whole METHOD its OSR entry at every back edge. See
+            // `regalloc::live_locals_per_pc_all` for the measurement.
+            if self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
+                let live_here = self.local_liveness_word(bci, i);
+                if live_here & (1u64 << (i % 64)) == 0 {
                     // `CRATONVM_DBG_EXCFRAME=1` reports every local DROPPED
                     // from a snapshot. That is the actionable signal for this
                     // whole bug class: a handler that reads a dropped local
@@ -351,12 +554,136 @@ impl Compiler {
                 // for the METHOD and usually not here. `kind_at` only ever
                 // answers a concrete NON-ref kind, so the oop mask (which ran
                 // above) keeps sole authority over ref-typed slots.
-                let kind = if matches!(kind, LocalKind::Ambiguous) {
-                    self.local_kinds_refined.kind_at(bci, i).unwrap_or(kind)
+                let refined = if matches!(kind, LocalKind::Ambiguous) {
+                    self.local_kinds_refined.kind_at(bci, i)
                 } else {
-                    kind
+                    None
                 };
-                typed_local_frame_value(reg, xmm, off, kind)
+                // A per-bci REFERENCE, at a bci where the oop mask has no
+                // opinion to defer to.
+                //
+                // `kind_at` filters `Ref` out on the stated grounds that "the
+                // flow-sensitive oop mask is the sole authority for ref-typed
+                // slots and has already had its say". At these bci it has not.
+                // The mask is a single `u64`, so it cannot address a slot at
+                // or above 64 at all -- the comment on `oop_mask` above says
+                // so, and names `local_kinds`'s `Ref` arm as "the reference
+                // authority above slot 63" -- and when the dataflow declines
+                // outright it publishes `oop_reached=false oop_mask=0x0`,
+                // which is silence, not a negative answer. Deferring to
+                // silence is what cost `BOBYQAOptimizer.trsbox` its OSR:
+                // `oop_reached=false` at EVERY one of its snapshots, local 87
+                // settled `Ref` by the per-bci dataflow, and the slot
+                // published `Unsupported` anyway.
+                //
+                // So publish exactly what `typed_local_frame_value`'s
+                // `LocalKind::Ref` arm publishes, for the reason it already
+                // gives, on a strictly stronger premise: that arm trusts a
+                // WHOLE-METHOD scan ("`Ref` everywhere it is ever accessed"),
+                // and this is a flow-sensitive answer at this pc.
+                //
+                // `has_jsr` is the one condition that must hold: `ret` is
+                // given no successors, which makes the graph NARROWER than the
+                // verifier's and could settle a kind the verifier would merge
+                // further. A handler's TOP seed is the opposite -- it can only
+                // turn a settled kind into `Ambiguous` -- so it is not checked.
+                let mask_has_no_opinion = !oop_reached || i >= 64;
+                let refined_ref = mask_has_no_opinion
+                    && !self.local_kinds_refined.has_jsr
+                    && matches!(
+                        self.local_kinds_refined.raw_at(bci, i),
+                        Some(LocalKind::Ref)
+                    )
+                    && osr_refined_ref_enabled();
+                let kind = if refined_ref {
+                    LocalKind::Ref
+                } else {
+                    refined.unwrap_or(kind)
+                };
+                let mut fv = typed_local_frame_value(reg, xmm, off, kind);
+                let was_unsupported = matches!(fv, crate::deopt::FrameValue::Unsupported);
+                // A slot the per-bci dataflow SETTLED as `Ambiguous` is not
+                // undescribable — it is unreadable, and `Undefined` describes
+                // it exactly.
+                //
+                // `Ambiguous` here means the dataflow reached this bci and two
+                // different concrete kinds arrive on different paths. JVMS
+                // 4.10.1.6 merges those to `top`, and 4.10.1.9's load rules
+                // make a `top` local an illegal operand of every `?load`, so
+                // no bytecode reachable from this bci can read the slot before
+                // redefining it. Resuming with an inert zero is therefore
+                // unobservable — the identical argument the `LocalKind::Ref`
+                // arm of `typed_local_frame_value` already makes, on a
+                // strictly weaker premise (a whole-method scan rather than a
+                // flow-sensitive answer at this pc).
+                //
+                // Three conditions, each load-bearing:
+                //
+                //  * `raw_at` must say `Ambiguous` specifically. `Unknown` is
+                //    "no evidence" (an unreached pc), and `Ref` belongs to the
+                //    flow-sensitive oop mask, which has already had its say.
+                //  * `cfg_is_exact` — with an exception range in the method
+                //    the pass seeds handlers TOP and is COARSER than the
+                //    verifier, so `Ambiguous` there does not imply `top` and
+                //    this would drop a live value. See its doc.
+                //  * The whole-method kind must be `Ambiguous` too, i.e. this
+                //    slot is genuinely reused; a settled kind that contradicts
+                //    its machine home is a different bug and keeps re-running.
+                //
+                // Why it matters: `osr_exit_policy` is an ARTIFACT-WIDE veto.
+                // One `Unsupported` slot at one deopt point refuses OSR entry
+                // at every back edge of the method. `BOBYQAOptimizer.trsbox`
+                // reuses local 87 as a double, an int AND a reference, and
+                // paid its entire OSR for it: 15,152 refusals per
+                // `BobyqaOne 8 1`, a `perf` profile 94% VM binary / 0.7%
+                // JIT-compiled code, and the class over its 90 s suite budget.
+                //
+                // `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD=1` restores the
+                // re-run encoding, so the A/B is one binary.
+                if matches!(fv, crate::deopt::FrameValue::Unsupported)
+                    && self.local_kinds_refined.cfg_is_exact
+                    && matches!(self.local_kinds.get(i), Some(LocalKind::Ambiguous))
+                    && matches!(
+                        self.local_kinds_refined.raw_at(bci, i),
+                        Some(LocalKind::Ambiguous)
+                    )
+                    && osr_ambiguous_dead_enabled()
+                {
+                    fv = crate::deopt::FrameValue::Undefined;
+                }
+                // `CRATONVM_DBG_OSR_SLOTS=1` names the slot that costs a method
+                // its OSR entry. `osr_exit_policy` is an artifact-wide veto --
+                // ONE `Unsupported` slot at ONE deopt point refuses OSR entry
+                // at every back edge of the method -- and until this existed
+                // the only report was "local 87 is Unsupported", which says
+                // that a slot could not be described but not WHY. The three
+                // answers below are three different bugs: an `Ambiguous` kind
+                // the per-bci dataflow did not settle, a settled kind whose
+                // machine home contradicts it, or a slot liveness should have
+                // dropped before reaching here.
+                if was_unsupported
+                    && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_SLOTS").is_some()
+                {
+                    eprintln!(
+                        "[osr-slot] {} local={i} bci={bci} whole_method_kind={:?} \
+                         refined={:?} raw={:?} cfg_exact={} reg={:?} xmm={:?} spill_off={off} \
+                         live_covered={} method={}",
+                        if matches!(fv, crate::deopt::FrameValue::Unsupported) {
+                            "UNSUPPORTED"
+                        } else {
+                            "RELAXED-TO-UNDEFINED"
+                        },
+                        self.local_kinds.get(i),
+                        refined,
+                        self.local_kinds_refined.raw_at(bci, i),
+                        self.local_kinds_refined.cfg_is_exact,
+                        reg,
+                        xmm,
+                        self.local_liveness_covered.get(bci).copied().unwrap_or(false),
+                        self.method_key,
+                    );
+                }
+                fv
             } else {
                 // No kind table (gate off / unmapped) — Phase-A int/provenance.
                 frame_value_for_slot(reg, xmm, off, false)
@@ -554,14 +881,42 @@ impl Compiler {
                         }
                     }
                 }
-                // An XMM-resident operand is FP, but float-vs-double is not
-                // recoverable from the abstract stack alone — EXCEPT at an
-                // invokedynamic trap bci, where the call site's own descriptor
-                // types each of its arguments exactly.
+                // An XMM-resident operand is FP, and float-vs-double has two
+                // sources: the call site's own descriptor at an invoke/indy bci
+                // (`indy_tag`, which types that call's arguments exactly), and
+                // the typed operand stack for everything else.
+                //
+                // The second one was missing here. The frame-slot and GPR arms
+                // above both grew a `stack_kinds` fallback when the typed stack
+                // landed; this arm kept its original "not recoverable from the
+                // abstract stack alone" comment, which stopped being true, and
+                // so an FP operand that happened to be REGISTER-resident — the
+                // ordinary case in FP code, which is where the XMMs are —
+                // published `Unsupported` while its spilled twin published a
+                // precise `StackSlotDouble`.
+                //
+                // One such entry makes the whole frame unresumable, and
+                // `osr_exit_policy` refuses OSR ENTRY at every back edge of the
+                // method for it. Measured on Apache Commons Math's
+                // `BOBYQAOptimizer.trsbox`: 17 757 of its 21 109 entry refusals
+                // were this one deopt point, bci 628 — a `getEntry(I)D` call
+                // with a live `dload`ed double underneath the receiver, which
+                // the typed stack calls `[Double, Ref, Int]` and agrees with the
+                // emitter's own oop marks about.
                 StackSlot::Xmm(n) => match indy_tag {
                     Some(b'D') => FrameValue::XmmDouble(*n),
                     Some(b'F') => FrameValue::XmmFloat(*n),
-                    _ => FrameValue::Unsupported,
+                    _ => match stack_kinds.and_then(|kinds| kinds.get(i)) {
+                        Some(super::stack_kinds::StackKind::Double) => {
+                            FrameValue::XmmDouble(*n)
+                        }
+                        Some(super::stack_kinds::StackKind::Float) => FrameValue::XmmFloat(*n),
+                        // An `Int`/`Long`/`Ref` kind claiming an XMM home is a
+                        // contradiction, not a value to encode — the same
+                        // judgement the two arms above make in the other
+                        // direction for a wide-FP kind in a GPR.
+                        _ => FrameValue::Unsupported,
+                    },
                 },
             });
         }
@@ -584,58 +939,35 @@ impl Compiler {
             })
             .unwrap_or_default();
 
-        let point = DeoptimizationPoint {
-            native_offset,
+        FrameState {
+            // Deopt-frame identity (jit-invokedynamic-groovy-regression root
+            // cause): bake this method's `"<class>.<method>:<descriptor>"`
+            // key into every snapshot so the VM-side resume sinks can verify
+            // a stashed `ReconstructedFrame` actually belongs to the method
+            // they are about to resume. Without it, a trap in a NESTED
+            // compiled callee propagated the `i64::MIN` sentinel up through
+            // its compiled callers' epilogue bails, and the OUTERMOST
+            // interpreter sink consumed the (identity-less) inner frame as
+            // if it were the outer method's — materializing the outer
+            // method's frame with the inner method's locals/stack/bci, i.e.
+            // resuming arbitrary bytecode with a foreign frame. Empty only
+            // for legacy/test wrappers that pass no key (the consumers
+            // treat an empty key as "never matches" → safe re-run).
+            //
+            // Inside a splice this is still the ENCLOSING method's key, which
+            // is why `capture_inline_caller_scope` records the key BEFORE the
+            // callee's body is emitted and why the scope stack carries it: a
+            // point published from inside a spliced body takes its own key
+            // from the site that pushed the scope, not from here.
+            method_key: self.method_key.clone(),
             // Interpreter-bci space; see "THE COORDINATE CHANGE" above.
             bci: resume_bci,
-            reason,
-            action: DeoptAction::Reinterpret,
-            // Behaviour-preserving: `for_reason` is exactly the per-`DeoptReason`
-            // prose convention this site already relied on, now written down in
-            // one place instead of being inferred by each resume sink.
-            semantics: crate::deopt::ResumeSemantics::for_reason(reason),
-            speculation_id: 0,
-            frame_state: FrameState {
-                // Deopt-frame identity (jit-invokedynamic-groovy-regression root
-                // cause): bake this method's `"<class>.<method>:<descriptor>"`
-                // key into every snapshot so the VM-side resume sinks can verify
-                // a stashed `ReconstructedFrame` actually belongs to the method
-                // they are about to resume. Without it, a trap in a NESTED
-                // compiled callee propagated the `i64::MIN` sentinel up through
-                // its compiled callers' epilogue bails, and the OUTERMOST
-                // interpreter sink consumed the (identity-less) inner frame as
-                // if it were the outer method's — materializing the outer
-                // method's frame with the inner method's locals/stack/bci, i.e.
-                // resuming arbitrary bytecode with a foreign frame. Empty only
-                // for legacy/test wrappers that pass no key (the consumers
-                // treat an empty key as "never matches" → safe re-run).
-                method_key: self.method_key.clone(),
-                // Interpreter-bci space; see "THE COORDINATE CHANGE" above.
-                bci: resume_bci,
-                locals,
-                stack,
-                monitors,
-                caller: None,
-            },
-        };
-        // Record a stable boxed copy (the frame-deopt stub bakes it as arg0) and
-        // the by-value point (find_deopt_point / iteration). The Box payload does
-        // not move when `deopt_boxes` reallocs or when it is moved into
-        // `CompiledMethod::_deopt_point_boxes` at finalize (and is leaked on
-        // Drop), so a baked imm64 of this pointer outlives the emitted code.
-        // Capture the heap payload's address with `addr_of!` BEFORE moving the
-        // Box into the Vec — pushing the Box (a pointer) does not relocate its
-        // payload, so this is the same address `&**deopt_boxes.last()` would
-        // yield, without a `.unwrap()` (keeps this hot codegen path panic-free).
-        let boxed = Box::new(point.clone());
-        let box_ptr: *const crate::deopt::DeoptimizationPoint = std::ptr::addr_of!(*boxed);
-        self.deopt_boxes.push(boxed);
-        self.deopt_points.push(point);
-        // The emitter pc this point was recorded at, kept in step with
-        // `deopt_points` so the coordinate change above can be re-derived and
-        // checked at finalize rather than trusted.
-        self.deopt_point_pcs.push(bci);
-        box_ptr
+            locals,
+            stack,
+            monitors,
+            // Filled by `build_and_record_deopt_point` from the scope stack.
+            caller: None,
+        }
     }
 
     /// Republish this caller's frame after a raw JIT-to-JIT CALL.
@@ -688,6 +1020,33 @@ impl Compiler {
              (info={has_info} args_base={has_args_base})",
             self.method_key,
         );
+    }
+
+    /// A raw JIT-to-JIT call whose callee CAN stash a deopt frame, but for which
+    /// the emitter could not reserve the contiguous service-argument slots the
+    /// sentinel check needs, is the unserviced edge `dbg_unserviced_direct_call`
+    /// exists to name: the callee traps, stashes a frame keyed to ITSELF, returns
+    /// `i64::MIN`, and nothing at this site can attribute it.
+    ///
+    /// Until now that site was emitted anyway and the hazard was only printed
+    /// under `CRATONVM_DBG_DEOPT`. Fail the compile instead, so "the ladder bound
+    /// this callee directly" implies "the trap is serviced here" with no
+    /// remaining case — which is the precondition
+    /// `direct_call_exc_table_publish_enabled` needs before a callee that
+    /// declares its own exception table may be bound this way at all.
+    ///
+    /// Measured cost of the stricter rule: on netty's `BigEndianHeapByteBufTest`
+    /// all 49 unserviced direct calls carry `info=false`, i.e. they are inline
+    /// intrinsics and thin native helpers with no `JitInvokeInfo` and no way to
+    /// stash. None is a Java callee, so this fails nothing there.
+    pub(super) fn fail_unserviced_java_direct_call(
+        &mut self,
+        info_ptr: Option<*const crate::JitInvokeInfo>,
+        service_args_base: Option<i32>,
+    ) {
+        if info_ptr.is_some() && service_args_base.is_none() {
+            self.fail("direct-call-service-slots");
+        }
     }
 
     pub(super) fn emit_inline_callee_deopt_check(
@@ -1021,6 +1380,17 @@ impl Compiler {
         // cheaper, and the stash stays quiet on straight-line invokes.
         let throw_bci = self.dbg_last_pc;
         let precise_exc_stub = self.precise_exception_frames && self.pc_is_protected(throw_bci);
+        if crate::rbc6_emit_dbg() {
+            eprintln!(
+                "[rbc6-emit] post_invoke_exc_check method={} bci={} ret={} precise_req={} protected={} -> {}",
+                self.method_key,
+                throw_bci,
+                ret_type as char,
+                self.precise_exception_frames,
+                self.pc_is_protected(throw_bci),
+                if precise_exc_stub { "REASON9" } else { "shared-sentinel" },
+            );
+        }
         if precise_exc_stub && !self.exc_frame_box_ptr_by_bci.contains_key(&throw_bci) {
             let box_ptr = self.build_and_record_deopt_point(
                 throw_bci,
@@ -1092,15 +1462,48 @@ impl Compiler {
     /// `i64::MIN` deopt sentinel and runs the epilogue; the interpreter's
     /// post-JIT drain then throws the stashed OOME through the method's
     /// exception table (catchable, matching the interpreter's allocation paths).
+    ///
+    /// **Inside a protected range this guard publishes a precise exceptional
+    /// frame**, exactly as `emit_post_invoke_exception_check` does, instead of
+    /// branching to the shared sentinel-only stub. That is what makes `new`
+    /// (0xbb) admissible to RBC.6 - see `precise_alloc_ops_enabled` in
+    /// `jit/src/lib.rs` for the argument that this is the whole obligation, and
+    /// the netty adaptive-allocator throughput page for the method it was
+    /// refusing (`AdaptivePoolingAllocator$Magazine.allocate`,
+    /// `reason=rbc6-handler-reads-unsafe-local(pc=338,op=0xbb)`).
+    ///
+    /// The bci keyed here is the ALLOCATING instruction's own, not its
+    /// successor: a reason-9 frame is consumed by `route_jit_signal_exception`,
+    /// which range-tests the bci as the THROW pc against `[start_pc, end_pc)`.
+    /// `emit_post_invoke_exception_check` carries the full argument for that
+    /// choice, and javac ends a protected range at the successor of its last
+    /// instruction often enough that keying on the successor puts the throw
+    /// outside its own handler.
     pub(super) fn emit_post_alloc_oom_check(&mut self) {
+        // Same shape as `emit_post_invoke_exception_check`: a frame is only
+        // useful where this method's own exception table can catch, so outside
+        // every protected range the cheaper shared sentinel exit stays.
+        let throw_bci = self.dbg_last_pc;
+        let precise_exc_stub = self.precise_exception_frames && self.pc_is_protected(throw_bci);
+        if precise_exc_stub && !self.exc_frame_box_ptr_by_bci.contains_key(&throw_bci) {
+            let box_ptr = self.build_and_record_deopt_point(
+                throw_bci,
+                crate::deopt::DeoptReason::PendingException,
+            );
+            self.exc_frame_box_ptr_by_bci.insert(throw_bci, box_ptr);
+        }
         // TEST RAX, RAX  (48 85 C0)
         self.buf.emit(&[0x48, 0x85, 0xC0]);
         // JZ rel32 → shared exception-check stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.exception_check_stubs
-            .push((patch_offset, self.dbg_last_pc));
+        if precise_exc_stub {
+            self.deopt_stubs.push((patch_offset, throw_bci, 9));
+        } else {
+            self.exception_check_stubs
+                .push((patch_offset, self.dbg_last_pc));
+        }
         // Force `has_dispatch` (see the field doc): the fallible `jit_newarray`
         // helper needs the per-thread `JIT_THREAD` TLS set — both to run the
         // allocation-failure GC and to construct the OOME — which only the

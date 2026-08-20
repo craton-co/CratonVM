@@ -59,6 +59,33 @@ use super::*;
 /// is pinned in `native_pin_roots` for the whole walk, and re-read from there
 /// on every iteration — a moving collector rewrites the pin slot in place, so
 /// the local copy taken before a GC is stale.
+/// The `invoke_pc` an OSR'd frame hands [`unwind_to_handler`] when it has
+/// ALREADY decided it cannot catch.
+///
+/// The unwinder's first act is to search `frames[frame_idx]`'s own exception
+/// table at `invoke_pc`. For every other producer that is exactly right —
+/// `invoke_pc` is the site that threw. For an OSR bail it is not: the pc
+/// available there is `entry_pc`, the BACK-EDGE the compiled body was ENTERED
+/// at, which has nothing to do with where the throw happened. When the loop sits
+/// inside a `try` (`try { for (..) {..} } catch`) that back-edge IS inside a
+/// protected range, so the unwinder found a handler that does not guard the
+/// throw site and entered it — on the stale pre-OSR locals, since the OSR'd body
+/// advanced its own copies and never wrote them back.
+///
+/// Measured on `probes/OsrThrowOutsideTryProbe.java`, whose `trip()` throws
+/// AFTER the `try` block: HotSpot `caught=0 escaped=1 sink=80000200000`,
+/// CratonVM `caught=1 escaped=1 sink=80018203000` — the exception taken by a
+/// handler that does not cover it, and an accumulator 18 003 000 too high from
+/// the iterations the spurious resume re-ran. Both silent.
+///
+/// `route_osr_exception_out_of_artifact` has already asked this frame's own
+/// table, with the PRECISE throw bci, and answered `Propagate`. So the
+/// unwinder must not ask again with a worse pc — it must start at the caller.
+/// A pc no `[start_pc, end_pc)` can contain says exactly that in the existing
+/// signature: the first search matches nothing, the frame pops, and `exc_pc` is
+/// then re-read from the caller's `last_instr_pc` as usual.
+pub(super) const OSR_FRAME_DECLINED_TO_CATCH: usize = usize::MAX;
+
 pub(super) fn unwind_to_handler(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -473,10 +500,14 @@ pub(super) fn route_jit_signal_exception(
     thread: &mut JvmThread,
     caller_frame_idx: usize,
     cached: &Arc<CachedBytecodeMethod>,
-    fallback_throw_pc: usize,
+    fallback_kind: JitThrowPc,
     exc: ObjectRef,
     fallback_locals: &[Value],
 ) -> Result<CachedCallResult, MethodCallFailed> {
+    let fallback_throw_pc = match fallback_kind {
+        JitThrowPc::InRange(pc) => pc,
+        _ => usize::MAX,
+    };
     let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
         Some(rframe)
             if deopt_frame_matches_method(
@@ -503,6 +534,20 @@ pub(super) fn route_jit_signal_exception(
         Some(_foreign) => None,
         None => None,
     };
+    if precise.is_none() && matches!(fallback_kind, JitThrowPc::OutsideAllRanges) {
+        // The compiled body stamped a throw site of its OWN that lies inside no
+        // protected range. That is not "pc unknown" — it is this method saying
+        // it cannot catch this throw — and the pc-unknown search below would
+        // match a typed row by exception class alone and swallow it. Propagate,
+        // which is what the JVM does for a throw outside every `try`.
+        if crate::jit::helpers::rbc6_dbg() {
+            eprintln!(
+                "[rbc6-dbg] route_jit_signal_exception PROPAGATE {}.{}{} — stamped throw pc is outside every protected range",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
+        return Err(MethodCallFailed::ExceptionThrown(exc));
+    }
     let (throw_pc, locals) = match precise.as_ref() {
         Some((bci, locals)) => (*bci, locals.as_slice()),
         None => {
@@ -596,7 +641,102 @@ pub(super) fn route_jit_signal_exception(
 /// publishes an exceptional frame, and `route_jit_signal_exception` prefers
 /// that — it is method-checked by `deopt_frame_matches_method` — over this
 /// fallback entirely.)
+/// The `Frame` sibling of [`jit_local_athrow_pc`], for the sink that has pushed
+/// a frame rather than holding a `CachedBytecodeMethod`.
+///
+/// Same two tests, same reason: the stamp carries no method identity, so it is
+/// honoured only when it lands inside one of THIS method's protected ranges and
+/// on a real instruction boundary.
+pub(super) fn jit_local_athrow_pc_in_frame(frame: &Frame, athrow_bci: i64) -> JitThrowPc {
+    if athrow_bci < 0 {
+        return JitThrowPc::Unknown;
+    }
+    let pc = athrow_bci as usize;
+    // `frame.code` carries 2 bytes of speculative-read padding.
+    let code_len = frame.code.len().saturating_sub(2);
+    if pc >= code_len {
+        return JitThrowPc::Unknown;
+    }
+    match cratonvm_reader::verified_code(&frame.code[..code_len]) {
+        Ok(verified) if verified.is_instruction_start(pc) => {}
+        _ => return JitThrowPc::Unknown,
+    }
+    let in_a_protected_range = frame
+        .exception_table()
+        .iter()
+        // Widening: u16 -> usize (non-negative, fits)
+        .any(|e| pc >= e.start_pc as usize && pc < e.end_pc as usize);
+    if in_a_protected_range {
+        JitThrowPc::InRange(pc)
+    } else {
+        JitThrowPc::OutsideAllRanges
+    }
+}
+
+/// What a stamped throw bci says about THIS method's exception table.
+///
+/// The two-state `usize::MAX`-or-pc answer conflated the last two, and that is
+/// how an exception got swallowed. A bci that is a real instruction boundary in
+/// this method but lies outside every protected range is not "unknown": it is a
+/// definite statement that no handler here covers the throw. Reporting it as
+/// unknown sent it to the pc-UNKNOWN search, which matches typed rows by
+/// exception CLASS ALONE — so `outsideTryStep`'s `catch (RuntimeException)`
+/// over `[23,27)` "caught" a throw at bci 20 and returned normally.
+/// `JitCalleeExceptionShapes.outsideTryChecksum` is the fixture; BouncyCastle's
+/// `CipherInputStream.nextChunk` is the field report, where the swallowed
+/// exception was an AEAD tag mismatch and the caller read a clean EOF over
+/// tampered ciphertext.
+pub(super) enum JitThrowPc {
+    /// Inside one of this method's protected ranges — range-check with it.
+    InRange(usize),
+    /// A real instruction boundary here, but inside no protected range. This
+    /// method cannot catch the throw; propagate to the caller.
+    OutsideAllRanges,
+    /// No usable stamp (absent, past the end, not an instruction boundary, or a
+    /// foreign method's). Fall back to the pc-unknown search.
+    Unknown,
+}
+
+pub(super) fn jit_local_athrow_pc_kind(
+    cached: &CachedBytecodeMethod,
+    athrow_bci: i64,
+) -> JitThrowPc {
+    if athrow_bci < 0 {
+        return JitThrowPc::Unknown;
+    }
+    let pc = athrow_bci as usize;
+    // `cached.code` carries 2 bytes of speculative-read padding.
+    let code_len = cached.code.len().saturating_sub(2);
+    if pc >= code_len {
+        return JitThrowPc::Unknown;
+    }
+    match cratonvm_reader::verified_code(&cached.code[..code_len]) {
+        Ok(verified) if verified.is_instruction_start(pc) => {}
+        _ => return JitThrowPc::Unknown,
+    }
+    // Widening: u16 -> usize (non-negative, fits)
+    let in_a_protected_range = cached
+        .exception_table
+        .iter()
+        .any(|e| pc >= e.start_pc as usize && pc < e.end_pc as usize);
+    if in_a_protected_range {
+        JitThrowPc::InRange(pc)
+    } else {
+        JitThrowPc::OutsideAllRanges
+    }
+}
+
 pub(super) fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize {
+    match jit_local_athrow_pc_kind(cached, athrow_bci) {
+        JitThrowPc::InRange(pc) => pc,
+        _ => usize::MAX,
+    }
+}
+
+/// The retired body of [`jit_local_athrow_pc`], kept as documentation of the
+/// two tests [`jit_local_athrow_pc_kind`] performs and why.
+#[allow(dead_code)]
+fn jit_local_athrow_pc_rationale(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize {
     if athrow_bci < 0 {
         return usize::MAX;
     }
@@ -886,6 +1026,22 @@ pub(super) fn handler_resume_needs_precise_locals(cached: &Arc<CachedBytecodeMet
 /// counts 199,491 wrong results in 200,000 calls before this fix, 0 after. Its
 /// `refuse` mode takes the handler out of the picture and passes, which is what
 /// identifies the handler resume as the mechanism.
+/// Why [`run_jit_callee_handler`] did not resume a handler.
+///
+/// The two are NOT interchangeable, and treating them as one is what let a
+/// callee's exception disappear. `NotCaught` means the callee's own exception
+/// table does not cover the throw at all — the JVM answer is to propagate to
+/// the caller, and re-running the callee from its entry is both wrong and
+/// unsound for any callee whose pre-throw prefix has side effects.
+/// `Declined` means a handler DID match but could not be resumed with correct
+/// locals, where a whole-method re-run is at least a defensible fallback.
+pub(crate) enum CalleeHandlerMiss {
+    /// No handler in the callee covers this throw site.
+    NotCaught,
+    /// A handler matched; resuming it would have needed locals nobody published.
+    Declined,
+}
+
 pub(crate) fn run_jit_callee_handler(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -893,7 +1049,7 @@ pub(crate) fn run_jit_callee_handler(
     throw_pc: usize,
     exc: ObjectRef,
     incoming_args: &[Value],
-) -> Option<MethodCallResult> {
+) -> Result<MethodCallResult, CalleeHandlerMiss> {
     let precise = precise_handler_frame_for(cached, incoming_args);
     // A precise frame's bci is the compiled body's own throw site, recorded by
     // the reason-9 stub. It is strictly better than the `athrow_bci` stamp
@@ -903,7 +1059,9 @@ pub(crate) fn run_jit_callee_handler(
         Some((bci, locals)) => (*bci, Some(locals.as_slice())),
         None => (throw_pc, None),
     };
-    let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
+    let Some(handler_pc) = find_jit_exception_handler(shared, cached, throw_pc, exc) else {
+        return Err(CalleeHandlerMiss::NotCaught);
+    };
     if precise_locals.is_none()
         && !params_only_callee_handler_frames()
         && handler_resume_needs_precise_locals(cached)
@@ -921,14 +1079,14 @@ pub(crate) fn run_jit_callee_handler(
                 cached.class_name, cached.method_name, cached.method_descriptor, throw_pc as i64,
             );
         }
-        return None;
+        return Err(CalleeHandlerMiss::Declined);
     }
     let incoming_args = precise_locals.unwrap_or(incoming_args);
     let mut synchronized_args = cached.is_synchronized.then(|| incoming_args.to_vec());
     let synchronized_monitor = match synchronized_args.as_mut() {
         Some(args) => match JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args) {
             Ok(monitor) => Some(monitor),
-            Err(error) => return Some(Err(error)),
+            Err(error) => return Ok(Err(error)),
         },
         None => None,
     };
@@ -957,7 +1115,7 @@ pub(crate) fn run_jit_callee_handler(
     // exception oop must live in a scanned frame slot before anything that can
     // allocate runs.
     if frame.stack.push(Value::Object(Some(exc))).is_err() {
-        return None;
+        return Err(CalleeHandlerMiss::Declined);
     }
     frame.pc = handler_pc;
     if let Some(monitor) = synchronized_monitor {
@@ -974,7 +1132,7 @@ pub(crate) fn run_jit_callee_handler(
             precise.is_some(),
         );
     }
-    Some(execute_prebuilt_frame(shared, thread, frame))
+    Ok(execute_prebuilt_frame(shared, thread, frame))
 }
 
 pub(super) fn route_jit_exception_through_method(

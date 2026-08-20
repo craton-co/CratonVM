@@ -1,6 +1,14 @@
 # W7-51 — the vacuous-test population, measured instead of sampled
 
-Status: **W6-5's two open residuals are closed structurally**, and a systematic
+Status: **OPEN. Round 5 (2026-08-12, lane C9) asked whether this record can be
+closed and the answer is no.** Thirteen tests that cannot fail are still in the
+tree, verified by symbol at this commit, and §6.3's proposed detector — the
+cheap textual tell the expensive sweep produced as a by-product — has been
+**measured for the first time and its recall is 3 of the 9 findings it claims to
+name**. Read §7 before working from §6.3 or from any "still open" list here.
+
+Status of the original round: **W6-5's two open residuals are closed
+structurally**, and a systematic
 sweep of the whole test surface found **67 further findings** plus one
 population of 23. Round 1 (`W6-5-vacuous-tests.md`) found six by accident, while
 reading source for something else. This round asked the question on purpose.
@@ -680,3 +688,295 @@ that value has no error term at all. In both cases the bound's own comment
 named the thing it was sized to admit. **A tolerance that names its
 justification is not thereby justified — the justification has to be measured,
 and the measurement takes about ten minutes.**
+
+---
+
+## 6. Round 4 (2026-08-12, doc-only lane) — §3's disposition ledger is incomplete, and twelve of the F-series are still in the tree
+
+**Read this before working from §2.2, §2.3 or §3.**
+
+This round re-derived §2.2's and §2.3's findings **against the working tree**,
+by symbol rather than by line number (every line number in those two sections has
+drifted, some by 150 lines). It ran no cargo and changed no Rust. The method was
+`grep` for the named symbol plus a read of the whole test body, which is a
+**verification** for "the assertion is still the one recorded" and only a
+**reading** for "reverting the named fix leaves it green" — the mutation was not
+executed here, exactly as §4.3 says of the original round.
+
+### 6.1 The bookkeeping defect
+
+§3 has two lists — **Fixed** and **Recorded and not fixed** — and the 27
+F-numbered findings of §2.2/§2.3 appear in **neither**, except F2/F12
+(`init_level.rs`) and F10. A reader who trusts §3, as the campaign's own
+convention says to, concludes that the F-series was disposed of. It was not.
+This is the same failure §3's own 2026-08-12 box condemns in its first three
+entries, one level up: there the list was stale, here the list is *silent*, and
+silence reads as "handled" just as reliably.
+
+Measured disposition of the 27:
+
+| state | count | which |
+| --- | --- | --- |
+| **fixed** | 6 | F2, F10, F12, F15, F17 (renamed `alloc_zero_is_refused` — *the old name was the lie*), the gaussian worked example |
+| **STILL IN THE TREE, verbatim** | 12 | F1, F3, F5, F6, F7, F8, F9, F11, F13, F14, F16, F18–F21, F22–F24, F25 (counting the F18–F21 and F22–F24 clusters as one each) |
+| not re-derived here | the rest | F4 (`tzdb.rs`; the cited `:881` is now production code and the test was not located by symbol — treat as unadjudicated, not as clean) |
+
+### 6.2 The twelve, re-anchored — **this is the list of tests that cannot fail**
+
+Line numbers are as of this commit and will drift again; the **symbol** is the
+durable anchor.
+
+| # | symbol / file | why it cannot fail | the mutation that should break it and does not |
+| --- | --- | --- | --- |
+| F1 | `test_secure_gaussian_uses_csprng_and_is_finite`, `native-builtins/src/securerandom.rs:1916` | the body declares its own `secure_uniform` closure and runs the polar transform locally; `native_secure_random_next_gaussian` is never called | repoint `SecureRandom.nextGaussian` at `java.util.Random`'s LCG — the named defect |
+| F3 | `nio_selector_indefinite_block_path_honors_wakeup`, `native-io/src/nio_selector.rs:4510` | the fix is the `0 → i64::MAX` mapping inside `selector_select_native`; the test calls the low-level `selector_select(id, i64::MAX)` and never crosses the mapping | delete the mapping — the 100%-CPU `select(0)` spin returns, the test does not move |
+| F5 | `path_rejects_parent_segment`, `native-builtins/src/jboss_resource_loader.rs:200` | the body iterates a literal `Path` looking for `..`; its own comment says *"we duplicate the check here"* | remove the traversal guard from `native_create_resource_loader` — **a security control** |
+| F6 | the timeout arm at `native-builtins/src/ironjacamar_pool.rs:573` | the test **re-writes the classification `if`** over a hard-coded string and asserts its own result | delete the classification from `native_pool_get_connection` |
+| F7 | `wp3_6_max_direct_transfer_size_is_int_max`, `native-io/src/file_channel.rs:1899` | the entire body is `assert_eq!(0x7fff_ffff_i32, i32::MAX)` | make `maxDirectTransferSize0` return 0, or unregister it |
+| F8 | `system_init_phase1_is_registered_as_native`, `vm/tests/wave3_scanner.rs:44` | asserts `find(...).is_some()`; **a no-op stub is registered too**, and its own failure message names a *behaviour* (*"the pre-S110 no-op stub left `System.in` null"*) | restore the no-op stub — registration is unchanged, the test is green, `System.in` is null |
+| F9 | `zip_comment_round_trips`, `native-io/src/zip_real_jar.rs:1459` | round-trips a comment through the third-party `zip` crate; the native is not on the call path | make `native_jarfile_get_comment` return null unconditionally |
+| F11 | `rg9_tiered_manager_exists`, `jit/src/lib.rs:26921` | body is one `let _manager = …` line; the doc promises the hot-counter threshold is asserted | change the default policy's threshold to anything |
+| F13 | `p89_cross_region_rset_tracking`, `gc/src/g1.rs:~13606` | ends on the comment *"we just verify no crash"* — no assertion | make `write_barrier` record nothing |
+| F14 | `p89_soft_ref_retained_with_free_heap`, `gc/src/g1.rs:~13668` | ends `let _ = result.stats.soft_refs_cleared;` | clear every soft ref regardless of heap pressure |
+| F16 | `jvmti_hooks_off_by_default`, `classloading/src/class_manager.rs:20224` | body is two `fire_*` calls; the comment **explicitly disclaims** the assertion the name makes (*"may be either true … or false"*) | fire the hooks when none are installed |
+| F18–F21 | `values_equal_null_null` / `_ints` / `_long` / `_mixed_types`, `native-collections/src/lib.rs:59044–59083` | **worse than recorded.** They do not merely fail to call `values_equal` — each asserts a `matches!` pattern against a `Value` literal it constructed two lines earlier, e.g. `matches!((&Value::Object(None), &Value::Object(None)), (Value::Object(None), Value::Object(None)))`. These are tautologies over constants | rewrite `values_equal` to `true` — or delete it — all four stay green |
+| F22–F24 | `test_serialization_not_supported_returns_err` and neighbours, `native-builtins/src/serialization.rs:5910` | constructs a `RuntimeError::UnsupportedOperationException` in the test and asserts it `matches!` itself; the comment states the method (*"we cannot call it directly without a `NativeContext`, but we can verify the error type by constructing the same `RuntimeError`"*) | make the not-supported paths return `Ok(None)` |
+| F25 | the two loops at `gc/src/gen_heap.rs:20497`, `:20548` | 20 alloc/collect cycles, then `for … { let _ = heap.get_field(*obj_ref, 0); }` under the comment *"should be readable without panicking"* | return a garbage `Value` from every surviving slot |
+
+Also still open and unchanged from §3's list, re-verified: the two `churn=(n > 0)`
+booleans (`RForNameGcStress.java:135`, `ROverlaySystemGcStress.java:193`, both
+verbatim), the two arithmetic tolerances (`types/src/compact_value.rs:2852`,
+`:2857`), F27's `gpu-offload` placement (`vm/src/runtime/gpu_residency.rs:8`
+onward, still the only gate), and the `jdk-only-strict-probes.sh` absent-arm
+agreement — **whose source comment now argues the shape is correct**
+(*"the agent section will report absent in EVERY arm, so the arms still agree
+and the gate stays honest"*, `scripts/jdk-only-strict-probes.sh:~252`). It is
+not honest: three arms that all failed to build agree with each other, and
+agreement between three broken instruments is this record's entire subject. The
+residual is now harder to close than when it was merely unnoticed, because a
+reader has to disagree with a comment first.
+
+**Round 3's four Java findings ARE repaired**, verified in the tree rather than
+taken from the commit log: `RJdkRecords.java:113` now carries an explicit
+*"NOT `!= null`"* comment, `RJdkFieldModule.java:186` asserts **IDENTITY**,
+`RJdkModule.java:99` cross-checks `isAutomatic()` against
+`modifiers().contains(AUTOMATIC)` beside the hardcoded-`false` note, and no
+`getClass() != null` remains in any of the 72 vectors.
+
+### 6.3 The sweep of 16,376 missed instances of its own named tell
+
+§2.2 names the give-away precisely — a comment of the form *"we can't call the
+native without a `NativeContext`, so we replicate the check here"*. Grepping
+**that sentence** across the eight first-party crates (excluding `vendor/`)
+returns 16 hits in ~10 seconds. It names every one of F1, F5, F6, F7, F9,
+F18–F21 and F22–F24 — and at least one the sweep did not report:
+
+* **`t10_9_a_adapter_preserves_empty_dispatch`, `vm/src/runtime/vtable.rs:2031`.**
+  The doc comment states the property under test: *"when the install adapter
+  sees a `VtableSlotDescriptor` with `dispatch: None`, the resulting
+  `VtableEntry` has `resolved_method: None`"*. The body constructs the
+  descriptor, then asserts `desc.dispatch.is_none()` and
+  `desc.method_index == 3` — **the two fields it set two lines above**.
+  `vtable_install_adapter` is never called, and its comment says why: *"We can't
+  call `vtable_install_adapter` without a global manager; simulate the
+  conversion manually."* **Mutation that should break it and does not:** make
+  the adapter populate `resolved_method: Some(..)` for a `dispatch: None`
+  descriptor — i.e. dispatch an abstract method to a body.
+
+The lesson is not that the sweep was careless; 16,376 is a lot of tests. It is
+that **once a species has a textual tell, the tell is a cheaper and more complete
+instrument than the sweep that discovered it**, and it was never run. This is
+W7-60's lesson (subtract the filter from the oracle) arriving from the other
+direction: the expensive census produced a cheap detector as a by-product and
+nobody consumed it.
+
+### 6.4 Is this record's evidence scheduled?
+
+Partly, and the split matters.
+
+* The **Rust** F-series is reachable by `cargo test --workspace`, which
+  `.github/workflows/ci.yml` runs. Those tests execute — they simply cannot go
+  red. Scheduling was never the problem here; discrimination is.
+* The **Java** side is scheduled: all 72 vectors go through
+  `regression-suite/run.sh`, `STRICT_COVERAGE: 1` is set at `ci.yml:1350` and
+  `CRATONVM_REQUIRE_E2E: 1` at `:211` — §1.2's and §2.7's producers, both
+  verified present.
+* **`probes/` is scheduled by essentially nothing, and the number is worse than
+  "not by `run.sh`".** The string `probes` appears **zero** times in
+  `regression-suite/run.sh`. The one scheduled consumer is
+  `scripts/jdk-only-strict-probes.sh` (`ci.yml:315` and `:1404`), and its
+  `PROBE_LIST` default is exactly three names —
+  `JdkOnlyCensusLoadProbe JdkOnlyBreadthProbe JdkOnlyPlatformProbe` — plus
+  `JdkOnlyProbeAgent`. There are **449 `.java` files in `probes/`**. So ~1% of
+  the probe corpus is scheduled, and **no suite run at any `SUITE=` value can
+  discharge a finding whose only witness is a probe** — which is the standing
+  caveat for W7-33 and W7-36, whose entire evidence base is
+  `probes/ShadowDifferentialProbe.java`. That file is named by no `.sh` and no
+  `.yml` in the tree.
+
+### 6.5 What round 4 did NOT do
+
+No cargo, no Rust, no mutation executed. Every row in §6.2 is a **reading** of a
+test body against the production symbol it names — strong for the twelve where
+the production function is provably absent from the call path (that is a
+structural fact, not a judgement), and weaker for F13/F14/F16/F25, where the
+claim is only that **no assertion exists**. That one needs no mutation: a test
+with no assertion cannot fail, and F13, F14, F16 and F25 have none.
+
+---
+
+## 7. Round 5 (2026-08-12, lane C9) — can this record be closed? No, and the reason is one level up again
+
+**Method.** Read-only. Every §6.2 symbol re-derived against the working tree by
+`git grep -l "fn <symbol>"` — symbol, not line number, since §6 already
+established that every line number in §2.2/§2.3 has drifted. Then the thing
+§6.3 asked for and nobody did: **the detector was executed.** No cargo, and no
+Rust changes to any file this lane does not own.
+
+### 7.1 The thirteen are still there — verified, not assumed
+
+All twelve symbols of §6.2, plus §6.3's `vtable.rs` addition, resolve at this
+commit, each in the file §6 names:
+
+```
+test_secure_gaussian_uses_csprng_and_is_finite       native-builtins/src/securerandom.rs
+nio_selector_indefinite_block_path_honors_wakeup     native-io/src/nio_selector.rs
+path_rejects_parent_segment                          native-builtins/src/jboss_resource_loader.rs
+wp3_6_max_direct_transfer_size_is_int_max            native-io/src/file_channel.rs
+system_init_phase1_is_registered_as_native           vm/tests/wave3_scanner.rs
+zip_comment_round_trips                              native-io/src/zip_real_jar.rs
+rg9_tiered_manager_exists                            jit/src/lib.rs
+p89_cross_region_rset_tracking                       gc/src/g1.rs
+p89_soft_ref_retained_with_free_heap                 gc/src/g1.rs
+jvmti_hooks_off_by_default                           classloading/src/class_manager.rs
+values_equal_null_null / _ints / _long / _mixed_types  native-collections/src/lib.rs
+test_serialization_not_supported_returns_err         native-builtins/src/serialization.rs
+t10_9_a_adapter_preserves_empty_dispatch             vm/src/runtime/vtable.rs
+```
+
+`alloc_zero_returns_some` resolves nowhere and `alloc_zero_is_refused` resolves
+in `jit/src/platform.rs` — §6.1's "renamed, *the old name was the lie*" row is
+confirmed. F27's `gpu-offload` gate, both `churn=(n > 0)` booleans
+(`RForNameGcStress.java:135`, `ROverlaySystemGcStress.java:193`), the two
+arithmetic tolerances (`types/src/compact_value.rs:2852`, `:2857`) and the
+`jdk-only-strict-probes.sh` absent-arm agreement (`:376`, `:402`) are all
+verbatim. **Nothing on this record's open list has moved.**
+
+### 7.2 The finding: §6.3's detector was never run, and it does not work
+
+§6.3's whole point is that the expensive census produced a cheap detector as a
+by-product and nobody consumed it. It then states that detector's recall as a
+fact:
+
+> Grepping **that sentence** across the eight first-party crates (excluding
+> `vendor/`) returns 16 hits in ~10 seconds. It names every one of F1, F5, F6,
+> F7, F9, F18–F21 and F22–F24 — and at least one the sweep did not report
+> [`t10_9_a_adapter_preserves_empty_dispatch`].
+
+Executed here for the first time. The hit COUNT reproduces — a widened form of
+the tell returns 16 hits across the first-party crates in about ten seconds.
+**What those hits NAME does not.** The exact phrase occurs in four files:
+
+| file | finding it names |
+| --- | --- |
+| `native-builtins/src/securerandom.rs:1815` | F1 |
+| `native-builtins/src/serialization.rs:5913` | F22–F24 |
+| `native-io/src/file_channel.rs:1825` | F7 |
+| `native-builtins/src/xnio_io_thread.rs:1458` | not an F-finding |
+
+and in **none** of `jboss_resource_loader.rs` (F5), `ironjacamar_pool.rs` (F6),
+`zip_real_jar.rs` (F9), `native-collections/src/lib.rs` (F18–F21),
+`nio_selector.rs` (F3), `wave3_scanner.rs` (F8), `jit/src/lib.rs` (F11),
+`g1.rs` (F13/F14), `class_manager.rs` (F16), `gen_heap.rs` (F25) — **or
+`vtable.rs`, the one case §6.3 offers as its own demonstration.** Measured
+recall: **3 of the 9 findings claimed, and 0 of the 2 it is demonstrated on.**
+
+**Why, and this is the durable lesson.** The two sentences the detector keys on
+are gone from the tree:
+
+```
+$ git grep -c "we duplicate the check here"      -- '*.rs'    ->  (no hits)
+$ git grep -c "simulate the conversion manually" -- '*.rs'    ->  (no hits)
+```
+
+Both were replaced by the round-3/4 annotation pass. `jboss_resource_loader.rs`
+now opens its test with `**THIS TEST CANNOT FAIL, and it is standing in for a
+SECURITY control.**`, and `vtable.rs` with `**THIS TEST CANNOT FAIL, and its
+name overstates what it covers.**` — strictly better prose, written by someone
+fixing this exact defect, which **destroyed the detector's recall as a side
+effect.** A detector keyed on prose is invalidated by improving the prose.
+
+So §6.3's conclusion survives and its instrument does not: the census did
+produce a cheap detector, nobody ran it, and by the time anyone did, the repair
+pass had disarmed it. **A detector whose recall is asserted rather than measured
+is the same species this record is about — a check that reads as good news
+because nothing ever made it speak.** That is the third occurrence inside this
+record's own repairs (§3's deleted `rounds.capped=(12 > 0)`, W6-5 §3.4, here).
+
+### 7.3 The repair: a stable marker plus a positive control
+
+Prose is the wrong key. Two sites have already independently converged on a
+literal, stable one — `THIS TEST CANNOT FAIL` — and it is greppable, but it is
+on **2 of the 13**:
+
+```
+$ git grep -c "THIS TEST CANNOT FAIL" -- '*.rs' ':!*/vendor/*'
+native-builtins/src/jboss_resource_loader.rs:1
+vm/src/runtime/vtable.rs:1
+```
+
+**NOMINATION (this lane owns neither file).** Adopt that literal as the campaign
+marker, put it on all thirteen, and gate it — with the gate's **positive control
+built in**, which is the half this campaign keeps omitting:
+
+* `vm/tests/vacuous_marker_census.rs`, reached by the `cargo test --workspace`
+  step `.github/workflows/ci.yml` already runs. It carries the thirteen
+  `(symbol, file)` pairs of §7.1 and asserts, for each, that the file contains
+  both the symbol and the marker.
+* **The positive control, which is the entire point:** the census must also
+  assert `found >= 13`. A gate written only as "no unmarked vacuous test exists"
+  passes identically when the search matched nothing at all — a wrong path, a
+  renamed crate, a `ripgrep` that is not installed, a stray `|| true`. All three
+  of this campaign's calibrated instances of that failure — the CI gate whose
+  `|| true` made "clean tree" and "search failed" identical, the mutation test
+  written against a `ripgrep` branch on a host with no `ripgrep`, and the
+  `ArrayDeque` negative control that drove only the ends of the deque and so
+  never called the method under test — are one defect: **the machinery's own
+  silence read as a pass.** An assertion with a positive floor cannot be
+  satisfied by silence.
+* Clearing a row is what makes the test green again — the ratchet shape §1.1
+  established and the reason its `probe_fixture_census.rs` works. A marker
+  removed because the test was genuinely repaired is a **deletion from the
+  table, in the same commit**, or the gate stays red.
+
+This does not repair the thirteen. It makes their number honest and makes a
+silent failure of the accounting loud — the strictly smaller claim this record
+is entitled to make without a build.
+
+### 7.4 Disposition — why W7-51 cannot be closed
+
+| blocker | state at this commit | measured how |
+| --- | --- | --- |
+| the thirteen tests that cannot fail | **all present, verbatim** | symbol grep, §7.1 |
+| §6.3's detector | **recall 3/9, disarmed by the annotation pass** | executed, §7.2 |
+| 11 of the 13 carry no greppable marker | **unmarked** | §7.3 |
+| the 16 missing `apps/` fixtures (§1.1) | unchanged | §1.1's own baseline |
+| F27 `gpu-offload` placement | unchanged | `gpu_residency.rs:8` |
+| `jdk-only-strict-probes.sh` absent-arm agreement | unchanged, **and still argued for in its own comments** | `:376`, `:402` |
+| the two `churn=(n > 0)` booleans | verbatim | §7.1 |
+| the two arithmetic tolerances | verbatim | §7.1 |
+
+**Closing this record requires a build, and this lane could not run one.** Every
+row above is a grep or a reading against the tree; none is a mutation, and
+§4.3's caveat still governs. The honest position: W7-51 is a correct and
+unusually well-evidenced description of a population that has now been
+re-measured four times and repaired twice, and **both repairs were
+documentation.** What it is still missing is the thing it names in its own §5 —
+*a vacuous test is not found by reading tests; it is found by breaking the code
+they claim to cover* — applied to the thirteen, one `cargo test` at a time.
+
+**One thing round 5 asks the next lane NOT to do:** do not re-derive §6.2. It
+has now been verified against the tree twice, by symbol, and both passes found
+the same list unchanged. A third reading buys nothing. Land §7.3's gate, then
+break one of the thirteen and watch it stay green — that is the only evidence
+this record does not already have.

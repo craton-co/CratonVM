@@ -9,10 +9,14 @@ use cratonvm_types::{ObjectRef, Value};
 
 use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
+// `LAYOUT_PADDING`, `LAYOUT_SEQUENCE`, `LAYOUT_STRUCT` and `LAYOUT_UNION` are
+// NOT imported here any more (F16, 2026-08-13): the group-layout family moved
+// wholesale to `phases_late/foreign_ffm.rs`, which does not tag a layout with a
+// kind at all, so this file's last uses of the four compound tags are in its
+// own `#[cfg(test)]` module — which imports them itself.
 use cratonvm_native_api::ffi::{
     self, LAYOUT_ADDRESS, LAYOUT_BOOLEAN, LAYOUT_BYTE, LAYOUT_CHAR, LAYOUT_DOUBLE, LAYOUT_FLOAT,
-    LAYOUT_INT, LAYOUT_LONG, LAYOUT_PADDING, LAYOUT_SEQUENCE, LAYOUT_SHORT, LAYOUT_STRUCT,
-    LAYOUT_UNION,
+    LAYOUT_INT, LAYOUT_LONG, LAYOUT_SHORT,
 };
 
 /// Maximum number of bytes for a single memory copy/fill operation.
@@ -22,6 +26,46 @@ const MAX_COPY_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 // retain the Java backing array and its primitive layout kind.
 const SEG_BACKING_ARRAY_FIELD: usize = 2;
 const SEG_BACKING_KIND_FIELD: usize = 4;
+
+// A CratonVM-minted segment that aliases a Java array WITHOUT an off-heap
+// mirror carries two extra slots. It is deliberately NOT a third tenant of
+// slots 2/4/5: `segment_address` answers `[0] + [5]` for any carrier with six
+// or more fields, so putting the array's byte offset in slot 5 would hand every
+// raw-pointer consumer in the tree a small integer to dereference — which is
+// exactly the defect F27 closed one level down (a heap segment's `length`
+// answered as its address, `0x10`). Slot 0 stays 0 here so `segment_address`
+// keeps answering 0, the value every consumer already refuses on.
+const SEG_HEAP_BASE_FIELD: usize = 6;
+const SEG_HEAP_START_FIELD: usize = 7;
+const SEG_HEAP_FIELDS: usize = 8;
+
+/// `Unsafe.arrayBaseOffset(<any array type>)` as **both** VMs publish it.
+///
+/// `HeapMemorySegmentImpl.offset` is an `Unsafe`-style offset with this bias
+/// baked in, so a fresh full-array segment's `offset` is 16 and its
+/// `address()` is 0 — not the other way round. Measured on the oracle
+/// (25.0.3+9-LTS, `--add-opens java.base/jdk.internal.foreign=ALL-UNNAMED`):
+/// `ofArray` on `byte[]`, `short[]`, `char[]`, `int[]`, `long[]`, `float[]` and
+/// `double[]` all report `offset=16`, and `asSlice(3)` on a `byte[32]` reports
+/// `offset=19`/`address()=3`. CratonVM answers 16 for every array type too
+/// (`unsafe_natives_ext::native_unsafe_array_base_offset` is a constant 16), so
+/// the two agree and one constant serves both carriers.
+const HEAP_ARRAY_BASE_OFFSET: i64 = cratonvm_native_io::ARRAY_BYTE_BASE_OFFSET;
+
+/// `UpcallEntry`/`UpcallUserdata`'s `return_kind` for a **void** upcall.
+///
+/// It was a bare `-1` at its two sites, and that bare `-1` is the reason
+/// `panama_libffi::LAYOUT_UNKNOWN` had to be `-2`: the file next door needed a
+/// value for "this carrier could not be classified" and the obvious one was
+/// already spoken for by an unrelated convention in this one. Two sentinels
+/// sharing a namespace, neither naming itself, is a collision waiting for
+/// whichever of the two travels furthest — and `return_kind` travels into
+/// `UpcallEntry` in `native-api`, across the libffi closure boundary, and back.
+///
+/// It is NOT a layout kind. Every real kind is `>= 0`
+/// (`LAYOUT_BYTE`=0 … `LAYOUT_PADDING`=13), so the only safe way to read this
+/// value is by name.
+const UPCALL_RETURN_VOID: i32 = -1;
 
 /// Maximum length to scan when reading a C string from native memory.
 const MAX_CSTR_LEN: usize = 4096;
@@ -237,6 +281,48 @@ fn require_native_access(ctx: &mut dyn NativeContext, op: &str) -> Result<(), Me
     Ok(())
 }
 
+/// The gate for the `MemorySegment` ACCESSORS — `get`, `set`, `getAtIndex`,
+/// `setAtIndex`, `copy`, `fill`.
+///
+/// **None of them is `@Restricted` on JDK 25, and refusing them was a wrong
+/// capability.** Measured against the JDK source at `C:\craton\jdk25src`:
+///
+/// ```text
+/// $ grep -n "@Restricted" java.base/java/lang/foreign/MemorySegment.java
+///   754:    @Restricted    MemorySegment reinterpret(long newSize);
+///   810:    @Restricted    MemorySegment reinterpret(Arena, Consumer<MemorySegment>);
+///   869:    @Restricted    MemorySegment reinterpret(long, Arena, Consumer<MemorySegment>);
+/// ```
+///
+/// Three methods, all `reinterpret`. `get`/`set`/`getAtIndex`/`setAtIndex`/
+/// `copy`/`fill`/`ofArray`/`asSlice` carry no annotation, and HotSpot 25 runs
+/// every one of them with no `--enable-native-access` flag at all. CratonVM
+/// raised `IllegalCallerException: Native access is not enabled for this module
+/// (MemorySegment.set denied)` — recorded, unfixed, as W7-89 §7.2, which is why
+/// every command in that record had to pass `--enable-native-access=ALL-UNNAMED`
+/// to BOTH VMs to keep the flag a constant of the comparison.
+///
+/// The JDK's actual safety argument is upstream of the accessor: a segment you
+/// can reach without a restricted call is one whose bounds the runtime knows.
+/// Turning an arbitrary `long` into an addressable segment needs
+/// `MemorySegment.ofAddress` (which answers a **zero-length** segment — measured,
+/// `MemorySegment.ofAddress(0x1000).get(JAVA_BYTE, 0)` is
+/// `IndexOutOfBoundsException`) and then `reinterpret`, which IS restricted.
+/// Both of those keep [`require_native_access`] here.
+///
+/// What this does NOT drop: the host policy check and the `RawMemory`
+/// capability row, so the audit still names every accessor. Only the
+/// flag-absent refusal goes — the half that had no counterpart in the JDK.
+///
+/// A heap segment reaches this too and has no raw memory in it at all; before
+/// the heap path existed that distinction did not matter, because no heap
+/// access could succeed anyway.
+fn require_segment_access(ctx: &mut dyn NativeContext, op: &str) -> Result<(), MethodCallFailed> {
+    crate::security_manager::check_host_native_access_or_throw(ctx, "foreign")?;
+    crate::capability_gate::gate_raw_memory_named(&*ctx, op)?;
+    Ok(())
+}
+
 /// Safely transmute a raw function address to an extern "C" fn pointer.
 /// Returns an error if native access is not permitted, or if the address
 /// is null or misaligned.
@@ -272,6 +358,14 @@ where
         }
         .into());
     }
+    // Null and alignment are NOT sufficient. A tagged arena handle
+    // (`Unsafe.allocateMemory`, hence every direct `ByteBuffer` address) is
+    // both non-null and 8-aligned, so it walked through the two checks above
+    // and was then CALLED — a jump to an address that is a Rust-side arena key
+    // rather than code. Same for a callee address in the unmappable low
+    // window. `checked_foreign_addr` is the one screen both this and the
+    // argument path in `panama_libffi::marshal_arg` share.
+    crate::panama_libffi::checked_foreign_addr(fn_addr, "downcall target")?;
     // SAFETY: We have verified the address is non-null and properly aligned.
     // The caller is responsible for ensuring the address points to a valid
     // extern "C" function with the expected signature.
@@ -290,11 +384,29 @@ pub(crate) fn register_pe_panama(registry: &mut NativeMethodRegistry) {
 }
 
 // --- ValueLayout: type descriptors for native memory ---
-// ValueLayout synthetic: [0]=kind (Int), [1]=byteSize (Int)
-
+//
+// `pe_make_layout` IS A TEST FIXTURE AND NOTHING ELSE (F16, 2026-08-13).
+//
+// It is the last thing in this crate that builds the `[0]=Int(kind)` layout
+// object, and it is `#[cfg(test)]` so that it cannot become a second
+// production encoding again. The shipping encoding — the JDK's own
+// `[0]=Long(byteSize), [1]=Long(byteAlignment), …` — is minted only by
+// `phases_late/foreign_ffm.rs::p67_layout_object` and the four group-layout
+// factories beside it. See the banner in `register_pe_value_layout` below.
+//
+// The kind tag it writes is still MEANINGFUL to the downcall marshaller:
+// `panama_libffi::read_layout_kind` reads slot 0 as `Int(kind)` first and
+// falls back to resolving the layout's CLASS NAME when slot 0 is a `Long`,
+// which is how the shipping carriers are decoded. That fallback is why
+// deleting the production rows did not break the FFI path — but it is also a
+// reconciliation layer for two encodings that now has only one left to
+// reconcile, and it carries a `_ => LAYOUT_LONG` default that is wrong for the
+// real JDK's own `ValueLayouts$Of*Impl` class names. Nominated, not this
+// lane's file.
+#[cfg(test)]
 const PE_VALUE_LAYOUT_NAME_SLOT: usize = 2;
-const PE_P67_LAYOUT_NAME_SLOT: usize = 3;
 
+#[cfg(test)]
 fn pe_make_layout(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRef, MethodCallFailed> {
     let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout", 3)?;
     ctx.set_field(layout, 0, Value::Int(kind));
@@ -303,190 +415,69 @@ fn pe_make_layout(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRef, M
     Ok(layout)
 }
 
-fn pe_optional(ctx: &mut dyn NativeContext, value: Value) -> Result<ObjectRef, MethodCallFailed> {
-    let pinned = match value {
-        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
-        _ => None,
-    };
-    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-    let value = match pinned {
-        Some((pin, obj)) => {
-            let obj = ctx.read_native_pin(pin, obj);
-            ctx.unpin_native_roots(pin);
-            Value::Object(Some(obj))
-        }
-        None => Value::Object(None),
-    };
-    ctx.set_field(opt, 0, value);
-    Ok(opt)
-}
-
-fn pe_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
-    match ctx.get_field(layout, 0) {
-        Value::Long(_) => {
-            if ctx.object_num_fields(layout) > PE_P67_LAYOUT_NAME_SLOT {
-                ctx.get_field(layout, PE_P67_LAYOUT_NAME_SLOT)
-            } else {
-                Value::Object(None)
-            }
-        }
-        _ => {
-            if ctx.object_num_fields(layout) > PE_VALUE_LAYOUT_NAME_SLOT {
-                ctx.get_field(layout, PE_VALUE_LAYOUT_NAME_SLOT)
-            } else {
-                Value::Object(None)
-            }
-        }
-    }
-}
-
-fn pe_layout_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let name = pe_layout_name_value(ctx, this);
-    Ok(Some(Value::Object(Some(pe_optional(ctx, name)?))))
-}
-
-fn pe_layout_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let name = args.get(1).copied().unwrap_or(Value::Object(None));
-    let class_name = ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
-        .unwrap_or_else(|| "java/lang/foreign/MemoryLayout".to_string());
-    let field_count = ctx.object_num_fields(this);
-    let name_slot = match ctx.get_field(this, 0) {
-        Value::Long(_) => PE_P67_LAYOUT_NAME_SLOT,
-        _ => PE_VALUE_LAYOUT_NAME_SLOT,
-    };
-    let clone_fields = std::cmp::max(field_count, name_slot + 1);
-    let this_pin = ctx.pin_native_root(this);
-    let name_pin = match name {
-        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
-        _ => None,
-    };
-
-    let cloned = try_alloc_concurrent_synthetic(ctx, &class_name, clone_fields)?;
-    let this = ctx.read_native_pin(this_pin, this);
-    for i in 0..field_count {
-        let value = ctx.get_field(this, i);
-        ctx.set_field(cloned, i, value);
-    }
-    let name = match name_pin {
-        Some((pin, obj)) => {
-            let obj = ctx.read_native_pin(pin, obj);
-            ctx.unpin_native_roots(pin);
-            Value::Object(Some(obj))
-        }
-        None => Value::Object(None),
-    };
-    ctx.set_field(cloned, name_slot, name);
-    ctx.unpin_native_roots(this_pin);
-    Ok(Some(Value::Object(Some(cloned))))
-}
-
 fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
     let vl = "java/lang/foreign/ValueLayout";
 
-    // Static factory fields — return pre-built layout objects
-    r.register(
-        vl,
-        "JAVA_BYTE",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_BYTE)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_SHORT",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_SHORT)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_INT",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_INT)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_LONG",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_LONG)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_FLOAT",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_FLOAT)?)))),
-    );
-    r.register(
-        vl,
-        "JAVA_DOUBLE",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| {
-            Ok(Some(Value::Object(Some(pe_make_layout(
-                ctx,
-                LAYOUT_DOUBLE,
-            )?))))
-        },
-    );
-    r.register(
-        vl,
-        "JAVA_BOOLEAN",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| {
-            Ok(Some(Value::Object(Some(pe_make_layout(
-                ctx,
-                LAYOUT_BOOLEAN,
-            )?))))
-        },
-    );
-    r.register(
-        vl,
-        "JAVA_CHAR",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_CHAR)?)))),
-    );
-    r.register(
-        vl,
-        "ADDRESS",
-        "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| {
-            Ok(Some(Value::Object(Some(pe_make_layout(
-                ctx,
-                LAYOUT_ADDRESS,
-            )?))))
-        },
-    );
-
-    r.register(vl, "byteSize", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let size = match ctx.get_field(this, 1) {
-            Value::Int(n) => n as i64,
-            _ => 1,
-        };
-        Ok(Some(Value::Long(size)))
-    });
-    r.register(vl, "byteAlignment", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let size = match ctx.get_field(this, 1) {
-            Value::Int(n) => n as i64,
-            _ => 1,
-        };
-        Ok(Some(Value::Long(size))) // alignment = size for primitive layouts
-    });
-    r.register(vl, "name", "()Ljava/util/Optional;", pe_layout_name);
-    r.register(
-        vl,
-        "withName",
-        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
-        pe_layout_with_name,
-    );
-    r.register(
-        vl,
-        "withName",
-        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
-        pe_layout_with_name,
-    );
-    ()
+    // NINE ROWS WERE DELETED HERE, AND THE SIX BELOW THEM WITH THEM
+    // (F16, 2026-08-13). What stood here was:
+    //
+    //     r.register(vl, "JAVA_BYTE",  "()Ljava/lang/foreign/ValueLayout;", …)
+    //     r.register(vl, "JAVA_SHORT", "()Ljava/lang/foreign/ValueLayout;", …)
+    //     … JAVA_INT, JAVA_LONG, JAVA_FLOAT, JAVA_DOUBLE, JAVA_BOOLEAN,
+    //     … JAVA_CHAR, ADDRESS
+    //
+    // each answering a `pe_make_layout` object, plus `byteSize`,
+    // `byteAlignment`, `name` and two `withName` overloads reading it.
+    //
+    // TWO THINGS WERE WRONG WITH THEM, AND THE SECOND IS THE ONE THAT
+    // MATTERED.
+    //
+    // 1. The descriptor is fabricated. These are FIELDS, not methods, and
+    //    `()Ljava/lang/foreign/ValueLayout;` appears nowhere in JDK 25:
+    //
+    //      $ javap -p java.lang.foreign.ValueLayout      # 25.0.3+9-LTS
+    //        public static final java.lang.foreign.ValueLayout$OfInt JAVA_INT;
+    //      $ javap -c F16Desc   # static Object e(){ return ValueLayout.JAVA_INT; }
+    //        0: getstatic Field java/lang/foreign/ValueLayout.JAVA_INT:
+    //                          Ljava/lang/foreign/ValueLayout$OfInt;
+    //
+    //    No classfile can reach these rows. Only a Rust-side `call_native`
+    //    could, and `vm/src/vm/tests.rs` was the only caller.
+    //
+    // 2. They were a SECOND MINTER FOR A SECOND ENCODING. `pe_make_layout`
+    //    built a 3-slot object whose slot 0 is `Int(kind)`;
+    //    `phases_late/foreign_ffm.rs::p67_layout_object` builds the JDK-shaped
+    //    4-slot `[byteSize, byteAlignment, …, name]`. Both were registered,
+    //    under different keys, so neither shadowed the other — and every
+    //    group-layout consumer decoded slot 0 as `Int(kind)` with a `_ => 0`
+    //    fallback. `LAYOUT_BYTE == 0`, so a 4-slot layout arriving at
+    //    `sequenceLayout(10, JAVA_INT)` answered 10 instead of 40. A defaulting
+    //    reader turning a wrong type into a plausible number is exactly the
+    //    shape that stays invisible until something returns it to Java.
+    //
+    // The 4-slot encoding won, because it is the JDK's own: a real
+    // `jdk.internal.foreign.layout.AbstractLayout` declares `byteSize` then
+    // `byteAlignment` then `name`, so slots 0 and 1 read the same on a real
+    // JDK object and on a CratonVM carrier. `foreign_ffm.rs` now owns the
+    // whole family, in both JDK modes, and is reachable the way the JDK is:
+    // its `<clinit>` row populates the real static fields, so a plain
+    // `getstatic ValueLayout.JAVA_INT` finds an object.
+    //
+    // The replacements, all in `foreign_ffm.rs::register_p67_foreign_memory`:
+    //   * the nine constants — the `$Of*`/`AddressLayout` FIELD rows, plus
+    //     `<clinit>`, which also covers the seven `_UNALIGNED` fields these
+    //     never had;
+    //   * `byteSize` / `byteAlignment` / `name` / `withName` on
+    //     `java/lang/foreign/ValueLayout` and on every `$Of*` class.
+    //
+    // DO NOT RE-ADD A LAYOUT FACTORY HERE. `register_pe_panama` runs AFTER
+    // `register_p67_foreign_memory` (lib.rs: `register_phase67_natives` at
+    // :24121, `register_pe_panama` at :24181, both inside
+    // `register_synthetic_overrides`), so a row added here silently REPLACES
+    // the JDK-true one for every synthetic-JDK run while leaving real-JDK mode
+    // — which never calls `register_pe_panama` at all — on the other body.
+    // That divergence-by-registration-order is what this deletion removes.
+    let _ = vl;
 }
 
 // --- Arena: lifecycle-scoped memory management ---
@@ -572,11 +563,22 @@ pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let layout = obj_arg(args, 1)?;
-            let size = match ctx.get_field(layout, 1) {
-                Value::Int(n) => n as i64,
-                _ => 1,
-            };
-            pe_arena_allocate_impl(ctx, this, size, size)
+            // This read WAS `match ctx.get_field(layout, 1) { Value::Int(n) =>
+            // n as i64, _ => 1 }` — slot 1 as an `Int`, i.e. the deleted
+            // `[0]=Int(kind), [1]=Int(byteSize)` carrier (F16, 2026-08-13).
+            // Every layout that reaches it now carries `Long(byteAlignment)`
+            // there, so the `Int` arm never matched and the `_ => 1` default
+            // took over: `arena.allocate(ValueLayout.JAVA_LONG)` reserved ONE
+            // byte for an eight-byte value, and the caller got a segment that
+            // passes its own bounds check at every offset it will then write.
+            // A defaulting reader is not a safe reader when what it feeds is
+            // an allocation size.
+            //
+            // It now uses the same two accessors as the rest of the family, so
+            // there is one definition of "how big is this layout".
+            let size = crate::phases_late::foreign_ffm::p67_layout_size_of(ctx, layout);
+            let align = crate::phases_late::foreign_ffm::p67_layout_align_of(ctx, layout);
+            pe_arena_allocate_impl(ctx, this, size, align)
         },
     );
     // allocate(MemoryLayout) uses the interface descriptor emitted for
@@ -588,8 +590,23 @@ pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let layout = obj_arg(args, 1)?;
-            let size = crate::panama_libffi::layout_total_size(ctx, layout)? as i64;
-            let align = crate::panama_libffi::layout_align(ctx, layout) as i64;
+            // `panama_libffi::layout_total_size` / `layout_align` CANNOT SIZE A
+            // GROUP LAYOUT ANY MORE, and could not size the one real-JDK mode
+            // has always had (F16, 2026-08-13). Both start from
+            // `read_layout_kind`, which resolves a `Long`-slot-0 carrier by
+            // CLASS NAME against a list of the nine `ValueLayout$Of*` spellings
+            // only. `java/lang/foreign/StructLayout` is not on that list, so it
+            // fell to `_ => LAYOUT_LONG` — a struct of any size was allocated
+            // EIGHT BYTES, at alignment 8.
+            //
+            // That was already true for every `--jdk-only` run, because
+            // `register_pe_panama` never executes there and the layout in hand
+            // has always been `foreign_ffm.rs`'s. It only looked correct under
+            // synthetic-JDK, where the kind-tagged carrier happened to answer.
+            // Reading the layout's own recorded size and alignment is right in
+            // both modes and does not depend on a name list staying in sync.
+            let size = crate::phases_late::foreign_ffm::p67_layout_size_of(ctx, layout);
+            let align = crate::phases_late::foreign_ffm::p67_layout_align_of(ctx, layout);
             pe_arena_allocate_impl(ctx, this, size, align)
         },
     );
@@ -730,9 +747,30 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         ))))
     });
 
-    // address() → long (raw pointer as long)
+    // address() → long.
+    //
+    // TWO DIFFERENT QUESTIONS SHARE ONE FUNCTION, and this registration asks
+    // the wrong one for a heap segment. `panama_libffi::segment_address` is
+    // "the machine address to dereference", and since F27 it deliberately
+    // answers **0** for a heap carrier so that every raw-pointer consumer
+    // refuses instead of dereferencing a `length` (the `0x10` of W7-89 §7.1).
+    // `MemorySegment.address()` is the JDK's own accessor and has a defined
+    // answer that is NOT always 0. Measured, 25.0.3+9-LTS:
+    //
+    //     ofArray(new byte[32]).address()            == 0   (offset field 16)
+    //     ofArray(new byte[32]).asSlice(3).address()  == 3   (offset field 19)
+    //
+    // i.e. `offset - Unsafe.arrayBaseOffset`, which is exactly
+    // `HeapSegmentView::start`. Answering 0 for the slice is the same class of
+    // wrong answer as answering the length was — a plausible number from a
+    // reader that could not decode the carrier — it is just quieter, because 0
+    // is also the right answer for the un-sliced case that every existing test
+    // uses.
     r.register(ms, "address", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(view) = heap_segment_view(ctx, this) {
+            return Ok(Some(Value::Long(view.start)));
+        }
         Ok(Some(Value::Long(crate::panama_libffi::segment_address(
             ctx, this,
         ))))
@@ -757,12 +795,21 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
     // this registrar runs AFTER it on both paths that reach them
     // (lib.rs:9736→9740, and :22995→23051), so THIS is the live answer — the
     // one over there was dead, and said the opposite. They now agree.
+    //
+    // The `ofArray` mirror is not the only heap carrier any more. A real
+    // `HeapMemorySegmentImpl$Of*` and this file's own alias carrier
+    // (`[6]=array, [7]=start`) hold nothing in `SEG_BACKING_ARRAY_FIELD`, so
+    // that check alone answered `true` for both. Measured on the oracle:
+    // `ofArray(new byte[32]).asSlice(3, 4).isNative()` is **false**.
     r.register(ms, "isNative", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let heap_backed = match ctx.get_field(this, SEG_BACKING_ARRAY_FIELD) {
             Value::Object(Some(array)) => ctx.object_is_array(array),
             _ => false,
         };
+        let heap_backed = heap_backed
+            || crate::panama_libffi::is_real_heap_segment(ctx, this)
+            || heap_segment_view(ctx, this).is_some();
         Ok(Some(Value::Int(i32::from(!heap_backed))))
     });
 
@@ -824,50 +871,38 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
     ] {
         r.register(ms, "set", desc, pe_segment_set);
     }
+    // getAtIndex / setAtIndex, ERASED descriptors.
+    //
+    // These used to open-code the stride as `get_field(layout, 1)` matched
+    // against `Value::Int` — the DELETED three-slot layout encoding, in which
+    // slot 1 was `Int(byteSize)`. Since F16 consolidated on the JDK-true
+    // four-slot carrier, slot 1 is `Long(byteAlignment)`, so:
+    //
+    //   * the `Value::Int` arm cannot match any layout this VM or the real JDK
+    //     mints, so every call took the `_ => 1` default and the stride was
+    //     **1 byte** — `getAtIndex(JAVA_INT, 2)` read offset 2, not 8;
+    //   * and had it matched, it would have been the ALIGNMENT, which is 1 for
+    //     `JAVA_INT_UNALIGNED` and 8 for `JAVA_LONG` — a different wrong number
+    //     per layout.
+    //
+    // The covariant registrations a few lines below route to
+    // `pe_segment_get_at_index`, which derives the stride from
+    // `ffi::layout_byte_size(read_layout_kind(...))` and is correct. So one
+    // rule had two implementations, adjacent, disagreeing — and only the
+    // erased one was wrong. Route both spellings at the same function; real
+    // bytecode emits the covariant descriptors, so this is reachable by
+    // reflection and by `MethodHandle`, not by a `javac` call site.
     r.register(
         ms,
         "getAtIndex",
         "(Ljava/lang/foreign/ValueLayout;J)Ljava/lang/Object;",
-        |ctx, args| {
-            // Defense-in-depth: dereferences the segment's raw `ptr` field.
-            require_native_access(ctx, "getAtIndex")?;
-            let this = obj_arg(args, 0)?;
-            let layout = obj_arg(args, 1)?;
-            let index = match args.get(2) {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
-            let elem_size = match ctx.get_field(layout, 1) {
-                Value::Int(n) => n as i64,
-                _ => 1,
-            };
-            let offset = index * elem_size;
-            pe_segment_get_impl(ctx, this, layout, offset)
-        },
+        pe_segment_get_at_index,
     );
-
-    // setAtIndex(ValueLayout, long index, value)
     r.register(
         ms,
         "setAtIndex",
         "(Ljava/lang/foreign/ValueLayout;JLjava/lang/Object;)V",
-        |ctx, args| {
-            // Defense-in-depth: dereferences the segment's raw `ptr` field.
-            require_native_access(ctx, "setAtIndex")?;
-            let this = obj_arg(args, 0)?;
-            let layout = obj_arg(args, 1)?;
-            let index = match args.get(2) {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
-            let value = args.get(3).copied().unwrap_or(Value::Int(0));
-            let elem_size = match ctx.get_field(layout, 1) {
-                Value::Int(n) => n as i64,
-                _ => 1,
-            };
-            let offset = index * elem_size;
-            pe_segment_set_impl(ctx, this, layout, offset, value)
-        },
+        pe_segment_set_at_index,
     );
 
     // Real-JDK bytecode resolves the covariant ValueLayout descriptors rather
@@ -900,22 +935,16 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
     }
 
     // asSlice(long offset, long size) → MemorySegment
+    //
+    // A NAMED FUNCTION, not an inline closure, so the heap arm below is
+    // reachable from a unit test. An anonymous closure inside a registrar can
+    // only be exercised by standing a whole `NativeMethodRegistry` up, which is
+    // why the defect it now fixes had no test either way.
     r.register(
         ms,
         "asSlice",
         "(JJ)Ljava/lang/foreign/MemorySegment;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let offset = match args.get(1) {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
-            let new_size = match args.get(2) {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
-            pe_segment_slice(ctx, this, offset, new_size, None)
-        },
+        pe_segment_as_slice,
     );
 
     // asSlice(long offset) → the rest of the segment.
@@ -931,10 +960,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "(J)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let offset = match args.get(1) {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
+            let offset = pe_long_arg(args, 1);
             let size = crate::panama_libffi::segment_byte_size(ctx, this);
             pe_segment_slice(ctx, this, offset, (size - offset).max(0), None)
         },
@@ -947,6 +973,10 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
     // nothing could obtain a read-only view at all — and
     // `AbstractMemorySegmentImpl.asByteBuffer()` reaches for exactly this to
     // decide whether to hand back a read-only buffer.
+    //
+    // The other direction is the F21 rule, and it is `pe_segment_slice`'s:
+    // read-only is CONTAGIOUS, so every `asSlice` above inherits the parent's
+    // flag and there is no route back to writable.
     r.register(
         ms,
         "asReadOnly",
@@ -979,24 +1009,36 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             let offset = pe_long_arg(args, 1);
             let new_size = pe_long_arg(args, 2);
             let align = pe_long_arg(args, 3);
-            if align <= 0 || (align & (align - 1)) != 0 {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("Invalid alignment constraint: {align}"),
-                }
-                .into());
-            }
-            let addr = crate::panama_libffi::segment_address(ctx, this).saturating_add(offset);
-            if addr % align != 0 {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("Target offset {offset} incompatible with alignment {align}"),
-                }
-                .into());
-            }
+            // Bounds, then power-of-two, then alignment — the oracle's order,
+            // measured. See [`pe_slice_bounds_check`].
+            pe_slice_bounds_check(ctx, this, offset, new_size)?;
+            pe_slice_alignment_check(ctx, this, offset, align)?;
             pe_segment_slice(ctx, this, offset, new_size, None)
         },
     );
 
-    // asSlice(long offset, MemoryLayout layout) — size taken from the layout.
+    // asSlice(long offset, MemoryLayout layout) — size AND ALIGNMENT taken
+    // from the layout.
+    //
+    // The JDK's body is `asSlice(offset, layout.byteSize(),
+    // layout.byteAlignment())`, so the layout's alignment is a CONSTRAINT, not
+    // merely a width. Dropping it made this the one slice arity that could
+    // hand back a view the oracle refuses to create:
+    //
+    // | call | oracle | before |
+    // |---|---|---|
+    // | `ofArray(byte[16]).asSlice(0, JAVA_INT)` | IAE | 4-byte slice |
+    // | `ofArray(byte[16]).asSlice(0, JAVA_INT_UNALIGNED)` | 4-byte slice | 4-byte slice |
+    // | `ofArray(int[8]).asSlice(2, JAVA_INT)` | IAE | 4-byte slice |
+    // | `ofArray(int[8]).asSlice(4, JAVA_INT)` | 4-byte slice | 4-byte slice |
+    // | `ofArray(byte[16]).asSlice(0, sequenceLayout(2, JAVA_INT))` | IAE | 8-byte slice |
+    // | `ofArray(byte[16]).asSlice(0, paddingLayout(4))` | 4-byte slice | 4-byte slice |
+    //
+    // (measured, `FfmProbe` C16/C17 and `FfmProbe3` M3a–M3i). The width comes
+    // from [`p67_layout_size_align`] rather than `pe_memory_layout_width` so
+    // that the size and the alignment are read out of the SAME carrier slots
+    // in one call — two readers for one four-slot object is how the two got to
+    // disagree in the first place.
     r.register(
         ms,
         "asSlice",
@@ -1005,33 +1047,74 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let offset = pe_long_arg(args, 1);
             let layout = obj_arg(args, 2)?;
-            let width = pe_memory_layout_width(ctx, layout);
+            let (width, align) =
+                crate::phases_late::foreign_ffm::p67_layout_size_align(ctx, layout);
+            pe_slice_bounds_check(ctx, this, offset, width)?;
+            pe_slice_alignment_check(ctx, this, offset, align)?;
             pe_segment_slice(ctx, this, offset, width, None)
         },
     );
 
-    // maxByteAlignment() — the JDK's rule is the largest power of two that
-    // divides the segment's base address, and the address-layout alignment for
-    // a base of 0.
+    // maxByteAlignment().
+    //
+    // SETTLED 2026-08-16 against the oracle; the previous body was a
+    // hypothesis and both of its arms were wrong.
+    //
+    // * **Heap.** The answer is the BACKING ARRAY'S ELEMENT ALIGNMENT, capped
+    //   by the low bit of the offset within that array — not the offset alone.
+    //   Measured: `ofArray(byte[16])`→1, `short[8]`→2, `char[8]`→2,
+    //   `int[8]`→4, `long[8]`→8, `float[8]`→4, `double[8]`→8, and
+    //   `ofArray(byte[0])`→1, `ofArray(long[0])`→8 (an empty segment still
+    //   knows its element type). The old body answered **8 for every one of
+    //   them** at offset 0, and 1/2/4 by accident of the offset elsewhere:
+    //   `ofArray(byte[16]).maxByteAlignment()` was 8 where the oracle says 1,
+    //   which is the difference between refusing and admitting
+    //   `get(JAVA_LONG, 0)` on a byte array.
+    // * **Native.** A base of 0 answers **2^62**, not 8 — measured on
+    //   `MemorySegment.NULL` and `ofAddress(0)`. 8 made `NULL.asSlice(0,0,16)`
+    //   an `IllegalArgumentException` where HotSpot returns a segment.
+    //
+    // Both arms live in [`pe_segment_max_byte_alignment`], which is the same
+    // reader `asSlice`'s alignment arms and the heap `get`/`set` gate go
+    // through, so this method and the refusals it explains cannot drift apart.
     r.register(ms, "maxByteAlignment", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let addr = crate::panama_libffi::segment_address(ctx, this);
-        Ok(Some(Value::Long(if addr == 0 {
-            8
-        } else {
-            addr & addr.wrapping_neg()
-        })))
+        Ok(Some(Value::Long(pe_segment_max_byte_alignment(ctx, this))))
     });
 
-    // heapBase() — present only for an `ofArray` segment, whose Java array this
-    // slot retains; a native segment has no heap base. Same discriminator
-    // `isNative()` above uses, so the two cannot disagree.
+    // heapBase() — present only for a heap segment, whose Java array this
+    // answers; a native segment has no heap base.
+    //
+    // Asked through `heap_segment_view`, which is the same reader `isNative()`
+    // and `address()` above use, so the three cannot disagree. The plain
+    // `SEG_BACKING_ARRAY_FIELD` read this used to do knew only ONE of the three
+    // heap carriers — the `ofArray` off-heap mirror — and answered empty for a
+    // real `HeapMemorySegmentImpl$Of*` and for this file's own alias carrier
+    // (`[6]=array, [7]=start`), the two that `isNative()` already reports as
+    // non-native. The mirror is kept as the fallback because its array lives in
+    // slot 2 and `heap_segment_view` does not claim it.
+    // A READ-ONLY SEGMENT HAS NO `heapBase`. MEASURED, and it is a
+    // CAPABILITY, not a formatting detail.
+    //
+    // | call | oracle |
+    // |---|---|
+    // | `ofArray(byte[16]).heapBase().isPresent()` | `true` |
+    // | `ofArray(byte[16]).asReadOnly().heapBase().isPresent()` | **`false`** |
+    // | `asReadOnly().asSlice(3,4).heapBase().isPresent()` | `false` |
+    // | `asReadOnly().elements(JAVA_BYTE).findFirst().get().heapBase().isPresent()` | `false` |
+    // | `ofBuffer(ByteBuffer.allocate(8).asReadOnlyBuffer()).heapBase().isPresent()` | `false` |
+    // | native `allocate(8).asReadOnly().heapBase().isPresent()` | `false` |
+    //
+    // (`FfmProbe` B12, `FfmProbe3` M4a–M4k.) The array `heapBase()` hands back
+    // is the segment's own storage and is fully writable through plain array
+    // stores, so returning it from a read-only view gives away exactly the
+    // capability `asReadOnly()` was called to remove — F26's "a wrong
+    // capability" and F21's "read-only is contagious", one call apart. Reads
+    // through the segment still work (`asReadOnly().toArray(JAVA_BYTE)` is
+    // 16 elements on the oracle); it is only the escape hatch that closes.
     r.register(ms, "heapBase", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let base = match ctx.get_field(this, SEG_BACKING_ARRAY_FIELD) {
-            Value::Object(Some(array)) if ctx.object_is_array(array) => Value::Object(Some(array)),
-            _ => Value::Object(None),
-        };
+        let base = pe_segment_heap_base(ctx, this);
         ctx.invoke(
             "java/util/Optional",
             "ofNullable",
@@ -1347,6 +1430,54 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // ofArray(byte[] | short[] | char[]) → MemorySegment ALIASING the array.
+    //
+    // `java.lang.foreign.MemorySegment` declares SEVEN `ofArray` overloads
+    // (`javap`, 25.0.3+9-LTS: `byte[] char[] short[] int[] float[] long[]
+    // double[]` — and NO `boolean[]`). This file registered four. `ofArray` is
+    // on `native_override.rs`'s force-route NAME list, but a forced name with
+    // no registration for that descriptor falls back to real bytecode, so in
+    // `--jdk-only` the three missing arms produced a real
+    // `HeapMemorySegmentImpl$OfByte/OfShort/OfChar` — and until F27 this file
+    // read one's `length` as its address and the VM died with
+    // `EXCEPTION_ACCESS_VIOLATION … at address 0x10` (W7-89 §7.1). In
+    // synthetic-JDK mode there is no real bytecode to fall back to at all.
+    //
+    // THESE THREE ALIAS; THE FOUR ABOVE COPY. That is deliberate and it is the
+    // one asymmetry in this registrar, so it is stated here rather than left
+    // to be discovered. The four above allocate an off-heap mirror and copy
+    // the array into it, because CratonVM cannot hand a moving Java array to
+    // native code and those carriers exist to be passed to downcalls
+    // (`sync_heap_backed_segment` copies back at the boundary). Measured, the
+    // oracle does not permit that at all:
+    //
+    //     strlen(MemorySegment.ofArray("hi\0".getBytes()))
+    //       -> IllegalArgumentException: Heap segment not allowed: MemorySegment{ kind: heap, … }
+    //
+    // and it DOES require aliasing:
+    //
+    //     byte[] a = new byte[8];
+    //     MemorySegment.ofArray(a).set(JAVA_INT_UNALIGNED, 0, 0x01020304);
+    //     // a == [4, 3, 2, 1, 0, 0, 0, 0]
+    //
+    // So the mirror is a wrong capability in both directions, and propagating
+    // it to three more descriptors — when the alias carrier costs nothing and
+    // needs no native allocation — would have been propagating a known defect.
+    // Unifying the other four is NOMINATED, not done here: they are the shape
+    // Elasticsearch's bulk-vector downcalls depend on.
+    // One body for all three: the element width comes from the ARRAY, through
+    // the same `heap_element_width` the accessors use, so the stride cannot
+    // drift between the factory and the reader. `NativeCallback` is a plain
+    // `fn` pointer, which is also why the width could not be a captured
+    // per-descriptor constant even if that had been desirable.
+    for descriptor in [
+        "([B)Ljava/lang/foreign/MemorySegment;",
+        "([S)Ljava/lang/foreign/MemorySegment;",
+        "([C)Ljava/lang/foreign/MemorySegment;",
+    ] {
+        r.register(ms, "ofArray", descriptor, pe_of_array_alias);
+    }
+
     // Copy primitive array elements into a native segment. Elasticsearch uses
     // this overload to stage float[] rows for bulk vector kernels.
     r.register(
@@ -1354,7 +1485,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "copy",
         "(Ljava/lang/Object;ILjava/lang/foreign/MemorySegment;Ljava/lang/foreign/ValueLayout;JI)V",
         |ctx, args| {
-            require_native_access(ctx, "copy")?;
+            require_segment_access(ctx, "copy")?;
             let src = obj_arg(args, 0)?;
             let src_index = match args.get(1) {
                 Some(Value::Int(v)) if *v >= 0 => *v as usize,
@@ -1402,7 +1533,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/foreign/MemorySegment;JLjava/lang/foreign/MemorySegment;JJ)V",
         |ctx, args| {
             // Defense-in-depth: copy dereferences both segments' raw `ptr` fields.
-            require_native_access(ctx, "copy")?;
+            require_segment_access(ctx, "copy")?;
             let src = obj_arg(args, 0)?;
             let src_offset = match args.get(1) {
                 Some(Value::Long(n)) => *n,
@@ -1896,7 +2027,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "(B)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
             // Defense-in-depth: fill writes to the segment's raw `ptr` field.
-            require_native_access(ctx, "fill")?;
+            require_segment_access(ctx, "fill")?;
             let this = obj_arg(args, 0)?;
             let byte_val = match args.get(1) {
                 Some(Value::Int(n)) => *n as u8,
@@ -1977,6 +2108,67 @@ fn pe_segment_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
         .into());
     }
+
+    // The alignment gate, AFTER the size gate — that order is the JDK's and it
+    // is measured, not assumed. `AbstractMemorySegmentImpl.toArray` runs
+    // `checkArraySize` (the `IllegalStateException` above) and only then hands
+    // the segment to `MemorySegment.copy`, which is where the alignment
+    // `IllegalArgumentException` comes from. So a segment that is BOTH badly
+    // sized and badly aligned reports the size:
+    //
+    // | call | oracle |
+    // |---|---|
+    // | `ofArray(byte[15]).toArray(JAVA_INT)` | ISE `Segment size is not a multiple of 4. Size: 15` |
+    // | `ofArray(byte[16]).toArray(JAVA_INT)` | IAE `Source segment incompatible with alignment constraints` |
+    // | `ofArray(byte[16]).toArray(JAVA_INT_UNALIGNED)` | `[50462976, 117835012, 185207048, 252579084]` |
+    // | `ofArray(int[8]).toArray(JAVA_LONG)` | IAE, same message |
+    // | `ofArray(int[8]).asSlice(4).toArray(JAVA_INT).length` | 7 |
+    //
+    // Note the message is `Source segment ...`, not the `Incompatible
+    // alignment constraints` that `spliterator` answers: they come from
+    // different JDK call sites and both are transcribed
+    // (`FfmProbe` G2/G3/G5/G50, `FfmProbe3` M1n/M2a).
+    let layout_align = crate::panama_libffi::layout_align(ctx, layout) as i64;
+    if layout_align > pe_segment_max_byte_alignment(ctx, this) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Source segment incompatible with alignment constraints".into(),
+        }
+        .into());
+    }
+
+    // A HEAP SEGMENT'S BYTES ARE IN A JAVA ARRAY, NOT AT AN ADDRESS.
+    //
+    // `segment_address` answers 0 for every heap carrier (F27), and the raw
+    // loop below then took its `base.is_null()` early return and handed back a
+    // correctly-sized array of ZEROS. `MemorySegment.ofArray(new byte[]{1,2,3})
+    // .toArray(JAVA_BYTE)` answered `[0, 0, 0]` where the oracle answers
+    // `[1, 2, 3]` — a silent wrong answer, not a refusal, on the one method
+    // whose entire job is to hand the bytes back. It reached real
+    // `HeapMemorySegmentImpl$Of*` receivers and every heap slice this file
+    // mints (`asSlice` is force-routed, so a slice of a real heap segment is
+    // one of ours).
+    //
+    // `heap_segment_read` is the same reader `get` uses, so `toArray` and a
+    // loop of `get`s cannot disagree about the stride or the byte order.
+    if let Some(view) = heap_segment_view(ctx, this) {
+        let arr = ctx.new_array(kind, count as usize);
+        for i in 0..count as usize {
+            let raw = heap_segment_read(ctx, &view, i as i64 * width, width as usize);
+            let value = match kind {
+                AET::Boolean => Value::Int(i32::from((raw & 0xff) != 0)),
+                AET::Byte => Value::Int(i32::from(raw as u8 as i8)),
+                AET::Char => Value::Int(i32::from(raw as u16)),
+                AET::Short => Value::Int(i32::from(raw as u16 as i16)),
+                AET::Int => Value::Int(raw as u32 as i32),
+                AET::Float => Value::Float(f32::from_bits(raw as u32)),
+                AET::Long => Value::Long(raw as i64),
+                _ => Value::Double(f64::from_bits(raw)),
+            };
+            ctx.set_array_element(arr, i, value);
+        }
+        return Ok(Some(Value::Object(Some(arr))));
+    }
+
     let base = crate::panama_libffi::segment_address(ctx, this) as *const u8;
     let arr = ctx.new_array(kind, count as usize);
     if base.is_null() {
@@ -2205,7 +2397,27 @@ fn pe_segment_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
         .into());
     }
-    if crate::panama_libffi::segment_address(ctx, this) % elem_align != 0 {
+    // `maxByteAlignment`, NOT `segment_address % elem_align`.
+    //
+    // On a heap carrier `segment_address` is deliberately 0 (F27), and
+    // `0 % anything == 0`, so this gate admitted EVERY element layout on every
+    // heap segment. Measured refusals it let through:
+    //
+    // | call | oracle |
+    // |---|---|
+    // | `ofArray(byte[16]).spliterator(JAVA_INT)` | IAE `Incompatible alignment constraints` |
+    // | `ofArray(byte[16]).elements(JAVA_INT)` | IAE, same message |
+    // | `ofArray(int[8]).asSlice(2).elements(JAVA_INT)` | IAE, same message |
+    // | `ofArray(byte[16]).elements(JAVA_INT_UNALIGNED)` | 4 elements |
+    // | `ofArray(int[8]).elements(JAVA_INT)` | 8 elements |
+    // | `ofArray(int[8]).asSlice(4).elements(JAVA_INT)` | 7 elements |
+    //
+    // (`FfmProbe` G22/G24/G48, `FfmProbe3` M1k/M1l/M1o.) The alignment gate
+    // also precedes the size-multiple gate below: `ofArray(byte[15])
+    // .elements(JAVA_INT)` is the alignment message, not
+    // `Segment size is not a multiple of layout size` (M2b/M2c), which is the
+    // order these four checks are already written in.
+    if elem_align > pe_segment_max_byte_alignment(ctx, this) {
         return Err(RuntimeError::IllegalArgumentException {
             message: "Incompatible alignment constraints".into(),
         }
@@ -2255,10 +2467,223 @@ fn pe_segment_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(stream))))
 }
 
-/// The body behind `asSlice(long,long)`, `asSlice(long)` and `asReadOnly()`.
+/// The base address a segment reports through `address()`.
+///
+/// NOT `panama_libffi::segment_address`: on a heap carrier that is deliberately
+/// 0 (F27 — slot 0 stays 0 so no raw-pointer consumer is ever handed a small
+/// integer to dereference), while `address()` answers the offset of the
+/// segment's first byte within its backing array. Anything that reasons about
+/// WHERE a segment starts — the alignment arms of `asSlice`/`maxByteAlignment`
+/// — must use this one, or it reasons about a native address on a segment that
+/// has none.
+fn pe_segment_base_address(ctx: &dyn NativeContext, seg: ObjectRef) -> i64 {
+    match heap_segment_view(ctx, seg) {
+        Some(view) => view.start,
+        None => crate::panama_libffi::segment_address(ctx, seg),
+    }
+}
+
+/// The value inside the `Optional` that `MemorySegment.heapBase()` answers.
+///
+/// A free function rather than a closure body so the read-only rule below has
+/// a test that does not need a whole `NativeMethodRegistry` stood up — the same
+/// reason F35 lifted `pe_segment_as_slice` out of its closure.
+///
+/// `Value::Object(None)` means the empty `Optional`.
+fn pe_segment_heap_base(ctx: &dyn NativeContext, seg: ObjectRef) -> Value {
+    let read_only = match heap_segment_view(ctx, seg) {
+        Some(view) => view.read_only,
+        None => matches!(
+            match ctx.get_field_by_name(seg, "readOnly") {
+                v @ Value::Int(_) => v,
+                _ => ctx.get_field(seg, 3),
+            },
+            Value::Int(n) if n != 0
+        ),
+    };
+    if read_only {
+        return Value::Object(None);
+    }
+    match heap_segment_view(ctx, seg) {
+        Some(view) => Value::Object(Some(view.base)),
+        None => match ctx.get_field(seg, SEG_BACKING_ARRAY_FIELD) {
+            Value::Object(Some(array)) if ctx.object_is_array(array) => Value::Object(Some(array)),
+            _ => Value::Object(None),
+        },
+    }
+}
+
+/// The alignment a native carrier can promise, given the address it starts at.
+///
+/// MEASURED on 25.0.3+9-LTS (`FfmProbe` rows H18–H21, A30, P6):
+/// `ofAddress(16)`→16, `ofAddress(12)`→4, `ofAddress(1)`→1, and
+/// `MemorySegment.NULL`/`ofAddress(0)`→**4611686018427387904 = 2^62**, not 8.
+/// The JDK's rule is `lowestOneBit(address | maxAlignMask)` with the mask
+/// falling back to the largest representable power of two when there is no
+/// address to constrain it — a zero address constrains nothing, so nothing is
+/// refused on it. Answering 8 (what this file used to answer) refused
+/// `NULL.asSlice(0, 0, 16)` where the oracle allows it.
+fn native_max_byte_alignment(addr: i64) -> i64 {
+    if addr == 0 {
+        1_i64 << 62
+    } else {
+        addr & addr.wrapping_neg()
+    }
+}
+
+/// The alignment a HEAP carrier can promise at `byte_offset` bytes into its
+/// backing array.
+///
+/// MEASURED (`FfmProbe2` row P1, every offset 0..=16 of seven element types):
+/// the answer is `min(elementAlignment, lowestOneBit(byteOffset))`, with
+/// offset 0 answering the element alignment outright. Transcribed:
+///
+/// ```text
+/// byte[32]   0:1 1:1 2:1 3:1 4:1 ... 16:1
+/// short[16]  0:2 1:1 2:2 3:1 4:2 ... 16:2
+/// int[8]     0:4 1:1 2:2 3:1 4:4 ... 16:4
+/// long[4]    0:8 1:1 2:2 3:1 4:4 8:8 12:4 16:8
+/// ```
+///
+/// `byte_offset` is the ABSOLUTE offset within the array — `view.start` for
+/// the segment itself, `view.start + access_offset` for an access inside it.
+/// Passing only `view.start` and then re-checking the access offset modulo the
+/// alignment is NOT the same rule and is stricter than the oracle: a slice
+/// starting at 2 of an `int[]` has `maxByteAlignment()==2`, yet
+/// `int[8].asSlice(2).get(JAVA_INT, 2)` SUCCEEDS on HotSpot (absolute offset
+/// 4) while `get(JAVA_INT, 0)` is refused — measured, `FfmProbe3` rows M1c/M1d.
+fn heap_max_byte_alignment(elem_width: i64, byte_offset: i64) -> i64 {
+    if byte_offset == 0 {
+        elem_width.max(1)
+    } else {
+        elem_width
+            .max(1)
+            .min(byte_offset & byte_offset.wrapping_neg())
+    }
+}
+
+/// `MemorySegment.maxByteAlignment()` for any carrier this VM can decode.
+///
+/// One reader for the one rule. Every alignment decision in this file —
+/// `maxByteAlignment()` itself, `asSlice(long,long,long)`,
+/// `asSlice(long,MemoryLayout)`, `spliterator`/`elements`, `toArray`, and the
+/// heap `get`/`set` gate — is `constraint <= maxByteAlignment(base + offset)`,
+/// and that equivalence is MEASURED, not assumed: `FfmProbe2` §P2/§P3/§P4
+/// cross every offset 0..=16 against alignments 1/2/4/8/16 on four heap
+/// element types and a native segment, comparing each call's success against
+/// `seg.asSlice(off).maxByteAlignment()` **as HotSpot itself computes it**, and
+/// report zero mismatches in all nine sweeps.
+fn pe_segment_max_byte_alignment(ctx: &dyn NativeContext, seg: ObjectRef) -> i64 {
+    match heap_segment_view(ctx, seg) {
+        Some(view) => heap_max_byte_alignment(view.elem_width as i64, view.start),
+        None => native_max_byte_alignment(crate::panama_libffi::segment_address(ctx, seg)),
+    }
+}
+
+/// The alignment available at `offset` bytes into `seg`, i.e. what
+/// `seg.asSlice(offset).maxByteAlignment()` answers.
+fn pe_segment_max_byte_alignment_at(ctx: &dyn NativeContext, seg: ObjectRef, offset: i64) -> i64 {
+    match heap_segment_view(ctx, seg) {
+        Some(view) => {
+            heap_max_byte_alignment(view.elem_width as i64, view.start.saturating_add(offset))
+        }
+        None => native_max_byte_alignment(
+            crate::panama_libffi::segment_address(ctx, seg).saturating_add(offset),
+        ),
+    }
+}
+
+/// The bounds half of every slice, extracted so the alignment-checked arity
+/// can run it FIRST.
+///
+/// MEASURED order (`FfmProbe3`/`FfmProbe2` §P5): `byte[16].asSlice(20, 4, 3)`
+/// is an `IndexOutOfBoundsException`, not the `IllegalArgumentException:
+/// Invalid alignment constraint : 3` that the same bad alignment produces in
+/// bounds — so bounds precede both the power-of-two check and the alignment
+/// check. Doing them in the other order reports the second-most-interesting
+/// problem.
+fn pe_slice_bounds_check(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    offset: i64,
+    new_size: i64,
+) -> Result<(), MethodCallFailed> {
+    let size = crate::panama_libffi::segment_byte_size(ctx, this);
+    let end = offset.checked_add(new_size);
+    if offset < 0 || new_size < 0 || end.map_or(true, |n| n > size) {
+        // `IndexOutOfBoundsException`, NOT `IllegalStateException`.
+        //
+        // MEASURED, every out-of-range slice arity on both carriers:
+        // `IndexOutOfBoundsException: Out of bound access on segment
+        // MemorySegment{ kind: heap, heapBase: [B@7c1503a3, address: 0x0,
+        // byteSize: 16 }; new offset = 17; new length = 0`. A caller writing
+        // `catch (IndexOutOfBoundsException)` — the idiom for a bounds check,
+        // and what `heap_segment_check_access` already answers for `get`/`set`
+        // — could not catch the `IllegalStateException` this used to raise.
+        // The bracketed receiver text is HotSpot's `toString()` and carries an
+        // identity hash we cannot reproduce; the CLASS and the two trailing
+        // clauses are what a program can act on, and those are exact.
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "Out of bound access on segment MemorySegment{{ kind: {}, address: 0x{:x}, \
+                 byteSize: {} }}; new offset = {}; new length = {}",
+                if heap_segment_view(ctx, this).is_some() {
+                    "heap"
+                } else {
+                    "native"
+                },
+                pe_segment_base_address(ctx, this),
+                size,
+                offset,
+                new_size
+            )),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The alignment half, shared by `asSlice(long,long,long)` and
+/// `asSlice(long,MemoryLayout)`.
+///
+/// MEASURED refusal texts, transcribed character for character (note the space
+/// before the colon in the first — it is HotSpot's, not a typo):
+///
+/// * `IllegalArgumentException: Invalid alignment constraint : 3`
+/// * `IllegalArgumentException: Target offset incompatible with alignment constraints`
+///
+/// Neither message interpolates the offset. The version this replaces wrote
+/// `Target offset {offset} incompatible with alignment {align}`, which is a
+/// different string on every row.
+fn pe_slice_alignment_check(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    offset: i64,
+    align: i64,
+) -> Result<(), MethodCallFailed> {
+    if align <= 0 || (align & (align - 1)) != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Invalid alignment constraint : {align}"),
+        }
+        .into());
+    }
+    if align > pe_segment_max_byte_alignment_at(ctx, this, offset) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Target offset incompatible with alignment constraints".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The body behind `asSlice(long,long)`, `asSlice(long)`, `asSlice(long,long,
+/// long)`, `asSlice(long,MemoryLayout)` and `asReadOnly()`.
 ///
 /// `read_only_override` is `None` to inherit the parent's flag (what a slice
-/// does) and `Some(true)` to force it on (what `asReadOnly` does).
+/// does) and `Some(true)` to force it on (what `asReadOnly` does). Inheriting
+/// is the F21 rule and not a convenience: read-only is CONTAGIOUS, there is no
+/// route back to writable, and a derived view that quietly cleared the flag
+/// would be the wrong CAPABILITY one call after the fix.
 fn pe_segment_slice(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -2266,16 +2691,66 @@ fn pe_segment_slice(
     new_size: i64,
     read_only_override: Option<bool>,
 ) -> MethodCallResult {
-    let size = crate::panama_libffi::segment_byte_size(ctx, this);
-    let end = offset.checked_add(new_size);
-    if offset < 0 || new_size < 0 || end.map_or(true, |n| n > size) {
-        return Err(RuntimeError::IllegalStateException {
-            message: format!(
-                "slice offset {} + size {} exceeds segment size {}",
-                offset, new_size, size
-            ),
-        }
-        .into());
+    pe_slice_bounds_check(ctx, this, offset, new_size)?;
+    // A SLICE OF A HEAP SEGMENT IS A HEAP SEGMENT.
+    //
+    // The address arithmetic below is only meaningful for a carrier
+    // that HAS an address. For a heap one `segment_address` answers 0
+    // (F27), so `slice_ptr` came out as the slice's OFFSET and was
+    // stamped into slot 0 of a synthetic segment — reconstructing, one
+    // level up, exactly the defect F27 closed: a small integer that is
+    // not an address, sitting where every consumer reads an address.
+    // `ofArray(new byte[16]).asSlice(3, 4).get(JAVA_BYTE, 0)` then
+    // dereferenced the literal address 3. (At offset 0 it stayed 0 and
+    // refused, which is why the un-sliced repro looked fixed.)
+    //
+    // Measured on the oracle: `ofArray(new byte[16]).asSlice(3, 4)` has
+    // `byteSize=4`, `address()=3`, `isNative()=false`, and a write
+    // through it lands at `src[3..7]`.
+    if let Some(view) = heap_segment_view(ctx, this) {
+        let read_only = i32::from(read_only_override.unwrap_or(view.read_only));
+        let start = view.start.saturating_add(offset);
+        // G19-1: A SLICE OF A HEAP SEGMENT SHARES ITS PARENT'S SCOPE.
+        //
+        // MEASURED on 25.0.3+9-LTS (`G19Probe` SC8/SC9):
+        // `heap.asSlice(4,4).scope() == heap.scope()` and
+        // `heap.asReadOnly().scope() == heap.scope()` are both **true** — and
+        // `asReadOnly()` reaches this same body, so one write covers both. Slot
+        // 2 was an unconditional `Object(None)` here, which is the same
+        // "no scope resolvable" hole the NATIVE arm below closed for W7-89 and
+        // this arm never did; the fresh session `p67_receiver_session` minted
+        // instead was a different object on every call.
+        let parent_session = pe_segment_session(ctx, this);
+        // The allocation below can MOVE the backing array and the session (the
+        // native stale-local family), so pin both and re-read them through the
+        // pins — the same discipline the session handling below uses.
+        // `unpin_native_roots` truncates to its argument, so releasing the
+        // FIRST handle releases both.
+        let base_pin = ctx.pin_native_root(view.base);
+        let session_pin = parent_session.map(|session| ctx.pin_native_root(session));
+        let slice = try_alloc_concurrent_synthetic(
+            ctx,
+            "java/lang/foreign/MemorySegment",
+            SEG_HEAP_FIELDS,
+        )?;
+        let base = ctx.read_native_pin(base_pin, view.base);
+        let scope_value = match (parent_session, session_pin) {
+            (Some(session), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, session))),
+            _ => Value::Object(None),
+        };
+        ctx.unpin_native_roots(base_pin);
+        // Slot 0 stays 0: a heap slice has no machine address either,
+        // and `segment_address` must keep answering the value every
+        // raw-pointer consumer already refuses on.
+        ctx.set_field(slice, 0, Value::Long(0));
+        ctx.set_field(slice, 1, Value::Long(new_size));
+        ctx.set_field(slice, 2, scope_value);
+        ctx.set_field(slice, 3, Value::Int(read_only));
+        ctx.set_field(slice, 4, Value::Int(1));
+        ctx.set_field(slice, 5, Value::Long(0));
+        ctx.set_field(slice, SEG_HEAP_BASE_FIELD, Value::Object(Some(base)));
+        ctx.set_field(slice, SEG_HEAP_START_FIELD, Value::Long(start));
+        return Ok(Some(Value::Object(Some(slice))));
     }
     let base_ptr = crate::panama_libffi::segment_address(ctx, this);
     let slice_ptr = base_ptr.checked_add(offset).ok_or_else(|| {
@@ -2509,6 +2984,21 @@ impl PeClassMemo {
         let relaxed = std::sync::atomic::Ordering::Relaxed;
         let class_id = ctx.class_id_of_object(obj);
         let raw = class_id.as_u32();
+        // G19-1: THE MEMO IS BYPASSED UNDER `cfg(test)`, AND ONLY THERE.
+        //
+        // Class ids are process-stable on the real VM, which is the whole
+        // premise of remembering one. Under `MockNativeContext` they are a
+        // PER-CONTEXT counter, so id 7 names `MemorySegment` in one test and
+        // `MemorySessionImpl` in the next — and this struct remembers exactly
+        // one hit and one miss for the whole process, so the second test is
+        // handed the first test's answer for a class it never saw. That made
+        // every test of a session-shaped predicate non-deterministic (it
+        // depends on which sibling test ran last, and they run in threads).
+        // The memo is a pure cache: skipping it changes no answer, only the
+        // number of `class_name_arc_of_id` calls.
+        if cfg!(test) {
+            return ctx.class_name_arc_of_id(class_id).as_deref() == Some(expected);
+        }
         if raw == self.hit.load(relaxed) {
             return true;
         }
@@ -2541,7 +3031,7 @@ static PE_SESSION_CLASS_MEMO: PeClassMemo = PeClassMemo::new();
 /// W7-58, never once fired. Calling the shared resolver keeps the decision in
 /// ONE implementation; open-coding the index here is what let the two files
 /// drift out of step in the first place.
-fn pe_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
+pub(crate) fn pe_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
     if !PE_SESSION_CLASS_MEMO.matches(ctx, session, PE_SESSION_CLASS) {
         return false;
     }
@@ -2671,6 +3161,498 @@ fn pe_zero_length_segment(
     Ok(seg)
 }
 
+// ===================================================================
+// Heap segments: a `MemorySegment` whose bytes live in a Java array
+// ===================================================================
+//
+// F27 (2026-08-13) established that this file could not read or write one at
+// all, and that `segment_address` was answering `new byte[16].length` — 16, the
+// `read at address 0x10` W7-89 §7.1 records and misattributes to a
+// `Buffer.address` read. F27 turned that fatal SIGSEGV into
+// `IllegalStateException: Null segment address`, which is an improvement and
+// not a fix: the JDK's own answer is to read and write the backing array.
+//
+// TWO CARRIERS reach the code below.
+//
+//   H1 — a real JDK `jdk.internal.foreign.HeapMemorySegmentImpl$Of*`. Measured
+//        (25.0.3+9-LTS): five fields, `length`/`readOnly`/`scope` from
+//        `AbstractMemorySegmentImpl` then `offset`/`base`. `offset` is
+//        `Unsafe`-style — see [`HEAP_ARRAY_BASE_OFFSET`]. `--jdk-only` gets one
+//        of these from `MemorySegment.ofArray(byte[]/short[]/char[])` (the
+//        three descriptors this file does not register), from
+//        `MemorySegment.ofBuffer(ByteBuffer.allocate(n))` (measured: a
+//        `HeapMemorySegmentImpl$OfByte`), and from `asSlice(long)`.
+//
+//   H2 — a CratonVM-minted alias carrier, `[6]=array, [7]=byte start`, slot 0
+//        deliberately 0. `asSlice(long,long)` mints one when its receiver is a
+//        heap segment; before that it computed `segment_address(this) + offset`
+//        and stamped the RESULT into slot 0, so a slice of a heap segment was a
+//        synthetic segment whose "address" was its offset — F27's fix made the
+//        un-sliced read refuse and left `asSlice(3, 4).get(...)` dereferencing
+//        the literal address 3.
+//
+// Not reached: CratonVM's `ofArray([I/[J/[F/[D)` carriers. Those copy into an
+// off-heap mirror and are addressable; `sync_heap_backed_segment` writes the
+// mirror back to the array. That is a different (and, against the oracle,
+// wrong — see the record) design, and it is left alone here.
+
+/// A `MemorySegment` whose bytes live in a Java primitive array, resolved into
+/// the pieces an access needs.
+#[derive(Clone, Copy)]
+struct HeapSegmentView {
+    /// The Java primitive array holding the bytes.
+    base: ObjectRef,
+    /// Byte offset of the segment's first byte within `base`'s DATA — i.e.
+    /// the JDK's `address()`, not its `offset` field.
+    start: i64,
+    /// The segment's `byteSize`.
+    size: i64,
+    read_only: bool,
+    /// 1, 2, 4 or 8 — the width of one `base` element.
+    elem_width: usize,
+    elem_type: cratonvm_types::ArrayElementType,
+}
+
+/// Read a named field off either heap carrier.
+///
+/// `get_field_by_name` answers `Value::Object(None)` both for a name it cannot
+/// resolve and for a null reference field, so a miss falls back to the
+/// class-side field table — the resolution `lang_invoke.rs::segment_raw_access`
+/// uses for these same two fields.
+fn heap_seg_field(ctx: &dyn NativeContext, seg: ObjectRef, name: &str) -> Value {
+    match ctx.get_field_by_name(seg, name) {
+        Value::Object(None) => {
+            match ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(seg), name) {
+                Some(index) => ctx.get_field(seg, index),
+                None => Value::Object(None),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Byte width of one array element, or `None` for a shape that cannot back a
+/// `MemorySegment`.
+///
+/// `Reference` is refused because there is no byte view of an object array.
+/// `Boolean` is refused because `java.lang.foreign.MemorySegment` has **no**
+/// `ofArray(boolean[])` overload — measured, `NoSuchMethodException:
+/// java.lang.foreign.MemorySegment.ofArray([Z)` — so a `boolean[]`-backed
+/// segment is not a thing the JDK can produce, and inventing a byte semantics
+/// for one is how a defaulting reader becomes a quiet wrong write.
+fn heap_element_width(elem: cratonvm_types::ArrayElementType) -> Option<usize> {
+    use cratonvm_types::ArrayElementType as A;
+    Some(match elem {
+        A::Byte => 1,
+        A::Char | A::Short => 2,
+        A::Int | A::Float => 4,
+        A::Long | A::Double => 8,
+        A::Boolean | A::Reference => return None,
+    })
+}
+
+/// Resolve `seg` if — and only if — it is a heap segment (H1 or H2).
+///
+/// `None` means "not a heap segment", which every caller reads as "take the
+/// raw-address path". A heap segment whose shape does not add up (a `base`
+/// that is not an array, a negative start, a size that runs off the end of the
+/// array) also answers `None` rather than a plausible view; the caller turns
+/// that into a named refusal.
+fn heap_segment_view(ctx: &dyn NativeContext, seg: ObjectRef) -> Option<HeapSegmentView> {
+    let (base, start) = if crate::panama_libffi::is_real_heap_segment(ctx, seg) {
+        let base = match heap_seg_field(ctx, seg, "base") {
+            Value::Object(Some(array)) => array,
+            _ => return None,
+        };
+        let raw_offset = match heap_seg_field(ctx, seg, "offset") {
+            Value::Long(n) => n,
+            Value::Int(n) => i64::from(n),
+            _ => return None,
+        };
+        (base, raw_offset - HEAP_ARRAY_BASE_OFFSET)
+    } else if ctx.object_num_fields(seg) > SEG_HEAP_START_FIELD {
+        let base = match ctx.get_field(seg, SEG_HEAP_BASE_FIELD) {
+            Value::Object(Some(array)) => array,
+            _ => return None,
+        };
+        match ctx.get_field(seg, SEG_HEAP_START_FIELD) {
+            Value::Long(n) => (base, n),
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    if start < 0 || !ctx.object_is_array(base) {
+        return None;
+    }
+    let elem_type = ctx.heap_element_type_of(base);
+    let elem_width = heap_element_width(elem_type)?;
+    let size = crate::panama_libffi::segment_byte_size(ctx, seg);
+    // The whole segment must lie inside the array. Every index computed below
+    // is derived from `start + offset` with `offset + width <= size`, so this
+    // one check is what keeps `get_array_element` in range without a per-byte
+    // bound.
+    let array_bytes = (ctx.array_length(base) as i64).saturating_mul(elem_width as i64);
+    if size < 0 || start.saturating_add(size) > array_bytes {
+        return None;
+    }
+    let read_only = matches!(heap_seg_field(ctx, seg, "readOnly"), Value::Int(n) if n != 0)
+        || (ctx.object_num_fields(seg) > SEG_HEAP_START_FIELD
+            && matches!(ctx.get_field(seg, 3), Value::Int(n) if n != 0));
+    Some(HeapSegmentView {
+        base,
+        start,
+        size,
+        read_only,
+        elem_width,
+        elem_type,
+    })
+}
+
+/// The raw bits of one array element, zero-extended into a `u64`.
+fn heap_element_bits(ctx: &dyn NativeContext, base: ObjectRef, index: usize) -> u64 {
+    match ctx.get_array_element(base, index) {
+        // A `byte`/`short`/`char`/`int` element arrives as `Value::Int`; the
+        // `as u32` is what stops a negative byte from smearing 0xFF across the
+        // upper 56 bits and corrupting the neighbouring bytes of a wider read.
+        Value::Int(v) => u64::from(v as u32),
+        Value::Long(v) => v as u64,
+        Value::Float(v) => u64::from(v.to_bits()),
+        Value::Double(v) => v.to_bits(),
+        _ => 0,
+    }
+}
+
+/// Store the raw bits of one array element back, in that array's own encoding.
+fn heap_store_element(
+    ctx: &dyn NativeContext,
+    view: &HeapSegmentView,
+    index: usize,
+    bits: u64,
+) {
+    use cratonvm_types::ArrayElementType as A;
+    let value = match view.elem_type {
+        A::Byte => Value::Int(i32::from(bits as u8 as i8)),
+        A::Char => Value::Int(i32::from(bits as u16)),
+        A::Short => Value::Int(i32::from(bits as u16 as i16)),
+        A::Int => Value::Int(bits as u32 as i32),
+        A::Long => Value::Long(bits as i64),
+        A::Float => Value::Float(f32::from_bits(bits as u32)),
+        A::Double => Value::Double(f64::from_bits(bits)),
+        // Unreachable: `heap_element_width` refused both, so no view exists.
+        A::Boolean | A::Reference => return,
+    };
+    ctx.set_array_element(view.base, index, value);
+}
+
+/// Read `width` bytes at `offset` bytes into the segment, LITTLE-ENDIAN.
+///
+/// Endianness is measured, not assumed: on the oracle,
+/// `MemorySegment.ofArray(new byte[8]).set(JAVA_INT_UNALIGNED, 0, 0x01020304)`
+/// leaves `[4, 3, 2, 1, 0, 0, 0, 0]`, and the same write into a `short[4]` with
+/// `JAVA_LONG_UNALIGNED 0x0102030405060708` leaves `[0x0708, 0x0506, 0x0304,
+/// 0x0102]` — so a byte index runs low-to-high through the element AND through
+/// the array.
+///
+/// The caller has already bounds-checked `offset + width <= view.size`, and
+/// [`heap_segment_view`] has checked `start + size <= array bytes`, so every
+/// index here is in range.
+fn heap_segment_read(
+    ctx: &dyn NativeContext,
+    view: &HeapSegmentView,
+    offset: i64,
+    width: usize,
+) -> u64 {
+    let mut raw: u64 = 0;
+    for i in 0..width {
+        let byte_index = (view.start + offset) as usize + i;
+        let element = byte_index / view.elem_width;
+        let shift_in = byte_index % view.elem_width;
+        let byte = (heap_element_bits(ctx, view.base, element) >> (8 * shift_in)) & 0xff;
+        raw |= byte << (8 * i);
+    }
+    raw
+}
+
+/// Write `width` bytes at `offset` bytes into the segment, little-endian.
+///
+/// Read-modify-write per byte rather than per element: an access is at most 8
+/// bytes wide and may start and end mid-element (measured: on an `int[4]`
+/// segment `set(JAVA_BYTE, 0, 0x7f)` leaves `iarr[0] == 127`, i.e. byte 0 is
+/// the element's low byte and the other three are untouched).
+fn heap_segment_write(
+    ctx: &dyn NativeContext,
+    view: &HeapSegmentView,
+    offset: i64,
+    width: usize,
+    raw: u64,
+) {
+    for i in 0..width {
+        let byte_index = (view.start + offset) as usize + i;
+        let element = byte_index / view.elem_width;
+        let shift_in = 8 * (byte_index % view.elem_width);
+        let byte = (raw >> (8 * i)) & 0xff;
+        let bits = heap_element_bits(ctx, view.base, element);
+        heap_store_element(
+            ctx,
+            view,
+            element,
+            (bits & !(0xffu64 << shift_in)) | (byte << shift_in),
+        );
+    }
+}
+
+/// Validate a heap-segment access: scope, read-only, bounds, alignment.
+///
+/// **Every exception class here is the oracle's**, measured on 25.0.3+9-LTS:
+///
+/// | call | thrown |
+/// |---|---|
+/// | `ofArray(byte[8]).get(JAVA_INT_UNALIGNED, 6)` | `IndexOutOfBoundsException` |
+/// | `ofArray(byte[8]).get(JAVA_BYTE, -1)` | `IndexOutOfBoundsException` |
+/// | `ofArray(byte[0]).get(JAVA_BYTE, 0)` | `IndexOutOfBoundsException` |
+/// | `ofArray(byte[8]).asReadOnly().set(JAVA_BYTE, 0, 1)` | `IllegalArgumentException: Attempt to write a read-only segment` |
+/// | `ofArray(byte[32]).get(JAVA_INT, 0)` | `IllegalArgumentException: Target offset 0 is incompatible with alignment constraint 4 (of i4) …` |
+/// | `ofArray(int[8]).get(JAVA_INT, 1)` | `IllegalArgumentException` (offset not a multiple of 4) |
+/// | `ofArray(int[8]).get(JAVA_LONG, 0)` | `IllegalArgumentException` (`maxByteAlignment` is 4) |
+/// | `ofArray(int[8]).get(JAVA_LONG_UNALIGNED, 0)` | OK |
+///
+/// The alignment rule is ONE predicate, and CORRECTED 2026-08-16: the
+/// constraint must be no larger than the alignment available at the
+/// **absolute** offset `view.start + offset`, i.e. exactly
+/// `seg.asSlice(offset).maxByteAlignment()`. The previous spelling was
+/// `align <= maxByteAlignment(view.start) && (view.start + offset) % align == 0`,
+/// which is one conjunct too many and is STRICTER than the oracle whenever a
+/// slice starts at a worse alignment than the offset inside it reaches:
+///
+/// | call | oracle | previous |
+/// |---|---|---|
+/// | `ofArray(int[8]).asSlice(2).get(JAVA_INT, 2)` | reads (absolute 4) | refused |
+/// | `ofArray(int[8]).asSlice(2).get(JAVA_INT, 0)` | refused (absolute 2) | refused |
+/// | `ofArray(long[4]).asSlice(4).get(JAVA_LONG, 4)` | reads (absolute 8) | refused |
+///
+/// (measured, `FfmProbe3` rows M1c/M1d/M1h; `int[8].asSlice(2)` reports
+/// `maxByteAlignment()==2` and `asSlice(2).asSlice(2)` reports 4.) Both halves
+/// are still present — they are just the two halves of
+/// [`heap_max_byte_alignment`]: the element width, and the low bit of the
+/// offset. A `byte[]` segment's element width is 1, which is what refuses
+/// `get(JAVA_INT, 0)` on one where a bare modulo would admit it.
+///
+/// This is enforced on the HEAP path only. The raw-address path has never
+/// checked alignment and is not changed here — a native segment's real
+/// `maxByteAlignment` is not knowable from the carrier (the oracle answers 32
+/// for a malloc'd one), so the same rule cannot be transplanted, and adding a
+/// half-rule to a path that works today would be a regression. NOMINATED in
+/// the record instead.
+fn heap_segment_check_access(
+    ctx: &mut dyn NativeContext,
+    seg: ObjectRef,
+    view: &HeapSegmentView,
+    layout: ObjectRef,
+    offset: i64,
+    width: i64,
+    writing: bool,
+) -> Result<(), MethodCallFailed> {
+    pe_segment_check_scope(ctx, seg)?;
+
+    if writing && view.read_only {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Attempt to write a read-only segment".into(),
+        }
+        .into());
+    }
+
+    let end = offset.checked_add(width);
+    if offset < 0 || end.map_or(true, |e| e > view.size) {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "Out of bound access on segment MemorySegment{{ kind: heap, address: 0x{:x}, \
+                 byteSize: {} }}; new offset = {}; new length = {}",
+                view.start, view.size, offset, width
+            )),
+        }
+        .into());
+    }
+
+    let align = crate::panama_libffi::layout_align(ctx, layout) as i64;
+    if align > 1 {
+        let max_align =
+            heap_max_byte_alignment(view.elem_width as i64, view.start.saturating_add(offset));
+        if align > max_align {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "Target offset {} is incompatible with alignment constraint {} for segment \
+                     MemorySegment{{ kind: heap, address: 0x{:x}, byteSize: {} }}",
+                    offset, align, view.start, view.size
+                ),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// The refusal for a heap carrier whose shape does not add up.
+///
+/// A named refusal, not a `0`: the whole family this file keeps paying for is a
+/// reader that answers a plausible number for a carrier it could not decode.
+fn unreadable_heap_segment(ctx: &dyn NativeContext, seg: ObjectRef, op: &str) -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: format!(
+            "MemorySegment.{op}: {} is a heap segment whose backing array cannot be resolved \
+             (base/offset unreadable, or its bytes do not fit the array)",
+            ctx.class_name_of_id(ctx.class_id_of_object(seg))
+                .unwrap_or_else(|| "<unknown>".to_string())
+        ),
+    }
+    .into()
+}
+
+/// `MemorySegment.asSlice(long offset, long size)`.
+///
+/// Extracted from an inline closure by F35 so its heap arm can be tested. The
+/// body itself is [`pe_segment_slice`] — the same one `asSlice(long)`,
+/// `asSlice(long,long,long)`, `asSlice(long,MemoryLayout)` and `asReadOnly()`
+/// call, so the heap arm and the read-only contagion cannot be present on one
+/// arity and absent on the next. Two bodies for one rule is what this file's
+/// `getAtIndex` banner is about; there is now one.
+fn pe_segment_as_slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let offset = pe_long_arg(args, 1);
+    let new_size = pe_long_arg(args, 2);
+    pe_segment_slice(ctx, this, offset, new_size, None)
+}
+
+/// `MemorySegment.ofArray(byte[] | short[] | char[])` — an ALIAS carrier.
+///
+/// Mints the H2 shape: `[0]=0` (no machine address), `[1]=byteSize`,
+/// `[2]=this segment's session`, `[6]=the array`, `[7]=0`. The element width is
+/// read off the array itself
+/// through [`heap_element_width`], so the factory and the accessors cannot
+/// disagree about the stride. See the registration site for why these three
+/// alias where the four `int[]/long[]/float[]/double[]` arms copy.
+fn pe_of_array_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let array = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        // Consistent with the four sibling arms, which also answer a null
+        // segment rather than raising. The oracle raises `NullPointerException`
+        // for `ofArray(null)`; that is one row for the whole family and is not
+        // diverged from in passing here.
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let width = match heap_element_width(ctx.heap_element_type_of(array)) {
+        Some(width) if ctx.object_is_array(array) => width as i64,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "MemorySegment.ofArray requires a byte[], short[] or char[]".into(),
+            }
+            .into())
+        }
+    };
+    let byte_size = (ctx.array_length(array) as i64).saturating_mul(width);
+    // G19-1: THE SCOPE IS MINTED HERE, ONCE, NOT ON EVERY `scope()` CALL.
+    //
+    // MEASURED on 25.0.3+9-LTS (`G19Probe` §SC): a heap segment's scope is a
+    // per-segment session that can never close —
+    //
+    //     ofArray(new byte[16]).scope().getClass()
+    //         = jdk.internal.foreign.GlobalSession$HeapSession
+    //     heap.scope() == heap.scope()                  true
+    //     heap.asSlice(4,4).scope() == heap.scope()     true
+    //     heap.asReadOnly().scope() == heap.scope()     true
+    //     ofArray(a).scope() == ofArray(a).scope()      FALSE  (same array!)
+    //     heap.scope() == Arena.global().scope()        FALSE
+    //
+    // so it is neither a fresh object per CALL nor a process-wide singleton:
+    // it is one object per SEGMENT, shared by everything derived from it. With
+    // slot 2 left empty, `p67_receiver_session` found nothing on this carrier
+    // and minted a fresh always-open session on every `scope()` — measured
+    // `heap.scope() == heap.scope()` = **false**, which is the assertion
+    // `RForeignLayoutJdkInterfaces` dies on ("a heap segment's scope is
+    // stable").
+    //
+    // Slot 2 is the right home and not a new convention: `pe_segment_session`
+    // above already documents "tolerate a segment stamped with the session
+    // directly", and every OTHER reader of slot 2 in this file
+    // (`sync_heap_backed_segment`, `pe_segment_heap_base`'s fallback, the
+    // `isNative` discriminator) gates on `ctx.object_is_array`, which a session
+    // is not — so none of them changes its answer.
+    let array_pin = ctx.pin_native_root(array);
+    let session = crate::phases_late::foreign_ffm::p67_memory_session(ctx)?;
+    let array = ctx.read_native_pin(array_pin, array);
+    ctx.unpin_native_roots(array_pin);
+    // Both the array and the session must survive the segment's allocation, so
+    // both are pinned across it; `unpin_native_roots` truncates the pin stack
+    // to its argument, so the FIRST handle releases both.
+    let array_pin = ctx.pin_native_root(array);
+    let session_obj = match session {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let seg = try_alloc_concurrent_synthetic(
+        ctx,
+        "java/lang/foreign/MemorySegment",
+        SEG_HEAP_FIELDS,
+    )?;
+    let array = ctx.read_native_pin(array_pin, array);
+    let session = match session_obj {
+        Some((pin, obj)) => Value::Object(Some(ctx.read_native_pin(pin, obj))),
+        None => Value::Object(None),
+    };
+    ctx.unpin_native_roots(array_pin);
+    ctx.set_field(seg, 0, Value::Long(0));
+    ctx.set_field(seg, 1, Value::Long(byte_size));
+    ctx.set_field(seg, 2, session);
+    ctx.set_field(seg, 3, Value::Int(0));
+    ctx.set_field(seg, 4, Value::Int(1));
+    ctx.set_field(seg, 5, Value::Long(0));
+    ctx.set_field(seg, SEG_HEAP_BASE_FIELD, Value::Object(Some(array)));
+    ctx.set_field(seg, SEG_HEAP_START_FIELD, Value::Long(0));
+    Ok(Some(Value::Object(Some(seg))))
+}
+
+/// Is `kind` one of the nine VALUE layouts (`LAYOUT_BYTE` … `LAYOUT_CHAR`)?
+///
+/// **Written as a range CONTAINMENT, not as `kind < 10`.** The kinds are
+/// `0..=8` for the value layouts and `10..=13` for the group family, so
+/// `kind < 10` looks like the same test and is not: it is also true for every
+/// NEGATIVE kind, and `panama_libffi::LAYOUT_UNKNOWN` is **-2**. Three sites in
+/// this file spelled it that way, so an unclassifiable carrier — the answer
+/// F27 introduced precisely so that an undecodable layout would stop being a
+/// plausible eight-byte integer — was admitted by all three and then fell to
+/// each one's default arm: `Value::Int(0)` for a read, a silent no-op for a
+/// write, and `"Ljava/lang/foreign/MemorySegment;"` for a carrier descriptor.
+///
+/// None of the three is reachable today, because `alloc_return_slot` and
+/// `layout_to_ffi_type` both refuse an unknown carrier earlier on every path.
+/// That is a property of TODAY'S CALLERS, not of this code, and it is one
+/// reorder away from being false. Every consumer in this file now either uses
+/// this predicate or names `LAYOUT_UNKNOWN` explicitly.
+fn layout_kind_is_value(kind: i32) -> bool {
+    (0..10).contains(&kind)
+}
+
+/// The refusal a `MemorySegment` accessor raises for a layout it cannot
+/// classify.
+///
+/// Names the class, because a refusal that cannot say WHICH carrier was
+/// undecodable is not actionable.
+fn unclassifiable_access_layout(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+    op: &str,
+) -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: format!(
+            "MemorySegment.{op}: cannot classify layout carrier {} — refusing rather than \
+             defaulting to an eight-byte integer",
+            ctx.class_name_of_id(ctx.class_id_of_object(layout))
+                .unwrap_or_else(|| "<unknown>".to_string())
+        ),
+    }
+    .into()
+}
+
 /// Validate a single-element access (get/set) against the segment's declared
 /// size and compute the target address with checked arithmetic.
 ///
@@ -2682,6 +3664,12 @@ fn pe_zero_length_segment(
 ///   - zero-size segments (a 0-size segment — as produced by `ofAddress`
 ///     before `reinterpret` — is not accessible, matching JDK semantics),
 ///   - negative `offset`,
+///
+/// **This is the RAW-ADDRESS path only.** A heap segment never reaches it:
+/// `pe_segment_get_impl`/`pe_segment_set_impl` resolve a [`HeapSegmentView`]
+/// first. The "Null segment address" arm below is therefore no longer the
+/// answer a heap segment gets — it used to be, and its wording named the
+/// symptom rather than the reason (F27 residual 4).
 ///   - `offset + width` overflowing `i64`,
 ///   - `offset + width` exceeding the segment size,
 ///   - `(ptr + base_off + offset)` overflowing the address space, or a null
@@ -2702,25 +3690,40 @@ fn pe_segment_access_addr(
     let ptr = crate::panama_libffi::segment_address(ctx, seg);
     let size = crate::panama_libffi::segment_byte_size(ctx, seg);
 
-    // A 0-size segment (e.g. ofAddress before reinterpret) is not accessible.
-    if size <= 0 {
-        return Err(RuntimeError::IllegalStateException {
-            message: format!(
-                "access of {} bytes at offset {} not allowed on zero-size segment",
-                width, offset
-            ),
-        }
-        .into());
-    }
-
     // Bounds check: 0 <= offset and offset + width <= size, with overflow guard.
+    //
+    // Bounds, not state. The final FFM API specifies `IllegalStateException`
+    // for a SCOPE violation — a closed arena, the wrong thread — and
+    // `IndexOutOfBoundsException` for an access outside the segment. Measured
+    // on HotSpot 25: `seg.get(JAVA_INT, 62)` on a 64-byte segment raises
+    // `IndexOutOfBoundsException`. A caller writing
+    // `catch (IndexOutOfBoundsException e)` — the idiom for a bounds check —
+    // did not catch ours.
+    //
+    // THE ZERO-SIZE CASE IS THE SAME CHECK, not a separate `IllegalStateException`.
+    // It used to be raised above this block, which contradicted the paragraph
+    // directly above it. Measured, 25.0.3+9-LTS, and the exception class is the
+    // same for a native and a heap carrier:
+    //
+    //     MemorySegment.NULL.get(JAVA_BYTE, 0)
+    //       -> IndexOutOfBoundsException: Out of bound access on segment
+    //          MemorySegment{ kind: native, address: 0x0, byteSize: 0 };
+    //          new offset = 0; new length = 1
+    //     MemorySegment.ofAddress(0x1000).get(JAVA_BYTE, 0)   -> IndexOutOfBoundsException
+    //     MemorySegment.ofArray(new byte[0]).get(JAVA_BYTE, 0) -> IndexOutOfBoundsException
+    //
+    // `size == 0` cannot pass `offset + width <= size` for any `width >= 1`, so
+    // deleting the special case does not admit anything: it only re-labels the
+    // refusal with the class the oracle throws and a caller can catch. A closed
+    // scope is still `IllegalStateException: Already closed`, raised above.
     let end = offset.checked_add(width);
-    if offset < 0 || end.map_or(true, |e| e > size) {
-        return Err(RuntimeError::IllegalStateException {
-            message: format!(
-                "offset {} + {} bytes exceeds segment size {}",
-                offset, width, size
-            ),
+    if offset < 0 || size <= 0 || end.map_or(true, |e| e > size) {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "Out of bound access on segment MemorySegment{{ kind: native, address: 0x{:x}, \
+                 byteSize: {} }}; new offset = {}; new length = {}",
+                ptr, size, offset, width
+            )),
         }
         .into());
     }
@@ -2743,7 +3746,7 @@ fn pe_segment_access_addr(
 // Exact primitive/covariant descriptors used by real-JDK MemorySegment
 // default methods. They share the checked erased implementation above.
 fn pe_segment_get_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    require_native_access(ctx, "getAtIndex")?;
+    require_segment_access(ctx, "getAtIndex")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let index = match args.get(2) {
@@ -2756,7 +3759,7 @@ fn pe_segment_get_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn pe_segment_set_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    require_native_access(ctx, "setAtIndex")?;
+    require_segment_access(ctx, "setAtIndex")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let index = match args.get(2) {
@@ -2771,7 +3774,7 @@ fn pe_segment_set_at_index(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn pe_segment_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Defense-in-depth: get() dereferences the segment's raw `ptr` field.
-    require_native_access(ctx, "get")?;
+    require_segment_access(ctx, "get")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let offset = match args.get(2) {
@@ -2788,10 +3791,61 @@ fn pe_segment_get_impl(
     offset: i64,
 ) -> MethodCallResult {
     let kind = crate::panama_libffi::read_layout_kind(ctx, layout);
+    // An unclassifiable carrier must not silently become a one-byte read that
+    // answers `Value::Int(0)`. `ffi::layout_byte_size` defaults to 1 and the
+    // `_ =>` arm below defaults to 0, so before this the pair produced a
+    // believable answer for a layout this VM could not decode at all.
+    // `LAYOUT_UNKNOWN` is -2, so the `kind < 10` spellings that used to guard
+    // this family admitted it; see [`layout_kind_is_value`].
+    if kind == crate::panama_libffi::LAYOUT_UNKNOWN {
+        return Err(unclassifiable_access_layout(ctx, layout, "get"));
+    }
     // Reject reads that fall outside the segment's declared bounds, overflow
     // the address space, or target a zero-size segment. The access width is
     // derived from the layout kind, matching the read widths below.
     let width = ffi::layout_byte_size(kind) as i64;
+
+    // HEAP SEGMENTS READ THE BACKING JAVA ARRAY, not an address they do not
+    // have. This is the whole of F27 NOM-3 item 2; before it, this path
+    // dereferenced whatever `segment_address` answered for a heap carrier.
+    if crate::panama_libffi::is_real_heap_segment(ctx, seg)
+        || ctx.object_num_fields(seg) > SEG_HEAP_START_FIELD
+    {
+        if let Some(view) = heap_segment_view(ctx, seg) {
+            heap_segment_check_access(ctx, seg, &view, layout, offset, width, false)?;
+            let raw = heap_segment_read(ctx, &view, offset, width as usize);
+            let value = match kind {
+                LAYOUT_BYTE => Value::Int(i32::from(raw as u8 as i8)),
+                LAYOUT_BOOLEAN => Value::Int(i32::from(raw as u8 != 0)),
+                LAYOUT_SHORT => Value::Int(i32::from(raw as u16 as i16)),
+                LAYOUT_CHAR => Value::Int(i32::from(raw as u16)),
+                LAYOUT_INT => Value::Int(raw as u32 as i32),
+                LAYOUT_LONG => Value::Long(raw as i64),
+                LAYOUT_FLOAT => Value::Float(f32::from_bits(raw as u32)),
+                LAYOUT_DOUBLE => Value::Double(f64::from_bits(raw)),
+                LAYOUT_ADDRESS => {
+                    return Ok(Some(Value::Object(Some(pe_zero_length_segment(
+                        ctx, raw as i64,
+                    )?))))
+                }
+                other => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!(
+                            "MemorySegment.get: layout kind {other} is not a value layout"
+                        ),
+                    }
+                    .into())
+                }
+            };
+            return Ok(Some(value));
+        } else if crate::panama_libffi::is_real_heap_segment(ctx, seg) {
+            // It IS a heap segment and its shape did not resolve. Refusing by
+            // name beats falling through to the raw-address path, which would
+            // dereference `segment_address`'s answer for it.
+            return Err(unreadable_heap_segment(ctx, seg, "get"));
+        }
+    }
+
     let addr = pe_segment_access_addr(ctx, seg, offset, width)? as *const u8;
 
     // SAFETY: addr is non-null, bounds-checked against the segment's declared
@@ -2844,7 +3898,7 @@ fn pe_segment_get_impl(
 
 fn pe_segment_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Defense-in-depth: set() dereferences the segment's raw `ptr` field.
-    require_native_access(ctx, "set")?;
+    require_segment_access(ctx, "set")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let offset = match args.get(2) {
@@ -2863,27 +3917,94 @@ fn pe_segment_set_impl(
     value: Value,
 ) -> MethodCallResult {
     let kind = crate::panama_libffi::read_layout_kind(ctx, layout);
+    // Symmetric with `pe_segment_get_impl`: an unclassifiable carrier used to
+    // reach the `_ => {}` arm below, i.e. a WRITE that silently did nothing.
+    if kind == crate::panama_libffi::LAYOUT_UNKNOWN {
+        return Err(unclassifiable_access_layout(ctx, layout, "set"));
+    }
     // Reject writes that fall outside the segment's declared bounds, overflow
     // the address space, or target a zero-size segment. The access width is
     // derived from the layout kind, matching the write widths below.
     let width = ffi::layout_byte_size(kind) as i64;
+
+    // `set(ADDRESS, off, seg)` takes a MemorySegment, not a long: its address
+    // is what gets stored. Without this the value arrives as `Value::Object`,
+    // misses every arm below and the write is a SILENT no-op -- which is the
+    // quieter half of the same defect as the missing registration.
+    //
+    // A HEAP SEGMENT HAS NO ADDRESS TO STORE, and since F27 `segment_address`
+    // answers 0 for one — so this arm would have written a C NULL and said
+    // nothing. The oracle refuses instead (measured, 25.0.3+9-LTS):
+    //
+    //     MemorySegment.ofArray(new byte[16])
+    //         .set(ValueLayout.ADDRESS.withByteAlignment(1), 0,
+    //              MemorySegment.ofArray(new byte[4]))
+    //       -> IllegalArgumentException: Heap segment not allowed:
+    //          MemorySegment{ kind: heap, heapBase: [B@…, address: 0x0, byteSize: 4 }
+    //
+    // and the same refusal, verbatim, when one is passed to a downcall as a
+    // pointer. A wrong ADDRESS is a wrong capability; 0 is a legitimate C null
+    // and cannot be told apart from one downstream.
+    let value = match (kind, value) {
+        (LAYOUT_ADDRESS, Value::Object(Some(target))) => {
+            if crate::panama_libffi::is_real_heap_segment(ctx, target)
+                || heap_segment_view(ctx, target).is_some()
+            {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Heap segment not allowed: MemorySegment{{ kind: heap, class: {} }}",
+                        ctx.class_name_of_id(ctx.class_id_of_object(target))
+                            .unwrap_or_else(|| "<unknown>".to_string())
+                    ),
+                }
+                .into());
+            }
+            Value::Long(crate::panama_libffi::segment_address(ctx, target))
+        }
+        (LAYOUT_ADDRESS, Value::Object(None)) => Value::Long(0),
+        _ => value,
+    };
+
+    // HEAP SEGMENTS WRITE THE BACKING JAVA ARRAY. See `pe_segment_get_impl`.
+    if crate::panama_libffi::is_real_heap_segment(ctx, seg)
+        || ctx.object_num_fields(seg) > SEG_HEAP_START_FIELD
+    {
+        if let Some(view) = heap_segment_view(ctx, seg) {
+            heap_segment_check_access(ctx, seg, &view, layout, offset, width, true)?;
+            let raw = match (kind, value) {
+                (LAYOUT_BYTE | LAYOUT_BOOLEAN, Value::Int(v)) => u64::from(v as u8),
+                (LAYOUT_SHORT | LAYOUT_CHAR, Value::Int(v)) => u64::from(v as u16),
+                (LAYOUT_INT, Value::Int(v)) => u64::from(v as u32),
+                (LAYOUT_LONG | LAYOUT_ADDRESS, Value::Long(v)) => v as u64,
+                (LAYOUT_FLOAT, Value::Float(v)) => u64::from(v.to_bits()),
+                (LAYOUT_DOUBLE, Value::Double(v)) => v.to_bits(),
+                // NOT a silent no-op, unlike the raw-address arm below. A
+                // value whose Rust shape does not match its layout is a
+                // marshalling defect upstream, and swallowing it is how a
+                // wrong write becomes invisible.
+                (other_kind, other_value) => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!(
+                            "MemorySegment.set on a heap segment: layout kind {other_kind} does \
+                             not accept {other_value:?}"
+                        ),
+                    }
+                    .into())
+                }
+            };
+            heap_segment_write(ctx, &view, offset, width as usize, raw);
+            return Ok(None);
+        } else if crate::panama_libffi::is_real_heap_segment(ctx, seg) {
+            return Err(unreadable_heap_segment(ctx, seg, "set"));
+        }
+    }
+
     let addr = pe_segment_access_addr(ctx, seg, offset, width)? as *mut u8;
 
     // SAFETY: addr is non-null, bounds-checked against the segment's declared
     // size, and the address arithmetic was overflow-checked (see
     // pe_segment_access_addr). The kind determines the write width so alignment
     // is implicit from the segment.
-    // `set(ADDRESS, off, seg)` takes a MemorySegment, not a long: its address
-    // is what gets stored. Without this the value arrives as `Value::Object`,
-    // misses every arm below and the write is a SILENT no-op -- which is the
-    // quieter half of the same defect as the missing registration.
-    let value = match (kind, value) {
-        (LAYOUT_ADDRESS, Value::Object(Some(target))) => {
-            Value::Long(crate::panama_libffi::segment_address(ctx, target))
-        }
-        (LAYOUT_ADDRESS, Value::Object(None)) => Value::Long(0),
-        _ => value,
-    };
     unsafe {
         match (kind, value) {
             (LAYOUT_BYTE | LAYOUT_BOOLEAN, Value::Int(v)) => *(addr as *mut i8) = v as i8,
@@ -3192,8 +4313,187 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
 }
 
 // --- Linker: create downcall handles ---
-// DowncallHandle synthetic: [0]=function_address, [1]=descriptor,
-// [2]=first variadic argument, [3]=cached CIF, [4]=captureCallState flag.
+//
+// The carrier a downcall handle is allocated AS is a real
+// `java/lang/invoke/MethodHandle`. See [`alloc_downcall_handle`] for why, and
+// for the slot layout that used to be a five-field
+// `java/lang/foreign/DowncallHandle`.
+
+/// First slot of the downcall state on a [`DOWNCALL_CARRIER_CLASS`] carrier.
+///
+/// Anchored well past `lang_invoke.rs`'s synthetic MethodHandle window, for the
+/// same reason that window is itself anchored at 16 rather than at the real
+/// JDK's field count of 6: the window GREW once already (`MH_BOUND + 1` to
+/// `MH_VARARGS + 1`, W7-19 §5.2), so a base chosen to sit exactly on top of
+/// today's last slot is a collision waiting for the next combinator.
+///
+/// The gap between the two windows is not addressed by this file and is left
+/// null by [`alloc_downcall_handle`] — see the null-fill there.
+pub(crate) const DOWNCALL_BASE: usize = 32;
+
+/// Discriminator slot: `Int(DOWNCALL_TAG_MAGIC)` on a downcall carrier and
+/// nothing else. See [`is_downcall_handle`].
+pub(crate) const DOWNCALL_TAG: usize = DOWNCALL_BASE;
+/// Target function pointer (`Long`). Never dereferenced without
+/// [`validated_fn_ptr`].
+pub(crate) const DOWNCALL_FN_ADDR: usize = DOWNCALL_BASE + 1;
+/// The `java/lang/foreign/FunctionDescriptor` this handle was linked against.
+pub(crate) const DOWNCALL_DESCRIPTOR: usize = DOWNCALL_BASE + 2;
+/// Index of the first variadic argument, or `-1` for a non-variadic call.
+pub(crate) const DOWNCALL_FIRST_VARIADIC: usize = DOWNCALL_BASE + 3;
+/// T5.6.3 cached `Box<Cif>` raw pointer as `u64` (`0` = not yet built).
+pub(crate) const DOWNCALL_CIF: usize = DOWNCALL_BASE + 4;
+/// `Int(1)` when `Linker.Option.captureCallState` added a leading
+/// `MemorySegment` parameter.
+pub(crate) const DOWNCALL_CAPTURE_CALL_STATE: usize = DOWNCALL_BASE + 5;
+/// Width [`alloc_downcall_handle`] requests.
+pub(crate) const DOWNCALL_SLOT_COUNT: usize = DOWNCALL_CAPTURE_CALL_STATE + 1;
+
+/// `"DCH1"`. Distinctive on purpose: [`is_downcall_handle`] is asked about
+/// arbitrary references, and a magic that could plausibly be a stored `int`
+/// would make the predicate answer yes for a handle that merely happens to be
+/// wide enough.
+const DOWNCALL_TAG_MAGIC: i32 = 0x4443_4831;
+
+/// The class a downcall handle is allocated as.
+///
+/// **This is the whole of the `--jdk-only` fix.** It used to be
+/// `java/lang/foreign/DowncallHandle`, a name NO JDK image declares — it is in
+/// `native-api/src/no_image_receiver.rs`'s `NO_IMAGE_JDK_RECEIVERS`. Strict
+/// mode refuses to fabricate such a class, correctly, so
+/// `Linker.downcallHandle` died with `NoClassDefFoundError:
+/// java/lang/foreign/DowncallHandle` and took all of Panama with it. The
+/// refusal was right; the caller surviving to ask for it was the defect.
+pub(crate) const DOWNCALL_CARRIER_CLASS: &str = "java/lang/invoke/MethodHandle";
+
+/// Is `obj` a downcall handle?
+///
+/// Replaces the `class_name == "java/lang/foreign/DowncallHandle"` test that
+/// the consumers in `lang_invoke.rs` used while the carrier had a class of its
+/// own. Three screens, cheapest first:
+///
+/// 1. **Width.** Every MethodHandle `lang_invoke.rs` mints is 22 slots, so this
+///    rejects the entire ordinary population on one integer compare — and it is
+///    what makes the tag read safe rather than an out-of-bounds access. Same
+///    discipline as `mh_is_varargs_collector`.
+/// 2. **Exact class.** Our carrier is allocated as `java/lang/invoke/
+///    MethodHandle` itself, so a real-JDK `BoundMethodHandle$Species_L` or
+///    `DirectMethodHandle$Constructor` is not one of ours no matter how wide.
+/// 3. **Tag.** [`DOWNCALL_TAG_MAGIC`], written by [`alloc_downcall_handle`].
+pub(crate) fn is_downcall_handle(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    ctx.object_num_fields(obj) > DOWNCALL_TAG
+        && ctx
+            .class_name_arc_of_id(ctx.class_id_of_object(obj))
+            .as_deref()
+            == Some(DOWNCALL_CARRIER_CLASS)
+        && matches!(ctx.get_field(obj, DOWNCALL_TAG), Value::Int(tag) if tag == DOWNCALL_TAG_MAGIC)
+}
+
+/// Mint the `MethodHandle` that `Linker.downcallHandle` hands back.
+///
+/// # Why a real `MethodHandle` and not a class of our own
+///
+/// `Linker.downcallHandle` is DECLARED to return `java.lang.invoke.
+/// MethodHandle`, and on a real JDK that is what it returns. Returning an
+/// invented `java/lang/foreign/DowncallHandle` instead cost three separate
+/// compensations, every one of which this carrier deletes rather than moves:
+///
+/// * `vm_exec.rs::is_method_handle_signature_polymorphic_receiver` had to name
+///   the class, or `invokeExact` would not link signature-polymorphically. A
+///   real `java/lang/invoke/MethodHandle` already satisfies that predicate's
+///   first arm. (ES-FAIL-FAMILY-20260710 is that compensation being added.)
+/// * `typecheck.rs` had to hard-code that the invented class is castable to
+///   `java/lang/invoke/MethodHandle`. Now it IS one.
+/// * `lang_invoke.rs`'s `asType` had to refuse to write the `type` field,
+///   because on the compact layout slot 0 was the FUNCTION ADDRESS and writing
+///   a `MethodType` over it turned a later void `invokeExact` into a silent
+///   no-op. Here slot 0 is the genuine `type` field and the write is correct.
+///
+/// # The `type` field is populated here, not lazily
+///
+/// It has to be. `pe_downcall_type` was registered as `DowncallHandle.type()`;
+/// with a `MethodHandle` receiver, `type()` resolves to `lang_invoke.rs`'s
+/// registration on `java/lang/invoke/MethodHandle`, which reads slot 0 and
+/// falls back to `()V` when it is null. A downcall that reported `()V` would
+/// mis-link every signature-polymorphic call site, so the MethodType is
+/// derived from the FunctionDescriptor and stored at mint time.
+///
+/// # GC
+///
+/// `build_method_type_from_descriptor` allocates, so both the carrier and the
+/// caller's `descriptor` are pinned across it and re-read after.
+pub(crate) fn alloc_downcall_handle(
+    ctx: &mut dyn NativeContext,
+    fn_addr: i64,
+    descriptor: ObjectRef,
+    first_variadic: i64,
+    capture_call_state: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Pinned BEFORE the allocation below, which can itself collect.
+    let desc_pin = ctx.pin_native_root(descriptor);
+    let handle = try_alloc_concurrent_synthetic(ctx, DOWNCALL_CARRIER_CLASS, DOWNCALL_SLOT_COUNT)?;
+    let handle_pin = ctx.pin_native_root(handle);
+    let descriptor = ctx.read_native_pin(desc_pin, descriptor);
+
+    let method_descriptor = downcall_carrier_descriptor(ctx, descriptor, capture_call_state)?;
+    let method_type = crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor)?
+        .ok_or_else(|| -> MethodCallFailed {
+            RuntimeError::IllegalStateException {
+                message: format!(
+                    "Unable to construct MethodType for DowncallHandle descriptor \
+                     {method_descriptor}"
+                ),
+            }
+            .into()
+        })?;
+
+    let handle = ctx.read_native_pin(handle_pin, handle);
+    let descriptor = ctx.read_native_pin(desc_pin, descriptor);
+
+    // Everything between the real JDK's `type` field and our base belongs to
+    // neither of us: slots 1-5 are the JDK's other MethodHandle fields and
+    // 16-21 are `lang_invoke.rs`'s synthetic MethodHandle window. Null rather
+    // than left raw, so a reader that reaches one — `mh_is_varargs_collector`
+    // tests `Int(1)` at slot 21 and would otherwise be interpreting whatever
+    // the allocator left there — gets a definite "absent" instead of padding.
+    // Null is the safe filler in both directions: a reference slot reads as a
+    // null oop and an int-shaped reader's `match` falls to its default arm.
+    for slot in 1..DOWNCALL_BASE {
+        ctx.set_field(handle, slot, Value::Object(None));
+    }
+    // Slot 0 is the real JDK `MethodHandle.type` field.
+    ctx.set_field(handle, 0, Value::Object(Some(method_type)));
+
+    ctx.set_field(handle, DOWNCALL_TAG, Value::Int(DOWNCALL_TAG_MAGIC));
+    ctx.set_field(handle, DOWNCALL_FN_ADDR, Value::Long(fn_addr));
+    ctx.set_field(handle, DOWNCALL_DESCRIPTOR, Value::Object(Some(descriptor)));
+    ctx.set_field(handle, DOWNCALL_FIRST_VARIADIC, Value::Long(first_variadic));
+    ctx.set_field(handle, DOWNCALL_CIF, Value::Long(0));
+    ctx.set_field(
+        handle,
+        DOWNCALL_CAPTURE_CALL_STATE,
+        Value::Int(capture_call_state as i32),
+    );
+
+    ctx.unpin_native_roots(desc_pin);
+    Ok(handle)
+}
+
+/// The function pointer this handle targets, or 0.
+pub(crate) fn downcall_fn_addr(ctx: &dyn NativeContext, handle: ObjectRef) -> i64 {
+    match ctx.get_field(handle, DOWNCALL_FN_ADDR) {
+        Value::Long(n) => n,
+        _ => 0,
+    }
+}
+
+/// The `FunctionDescriptor` this handle was linked against.
+fn downcall_descriptor(ctx: &dyn NativeContext, handle: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field(handle, DOWNCALL_DESCRIPTOR) {
+        Value::Object(Some(d)) => Some(d),
+        _ => None,
+    }
+}
 
 pub(crate) fn register_pe_linker_options(r: &mut NativeMethodRegistry) {
     let option = "java/lang/foreign/Linker$Option";
@@ -3240,23 +4540,13 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
 
     // downcallHandle(MemorySegment address, FunctionDescriptor desc) → MethodHandle
     //
-    // The handle synthetic carries 4 fields:
-    //   field 0 : Long   — function pointer
-    //   field 1 : Object — FunctionDescriptor
-    //   field 2 : Long   — first-variadic-arg index (-1 = non-variadic)
-    //   field 3 : Long   — T5.6.3 cached `Box<Cif>` raw pointer as u64
-    //                      (0 = not yet built). See `panama_libffi`.
+    // Layout and carrier class: see `alloc_downcall_handle`.
     r.register(linker, "downcallHandle", "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/FunctionDescriptor;)Ljava/lang/invoke/MethodHandle;", |ctx, args| {
         let addr_seg = obj_arg(args, 1)?;
         let descriptor = obj_arg(args, 2)?;
         let fn_addr = crate::panama_libffi::segment_address(ctx, addr_seg);
 
-        let handle = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
-        ctx.set_field(handle, 0, Value::Long(fn_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-        ctx.set_field(handle, 2, Value::Long(-1));
-        ctx.set_field(handle, 3, Value::Long(0)); // cif not yet cached
-        ctx.set_field(handle, 4, Value::Int(0)); // captureCallState disabled
+        let handle = alloc_downcall_handle(ctx, fn_addr, descriptor, -1, false)?;
         Ok(Some(Value::Object(Some(handle))))
     });
 
@@ -3300,12 +4590,13 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
                     args.get(3).is_some()
                 );
             }
-            let handle = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
-            ctx.set_field(handle, 0, Value::Long(fn_addr));
-            ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-            ctx.set_field(handle, 2, Value::Long(variadic_fixed));
-            ctx.set_field(handle, 3, Value::Long(0)); // cif not yet cached
-            ctx.set_field(handle, 4, Value::Int(capture_call_state as i32));
+            let handle = alloc_downcall_handle(
+                ctx,
+                fn_addr,
+                descriptor,
+                variadic_fixed,
+                capture_call_state,
+            )?;
             Ok(Some(Value::Object(Some(handle))))
         },
     );
@@ -3326,7 +4617,28 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
     register_pe_linker_options(r);
 
     // DowncallHandle.invoke(Object... args) → Object
-    // This is the actual native function call entry point.
+    //
+    // UNREACHABLE since the carrier became a real `java/lang/invoke/
+    // MethodHandle` ([`alloc_downcall_handle`]): nothing in the VM allocates a
+    // `java/lang/foreign/DowncallHandle` any more, so no receiver can ever
+    // resolve to these four rows. Invocation now arrives at `lang_invoke.rs`'s
+    // `MethodHandle.invoke`/`invokeExact`, whose `mh_dispatch` routes downcalls
+    // to `pe_downcall_invoke` before decoding the generic MethodHandle layout.
+    //
+    // NOT DELETED HERE, deliberately. These four rows are frozen by name in
+    // `scripts/baselines/jdk-only-kind-map-25-linux.tsv`,
+    // `jdk-only-gated-never-delete.tsv` and `jdk-only-dead-everywhere-GATED.tsv`,
+    // and removing a registration those gates enumerate is a census change that
+    // has to be made with the gate run, not alongside a behaviour change. The
+    // rows are inert in the meantime, which is the safe direction: a dead
+    // registration decides nothing, whereas deleting one the gate still expects
+    // reddens the gate for a reason unrelated to this fix.
+    //
+    // Do NOT re-point these at `java/lang/invoke/MethodHandle`. `register` is
+    // last-write-wins on (class, method, descriptor), so registering
+    // `pe_downcall_invoke` on `MethodHandle.invoke([Ljava/lang/Object;)…` would
+    // silently replace `lang_invoke.rs`'s body for EVERY method handle in the
+    // VM, not only for downcalls.
     let dh = "java/lang/foreign/DowncallHandle";
     r.register(
         dh,
@@ -3368,27 +4680,23 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
     );
 }
 
-/// Return the MethodHandle type represented by a synthetic DowncallHandle.
+/// The JVM method descriptor a downcall handle's `MethodType` is built from.
 ///
-/// The synthetic stores its FunctionDescriptor in field 1, while JDK callers
-/// still invoke inherited MethodHandle.type(). Derive its carrier signature
-/// from that descriptor instead of exposing an untyped Object[] invoker.
-pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// Derived from the `FunctionDescriptor`'s layouts rather than exposing an
+/// untyped `Object[]` invoker, because a signature-polymorphic call site links
+/// against whatever `type()` reports.
+///
+/// Allocation-free (reads layout fields only), so [`alloc_downcall_handle`]
+/// may call it before it has anything pinned.
+fn downcall_carrier_descriptor(
+    ctx: &dyn NativeContext,
+    descriptor: ObjectRef,
+    captures_call_state: bool,
+) -> Result<String, MethodCallFailed> {
     use crate::panama_libffi as plf;
 
-    let handle = obj_arg(args, 0)?;
-    let descriptor = match ctx.get_field(handle, 1) {
-        Value::Object(Some(descriptor)) => descriptor,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "DowncallHandle has no FunctionDescriptor".into(),
-            }
-            .into());
-        }
-    };
-
     let mut method_descriptor = String::from("(");
-    if downcall_handle_captures_call_state(ctx, handle) {
+    if captures_call_state {
         method_descriptor.push_str("Ljava/lang/foreign/MemorySegment;");
     }
     for layout in plf::descriptor_param_layouts(ctx, descriptor) {
@@ -3398,17 +4706,36 @@ pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             }
             .into()
         })?;
-        method_descriptor.push_str(downcall_layout_carrier_descriptor(plf::read_layout_kind(
-            ctx, layout,
-        )));
+        method_descriptor.push_str(downcall_layout_carrier_descriptor(ctx, layout)?);
     }
     method_descriptor.push(')');
     match plf::descriptor_return_layout(ctx, descriptor) {
-        Some(layout) => method_descriptor.push_str(downcall_layout_carrier_descriptor(
-            plf::read_layout_kind(ctx, layout),
-        )),
+        Some(layout) => method_descriptor.push_str(downcall_layout_carrier_descriptor(ctx, layout)?),
         None => method_descriptor.push('V'),
     }
+    Ok(method_descriptor)
+}
+
+/// Return the `MethodType` represented by a downcall handle.
+///
+/// **Now a fallback, not the primary path.** While the carrier was a class of
+/// its own this was registered as `DowncallHandle.type()`. On a real
+/// `java/lang/invoke/MethodHandle` carrier, `type()` resolves to
+/// `lang_invoke.rs`'s registration, which reads the real `type` field at slot
+/// 0 — populated by [`alloc_downcall_handle`] for exactly that reason. This
+/// stays because the registration on the old receiver is still present (see
+/// the note at the `DowncallHandle` registration block) and because it is the
+/// one place the descriptor→`MethodType` derivation is spelled out.
+pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let handle = obj_arg(args, 0)?;
+    let descriptor = downcall_descriptor(ctx, handle).ok_or_else(|| -> MethodCallFailed {
+        RuntimeError::IllegalStateException {
+            message: "DowncallHandle has no FunctionDescriptor".into(),
+        }
+        .into()
+    })?;
+    let captures = downcall_handle_captures_call_state(ctx, handle);
+    let method_descriptor = downcall_carrier_descriptor(ctx, descriptor, captures)?;
 
     let method_type =
         crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor)?.ok_or_else(
@@ -3424,8 +4751,23 @@ pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Object(Some(method_type))))
 }
 
-fn downcall_layout_carrier_descriptor(kind: i32) -> &'static str {
-    match kind {
+/// The JVM descriptor letter a layout's carrier contributes to a downcall's
+/// `MethodType`.
+///
+/// **Takes the LAYOUT, not a bare kind, and returns a `Result`.** It used to
+/// take an `i32` and answer `"Ljava/lang/foreign/MemorySegment;"` for anything
+/// it did not recognise — including `panama_libffi::LAYOUT_UNKNOWN`, whose
+/// whole purpose is to stop an undecodable carrier from getting a plausible
+/// answer. A wrong descriptor here is not a local wrong answer: it is the
+/// signature the `MethodType` is built from, so every argument after it lands
+/// in the wrong slot kind. Refusing needs the layout's class name to be
+/// actionable, which is why the parameter changed.
+fn downcall_layout_carrier_descriptor(
+    ctx: &dyn NativeContext,
+    layout: ObjectRef,
+) -> Result<&'static str, MethodCallFailed> {
+    let kind = crate::panama_libffi::read_layout_kind(ctx, layout);
+    Ok(match kind {
         LAYOUT_BOOLEAN => "Z",
         LAYOUT_BYTE => "B",
         LAYOUT_SHORT => "S",
@@ -3434,13 +4776,16 @@ fn downcall_layout_carrier_descriptor(kind: i32) -> &'static str {
         LAYOUT_LONG => "J",
         LAYOUT_FLOAT => "F",
         LAYOUT_DOUBLE => "D",
+        crate::panama_libffi::LAYOUT_UNKNOWN => {
+            return Err(unclassifiable_access_layout(ctx, layout, "downcall carrier"))
+        }
         // ADDRESS and aggregate layouts use the FFM MemorySegment carrier.
         _ => "Ljava/lang/foreign/MemorySegment;",
-    }
+    })
 }
 
 fn downcall_handle_captures_call_state(ctx: &dyn NativeContext, handle: ObjectRef) -> bool {
-    matches!(ctx.get_field(handle, 4), Value::Int(flag) if flag != 0)
+    matches!(ctx.get_field(handle, DOWNCALL_CAPTURE_CALL_STATE), Value::Int(flag) if flag != 0)
 }
 
 fn write_downcall_capture_state(ctx: &dyn NativeContext, state: ObjectRef) {
@@ -3460,18 +4805,18 @@ fn write_downcall_capture_state(ctx: &dyn NativeContext, state: ObjectRef) {
 
 /// Execute a downcall via libffi (NEW-18).
 ///
-/// The handle synthetic carries the function pointer (field 0), the
-/// FunctionDescriptor (field 1), an optional fixed-arg count for
-/// variadic calls (field 2; -1 means non-variadic), and a T5.6.3
-/// cached `Box<Cif>` raw pointer (field 3; 0 means unpopulated).
-/// The descriptor carries the parameter and return layouts.
+/// The handle carries the function pointer, the FunctionDescriptor, an
+/// optional fixed-arg count for variadic calls (-1 means non-variadic) and a
+/// T5.6.3 cached `Box<Cif>` raw pointer (0 means unpopulated) at the
+/// `DOWNCALL_*` slots — see [`alloc_downcall_handle`]. The descriptor carries
+/// the parameter and return layouts.
 ///
 /// libffi handles ABI classification (integer vs float register
 /// allocation, struct-by-value, alignment, padding) for every
 /// supported platform — replacing the previous 8-arg integer-only
 /// dispatcher. See `panama_libffi` for the layout↔ffi_type bridge.
 ///
-/// TODO(T5.6.3 finalization): the `Box<Cif>` stashed on field 3 is
+/// TODO(T5.6.3 finalization): the `Box<Cif>` stashed on `DOWNCALL_CIF` is
 /// currently leaked when the DowncallHandle is garbage-collected —
 /// the Panama synthetic objects don't yet route through a finalizer
 /// callback. Since `Linker::downcallHandle` is called once per native
@@ -3484,23 +4829,17 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
     require_native_access(ctx, "downcall")?;
     let handle = obj_arg(args, 0)?;
-    let fn_addr = match ctx.get_field(handle, 0) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
+    let fn_addr = downcall_fn_addr(ctx, handle);
     // Work-list item 14. The symbol name is not carried on the handle, so the
     // scope is the target address — which is what a denial needs to report and
     // what an operator would have to grant. Permissive by default.
     crate::capability_gate::gate_foreign_downcall(&*ctx, &format!("0x{fn_addr:x}"))?;
-    let descriptor = match ctx.get_field(handle, 1) {
-        Value::Object(Some(d)) => d,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "No FunctionDescriptor".into(),
-            }
-            .into())
+    let descriptor = downcall_descriptor(ctx, handle).ok_or_else(|| -> MethodCallFailed {
+        RuntimeError::IllegalStateException {
+            message: "No FunctionDescriptor".into(),
         }
-    };
+        .into()
+    })?;
 
     if fn_addr == 0 {
         return Err(RuntimeError::IllegalStateException {
@@ -3514,7 +4853,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Variadic flag — the Linker.Option.firstVariadicArg(int) overload
     // populates this when registering the downcall handle. -1 (or
     // missing field) = non-variadic.
-    let variadic_fixed: Option<usize> = match ctx.get_field(handle, 2) {
+    let variadic_fixed: Option<usize> = match ctx.get_field(handle, DOWNCALL_FIRST_VARIADIC) {
         Value::Long(n) if n >= 0 => Some(n as usize),
         Value::Int(n) if n >= 0 => Some(n as usize),
         _ => None,
@@ -3522,7 +4861,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
     // T5.6.3 — previously cached `Box<Cif>` pointer (0 = miss). See
     // `panama_libffi::box_cif_to_u64` for the encoding.
-    let cached_cif_u64: u64 = match ctx.get_field(handle, 3) {
+    let cached_cif_u64: u64 = match ctx.get_field(handle, DOWNCALL_CIF) {
         Value::Long(n) => n as u64,
         _ => 0,
     };
@@ -3645,7 +4984,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
         // Move the Cif into a Box, stash the raw pointer, and return a
         // pointer to the Box-owned Cif for this call.
         let stash_u64 = plf::box_cif_to_u64(cif);
-        ctx.set_field(handle, 3, Value::Long(stash_u64 as i64));
+        ctx.set_field(handle, DOWNCALL_CIF, Value::Long(stash_u64 as i64));
         // SAFETY: stash_u64 was produced above; Box is live for the
         // remainder of this call and beyond.
         let cif_ref =
@@ -3734,26 +5073,72 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 ctx.set_field(seg, 4, Value::Int(1));
                 ctx.set_field(seg, 5, Value::Long(0));
                 Value::Object(Some(seg))
-            } else if kind < 10 {
+            } else if kind == plf::LAYOUT_UNKNOWN {
+                // Cannot arrive today — `alloc_return_slot` refused this
+                // carrier before the call was made, and it is on every path to
+                // here. Named anyway: the old spelling of the arm below was
+                // `kind < 10`, which is TRUE for -2, so an unknown carrier
+                // would have been unmarshalled as whatever
+                // `unmarshal_return_primitive`'s default arm answers rather
+                // than reported. See [`layout_kind_is_value`].
+                return Err(unclassifiable_access_layout(ctx, rl, "downcall return"));
+            } else if layout_kind_is_value(kind) {
                 plf::unmarshal_return_primitive(kind, &ret_slot)
             } else {
                 // Struct/union/sequence return: copy the bytes into a
                 // freshly allocated MemorySegment via the global arena
                 // path. The Java caller will then read the segment.
-                let total = plf::layout_total_size(ctx, rl)?;
+                //
+                // Sized from the layout's own `byteSize`/`byteAlignment` and
+                // not from `plf::layout_total_size` — see the note at
+                // `Arena.allocate(MemoryLayout)`. `layout_total_size` answers 8
+                // for EVERY group layout (its `read_layout_kind` resolves a
+                // `Long`-slot-0 carrier by class name, and no GROUP class is on
+                // that list, so it defaults to `LAYOUT_LONG`), so a by-value
+                // struct return of any width got an 8-byte segment.
+                let total =
+                    crate::phases_late::foreign_ffm::p67_layout_size_of(ctx, rl).max(0) as usize;
+                let align =
+                    crate::phases_late::foreign_ffm::p67_layout_align_of(ctx, rl).max(1) as usize;
                 let (alloc_id, ptr) = ctx
-                    .allocate_native_memory(total, plf::layout_align(ctx, rl).max(8))
+                    .allocate_native_memory(total, align.max(8))
                     .ok_or_else(|| -> MethodCallFailed {
                         RuntimeError::OutOfMemoryError {
                             message: "Failed to allocate result MemorySegment".into(),
                         }
                         .into()
                     })?;
-                // SAFETY: ptr was just freshly allocated to `total`
-                // bytes; ret_slot has at least `total` bytes (we sized
-                // it that way for aggregate returns).
+                // THE COPY LENGTH IS CLAMPED TO `ret_slot`, DELIBERATELY.
+                //
+                // `ret_slot` is sized by `panama_libffi::alloc_return_slot`
+                // and `total` by `foreign_ffm::p67_layout_size_of` — two size
+                // functions in two files, with one `unsafe
+                // copy_nonoverlapping` between them. Copying `total` bytes
+                // unconditionally would read past the end of `ret_slot` the
+                // moment those two disagree in that direction, which is what
+                // fixing the size on only one side of the pair produces.
+                //
+                // THE MATCHING FIX LANDED (F27, 2026-08-13).
+                // `panama_libffi::layout_total_size` now reads the carrier's
+                // own `[0]=byteSize`, and `alloc_return_slot` rounds that up to
+                // the layout's alignment because libffi writes the C size of an
+                // aggregate (measured: struct(JAVA_LONG, JAVA_INT) is 12 to the
+                // JDK and 16 to C). So `ret_slot.len() >= total` always and this
+                // clamp no longer truncates anything.
+                //
+                // IT STAYS ANYWAY. `total` is computed by `p67_layout_size_of`
+                // in foreign_ffm.rs and `ret_slot.len()` by `alloc_return_slot`
+                // in panama_libffi.rs; the clamp is the LOCAL proof that the
+                // unsafe copy below is in bounds. Removing it would make an
+                // unsafe block's safety argument depend on two functions in two
+                // files continuing to agree, with nothing at the site saying so.
+                let copy_len = total.min(ret_slot.len());
+                // SAFETY: `ptr` was freshly allocated with `total >= copy_len`
+                // bytes, and `copy_len <= ret_slot.len()`, so both sides are in
+                // bounds. The regions cannot overlap — one is a fresh
+                // allocation.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(ret_slot.as_ptr(), ptr, total);
+                    std::ptr::copy_nonoverlapping(ret_slot.as_ptr(), ptr, copy_len);
                 }
                 let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
@@ -4326,7 +5711,7 @@ unsafe extern "C" fn upcall_dispatch(
 
     // Marshal Java return value into the C return slot.
     *result = match (userdata.return_kind, returned) {
-        (-1, _) => 0,
+        (UPCALL_RETURN_VOID, _) => 0,
         (cratonvm_native_api::ffi::LAYOUT_BYTE, Value::Int(n))
         | (cratonvm_native_api::ffi::LAYOUT_BOOLEAN, Value::Int(n))
         | (cratonvm_native_api::ffi::LAYOUT_SHORT, Value::Int(n))
@@ -4398,7 +5783,7 @@ fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
     let return_kind = match return_layout {
         Some(rl) => plf::read_layout_kind(ctx, rl),
-        None => -1,
+        None => UPCALL_RETURN_VOID,
     };
     let ffi_ret = match return_layout {
         Some(rl) => plf::layout_to_ffi_type(ctx, rl, 0)?,
@@ -4504,232 +5889,63 @@ fn pe_upcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 }
 
-// --- StructLayout / UnionLayout / SequenceLayout ---
-// StructLayout synthetic: [0]=kind(LAYOUT_STRUCT), [1]=totalSize(Long), [2]=memberLayouts(array),
-//                          [3]=memberNames(array), [4]=memberOffsets(array), [5]=alignment(Long)
-
+// --- MemoryLayout$PathElement ---
+//
+// This registrar KEEPS ITS NAME and has lost its subject. The
+// StructLayout/UnionLayout/SequenceLayout family it was written for lives in
+// `phases_late/foreign_ffm.rs` now; what is left is the two path-element
+// factories, which have no twin there. The banner that used to sit here
+// described the deleted 6-slot `[kind, size, members, names, offsets, align]`
+// carrier — the authoritative one is 4-slot `[byteSize, byteAlignment,
+// payload, name]` and is documented at `foreign_ffm.rs::p67_member_size_align`.
 fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
     let ml = "java/lang/foreign/MemoryLayout";
 
-    // MemoryLayout.structLayout(members...) → StructLayout
-    r.register(
-        ml,
-        "structLayout",
-        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
-        pe_struct_layout,
-    );
-    r.register(
-        ml,
-        "structLayout",
-        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
-        pe_struct_layout,
-    );
-
-    // MemoryLayout.unionLayout(members...) → UnionLayout
-    r.register(
-        ml,
-        "unionLayout",
-        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
-        pe_union_layout,
-    );
-    r.register(
-        ml,
-        "unionLayout",
-        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;",
-        pe_union_layout,
-    );
-
-    // MemoryLayout.sequenceLayout(count, element) → SequenceLayout
-    r.register(
-        ml,
-        "sequenceLayout",
-        "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
-        pe_sequence_layout,
-    );
-    r.register(
-        ml,
-        "sequenceLayout",
-        "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;",
-        pe_sequence_layout,
-    );
-
-    // MemoryLayout.paddingLayout(bytes) → PaddingLayout
-    r.register(
-        ml,
-        "paddingLayout",
-        "(J)Ljava/lang/foreign/MemoryLayout;",
-        |ctx, args| {
-            let bytes = match args.first() {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
-            let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
-            ctx.set_field(layout, 0, Value::Int(LAYOUT_PADDING));
-            ctx.set_field(layout, 1, Value::Long(bytes));
-            ctx.set_field(layout, 5, Value::Long(1)); // alignment=1
-            Ok(Some(Value::Object(Some(layout))))
-        },
-    );
-    r.register(
-        ml,
-        "paddingLayout",
-        "(J)Ljava/lang/foreign/PaddingLayout;",
-        |ctx, args| {
-            let bytes = match args.first() {
-                Some(Value::Long(n)) => *n,
-                _ => 0,
-            };
-            let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
-            ctx.set_field(layout, 0, Value::Int(LAYOUT_PADDING));
-            ctx.set_field(layout, 1, Value::Long(bytes));
-            ctx.set_field(layout, 5, Value::Long(1)); // alignment=1
-            Ok(Some(Value::Object(Some(layout))))
-        },
-    );
-
-    // Common methods on all layouts
-    fn layout_members_as_list(ctx: &mut dyn NativeContext, members_arr: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
-        let len = ctx.array_length(members_arr);
-        let arr_pin = ctx.pin_native_root(members_arr);
-        let data_slot = ctx
-            .resolve_field_index("java/util/ArrayList", "elementData")
-            .unwrap_or(0);
-        let size_slot = ctx
-            .resolve_field_index("java/util/ArrayList", "size")
-            .unwrap_or(1);
-        let n_fields = std::cmp::max(data_slot, size_slot) + 1;
-        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
-        let members_arr = ctx.read_native_pin(arr_pin, members_arr);
-        ctx.set_field(list, data_slot, Value::Object(Some(members_arr)));
-        ctx.set_field(list, size_slot, Value::Int(len as i32));
-        ctx.unpin_native_roots(arr_pin);
-        Ok(list)
-    }
-
-    let sl = "java/lang/foreign/StructLayout";
-    for layout_class in [sl, "java/lang/foreign/GroupLayout"] {
-        r.register(layout_class, "byteSize", "()J", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let size = match ctx.get_field(this, 1) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            Ok(Some(Value::Long(size)))
-        });
-        r.register(layout_class, "byteAlignment", "()J", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let align = match ctx.get_field(this, 5) {
-                Value::Long(n) => n,
-                _ => 1,
-            };
-            Ok(Some(Value::Long(align)))
-        });
-        r.register(
-            layout_class,
-            "name",
-            "()Ljava/util/Optional;",
-            pe_layout_name,
-        );
-        r.register(
-            layout_class,
-            "withName",
-            "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
-            pe_layout_with_name,
-        );
-        r.register(
-            layout_class,
-            "memberLayouts",
-            "()Ljava/util/List;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                match ctx.get_field(this, 2) {
-                    Value::Object(Some(members_arr)) => Ok(Some(Value::Object(Some(
-                        layout_members_as_list(ctx, members_arr)?,
-                    )))),
-                    _ => {
-                        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                        Ok(Some(Value::Object(Some(layout_members_as_list(
-                            ctx, empty,
-                        )?))))
-                    }
-                }
-            },
-        );
-    }
-
-    // byteOffset(PathElement...) — compute offset to a named field
-    r.register(
-        sl,
-        "byteOffset",
-        "([Ljava/lang/foreign/MemoryLayout$PathElement;)J",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Simple case: one path element = field name
-            if let Some(Value::Object(Some(path_arr))) = args.get(1) {
-                if ctx.array_length(*path_arr) > 0 {
-                    if let Value::Object(Some(pe)) = ctx.get_array_element(*path_arr, 0) {
-                        // PathElement stores the field name in field 0
-                        if let Value::Object(Some(name_ref)) = ctx.get_field(pe, 0) {
-                            let target_name = ctx.read_string(name_ref).unwrap_or_default();
-                            // Search member names and return corresponding offset
-                            if let Value::Object(Some(names_arr)) = ctx.get_field(this, 3) {
-                                if let Value::Object(Some(offsets_arr)) = ctx.get_field(this, 4) {
-                                    let count = ctx.array_length(names_arr);
-                                    for i in 0..count {
-                                        if let Value::Object(Some(n)) =
-                                            ctx.get_array_element(names_arr, i)
-                                        {
-                                            if ctx.read_string(n).as_deref() == Some(&target_name) {
-                                                if let Value::Long(off) =
-                                                    ctx.get_array_element(offsets_arr, i)
-                                                {
-                                                    return Ok(Some(Value::Long(off)));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Some(Value::Long(0)))
-        },
-    );
-
-    // MemoryLayout.withName(name) → layout with name set
-    r.register(
-        ml,
-        "withName",
-        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
-        pe_layout_with_name,
-    );
-    r.register(
-        ml,
-        "varHandle",
-        "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
-        pe_memory_layout_var_handle,
-    );
-    r.register(ml, "name", "()Ljava/util/Optional;", pe_layout_name);
-
-    // MemoryLayout.byteSize() fallback for any layout
-    r.register(ml, "byteSize", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let kind = match ctx.get_field(this, 0) {
-            Value::Int(k) => k,
-            _ => 0,
-        };
-        let size = if kind < 10 {
-            ffi::layout_byte_size(kind) as i64
-        } else {
-            match ctx.get_field(this, 1) {
-                Value::Long(n) => n,
-                _ => 0,
-            }
-        };
-        Ok(Some(Value::Long(size)))
-    });
+    // THE WHOLE GROUP-LAYOUT FAMILY WAS DELETED FROM HERE
+    // (F16, 2026-08-13). It is now `phases_late/foreign_ffm.rs`'s, alone.
+    //
+    // What stood here: `structLayout`, `unionLayout`, `sequenceLayout` and
+    // `paddingLayout`, each registered TWICE — once under the JDK-true return
+    // type and once under a fabricated `…)Ljava/lang/foreign/MemoryLayout;`
+    // one — plus `byteSize`/`byteAlignment`/`name`/`withName`/`memberLayouts`
+    // on `StructLayout` and `GroupLayout`, `byteOffset` on `StructLayout`, and
+    // `withName`/`varHandle`/`name`/`byteSize` on `MemoryLayout`.
+    //
+    // EVERY ONE OF THEM HAD A TWIN in `register_p67_foreign_memory`, and the
+    // twins disagreed, because the two files carry two different layout
+    // objects:
+    //
+    //     panama       [0]=Int(kind) [1]=size [2]=members [3]=names
+    //                  [4]=offsets   [5]=align
+    //     foreign_ffm  [0]=Long(byteSize) [1]=Long(byteAlignment)
+    //                  [2]=payload        [3]=name
+    //
+    // Which one a caller got was decided by REGISTRATION ORDER, not by the
+    // descriptor it wrote: `register_pe_panama` runs after
+    // `register_p67_foreign_memory`, and `register()` is last-write-wins, so
+    // these rows took the JDK-true keys away from the JDK-true bodies — but
+    // only in synthetic-JDK mode, since real-JDK mode never calls
+    // `register_pe_panama` at all. One VM, two answers, chosen by which mode
+    // you booted.
+    //
+    // The surviving implementation is also the CORRECT one, which the deleted
+    // `pe_struct_layout` was not. Measured on HotSpot 25.0.3+9-LTS:
+    //
+    //     structLayout(JAVA_BYTE, JAVA_INT)  -> IllegalArgumentException
+    //     structLayout(JAVA_INT, JAVA_LONG)  -> IllegalArgumentException
+    //     structLayout(JAVA_LONG, JAVA_INT)  -> byteSize=12  (NOT 16)
+    //
+    // `pe_struct_layout` auto-padded the first two into a fabricated success
+    // and rounded the third up to 16. The JDK never pads a struct: the caller
+    // writes `paddingLayout(...)`, and an under-aligned member is an error.
+    //
+    // `MemoryLayout$PathElement`'s two factories are the ONLY thing kept, and
+    // deliberately: `foreign_ffm.rs` decodes path elements but mints none,
+    // because in real-JDK mode `PathElement.groupElement("c")` runs the JDK's
+    // own bytecode and yields a `jdk.internal.foreign.LayoutPath$…` record.
+    // Synthetic-JDK mode has no such bytecode, so these two rows are its only
+    // source — and the 2-field carrier they build is a shape
+    // `p67_classify_path_element` explicitly accepts.
 
     // PathElement.groupElement(name) → PathElement
     let pe = "java/lang/foreign/MemoryLayout$PathElement";
@@ -4760,278 +5976,22 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
     );
 }
 
-/// A layout's byte size, across BOTH layout shapes this tree mints.
-///
-/// This file's shape is `[0]=kind(Int), [1]=byteSize`; `phases_late
-/// ::foreign_ffm`'s — the one that wins in real-JDK mode, where
-/// `ValueLayout.JAVA_INT` comes from `p67_layout_object` — is
-/// `[0]=byteSize(Long), [1]=byteAlignment(Long)`.
-///
-/// The `_ => -1` this replaces treated the second shape as an unknown KIND, and
-/// `-1` is `< 10`, so `ffi::layout_byte_size(-1)` answered **1 byte for every
-/// layout in real-JDK mode**. Measured with `FfmInterfaceAuditProbe`:
-/// `segment.asSlice(8, JAVA_INT).byteSize()` answered 1 where HotSpot says 4.
-/// Silently wrong, in every caller of this helper — which is why it surfaced
-/// only once `asSlice(J,MemoryLayout)` above gave it a caller that reports.
-fn pe_memory_layout_width(ctx: &mut dyn NativeContext, layout: ObjectRef) -> i64 {
-    match ctx.get_field(layout, 0) {
-        Value::Int(kind) => {
-            if kind < 10 {
-                ffi::layout_byte_size(kind) as i64
-            } else {
-                match ctx.get_field(layout, 1) {
-                    Value::Long(v) => v,
-                    _ => 1,
-                }
-            }
-        }
-        // `foreign_ffm`'s shape: slot 0 IS the byte size.
-        Value::Long(size) if size > 0 => size,
-        _ => 1,
-    }
-}
-
-fn pe_memory_layout_path_target(
-    ctx: &mut dyn NativeContext,
-    layout: ObjectRef,
-    path_arr: ObjectRef,
-) -> ObjectRef {
-    let mut current = layout;
-    let mut i = 0;
-    let len = ctx.array_length(path_arr);
-    while i < len {
-        let pe = match ctx.get_array_element(path_arr, i) {
-            Value::Object(Some(pe)) => pe,
-            _ => break,
-        };
-        let path_kind = match ctx.get_field(pe, 1) {
-            Value::Int(v) => v,
-            _ => -1,
-        };
-        match path_kind {
-            0 => {
-                let target_name = match ctx.get_field(pe, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                if target_name.is_empty() {
-                    break;
-                }
-                let current_kind = match ctx.get_field(current, 0) {
-                    Value::Int(v) => v,
-                    _ => -1,
-                };
-                if current_kind != LAYOUT_STRUCT && current_kind != LAYOUT_UNION {
-                    break;
-                }
-                let names_arr = match ctx.get_field(current, 3) {
-                    Value::Object(Some(arr)) => arr,
-                    _ => break,
-                };
-                let members_arr = match ctx.get_field(current, 2) {
-                    Value::Object(Some(arr)) => arr,
-                    _ => break,
-                };
-                let mut found = false;
-                let name_len = ctx.array_length(names_arr);
-                let mut j = 0;
-                while j < name_len {
-                    if let Value::Object(Some(name_ref)) = ctx.get_array_element(names_arr, j) {
-                        if ctx.read_string(name_ref).as_deref() == Some(&target_name) {
-                            if let Value::Object(Some(member_layout)) =
-                                ctx.get_array_element(members_arr, j)
-                            {
-                                current = member_layout;
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                    j += 1;
-                }
-                if !found {
-                    break;
-                }
-            }
-            1 => {
-                if let Value::Object(Some(element)) = ctx.get_field(current, 2) {
-                    current = element;
-                } else {
-                    break;
-                }
-            }
-            _ => break,
-        }
-        i += 1;
-    }
-    current
-}
-
-fn pe_memory_layout_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let target_layout = match args.get(1) {
-        Some(Value::Object(Some(path_arr))) => pe_memory_layout_path_target(ctx, this, *path_arr),
-        _ => this,
-    };
-    let mut width = pe_memory_layout_width(ctx, target_layout);
-    if !(1..=8).contains(&width) {
-        width = 1;
-    }
-    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", 3)?;
-    ctx.set_field(vh, 0, Value::Int(1)); // little-endian marker for memory-segment varhandles
-    ctx.set_field(vh, 1, Value::Int(width as i32));
-    ctx.set_field(vh, 2, Value::Int(3)); // VH_KIND_MEMORY_SEGMENT
-    Ok(Some(Value::Object(Some(vh))))
-}
-
-/// Compute struct layout: iterate members, align each, compute offsets and total size.
-fn pe_struct_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let members_arr = match args.first() {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let count = ctx.array_length(members_arr);
-
-    let offsets_arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, count);
-    let names_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
-
-    let mut offset: usize = 0;
-    let mut max_align: usize = 1;
-
-    for i in 0..count {
-        let member = ctx.get_array_element(members_arr, i);
-        if let Value::Object(Some(m)) = member {
-            let kind = match ctx.get_field(m, 0) {
-                Value::Int(k) => k,
-                _ => 0,
-            };
-            let (member_size, member_align) = if kind < 10 {
-                (ffi::layout_byte_size(kind), ffi::layout_alignment(kind))
-            } else {
-                let s = match ctx.get_field(m, 1) {
-                    Value::Long(n) => n as usize,
-                    _ => 0,
-                };
-                let a = match ctx.get_field(m, 5) {
-                    Value::Long(n) => n as usize,
-                    _ => 1,
-                };
-                (s, a)
-            };
-
-            offset = ffi::align_up(offset, member_align);
-            ctx.set_array_element(offsets_arr, i, Value::Long(offset as i64));
-            ctx.set_array_element(names_arr, i, pe_layout_name_value(ctx, m));
-            offset += member_size;
-            if member_align > max_align {
-                max_align = member_align;
-            }
-        }
-    }
-
-    // Pad total size to alignment
-    let total_size = ffi::align_up(offset, max_align);
-
-    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 6)?;
-    ctx.set_field(layout, 0, Value::Int(LAYOUT_STRUCT));
-    ctx.set_field(layout, 1, Value::Long(total_size as i64));
-    ctx.set_field(layout, 2, Value::Object(Some(members_arr)));
-    ctx.set_field(layout, 3, Value::Object(Some(names_arr)));
-    ctx.set_field(layout, 4, Value::Object(Some(offsets_arr)));
-    ctx.set_field(layout, 5, Value::Long(max_align as i64));
-
-    Ok(Some(Value::Object(Some(layout))))
-}
-
-/// Compute union layout: all fields at offset 0, size = max member size.
-fn pe_union_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let members_arr = match args.first() {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let count = ctx.array_length(members_arr);
-
-    let mut max_size: usize = 0;
-    let mut max_align: usize = 1;
-
-    for i in 0..count {
-        if let Value::Object(Some(m)) = ctx.get_array_element(members_arr, i) {
-            let kind = match ctx.get_field(m, 0) {
-                Value::Int(k) => k,
-                _ => 0,
-            };
-            let (member_size, member_align) = if kind < 10 {
-                (ffi::layout_byte_size(kind), ffi::layout_alignment(kind))
-            } else {
-                let s = match ctx.get_field(m, 1) {
-                    Value::Long(n) => n as usize,
-                    _ => 0,
-                };
-                let a = match ctx.get_field(m, 5) {
-                    Value::Long(n) => n as usize,
-                    _ => 1,
-                };
-                (s, a)
-            };
-            if member_size > max_size {
-                max_size = member_size;
-            }
-            if member_align > max_align {
-                max_align = member_align;
-            }
-        }
-    }
-
-    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
-    ctx.set_field(layout, 0, Value::Int(LAYOUT_UNION));
-    ctx.set_field(layout, 1, Value::Long(max_size as i64));
-    ctx.set_field(layout, 2, Value::Object(Some(members_arr)));
-    ctx.set_field(layout, 3, Value::Object(None));
-    ctx.set_field(layout, 4, Value::Object(None));
-    ctx.set_field(layout, 5, Value::Long(max_align as i64));
-
-    Ok(Some(Value::Object(Some(layout))))
-}
-
-/// Compute sequence layout (array): count * element size.
-fn pe_sequence_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let count = match args.first() {
-        Some(Value::Long(n)) => *n as usize,
-        _ => 0,
-    };
-    let element = match args.get(1) {
-        Some(Value::Object(Some(e))) => *e,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-
-    let kind = match ctx.get_field(element, 0) {
-        Value::Int(k) => k,
-        _ => 0,
-    };
-    let (elem_size, elem_align) = if kind < 10 {
-        (ffi::layout_byte_size(kind), ffi::layout_alignment(kind))
-    } else {
-        let s = match ctx.get_field(element, 1) {
-            Value::Long(n) => n as usize,
-            _ => 0,
-        };
-        let a = match ctx.get_field(element, 5) {
-            Value::Long(n) => n as usize,
-            _ => 1,
-        };
-        (s, a)
-    };
-
-    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
-    ctx.set_field(layout, 0, Value::Int(LAYOUT_SEQUENCE));
-    ctx.set_field(layout, 1, Value::Long((count * elem_size) as i64));
-    ctx.set_field(layout, 2, Value::Object(Some(element))); // element layout
-    ctx.set_field(layout, 3, Value::Object(None));
-    ctx.set_field(layout, 4, Value::Object(None));
-    ctx.set_field(layout, 5, Value::Long(elem_align as i64));
-
-    Ok(Some(Value::Object(Some(layout))))
-}
+// THE LAST SURVIVOR OF THE GROUP-LAYOUT FAMILY IS GONE TOO (G6, 2026-08-16).
+//
+// `pe_memory_layout_width` stood here — a size reader that understood BOTH
+// this file's old `[0]=Int(kind)` carrier and `foreign_ffm`'s
+// `[0]=Long(byteSize)` one. It had exactly one caller,
+// `asSlice(long, MemoryLayout)`, and that caller now reads size AND alignment
+// out of the four-slot carrier in one call through
+// `foreign_ffm::p67_layout_size_align`, because the JDK's own body is
+// `asSlice(offset, layout.byteSize(), layout.byteAlignment())` and a reader
+// that answers only the size cannot express the second half.
+//
+// This closes F16-1's remaining question. The reconciling arm this function
+// existed for — "which of the two encodings am I looking at?" — has nothing
+// left to reconcile: `pe_make_layout`, the only minter of `[0]=Int(kind)`, is
+// `#[cfg(test)]`, and every shipping carrier comes from `p67_layout_object` or
+// the four group-layout factories beside it. One encoding, one reader.
 
 // --- String marshaling helpers ---
 
@@ -5270,37 +6230,64 @@ fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> O
 /// holding the string's UTF-8 bytes plus a NUL terminator.
 ///
 /// Named rather than inline so `foreign_ffm`'s `allocateFrom` registration can
-/// share it. That spelling used to answer a `p67_arena_segment` stand-in —
-/// address 0, byteSize 0, bytes never written — which is the second half of
-/// residual 3 in `ffm-elements-spliterator-and-allocatefrom-gaps-20260813`.
+/// share it — the two spellings used to be two bodies, and only one of them was
+/// repaired. That spelling used to answer a `p67_arena_segment` stand-in: it
+/// allocated NO memory (`set_field(segment, 1, Long(0)) // address`) and wrote
+/// the SIZE into slot 0 — the inverse of the convention
+/// `panama_libffi::segment_address` and `pe_arena_allocate_impl` use. So
+/// `segment_address` fell through to `get_field(seg, 0)`, read `Long(5)` — the
+/// byte length of `"abcd\0"` — and libffi passed 5 as the `char *`. `strlen`
+/// then dereferenced address 0x5.
+///
+/// Measured 2026-08-12: the same object reported `byteSize() == 0` and
+/// `address() == 5`, inverted on both. The downcall carrier, `invoke` dispatch,
+/// CIF build and return unmarshal were all correct — a positive control
+/// building the argument with `allocate(5)` plus explicit stores returns
+/// `strlen(abcd) == 4`, matching HotSpot. It is the second half of residual 3
+/// in `ffm-elements-spliterator-and-allocatefrom-gaps-20260813`.
+///
+/// A failed allocation RAISES rather than answering a null segment. The whole
+/// defect above was a segment that looked allocated and was not; handing back
+/// `null` here would put the same silence one call further out, where the
+/// caller dereferences it in a downcall.
 pub(crate) fn pe_arena_allocate_from_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-            let this = obj_arg(args, 0)?;
-            let str_obj = obj_arg(args, 1)?;
-            let s = ctx.read_string(str_obj).unwrap_or_default();
-            let bytes = s.as_bytes();
-            let size = (bytes.len() + 1) as i64; // +1 for null terminator
+    let this = obj_arg(args, 0)?;
+    let str_obj = obj_arg(args, 1)?;
+    let s = ctx.read_string(str_obj).unwrap_or_default();
+    let bytes = s.as_bytes();
+    let size = (bytes.len() + 1) as i64; // +1 for null terminator
 
-            // Allocate via arena
-            let seg_val = pe_arena_allocate_impl(ctx, this, size, 1)?;
-            if let Some(Value::Object(Some(seg))) = seg_val {
-                // Write the string bytes + null terminator
-                let ptr = match ctx.get_field(seg, 0) {
-                    Value::Long(n) => n,
-                    _ => 0,
-                };
-                if ptr != 0 {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-                        *(ptr as *mut u8).add(bytes.len()) = 0;
-                    }
-                }
-                Ok(Some(Value::Object(Some(seg))))
-            } else {
-                Ok(Some(Value::Object(None)))
+    // Allocate through the SAME path as `Arena.allocate(long, long)`, so the
+    // segment carries a real off-heap base in the `[0]=ptr, [1]=size` layout
+    // every reader expects.
+    let seg = match pe_arena_allocate_impl(ctx, this, size, 1)? {
+        Some(Value::Object(Some(seg))) => seg,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Arena.allocateFrom could not allocate a segment".into(),
             }
+            .into())
+        }
+    };
+    // Write the string bytes + null terminator.
+    let ptr = match ctx.get_field(seg, 0) {
+        Value::Long(n) => n,
+        _ => 0,
+    };
+    if ptr == 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Arena.allocateFrom segment is not writable".into(),
+        }
+        .into());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        *(ptr as *mut u8).add(bytes.len()) = 0;
+    }
+    Ok(Some(Value::Object(Some(seg))))
 }
 
 // ---------------------------------------------------------------------------
@@ -5375,11 +6362,48 @@ mod segment_splitter_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The four compound layout tags are test-only in this file now — see the
+    // note on the `ffi::` import at the top.
+    use cratonvm_native_api::ffi::{
+        LAYOUT_PADDING, LAYOUT_SEQUENCE, LAYOUT_STRUCT, LAYOUT_UNION,
+    };
     #[allow(unused_imports)]
     use cratonvm_native_api::{
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
+
+    /// Build a downcall carrier the way [`alloc_downcall_handle`] does, minus
+    /// the `MethodType` derivation.
+    ///
+    /// These tests exercise `pe_downcall_invoke`'s libffi marshalling, not the
+    /// mint. Routing them through `alloc_downcall_handle` would drag
+    /// `build_method_type_from_descriptor` into every one of them, and what
+    /// that measures on a `MockNativeContext` is the mock's class table rather
+    /// than anything about a downcall.
+    ///
+    /// It does allocate the real carrier class at the real width, so the slot
+    /// arithmetic under test is the production arithmetic: a test that kept
+    /// writing the old compact `[0]=addr, [1]=descriptor` layout would read
+    /// back zeros through the `DOWNCALL_*` accessors and pass or fail for a
+    /// reason that has nothing to do with the code it names.
+    fn mk_downcall_handle(
+        ctx: &mut dyn NativeContext,
+        fn_addr: i64,
+        descriptor: Option<ObjectRef>,
+        first_variadic: i64,
+    ) -> ObjectRef {
+        let handle =
+            try_alloc_concurrent_synthetic(ctx, DOWNCALL_CARRIER_CLASS, DOWNCALL_SLOT_COUNT)
+                .unwrap();
+        ctx.set_field(handle, DOWNCALL_TAG, Value::Int(DOWNCALL_TAG_MAGIC));
+        ctx.set_field(handle, DOWNCALL_FN_ADDR, Value::Long(fn_addr));
+        ctx.set_field(handle, DOWNCALL_DESCRIPTOR, Value::Object(descriptor));
+        ctx.set_field(handle, DOWNCALL_FIRST_VARIADIC, Value::Long(first_variadic));
+        ctx.set_field(handle, DOWNCALL_CIF, Value::Long(0));
+        ctx.set_field(handle, DOWNCALL_CAPTURE_CALL_STATE, Value::Int(0));
+        handle
+    }
 
     // FIX(test): RAII guard that enables the process-wide native-access gate
     // for the duration of a downcall test and restores the previous value on
@@ -6223,10 +7247,8 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        // Build DowncallHandle
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2).unwrap();
-        ctx.set_field(handle, 0, Value::Long(strlen_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
+        // Build the downcall handle
+        let handle = mk_downcall_handle(&mut ctx, strlen_addr, Some(descriptor), -1);
 
         // Build args array with the pointer as a Long
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
@@ -6268,9 +7290,7 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2).unwrap();
-        ctx.set_field(handle, 0, Value::Long(abs_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
+        let handle = mk_downcall_handle(&mut ctx, abs_addr, Some(descriptor), -1);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(-42));
@@ -6318,12 +7338,9 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        // Build a DowncallHandle with 4 fields (the new cache layout).
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4).unwrap();
-        ctx.set_field(handle, 0, Value::Long(abs_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-        ctx.set_field(handle, 2, Value::Long(-1));
-        ctx.set_field(handle, 3, Value::Long(0)); // cache miss marker
+        // `mk_downcall_handle` leaves DOWNCALL_CIF at 0 — the cache-miss marker
+        // this test's first call must observe.
+        let handle = mk_downcall_handle(&mut ctx, abs_addr, Some(descriptor), -1);
 
         // Snapshot the global build counter.
         let before = plf::CIF_BUILD_COUNT.load(Ordering::Relaxed);
@@ -6345,8 +7362,8 @@ mod tests {
             "first call must construct exactly one Cif"
         );
 
-        // Verify field 3 now carries a non-zero pointer.
-        let stash_v = ctx.get_field(handle, 3);
+        // Verify DOWNCALL_CIF now carries a non-zero pointer.
+        let stash_v = ctx.get_field(handle, DOWNCALL_CIF);
         let stash_u64 = match stash_v {
             Value::Long(n) => n as u64,
             _ => 0,
@@ -6379,87 +7396,37 @@ mod tests {
 
     #[test]
     fn panama_cif_cache_field3_sticks_to_boxed_ptr() {
-        // Simpler smoke test: if we don't actually call, field 3 stays 0.
+        // Simpler smoke test: if we don't actually call, DOWNCALL_CIF stays 0.
         // Only the invoke path populates the cache slot.
         let mut ctx = mock_ctx();
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4).unwrap();
-        ctx.set_field(handle, 3, Value::Long(0));
-        match ctx.get_field(handle, 3) {
+        let handle = mk_downcall_handle(&mut ctx, 0, None, -1);
+        match ctx.get_field(handle, DOWNCALL_CIF) {
             Value::Long(0) => {}
             other => panic!("expected Long(0), got {:?}", other),
         }
     }
 
-    #[test]
-    fn test_85_3_downcall_struct_layout() {
-        // Test struct layout computation for passing structs
-        let mut ctx = mock_ctx();
-
-        // struct { int x; long y; } — should have size 16 (4 + 4 padding + 8)
-        let int_layout = make_layout(&mut ctx, LAYOUT_INT);
-        let long_layout = make_layout(&mut ctx, LAYOUT_LONG);
-
-        let members = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
-        ctx.set_array_element(members, 0, Value::Object(Some(int_layout)));
-        ctx.set_array_element(members, 1, Value::Object(Some(long_layout)));
-
-        let result = pe_struct_layout(&mut ctx, &[Value::Object(Some(members))]);
-        assert!(result.is_ok());
-        let layout = match result.unwrap() {
-            Some(Value::Object(Some(l))) => l,
-            _ => panic!("Expected struct layout object"),
-        };
-
-        let total_size = match ctx.get_field(layout, 1) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
-        // int(4) + padding(4) + long(8) = 16, aligned to 8
-        assert_eq!(total_size, 16);
-
-        let alignment = match ctx.get_field(layout, 5) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
-        assert_eq!(alignment, 8);
-    }
-
-    #[test]
-    fn panama_struct_layout_preserves_named_members() {
-        let mut ctx = mock_ctx();
-        let address = make_layout(&mut ctx, LAYOUT_ADDRESS);
-        let name = ctx.create_string("ptr");
-        let named = pe_layout_with_name(
-            &mut ctx,
-            &[Value::Object(Some(address)), Value::Object(Some(name))],
-        )
-        .unwrap()
-        .and_then(|v| match v {
-            Value::Object(Some(obj)) => Some(obj),
-            _ => None,
-        })
-        .expect("withName must return a layout object");
-
-        let members = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-        ctx.set_array_element(members, 0, Value::Object(Some(named)));
-        let layout = pe_struct_layout(&mut ctx, &[Value::Object(Some(members))])
-            .unwrap()
-            .and_then(|v| match v {
-                Value::Object(Some(obj)) => Some(obj),
-                _ => None,
-            })
-            .expect("structLayout must return a layout object");
-
-        let names_arr = match ctx.get_field(layout, 3) {
-            Value::Object(Some(arr)) => arr,
-            other => panic!("expected names array, got {other:?}"),
-        };
-        let stored_name = match ctx.get_array_element(names_arr, 0) {
-            Value::Object(Some(obj)) => obj,
-            other => panic!("expected stored member name, got {other:?}"),
-        };
-        assert_eq!(ctx.read_string(stored_name).as_deref(), Some("ptr"));
-    }
+    // `test_85_3_downcall_struct_layout` AND
+    // `panama_struct_layout_preserves_named_members` WERE HERE AND ARE DELETED
+    // WITH THE FUNCTION THEY TESTED (F16, 2026-08-13).
+    //
+    // The first called `pe_struct_layout` on `{int, long}` and asserted
+    // size 16 / alignment 8. That is a call HotSpot 25.0.3+9-LTS REFUSES:
+    //
+    //     MemoryLayout.structLayout(JAVA_INT, JAVA_LONG)
+    //       -> IllegalArgumentException: Invalid alignment constraint for
+    //          member layout: j8
+    //
+    // so the test was pinning a fabricated success — it froze the VM's own
+    // wrong answer as if it were the specification. The second asserted that
+    // member NAMES survive into a `names` array at slot 3, which is a slot the
+    // authoritative carrier does not have: `foreign_ffm.rs` keeps the member
+    // LAYOUTS at slot 2 and resolves a name by asking each member for its own
+    // (`p67_layout_named_member`), so there is no second copy to drift.
+    //
+    // Both behaviours are now covered against the ORACLE'S numbers in
+    // `vm/src/vm/tests.rs` — see `struct_layout_rejects_underaligned_member`,
+    // `struct_layout_does_not_pad_the_total` and `struct_layout_single_field`.
 
     #[test]
     fn test_85_3_downcall_void_return() {
@@ -6486,9 +7453,7 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(None)); // void
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2).unwrap();
-        ctx.set_field(handle, 0, Value::Long(abs_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
+        let handle = mk_downcall_handle(&mut ctx, abs_addr, Some(descriptor), -1);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(5));
@@ -6684,10 +7649,7 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3).unwrap();
-        ctx.set_field(handle, 0, Value::Long(fn_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-        ctx.set_field(handle, 2, Value::Long(-1));
+        let handle = mk_downcall_handle(&mut ctx, fn_addr, Some(descriptor), -1);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 12);
         for i in 0..12 {
@@ -6732,10 +7694,7 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3).unwrap();
-        ctx.set_field(handle, 0, Value::Long(fn_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-        ctx.set_field(handle, 2, Value::Long(-1));
+        let handle = mk_downcall_handle(&mut ctx, fn_addr, Some(descriptor), -1);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_array_element(call_args, 0, Value::Int(10));
@@ -6802,11 +7761,8 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3).unwrap();
-        ctx.set_field(handle, 0, Value::Long(snprintf_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         // First 3 args fixed; everything from index 3 is variadic.
-        ctx.set_field(handle, 2, Value::Long(3));
+        let handle = mk_downcall_handle(&mut ctx, snprintf_addr, Some(descriptor), 3);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_array_element(call_args, 0, Value::Long(buf_ptr as i64));
@@ -7200,5 +8156,1590 @@ mod tests {
 
         // Don't leak our entry into other tests sharing the global registry.
         upcall_registry().lock().remove(&code_ptr);
+    }
+    // ===================================================================
+    // F35 (2026-08-13): heap segments, the LAYOUT_UNKNOWN range tests, and
+    // the accessor gate.
+    //
+    // ORACLE. Every number quoted below is `java` on this host, Microsoft
+    // build 25.0.3+9-LTS, with
+    // `--add-opens java.base/jdk.internal.foreign=ALL-UNNAMED` where a private
+    // field is read. Transcripts: `scratchpad/f35/F35Probe.java` and
+    // `F35Probe2.java`.
+    //
+    // MOCK. `MockNativeContext::get_field_by_name` is a name-keyed map that is
+    // independent of `set_field`, so a test that only round-trips a NAME
+    // measures the mock. Nothing below asserts on a name lookup: every
+    // assertion is about the CONTENTS of a real array after a write, or about
+    // an exception class. The names only supply the carrier's inputs, exactly
+    // as the real VM's field resolver would.
+    // ===================================================================
+
+    /// A real JDK heap carrier: `HeapMemorySegmentImpl$Of*` with the five
+    /// fields `javap` reports, in declaration order
+    /// (`AbstractMemorySegmentImpl{length, readOnly, scope}` then
+    /// `HeapMemorySegmentImpl{offset, base}`).
+    ///
+    /// `byte_start` is the JDK's `address()`, i.e. `offset - 16`; the `offset`
+    /// field is written WITH the bias applied, which is what the real
+    /// constructor does.
+    fn make_real_heap_segment(
+        ctx: &mut dyn NativeContext,
+        class: &str,
+        base: ObjectRef,
+        byte_start: i64,
+        size: i64,
+        read_only: bool,
+    ) -> ObjectRef {
+        let cid = ctx.ensure_class_initialized(class).unwrap();
+        let seg = ctx.alloc_object(cid, 5);
+        ctx.set_field(seg, 0, Value::Long(size)); // length
+        ctx.set_field(seg, 1, Value::Int(i32::from(read_only))); // readOnly
+        ctx.set_field(seg, 2, Value::Object(None)); // scope
+        ctx.set_field(seg, 3, Value::Long(byte_start + 16)); // offset
+        ctx.set_field(seg, 4, Value::Object(Some(base))); // base
+        ctx.set_field_by_name(seg, "length", Value::Long(size));
+        ctx.set_field_by_name(seg, "readOnly", Value::Int(i32::from(read_only)));
+        ctx.set_field_by_name(seg, "offset", Value::Long(byte_start + 16));
+        ctx.set_field_by_name(seg, "base", Value::Object(Some(base)));
+        seg
+    }
+
+    /// A JDK-true four-slot value layout: `[0]=Long(byteSize)`,
+    /// `[1]=Long(byteAlignment)`, classified by CLASS NAME.
+    ///
+    /// This is the carrier `--jdk-only` actually has (F27 §1): the nine
+    /// `jdk/internal/foreign/layout/ValueLayouts$Of*Impl`. `align = 1` builds
+    /// `JAVA_INT_UNALIGNED`, which the oracle reports as
+    /// `byteSize=4 byteAlignment=1 toString=1%i4`.
+    fn make_jdk_layout(
+        ctx: &mut dyn NativeContext,
+        class: &str,
+        byte_size: i64,
+        align: i64,
+    ) -> ObjectRef {
+        let cid = ctx.ensure_class_initialized(class).unwrap();
+        let layout = ctx.alloc_object(cid, 4);
+        ctx.set_field(layout, 0, Value::Long(byte_size));
+        ctx.set_field(layout, 1, Value::Long(align));
+        ctx.set_field(layout, 2, Value::Object(None));
+        ctx.set_field(layout, 3, Value::Object(None));
+        layout
+    }
+
+    fn jdk_int_unaligned(ctx: &mut dyn NativeContext) -> ObjectRef {
+        make_jdk_layout(
+            ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            1,
+        )
+    }
+
+    fn jdk_byte_layout(ctx: &mut dyn NativeContext) -> ObjectRef {
+        make_jdk_layout(
+            ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+            1,
+            1,
+        )
+    }
+
+    fn arena_segment(ctx: &mut dyn NativeContext, arena: ObjectRef, size: i64) -> ObjectRef {
+        pe_arena_allocate_impl(ctx, arena, size, 8)
+            .unwrap()
+            .and_then(|v| {
+                if let Value::Object(Some(s)) = v {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+    }
+
+    fn byte_vec(ctx: &dyn NativeContext, arr: ObjectRef, len: usize) -> Vec<i32> {
+        (0..len)
+            .map(|i| match ctx.get_array_element(arr, i) {
+                Value::Int(v) => v,
+                other => panic!("array element {i} is {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The headline: a real heap segment now reads and writes its backing
+    /// array instead of dereferencing a number that is not an address.
+    ///
+    /// The oracle row this pins, verbatim:
+    ///
+    /// ```text
+    /// byte[] a = new byte[8];
+    /// MemorySegment.ofArray(a).set(JAVA_INT_UNALIGNED, 0, 0x01020304);
+    /// // a == [4, 3, 2, 1, 0, 0, 0, 0]
+    /// ```
+    ///
+    /// PRE-FIX `pe_segment_set_impl` called `pe_segment_access_addr`, which
+    /// called `segment_address`, which for this carrier answered slot 0 — the
+    /// LENGTH. Before F27 that was a wild store; after F27 it is
+    /// `IllegalStateException: Null segment address`. Either way the array
+    /// stayed all zeroes, so the `[4, 3, 2, 1]` assertion is the mutation
+    /// check as well as the assertion.
+    #[test]
+    fn a_real_heap_segment_reads_and_writes_its_backing_array() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
+        let seg = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfByte",
+            arr,
+            0,
+            8,
+            false,
+        );
+        let layout = jdk_int_unaligned(&mut ctx);
+
+        pe_segment_set_impl(&mut ctx, seg, layout, 0, Value::Int(0x0102_0304)).unwrap();
+
+        assert_eq!(
+            byte_vec(&ctx, arr, 8),
+            vec![4, 3, 2, 1, 0, 0, 0, 0],
+            "the write must land in the Java array, little-endian, and touch \
+             exactly four bytes"
+        );
+        assert_eq!(
+            pe_segment_get_impl(&mut ctx, seg, layout, 0).unwrap(),
+            Some(Value::Int(0x0102_0304)),
+            "and reading it back must go through the same array"
+        );
+    }
+
+    /// The `Unsafe.arrayBaseOffset` bias is removed EXACTLY ONCE.
+    ///
+    /// Oracle: `ofArray(new byte[32]).asSlice(3)` has `offset == 19` and
+    /// `address() == 3`, and a write through `asSlice(3, 4)` lands at
+    /// `src[3..7]` — measured, `[0, 0, 0, 4, 3, 2, 1, 0, ...]`.
+    ///
+    /// MUTATION: drop the `- HEAP_ARRAY_BASE_OFFSET` and the four bytes land
+    /// at index 19; subtract it twice and the start is negative and the view
+    /// is refused. Only the correct arithmetic puts them at 3.
+    #[test]
+    fn the_array_base_offset_bias_is_removed_exactly_once() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
+        let seg = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfByte",
+            arr,
+            3,
+            4,
+            false,
+        );
+        let layout = jdk_int_unaligned(&mut ctx);
+
+        pe_segment_set_impl(&mut ctx, seg, layout, 0, Value::Int(0x0102_0304)).unwrap();
+
+        assert_eq!(
+            byte_vec(&ctx, arr, 8),
+            vec![0, 0, 0, 4, 3, 2, 1, 0],
+            "the segment's first byte is array index 3, not 19 and not 0"
+        );
+    }
+
+    /// A non-byte backing array is addressed by BYTE, not by element.
+    ///
+    /// Oracle, on an `int[4]`-backed segment:
+    ///
+    /// ```text
+    /// si.set(JAVA_BYTE, 0, (byte) 0x7f);   // iarr[0] == 127
+    /// si.set(JAVA_INT, 4, 0x11223344);     // iarr[1] == 0x11223344
+    /// si.get(JAVA_BYTE, 3)  == 0
+    /// ```
+    ///
+    /// so byte offset `k` is element `k / 4`, byte `k % 4`, little-endian, and
+    /// a one-byte write must not disturb the other three bytes of its element.
+    #[test]
+    fn a_non_byte_backing_array_is_addressed_by_byte_not_by_element() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, 4);
+        let seg = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfInt",
+            arr,
+            0,
+            16,
+            false,
+        );
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let byte_layout = jdk_byte_layout(&mut ctx);
+
+        pe_segment_set_impl(&mut ctx, seg, byte_layout, 0, Value::Int(0x7f)).unwrap();
+        pe_segment_set_impl(&mut ctx, seg, int_aligned, 4, Value::Int(0x1122_3344)).unwrap();
+
+        assert_eq!(
+            ctx.get_array_element(arr, 0),
+            Value::Int(0x7f),
+            "a one-byte write is the element's LOW byte and leaves the rest alone"
+        );
+        assert_eq!(
+            ctx.get_array_element(arr, 1),
+            Value::Int(0x1122_3344),
+            "byte offset 4 is element 1 whole"
+        );
+        assert_eq!(
+            pe_segment_get_impl(&mut ctx, seg, byte_layout, 3).unwrap(),
+            Some(Value::Int(0)),
+            "byte 3 of element 0 is still zero"
+        );
+        assert_eq!(
+            pe_segment_get_impl(&mut ctx, seg, int_aligned, 4).unwrap(),
+            Some(Value::Int(0x1122_3344))
+        );
+    }
+
+    /// Alignment is enforced on the heap path, with BOTH halves of the rule.
+    ///
+    /// Oracle rows, all `IllegalArgumentException` unless marked OK:
+    ///
+    /// | receiver | layout | offset | result |
+    /// |---|---|---|---|
+    /// | `byte[32]` | `JAVA_INT` (align 4) | 0 | refused - maxByteAlignment is 1 |
+    /// | `byte[32]` | `JAVA_INT_UNALIGNED` | 0 | OK |
+    /// | `int[8]` | `JAVA_INT` | 0 | OK |
+    /// | `int[8]` | `JAVA_INT` | 1 | refused - offset not a multiple of 4 |
+    /// | `int[8]` | `JAVA_LONG` (align 8) | 0 | refused - maxByteAlignment is 4 |
+    ///
+    /// MUTATION: keeping only the modulo half admits row 1 (0 % 4 == 0);
+    /// keeping only the `maxByteAlignment` half admits row 4 (4 <= 4). Each
+    /// row is red under exactly one of those two mutations.
+    #[test]
+    fn heap_alignment_is_enforced_the_way_the_oracle_enforces_it() {
+        let mut ctx = mock_ctx();
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
+        let byte_seg = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfByte",
+            bytes,
+            0,
+            32,
+            false,
+        );
+        let ints = ctx.new_array(cratonvm_types::ArrayElementType::Int, 8);
+        let int_seg = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfInt",
+            ints,
+            0,
+            32,
+            false,
+        );
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let int_unaligned = jdk_int_unaligned(&mut ctx);
+        let long_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            8,
+            8,
+        );
+
+        assert!(
+            pe_segment_get_impl(&mut ctx, byte_seg, int_aligned, 0).is_err(),
+            "a byte[] segment's maxByteAlignment is 1, so JAVA_INT is refused \
+             even at offset 0"
+        );
+        assert!(
+            pe_segment_get_impl(&mut ctx, byte_seg, int_unaligned, 0).is_ok(),
+            "JAVA_INT_UNALIGNED on the same receiver is the oracle's OK row"
+        );
+        assert!(pe_segment_get_impl(&mut ctx, int_seg, int_aligned, 0).is_ok());
+        assert!(
+            pe_segment_get_impl(&mut ctx, int_seg, int_aligned, 1).is_err(),
+            "offset 1 is not a multiple of the 4-byte alignment"
+        );
+        assert!(
+            pe_segment_get_impl(&mut ctx, int_seg, long_aligned, 0).is_err(),
+            "an int[] segment's maxByteAlignment is 4, so JAVA_LONG is refused"
+        );
+    }
+
+    /// Bounds, zero size and read-only answer the oracle's exception CLASS,
+    /// not merely "an error".
+    ///
+    /// A caller writing `catch (IndexOutOfBoundsException)` — the idiom for a
+    /// bounds check — must catch ours. Measured: every out-of-bounds and
+    /// zero-size access on BOTH a native and a heap carrier is
+    /// `IndexOutOfBoundsException`, and a read-only write is
+    /// `IllegalArgumentException: Attempt to write a read-only segment`.
+    #[test]
+    fn heap_refusals_use_the_oracles_exception_classes() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
+        let seg = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfByte",
+            arr,
+            0,
+            8,
+            false,
+        );
+        let layout = jdk_int_unaligned(&mut ctx);
+        let byte_layout = jdk_byte_layout(&mut ctx);
+
+        let oob = pe_segment_get_impl(&mut ctx, seg, layout, 6).unwrap_err();
+        assert!(
+            format!("{oob:?}").contains("IndexOutOfBounds"),
+            "offset 6 + 4 > 8 must be IndexOutOfBoundsException, got {oob:?}"
+        );
+        let negative = pe_segment_get_impl(&mut ctx, seg, byte_layout, -1).unwrap_err();
+        assert!(
+            format!("{negative:?}").contains("IndexOutOfBounds"),
+            "a negative offset must be IndexOutOfBoundsException, got {negative:?}"
+        );
+
+        let empty_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+        let empty = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfByte",
+            empty_arr,
+            0,
+            0,
+            false,
+        );
+        let zero = pe_segment_get_impl(&mut ctx, empty, byte_layout, 0).unwrap_err();
+        assert!(
+            format!("{zero:?}").contains("IndexOutOfBounds"),
+            "a zero-size segment is IndexOutOfBoundsException on the oracle, \
+             not IllegalStateException, got {zero:?}"
+        );
+
+        let ro_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
+        let ro = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfByte",
+            ro_arr,
+            0,
+            8,
+            true,
+        );
+        assert!(
+            pe_segment_get_impl(&mut ctx, ro, byte_layout, 0).is_ok(),
+            "a read-only segment still READS (oracle: OK)"
+        );
+        let write = pe_segment_set_impl(&mut ctx, ro, byte_layout, 0, Value::Int(1)).unwrap_err();
+        assert!(
+            format!("{write:?}").contains("IllegalArgument"),
+            "writing a read-only segment is IllegalArgumentException, got {write:?}"
+        );
+        assert_eq!(
+            ctx.get_array_element(ro_arr, 0),
+            Value::Int(0),
+            "and the refused write must not have happened"
+        );
+    }
+
+    // ===================================================================
+    // G6 (2026-08-16): the three callers `pe_segment_slice`'s heap arm
+    // reached and nothing tested — `spliterator`, `elements`, `toArray` —
+    // plus the `maxByteAlignment` rule the merge left UNSETTLED and the
+    // `heapBase` capability the oracle withholds from a read-only view.
+    //
+    // ORACLE. Every number and message below is `java` on this host, Temurin
+    // 25.0.3+9-LTS, transcribed from the probes `FfmProbe`, `FfmProbe2` and
+    // `FfmProbe3` (see the G6-1 record for the full tables). NOTHING here has
+    // been measured on a CratonVM binary.
+    //
+    // MOCK. These tests build their heap carriers with [`heap_alias_segment`],
+    // the eight-slot H2 shape, and NOT with [`make_real_heap_segment`]. That
+    // is not a preference. `make_real_heap_segment` writes `base`/`offset`/
+    // `readOnly`/`length` BY NAME, and `MockNativeContext::set_field_by_name`
+    // resolves a name through `mock_field_slot`, whose whole chain — including
+    // `cratonvm_classloading::synthetic_stub_field_model` — has no entry for
+    // `jdk/internal/foreign/HeapMemorySegmentImpl$Of*`. An unresolved name is
+    // a SILENT no-op on write and `Value::Int(0)` on read, so
+    // `heap_segment_view` cannot resolve such a carrier under the mock and
+    // answers `None`. H2 resolves by SLOT (`[6]=array, [7]=start`) and needs
+    // no name table, which is why `of_array_covers_byte_short_and_char_and_
+    // the_carrier_aliases` — the one existing test that proves a write reaches
+    // the caller's array — uses it. See the G6-1 record's NOM-1: the fix is a
+    // `mock_field_slot` arm in `test_utils.rs`, which this lane does not own.
+    // ===================================================================
+
+    /// The H2 heap carrier: `[0]=0` (no machine address), `[1]=byteSize`,
+    /// `[2]=scope`, `[3]=readOnly`, `[4]=1`, `[5]=0`, `[6]=array`,
+    /// `[7]=startWithinArray`.
+    ///
+    /// This is the production shape, not a test fixture: it is exactly what
+    /// [`pe_of_array_alias`] mints for `ofArray(byte[]|short[]|char[])` and
+    /// what [`pe_segment_slice`]'s heap arm mints for every slice of a heap
+    /// segment — including a slice of a REAL `HeapMemorySegmentImpl$Of*`,
+    /// because `asSlice` is force-routed. So it is also the receiver that
+    /// `toArray`/`elements`/`spliterator` actually see in the field.
+    fn heap_alias_segment(
+        ctx: &mut dyn NativeContext,
+        array: ObjectRef,
+        start: i64,
+        size: i64,
+        read_only: bool,
+    ) -> ObjectRef {
+        let seg =
+            try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", SEG_HEAP_FIELDS)
+                .unwrap();
+        ctx.set_field(seg, 0, Value::Long(0));
+        ctx.set_field(seg, 1, Value::Long(size));
+        ctx.set_field(seg, 2, Value::Object(None));
+        ctx.set_field(seg, 3, Value::Int(i32::from(read_only)));
+        ctx.set_field(seg, 4, Value::Int(1));
+        ctx.set_field(seg, 5, Value::Long(0));
+        ctx.set_field(seg, SEG_HEAP_BASE_FIELD, Value::Object(Some(array)));
+        ctx.set_field(seg, SEG_HEAP_START_FIELD, Value::Long(start));
+        seg
+    }
+
+    /// A `byte[]`-backed heap segment holding `bytes`, plus the array itself.
+    fn heap_byte_segment(ctx: &mut dyn NativeContext, bytes: &[i32]) -> (ObjectRef, ObjectRef) {
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b));
+        }
+        let seg = heap_alias_segment(ctx, arr, 0, bytes.len() as i64, false);
+        (seg, arr)
+    }
+
+    /// An `int[]`-backed heap segment holding `values`, plus the array itself.
+    fn heap_int_segment(ctx: &mut dyn NativeContext, values: &[i32]) -> (ObjectRef, ObjectRef) {
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, values.len());
+        for (i, v) in values.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*v));
+        }
+        let seg = heap_alias_segment(ctx, arr, 0, values.len() as i64 * 4, false);
+        (seg, arr)
+    }
+
+    /// `maxByteAlignment()` is the BACKING ARRAY'S element alignment, not 8.
+    ///
+    /// This is the question the merge lane left open, and both arms of the
+    /// answer it guessed were wrong. Oracle rows, transcribed:
+    ///
+    /// | receiver | `maxByteAlignment()` |
+    /// |---|---|
+    /// | `ofArray(byte[16])` | 1 |
+    /// | `ofArray(short[8])` / `ofArray(char[8])` | 2 |
+    /// | `ofArray(int[8])` / `ofArray(float[8])` | 4 |
+    /// | `ofArray(long[8])` / `ofArray(double[8])` | 8 |
+    /// | `ofArray(byte[0])` | 1 |
+    /// | `ofArray(long[0])` | 8 |
+    /// | `ofArray(long[4]).asSlice(4)` | 4 |
+    /// | `ofArray(int[8]).asSlice(2)` | 2 |
+    /// | `ofArray(byte[16]).asSlice(8)` | 1 |
+    /// | `MemorySegment.NULL` / `ofAddress(0)` | 4611686018427387904 |
+    /// | `ofAddress(16)` | 16 |
+    /// | `ofAddress(12)` | 4 |
+    ///
+    /// MUTATION: the previous body was `addr == 0 ? 8 : addr & -addr` over the
+    /// segment's START, so every row with start 0 answered 8. Rows 1-3, 5 and
+    /// 10 are red under it; row 4 (`long[8]` -> 8) is the single row that
+    /// agreed, which is why reading one row would have settled nothing.
+    #[test]
+    fn max_byte_alignment_is_the_element_type_not_a_constant_eight() {
+        use cratonvm_types::ArrayElementType as A;
+        let mut ctx = mock_ctx();
+        for (elem, len, expected) in [
+            (A::Byte, 16usize, 1_i64),
+            (A::Short, 8, 2),
+            (A::Char, 8, 2),
+            (A::Int, 8, 4),
+            (A::Float, 8, 4),
+            (A::Long, 8, 8),
+            (A::Double, 8, 8),
+            (A::Byte, 0, 1),
+            (A::Long, 0, 8),
+        ] {
+            let width = heap_element_width(elem).unwrap() as i64;
+            let arr = ctx.new_array(elem, len);
+            let seg = heap_alias_segment(&mut ctx, arr, 0, len as i64 * width, false);
+            assert_eq!(
+                pe_segment_max_byte_alignment(&ctx, seg),
+                expected,
+                "a {elem:?}[] segment starting at offset 0 promises its element \
+                 alignment, not 8"
+            );
+        }
+
+        // The offset cap, on the element type wide enough to show it.
+        let longs = ctx.new_array(A::Long, 4);
+        for (start, expected) in [(0_i64, 8_i64), (1, 1), (2, 2), (4, 4), (8, 8), (12, 4)] {
+            let seg = heap_alias_segment(&mut ctx, longs, start, 32 - start, false);
+            assert_eq!(
+                pe_segment_max_byte_alignment(&ctx, seg),
+                expected,
+                "long[4] at byte offset {start} promises min(8, lowestOneBit({start}))"
+            );
+        }
+
+        // A byte[] never promises more than 1, at any offset — the row the old
+        // body got most wrong.
+        let bytes = ctx.new_array(A::Byte, 16);
+        for start in [0_i64, 1, 4, 8, 12] {
+            let seg = heap_alias_segment(&mut ctx, bytes, start, 16 - start, false);
+            assert_eq!(pe_segment_max_byte_alignment(&ctx, seg), 1);
+        }
+
+        // The native arm, including the address-0 row that used to answer 8.
+        assert_eq!(native_max_byte_alignment(0), 1_i64 << 62);
+        assert_eq!(native_max_byte_alignment(16), 16);
+        assert_eq!(native_max_byte_alignment(12), 4);
+        assert_eq!(native_max_byte_alignment(1), 1);
+    }
+
+    /// `toArray` on a heap receiver hands back the ARRAY'S BYTES.
+    ///
+    /// It used to hand back zeros: `segment_address` is 0 for every heap
+    /// carrier (F27), and the raw-pointer loop took its `base.is_null()` early
+    /// return and returned a correctly-sized array of the type's default.
+    /// Oracle:
+    ///
+    /// * `ofArray(new byte[]{0..7}).toArray(JAVA_BYTE)` -> `[0, 1, ..., 7]`
+    /// * `ofArray(byte[16]).asSlice(3,4).toArray(JAVA_BYTE)` -> `[3, 4, 5, 6]`
+    /// * `ofArray(new int[]{10,20,30,40}).toArray(JAVA_INT)` -> `[10, 20, 30, 40]`
+    ///
+    /// MUTATION: delete the heap arm and every assertion below reads 0.
+    #[test]
+    fn to_array_on_a_heap_receiver_reads_the_arrays_own_bytes() {
+        let mut ctx = mock_ctx();
+        let byte_layout = jdk_byte_layout(&mut ctx);
+        let (seg, _arr) = heap_byte_segment(&mut ctx, &[0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let out = pe_segment_to_array(
+            &mut ctx,
+            &[Value::Object(Some(seg)), Value::Object(Some(byte_layout))],
+        )
+        .unwrap();
+        let Some(Value::Object(Some(out))) = out else {
+            panic!("toArray must answer an array")
+        };
+        assert_eq!(ctx.array_length(out), 8);
+        for i in 0..8 {
+            assert_eq!(
+                ctx.get_array_element(out, i),
+                Value::Int(i as i32),
+                "byte {i} must come from the backing array, not from address 0"
+            );
+        }
+
+        // A SLICE of that heap segment is the receiver `elements` and
+        // `spliterator` hand on, and the one `asSlice` mints from a REAL
+        // `HeapMemorySegmentImpl$Of*`.
+        let Some(Value::Object(Some(slice))) = pe_segment_slice(&mut ctx, seg, 3, 4, None).unwrap()
+        else {
+            panic!("a heap slice must be a segment")
+        };
+        let sliced = pe_segment_to_array(
+            &mut ctx,
+            &[Value::Object(Some(slice)), Value::Object(Some(byte_layout))],
+        )
+        .unwrap();
+        let Some(Value::Object(Some(sliced))) = sliced else {
+            panic!("toArray must answer an array")
+        };
+        assert_eq!(ctx.array_length(sliced), 4);
+        for (i, expected) in [3, 4, 5, 6].into_iter().enumerate() {
+            assert_eq!(
+                ctx.get_array_element(sliced, i),
+                Value::Int(expected),
+                "a heap slice's toArray starts at the slice, not at the array"
+            );
+        }
+
+        // A wider element type, so the stride is exercised and not only the
+        // byte-for-byte identity case.
+        let int_layout = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let (int_seg, _) = heap_int_segment(&mut ctx, &[10, 20, 30, 40]);
+        let out = pe_segment_to_array(
+            &mut ctx,
+            &[
+                Value::Object(Some(int_seg)),
+                Value::Object(Some(int_layout)),
+            ],
+        )
+        .unwrap();
+        let Some(Value::Object(Some(out))) = out else {
+            panic!("toArray must answer an array")
+        };
+        assert_eq!(ctx.array_length(out), 4);
+        for (i, v) in [10, 20, 30, 40].into_iter().enumerate() {
+            assert_eq!(ctx.get_array_element(out, i), Value::Int(v));
+        }
+    }
+
+    /// `toArray`'s two refusals, in the oracle's ORDER.
+    ///
+    /// | call | oracle |
+    /// |---|---|
+    /// | `ofArray(byte[15]).toArray(JAVA_INT)` | ISE `Segment size is not a multiple of 4. Size: 15` |
+    /// | `ofArray(byte[16]).toArray(JAVA_INT)` | IAE `Source segment incompatible with alignment constraints` |
+    /// | `ofArray(byte[16]).toArray(JAVA_INT_UNALIGNED)` | 4 elements |
+    /// | `ofArray(int[8]).toArray(JAVA_LONG)` | IAE, same message |
+    /// | `ofArray(int[8]).toArray(JAVA_INT)` | 8 elements |
+    ///
+    /// Row 1 is the ordering witness: that segment is BOTH badly sized and
+    /// badly aligned, and HotSpot reports the SIZE, because
+    /// `AbstractMemorySegmentImpl.toArray` runs `checkArraySize` before it
+    /// hands the segment to `MemorySegment.copy`.
+    #[test]
+    fn to_array_alignment_gate_matches_the_oracle_and_runs_after_the_size_gate() {
+        let mut ctx = mock_ctx();
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        // Same CLASS, alignment 1: that is exactly how the JDK spells
+        // `JAVA_INT_UNALIGNED` — one `OfIntImpl` with a different alignment
+        // slot — so the element-kind sniff and the alignment gate are being
+        // read off the two different places they are read off in production.
+        let int_unaligned = jdk_int_unaligned(&mut ctx);
+        let long_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            8,
+            8,
+        );
+
+        let (b15, _) = heap_byte_segment(&mut ctx, &[0; 15]);
+        let err = pe_segment_to_array(
+            &mut ctx,
+            &[Value::Object(Some(b15)), Value::Object(Some(int_aligned))],
+        )
+        .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("IllegalState") && text.contains("not a multiple of 4"),
+            "a segment that is both badly sized and badly aligned reports the \
+             SIZE on the oracle, got {text}"
+        );
+
+        let (b16, _) = heap_byte_segment(&mut ctx, &[0; 16]);
+        let err = pe_segment_to_array(
+            &mut ctx,
+            &[Value::Object(Some(b16)), Value::Object(Some(int_aligned))],
+        )
+        .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("IllegalArgument") && text.contains("Source segment incompatible"),
+            "a byte[] segment's maxByteAlignment is 1, so JAVA_INT is refused, \
+             got {text}"
+        );
+        assert!(
+            pe_segment_to_array(
+                &mut ctx,
+                &[Value::Object(Some(b16)), Value::Object(Some(int_unaligned))]
+            )
+            .is_ok(),
+            "JAVA_INT_UNALIGNED on the same receiver is the oracle's OK row"
+        );
+
+        let (int_seg, _) = heap_int_segment(&mut ctx, &[0; 8]);
+        assert!(
+            pe_segment_to_array(
+                &mut ctx,
+                &[
+                    Value::Object(Some(int_seg)),
+                    Value::Object(Some(long_aligned))
+                ]
+            )
+            .is_err(),
+            "an int[] segment's maxByteAlignment is 4, so JAVA_LONG is refused"
+        );
+        assert!(pe_segment_to_array(
+            &mut ctx,
+            &[
+                Value::Object(Some(int_seg)),
+                Value::Object(Some(int_aligned))
+            ]
+        )
+        .is_ok());
+    }
+
+    /// `spliterator` and `elements` count a heap receiver's elements and share
+    /// ONE alignment gate — the one that reads `maxByteAlignment`.
+    ///
+    /// The gate used to be `segment_address % elemAlign`, and a heap segment's
+    /// address is 0, so it admitted every element layout on every heap
+    /// receiver. Oracle:
+    ///
+    /// | call | oracle |
+    /// |---|---|
+    /// | `ofArray(byte[16]).spliterator(JAVA_BYTE).estimateSize()` | 16 |
+    /// | `ofArray(byte[16]).spliterator(JAVA_INT_UNALIGNED).estimateSize()` | 4 |
+    /// | `ofArray(byte[16]).spliterator(JAVA_INT)` | IAE `Incompatible alignment constraints` |
+    /// | `ofArray(int[8]).spliterator(JAVA_INT).estimateSize()` | 8 |
+    /// | `ofArray(int[8]).elements(JAVA_LONG)` | IAE, same message |
+    /// | `ofArray(byte[15]).elements(JAVA_INT_UNALIGNED)` | IAE `Segment size is not a multiple of layout size` |
+    ///
+    /// MUTATION: restore `segment_address % elemAlign` and rows 3 and 5 turn
+    /// into successful streams over misaligned memory.
+    #[test]
+    fn spliterator_and_elements_gate_a_heap_receiver_on_max_byte_alignment() {
+        let mut ctx = mock_ctx();
+        let byte_layout = jdk_byte_layout(&mut ctx);
+        let int_unaligned = jdk_int_unaligned(&mut ctx);
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let long_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            8,
+            8,
+        );
+
+        fn split(
+            ctx: &mut dyn NativeContext,
+            seg: ObjectRef,
+            layout: ObjectRef,
+        ) -> MethodCallResult {
+            pe_segment_spliterator(
+                ctx,
+                &[Value::Object(Some(seg)), Value::Object(Some(layout))],
+            )
+        }
+        fn elements(
+            ctx: &mut dyn NativeContext,
+            seg: ObjectRef,
+            layout: ObjectRef,
+        ) -> MethodCallResult {
+            pe_segment_elements(
+                ctx,
+                &[Value::Object(Some(seg)), Value::Object(Some(layout))],
+            )
+        }
+
+        let (b16, _) = heap_byte_segment(&mut ctx, &[0; 16]);
+
+        let Some(Value::Object(Some(s))) = split(&mut ctx, b16, byte_layout).unwrap() else {
+            panic!("a byte-layout spliterator over a byte[16] heap segment must exist")
+        };
+        assert_eq!(pe_splitter_state(&mut ctx, s), (16, 1, 0));
+
+        let Some(Value::Object(Some(s))) = split(&mut ctx, b16, int_unaligned).unwrap() else {
+            panic!("JAVA_INT_UNALIGNED is the oracle's OK row on a byte[] receiver")
+        };
+        assert_eq!(pe_splitter_state(&mut ctx, s), (4, 4, 0));
+
+        let err = split(&mut ctx, b16, int_aligned).unwrap_err();
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("IllegalArgument") && text.contains("Incompatible alignment constraints"),
+            "a byte[] segment's maxByteAlignment is 1, so JAVA_INT is refused, \
+             got {text}"
+        );
+
+        let (int_seg, _) = heap_int_segment(&mut ctx, &[0; 8]);
+        let Some(Value::Object(Some(s))) = split(&mut ctx, int_seg, int_aligned).unwrap() else {
+            panic!("JAVA_INT over an int[] receiver is the oracle's 8-element row")
+        };
+        assert_eq!(pe_splitter_state(&mut ctx, s), (8, 4, 0));
+        assert!(
+            split(&mut ctx, int_seg, long_aligned).is_err(),
+            "an int[] segment's maxByteAlignment is 4, so JAVA_LONG is refused"
+        );
+
+        // `elements` is `spliterator` plus a Stream carrier, so its REFUSALS
+        // must be identical — the gate runs before anything is allocated.
+        assert!(
+            elements(&mut ctx, b16, int_aligned).is_err(),
+            "elements() shares spliterator()'s alignment gate"
+        );
+        assert!(
+            elements(&mut ctx, int_seg, long_aligned).is_err(),
+            "elements() shares spliterator()'s alignment gate"
+        );
+        assert!(matches!(
+            elements(&mut ctx, int_seg, int_aligned),
+            Ok(Some(Value::Object(Some(_))))
+        ));
+
+        // The size-multiple gate, on a receiver the alignment gate admits.
+        let (b15, _) = heap_byte_segment(&mut ctx, &[0; 15]);
+        let err = split(&mut ctx, b15, int_unaligned).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Segment size is not a multiple of layout size"),
+            "got {err:?}"
+        );
+    }
+
+    /// The splitter walks a heap receiver, and each element it mints is a HEAP
+    /// slice over the same array — not a synthetic native carrier parked at a
+    /// small integer address.
+    ///
+    /// Oracle: `ofArray(new int[]{10,20,30,40}).spliterator(JAVA_INT)` advances
+    /// four times then reports exhausted; the second element has
+    /// `address() == 4`, `isNative() == false`, `heapBase()` present, and reads
+    /// `20`.
+    #[test]
+    fn the_splitter_walks_a_heap_receiver_element_by_element() {
+        let mut ctx = mock_ctx();
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let (seg, arr) = heap_int_segment(&mut ctx, &[10, 20, 30, 40]);
+
+        let Some(Value::Object(Some(splitter))) = pe_segment_spliterator(
+            &mut ctx,
+            &[Value::Object(Some(seg)), Value::Object(Some(int_aligned))],
+        )
+        .unwrap() else {
+            panic!("spliterator over an int[4] heap segment must exist")
+        };
+        assert_eq!(pe_splitter_state(&mut ctx, splitter), (4, 4, 0));
+
+        // A null consumer exercises the mint and the advance without needing
+        // the mock to dispatch `Consumer.accept`.
+        for expected_index in 1..=4_i64 {
+            assert_eq!(
+                pe_splitter_try_advance(&mut ctx, &[Value::Object(Some(splitter))]).unwrap(),
+                Some(Value::Int(1)),
+                "element {expected_index} of 4 must be produced"
+            );
+            assert_eq!(pe_splitter_state(&mut ctx, splitter).2, expected_index);
+        }
+        assert_eq!(
+            pe_splitter_try_advance(&mut ctx, &[Value::Object(Some(splitter))]).unwrap(),
+            Some(Value::Int(0)),
+            "the fifth advance is exhausted"
+        );
+
+        // And the element body itself — the same `pe_segment_slice` call
+        // `tryAdvance` makes for index 1.
+        let Some(Value::Object(Some(elem))) = pe_segment_slice(&mut ctx, seg, 4, 4, None).unwrap()
+        else {
+            panic!("element 1 must be a segment")
+        };
+        assert_eq!(pe_segment_base_address(&ctx, elem), 4, "address() is 4");
+        assert_eq!(
+            pe_segment_heap_base(&ctx, elem),
+            Value::Object(Some(arr)),
+            "an element of a heap segment is a HEAP segment over the SAME \
+             array, not a native carrier parked at the small integer 4"
+        );
+        assert_eq!(
+            pe_segment_get_impl(&mut ctx, elem, int_aligned, 0).unwrap(),
+            Some(Value::Int(20)),
+            "element 1 reads the array's second int"
+        );
+    }
+
+    /// A read-only segment has NO `heapBase`.
+    ///
+    /// Oracle (`FfmProbe` B12, `FfmProbe3` M4a-M4g): `heapBase()` is present on
+    /// a writable heap segment and EMPTY on `asReadOnly()`, on a slice of a
+    /// read-only segment, on an element of one, on a read-only `ofBuffer`
+    /// segment, and on a read-only native segment.
+    ///
+    /// This is a capability, not cosmetics: the array `heapBase()` returns is
+    /// writable through plain array stores, so handing it out from a read-only
+    /// view returns exactly the capability `asReadOnly()` removed — F26's
+    /// "a copying slice is a wrong capability", one call further on.
+    ///
+    /// MUTATION: drop the read-only arm and rows 2, 3 and 4 hand the array
+    /// back.
+    #[test]
+    fn a_read_only_segment_hands_out_no_backing_array() {
+        let mut ctx = mock_ctx();
+        let (writable, arr) = heap_byte_segment(&mut ctx, &[1, 2, 3, 4]);
+        assert_eq!(
+            pe_segment_heap_base(&ctx, writable),
+            Value::Object(Some(arr)),
+            "a writable heap segment answers its array"
+        );
+
+        let read_only = heap_alias_segment(&mut ctx, arr, 0, 4, true);
+        assert_eq!(
+            pe_segment_heap_base(&ctx, read_only),
+            Value::Object(None),
+            "a read-only heap segment must not hand out its writable array"
+        );
+
+        // Read-only is contagious through `asSlice` (F21), so the slice must
+        // withhold it too — the arm that would otherwise leak the array one
+        // call after the fix.
+        let Some(Value::Object(Some(slice))) =
+            pe_segment_slice(&mut ctx, read_only, 1, 2, None).unwrap()
+        else {
+            panic!("a heap slice must be a segment")
+        };
+        assert_eq!(
+            pe_segment_heap_base(&ctx, slice),
+            Value::Object(None),
+            "a slice of a read-only segment is read-only, so it has no \
+             heapBase either"
+        );
+
+        // And `asReadOnly()`'s own shape: the same body with the flag FORCED.
+        let Some(Value::Object(Some(forced))) =
+            pe_segment_slice(&mut ctx, writable, 0, 4, Some(true)).unwrap()
+        else {
+            panic!("asReadOnly must answer a segment")
+        };
+        assert_eq!(
+            pe_segment_heap_base(&ctx, forced),
+            Value::Object(None),
+            "asReadOnly() of a writable heap segment withholds the array"
+        );
+
+        // Reads still work through the read-only view — the oracle's
+        // `asReadOnly().toArray(JAVA_BYTE).length == 16` row. Withholding the
+        // array must not become "a read-only segment is unreadable".
+        let byte_layout = jdk_byte_layout(&mut ctx);
+        let out = pe_segment_to_array(
+            &mut ctx,
+            &[
+                Value::Object(Some(read_only)),
+                Value::Object(Some(byte_layout)),
+            ],
+        )
+        .unwrap();
+        let Some(Value::Object(Some(out))) = out else {
+            panic!("a read-only segment still reads")
+        };
+        assert_eq!(ctx.get_array_element(out, 0), Value::Int(1));
+    }
+
+    /// The slice arities refuse in the oracle's ORDER, with the oracle's
+    /// exception CLASSES and message TEXTS.
+    ///
+    /// | call | oracle |
+    /// |---|---|
+    /// | `ofArray(byte[16]).asSlice(17, 0)` | `IndexOutOfBoundsException` |
+    /// | `ofArray(byte[16]).asSlice(4, -1)` | `IndexOutOfBoundsException` |
+    /// | `ofArray(byte[16]).asSlice(20, 4, 3)` | `IndexOutOfBoundsException` (bounds beat a bad alignment) |
+    /// | `ofArray(byte[16]).asSlice(4, 4, 3)` | IAE `Invalid alignment constraint : 3` |
+    /// | `ofArray(byte[16]).asSlice(4, 4, 0)` | IAE `Invalid alignment constraint : 0` |
+    /// | `ofArray(byte[16]).asSlice(0, 8, 8)` | IAE `Target offset incompatible with alignment constraints` |
+    /// | `ofArray(byte[16]).asSlice(4, 4, 1)` | OK |
+    /// | `ofArray(int[8]).asSlice(0, 4, 4)` | OK |
+    /// | `ofArray(int[8]).asSlice(2, 4, 4)` | IAE, alignment |
+    /// | `ofArray(int[8]).asSlice(0, 8, 8)` | IAE, alignment |
+    ///
+    /// Note the SPACE before the colon in `Invalid alignment constraint : 3`.
+    /// It is HotSpot's, transcribed; the previous text had no space, and
+    /// interpolated the offset into the second message, which HotSpot does not
+    /// do at all.
+    #[test]
+    fn slice_refusals_are_the_oracles_classes_texts_and_order() {
+        let mut ctx = mock_ctx();
+        let (b16, _) = heap_byte_segment(&mut ctx, &[0; 16]);
+
+        let oob = pe_slice_bounds_check(&ctx, b16, 17, 0).unwrap_err();
+        assert!(
+            format!("{oob:?}").contains("IndexOutOfBounds"),
+            "an over-long slice is IndexOutOfBoundsException, not \
+             IllegalStateException, got {oob:?}"
+        );
+        assert!(pe_slice_bounds_check(&ctx, b16, 4, -1).is_err());
+        assert!(pe_slice_bounds_check(&ctx, b16, -1, 4).is_err());
+        assert!(pe_slice_bounds_check(&ctx, b16, 16, 0).is_ok());
+
+        let bad_power = pe_slice_alignment_check(&ctx, b16, 4, 3).unwrap_err();
+        assert!(
+            format!("{bad_power:?}").contains("Invalid alignment constraint : 3"),
+            "the space before the colon is the oracle's, got {bad_power:?}"
+        );
+        let zero = pe_slice_alignment_check(&ctx, b16, 4, 0).unwrap_err();
+        assert!(format!("{zero:?}").contains("Invalid alignment constraint : 0"));
+        let unmeetable = pe_slice_alignment_check(&ctx, b16, 0, 8).unwrap_err();
+        let text = format!("{unmeetable:?}");
+        assert!(
+            text.contains("Target offset incompatible with alignment constraints"),
+            "the message does not interpolate the offset, got {text}"
+        );
+        assert!(
+            pe_slice_alignment_check(&ctx, b16, 4, 1).is_ok(),
+            "alignment 1 is always available"
+        );
+
+        let (int_seg, _) = heap_int_segment(&mut ctx, &[0; 8]);
+        assert!(pe_slice_alignment_check(&ctx, int_seg, 0, 4).is_ok());
+        assert!(pe_slice_alignment_check(&ctx, int_seg, 4, 4).is_ok());
+        assert!(
+            pe_slice_alignment_check(&ctx, int_seg, 2, 4).is_err(),
+            "absolute offset 2 cannot carry a 4-byte alignment"
+        );
+        assert!(
+            pe_slice_alignment_check(&ctx, int_seg, 0, 8).is_err(),
+            "an int[] segment's maxByteAlignment is 4"
+        );
+    }
+
+    /// A slice's own start does NOT disqualify a better-aligned offset inside
+    /// it.
+    ///
+    /// This is the conjunct the previous `heap_segment_check_access` had one
+    /// too many of. Oracle (`FfmProbe3` M1a-M1j):
+    ///
+    /// | call | oracle |
+    /// |---|---|
+    /// | `ofArray(int[8]).asSlice(2).maxByteAlignment()` | 2 |
+    /// | `ofArray(int[8]).asSlice(2).get(JAVA_INT, 2)` | reads (absolute 4) |
+    /// | `ofArray(int[8]).asSlice(2).get(JAVA_INT, 0)` | IAE (absolute 2) |
+    /// | `ofArray(long[4]).asSlice(4).get(JAVA_LONG, 4)` | reads (absolute 8) |
+    ///
+    /// MUTATION: re-add `align <= maxByteAlignment(view.start)` and rows 2 and
+    /// 4 are refused.
+    #[test]
+    fn alignment_is_judged_at_the_absolute_offset_not_the_slice_start() {
+        let mut ctx = mock_ctx();
+        let int_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            4,
+            4,
+        );
+        let long_aligned = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            8,
+            8,
+        );
+
+        let ints = ctx.new_array(cratonvm_types::ArrayElementType::Int, 8);
+        let at2 = heap_alias_segment(&mut ctx, ints, 2, 30, false);
+        assert_eq!(
+            pe_segment_max_byte_alignment(&ctx, at2),
+            2,
+            "a slice starting at byte 2 of an int[] promises 2"
+        );
+        assert!(
+            pe_segment_get_impl(&mut ctx, at2, int_aligned, 2).is_ok(),
+            "offset 2 of a slice starting at 2 is absolute 4, which the oracle \
+             reads"
+        );
+        assert!(
+            pe_segment_get_impl(&mut ctx, at2, int_aligned, 0).is_err(),
+            "offset 0 of the same slice is absolute 2, which the oracle refuses"
+        );
+
+        let longs = ctx.new_array(cratonvm_types::ArrayElementType::Long, 4);
+        let at4 = heap_alias_segment(&mut ctx, longs, 4, 28, false);
+        assert_eq!(pe_segment_max_byte_alignment(&ctx, at4), 4);
+        assert!(
+            pe_segment_get_impl(&mut ctx, at4, long_aligned, 4).is_ok(),
+            "absolute offset 8 carries an 8-byte alignment even though the \
+             slice starts at 4"
+        );
+        assert!(pe_segment_get_impl(&mut ctx, at4, long_aligned, 0).is_err());
+    }
+
+    /// The zero-size refusal on the RAW-ADDRESS path changed class too, and
+    /// this is the control for that half.
+    ///
+    /// Oracle: `MemorySegment.ofAddress(0x1000).get(JAVA_BYTE, 0)` is
+    /// `IndexOutOfBoundsException`, exactly as the heap and native
+    /// out-of-bounds rows are. It used to be `IllegalStateException` here,
+    /// which contradicted the "Bounds, not state" paragraph sitting directly
+    /// below it in the same function.
+    #[test]
+    fn a_zero_size_native_segment_is_also_an_index_out_of_bounds() {
+        let mut ctx = mock_ctx();
+        let seg =
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
+        ctx.set_field(seg, 0, Value::Long(0x1000));
+        ctx.set_field(seg, 1, Value::Long(0));
+        ctx.set_field(seg, 5, Value::Long(0));
+        let err = pe_segment_access_addr(&mut ctx, seg, 0, 1).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("IndexOutOfBounds"),
+            "got {err:?}"
+        );
+    }
+
+    /// `MemorySegment.ofArray` now covers all three missing primitive arrays,
+    /// and the carrier it mints ALIASES.
+    ///
+    /// `javap java.lang.foreign.MemorySegment` declares seven `ofArray`
+    /// overloads — `byte[] char[] short[] int[] float[] long[] double[]` — and
+    /// NO `boolean[]` (measured: `NoSuchMethodException ... ofArray([Z)`).
+    /// This file registered four.
+    #[test]
+    fn of_array_covers_byte_short_and_char_and_the_carrier_aliases() {
+        for (elem, width) in [
+            (cratonvm_types::ArrayElementType::Byte, 1usize),
+            (cratonvm_types::ArrayElementType::Short, 2),
+            (cratonvm_types::ArrayElementType::Char, 2),
+        ] {
+            let mut ctx = mock_ctx();
+            let arr = ctx.new_array(elem, 8);
+            let seg = match pe_of_array_alias(&mut ctx, &[Value::Object(Some(arr))]).unwrap() {
+                Some(Value::Object(Some(seg))) => seg,
+                other => panic!("ofArray({elem:?}) answered {other:?}"),
+            };
+
+            assert_eq!(
+                crate::panama_libffi::segment_byte_size(&ctx, seg),
+                (8 * width) as i64,
+                "byteSize is length x element width for {elem:?}"
+            );
+            assert_eq!(
+                crate::panama_libffi::segment_address(&ctx, seg),
+                0,
+                "an alias carrier has NO machine address; 0 is the value every \
+                 raw-pointer consumer refuses on"
+            );
+
+            // A write through the segment must be visible in the Java array —
+            // the property the four `int[]/long[]/float[]/double[]` arms do
+            // NOT have, because they copy into an off-heap mirror.
+            let byte_layout = jdk_byte_layout(&mut ctx);
+            pe_segment_set_impl(&mut ctx, seg, byte_layout, 0, Value::Int(0x5a)).unwrap();
+            assert_eq!(
+                ctx.get_array_element(arr, 0),
+                Value::Int(0x5a),
+                "the write must alias the caller's {elem:?} array"
+            );
+        }
+    }
+
+    /// G19-1: a heap segment's scope is ONE session, minted with the segment,
+    /// and every view derived from it hands back that same object.
+    ///
+    /// MEASURED on 25.0.3+9-LTS (`G19Probe` §SC), and every row below is one of
+    /// those rows:
+    ///
+    /// ```text
+    /// heap.scope() == heap.scope()                 true
+    /// heap.asSlice(4,4).scope() == heap.scope()    true
+    /// heap.asReadOnly().scope() == heap.scope()    true
+    /// ofArray(a).scope() == ofArray(a).scope()     FALSE   (the same array!)
+    /// ```
+    ///
+    /// The last row is the one that says the answer is per-SEGMENT and not a
+    /// process-wide singleton, so it is asserted as a NEGATIVE — a fix that
+    /// handed every heap segment one shared session would satisfy the first
+    /// three and fail this one.
+    ///
+    /// Asserted through `pe_segment_session` as well as by slot, because the
+    /// slot write is only half the repair: the reader in `foreign_ffm`
+    /// (`p67_receiver_session`) has to recognise a session in slot 2, and if it
+    /// does not, `scope()` still mints a fresh one and this whole family stays
+    /// red with the carrier looking correct.
+    #[test]
+    fn a_heap_segments_scope_is_one_session_shared_by_its_slices() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        let seg = match pe_of_array_alias(&mut ctx, &[Value::Object(Some(arr))]).unwrap() {
+            Some(Value::Object(Some(seg))) => seg,
+            other => panic!("ofArray answered {other:?}"),
+        };
+
+        let session = match ctx.get_field(seg, PE_SEGMENT_ARENA_FIELD) {
+            Value::Object(Some(session)) => session,
+            other => panic!("slot 2 must carry the segment's session, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.class_name_of_id(ctx.class_id_of_object(session))
+                .as_deref(),
+            Some(PE_SESSION_CLASS),
+            "the stamped object must be a session, not an arena and not the array"
+        );
+        assert_eq!(
+            pe_segment_session(&ctx, seg),
+            Some(session),
+            "the resolver must find the stamped session"
+        );
+
+        // A slice and a read-only view both go through `pe_segment_slice`, so
+        // one write covers both — assert both anyway, because that sharing is a
+        // property of today's call graph and not of the rule.
+        let slice = match pe_segment_as_slice(
+            &mut ctx,
+            &[Value::Object(Some(seg)), Value::Long(4), Value::Long(4)],
+        )
+        .unwrap()
+        {
+            Some(Value::Object(Some(slice))) => slice,
+            other => panic!("asSlice answered {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field(slice, PE_SEGMENT_ARENA_FIELD),
+            Value::Object(Some(session)),
+            "a slice of a heap segment must share its parent's scope"
+        );
+        assert_eq!(pe_segment_session(&ctx, slice), Some(session));
+
+        let read_only = match pe_segment_slice(&mut ctx, seg, 0, 16, Some(true)).unwrap() {
+            Some(Value::Object(Some(view))) => view,
+            other => panic!("asReadOnly answered {other:?}"),
+        };
+        assert_eq!(
+            pe_segment_session(&ctx, read_only),
+            Some(session),
+            "asReadOnly must not drop the scope on the floor"
+        );
+
+        // Per SEGMENT, not per array and not per process.
+        let twin = match pe_of_array_alias(&mut ctx, &[Value::Object(Some(arr))]).unwrap() {
+            Some(Value::Object(Some(twin))) => twin,
+            other => panic!("ofArray answered {other:?}"),
+        };
+        assert_ne!(
+            pe_segment_session(&ctx, twin),
+            Some(session),
+            "two segments over the SAME array have distinct scopes on the oracle"
+        );
+    }
+
+    /// G19-1: stamping the session into slot 2 must not disturb the slot's two
+    /// older tenants.
+    ///
+    /// Slot 2 is [`SEG_BACKING_ARRAY_FIELD`] on an `ofArray` MIRROR carrier and
+    /// the owning arena on an arena-allocated one, and three readers key off it
+    /// — `sync_heap_backed_segment`, `pe_segment_heap_base`'s fallback and the
+    /// `isNative` discriminator. All three gate on `ctx.object_is_array`, which
+    /// a session is not, so all three must answer exactly what they answered
+    /// before. `heapBase()` is the one with a visible return value, so it is the
+    /// one asserted: the oracle says an alias carrier's `heapBase()` is present
+    /// and holds the caller's array (`G6-1` §6, row 1).
+    #[test]
+    fn stamping_the_scope_does_not_disturb_the_other_tenants_of_slot_two() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        let seg = match pe_of_array_alias(&mut ctx, &[Value::Object(Some(arr))]).unwrap() {
+            Some(Value::Object(Some(seg))) => seg,
+            other => panic!("ofArray answered {other:?}"),
+        };
+        assert_eq!(
+            pe_segment_heap_base(&ctx, seg),
+            Value::Object(Some(arr)),
+            "heapBase() must still be the caller's array, read from slot 6"
+        );
+        assert!(
+            heap_segment_view(&ctx, seg).is_some(),
+            "the carrier must still decode as a heap view"
+        );
+        // The read-only contagion still withholds the array, and it does so on a
+        // carrier whose slot 2 is now occupied.
+        let read_only = match pe_segment_slice(&mut ctx, seg, 0, 16, Some(true)).unwrap() {
+            Some(Value::Object(Some(view))) => view,
+            other => panic!("asReadOnly answered {other:?}"),
+        };
+        assert_eq!(
+            pe_segment_heap_base(&ctx, read_only),
+            Value::Object(None),
+            "a read-only view must not hand back the writable array"
+        );
+    }
+
+    /// A slice of a heap segment is still a heap segment — and this is the
+    /// crash F27 moved rather than closed.
+    ///
+    /// PRE-FIX `asSlice` computed `segment_address(this) + offset`, which for a
+    /// heap receiver is `0 + offset`, and stamped THAT into slot 0 of a
+    /// six-field synthetic. `ofArray(new byte[16]).asSlice(3, 4).get(...)`
+    /// then dereferenced the literal address 3. At offset 0 the product was 0
+    /// and refused, which is exactly why the un-sliced W7-89 §7.1 repro looked
+    /// fixed while the sliced one still died.
+    ///
+    /// Oracle: `asSlice(3, 4)` has `byteSize=4`, `address()=3`,
+    /// `isNative()=false`, and a write through it lands at `src[3..7]`.
+    #[test]
+    fn a_slice_of_a_heap_segment_is_still_a_heap_segment() {
+        let mut ctx = mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        let parent = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfByte",
+            arr,
+            0,
+            16,
+            false,
+        );
+
+        let slice = match pe_segment_as_slice(
+            &mut ctx,
+            &[Value::Object(Some(parent)), Value::Long(3), Value::Long(4)],
+        )
+        .unwrap()
+        {
+            Some(Value::Object(Some(slice))) => slice,
+            other => panic!("asSlice answered {other:?}"),
+        };
+
+        assert_eq!(
+            crate::panama_libffi::segment_address(&ctx, slice),
+            0,
+            "the slice must NOT carry its offset where an address belongs"
+        );
+        assert_eq!(crate::panama_libffi::segment_byte_size(&ctx, slice), 4);
+        let view = heap_segment_view(&ctx, slice).expect("a heap slice is a heap segment");
+        assert_eq!(view.start, 3, "and its address() is 3, per the oracle");
+
+        let layout = jdk_int_unaligned(&mut ctx);
+        pe_segment_set_impl(&mut ctx, slice, layout, 0, Value::Int(0x0102_0304)).unwrap();
+        assert_eq!(
+            byte_vec(&ctx, arr, 8),
+            vec![0, 0, 0, 4, 3, 2, 1, 0],
+            "the write goes through the slice to src[3..7]"
+        );
+
+        // And the slice's own bounds are the SLICE's, not the parent's.
+        assert!(
+            pe_segment_set_impl(&mut ctx, slice, layout, 1, Value::Int(0)).is_err(),
+            "offset 1 + 4 > 4"
+        );
+    }
+
+    /// NEGATIVE CONTROL for every arm above: a genuinely native segment must
+    /// still take the raw-address path and behave exactly as before.
+    ///
+    /// Without this, an over-broad heap predicate would silently route arena
+    /// memory through `get_array_element` and every test above would still
+    /// pass.
+    #[test]
+    fn a_native_segment_still_takes_the_raw_address_path() {
+        let mut ctx = mock_ctx();
+        let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
+        let seg = arena_segment(&mut ctx, arena, 16);
+        assert!(
+            heap_segment_view(&ctx, seg).is_none(),
+            "an arena segment is not a heap segment"
+        );
+        assert!(!crate::panama_libffi::is_real_heap_segment(&ctx, seg));
+
+        let layout = make_layout(&mut ctx, LAYOUT_INT);
+        pe_segment_set_impl(&mut ctx, seg, layout, 0, Value::Int(0x2a)).unwrap();
+        assert_eq!(
+            pe_segment_get_impl(&mut ctx, seg, layout, 0).unwrap(),
+            Some(Value::Int(0x2a)),
+            "the off-heap round trip is unchanged"
+        );
+        let ptr = match ctx.get_field(seg, 0) {
+            Value::Long(p) => p as *const i32,
+            other => panic!("arena segment slot 0 is {other:?}"),
+        };
+        assert_eq!(
+            unsafe { *ptr },
+            0x2a,
+            "and it really went to the native block, not to an array"
+        );
+    }
+
+    /// A heap segment must not be handed to anything as a POINTER.
+    ///
+    /// Oracle, and the message is quoted from it:
+    ///
+    /// ```text
+    /// MemorySegment.ofArray(new byte[16])
+    ///     .set(ADDRESS.withByteAlignment(1), 0, MemorySegment.ofArray(new byte[4]))
+    ///   -> IllegalArgumentException: Heap segment not allowed: ...
+    /// strlen(MemorySegment.ofArray("hi\0".getBytes()))
+    ///   -> IllegalArgumentException: Heap segment not allowed: ...
+    /// ```
+    ///
+    /// PRE-FIX this arm stored `segment_address(target)`, which since F27 is
+    /// **0** for a heap segment — a legitimate C null that no downstream
+    /// consumer can tell apart from a real one. A quiet wrong write, not a
+    /// refusal.
+    #[test]
+    fn a_heap_segment_is_refused_as_an_address_value() {
+        let mut ctx = mock_ctx();
+        let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
+        let dst = arena_segment(&mut ctx, arena, 16);
+        let address_layout = make_jdk_layout(
+            &mut ctx,
+            "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+            8,
+            1,
+        );
+
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
+        let heap = make_real_heap_segment(
+            &mut ctx,
+            "jdk/internal/foreign/HeapMemorySegmentImpl$OfByte",
+            arr,
+            0,
+            4,
+            false,
+        );
+        let err = pe_segment_set_impl(&mut ctx, dst, address_layout, 0, Value::Object(Some(heap)))
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Heap segment not allowed"),
+            "the refusal must name the reason, got {err:?}"
+        );
+
+        // CONTROL: a real native segment is still stored, so the arm above is
+        // not simply refusing every ADDRESS write.
+        let target = arena_segment(&mut ctx, arena, 8);
+        pe_segment_set_impl(&mut ctx, dst, address_layout, 0, Value::Object(Some(target)))
+            .expect("a native segment is still a legal ADDRESS value");
+        let stored = match pe_segment_get_impl(&mut ctx, dst, address_layout, 0).unwrap() {
+            Some(Value::Object(Some(seg))) => crate::panama_libffi::segment_address(&ctx, seg),
+            other => panic!("get(ADDRESS) answered {other:?}"),
+        };
+        assert_eq!(
+            stored,
+            crate::panama_libffi::segment_address(&ctx, target),
+            "and the value that was written is the target's real address"
+        );
+    }
+
+    /// `kind < 10` is NOT "is this a value layout".
+    ///
+    /// `LAYOUT_UNKNOWN` is -2, so the old spelling admitted it at all three
+    /// sites. This pins the arithmetic fact itself, so a future change to
+    /// either constant that re-opens the hole goes red here rather than in a
+    /// downstream default arm.
+    #[test]
+    fn the_range_test_excludes_layout_unknown() {
+        assert!(
+            crate::panama_libffi::LAYOUT_UNKNOWN < 10,
+            "this is WHY `kind < 10` was wrong - it is true for the unknown \
+             sentinel"
+        );
+        assert!(!layout_kind_is_value(crate::panama_libffi::LAYOUT_UNKNOWN));
+        assert!(!layout_kind_is_value(UPCALL_RETURN_VOID));
+        for kind in [
+            LAYOUT_BYTE,
+            LAYOUT_SHORT,
+            LAYOUT_INT,
+            LAYOUT_LONG,
+            LAYOUT_FLOAT,
+            LAYOUT_DOUBLE,
+            LAYOUT_ADDRESS,
+            LAYOUT_BOOLEAN,
+            LAYOUT_CHAR,
+        ] {
+            assert!(layout_kind_is_value(kind), "kind {kind} is a value layout");
+        }
+        for kind in [LAYOUT_STRUCT, LAYOUT_UNION, LAYOUT_SEQUENCE, LAYOUT_PADDING] {
+            assert!(!layout_kind_is_value(kind), "kind {kind} is a group layout");
+        }
+        assert_ne!(
+            UPCALL_RETURN_VOID,
+            crate::panama_libffi::LAYOUT_UNKNOWN,
+            "the two sentinels must stay distinct"
+        );
+    }
+
+    /// An unclassifiable layout is REFUSED by both accessors, not defaulted.
+    ///
+    /// PRE-FIX `ffi::layout_byte_size` answers 1 for an unrecognised kind and
+    /// the read's `_ =>` arm answered `Value::Int(0)`, so `get` returned a
+    /// believable zero and `set` was a silent no-op. Both are the shape this
+    /// family keeps paying for.
+    #[test]
+    fn an_unclassifiable_layout_is_refused_by_get_and_set() {
+        let mut ctx = mock_ctx();
+        let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
+        let seg = arena_segment(&mut ctx, arena, 16);
+        // A carrier with a `Long` slot 0 and a class name that is not any
+        // layout: `read_layout_kind` falls to the class matcher and answers
+        // LAYOUT_UNKNOWN.
+        let layout = make_jdk_layout(&mut ctx, "com/example/NotALayout", 4, 4);
+        assert_eq!(
+            crate::panama_libffi::read_layout_kind(&ctx, layout),
+            crate::panama_libffi::LAYOUT_UNKNOWN
+        );
+
+        let read = pe_segment_get_impl(&mut ctx, seg, layout, 0).unwrap_err();
+        assert!(
+            format!("{read:?}").contains("NotALayout"),
+            "the refusal must name the carrier, got {read:?}"
+        );
+        let write = pe_segment_set_impl(&mut ctx, seg, layout, 0, Value::Int(1)).unwrap_err();
+        assert!(format!("{write:?}").contains("NotALayout"));
+
+        // CONTROL: the same segment with a layout that DOES classify still
+        // works, so the refusal is not simply "this segment is broken".
+        let good = jdk_int_unaligned(&mut ctx);
+        assert!(pe_segment_get_impl(&mut ctx, seg, good, 0).is_ok());
+    }
+
+    /// The stride the ERASED `getAtIndex`/`setAtIndex` used cannot exist.
+    ///
+    /// They read `get_field(layout, 1)` matched against `Value::Int` — the
+    /// DELETED three-slot encoding, in which slot 1 was `Int(byteSize)`. On
+    /// the JDK-true four-slot carrier F16 made authoritative, slot 1 is
+    /// `Long(byteAlignment)`. So the arm could never match and the stride was
+    /// the `_ => 1` default: `getAtIndex(JAVA_INT, 2)` read offset 2.
+    ///
+    /// This pins the fact that made the old code unreachable-correct, which is
+    /// what a future re-introduction would have to contradict.
+    #[test]
+    fn slot_one_of_a_layout_is_a_long_alignment_never_an_int_size() {
+        let mut ctx = mock_ctx();
+        let int_unaligned = jdk_int_unaligned(&mut ctx);
+        assert_eq!(
+            ctx.get_field(int_unaligned, 1),
+            Value::Long(1),
+            "JAVA_INT_UNALIGNED is byteSize=4 byteAlignment=1 on the oracle, \
+             and slot 1 carries the ALIGNMENT"
+        );
+        assert!(
+            !matches!(ctx.get_field(int_unaligned, 1), Value::Int(_)),
+            "the erased accessors' `Value::Int` arm can never match"
+        );
+        assert_eq!(
+            crate::panama_libffi::layout_align(&ctx, int_unaligned),
+            1,
+            "so 1 is the alignment, not the size"
+        );
+        assert_eq!(
+            ffi::layout_byte_size(crate::panama_libffi::read_layout_kind(&ctx, int_unaligned)),
+            4,
+            "and the size - the stride the covariant accessors use - is 4"
+        );
+    }
+
+    /// W7-89 §7.2: the accessors are not `@Restricted` on JDK 25, so a missing
+    /// `--enable-native-access` must not refuse them.
+    ///
+    /// `grep "@Restricted" jdk25src/java.base/java/lang/foreign/MemorySegment.java`
+    /// hits three lines and all three are `reinterpret`. HotSpot 25 runs
+    /// `get`/`set`/`copy`/`fill` with no flag at all.
+    ///
+    /// MUTATION: reverting `require_segment_access` to `require_native_access`
+    /// makes the first assertion fail whenever the process has granted
+    /// nothing, which is the state a unit-test process is in. The second
+    /// assertion is the control: the flag-absent refusal still exists for the
+    /// paths that genuinely need it, and is still keyed on the same global.
+    #[test]
+    fn the_segment_accessors_are_not_gated_on_enable_native_access() {
+        let mut ctx = mock_ctx();
+        for op in ["get", "set", "getAtIndex", "setAtIndex", "copy", "fill"] {
+            assert!(
+                require_segment_access(&mut ctx, op).is_ok(),
+                "MemorySegment.{op} is not @Restricted on JDK 25 and must not \
+                 raise IllegalCallerException"
+            );
+        }
+        assert_eq!(
+            require_native_access(&mut ctx, "downcall").is_err(),
+            !native_access_enabled(),
+            "the flag-absent refusal must survive, unchanged, for the paths \
+             the JDK really does restrict"
+        );
     }
 }

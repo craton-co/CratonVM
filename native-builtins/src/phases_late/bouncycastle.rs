@@ -27,8 +27,10 @@ use super::*;
 /// The Java method computes `x mod m` — via `BigInteger.valueOf(m)`,
 /// `BigInteger.mod`, then `intValue()` — for ten ~32-bit moduli, each a
 /// product of consecutive small primes, and tests the remainder against every
-/// prime in the group. With `org/bouncycastle/*` JIT-banned this runs
-/// interpreted: ~10 BigInteger allocations + 10 limb-division calls per
+/// prime in the group. (The `org/bouncycastle/*` JIT ban this was written under
+/// is long gone — no ban list names the package today — but the allocation cost
+/// below is what motivates the intrinsic and does not depend on it.)
+/// ~10 BigInteger allocations + 10 limb-division calls per
 /// candidate, over hundreds of candidates per RSA prime, which dominates
 /// `RSAKeyPairGenerator.chooseRandomPrime` (see `RSATest.test_CVE_2017_15361`,
 /// the documented RSA non-finish — `comparison-handoff/
@@ -478,11 +480,28 @@ pub(crate) fn bc_poly_inverse(a: &[u64], m: usize, ks: &[usize]) -> Option<Vec<u
     Some(bc_poly_reduce(g1, m, ks))
 }
 
+/// The smallest `m_ints` BouncyCastle's `LongArray` ever carries.
+///
+/// `bc_trim_poly` drops trailing zero words, so the ZERO polynomial trims to an
+/// empty slice — and an empty `long[]` is not a value `LongArray` accepts.
+/// `isOne()` reads `a[0]` with no length test (`isZero()` loops and so survives
+/// one, which is why this stayed hidden), and the class's own
+/// `LongArray(BigInteger)` spells the intended representation out: a zero
+/// bigInt becomes `new long[]{ 0L }`, never `new long[0]`. A native handing
+/// back the empty array therefore builds a `LongArray` no BouncyCastle
+/// constructor could have produced, and the next `isOne()` on it raises
+/// `ArrayIndexOutOfBoundsException: Index 0 out of bounds for length 0` —
+/// `GeneralKeyTest.testDstu4145`, via `DSTU4145PointEncoder.encodePoint`.
+const LONG_ARRAY_MIN_WORDS: usize = 1;
+
 pub(crate) fn bc_alloc_long_array(
     ctx: &mut dyn NativeContext,
     words: &[u64],
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, words.len());
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Long,
+        words.len().max(LONG_ARRAY_MIN_WORDS),
+    );
     for (i, &word) in words.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Long(word as i64));
     }
@@ -517,7 +536,11 @@ pub(crate) fn bc_longarray_set_value(
     this: ObjectRef,
     words: &[u64],
 ) -> Result<(), MethodCallFailed> {
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, words.len());
+    // Same floor as `bc_alloc_long_array`; see `LONG_ARRAY_MIN_WORDS`.
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Long,
+        words.len().max(LONG_ARRAY_MIN_WORDS),
+    );
     for (i, &word) in words.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Long(word as i64));
     }
@@ -6118,8 +6141,86 @@ pub(crate) fn bc_aes_native_generate_working_key(
     Ok(Some(Value::Object(Some(wk))))
 }
 
+/// Are BouncyCastle services constraints installed?
+///
+/// Every AES engine entry point that CratonVM replaces natively ends, in
+/// BouncyCastle's own bytecode, with a
+/// `CryptoServicesRegistrar.checkConstraints(...)` call: the constructors
+/// check the algorithm at full strength, `init` checks the key that was
+/// actually supplied. That call raises `CryptoServiceConstraintsException`
+/// when the process has constraints installed and the service does not meet
+/// them, and a native that REPLACES the whole method drops it — an
+/// under-strength key then initialises with no error at all, which is exactly
+/// the failure a constraints policy exists to prevent
+/// (`SymmetricConstraintsTest.testAES`, "no exception!").
+///
+/// Constraints are off by default and these natives exist for that default
+/// path, so ask the registrar and hand the call straight back to the bytecode
+/// whenever anything other than the built-in no-op constraints object is
+/// installed. The real method then performs the real check with BouncyCastle's
+/// own `DefaultServiceProperties`, which carry a per-engine bits-of-security
+/// figure and a purpose derived from the direction — not something worth
+/// transcribing here, where it would silently rot against the library.
+///
+/// Every uncertain answer (registrar unloadable, field renamed, accessor
+/// missing) reports `true`: declining to the bytecode is always correct, only
+/// slower, whereas skipping the check is a security hole.
+fn bc_services_constraints_active(ctx: &mut dyn NativeContext) -> bool {
+    const REGISTRAR: &str = "org/bouncycastle/crypto/CryptoServicesRegistrar";
+    let Ok(class_id) = ctx.ensure_class_initialized(REGISTRAR) else {
+        return true;
+    };
+    let Some(idx) = ctx.static_field_index_by_name(class_id, "noConstraintsImpl") else {
+        return true;
+    };
+    let Value::Object(no_constraints) = ctx.get_static_field(class_id, idx) else {
+        return true;
+    };
+    match ctx.invoke(
+        REGISTRAR,
+        "getServicesConstraints",
+        "()Lorg/bouncycastle/crypto/CryptoServicesConstraints;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(current))) => current != no_constraints,
+        _ => true,
+    }
+}
+
+/// `<init>()` for the three AES engines. BouncyCastle's constructors are not
+/// empty: each one checks its algorithm against the installed constraints at
+/// full strength (`AESEngine` hardcodes 256, the other two ask
+/// `bitsOfSecurity()`). With no constraints installed there is genuinely
+/// nothing to do — the key schedule is built lazily by `init` /
+/// `generateWorkingKey`, and no field initialiser runs — so the native keeps
+/// the empty fast path that `newInstance()`'s `alloc_object` path wants, and
+/// defers to the bytecode only when the check can actually fire.
+pub(crate) fn bc_aes_native_ctor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if bc_services_constraints_active(ctx) {
+        let Some(class_name) = ctx.class_name_arc_of_id(ctx.class_id_of_object(this)) else {
+            return Ok(None);
+        };
+        return ctx.invoke_special_bytecode_only(
+            &class_name,
+            "<init>",
+            "()V",
+            &[Value::Object(Some(this))],
+        );
+    }
+    Ok(None)
+}
+
 pub(crate) fn bc_aes_native_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if bc_services_constraints_active(ctx) {
+        return ctx.invoke_virtual_bytecode_only(
+            this,
+            "init",
+            "(ZLorg/bouncycastle/crypto/CipherParameters;)V",
+            &args[1..],
+        );
+    }
     let for_enc = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
     let params = obj_arg(args, 2)?;
     let key_arr = match ctx.get_field_by_name(params, "key") {
@@ -6573,13 +6674,15 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // KEEP (genuinely empty): BouncyCastle's own `AESEngine()` no-arg
-    // constructor has an empty body — the key schedule is built lazily by
-    // `init`/`generateWorkingKey` (registered below), not at construction. The
-    // native exists only so `newInstance()`'s `alloc_object` + the real
-    // `MultiBlockCipher` call path do not have to run interpreted bytecode for
-    // a method that does nothing; it shadows nothing of substance.
-    r.register(aes, "<init>", "()V", |_ctx, _args| Ok(None));
+    // KEEP (empty only while no constraints are installed): the key schedule
+    // is built lazily by `init`/`generateWorkingKey` (registered below), not at
+    // construction, and BouncyCastle's own `AESEngine()` declares no field
+    // initialiser — so with the registrar at its default the native body is
+    // genuinely nothing, which is what `newInstance()`'s `alloc_object` + the
+    // real `MultiBlockCipher` call path want. The constructor is NOT empty
+    // otherwise: it checks AES-256 against the installed constraints, so
+    // `bc_aes_native_ctor` hands the call back to the bytecode when any are.
+    r.register(aes, "<init>", "()V", bc_aes_native_ctor);
     r.register(
         aes,
         "newInstance",
@@ -6650,6 +6753,16 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         "(ZLorg/bouncycastle/crypto/CipherParameters;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Same dropped `CryptoServicesRegistrar.checkConstraints` as in
+            // `bc_aes_native_init`; see `bc_services_constraints_active`.
+            if bc_services_constraints_active(ctx) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "init",
+                    "(ZLorg/bouncycastle/crypto/CipherParameters;)V",
+                    &args[1..],
+                );
+            }
             let for_enc = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
             let params = obj_arg(args, 2)?;
             let key_arr = match ctx.get_field_by_name(params, "key") {
@@ -6686,16 +6799,19 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         "org/bouncycastle/crypto/engines/AESLightEngine",
         "org/bouncycastle/crypto/engines/AESFastEngine",
     ] {
-        // Verified trivial constructor. BouncyCastle's block ciphers carry all
-        // their state in fields that `init(boolean, CipherParameters)` writes —
-        // here `bc_aes_native_init` (registered a few lines below for this same
-        // class) sets `ROUNDS`, `WorkingKey`, `forEncryption` and `s`. The
-        // no-arg constructor itself declares no field initializers and only
-        // chains to `Object.<init>`, and `bc_aes_native_process_block` refuses
-        // to run on an object whose `WorkingKey` is still unset
-        // ("AES engine not initialised"), so the real initialiser is provably
-        // on the use path and an empty constructor body loses nothing. KEEP.
-        r.register(aes_impl, "<init>", "()V", native_noop);
+        // Trivial constructor with one caveat. BouncyCastle's block ciphers
+        // carry all their state in fields that `init(boolean,
+        // CipherParameters)` writes — here `bc_aes_native_init` (registered a
+        // few lines below for this same class) sets `ROUNDS`, `WorkingKey`,
+        // `forEncryption` and `s`. The no-arg constructor declares no field
+        // initializers and only chains to `Object.<init>`, and
+        // `bc_aes_native_process_block` refuses to run on an object whose
+        // `WorkingKey` is still unset ("AES engine not initialised"), so the
+        // real initialiser is provably on the use path. What the body does
+        // carry is a constraints check on `bitsOfSecurity()`, so
+        // `bc_aes_native_ctor` runs the bytecode whenever constraints are
+        // installed and stays empty otherwise. KEEP.
+        r.register(aes_impl, "<init>", "()V", bc_aes_native_ctor);
         r.register(aes_impl, "encryptBlock", desc, bc_aes_native_encrypt_block);
         r.register(aes_impl, "decryptBlock", desc, bc_aes_native_decrypt_block);
         r.register(
@@ -8494,6 +8610,173 @@ pub(crate) fn register_bc_blake2s_digest(r: &mut NativeMethodRegistry) {
     );
 
     r.set_category(__prev_cat);
+}
+
+/// The eight chaining words `H1..H8`, in order, plus the two remaining fields
+/// `processBlock` touches.
+const BC_SHA256_STATE_FIELDS: [&str; 8] = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8"];
+
+/// Resolved heap slot indices for one `SHA256Digest` class: `(H1..H8, X, xOff)`.
+#[derive(Clone, Copy)]
+struct BcSha256Slots {
+    h: [usize; 8],
+    x: usize,
+    x_off: usize,
+}
+
+/// Slot cache, keyed by the receiver's `ClassId`.
+///
+/// `get_field_by_name` takes the class-manager read lock and walks the class
+/// hierarchy by name on every call; `processBlock` touches ten fields and is
+/// called once per 64-byte block, so paying that eighteen times per block would
+/// cost more than the bytecode this native replaces. The indices are a property
+/// of the class layout, so they are resolved once and reused.
+///
+/// Keyed on `ClassId` rather than cached unconditionally because the same class
+/// name can be loaded by two class loaders (two `ClassId`s, two layouts); a
+/// mismatch simply re-resolves rather than reading the wrong slots.
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both acquisitions copy a
+/// `Copy` payload out in the same statement; every `NativeContext` call in
+/// `bc_sha256_slots` (`class_id_of_object`, `declared_fields`) runs with no
+/// guard held.
+static BC_SHA256_SLOTS: cratonvm_types::lock_order::OrderedPlRwLock<Option<(u32, BcSha256Slots)>> =
+    cratonvm_types::lock_order::OrderedPlRwLock::new(None, cratonvm_types::lock_order::LockLevel::Scratch);
+
+fn bc_sha256_slots(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<BcSha256Slots, MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(this);
+    let key = class_id.as_u32();
+    if let Some((cached_key, slots)) = *BC_SHA256_SLOTS.read() {
+        if cached_key == key {
+            return Ok(slots);
+        }
+    }
+    let bad = |what: &str| -> MethodCallFailed {
+        RuntimeError::IllegalStateException {
+            message: format!("SHA256Digest: cannot resolve field {what}"),
+        }
+        .into()
+    };
+    // `declared_fields` reports fields declared BY this class with an absolute
+    // heap slot index; H1..H8, X and xOff are all declared on `SHA256Digest`
+    // itself, so no super-class walk is needed.
+    let fields = ctx.declared_fields(class_id);
+    let index_of = |name: &str| -> Option<usize> {
+        fields
+            .iter()
+            .find(|f| f.name == name && !f.is_static)
+            .map(|f| f.slot_index)
+    };
+    let mut h = [0usize; 8];
+    for (slot, name) in h.iter_mut().zip(BC_SHA256_STATE_FIELDS) {
+        *slot = index_of(name).ok_or_else(|| bad(name))?;
+    }
+    let slots = BcSha256Slots {
+        h,
+        x: index_of("X").ok_or_else(|| bad("X"))?,
+        x_off: index_of("xOff").ok_or_else(|| bad("xOff"))?,
+    };
+    *BC_SHA256_SLOTS.write() = Some((key, slots));
+    Ok(slots)
+}
+
+/// Native `org.bouncycastle.crypto.digests.SHA256Digest.processBlock()`.
+///
+/// # Why this one and not `MessageDigest`
+///
+/// BouncyCastle's LMS/HSS (`pqc.crypto.lms`) builds `new SHA256Digest()`
+/// directly — see that package's `DigestUtil.createDigest` — so this VM's
+/// native JCA SHA-256 is on a path the workload never takes, and HotSpot has no
+/// intrinsic for BouncyCastle's class either. Both VMs run the round schedule as
+/// real bytecode; measurement put CratonVM at ~37x HotSpot on that kernel with
+/// the JIT fully engaged and nothing stuck in the interpreter. This replaces the
+/// one leaf that owns the cost.
+///
+/// # Why `processBlock` is the right seam
+///
+/// It is a `protected` leaf with no arguments and no calls out: every input is a
+/// field of the receiver (`H1..H8`, `X`), and the kernel reproduces its exact
+/// post-state including the expanded schedule left in `X[16..64]` and the
+/// cleared `X[0..16]`. Buffering, padding, length encoding, `reset`, `copy` and
+/// `getEncodedState` all stay real bytecode.
+///
+/// `SHA256Digest` has no subclasses in BouncyCastle, so the superclass walk in
+/// `intercept_force_registered_native` cannot divert some other digest's
+/// `processBlock` here. Tagged `Intrinsic`, not a stub: it computes the method's
+/// exact result rather than standing in for it.
+pub(crate) fn register_bc_sha256_digest(r: &mut NativeMethodRegistry) {
+    // `register_with_kind` rather than the ambient `set_category` the older BC
+    // registrars around this one use: it records `kind_stated`, so the census
+    // can tell "somebody adjudicated this as an Intrinsic" from "this inherited
+    // whatever category was ambient at the registration site".
+    r.register_with_kind(
+        "org/bouncycastle/crypto/digests/SHA256Digest",
+        "processBlock",
+        "()V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let slots = bc_sha256_slots(ctx, this)?;
+
+            let mut state = [0u32; 8];
+            for (slot, index) in state.iter_mut().zip(slots.h) {
+                match ctx.get_field(this, index) {
+                    Value::Int(v) => *slot = v as u32,
+                    _ => {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: "SHA256Digest: malformed chaining word".into(),
+                        }
+                        .into())
+                    }
+                }
+            }
+
+            let x_arr = match ctx.get_field(this, slots.x) {
+                Value::Object(Some(o)) => o,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "SHA256Digest: missing X".into(),
+                    }
+                    .into())
+                }
+            };
+
+            // One bulk read of all 64 words rather than 64 `get_array_element`
+            // round trips — the per-element path costs a virtual dispatch plus a
+            // `Value` box per word, which is most of what this native exists to
+            // remove. Only `X[0..16]` is live input; the tail is read so the
+            // single bulk write-back below can restore the whole array. A short
+            // read means `X` is not the 64-word `int[]` the class declares.
+            let mut words = [0i32; 64];
+            if ctx.read_int_array_into(x_arr, 0, &mut words) != 64 {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "SHA256Digest: X is not a 64-word int[]".into(),
+                }
+                .into());
+            }
+            let mut x = [0u32; 64];
+            for (dst, src) in x.iter_mut().zip(words.iter()) {
+                *dst = *src as u32;
+            }
+
+            cratonvm_native_builtins_crypto::bc_digest::sha256_process_block(&mut state, &mut x);
+
+            for (word, index) in state.iter().zip(slots.h) {
+                ctx.set_field(this, index, Value::Int(*word as i32));
+            }
+            for (dst, src) in words.iter_mut().zip(x.iter()) {
+                *dst = *src as i32;
+            }
+            ctx.write_int_array_from(x_arr, 0, &words);
+            // BouncyCastle's `xOff = 0`, which `processWord` reads to decide
+            // when the next block is full. Omitting it would leave the digest
+            // permanently mid-block.
+            ctx.set_field(this, slots.x_off, Value::Int(0));
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Intrinsic,
+    );
 }
 
 pub(crate) const BC_KECCAK_ROUND_CONSTANTS: [u64; 24] = [
@@ -10557,6 +10840,26 @@ pub(crate) fn bc_pkcs12_generator_bytes(
     }
 }
 
+/// Is this `PKCS12ParametersGenerator` the SHA-1 one the native KDF computes?
+///
+/// PKCS#12's KDF is parameterised by a digest: `new PKCS12ParametersGenerator(
+/// new SHA1Digest())` is the common case and the only one
+/// `bc_pkcs12_derive_sha1` implements. Every other digest — SHA-256, GOST3411 —
+/// must run BouncyCastle's OWN bytecode, exactly as the `PKCS5S2` sibling does
+/// for a PRF this VM has no arm for. Raising instead turned three bc-java
+/// `PfxPduTest` cases (`testGOST1`, `testGOST2`, `testCreateAES256andSHA256`)
+/// into hard errors from inside the MAC-calculator builder.
+fn bc_pkcs12_is_sha1(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let Value::Object(Some(digest)) = ctx.get_field_by_name(this, "digest") else {
+        return false;
+    };
+    matches!(
+        ctx.class_name_arc_of_id(ctx.class_id_of_object(digest))
+            .as_deref(),
+        Some("org/bouncycastle/crypto/digests/SHA1Digest")
+    )
+}
+
 pub(crate) fn bc_pkcs12_require_sha1(
     ctx: &dyn NativeContext,
     this: ObjectRef,
@@ -10710,6 +11013,14 @@ pub(crate) fn register_bc_pkcs12_parameters_generator(r: &mut NativeMethodRegist
                 }
                 _ => 0,
             };
+            if !bc_pkcs12_is_sha1(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedParameters",
+                    "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0))],
+                );
+            }
             let (password, salt, iteration_count) = bc_pkcs12_read_state(ctx, this)?;
             let key = bc_pkcs12_derive_sha1(&password, &salt, iteration_count, 1, key_size);
             let obj = bc_pkcs12_key_parameter(ctx, &key)?;
@@ -10736,6 +11047,14 @@ pub(crate) fn register_bc_pkcs12_parameters_generator(r: &mut NativeMethodRegist
                 }
                 _ => 0,
             };
+            if !bc_pkcs12_is_sha1(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedParameters",
+                    "(II)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0)), args.get(2).copied().unwrap_or(Value::Int(0))],
+                );
+            }
             let (password, salt, iteration_count) = bc_pkcs12_read_state(ctx, this)?;
             let key = bc_pkcs12_derive_sha1(&password, &salt, iteration_count, 1, key_size);
             let iv = bc_pkcs12_derive_sha1(&password, &salt, iteration_count, 2, iv_size);
@@ -10756,6 +11075,14 @@ pub(crate) fn register_bc_pkcs12_parameters_generator(r: &mut NativeMethodRegist
                 }
                 _ => 0,
             };
+            if !bc_pkcs12_is_sha1(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedMacParameters",
+                    "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0))],
+                );
+            }
             let (password, salt, iteration_count) = bc_pkcs12_read_state(ctx, this)?;
             let key = bc_pkcs12_derive_sha1(&password, &salt, iteration_count, 3, key_size);
             let obj = bc_pkcs12_key_parameter(ctx, &key)?;

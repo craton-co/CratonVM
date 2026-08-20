@@ -2383,10 +2383,52 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
         // `dead` is processed under the collector's stop-the-world token, so
         // no mutator can retain a cache hit while its registry owner is
         // removed. The next mutator observation must use a fresh lookup.
+        //
+        // Bumped unconditionally, BEFORE the survey below decides whether any
+        // removal is possible. One relaxed atomic add is not worth reasoning
+        // about whether a mutator can hold a cached handle for an address the
+        // sweep has just recycled.
         self.cas_lock_epoch.fetch_add(1, Ordering::Release);
-        {
+        // Which shards hold anything at all, asked ONCE.
+        //
+        // `dead` is every address the sweep freed, so on an allocation-heavy
+        // workload it is millions of entries per cycle, while the number of
+        // INFLATED monitors is usually zero and never more than a handful --
+        // inflation needs real contention. The loops below used to lock a
+        // shard and hash a key for every one of those addresses, in both
+        // registries, to remove nothing: `MonitorTable::prune_dead` measured
+        // 5.36% of `LegendreHighPrecisionTest` and 4.98% of
+        // `PSquarePercentileTest`, two workloads with no contended monitor in
+        // them at all.
+        //
+        // 64 shards, so this costs at most 128 uncontended lock/unlock pairs
+        // and answers the only question that matters: an empty shard cannot
+        // contain any dead address, so every key hashing to it can be skipped
+        // without taking its lock. When nothing is inflated -- the common case
+        // -- the whole prune becomes those 128 pairs instead of `2 * dead.len()`.
+        //
+        // Sound because this runs under the collector's stop-the-world token:
+        // no mutator can inflate a monitor between the survey and the loops,
+        // so a shard observed empty stays empty for the duration.
+        let mut monitors_nonempty = [false; MONITOR_SHARDS];
+        let mut cas_nonempty = [false; MONITOR_SHARDS];
+        let mut any_monitor = false;
+        let mut any_cas = false;
+        for i in 0..MONITOR_SHARDS {
+            monitors_nonempty[i] = !self.monitors[i].lock().is_empty();
+            cas_nonempty[i] = !self.cas_locks[i].lock().is_empty();
+            any_monitor |= monitors_nonempty[i];
+            any_cas |= cas_nonempty[i];
+        }
+        if !any_monitor && !any_cas {
+            return;
+        }
+        if any_monitor {
             // Group by shard so each shard is locked once; never two at a time.
             for d in dead {
+                if !monitors_nonempty[shard_of(*d)] {
+                    continue;
+                }
                 let removed = self.monitor_shard(*d).lock().remove(d);
                 if let Some(monitor) = removed {
                     // SAFETY: `dead` is documented EXACT — this address was a
@@ -2398,8 +2440,11 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
                 }
             }
         }
-        {
+        if any_cas {
             for d in dead {
+                if !cas_nonempty[shard_of(*d)] {
+                    continue;
+                }
                 self.cas_locks[shard_of(*d)].lock().remove(d);
             }
         }
@@ -2796,8 +2841,70 @@ mod tests {
         );
     }
 
+    /// The shard survey must not lose a removal.
+    ///
+    /// `prune_dead` skips a dead address whose shard is empty, which is what
+    /// makes it O(shards) instead of O(dead) on an allocation-heavy workload.
+    /// The risk of that shortcut is precisely that it skips a shard that is
+    /// NOT empty, so this inflates a real monitor, prunes it alongside a large
+    /// slab of unrelated dead addresses, and asserts the entry is gone.
+    ///
+    /// Verified by BREAKING it: making the survey answer `false` for every
+    /// shard (`monitors_nonempty = [false; MONITOR_SHARDS]`) leaves the entry
+    /// in the index and fails here.
+    #[test]
+    fn prune_dead_still_removes_an_inflated_monitor_among_many_dead() {
+        use cratonvm_gc::MonitorCleanup;
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(1);
+
+        // Force inflation, then release it so the entry is prunable.
+        table.enter(obj, tid);
+        table.wait(obj, tid, Some(1), None).unwrap();
+        table.exit(obj, tid).ok();
+        let before = table.indexed_monitor_count();
+        assert!(
+            before > 0,
+            "the fixture must actually inflate, or the assertion below passes             vacuously against an index that was empty all along"
+        );
+
+        // A realistic `dead` slab: the one real address buried in a crowd of
+        // addresses that hash all over the 64 shards.
+        let mut dead: Vec<usize> = (1..=4096).map(|i| i * 4096).collect();
+        dead.push(obj.as_ptr() as usize);
+        table.prune_dead(&dead);
+
+        assert_eq!(
+            table.indexed_monitor_count(),
+            before - 1,
+            "the shard survey must not let a real entry through: an address             whose shard is NON-empty has to be looked up"
+        );
+    }
+
+    /// The other half of the same shortcut: with nothing inflated anywhere,
+    /// pruning must be a no-op that touches no key.
+    ///
+    /// This is the case that dominates in practice -- `LegendreHighPrecision`
+    /// and `PSquarePercentile` inflate no monitor at all -- and it is the one
+    /// the old code spent 5% of the run on.
+    #[test]
+    fn prune_dead_on_an_empty_table_removes_nothing() {
+        use cratonvm_gc::MonitorCleanup;
+        let table = MonitorTable::new();
+        assert_eq!(table.indexed_monitor_count(), 0);
+        let dead: Vec<usize> = (1..=4096).map(|i| i * 4096).collect();
+        table.prune_dead(&dead);
+        assert_eq!(
+            table.indexed_monitor_count(),
+            0,
+            "an empty index must stay empty"
+        );
+    }
+
     #[test]
     fn monitor_contention_two_threads() {
+
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let heap = Heap::new();
@@ -3531,37 +3638,86 @@ mod tests {
         // the thin lock; the second arrival must inflate to a heavyweight
         // Monitor. After both finish, the registry must contain exactly
         // one inflated monitor.
-        use std::sync::Barrier;
+        //
+        // CONTENTION IS ARRANGED, NOT TIMED. This test used to hold the lock
+        // for 20ms and have the second thread sleep 2ms before entering,
+        // trusting the 10x margin to keep the two windows overlapping. That is
+        // an assumption about the SCHEDULER, and it does not hold on a busy
+        // box: if thread 1's whole hold completes before thread 2 wakes,
+        // thread 2 takes an UNCONTENDED thin lock, nothing ever inflates, and
+        // the assertions below fail with `left: 0, right: 1`. It failed exactly
+        // that way twice on an 8-core CI host with a second cargo job running,
+        // and resisted 24 deliberate reproduction attempts afterwards — the
+        // signature of a timing assumption, not of a defect in `MonitorTable`.
+        // (`fixed-bugs/monitor-inflation-test-timed-its-contention-instead-of-`
+        // `arranging-it-FIXED-20260818`, in the internal tree.)
+        //
+        // The handshake below removes the assumption in both directions:
+        //
+        //   * thread 2 does not attempt entry until thread 1 has published
+        //     that it HOLDS the thin lock, so it can never arrive early;
+        //   * thread 1 does not release until it observes the object INFLATED,
+        //     so it can never leave early.
+        //
+        // That is deadlock-free by the documented shape of the contended path:
+        // `enter_or_contend`'s `THIN_LOCKED(other)` arm inflates FIRST and only
+        // then blocks, so thread 1's wait is satisfied by thread 2 reaching the
+        // block, not by thread 1 releasing. The deadline turns a regression
+        // that breaks that ordering into a failure with a message instead of a
+        // hung suite.
+        use std::sync::{Condvar, Mutex};
+        use std::time::{Duration, Instant};
 
         let heap = Heap::new();
         let obj = heap.alloc_object(ClassId::new(0), 0);
         let table = Arc::new(MonitorTable::new());
 
-        // Barrier to ensure both threads are running before contention starts.
-        let barrier = Arc::new(Barrier::new(2));
+        // `false` until thread 1 owns the thin lock.
+        let held = Arc::new((Mutex::new(false), Condvar::new()));
 
-        // Thread 1 takes the lock and holds it long enough that thread 2
-        // arrives and must inflate.
         let table1 = table.clone();
-        let barrier1 = barrier.clone();
+        let held1 = held.clone();
         let h1 = std::thread::spawn(move || {
             table1.enter(obj, ThreadId(1));
-            // Mark word should be THIN_LOCKED for tid 1 here -- but thread 2
-            // is about to race in and inflate it.
-            barrier1.wait();
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            {
+                let (lock, cv) = &*held1;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+            }
+            // Hold until thread 2's contended entry has actually inflated the
+            // object. This is the half that makes the test measure inflation
+            // rather than measure the scheduler.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+                if ObjectHeader::mark_state(mark) == types::MARK_INFLATED {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "thread 2 never inflated the object while thread 1 held the \
+                     thin lock: the contended `enter` path must inflate BEFORE \
+                     it blocks, or this handshake (and the fast path it \
+                     documents) is wrong"
+                );
+                std::thread::yield_now();
+            }
             table1.exit(obj, ThreadId(1)).unwrap();
         });
 
-        // Thread 2: arrives after thread 1 has the thin lock. The
-        // contended-thin-lock path inflates and then blocks on entry.
         let table2 = table.clone();
-        let barrier2 = barrier.clone();
+        let held2 = held.clone();
         let h2 = std::thread::spawn(move || {
-            barrier2.wait();
-            // Brief delay to ensure thread 1 is still inside the critical
-            // section when we attempt to enter.
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            {
+                let (lock, cv) = &*held2;
+                let mut owned = lock.lock().unwrap();
+                while !*owned {
+                    owned = cv.wait(owned).unwrap();
+                }
+            }
+            // Thread 1 provably holds the thin lock right now, so this entry
+            // is contended by construction: it inflates, then blocks until
+            // thread 1 observes the inflation and releases.
             table2.enter(obj, ThreadId(2));
             table2.exit(obj, ThreadId(2)).unwrap();
         });

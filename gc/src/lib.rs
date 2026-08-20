@@ -43,6 +43,21 @@
     clippy::explicit_auto_deref,
     clippy::doc_lazy_continuation
 )]
+// A RATCHET, not a style preference. `duplicate_macro_attributes` fired on
+// `tlab.rs` and was read past, and what it was reporting was that a test had
+// stopped being a test: an insertion between `#[test]` and its `fn` moved the
+// attribute onto the item below, so `retire_charges_the_thread_for_...` was
+// registered TWICE and `install_tail_filler_always_consumes_the_tlab` was
+// registered NOT AT ALL. The suite count went up, nothing failed, and a
+// heap-corruption guard silently stopped running for as long as it took someone
+// to compare `--list` against the source.
+//
+// Denying it makes the next occurrence a build failure. It is the right lint for
+// this: a duplicated `#[test]` has no legitimate use, and the duplicate is the
+// *observable* half of a slip whose other half -- the orphaned function -- is
+// invisible in test output. Worth adding workspace-wide; scoped here because
+// this is where it happened and where the largest test module lives.
+#![deny(duplicate_macro_attributes)]
 
 /// The GC slice of the process-wide typed configuration.
 ///
@@ -149,8 +164,9 @@ pub use gc_metrics::{
     collector_decision_report, gc_metrics_report, CollectorDecision, GcMetricsRaw, GcMetricsReport,
 };
 pub use gen_heap::{
-    jit_region_bounds_addr, GenerationalHeap, HeapStats, HeapStatsSnapshot, JitRegionBoundsTable,
-    JIT_REGION_BOUNDS,
+    clear_jit_read_bounds, jit_read_bounds_addr, jit_region_bounds_addr, publish_jit_read_bounds,
+    GenerationalHeap, HeapStats, HeapStatsSnapshot, JitReadBoundsTable, JitRegionBoundsTable,
+    JIT_READ_BOUNDS, JIT_REGION_BOUNDS,
 };
 pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;

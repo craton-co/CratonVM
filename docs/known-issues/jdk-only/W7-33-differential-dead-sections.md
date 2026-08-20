@@ -520,3 +520,70 @@ in `native_stack_pop` and `native_stack_peek`.
   cannot reach the synthetic-stub layout at all — all three call sites are on
   the named-`array` branch, which a stub with unnamed slots does not take — so
   the synthetic path is bit-identical.
+
+---
+
+## Is any of this scheduled? — 2026-08-12 (doc-only lane)
+
+Checked against the tree, because the reconciliation banner above closes items
+"in source" and a source close is only as good as what re-reads it later.
+
+**The source claims are all verified present.** `RuntimeError::EmptyStackException`
+at `types/src/error.rs:1097-1098`, mapped at `:1633`, in the exhaustiveness loop
+at `:1720`; no `"Stack is empty"` `NoSuchElementException` string remains
+anywhere in `native-collections/src/lib.rs`. **Both** `classloading/src/class_manager.rs`
+additions the R2 follow-up specifies are in the tree —
+`| "java/util/EmptyStackException"` in the `jdk_superclass` arm at `:10673` and
+in the `synthetic_stub_fields` arm at `:12116`, each with a comment naming the
+`RuntimeException`-directly rule. So the banner's *"APPLIED 2026-08-12, unbuilt"*
+is accurate on both halves.
+
+**The headline's coverage is genuinely scheduled.** `RExceptions` is in
+`CORE_CLASSES` (`regression-suite/run.sh:106`), and `RExceptions.java:206-220`
+carries both the `pop()` and `peek()` pairs with the wrong-type arm. That is a
+default-invocation gate, and it discriminates: `EmptyStackException` is not a
+`NoSuchElementException`, so the pre-`aab87e003` behaviour trips
+`eseWrongType`.
+
+**The rest of this record's evidence is scheduled by nothing, and the number is
+worse than "not by `run.sh`".** Every before/after row in Parts 1–3, all 96 and
+all 43 divergent observables, and the whole family table come from
+`probes/ShadowDifferentialProbe.java`. Measured:
+
+* the string `probes` appears **zero** times in `regression-suite/run.sh`, at any
+  `SUITE=` value — so **no suite run, however green, can discharge anything
+  here**;
+* the only scheduled consumer of `probes/` is
+  `scripts/jdk-only-strict-probes.sh` (`.github/workflows/ci.yml:315`, `:1404`),
+  whose `PROBE_LIST` default is three names —
+  `JdkOnlyCensusLoadProbe JdkOnlyBreadthProbe JdkOnlyPlatformProbe` — out of
+  **449 `.java` files in `probes/`**;
+* `ShadowDifferentialProbe` is named by **no `.sh` and no `.yml`** in the tree.
+  Its only in-tree references are Rust doc comments in
+  `native-builtins/src/lang_class.rs` and `lang_string.rs` describing cases it
+  once measured.
+
+That is not an argument for scheduling it. A 1,400-line differential probe
+diffed against HotSpot is the wrong shape for a gate — it goes red on any
+unrelated formatting drift, which is the failure mode `run.sh`'s `extract()`
+filter exists to avoid (W7-60). The point is narrower and it is a **standing
+caveat for every reader of this record**: the 43 remaining divergent
+observables, the residual list R1/R2/R3, and the "next lane's real target list"
+(`format` 12, `Throwable` 5, `TreeMap` 4, `subList` 3, `VM` 3, `TreeSet` 3,
+`CHM` 2) are **snapshots taken by hand on one binary on one day**. Nothing
+re-takes them, nothing notices when one converges, and nothing notices when one
+regresses. A lane that wants a number from this record must re-run the probe
+itself; it must not infer from a green suite that the numbers still hold.
+
+**R1 and R3 disposition.** R1 (`PriorityQueue.add(null)`) is closed in source by
+`W7-36-differential-view-families.md` Part 1 and is covered by `RJdkViews`'s
+`sortedContainerRefusals()`, which **is** scheduled (`RJdkViews` in
+`CORE_CLASSES`). R3 (`CHM.reduceValues` / `searchKeys`) is closed in source by
+W7-36 Part 1 R3 and has **no scheduled witness at all** — its only observable is
+the probe. The long "deliberately still unregistered" list W7-36 leaves behind
+(`reduceKeys`, `reduceEntries`, `searchValues`, `searchEntries`, the `…ToInt/Long/Double`
+family, `forEachKey`/`forEachValue`/`forEachEntry`) is in the same position, and
+for that list there is now a cheaper instrument than the probe: a
+`--jdk-only-report` run emits `native-shadows-bytecode` rows carrying class,
+method and descriptor, which answers "is this triple registered on this build"
+directly and without a differential.

@@ -365,6 +365,48 @@ pub fn zgc_read_barrier_blocks_inline_fields() -> bool {
 /// inline reference emission is ever re-enabled under an armed barrier, this
 /// must go back to `false`**, or `zgc_relocation_permitted` silently starts
 /// allowing a relocating cycle to hand JIT code stale pointers.
+///
+/// # Re-examined 2026-08-18, when `JIT_READ_BOUNDS` landed
+///
+/// The read-side bounds table exists precisely to make the guarded inline
+/// `getfield` containment check PASS under a collector that publishes no
+/// region bounds -- which is the condition that had been keeping inline
+/// reference reads unreachable under ZGC. So it is exactly the kind of change
+/// this obligation is about, and it was checked rather than assumed.
+///
+/// Still `true`, by TWO independent mechanisms, either of which alone suffices:
+///
+/// 1. ~~**ZGC does not publish.**~~ **SUPERSEDED 2026-08-19 — ZGC publishes
+///    now, and mechanism 1 was replaced rather than lost.** The reason it was
+///    safe not to publish was that a compact reference slot under ZGC holds a
+///    colored word; `feature-designs/zgc-reference-slot-representation.md`
+///    measured that premise false for the tree that runs (*"Reference slots
+///    are plain pointers; nothing in the heap stores a colored word"*), and
+///    `ZgcRealHeap::set_barrier_color` — the sole writer of the colored state
+///    — has no non-test caller, so the barrier this predicate is named for is
+///    never armed in a real process.
+///
+///    What took its place is stronger where mechanism 2 is weakest: **arming
+///    the barrier CLEARS `JIT_READ_BOUNDS`** (`gc/src/zgc.rs`,
+///    `set_barrier_color`). The emitted containment sequence loads those words
+///    at RUNTIME, so clearing them disables the inline branch in code that was
+///    ALREADY COMPILED — which mechanism 2, an emission-time gate, cannot do.
+///    Before 2026-08-19 nothing covered that window; it did not matter only
+///    because ZGC published nothing at all.
+/// 2. **Emission is blocked outright while the barrier is armed.** Every
+///    inline compact-field site is gated on
+///    [`narrow_oops_block_inline_fields`], which is
+///    `narrow_oops_enabled() || zgc_read_barrier_blocks_inline_fields()`. An
+///    armed barrier therefore suppresses the emission, not merely the branch.
+///
+/// Someone later DID decide ZGC should publish its `conservative_addr_span()`
+/// after all — 2026-08-19, to close the 56.9M-call reference-read residual on
+/// the default collector. Mechanism 2 survived that unchanged, as predicted;
+/// mechanism 1 was rewritten above into the runtime clear that covers
+/// already-compiled code. The obligation is unchanged and still binds, and it
+/// now has a third clause: **the clear must not race a live inline sequence**,
+/// so a real cycle has to arm at a safepoint. That is stated at
+/// `set_barrier_color`, where the first non-test caller will read it.
 #[inline]
 pub fn zgc_codegen_honours_read_barrier() -> bool {
     true
@@ -579,8 +621,16 @@ pub fn inline_getfield_enabled() -> bool {
 /// — never dereference a receiver outside the always-mapped GC arenas — at
 /// inline-check cost: null/alignment bit-tests plus the same three-region
 /// `[base, end)` containment check that `is_object_address` uses as its
-/// gate, reading the GC's process-global `JIT_REGION_BOUNDS` table whose
-/// address the helpers table carries in `region_bounds_addr`. Receivers that
+/// gate, reading the GC's process-global `JIT_READ_BOUNDS` table whose
+/// address the helpers table carries in `read_bounds_addr`.
+///
+/// The READ table, not `JIT_REGION_BOUNDS`, since 2026-08-18: that table's
+/// emptiness under G1/ZGC is what keeps inline reference STORES unreachable
+/// (`audits/g1-audit.md` 8.1), so it could never be filled to make inline
+/// READS reachable. `JIT_READ_BOUNDS` answers only the read question -- is
+/// this address mapped -- and G1 fills it with its single contiguous arena
+/// span. ZGC still publishes nothing, which keeps this path unreachable
+/// there, as `zgc_codegen_honours_read_barrier` requires. Receivers that
 /// pass are raw-loaded inline (a mapped-arena read cannot fault); everything
 /// else — null, unaligned garbage, out-of-heap bits, or a backend that does
 /// not publish bounds (G1/ZGC → table all zeros) — branches to the checked
@@ -2465,10 +2515,14 @@ pub(super) fn compute_local_oop_masks(
 /// math.ec` AllTests, and as a bad pointer the young-gen GC scavenge later
 /// follows into a SEGV.
 ///
-/// `jit_scan` already ACCEPTS `dup2` (it only advances `pc`), and the five
-/// other type-dependent stack ops (`pop2`, `dup_x1`, `dup_x2`, `dup2_x1`,
-/// `dup2_x2`) are not implemented by codegen and safely bail. Only `dup2` is
-/// both accepted AND (mis-)implemented, so it is the lone miscompile.
+/// `jit_scan` already ACCEPTS `dup2` (it only advances `pc`), and at the time
+/// this was written the five other type-dependent stack ops (`pop2`,
+/// `dup_x1`, `dup_x2`, `dup2_x1`, `dup2_x2`) were not implemented by codegen
+/// and safely bailed, so `dup2` was the lone miscompile. **All five have
+/// since grown codegen arms**, each proving its form before shuffling —
+/// `dup2_x2` last, in 2026-08-18. Do not read the sentence above as a live
+/// statement about the codegen's repertoire; this whole helper is retained
+/// for reference only (see the NOTE below).
 ///
 /// ## The fix
 ///
@@ -2661,12 +2715,14 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // --- stack manipulation (the crux) ---
             //
             // POLICY: this analyzer's ONLY purpose is to reject methods whose
-            // `dup2` (0x5C, the single ambiguous stack op the codegen actually
-            // implements) operates on a CATEGORY-2 value. The other ambiguous
-            // ops (`pop2`, `dup_x1`, `dup_x2`, `dup2_x1`, `dup2_x2`) are NOT
-            // implemented by codegen — they hit the `_ => return false` bail in
-            // `compile_bytecode` and the method safely stays interpreted, so we
-            // do NOT reject for them here. An imprecisely-modeled state is
+            // `dup2` (0x5C) operates on a CATEGORY-2 value. When it was
+            // written, the other ambiguous ops (`pop2`, `dup_x1`, `dup_x2`,
+            // `dup2_x1`, `dup2_x2`) had no codegen arm — they hit the
+            // `_ =>` bail in `compile_bytecode` and the method safely stayed
+            // interpreted — so we did not reject for them here. They all have
+            // arms now, which does not change this helper's policy (it is no
+            // longer wired into `jit_scan` at all), but does mean the
+            // parenthetical is history, not a fact about today's codegen. An imprecisely-modeled state is
             // handled by CLEARING the abstract stack (treat subsequent values
             // as unknown) rather than rejecting outright, preserving JIT
             // coverage up to the next ambiguity. A `dup2` reached against a
@@ -2681,8 +2737,8 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
                 pop!();
                 pc += 1;
             }
-            // pop2: two cat-1 OR one cat-2 — codegen's `pop2` is unimplemented
-            // (bails), so we only need to keep the model's height roughly sane.
+            // pop2: two cat-1 OR one cat-2. This model only needs the height
+            // roughly sane; the codegen's own `pop2` arm proves its form.
             0x58 => {
                 match widths.last().copied() {
                     Some(2) => {
@@ -2701,9 +2757,10 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
                 push!(w);
                 pc += 1;
             }
-            // dup_x1 / dup_x2 — unimplemented by codegen (safe bail); just
-            // resync the model loosely. Clear so we do not mis-evaluate a later
-            // dup2 against a now-shuffled stack we no longer model precisely.
+            // dup_x1 / dup_x2 — both have codegen arms now; this model still
+            // cannot follow the shuffle, so resync loosely. Clear so we do not
+            // mis-evaluate a later dup2 against a now-shuffled stack we no
+            // longer model precisely.
             0x5a | 0x5b => {
                 widths.clear();
                 pc += 1;
@@ -2758,8 +2815,10 @@ pub(super) fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
                 }
                 pc += 1;
             }
-            // dup2_x1 / dup2_x2 — unimplemented by codegen (safe bail); resync
-            // the model loosely by clearing.
+            // dup2_x1 / dup2_x2 — both have codegen arms now, but their form
+            // depends on the width of entries this descriptor-less model
+            // cannot see. Resync loosely by clearing, which is still sound
+            // here: a later `dup2` against a cleared top is REJECTED.
             0x5d | 0x5e => {
                 widths.clear();
                 pc += 1;

@@ -207,6 +207,7 @@ mark), BinaryTrees (deep recursion). Always diff against a real JDK run.
 | `CRATONVM_G1_NO_EVAC_RETRY=1` | Disable the evacuation-failure drain (bisection) |
 | `CRATONVM_G1_PARALLEL_EVAC=0` | Force the single-threaded evacuator. Parallel evacuation is the DEFAULT since 2026-08-13; the "known race" this row used to warn about was G1-9, which was neither known to be a race nor a race — it was a compact-layout scan divergence, now fixed (`audits/g1-audit.md` §0, internal record tree). The worker threads are also no longer respawned per pause. Still owed: a gauntlet-scale soak and a throughput number, so this remains the bisection lever for any suspected parallel-evacuation regression. |
 | `CRATONVM_G1_EAGER_HUMONGOUS=0` | Restore cleanup-only humongous reclaim. By default an evacuation pause also frees humongous spans it can prove nothing references. This is the only path that frees memory outside the collection set, so it is the first thing to rule out if a live humongous object goes missing. |
+| `CRATONVM_G1_YOUNG_PAUSE_TARGET=1` | **Opt-in.** Let `max_gc_pause_ms` bound the YOUNG generation too, not just the old half of a mixed collection set: G1 also collects once the Eden+Survivor region count reaches an adaptive target, tightened by 20% after any PRODUCTIVE pause that overruns the goal and relaxed while pauses stay under half of it. Does nothing until such an overrun is measured (the target starts at its 60%-of-regions ceiling and a target at the ceiling is not a trigger). Measured trade on `G1ChurnPauseProbe` at `-Xmx2048m`: p50 -21%, p99 +3%, wall +4.2%, one extra pause — see the young-sizing paragraph under Backend details for the full table and why it is not a default. |
 | `CRATONVM_G1_WORKERS=<n>` | Force the evacuation worker count; `=1` drains the parallel path serially, which separates a concurrency race from a logic divergence |
 | `CRATONVM_DBG_GC_STRESS=<bytes>` | Force young GCs every N allocated bytes (Generational) |
 | `CRATONVM_GC_PAR_THREADS=<n>` | Generational young-GC worker count. `0`/`1` forces the sequential collector; `>= 2` forces that many workers regardless of heap size. Unset = `min(available_parallelism, 8)` once the young gen passes the size floor. `available_parallelism` follows CPU affinity, so a `taskset -c N` run is automatically sequential |
@@ -300,6 +301,108 @@ same-pause drain recovers them; a wedged drain leaves the kept regions
 coherent (remembered-set edges recorded, precise liveness answers).
 Allocation failure escalates: young pause → synchronous full mark cycle
 → OOM.
+
+*Young sizing (2026-08-18), opt-in.* `max_gc_pause_ms` reaches exactly one
+decision by default — how many OLD regions a mixed collection set may take.
+The young half is bounded by the free pool alone (`needs_gc` fires below
+25 % free), so Eden grows to roughly three quarters of `-Xmx` and young
+pause time scales with the heap SIZE. `CRATONVM_G1_YOUNG_PAUSE_TARGET=1`
+adds an adaptive young-region target: shrink 20 % after a pause that
+overruns the goal, give 12.5 % back while pauses stay under half of it,
+floor/ceiling 5 %/60 % of regions. It does nothing until a PRODUCTIVE pause
+has been measured to overrun — the target starts at its ceiling and a
+target at the ceiling is not a trigger — and an unproductive pause (nothing
+copied, nothing freed) resets it to the ceiling so it can never storm.
+
+It is **not** a default, and the reason is measured. On
+`probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m` (96 MiB retained, 3.6 GiB
+of garbage, 200 ms goal), medians of 3 interleaved reps:
+
+| arm | wall | pauses | total pause | p50 | p99 |
+|---|---|---|---|---|---|
+| pre-audit baseline | 5773 ms | 3 | 3801 ms | 1082 ms | 1726 ms |
+| audit fixes, flag OFF | 2633 ms | 3 | 719 ms | 236 ms | 243 ms |
+| audit fixes, flag ON | 2744 ms | 4 | 814 ms | 187 ms | 250 ms |
+
+The 7x pause reduction there belongs to the audit's evacuation-destination,
+free-region-scan, region-scrub and remembered-set fixes — the middle row has
+this flag off. The flag itself buys the third row against the second: p50
+−21 %, p99 **+3 %**, wall +4.2 %, one extra pause. p99 is what a pause goal
+is about and it did not move, and on an adaptive scheme it cannot: the
+target only tightens after a pause has already overrun, so the largest pause
+is always paid in full and it is the one p99 reports. A latency-sensitive
+workload may still want the median improvement — turn it on and measure your
+own pause distribution.
+
+*Where a young pause actually goes (2026-08-18).* Every `--verbose:gc`
+`[GC-STAT]` line now carries a per-phase breakdown — `roots_us`, `rset_us`,
+`closure_us`, `fixup_us`, `free_us` — with `fixup_us` printed beside the
+`fixup_regions` / `fixup_bytes` it covered, because a slow walk and a large
+old generation are different problems. On `probes/G1ChurnPauseProbe 96 900`
+at `-Xmx2048m` a 330 ms young pause split: roots 0.7 %, remembered-set
+walks 0.03 %, Cheney closure 38 %, whole-heap fix-up 10-18 %, freeing the
+collection set **42 %**. That last figure is why the phase breakdown exists
+at all: the reclaim phase was the most expensive part of a G1 pause and
+nobody had ever looked.
+
+It was `G1Region::reset` scrubbing every reclaimed region — 1.61 GB at
+11.9 GB/s, which is memset bandwidth and nothing else — and it was
+redundant with the allocator's own zeroing (`bump_alloc` zeroes exactly the
+range it hands out; `alloc_humongous_locked` zeroes its whole span; no
+inter-object padding can exist because every object size is a multiple of
+8; no walker reads a `Free` region). Removed: single-binary A/B, medians of
+3 interleaved reps, identical program checksums in both arms — p50 403 ->
+265 ms, p99 412 -> 267 ms, total pause 1213 -> 790 ms, the free phase
+itself 152 -> 18 ms. `CRATONVM_G1_SCRUB_FREE=1` restores it, and that is
+the first thing to try if a G1 heap-corruption investigation wants the old
+"a freed region reads as zeros" world back.
+
+*The Phase-4 walk, narrowed (2026-08-18).* A young pause's reference fix-up
+used to walk EVERY object of every non-CSet region, which is what made pause
+time O(live heap) rather than O(young live set). It now walks only the
+collection set's remembered-set sources plus every region the pause WROTE
+INTO. `CRATONVM_G1_NARROW_FIXUP=0` restores the whole-heap walk, and is the
+first lever to pull for any suspected G1 dangling-reference or lost-edge
+defect: under it the collector behaves as every G1 result before this date
+was produced.
+
+Why that set is sufficient: a slot needing a forwarding rewrite points at an
+evacuated object, so it lives in a root (Phase 1 rewrites those), in the CSet
+(Phase 3 scans every to-space copy), or in a non-CSet region reachable only
+through the remembered set (Phase 2 walks exactly those). The remembered set
+is complete because every mutator reference store reaches
+`post_write_barrier_rset` — the interpreter's and every native's directly,
+and every JIT-compiled one through `jit_putfield_object` since G1-2 closed.
+The walk's other job, the GC-internal edge rebuild, only concerns regions the
+pause wrote into, and those are found by diffing a pre-evacuation
+`(region_type, cursor)` snapshot rather than by asking the evacuator — so no
+allocation path, present or future, can forget to register itself. The
+humongous census still forces the wide walk, because "nothing in the heap
+references this span" is a whole-heap claim.
+
+Scope: the SERIAL young pause. Mixed pauses and the parallel evacuator still
+walk wide.
+
+Measured (single binary, one env flag, interleaved, `G1ChurnPauseProbe`): on
+a workload whose live set stays YOUNG the narrow set equals the wide one and
+nothing changes — `fixup_regions` is 116 in both arms. On one whose live set
+has settled into Old (`-Xmx512m`, 48 MiB live, 12 GiB of garbage) the walk
+drops from **60 regions / 58 MiB to 1 region / 0 MiB**, p50 27 -> 17 ms,
+total pause -12%, p99 unchanged, checksums identical. The size of the win is
+the ratio of settled old generation to young — which is the shape the
+original criticism was always about.
+
+Verification, and its limits. The unit suite CANNOT discriminate this change:
+every pre-existing test passes even when Phase 4 walks nothing, because on
+every constructible fixture the mutator barrier alone already records every
+edge. The tests that do discriminate check the narrow SET's composition. The
+consequence is checked at runtime instead — `CRATONVM_G1_DBG_RSET=1` verifies
+after each pause that every cross-region edge into a collectable region is
+named in that region's remembered set, and prints `edges=N missing=M` so a
+green result cannot hide a vacuous one. On the shape that genuinely skips 59
+of 60 regions it reports `edges=2114 missing=0`, and a unit test proves that
+checker can fail (clear every remembered set and all 2114 are reported
+missing). What is still owed is a suite-scale soak.
 
 **ZgcRealHeap.** One arena + free list (post-sweep coalesced) + hash-set
 registry of allocation bases. `needs_gc` triggers at 75 % occupancy with

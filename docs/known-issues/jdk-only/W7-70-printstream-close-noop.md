@@ -500,6 +500,52 @@ because that native is on `PrintStream`.
   W7-64 (untouched).
 * `route_write_through_out` and the whole write path (comments only).
 
+## Re-verified 2026-08-12 against the working tree, by the P3-D lane
+
+Nothing built, nothing run.
+
+**The repair is PRESENT and this record is accurate, not stale.**
+`native_printstream_close` at `native-builtins/src/logging_shims.rs:1245` is the
+body this record describes, in the order it describes: `is_closing` early return
+(`:1254`), `out` read by name (`:1263`), the console branch on a non-object
+`out` that flushes the fd and deliberately does **not** latch `closing`
+(`:1264`–`:1277`), then `latch_closing` followed by
+`absorb_io_exception_recording(flush)?` and
+`absorb_io_exception_recording(close)?` (`:1278`–`:1282`). The `?` between the
+two is the "a flush `Error` skips the close" behaviour the measurement table
+above required. The site is in `native-builtins`, which this lane does not own;
+nothing needed changing.
+
+### One residual CLOSED, and a second site for it that this record had not counted
+
+This record's **What is left** names `native_fos_close` as "directly downstream
+of the repair: a disk-full at close is still invisible even once
+`PrintStream.close()` delegates properly". That site is in `native-io/src/lib.rs`
+(`:2237`), which this lane owns, and it is now fixed — see
+`W7-57-close-flush-swallow-sweep.md`'s 2026-08-12 re-verification for the full
+reasoning. In summary: it propagates the host `flush` and `close` failure for
+`fd >= 3` (flush wins, close still attempted), keeps the swallow for `fd < 3`
+because `FdTable::close` refuses those outright and the flush there is of the
+shared process console, and it now agrees with its own neighbour
+`native_fos_flush`, which already propagated.
+
+**The site this record named is not the one the shipping mode uses.** The real
+`FileOutputStream.close()` bytecode routes through `FileDescriptor.closeAll` →
+`close()` → `close0()`, i.e. through `native_fd_close0`
+(`native-io/src/lib.rs:1846`), which carried the identical
+`let _ = flush; let _ = close` pair and which no record had counted. Fixing only
+`native_fos_close` would have repaired the fallback body, left Compatible mode
+swallowing, and taken the row off the list anyway. Its **flush** half now
+propagates (blast radius outside buffered file writers is provably empty —
+`FdTable::flush` ends in `_ => Ok(())` for every non-writable entry, which covers
+the `FileInputStream` and `sun/nio/ch/UnixDispatcher.close0` socket
+registrations that share the body); its **close** half deliberately does not,
+and that is the residual left in its place rather than a claim of completion.
+
+This is the same lesson this record already teaches about its own census — the
+handed-over count is a sample until the *registrations* are walked. Here the
+sample was one function name where the shipping path was a different one.
+
 ## What is left
 
 * **A write after `close()` is not refused.** HotSpot nulls `out`, so
@@ -521,8 +567,16 @@ because that native is on `PrintStream`.
   above and deliberately not shipped.
 * **The six unregistered `PrintStream` methods** listed above, which are
   `NoSuchMethodError` under `--synthetic-jdk`.
-* **`native_fos_close` absorbs its host `flush`/`close` errors**, so a
-  disk-full at close is still invisible one layer below the repair.
+* ~~**`native_fos_close` absorbs its host `flush`/`close` errors**, so a
+  disk-full at close is still invisible one layer below the repair.~~
+  **FIXED 2026-08-12** — see the re-verification section above. What replaces it
+  as the residual is narrower and is stated there: `native_fd_close0`'s **close**
+  half is still swallowed (its flush half is not), because that body is shared
+  with `sun/nio/ch/UnixDispatcher.close0` on sockets and no measurement covers
+  propagating a socket close failure. `native_fis_close`
+  (`native-io/src/lib.rs:1903`) likewise still swallows its close; a read-side
+  close cannot lose buffered data, so it is the lowest-value member of the
+  family. **Neither of the three edits has been compiled.**
 * **`addSuppressed`** — still open from W7-57, untouched.
 * **`java.io.PrintWriter` has no closed marker at all.** W7-64 named this; it
   is unchanged, because `PrintWriter` genuinely declares no `closing` field

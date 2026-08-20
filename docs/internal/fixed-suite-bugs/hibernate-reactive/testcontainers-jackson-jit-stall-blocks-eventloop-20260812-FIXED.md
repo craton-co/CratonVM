@@ -57,9 +57,9 @@ Repro, for anyone re-checking:
 
 ```bash
 export TESTCONTAINERS_RYUK_DISABLED=true
-cd /data/cratonvm/apps/hibernate-reactive-suite-runner
+cd /data/cratonvm/apps/hibernate-suite-runner
 echo org.hibernate.reactive.CachedQueryResultsGenerateStatisticsTest > /tmp/one.txt
-CV_BIN=<binary> bash run-hibernate-reactive-suite.sh --list /tmp/one.txt \
+CV_BIN=<binary> bash run-hibernate-suite.sh --list /tmp/one.txt \
   --shards 1 --timeout 420 --out /tmp/hr
 ```
 

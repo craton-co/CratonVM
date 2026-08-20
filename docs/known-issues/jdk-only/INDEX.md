@@ -1,0 +1,971 @@
+# INDEX — every record in `docs/known-issues/jdk-only/`
+
+**Built by lane C18, 2026-08-13.** Snapshot: `ls docs/known-issues/jdk-only/*.md`
+taken at **00:07 local on 2026-08-13**, **155 files** including this one, on
+branch `claude/jdk-only-mode-completion-1351c0` at `HEAD = 7c00dee66`
+(records land untracked, so `git ls-files` and `ls` disagree here by design).
+
+> **This index is a snapshot and it will rot.** Records were still landing from
+> lanes C14, C15, C16, C17 and C19 while it was being written — five arrived
+> *during* this lane's own pass. If a file exists that is not listed here, it is
+> newer than this snapshot, not a stray. Re-take the listing before trusting the
+> count. Do not carry the number 153 forward without recounting; that is exactly
+> the mistake `README.md`'s own headline documents.
+
+> **SECOND PASS — lane F25, 2026-08-13.** The warning above was right. Listing
+> re-taken: **227 `.md` files** including this one, and **73 of them had no row
+> in this index** — every wave-D, wave-E and wave-F record, the whole
+> `W8-D`/`W8-E`/`W8-F` harness line, the two C19 fixture records, and **all
+> seven records of the SSL-session chain**. They are added below, in a dated
+> block of their own rather than merged into C18's topic tables, so that
+> C18's snapshot stays legible as the snapshot it is. **This block will rot the
+> same way**: lanes F14–F25 were still landing while it was written.
+
+> **FOURTH PASS — lane G40, 2026-08-17. Start here.** The warning above was
+> right again. Listing re-taken: **280 `.md` files** including this one, and
+> **36 of them had no row** — the entire wave-G line (`G1-1` … `G34-1`), plus
+> `BASELINE-20260817.md` and `HANDOFF-20260814.md`, which are the two most
+> current documents in this directory. They are added in the **FOURTH PASS**
+> block at the bottom, §A. That block also carries:
+>
+> * **§B — seven standing claims this session falsified**, each naming the
+>   record that asserted it, the record or commit that falsified it, and the
+>   class of evidence. Read §B.1 before you trust any "this body is dead"
+>   conclusion anywhere in this directory, and §B.2 before you reason about
+>   which of a native and real JDK bytecode wins.
+> * **§C — the statuses measurement settled**: 88 → 93 → 95 of 99 under
+>   `--jdk-only`, and the eight vectors that closed.
+> * **§D — what that pass could not settle.** An honest `unknown` is worth more
+>   here than a confident label.
+>
+> **The count 280 will rot too, and faster than 155 or 227 did**: seven lanes
+> were editing this tree as it was taken, and five records (`G35-1` … `G39-1`)
+> were being written during the pass and have no row. Re-take the listing.
+
+## How to read the columns
+
+**Status** — derived by **reading each record's own status prose**, never from
+its filename or its title. Records state status a dozen different ways
+(`**Status: OPEN`, `Status: the`, a blockquote banner, a table row, or plain
+prose in the opening paragraph), so a grep would have missed roughly a fifth of
+them.
+
+| status | means |
+|---|---|
+| `OPEN` | live defect, or partly fixed with a named live residual. **Partly-fixed records are listed OPEN**, with `partial` in Notes — a half-closed record is a trap if it reads as closed. |
+| `FIXED-UNVERIFIED` | the fix is in source; **no binary carrying it has been built or run** |
+| `FIXED-MEASURED` | verified by running a binary that carries the fix |
+| `SUPERSEDED` | the work moved to another record; kept for its history |
+| `META` | not a defect record — handoff, census, retirement audit, run report, queue |
+
+**Prov(enance)** — where the numbers came from. This column exists because
+wave-C lanes were forbidden to build, so most CratonVM "after" values in this
+directory are **predictions**, and a reader must not mistake one for a
+measurement.
+
+| prov | means |
+|---|---|
+| `MEAS` | executed against a CratonVM binary |
+| `PRED` | CratonVM column is predicted; nothing was built or run |
+| `SRC` | source reading only (still stronger than a prediction, weaker than a run) |
+| `MIXED` | typically: "before" executed on an old binary, "after" PREDICTED; or HotSpot arm executed, CratonVM arm predicted |
+
+**Nothing in this pass upgraded a PREDICTED value to measured.** The only
+records marked `MEAS` for a *correction* are the eight facts listed in
+"Corrections applied" below, each of which was executed by the orchestrator.
+
+---
+
+## Corrections applied 2026-08-13 (lane C18) — the facts that moved
+
+Each was measured or source-verified elsewhere and was still being asserted the
+old way somewhere in this directory. The record now carries a `RECONCILED
+2026-08-12/13 (lane C18)` banner naming the source.
+
+| fact | now | where it was still wrong |
+|---|---|---|
+| `Math.floorDiv`/`floorMod` at `MIN_VALUE / -1` aborting the VM | **FIXED, MEASURED on a real binary** | `W7-95` headline + §, `W7-99` §, `W8-C3-1` §prediction |
+| the six "VM-fatal" intrinsic triples | **no family aborts the VM; every second-generation-census failure is a Java `AssertionError`. MEASURED** | `W7-95` headline, `W8-C3-1` headline |
+| `Math.pow` | **TWO items.** Special values FIXED + MEASURED; the **fast path on ORDINARY inputs** (`a.powi(b as i32)`) measured at **1.4 ulp at \|b\|=2, 44.3 ulp at \|b\|=63 against a 1-ulp contract** — separate, and not closed | `W7-99` (treated pow as one item), `W7-95` closure table |
+| `Math.ulp` | **NOT a defect.** Proved equivalent over **all 4,294,967,296 `float` bit patterns**. MEASURED | `W7-95` divergent-triple list + closure table, `W7-99` §2 |
+| "645 triples registered" | **645 registry ROWS = 614 DISTINCT triples** (31 duplicate registrations). Coverage is 258/614 = **42%**; never-invoked is **356** distinct, not 387 | `W7-95` ×2, `STUB-CENSUS` ×2 |
+| corpus `DIVERGE` counts from a `junit`-kind corpus | **62 of 75 stored rows (83%) were harness artefacts** (`C8` §4.1, replayed row-for-row by `C17`). `h2` is a `main`-kind corpus and correctly did not move — 0 of 3 | `P4A-CORPORA`, `W7-92` §0 |
+| `SimpleTimeZone` skew for `America/Sao_Paulo` | predicted `10,800,000` ms, **measured `7,200,000`** — São Paulo was in DST on 2002-01-22 | `C6-2` §D. **`P4A-CORPORA`'s `10800000` is a different, correct quantity** — see the contradiction note below |
+| shutdown hooks | **MEASURED never to run.** HotSpot prints three hook lines, CratonVM none, **with no output-lost marker** — so "the hook ran and its output was lost" is ruled out. The *fix* is still unverified | `W7-92` (hedged), `WAVE-D-QUEUE` measurement 3 |
+| `register_queue_deque_interface_natives` | **`:38096`, 23 rows** — not `:37787`, not 18. Four rows come out of a `for` loop, so counting `registry.register(` sites by grep undercounts. **SOURCE-VERIFIED, not measured** | `C7-2`, `P2` |
+| `register_interface_natives` | **28773–28991, 38 registrations**; its own in-file header comment saying "these 23" is stale. **SOURCE-VERIFIED** | `C7-2` (opens-at figure), `P2` §2.2 |
+| the `HashMap$Values` "interface door wins for inherited methods" hazard | **DOES NOT EXIST.** The native-above-receiver walk follows `superclass` only and never enumerates interfaces. **SOURCE-VERIFIED** (`invoke.rs:3281-3323` + two mirrors, `C13-1` §1.1). It had been briefed as "the highest-risk item" | `C7-1`, `C7-2` §4 row A2 |
+| the collections census direction | retiring 8 `ArrayList` rows while adding the ~25 real view-class rows is **NET +17**. Correctness here **costs** registrations | `P2` title/framing, `C7-1` |
+
+### Number collision, resolved
+
+Two records both claimed `W7-39`. The **older** is
+`W7-39-jca-missing-algorithms.md` (created 2026-08-12 00:09:45 −0300); the
+**newer**, `W7-39-aastore-interface-component-blanket.md` (23:24:35 −0300), was
+renumbered to **`W7-101`** — the first number above the highest allocated
+(`W7-100`), chosen over the free low gaps (`W7-4`, `-6`, `-7`, `-11`, `-13`,
+`-28`, `-32`, `-43`, `-45`, `-47`, `-48`, `-52`, `-59`, `-67`, `-82`) because
+**all but three of those are still cited by live records** and reusing one would
+manufacture a second collision. `W7-101` was checked unreferenced before use.
+
+**13 cross-references rewritten** in 2 files (`W8-C10-1` ×11, `W8-C16-1` ×2).
+Every remaining `W7-39` in this directory (README, `RETIREMENT-20260812B`,
+`W7-15`, `W7-21`) refers to the JCA record and is correct.
+
+**Two references live in Rust and could not be touched by this lane — see
+NOMINATIONS at the bottom of this file.**
+
+---
+
+## Meta / deliverables — not defect records
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| README | index and standing rules for this directory | META | MIXED | headline record count is self-admittedly stale arithmetic; per-record tables ~86 rows |
+| INDEX (this file) | every record, status read from the record | META | — | snapshot; recount before quoting |
+| WAVE-D-QUEUE | wave-C nominations no lane applied, plus measurements owed | META | — | measurement 3 (shutdown probe) narrowed by C18 |
+| HANDOFF-20260812 | first-wave orchestration handoff | META | MEAS | corrects the 70/0 suite row to 67/5 and 68/3 |
+| HANDOFF-20260812B | second-wave handoff; 3,232 uncompiled Rust lines | META | MIXED | supersedes the first; nothing in that wave built |
+| RETIREMENT-20260811 | audit moving 30 records out, keeping 22 | META | MEAS | carries a correction that three of its own "kept" reasons were false |
+| RETIREMENT-20260812 | audit moving 4 records out, holding W6-2 | META | MIXED | |
+| RETIREMENT-20260812B | second-pass audit, 8 out, 2 held | META | MEAS | |
+| STUB-CENSUS-20260812 | per-registration census of stub/bridge surface | META | MEAS | **corrected**: `intrinsic=645` is ROWS = 614 triples |
+| JDK-ONLY-REPORT-CENSUS-20260812 | `--jdk-only-report` is a complete, unused census | META | MEAS | census over-reports, probe under-reports |
+| APP-READINESS-20260812 | what stops real Java apps under `--jdk-only` | META | MEAS | stderr banner under-reports blockers by half |
+| P1-BASELINE-20260812 | phase-1 before-measurement, corrected exit criterion | META | MEAS | true worklist 57 candidates, not 3 |
+| P1-RESULT-20260812 | phase-1 after: nine blocking families closed | FIXED-MEASURED | MEAS | 54/54 from 28/54 |
+| P2-COLLECTIONS-SHADOWS-20260812 | per-triple adjudication of the collections slice | META | MIXED | **corrected**: net +17, both registrar ranges |
+| P4B-SYNTHETIC-JDK-MODE-20260812 | synthetic-JDK mode needs its own feature build | META | MEAS | superseded by the FIRST-RUN doc |
+| P4B-SYNTHETIC-JDK-FIRST-RUN-20260812 | first run of the `--synthetic-jdk` binary | META | MEAS | reports two defects it does not file |
+| W7-55-record-reconciliation | status-line reconciliation across 58 records | META | MIXED | six of its own line anchors rotted the same day |
+| W7-78-inherited-residual-closeout | inherited residuals closed out | META | MIXED | its own headline finding is superseded in-tree |
+| W7-5-registrars-that-never-shipped | 301 registrars absent from the shipping binary | OPEN | SRC | partial; own gap count self-corrected 32→20 |
+| W7-100-absent-marker-in-a-composite-key | one missing feature inflates DIVERGE verdicts | META | MEAS | method record; its 12/9/36 counts superseded by C8/C17 |
+| W7-40-tier-parity-fixtures-and-fast-throw | a tier-parity fixture goes red on the oracle | META | MEAS | cause is `-XX:+OmitStackTraceInFastThrow` |
+
+## Harness / corpus
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| C8-CORPUS-HARNESS-DEFECTS-20260812 | nine corpus-driver faults and the results they invalidate | OPEN | MEAS | partial; **the authority for "62 of 75 DIVERGE rows were the harness"** |
+| C17-CORPUS-READJUDICATION-20260812 | all 163 stored rows re-adjudicated without the VM | META | MEAS (replay) | reproduces C8 row-for-row; finds 4 "agreements" where CratonVM ran zero tests; h2 control moved 0 of 3 |
+| C8-CORPUS-TIMEOUT-TAXONOMY-20260812 | CV-TIMEOUT split into SIGNAL/STALLED/BUSY/UNKNOWN | FIXED-MEASURED | MEAS | never exercised against a real access violation |
+| C8-H2-TESTBACKUP-SHARED-WORKDIR-20260812 | TestBackup flake is a shared working directory | OPEN | MEAS | not a VM defect; remedy declared by no corpus |
+| P4A-FIRST-CORPUS-RUN-20260812 | first H2 corpus run, fourteen classes | META | MEAS | no `--real-jdk` control taken |
+| P4A-H2-DIVERGENCES-20260812 | H2 failures with the control arm | OPEN | MEAS | timeout caps differ 200s vs 420s — every TIMEOUT row confounded |
+| P4A-CORPORA-20260812 | bc-java + commons-math wired and run | OPEN | MEAS | **corrected twice**: DIVERGE counts (C8/C17) and the two different timezone quantities |
+| W6-5-vacuous-tests | tests that passed without testing anything | OPEN | MIXED | partial; adds shape C — a 1-in-155 load-bearing assertion |
+| W7-51-vacuous-sweep-round-2 | thirteen tests still cannot fail | OPEN | MIXED | detector recall measured 3 of 9; read §7 first |
+| W7-60-harness-extract-blindness | `run.sh` `extract()` discarded vectors' evidence | FIXED-MEASURED | MEAS | one residual vector |
+| W7-62-ratchets-and-dead-code | three stale ratchets, six tests guarding nothing | OPEN | MIXED | its Status line and its own top banner disagree — see contradictions |
+| W7-42-differential-instrument-holes | the differential compared two class files | FIXED-MEASURED | MIXED | divergence count re-stated 14 → 9 |
+| W7-30-stub-ratchet-boot-path-scope | ratchet censused 6 of 48 boot registrars | OPEN | MIXED | the 2026-08-11 fix was inert; gate now firing unfrozen |
+| W7-33-differential-dead-sections | dead sections in the differential | FIXED-UNVERIFIED | MIXED | residual unobservable — no suite runs `--synthetic-jdk` |
+
+## Math / intrinsics
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W7-94-math-min-max-nan-and-negative-zero | `Math.min`/`max` violated the JLS for NaN and −0.0 | FIXED-MEASURED | MEAS | found by running a probe, not by reading a record |
+| W7-95-intrinsic-semantics-census | the `Intrinsic` category never had its semantics checked | OPEN | MIXED | partial — String code-point triples open. **Carries the C18 reconciliation banner: VM-fatal, ulp, pow-split, 645-rows** |
+| W7-95a-string-code-point-family | String code-point natives read UTF-16 through a Rust `str` | OPEN | MIXED | **its two `VM ABORT` rows are NOT covered by the "no family aborts the VM" result** — see contradictions |
+| W7-99-parse-and-pow-grammars | Rust std routines where Java specifications were meant | FIXED-UNVERIFIED | MIXED | **banner**: special values MEASURED-fixed; the pow FAST PATH is a separate open item |
+| W7-98-character-unicode | `java.lang.Character` answered Rust's Unicode, not Java's | OPEN | MIXED | partial; fixes inert until the duplicate deregistrations land |
+| W7-54-strictmath-fdlibm-family | StrictMath fdlibm port, bit-exact on 29 of 29 | FIXED-MEASURED | MEAS | **no `Status:` line** — status prose is the RETIRED blockquote |
+| W8-C3-1-intrinsic-census-round-2 | second-generation vector over the never-invoked 40% | OPEN | MIXED | **banner**: it HAS since been run; no VM aborts. 614-triple arithmetic is its own |
+| W8-C15-2-option-objects-with-no-reader | `HexFormat`/`UUID`/`Base64` option object with no reader | OPEN | PRED | partial; the load-bearing half is NOMINATIONS N1–N3 |
+
+## Collections
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| C7-1-map-values-is-an-abstractcollection-not-a-list | `Map.values()` returns an `ArrayList` | OPEN | PRED | partial. **Banner**: the inherited-method hazard does not exist; the rewrite costs +17 registrations |
+| C7-2-the-interface-doors-and-what-must-move-together | interface-door line numbers and the atomic set | OPEN | SRC | **Banner**: 23 rows not 18, `:38096` not `:37787`, hazard disproved |
+| C7-3-ll-get-overlay-first-and-the-four-second-writers | LinkedList overlay-first reads, four second writers | OPEN | MIXED | partial; fixture green on HotSpot, never run on CratonVM |
+| C13-1-the-interface-doors-never-open-for-a-values-view | the doors never open; routing layer landed | OPEN | MIXED | partial — routing layer landed but **inert today**. Authority for the two corrections above |
+| C13-2-the-five-values-view-classes-are-not-one-family | per-class native needs for the five view classes | OPEN | MIXED | analysis + a costed change NOT taken; 25 registrations, not 32 |
+| C13-3-native-map-key-set-returns-a-hashset | `keySet()` returns a real `HashSet`, not a view | OPEN | MIXED | nothing changed; Serializable divergence unmeasured |
+| W7-1-treemap-views-and-iterator-remove-contract | TreeMap views and the `Iterator.remove` contract | OPEN | MEAS | partial; modCount on sort/replaceAll left open deliberately |
+| W7-16-arraydeque-and-linkedlist-residuals | ArrayDeque streamed empty; LinkedList iterator gates | FIXED-MEASURED | MEAS | closed in three arms; **files a NEW open synthetic-mode finding** |
+| W7-20-refusal-laundered-into-wrong-answer | a refusal laundered into a wrong answer | FIXED-MEASURED | MEAS | includes a confirmed negative prediction |
+| W7-2-primitive-stream-terminal-surface | primitive stream terminals compiled out of the binary | FIXED-MEASURED | MIXED | partial; Double/LongStream residuals source-only |
+| W7-33 / W7-36-differential-view-families | views not writing through; refusals never firing | OPEN | MIXED | partial; 19 of 20 changed in source, nothing rebuilt |
+| W7-65-stream-reuse-throws | modelling `linkedOrConsumed` for stream reuse | OPEN | MIXED | partial; a named residual set left open on purpose |
+| W7-96-chm-table-never-populated | `ConcurrentHashMap.table` never populated | OPEN | MIXED | partial; retirement half not unblocked |
+| W2-1-strict-refuses-the-synthetic-stream-stack | strict refuses the synthetic stream stack | OPEN | MIXED | partial; its own original warrant declared FALSE, conclusion survives |
+
+## JCA / crypto
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W7-15-cipher-silently-wrong-algorithm | `Cipher.getInstance("ChaCha20")` returned AES-256-ECB | FIXED-MEASURED | MEAS | RFC 8439 known-answer vector; three before/after rows now stale |
+| W7-21-keygen-and-the-synthetic-secretkeyspec-twin | `KeyGenerator` ignored its algorithm | FIXED-MEASURED | MEAS | `Key.getAlgorithm` hardcoded `"AES"` still open (synthetic-jdk only) |
+| W7-39-jca-missing-algorithms | HmacSHA224 / Blowfish / RC4 refused; advertising reconciled | FIXED-UNVERIFIED | MIXED | **the original `W7-39`** — keeps the number |
+| W7-29-jca-advertise-implement-gaps | engines answering algorithms never advertised | SUPERSEDED | MIXED | retired as work; residuals live under W7-63 |
+| W7-63-jca-advertise-vs-serve | advertises what it refuses, serves what it never advertised | FIXED-UNVERIFIED | MIXED | second pass found an ALIAS half that never landed; true count 5 → 7 |
+| W7-71-jca-exception-types-and-line-separator | RSA padding raised unchecked types; `Files.write` LF | FIXED-UNVERIFIED | MIXED | 2 sampled rows → 9 defects |
+| W4-3-security-getalgorithms-short-list | `Security.getAlgorithms` answered the empty set | SUPERSEDED | MIXED | Patch E marked DEAD and destructive if applied |
+| L8-securerandom-provider | `SecureRandom.getProvider()` null; any algorithm accepted | FIXED-UNVERIFIED | MIXED | headline verified on `ba65f1a19`; residual unbuilt |
+| W7-61-sslengine-layout-and-tls-blocking | SSLEngine layout false positive; TLS blocking sites | OPEN | MIXED | **no `Status:` line** — status is a third-pass blockquote. Windows half of item 2 OPEN |
+
+## IO / net
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W2-2-blocked-reader-async-close-wakeup | a blocked reader never woke on `close()` | FIXED-UNVERIFIED | MIXED | surface 3 explicitly unverified |
+| W7-53-blocking-close-family | blocking close-awareness: 19 sites fixed, 7 open | OPEN | MIXED | **no `Status:` line** — status is the title plus a bold block |
+| W7-57-close-flush-swallow-sweep | 51 close/flush sites dropped the delegated failure | FIXED-UNVERIFIED | MIXED | 213 bound-but-uninspected calls left unclaimed |
+| W7-64-printstream-trouble-and-errormanager | PrintStream trouble/ErrorManager fixes measurably inert | OPEN | MEAS | its run banner refutes its own FIXED rows |
+| W7-70-printstream-close-noop | `PrintStream.close()` was a no-op for every stream | FIXED-UNVERIFIED | MIXED | contract measured on a recording sink |
+| W7-81-write-route-three-way | a delegated write's three outcomes collapsed into one bool | FIXED-UNVERIFIED | MIXED | |
+| W7-83-segment-as-backing-array | `ByteBuffer.array()` handed back a MemorySegment | FIXED-UNVERIFIED | MIXED | the mock hid it |
+| W7-88-net-channels-dead-registration | dead `ServerSocketChannel.socket()` registration | FIXED-UNVERIFIED | MIXED | live sibling defects flagged |
+| W7-24-httpserverloop-and-strict-fallbacks | HttpServerLoop door defect and strict fallbacks | FIXED-UNVERIFIED | MIXED | binary predates the fix |
+| W7-50-synthetic-jdk-strict-six | six vectors only the synthetic-jdk strict arm fails | OPEN | MIXED | **its own Status line is stale** — §12 is a real run showing defect A live |
+| C6-1-https-urlconnection-session-accessors | https carrier was the abstract class; six accessors added | OPEN | MIXED | partial; the populator is a NOMINATION, so every accessor answers "not open" |
+| C12-2-https-session-capture-and-the-cipher-name-it-records | session capture; rustls cipher name rewritten | FIXED-UNVERIFIED | PRED | |
+| C12-3-optional-value-slot-holds-an-int-flag | Optional natives write an int flag into the value slot | OPEN | PRED | lane owns neither file; all NOMINATIONS |
+| P4A-TOMCAT-20260812 | embedded Tomcat serves HTTPS; four defects | OPEN | MEAS | two of three VM defects reproduce in both modes |
+
+## nio / file
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W7-8-fabricated-success-io-sweep | fabricated success across `java.io` / `java.nio.file` | OPEN | MIXED | partial; §9 is the largest item and is NOT fixed |
+| W8-C14-1-default-filesystem-second-door | `theFileSystem()` was a second, unwired door | FIXED-UNVERIFIED | MIXED | |
+| W8-C14-2-default-provider-singleton | the default provider was never a singleton anywhere | FIXED-UNVERIFIED | MIXED | |
+| W8-C14-3-nio-singleton-audit-and-residuals | `nio_file.rs` split-singleton audit | OPEN | MIXED | corrects a brief: the wrong-typed field read is **not** VM-FATAL |
+| W8-C4-3-default-filesystem-two-doors | the boot-loader door is a missing native | OPEN | MIXED | NOMINATION only |
+
+## JIT / typecheck
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W7-38-jit-aastore-never-called-its-own-check | the JIT lowered `aastore` inline, bypassing its check | FIXED-UNVERIFIED | MIXED | after values explicitly PREDICTED |
+| W7-101-aastore-interface-component-blanket | `aastore` fails open on every interface-component array | FIXED-UNVERIFIED | MIXED | **renumbered from `W7-39` by C18**; before EXECUTED, after PREDICTED |
+| W8-C10-1-typecheck-hatch-audit-and-aastore-precedence | every fail-open hatch in `typecheck.rs`, audited | OPEN | MIXED | partial; all 11 references to the renumbered record rewritten |
+| W8-C16-1-serializable-cloneable-are-not-object | `Serializable[]`/`Cloneable[]` are not `Object[]` | FIXED-UNVERIFIED | MIXED | must land as a PAIR with `synthetic_implements` |
+| W8-C16-2-synthetic-implements-simple-name | `synthetic_implements` asked whether a CONTAINER's name contains "Collection" | FIXED-UNVERIFIED | MIXED | 410 over-admissions → 50; oracle rows EXECUTED, CratonVM effect PREDICTED; closes `W8-C10-1` §7 N3 |
+| W8-C4-1-array-cast-klass-origin | `klass_origin` looked up the array class | FIXED-UNVERIFIED | MIXED | |
+| W8-C4-2-map-of-instanceof-collection | `Map.of()` answered `instanceof Collection` true | OPEN | MIXED | NOMINATION, outside the lane's files |
+| W7-37-differential-throwable-and-vm | Throwable state machine, array cast-message clause | OPEN | MEAS | partial; 6 of 8 rows verified; the array arm of `klass_origin` never executed |
+
+## Class loading / modules
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W2-3-module-descriptor-answers-empty-sets | `ModuleDescriptor` returned empty sets for every module | OPEN | MEAS | all four out-of-file patch parts deliberately not landed |
+| W4-2-unnamed-accessor-bypasses-encapsulation | instantiating a class in a non-exported package | FIXED-UNVERIFIED | MIXED | |
+| W5-1-loadlibrary-allowlist-too-wide | the `loadLibrary` allowlist admitted too much | OPEN | MIXED | partial; a green Windows A/B does not measure the Linux road at risk |
+| W6-2-module-serviceloader-provider-factory | no `provider()` factory form; `setAccessible` discarded | FIXED-UNVERIFIED | SRC | last row armed in source, unrun |
+| W6-6-nativelibraries-load-fabricated-success | `NativeLibraries.load` returned true for everything | OPEN | MIXED | partial; a NEW finding — `java.desktop` admitted on one road only |
+| W7-9-minted-interface-abstract-methods | minted interface/abstract receivers | OPEN | SRC | partial; five residual triples, four unfixable in-lane |
+| W7-17-vm-internal-door-sweep | 44 minted classes, two gates, four verdicts | FIXED-UNVERIFIED | MIXED | §5's `strict?` column self-falsified |
+| W7-31-enable-preview-wiring | the preview gate had no switch | FIXED-UNVERIFIED | MIXED | typed `defineClass` fix absent from every available binary |
+| W7-79-loadlibrary-compatible-arm | `load0`/`loadLibrary0` read `args[1]` on the Compatible arm | FIXED-UNVERIFIED | MIXED | RED proof measured pre-fix; post-fix arm not re-run |
+| W7-85-serviceloader-stream-validation | `stream()` skipped the provider return-type gate | FIXED-UNVERIFIED | MIXED | |
+| W7-87-urlclassloader-namespace-asymmetry | bare `URLClassLoader` resolved classes it never loaded | FIXED-MEASURED | MEAS | |
+| W7-97-initphase2-skipped | `initPhase2` skipped; nio is the real blocker | OPEN | MIXED | the skip is correct; the stated reason for it was not |
+| L16-classnotfound-vs-noclassdeffound-shapes | absent array element type thrown as the wrong error | FIXED-UNVERIFIED | MIXED | last residual closed in source, not built |
+
+## Reflection / method handles
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W4-1-publiclookup-allowedmodes-never-checked | `allowedModes` never written or enforced | FIXED-UNVERIFIED | MIXED | **its own two status bullets contradict each other** — see contradictions |
+| W6-8-method-invoke-exports-gate | `Method.invoke` gave public methods no module check | OPEN | SRC | partial; the gate is unexercised by any vector |
+| W7-12-strict-annotation-proxy | strict-mode annotation proxy refusal and `toString` | OPEN | MEAS | headline closed; a NEW live defect found in both arms |
+| W7-19-methodhandles-compatible-residuals | `asCollector` carrier, `bindTo` refusal | FIXED-UNVERIFIED | MIXED | one out-of-file line still unapplied |
+| W7-26-getannotation-swallowed-exception | `getAnnotation` returned null for a pending VM failure | FIXED-UNVERIFIED | MIXED | partial; 13 delegation sites remain |
+| W7-93-stackwalker-option-constants-null | `StackWalker$Option` constants fabricated | FIXED-UNVERIFIED | MIXED | `Thread$State.values()` mints fresh instances |
+| L15-nestmate-access-field-and-constructor | field/constructor reflection lacked the caller check | FIXED-UNVERIFIED | MIXED | vector has NEVER been run on CratonVM |
+
+## Threads / concurrency
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W3-4-forkjointask-status-flags-and-the-eager-default | `isCompletedAbnormally` and the eager-fork default | OPEN | MIXED | two vacuous Rust guards — `apps/fjp_probe/` is absent |
+| W6-9-complete-erases-the-abnormal-record | `ForkJoinTask.complete` erased the abnormal record | FIXED-UNVERIFIED | SRC | §8's heading still says "not applied" though it is — cost two agent runs |
+| W6-12-stampedlock-split-brain | StampedLock refuted; Phaser was the live defect | OPEN | MIXED | both of its prescriptions rejected |
+| W7-14-fjp-common-factory-bound-by-name | the common-pool factory was bound by a JDK-21 name | OPEN | MIXED | Compatible half awaits a human decision |
+| W7-18-structured-task-scope-jep505 | StructuredTaskScope JEP 505 surface | OPEN | MIXED | never run on CratonVM |
+| W7-23-thread-container-registration | container dropped on start, never removed on exit | FIXED-UNVERIFIED | MIXED | a wrong flip signature is a hang, not a FAIL |
+| W7-27-thread-exit-java-cleanup | terminating threads never got Java-side cleanup | OPEN | MIXED | partial; the main/primordial call site is unapplied |
+| W7-75-continuation-forkjoinpool-alias | Continuation and ForkJoinPool read-side slot aliases | FIXED-UNVERIFIED | MIXED | assert agreement, not the parallelism value |
+| W8-C15-1-atomic-array-bounds-had-no-check-at-all | the atomic ARRAY family had no bounds check at all | FIXED-UNVERIFIED | MIXED | a 224-line fixture said that was fine; before EXECUTED, after PREDICTED |
+
+## Process
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W6-10-process-enumeration-syscall-cost | one snapshot per tree node, one `OpenProcess` too many | OPEN | SRC | residual un-appliable as written — its target record left the directory |
+| W7-10-processhandle-interface-stub-bodies | `ProcessHandle`/`$Info` stub bodies fabricated | OPEN | SRC | §6's stub-count deltas declared dead — do not quote |
+| W7-46-process-cluster | process natives, silently skipped checks | OPEN | MIXED | only the oracle fixture was executed |
+| W7-86-static-native-arity | natives indexed args for the wrong receiver shape | OPEN | MIXED | partial; §4.2's four rows still open |
+| W7-92-shutdown-hooks-never-run | hooks register and no thread ever starts them | FIXED-UNVERIFIED | MIXED | **banner**: the DEFECT is MEASURED (flatly, no hedge); the FIX is not |
+| P4A-SPRING-20260812 | a Spring context constructs; hooks never run | OPEN | MEAS | shutdown-hook finding stated flatly; four nominations open |
+
+## Time / locale / format
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| C6-2-simpletimezone-id-resolved-instead-of-rawoffset | `SimpleTimeZone` answers from the ID | SUPERSEDED | MIXED | **corrected**: §D's predicted 10,800,000 measured at 7,200,000 |
+| C12-1-simpletimezone-the-trap-and-the-second-site | the unregistration landed; a second site remains | OPEN | MIXED | the authority for 7,200,000 and for "the skew is not a constant" |
+| C6-3-a-native-registered-for-the-vms-own-instance-hijacks-the-apps | class-wide registration hijacks app instances | OPEN | **none** | **no provenance statement anywhere near the top** |
+| W7-3-format-conversions-and-stringbuilder-bounds | `String.format` float conversions, StringBuilder bounds | FIXED-UNVERIFIED | MIXED | |
+| W7-34-formatter-family-residuals | twelve `java.util.Formatter` divergences | OPEN | MIXED | a blocking co-requisite drops its Locale — RJdkHello goes red |
+| W7-41-format-exception-subclasses | refusals threw the base type, not the subclass | FIXED-UNVERIFIED | MIXED | evidence unscheduled — `run.sh` never runs `probes/` |
+| W7-44-numberformat-enum-and-double-tostring | accounting currency pattern, enum message, last-bit log | FIXED-UNVERIFIED | MIXED | |
+| W7-80-locale-data-stage-two | CLDR locale data was reachable all along | FIXED-UNVERIFIED | MIXED | one named breaking site must land in the same change |
+| W7-91-format-date-symbols-hardcoded-english | `%t`/`%T` names came from hard-coded English tables | OPEN | MIXED | partial; §5's numeric half is live |
+
+## Logging
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W7-22-shadow-retirement-logging-and-time | shadow retirement for logging and date/time | OPEN | MIXED | blocked on a Linux build and three frozen artefacts |
+| W7-25-jul-getlogger-regression | JUL `getLogger` regression; ambient kind hides a shadow | FIXED-MEASURED | MEAS | a Compatible-only console fallback divergence is open |
+| W7-35-jul-supplier-and-payload-residuals | JUL supplier overloads and record payload residuals | FIXED-MEASURED | MEAS | 24 rows still ambient `Intrinsic` |
+| W7-56-infercaller-strict | the shadow LogRecord ctor dropped `needToInferCaller` | FIXED-MEASURED | MEAS | **no `Status:` line** — status is a table ROW at line 5 |
+
+## GC / memory / object layout
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| W4-4-slot-index-species-sweep | natives using synthetic slot indices on real JDK objects | OPEN | SRC | every count is a `javap`+source upper bound, never a run |
+| W7-49-slot-index-recensus | census against the un-blinded alias detector | OPEN | SRC | 511 direct allocation sites bypass the detector |
+| W7-58-bytebuffer-direct-arm | `bb_state` had no direct-buffer arm | FIXED-UNVERIFIED | MIXED | |
+| W7-66-live-over-allocations | 22 live over-allocation sites | OPEN | MIXED | "over is not a defect predicate"; one genuine aliasing defect left |
+| W7-68-live-under-allocations | the under-half: no object is actually short | FIXED-UNVERIFIED | MIXED | §3.5's premise refuted in its own banner |
+| W7-69-read-side-alias-instrument | the read-side alias instrument and its first census | OPEN | SRC | the census has never been run; all `lib.rs` line numbers stale |
+| W7-72-ssc-socket-and-filechannel | ServerSocket cached into `keys`; FileChannel map | FIXED-UNVERIFIED | MIXED | an in-bounds write of the wrong field — invisible to count-based instruments |
+| W7-73-short-object-blind-spot | short objects hide in the `Err(_) => ClassId::new(0)` arm | OPEN | SRC | headline self-corrected 16-of-30 → 12-of-28; a cited authority does not exist |
+| W7-74-short-object-repairs | two live short Thread mirrors repaired, twelve latent | FIXED-UNVERIFIED | MIXED | §5's "14 of 28" is an arithmetic slip |
+| W7-76-bytebuffer-alias-residuals | one parity fix, two refused renumbers | OPEN | MIXED | |
+| W7-77-guarded-slot-maps | four guarded slot maps; no map renumbered | FIXED-UNVERIFIED | MIXED | §5.3's disposition stands but BOTH its stated reasons are false |
+| W7-84-primitive-in-reference-store | a primitive stored into a declared-reference slot | FIXED-UNVERIFIED | MIXED | four implementations converged on auto-boxing |
+| W7-89-memorysession-checkvalidstate | the FFM liveness gate fails open on closed arenas | FIXED-UNVERIFIED | MIXED | |
+| W7-90-slot-map-sweep-caller | the declared-slot-map sweep had no caller | OPEN | SRC | three of four doors closed |
+
+---
+
+# SECOND PASS — waves D, E and F (added by lane F25, 2026-08-13)
+
+**73 records, none of which had a row above.** Subjects are each record's own
+H1, condensed; status is read from the record's own status prose, never from
+its filename.
+
+**A provenance convention runs through almost all of these and is stated once
+here rather than repeated 73 times.** Waves D/E/F worked on a shared branch
+whose lanes were forbidden to build or run CratonVM, so the standard shape is:
+**HotSpot 25.0.3+9-LTS column MEASURED on the lane's own host, tree and
+`jdk25src` citations READ, CratonVM "after" column PREDICTED** — i.e. `MIXED`
+in this index's vocabulary, and `FIXED-UNVERIFIED` where a fix landed. Rows
+below carry `MIXED` unless the record itself says otherwise; the exceptions
+worth knowing are the `R11` baseline line (E32/E37/E41-R11 ran `cargo test` and
+say so) and the `W8-E*` harness records (which ran the suite).
+
+> **Do not read `FIXED-UNVERIFIED` here as "nearly done".** In this directory it
+> means *no binary carrying the change has ever executed*. Several of these
+> records also say, in their own residuals, that they were never type-checked.
+
+## The SSL / TLS session chain — read in this order
+
+Seven records, not six, and each one corrects or extends the one before it. A
+reader who opens any single one of them will get a picture that a later record
+in the chain has already moved.
+
+| # | record | what it established | status | prov |
+|---|---|---|---|---|
+| 1 | E12-1-the-null-session-and-the-fabricated-cipher | a session that negotiated nothing answered `TLS_AES_256_GCM_SHA384`, `"UNKNOWN"`, a 32-byte pseudo-random id, and a **null** `SSLSocket.getSession()`; the eleven accessors are NOT uniform (some refuse, some answer null). Created `RSslNullSession` | FIXED-UNVERIFIED | MIXED |
+| 2 | E22-1-the-null-session-in-the-registrar-that-actually-answers | the E12-1 fix went into a registrar that does not answer; the live one is `t27_tls.rs`. **`--dump-native-registry` is the instrument**, not grep | FIXED-UNVERIFIED | MIXED |
+| 3 | E31-1-the-unregistered-door-and-the-slot-that-resurrects-a-fabrication | `getHandshakeSession` had no registration at all, so `RSslNullSession` ran **1 of its 47 checks**; and slot 3 is the peer host on the wide shapes and the **attribute map** on the 4-field one, which Jetty arms on every SSL request | FIXED-UNVERIFIED | MIXED |
+| 4 | E42-1-the-slot-that-was-never-there-and-the-predicate-that-was-its-own-negation | the attribute slot the previous record reached for did not exist at that width, and a predicate was its own negation. Blocks the obvious "widen NEW-13" repair | FIXED-UNVERIFIED | MIXED |
+| 5 | F6-1-the-arm-that-had-to-move-and-the-two-minters-it-keeps-wrong | the width arm moved; two minters are **deliberately** left wrong, with the reason recorded | FIXED-UNVERIFIED | MIXED |
+| 6 | F10-1-the-two-minters-that-told-a-completed-handshake-it-never-happened | a COMPLETED handshake reported as never negotiated; `HTTPS_CLIENT_SESSION_MARKER` is not free to choose — it must not collide with any real socket id | FIXED-UNVERIFIED | MIXED (HTTPS arm measured on a loopback `HttpsServer`) |
+| 7 | F18-1-four-session-doors-with-no-registration-and-the-twin-that-read-another-table | `invalidate`/`getPeerHost`/`getPeerPort`/`getSessionContext` had **no registration** (⇒ `AbstractMethodError`), and `getPeerPrincipal` read a different table from its twin `getPeerCertificates`. **Corrects "invalidate moves isValid and nothing else"** — it moves `getSessionContext` too | FIXED-UNVERIFIED | MIXED |
+
+Adjacent, same family, not part of the chain proper:
+`E3-1-the-cipher-name-helper-and-its-real-denominator` (the helper had 1 caller
+of 8) and `D3-3-rustls-cipher-names-reaching-jsse` (five of seven sites need
+the rustls spelling).
+
+**Fixture state:** `regression-suite/src/RSslNullSession.java` was **47 checks**
+through records 1–7 and asserted nothing about any of record 7's four doors.
+Lane F25 extended it to **89 checks**; see
+`F25-1-the-four-doors-the-null-session-never-knocked-on-and-two-argument-kind-vectors-20260813.md`.
+
+## Wave D
+
+| record | subject | status | prov |
+|---|---|---|---|
+| D1-R11-SERVICELOADER-DOUBLE-SOURCE | the duplicate `junit-jupiter` engine is a modular jar on `-cp` promoted into the boot layer; **not intermittent**, and `getResources` is innocent | OPEN | MIXED |
+| D3-1-simpledateformat-format-zone-arm | the zone-arm patch is right and **the fixture meant to prove it cannot** | OPEN | MIXED |
+| D3-2-http2-optional-reference-layout | eleven `Optional` sites, not nine — and every one is dead outside synthetic-JDK mode | OPEN | MIXED |
+| D3-3-rustls-cipher-names-reaching-jsse | five of seven sites need the rustls spelling; one is a provable no-op | OPEN | MIXED |
+| W8-D2-1-two-summary-lines-and-the-suite-denominator | two REGRESSION SUITE lines in one log, neither with a denominator | META (instrument audit, no VM defect) | MEAS |
+
+## Wave E — defect and census records
+
+| record | subject | status | prov |
+|---|---|---|---|
+| E1-1-simpledateformat-format-zone-arm-landed | the `format` zone arm LANDED; the fixture the brief named cannot gate it | FIXED-UNVERIFIED | MIXED |
+| E2-1-optional-reference-layout-landed | eleven `Optional` sites fixed, one left alone; the builder family keeps four fixture rows red | FIXED-UNVERIFIED | MIXED |
+| E5-1-base64-null-contract-and-the-fourth-site | the fourth Base64 null site, and a whole-surface audit behind it | FIXED-UNVERIFIED | MIXED |
+| E7-1-character-int-code-point-contracts | `Character.charCount` lost the sign; the above-BMP case tables had never been looked at | FIXED-UNVERIFIED | MIXED |
+| E8-1-string-null-contracts-and-the-third-copy-of-six-constants | `String`'s reference arguments swallowed every null; six version-skew constants needed a third copy | FIXED | MIXED |
+| E10-1-intrinsic-census-round-3 | 292 of the last 420 `Intrinsic` triples, and a `SimpleDateFormat` memo collision | OPEN | MIXED |
+| E13-1-the-six-builders-decode-a-reference-as-an-int | six builders decoded a reference as an `Int`; four more sites the idiom did not mark; one row that still cannot go green | FIXED-UNVERIFIED | MIXED |
+| E14-1-base64-the-fabricated-receiver-and-the-seven-methods-that-read-it | the fabricated Base64 receiver and the seven methods reading it | OPEN (NOMINATION §7) | MIXED |
+| E17-1-character-digit-int-and-the-fifteen-unregistered | `Character.digit(int,int)` stays unregistered; the "15 deliberately unregistered" methods are **57** | OPEN — **no code change** | SRC |
+| E18-1-the-jit-facing-string-doors-and-the-fourth-copy-of-one-search-rule | the JIT-facing `String` doors, and one JVMS search rule written four times | FIXED | MIXED |
+| E21-1-getstatic-has-no-native-path | `GETSTATIC` has no native path; the family is **148, not 5** | OPEN | PRED |
+| E23-1-synthetic-jdk-nosuchmethoderror-census | 7,700 methods over 845 classes; the one that costs 88 fixtures | META (measurement + one behaviour-neutral deletion) | MEAS |
+| E26-1-the-reach-audit-what-eleven-green-families-were-not-asking | eleven GREEN families audited for what they were **not** asking | OPEN (mostly NOMINATION §8) | MIXED |
+| E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy | closes E18-1's three JIT doors; the fifth copy of the search rule; one E18-1 claim was wrong | FIXED | MIXED |
+| E34-1-the-throwable-ctor-table-and-the-descriptor-javac-actually-emits | one fixed descriptor list; 62 classes, 97 constructors that do not exist and 15 that do | FIXED (registrar data) | PRED |
+| E36-1-inverted-enum-fallbacks-and-the-field-shaped-rows-that-cannot-fire | inverted `name`/`ordinal` fallbacks; a `values()` returning nine nulls with the difficulty stated as its excuse; 21 field-shaped rows classified | OPEN | PRED |
+| E38-1-biginteger-shifts-ctors-and-the-stringbuilder-repeat-twin | the shift that allocates, the constructor that validated nothing, the `repeat` twin that won | LANDED (unbuilt) | MIXED |
+| E39-1-four-pending-nominations-applied-on-top-of-the-new-denominators | four pending nominations APPLIED on denominators that had just moved | META / APPLIED | MIXED |
+| E40-1-the-test-that-pinned-a-wrong-type-and-the-36-sites-a-getstatic-cannot-reach | a test pinning a wrong type; a withdrawn class three tests still describe; 36 call sites no `getstatic` can reach | OPEN | PRED |
+| E41-GATHERER-SLOT-MAP-AND-JUL-LOGGER-CONVENTION | one slot map per class for `Gatherer`; the **second** `java/util/logging/Logger` convention | FIXED-UNVERIFIED | MIXED |
+| E43-1-collapsing-the-blanket-throwable-ctor-rule-onto-one-table | the blanket throwable-`<init>` rule was at **five** sites, not four | FIXED (registrar side) | PRED |
+
+## Wave E / R11 — the JDK-baseline and unfalsifiable-guard line
+
+The one part of waves D–F that **ran tests**. Read E32 → E37 → E41-R11 in order.
+
+| record | subject | status | prov |
+|---|---|---|---|
+| E4-R11-CLASS-PATH-MODULE-BOOT-LAYER-FIX | the fix for the class-path module promoted into the boot layer, and the one jar shape it does NOT close | FIXED-UNVERIFIED | PRED |
+| E16-R11-P59-MODULE-LAYER-TWIN | NOM E-7's "dormant twin" was **not dormant, and not for the stated reason** | OPEN | MIXED |
+| E20-R11-INTERSECTION-BLIND-GUARD | a guard that could not fail for the case it was written for, and a census built from its own answer | OPEN | MIXED |
+| E25-R11-GUARD-POPULATION-SWEEP | the seventeenth `Mac` method, and every other guard whose population was its own answer | FIXED-UNVERIFIED | MIXED |
+| E28-R11-P59-MODULE-WIDTHS-AND-CATALOG | three widths, and a catalog side effect whose real blocker is a field **NAME** | OPEN | MIXED |
+| E32-R11-JDK-BASELINE-CAPABILITY | checked-in JDK surface baselines + the generator that writes them — **the missing capability, built** | FIXED-MEASURED (generator self-verified); consumer pending | MEAS |
+| E33-R11-FOUR-UNFALSIFIABLE-GUARDS | four guards that could not go red, repaired and **mutation-checked** | FIXED-UNVERIFIED-BY-CARGO | MEAS (mutation) |
+| E35-R11-SYNTHETIC-WIDTH-SWEEP | every synthetic allocation in `native-builtins/src/lib.rs` against its declaration and its twins | OPEN | MIXED |
+| E37-R11-JDK-BASELINE-CONSUMER-AND-RATCHET | a self-testing parser, a four-kind two-way ratchet, the worked rewrite | FIXED-MEASURED (17/17) | MEAS |
+| E41-R11-TWELVE-GUARDS-CONVERTED | twelve guards converted; three class names JDK 25 does not have | FIXED-MEASURED (25/25 in module) | MEAS |
+
+## Wave W8-E — harness, oracles and the `aastore` atomic set
+
+The `W8-E` line is where the **suite's own instruments** were audited. Six
+fixtures had a broken HotSpot oracle; that is the standing reason a green
+family is not evidence.
+
+| record | subject | status | prov |
+|---|---|---|---|
+| W8-E6-1-aastore-ase-names-the-component-not-the-array | `aastore`'s ArrayStoreException named the element's COMPONENT class; the helper that fixed this for `checkcast` had one caller | APPLIED | MIXED |
+| W8-E9-1-three-broken-oracles-and-the-suite-denominator | three fixtures whose HotSpot oracle was broken, and the suite's denominator. **The authority for the `checks=`/`fails=` one-value-per-line rule** | FIXED-MEASURED | MEAS |
+| W8-E11-1-jit-aastore-third-twin-and-the-check-only-helper | the third `aastore` twin, and a check-only helper that lets the inline store come back | APPLIED + NOMINATION SET | MIXED |
+| W8-E15-1-the-fourth-broken-oracle-the-unscheduled-vector-and-the-reach-ratchet | the fourth broken oracle, a vector registered nowhere, and G5 — a ratchet for **reach** | FIXED-MEASURED (for two fixtures) | MEAS |
+| W8-E19-1-the-void-guard-sweep-and-the-aastore-atomic-set | undefined-RAX guard sweep; the `aastore` ATOMIC SET, 2 of 5 applied — **the tree does not build until §3 lands** | OPEN (partial) | MIXED |
+| W8-E24-1-the-aastore-abi-slot-applied-and-seven-literals-the-nomination-missed | the ABI slot APPLIED 5 of 5; seven count literals W8-E19-1 did not carry | FIXED-UNVERIFIED | MIXED |
+| W8-E29-1-bridge-census-round-1 | the first `Bridge` census — the largest `NativeKind` had never been measured | OPEN | MIXED |
+| W8-E30-1-broken-oracles-five-and-six-and-a-lint | oracles five and six, shared launch hooks, and G6 — a lint making the reporting dialect self-enforcing | FIXED-MEASURED (for three fixtures) | MEAS |
+
+## Wave F
+
+| record | subject | status | prov |
+|---|---|---|---|
+| F1-1-the-boxing-caches-were-three-of-six-and-the-bounds-all-differ | three of six boxing caches, and no two of the six share a bound | FIXED-UNVERIFIED | MIXED |
+| F2-1-the-charbuffer-that-read-empty-and-the-two-shifts-that-allocated | a `CharBuffer` that read empty, a shift that allocated 256 MB, a constructor that invented a zero | LANDED (unbuilt) | MIXED |
+| F3-1-RANDOM-NULL-CONTRACT-AND-THE-SECOND-JUL-LOGGER-CONVENTION | `java.util.Random`'s null contract lives in a file that lane could not edit; the second `Logger` convention in `lib.rs` | OPEN (NOMINATION) | MIXED |
+| F5-1-charbuffer-accessible-array-three-way-split | `hasArray`/`array`/`arrayOffset` had ONE branch where the JDK has THREE | FIXED-UNVERIFIED | MIXED |
+| F6-1 … | see the SSL chain above | | |
+| F9-1-the-eighteen-that-could-not-fail-and-the-descriptor-that-cannot-be-corrected | eighteen tests an `if let` could skip; two struct layouts HotSpot refuses to build; a descriptor that cannot be corrected in the test | OPEN | PRED |
+| F10-1 … | see the SSL chain above | | |
+| F11-1-reflective-boxing-is-canonical-everywhere-except-array-get | reflective boxing is canonical everywhere except `Array.get`; the caller that forbade the obvious fix was never a caller | FIXED-UNVERIFIED | MIXED |
+| F12-1-NULL-CONTRACT-APPLIED-AND-THE-GETINSTANCE-ARGUMENT-ORDER | NOM F3-1 applied, plus a seventh divergence: `getInstance`'s argument **ORDER**. **Five of the seven had no check anywhere in the tree** | FIXED-UNVERIFIED | MIXED |
+| F14-1-the-mutable-alias-a-hasarray-check-handed-out | the mutable alias `hasArray()` handed out, and the supertype that makes half the family's assertions ornamental | FIXED-UNVERIFIED | MIXED |
+| F15-1-two-registrars-that-no-bytecode-can-name | two registrars no bytecode on this JDK can name, and the mode question that shortens every reachability argument | OPEN | MIXED |
+| F16-1-one-layout-encoding-and-the-padding-the-jdk-never-inserts | one layout encoding, padding the JDK never inserts, and the union that discarded its members | FIXED-UNVERIFIED | PRED |
+| F17-1-cds-sharedsecrets-fabrications | eleven CDS natives for classes JDK 25 does not have; two real natives a public-only baseline could not see; a factory-name guard punishing the correct spelling | FIXED-UNVERIFIED | MIXED |
+| F18-1 … | see the SSL chain above | | |
+| F19-1-the-sixteen-that-allocated-and-the-boolean-that-was-not-TRUE | sixteen allocating sites, a `Boolean` that was not `TRUE`, and the fifth boxing implementation that is the only correct one | FIXED-UNVERIFIED | MIXED |
+| F20-1-the-three-unguarded-rescales-and-the-scale-that-negates-into-a-panic | three unguarded rescales, a scale that negates into a panic, two twins that shadow their own fix | **PARTIAL** | MIXED |
+| F21-1-read-only-is-contagious-and-the-registrar-that-shadows-the-fix | read-only is contagious through `duplicate`/`slice`/`slice(int,int)`; three copies converge; a registrar shadows the repair | FIXED-UNVERIFIED | MIXED (916-row seven-family sweep MEASURED) |
+| F22-1-formatter-utf16-units-and-t-zone | `java.util.Formatter` carried its output as a Rust `String`; `%t` had no time zone | FIXED-UNVERIFIED | MIXED |
+| W8-F4-1-the-formatter-conversion-table-swept-against-the-spec | `%h` was an alias for `%s`; the null argument had never taken the JDK's printer | OPEN (edits landed, unbuilt) | MIXED |
+| W8-F7-1-the-argument-driven-allocation-sweep-of-biginteger-and-bigdecimal | one bit that cost 256 MB, and the sweep for everything else sized by an argument | LANDED (unbuilt) | MIXED |
+| W8-F13-1-formattable-never-dispatched-and-the-upper-caser-ran-after-the-justifier | `%s` of a `Formattable` never dispatched; the upper-caser ran AFTER the width justifier | OPEN (edits landed, unbuilt) | MIXED |
+| F25-1-the-four-doors-the-null-session-never-knocked-on-and-two-argument-kind-vectors | fixture-only: F21-1's GAP 3c landed (19 rows), `RSslNullSession` 47 → 89, `RJdkSecurity` 80 → 123, this index brought current | FIXED-MEASURED **on the oracle only** — no CratonVM run | MEAS (HotSpot) |
+| F23-1-the-guard-that-could-not-see-a-private-native | the surface baseline kept public+protected only, so **27.7% of the surface (528 rows) was invisible** and visible `native` methods went 3 → 13; 3 of 5 prior off-surface CDS verdicts were artifacts; **no registration had been wrongly deleted** | FIXED (32 baselines regenerated, v1 → v2) | MEAS (jrt image); the Rust half checked by a **transcribed proxy oracle**, 56 assertions |
+| F24-1-sharedsecrets-spellings-and-the-list-that-checked-itself | `getJavaSecurityAccess` went with JEP 486; `getJavaUtilJarAccess` → `javaUtilJarAccess`; the two lists diverged **in both directions at length 15**, so every count-based check passed | FIXED-UNVERIFIED | MEAS (`javap -p` = 98 members; plain `javap` = 65) |
+| F26-1-a-copying-slice-is-a-wrong-capability | `slice`/`duplicate`/`wrap` copied where HotSpot aliases; `bb.slice(2,4).duplicate().get(0)` read the wrong element **on dev** | PARTIAL — `ByteBuffer` landed; the six typed families are **specified, not landed** (three different aliasing mechanisms) | MEAS |
+| F27-1-the-reader-that-answered-eight-and-the-length-it-called-an-address | `read_layout_kind` matched none of the real `ValueLayouts$Of*Impl` carriers; `alloc_return_slot` sized every aggregate return at 8 bytes — a live **out-of-bounds heap write**, since `ffi_call` writes `rtype->size` | FIXED-UNVERIFIED | MEAS |
+| F28-1-the-t-family-answered-27-fields-it-must-refuse-and-a-null-locale-is-not-the-default | 186-cell sweep (31 `%t` fields × 6 `java.time` types): CratonVM answered **all 31 for all six** because `invoke_i32` returns 0 for a missing method; a null locale means **three** different things and the JDK means all three | FIXED-UNVERIFIED — **79 cells now refuse**; real blast radius, stated not buried | MEAS (forced `ru_RU`, `tr_TR`, `ar-EG`, `Asia/Kolkata`) |
+| F29-1-the-wrapper-class-comes-from-the-call-site-not-the-methodtype | one handle whose `MethodType` says `Object` yields **six** wrapper classes — the class comes from the call-site static type, which never reaches natives; refutes F19-1 §7 N2's stated mechanism | PARTIAL — the `Object[]` collector needs a descriptor threaded across three crates | MEAS (3 runs, `-Xint`, `-XX:-UseCompressedOops`) |
+| F30-1-the-registrar-call-graph-and-the-drifted-arm | **three** registration arms serving **four** configurations; the feature-build's real-JDK arm was missing four passes — incl. `register_random_and_securerandom_natives`, so a seeded `Random` returned **0 from every `nextInt`/`nextLong`/`nextDouble`** | FIXED-UNVERIFIED, gated by a source-witness that compares the arms element-for-element (mutation 8/8, control green) | READ (source census, line-numbered) |
+| F31-1-three-roads-out-of-one-scale-and-the-zero-operand-that-is-exempt | one receiver, three answers — `Underflow` / `0` / `Overflow`, because `setScale` reaches the clamping instance `checkScale` and `toPlainString` the casting static `checkScaleNonZero`; a **zero raised operand is exempt**, so F20-1 N1(a)'s text would have refused four rows HotSpot answers | FIXED-UNVERIFIED | MEAS |
+| F32-1-the-proxy-route-and-the-drifted-twin | the deciding line is an **inlined one-name copy** in a third dispatch door (`dispatch_virtual.rs`), not either site read before; since `real_proxy_super()` defaults true the guard has been **inert for the shipping configuration** since the real-super gate landed | PARTIAL — the route switch is staged and must land **after** the shim's `C B S I J` boxing arms | READ (line-numbered) + MEAS (a real `$Proxy0` dumped and disassembled) |
+| F33-1-a-factory-and-its-owner-must-share-one-kind | `register()` re-tags by **receiver class**, so one ambient `Bridge` block left factories surviving strict mode while their carriers were dropped; **2 of 4 carriers cannot service a single `invokeinterface` in any mode**, which refutes "make them work" | FIXED-UNVERIFIED — the factory now carries the kind of the owner it hands out (derived rule, no second list) | MEAS (`javap -p`, with negative controls) |
+
+## Wave C stragglers — the two C19 fixture records
+
+| record | subject | status | prov |
+|---|---|---|---|
+| C19-1-optional-shape-fixture | `RJdkOptionalShape` — the executable form of C12-3, with an honest account of which rows reach it | FIXED-UNVERIFIED | MIXED |
+| C19-2-simpledateformat-zone-fixture | `RSimpleDateFormatZone` — the `format`-shaped vector C12-1 §5 asked for, vacuity trap closed mechanically | FIXED-UNVERIFIED | MIXED |
+
+---
+
+## Contradictions found and NOT resolved
+
+A contradiction stated is worth more than a contradiction guessed. None of
+these was silently decided.
+
+1. **`Math.ulp`'s NaN patterns.** `W7-95` §"`Math.ulp` is EXECUTED-fixed"
+   reports the shipped body differing from `Math.abs` on **16,777,212 NaN bit
+   patterns** (payload dropped). The later result is that the two forms are
+   **equivalent over all 4,294,967,296 patterns**. Both are described as
+   measured. They reconcile only if "equivalent" excludes NaN payload — which
+   the javadoc permits, since it promises only "is NaN". **Not settled here.**
+   Whoever re-runs it should say which of the two claims their number is.
+2. **`W7-95a`'s `VM ABORT` rows.** Rows 14 and 38 of the String code-point
+   family (`offsetByCodePoints(10,-1)`, `indent(-1)` over an NBSP) are recorded
+   as Rust panics. The measured result "no family aborts the VM" is scoped to
+   the six `floorDiv`/`floorMod` triples and to the second-generation census.
+   **Whether these two String rows still abort is not established by that
+   result**, and `W7-95` lists the String family as still open. Do not read
+   "no family aborts the VM any more" as covering them.
+3. **`W7-62`'s own two statements about itself.** Its `Status:` line (≈:50)
+   says *"SOURCE COMPLETE, NOTHING BUILT OR RUN"*; its top banner (≈:3–48) is a
+   measured `cargo test` run. One of the two is describing a different scope
+   and the record does not say which.
+4. **`W4-1`'s two status bullets.** One says the residual is "FULLY CLOSED";
+   the next says the deletion-only patch is "genuinely unapplied". Both are in
+   the same status block.
+5. **`W7-50`'s header vs its §12.** The header says "source landed,
+   UNVERIFIED"; §12 is a real run showing defect A still live. The header is
+   the stale half, but this lane did not rewrite it — it belongs to the lane
+   that took §12's run.
+6. **`W6-9` §8's heading** still reads "not applied" for a section that is
+   fully applied. Recorded because it has already cost two agent runs.
+7. **`README.md`'s record count.** Its headline says 94, with a paragraph
+   explaining that both terms of the arithmetic that produced 94 have moved and
+   cancelled. The directory now holds **153 `.md` files**. The README's
+   exclusion list is what drifts, not the count. Not rewritten here: the README
+   is the directory's own front matter and a recount belongs with whoever owns
+   its exclusion rules.
+
+## Records with no parseable status
+
+A grep for a line beginning `Status` misses **22 of the 153 files**. Of those
+22, all but one carry status prose somewhere else — in the title, in an opening
+blockquote, in a bold paragraph, or (in `W7-56`) in a **table row**. Four are
+worth naming because they read as status-less on a skim: `W7-53`, `W7-54`,
+`W7-56`, `W7-61`. The remaining seventeen are dated deliverables whose whole
+body is the status.
+
+**Exactly one record has no provenance statement near the top at all:**
+`C6-3-a-native-registered-for-the-vms-own-instance-hijacks-the-apps.md`. Every
+other record in this directory says, somewhere in its first screen, whether its
+numbers were executed or predicted.
+
+## NOMINATIONS (out of this lane's boundary — `.md` under this directory only)
+
+**N1 — the renamed record is cited from two Rust files.** Both are stale paths
+now.
+
+*File:* `vm/src/runtime/interpreter/typecheck.rs`, line ≈782
+*exact literal old text:*
+`docs/known-issues/jdk-only/W7-39-aastore-interface-component-blanket.md`
+*exact literal new text:*
+`docs/known-issues/jdk-only/W7-101-aastore-interface-component-blanket.md`
+
+*File:* `vm/src/runtime/interpreter/tests.rs`, line ≈91
+*exact literal old text:*
+`docs/known-issues/jdk-only/W7-39-aastore-interface-component-blanket.md`
+*exact literal new text:*
+`docs/known-issues/jdk-only/W7-101-aastore-interface-component-blanket.md`
+
+The five `W7-39` mentions in `native-builtins/src/jca/*.rs` and
+`phases_late/ssl_security.rs` refer to the **JCA** record, which kept the
+number. **Do not rewrite those.**
+
+**N2 — `register_interface_natives`' own header comment is stale.** It says
+"these 23" for a function with 38 registrations
+(`native-collections/src/lib.rs`, ≈28773). Two records now correct it from the
+outside; the comment itself is what a reader hits first.
+
+---
+
+# THIRD PASS — the measurement phase, 2026-08-14
+
+**Why this block exists.** Waves A–F were written by lanes that could not
+build or run the VM: every "after" in those records is **PREDICTED**. A
+measurement phase then built the binary and ran the fixtures against the
+HotSpot 25.0.3+9-LTS oracle. This block records what the binary said, adds the
+seven records that had no row, and corrects the rows measurement falsified.
+
+**Read `F41-1` first.** It is the summary of that phase and the only record in
+
+**Starting fresh? Read `HANDOFF-20260814.md` first instead.** It has the build
+and measurement loop, the traps that cost this session real time, and the
+ordered list of what to pick up next.
+this directory whose claims were verified by running the VM.
+
+## Records added (had no row in either earlier pass)
+
+| record | subject | status | prov |
+|---|---|---|---|
+| F34-1-the-synthetic-only-registrar-population-and-its-gate | 284 registrars reachable only via `register_synthetic_overrides`; **0 of 127 exclusive classes declare a `native` method**, so no capability gap at class granularity — the exposure is 2,412 triples registered by BOTH a synthetic-only family and a shipping pass (drift, ungated) | GATE LANDED, and **RUN**: `cargo test --test registrar_reachability` = 4 passed | READ + the gate EXECUTED |
+| F35-1-the-segment-that-could-not-read-its-own-array-and-the-gate-that-was-inverted | heap `MemorySegment` access implemented; `asSlice` stamped `0 + offset` as an address, so a sliced heap segment dereferenced the literal offset — F27-1 **moved** that fault rather than closing it | FIXED-UNVERIFIED | MEAS (oracle) |
+| F36-1-the-half-the-null-session-cannot-reach-and-the-verifier-that-was-never-invoked | `RSslLiveSession`, 95 checks, loopback TLS; **F18-1 §8.3(4) is WRONG** — its verifier claim was measured against a verifier that never ran | FIXED-MEASURED on the oracle | MEAS (121/121 mutants dead) |
+| F37-1-the-typed-families-alias-and-a-read-only-put-that-succeeded | `ByteBuffer.allocate(8).asReadOnlyBuffer().put(0,(byte)1)` **SUCCEEDED**; F21-1 had CLEARED that cell against a body registration order shadows | FIXED-UNVERIFIED | MEAS |
+| F38-1-the-formatter-locale-slot-and-two-year-fields-with-one-localized-minus | `Formatter()` wrote null into the locale slot, collapsing "no locale" and "the default" into one value; the deletion route fails on slot 0 | FIXED-UNVERIFIED | MEAS |
+| F41-1-what-the-first-real-measurement-of-wave-f-found | **the measurement phase itself** — four defects, three of them created or left behind by wave F, none visible to the lane that owned the file | FIXED-MEASURED | MEAS (both VMs) |
+| W8-E30-1-broken-oracles-five-and-six-and-a-lint-that-makes-the-dialect-self-enforcing | harness dialect lint | (as stated in the record) | — |
+
+## Rows measurement CONFIRMED (PRED → MEASURED)
+
+These predicted a denominator or a flip, and the binary agreed **exactly**:
+
+| record | predicted | measured |
+|---|---|---|
+| F2-1 | `hex` 73 → up, checks 32–49/54–57/69/73 flip | **`hex=77`**, family green |
+| F14-1 | `hex` 73 → **77** | **77** |
+| F21-1 | `bounds` 102 → **121** | **121** |
+| F25-1 | `RJdkIntrinsics2` **1022**, `RJdkSecurity` **149** | **1022 PASS**, **149 PASS** |
+| F11-1 / F19-1 / F29-1 | reflective boxing identity | **`RJdkReflBox` PASS, 107 checks** |
+| F40-1 | the route switch would not redden the proxy arms | proxy family green |
+
+## Rows measurement FALSIFIED or narrowed
+
+| record | what it claimed | what the binary showed |
+|---|---|---|
+| **F14-1 §N1** | fixed `native_tb_array`'s refusals | that body **never ran**. `--dump-native-registry`: `java/nio/IntBuffer.array()[I` is owned by `servlet.rs` (`owns_slot=true, overwrote=null`), and four sibling families were registered under the **wrong descriptor** `()[I` — phantom rows nothing can dispatch to. Fixed in `fdacf3a01`. |
+| **F2-1** | `parseHex` fixed by registering the ranged overloads | correct, but resting on a reader that was wrong one layer down: `CharBuffer.toString()` applied the length and dropped the position **on the reflective route only**. Fixed in `fdacf3a01`. |
+| **F18-1 §8.3(4)** | the `HostnameVerifier`'s session is a different object | **same object** — measured against a verifier that was never invoked. Correction note inlined in F18-1 by `871ae0a25`. |
+| **F19-1 §7 N2** | the collector fix needs the handle's `MethodType` | the wrapper class comes from the **call-site static type**; one handle whose `MethodType` says `Object` yields six wrapper classes (F29-1). |
+| **F5-1 §1** | `ReadOnlyBufferException` and `UnsupportedOperationException` share no supertype below `RuntimeException` | ROBE **extends** UOE; the conclusion survives on check *ordering* (F14-1). |
+| **a `phases_early.rs` comment** | the `lib.rs` LogRecord ctor registration "is refused and this one silently owns the slot" | the reverse: `lib.rs owns=true inv=2`, `phases_early owns=false inv=0`. A fix landed in the dead body and changed nothing. Corrected in place by `8c72d23ca`. |
+
+## Still open, measured but deliberately NOT fixed
+
+- **`java/util/Hashtable`** diverges on **7 of 9** rows of the null axis. A
+  separate slot from `Properties`, served partly by generic Map natives shared
+  with `HashMap` (which legitimately accepts null keys), so it needs
+  receiver-routing, not a copied guard.
+- **`ConcurrentHashMap`**'s null-key helper carries an invented message
+  (`"ConcurrentHashMap does not permit null keys"`) never checked against the
+  oracle.
+- **`InheritableThreadLocal`** captures at `start()` where the JDK captures at
+  construction — see F41-1 §6. The current behaviour is a *documented
+  workaround* protecting every `Executors` path; moving it needs
+  interpreter-level tracing.
+
+---
+
+# FOURTH PASS — the listing re-taken, and seven claims this directory got wrong
+
+**Lane G40, 2026-08-17.** Listing re-taken at `ls docs/known-issues/jdk-only/*.md
+| wc -l` = **280 files**, including `INDEX.md` and `README.md`, on branch
+`claude/jdk-only-mode-completion-1351c0` at `HEAD = 9ae371468`. Every file is
+`.md`; there are no non-`.md` entries in this directory.
+
+**Thirty-six of those 280 had no row anywhere in this index** — the whole wave-G
+line (`G1-1` … `G34-1`, 34 records), plus `BASELINE-20260817.md` and
+`HANDOFF-20260814.md`, both of which are the most current documents here and
+neither of which was listed. They are added in §A below. The eight SSL-chain
+records that a first-cell scan reports as missing are **not** missing: they are
+rowed in "The SSL / TLS session chain", whose first column is a sequence number.
+
+> **This block will rot too, and faster than its predecessors.** Seven lanes were
+> editing this tree while it was written and five further records (`G35-1`,
+> `G36-1`, `G37-1`, `G38-1`, `G39-1`) were being written *as* the count was
+> taken. If you find a file with no row, it is newer than this pass, not a stray.
+> **Re-take the listing before quoting 280.** The number has been 155, then 227,
+> then 280 in four days.
+
+**How completeness was checked**, so the next lane can repeat it rather than
+trust it: extract every table row's first cell from `INDEX.md`, strip backticks
+and bold, and test each filename's first 18 characters against that set. That
+method has one known false-positive mode (the SSL chain, above) and one known
+false-negative mode (a record named only in prose, never in a row) — both were
+resolved by hand here.
+
+---
+
+## A. Records added — the wave-G line, the baseline and the handoff
+
+Status is read from **each record's own status prose**, as everywhere else in
+this index. Where the record's own prose and a later measurement disagree, the
+row carries both and the Notes column says which is which.
+
+| record | subject | status | prov | notes |
+|---|---|---|---|---|
+| BASELINE-20260817 | the measured state of the suite after `dev` merged: 88 → 93 → 95 of 99 under `--jdk-only`, plus this session's running corrections | META | MEAS | **the most current document in this directory.** Every number in it was executed |
+| HANDOFF-20260814 | the previous session's handoff: build loop, traps, ordered next steps | META | MIXED | **carries a banner now** — §1's "two remain red", §3's `jdk25src` path and §4's `--dump-native-registry` recommendation are each falsified or narrowed. §2 stands, and is the standard this directory holds itself to |
+| G1-1-hashtable-null-axis-and-the-chm-message-that-was-invented | `Hashtable`'s null axis; the `ConcurrentHashMap` message that was invented | OPEN | MIXED (oracle MEAS, CratonVM PRED) | bannered: its "no JDK source was read" premise was wrong — `src.zip` was there |
+| G2-1-the-formatter-conversion-surface-measured-against-the-oracle | 2,932 oracle cells over the `Formatter` conversion surface; four disagreements | OPEN | MIXED (2,932 HotSpot cells MEAS; every CratonVM value PRED) | its §0 is the clearest provenance statement in this directory; copy it |
+| G3-1-the-triple-level-mode-drift-census-and-its-gate | F34-1's 2,412 drifting triples re-counted at triple granularity: **1,540, not 2,412**; gate written | META (census + gate) | SRC | its own §0 says "NOTHING HERE WAS MEASURED ON A BINARY" |
+| G4-1-the-io-and-nio-fabricated-success-sweep-measured | the `java.io` / `java.nio.file` fabricated-success sweep | OPEN | MIXED (oracle MEAS, CratonVM arm not) | bannered: "no JDK source was read" |
+| G5-1-inheritable-threadlocal-captures-at-construction | `InheritableThreadLocal` captures at construction; the note that named the wrong cause | OPEN | MIXED | partial — the `--jdk-only` half is a NOMINATION, not a fix. Still red as `tlocal` inside `RJdkIntrinsics3` |
+| G6-1-the-ffm-surface-measured-and-the-merge-questions-settled | the FFM surface; the merge's three questions | FIXED-UNVERIFIED (own prose: "FIXED-ON-ORACLE, NOT MEASURED ON A CRATONVM BINARY") | MIXED | **`RJdkForeign` has since gone green, MEASURED at `783685c34`** — see §C |
+| G7-1-the-sslsession-surface-measured-and-the-merge-questions-settled | the `SSLSession` surface end to end | FIXED-UNVERIFIED | MIXED | bannered: "no JDK source was read". `RSslLiveSession` is still red |
+| G8-1-the-collections-view-families-and-the-null-function-axis | the collections view families; the null-function axis | OPEN | MIXED (oracle MEAS, CratonVM PRED) | bannered: "no JDK source was read" |
+| G9-1-the-intrinsic-semantics-census-settled | the `Intrinsic` semantics census, settled where it could be | FIXED-UNVERIFIED | MIXED | bannered: it names `jdk25src`'s absence as the reason a question stayed open |
+| G10-1-the-bignum-surface-measured-and-the-shipping-twin | the bignum surface; the twin that is not compiled at all | FIXED-UNVERIFIED (own prose: "CODE LANDED, BEHAVIOUR UNVERIFIED ON CRATONVM") | MIXED | flags its own `invocations = 0` risk; that risk is now **larger**, not smaller (§B.1) |
+| G11-1-shutdown-hooks-and-the-process-cluster | the shutdown-hook contract measured end to end; the process cluster re-read | FIXED-UNVERIFIED | MIXED | bannered: "no JDK source was read" |
+| G12-1-the-proxy-that-any-interface-array-accepted | the `$Proxy` substring blanket in `typecheck.rs`, scoped | FIXED-UNVERIFIED per the record | MIXED (before MEASURED) | **`RArrayStoreInterfaces` went RED → GREEN, MEASURED**, at `d2e127930` |
+| G13-1-the-abstract-declaration-that-was-invoked-directly | three vectors, **two** mechanisms, and the discriminator is a single field | OPEN (partial) | MEAS | the record that corrected `BASELINE-20260817`'s own owner column in place |
+| G14-1-the-uri-value-surface-and-how-far-RJdkBridge1-got | the URI value surface | OPEN (own prose: PARTIAL) | MIXED (before MEAS) | `RJdkBridge1` is one of the four still red at `9964ca733` |
+| G15-1-the-jul-null-axis-and-how-far-RJdkIntrinsics3-got | the `java.util.logging` null axis | OPEN | MIXED | **bannered** — its "the registry dump is taken at registration time" is falsified (§B.1) |
+| G16-1-the-server-socket-impl-and-how-far-RSslLiveSession-got | the `ServerSocket` impl that was never there | OPEN | MIXED (before MEAS) | **bannered** — §8 concludes `plain_socket.rs` is off the path from `invocations = 0` (§B.1) |
+| G17-1-the-dst-family-and-the-fixture-that-compared-two-empty-strings | the DST family answered "no zone has ever observed daylight saving"; the fixture that would have caught it compared two empty strings | OPEN in its own prose; **its vector is now GREEN, MEASURED** | MIXED | **bannered** for one `invocations = 0` inference (§B.1). `RSimpleTimeZoneRaw` green at `9964ca733` |
+| G18-1-the-proxy-invocation-contract-and-two-vectors | the proxy invocation contract, and the two vectors that ride on it | OPEN (own prose: PART-FIXED-MEASURED) | MEAS | **bannered** — its `MethodHandle.asType` "not the live body either" was falsified by `G31-1` (§B.1) |
+| G19-1-the-layout-step-and-the-scope-that-was-not-stable | the layout step; the scope that was not stable | FIXED-UNVERIFIED per the record | MEAS (before) | **`RJdkForeign` and `RForeignLayoutJdkInterfaces` both green, MEASURED**, at `783685c34` |
+| G20-1-the-first-performance-profile-of-this-branch | the first performance profile: startup 3.2x, JIT 239x on matrix, the native boundary at ~141 ns | META | MEAS, **with two falsified findings** | **bannered.** Its GC headline is wrong (`G27-1`, `3765fad76`), its `invocations` §8 claim is not reproducible (`G33-1`), and its binary is `target-fcheck` — the build the tree now says to ignore |
+| G21-1-the-handler-setlevel-store-and-how-far-RJdkIntrinsics3-got | the `Handler.setLevel` store | OPEN | MIXED (before MEAS, both modes) | the record that **falsified `G15-1`'s registration-time premise**, and that found `--only=<family>` (§B.6) |
+| G22-1-the-slot-collision-and-the-matcher-with-no-method | the field-slot collision behind `Map.isEmpty()`; the matcher with no method | FIXED-UNVERIFIED per the record ("AFTER NOT MEASURED ON A VECTOR") | MEAS (before) | **`RJdkMapViews` green, MEASURED**, at `783685c34`. First record here to read `src.zip` (§B.3) |
+| G23-1-the-nominations-that-needed-lib-rs | the nominations that needed `lib.rs`; the three that turned out to be wrong | OPEN | MIXED (vector rewrite FIXED-MEASURED) | states the inverse of the `invocations` trap correctly, before `G33-1` had the mechanism |
+| G24-1-the-proxy-return-coercion-on-the-live-path | the proxy return coercion, on the path that actually runs | FIXED per the record; after PENDING-A-BINARY | MEAS (before) | **`RJdkProxy` green, MEASURED**, at `783685c34`. **bannered** for §7.3's "`invocations=0` confirms it" |
+| G25-1-the-int-written-into-a-reference-slot | the int written into a reference slot, and the null it actually wrote | OPEN (SOURCE-FIXED / BEFORE-MEASURED) | MEAS | **the authority for the W7-84 correction** (§B.5) |
+| G26-1-four-families-of-RJdkIntrinsics3 | four families of `RJdkIntrinsics3`, and the one that turned out to be its own | OPEN | MIXED (before MEAS on both VMs) | |
+| G27-1-the-young-collection-that-never-runs | `gen_heap.rs` is not the collector; ZGC is, and has been since 2026-08-10 | META | MEAS (96 runs, every checksum 68332206) | **the record that falsified `G20-1`'s headline** (§B.4) |
+| G28-1-the-dst-rule-layer-rebuilt | the DST rule layer rebuilt from the JDK's own arithmetic; 632 zones × 9,480 rows | FIXED — **`RSimpleTimeZoneRaw` GREEN, MEASURED** at `9964ca733` | MEAS | **bannered** for restating `G17-1`'s `invocations = 0` inference. Its "74 divergences → 0" prediction held exactly |
+| G29-1-the-fabricated-http-request-and-its-missing-accessors | Mechanism A, instances 4 and 5: `HttpRequest` minted with 3 of 7 accessors | FIXED — **`RJdkOptionalShape` GREEN, MEASURED** at `9964ca733` | MEAS (before) | its §6 worry about the force list is answered by `G34-1`, and was unfounded |
+| G30-1-the-silent-reference-slot-coercion | the silent reference-slot coercion, made visible without moving it | OPEN (instrumented) | MEAS (census + runtime population) | with `G25-1`, the authority for §B.5 |
+| G31-1-astype-and-the-verifier-that-was-never-asked | `asType` had no convertibility check; a lambda verifier that was invisible | FIXED-UNVERIFIED (own prose: "FIXED-UNRUN") | MEAS (before) | **falsifies `G18-1`'s reading of `MethodHandle.asType`.** `RJdkProxyIface` was still red at `9964ca733`; the fix landed in `2944095fe`, after |
+| G32-1-the-four-families-at-their-owners | `fmtobj`, `inet`, `bufslice`, `misc` fixed at their real owners | FIXED-UNVERIFIED (own prose: "before MEASURED, after PREDICTED") | MIXED | landed in `1eb5f8346`, **after** the `9964ca733` binary — not represented in 95/99 |
+| G33-1-the-instrument-that-under-reported | `invocations` is a FLOOR; the configuration in which it is exact | META (tooling) | MEAS (causal) + SRC (mechanism) | **the authority for §B.1.** Supersedes two earlier corrections in `BASELINE-20260817` |
+| G34-1-who-wins-native-or-bytecode | registering a `Bridge` is by itself the gate under `--jdk-only`; the force list is a later cache-shape override | META (rule) + FIXED-UNVERIFIED (§5 hazard fix) | MEAS, both directions, cold and warm | **the authority for §B.2** |
+| G40-1-the-index-reconciled-20260817 | this pass: the listing re-taken at 280, 36 rows added, seven claims reconciled, sixteen banners placed | META | — (documentation only; no `.rs`, no `cargo`, no VM run) | **written after the listing was taken, so it makes the directory 281.** That is the rot, in one row |
+
+---
+
+## B. RECONCILED 2026-08-17 (lane G40) — seven standing claims this session falsified
+
+House convention: each row names the record that asserted the claim, the record
+or commit that falsified it, and the class of evidence that did the falsifying.
+Where a record's headline is affected it now carries a `RECONCILED 2026-08-17
+(lane G40)` banner of its own, in the style the five `aastore` records already
+use. **Histories are not rewritten — the banner goes on top and the record's own
+account is left exactly as written.**
+
+### B.1 `invocations` in `--dump-native-registry` is a FLOOR. Zero proves nothing.
+
+| | |
+|---|---|
+| **the claim** | `invocations == 0` shows the body is dead, off the path, or has no constituency |
+| **asserted in** | `HANDOFF-20260814` §4 (recommends the tool with no caveat); `G15-1` §"one measurement that outlived its purpose" (*"the registry dump is taken at registration time"*); `G16-1` §8 (`plain_socket.rs` "not on the path"); `G17-1` §1.3 and §4 (*"the base's rows read `invocations=0` … so the narrow registration loses nothing measured"*), restated in `G28-1`; `G18-1` §1 and its `MethodHandle.asType` paragraph (*"so that native is not the live body either"*); `G24-1` §7.3 (*"`invocations=0` confirms it"*) |
+| **falsified by** | `G33-1`, and `G31-1` for the `asType` instance specifically |
+| **evidence class** | MEASURED, causally isolated on the `783685c34` binary, plus source reading of `record_invocation` |
+| **what is true now** | `invocations > 0` proves the body **ran** — unchanged. `invocations == 0` proves **nothing**: the counter is an exact count of *registry-resolved* dispatches and a lower bound on Java-level calls, because `CachedInvokeTarget::Intrinsic` and the JIT's thin direct-call helpers dispatch without ever holding a `NativeMethodId`. `Math.abs` reads **1** for 100,000 calls under `--nojit`, and **100,000** with `CRATONVM_DISABLE_INTRINSICS=1`. The magnitude was never usable. `owns_slot`, `kind`, `registered_by`, `overwrote`, `kind_stated`, `kind_chosen` and the `counts` block are untouched |
+| **the exact configuration** | `--nojit` **and** `CRATONVM_DISABLE_INTRINSICS=1`. Every native probed counted 1:1 there |
+| **what a reader must do** | any conclusion of the form "this body is dead because the dump says zero" must be re-derived from `owns_slot` plus a behavioural probe. `G31-1` is the worked example of that re-derivation returning the opposite answer |
+
+### B.2 `force_native_over_real_jdk_bytecode` is not the gate
+
+| | |
+|---|---|
+| **the claim** | a class must be on the force list for its natives to preempt real JDK bytecode; a class absent from the list answers only where the resolved method has no `Code` |
+| **asserted in** | `F5-1` §"`resolve_dispatch` step 3" (`CharBuffer` "is in neither … so in real-JDK mode these natives answer for exactly the receivers whose resolved method has **no `Code`**"); `F14-1` §, in the same form; and the doc banner on the Rust function itself, which `G34-1` §5.2 corrects in place |
+| **falsified by** | `G34-1` (`9ae371468`) |
+| **evidence class** | MEASURED on a real binary against a real oracle, in both directions, cold and warm, with a second, differently-registered binary as a control |
+| **what is true now** | under `--jdk-only`, registering a `Bridge` for a triple is **by itself sufficient** to preempt real JDK bytecode. The decision is taken at the first dispatch site that answers, and for nearly every call that site is `try_stackless_invoke` step 1 → `resolve_step1_native`, which runs *before* method resolution and so passes `bytecode_available: false` unless `CRATONVM_ENFORCE_NATIVE_SHADOW` is armed. The force list is a **second, later, cache-shape-only** override, consulted by the vtable inline cache and the JIT — the sites that resolved a bytecode `Method` without asking the registry. Two rows of `G34-1`'s decision table fire in the same run for the same triple from different sites: the answer is **site**-dependent, not triple-dependent |
+| **what this lane could not settle** | whether `F5-1`'s and `F14-1`'s *specific* conclusions survive. Their general reachability argument is void; re-deriving each family's answer needs a dump and a probe, which is a Rust-owning lane's work. Their banners say that and no more |
+| **still correct** | `C13-2` §, `W4-4` §, and `P2-COLLECTIONS-SHADOWS` §2.3 already described the force list as *reinstating* a default on the warm/cached/reflective/JIT paths rather than as the mode's policy. Those readings are confirmed, not falsified |
+
+### B.3 The JDK's sources are readable on this machine
+
+| | |
+|---|---|
+| **the claim** | JDK 25 sources cannot be read locally; work from the oracle's behaviour |
+| **asserted in** | `G1-1` §provenance, `G4-1` §, `G7-1` §, `G8-1` §provenance, `G9-1` §, `G11-1` §provenance — each in the form "`C:\craton\jdk25src` is absent … so no JDK source was read". `HANDOFF-20260814`'s preamble asserts the *opposite* error: "JDK 25 source is checked out at `C:\craton\jdk25src`" |
+| **falsified by** | `BASELINE-20260817` §"CORRECTION: the JDK's sources ARE readable"; first used in practice by `G22-1`, then `G14-1`, `G23-1`, `G28-1`, `G31-1`, `G34-1` |
+| **evidence class** | FILESYSTEM, re-verified by this lane: `C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot\lib\src.zip`, **52,462,198 bytes**, dated 2026-04-27. `C:\craton\jdk25src` does not exist — that half of the claim was always right |
+| **what is true now** | `unzip -p "$JAVA_HOME/lib/src.zip" java.base/java/net/URI.java`. It is the source of the exact build being used as the oracle. It does not replace the oracle — a source reading can be wrong about what the shipped build does — but it is the difference between transcribing a contract and guessing at one. Two results this session were not derivable from black-box probing in reasonable time and were two minutes of reading: `URI.parseAuthority`'s demotion rule, and `ZoneInfoFile`'s `dstSavings` arithmetic |
+
+### B.4 `moving_young: cycles=0` did not mean a broken young path
+
+| | |
+|---|---|
+| **the claim** | the generational moving-young collection was requested and never ran, making every collection a whole-heap non-moving pass — the session's headline performance finding |
+| **asserted in** | `G20-1` §0 and §4 |
+| **falsified by** | `G27-1`, landed as `3765fad76` |
+| **evidence class** | MEASURED — 96 interleaved runs, order rotated per round, every checksum `68332206` — plus source: `vm/src/config.rs:769` has defaulted to `GcAlgorithm::Zgc` since 2026-08-10, and `grep -c moving_young gc/src/zgc.rs` returns **0** |
+| **what is true now** | `gen_heap.rs` is not the collector in a default run, so its gating predicate at `:5719` is never reached. All three diagnostics the finding rested on mislead in the same direction: `moving_young_requested=true` is a **JIT-codegen capability flag**, not a request for a collection; `"no collection has run yet"` fires because ZGC never calls `record_collector_decision`; the whole `[GC] cards:` block is generational-only and structurally zero. The real result is that **ZGC is 4.37x–6.35x slower than the generational backend** at every heap size, with the ranges not touching. The predicate itself works: 8/8 cycles MOVING when the generational backend is selected |
+| **also wrong in that record** | its binary is `C:/craton/target-fcheck/release/cratonvm.exe`, which `G34-1` §provenance now says to ignore outright ("that build partly failed; its timestamp misrepresents its contents"). `G20-1` itself flagged the attribution as only "partly" sound |
+
+### B.5 The `gc::guard` W7-84 warning is not a reference-slot census
+
+| | |
+|---|---|
+| **the claim** | the ~16 `gc::guard` W7-84 warnings per VM start are a census of native reference-slot violations, and an `Int` written into a reference slot is "silently dropped by the field-layout guard" |
+| **asserted in** | the orchestrator's own lane briefs and its `RSslLiveSession` write-up, quoted verbatim in `G25-1` §1 |
+| **falsified by** | `G25-1`, re-measured and widened by `G30-1` §2.2 |
+| **evidence class** | MEASURED with `CRATONVM_DBG_LAYOUT=1` over a full `--jdk-only` run, then re-measured across six vectors, plus a line-numbered source trace |
+| **what is true now** | the int is **not dropped, it is actively written as null** — `NativeContextImpl::set_field` → `VmHeap::set_field_as(.., b'L')` → `coerce_field_value_by_descriptor` (`gc/src/heap.rs:1674`), which maps `Value::Int` / `Value::Long` to `Value::Object(None)`. That coercion is deliberate and documented (tag `S111r29`) and it is **bidirectional**. It is silent unless `CRATONVM_DBG_OVERLAY` is set. W7-84 is a different path entirely: **every** warning in every run is `class_id=ClassId(12) index=0` — one class, one slot, the VM's own class-mirror populator writing over `java.lang.Class.cachedConstructor`. Native reference-slot writes produce **no warning at all**. A W7-84 count is a census of one line of `vm_object.rs` |
+| **the real number** | 271 sites, by source scan — a **lower bound** (single-line allocations only). `phases_early.rs` 68, `servlet.rs` 22, `http2.rs` 19, `net_channels.rs` 19, `tls.rs` 18; by class, `ArrayList.elementData` 56, `SocketChannel` 22, `HashMap.table` 19. The systemic fix is a layout-aware field writer, not 271 individual edits |
+
+### B.6 `--only=<family>`, `--list` and `--jdk-only-report` exist and are under-used
+
+| | |
+|---|---|
+| **the claim** | not a false claim so much as an absent one: every lane so far has worked from "the first failing assertion", because an `AssertionError` aborts the run |
+| **reframes** | every record that describes a vector as one assertion from green — most sharply `HANDOFF-20260814` §6.1, which says of `RJdkBridge1` and `RJdkIntrinsics3` that "each cycle is roughly one build. Nothing clever is needed" |
+| **established by** | lane G21, recorded in `BASELINE-20260817` §"Process" |
+| **evidence class** | MEASURED, on a binary that already existed, before a line was written |
+| **what is true now** | the vectors take a family selector: `cratonvm.exe --java-home "$JAVA_HOME" --jdk-only -cp regression-suite/build RJdkIntrinsics3 --only=logrec`. Used on `RJdkIntrinsics3` it showed the vector is **not** one assertion from green: it reaches **800 of 1011** and stops at `tlocal`, with `fmtobj`, `inet`, `misc` and `bufslice` red for four unrelated reasons and `regex` (42) and `mathexact` (57) green. `--list` enumerates the families; `--jdk-only-report` is a complete census that `JDK-ONLY-REPORT-CENSUS-20260812` recorded as unused two waves ago and which is still unused. Any lane blocked at "assertion X, and I cannot see past it" should reach for these first |
+
+### B.7 `SUITE` defaults to `core`, and `SUITE=all` is still not `--jdk-only`
+
+| | |
+|---|---|
+| **the claim** | a green suite run says something about the `RJdk*` corpus, or about the `--jdk-only` policy |
+| **asserted in** | implicitly by every record quoting a bare suite pass count; `HANDOFF-20260814` §3's one-vector recipe does not mention the arms at all |
+| **falsified by** | `BASELINE-20260817` §"Three things this measurement corrects", items 2 and 3 |
+| **evidence class** | MEASURED, three separate runs, plus `run.sh:330` and `:585` read directly |
+| **what is true now** | **three distinct runs, and they disagree.** `bash run.sh` runs `core` only — 61 vectors — and the 38-vector `RJdk*` corpus this whole effort is named after does **not** run. `SUITE=all` runs all 99 but in **Compatible** mode, because `run.sh:330` sets `JDK_ONLY=1` only when `CRATONVM_ARGS` names the flag. The policy arm is a third run: `CRATONVM_ARGS="--jdk-only" bash regression-suite/run.sh`. At the merge the three read 53/61, 84/99 and **88/99** — the policy arm was the *best* of the three, which inverts the framing used everywhere else in this directory that `--jdk-only` is the harder mode |
+
+---
+
+## C. Statuses this session settled — MEASURED, not predicted
+
+The suite under `--jdk-only` went **88 → 93 → 95 of 99** across three attributable
+binaries. This is the first sustained sequence in this directory where predictions
+made by lanes that could not build were checked against a binary that could.
+
+| | `d2e127930` | `783685c34` | `9964ca733` |
+|---|---|---|---|
+| passing of 99 | 88 | 93 | **95** |
+| failing | 11 | 6 | **4** |
+
+**Vectors closed and MEASURED this session**, with the record each closes out. A
+green vector proves the vector's own assertions pass; it does **not**
+retroactively promote every claim in the named record from PREDICTED to
+MEASURED, and these rows must not be read that way.
+
+| vector | closed at | the record it closes out | note |
+|---|---|---|---|
+| `RArrayStoreInterfaces` | `d2e127930` | `G12-1` | the `$Proxy` substring blanket in `typecheck.rs`, scoped |
+| `RJdkProxy` | `783685c34` | `G24-1` | the return coercion, one level in from where the nomination pointed |
+| `RJdkMapViews` | `783685c34` | `G22-1`, `G13-1` | a **field-slot collision**, not the interface doors — in Compatible mode the substitution *succeeded* and reported a three-entry view as empty, so the `AbstractMethodError` was the better outcome |
+| `RCrypto` | `783685c34` | `d378eee51` | went GREEN → RED first, for a correct reason: it had only ever been green because `Files.newDirectoryStream`'s filter was never called |
+| `RJdkForeign` | `783685c34` | `G19-1`, `G6-1` | |
+| `RForeignLayoutJdkInterfaces` | `783685c34` | `G19-1` | |
+| `RSimpleTimeZoneRaw` | `9964ca733` | `G28-1`, `G17-1`, `G23-1` | three pieces, in three commits, by three lanes; the fixture had to be rewritten first because the old one compared `104` against `104` and **could not fail**. The rule layer's author predicted 74 divergences → 0 without ever building, and it held exactly |
+| `RJdkOptionalShape` | `9964ca733` | `G29-1`, `G13-1` | |
+
+**Still red at `9964ca733` (4):** `RJdkIntrinsics3`, `RJdkBridge1`,
+`RSslLiveSession`, `RJdkProxyIface`. None is untouched — each has a fix
+committed after that binary was built (`1eb5f8346`, `c703cff68`, `2944095fe`) or
+in flight. **No binary has yet measured any of those four fixes.**
+
+---
+
+## D. What this lane could NOT settle
+
+Stated rather than guessed, in this index's own convention.
+
+1. **Whether `F5-1`'s and `F14-1`'s `CharBuffer` reachability conclusions
+   survive `G34-1`.** The *argument* they rest on is void. The *answer* needs a
+   registry dump and a behavioural probe on the current binary, from a lane that
+   may edit Rust. Their banners say the argument is void and stop there.
+2. **How many of this directory's "dead body" conclusions rest on a zero.** The
+   seven sites in §B.1 are what a targeted grep found; the phrasing varies too
+   much for a grep to be a census. Treat §B.1's list as a floor — exactly like
+   the instrument it is about.
+3. **Which of `G20-1`'s remaining numbers are affected by its binary.** Its
+   provenance names `target-fcheck`, which `G34-1` says to ignore. `G27-1`
+   re-measured the GC claims on a good binary; the startup, throughput and
+   native-boundary numbers were not re-taken. They are not marked wrong here —
+   they are marked **unre-measured**, which is not the same thing.
+4. **The five records being written as this pass ran** (`G35-1`, `G36-1`,
+   `G37-1`, `G38-1`, `G39-1`). They did not exist when the listing was taken and
+   have no row. That is not an oversight; it is the rot this block's header
+   warns about, observed in the act.
+5. **`README.md`'s per-record tables.** Its headline count is corrected; the ~86
+   per-record rows below it were not audited row by row and may name records
+   that have since moved.
+6. **Whether any pre-wave-G record's status prose is now stale for a reason this
+   session did not touch.** This pass reconciled the seven claims it was given
+   plus what the suite measured. It did not re-read 244 older records, and does
+   not claim their statuses are current.
+
+---
+
+# FIFTH PASS — in-session, 2026-08-17. Status only; the tables are NOT rebuilt.
+
+## §E.1 The one number that matters has moved
+
+The FOURTH PASS's §C reads **88 → 93 → 95 of 99** under `--jdk-only`. It is
+stale. MEASURED since, same three-arm method, same oracle:
+
+| binary | `--jdk-only` |
+|---|---|
+| `9ae371468` | 97 of 99 |
+| `e7e840264` | 97 of 99 |
+| `3fcc8d90f` | **98 of 99** |
+
+**`RSslLiveSession` is green** — 104 checks, empty diff against HotSpot, on a
+vector that had never passed in its life. It closed in two steps, `G57-1` (the
+carrier had to CARRY the dialled endpoint, because the session is minted long
+after the request returned) and `G58-1` (the whole `BaisEvent` mechanism
+existed and nothing had ever installed a consumer).
+
+**`RJdkBridge1` is the only red vector left.** It stops in `surrog`, and the
+step it stops at is the useful number — its check count is not comparable
+across binaries because the vector aborts at its first failure. See
+`BASELINE-20260817.md` for both, and for the two harness traps that cost a run
+each today (`run.sh`'s default `JDK` does not exist on this host; its
+per-vector `timeout` means a parallel build can manufacture a failure).
+
+## §E.2 The listing is 307, and I am not publishing a coverage number
+
+`ls docs/known-issues/jdk-only/*.md` — **307 files**, against the FOURTH PASS's
+280. So this index has rotted again, exactly as its own four warnings predicted.
+
+**How much has rotted is not established here, deliberately.** Two scripted
+attempts disagreed — 98 unindexed by one measure, 174 by another — because
+records are cited in this file three different ways: by full slug
+(`G33-1-the-instrument-that-under-reported-20260817`), by bare id (`G1-1`), and
+by id-plus-prose. No grep separates "has a row" from "is mentioned in passing
+in someone else's row", and both of my numbers conflate them. A number I cannot
+stand behind is worth less than nothing in this directory, so there is not one
+here.
+
+What IS spot-verified: **`G50-1` and `G60-1` have zero mentions anywhere in this
+file**, and the whole `G35-1`…`G60-1` run postdates the FOURTH PASS. A real
+sixth pass needs to read each record's status prose, which is what passes one
+through four each did and why they took a lane apiece.
+
+## §E.3 Records added since the FOURTH PASS, by id
+
+`G35-1` `G36-1` `G36-2` `G37-1` `G38-1` `G39-1` `G41-1` `G42-1` `G43-1` `G44-1`
+`G45-1` `G46-1` `G47-1` `G48-1` `G49-1` `G50-1` `G51-1` `G52-1` `G53-1` `G54-1`
+`G55-1` `G56-1` `G57-1` `G58-1` `G59-1` `G60-1` `G61-1` `G62-1` `G63-1`
+
+Three of those are worth reading before acting anywhere in this tree:
+
+* **`G56-1`** — the allocator's "reference types are already `Object(None)` from
+  zero memory" comment stopped being true when `Value::Object` gained a
+  `NonNull` niche. 1,111 of 1,122 coercion events were that one expired premise.
+* **`G59-1`** — with the noise gone, the residue was readable, and it named a
+  defect no vector points at: `URL.openConnection()` writing a synthetic slot
+  map into a real JDK class. **Two of its four wrong writes were invisible to
+  the guard**, because a well-typed value in the wrong slot is not a descriptor
+  mismatch. Read this before treating a quiet coercion log as a clean one.
+* **`G63-1`** — `map.values().iterator()` is **not fail-fast**, in BOTH modes.
+  The view is real (`HashMap$Values`); its iterator is a snapshot `ArrayList$Itr`
+  handed over by the `java/util/Collection.iterator` interface door, so a
+  structural modification mid-iteration throws `ConcurrentModificationException`
+  on HotSpot and nothing here. `keySet()`/`entrySet()` are correct, which is what
+  localises it to the door. Found by disbelieving a measurement in `G60-1` — that
+  record had attributed the same exception to `java/util/ArrayList.iterator` and
+  held four retirable triples back on it.
+* **`G60-1`** — **RESOLVED 2026-08-17, moved to
+  `jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`.**
+  `--jdk-only` counts its own violations and nobody had read the count. 0 classes
+  fabricated, 0 synthetic stubs run. Read the resolved record before quoting any
+  of its numbers: **the "81 natives that won over real JDK bytecode" was 58.**
+  The other 23 rows are recorded on the YIELD path — §1.4 enforced, the bridge
+  losing to real bytes — and the report gave them a `summary` saying the
+  opposite, which is now fixed and carries an explicit `outcome` field. A real
+  application (embedded Tomcat, booting and serving under `--jdk-only`) puts the
+  population at **521 native-won triples**, so one vector was about a ninth of
+  it, and the report now says out loud when its own list is truncated.

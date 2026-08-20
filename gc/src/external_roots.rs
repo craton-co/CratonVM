@@ -10,6 +10,7 @@
 use cratonvm_types::ObjectRef;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
 pub type OwnerPredicate<'a> = dyn Fn(usize) -> bool + 'a;
@@ -44,10 +45,59 @@ pub struct ExternalRootProvider {
     pub roots_for_matching_owners: fn(&OwnerPredicate<'_>) -> Vec<ObjectRef>,
     pub remap: fn(&cratonvm_types::PointerMap),
     pub prune: fn(&OwnerPredicate<'_>),
+    /// `(fast_path_hits, mutex_fallthroughs, disabled)` for a provider that
+    /// gates [`Self::roots_for_owner`] before doing real work.
+    ///
+    /// # Why the provider reports and `gc` does not measure
+    ///
+    /// `roots_for_owner` runs once per marked object and was **20–29% of mark
+    /// samples on both the serial and the one-worker parallel arm** (2026-08-17
+    /// `perf record`). A provider that gates it returns an empty `Vec` either way,
+    /// so from this side a gate that works and a gate that is inert are
+    /// indistinguishable — and the previous attempt at that optimisation was
+    /// measured inert, so this is not a hypothetical. Only the provider can count
+    /// it, and `gc` cannot call into the provider's crate because the dependency
+    /// runs the other way.
+    ///
+    /// `None` for a provider with no gate.
+    pub gate_stats: Option<fn() -> (u64, u64, bool)>,
+}
+
+/// Every registered provider's gate counters, for the shutdown report. See
+/// [`ExternalRootProvider::gate_stats`].
+pub fn provider_gate_stats() -> Vec<(&'static str, u64, u64, bool)> {
+    if PROVIDER_COUNT.load(Ordering::Relaxed) == 0 {
+        return Vec::new();
+    }
+    PROVIDERS
+        .read_recursive()
+        .iter()
+        .filter_map(|p| p.gate_stats.map(|f| { let (h, m, d) = f(); (p.name, h, m, d) }))
+        .collect()
 }
 
 static PROVIDERS: LazyLock<RwLock<Vec<ExternalRootProvider>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// How many providers are registered, as one relaxed word.
+///
+/// # Why the per-object paths need it
+///
+/// [`external_roots_for_owner`] is called **once per marked object** by every
+/// marker in the tree, and it went through [`snapshot`], which is
+/// `PROVIDERS.read().clone()` — an `RwLock` read plus a heap allocation, per
+/// object, for a registry that is empty in every `--jdk-only` run and in every
+/// unit test.
+///
+/// The 2026-08-14 parallel-marking measurement is why that matters: four workers
+/// cost **+153% pause** against zero, and the rise is monotonic in worker count,
+/// which is a lock rather than a start-up offset. An uncontended `RwLock` read is
+/// a few nanoseconds; the same read from eight workers is a shared cache line
+/// bouncing between eight cores, once per object — and the allocation is worse.
+///
+/// Monotone in practice (nothing unregisters) but recomputed from the vector's
+/// own length under the write lock anyway, so it cannot drift from it.
+static PROVIDER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn same_callbacks(a: ExternalRootProvider, b: ExternalRootProvider) -> bool {
     a.scan as usize == b.scan as usize
@@ -76,6 +126,7 @@ pub fn register_external_root_provider(provider: ExternalRootProvider) {
         return;
     }
     providers.push(provider);
+    PROVIDER_COUNT.store(providers.len(), Ordering::Relaxed);
 }
 
 fn snapshot() -> Vec<ExternalRootProvider> {
@@ -105,8 +156,21 @@ pub fn external_owner_addrs() -> Option<HashSet<usize>> {
 /// [`ExternalRootProvider::roots_for_owner`]. Pass `None` only where the class
 /// genuinely is not available; the check is skipped then.
 pub fn external_roots_for_owner(owner_addr: usize, owner_class_id: Option<u32>) -> Vec<ObjectRef> {
+    // THE LATCH FIRST, then iterate IN PLACE -- see [`PROVIDER_COUNT`]. This is
+    // the one function here that runs per marked object, so it is the only one
+    // that does not go through `snapshot`.
+    if PROVIDER_COUNT.load(Ordering::Relaxed) == 0 {
+        return Vec::new();
+    }
     let mut roots = Vec::new();
-    for provider in snapshot() {
+    // `read_recursive`, not `read`: a provider callback runs while this guard is
+    // held, and `parking_lot`'s plain `read` can deadlock a second read on the
+    // same thread when a writer is queued behind it. Nothing registers a provider
+    // from inside a root callback today, and this is what makes that a
+    // non-question rather than a latent deadlock waiting for the day something
+    // does. `Vec::new()` does not allocate until something is pushed, so the
+    // no-roots case (the overwhelming majority of objects) is allocation-free.
+    for provider in PROVIDERS.read_recursive().iter() {
         roots.extend((provider.roots_for_owner)(owner_addr, owner_class_id));
     }
     roots
@@ -172,6 +236,7 @@ mod tests {
             roots_for_matching_owners: matching,
             remap,
             prune,
+            gate_stats: None,
         }
     }
 

@@ -51,6 +51,49 @@ detect that species.
 >   This is `reference_classpath_exclusion_leaked_through_four_process_wide_lookups`
 >   arriving one layer out, in the paragraph that cites it.
 
+> **RE-VERIFIED 2026-08-12 (lane A1, `--jdk-only` field-updater lane). STAYS
+> OPEN.** Source-level only; this lane may not invoke `cargo` and ran nothing.
+> The wiring claims all hold; the record stays open on §6 and §7, which are
+> about what the instrument still cannot see and have not moved.
+>
+> **Every call site claimed above is present, but every line number in the
+> block above it has drifted.** Anchor on the symbol:
+>
+> | claimed | actually at, today | symbol to anchor on |
+> |---|---|---|
+> | `vm-cli/src/main.rs:4281` | `:4282` | `vm.sweep_declared_slot_maps("main-returned")` |
+> | `vm/src/vm/vm_init.rs:7965` | `:7961` (doc comment) | `Vm::sweep_declared_slot_maps` |
+> | `native-builtins/src/lang_system.rs:137` | `:150` | `pub(crate) fn sweep_declared_slot_maps_before_exit` |
+> | its call sites `:1354`, `:2628`, `:2664` | `:1480`, `:2754`, `:2790` | labels `"System.exit"`, `"Runtime.exit"`, `"Runtime.halt"` |
+> | `test_frameworks.rs:3684`, `:3710`, `:3735` | `:3690`, `:3724`, `:3751` | labels `"ForkedBooter.acknowledgedExit"`, `"ForkedBooter.exit1"`, `"ForkedBooter.exit"` |
+>
+> The helper really is `pub(crate)`, all three `ForkedBooter` bodies really do
+> call it with their own label, and links 7–10 are all four in
+> `native-api/tests/read_alias_coverage.rs` (`:589`, `:673`, `:734`, `:809`).
+> §2.2.1's "NOW WIRED" and §7's "DONE" are accurate. This is the third time
+> a fixed-line-band citation in this family has gone stale within a day; the
+> `linebands` lesson applies to *records*, not only to source-witness tests.
+>
+> **The map population is still EIGHT** — re-counted today, `declare_slot_map(`
+> outside `native-api/src` and outside tests matches exactly 8 sites:
+> `jdk25_concurrency.rs:2058` (`SYNTHETIC_THREAD_SLOT_MAP`),
+> `lang_reflect.rs:2021` (`METHOD_LEGACY_SLOT_MAP`),
+> `phases_early.rs:11523` (`MONTH_SLOT_MAP`),
+> `phases_late/concurrent.rs:8376` (`NEW15_CONT_SLOT_MAP`) and `:8656`
+> (`NEW15_FJP_SLOT_MAP`), `phases_late/net_channels.rs:78`
+> (`SSC_P58_SLOT_MAP`), `native-collections/src/lib.rs:30409`
+> (`SJ_STUB_SLOT_MAP`), `native-io/src/lib.rs:5691` (`BB_SLOT_MAP`). §4.7's
+> corrected eight-map row is therefore still the current figure, and §4.6.1's
+> addition is the most recent one. The instruction to *"count
+> `declare_slot_map(` before quoting one"* was followed rather than trusted, and
+> it came back the same.
+>
+> **§6.10 has not moved and is what keeps this record open.** Nobody has yet run
+> `CRATONVM_DBG_LAYOUT_ALIAS=1` over a workload, so every row in §4 is still a
+> prediction and not a transcript. Nothing in this pass changes that, and no
+> claim here should be read as evidence that the sweep produces the predicted
+> census — only that the code that would produce it is wired.
+
 **Nothing here was built or run.** This lane writes code, tests and docs; the
 orchestrator builds. The three new gates were re-implemented outside the tree
 and run against the real worktree and against six mutated copies (§5). The one

@@ -152,8 +152,8 @@ to make them appear at all:
 | `CratonVM$HttpServerLoop` | `re10_spawn_dispatcher` | not found | 1 bridge → **1 bridge** | **VM service** | door defect — §1, FIXED |
 | `com/sun/net/httpserver/HttpExchange$ResponseBody` | `register_re10_http_server` · `getResponseBody` | not found | 5 synthetic-stub → **0** | **behaviour carrier** | fallback — §3, IMPLEMENTED |
 | `cratonvm/net/HttpBodyReplaySubscription` | `re5_drive_body_handler` | not found | 2 synthetic-stub → **0** | **behaviour carrier** | fallback BLOCKED — §4 |
-| `javax/net/ssl/SSLSocketInputStream` | `register_re1_socket` · `getInputStream` | not found | 4 synthetic-stub → **0** | behaviour carrier | unreachable by default — §5 |
-| `javax/net/ssl/SSLSocketOutputStream` | `register_re1_socket` · `getOutputStream` | not found | 4 synthetic-stub → **0** | behaviour carrier | unreachable by default — §5 |
+| `javax/net/ssl/SSLSocketInputStream` | `register_re1_socket` · `getInputStream` — **but see §5: the LIVE requester is `ssl_security.rs`'s twin, a `bridge` in both modes** | not found | 4 synthetic-stub → **0** | behaviour carrier | ~~unreachable by default~~ **FATAL — all HTTPS. Corrected 2026-08-12, §5** |
+| `javax/net/ssl/SSLSocketOutputStream` | `register_re1_socket` · `getOutputStream` — same | not found | 4 synthetic-stub → **0** | behaviour carrier | ~~unreachable by default~~ **FATAL — the witness names this half. §5** |
 
 The three-way split `W7-17` predicted reproduces exactly, in one file, on five
 classes: **one VM service, four behaviour carriers, no data carriers.** Every
@@ -290,6 +290,66 @@ cratonvm/net/HttpBodyReplaySubscription`, naming the class, at the
 
 ## 5. The two `javax/net/ssl/SSLSocket*Stream` sites — latent, not live
 
+> **CORRECTED 2026-08-12. The heading is right about the two sites in THIS file
+> and wrong as a verdict on the two class names.** §2's table row reads
+> "unreachable by default — §5", and §7 carries it as a residual. Both
+> statements are true of `net_phase_e.rs`'s `register_re1_socket` mints, which
+> are still behind the `io.real_net_sockets` early return and still dead in a
+> default run — re-checked in source today, `net_phase_e.rs:5273` and `:5296`,
+> inside a function whose first statement is `if
+> crate::vmflags().io.real_net_sockets { return (); }`.
+>
+> **The last paragraph of this section names the live twins and then stops.**
+> That was the whole finding: `phases_late/ssl_security.rs`'s
+> `SSLSocket.getInputStream()`/`getOutputStream()` are `bridge` in **both**
+> modes — they survive `--jdk-only` — and they minted the same two absent class
+> names with a bare `?`. So under strict a real TLS connection **handshook
+> successfully and then died at the first stream access**:
+>
+>     java.lang.NoClassDefFoundError: javax/net/ssl/SSLSocketOutputStream
+>
+> with HotSpot 25 running the identical program green. That is all HTTPS, client
+> and server, and it is the same shape as §1's `CratonVM$HttpServerLoop`: a
+> surviving bridge asking for a class §5 forbids. **The refusal was correct; the
+> survival of its caller was the defect.** This record classified the pair
+> "behaviour carrier, unreachable by default" on the strength of the file it was
+> auditing, and `W7-17`'s table then inherited the verdict at its line 248 —
+> which is the falsification that opened the 2026-08-12 re-audit in
+> `W7-17-vm-internal-door-sweep.md` §5.0.
+>
+> **The fix is neither of the two repairs §3 of `W7-17` names.** A door fix
+> would have been wrong (gate 2 is shut: 4 natives → 0), and no real JDK class
+> can be *fallen back to* here because the natives ARE the TLS implementation.
+> The landed fix re-targets the **receiver name** onto the exact pair real
+> JSSE's `SSLSocketImpl` returns — `TLS_APP_IN_CLASS` /
+> `TLS_APP_OUT_CLASS` = `sun/security/ssl/SSLSocketImpl$AppInputStream` /
+> `$AppOutputStream` — keeping the natives and making the class real, so both
+> gates stop firing and `getClass().getName()` now agrees with HotSpot instead
+> of naming a class HotSpot has never had. `W7-17` §5.0 records this as repair
+> shape **4**, which its §3 taxonomy was missing.
+>
+> **Status of that fix, stated precisely:** it is in
+> `native-builtins/src/phases_late/ssl_security.rs` in this **working tree,
+> uncommitted**, by another lane. Not on `dev`. Not built, not run. This lane
+> read it; it did not verify it.
+>
+> **Two things it does NOT close, and both are load-bearing:**
+>
+> 1. The legacy names are **still registered on purpose**
+>    (`TLS_LEGACY_IN_CLASS` / `TLS_LEGACY_OUT_CLASS`, with the reason on the
+>    constants) precisely because `net_phase_e.rs:5273`/`:5296` can still mint
+>    them under `CRATONVM_SYNTHETIC_NET_SOCKETS=1`. Dropping the eight
+>    registrations would turn that path's `NoClassDefFoundError` into an
+>    `UnsatisfiedLinkError` — `STRICT_STILL_FABRICATES`'s warning in the other
+>    direction. So both names must stay in `NO_IMAGE_JDK_RECEIVERS`, and the
+>    §5 sites below remain exactly as described.
+> 2. Registering natives on `sun/security/ssl/SSLSocketImpl$App*Stream` makes
+>    them **shadow real bytecode** — a `native-shadows-bytecode` census row
+>    where there was a fabricated-class row. That is a better row to hold, and
+>    it is a different row; it is that lane's to place.
+
+
+
 `register_re1_socket`'s `getInputStream`/`getOutputStream` mint
 `javax/net/ssl/SSLSocketInputStream` / `…OutputStream` for a layered TLS socket
 (`sid >= RUSTLS_SOCK_ID_BASE`). Both names are absent from the image and both
@@ -381,6 +441,14 @@ cheaper to make than to notice:
   (`net_phase_e.rs`), still behind the `io.real_net_sockets` early return that
   makes them unreachable in a default run, and their live twins are still in
   `phases_late/ssl_security.rs` with all eight natives registered there.
+  **AMENDED later the same day: "their live twins are still in
+  `phases_late/ssl_security.rs`" was the whole defect and this bullet reports it
+  as an inventory item.** Those twins are `bridge` in both modes, so they ran
+  under `--jdk-only`, minted a class no image declares, and took every TLS
+  stream with them. A working-tree fix re-targets the receiver onto
+  `sun/security/ssl/SSLSocketImpl$App{In,Out}putStream`; the `net_phase_e.rs`
+  half of this bullet is still accurate and still open. Full correction in §5's
+  header block.
 
 **No fixture assertion was added for either residual, deliberately.** Both are
 strict-only refusals whose current correct reading is a *failure*: an assertion

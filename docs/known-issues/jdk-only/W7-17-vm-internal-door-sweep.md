@@ -32,6 +32,34 @@
 > built, not run. Section 8's other residuals are still open; §8's R1 is
 > partially discharged by `W7-26`'s widened census (2026-08-12).
 
+> ## 2026-08-12 — THE `strict?` COLUMN IS FALSIFIED. Read §5.0 before §5.
+>
+> This record's headline was "45 of 45 pairs adjudicated, 45 of 45 resolved."
+> **That is wrong, and it was wrong on the day it was written.** Eight rows in
+> §5 carry `no` in the `strict?` column. `no` there does not mean *strict mode
+> does not reach this class*; it means *nothing in this sweep's 71 vectors and
+> 321 probes reached it*. Those are different statements and this record used
+> the first word for the second finding.
+>
+> Five of the eight have since been falsified by other lanes, one at a time,
+> each with a fatal `--jdk-only` witness: `javax/net/ssl/SSLSocket{In,Out}putStream`
+> (all HTTPS), `Atomic*FieldUpdater$RustJvmImpl`, `java/util/function/Consumer$AndThen`,
+> `java/util/ArrayDeque$Itr` + `java/util/LinkedList$Itr`, and — from this
+> re-audit — `cratonvm/internal/SnapshotEnumeration`. A sixth
+> (`cratonvm/synthetic/Process*`) and a seventh
+> (`java/util/concurrent/CompletedFuture`) are falsified below by source and by
+> the frozen kind map, not yet by a run. **One of the eight survives the
+> re-audit.** A column with a 7-in-8 falsification rate was never a result.
+>
+> The `YES` rows are not clean either: the 11 × `cratonvm/internal/Unmodifiable*`
+> row says *"refusal absorbed and warned"*, and `cratonvm/internal/UnmodifiableMap`
+> is on the 2026-08-12 Phase 1 blocking set. Absorbed-and-warned was measured on
+> the boot path, not on `System.getenv()`.
+>
+> §5.0 gives the discriminator this record should have used, applies it to every
+> row, and marks each verdict **measured** or **unreached**. §5's table is kept
+> verbatim underneath so the two can be diffed; **do not cite §5 without §5.0.**
+
 **Status: two hunks APPLIED IN SOURCE, sweep COMPLETE, 2026-08-11. NOT
 REBUILT.** Every number in this record was taken by running the already-built
 `dev` binary at `C:/craton/CratonVM/target/release/cratonvm.exe` (built
@@ -195,7 +223,12 @@ cratonvm --real-jdk --jdk-only-report <F> …
 
 **465 runs, 6,284 raw `compatibility-class-requested` rows, 44 distinct
 classes, 45 distinct (class, `requester`) pairs — 22 of the 44 reachable under
-`--jdk-only`. All 45 pairs adjudicated; 45 of 45 resolved.** The count is of rows actually adjudicated, not of grep hits: a
+`--jdk-only`. All 45 pairs adjudicated; 45 of 45 resolved.**
+**WITHDRAWN 2026-08-12 — "45 of 45 resolved" is false; see the header block and
+§5.0.** 45 of 45 pairs were *given a verdict*; six of those verdicts were the
+corpus's reach reported as the class's property, and have since been falsified
+one at a time. Adjudicated ≠ resolved, and this sentence used the second word.
+The count is of rows actually adjudicated, not of grep hits: a
 grep for `try_alloc_concurrent_synthetic` over the workspace returns thousands
 of call sites and would have answered a different question badly, which is the
 error the campaign README records being made in this direction repeatedly.
@@ -214,7 +247,191 @@ error the campaign README records being made in this direction repeatedly.
   the ten carriers visible as the control group whose verdict is already
   settled.
 
+## 5.0 The re-audit: the discriminator this sweep should have used
+
+**Read this before §5.** Added 2026-08-12 by the lane that owns this record,
+after a sibling lane falsified the `SSLSocket*Stream` row and the campaign's
+33-probe reachability screen falsified three more.
+
+### What went wrong
+
+§4 states the corpus honestly — 71 vectors, 321 probes, one of two choke
+points — and then §5's `strict?` column silently converts *"no row appeared"*
+into *"strict mode is fine here"*. Nothing bridged the two, and the four-way
+verdict column inherited the error: sixteen rows read **"door correct; none"**
+on the strength of a run that never called the method.
+
+This is the campaign's own recurring shape — a narrow probe reports its own
+reach — and this record is the largest instance of it in the directory.
+
+### The discriminator, which is a two-term predicate over data already frozen
+
+A fabricated-receiver mint is a **live** `--jdk-only` blocker iff **both**
+hold, and neither term needs a run:
+
+1. **The receiver is refused.** Its name is on `NO_IMAGE_JDK_RECEIVERS` or
+   `VM_MINTED_STAND_IN_RECEIVERS` (`native-api/src/no_image_receiver.rs`), so
+   the class is `CompatibilityStub` at the door **and** its own natives are
+   re-tagged `SyntheticStub` and dropped. Gate 1 and gate 2 both shut.
+2. **The minting native survives.** The native that performs the mint is
+   `bridge` — so `NativeKind::allowed_in(JdkOnly)` keeps it, it runs in strict,
+   and it asks for a class §5 forbids. This is Phase 1's shape exactly: *the
+   refusal is correct; the survival of its caller is the defect.*
+
+And a third term decides how loud the failure is:
+
+3. **The mint site has no `Err(_)` arm.** A bare `try_alloc_*(…)?` propagates
+   the refusal as `NoClassDefFoundError` at the application's call site; a
+   `match` with a real-JDK fallback absorbs it. §8's "refusal laundered into a
+   wrong answer" is the third case and the worst.
+
+**Term 2 is the one this sweep never evaluated, and it is free.**
+`scripts/baselines/jdk-only-kind-map-25-linux.tsv` is a frozen per-registration
+census whose unit is one `(class, name, descriptor, ordinal)` triple with its
+adjudicated `kind`. Every verdict in §5.0 below is a lookup in that file plus a
+read of the mint site's `?`-vs-`match`. **It is not a run**, and it is stated
+as such: a `bridge` minting native proves the mint is *reachable* in strict, not
+that any workload reaches it.
+
+Two secondary findings from the same instrument, both worth recording:
+
+* `sun/misc/Cleaner` and `jdk/internal/logger/AbstractLoggerFinder` are in
+  `NO_IMAGE_JDK_RECEIVERS` and have **zero rows in the kind map** — no
+  registration exists on either name in either mode. They are inert table
+  entries, not live fabrications; the predicate answers `true` for a name
+  nothing ever asks about. Confirmed here, not fixed: they cost nothing and
+  their image fact is still true, so the gate script should keep checking it.
+* A pair of siblings can be split by term 2 alone. `Function.andThen` /
+  `.compose` are `synthetic-stub` and `Consumer.andThen` is `bridge`, which is
+  the entire reason `Function$AndThen` is dead in strict and `Consumer$AndThen`
+  is a blocker — three names that §5 puts on one row with one verdict.
+
+### The re-audit, row by row
+
+`survives?` is the minting native's frozen kind. `fallback?` is `Err(_)` arm
+present at the mint. **basis** is the point of the table: whether the verdict
+rests on a measurement of the class, or on nothing having reached it.
+
+| §5 row | minting native · frozen kind | fallback? | corrected strict verdict | basis |
+|---|---|---|---|---|
+| `AnnotationProxy` | `lang_class.rs` · 0 natives on the class | n/a | YES — fixed here (door) | **measured** — the `compatibility-class-requested` row is quoted in §1 |
+| 10 × `__mh_*` | `lang_invoke.rs` · 0 natives on the class | n/a | YES — fixed by `W7-13` | **measured** |
+| `CratonVM$HttpServerLoop` | `HttpServer.start` · **bridge** | no | YES, fatal — fixed (door) | **measured** — `NoClassDefFoundError` witness, §6A |
+| `ForkJoinPool$DefaultCommonPool…` | `bridge` | n/a | YES, fatal — fixed by `W7-14` | **measured** |
+| `cratonvm/internal/SystemLogger` | VM service, natives kept `bridge` | yes | correct | **measured** |
+| `cratonvm/stream/LazyOp` | — | — | correct, deliberate | **measured** |
+| `HashMap$KeyItr` | `HashSet.iterator`, `HashMap.keySet` · **bridge** | yes (landed after this binary) | YES — was fatal, now absorbed | **measured** — `RChmKeySetView` |
+| `TreeSet$Itr` | `TreeSet.iterator`/`descendingIterator` · **bridge** | yes | YES — absorbed | **measured** |
+| `IteratorEnumeration` | `*KeyStore.engineAliases` · **bridge** | yes (`keystore.rs:2666` is a `match`) | YES — absorbed | **measured** |
+| 11 × `Unmodifiable*` | boot path, **and** `System.getenv()Ljava/util/Map;` · **bridge** | boot arm warns; the `getenv` arm is another lane's | YES — **`UnmodifiableMap` is on the 2026-08-12 blocking set** | **PARTLY UNREACHED** — "absorbed and warned" was measured on the boot path only |
+| `Comparator$Native` | `Comparator.naturalOrder`/`comparing*` · **synthetic-stub** | n/a | not reached in strict — real bytecode serves | **measured**, and now *structurally* so |
+| `Enumeration$Impl` | boot path | absorbed | correct | **measured** |
+| `ArrayListSubList` | `ArrayList.subList` · **synthetic-stub** | n/a | dropped before the mint | **structural** — term 2 fails, so unreachable by construction |
+| `StreamCollector`, `StreamChainCollector` | collection `stream()` · **bridge** | **yes** (`lib.rs:17846` is a `match`) | absorbed | **measured** |
+| **`SnapshotEnumeration`** | `Properties.propertyNames`/`keys`/`elements`, `ConcurrentHashMap.keys`/`elements`, `Hashtable.keys`/`elements` · **bridge** | **no** — `make_snapshot_enumeration` is a bare `?` | **YES, fatal — NEW, §5.1** | was **unreached** |
+| **`cratonvm/synthetic/Process*`** | `ProcessBuilder.start` · synthetic-stub **but `Runtime.exec` ×6 · bridge** | **no** — `refused_class(…)?` | **YES, fatal — NEW, §5.1** | was **unreached** |
+| `ArrayDeque$Itr`, `LinkedList$Itr` | `.iterator()` · **bridge** | **yes**, both, landed by `W7-16` | was fatal; now absorbed | was **unreached** — the source comments say both died before `hasNext()` |
+| **`CompletedFuture`** | `AsynchronousFileChannel.read`/`write`/`lock` · **bridge** | **no** — `wrap_completed_future` is a bare `?` | **YES, fatal — NEW, §5.1** | was **unreached** |
+| 3 × `Atomic*FieldUpdater$RustJvmImpl` | `*FieldUpdater.newUpdater` · **bridge** | no | **YES, fatal** — on the blocking set | was **unreached** |
+| `Function$AndThen`, `Function$Compose` | `Function.andThen`/`.compose` · **synthetic-stub** | n/a | dropped before the mint | **structural** |
+| `Consumer$AndThen` | `Consumer.andThen` · **bridge** | no | **YES, fatal** — on the blocking set | was **unreached**; §5 put it on the `Function$*` row and it does not belong there |
+| `LogManager$StringEnumeration` | `LogManager.getLoggerNames` · **synthetic-stub** | n/a | dropped before the mint | **structural** |
+| `SSLSocketInputStream`, `SSLSocketOutputStream` | `SSLSocket.getInputStream`/`getOutputStream` · **bridge** | no | **YES, fatal — all HTTPS.** Fixed 2026-08-12 by re-targeting the receiver | was **unreached** — falsified by a sibling lane |
+
+**Score: of 22 rows, 6 were `unreached` and stated as if measured, 1 is partly
+so, and 3 are structural (right answer, wrong reason).** The three structural
+rows are worth separating from the measured ones: `ArrayListSubList`,
+`Function$AndThen`/`$Compose` and `LogManager$StringEnumeration` really are dead
+in strict, but not for the reason §5 gives ("door correct"). They are dead
+because their *minting native* is dropped first. That is a stronger guarantee
+than the one §5 claims, and it is the one that would survive somebody re-tagging
+a class.
+
+### The correction to §3's taxonomy
+
+§3 gives three carrier kinds and two repairs — the door, or a real-JDK fallback.
+The `SSLSocket*Stream` fix is neither, and it is the best of the three:
+
+> **4 — a wrong receiver NAME.** The carrier is a behaviour carrier, its natives
+> are the whole of its behaviour and must survive, and the fix is to mint them
+> on **the class the real JDK returns** instead of on an invented name. Gate 1
+> stops refusing because the class is real; gate 2 stops firing because
+> `receiver_declared_by_no_supported_image` no longer matches; and
+> `getClass().getName()` starts agreeing with HotSpot, which neither of the
+> other two repairs buys. Landed for `SSLSocketImpl$AppInputStream` /
+> `$AppOutputStream` (`native-builtins/src/phases_late/ssl_security.rs`,
+> another lane's file, working tree, uncommitted, not built).
+
+It costs a layout audit — a real class has declared fields, so the native's
+private slot must be **appended**, not written at slot 0 — which is why it is
+fourth and not first. `alloc_tls_stream` uses `try_alloc_with_appended_slots`
+for exactly that reason.
+
+### 5.1 Three blockers the 33-probe screen did not reach
+
+All three satisfy terms 1–3: refused receiver, `bridge` minting native, bare
+`?` at the mint. **Read from source and from the frozen kind map; no run.**
+Each needs a probe, and the probe is the deliverable, not the fix.
+
+**N1 — `cratonvm/synthetic/Process*` via `Runtime.exec`.** A prior lane
+re-tagged `java/lang/ProcessBuilder.start` `SyntheticStub` **explicitly to stop
+a fabricated `cratonvm/synthetic/Process` escaping into `--jdk-only`**
+(`native-io/src/process.rs`, the `register_with_kind` comment says so in as many
+words). It pinned one of two spawn routes. All six
+`java/lang/Runtime.exec` overloads (`native-builtins/src/lib.rs`, bare
+`registry.register`, ambient kind **bridge** in the frozen map) call
+`native-builtins/src/lang_system.rs::runtime_spawn_process` →
+`native_io::process::spawn_and_wrap` → `spawn_and_wrap_with_redirects`, whose
+mint is `crate::refused_class(ctx, SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT)?`
+— the same `?`, in the same function, that `ProcessBuilder.start` no longer
+reaches. Predicted witness: `Runtime.getRuntime().exec("…")` under `--jdk-only`
+→ `NoClassDefFoundError: cratonvm/synthetic/Process`. This is the
+"a fix that only pins the positive half" shape, and the half it left open is the
+older API.
+
+**N2 — `java/util/concurrent/CompletedFuture` via `AsynchronousFileChannel`.**
+`read(ByteBuffer,J)Ljava/util/concurrent/Future;`, its `write` twin and `lock()`
+are all **bridge**; every one of their exit points goes through
+`native-io/src/lib.rs::wrap_completed_future`, which is
+`try_alloc_synthetic(ctx, "java/util/concurrent/CompletedFuture", 2)?` with no
+`Err` arm, on a name that is in `NO_IMAGE_JDK_RECEIVERS`. Predicted witness:
+any `AsynchronousFileChannel.read/write` under `--jdk-only`. **This one is not
+hypothetical for the app corpus** — the comment two lines above that helper
+names H2's `FileAsync.write` and `TestFileSystem.testConcurrent` against the
+`async:` filesystem as the caller it was hardened for.
+
+**N3 — `cratonvm/internal/SnapshotEnumeration` via the legacy `Enumeration`
+getters.** `java/util/Properties.propertyNames()`, `.keys()`, `.elements()` and
+`java/util/concurrent/ConcurrentHashMap.keys()`, `.elements()` are all
+**bridge**, and all route to
+`native-collections/src/lib.rs::make_snapshot_enumeration`, whose mint is a bare
+`try_alloc_synthetic(ctx, "cratonvm/internal/SnapshotEnumeration", 2)?` on a
+name in `VM_MINTED_STAND_IN_RECEIVERS`. Predicted witness:
+`System.getProperties().propertyNames()` under `--jdk-only`. This is the widest
+of the three by call-site count — it is the JDBC/logging idiom.
+**One caveat, stated rather than assumed:** `java/util/Hashtable.keys` has
+**two** registrations in the frozen map (both `bridge`), so which registrar owns
+the slot under last-write-wins is unresolved here and the `Hashtable` half of
+this claim is *unadjudicated*. `Properties` and `ConcurrentHashMap` were traced
+to source and are not.
+
+### What a future sweep must do differently
+
+1. **Never write `no` in a reachability column.** Write `not reached by <this
+   corpus>`. The two rows this record lost were both lost to that word.
+2. **Take term 2 before taking the corpus.** The kind map is frozen, free, and
+   splits every candidate into *structurally dead* and *live and waiting for a
+   probe* before a single vector runs. Every one of §5.1's three would have
+   fallen out of a `join` between `NO_IMAGE_JDK_RECEIVERS` and that file.
+3. **A retag that pins one caller must enumerate the callers.** N1 exists
+   because `ProcessBuilder.start` and `Runtime.exec` share a mint and only one
+   was adjudicated.
+
+---
+
 ## 5. The table
+
+**Superseded in its `strict?` and `verdict` columns by §5.0.** Kept verbatim.
 
 `javap` column: run against the JDK 25 image on this host. **Every one of the
 44 answered "class not found" — there is not a single genuinely-missing real
@@ -236,16 +453,18 @@ changes the fix completely.
 | `java/util/HashMap$KeyItr` (×2 sites) | `native-collections/src/lib.rs` · `native_hs_iterator`, `native_ksv_iterator` | YES | 3 → 0 | behaviour carrier; door correct | none — fallback landed on `dev` after this binary |
 | `java/util/TreeSet$Itr` | `native-collections/src/lib.rs` · `native_ts_iterator`, `native_ts_descending_iterator` | YES | 3 → 0 | behaviour carrier; door correct, fallback present | none |
 | `java/util/IteratorEnumeration` | `native-builtins/src/keystore.rs` · `engine_aliases` | YES | 2 → 0 | behaviour carrier; door correct, fallback present | none |
-| 11 × `cratonvm/internal/Unmodifiable*` | `vm/src/vm/vm_init.rs` · `ensure_bootstrap_compat_class` | YES | 3–49 → 0 | behaviour carriers; door correct, refusal absorbed and warned | none |
+| 11 × `cratonvm/internal/Unmodifiable*` | `vm/src/vm/vm_init.rs` · `ensure_bootstrap_compat_class` — **and a second requester this sweep did not fold: `java/lang/System.getenv()Ljava/util/Map;`, kind `bridge`** | YES | 3–49 → 0 | behaviour carriers; door correct, refusal absorbed and warned **on the boot path only — `UnmodifiableMap` is on the 2026-08-12 Phase 1 blocking set; §5.0** | none — another lane's |
 | `java/util/Comparator$Native`, `java/util/Enumeration$Impl` | same | YES | 2 / 4 → 0 | same | none |
-| `cratonvm/internal/ArrayListSubList`, `StreamCollector`, `StreamChainCollector`, `SnapshotEnumeration` | `native-collections/src/lib.rs` | no | 1–30 → 0 | behaviour carriers; door correct | none |
-| `cratonvm/synthetic/Process`, `ProcessPipeInputStream`, `ProcessPipeOutputStream` | `native-io/src/process.rs` · `spawn_and_wrap_with_redirects` | no | 5–13 → 0 | behaviour carriers; door correct | none |
-| `java/util/ArrayDeque$Itr`, `java/util/LinkedList$Itr` | `native-collections/src/lib.rs` · `native_ad_iterator`, `native_ll_iterator` | no | 3 → 0 | behaviour carriers; door correct | none |
-| `java/util/concurrent/CompletedFuture` | `native-io/src/lib.rs` · `wrap_completed_future` | no | 5 → 0 | behaviour carrier; door correct | none |
-| 3 × `Atomic*FieldUpdater$RustJvmImpl` | `native-builtins/src/atomic_updater.rs` | no | 8–12 → 0 | behaviour carriers; door correct | none |
-| `Function$AndThen`, `Function$Compose`, `Consumer$AndThen` | `native-builtins/src/phases_late/streams.rs` | no | 1 → 0 | behaviour carriers; door correct | none |
+| `cratonvm/internal/ArrayListSubList`, `StreamCollector`, `StreamChainCollector` | `native-collections/src/lib.rs` | no (subList dropped; the `stream()` sites have `Err` arms) | 1–30 → 0 | door correct | none |
+| `cratonvm/internal/SnapshotEnumeration` — **split off this row by §5.0** | `native-collections/src/lib.rs` · `make_snapshot_enumeration` | ~~no~~ **YES, fatal (N1/N3)** | 2 → 0 | ~~door correct~~ **FALSIFIED — `Properties.propertyNames`/`CHM.keys` are `bridge`, mint is a bare `?`; §5.1** | NOMINATED |
+| `cratonvm/synthetic/Process`, `ProcessPipeInputStream`, `ProcessPipeOutputStream` | `native-io/src/process.rs` · `spawn_and_wrap_with_redirects` | ~~no~~ **YES, fatal via `Runtime.exec`** | 5–13 → 0 | ~~door correct~~ **FALSIFIED — `ProcessBuilder.start` was retagged, `Runtime.exec` ×6 was not; §5.1 N1** | NOMINATED |
+| `java/util/ArrayDeque$Itr`, `java/util/LinkedList$Itr` | `native-collections/src/lib.rs` · `native_ad_iterator`, `native_ll_iterator` | ~~no~~ **was YES, fatal** | 3 → 0 | ~~door correct~~ **FALSIFIED — both mint sites' own comments record a `NoClassDefFoundError` before `hasNext()`** | fallbacks landed by `W7-16` |
+| `java/util/concurrent/CompletedFuture` | `native-io/src/lib.rs` · `wrap_completed_future` | ~~no~~ **YES, fatal** | 5 → 0 | ~~door correct~~ **FALSIFIED — `AsynchronousFileChannel.read`/`write` are `bridge`, mint is a bare `?`; §5.1 N2** | NOMINATED |
+| 3 × `Atomic*FieldUpdater$RustJvmImpl` | `native-builtins/src/atomic_updater.rs` | ~~no~~ **YES, fatal** | 8–12 → 0 | ~~door correct~~ **FALSIFIED — `newUpdater` is `bridge`; §5.0** | none — another lane's |
+| `Function$AndThen`, `Function$Compose` (`.andThen`/`.compose` are `synthetic-stub`) | `native-builtins/src/phases_late/streams.rs` | no — **structurally**, the minting native is dropped first | 1 → 0 | door correct, for a reason §5 did not give | none |
+| `Consumer$AndThen` — **split off this row by §5.0** | same | ~~no~~ **YES, fatal** | 1 → 0 | ~~door correct~~ **FALSIFIED — `Consumer.andThen` is `bridge`; §5.0** | none — another lane's |
 | `java/util/logging/LogManager$StringEnumeration` | `native-builtins/src/logmanager.rs` | no | 2 → 0 | behaviour carrier; door correct | none |
-| `javax/net/ssl/SSLSocketInputStream`, `SSLSocketOutputStream` | `native-builtins/src/phases_late/ssl_security.rs` | no | 4 → 0 | behaviour carriers; door correct | none |
+| `javax/net/ssl/SSLSocketInputStream`, `SSLSocketOutputStream` | `native-builtins/src/phases_late/ssl_security.rs` | ~~no~~ **YES, fatal** | 4 → 0 | ~~behaviour carriers; door correct~~ **FALSIFIED — see §5.0** | ~~none~~ receiver re-targeted, 2026-08-12 |
 
 **Why "no" in the strict column is a result, not a gap.** `RJdkLambdas`,
 `RJdkProcess` and `RJdkCollections` all **PASS** under `--jdk-only` while
@@ -515,6 +734,39 @@ this change moves.
   `VM_MINTED_STAND_IN_RECEIVERS` and was adjudicated by the concurrent lane
   that supplied §3's measurement; it does not appear in this sweep's rows and
   is that lane's to close.
+
+### 8.1 Residuals opened by the 2026-08-12 re-audit
+
+* **R2 — the three §5.1 blockers have no probe.** N1 (`Runtime.exec` →
+  `cratonvm/synthetic/Process`), N2 (`AsynchronousFileChannel` →
+  `CompletedFuture`), N3 (`Properties.propertyNames` →
+  `SnapshotEnumeration`) are read from source and from the frozen kind map.
+  **Term 2 of §5.0's predicate proves the mint is reachable in strict; it does
+  not prove any workload reaches it.** Each needs a `--jdk-only` witness with a
+  HotSpot 25 control, and `probes/` is not run by `regression-suite/run.sh` at
+  any `SUITE=`, so a probe alone cannot discharge them — the witness has to land
+  as a `regression-suite` vector or it is unscheduled evidence.
+* **R3 — this record's own evidence is unscheduled.** §9's recipe is a
+  hand-run over `regression-suite/build` and `probes/`. Nothing in CI re-takes
+  it, which is why the `strict?` column could rot for a day without a red.
+  The frozen kind map *is* gated (`scripts/jdk-only-kind-map.py`), so the
+  cheapest durable guard for this whole species is a check that **no name in
+  `NO_IMAGE_JDK_RECEIVERS` ∪ `VM_MINTED_STAND_IN_RECEIVERS` is minted from a
+  `bridge` native without an `Err(_)` arm** — i.e. §5.0's predicate, run as a
+  gate rather than as a sweep. Not attempted here: the third term needs the mint
+  sites enumerated, and §4 already records why a grep over
+  `try_alloc_concurrent_synthetic` answers a different question badly.
+* **R4 — `sun/misc/Cleaner` and `jdk/internal/logger/AbstractLoggerFinder`
+  have zero registrations.** Confirmed against the frozen kind map (§5.0). They
+  are inert rows on `NO_IMAGE_JDK_RECEIVERS`, not live fabrications. Left in
+  place deliberately — the image fact is true and the gate script should keep
+  checking it — but a reader counting "fabricated classes" from that table
+  overcounts by two.
+* **R5 — `java/util/Hashtable.keys` has two registrations, both `bridge`.**
+  Which registrar owns the slot decides whether the `Hashtable` half of N3 is
+  real. Unresolved; `register()` is last-write-wins and this lane did not read
+  the boot order. The `Properties` and `ConcurrentHashMap` halves do not depend
+  on it.
 
 ## 9. How to re-take all of this
 

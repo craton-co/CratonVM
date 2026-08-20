@@ -42,6 +42,36 @@ pub struct LookupSwitch {
     pub pairs: Vec<(i32, i32)>,
 }
 
+impl LookupSwitch {
+    /// Branch offset for `key`, or [`Self::default`] when no pair matches.
+    ///
+    /// JVMS §6.5 (`lookupswitch`) requires the `match` values to appear "in
+    /// increasing numerical order", so the ordinary case is a binary search —
+    /// which matters because `lookupswitch` is what javac emits for the
+    /// `hashCode()` arm of a string switch and for sparse `enum`/`int`
+    /// switches, tables that routinely run to hundreds of entries. A linear
+    /// scan makes every one of those a walk over the whole table.
+    ///
+    /// The linear fallback is not belt-and-braces, it is the correctness
+    /// argument: this VM can run with verification skipped, and nothing else
+    /// on the path proves the table is ordered. A binary-search *hit* is
+    /// authoritative regardless of ordering (it only ever reports `Ok(i)` when
+    /// `pairs[i].0 == key`), so the fallback is needed exactly for the
+    /// unsorted-and-missed case, where it restores the old behaviour.
+    #[inline]
+    pub fn target(&self, key: i32) -> i32 {
+        match self.pairs.binary_search_by_key(&key, |(k, _)| *k) {
+            Ok(i) => self.pairs[i].1,
+            Err(_) => self
+                .pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, off)| *off)
+                .unwrap_or(self.default),
+        }
+    }
+}
+
 /// A JVM bytecode instruction (JVM spec 6.5).
 ///
 /// Each variant represents a single JVM instruction with its operands already decoded.
@@ -1136,5 +1166,43 @@ mod tests {
             }
         );
         assert_eq!(next, 4);
+    }
+
+    /// `lookupswitch` resolution is a binary search over the JVMS-mandated
+    /// sorted key table. This pins both halves of that claim: the search finds
+    /// every key and every gap in a sorted table, AND an UNSORTED table — which
+    /// only unverified bytecode can produce, and which a bare binary search
+    /// would silently mis-answer — still resolves through the linear fallback.
+    ///
+    /// Delete the `Err(_)` arm of `LookupSwitch::target` and the unsorted half
+    /// of this test fails on key 5.
+    #[test]
+    fn lookupswitch_target_resolves_sorted_and_unsorted_tables() {
+        let sorted = LookupSwitch {
+            default: -1,
+            pairs: vec![(-9, 10), (0, 20), (5, 30), (7, 40), (1000, 50)],
+        };
+        for (k, want) in [(-9, 10), (0, 20), (5, 30), (7, 40), (1000, 50)] {
+            assert_eq!(sorted.target(k), want, "sorted key {k}");
+        }
+        for k in [i32::MIN, -10, -8, 1, 6, 8, 999, 1001, i32::MAX] {
+            assert_eq!(sorted.target(k), -1, "sorted miss {k}");
+        }
+
+        // Not sorted: a binary search alone reports a miss on 5 here.
+        let unsorted = LookupSwitch {
+            default: -1,
+            pairs: vec![(7, 40), (0, 20), (5, 30)],
+        };
+        assert_eq!(unsorted.target(7), 40);
+        assert_eq!(unsorted.target(0), 20);
+        assert_eq!(unsorted.target(5), 30);
+        assert_eq!(unsorted.target(3), -1);
+
+        let empty = LookupSwitch {
+            default: 77,
+            pairs: vec![],
+        };
+        assert_eq!(empty.target(0), 77);
     }
 }

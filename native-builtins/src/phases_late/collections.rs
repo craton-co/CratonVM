@@ -368,488 +368,80 @@ pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
 }
 
 // =============================================================================
-// NavigableMap/NavigableSet completion — floorEntry, ceilingEntry, etc.
+// NavigableMap/NavigableSet completion — REMOVED, see below.
 // =============================================================================
 
-pub(crate) fn register_p62_navigable_expansion(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let tm = "java/util/TreeMap";
-    r.register(
-        tm,
-        "floorKey",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_tm_floor_key,
-    );
-    r.register(
-        tm,
-        "ceilingKey",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_tm_ceiling_key,
-    );
-    r.register(
-        tm,
-        "lowerKey",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_tm_lower_key,
-    );
-    r.register(
-        tm,
-        "higherKey",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_tm_higher_key,
-    );
-    r.register(
-        tm,
-        "floorEntry",
-        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        p62_tm_floor_entry,
-    );
-    r.register(
-        tm,
-        "ceilingEntry",
-        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        p62_tm_ceiling_entry,
-    );
-    r.register(
-        tm,
-        "lowerEntry",
-        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        p62_tm_lower_entry,
-    );
-    r.register(
-        tm,
-        "higherEntry",
-        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        p62_tm_higher_entry,
-    );
-
-    let nm = "java/util/NavigableMap";
-    r.register(
-        nm,
-        "floorKey",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_tm_floor_key,
-    );
-    r.register(
-        nm,
-        "ceilingKey",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_tm_ceiling_key,
-    );
-    r.register(
-        nm,
-        "lowerKey",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_tm_lower_key,
-    );
-    r.register(
-        nm,
-        "higherKey",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_tm_higher_key,
-    );
-    r.register(
-        nm,
-        "floorEntry",
-        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        p62_tm_floor_entry,
-    );
-    r.register(
-        nm,
-        "ceilingEntry",
-        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        p62_tm_ceiling_entry,
-    );
-    r.register(
-        nm,
-        "lowerEntry",
-        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        p62_tm_lower_entry,
-    );
-    r.register(
-        nm,
-        "higherEntry",
-        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
-        p62_tm_higher_entry,
-    );
-
-    let ts = "java/util/TreeSet";
-    r.register(
-        ts,
-        "floor",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_ts_floor,
-    );
-    r.register(
-        ts,
-        "ceiling",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_ts_ceiling,
-    );
-    r.register(
-        ts,
-        "lower",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_ts_lower,
-    );
-    r.register(
-        ts,
-        "higher",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_ts_higher,
-    );
-
-    let ns = "java/util/NavigableSet";
-    r.register(
-        ns,
-        "floor",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_ts_floor,
-    );
-    r.register(
-        ns,
-        "ceiling",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_ts_ceiling,
-    );
-    r.register(
-        ns,
-        "lower",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_ts_lower,
-    );
-    r.register(
-        ns,
-        "higher",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        p62_ts_higher,
-    );
-    r.set_category(__prev_cat);
-}
-
-// TreeMap navigable helpers — operate on sorted interleaved array [k0,v0,k1,v1,...]
-pub(crate) fn p62_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let mut result = Value::Object(None);
-    for i in 0..size {
-        let k = ctx.get_array_element(data, i * 2);
-        if natural_compare_values(k, key) <= 0 {
-            result = k;
-        } else {
-            break;
-        }
-    }
-    Ok(Some(result))
-}
-
-pub(crate) fn p62_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    for i in 0..size {
-        let k = ctx.get_array_element(data, i * 2);
-        if natural_compare_values(k, key) >= 0 {
-            return Ok(Some(k));
-        }
-    }
-    Ok(Some(Value::Object(None)))
-}
-
-pub(crate) fn p62_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let mut result = Value::Object(None);
-    for i in 0..size {
-        let k = ctx.get_array_element(data, i * 2);
-        if natural_compare_values(k, key) < 0 {
-            result = k;
-        } else {
-            break;
-        }
-    }
-    Ok(Some(result))
-}
-
-pub(crate) fn p62_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    for i in 0..size {
-        let k = ctx.get_array_element(data, i * 2);
-        if natural_compare_values(k, key) > 0 {
-            return Ok(Some(k));
-        }
-    }
-    Ok(Some(Value::Object(None)))
-}
-
-// The relative-`*Entry` variants for the p62 TreeMap layout (field0 = sorted
-// key/value array with key at i*2 + value at i*2+1, field1 = size). These
-// mirror the p62 `*Key` scans exactly but return a `Map.Entry` for the
-// resolved slot — needed so that whichever TreeMap impl registers last (this
-// linear-scan one or native-collections' array/fast-mode one) has a layout-
-// consistent `*Entry` alongside its `*Key`.
-
-/// Build a `Map.Entry` for the p62 slot at logical index `idx` (None → null).
-pub(crate) fn p62_tm_entry_at(
-    ctx: &mut dyn NativeContext,
-    data: ObjectRef,
-    idx: Option<usize>,
-) -> Result<Value, MethodCallFailed> {
-    match idx {
-        Some(i) => {
-            let k = ctx.get_array_element(data, i * 2);
-            let v = ctx.get_array_element(data, i * 2 + 1);
-            Ok(Value::Object(Some(p64_make_entry(ctx, k, v)?)))
-        }
-        None => Ok(Value::Object(None)),
-    }
-}
-
-pub(crate) fn p62_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) if size != 0 => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let mut found: Option<usize> = None;
-    for i in 0..size {
-        let k = ctx.get_array_element(data, i * 2);
-        if natural_compare_values(k, key) <= 0 {
-            found = Some(i);
-        } else {
-            break;
-        }
-    }
-    Ok(Some(p62_tm_entry_at(ctx, data, found)?))
-}
-
-pub(crate) fn p62_tm_ceiling_entry(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) if size != 0 => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    for i in 0..size {
-        let k = ctx.get_array_element(data, i * 2);
-        if natural_compare_values(k, key) >= 0 {
-            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))?));
-        }
-    }
-    Ok(Some(Value::Object(None)))
-}
-
-pub(crate) fn p62_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) if size != 0 => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let mut found: Option<usize> = None;
-    for i in 0..size {
-        let k = ctx.get_array_element(data, i * 2);
-        if natural_compare_values(k, key) < 0 {
-            found = Some(i);
-        } else {
-            break;
-        }
-    }
-    Ok(Some(p62_tm_entry_at(ctx, data, found)?))
-}
-
-pub(crate) fn p62_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) if size != 0 => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    for i in 0..size {
-        let k = ctx.get_array_element(data, i * 2);
-        if natural_compare_values(k, key) > 0 {
-            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))?));
-        }
-    }
-    Ok(Some(Value::Object(None)))
-}
-
-// TreeSet navigable helpers — operate on sorted element array
-pub(crate) fn p62_ts_floor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let mut result = Value::Object(None);
-    for i in 0..size {
-        let elem = ctx.get_array_element(data, i);
-        if natural_compare_values(elem, key) <= 0 {
-            result = elem;
-        } else {
-            break;
-        }
-    }
-    Ok(Some(result))
-}
-
-pub(crate) fn p62_ts_ceiling(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    for i in 0..size {
-        let elem = ctx.get_array_element(data, i);
-        if natural_compare_values(elem, key) >= 0 {
-            return Ok(Some(elem));
-        }
-    }
-    Ok(Some(Value::Object(None)))
-}
-
-pub(crate) fn p62_ts_lower(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let mut result = Value::Object(None);
-    for i in 0..size {
-        let elem = ctx.get_array_element(data, i);
-        if natural_compare_values(elem, key) < 0 {
-            result = elem;
-        } else {
-            break;
-        }
-    }
-    Ok(Some(result))
-}
-
-pub(crate) fn p62_ts_higher(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let size = match ctx.get_field(this, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    for i in 0..size {
-        let elem = ctx.get_array_element(data, i);
-        if natural_compare_values(elem, key) > 0 {
-            return Ok(Some(elem));
-        }
-    }
-    Ok(Some(Value::Object(None)))
-}
-
-pub(crate) fn natural_compare_values(a: Value, b: Value) -> i32 {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(&y) as i32,
-        (Value::Long(x), Value::Long(y)) => x.cmp(&y) as i32,
-        (Value::Float(x), Value::Float(y)) => {
-            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal) as i32
-        }
-        (Value::Double(x), Value::Double(y)) => {
-            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal) as i32
-        }
-        _ => 0,
-    }
+/// **Deliberately empty.** Kept only because `phases_late.rs` still calls it;
+/// deleting the call site is a nomination (`G41-1` §7 N1a), not this file's to
+/// make.
+///
+/// # What used to be here, and why it is gone
+///
+/// This pass registered 24 triples — `floor/ceiling/higher/lower` × `Key/Entry`
+/// on `java/util/TreeMap` and `java/util/NavigableMap`, and `floor/ceiling/
+/// higher/lower` on `java/util/TreeSet` and `java/util/NavigableSet` — against
+/// local `p62_tm_*` / `p62_ts_*` bodies that were **linear scans over the
+/// interleaved `[k0,v0,k1,v1,…]` slot-0 array using a `natural_compare_values`
+/// helper that only knew the four primitive `Value` arms and answered `0` for
+/// everything else.**
+///
+/// `native-collections/src/lib.rs` registers the SAME 24 triples
+/// (`register_tree_map_natives` / `register_tree_set_natives`) against
+/// `native_tm_*` / `native_ts_*`, which call `tm_sync_native_state` first, take
+/// a `tm_fast_with` BTree range path, honour a user-supplied `Comparator`, and
+/// deliberately re-read `data` after a comparator call because that call can
+/// move the heap (the "Family-1 stale-`ObjectRef` fix" in that file).
+///
+/// This pass is reachable ONLY from `register_synthetic_overrides`, which is
+/// `#[cfg(feature = "synthetic-jdk")]` and runs LAST. `register()` is
+/// last-write-wins. So:
+///
+/// * a shipping build (`--jdk-only` included) ran the `native_tm_*` bodies;
+/// * a `--features synthetic-jdk` build ran these `p62_*` ones.
+///
+/// The two answer differently for any `TreeMap`/`TreeSet` with a custom
+/// `Comparator` or with non-primitive keys, and the copy every synthetic-JDK
+/// test measured was the weaker one. That is the `register_pe_panama` /
+/// `structLayout` defect in a second family.
+///
+/// # Why deleting these arms takes nothing with it — MEASURED, not reasoned
+///
+/// `F34-1` §5's trap is that dropping a synthetic-only pass can drop triples
+/// its shipping twin never registered. It does not apply here, and this was
+/// checked against `--dump-native-registry` rather than against the source:
+///
+/// * `cratonvm --dump-native-registry` (compatible mode, no `synthetic-jdk`):
+///   all 24 triples present, `kind = bridge`, `owns_slot = true`,
+///   `overwrote = null`, `registered_by = native-collections/src/lib.rs`
+///   :48609–48651 (`TreeMap`), :48821–48863 (`NavigableMap`), :48980–48998
+///   (`TreeSet`), :49116–49134 (`NavigableSet`).
+/// * `cratonvm --jdk-only --dump-native-registry`: the identical 24 rows, same
+///   kind, same owner, `synthetic-stub` count 0 for the whole registry.
+///
+/// `Bridge` is `allowed_in(JdkOnly)` (`native-api/src/registry.rs`
+/// `allowed_in` refuses only `SyntheticStub`), and `G34-1` settled that
+/// registering a `Bridge` is by itself sufficient to preempt real JDK
+/// bytecode. So the shipping bodies serve all 24 triples in BOTH modes, and
+/// the interface (`NavigableMap`/`NavigableSet`) triples — the ones §5's trap
+/// is actually about — are among them.
+///
+/// The registrar's own arms were the complete set: 8 `TreeMap` + 8
+/// `NavigableMap` + 4 `TreeSet` + 4 `NavigableSet`, no fifth class, no `for`
+/// loop, nothing else. Removing them removes exactly 24 drifting triples and
+/// no capability.
+///
+/// `native-builtins/tests/registrar_drift.rs` pins this: the 24 triples are a
+/// vacuity-guarded NEGATIVE control (`FIXED_NOT_DRIFTING`) — they must still be
+/// registered, and must no longer drift. If the twin comes back, that test
+/// reddens.
+pub(crate) fn register_p62_navigable_expansion(_r: &mut NativeMethodRegistry) {
+    // Intentionally no registrations. Do NOT re-add a TreeMap/TreeSet body
+    // here: `native-collections/src/lib.rs` owns these 24 slots in every mode,
+    // and a second copy is only ever reachable in one of them. The `p62_tm_*`
+    // / `p62_ts_*` bodies and their `natural_compare_values` helper were
+    // deleted with the registrations rather than left behind, because a fix
+    // landing in an unreachable body is a failure mode this branch has already
+    // had once.
 }
 
 // =============================================================================
@@ -2215,7 +1807,12 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
                 comparable_boxed_number(ctx, this),
                 comparable_boxed_number(ctx, other),
             ) {
-                return Ok(Some(Value::Int(ordering_to_int(a.total_cmp(&b)))));
+                // `Double.compare` semantics, not IEEE totalOrder — the two
+                // disagree on a negatively-signed or payload-carrying NaN. See
+                // `cratonvm_types::jfp`. (`comparable_boxed_number` widens
+                // every boxed number to `f64`, so the integral receivers that
+                // dominate this path are unaffected either way.)
+                return Ok(Some(Value::Int(cratonvm_types::jfp::double_compare(a, b))));
             }
             Err(RuntimeError::ClassCastException {
                 message:

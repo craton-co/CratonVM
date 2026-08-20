@@ -481,6 +481,59 @@ pub fn object_degradation_breakdown() -> [u64; DegradationSource::COUNT] {
     ]
 }
 
+/// Count of NaN payloads destroyed by the tag collision in
+/// [`CompactValue::double`].
+///
+/// Separate from [`DEGRADATION_COUNTS`] on purpose: a degradation is a
+/// reference-shaped word that was refused (a memory-safety event), this is a
+/// double that lost its NaN payload (a fidelity event). Folding them would make
+/// a benign number and an alarming one indistinguishable.
+static NAN_PAYLOAD_COLLAPSES: AtomicU64 = AtomicU64::new(0);
+
+/// One-shot diagnostic the first time a payload is lost in a process.
+static FIRST_NAN_COLLAPSE_DIAG: Once = Once::new();
+
+/// Record one NaN payload collapsed by the tag collision.
+///
+/// Called from the cold arm of [`CompactValue::double`], which is already
+/// branch-predicted away for every ordinary double.
+#[inline]
+pub fn note_nan_payload_collapse() {
+    NAN_PAYLOAD_COLLAPSES.fetch_add(1, Ordering::Relaxed);
+    // One line per process, matching `emit_first_degradation_diag`'s shape and
+    // gated the same way — by a `Once`, not by a flag, so a workload that hits
+    // this says so without anyone having to know to ask. Deliberately worded as
+    // the fidelity event it is: nothing here is unsafe, and a reader who greps
+    // this line should not go hunting for a memory bug.
+    FIRST_NAN_COLLAPSE_DIAG.call_once(|| {
+        eprintln!(
+            "CompactValue: first NaN payload collapsed by the tag collision. \
+             The double is a negative quiet NaN with mantissa bit 50 set, which \
+             is bit-for-bit the NaN-box tag pattern, so it is stored as the \
+             canonical quiet NaN instead. It still IS NaN — isNaN, compare, \
+             equals, hashCode and toString are all unaffected — but \
+             doubleToRawLongBits reports 7ff8000000000000 where HotSpot reports \
+             the original payload. Subsequent collapses are counted by \
+             nan_payload_collapse_count() but not logged."
+        );
+    });
+}
+
+/// How many NaN payloads this process has lost to the tag collision.
+///
+/// The number a workload run should report. Zero means the encoding's known
+/// lossy case was never reached, which is the answer the write-up wanted and
+/// could not get.
+#[must_use]
+pub fn nan_payload_collapse_count() -> u64 {
+    NAN_PAYLOAD_COLLAPSES.load(Ordering::Relaxed)
+}
+
+/// Reset the NaN-payload counter, returning the previous value. Test-only.
+pub fn reset_nan_payload_collapse_count() -> u64 {
+    NAN_PAYLOAD_COLLAPSES.swap(0, Ordering::Relaxed)
+}
+
 /// Reset the degradation counter to zero, returning the previous value.
 ///
 /// Intended for test harnesses and fuzzers that want to measure degradations
@@ -780,16 +833,47 @@ impl CompactValue {
     /// Create a CompactValue holding a 64-bit double.
     ///
     /// If the bit pattern of `v` collides with our NaN-tagged encoding space,
-    /// it is replaced with the canonical quiet NaN.  This is lossless for all
-    /// non-NaN doubles and for the standard quiet NaN; only exotic NaN payloads
-    /// that happen to set our marker bits are canonicalized (Java mandates a
-    /// single NaN anyway).
+    /// it is replaced with the canonical quiet NaN. This is lossless for all
+    /// non-NaN doubles and for the standard quiet NaN.
+    ///
+    /// It is NOT lossless for every NaN, and the parenthetical that used to
+    /// stand here — "Java mandates a single NaN anyway" — is false.
+    /// `Double.doubleToLongBits` canonicalizes by specification, but
+    /// `doubleToRawLongBits` exists precisely so a program can observe the
+    /// payload it was handed, and HotSpot carries payloads through `f2d`,
+    /// `d2f`, `dmul`, `dadd`, array stores and field stores. So does this VM,
+    /// everywhere except here.
+    ///
+    /// The cost is measurable, not hypothetical. `is_nan_tagged` is
+    /// `(bits & 0xFFFC_0000_0000_0000) == 0xFFFC_0000_0000_0000` — sign,
+    /// exponent, quiet bit and marker bit — so exactly the NEGATIVE QUIET NaNs
+    /// with mantissa bit 50 set are destroyed. `probes/F2dCensus.java` widens
+    /// random NaN floats and finds 49 667 of 200 000 flattened, because a float
+    /// NaN's mantissa shifts left by 29 and its bits 22 and 21 land on the
+    /// quiet and marker bits. Positives: 0 of 2048. Negatives: 1024 of 2048.
+    ///
+    /// Keeping the check is still right — without it a tagged slot would be
+    /// indistinguishable from a double, which is a memory-safety problem rather
+    /// than a payload one. What is wrong is calling the loss free. See
+    /// `nan-payloads-lost-to-the-compactvalue-tag-collision-20260816` for the
+    /// write-up and the candidate fixes, all of which are changes to this
+    /// encoding.
+    ///
+    /// The loss is no longer *silent*: every collapse is counted by
+    /// [`note_nan_payload_collapse`], so
+    /// [`nan_payload_collapse_count`] answers "did this workload hit it at
+    /// all?" without a rebuild. That was the cheapest item on the write-up's
+    /// own fix list and it is the one that turns an unbounded unknown into a
+    /// number. The counter is a single relaxed increment on a branch that is
+    /// already taken, so the common path — every non-NaN double, and every
+    /// positive NaN — pays nothing.
     #[inline]
     pub fn double(v: f64) -> Self {
         let bits = v.to_bits();
         if is_nan_tagged(bits) {
             // Collision: this double's bit pattern looks like a tagged value.
-            // Replace with canonical NaN.
+            // Replace with canonical NaN, and record that a payload died here.
+            note_nan_payload_collapse();
             Self(CANONICAL_NAN)
         } else {
             Self(bits)
@@ -3629,5 +3713,71 @@ mod tests {
             DegradationSource::Jit.name(),
             DegradationSource::ArrayElement.name(),
         );
+    }
+
+    /// The collapse set is exactly the negative quiet NaNs with mantissa bit 50
+    /// set, the counter sees every one of them, and it sees nothing else.
+    ///
+    /// This is a characterisation test, not an aspiration: it pins the KNOWN
+    /// lossy case of the encoding so that a future change to `NANBOX_BITS`
+    /// cannot widen it unnoticed. If the encoding is ever made lossless, this
+    /// test is what has to be rewritten — deliberately, rather than a silent
+    /// count going up.
+    #[test]
+    fn the_nan_collapse_set_is_exactly_the_tag_pattern_and_is_counted() {
+        // Not affected: every ordinary value, +/-0, the infinities, the
+        // canonical quiet NaN, a POSITIVE payload NaN, and a negative NaN whose
+        // mantissa bit 50 is CLEAR.
+        let survivors: [u64; 8] = [
+            0x3ff0_0000_0000_0000, // 1.0
+            0xbff0_0000_0000_0000, // -1.0
+            0x0000_0000_0000_0000, // +0.0
+            0x8000_0000_0000_0000, // -0.0
+            0x7ff0_0000_0000_0000, // +inf
+            0xfff0_0000_0000_0000, // -inf
+            0x7ff8_0000_0000_0001, // positive quiet NaN with a payload
+            0xfff8_0000_0000_0000, // NEGATIVE quiet NaN, marker bit 50 clear
+        ];
+        let before = reset_nan_payload_collapse_count();
+        let _ = before; // whatever earlier tests in this process did
+        for bits in survivors {
+            let cv = CompactValue::double(f64::from_bits(bits));
+            assert_eq!(
+                cv.0, bits,
+                "{bits:#018x} must round-trip verbatim through CompactValue::double",
+            );
+        }
+        assert_eq!(
+            nan_payload_collapse_count(),
+            0,
+            "no survivor may be counted as a collapse",
+        );
+
+        // Affected: sign + exponent + quiet + marker all set. `0xFFFC…` is the
+        // boundary; `0xFFFF_FFFF_FFFF_FFFF` is the pattern the commons-math NaN
+        // census tripped over, and `Math.sqrt(-1.0)` widened from a float NaN
+        // with mantissa bits 22 and 21 set lands here too.
+        let collapsed: [u64; 4] = [
+            0xFFFC_0000_0000_0000,
+            0xFFFC_0000_0000_0001,
+            0xFFFE_5E0E_8000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ];
+        for bits in collapsed {
+            let cv = CompactValue::double(f64::from_bits(bits));
+            assert_eq!(
+                cv.0, CANONICAL_NAN,
+                "{bits:#018x} collides with the tag space and must canonicalize",
+            );
+            // ...and it is still a NaN, which is why nothing above the encoding
+            // notices: this is a payload loss, not a value change.
+            assert!(f64::from_bits(cv.0).is_nan());
+        }
+        assert_eq!(
+            nan_payload_collapse_count(),
+            collapsed.len() as u64,
+            "every collapse must be counted exactly once",
+        );
+        reset_nan_payload_collapse_count();
     }
 }

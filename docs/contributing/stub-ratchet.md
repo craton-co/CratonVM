@@ -16,6 +16,37 @@ The baseline equals the exact default-registry count. There is no slack.
 - A zero-registration registry is rejected separately so broken census wiring
   cannot pass vacuously.
 
+## The count rising is not the same as a stub being added
+
+There are TWO ways to push this number up and they want opposite responses:
+
+1. a **new fake** was written — that is the case the gate was built for;
+2. an **existing** registration changed kind, `Bridge` -> `SyntheticStub`.
+
+(2) is a fake being labelled honestly, so `--jdk-only` drops the row and the
+JDK's own bytecode runs. It is the opposite of a regression and it still raises
+the count. On 2026-08-19 the gate was red at +31 and **30 of the 33 added rows
+were (2)** — the `retired_shadow` table's `ArrayList` family, `Runtime.exec`,
+the `java.util.function` default methods, and the `SharedSecrets` legacy alias.
+Treating them as (1) means un-doing the improvement.
+
+So the first step on a failure is never "find what to implement". It is
+**find out which rows moved**:
+
+```text
+git worktree add /tmp/freeze <the commit that last set the baseline>
+cargo test -p cratonvm-native-builtins --test stub_ratchet dump_synthetic_stubs -- --nocapture
+```
+
+Run it in both trees and `comm -23` the sorted `@@STUB` lines. Then, for each
+added triple, check `native-api/src/retired_shadow.rs` and the registration
+site's own comment before concluding anything.
+
+Measure BOTH configurations before re-freezing — `--features management` and
+without — and paste the two printed numbers. The file's own history has a case
+of a constant derived by arithmetic from the other configuration sitting six
+above the truth for a week.
+
 ## What "the default registry" means, and how it stopped meaning less
 
 The census runs **all six registration passes `vm/src/vm/vm_init.rs` runs** on

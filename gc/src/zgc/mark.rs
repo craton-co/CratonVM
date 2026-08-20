@@ -939,12 +939,35 @@ impl ZMarkStripeSet {
 /// the *thread* rather than the *heap* is exactly that bug in miniature (see
 /// `satb.rs`'s `thread_local_buffers_are_queue_scoped` regression test, which
 /// exists because the SATB buffers were once not queue-scoped).
+/// One ingress bucket: the queue and its counters, all under one lock.
+///
+/// # Why the counters are inside the mutex rather than atomics beside it
+///
+/// `ZMarkIngress` buckets its queues so mutators publishing SATB work land on
+/// different locks instead of contending on one. That striping was **defeated by
+/// two shared `AtomicUsize`s** on the same path: `pending_hint` here and
+/// `ZgcRealHeap::mark_ingress_pushes` at the caller, each a `fetch_add` on one
+/// cache line per reference store, from every mutator. Striping N locks and then
+/// funnelling every push through one atomic counter leaves the contention exactly
+/// where it was.
+///
+/// The push already holds this bucket's lock, so a plain `usize` increment under
+/// it is free. Telemetry reads sum across buckets, which is rare and is allowed
+/// to be slow.
+#[derive(Debug, Default)]
+struct ZIngressBucket {
+    queue: Vec<u64>,
+    /// Cumulative pushes into this bucket, for
+    /// [`ZMarkIngress::pushed_total`]. Never reset by `drain_into` — a
+    /// *cumulative* count is what a caller deciding "have I published enough to
+    /// hand off?" wants, and it is what the suppression-channel test asserts on.
+    pushed_total: usize,
+}
+
 #[derive(Debug)]
 pub struct ZMarkIngress {
-    buckets: Vec<Mutex<Vec<u64>>>,
+    buckets: Vec<Mutex<ZIngressBucket>>,
     mask: usize,
-    /// Telemetry only — a hint, never consulted by the termination probe.
-    pending_hint: AtomicUsize,
 }
 
 impl Default for ZMarkIngress {
@@ -957,12 +980,11 @@ impl ZMarkIngress {
     /// A fresh ingress with [`Z_MARK_INGRESS_BUCKETS`] buckets.
     pub fn new() -> Self {
         let buckets = (0..Z_MARK_INGRESS_BUCKETS)
-            .map(|_| Mutex::new(Vec::new()))
+            .map(|_| Mutex::new(ZIngressBucket::default()))
             .collect();
         ZMarkIngress {
             buckets,
             mask: Z_MARK_INGRESS_BUCKETS - 1,
-            pending_hint: AtomicUsize::new(0),
         }
     }
 
@@ -971,17 +993,30 @@ impl ZMarkIngress {
         slot & self.mask
     }
 
-    /// Push one address. The single-address path, for a load-barrier slow
-    /// path that has no buffer to batch into.
+    /// Push one address, and return this **bucket's** cumulative push count.
     ///
     /// Costs one uncontended mutex per call, which is why
     /// [`ZMarkMutatorBuffer`] exists and should be preferred wherever the
     /// caller can hold per-thread state.
-    pub fn push(&self, slot: usize, addr: u64) {
+    ///
+    /// # Why it returns a count
+    ///
+    /// So a caller deciding "have I published enough to hand off to the marker?"
+    /// can read the answer out of the lock it is already holding, instead of
+    /// keeping a shared atomic of its own. `ZgcRealHeap::satb_pre_barrier_slow`
+    /// did keep one, and it was a `fetch_add` on a single cache line per
+    /// reference store from every mutator — which is precisely the contention
+    /// the buckets exist to avoid. It is a PER-BUCKET count, so a handoff
+    /// interval of K now means "K pushes into one bucket" rather than "K pushes
+    /// in total"; with `Z_MARK_INGRESS_BUCKETS` buckets and addresses spread over
+    /// them, the effective interval is that much longer, and the caller's
+    /// constant is chosen with that in mind.
+    pub fn push(&self, slot: usize, addr: u64) -> usize {
         let idx = self.bucket_for(slot);
-        self.buckets[idx].lock().push(addr);
-        // Relaxed: telemetry, and nothing is published through it.
-        self.pending_hint.fetch_add(1, Ordering::Relaxed);
+        let mut b = self.buckets[idx].lock();
+        b.queue.push(addr);
+        b.pushed_total += 1;
+        b.pushed_total
     }
 
     /// Move everything in `buf` into this slot's bucket.
@@ -991,15 +1026,16 @@ impl ZMarkIngress {
         }
         let idx = self.bucket_for(slot);
         let n = buf.len();
-        self.buckets[idx].lock().append(buf);
-        self.pending_hint.fetch_add(n, Ordering::Relaxed);
+        let mut b = self.buckets[idx].lock();
+        b.queue.append(buf);
+        b.pushed_total += n;
         n
     }
 
     /// Does any bucket hold work? Authoritative — scans under the locks, for
     /// the same reason [`ZMarkStripeSet::has_work`] does.
     pub fn has_work(&self) -> bool {
-        self.buckets.iter().any(|b| !b.lock().is_empty())
+        self.buckets.iter().any(|b| !b.lock().queue.is_empty())
     }
 
     /// Move everything out of every bucket into `out`. Returns the count.
@@ -1007,32 +1043,36 @@ impl ZMarkIngress {
         let mut moved = 0usize;
         for bucket in &self.buckets {
             let mut b = bucket.lock();
-            if b.is_empty() {
+            if b.queue.is_empty() {
                 continue;
             }
-            moved += b.len();
-            out.append(&mut b);
-        }
-        if moved > 0 {
-            self.pending_hint.fetch_sub(
-                moved.min(self.pending_hint.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
+            moved += b.queue.len();
+            out.append(&mut b.queue);
         }
         moved
     }
 
-    /// Telemetry hint. Never use this to decide termination.
+    /// Telemetry hint: how much is queued right now. Never use this to decide
+    /// termination.
+    ///
+    /// Summed under the locks rather than kept in a shared counter — see
+    /// [`ZIngressBucket`]. It is O(buckets) and it runs on a diagnostic path.
     pub fn pending_hint(&self) -> usize {
-        self.pending_hint.load(Ordering::Relaxed)
+        self.buckets.iter().map(|b| b.lock().queue.len()).sum()
+    }
+
+    /// Cumulative pushes since the last [`Self::clear`], across every bucket.
+    pub fn pushed_total(&self) -> usize {
+        self.buckets.iter().map(|b| b.lock().pushed_total).sum()
     }
 
     /// Drop everything. Only legal between cycles.
     pub fn clear(&self) {
         for bucket in &self.buckets {
-            bucket.lock().clear();
+            let mut b = bucket.lock();
+            b.queue.clear();
+            b.pushed_total = 0;
         }
-        self.pending_hint.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1362,6 +1402,49 @@ pub struct ZMarkTerminator {
     /// `Release` on store / `Acquire` on load so a reader that *does* observe
     /// `true` also observes everything the terminating worker did first.
     terminated_hint: AtomicBool,
+    /// Times a [`Self::wait_for_fixed_point`] wait expired instead of being
+    /// woken by the termination edge.
+    ///
+    /// # Why a counter and not a timing
+    ///
+    /// Every `wait_for` in this module is `wait_for` and never a bare `wait`,
+    /// because a lost notification must cost a poll interval rather than a hang
+    /// -- this codebase has a documented history of GC livelocks presenting as an
+    /// unexplained freeze. That insurance is invisible when it is *load-bearing*:
+    /// a wait that always times out behaves identically to one that is notified,
+    /// only `Z_MARK_PARK_POLL_MS` slower, and no assertion anywhere fires.
+    ///
+    /// So this counts the expiries. **Nonzero on a stop-the-world cycle means a
+    /// notification is missing**, and it is a count rather than a duration, so it
+    /// says so on a loaded host where a timing could not.
+    ///
+    /// It caught exactly that: the mark driver
+    /// (`ZgcConcurrentMarkController::await_fixed_point`) polled a *different*
+    /// condvar, on a 5 ms grid, which nothing ever notified -- so every pass of
+    /// every cycle waited out the full interval before noticing a mark that had
+    /// already finished.
+    park_timeouts: AtomicU64,
+    /// Times a [`Self::wait_for_fixed_point`] wait was released by a
+    /// notification **and found the cycle terminated** — i.e. the termination
+    /// edge itself woke the waiter.
+    ///
+    /// # Why not just count notified wakes
+    ///
+    /// The driver and the workers wait on the same condvar, and `notify_all` is
+    /// also called when a worker publishes work (`work_generation`) and when a
+    /// cycle is armed. A plain "was it notified?" counter would therefore be
+    /// incremented by traffic that has nothing to do with the fixed point, and
+    /// would stay nonzero even with the termination notify removed. Requiring
+    /// `terminated` to be true on wake is what makes this specific.
+    ///
+    /// # Why `park_timeouts == 0` was not a sufficient assertion
+    ///
+    /// It is satisfied by a wait that was never entered, which is exactly what a
+    /// fast mark produces: the driver arrives after the workers have already
+    /// converged, takes the `is_terminated` fast path, and waits zero times. The
+    /// test therefore has to make the mark slow enough that the wait is certain,
+    /// and then assert on THIS — a probe that cannot fail is not a probe.
+    park_termination_wakes: AtomicU64,
 }
 
 impl ZMarkTerminator {
@@ -1377,6 +1460,8 @@ impl ZMarkTerminator {
             }),
             wake: Condvar::new(),
             terminated_hint: AtomicBool::new(true),
+            park_timeouts: AtomicU64::new(0),
+            park_termination_wakes: AtomicU64::new(0),
         }
     }
 
@@ -1576,9 +1661,48 @@ impl ZMarkTerminator {
             if should_stop.load(Ordering::Acquire) || g.terminated {
                 return;
             }
-            self.wake
-                .wait_for(&mut g, Duration::from_millis(Z_MARK_PARK_POLL_MS));
+            let timed_out = self
+                .wake
+                .wait_for(&mut g, Duration::from_millis(Z_MARK_PARK_POLL_MS))
+                .timed_out();
+            if timed_out {
+                // See `park_timeouts`: the timeout is insurance against a lost
+                // notification, and insurance that is load-bearing is
+                // indistinguishable from a working notification except in speed.
+                self.park_timeouts.fetch_add(1, Ordering::Relaxed);
+            } else if g.terminated {
+                // Woken by the termination edge itself -- `g` is re-locked here,
+                // so this is the current state and not a guess. See
+                // `park_termination_wakes` for why "notified" alone is too weak.
+                self.park_termination_wakes.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Waits this terminator's [`Self::wait_for_fixed_point`] has served by
+    /// TIMING OUT rather than by being woken. See the field.
+    pub fn park_timeouts(&self) -> u64 {
+        self.park_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Waits released by the termination edge itself. See the field.
+    pub fn park_termination_wakes(&self) -> u64 {
+        self.park_termination_wakes.load(Ordering::Relaxed)
+    }
+
+    /// Wake everything blocked on this terminator, changing no state.
+    ///
+    /// For a caller that has just set a stop flag of its own and needs a waiter
+    /// parked in [`Self::wait_for_fixed_point`] to observe it now rather than at
+    /// the next poll interval. Spurious wakes are always safe here: every waiter
+    /// re-checks its predicate under the lock in a loop.
+    ///
+    /// Deliberately NOT [`Self::note_work_published`], which is the other way to
+    /// reach this condvar: that bumps `work_generation` and therefore resumes
+    /// idle workers, which is precisely wrong for a stop.
+    pub fn wake_blocked_waiters(&self) {
+        let _g = self.state.lock();
+        self.wake.notify_all();
     }
 
     /// Non-blocking read of the fixed-point flag. Lags; diagnostics only.

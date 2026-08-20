@@ -210,8 +210,20 @@ fn clear_pending_pre_barrier() {
 pub enum VmHeap {
     Generational(GenerationalHeap),
     G1(G1State),
+    /// # Why an `Arc` and not the heap by value
+    ///
+    /// Genuine concurrent marking (2026-08-16) needs the marking engine's
+    /// worker threads to keep tracing **after** the mark-start safepoint
+    /// returns, and [`crate::zgc::mark::ZMarkCoordinator::new`] takes an
+    /// `Arc<dyn ZMarkContext>`. `ZgcRealHeap` *is* that context, so the only
+    /// two ways to hand it over are an `Arc` or a raw-pointer bridge whose
+    /// soundness argument degrades from "cannot outlive one `&self` call" to
+    /// "the heap is never moved", which nothing enforces. This is the honest
+    /// one, and `Arc<T>: Deref<Target = T>` keeps every existing
+    /// `VmHeap::Zgc(h) => h.method()` call site compiling unchanged --
+    /// `ZgcRealHeap` has no `&mut self` method.
     #[cfg(feature = "zgc")]
-    Zgc(ZgcRealHeap),
+    Zgc(std::sync::Arc<ZgcRealHeap>),
 }
 
 // Safety: both inner types are already Send + Sync.
@@ -275,7 +287,7 @@ impl VmHeap {
                 VmHeap::G1(G1State::new(config))
             }
             #[cfg(feature = "zgc")]
-            GcBackend::Zgc => VmHeap::Zgc(ZgcRealHeap::with_capacity(total_bytes)),
+            GcBackend::Zgc => VmHeap::Zgc(ZgcRealHeap::new_shared(total_bytes)),
         }
     }
 
@@ -464,6 +476,10 @@ impl VmHeap {
         // KINDOF-SENTINEL: see `kind_of` below — same idiom, same observed
         // sentinel (`0xFFFFFFFFFFFFFFFF`) reaching this dispatch unchecked.
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            // The `ClassId(0)` this returns is what the H2 residual's own
+            // `checkcast` reporter had to be taught to look past — see
+            // `note_dead_base_deref`, which reports the swallow instead.
+            self.note_dead_base_deref(obj, "class_id_of");
             return ClassId::new(0);
         }
         dispatch!(self, class_id_of(obj))
@@ -788,7 +804,49 @@ impl VmHeap {
         // reproduced crash site downstream (`kind_of`, `class_id_of`,
         // `element_type_of`, `identity_hash_code`) now validates its own
         // input independently — see those methods below.
+        // `CRATONVM_DBG_VACATED_FRAMES`: was this barrier just asked to repair a
+        // reference the collector really did move, and did it fail?
+        //
+        // This barrier repairs by reading a FORWARDING WORD at the OLD address.
+        // ZGC's slide has none to read: `Arena::compact_low_to` zeroes the span
+        // above the new cursor and the memmove overwrites everything below it,
+        // so a stale reference either lands on zeroed bytes (not a registered
+        // base — the early return right below) or on another live object (whose
+        // header is not forwarded — the `is_forwarded` return after it). Every
+        // caller that treats this call as the repair for "a collection may have
+        // run since the frame read" is therefore unprotected on the DEFAULT
+        // collector. The ledger is exact (`gc_quiescence::note_allocated`
+        // removes re-issued addresses), so a hit here is proof, not a
+        // suspicion.
+        if crate::gc_quiescence::vacated_frames_enabled() {
+            if let Some(moved_to) = crate::gc_quiescence::was_vacated(obj.as_ptr() as usize) {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                    tracing::error!(
+                        target: "cratonvm::gc::guard",
+                        obj = format!("{:#x}", obj.as_ptr() as usize),
+                        moved_to = format!("{moved_to:#x}"),
+                        backtrace = %std::backtrace::Backtrace::force_capture(),
+                        "load_and_forward was handed a reference the collector MOVED, and                          cannot repair it: this collector leaves no forwarding word at the                          vacated address. The caller in the backtrace is holding a stale                          ObjectRef that nothing else will fix.",
+                    );
+                }
+            }
+        }
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            // Not a live base. On a collector that leaves a forwarding word
+            // this is the end of the road; ZGC's slide leaves none, so ask its
+            // relocation table instead — that is the whole point of
+            // `ZgcRealHeap::relocations`, and without it this barrier is a
+            // silent no-op on the default collector.
+            #[cfg(feature = "zgc")]
+            if let VmHeap::Zgc(h) = self {
+                if let Some(moved_to) = h.forwarded_after_slide(obj.as_ptr() as usize) {
+                    // SAFETY: `forwarded_after_slide` only answers with an
+                    // address the object-start registry currently holds, i.e. a
+                    // live object base inside the arena.
+                    return unsafe { ObjectRef::from_raw(moved_to as *mut u8) };
+                }
+            }
             return obj;
         }
         // SAFETY: the caller guarantees `obj` is a live root. Every
@@ -879,6 +937,7 @@ impl VmHeap {
     // independently rather than trusting an already-validated caller.
     pub fn kind_of(&self, obj: ObjectRef) -> ObjectKind {
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            self.note_dead_base_deref(obj, "kind_of");
             return ObjectKind::Object;
         }
         dispatch!(self, kind_of(obj))
@@ -886,9 +945,75 @@ impl VmHeap {
 
     pub fn element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            self.note_dead_base_deref(obj, "element_type_of");
             return ArrayElementType::Reference;
         }
         dispatch!(self, element_type_of(obj))
+    }
+
+    /// `CRATONVM_DBG_VACATED_FRAMES`: somebody just dereferenced an address
+    /// that is **not a live object base**, and the sentinel guards above
+    /// swallowed it into a default.
+    ///
+    /// This is the EARLY face of the stale-holder family, and the one every
+    /// other instrument is blind to. A holder left naming an address the slide
+    /// vacated reads a zeroed corpse until the allocator hands the span out
+    /// again: `is_object_address` says no, `class_id_of` answers `ClassId(0)`,
+    /// `kind_of` answers `Object`, and the caller carries on with a plausible
+    /// default. Nothing is thrown, so nothing is reported — and by the time the
+    /// address IS re-issued and the failure becomes visible as a
+    /// `ClassCastException`, the exact vacated ledger has already dropped the
+    /// entry (that pruning is what makes it exact) and every consumption-point
+    /// detector goes quiet. That gap is why the H2 MVStore-writer residual
+    /// could be measured, cornered to "a raw ObjectRef in VM-side state", and
+    /// still not named.
+    ///
+    /// The backtrace is the whole point: it names the Rust frame holding the
+    /// reference, which is the one fact none of the Java-side evidence carries.
+    /// `moved_to` distinguishes the two reasons an address fails the live-base
+    /// test — the collector moved the object (a stale holder, this defect) or
+    /// the value was never an object at all (the `0xFFFF..` sentinel family the
+    /// guards above were originally written for).
+    #[cold]
+    fn note_dead_base_deref(&self, obj: ObjectRef, site: &'static str) {
+        if !crate::gc_quiescence::vacated_frames_enabled() {
+            return;
+        }
+        let addr = obj.as_ptr() as usize;
+        // Null is not a stale holder; it is the ordinary absent reference, and
+        // reporting it would bury the signal.
+        if addr == 0 {
+            return;
+        }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 24 {
+            return;
+        }
+        let moved_to = crate::gc_quiescence::was_vacated(addr)
+            .or_else(|| self.zgc_forwarded_after_slide(addr));
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            site,
+            obj = format!("{addr:#x}"),
+            moved_to = moved_to.map(|a| format!("{a:#x}")).unwrap_or_else(|| "<unknown>".into()),
+            was_vacated = moved_to.is_some(),
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "a dereference of an address that is NOT a live object base was \
+             swallowed into a default. When `was_vacated` is true this is a \
+             holder the collector moved out from under and nothing repaired — \
+             the caller in the backtrace is the one holding it.",
+        );
+    }
+
+    /// ZGC's slide ledger, for [`Self::note_dead_base_deref`]. `None` on every
+    /// other backend (they leave a forwarding word instead, which
+    /// `load_and_forward` reads).
+    fn zgc_forwarded_after_slide(&self, addr: usize) -> Option<usize> {
+        match self {
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.forwarded_after_slide(addr),
+            _ => None,
+        }
     }
 
     pub fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
@@ -917,6 +1042,20 @@ impl VmHeap {
     // =====================================================================
 
     pub fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        // `CRATONVM_DBG_VACATED_FRAMES`: is the RECEIVER of this read an
+        // address the collector moved an object away from?
+        //
+        // This is the consumption point neither the stack-push nor the
+        // frame-local detector can see, and the one the H2 residual's surviving
+        // witnesses point at: a stale receiver makes every field read off it
+        // return whatever now occupies that memory — a perfectly VALID object
+        // of the wrong class, which is why the value being pushed looks clean
+        // and the `checkcast` one instruction later does not.
+        crate::gc_quiescence::report_vacated_receiver(obj.as_ptr() as usize, "get_field");
+        // The re-issue-proof half of the same question — see
+        // `gc_quiescence::stale_use_verdict` for why the exact ledger above
+        // cannot answer it.
+        crate::gc_quiescence::check_stale_use(obj.as_ptr() as usize, "get_field receiver");
         dispatch!(self, get_field(obj, index))
     }
 
@@ -930,21 +1069,33 @@ impl VmHeap {
         dispatch!(self, set_field(obj, index, value))
     }
 
-    /// INT-8: field store with the G1 SATB pre-barrier SUPPRESSED. Reserved
+    /// INT-8: field store with the SATB pre-barrier SUPPRESSED. Reserved
     /// for the weak-reference PROTOCOL writes (the pre-collection referent
     /// null pass and the remark-time referent clears): those are not
     /// semantic overwrites, and SATB-logging them recorded every active
     /// referent as a mark root — the taint that made bitmap-based reference
-    /// processing inert (see `G1Collector::set_field_no_satb`). On the
-    /// Generational and ZGC backends this is a plain `set_field`: their
-    /// reference protocols never depended on hiding these writes (Gen uses
-    /// the watched-referents channel; ZGC processes references against its
-    /// own non-moving mark), so no behavior change there.
+    /// processing inert (see `G1Collector::set_field_no_satb`).
+    ///
+    /// **ZGC joined the suppressed set on 2026-08-16, and it had to.** This was
+    /// a plain `set_field` on that backend, correctly, for as long as ZGC had
+    /// no concurrent cycle and no armed pre-write barrier of its own. Genuine
+    /// concurrent marking gave it both, and `ZgcRealHeap::set_field` now
+    /// publishes the overwritten reference itself — so the unsuppressed arm
+    /// would have handed the concurrent marker EVERY active referent as a mark
+    /// root at the pre-collection null pass, which runs while the cycle is
+    /// still armed. No weak, soft, phantom or cleaner reference would ever
+    /// have been cleared again, and no reference test would have caught it:
+    /// they are all satisfied by "the referent survived".
+    ///
+    /// Generational stays a plain `set_field` — its reference protocol never
+    /// depended on hiding these writes (it uses the watched-referents channel).
     pub fn set_field_suppress_satb(&self, obj: ObjectRef, index: usize, value: Value) {
         #[cfg(debug_assertions)]
         clear_pending_pre_barrier();
         match self {
             VmHeap::G1(h) => h.collector.set_field_no_satb(obj, index, value),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.set_field_no_satb(obj, index, value),
             other => dispatch!(other, set_field(obj, index, value)),
         }
     }
@@ -2007,6 +2158,83 @@ impl VmHeap {
         }
     }
 
+    // =====================================================================
+    // ZGC concurrent marking (2026-08-16)
+    // =====================================================================
+    //
+    // Deliberately NOT folded into the `g1_*` predicates above. The two
+    // collectors reach the same shape (open at a brief STW, trace with
+    // mutators running, close at the next collection's STW) from opposite
+    // sides -- G1 opens on an old-gen occupancy that only a young collection
+    // updates, ZGC on total allocation, and G1 closes on a quiescence poll
+    // while ZGC closes when the collection itself arrives. A shared predicate
+    // would have to be a union of both, and the arm that did not apply would
+    // be dead code that reads as coverage.
+
+    /// Should a ZGC concurrent mark cycle open now?
+    ///
+    /// On the allocation path (`maybe_gc`), so the ZGC arm is two relaxed
+    /// loads and the others are a compile-time-known `false`.
+    #[inline]
+    pub fn zgc_should_start_concurrent_mark(&self) -> bool {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.should_start_concurrent_mark(),
+        }
+    }
+
+    /// Is a ZGC concurrent mark cycle in flight?
+    #[inline]
+    pub fn zgc_concurrent_mark_active(&self) -> bool {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.concurrent_mark_active(),
+        }
+    }
+
+    /// Open a ZGC concurrent mark cycle at a brief stop-the-world pause.
+    ///
+    /// `roots` must be the COMPLETE root set -- this thread, every parked
+    /// peer's snapshot, and the conservative roots of any forcibly-stopped
+    /// in-JIT peer. A root missed here is an object the concurrent phase never
+    /// traces, and the mark-end re-scan only covers roots that still exist
+    /// then. Returns `true` iff a cycle opened.
+    pub fn zgc_start_concurrent_mark(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &[ObjectRef],
+    ) -> bool {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => {
+                let addrs: Vec<u64> = roots.iter().map(|r| r.as_ptr() as u64).collect();
+                h.start_concurrent_mark(stw, &addrs)
+            }
+        }
+    }
+
+    /// Abandon an open ZGC concurrent cycle, discarding its mark bits.
+    pub fn zgc_abandon_concurrent_mark(&self) {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => {}
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.abandon_concurrent_mark(),
+        }
+    }
+
+    /// `(started, completed, black_allocations, ingress_replayed, phase_nanos)`
+    /// for the ZGC concurrent marker; all zeros on the other backends.
+    pub fn zgc_concurrent_mark_stats(&self) -> (usize, usize, usize, usize, u64) {
+        match self {
+            VmHeap::G1(_) | VmHeap::Generational(_) => (0, 0, 0, 0, 0),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.concurrent_mark_stats(),
+        }
+    }
+
     /// Check if G1 concurrent marking is currently active.
     pub fn g1_is_marking_active(&self) -> bool {
         match self {
@@ -2296,6 +2524,11 @@ impl VmHeap {
     pub fn print_gc_summary(&self) {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
+            // Independent of GC stats being requested: this census answers
+            // "how many accessor calls still take the global regions lock?",
+            // which is a question about the MUTATOR, not about collections.
+            // Gated by its own flag (`CRATONVM_DBG_G1ACCESSOR`).
+            g1.dbg_report_accessor_census();
         }
         // ZGC: the same unconditional-counts treatment the generational branch
         // below gets, and for the same reason — without it a `--verbose:gc` run
@@ -2356,12 +2589,117 @@ impl VmHeap {
                  relocation_skipped_jit={skipped_jit} \
                  tlab_retire_skipped={tlab_skipped}"
             );
+            // CONCURRENT marking, on its own line and with five fields rather
+            // than one, because four different runs look identical in any
+            // smaller summary:
+            //
+            //   started=0                 the threshold was never crossed --
+            //                             this run says NOTHING about
+            //                             concurrent marking
+            //   started>0, completed=0    every cycle opened and then failed to
+            //                             certify; the collector fell back to a
+            //                             stop-the-world mark each time
+            //   started>0, replayed=0     the barrier saw no reference
+            //                             overwrites, so the SATB half is
+            //                             untested by this workload
+            //   started>0, phase_ms~0     the cycle opened and the collection
+            //                             arrived immediately, so there was no
+            //                             concurrent phase to speak of
+            //
+            // `black` is the allocate-black count: objects born marked because
+            // a cycle was in flight. Zero of those with a non-zero `phase_ms`
+            // means the mutators allocated nothing while the marker ran.
+            let (started, completed, black, replayed, phase_nanos) =
+                self.zgc_concurrent_mark_stats();
+            eprintln!(
+                "[GC] zgc-concurrent: cycles_started={started} cycles_completed={completed} \
+                 black_allocations={black} satb_replayed={replayed} \
+                 concurrent_phase_ms={}",
+                phase_nanos / 1_000_000
+            );
+            // PHASE G. `old_retained` is the one that says whether the phase
+            // did anything: it counts the objects a young cycle kept WITHOUT
+            // tracing, i.e. the tracing it did not do. A run with
+            // `young_cycles>0` and `old_retained=0` did full-heap work under a
+            // generational name -- which is precisely the vacuous green a
+            // "generational is on" claim would otherwise be built on. Printed
+            // unconditionally, so a run that never engaged the phase says so
+            // instead of printing nothing.
+            let (young, since_major, retained, remembered, promoted, recards) =
+                h.generational_stats();
+            eprintln!(
+                "[GC] zgc-generational: enabled={} young_cycles={young} \
+                 minors_since_major={since_major} old_retained={retained} \
+                 remembered_roots={remembered} promotions={promoted} \
+                 recards_after_relocation={recards}",
+                h.generational_enabled(),
+            );
+            // THE NURSERY, beside the split it bounds. `sweep_skipped` is the
+            // engagement counter: a run with `young_cycles>0` and
+            // `sweep_skipped=0` swept the whole registry on every young cycle, so
+            // the floor never moved and the O(young) sweep is not happening.
+            let (skipped, floor, old_live) = h.nursery_stats();
+            let (nursery_fired, nursery_budget) = h.nursery_trigger_stats();
+            eprintln!(
+                "[GC] zgc-nursery-trigger: fired={nursery_fired}                  budget_bytes={nursery_budget} promotions_by_slide={} \
+                 overshoot_max={}",
+                h.promotions_by_slide(),
+                // BESIDE THE BUDGET, because it is meaningless without it: this
+                // is how far past `budget_bytes` the nursery got before a
+                // safepoint arrived, and it prices "a hard ceiling rather than a
+                // trigger" -- an open item that has had no number attached. See
+                // `ZgcRealHeap::gen_nursery_overshoot_max`.
+                h.nursery_overshoot_max(),
+            );
+            eprintln!(
+                "[GC] zgc-nursery: sweep_skipped={skipped} floor={floor}                  old_live_bytes={old_live}",
+            );
+            // WHAT THE YOUNG SWEEP STOPPED DOING PER DEAD OBJECT.
+            //
+            // Read the two together and against `young_cycles` above.
+            // `zero_bytes_skipped=0` with `young_cycles>0` means every dead
+            // object was still memset in full, so `CRATONVM_ZGC_GEN_HEADER_ZERO`
+            // is on and inert; `dead_runs == dead_objects` means no two dead
+            // objects were ever adjacent, so the run merge is. Neither number
+            // says it alone -- a small `dead_runs` is equally consistent with a
+            // cycle that found almost no garbage.
+            let (zero_skipped, dead_runs, dead_objects) = h.gen_sweep_cost_stats();
+            eprintln!(
+                "[GC] zgc-sweep-cost: zero_bytes_skipped={zero_skipped} \
+                 dead_runs={dead_runs} dead_objects={dead_objects}",
+            );
             // `ZGC_UNSIZABLE_OBJECTS` had no reader anywhere but a unit test.
             // It is the sweep's own count of registered objects whose header it
             // could not size -- i.e. of heap corruption the collector has
             // already met and silently worked around, one warning per process.
             // A run that ends with a nonzero here has corrupt headers whatever
             // else it reports.
+            // A NOTIFICATION THAT IS MISSING IS A SLOWDOWN, NOT A FAILURE.
+            // The mark driver's fixed-point wait is a `wait_for`, so a lost
+            // notification costs a poll interval and is otherwise
+            // indistinguishable from a working one -- which is how the driver
+            // came to poll a never-notified condvar on a 5 ms grid for months.
+            // Nonzero here means it is back. A count, so it reads the same on a
+            // loaded host as on a quiet one.
+            // THE OVERLAY GATE, asked of the provider rather than measured here
+            // -- see `ExternalRootProvider::gate_stats`. `roots_for_owner` runs
+            // once per marked object and was 20-29% of mark samples on both the
+            // serial and the parallel arm (2026-08-17 `perf record`). A gate that
+            // works and a gate that is inert return the same empty `Vec`, and the
+            // previous attempt at this optimisation WAS inert, so `hits` is the
+            // only thing that separates them. `disabled=true` means an owner was
+            // registered with no class id and the gate has failed safe.
+            for (name, hits, misses, disabled) in
+                crate::external_roots::provider_gate_stats()
+            {
+                eprintln!(
+                    "[GC] zgc-overlay-gate: provider={name} hits={hits}                      misses={misses} disabled={disabled}",
+                );
+            }
+            eprintln!(
+                "[GC] zgc-mark-wait: park_timeouts={}",
+                h.mark_park_timeouts(),
+            );
             eprintln!(
                 "[GC] zgc-integrity: unsizable_registered_objects={}",
                 crate::zgc::ZGC_UNSIZABLE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed),
@@ -2401,7 +2739,7 @@ impl VmHeap {
         // `par_accepts` far below `par_attempts` means the parallel sweep
         // prefix is being discarded and the entire arena is re-swept
         // sequentially. Until 2026-08-12 that was the state on EVERY JIT-warm
-        // workload — `attempts=5 accepts=0` on the hibernate-reactive repro,
+        // workload — `attempts=5 accepts=0` on the hibernate repro,
         // every abort the benign empty-object zero run — and these counters
         // said so the whole time with nobody to read them.
         //
@@ -2415,13 +2753,15 @@ impl VmHeap {
             eprintln!(
                 "[GC] young_sweep: par_attempts={} par_accepts={} zero_spans={} \
                  zero_empty_runs={} phantom_extents={} phantom_nonbase_marks={} \
-                 live_in_dead={} walk_overshoot={} anchor_not_a_base={}",
+                 raw_interior_cleared={} live_in_dead={} walk_overshoot={} \
+                 anchor_not_a_base={}",
                 crate::gen_heap::PAR_SWEEP_ATTEMPTS.load(O::Relaxed),
                 crate::gen_heap::PAR_SWEEP_ACCEPTS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ZERO_SPAN_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ZERO_SPAN_EMPTY_RUNS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_PHANTOM_EXTENTS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_PHANTOM_INTERIOR_MARKS.load(O::Relaxed),
+                crate::gen_heap::LATE_RESOLVE_RAW_INTERIOR_CLEARED.load(O::Relaxed),
                 crate::gen_heap::LIVE_IN_DEAD_SPANS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_WALK_OVERSHOOT_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),
@@ -2799,9 +3139,33 @@ impl VmHeap {
     /// to consult.
     /// H2-CID0 — see [`GenerationalHeap::live_holders_of`]. Empty for every
     /// non-generational backend.
+    /// ZGC's relocation ledger: what the slide moved AWAY from `addr`, as
+    /// `(from, moved_to, class_id, size, still_live_at_target)`.
+    ///
+    /// `None` on every other backend, and `None` on ZGC unless
+    /// `CRATONVM_DBG_ZGC_CORPSE` armed the run -- the ledger costs a map insert
+    /// per relocated object and a cycle relocates hundreds of thousands, so it
+    /// cannot be flag-free. It is asked anyway because it is the one thing that
+    /// separates "the holder was never rewritten when its referent moved" from
+    /// "the object died later": `still_live_at_target` answers exactly that.
+    pub fn zgc_corpse_lookup(&self, addr: usize) -> Option<(usize, usize, u32, usize, bool)> {
+        match self {
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.corpse_lookup(addr),
+            _ => {
+                let _ = addr;
+                None
+            }
+        }
+    }
+
     pub fn live_holders_of(&self, addr: usize, cap: usize) -> Vec<(usize, u32, usize)> {
         match self {
             VmHeap::Generational(h) => h.live_holders_of(addr, cap),
+            // See `ZgcRealHeap::live_holders_of`: the slot ordinal it reports
+            // is the object's own reference-slot ordinal, not a field index.
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.live_holders_of(addr, cap),
             _ => Vec::new(),
         }
     }
@@ -2810,8 +3174,16 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.reclaimed_hole_at(addr),
             VmHeap::G1(_) => None,
+            // ZGC answers this now (2026-08-17). The arm said `None` on the
+            // grounds that "their liveness is region/registry based and
+            // `is_addr_live` already answers exactly, so there is no free-list
+            // view to consult" -- true of G1, but ZGC's sweep zeroes each dead
+            // object and returns its span to an arena free list, which is
+            // precisely the view this predicate wants. While it answered
+            // `None`, the DEFAULT collector reported nothing at all for a
+            // reclaimed receiver.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => None,
+            VmHeap::Zgc(h) => h.reclaimed_hole_at(addr),
         }
     }
 
@@ -3331,7 +3703,7 @@ mod concurrent_mark_controller_tests {
     #[cfg(feature = "zgc")]
     #[test]
     fn the_pre_gc_address_predicates_are_correct_for_an_object_compaction_moved() {
-        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(256 * 1024));
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(256 * 1024));
         let VmHeap::Zgc(z) = &heap else {
             unreachable!("constructed as Zgc")
         };
@@ -3399,7 +3771,7 @@ mod concurrent_mark_controller_tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
             || {
-                let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(256 * 1024));
+                let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(256 * 1024));
                 let VmHeap::Zgc(z) = &heap else {
                     unreachable!("constructed as Zgc")
                 };
@@ -3444,7 +3816,7 @@ mod concurrent_mark_controller_tests {
     #[cfg(feature = "zgc")]
     #[test]
     fn the_vm_heap_satb_arm_reaches_the_zgc_barrier() {
-        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(64 * 1024));
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(64 * 1024));
         let VmHeap::Zgc(z) = &heap else {
             unreachable!("constructed as Zgc")
         };
@@ -3464,12 +3836,195 @@ mod concurrent_mark_controller_tests {
         );
     }
 
+    /// `set_field_suppress_satb` really suppresses on ZGC, and plain
+    /// `set_field` really does not.
+    ///
+    /// # The bug this exists to have caught
+    ///
+    /// That method was a plain `set_field` on this backend, and correctly so
+    /// for as long as ZGC had no armed pre-write barrier. Concurrent marking
+    /// gave it one. `weakref_null_referents_pre_gc` nulls EVERY registered
+    /// referent immediately before `collect_garbage` -- i.e. while the cycle is
+    /// still armed -- so the unsuppressed arm would have published every active
+    /// referent into the ingress, `finish_concurrent_mark` would have replayed
+    /// them as mark roots, and no weak, soft, phantom or cleaner reference
+    /// could ever have been cleared again.
+    ///
+    /// It would have been invisible. Every reference test in this tree is
+    /// satisfied by "the referent survived", which is exactly what the bug
+    /// produces; the only symptom is a leak.
+    ///
+    /// Both directions are asserted. A suppression that suppressed everything
+    /// -- including the ordinary store path -- would pass the half of this test
+    /// that matters most and disable the barrier wholesale.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn zgc_set_field_suppress_satb_suppresses_and_plain_set_field_does_not() {
+        let heap = VmHeap::new(GcBackend::Zgc, 1024 * 1024);
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        let holder = heap.alloc_object(ClassId::new(1), 2);
+        let a = heap.alloc_object(ClassId::new(1), 0);
+        let b = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(holder, 0, Value::Object(Some(a)));
+        heap.set_field(holder, 1, Value::Object(Some(b)));
+        z.set_mark_active(true);
+
+        let before = z.mark_ingress_pushes();
+        heap.set_field_suppress_satb(holder, 0, Value::Object(None));
+        assert_eq!(
+            z.mark_ingress_pushes(),
+            before,
+            "the referent-protocol write must NOT reach the concurrent marker"
+        );
+
+        let before = z.mark_ingress_pushes();
+        heap.set_field(holder, 1, Value::Object(None));
+        assert_eq!(
+            z.mark_ingress_pushes(),
+            before + 1,
+            "...while an ordinary store still must, or the suppression has \
+             disabled the barrier rather than exempted one caller"
+        );
+
+        z.set_mark_active(false);
+    }
+
+    /// **The card barrier is reached through `VmHeap`, by BOTH store channels.**
+    ///
+    /// # Why through the enum and not through `ZgcRealHeap`
+    ///
+    /// The card barrier's whole history is of being wired to something nothing
+    /// calls. Until 2026-08-17 it hung off `GarbageCollector::write_barrier`,
+    /// which this backend's `set_field` never invokes -- so `remembered_roots`
+    /// had no non-test caller and the remembered set was empty on every real
+    /// workload, while the collector-level tests were green. The tests in
+    /// `zgc.rs` cannot see that: they call the accessor directly. This one goes
+    /// through the dispatch the interpreter goes through.
+    ///
+    /// Both channels, because `set_field_suppress_satb` exists to skip the OTHER
+    /// barrier and must not skip this one: SATB is about a reference being LOST,
+    /// a card is about one now being HELD. A single implementation change
+    /// (routing the suppression channel around `set_field_no_satb`) would break
+    /// exactly one of the two assertions below.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_vm_heap_store_channels_both_reach_the_zgc_card_barrier() {
+        let heap = VmHeap::new(GcBackend::Zgc, 64 * 1024 * 1024);
+        let VmHeap::Zgc(z) = &heap else {
+            unreachable!("constructed as Zgc")
+        };
+        z.set_generational_enabled(true);
+        z.set_gen_promotion_age(1);
+        z.set_relocation_enabled(false);
+
+        let plain = heap.alloc_object(ClassId::new(1), 2);
+        let suppressed = heap.alloc_object(ClassId::new(1), 2);
+        let target = heap.alloc_object(ClassId::new(1), 0);
+
+        // Promote all three, then let a young cycle clean the promotion cards --
+        // otherwise the assertions read a set that is dirty for a reason they
+        // did not cause.
+        let mut roots = [plain, suppressed, target];
+        {
+            // SAFETY: single-threaded test.
+            let stw = unsafe { crate::collector::StopTheWorldToken::new() };
+            let _ = z.collect_garbage(&stw, &mut roots, &R6NoMonitors);
+            let _ = z.collect_garbage(&stw, &mut roots, &R6NoMonitors);
+        }
+        let [plain, suppressed, target] = roots;
+        assert!(
+            !z.is_carded_for_test(plain.as_ptr() as usize)
+                && !z.is_carded_for_test(suppressed.as_ptr() as usize),
+            "the young cycle must have cleaned the promotion cards first"
+        );
+
+        heap.set_field(plain, 0, Value::Object(Some(target)));
+        assert!(
+            z.is_carded_for_test(plain.as_ptr() as usize),
+            "an ordinary store through VmHeap must card its receiver"
+        );
+
+        heap.set_field_suppress_satb(suppressed, 0, Value::Object(Some(target)));
+        assert!(
+            z.is_carded_for_test(suppressed.as_ptr() as usize),
+            "...and so must the SATB-suppressed channel: suppressing the \\
+             snapshot barrier must not suppress the card, or every referent \\
+             write silently drops an old-to-young edge"
+        );
+    }
+
+    /// Every `zgc_*_concurrent_mark` arm of `VmHeap` reaches the collector.
+    ///
+    /// # Why this is a separate test from the ones in `zgc.rs`
+    ///
+    /// Those exercise `ZgcRealHeap` directly. This exercises the **dispatch**,
+    /// and in this enum the dispatch is where a feature goes quietly missing:
+    /// every one of these methods has two arms that are a literal `false` /
+    /// `{}` / `(0, 0, 0, 0, 0)`, and a fifth arm that reads
+    /// `VmHeap::Zgc(_) => false` compiles, passes every collector-level test,
+    /// and turns the whole feature off. This tree has shipped exactly that
+    /// shape before — an inert registration is indistinguishable from a
+    /// missing feature from anywhere except the call site.
+    ///
+    /// The exact edit that trips it: change any `VmHeap::Zgc(h) => h.…` arm in
+    /// the ZGC concurrent-marking block to the neutral value its siblings use.
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn the_vm_heap_zgc_concurrent_arms_reach_the_collector() {
+        let heap = VmHeap::new(GcBackend::Zgc, 8 * 1024 * 1024);
+        assert!(!heap.zgc_concurrent_mark_active());
+        assert_eq!(heap.zgc_concurrent_mark_stats(), (0, 0, 0, 0, 0));
+
+        let holder = heap.alloc_object(ClassId::new(1), 2);
+        let child = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(holder, 0, Value::Object(Some(child)));
+        let garbage = heap.alloc_object(ClassId::new(1), 0);
+        let garbage_addr = garbage.as_ptr() as usize;
+
+        // SAFETY: this test is the only mutator.
+        let stw = unsafe { crate::collector::StopTheWorldToken::new() };
+        assert!(
+            heap.zgc_start_concurrent_mark(&stw, &[holder]),
+            "the VmHeap arm must open a cycle, not return a neutral false"
+        );
+        assert!(heap.zgc_concurrent_mark_active());
+
+        // The mutator ingress, through the funnel every reference store in the
+        // VM already reaches.
+        let extra = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(holder, 1, Value::Object(Some(extra)));
+        heap.satb_barrier(Value::Object(Some(child)));
+
+        let mut roots = [holder];
+        let _ = heap.collect_garbage(&stw, &mut roots, &R6NoMonitors);
+
+        let (started, completed, black, _replayed, _ns) = heap.zgc_concurrent_mark_stats();
+        assert_eq!(
+            (started, completed),
+            (1, 1),
+            "the cycle must have been opened AND certified through the VmHeap arms"
+        );
+        assert!(black >= 1, "the object allocated mid-cycle was born marked");
+        assert!(!heap.zgc_concurrent_mark_active());
+
+        assert!(
+            heap.is_object_address(child.as_ptr() as usize).is_some(),
+            "the live child survived a concurrently-marked collection"
+        );
+        assert!(
+            heap.is_object_address(garbage_addr).is_none(),
+            "...and the garbage did not, so this is not just 'nothing was freed'"
+        );
+    }
+
     /// ...and the same funnel is inert on ZGC while no cycle is marking, which
     /// is what makes it free to leave wired in every build.
     #[cfg(feature = "zgc")]
     #[test]
     fn the_vm_heap_satb_arm_is_inert_on_zgc_while_not_marking() {
-        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::with_capacity(64 * 1024));
+        let heap = VmHeap::Zgc(crate::zgc::ZgcRealHeap::new_shared(64 * 1024));
         let VmHeap::Zgc(z) = &heap else {
             unreachable!("constructed as Zgc")
         };

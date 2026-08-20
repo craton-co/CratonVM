@@ -154,6 +154,31 @@ pub fn open_udp_gated(
     }
 }
 
+/// [`open_udp_gated`] for a WILDCARD bind, opening a dual-stack AF_INET6
+/// socket the way the JDK's `DatagramSocket` does.
+///
+/// `java.net.DatagramSocket` on JDK 25 is a `DatagramChannel` adaptor, so its
+/// wildcard constructors give an AF_INET6 socket with `IPV6_V6ONLY` off —
+/// measured, `new DatagramSocket().getLocalAddress()` is
+/// `/0:0:0:0:0:0:0:0` on HotSpot 25 and was `/0.0.0.0` here.
+///
+/// That mismatch is observable, and netty's
+/// `DnsNameResolverTest.testAddressAlreadyInUse` is where: it holds a port
+/// with a `DatagramSocket`, points a resolver at the same address, and
+/// asserts a `BindException`. With the socket on AF_INET and the resolver's
+/// channel on dual-stack AF_INET6, the two wildcards did not collide, the
+/// second bind SUCCEEDED, and the test saw a query timeout instead of the
+/// bind failure it was written to observe.
+pub fn open_udp_wildcard_dual_stack_gated(
+    ctx: &dyn NativeContext,
+    port: u16,
+) -> Result<FdId, FdCapabilityError> {
+    match ctx.vm_capabilities() {
+        Some(caps) => ctx.fd_table().open_udp_dual_stack_checked(&caps, port),
+        None => Ok(ctx.fd_table().open_udp_dual_stack_port(port)?),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error translation
 // ---------------------------------------------------------------------------
@@ -177,7 +202,53 @@ pub fn translate_open_failure(
 ) -> MethodCallFailed {
     match err {
         FdCapabilityError::Denied(denied) => denied.into(),
-        FdCapabilityError::Io(io) => cratonvm_types::error::RuntimeError::IOException {
+        FdCapabilityError::Io(io) => translate_bind_io(io, io_message),
+    }
+}
+
+/// The I/O arm of [`translate_open_failure`], split out so the BIND failures
+/// keep their JDK type.
+///
+/// An unavailable address is `java.net.BindException` on HotSpot, and callers
+/// test for it by type rather than by message —
+/// `new DatagramSocket(portAlreadyBound)` is specified to throw
+/// `SocketException`, and the JDK narrows it to `BindException`. A flat
+/// `IOException` here also loses to locale: the Windows text for
+/// `WSAEADDRINUSE` is translated, so a message match cannot substitute.
+///
+/// Windows reports the clash as `WSAEADDRINUSE` normally and as `WSAEACCES`
+/// (Rust `PermissionDenied`) when the caller set `SO_REUSEADDR` against an
+/// exclusively-held port. Both are `BindException` on HotSpot.
+/// [`translate_bind_io`] for a caller that already has a bare `io::Error` —
+/// the `rebind` paths, which never go through the capability gate because the
+/// socket they replace was gated when it was opened.
+pub fn translate_bind_failure(
+    io: std::io::Error,
+    io_message: impl FnOnce(&std::io::Error) -> String,
+) -> MethodCallFailed {
+    translate_bind_io(io, io_message)
+}
+
+fn translate_bind_io(
+    io: std::io::Error,
+    io_message: impl FnOnce(&std::io::Error) -> String,
+) -> MethodCallFailed {
+    use cratonvm_types::error::RuntimeError;
+    use std::io::ErrorKind;
+    match io.kind() {
+        ErrorKind::AddrInUse => RuntimeError::BindException {
+            message: format!("Address already in use: {}", io_message(&io)),
+        }
+        .into(),
+        ErrorKind::AddrNotAvailable => RuntimeError::BindException {
+            message: format!("Cannot assign requested address: {}", io_message(&io)),
+        }
+        .into(),
+        ErrorKind::PermissionDenied => RuntimeError::BindException {
+            message: format!("Permission denied: {}", io_message(&io)),
+        }
+        .into(),
+        _ => RuntimeError::IOException {
             message: io_message(&io),
         }
         .into(),

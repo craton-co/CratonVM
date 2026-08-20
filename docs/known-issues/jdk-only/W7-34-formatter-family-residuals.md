@@ -1,5 +1,105 @@
 # W7-34 — the twelve `java.util.Formatter` divergences that survived W7-3
 
+> ## 2026-08-12 (P3-E) — the no-`Locale` overload now takes the FORMAT default. The `%t` "hard-coded English tables" paragraph below is STALE. And one lib.rs surface must land WITH this or an existing green vector goes red
+>
+> **Discharged.** §"What is left" bullet 4 — *"`String.format(String, Object[])`
+> (no locale overload) still formats with the root separators rather than
+> `Locale.getDefault(Locale.Category.FORMAT)` … Deliberately left."* — is
+> **CLOSED** in `native-builtins/src/lang_string.rs`. W7-91 §5 is the same row.
+>
+> **What the fix is.** `format_impl`'s `locale` parameter was
+> `Option<ObjectRef>`, and `None` meant two different requests at once:
+>
+> | request | JDK's rule | old `None` behaviour |
+> |---|---|---|
+> | overload has **no** `Locale` (`String.format(String, Object...)`, `String.formatted`, `PrintStream.printf(String, …)`) | `Locale.getDefault(Locale.Category.FORMAT)` | root separators — **wrong** |
+> | overload given an explicit **`null`** | "no localization is applied" | root separators — correct |
+>
+> It is now a three-armed `FmtLocale { DefaultFormat, Given(Option<..>) }`,
+> reconciled **at consumption** in `fmt_symbols_for` and `fmt_date_name` rather
+> than by re-encoding one arm as the other. `DefaultFormat` resolves through the
+> **no-arg** `DecimalFormatSymbols.getInstance()`, whose body already *is*
+> `getInstance(Locale.getDefault(Locale.Category.FORMAT))` — the same "ask the
+> JDK rather than compose a fourth opinion" route `fmt_date_name` was already
+> taking.
+>
+> **The two helpers were drifted twins, and that is how this was found.** One
+> JDK rule — "an absent `Locale` means the FORMAT default" — implemented twice
+> in one file: `fmt_date_name`'s absent-locale arm had been correct since the
+> `%t` name fields landed (it called the no-arg `DateFormatSymbols.getInstance()`),
+> while `fmt_symbols_for`'s took the root constants. `RStrings` even asserts the
+> correct half (`String.format("%tb", …)` vs `DateFormatSymbols.getInstance()`),
+> so the date side was *covered* while the number side was wrong beside it.
+>
+> **The re-entrancy hazard this record named as the reason to leave it is
+> bounded by two mechanisms that were already there**, not by new code:
+> *laziness* (`format_impl` calls `fmt_symbols_for` only at a
+> `%d`/`%f`/`%e`/`%g` conversion, so an internal `String.format` over `%s` runs
+> zero locale bytecode) and `FMT_SYMBOLS_RESOLVING` (an inner call answers the
+> root constants and cannot recurse). `fmt_date_name` has been taking exactly
+> this route on exactly this path already.
+>
+> **The `Locale.ROOT` fast path is untouched.** The only fast path ROOT ever had
+> is that laziness; `Given(Some(l))` resolves exactly as before. Nothing was
+> added to any explicit-`Locale` path.
+>
+> ### BLOCKING co-requisite in `native-builtins/src/lib.rs` (NOT this lane's file)
+>
+> `native_printf_locale` **drops its `Locale`** and delegates to
+> `native_printf` → `native_string_format`. Its own doc comment justifies that
+> with *"exactly as `String.format(Locale, …)` already drops it"* — a claim this
+> record's own 2026-08-12 patch made **false**, and which is now actively
+> harmful: with the no-`Locale` overload following the FORMAT default,
+> `System.out.printf(Locale.ROOT, …)` renders the **host default** instead of
+> ROOT. `regression-suite/src/RJdkHello.java` asserts
+> `ps.printf(Locale.ROOT, " [%s|%d|%05.2f]", …)` equals `" [x|7|01.50]"`
+> character for character, so on any host whose FORMAT default is not
+> ROOT/en-US that vector goes **RED**. It stays green on an en-US CI box, which
+> is the same hiding place the defect being fixed used. The patch is in the
+> P3-E lane report; it is two lines and must land in the same change.
+>
+> The same file's `Formatter` `()V` and `(Ljava/lang/Appendable;)V` constructors
+> write a **null** locale into slot 1 where the real `java.util.Formatter`
+> constructors write `Locale.getDefault(Locale.Category.FORMAT)`. That is the
+> `new Formatter()` half of this row and it is **still open** — see §"What is
+> left". It is not a regression from this change (a null slot 1 meant root
+> separators before and means root separators now), and it is why
+> `fmt_date_name` deliberately does **not** implement `printDateTime`'s
+> `Locale lt = ((l == null) ? Locale.US : l)`: `Given(None)` in this VM is both
+> "explicit null" and "`new Formatter()`", and answering English would trade a
+> rare divergence for a common regression. The function's doc comment says so.
+>
+> ### `%t`'s "hard-coded English tables" — STALE since W7-91
+>
+> The paragraph below headed *"Also from 'What is left', now measured against
+> the source rather than assumed"* says `%tB`/`%tb`/`%tA`/`%ta`/`%tp` are
+> answered from `MONTHS_ABBR` / `MONTHS_FULL` / `DAYS_ABBR` / `DAYS_FULL`
+> "consulted for every locale". **They are not.** Those four arrays are now the
+> FALLBACK for a configuration with no `DateFormatSymbols` to ask; the live path
+> is `fmt_date_name` → `java.text.DateFormatSymbols`, and `RStrings` asserts
+> each of the six name fields against the JDK's own table. Read that paragraph
+> as history.
+>
+> ### Coverage
+>
+> `regression-suite/src/RJdkFormatLocale.java` (new; **needs registering in
+> `CORE_CLASSES`** — see the lane report). It **pins the FORMAT default itself**
+> to `Locale.GERMANY` and restores it in a `finally`, so it asserts the RULE
+> rather than the host's incidental locale — a vector that merely read the
+> host's default would be green on en-US against a VM that always answered ROOT.
+> Every expectation is an exact string equality; where the expected text depends
+> on locale DATA it is built from that locale's own `DecimalFormatSymbols`, so a
+> platform without German data cannot manufacture a red, and the CK line reports
+> whether the implication had an antecedent. It covers `String.format`,
+> `String.formatted`, `PrintStream.printf`, `PrintStream.format`, the
+> `printf(Locale.ROOT, …)` anti-overshoot, the explicit-`null` arm, and the
+> `%tB`/`%tb` date twin. **Measured green on HotSpot 25.0.3.9, 20 checks,
+> byte-identical CK lines under `-Duser.language=` en-US / ru-RU / fr-FR /
+> ar-EG.** Mutation-checked: five separate injected regressions (no-locale
+> numeric → ROOT, `formatted` → ROOT, `printf` → ROOT, `printf(Locale.ROOT)`
+> dropping its locale, `%tB` → ROOT) each fail it, at the intended assertion.
+> **Not run on CratonVM** — this lane does not build.
+
 > ## 2026-08-12 — the locale patch is APPLIED, and the registrar order this record said had to be settled first IS settled
 >
 > **Which registrar wins, read from the boot path rather than from a census.**
@@ -364,6 +464,18 @@ and the whole tree for Rust:
   in `native-builtins/src/lib.rs`, and `logging_shims.rs`'s `PrintWriter.format`.
   `format_arg_full` and `format_arg` have no callers outside this file.
 
+  > **RE-GREPPED 2026-08-12 (P3-E), and this list is now wrong in two places.**
+  > The `java/util/Formatter.format` registrations reach
+  > `native_string_format_**locale**` (both registrars, since this record's own
+  > patch), not the no-locale entry. The current callers of the no-locale entry
+  > are exactly three: `native_printf` (`lib.rs`, which
+  > `native_printf_locale` also funnels into — see the head of this record),
+  > `native_printwriter_printf` (`logging_shims.rs`), and
+  > `native_string_formatted` (same file). All three are surfaces the JDK
+  > specifies as taking the FORMAT default, so all three moved together with the
+  > P3-E fix and none of them needed a signature change. `native_string_format`'s
+  > signature is still unchanged; the `FmtLocale` threading is entirely below it.
+
 Nothing in the tree depends on the old behaviour. The changes are
 `Compatible`-mode by construction — every one is a wrong value or an absent
 refusal becoming the specified one — but `%q`, `%-d` and `%.2d` now throw where
@@ -474,12 +586,42 @@ diff `--dump-native-registry` before and after.
   the `0x` prefix (`%020a` of 1.0 is `0x00000000000001.0p0`); the generic
   padder still excludes `a`/`A`, as it did before. Left with its existing
   argued comment.
-* **`String.format(String, Object[])`** (no locale overload) still formats with
+* ~~**`String.format(String, Object[])`** (no locale overload) still formats with
   the root separators rather than `Locale.getDefault(Locale.Category.FORMAT)`.
   Invisible under the probe's `-Duser.language=en -Duser.country=US`, and
   resolving a default locale on the no-locale path is the one place where the
   re-entrancy hazard is worst — every internal `String.format` in the VM,
-  including the logging shims, goes through it. Deliberately left.
+  including the logging shims, goes through it. Deliberately left.~~
+  **CLOSED 2026-08-12 (P3-E)** — see the head of this record. The re-entrancy
+  argument was right about the hazard and wrong about the mitigation: laziness
+  and `FMT_SYMBOLS_RESOLVING` already bound it, and `fmt_date_name` was already
+  running the identical route on the identical path.
+* **`new Formatter()` and `new Formatter(Appendable)` still format with the root
+  separators**, where the real `java.util.Formatter` constructors carry
+  `Locale.getDefault(Locale.Category.FORMAT)`. This is the last piece of the
+  locale row and it is in `native-builtins/src/lib.rs`, not `lang_string.rs`:
+  registrar 1's `<init>()V` and `<init>(Ljava/lang/Appendable;)V` natives write
+  a **null** into slot 1, and `format` correctly reads a null slot 1 as "no
+  localization". Two shapes of fix, and the choice is not obvious — (a) write
+  the FORMAT default into slot 1 in both constructors, or (b) stop registering
+  them and let the real constructors run, which is the argument this record
+  already accepted for `(Appendable, Locale)` (they write slot 0, slot 1 **and**
+  `zero`) but which changes slot 0 from a `String` to a `StringBuilder` for the
+  `()V` case and needs `format`'s append path and `Formatter.toString` checked
+  against that. Whoever takes it: (b) is the one that cannot drift, and it needs
+  a build to land. Not asserted in `RJdkFormatLocale`, deliberately, with a
+  comment at the site saying why.
+* **`PrintStream.printf/format(Locale, …)` drops its `Locale`**
+  (`native_printf_locale`, `native-builtins/src/lib.rs`). See the BLOCKING note
+  at the head of this record — after the P3-E fix this is no longer a quiet
+  wrong answer, it breaks `RJdkHello` on any non-ROOT-default host.
+  `PrintWriter.printf/format(Locale, …)` is not registered at all and falls
+  through to real bytecode; unmeasured.
+* **`String.format((Locale) null, "%tB", d)`** renders the FORMAT default's
+  month name where HotSpot's `printDateTime` renders `Locale.US`'s. Kept on
+  purpose while the `new Formatter()` row above is open — the two readings of
+  `Given(None)` cannot both be served, and this is the rarer of the two. Fix it
+  in the same change that fixes the constructors, not before.
 * W7-3 left `append(CharSequence,int,int)` clamping and `appendCodePoint`
   truncating, each with an argued rationale and a pinning unit test. **Not
   touched, and not disagreed with** — neither is in this family.

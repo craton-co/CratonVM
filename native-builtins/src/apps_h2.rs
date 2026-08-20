@@ -619,11 +619,60 @@ fn h2_internal_error(ctx: &mut dyn NativeContext, message: String) -> MethodCall
     }
 }
 
+/// # Why every `ObjectRef` in here is pinned and re-read
+///
+/// This native keeps `session`, `left` and `right` in Rust locals and then
+/// calls back into Java through `ctx` several times. Each of those calls can
+/// allocate, and therefore collect: the funnel pins the ARGUMENT SLICE and
+/// remaps it, but the copies this function took out of it are invisible to
+/// every root scan there is. On a copying collector the stale copy could still
+/// be repaired at the next `load_and_forward`, because the vacated address
+/// keeps a forwarding word; **ZGC's slide leaves none** (`Arena::compact_low_to`
+/// zeroes what it vacated and the memmove overwrites the rest), so the barrier
+/// is a no-op there and a stale copy stays stale forever.
+///
+/// MEASURED, H2 `TestMultiThread.testConcurrentUpdate` under
+/// `CRATONVM_DBG_GC_STRESS=4194304` with the vacated-address ledger armed: this
+/// function and `h2_comparison_get_value` were the two callers that handed
+/// `load_and_forward` an address the collector had moved an object away from,
+/// and the failure it produced is
+/// `NoSuchMethodError: 'int java.lang.Object.compareWithNull(...)'` — a
+/// `SessionLocal` receiver read at its pre-collection address.
+///
+/// `h2_integral_value` and `h2_int_arg` take `&dyn NativeContext` and cannot
+/// collect, so the fast integral path below needs no refresh; everything after
+/// the first `h2_static_value` / `ctx.invoke*` does.
 fn h2_comparison_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let session = h2_object_arg(args, 0, "Comparison.compare session is null")?;
     let left = h2_object_arg(args, 1, "Comparison.compare left is null")?;
     let right = h2_object_arg(args, 2, "Comparison.compare right is null")?;
     let compare_type = h2_int_arg(args, 3, "Comparison.compare type is invalid")?;
+    let pin_base = ctx.pin_native_root(session);
+    let left_pin = ctx.pin_native_root(left);
+    let right_pin = ctx.pin_native_root(right);
+    let result = h2_comparison_compare_pinned(
+        ctx,
+        (session, pin_base),
+        (left, left_pin),
+        (right, right_pin),
+        compare_type,
+    );
+    ctx.unpin_native_roots(pin_base);
+    result
+}
+
+/// The body of [`h2_comparison_compare`], with each reference reachable through
+/// a pin handle so it can be re-read after anything that may have collected.
+fn h2_comparison_compare_pinned(
+    ctx: &mut dyn NativeContext,
+    session: (ObjectRef, usize),
+    left: (ObjectRef, usize),
+    right: (ObjectRef, usize),
+    compare_type: i32,
+) -> MethodCallResult {
+    let (session, session_pin) = session;
+    let (left, left_pin) = left;
+    let (right, right_pin) = right;
     // Range joins compare H2's immutable ValueInteger / ValueBigint instances
     // millions of times.  Their primitive payloads are already in the common
     // integral domain, so `SessionLocal.compareWithNull` would only enter the
@@ -649,6 +698,10 @@ fn h2_comparison_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     let result = match compare_type {
         0 | 1 | 2 | 3 | 4 | 5 => {
+            // `h2_static_value` above may have run `<clinit>` and collected.
+            let session = ctx.read_native_pin(session_pin, session);
+            let left = ctx.read_native_pin(left_pin, left);
+            let right = ctx.read_native_pin(right_pin, right);
             let comparison = match ctx.invoke_virtual(
                 session,
                 "compareWithNull",
@@ -689,6 +742,9 @@ fn h2_comparison_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }
         }
         6 | 7 => {
+            let session = ctx.read_native_pin(session_pin, session);
+            let left = ctx.read_native_pin(left_pin, left);
+            let right = ctx.read_native_pin(right_pin, right);
             let equal = matches!(
                 ctx.invoke_virtual(
                     session,
@@ -711,6 +767,9 @@ fn h2_comparison_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
         8 => {
             let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
+            // `h2_static_object` resolves a class and can collect.
+            let left = ctx.read_native_pin(left_pin, left);
+            let right = ctx.read_native_pin(right_pin, right);
             if null == Some(left) || null == Some(right) {
                 h2_static_value(ctx, "org/h2/value/ValueNull", "INSTANCE")?
             } else {
@@ -725,6 +784,9 @@ fn h2_comparison_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 )?;
                 let left_geometry =
                     h2_object_arg(&[left_geometry], 0, "geometry conversion returned null")?;
+                let geometry_pin = ctx.pin_native_root(left_geometry);
+                // `convertToGeometry` ran Java: `right` may have moved.
+                let right = ctx.read_native_pin(right_pin, right);
                 let right_geometry = h2_value_result(
                     ctx.invoke_virtual(
                         right,
@@ -734,6 +796,9 @@ fn h2_comparison_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     )?,
                     "Value.convertToGeometry",
                 )?;
+                // Same again for the receiver of the intersection test, which
+                // was produced BEFORE the conversion above.
+                let left_geometry = ctx.read_native_pin(geometry_pin, left_geometry);
                 let intersects = matches!(
                     ctx.invoke_virtual(
                         left_geometry,
@@ -762,10 +827,30 @@ fn h2_comparison_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = h2_object_arg(args, 0, "ConditionAndOr receiver is null")?;
     let session = h2_object_arg(args, 1, "ConditionAndOr session is null")?;
+    // `getValue` runs Java, so a peer thread's collection can relocate
+    // everything held in a Rust local here — where no root scan reaches it.
+    // `this` is read AFTER the first callback (`andOrType`, then `right`) and
+    // `session` is PASSED to the second one, so both must survive it.
+    //
+    // A stale `session` is the H2 MVStore-writer page's own headline verdict —
+    // `receiver names an address the ZGC slide VACATED … original_class=
+    // org/h2/engine/SessionLocal … site="invoke dispatch"` — which is this
+    // argument reaching `getValue(SessionLocal)` after a relocation. The
+    // receiver of a `ctx` field read is repaired by `load_and_forward`; an
+    // ARGUMENT handed to `invoke_virtual` is not, so it lands in a Java frame
+    // as a raw stale pointer.
+    //
+    // Pins are truncated to the call's watermark by `safe_native_call_impl` on
+    // every exit, so the early returns below need no unpin.
+    let this_pin = ctx.pin_native_root(this);
+    let session_pin = ctx.pin_native_root(session);
     let left =
         h2_object_field(ctx, this, "left").ok_or_else(|| RuntimeError::NullPointerException {
             message: Some("ConditionAndOr.left".to_string()),
         })?;
+    let left_pin = ctx.pin_native_root(left);
+    let left = ctx.read_native_pin(left_pin, left);
+    let session = ctx.read_native_pin(session_pin, session);
     let left_value = h2_value_result(
         ctx.invoke_virtual(
             left,
@@ -775,6 +860,7 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
         )?,
         "ConditionAndOr.left.getValue",
     )?;
+    let this = ctx.read_native_pin(this_pin, this);
     let left_value_ref = h2_object_arg(
         &[left_value.clone()],
         0,
@@ -786,10 +872,12 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
         1 => "isTrue",
         _ => return Err(h2_internal_error(ctx, and_or_type.to_string())),
     };
+    let left_value_pin = ctx.pin_native_root(left_value_ref);
     let left_matches = matches!(
         ctx.invoke_virtual(left_value_ref, test_method, "()Z", &[])?,
         Some(Value::Int(value)) if value != 0
     );
+    let left_value_ref = ctx.read_native_pin(left_value_pin, left_value_ref);
     let boolean_field = if and_or_type == 0 { "FALSE" } else { "TRUE" };
     if left_matches {
         return Ok(Some(h2_static_value(
@@ -798,10 +886,14 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
             boolean_field,
         )?));
     }
+    let this = ctx.read_native_pin(this_pin, this);
     let right =
         h2_object_field(ctx, this, "right").ok_or_else(|| RuntimeError::NullPointerException {
             message: Some("ConditionAndOr.right".to_string()),
         })?;
+    let right_pin = ctx.pin_native_root(right);
+    let right = ctx.read_native_pin(right_pin, right);
+    let session = ctx.read_native_pin(session_pin, session);
     let right_value = h2_value_result(
         ctx.invoke_virtual(
             right,
@@ -811,11 +903,16 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
         )?,
         "ConditionAndOr.right.getValue",
     )?;
+    // `left_value_ref` is live across the callback just above and compared by
+    // IDENTITY against `ValueNull.INSTANCE` at the end of this function, where a
+    // stale address would silently compare unequal.
+    let left_value_ref = ctx.read_native_pin(left_value_pin, left_value_ref);
     let right_value_ref = h2_object_arg(
         &[right_value.clone()],
         0,
         "ConditionAndOr right value is null",
     )?;
+    let right_value_pin = ctx.pin_native_root(right_value_ref);
     if matches!(
         ctx.invoke_virtual(right_value_ref, test_method, "()Z", &[])?,
         Some(Value::Int(value)) if value != 0
@@ -826,6 +923,11 @@ fn h2_condition_and_or_get_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
             boolean_field,
         )?));
     }
+    // Both operands are compared by IDENTITY below, so both have to be re-read
+    // after the callback above: a stale address compares unequal to the live
+    // `ValueNull.INSTANCE` and this returns TRUE/FALSE where SQL requires NULL.
+    let left_value_ref = ctx.read_native_pin(left_value_pin, left_value_ref);
+    let right_value_ref = ctx.read_native_pin(right_value_pin, right_value_ref);
     let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
     if null == Some(left_value_ref) || null == Some(right_value_ref) {
         Ok(Some(h2_static_value(
@@ -867,6 +969,23 @@ fn h2_coalesce_function_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
         h2_object_field(ctx, this, "type").ok_or_else(|| RuntimeError::NullPointerException {
             message: Some("CoalesceFunction.type".to_string()),
         })?;
+    // Everything below is live ACROSS a `getValue` callback — and across it once
+    // per loop iteration, so the window is entered as many times as the function
+    // has arguments. `session` and `value_type` are handed to `convertTo` as
+    // ARGUMENTS, which nothing repairs (only the receiver of a `ctx` call goes
+    // through `load_and_forward`), and `null` is compared by IDENTITY: a stale
+    // `ValueNull.INSTANCE` compares unequal to every value, so COALESCE would
+    // return its first argument instead of skipping NULLs. See the sibling fix
+    // in `h2_condition_and_or_get_value` for the mechanism and the verdict that
+    // named it.
+    let session_pin = ctx.pin_native_root(session);
+    let args_pin = ctx.pin_native_root(args_array);
+    let null_pin = null.map(|n| (ctx.pin_native_root(n), n));
+    let type_pin = ctx.pin_native_root(value_type);
+    let mut args_array = args_array;
+    let mut null = null;
+    let mut value_type = value_type;
+    let mut session = session;
     for index in 0..ctx.array_length(args_array) {
         let expression = match ctx.get_array_element(args_array, index) {
             Value::Object(Some(value)) => value,
@@ -881,6 +1000,10 @@ fn h2_coalesce_function_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
             )?,
             "CoalesceFunction expression.getValue",
         )?;
+        args_array = ctx.read_native_pin(args_pin, args_array);
+        value_type = ctx.read_native_pin(type_pin, value_type);
+        session = ctx.read_native_pin(session_pin, session);
+        null = null_pin.map(|(pin, n)| ctx.read_native_pin(pin, n));
         let value_ref = h2_object_arg(&[value.clone()], 0, "CoalesceFunction value is null")?;
         if null != Some(value_ref) {
             return Ok(Some(h2_value_result(
@@ -1123,7 +1246,13 @@ fn h2_cardinality_expression_get_value(
 fn h2_comparison_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let comparison = h2_object_arg(args, 0, "Comparison.getValue receiver is null")?;
     let session = h2_object_arg(args, 1, "Comparison.getValue session is null")?;
+    // `comparison` was pinned here from the start; `session`, the two operand
+    // expressions and `left` were not, and every one of them is held across a
+    // `getValue` callback that runs arbitrary Java. See
+    // `h2_comparison_compare` for why the forwarding barrier cannot clean up
+    // afterwards on this VM's default collector.
     let comparison_pin = ctx.pin_native_root(comparison);
+    let session_pin = ctx.pin_native_root(session);
     let result = (|| -> MethodCallResult {
         let comparison = ctx.read_native_pin(comparison_pin, comparison);
         let left_expression = h2_object_field(ctx, comparison, "left").ok_or_else(|| {
@@ -1141,27 +1270,35 @@ fn h2_comparison_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             "Comparison.left.getValue",
         )?;
         let left = h2_object_arg(&[left], 0, "Comparison.left.getValue returned null")?;
+        let left_pin = ctx.pin_native_root(left);
         let comparison = ctx.read_native_pin(comparison_pin, comparison);
         let compare_type = h2_int_field(ctx, comparison, "compareType");
         let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
+        let left = ctx.read_native_pin(left_pin, left);
         if null == Some(left) && (compare_type & !1) != 6 {
             return h2_static_value(ctx, "org/h2/value/ValueNull", "INSTANCE").map(Some);
         }
+        let comparison = ctx.read_native_pin(comparison_pin, comparison);
         let right_expression = h2_object_field(ctx, comparison, "right").ok_or_else(|| {
             RuntimeError::IllegalStateException {
                 message: "Comparison.right is null".to_string(),
             }
         })?;
+        let expr_pin = ctx.pin_native_root(right_expression);
+        let session_now = ctx.read_native_pin(session_pin, session);
         let right = h2_value_result(
             ctx.invoke_virtual(
                 right_expression,
                 "getValue",
                 "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
-                &[Value::Object(Some(session))],
+                &[Value::Object(Some(session_now))],
             )?,
             "Comparison.right.getValue",
         )?;
         let right = h2_object_arg(&[right], 0, "Comparison.right.getValue returned null")?;
+        let right_pin = ctx.pin_native_root(right);
+        let right_expression = ctx.read_native_pin(expr_pin, right_expression);
+        let left = ctx.read_native_pin(left_pin, left);
         // Hibernate's nested JSON unnest plan has exactly three table
         // filters: the entity plus two `system_range` filters.  Its two
         // cardinality predicates are monotonic bounds over those ranges.
@@ -1175,6 +1312,10 @@ fn h2_comparison_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         {
             h2_prune_nested_unnest_range(ctx, right_expression);
         }
+        // Last refresh: the prune above walks H2 objects and can collect.
+        let session = ctx.read_native_pin(session_pin, session);
+        let left = ctx.read_native_pin(left_pin, left);
+        let right = ctx.read_native_pin(right_pin, right);
         ctx.invoke(
             "org/h2/expression/condition/Comparison",
             "compare",
@@ -2126,6 +2267,21 @@ fn h2_constraint_check_existing_data(
         return Ok(None);
     }
 
+    // H2's own `checkExistingData` type-checks the referencing against the
+    // referenced columns as a SIDE EFFECT of PREPARING the probe query: the
+    // generated `... WHERE C."X"=P."Y"` runs through `Comparison.optimize`,
+    // which calls `TypeInfo.checkComparable` and raises
+    // `TYPES_ARE_NOT_COMPARABLE_2` (90110) for, say, an `INTEGER ARRAY` column
+    // referencing a `TIME ARRAY` one. That check does not depend on there being
+    // any rows -- H2 raises it on an empty table too.
+    //
+    // The row-count shortcut below skips the prepare, so it skipped the type
+    // check with it, and CratonVM silently ACCEPTED a foreign key that H2
+    // refuses (`ddl/alterTableAdd.sql:166`). Do the check explicitly, before
+    // the shortcut, so the fast path only skips the part that is genuinely a
+    // no-op on an empty table -- scanning it for orphaned rows.
+    h2_constraint_check_column_types(ctx, this)?;
+
     let table = match ctx.get_field_by_name(this, "table") {
         Value::Object(Some(o)) => o,
         _ => return Ok(None),
@@ -2143,6 +2299,48 @@ fn h2_constraint_check_existing_data(
     }
 
     h2_constraint_run_existing_data_query(ctx, this, session)
+}
+
+/// `TypeInfo.checkComparable(columns[i].type, refColumns[i].type)` for every
+/// column pair of a referential constraint -- the check H2 gets for free by
+/// preparing its probe query (see `h2_constraint_check_existing_data`).
+///
+/// No pinning: `Column.getType()` is a plain field getter and cannot allocate,
+/// so no moving GC can run between reading the two `TypeInfo`s and passing them
+/// as arguments. `checkComparable` itself can allocate (it builds the exception
+/// message), but only after both refs are arguments and therefore rooted.
+fn h2_constraint_check_column_types(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let columns = match ctx.get_field_by_name(this, "columns") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(()),
+    };
+    let ref_columns = match ctx.get_field_by_name(this, "refColumns") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(()),
+    };
+    let len = ctx.array_length(columns).min(ctx.array_length(ref_columns));
+    for i in 0..len {
+        let col = h2_index_column(ctx, columns, i)?;
+        let ref_col = h2_index_column(ctx, ref_columns, i)?;
+        let t1 = match ctx.invoke_virtual(col, "getType", "()Lorg/h2/value/TypeInfo;", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => continue,
+        };
+        let t2 = match ctx.invoke_virtual(ref_col, "getType", "()Lorg/h2/value/TypeInfo;", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => continue,
+        };
+        ctx.invoke(
+            "org/h2/value/TypeInfo",
+            "checkComparable",
+            "(Lorg/h2/value/TypeInfo;Lorg/h2/value/TypeInfo;)V",
+            &[Value::Object(Some(t1)), Value::Object(Some(t2))],
+        )?;
+    }
+    Ok(())
 }
 
 fn h2_constraint_run_existing_data_query(
@@ -2528,29 +2726,46 @@ fn h2_parser_test_token_fast(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     if matches!(ctx.get_field_by_name(token, "quoted"), Value::Int(value) if value != 0) {
         return Ok(Some(Value::Int(0)));
     }
+    // `asIdentifier()` runs Java, so a collection can relocate everything this
+    // function is holding in Rust locals — where no root scan can see them.
+    // Caught by `CRATONVM_DBG_VACATED_FRAMES` on the H2 MVStore-writer repro:
+    // `load_and_forward` was handed a moved `this` from the `identifiersToUpper`
+    // read below, with the backtrace naming this function.
+    //
+    // The previous shape pinned two of the three and re-read them **inside the
+    // match arm**, so the re-read values died with the arm's scope and the
+    // stale outer `expected` was the one that reached `native_string_equals`.
+    // `this` was never pinned at all. Pin all three across the callback and
+    // re-bind the OUTER names from the pins afterwards, so there is no shadow
+    // to lose. `identifier` is pinned too: it is live across the
+    // `identifiersToUpper` read below, which can itself collect.
+    let mut this = this;
+    let mut expected = expected;
     let identifier = match ctx.get_field_by_name(token, "identifier") {
         Value::Object(Some(value)) => value,
         _ => {
+            let this_pin = ctx.pin_native_root(this);
             let expected_pin = ctx.pin_native_root(expected);
             let token_pin = ctx.pin_native_root(token);
             let token = ctx.read_native_pin(token_pin, token);
             let result = ctx.invoke_virtual(token, "asIdentifier", "()Ljava/lang/String;", &[])?;
-            let expected = ctx.read_native_pin(expected_pin, expected);
-            ctx.unpin_native_roots(token_pin);
-            ctx.unpin_native_roots(expected_pin);
+            this = ctx.read_native_pin(this_pin, this);
+            expected = ctx.read_native_pin(expected_pin, expected);
+            ctx.unpin_native_roots(this_pin);
             match result { Some(Value::Object(Some(value))) => value, _ => return Ok(Some(Value::Int(0))) }
         }
     };
-    if matches!(ctx.get_field_by_name(this, "identifiersToUpper"), Value::Int(value) if value != 0) {
-        return crate::lang_string::native_string_equals(
-            ctx,
-            &[Value::Object(Some(expected)), Value::Object(Some(identifier))],
-        );
+    let identifier_pin = ctx.pin_native_root(identifier);
+    let expected_pin = ctx.pin_native_root(expected);
+    let upper = matches!(ctx.get_field_by_name(this, "identifiersToUpper"), Value::Int(value) if value != 0);
+    let identifier = ctx.read_native_pin(identifier_pin, identifier);
+    let expected = ctx.read_native_pin(expected_pin, expected);
+    ctx.unpin_native_roots(identifier_pin);
+    let args = [Value::Object(Some(expected)), Value::Object(Some(identifier))];
+    if upper {
+        return crate::lang_string::native_string_equals(ctx, &args);
     }
-    crate::lang_string::native_string_equals_ignore_case(
-        ctx,
-        &[Value::Object(Some(expected)), Value::Object(Some(identifier))],
-    )
+    crate::lang_string::native_string_equals_ignore_case(ctx, &args)
 }
 
 /// Exact UTF-16-code-unit comparison used by H2's tokenizer for case-insensitive

@@ -1092,6 +1092,31 @@ pub fn classify_key_type(spki_oid: &[u8]) -> &'static str {
 }
 
 /// True if the cert is acceptable as a *server* certificate.
+/// True if the cert is *preferred* as a **server** certificate.
+///
+/// **This is a preference, not an eligibility test.** JSSE's default
+/// `KeyManagerFactory` algorithm is `SunX509`, and
+/// `SunX509KeyManagerImpl.getAliases` filters ONLY on the key's algorithm and
+/// (when the peer supplies one) the issuer list — it never consults KeyUsage or
+/// ExtendedKeyUsage. `X509KeyManagerImpl` (NewSunX509) does look at them, but it
+/// *ranks* on the result and still answers; an `EXTENSION_MISMATCH` alias sorts
+/// last rather than dropping out. Measured on JDK 25 with a self-signed cert
+/// carrying `KeyUsage=digitalSignature` and `EKU={id-kp-serverAuth}` only:
+///
+/// ```text
+/// SunX509     getClientAliases(RSA)=[key]      chooseClientAlias(RSA)=key
+/// NewSunX509  getClientAliases(RSA)=[1.0.key]  chooseClientAlias(RSA)=3.0.key
+/// ```
+///
+/// So callers must use these to ORDER the by-key-type alias lists, never to
+/// decide membership. Using them as a filter is what made
+/// `chooseClientAlias(RSA)` answer `null` here for exactly that certificate,
+/// and a client that has no alias sends no certificate: against a server with
+/// `ClientAuth.REQUIRE` that is `SSLV3_ALERT_HANDSHAKE_FAILURE` /
+/// `TLSV1_ALERT_CERTIFICATE_REQUIRED` — the 14 residual rows of
+/// `JdkDelegatingPrivateKeyMethodTest`, whose fixture builds its cert with
+/// `.setKeyUsage(true, digitalSignature).addExtendedKeyUsageServerAuth()` and
+/// then uses it on BOTH sides.
 pub fn is_server_cert(p: &ParsedCert) -> bool {
     // KeyUsage check (if extension present): need digitalSignature OR
     // keyEncipherment. Many server certs only set keyEncipherment.
@@ -1114,7 +1139,8 @@ pub fn is_server_cert(p: &ParsedCert) -> bool {
     true
 }
 
-/// True if the cert is acceptable as a *client* certificate.
+/// True if the cert is *preferred* as a **client** certificate. See
+/// [`is_server_cert`] for why this must not be used as an eligibility filter.
 pub fn is_client_cert(p: &ParsedCert) -> bool {
     if let Some(ku) = p.key_usage {
         if (ku & KU_DIGITAL_SIGNATURE) == 0 {
@@ -1259,24 +1285,31 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
             .map(|a| a.alias.to_string())
             .collect::<Vec<_>>(),
     );
-    for alias in &ordered_aliases {
-        let entry = private_key_aliases
-            .iter()
-            .find(|a| a.alias == alias)
-            .expect("alias came from private_key_aliases");
-        if entry.is_server {
-            state
-                .server_aliases_by_key_type
-                .entry(entry.key_type.clone())
-                .or_default()
-                .push(alias.clone());
-        }
-        if entry.is_client {
-            state
-                .client_aliases_by_key_type
-                .entry(entry.key_type.clone())
-                .or_default()
-                .push(alias.clone());
+    // `is_server`/`is_client` ORDER these lists; they do not gate them. Every
+    // alias with a matching key type is a candidate for both roles, exactly as
+    // `SunX509KeyManagerImpl` (the default) treats it — see `is_server_cert`.
+    // Two passes so a properly-marked cert still wins when a keystore holds
+    // several.
+    for preferred in [true, false] {
+        for alias in &ordered_aliases {
+            let entry = private_key_aliases
+                .iter()
+                .find(|a| a.alias == alias)
+                .expect("alias came from private_key_aliases");
+            if entry.is_server == preferred {
+                state
+                    .server_aliases_by_key_type
+                    .entry(entry.key_type.clone())
+                    .or_default()
+                    .push(alias.clone());
+            }
+            if entry.is_client == preferred {
+                state
+                    .client_aliases_by_key_type
+                    .entry(entry.key_type.clone())
+                    .or_default()
+                    .push(alias.clone());
+            }
         }
     }
     state
@@ -1419,23 +1452,27 @@ pub(crate) fn build_key_manager_state_from_live_keystore(
             .map(|c| c.alias.clone())
             .collect::<Vec<_>>(),
     );
-    for alias in &ordered {
-        let Some(c) = candidates.iter().find(|c| &c.alias == alias) else {
-            continue;
-        };
-        if c.is_server {
-            state
-                .server_aliases_by_key_type
-                .entry(c.key_type.clone())
-                .or_default()
-                .push(alias.clone());
-        }
-        if c.is_client {
-            state
-                .client_aliases_by_key_type
-                .entry(c.key_type.clone())
-                .or_default()
-                .push(alias.clone());
+    // Preference, not eligibility — same two-pass shape as
+    // `build_key_manager_state`; see `is_server_cert`.
+    for preferred in [true, false] {
+        for alias in &ordered {
+            let Some(c) = candidates.iter().find(|c| &c.alias == alias) else {
+                continue;
+            };
+            if c.is_server == preferred {
+                state
+                    .server_aliases_by_key_type
+                    .entry(c.key_type.clone())
+                    .or_default()
+                    .push(alias.clone());
+            }
+            if c.is_client == preferred {
+                state
+                    .client_aliases_by_key_type
+                    .entry(c.key_type.clone())
+                    .or_default()
+                    .push(alias.clone());
+            }
         }
     }
 
@@ -1558,6 +1595,172 @@ pub(crate) fn trust_manager_state_by_id(id: i32) -> TrustManagerState {
     build_trust_manager_state(id)
 }
 
+/// The two shapes that reached this validator only once the client started
+/// capturing whole chains: a CROSS-SIGNED root, and a P-384 issuer key.
+///
+/// Both are built with real OpenSSL keys and real signatures rather than the
+/// synthetic `mk_cert` fixtures beside them, because both are questions about
+/// CRYPTOGRAPHY and about identity across two encodings of one key — neither
+/// survives a fixture whose signatures are not real.
+#[cfg(all(test, unix))]
+mod real_chain_shape_tests {
+    use super::*;
+    use openssl::asn1::Asn1Time;
+    use openssl::bn::{BigNum, MsbOption};
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::{PKey, Private};
+    use openssl::x509::extension::BasicConstraints;
+    use openssl::x509::{X509Name, X509};
+
+    fn serial() -> openssl::asn1::Asn1Integer {
+        let mut bn = BigNum::new().expect("bn");
+        bn.rand(64, MsbOption::MAYBE_ZERO, false).expect("rand");
+        bn.to_asn1_integer().expect("serial")
+    }
+
+    fn name(cn: &str) -> X509Name {
+        let mut n = X509Name::builder().expect("name builder");
+        n.append_entry_by_text("CN", cn).expect("cn");
+        n.build()
+    }
+
+    fn p384_key() -> PKey<Private> {
+        let group = EcGroup::from_curve_name(Nid::SECP384R1).expect("group");
+        PKey::from_ec_key(EcKey::generate(&group).expect("keygen")).expect("pkey")
+    }
+
+    /// A certificate for `subject`/`key`, signed by `(issuer_name, issuer_key)`,
+    /// CA or leaf.
+    fn cert(
+        subject: &str,
+        key: &PKey<Private>,
+        issuer: &str,
+        issuer_key: &PKey<Private>,
+        ca: bool,
+    ) -> Vec<u8> {
+        let mut b = X509::builder().expect("builder");
+        b.set_version(2).expect("v3");
+        b.set_serial_number(&serial()).expect("serial");
+        b.set_subject_name(&name(subject)).expect("subject");
+        b.set_issuer_name(&name(issuer)).expect("issuer");
+        b.set_pubkey(key).expect("pubkey");
+        b.set_not_before(&Asn1Time::days_from_now(0).expect("nb"))
+            .expect("nb");
+        b.set_not_after(&Asn1Time::days_from_now(3650).expect("na"))
+            .expect("na");
+        let bc = if ca {
+            BasicConstraints::new().critical().ca().build()
+        } else {
+            BasicConstraints::new().critical().build()
+        };
+        b.append_extension(bc.expect("bc")).expect("bc ext");
+        b.sign(issuer_key, MessageDigest::sha384()).expect("sign");
+        b.build().to_der().expect("der")
+    }
+
+    fn trust_with(anchor_der: Vec<u8>) -> TrustManagerState {
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, anchor_der);
+        trust
+    }
+
+    /// A peer that ends its chain with a CROSS-SIGNED copy of a root that IS in
+    /// the trust store — `www.cloudflare.com` and `adoptium.net` both serve
+    /// `CN=GTS Root R4` as signed by `CN=GlobalSign Root CA`, whose bytes
+    /// differ from the self-signed GTS Root R4 in JDK 25's cacerts and whose
+    /// own issuer that cacerts no longer ships.
+    ///
+    /// What carries it is the PATH REBUILD, not the anchor comparison: the
+    /// cross-signed tail is dropped by `select_path` and the anchor is found
+    /// by issuer lookup. Named that way because the first version of this test
+    /// was written to guard a relaxation of `presented_cert_is_anchor` and
+    /// passed just as well with that relaxation reverted — it never touched
+    /// it. Breaking `rebuild_path` is what fails this.
+    #[test]
+    fn a_cross_signed_tail_is_dropped_and_the_real_anchor_still_found() {
+        let root_key = p384_key();
+        let other_root_key = p384_key();
+        let leaf_key = p384_key();
+
+        let root_self_signed = cert("Trusted Root", &root_key, "Trusted Root", &root_key, true);
+        // The SAME subject and the SAME key, certified by somebody else — the
+        // shape a real cross-certificate has.
+        let root_cross_signed = cert("Trusted Root", &root_key, "Other Root", &other_root_key, true);
+        assert_ne!(
+            root_self_signed, root_cross_signed,
+            "the fixture must present a DIFFERENT encoding, or it proves nothing"
+        );
+        let leaf = cert("leaf.example", &leaf_key, "Trusted Root", &root_key, false);
+
+        let trust = trust_with(root_self_signed);
+        // Only the cross-signed copy is on the wire; the issuer that signed it
+        // is NOT in the trust store, exactly as with GlobalSign Root CA.
+        let chain = vec![leaf, root_cross_signed];
+        assert!(
+            validate_chain(&chain, &trust).is_ok(),
+            "the cross-signed tail must be dropped and the real anchor still found"
+        );
+    }
+
+    /// …and the same subject with a DIFFERENT key must still be refused, or
+    /// the relaxation above would be a hole rather than a fix.
+    #[test]
+    fn the_same_subject_with_a_different_key_is_not_that_root() {
+        let root_key = p384_key();
+        let impostor_key = p384_key();
+        let other_root_key = p384_key();
+        let leaf_key = p384_key();
+
+        let root_self_signed = cert("Trusted Root", &root_key, "Trusted Root", &root_key, true);
+        let impostor = cert(
+            "Trusted Root",
+            &impostor_key,
+            "Other Root",
+            &other_root_key,
+            true,
+        );
+        let leaf = cert("leaf.example", &leaf_key, "Trusted Root", &impostor_key, false);
+
+        let trust = trust_with(root_self_signed);
+        assert!(
+            validate_chain(&vec![leaf, impostor], &trust).is_err(),
+            "a certificate that only borrows the anchor's NAME must be refused"
+        );
+    }
+
+    /// The whole chain signed by P-384 keys. Before the named-curve verifier
+    /// this failed with `BadSignature` at whichever index first had a P-384
+    /// issuer — six of twenty live public sites.
+    #[test]
+    fn a_p384_chain_validates() {
+        let root_key = p384_key();
+        let inter_key = p384_key();
+        let leaf_key = p384_key();
+        let root = cert("P384 Root", &root_key, "P384 Root", &root_key, true);
+        let inter = cert("P384 Intermediate", &inter_key, "P384 Root", &root_key, true);
+        let leaf = cert("leaf.example", &leaf_key, "P384 Intermediate", &inter_key, false);
+
+        let trust = trust_with(root);
+        assert!(
+            validate_chain(&vec![leaf.clone(), inter.clone()], &trust).is_ok(),
+            "a P-384 chain to a P-384 anchor must validate"
+        );
+
+        // The paired refusal: one flipped byte in the leaf's signature must
+        // make it fail, or "validates" above would also hold for a verifier
+        // that never checks anything.
+        let mut tampered = leaf;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(
+            validate_chain(&vec![tampered, inter], &trust).is_err(),
+            "a tampered P-384 signature must be refused"
+        );
+    }
+}
+
 fn insert_anchor(state: &mut TrustManagerState, der: Vec<u8>) {
     let parsed = match parse_certificate(&der) {
         Ok(p) => p,
@@ -1580,6 +1783,30 @@ fn presented_cert_is_anchor(
     presented_der: &[u8],
     parsed: &ParsedCert,
 ) -> bool {
+    // Exact-encoding equality, NOT the (name, key) pair RFC 5280 §6.1.1
+    // defines a trust anchor by. That relaxation was written, and then
+    // MEASURED to fix nothing, so it is not here.
+    //
+    // The shape it was aimed at is real: `www.cloudflare.com` and
+    // `adoptium.net` both end their chain with `CN=GTS Root R4` as signed by
+    // `CN=GlobalSign Root CA`, whose bytes differ from the self-signed GTS
+    // Root R4 in JDK 25's cacerts, and whose own issuer that cacerts no longer
+    // ships. Both were rejected with `NoTrustAnchor` — which is what this
+    // exact-match produces, and is why it looked like the cause.
+    //
+    // It was not. `validate_chain` retries through `rebuild_path`, and
+    // `select_path` stops the moment the current certificate's ISSUER is a
+    // configured anchor — so the cross-signed tail is dropped and the anchor
+    // is found by issuer lookup instead. The presented-order `NoTrustAnchor`
+    // is simply the error `validate_chain` reports when the REBUILD also
+    // fails, and at the time it failed for an unrelated reason: the P-384
+    // ECDSA gap. With that closed, both sites validate with this function
+    // untouched — 20 of 20 live public sites, measured with the relaxation
+    // reverted.
+    //
+    // Read an error message as a symptom, not as an attribution: the one
+    // printed here came from the arm that ran FIRST, not from the arm that
+    // decided.
     match anchor.full_cert_der.as_deref() {
         Some(anchor_der) => anchor_der == presented_der,
         None => anchor.subject_der == parsed.subject_der && anchor.spki_der == parsed.spki_der,
@@ -2543,7 +2770,8 @@ fn verify_one_signature(
     issuer_spki: &[u8],
 ) -> Result<(), TrustError> {
     use crate::crypto_impl::{
-        parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256, Sha384, Sha512,
+        parse_named_ec_public_key, parse_rsa_public_key, verify_named_ecdsa, Rsa, Sha256, Sha384,
+        Sha512,
     };
     use cratonvm_native_builtins_crypto::signature::DigestAlgorithm;
 
@@ -2583,11 +2811,22 @@ fn verify_one_signature(
         || oid == OID_SIG_ECDSA_SHA512
     {
         // ECDSA: DER-decoded (r, s), check u1*G + u2*Q.x ≡ r (mod n).
-        // `verify_with_digest` takes a PRE-HASHED digest and truncates it to
+        // `verify_named_ecdsa` takes a PRE-HASHED digest and truncates it to
         // the curve order's bit length itself (FIPS 186-4 §6.4), which is
         // exactly why SHA-384/512 need no separate verify path — only the
         // right hash over the TBS.
-        let pk = match parse_ecdsa_public_key(issuer_spki) {
+        //
+        // ON THE CURVE, not on P-256. `parse_ecdsa_public_key` (still used by
+        // the JCE-facing P-256 paths) discards the SPKI's named-curve OID and
+        // then requires a 65-byte point, so a P-384 issuer key came back as
+        // `None` and this returned `BadSignature` — a refusal indistinguishable
+        // from a forged certificate. MEASURED across 20 live public sites the
+        // first time this validator was handed real chains: SIX rejected, all
+        // six with a P-384 issuer (Let's Encrypt Root YE / YE1 / YE2, Sectigo
+        // Root E46, DigiCert Global G3 TLS ECC, Google GTS Root R4). See
+        // `crypto_impl`'s named-curve section for why that was invisible until
+        // the leaf-only chain capture was fixed.
+        let pk = match parse_named_ec_public_key(issuer_spki) {
             Some(k) => k,
             None => return Err(TrustError::BadSignature { at }),
         };
@@ -2598,7 +2837,7 @@ fn verify_one_signature(
         } else {
             Sha256::digest(tbs).to_vec()
         };
-        if Ecdsa::verify_with_digest(&pk, &digest, sig) {
+        if verify_named_ecdsa(&pk, &digest, sig) {
             Ok(())
         } else {
             Err(TrustError::BadSignature { at })
@@ -3071,11 +3310,15 @@ fn verify_ocsp_response_signature(
                 )
             }
             oid if oid == OID_SIG_ECDSA_SHA256 => {
-                let Some(pk) = crate::crypto_impl::parse_ecdsa_public_key(spki) else {
+                // Named-curve, for the same reason the chain verifier is: an
+                // OCSP responder under a P-384 CA is exactly as ordinary as a
+                // certificate under one, and the P-256-only parser answered
+                // `None` -- i.e. "signature invalid" -- for every such key.
+                let Some(pk) = crate::crypto_impl::parse_named_ec_public_key(spki) else {
                     return false;
                 };
                 let digest = crate::crypto_impl::Sha256::digest(&resp.tbs_response_data_der);
-                crate::crypto_impl::Ecdsa::verify_with_digest(&pk, &digest, &resp.signature)
+                crate::crypto_impl::verify_named_ecdsa(&pk, &digest, &resp.signature)
             }
             _ => false,
         }
@@ -4801,16 +5044,38 @@ fn get_client_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     )))))
 }
 
+/// Build a Java `String[]` from `items`.
+///
+/// GC NOTE, and it is the whole reason this is not three lines. `arr` outlives
+/// `create_string`, which ALLOCATES: under a moving young collector the array
+/// is relocated by that allocation and every `set_array_element` after it
+/// writes into the vacated slots. What the live array keeps is whatever the
+/// collector left there — usually `null`.
+///
+/// This is the same defect
+/// `openssl-key-material-and-engine-residuals-20260813.md` §D recorded against
+/// `getAcceptedIssuers`, at the two methods it did NOT sweep:
+/// `getServerAliases` and `getClientAliases`. A null-riddled alias array is
+/// exactly what netty's `OpenSslKeyMaterialProvider` turns into
+/// `NO_CERTIFICATE_SET` / `Unable to find key material for auth method(s)`,
+/// and it is intermittent for the same reason every instance of this shape is:
+/// it needs a collection to land inside the loop.
+///
+/// `t27_tls::build_issuer_principals` has carried the rooted form since
+/// 2026-08-01; this is that form.
 fn materialize_string_array(ctx: &mut dyn NativeContext, items: &[String]) -> ObjectRef {
     let cls_id = ctx
         .ensure_class_initialized("java/lang/String")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, items.len());
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let arr = scope.new_ref_array(cls_id, items.len());
+    let arr_h = scope.root(arr);
     for (i, s) in items.iter().enumerate() {
-        let js = ctx.create_string(s);
-        ctx.set_array_element(arr, i, Value::Object(Some(js)));
+        let js = scope.create_string(s);
+        let arr = scope.get(&arr_h);
+        scope.set_array_element(arr, i, Value::Object(Some(js)));
     }
-    arr
+    scope.get(&arr_h)
 }
 
 // ---------------------------------------------------------------------------
@@ -5034,11 +5299,22 @@ fn kmf_engine_get_key_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let cls_id = ctx
         .ensure_class_initialized("javax/net/ssl/KeyManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, 1);
-    let km = try_alloc_concurrent_synthetic(ctx, mirror, 2)?;
-    set_km_id(ctx, km, id);
-    ctx.set_array_element(arr, 0, Value::Object(Some(km)));
-    Ok(Some(Value::Object(Some(arr))))
+    // GC NOTE: `try_alloc_concurrent_synthetic` allocates, so the array must be
+    // rooted across it — see `materialize_string_array`. A length-1 array is
+    // not exempt: the relocation moves the array, not the element count, and a
+    // `KeyManager[]` whose only slot reads back `null` is
+    // `getKeyManagers()[0]` throwing where the caller cannot see why.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let arr = scope.new_ref_array(cls_id, 1);
+    let arr_h = scope.root(arr);
+    let km = try_alloc_concurrent_synthetic(&mut *scope, mirror, 2)?;
+    let km_h = scope.root(km);
+    let km = scope.get(&km_h);
+    set_km_id(&mut *scope, km, id);
+    let km = scope.get(&km_h);
+    let arr = scope.get(&arr_h);
+    scope.set_array_element(arr, 0, Value::Object(Some(km)));
+    Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
 }
 
 fn tmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5076,9 +5352,15 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let cls_id = ctx
         .ensure_class_initialized("javax/net/ssl/TrustManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(cls_id, 1);
-    let tm = try_alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2)?;
-    set_tm_id(ctx, tm, id);
+    // GC NOTE: same rooting as `kmf_engine_get_key_managers` above.
+    let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+    let arr = scope.new_ref_array(cls_id, 1);
+    let arr_h = scope.root(arr);
+    let tm = try_alloc_concurrent_synthetic(&mut *scope, FQN_X509_TM, 2)?;
+    let tm_h = scope.root(tm);
+    let tm = scope.get(&tm_h);
+    set_tm_id(&mut *scope, tm, id);
+    let tm = scope.get(&tm_h);
     if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] tmf_engine_get_trust_managers stamped tm_ptr={:?} id={}",
@@ -5086,8 +5368,9 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
             id
         );
     }
-    ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
-    Ok(Some(Value::Object(Some(arr))))
+    let arr = scope.get(&arr_h);
+    scope.set_array_element(arr, 0, Value::Object(Some(tm)));
+    Ok(Some(Value::Object(Some(scope.get(&arr_h)))))
 }
 
 // ---------------------------------------------------------------------------
@@ -5385,7 +5668,7 @@ mod tests {
     }
 
     #[test]
-    fn server_cert_requires_eku_serverauth_when_eku_present() {
+    fn server_cert_prefers_eku_serverauth_when_eku_present() {
         let cert_ok = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
             not_after_utc: "300101000000Z",
@@ -5413,7 +5696,7 @@ mod tests {
     }
 
     #[test]
-    fn client_cert_requires_eku_clientauth_when_eku_present() {
+    fn client_cert_prefers_eku_clientauth_when_eku_present() {
         let cert_ok = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
             not_after_utc: "300101000000Z",
@@ -5441,7 +5724,7 @@ mod tests {
     }
 
     #[test]
-    fn cert_without_eku_is_acceptable_for_both_roles() {
+    fn cert_without_eku_is_preferred_for_both_roles() {
         let cert = mk_cert(&CertSpec {
             not_before_utc: "200101000000Z",
             not_after_utc: "300101000000Z",
@@ -5456,6 +5739,98 @@ mod tests {
         let p = parse_certificate(&cert).unwrap();
         assert!(is_server_cert(&p));
         assert!(is_client_cert(&p));
+    }
+
+    /// An EKU that names only `serverAuth` must still yield a CLIENT alias.
+    ///
+    /// `SunX509KeyManagerImpl` — the default `KeyManagerFactory` algorithm —
+    /// filters aliases on the key algorithm and the peer's issuer list only, so
+    /// on JDK 25 this exact certificate answers `chooseClientAlias(RSA)=key`.
+    /// Treating [`is_client_cert`] as an eligibility test instead of a
+    /// preference made `getClientAliases(RSA)` answer `[]` and
+    /// `chooseClientAlias(RSA)` answer `null`, so netty's OPENSSL client sent no
+    /// certificate at all and a `ClientAuth.REQUIRE` server closed the
+    /// handshake with `SSLV3_ALERT_HANDSHAKE_FAILURE` — 14 of the 17 residual
+    /// rows of `JdkDelegatingPrivateKeyMethodTest`, whose fixture builds
+    /// `.setKeyUsage(true, digitalSignature).addExtendedKeyUsageServerAuth()`
+    /// and then uses that one cert on BOTH sides.
+    #[test]
+    fn an_eku_mismatch_orders_an_alias_last_but_never_drops_it() {
+        let server_only = mk_cert(&CertSpec {
+            not_before_utc: "200101000000Z",
+            not_after_utc: "300101000000Z",
+            subject_cn: "serveronly.example",
+            issuer_cn: "serveronly.example",
+            spki_alg: OID_RSA,
+            key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+            ext_key_usages: &[OID_KP_SERVER_AUTH],
+            basic_constraints_ca: Some(false),
+            subject_alt_dns: &[],
+        });
+        let both = mk_cert(&CertSpec {
+            not_before_utc: "200101000000Z",
+            not_after_utc: "300101000000Z",
+            subject_cn: "both.example",
+            issuer_cn: "both.example",
+            spki_alg: OID_RSA,
+            key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+            ext_key_usages: &[OID_KP_SERVER_AUTH, OID_KP_CLIENT_AUTH],
+            basic_constraints_ca: Some(false),
+            subject_alt_dns: &[],
+        });
+
+        // A store holding ONLY the serverAuth-marked cert: the client list must
+        // still name it. This is the shape the netty fixture builds.
+        let mut only = crate::keystore::LoadedKeyStore::default();
+        only.entries.insert(
+            "key".to_string(),
+            crate::keystore::KeyStoreEntry {
+                alias: "key".to_string(),
+                creation_time_ms: 0,
+                kind: crate::keystore::EntryKind::PrivateKey {
+                    key_der: vec![0x30, 0x00],
+                    chain: vec![server_only.clone()],
+                },
+            },
+        );
+        let st = build_key_manager_state(crate::keystore::keystore_register(only));
+        assert_eq!(
+            st.client_aliases_by_key_type.get("RSA").map(Vec::as_slice),
+            Some(&["key".to_string()][..]),
+            "a serverAuth-only cert must still be offered as a client alias"
+        );
+        assert_eq!(
+            st.server_aliases_by_key_type.get("RSA").map(Vec::as_slice),
+            Some(&["key".to_string()][..])
+        );
+
+        // With BOTH in one store the properly-marked one must come first, so a
+        // caller taking `.first()` still prefers it.
+        let mut two = crate::keystore::LoadedKeyStore::default();
+        for (alias, der) in [("aserver", &server_only), ("zboth", &both)] {
+            two.entries.insert(
+                alias.to_string(),
+                crate::keystore::KeyStoreEntry {
+                    alias: alias.to_string(),
+                    creation_time_ms: 0,
+                    kind: crate::keystore::EntryKind::PrivateKey {
+                        key_der: vec![0x30, 0x00],
+                        chain: vec![der.clone()],
+                    },
+                },
+            );
+        }
+        let st2 = build_key_manager_state(crate::keystore::keystore_register(two));
+        let clients = st2
+            .client_aliases_by_key_type
+            .get("RSA")
+            .expect("both aliases are RSA");
+        assert_eq!(
+            clients.first().map(String::as_str),
+            Some("zboth"),
+            "the clientAuth-marked alias must be preferred: got {clients:?}"
+        );
+        assert_eq!(clients.len(), 2, "neither alias may be dropped: {clients:?}");
     }
 
     #[test]

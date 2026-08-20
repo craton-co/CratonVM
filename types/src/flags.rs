@@ -66,6 +66,24 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+
+/// FxHash-backed aliases for the two collections on the flag *read* path.
+///
+/// PERF (2026-08-18, commons-math `BigDecimalBench` profile): `runtime_var_os`
+/// consults `declared_flag_names()` on EVERY call, and with the default
+/// `RandomState` that is a SipHash of the key plus a `memcmp`. On a
+/// `BigDecimal` benchmark that showed up as `hash_one::<&str>` 1.70% +
+/// `sip::Hasher::write` 1.41% of the whole process — for looking up string
+/// constants in a set that never changes after startup.
+///
+/// This is the same trade this crate already made for `StringPool` (see the
+/// `rustc-hash` dependency note in Cargo.toml): FxHash is ~3-5x faster than
+/// SipHash on the short ASCII keys these hold, and neither collection is
+/// exposed to untrusted input — the flag-name set is built from a compile-time
+/// inventory, and `MapSource` from the process environment — so the HashDoS
+/// resistance SipHash buys is not load-bearing here.
+type FxHashSetStr = rustc_hash::FxHashSet<&'static str>;
+type FxHashMapStr = rustc_hash::FxHashMap<String, OsString>;
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -97,7 +115,7 @@ impl FlagSource for EnvSource {
 /// An explicit map, for tests and for launchers that layer `-XX:` flags over
 /// the environment.
 #[derive(Debug, Clone, Default)]
-pub struct MapSource(HashMap<String, OsString>);
+pub struct MapSource(FxHashMapStr);
 
 impl MapSource {
     /// Build from `(name, value)` pairs.
@@ -131,7 +149,7 @@ impl MapSource {
     /// not valid UTF-8 are dropped, which is not observable — every lookup is
     /// by `&str`, so such a name could never be matched anyway.
     pub fn from_process_env() -> Self {
-        let mut map: HashMap<String, OsString> = HashMap::new();
+        let mut map: FxHashMapStr = FxHashMapStr::default();
         for (name, value) in std::env::vars_os() {
             if let Ok(name) = name.into_string() {
                 map.entry(name).or_insert(value);
@@ -141,7 +159,7 @@ impl MapSource {
     }
 
     fn declared_snapshot(src: &dyn FlagSource) -> Self {
-        let mut map = HashMap::new();
+        let mut map = FxHashMapStr::default();
         for &name in declared_flag_names() {
             if let Some(value) = src.get(name) {
                 map.insert(name.to_string(), value);
@@ -731,6 +749,116 @@ pub struct GcFlags {
     /// memory outside the collection set, so it is the first thing to rule out
     /// if a pause is suspected of losing a live humongous object.
     pub g1_eager_humongous: bool,
+    /// `CRATONVM_G1_YOUNG_PAUSE_TARGET` — let `max_gc_pause_ms` bound the
+    /// YOUNG generation, not just the old half of a mixed collection set.
+    /// **Opt-in** ([`parse::present`]); see the measurement below for why it is
+    /// not a default.
+    ///
+    /// G1's whole proposition is a configurable pause goal, and until this flag
+    /// the goal reached exactly one decision: how many OLD regions a mixed
+    /// collection set may take. The young half was unbounded — the only thing
+    /// that ever asked for a young collection was `needs_gc`, which fires when
+    /// the FREE pool falls below ~25% of the heap. So Eden grows to roughly
+    /// three quarters of `-Xmx` before the first pause, and young pause time
+    /// scales with the heap SIZE rather than with the pause goal: raising
+    /// `-Xmx` makes every pause longer, which is the opposite of what a
+    /// pause-target collector is for.
+    ///
+    /// With it on, the collector also collects once the young region count
+    /// reaches an adaptive target, shrunk after any pause that overruns
+    /// `max_gc_pause_ms` and grown back while pauses stay under half of it. Two
+    /// rules keep it from acting on anything but evidence:
+    ///
+    /// * the target starts at its ceiling AND a target at the ceiling is not a
+    ///   trigger, so the cap does nothing at all until a productive pause has
+    ///   been measured to overrun the goal. (Starting at the ceiling alone was
+    ///   not enough and this doc claimed it was: the ceiling is 60% of the
+    ///   region count while the free-pool trigger waits for 75%, so on a heap
+    ///   with headroom the ceiling itself fired. Measured at `-Xmx2048m`: a
+    ///   210 ms pause manufactured in a run whose other arms took none.)
+    /// * an unproductive pause (nothing copied, nothing freed — e.g. everything
+    ///   pinned) resets the target to the ceiling, so the cap can never turn
+    ///   into a storm of pauses that cannot help.
+    ///
+    /// # Measured, 2026-08-18 — why this is opt-IN
+    ///
+    /// `probes/G1ChurnPauseProbe 96 900` under `-Xmx2048m` (96 MiB retained,
+    /// 3.6 GiB of garbage, 200 ms goal), 3 interleaved reps, medians, all three
+    /// arms from ONE binary except `base` which differs only in `gc/src/g1.rs`
+    /// and `gc/src/region.rs`:
+    ///
+    /// | arm                    | wall    | pauses | total pause | p50     | p99     |
+    /// |------------------------|---------|--------|-------------|---------|---------|
+    /// | pre-audit baseline     | 5773 ms | 3      | 3801 ms     | 1082 ms | 1726 ms |
+    /// | audit, this flag OFF   | 2633 ms | 3      |  719 ms     |  236 ms |  243 ms |
+    /// | audit, this flag ON    | 2744 ms | 4      |  814 ms     |  187 ms |  250 ms |
+    ///
+    /// The 7x pause reduction in that table belongs to the audit's scan and
+    /// scrub fixes, NOT to this flag — the middle row has it off. What the flag
+    /// itself buys is the third row against the second: p50 -21%, p99 **+3%**,
+    /// wall +4.2%, one extra pause.
+    ///
+    /// p99 is the quantity a pause GOAL is about, and it did not move. It
+    /// cannot, on an adaptive scheme: the target only tightens after a pause
+    /// has already overrun, so the first (largest) pause is always paid in
+    /// full and it is the one p99 reports. The flag delivers a real median
+    /// improvement and a real throughput cost, which is a trade a specific
+    /// latency-sensitive workload may well want — but it is not a default, and
+    /// nothing measured here says it should be one.
+    ///
+    /// Turn it on and measure YOUR pause distribution before keeping it.
+    pub g1_young_pause_target: bool,
+    /// `CRATONVM_G1_SCRUB_FREE` — zero a region's bytes when a collection
+    /// frees it. **Opt-in** ([`parse::present`]); off means the allocator's own
+    /// zeroing is relied on, which is where it always came from.
+    ///
+    /// G1 used to `fill(0)` every reclaimed region. That was the LARGEST single
+    /// phase of a young pause — 42% of a 330 ms pause on
+    /// `probes/G1ChurnPauseProbe 96 900` at `-Xmx2048m`, freeing 1.61 GB at
+    /// 11.9 GB/s, which is memset bandwidth and nothing else. It was also
+    /// entirely redundant: `G1Region::bump_alloc` zeroes exactly the range it
+    /// hands out (the TLAB zeroing contract that gives a fresh object its
+    /// default-zero fields), `alloc_humongous_locked` zeroes its whole span,
+    /// every object size is a multiple of 8 so no inter-object padding exists,
+    /// and no walker reads a `Free` region at all.
+    ///
+    /// `=1` restores the scrub. It is the first thing to try if a G1
+    /// heap-corruption investigation wants the old "a freed region reads as
+    /// zeros" world back — a use-after-free read is the one thing the scrub was
+    /// really buying — and it is what makes the change a single-binary A/B.
+    pub g1_scrub_free: bool,
+    /// `CRATONVM_G1_NARROW_FIXUP` — restrict G1's Phase-4 reference fix-up to
+    /// the regions that can actually need it, instead of every non-CSet region
+    /// in the heap. Default **ON** ([`parse::on_unless_zero`]); `=0` restores
+    /// the whole-heap walk.
+    ///
+    /// The walk is what makes a young pause O(LIVE HEAP) rather than O(young
+    /// live set) — the property G1's region design exists to buy. It visits
+    /// every object of every surviving region to rewrite forwarding pointers
+    /// and rebuild GC-internal remembered-set edges. Neither job needs the
+    /// whole heap: the rewrite is redundant with Phases 2 and 3 once every
+    /// mutator store reaches `post_write_barrier_rset` (true since defect G1-2
+    /// closed), and the rebuild only concerns regions this pause WROTE INTO.
+    /// See `G1Collector::phase4_regions_to_walk`.
+    ///
+    /// `=0` is the bisection lever, and the FIRST thing to try for any
+    /// suspected G1 dangling-reference or lost-edge defect: under it the
+    /// collector re-walks the whole heap every pause, which is the behaviour
+    /// every G1 result before 2026-08-18 was produced under.
+    pub g1_narrow_fixup: bool,
+    /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
+    /// every cross-region reference into a COLLECTABLE region is named in that
+    /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
+    /// bytes), never a shipping default.
+    ///
+    /// The complement of `verify_no_dangling_into_cset`, which asks "did this
+    /// pause leave a stale pointer?". This asks "will the NEXT pause know where
+    /// to look?" — a missing edge means the pause that collects the target
+    /// never scans the holder and frees a live object. It exists because the
+    /// unit suite cannot discriminate a correct Phase-4 narrowing from one that
+    /// walks nothing: on every constructible fixture the mutator barrier alone
+    /// already records every edge.
+    pub g1_dbg_rset: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
     /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
@@ -883,6 +1011,15 @@ pub struct GcFlags {
     /// see fixed-suite-bugs/
     /// g1-native-alloc-no-safepoint-oom-FIXED.md.
     pub g1_dbg_diag: bool,
+    /// `CRATONVM_DBG_G1ACCESSOR` — at VM exit, print how many of this
+    /// collector's field/array accessor calls had to take the global `regions`
+    /// lock, and how many answered from `may_be_humongous` without it.
+    ///
+    /// The load-independent half of the accessor-lock measurement: absolute
+    /// wall time on a shared box is worth a factor of several, but "1 lock
+    /// acquisition per store" versus "0" is a structural fact that no
+    /// concurrent build can move. See `G1Collector::may_be_humongous`.
+    pub g1_dbg_accessor: bool,
     /// `CRATONVM_G1_DBG_PINS`
     pub g1_dbg_pins: bool,
     /// `CRATONVM_G1_DBG_REACH`
@@ -923,6 +1060,10 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
+            g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
+            g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
+            g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
+            g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
@@ -985,6 +1126,7 @@ impl GcFlags {
             no_oldgen_coalesce: present(src, "CRATONVM_NO_OLDGEN_COALESCE"),
             g1_dbg_headers: present(src, "CRATONVM_G1_DBG_HEADERS"),
             g1_dbg_diag: present(src, "CRATONVM_DBG_G1DIAG"),
+            g1_dbg_accessor: present(src, "CRATONVM_DBG_G1ACCESSOR"),
             g1_dbg_pins: present(src, "CRATONVM_G1_DBG_PINS"),
             g1_dbg_reach: present(src, "CRATONVM_G1_DBG_REACH"),
             g1_dbg_rootcensus: present(src, "CRATONVM_G1_DBG_ROOTCENSUS"),
@@ -1785,6 +1927,21 @@ pub struct NativeFlags {
     /// `CRATONVM_SYNTHETIC_VERTX`
     pub synthetic_vertx: bool,
 
+    /// `CRATONVM_TLS_OPENSSL_CLIENT` — back the default `SSLSocket` client
+    /// path with a raw `openssl::SslConnector` instead of
+    /// `native_tls::TlsConnector`. **Default ON** on Unix (no effect
+    /// elsewhere — `openssl` is a Unix-only dependency); `0` turns it off.
+    /// [`parse::on_unless_zero`].
+    ///
+    /// The kill switch exists so the two can be A/B'd in ONE binary. What
+    /// only the raw connector can do: hand out the peer's FULL certificate
+    /// chain (`SSL_get_peer_cert_chain`, which native-tls 0.2 does not
+    /// expose — it has `peer_certificate()` and nothing else), and set the
+    /// certificate security level. Both are load-bearing: an application
+    /// TrustManager cannot build a path from a one-element chain, and
+    /// OpenSSL's default security level of 2 is stricter than the JDK's own
+    /// 1024-bit floor.
+    pub tls_openssl_client: bool,
     /// `CRATONVM_TRACE_ARRAYS_HASHCODE`
     pub trace_arrays_hashcode: bool,
 
@@ -1975,6 +2132,7 @@ impl NativeFlags {
             synthetic_quarkus_start: present(src, "CRATONVM_SYNTHETIC_QUARKUS_START"),
             synthetic_rsa: present(src, "CRATONVM_SYNTHETIC_RSA"),
             synthetic_vertx: present(src, "CRATONVM_SYNTHETIC_VERTX"),
+            tls_openssl_client: on_unless_zero(src, "CRATONVM_TLS_OPENSSL_CLIENT"),
             trace_arrays_hashcode: present(src, "CRATONVM_TRACE_ARRAYS_HASHCODE"),
             trace_classvalue: present(src, "CRATONVM_TRACE_CLASSVALUE"),
             trace_pti_args: present(src, "CRATONVM_TRACE_PTI_ARGS"),
@@ -2112,10 +2270,10 @@ impl VmFlags {
 
 static FLAGS: OnceLock<VmFlags> = OnceLock::new();
 
-fn declared_flag_names() -> &'static HashSet<&'static str> {
-    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+fn declared_flag_names() -> &'static FxHashSetStr {
+    static NAMES: OnceLock<FxHashSetStr> = OnceLock::new();
     NAMES.get_or_init(|| {
-        let mut names = HashSet::new();
+        let mut names = FxHashSetStr::default();
         for entry in crate::flag_groups::INVENTORY {
             if let Some(name) = entry.on_key {
                 names.insert(name);
@@ -2480,12 +2638,61 @@ pub fn runtime_var<K: AsRef<OsStr>>(key: K) -> Result<String, std::env::VarError
 #[inline]
 pub fn runtime_var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
     let key = key.as_ref();
+    // Per-name read census (`CRATONVM_DBG_FLAGREADS=1`). Kept because it is the
+    // instrument that found the `CRATONVM_DBG_COMPACT_INLINE` read in
+    // `jit_getfield` — `perf` put `runtime_var_os` at 1.21% of a `BigDecimal`
+    // benchmark, but inlining defeated stack attribution and a dwarf capture
+    // pointed at the callee side of the JIT->heap boundary. The KEY names the
+    // caller directly, and did so in one run. Off, it is one relaxed atomic load.
+    flag_read_census(key);
     if let Some(name) = key.to_str() {
         if declared_flag_names().contains(name) {
             return flags().legacy_var_os(name);
         }
     }
     std::env::var_os(key)
+}
+
+/// Per-flag-name read census — see the call in [`runtime_var_os`].
+///
+/// `CRATONVM_DBG_FLAGREADS=1` prints the top offenders every 200k reads. A flag
+/// read is supposed to be rare (every gate is expected to cache its answer), so
+/// a name appearing here in the millions IS the bug — which is exactly how
+/// `CRATONVM_DBG_COMPACT_INLINE` was found at 4,560,891 of 4,600,000 reads
+/// (99.1%) on a 50k-iteration `BigDecimal` run, uncached inside `jit_getfield`.
+/// After that fix the same run does not reach the first 200k report at all.
+fn flag_read_census(key: &OsStr) {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on
+    let gate = match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            // std::env directly: reading through this module would recurse.
+            let on = std::env::var_os("CRATONVM_DBG_FLAGREADS").is_some();
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    };
+    if !gate {
+        return;
+    }
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static COUNTS: OnceLock<std::sync::Mutex<HashMap<String, u64>>> = OnceLock::new();
+    let map = COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let name = key.to_string_lossy().into_owned();
+    let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(mut g) = map.lock() {
+        *g.entry(name).or_insert(0) += 1;
+        if n % 200_000 == 0 {
+            let mut v: Vec<(String, u64)> = g.iter().map(|(k, c)| (k.clone(), *c)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!("[flagreads] total={n}");
+            for (k, c) in v.iter().take(8) {
+                eprintln!("[flagreads]   {c:>10}  {k}");
+            }
+        }
+    }
 }
 
 /// Publish an explicitly-built configuration.

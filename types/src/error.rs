@@ -185,6 +185,46 @@ const REMEDIATION_FALLBACK: &str =
 const REMEDIATION_CAPTURE: &str =
     "capture the full machine-readable report with --jdk-only-report <FILE>";
 
+/// The one `native_kind` spelling on a
+/// [`JdkOnlyViolation::NativeShadowsBytecode`] row that means **the native
+/// won** — it dispatched in front of real class bytes and the bytecode never
+/// ran.
+///
+/// # Why this constant is here and not in `vm`
+///
+/// It was in `vm/src/vm/vm_exec.rs` (`JDK_ONLY_SHADOW_UNENFORCED_TAG`, which now
+/// aliases this), and being there is what let the report ship a row whose
+/// human-readable text said the opposite of what the row meant. `types` owns
+/// `summary()`, `detail()` and `to_json()` for this variant, so `types` is where
+/// the outcome has to be decidable — otherwise every consumer re-derives it, and
+/// the first one to get it wrong does so silently.
+///
+/// # The reading this exists to make impossible
+///
+/// `jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`
+/// §1 split one `RJdkReflBox` census into
+/// `58 bridge-ran-over-bytecode` and `21 bridge`, and glossed the second group
+/// as *"registered over bytecode; not observed running"* — then nominated all 21
+/// for measurement as *"neither safe nor unsafe today — they are unmeasured"*.
+/// The 21 are the opposite of unmeasured: each one is a triple where strict mode
+/// sent a dispatch to the REAL bytecode and the bridge lost, recorded from the
+/// yield path itself. The row said `bridge` because that is
+/// `NativeKind::as_str()`, and nothing in the row said which side won.
+///
+/// So the tag is a discriminator, not a kind, and it is the ONLY one: every
+/// other spelling (`bridge`, `synthetic-stub`, `jit-thin-direct-helper`) is
+/// recorded where the native yielded. See [`JdkOnlyViolation::shadow_outcome`].
+pub const NATIVE_SHADOW_RAN_TAG: &str = "bridge-ran-over-bytecode";
+
+/// `"outcome"` for a row where the registered native ran and the real bytes did
+/// not — the §1.4 violation that actually took effect.
+pub const SHADOW_OUTCOME_NATIVE_WON: &str = "native-won";
+
+/// `"outcome"` for a row where the registered native lost to the real bytes —
+/// §1.4 enforced. Still a mis-tagged registration worth removing, and **not** a
+/// behavioural defect in this run.
+pub const SHADOW_OUTCOME_BYTECODE_WON: &str = "bytecode-won";
+
 /// A JDK-only policy violation. All fields are owned/plain so `types` needs no
 /// dependency on `native-api` or `classloading` — `NativeKind` and
 /// `ClassOrigin` are carried as their own `as_str()` spellings, never as the
@@ -228,12 +268,22 @@ pub enum JdkOnlyViolation {
     },
     /// A registered native stood in front of concrete Java bytecode for the
     /// same method, and is not a reviewed intrinsic (§1.4).
+    ///
+    /// **One variant, two OPPOSITE outcomes**, and [`native_shadow_outcome`] is
+    /// the only thing that tells them apart. Every producer records the same
+    /// §1.4 shape, but three of the four record it on the *yield* path — the
+    /// native lost and the real bytes ran — while one records it on the path
+    /// where the native WON. Read [`Self::shadow_outcome`] before drawing any
+    /// conclusion from a row of this kind; the field below cannot be read as a
+    /// kind alone.
     NativeShadowsBytecode {
         class: String,
         method: String,
         descriptor: String,
         /// `NativeKind::as_str()`, or the VM mechanism when the reporting crate
-        /// cannot see that enum (the JIT's thin direct helpers).
+        /// cannot see that enum (the JIT's thin direct helpers) — plus the one
+        /// value that is neither, [`NATIVE_SHADOW_RAN_TAG`], which is how the
+        /// "the native won" outcome is spelled.
         native_kind: &'static str,
     },
     /// A boot class was not present in the real runtime image (§1.1).
@@ -265,6 +315,36 @@ impl JdkOnlyViolation {
             JdkOnlyViolation::NativeShadowsBytecode { .. } => "native-shadows-bytecode",
             JdkOnlyViolation::MissingBootClass { .. } => "missing-boot-class",
             JdkOnlyViolation::MissingImplementation { .. } => "missing-implementation",
+        }
+    }
+
+    /// Which side of §1.4 actually ran, for the one variant where that is a
+    /// question — `None` for every other variant.
+    ///
+    /// [`SHADOW_OUTCOME_NATIVE_WON`] is the violation that took effect;
+    /// [`SHADOW_OUTCOME_BYTECODE_WON`] is §1.4 being enforced, recorded because
+    /// the registration is still over-tagged and worth removing. **Both wear
+    /// `kind() == "native-shadows-bytecode"`**, which is why a consumer that
+    /// tallies by `kind()` alone — `difftest/src/census.rs` does — is counting
+    /// two opposite facts as one, and why this accessor exists rather than a
+    /// comment telling readers to compare strings themselves.
+    ///
+    /// The discriminator is [`NATIVE_SHADOW_RAN_TAG`], and the polarity is
+    /// deliberate: the "native won" spelling is a single closed value, so a NEW
+    /// producer that forgets about outcomes is classified `bytecode-won` — the
+    /// reading that under-states a violation rather than inventing one. A new
+    /// native-won producer must therefore say so explicitly, which is the whole
+    /// point.
+    pub fn shadow_outcome(&self) -> Option<&'static str> {
+        match self {
+            JdkOnlyViolation::NativeShadowsBytecode { native_kind, .. } => {
+                Some(if *native_kind == NATIVE_SHADOW_RAN_TAG {
+                    SHADOW_OUTCOME_NATIVE_WON
+                } else {
+                    SHADOW_OUTCOME_BYTECODE_WON
+                })
+            }
+            _ => None,
         }
     }
 
@@ -343,9 +423,22 @@ impl JdkOnlyViolation {
             JdkOnlyViolation::MissingNative { .. } => {
                 "the method is ACC_NATIVE and no bridge or reviewed intrinsic is bound".to_string()
             }
+            // Two outcomes, two sentences. This line used to end "concrete
+            // bytecode wins under --jdk-only" for BOTH, which is the promise
+            // §1.4 makes and not what happened on the rows tagged
+            // `NATIVE_SHADOW_RAN_TAG` — there the native won and the real bytes
+            // never ran. A `reason` that states policy where it should state
+            // measurement is how a report gets read backwards.
+            JdkOnlyViolation::NativeShadowsBytecode { native_kind, .. }
+                if *native_kind == NATIVE_SHADOW_RAN_TAG =>
+            {
+                "a registered bridge stood in front of the real class bytes and RAN; \
+                 §1.4 was observed but not enforced for this dispatch"
+                    .to_string()
+            }
             JdkOnlyViolation::NativeShadowsBytecode { native_kind, .. } => format!(
                 "a registered {native_kind} native stands in front of the real class \
-                 bytes; concrete bytecode wins under --jdk-only"
+                 bytes; concrete bytecode won this dispatch under --jdk-only"
             ),
             JdkOnlyViolation::MissingBootClass { searched_image, .. } => {
                 format!("no real class bytes for this boot class in {searched_image}")
@@ -372,6 +465,22 @@ impl JdkOnlyViolation {
             }
             JdkOnlyViolation::MissingNative { .. } => {
                 &["implement the method as a NativeKind::Bridge and register it at VM init"]
+            }
+            // The native-won rows need the extra line, and it is not advice:
+            // retirement through `native-api`'s `retired_shadow` table is the
+            // mechanism that already exists for exactly this, and a reader who
+            // does not know that reaches for a dispatch-time allow-list instead
+            // — which AGENTS.md forbids and which this tree has several
+            // disagreeing copies of already.
+            JdkOnlyViolation::NativeShadowsBytecode { native_kind, .. }
+                if *native_kind == NATIVE_SHADOW_RAN_TAG =>
+            {
+                &[
+                    "unregister the native, or have it reviewed and reclassified as an Intrinsic",
+                    "to retire it for strict mode only, add the triple to \
+                     native-api's retired_shadow table — do not add a dispatch-time \
+                     class-name allow-list",
+                ]
             }
             JdkOnlyViolation::NativeShadowsBytecode { .. } => {
                 &["unregister the native, or have it reviewed and reclassified as an Intrinsic"]
@@ -416,12 +525,23 @@ impl JdkOnlyViolation {
                 descriptor,
                 ..
             } => format!("no native bound for {class}.{method}{descriptor}"),
+            // The outcome is APPENDED rather than woven in, on purpose: the
+            // leading `"{native_kind} native shadows bytecode of {triple}"` is
+            // what every existing grep, log-scrape and sort key in the tree
+            // matches on, and this is a summary line, not a place to break them.
+            // What it adds is the half a reader cannot otherwise get — G60-1 §1
+            // read 21 of these rows as "not observed running" when each one is a
+            // recorded dispatch that went to the real bytes.
             JdkOnlyViolation::NativeShadowsBytecode {
                 class,
                 method,
                 descriptor,
                 native_kind,
-            } => format!("{native_kind} native shadows bytecode of {class}.{method}{descriptor}"),
+            } => format!(
+                "{native_kind} native shadows bytecode of {class}.{method}{descriptor} \
+                 [{}]",
+                self.shadow_outcome().unwrap_or(SHADOW_OUTCOME_BYTECODE_WON)
+            ),
             JdkOnlyViolation::MissingBootClass {
                 class,
                 searched_image,
@@ -634,6 +754,19 @@ impl JdkOnlyViolation {
                     Some(descriptor.as_str()),
                 );
                 json_field(&mut out, &mut first, "native_kind", Some(*native_kind));
+                // The field a machine consumer needs and could not compute:
+                // `native_kind` is a kind on three of the four producers and a
+                // discriminator on the fourth, so deriving the outcome from it
+                // means hard-coding `NATIVE_SHADOW_RAN_TAG` in every reader.
+                // Emitted for every row of this kind, never conditionally — an
+                // absent `outcome` would be indistinguishable from
+                // `bytecode-won`, which is the direction that hides a violation.
+                json_field(
+                    &mut out,
+                    &mut first,
+                    "outcome",
+                    self.shadow_outcome(),
+                );
             }
             JdkOnlyViolation::MissingBootClass {
                 class,
@@ -1626,7 +1759,22 @@ impl RuntimeError {
                 ("java/util/ConcurrentModificationException", None)
             }
             RuntimeError::NoSuchElementException { message } => {
-                ("java/util/NoSuchElementException", Some(message.as_str()))
+                // An EMPTY message means "no message", i.e. the no-arg
+                // constructor and a null `getMessage()` -- not the (String)
+                // constructor with "". HotSpot's own `Vector.firstElement()`,
+                // `lastElement()` and the ArrayDeque/TreeMap family throw with
+                // NO message (MEASURED 2026-08-13, scratchpad/orch/V2.java:
+                // `NoSuchElementException: null`), and six sites in this tree
+                // already pass `String::new()` intending exactly that. The
+                // variant carries a non-optional String, so this is where the
+                // distinction has to be made; converting all 83 construction
+                // sites to Option<String> is the wider change it does not
+                // need.
+                if message.is_empty() {
+                    ("java/util/NoSuchElementException", None)
+                } else {
+                    ("java/util/NoSuchElementException", Some(message.as_str()))
+                }
             }
             // `None`, like `ConcurrentModificationException` above: the real
             // class has a no-arg constructor only.

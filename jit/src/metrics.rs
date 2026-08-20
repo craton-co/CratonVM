@@ -1376,7 +1376,7 @@ pub fn clear_reports() {
 ///
 /// Same shape as [`SCHEDULING_EVENTS`]: a closed set, a fixed array of relaxed
 /// counters, no allocation and no initialization order.
-pub const OSR_EVENTS: [&str; 12] = [
+pub const OSR_EVENTS: [&str; 13] = [
     // An OSR entry was actually taken: the trampoline ran and control reached
     // compiled code at a back edge. The denominator for everything below.
     "osr_entered",
@@ -1447,10 +1447,28 @@ pub const OSR_EVENTS: [&str; 12] = [
     "osr_published_but_unenterable",
     // The method is on the OSR-denied list, so no back edge in it will enter.
     "osr_method_denied",
+    // An exception raised inside an OSR'd body was routed through that method's
+    // OWN exception table and the live frame was parked at the handler — the
+    // thing RBC.6b refused to allow at all until 2026-08-17.
+    //
+    // This is the engagement counter for the lift, and it is the row to read
+    // when a `try`/`catch` loop is "still slow". `osr_entered` climbing with
+    // this at zero means the loop's `catch` never fires (so the lift is not
+    // what is costing you); this climbing means it fires, and each one is an
+    // OSR exit plus a re-entry at the next back edge.
+    //
+    // It also names the shape that ate the lift once already: each of these
+    // used to be charged to the per-pc rejection budget
+    // (`Frame::record_osr_rejection`), which retires OSR after
+    // `OSR_MAX_ATTEMPTS = 5`. A loop with netty's 7.7% throw rate therefore ran
+    // compiled for about sixty-five of four billion iterations while passing
+    // every correctness probe.
+    "osr_exception_handler_entered",
 ];
 
 /// One relaxed counter per [`OSR_EVENTS`] entry.
 static OSR_COUNTERS: [AtomicU64; OSR_EVENTS.len()] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -2695,4 +2713,164 @@ mod tests {
         assert_eq!(n.json(), "null");
         assert_eq!(Measured::<u32>::default(), Measured::NotMeasured);
     }
+}
+
+/// Which emission arm produced each `jit_getfield` CALL.
+///
+/// The runtime helper counter says compiled code called the helper 49 M times;
+/// the collector A/B and the compile-time layout census both came back negative,
+/// and a receiver dump showed the failing receivers were INSIDE the published
+/// bounds on Generational — i.e. they should have passed the inline guard. That
+/// leaves only "a different arm emitted the CALL", and there are six of them.
+/// This names the one, at COMPILE time, instead of another round of inference.
+///
+/// Index: 0 = single-pass inlined-callee, 1 = single-pass compact-inline slow
+/// path, 2 = single-pass legacy-inline slow path, 3 = single-pass
+/// resolved-but-inline-disabled, 4 = single-pass unresolved, 5 = IR tier
+/// helper fallback.
+pub static GETFIELD_ARM_EMITS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// What the spliced-call emitter actually EMITTED, per arm.
+///
+/// A feature that reports itself on while emitting nothing is the failure mode
+/// this whole line of work keeps running into: `nest` and `devirt` measured
+/// within noise of each other, and without these there is no way to tell "the
+/// devirtualised splice did not help" from "the devirtualised splice never
+/// fired". Index-parallel with [`INLINE_CALL_ARM_NAMES`].
+pub static INLINE_CALL_ARM_EMITS: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`INLINE_CALL_ARM_EMITS`], index-parallel.
+pub const INLINE_CALL_ARM_NAMES: [&str; 7] = [
+    // A call inside a spliced body, emitted as a raw CALL to a compiled entry.
+    "spliced-call-direct",
+    // The same, emitted through the blind `jit_invoke_dispatch` helper. Should
+    // be 0 unless `CRATONVM_JIT_INLINE_CALL_DISPATCH` is on.
+    "spliced-call-dispatch",
+    // A statically bound call replaced by the callee's own body.
+    "nested-splice",
+    // A virtual/interface call replaced by a body behind a receiver class-id
+    // guard. This is the devirtualisation counter.
+    "nested-splice-guarded",
+    // A guarded splice that was PLANNED and then refused at emission — the
+    // number that distinguishes "did not help" from "could not be emitted".
+    "nested-splice-guarded-refused",
+    // A statically bound nested splice that was PLANNED and bailed during
+    // emission. The counter set shipped without this, which is why a run
+    // showing `nested-splice=0` could not distinguish "no nested site was ever
+    // planned" from "every one of them was planned and then rolled back".
+    "nested-splice-refused",
+    // An OUTER splice that the planner admitted and the emitter rolled back.
+    // Everything nested inside it dies with it, so a zero in every nested arm
+    // means nothing until this number is known.
+    "outer-splice-rolled-back",
+];
+
+/// Record that the spliced-call emitter took arm `arm`.
+#[inline]
+pub fn note_inline_call_arm(arm: usize) {
+    if let Some(slot) = INLINE_CALL_ARM_EMITS.get(arm) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Names for [`GETFIELD_ARM_EMITS`], index-parallel.
+pub const GETFIELD_ARM_NAMES: [&str; 6] = [
+    "sp-inlined-callee",
+    "sp-compact-inline-slowpath",
+    "sp-legacy-inline-slowpath",
+    "sp-resolved-inline-disabled",
+    "sp-unresolved",
+    "ir-helper-fallback",
+];
+
+/// Record that emission arm `arm` emitted a `jit_getfield` CALL site.
+#[inline]
+pub fn note_getfield_arm(arm: usize) {
+    if let Some(c) = GETFIELD_ARM_EMITS.get(arm) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for every spliced-call arm, INCLUDING the zeros.
+///
+/// Unfiltered on purpose, unlike `getfield_arm_emits`: a zero is the answer
+/// here. "devirt measured the same as nest" and "devirt never fired" are
+/// different findings, and only an explicit `nested-splice-guarded=0` tells
+/// them apart.
+pub fn inline_call_arm_emits() -> Vec<(&'static str, u64)> {
+    INLINE_CALL_ARM_NAMES
+        .iter()
+        .zip(INLINE_CALL_ARM_EMITS.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .collect()
+}
+
+/// `(name, count)` for every arm that emitted at least one CALL site.
+pub fn getfield_arm_emits() -> Vec<(&'static str, u64)> {
+    GETFIELD_ARM_NAMES
+        .iter()
+        .zip(GETFIELD_ARM_EMITS.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
+}
+
+/// Why the IR tier declined to inline a `getfield`, by early-out.
+///
+/// The tier A/B (C2 threshold raised out of reach) moved helper calls
+/// 48.9 M -> 5.7 M, so ~88% of them are this function's `return false`
+/// fallback, which emits an UNGUARDED `CALL jit_getfield`. It has seven
+/// early-outs; this says which.
+pub static IR_GETFIELD_DECLINE: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Names for [`IR_GETFIELD_DECLINE`], index-parallel.
+pub const IR_GETFIELD_DECLINE_NAMES: [&str; 7] = [
+    "no-helper-addr",
+    "no-bytecode-pc",
+    "no-compact-slot-for-pc",
+    "narrow-oops-or-zgc-barrier",
+    "inline-gates-off",
+    "type-tag-disagrees",
+    "width-not-int-category",
+];
+
+/// Record an IR-tier inline-`getfield` refusal.
+#[inline]
+pub fn note_ir_getfield_decline(reason: usize) {
+    if let Some(c) = IR_GETFIELD_DECLINE.get(reason) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for every refusal reason that fired.
+pub fn ir_getfield_declines() -> Vec<(&'static str, u64)> {
+    IR_GETFIELD_DECLINE_NAMES
+        .iter()
+        .zip(IR_GETFIELD_DECLINE.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|(_, v)| *v > 0)
+        .collect()
 }

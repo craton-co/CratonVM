@@ -124,6 +124,7 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 | `jit/src/lib.rs` `AtomicIntFieldLayout::new` (new 2026-08-12) | `(HEADER_SIZE + body_off) as i32` — compact `AtomicInteger.value` **payload** address | disp32 |
 | `jit/src/lib.rs` `AtomicIntFieldLayout::new` (new 2026-08-12) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32 + FIELD_CELL_PAYLOAD32_OFFSET` — legacy `AtomicInteger.value` cell | disp32 |
 | `jit/src/ir_lower.rs` `emit_inline_getstatic` (new 2026-08-03, cov-01) | direct `getstatic`: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET` from the class's statics-block base | disp32 |
+| `jit/src/ir_lower.rs` `emit_inline_compact_getfield`, LEGACY branch (new 2026-08-18) | `HEADER_SIZE + field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET` — the uniform 16-byte `Value` cell, four emitted forms (ref / `J`\|`D` qword, `F` zero-extending dword, int-category `MOVSXD`) | disp32 |
 
 **2026-08-03, COV-02** (`docs/internal/cov-02-array-element-access-RETIRED-20260803.md`)
 added three more `ir_lower.rs` sites, all **disp8**, all checked by
