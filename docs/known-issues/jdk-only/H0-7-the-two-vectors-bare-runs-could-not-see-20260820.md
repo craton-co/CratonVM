@@ -1,4 +1,6 @@
-# H0-7 — the two vectors bare runs could not see, and a time-zone registry nobody had in the blast radius
+# H0-7 — the two vectors bare runs could not see, and how far the `HashMap` defect reaches
+
+*(Title corrected after §7. It first read "…and a time-zone registry nobody had in the blast radius", which §7 disproves. §3's wrong sentence is left standing per convention, but a TITLE is what the index and every citation carry, so a wrong one propagates rather than sits still.)*
 
 **Status: OPEN — MEASURED.** Five runs of `regression-suite/run.sh` with
 `ONLY="RJdkModule RJdkLogging"` on `C:/craton/target-jdkonly-h2/release/cratonvm.exe`

@@ -733,3 +733,44 @@ the real field the whole time. **A constant named after a fabricated layout is
 not evidence that the layout is fabricated** — and this one had a comment header
 saying `HashSet — field 0 = Object (backing HashMap)`, which reads as synthetic
 and is a correct description of the real class.
+
+---
+
+## INDEPENDENT VERIFICATION (lane H0, 2026-08-20, on the PRISTINE binary)
+
+`H9`'s central defect claim is **CONFIRMED**, and confirmed *before* its fix was
+built — `C:/craton/target-jdkonly-h2/release/cratonvm.exe` at `fe59bf9d9`, which
+does not contain commit `11798a8a2`.
+
+Five ways of populating a `HashSet`, `remove("b")` on each, oracle
+HotSpot 25.0.3+9:
+
+| population shape | HotSpot | CratonVM `--jdk-only` unarmed | CratonVM `--jdk-only` **armed** `java/util/HashSet` |
+|---|---|---|---|
+| `new HashSet<>(Arrays.asList(…))` | `true` | `true` | **`false`** |
+| `Collectors.toSet()` | `true` | `true` | **`false`** |
+| `new HashSet<>(Set.of(…))` | `true` | `true` | `true` |
+| `map.keySet()` | `true` | `true` | `true` |
+| `Collectors.toCollection(HashSet::new)` | `true` | `true` | `true` |
+
+**In both failing rows the size still goes `4 -> 3` and `contains("b")` is
+`false`.** The element *is* removed and the method reports that it was not —
+exactly the identity-test failure `H9` describes, since real
+`HashSet.remove` is `map.remove(o) == PRESENT`.
+
+**Two refinements to the record above, both from these runs:**
+
+1. **It is 2 of 5 shapes, not all of them.** `Set.of`-copy, `keySet()` and
+   `toCollection(HashSet::new)` already write a marker real bytecode accepts. So
+   the six population sites `H9` patched are **not uniformly wrong today**, and
+   whichever sites back those three were already correct. Anyone re-verifying
+   the fix should expect movement in two rows, not five.
+2. **The defect is invisible without the dial.** The unarmed column is fully
+   correct, because the VM's own reader infers membership from "was the previous
+   value null" and is self-consistent with its own wrong marker. This is a
+   textbook instance of the standing trap: *a green arm is evidence about the
+   question it asked.* The unarmed 104/104 asked nothing about this.
+
+**Not verified here:** `H9`'s predicted post-fix result (103/104 armed), which
+needs the build; its O1/O2/O3 out-of-file claims; and its `RMapGcStress`
+mechanism. Those are the merging lane's job and are tracked separately.
