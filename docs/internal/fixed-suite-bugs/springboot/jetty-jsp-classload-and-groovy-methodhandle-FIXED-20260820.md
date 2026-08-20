@@ -172,9 +172,36 @@ never fills.
 **Fix** (`8c350a300`): `native_hs_remove_if`, registered on the whole family,
 deleting through `native_hs_remove` so a removal reaches the backing map.
 
+## 4. What the rest of that gate list was hiding
+
+"A gate entry is not a registration" is a checkable claim, so the remaining
+gated methods were swept against every carrier the gate names. One more was
+in the same state, and it was not a Spring Boot problem at all:
+
+```
+NullPointerException: Cannot invoke
+  "java.util.TreeMap$NavigableSubMap.keySpliterator()" because "sm" is null
+```
+
+`java/util/TreeSet` and `java/util/TreeMap$KeySet` both **declare**
+`spliterator()`, both are named in a gate for it, and neither had a native —
+so `treeSet.spliterator()` and `treeMap.keySet().spliterator()` threw for
+every caller, unconditionally, while HotSpot answers the elements. `stream()`
+has carried an override for this exact reason since the Keycloak
+`FeatureOptions.<clinit>` fix; `spliterator()` never got one.
+
+**Fix** (`1c244f0b4`): `native_ts_spliterator` takes the same sorted snapshot
+`native_ts_stream` takes and returns it in the three-field synthetic
+`java/util/Spliterator` shape `native_hs_spliterator` already produces, so the
+existing stream pipeline consumes it unchanged.
+
+Nothing in the 17 classes above depended on it — this one is here because the
+sweep was cheap and the next page would otherwise have had to find it the
+expensive way.
+
 ## Regression tests
 
-Two new integration tests, both self-checking (no HotSpot arm, and neither can
+Three new integration tests, all self-checking (no HotSpot arm, and none can
 pass vacuously — a VM that iterates nothing reports mismatched lengths rather
 than agreement):
 
@@ -189,6 +216,14 @@ than agreement):
   time so a view that "removed" from a detached snapshot fails too, plus the
   no-match case (must return `false`, change nothing). The pre-fix binary dies
   on the first row.
+* `vm/tests/collection_view_gated_surface.rs` →
+  `cratonvm/CollectionViewGatedSurfaceProbe` — the whole gated surface
+  (`spliterator`, `stream`, `removeIf`, `toArray(T[])`, `forEach`,
+  `containsAll`, `equals`, `hashCode`) on every carrier the gate names. Both
+  defects here were the same shape and in both cases only the ONE carrier that
+  declares the method noticed, the rest inheriting a `Collection` default that
+  happens to work — that is luck, not design, so the test is the sweep and not
+  the two rows that broke.
 
 ## Verification
 
