@@ -3106,6 +3106,38 @@ impl SharedVm {
                     // Iterator-based copy using virtual dispatch on the
                     // receiver's actual class.
                     //
+                    // Every call below goes through `invoke_virtual`, which
+                    // dispatches on the RECEIVER. The by-name `ctx.invoke(
+                    // <class>, ...)` this used to call resolves against the
+                    // named class's own bytecode and never consults
+                    // `should_force_registered_native_over_bytecode` — the gate
+                    // that exists precisely because a CratonVM-minted
+                    // `HashMap$KeyIterator` / `LinkedHashMap$LinkedKeyIterator`
+                    // carries its snapshot PAST the fields the real
+                    // `HashIterator` bytecode walks (`key_itr_base`), so the
+                    // real `hasNext()` reads an unset `next` field and answers
+                    // `false` on the FIRST element. The loop then broke at
+                    // i = 0 and every slot of the freshly allocated result
+                    // stayed null while `size()` had already fixed the length —
+                    // a right-length, all-null array, which is the single
+                    // hardest shape for a caller to notice.
+                    //
+                    // That is the whole of the Jetty embedded-JSP failure:
+                    // `ClassMatcher extends AbstractSet<String>` with
+                    // `iterator()` = `_entries.keySet().iterator()`, so
+                    // `ClassMatcher.getPatterns()` (`toArray(new String[size])`)
+                    // handed Jetty `[null]`. An all-null pattern set makes
+                    // `IncludeExcludeSet` answer "empty", and an EMPTY
+                    // hidden-class matcher matches EVERYTHING
+                    // (`ClassMatcher.combine`: empty patterns fall through to
+                    // the empty location set, whose `test` is vacuously true).
+                    // `WebAppClassLoader.loadClass` therefore discarded the
+                    // `org.apache.jasper.servlet.JspServlet` its parent had just
+                    // resolved, as "hidden", and threw
+                    // `ClassNotFoundException` from line 540 with no cause —
+                    // surfacing as `UnavailableException: Class loading error
+                    // for holder jsp==...JspServlet`.
+                    //
                     // GC-safety (DOM17 stale-canary backtrace, 2026-07-15):
                     // every `ctx.invoke` below can run a moving GC, and the
                     // pre-fix loop re-used `this`, the template array, the
@@ -3120,12 +3152,7 @@ impl SharedVm {
                         _ => None,
                     };
                     let result = (|| -> cratonvm_types::error::MethodCallResult {
-                        let recv_cid = ctx.class_id_of_object(this);
-                        let recv_class = ctx
-                            .class_name_of_id(recv_cid)
-                            .unwrap_or_else(|| "java/util/AbstractCollection".to_string());
-                        let size_v =
-                            ctx.invoke(&recv_class, "size", "()I", &[Value::Object(Some(this))])?;
+                        let size_v = ctx.invoke_virtual(this, "size", "()I", &[])?;
                         let size = match size_v {
                             Some(Value::Int(n)) => n.max(0) as usize,
                             _ => 0,
@@ -3151,12 +3178,8 @@ impl SharedVm {
                         };
                         let target_pin = ctx.pin_native_root(target);
                         let cur_this = ctx.read_native_pin(pin_base, this);
-                        let it_v = ctx.invoke(
-                            &recv_class,
-                            "iterator",
-                            "()Ljava/util/Iterator;",
-                            &[Value::Object(Some(cur_this))],
-                        )?;
+                        let it_v =
+                            ctx.invoke_virtual(cur_this, "iterator", "()Ljava/util/Iterator;", &[])?;
                         let it = match it_v {
                             Some(Value::Object(Some(o))) => o,
                             _ => {
@@ -3165,28 +3188,15 @@ impl SharedVm {
                             }
                         };
                         let it_pin = ctx.pin_native_root(it);
-                        let it_cid = ctx.class_id_of_object(it);
-                        let it_class = ctx
-                            .class_name_of_id(it_cid)
-                            .unwrap_or_else(|| "java/util/Iterator".to_string());
                         for i in 0..size {
                             let cur_it = ctx.read_native_pin(it_pin, it);
-                            let has = ctx.invoke(
-                                &it_class,
-                                "hasNext",
-                                "()Z",
-                                &[Value::Object(Some(cur_it))],
-                            )?;
+                            let has = ctx.invoke_virtual(cur_it, "hasNext", "()Z", &[])?;
                             if !matches!(has, Some(Value::Int(1))) {
                                 break;
                             }
                             let cur_it = ctx.read_native_pin(it_pin, it);
-                            let nxt = ctx.invoke(
-                                &it_class,
-                                "next",
-                                "()Ljava/lang/Object;",
-                                &[Value::Object(Some(cur_it))],
-                            )?;
+                            let nxt =
+                                ctx.invoke_virtual(cur_it, "next", "()Ljava/lang/Object;", &[])?;
                             let v = nxt.unwrap_or(Value::Object(None));
                             let cur_target = ctx.read_native_pin(target_pin, target);
                             ctx.set_array_element(cur_target, i, v);
