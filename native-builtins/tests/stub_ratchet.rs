@@ -1155,22 +1155,9 @@ fn synthetic_stub_count_does_not_regress() {
          \n\
          Re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
          {synthetic} + SLACK ({}) only with that account written down. See \
-         stub-ratchet.md.",
-         {BASELINE_SYNTHETIC_STUBS}. A change added a NEW synthetic stub. Make the new \
-         native a real Bridge/Intrinsic (correct behavior) instead of a fake — do NOT \
-         just raise the baseline. If the stub is genuinely, unavoidably needed, \
-         re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
-         {synthetic} + SLACK ({}) and explain why in the PR. See \
-         stub-ratchet.md.\n\nWHERE THEY ARE (top 8 files): {}\n\nA retag that \
-         moves an already-fake native from `Bridge` to `SyntheticStub` also \
-         raises this number, and is the one rise that is an IMPROVEMENT — the \
-         157 -> 165 note on `BASELINE_SYNTHETIC_STUBS_MANAGEMENT` is the \
-         precedent. Say which of the two happened before touching the \
-         constant.\n\nCLASSIFY IT: total registrations are {total}, and this \
-         baseline was measured beside {MEASURED_TOTAL_REGISTRATIONS}. A total \
-         that did NOT move means existing fakes were relabelled (welcome, \
-         re-freeze with the list); a total up by roughly the stub delta means \
-         new fakes were registered (the regression this gate exists for).",
+         stub-ratchet.md.\n\
+         \n\
+         WHERE THEY ARE (top 8 files): {}",
         synthetic + SLACK,
         breakdown,
     );
