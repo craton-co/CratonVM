@@ -1200,6 +1200,53 @@ pub(super) fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // `VarHandle` read modes on an instance field with a
+                    // primitive return — parity with `jit::try_compile`'s
+                    // recognition (see `cratonvm_jit::VARHANDLE_READ_DIRECT_FNS`).
+                    //
+                    // THIS is the load-bearing door for the workload that
+                    // motivates the bind. netty checks `refCnt` on every
+                    // buffer accessor, so the reads happen inside the
+                    // byte-transfer LOOPS of `SnappyFrameDecoder` and
+                    // `ByteToMessageDecoder`, and a loop body is what OSR
+                    // compiles. A single-pass-only bind would report sites and
+                    // move nothing.
+                    //
+                    // Unlike its neighbours here this one asks the policy
+                    // question, because the answer is not the same for every
+                    // bind: the four read modes are registered
+                    // `NativeKind::Bridge`, which JDK-ONLY-WAVE2 §1.4 does not
+                    // permit a compile-time bake of. `dispatch_policy` is the
+                    // same source `jit::try_compile`'s `jdk_only` argument comes
+                    // from, so both doors refuse together.
+                    if invoke_kind == 0
+                        && cratonvm_jit::varhandle_read_direct_helpers_enabled()
+                        && target_class == "java/lang/invoke/VarHandle"
+                        && !crate::vm::dispatch_policy(shared).is_jdk_only()
+                    {
+                        if let Some(slot) = cratonvm_jit::varhandle_read_helper_slot(&mn, &desc) {
+                            // The helper address is taken directly rather than
+                            // read out of the jit-crate cell, for the
+                            // registration-order reason spelled out on the
+                            // `Integer.valueOf` recognition above: this path can
+                            // run before `build_helpers` has published them.
+                            let entry = crate::jit::helpers::varhandle_read_direct_fn(slot);
+                            cratonvm_jit::VARHANDLE_READ_SITES_OSR
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: cratonvm_jit::VARHANDLE_READ_RETURNS
+                                        [slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len()],
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     // Exact-HashMap `put`/`get` thin direct calls — parity
                     // with `jit::try_compile`'s recognition (guard-free: the
                     // helper verifies the receiver's EXACT class and routes

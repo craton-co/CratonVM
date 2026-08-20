@@ -8949,6 +8949,162 @@ pub fn long_box_direct_helper_sites() -> (u64, u64) {
     )
 }
 
+/// `VarHandle` READ-mode thin direct-call helper cells, one per
+/// (access mode, primitive return kind) pair — see
+/// [`varhandle_read_helper_slot`] for the index. `0` = not wired, and the
+/// recognition is skipped so the site uses the generic dispatch helper.
+///
+/// **Why this one.** `--dump-native-registry` on `NettyZipBombPhases snappy 4`
+/// (`HttpContentDecompressorTest`'s wall) counts **21 368 822**
+/// `java/lang/invoke/VarHandle.get` calls out of 26 673 142 native calls total
+/// — ~5.1 per output byte. `DataCompressionHttp2Test` censuses the same
+/// signature at 5 356 015 of 18 371 699 (29 %). Both are netty 4.2's reference
+/// count check: `AbstractByteBuf`'s checked accessors call `ensureAccessible()`
+/// -> `RefCnt.isLiveNonVolatile`, which is `(int) VH.get(instance)` on an
+/// ordinary `int` instance field.
+///
+/// A VM-side fast path for exactly this shape already exists
+/// (`vm/src/jit/helpers.rs::try_varhandle_instance_field_read`, keyed on the
+/// handle's identity hash), and it saves the field resolution and the boxing
+/// round trip — but it sits INSIDE `jit_invoke_dispatch`, so every call still
+/// pays the SATB flush, the reference-argument forwarding, the site-key
+/// revalidation and two thread-local map probes before reaching it. That is
+/// the per-call floor `Preconditions.checkIndex` and
+/// `Reference.reachabilityFence` were taken off for 143 -> 23 ns.
+///
+/// **Scope: primitive returns only.** A reference-returning read is left on
+/// the funnel deliberately. The generic path applies
+/// `unbox_poly_return_checked`, whose W6-1 rule turns *a boxed primitive
+/// reaching a non-`Object` reference return* into a `WrongMethodTypeException`
+/// — and that rule reads the CALL SITE's own descriptor, which a thin helper
+/// does not have (a baked direct call has no `JitInvokeInfo`). The synthetic
+/// call site these helpers fall back through carries an erased
+/// `(Ljava/lang/Object;)X` descriptor, which is indistinguishable from the real
+/// one for a primitive `X` and is NOT for a reference one.
+pub static VARHANDLE_READ_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_READ_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; VARHANDLE_READ_SLOTS];
+
+/// The `VarHandle` access modes served by [`VARHANDLE_READ_DIRECT_FNS`], in
+/// slot-major order. All four are plain reads of the variable; the VM's
+/// registry maps `getVolatile`/`getOpaque`/`getAcquire` to the same
+/// `varhandle_get` callback `get` uses, so binding them together does not
+/// widen what a bound site may do.
+pub const VARHANDLE_READ_MODES: [&str; 4] = ["get", "getVolatile", "getOpaque", "getAcquire"];
+
+/// The primitive return kinds served by [`VARHANDLE_READ_DIRECT_FNS`], in
+/// slot-minor order. `L` and `[` are absent on purpose — see the cells' own doc.
+pub const VARHANDLE_READ_RETURNS: [u8; 8] = [b'Z', b'B', b'C', b'S', b'I', b'J', b'F', b'D'];
+
+/// `VARHANDLE_READ_MODES.len() * VARHANDLE_READ_RETURNS.len()`.
+pub const VARHANDLE_READ_SLOTS: usize = 32;
+
+/// The single-reference-coordinate, primitive-return shape this bind serves,
+/// as a slot into [`VARHANDLE_READ_DIRECT_FNS`], or `None` when the site is
+/// not that shape.
+///
+/// The descriptor test is what keeps the bind to *instance field* reads
+/// without asking the VM anything at compile time:
+///
+/// * a **static-field** handle's read site is `()X` — zero coordinates;
+/// * an **array element** or **byte-array/ByteBuffer view** handle's is
+///   `([BI)X` / `(Ljava/nio/ByteBuffer;I)X` — two;
+/// * a **`MemorySegment`** handle's carries a `J` offset — also two.
+///
+/// Only an instance-field handle reads with exactly one reference coordinate,
+/// so `(L…;)X` / `([…)X` with a primitive `X` is the shape, and every other
+/// site keeps the dispatch it has today. The helper re-checks the handle
+/// itself at runtime and declines to the generic dispatcher when the side
+/// table does not describe it as a resolved instance field, so this test is a
+/// cheap pre-filter and not the correctness argument.
+pub fn varhandle_read_helper_slot(method: &str, descriptor: &str) -> Option<usize> {
+    let mode = VARHANDLE_READ_MODES.iter().position(|m| *m == method)?;
+    if !descriptor.starts_with('(') {
+        return None;
+    }
+    let close = descriptor.find(')')?;
+    // Exactly one parameter, and it is a reference. A leading `[` covers an
+    // array-TYPED field (`[I`, `[[B`, `[Ljava/lang/String;`), which is still an
+    // ordinary reference-valued instance field, not an array-ELEMENT handle.
+    let params = &descriptor[1..close];
+    let one_reference_param = match params.as_bytes().first() {
+        Some(b'L') => is_single_object_descriptor(params),
+        Some(b'[') => {
+            let elem = params.trim_start_matches('[');
+            match elem.as_bytes().first() {
+                Some(b'L') => is_single_object_descriptor(elem),
+                Some(c) => elem.len() == 1 && VARHANDLE_READ_RETURNS.contains(c),
+                None => false,
+            }
+        }
+        _ => false,
+    };
+    if !one_reference_param {
+        return None;
+    }
+    let ret = descriptor[close + 1..].as_bytes();
+    if ret.len() != 1 {
+        return None;
+    }
+    let kind = VARHANDLE_READ_RETURNS.iter().position(|r| *r == ret[0])?;
+    Some(mode * VARHANDLE_READ_RETURNS.len() + kind)
+}
+
+/// `Lfoo/Bar;` and nothing after it — one object descriptor consuming the
+/// whole slice. Two parameters (`Lfoo;Lbar;`) fail on the interior `;`.
+fn is_single_object_descriptor(s: &str) -> bool {
+    s.len() >= 3 && s.ends_with(';') && !s[1..s.len() - 1].contains(';')
+}
+
+/// Register the `VarHandle` read-mode thin direct-call helpers (called once
+/// from the VM's `build_helpers`). The array is indexed by
+/// [`varhandle_read_helper_slot`]; a `0` entry means that slot is not served
+/// and the sites that would use it keep the generic dispatch helper.
+pub fn set_varhandle_read_direct_fns(addrs: &[usize; VARHANDLE_READ_SLOTS]) {
+    for (cell, addr) in VARHANDLE_READ_DIRECT_FNS.iter().zip(addrs.iter()) {
+        cell.store(*addr, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS=0` — stop binding `VarHandle`
+/// read modes to their thin direct helpers and send every one back through the
+/// generic native funnel (where `try_varhandle_instance_field_read` still
+/// serves them, one funnel round trip later). Default ON.
+///
+/// Same reason the `census-direct-helpers` and `long-box-direct-helpers`
+/// switches beside it exist: the blast radius has to be measurable on ONE
+/// binary. A control built from a different commit manufactured a 13-19 %
+/// "regression" on phases containing neither call the last time that shortcut
+/// was taken.
+pub fn varhandle_read_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Sites bound to a `VarHandle` read helper, split by compile door, so "did
+/// this land" is answerable without a timing run. The OSR column is the one
+/// that matters here: netty reads `refCnt` inside the transfer loops, and a
+/// loop body is an OSR compilation.
+pub static VARHANDLE_READ_SITES_SINGLEPASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static VARHANDLE_READ_SITES_OSR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(single-pass, OSR)` `VarHandle` read sites bound to a thin direct helper.
+pub fn varhandle_read_direct_helper_sites() -> (u64, u64) {
+    (
+        VARHANDLE_READ_SITES_SINGLEPASS.load(std::sync::atomic::Ordering::Relaxed),
+        VARHANDLE_READ_SITES_OSR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `Thread.currentThread()` thin direct-call helper — the JIT half of the
 /// funnel bypass the interpreter already has.
 ///
@@ -20017,6 +20173,66 @@ fn try_compile_inner(
                         continue;
                     }
                 }
+                // `VarHandle.get`/`getVolatile`/`getOpaque`/`getAcquire` on an
+                // instance field with a primitive return (see
+                // `VARHANDLE_READ_DIRECT_FNS`). `java/lang/invoke/VarHandle` is
+                // NOT final and the site is signature-polymorphic, so this is
+                // not a monomorphism argument like `Integer.intValue`'s above —
+                // it does not need to be. Every VarHandle read mode resolves to
+                // ONE registered native (`varhandle_get`) regardless of the
+                // receiver's concrete handle class, so there is no subclass
+                // whose override a guard would have to protect; and the helper
+                // re-validates the handle at runtime, declining to the generic
+                // dispatcher for anything the side table does not describe as a
+                // resolved instance field of the site's own return kind.
+                //
+                // `num_params: 1` — the single reference coordinate.
+                // `needs_context: true` puts `vm_ptr` in ARG_REGS[0], so the
+                // helper sees `(vm_ptr, varhandle, receiver)`.
+                if direct_jit_callee_calls_enabled
+                    && varhandle_read_direct_helpers_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/lang/invoke/VarHandle"
+                {
+                    if let Some(slot) = varhandle_read_helper_slot(&method_name, &descriptor) {
+                        // JDK-ONLY-WAVE2: see the marker on the
+                        // `StringLatin1.toLowerCase` bind above — same list.
+                        // The descriptor handed to the policy check is the
+                        // native's REGISTERED (erased) one, not the call site's:
+                        // `register_varhandle_natives` files every read mode
+                        // under `([Ljava/lang/Object;)Ljava/lang/Object;`, and
+                        // asking the registry about the site's own descriptor
+                        // would find nothing and refuse for the wrong reason.
+                        // All four modes are `NativeKind::Bridge`, so under
+                        // `JdkOnly` this bind is refused — deliberately, and on
+                        // the same terms as `HashMap.get`.
+                        let entry = direct_native_helper(
+                            &VARHANDLE_READ_DIRECT_FNS[slot],
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            "([Ljava/lang/Object;)Ljava/lang/Object;",
+                        );
+                        if entry != 0 {
+                            VARHANDLE_READ_SITES_SINGLEPASS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: VARHANDLE_READ_RETURNS
+                                        [slot % VARHANDLE_READ_RETURNS.len()],
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 // `Long.longValue()` — the twin of the `Integer.intValue()`
                 // bind directly above. `java/lang/Long` is `final` on exactly
                 // the same terms, so a site whose constant-pool class is
@@ -21757,6 +21973,166 @@ mod long_box_direct_bind_tests {
         let (final_v, final_l) = long_box_direct_helper_sites();
         assert_eq!(final_v, before_v + 3);
         assert_eq!(final_l, before_l + 5);
+    }
+}
+
+#[cfg(test)]
+mod varhandle_read_direct_bind_tests {
+    use super::*;
+
+    /// The netty shape this bind exists for, at all four read modes.
+    ///
+    /// `RefCnt.isLiveNonVolatile` is `(int) VH.get(instance)` and `refCnt()` is
+    /// `(int) VH.getAcquire(instance) >>> 1`, so a filter that recognised only
+    /// `get` would leave the second of the two on the funnel and the class's
+    /// `retain`/`release` paths with it.
+    #[test]
+    fn the_netty_refcnt_shape_is_recognised_in_every_read_mode() {
+        let desc = "(Lio/netty/util/internal/RefCnt;)I";
+        let int_slot = VARHANDLE_READ_RETURNS.iter().position(|r| *r == b'I').unwrap();
+        for (mode, name) in VARHANDLE_READ_MODES.iter().enumerate() {
+            assert_eq!(
+                varhandle_read_helper_slot(name, desc),
+                Some(mode * VARHANDLE_READ_RETURNS.len() + int_slot),
+                "{name} on the netty refCnt descriptor",
+            );
+        }
+    }
+
+    /// Every slot is reachable and no two shapes share one.
+    ///
+    /// A collision would be silent: two different return kinds would land on
+    /// one helper, and the one whose kind lost would read the field with the
+    /// wrong descriptor. The count also pins `VARHANDLE_READ_SLOTS` against the
+    /// two tables it is supposed to be the product of.
+    #[test]
+    fn every_mode_return_pair_has_its_own_slot() {
+        let mut seen = std::collections::HashSet::new();
+        for name in VARHANDLE_READ_MODES {
+            for ret in VARHANDLE_READ_RETURNS {
+                let desc = format!("(Ljava/lang/Object;){}", ret as char);
+                let slot = varhandle_read_helper_slot(name, &desc)
+                    .unwrap_or_else(|| panic!("{name}{desc} was not recognised"));
+                assert!(slot < VARHANDLE_READ_SLOTS);
+                assert!(seen.insert(slot), "{name}{desc} collided on slot {slot}");
+            }
+        }
+        assert_eq!(seen.len(), VARHANDLE_READ_SLOTS);
+    }
+
+    /// The shapes that must NOT bind, each for its own reason.
+    ///
+    /// This is the whole correctness argument for using the descriptor as the
+    /// instance-field test, so every family that reads through a `VarHandle`
+    /// with a different coordinate list is listed explicitly rather than
+    /// summarised. A regression here does not fail loudly — it hands a helper
+    /// that assumes `[handle, receiver]` an argument list of a different
+    /// shape.
+    #[test]
+    fn only_a_single_reference_coordinate_with_a_primitive_return_binds() {
+        // A static-field handle: no coordinates at all.
+        assert_eq!(varhandle_read_helper_slot("get", "()I"), None);
+        // An array-element handle: (array, index).
+        assert_eq!(varhandle_read_helper_slot("get", "([II)I"), None);
+        // A byte-array / ByteBuffer view handle: (container, byte offset).
+        assert_eq!(varhandle_read_helper_slot("get", "([BI)J"), None);
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/nio/ByteBuffer;I)J"),
+            None
+        );
+        // A MemorySegment handle: (segment, long offset).
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/foreign/MemorySegment;J)I"),
+            None
+        );
+        // Two reference coordinates.
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;Ljava/lang/Object;)I"),
+            None
+        );
+        // A primitive coordinate is not an instance-field receiver.
+        assert_eq!(varhandle_read_helper_slot("get", "(I)I"), None);
+        // Reference returns are out of scope — `unbox_poly_return_checked`'s
+        // W6-1 rule reads the SITE's declared class, which a baked direct call
+        // cannot carry. See `VARHANDLE_READ_DIRECT_FNS`.
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)Ljava/lang/String;"),
+            None
+        );
+        assert_eq!(varhandle_read_helper_slot("get", "(Ljava/lang/Object;)[I"), None);
+        // `void` is not a read.
+        assert_eq!(varhandle_read_helper_slot("get", "(Ljava/lang/Object;)V"), None);
+        // Write and read-modify-write modes are not read modes.
+        for name in ["set", "setVolatile", "setRelease", "getAndAdd", "compareAndSet"] {
+            assert_eq!(
+                varhandle_read_helper_slot(name, "(Ljava/lang/Object;)I"),
+                None,
+                "{name} bound as a read mode",
+            );
+        }
+    }
+
+    /// An array-TYPED instance field still binds: `[I` as a *coordinate* means
+    /// the receiver is an array-valued object reference, which is an ordinary
+    /// instance-field read, not the array-ELEMENT handle the row above rejects.
+    /// The two are told apart by the coordinate COUNT, and this is the row that
+    /// says a stricter "no `[` anywhere" filter would be over-broad.
+    #[test]
+    fn an_array_typed_receiver_is_still_one_reference_coordinate() {
+        assert!(varhandle_read_helper_slot("get", "([Ljava/lang/String;)I").is_some());
+        assert!(varhandle_read_helper_slot("get", "([[B)J").is_some());
+        assert_eq!(varhandle_read_helper_slot("get", "([Ljava/lang/String;I)I"), None);
+    }
+
+    /// The cells default to "not wired", and `set_varhandle_read_direct_fns`
+    /// lands each address on the slot the recognition will look it up under.
+    ///
+    /// The failure this catches is an off-by-one or reversed registration
+    /// order, which would not fail to compile and would not fail loudly: a
+    /// `get`-returning-`I` site would call the helper whose baked slot says
+    /// `getAcquire` returning `Z`, and read the right field with the wrong
+    /// return kind.
+    #[test]
+    fn the_slots_are_registered_in_recognition_order() {
+        let addrs: [usize; VARHANDLE_READ_SLOTS] =
+            std::array::from_fn(|i| 0x1000 + i * 0x10);
+        set_varhandle_read_direct_fns(&addrs);
+        for name in VARHANDLE_READ_MODES {
+            for ret in VARHANDLE_READ_RETURNS {
+                let desc = format!("(Ljava/lang/Object;){}", ret as char);
+                let slot = varhandle_read_helper_slot(name, &desc).unwrap();
+                assert_eq!(
+                    VARHANDLE_READ_DIRECT_FNS[slot].load(std::sync::atomic::Ordering::Relaxed),
+                    addrs[slot],
+                    "{name}{desc} -> slot {slot}",
+                );
+            }
+        }
+        // Leave the cells as `build_helpers` would find them — `0` is the
+        // "use the generic dispatch helper" sentinel, and a fake address left
+        // behind here would be baked into a `CALL` by a later compile in the
+        // same test binary.
+        set_varhandle_read_direct_fns(&[0; VARHANDLE_READ_SLOTS]);
+        assert!(VARHANDLE_READ_DIRECT_FNS
+            .iter()
+            .all(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 0));
+    }
+
+    /// The two door counters are separate, so `VarHandle.read=N/0` reports two
+    /// facts. The OSR column is the load-bearing one — netty reads `refCnt`
+    /// inside loop bodies — and a single-pass-only bind reporting a non-zero
+    /// total would otherwise read as success.
+    #[test]
+    fn the_two_varhandle_door_counters_are_separate() {
+        let (before_sp, before_osr) = varhandle_read_direct_helper_sites();
+        VARHANDLE_READ_SITES_SINGLEPASS.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        let (mid_sp, mid_osr) = varhandle_read_direct_helper_sites();
+        assert_eq!(mid_sp, before_sp + 2);
+        assert_eq!(mid_osr, before_osr, "bumping single-pass moved the OSR tally");
+        VARHANDLE_READ_SITES_OSR.fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        let (end_sp, end_osr) = varhandle_read_direct_helper_sites();
+        assert_eq!(end_sp, before_sp + 2);
+        assert_eq!(end_osr, before_osr + 7);
     }
 }
 

@@ -5003,6 +5003,19 @@ fn run() -> Result<()> {
             "[cratonvm]   of which VarHandle instance-field reads served directly: {}",
             cratonvm_vm::jit::helpers::varhandle_field_read_hit_count()
         );
+        // The same read, reached WITHOUT the funnel — a thin direct call baked
+        // into compiled code by `VARHANDLE_READ_DIRECT_FNS`. The pair is the
+        // engagement evidence for that bind: `served` counts calls that never
+        // entered `jit_invoke_dispatch` at all, `declined` counts the ones that
+        // did. A non-zero bind count in the "thin direct-helper binds" line with
+        // `served=0` here is the specific failure this exists to name — the site
+        // compiled and every execution refused.
+        {
+            let (served, declined) = cratonvm_vm::jit::helpers::varhandle_read_direct_counts();
+            eprintln!(
+                "[cratonvm] VarHandle read thin direct calls: served={served} declined={declined}",
+            );
+        }
         // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of
         // the two above: it is the one by-name fast path that decides per
         // dispatch rather than at cache-fill time. Reported separately because
