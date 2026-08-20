@@ -4359,9 +4359,44 @@ pub mod oop_map_audit {
     /// i.e. the codegen bit asserting complete coverage was wrong.
     pub static NEVER_MAPPED_WHILE_COVERED: AtomicU64 = AtomicU64::new(0);
 
+    /// Distinct `(method entry_ptr, slot offset)` pairs reported as
+    /// never-mapped, with the storage class of the slot.
+    ///
+    /// The raw counter double-counts in two ways, both of which made the first
+    /// run unreadable: the audit runs once per CHAIN ENTRY and every entry
+    /// re-walks the same parent frames, and a workload takes many collections
+    /// at the same stack shape. What the question needs is "which METHOD has
+    /// which unmapped SLOT", which is what this records.
+    pub static SITES: std::sync::Mutex<
+        Option<std::collections::BTreeMap<(usize, i32), &'static str>>,
+    > = std::sync::Mutex::new(None);
+
+    pub fn note_site(entry_ptr: usize, off: i32, class: &'static str) {
+        if let Ok(mut g) = SITES.lock() {
+            g.get_or_insert_with(Default::default).insert((entry_ptr, off), class);
+        }
+    }
+
     pub fn dump() {
         if FRAMES.load(Ordering::Relaxed) == 0 && WORDS.load(Ordering::Relaxed) == 0 {
             return;
+        }
+        if let Ok(g) = SITES.lock() {
+            if let Some(map) = g.as_ref() {
+                let mut by_class: std::collections::BTreeMap<&'static str, usize> =
+                    Default::default();
+                for class in map.values() {
+                    *by_class.entry(class).or_default() += 1;
+                }
+                eprintln!(
+                    "[cratonvm] oop-map audit: DISTINCT never-mapped sites={} by_class={:?}",
+                    map.len(),
+                    by_class
+                );
+                for ((ptr, off), class) in map.iter().take(24) {
+                    eprintln!("[cratonvm] oop-map audit:   code={ptr:#x} rbp-{off:#x} {class}");
+                }
+            }
         }
         eprintln!(
             "[cratonvm] oop-map audit: frames={} unreadable_frames={} words={} \
@@ -4374,6 +4409,38 @@ pub mod oop_map_audit {
             WRONG_MAP.load(Ordering::Relaxed),
             BELOW_JIT.load(Ordering::Relaxed),
         );
+    }
+}
+
+/// Which storage class of the compiled frame the slot at `[rbp - off]` is in.
+///
+/// This is what turns a never-mapped hit from a number into a verdict. The
+/// abstract model behind `moving_young_coverage_complete` describes Java locals
+/// and the operand stack; the module block on
+/// `refresh_moving_young_coverage_for_current_thread` names the three storage
+/// classes it does NOT describe — scalar-replacement field slots, LICM hoist
+/// slots, and the full-GPR safepoint spill area. A hit in one of those is the
+/// PREDICTED defect. A hit in a Java local is either a genuine miss of what the
+/// model does claim, or this oracle's known false positive (a primitive whose
+/// bits land on a live object header).
+fn classify_frame_slot(off: i32, layout: &cratonvm_jit::FrameLayout) -> &'static str {
+    let within = |lo: i32, hi: i32| hi > lo && off >= lo && off < hi;
+    if within(layout.scalar_lo, layout.scalar_hi) {
+        "scalar-replacement-field"
+    } else if within(layout.ref_hoist_lo, layout.ref_hoist_hi) {
+        "licm-ref-hoist"
+    } else if within(layout.arith_lo, layout.arith_hi) {
+        "licm-arith-hoist"
+    } else if within(layout.reg_spill_lo, layout.reg_spill_hi) {
+        "gpr-safepoint-spill"
+    } else if layout.java_locals_hi > 0 && off <= layout.java_locals_hi {
+        "java-local"
+    } else if within(layout.spill_lo, layout.spill_hi) {
+        "operand-spill"
+    } else if layout.locals_hi > 0 && off <= layout.locals_hi {
+        "reserved-locals-tail"
+    } else {
+        "other"
     }
 }
 
@@ -4525,13 +4592,21 @@ fn verify_precise_covers_conservative(
                         audit::WRONG_MAP.fetch_add(1, AOrd::Relaxed);
                     } else {
                         audit::NEVER_MAPPED.fetch_add(1, AOrd::Relaxed);
+                        let class = classify_frame_slot(off, &frame_cm.frame_layout);
+                        // Only a frame that ASSERTS full coverage is evidence about
+                        // the codegen bit. A map-less frame (`maps=0 covered=false`)
+                        // is already reported by the NO_PRECISE_MAP obligation and
+                        // says nothing here -- the first run's probe arm was almost
+                        // entirely those.
                         if frame_cm.fully_oop_covered {
                             audit::NEVER_MAPPED_WHILE_COVERED.fetch_add(1, AOrd::Relaxed);
+                            audit::note_site(frame_cm.entry_ptr() as usize, off, class);
                         }
                         if STEP3_LOG_COUNT.fetch_add(1, AOrd::Relaxed) < STEP3_LOG_CAP {
                             eprintln!(
                                 "[VERIFY-OOP-MAPS] NEVER-MAPPED in-band oop: code@{:p} \
-                                 rbp={rbp:#x} slot=[rbp-{off:#x}] addr={addr:#x} \
+                                 rbp={rbp:#x} slot=[rbp-{off:#x}] class={class} \
+                                 addr={addr:#x} \
                                  val={qword:#x} frame_size={frame_size} maps={} covered={}",
                                 frame_cm.entry_ptr(),
                                 frame_cm.oop_maps.len(),
