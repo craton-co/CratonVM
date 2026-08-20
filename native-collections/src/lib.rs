@@ -9823,6 +9823,76 @@ fn present_marker(elem: Value) -> Value {
     }
 }
 
+/// Where `java.util.HashSet.PRESENT` lives: `(HashSet's class id, its static
+/// slot)`, or `None` when this VM has no such field.
+///
+/// Resolved rather than assumed, and read through `&dyn NativeContext` on
+/// purpose: every call here is a pure read (`class_id_by_name`,
+/// `static_field_index_by_name`, `get_static_field` are all `&self`), so it
+/// **cannot allocate and cannot complete a moving GC**. That is what lets
+/// [`hs_present_marker_at`] be called between a `pin_native_root` and its
+/// `read_native_pin` without a refresh — see the loops in
+/// [`make_hashset_with_elements`] and [`make_set_of`].
+///
+/// `None` on a synthetic-JDK build, where `java/util/HashSet` is a fabricated
+/// carrier with no static block at all. Every caller falls back to
+/// [`present_marker`], so that configuration is byte-identical to before.
+fn hs_present_slot(ctx: &dyn NativeContext) -> Option<(ClassId, usize)> {
+    let cid = ctx.class_id_by_name("java/util/HashSet")?;
+    let idx = ctx.static_field_index_by_name(cid, "PRESENT")?;
+    Some((cid, idx))
+}
+
+/// The value a **HashSet-family** receiver's backing map stores to mean "this
+/// element is present", preferring the real `java.util.HashSet.PRESENT`.
+///
+/// [`present_marker`]'s "the element is its own marker" is sound for the
+/// encoding CratonVM's own natives read — *previous value non-null* — and it is
+/// **wrong for real `java.util.HashSet` bytecode**, which does not ask whether
+/// the value is null. JDK 25 `HashSet` is:
+///
+/// ```java
+///     public boolean add(E e)         { return map.put(e, PRESENT) == null; }
+///     public boolean remove(Object o) { return map.remove(o) == PRESENT; }
+/// ```
+///
+/// so `remove` is an **identity** test against one specific `Object`. Any other
+/// non-null marker — the element itself, `Int(1)`, or the `Value::Object(None)`
+/// two producers in this file were writing — makes that comparison false, and
+/// real `HashSet.remove(x)` then deletes the element and answers `false`. That
+/// is the same failure `7bf427af1` fixed on the LinkedHashMap side and that
+/// [`try_native_hashset_remove`]'s doc comment already names; this function is
+/// the other half of it, for the direction where the *native* writes the value
+/// and *bytecode* reads it.
+///
+/// That direction is not hypothetical: it is exactly what
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/HashSet` (and a permanent
+/// retirement of these registrations) turns on.
+///
+/// Only the HashSet FAMILY needs this. A keySet/entrySet view carrier's real
+/// bytecode is `HashMap$KeySet.remove`, which is
+/// `HashMap.removeNode(...) != null` and never looks at the value — so
+/// [`make_view_set_of`] and [`resync_view_set`] deliberately keep
+/// [`present_marker`].
+fn hs_present_marker_at(
+    ctx: &dyn NativeContext,
+    slot: Option<(ClassId, usize)>,
+    elem: Value,
+) -> Value {
+    if let Some((cid, idx)) = slot {
+        if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
+            return v;
+        }
+    }
+    present_marker(elem)
+}
+
+/// [`hs_present_marker_at`] for a single write, resolving the slot itself.
+/// Use the `_at` spelling in a loop so the name lookup is paid once.
+fn hs_present_marker(ctx: &dyn NativeContext, elem: Value) -> Value {
+    hs_present_marker_at(ctx, hs_present_slot(ctx), elem)
+}
+
 /// S111r26: Layout-aware node key reader.
 ///
 /// The legacy synthetic layout stores: key=0, value=1, hash=2, next=3.
@@ -15980,7 +16050,15 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
         // per-element re-read treatment across the node alloc below.
         let (_, elem_pins) = pin_value_slice(ctx, elems);
 
-        let sentinel = Value::Object(None); // PRESENT marker; null is fine for "is in set"
+        // The set's PRESENT marker. It was `Value::Object(None)` here, with the
+        // comment "null is fine for 'is in set'". It is not fine in either
+        // direction: `native_hs_add`/`native_hs_remove` read membership out of
+        // "was the previous value null", so a null marker makes every re-add
+        // report NEW and every remove report `false` while deleting; and real
+        // `java.util.HashSet.remove` is `map.remove(o) == PRESENT`, an identity
+        // test a null can never pass. See [`hs_present_marker_at`]. Resolved
+        // once, outside the per-element loop.
+        let present_slot = hs_present_slot(&*ctx);
         let mut size = 0i32;
         for (i, elem) in elems.iter().enumerate() {
             let key_obj = match read_pinned_elem(ctx, elem_pins[i], *elem) {
@@ -16039,6 +16117,11 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
             let node = ctx.alloc_object(node_class_id, node_n_fields);
             let key_obj = ctx.read_native_pin(elem_pins[i], key_obj);
             let existing_head = read_pinned_elem(ctx, existing_head_pin, existing_head);
+            // Read AFTER the `alloc_object` above: `PRESENT` is a static field,
+            // so the read always yields its current address and no pin is
+            // needed — but it must not be hoisted above an allocation into a
+            // bare local, which is why only the (class, slot) pair is hoisted.
+            let sentinel = hs_present_marker_at(&*ctx, present_slot, Value::Object(Some(key_obj)));
             ctx.set_field(node, n_hash, Value::Int(raw_hash));
             ctx.set_field(node, n_key, Value::Object(Some(key_obj)));
             ctx.set_field(node, n_value, sentinel);
@@ -16075,16 +16158,19 @@ pub fn make_hashset_with_elements(ctx: &mut dyn NativeContext, elems: &[Value]) 
     hs_set_backing_map(ctx, set, backing_map);
 
     let (_, elem_pins) = pin_value_slice(ctx, elems);
-    let sentinel = Value::Int(1);
+    // The `let sentinel = Value::Int(1)` that stood here was dead — the marker
+    // has come from `present_marker(elem)` since that helper was introduced —
+    // and it read as the live marker to anyone scanning this loop. See
+    // [`hs_present_marker_at`] for why a HashSet-family receiver needs the real
+    // `PRESENT` and not the element.
+    let present_slot = hs_present_slot(&*ctx);
     for (i, elem) in elems.iter().enumerate() {
         let elem = read_pinned_elem(ctx, elem_pins[i], *elem);
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
+        let present = hs_present_marker_at(&*ctx, present_slot, elem);
         // Best-effort populate; ignore errors so callers see a non-empty
         // set even if a single put failed (e.g. unhashable wrapper).
-        let _ = native_map_put(
-            ctx,
-            &[Value::Object(Some(backing_map)), elem, present_marker(elem)],
-        );
+        let _ = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present]);
     }
     let set = ctx.read_native_pin(set_pin, set);
     ctx.unpin_native_roots(set_pin);
@@ -16725,7 +16811,11 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
     // put(element, PRESENT) — the previous value being null is how this
     // reports "the element was not already in the set". See `present_marker`
-    // for why the marker must be a reference.
+    // for why the marker must be a reference, and [`hs_present_marker_at`] for
+    // why on a HashSet-family receiver it must be the REAL
+    // `java.util.HashSet.PRESENT`: an element added here and removed by real
+    // `HashSet.remove` bytecode is decided by `map.remove(o) == PRESENT`, an
+    // identity test that the element-as-its-own-marker fallback fails.
     //
     // A NULL element has no reference to mark itself with, so its membership
     // cannot be read out of the value slot at all. Settle that one case with
@@ -16740,7 +16830,8 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     } else {
         false
     };
-    let put_args = [Value::Object(Some(backing)), elem, present_marker(elem)];
+    let present = hs_present_marker(&*ctx, elem);
+    let put_args = [Value::Object(Some(backing)), elem, present];
     let old = native_map_put(ctx, &put_args)?;
     let was_new = if elem_is_null {
         !had_null
@@ -21274,14 +21365,17 @@ fn make_set_of(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult
     let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
     hs_set_backing_map(ctx, set, backing_map);
 
-    let sentinel = Value::Int(1);
+    // Dead `let sentinel = Value::Int(1)` removed: the marker has come from
+    // `present_marker(elem)` since that helper landed, and leaving the old
+    // binding in the loop's header made it read as the live one. The receiver
+    // built here is a `java/util/HashSet`, so it takes the real `PRESENT` —
+    // see [`hs_present_marker_at`].
+    let present_slot = hs_present_slot(&*ctx);
     for (index, elem) in elems.iter().enumerate() {
         let backing_map = ctx.read_native_pin(backing_map_pin, backing_map);
         let elem = read_pinned_elem(ctx, elem_handles[index], *elem);
-        if let Err(err) = native_map_put(
-            ctx,
-            &[Value::Object(Some(backing_map)), elem, present_marker(elem)],
-        ) {
+        let present = hs_present_marker_at(&*ctx, present_slot, elem);
+        if let Err(err) = native_map_put(ctx, &[Value::Object(Some(backing_map)), elem, present]) {
             ctx.unpin_native_roots(if elem_base == usize::MAX {
                 set_pin
             } else {
@@ -33028,14 +33122,15 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     let source = ctx.read_native_pin(source_pin, source);
     let elems = collect_collection_elements_or_real(ctx, source)?;
     let (_, elem_handles) = pin_value_slice(ctx, &elems);
-    let sentinel = Value::Int(1);
+    // Dead `let sentinel = Value::Int(1)` removed — see [`hs_present_marker_at`].
+    // The receiver is a `HashSet`/`LinkedHashSet`, both of which inherit
+    // `HashSet.remove`'s `== PRESENT` identity test, so both need the real one.
+    let present_slot = hs_present_slot(&*ctx);
     for (i, val) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
-        if let Err(e) = native_map_put(
-            ctx,
-            &[Value::Object(Some(backing)), val, present_marker(val)],
-        ) {
+        let present = hs_present_marker_at(&*ctx, present_slot, val);
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, present]) {
             ctx.unpin_native_roots(source_pin);
             return Err(e);
         }
@@ -57639,11 +57734,12 @@ fn native_collections_singleton(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
     hs_set_backing_map(ctx, set, inner_map);
-    // Add elem
-    native_map_put(
-        ctx,
-        &[Value::Object(Some(inner_map)), elem, Value::Object(None)],
-    )?;
+    // Add elem. The value was `Value::Object(None)` — a NULL marker, which
+    // `native_hs_add`/`native_hs_remove` read as "the element is absent" and
+    // which real `HashSet.remove`'s `== PRESENT` identity test can never
+    // satisfy. See [`hs_present_marker_at`].
+    let present = hs_present_marker(&*ctx, elem);
+    native_map_put(ctx, &[Value::Object(Some(inner_map)), elem, present])?;
     Ok(Some(Value::Object(Some(set))))
 }
 
