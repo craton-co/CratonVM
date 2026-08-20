@@ -1196,6 +1196,15 @@ pub enum RuntimeError {
     #[error("NoSuchFileException: {path}")]
     NoSuchFileException { path: String },
 
+    /// `java.nio.file.NotDirectoryException` — a directory operation applied to
+    /// something that is not one.
+    ///
+    /// Like [`Self::NoSuchFileException`] the message is the PATH alone, because
+    /// `FileSystemException.getMessage` builds its text from the `file` field; a
+    /// populated `detailMessage` renders as `<path>: <path>`.
+    #[error("NotDirectoryException: {path}")]
+    NotDirectoryException { path: String },
+
     #[error("UnsupportedOperationException: {message}")]
     UnsupportedOperationException { message: String },
 
@@ -1704,9 +1713,16 @@ impl RuntimeError {
             RuntimeError::IOException { message } => {
                 ("java/io/IOException", Some(message.as_str()))
             }
-            RuntimeError::EOFException { message } => {
-                ("java/io/EOFException", Some(message.as_str()))
-            }
+            RuntimeError::EOFException { message } => (
+                "java/io/EOFException",
+                // An EMPTY message is no message, not the empty string — the
+                // same distinction `IllegalThreadStateException` needs above.
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
+            ),
             RuntimeError::UnknownHostException { message } => {
                 ("java/net/UnknownHostException", Some(message.as_str()))
             }
@@ -1728,6 +1744,9 @@ impl RuntimeError {
             RuntimeError::NoSuchFileException { path } => {
                 ("java/nio/file/NoSuchFileException", Some(path.as_str()))
             }
+            RuntimeError::NotDirectoryException { path } => {
+                ("java/nio/file/NotDirectoryException", Some(path.as_str()))
+            }
             RuntimeError::UnsupportedOperationException { message } => (
                 "java/lang/UnsupportedOperationException",
                 // An empty message means "no message" (e.g. the blocked-mutator
@@ -1747,7 +1766,18 @@ impl RuntimeError {
             }
             RuntimeError::IllegalThreadStateException { message } => (
                 "java/lang/IllegalThreadStateException",
-                Some(message.as_str()),
+                // G72-1: an EMPTY message is not the empty string, it is no
+                // message. `Thread.start()` on a started thread throws the
+                // no-arg constructor on HotSpot, so `getMessage()` is null --
+                // and `Some("")` renders as `""`, which is a different value a
+                // caller can see. The variant is a `String` rather than an
+                // `Option<String>`, so this is where the distinction has to be
+                // made.
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message.as_str())
+                },
             ),
             RuntimeError::IllegalCallerException { message } => {
                 // Task #57: route the new variant to `java.lang.IllegalCallerException`
