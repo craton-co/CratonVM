@@ -12856,7 +12856,10 @@ const DIRECT_CALL_HELPER_NATIVES: [(&str, &str, &str); 8] = [
         "toLowerCase",
         "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
     ),
-    // `jit_concurrent_hashmap_get_direct` — calls `native_chm_get` directly.
+    // `jit_concurrent_hashmap_get_direct` — reaches `native_chm_get` through
+    // `safe_native_call_prevalidated_objects` (H7-1), which restores the funnel
+    // but still carries no `NativeMethodId`, so `record_invocation` never fires
+    // and this row's count stays a floor.
     (
         "java/util/concurrent/ConcurrentMap",
         "get",
@@ -13022,6 +13025,53 @@ unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64)
 /// Guarded direct path for `ConcurrentMap.get(Object)` when the runtime
 /// receiver is exactly ConcurrentHashMap. All other receivers retain the
 /// canonical interface dispatcher.
+///
+/// # H7-1: one entry, one wrapper, one fallback
+///
+/// Two things in this body used to differ from its own sibling
+/// [`jit_hashmap_get_direct`], for no stated reason, and both differences were
+/// invisible to every arm because nothing runs a map lookup cold and warm and
+/// diffs the two answers (`docs/known-issues/jdk-only/H7-1-*`):
+///
+/// 1. **An unrecognised key address answered `null` instead of falling back.**
+///    The old `else { return 0 }` below turned "this argument is not an object
+///    I can find in the heap" into the Java-visible answer `null`. Interpreted,
+///    the identical call goes through the full dispatcher — so the same source
+///    line could answer differently once its caller tiered up. The sibling
+///    already took the other branch (`None => break 'fast`) and says why:
+///    the arena-membership probe "is the only check between a stale/fabricated
+///    key argument and that dereference". It is now `break 'fast` here too, so
+///    the two helpers give one answer to one question. This is also the shape
+///    `chm-get-misses-stored-key-in-process-RETIRED-20260804.md` records:
+///    reporting ABSENT for a pair that was never compared.
+/// 2. **`native_chm_get` was called with no funnel at all.** The comment that
+///    stood here argued the wrapper was "second, redundant" because the native
+///    pins its own receiver and key. Pinning is a *service of the funnel* —
+///    `pin_native_root` writes into the ring `safe_native_call_impl` sets a
+///    watermark on and truncates — and the funnel also supplies the
+///    `NativeRunning` transition (which is what makes the STW census WAIT for a
+///    native holding raw `ObjectRef`s in Rust locals), the argument-forwarding
+///    barrier, the JNI pending-exception drain and `catch_unwind`.
+///    `native_chm_get` is not a leaf by any of `set_leaf`'s four criteria: it
+///    reaches `chm_key_hash`, which dispatches the key's real `hashCode()`.
+///    Its sibling `native_chm_contains_key` carries a comment about exactly
+///    this hazard being caught live by `RMapGcStress`. So the call now goes
+///    through `safe_native_call_prevalidated_objects`, which is what the
+///    sibling helper already used for its own non-leaf fallback
+///    (`native_hashmap_get_exact`) three hundred lines below.
+///
+/// **Cost of (2), stated rather than measured** — no binary carrying this has
+/// been built. It adds one native funnel entry per compiled `ConcurrentMap.get`
+/// that reaches the native. The in-tree figure for the funnel-plus-by-name
+/// round trip is ~400 ns/call
+/// (`native-call-funnel-per-call-floor-item2-20260805.md`); this restores only
+/// the funnel half, since the callback is still resolved at compile time. The
+/// native it fronts is itself measured at 6920 cycles/call on the path that
+/// misses its string-node cache (see `native_chm_get`'s own comment in
+/// `native-collections/src/lib.rs`), so the wrapper is a small addition to a
+/// large number — and the wrapper-free variant only ever appeared on the JIT
+/// side, meaning every interpreted `ConcurrentHashMap.get` in this VM has
+/// always paid it.
 pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
     vm_ptr: i64,
     receiver: i64,
@@ -13030,49 +13080,66 @@ pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
-    if receiver != 0
-        && (receiver as u64 & 0x7) == 0
-        && (receiver as u64) < (1u64 << 48)
-        && jit_concurrent_hashmap_receiver_is_exact(vm, receiver)
-    {
-        if let (Some(recv), Some((thread, _guard))) = (
-            vm.mem.heap.is_object_address(receiver as usize),
-            jit_thread_mut(),
-        ) {
-            let key = if key == 0 {
-                Value::Object(None)
-            } else if let Some(key) = vm.mem.heap.is_object_address(key as usize) {
-                Value::Object(Some(key))
-            } else {
-                return 0;
-            };
-            let values = [Value::Object(Some(recv)), key];
-            // `native_chm_get` pins its receiver/key before every operation
-            // that can invoke Java or collect. Calling it directly avoids the
-            // second, redundant safe-native wrapper/root snapshot on a hot
-            // read-only lookup while retaining its canonical error contract.
-            let result = {
-                let mut ctx = crate::vm::NativeContextImpl {
-                    shared: vm,
-                    thread: &mut *thread,
-                };
-                cratonvm_native_collections::native_chm_get(&mut ctx, &values)
-            };
-            match result {
-                Ok(Some(Value::Object(Some(object)))) => {
-                    thread.native_pending_return = Some(object);
-                    return object.as_ptr() as i64;
-                }
-                Ok(Some(Value::Object(None))) | Ok(None) => return 0,
-                Ok(_) => {}
-                Err(error) => {
-                    return handle_jit_dispatch_error(
-                        vm,
-                        thread,
-                        error,
-                        &CONCURRENT_HASHMAP_GET_DIRECT_INFO,
-                    )
-                }
+    'fast: {
+        if receiver == 0
+            || (receiver as u64 & 0x7) != 0
+            || (receiver as u64) >= (1u64 << 48)
+            || !jit_concurrent_hashmap_receiver_is_exact(vm, receiver)
+        {
+            break 'fast;
+        }
+        let Some(recv) = vm.mem.heap.is_object_address(receiver as usize) else {
+            break 'fast;
+        };
+        let key_val = if key == 0 {
+            // An explicit `null` key ARGUMENT, which `native_chm_get` answers
+            // with `chm_reject_null_key`'s NPE. Do not confuse it with the
+            // unrecognised-address case below — that one is not an argument
+            // value at all, it is a failed validation.
+            Value::Object(None)
+        } else if (key as u64 & 0x7) != 0 || (key as u64) >= (1u64 << 48) {
+            break 'fast;
+        } else {
+            match vm.mem.heap.is_object_address(key as usize) {
+                Some(object) => Value::Object(Some(object)),
+                // See item 1 in this function's doc comment. Was `return 0`.
+                None => break 'fast,
+            }
+        };
+        let Some((thread, _guard)) = jit_thread_mut() else {
+            break 'fast;
+        };
+        let values = [Value::Object(Some(recv)), key_val];
+        // Item 2 in this function's doc comment: the SAME funnel the
+        // interpreter uses for the SAME callback, so the two tiers cannot
+        // disagree about pinning, transitions or exception draining. Every
+        // `Value::Object` in `values` was validated against this VM's heap
+        // immediately above, which is exactly the precondition the
+        // `_prevalidated_objects` variant is documented against.
+        let result = crate::vm::safe_native_call_prevalidated_objects(
+            vm,
+            thread,
+            cratonvm_native_collections::native_chm_get,
+            &values,
+        );
+        match result {
+            Ok(Some(Value::Object(Some(object)))) => {
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+            Ok(Some(Value::Object(None))) | Ok(None) => return 0,
+            // A non-object `Value` out of an object-typed map is
+            // out-of-contract. `get` is a read, so re-running it through the
+            // dispatcher is idempotent and costs only a second lookup — the
+            // reason the PUT sibling may NOT do the same thing.
+            Ok(_) => break 'fast,
+            Err(error) => {
+                return handle_jit_dispatch_error(
+                    vm,
+                    thread,
+                    error,
+                    &CONCURRENT_HASHMAP_GET_DIRECT_INFO,
+                )
             }
         }
     }
