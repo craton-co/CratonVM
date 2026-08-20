@@ -56,9 +56,9 @@ correct answer and reported the class unfindable. That investigation's own
 write-up could not be located in the current docs tree while filing this page
 (likely retired or pruned since) so the mechanism is not re-verified here.
 **Check first** whether
-`docs/internal/fixed-bugs/jit-multianewarray-allocated-every-level-with-classid-0-FIXED-20260817.md`
+`fixed-bugs/jit-multianewarray-allocated-every-level-with-classid-0-FIXED-20260817.md` (internal)
 or
-`docs/internal/fixed-bugs/interpreter-checkcast-and-instanceof-re-resolved-their-target-every-time-FIXED-20260818.md`
+`fixed-bugs/interpreter-checkcast-and-instanceof-re-resolved-their-target-every-time-FIXED-20260818.md` (internal)
 already covers this `toArray`/array-allocation path — if so, this page may
 just need a re-verify on current `dev` rather than a fresh investigation from
 scratch.

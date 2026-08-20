@@ -58,7 +58,7 @@ io.netty.resolver.dns.DnsNameResolverTest	232	216	16
 # classpath: found/ok/aborted below are byte-for-byte what CratonVM reports.
 # Only AlignedPooledByteBufAllocatorTest had been cross-checked before; the
 # other six were an inference in
-# docs/internal/.../buffer-alignment-abort-cluster-not-a-cratonvm-bug-20260819.md
+# buffer-alignment-abort-cluster-not-a-cratonvm-bug-20260819.md (an internal record)
 # until this table was written.
 io.netty.buffer.AdvancedLeakAwareCompositeByteBufTest	506	497	9
 io.netty.buffer.AlignedPooledByteBufAllocatorTest	49	21	28
