@@ -766,7 +766,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// rejected 28 further triples the 36-vector screen had passed
 /// (`java/lang/ref/`, `sun/nio/fs/`; see `G90-1` §5).
 ///
-/// # H3-1 REBASELINE REQUIRED — 2026-08-20, NOT YET MEASURED
+/// # H3-1 REBASELINE (DONE 2026-08-20 by H0, see the RE-FREEZE note) — 2026-08-20, NOT YET MEASURED
 ///
 /// **Old value 1622, expected delta −7, expected new value 1615.** The seven
 /// `java.util.function` default/static-method stubs `G89-1` N1 nominated were
@@ -799,13 +799,58 @@ use cratonvm_types::compat::CompatibilityMode;
 /// Anything other than −7 in either configuration is a finding to attribute
 /// before re-freezing: use `CRATONVM_RATCHET_ROWS=1` on this commit and on
 /// `26e4b5db4` and diff the sorted `stub-ratchet(row):` lines.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1622;
+/// # H0 RE-FREEZE — 2026-08-20, MEASURED, and the delta was NOT the predicted one
+///
+/// H3-1 predicted -7 in both configurations. **Measured: +4 in both**, with the
+/// row column up 65. The whole delta is named, by diffing the `@@STUB` lines at
+/// the freeze commit `083998c7b` against this tree -- 11 added, 7 removed:
+///
+/// **+8, cause (b), the opposite of a regression.** The eight
+/// `sun/nio/fs/WindowsFileAttributes` accessors (`creationTime`,
+/// `lastAccessTime`, `lastModifiedTime`, `isDirectory`, `isOther`,
+/// `isRegularFile`, `isSymbolicLink`, `size`) were RETIRED as shadows by H2-1,
+/// so they stopped claiming to be `Bridge` and now read `SyntheticStub` --
+/// which means `--jdk-only` drops them and real `WindowsFileAttributes`
+/// bytecode runs, reading the Windows FILETIME fields H2-1 taught the VM to
+/// populate. **This wave's headline win arrives at this gate as a RISE.** Do
+/// not read it as one; verified live, not inert: all eight print
+/// `[JDK-ONLY-REFUSED]` under `CRATONVM_DBG_DROPPED_STUBS=1` and `RFileTimes`
+/// still passes 68 checks.
+///
+/// **+3, pre-existing, arrived by merge.**
+/// `cratonvm/internal/ss/JavaUtilJarAccess$1.{entryFor,getTrustedAttributes,isInitializing}`.
+/// Not new fakes: that receiver is a **CratonVM-internal** SharedSecrets
+/// carrier, so there is no real JDK class being shadowed and `SyntheticStub` is
+/// the honest kind. They became COUNTED rather than written, because
+/// `b7e24364f` corrected the accessor spelling (`javaUtilJarAccess`, no `get`
+/// prefix -- the real method never carried one) and a door measured
+/// `method-nowhere`-dead went live. They entered this tree through the
+/// `origin/dev` merge, not through wave H.
+///
+/// **-7, a genuine removal.** H3-1's seven `java.util.function` default/static
+/// stubs, exactly as it claimed.
+///
+/// The other ~61 of the +65 rows are NON-stub registrations from work that
+/// landed on `dev` concurrently. They are visible here only because this gate
+/// could not run: it was red from 2026-08-14 (`G89-1` §4) and then did not
+/// PARSE at all from merge `26e4b5db4` until H3-1 repaired it, so this is the
+/// first adjudication since `083998c7b`.
+///
+/// **An instrument finding, recorded because it will bite the next re-freeze.**
+/// The failure message tells you to "run `dump_synthetic_stubs` here and at the
+/// commit that last set the baseline, and diff the sorted `@@STUB` lines". That
+/// was **impossible**: `dump_synthetic_stubs` did not exist at `083998c7b`. The
+/// diff above was only possible by back-porting the function into a scratch
+/// worktree at that commit. The procedure works for baselines set from now on;
+/// it did not work for this one, and a procedure that cannot run reads exactly
+/// like a procedure nobody bothered to run.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1626;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
 ///
-/// **H3-1 REBASELINE REQUIRED — old value 1611, expected delta −7, expected new
+/// **H3-1 REBASELINE (DONE 2026-08-20 by H0, see the RE-FREEZE note) — old value 1611, expected delta −7, expected new
 /// value 1604.** Not measured; see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for
 /// the reason the guess is not written here and for the command that
 /// recomputes it. The seven deleted rows are in
@@ -813,7 +858,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1622;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1611;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1615;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -835,18 +880,18 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1611;
 /// direction in which re-freezing records work rather than absorbing it, and it
 /// is what H3-1's seven deletions produce.
 ///
-/// **H3-1 REBASELINE REQUIRED — old value 13160, expected delta −7, expected
+/// **H3-1 REBASELINE (DONE 2026-08-20 by H0, see the RE-FREEZE note) — old value 13160, expected delta −7, expected
 /// new value 13153.** Not measured. Recomputed by the same two commands as
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
 /// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13160;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13225;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
-/// **H3-1 REBASELINE REQUIRED — old value 12792, expected delta −7, expected
+/// **H3-1 REBASELINE (DONE 2026-08-20 by H0, see the RE-FREEZE note) — old value 12792, expected delta −7, expected
 /// new value 12785.** Not measured.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12792;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12857;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
