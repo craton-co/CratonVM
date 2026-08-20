@@ -169,12 +169,39 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # fail, the exact defect this file's guards exist to catch) or fail every run
 # for all eight lanes. The design constraints for landing one are in
 # docs/known-issues/jdk-only/W8-E9-1-three-broken-oracles-and-the-suite-denominator.md.
+# RJitMapTierDiff landed 2026-08-20 (lane H10) as H7-1 N1. It is in CORE and
+# NOT in JDKONLY_CLASSES, for the same reason RJdkViews is: the thing it
+# discriminates on only exists in --real-jdk. jit/src/lib.rs's four collection
+# direct-helper triples are all `bridge` in
+# scripts/baselines/jdk-only-kind-map-25-linux.tsv, so under --jdk-only
+# direct_native_helper refuses every one of them at BIND time and strict mode
+# has no second tier for these calls at all. CORE membership gets it BOTH arms
+# anyway — SUITE_SET is "$CORE_CLASSES${JDK_ONLY:+ $JDKONLY_CLASSES}", so the
+# strict run schedules it too and it PINS that refusal (every `moved=` must
+# still read -1) — while a second registration in JDKONLY_CLASSES would only
+# run the identical command twice.
+#
+# READ THIS BEFORE COMPARING TO A PUBLISHED BASELINE: it is the 105th vector.
+# HANDOFF-20260820.md §1's `--jdk-only 104 / 104`, `SUITE=all 99 / 104` and
+# `SUITE=core 63 / 64` all gain one to their DENOMINATOR. A run that reports
+# 104/105 without naming which vector failed has not been read carefully.
+#
+# It is a two-tier fixture and that is the whole point: every shape is read at
+# the first (interpreted) invocation and at the last, and the iteration at
+# which the answer moved is PUBLISHED on every row, so a wrong answer that only
+# appears after tier-up is arm-visible. Reading each shape once measures
+# whichever tier happened to be right — the defect H4-1 O1 named as "a
+# tier-dependent wrong answer no arm diffs for" and no arm in this suite could
+# see. MEASURED on HotSpot 25.0.3+9 in the scheduled configuration: rc=0,
+# PASS RJitMapTierDiff (75 checks), md5-identical over 3 runs and identical
+# under -Xint. Falsified on purpose before landing (H10-1 §5).
+#
 # The list below is the UNION of both sides of the 2026-08-17 dev merge:
 # this branch had 61 vectors, dev had 44, and RVarHandleAccess is dev's one
 # addition this branch had never scheduled. Dropping either side would
 # silently unschedule working coverage, which is the defect several of the
 # guards further down exist to catch.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RJitArraycopyRefDeopt RJitMultiArrayClass RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession RVarHandleAccess"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RJitArraycopyRefDeopt RJitMultiArrayClass RJitMapTierDiff RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession RVarHandleAccess"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
