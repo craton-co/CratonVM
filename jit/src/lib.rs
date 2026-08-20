@@ -8731,6 +8731,69 @@ fn direct_native_helper(
     entry
 }
 
+/// [`direct_native_helper`] for a ladder whose CALL-SITE class is not the class
+/// whose native the helper actually runs.
+///
+/// # H7-1: a serviceability predicate must mirror the dispatch it guards
+///
+/// Two of the collection ladders below recognise an `invokeinterface` against
+/// an interface — `java/util/Map.get` and
+/// `java/util/concurrent/ConcurrentMap.get` — and bind a helper that runs the
+/// *implementation's* native: `native_hashmap_get_exact`, registered on
+/// `java/util/HashMap`, and `native_chm_get`, registered on
+/// `java/util/concurrent/ConcurrentHashMap`. `direct_native_helper` asks the
+/// registry about the triple it is handed, so those two sites were asking
+/// §1.4's reviewed-exception question about a row that is not the one that
+/// runs.
+///
+/// It happens to answer correctly today: all four rows are `bridge` in
+/// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, so both questions
+/// refuse. That is a coincidence of the current tagging, not a property of the
+/// code — and the whole point of `H4-1`/`H0-3` is that this cluster's tagging
+/// is what somebody is about to change. A retag that moved only the interface
+/// row to `Intrinsic` would bind, under `--jdk-only`, a helper whose
+/// implementation is still a `Bridge`: compiled code back in front of real
+/// bytecode that the interpreter would have run, with no arm able to see the
+/// difference.
+///
+/// So both rows must be approved. `Intrinsic` is §1.4's *reviewed* exception;
+/// requiring the review to cover the row that actually executes is what the
+/// exception means. Refusing names the implementing class, because that is the
+/// registration the refusal is about.
+///
+/// Costs one extra resolver call, on the strict arm, at compile time, only for
+/// a triple whose cell is already non-zero and whose site class differs from
+/// its implementing class.
+#[inline]
+fn direct_native_helper_for_impl(
+    cell: &std::sync::atomic::AtomicUsize,
+    jdk_only: bool,
+    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
+    site_class: &str,
+    impl_class: &str,
+    method: &str,
+    descriptor: &str,
+) -> usize {
+    let entry = direct_native_helper(
+        cell,
+        jdk_only,
+        intrinsic_resolver,
+        site_class,
+        method,
+        descriptor,
+    );
+    if entry == 0 || !jdk_only || site_class == impl_class {
+        return entry;
+    }
+    let approved =
+        intrinsic_resolver.is_some_and(|is_intrinsic| is_intrinsic(impl_class, method, descriptor));
+    if !approved {
+        record_jdk_only_direct_native_refusal(impl_class, method, descriptor);
+        return 0;
+    }
+    entry
+}
+
 // ---------------------------------------------------------------------------
 // JDK-ONLY-NOTE — native-dispatch sites reachable from compiled code that this
 // crate cannot fix, recorded here because they are the JIT's obligations even
@@ -8857,6 +8920,54 @@ pub fn set_string_latin1_lower_direct_fn(addr: usize) {
 }
 pub fn set_concurrent_hashmap_get_direct_fn(addr: usize) {
     CONCURRENT_HASHMAP_GET_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Call sites bound to one of the three COLLECTION thin direct helpers, per
+/// compile door (only the single-pass ladder recognises these three today —
+/// see the scope note in the IR ladder above `THREAD_CURRENT_THREAD_SITES_IR`).
+///
+/// # H7-1: why a counter, and why this one
+///
+/// `H4-1` §1c and `H0-3` are about VM-side writers of a container's state that
+/// the native registry cannot see. These three binds put a *compiled* one in
+/// that population: after them, a `HashMap.get` in a tiered-up method and the
+/// same `HashMap.get` interpreted reach the map's state by two different
+/// routes. Nothing in the arms could say whether a given run had any such site
+/// at all — `--jdk-only-report` marks the four registry rows'
+/// [`invocations`] incomplete (`DIRECT_CALL_HELPER_NATIVES` in
+/// `vm/src/jit/helpers.rs`) but "incomplete" is a static claim about wiring,
+/// not a count of what this run bound.
+///
+/// So this is the same instrument, and the same lesson, as `LEAF_NATIVE_HITS`:
+/// **timings cannot tell "the fast path was never installed" from "it was
+/// installed and is no faster"** — and a strict-mode run cannot tell "the gate
+/// refused" from "no compile ever reached the site". Read beside
+/// [`jdk_only_direct_native_refusals`], the two together answer both:
+///
+/// | sites | refusals | reading |
+/// |---|---|---|
+/// | 0 | 0 | no compiled site ever saw one of these calls — the run says NOTHING about the gate |
+/// | 0 | >0 | the gate fired; strict mode is taking the interpreter's route |
+/// | >0 | 0 | compiled code holds a second entry into the map's state (expected under `--real-jdk`) |
+/// | >0 | >0 | two VMs in one process, or a policy that changed between compiles |
+///
+/// Relaxed adds on a cold compile path; nothing here is on a hot path.
+pub static HASHMAP_GET_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static HASHMAP_PUT_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CONCURRENT_HASHMAP_GET_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(HashMap.get, HashMap.put, ConcurrentMap.get)` sites bound to a collection
+/// thin direct helper since process start. See
+/// [`HASHMAP_GET_DIRECT_SITES`] for how to read it.
+pub fn collection_direct_helper_sites() -> (u64, u64, u64) {
+    (
+        HASHMAP_GET_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        HASHMAP_PUT_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        CONCURRENT_HASHMAP_GET_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// Register the `Integer.intValue` thin direct-call helper (called once from
@@ -19860,15 +19971,32 @@ fn try_compile_inner(
                 {
                     // JDK-ONLY-WAVE2: see the marker on the
                     // `StringLatin1.toLowerCase` bind above — same list.
-                    let entry = direct_native_helper(
+                    // H7-1: the site names the INTERFACE; the helper runs
+                    // `native_chm_get`, registered on `ConcurrentHashMap`.
+                    // Both rows must be admitted — see
+                    // `direct_native_helper_for_impl`.
+                    let entry = direct_native_helper_for_impl(
                         &CONCURRENT_HASHMAP_GET_DIRECT_FN,
                         jdk_only,
                         intrinsic_resolver,
                         &class_name,
+                        "java/util/concurrent/ConcurrentHashMap",
                         &method_name,
                         &descriptor,
                     );
                     if entry != 0 {
+                        // H7-1 instrument — see `CONCURRENT_HASHMAP_GET_DIRECT_SITES`.
+                        // The POLICY question above was asked about
+                        // `java/util/concurrent/ConcurrentMap.get`, the
+                        // INTERFACE named at the call site; the helper this
+                        // binds runs `native_chm_get`, which is registered on
+                        // `ConcurrentHashMap` as well. Both rows are `bridge`
+                        // today (`scripts/baselines/jdk-only-kind-map-25-linux.tsv`),
+                        // so the refusal is correct — but it is correct about
+                        // the interface row, and a retag that moved only ONE of
+                        // the two would separate them. See H7-1 §OUT-OF-FILE.
+                        CONCURRENT_HASHMAP_GET_DIRECT_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         needs_heap = true;
                         direct_calls.push((
                             pc,
@@ -19917,12 +20045,17 @@ fn try_compile_inner(
                     {
                         // JDK-ONLY-WAVE2: see the marker on the
                         // `StringLatin1.toLowerCase` bind above — same list.
+                        // H7-1: `put` is only reached from the
+                        // `invokevirtual java/util/HashMap` arm, so site class
+                        // and implementing class coincide; routed through the
+                        // same helper as `get` so the two stay one rule.
                         Some((
-                            direct_native_helper(
+                            direct_native_helper_for_impl(
                                 &HASHMAP_PUT_DIRECT_FN,
                                 jdk_only,
                                 intrinsic_resolver,
                                 &class_name,
+                                "java/util/HashMap",
                                 &method_name,
                                 &descriptor,
                             ),
@@ -19933,12 +20066,18 @@ fn try_compile_inner(
                     {
                         // JDK-ONLY-WAVE2: see the marker on the
                         // `StringLatin1.toLowerCase` bind above — same list.
+                        // H7-1: this arm also fires for
+                        // `invokeinterface java/util/Map.get`, where the site
+                        // class is the INTERFACE and the helper runs
+                        // `native_hashmap_get_exact`, registered on
+                        // `java/util/HashMap`. Both rows must be admitted.
                         Some((
-                            direct_native_helper(
+                            direct_native_helper_for_impl(
                                 &HASHMAP_GET_DIRECT_FN,
                                 jdk_only,
                                 intrinsic_resolver,
                                 &class_name,
+                                "java/util/HashMap",
                                 &method_name,
                                 &descriptor,
                             ),
@@ -19949,6 +20088,22 @@ fn try_compile_inner(
                     };
                     if let Some((entry, num_params)) = recognized {
                         if entry != 0 {
+                            // H7-1 instrument — see `HASHMAP_GET_DIRECT_SITES`.
+                            // Note which triple the POLICY question above was
+                            // asked about: for the `invoke_kind == 2` arm it is
+                            // `java/util/Map.get`, the INTERFACE, while the
+                            // helper this binds runs `native_hashmap_get_exact`
+                            // against a `java/util/HashMap` receiver. Both rows
+                            // are `bridge` today, so today's refusal is right;
+                            // it is right about the interface row. H7-1
+                            // §OUT-OF-FILE asks for the two to be tied.
+                            if num_params == 2 {
+                                HASHMAP_PUT_DIRECT_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                HASHMAP_GET_DIRECT_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             needs_heap = true;
                             direct_calls.push((
                                 pc,
@@ -22186,6 +22341,182 @@ mod tests {
         assert_eq!(
             direct_native_helper(&CELL, false, Some(&bridge), "java/util/HashMap", "put", "()V"),
             0xfeed_face
+        );
+    }
+
+    /// H7-1 — the gate that is the ONLY thing keeping the interpreter and
+    /// compiled code from answering a map lookup two different ways under
+    /// `--jdk-only`, pinned per triple.
+    ///
+    /// `H4-1` O1 called the six collection direct helpers "blocking" because
+    /// their failure mode is a tier-dependent wrong answer no arm diffs for.
+    /// The reason strict mode is nonetheless consistent today is entirely this
+    /// function: all four triples the collection ladders ask about are
+    /// `bridge` in `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, so the
+    /// `Intrinsic`-only admission refuses every one and the call falls to the
+    /// generic, policy-checked dispatcher — the same route the interpreter
+    /// takes. **That fact is load-bearing and was written down nowhere.**
+    ///
+    /// The second half is the part that would have rotted: the ladders ask
+    /// about the triple named at the CALL SITE, which for the two
+    /// `invokeinterface` arms is `java/util/Map.get` and
+    /// `java/util/concurrent/ConcurrentMap.get` — not the `java/util/HashMap`
+    /// / `java/util/concurrent/ConcurrentHashMap` row whose native the helper
+    /// actually runs. Both rows in each pair are `bridge` today, so the two
+    /// questions currently agree; a retag moving only the interface row to
+    /// `Intrinsic` would have bound a helper whose implementation is still a
+    /// `Bridge`, under strict mode, silently. `direct_native_helper_for_impl`
+    /// closes that, and the last block here is the executable statement of it.
+    #[test]
+    fn strict_mode_refuses_every_collection_direct_helper() {
+        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        CELL.store(0x0c0f_fee0, std::sync::atomic::Ordering::Relaxed);
+
+        // What the registry says today for the four triples the collection
+        // ladders name. Source: scripts/baselines/jdk-only-kind-map-25-linux.tsv
+        // (rows 6554, 6560, 6851, 7602), all `bridge`.
+        // "Is this triple a reviewed `Intrinsic`?" — `false` for all four,
+        // because all four are `bridge`. Written as a constant `false` rather
+        // than a name list so the test cannot drift into asserting a list it
+        // maintains itself; the TSV is the source and it is cited above.
+        let as_measured_today = |_c: &str, _m: &str, _d: &str| -> bool { false };
+
+        const COLLECTION_LADDER_TRIPLES: [(&str, &str, &str); 4] = [
+            // `jit_hashmap_get_direct`, invokevirtual arm.
+            (
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // `jit_hashmap_put_direct`.
+            (
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // `jit_hashmap_get_direct`, invokeinterface arm — the INTERFACE.
+            (
+                "java/util/Map",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // `jit_concurrent_hashmap_get_direct` — also the INTERFACE.
+            (
+                "java/util/concurrent/ConcurrentMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+        ];
+
+        for (class, method, descriptor) in COLLECTION_LADDER_TRIPLES {
+            let before = jdk_only_direct_native_refusals();
+            assert_eq!(
+                direct_native_helper(
+                    &CELL,
+                    true,
+                    Some(&as_measured_today),
+                    class,
+                    method,
+                    descriptor
+                ),
+                0,
+                "{class}.{method}{descriptor} is a Bridge: binding it under \
+                 --jdk-only would give compiled code a second entry into the \
+                 map's state while the interpreter took the bytecode route"
+            );
+            assert!(
+                jdk_only_direct_native_refusals() > before,
+                "{class}.{method}{descriptor} must be REFUSED, not merely unbound \
+                 — a silent zero is indistinguishable from an unwired cell"
+            );
+            // …and compatible mode still binds it, which is why this whole
+            // family is a compatible-mode concern and moves strict mode by
+            // exactly zero.
+            assert_eq!(
+                direct_native_helper(
+                    &CELL,
+                    false,
+                    Some(&as_measured_today),
+                    class,
+                    method,
+                    descriptor
+                ),
+                0x0c0f_fee0,
+                "{class}.{method}{descriptor} must still bind under --real-jdk"
+            );
+        }
+
+        // Retagging ONLY the interface row must NOT open the door: the helper
+        // this ladder binds runs `native_hashmap_get_exact`, registered on
+        // `java/util/HashMap`, which is still a `Bridge`.
+        let interface_only_intrinsic =
+            |class: &str, _m: &str, _d: &str| -> bool { class == "java/util/Map" };
+        let before = jdk_only_direct_native_refusals();
+        assert_eq!(
+            direct_native_helper_for_impl(
+                &CELL,
+                true,
+                Some(&interface_only_intrinsic),
+                "java/util/Map",
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;"
+            ),
+            0,
+            "an Intrinsic on the INTERFACE row must not admit a helper whose \
+             implementing row is still a Bridge"
+        );
+        assert!(
+            jdk_only_direct_native_refusals() > before,
+            "the implementing-row refusal must be counted too"
+        );
+
+        // Both rows Intrinsic: §1.4's reviewed exception genuinely covers the
+        // code that runs, so it binds.
+        let both_intrinsic = |class: &str, _m: &str, _d: &str| -> bool {
+            matches!(class, "java/util/Map" | "java/util/HashMap")
+        };
+        assert_eq!(
+            direct_native_helper_for_impl(
+                &CELL,
+                true,
+                Some(&both_intrinsic),
+                "java/util/Map",
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;"
+            ),
+            0x0c0f_fee0,
+            "when BOTH rows are reviewed Intrinsics the bind is admitted"
+        );
+
+        // And when the site class already IS the implementing class, the
+        // second question is skipped rather than asked twice. That property is
+        // asserted through the RESOLVER's own call count rather than through
+        // `jdk_only_direct_native_refusals`, which is a process-global that
+        // every other test in this binary also moves — an exact delta on it
+        // would be a race, not a check.
+        let asked = std::cell::Cell::new(0usize);
+        let counting = |_c: &str, _m: &str, _d: &str| -> bool {
+            asked.set(asked.get() + 1);
+            false
+        };
+        assert_eq!(
+            direct_native_helper_for_impl(
+                &CELL,
+                true,
+                Some(&counting),
+                "java/util/HashMap",
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+            ),
+            0
+        );
+        assert_eq!(
+            asked.get(),
+            1,
+            "site class == implementing class: the registry must be asked once, not twice"
         );
     }
     /// Poll `cond` until it holds, for up to ~1s.
