@@ -908,16 +908,28 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // gap is a real defect in its own right and is tracked separately; this
     // term stops G1 depending on it.
     //
+    // The term is spelled `is_generational()`, not `!is_g1()`, because that is
+    // what its two SIBLING suppression sites already say —
+    // `interpreter::update_root_snapshot` and `vm_exec::deposit_root_snapshot`
+    // both open with `heap.is_generational() && moving_young_enabled() && ...`.
+    // This site is the one that drifted, and the drift is the whole bug: three
+    // places decide whether to trade the conservative scan away, and only two
+    // of them asked which collector was going to consume the result.
+    //
+    // It also excludes ZGC, which likewise publishes no young-bounds table and
+    // so likewise gets a vacuous coverage proof (see the fail-closed guard in
+    // `conservative_roots::moving_young_unpublished_frame_oop_present`).
+    //
     // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`
     // states this restriction as though it were already implemented ("requires
-    // `is_generational()`, so under G1 it is false"). It was not; this is the
-    // line that makes the record true.
+    // `is_generational()`, so under G1 it is false"). It was true of the
+    // siblings and false here; this is the line that makes the record true.
     //
     // `CRATONVM_G1_PRECISE_ONLY_ROOTS=1` restores the old behaviour so the
     // difference is an A/B inside one binary.
     let g1_precise_only_roots = dbg_g1_precise_only_roots();
     let moving_young_precise_only = moving_young
-        && (!shared.mem.heap.is_g1() || g1_precise_only_roots)
+        && (shared.mem.heap.is_generational() || g1_precise_only_roots)
         && !moving_young_osr_fallback
         && crate::jit::conservative_roots::refresh_moving_young_coverage_for_collection()
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
