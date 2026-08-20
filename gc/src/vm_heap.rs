@@ -178,6 +178,26 @@ fn mirror_pin_young_defer_enabled() -> bool {
     })
 }
 
+/// Whether the trusted `*_validated` twins may skip the membership walk their
+/// checking counterparts do.
+///
+/// Default ON. `CRATONVM_GC_NO_VALIDATE_ONCE=1` makes every twin re-validate,
+/// restoring the two and three `is_object_address` walks per `NativeContext`
+/// accessor call that "validate once per native accessor call" removed — so
+/// that change is an A/B inside ONE binary. It landed with a walk count and no
+/// wall clock, and on this path those are not the same measurement: the
+/// getfield fix removed 34M walks and bought ~1.05x.
+///
+/// Read once; consulted on the hottest accessor path in the VM.
+#[inline]
+fn validate_once_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_VALIDATE_ONCE").is_none()
+    })
+}
+
 #[cfg(debug_assertions)]
 #[inline]
 fn arm_pending_pre_barrier() {
@@ -509,6 +529,9 @@ impl VmHeap {
     /// from JNI handles, and the sentinel above is the record of one arriving
     /// unvalidated. Anything less certain must keep using `class_id_of`.
     pub fn class_id_of_validated(&self, obj: ObjectRef) -> ClassId {
+        if !validate_once_enabled() {
+            return self.class_id_of(obj);
+        }
         dispatch!(self, class_id_of(obj))
     }
 
@@ -942,7 +965,7 @@ impl VmHeap {
     /// answered `Some` for `obj`, on this heap, with no intervening safepoint.
     #[inline]
     pub fn load_and_forward_validated(&self, obj: ObjectRef) -> ObjectRef {
-        self.load_and_forward_inner(obj, true).0
+        self.load_and_forward_inner(obj, validate_once_enabled()).0
     }
 
     /// Decode the first 8 bytes of an object's header as a compact
@@ -1004,12 +1027,18 @@ impl VmHeap {
     /// [`Self::kind_of`] for a caller holding a validated `ObjectRef`.
     /// Same contract as [`Self::class_id_of_validated`].
     pub fn kind_of_validated(&self, obj: ObjectRef) -> ObjectKind {
+        if !validate_once_enabled() {
+            return self.kind_of(obj);
+        }
         dispatch!(self, kind_of(obj))
     }
 
     /// [`Self::element_type_of`] for a caller holding a validated
     /// `ObjectRef`. Same contract as [`Self::class_id_of_validated`].
     pub fn element_type_of_validated(&self, obj: ObjectRef) -> ArrayElementType {
+        if !validate_once_enabled() {
+            return self.element_type_of(obj);
+        }
         dispatch!(self, element_type_of(obj))
     }
 
