@@ -13360,9 +13360,47 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
 }
 
 /// PUT sibling of [`jit_hashmap_get_direct`] — see its doc for the contract.
-/// The overlay insert writes only the Rust-side table (GC-scanned as roots),
-/// so the wrapper-free path holds; any non-overlay case (materialization,
-/// resize, non-Integer key) falls back to full dispatch.
+///
+/// # H7-1: one implementation, and no arm that mutates and then re-dispatches
+///
+/// This used to call `cratonvm_native_collections::jit_overlay_hashmap_put`
+/// — a `pub` re-export of `try_hm_int_fast_put` — as its own private first
+/// stage, and hand every other outcome back to `jit_invoke_dispatch`. Two
+/// consequences, the second of which is a wrong answer:
+///
+/// * It was a **second entry into the map's write path** that the registry has
+///   never heard of, which is the population `H4-1` §1c and `H0-3` are about.
+///   `native_hashmap_put_exact`'s FIRST statement is that same
+///   `try_hm_int_fast_put`, so calling the native loses no fast path — it
+///   loses the private door.
+/// * `Some(Ok(Some(<non-object Value>)))` fell to `break 'fast`, i.e. to
+///   `jit_invoke_dispatch`, **after the overlay insert had already happened**.
+///   The generic path then re-executed the put and returned the value this
+///   call had just written as if it were the previous mapping.
+///   `HashMap.put`'s return value is the previous mapping, so that is a
+///   silently wrong answer, and it is reachable: the overlay's stored `Value`
+///   comes from whoever wrote it, and `H4-1` §1a counts 42 direct Rust
+///   `native_map_put_pub` call sites that are not obliged to store an object.
+///   The GET sibling may re-dispatch on this arm because a read is idempotent;
+///   a write is not, and the two were written as if they were the same shape.
+///
+/// The exact-`java/util/HashMap` receiver guard above is what makes
+/// `native_hashmap_put_exact` the right callee rather than the registered
+/// `native_map_put`: for that receiver `native_map_put_evict`'s
+/// `is_bare_java_lang_object` / `is_unmod_wrapper` / `ht_reject_null_*` /
+/// CHM / LHM / TreeMap ladder is all no-ops, and its `CF_EXACT_HASHMAP` arm is
+/// `native_hashmap_put_exact`'s body line for line. That is the same identity
+/// `hashmap_native_callback` already relies on for the site-cache door, and
+/// the same shape [`jit_hashmap_get_direct`]'s own fallback arm already uses.
+///
+/// **Cost, stated rather than measured** — no binary carrying this has been
+/// built. The overlay-servable put now pays one
+/// `safe_native_call_prevalidated_objects` funnel entry it did not pay before.
+/// It buys the funnel's pin ring, `NativeRunning` transition and exception
+/// drain for a call that can reach `map_hash_key` (arbitrary Java `hashCode()`)
+/// on any non-overlay outcome — which the old code reached only via the
+/// dispatcher, so nothing is lost there. Falsified by an A/B on one binary
+/// showing a map-put-dominated workload regressing beyond noise.
 ///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_hashmap_put_direct(
@@ -13412,26 +13450,44 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
         let Some((thread, _guard)) = jit_thread_mut() else {
             break 'fast;
         };
-        let probe = {
-            let mut ctx = crate::vm::NativeContextImpl {
-                shared: vm,
-                thread: &mut *thread,
-            };
-            cratonvm_native_collections::jit_overlay_hashmap_put(
-                &mut ctx, recv_obj, vals[0], vals[1],
-            )
-        };
-        match probe {
-            Some(Ok(Some(Value::Object(Some(object))))) => {
+        // H7-1: the ONE implementation, through the same funnel the
+        // interpreter uses for the same receiver. `native_hashmap_put_exact`
+        // opens with `try_hm_int_fast_put`, so the overlay fast path is
+        // unchanged; what is gone is the JIT's private entry into it and the
+        // arm that inserted and then re-dispatched. Every `Value::Object` in
+        // `vals` was validated against this VM's heap above, which is the
+        // `_prevalidated_objects` precondition.
+        let values = [Value::Object(Some(recv_obj)), vals[0], vals[1]];
+        match crate::vm::safe_native_call_prevalidated_objects(
+            vm,
+            thread,
+            cratonvm_native_collections::native_hashmap_put_exact,
+            &values,
+        ) {
+            Ok(Some(Value::Object(Some(object)))) => {
                 thread.native_pending_return = Some(object);
                 return object.as_ptr() as i64;
             }
-            Some(Ok(Some(Value::Object(None)))) | Some(Ok(None)) => return 0,
-            Some(Ok(Some(_))) => break 'fast,
-            Some(Err(error)) => {
+            Ok(Some(Value::Object(None))) | Ok(None) => return 0,
+            // Out-of-contract: an object-typed map answered with a non-object
+            // `Value`. The put has ALREADY been applied by the call above, so
+            // re-dispatching would apply it twice and return the value this
+            // call wrote instead of the previous mapping — the defect this
+            // rewrite exists to remove. There is no `L`-shaped encoding of a
+            // primitive `Value`, so answer `null`: it is the one reply that
+            // does not mutate a second time, and it is what the same match
+            // already answers for `Value::Object(None)`.
+            Ok(Some(_)) => {
+                debug_assert!(
+                    false,
+                    "java/util/HashMap.put returned a non-object Value; a non-Java writer \
+                     stored a primitive under this key (H4-1 §1a)"
+                );
+                return 0;
+            }
+            Err(error) => {
                 return handle_jit_dispatch_error(vm, thread, error, &HASHMAP_PUT_DIRECT_INFO)
             }
-            None => break 'fast,
         }
     }
     let args = [receiver, key, value];
