@@ -24371,6 +24371,59 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Object(Some(stream))))
 }
 
+/// `TreeSet.spliterator()` / `TreeMap$KeySet.spliterator()` — the same sorted
+/// snapshot [`native_ts_stream`] takes, in the three-field synthetic
+/// `java/util/Spliterator` shape [`native_hs_spliterator`] produces.
+///
+/// The comment on `native_ts_stream` above explains why `stream()` needs an
+/// override; `spliterator()` needs it for the same reason and did not have one.
+/// Both classes DECLARE `spliterator()`, so the receiver-has-own-bytecode rule
+/// ran the JDK body — `TreeMap.keySpliteratorFor(m)` — against fields our
+/// layout keeps in the `ts_array_table` side-table instead, and every caller
+/// got `NullPointerException: Cannot invoke
+/// "java.util.TreeMap$NavigableSubMap.keySpliterator()" because "sm" is null`.
+/// `force_native_over_real_jdk_bytecode` already listed `spliterator` for
+/// `java/util/TreeMap$KeySet`; as ever, a gate entry is not a registration.
+fn native_ts_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+            ctx.set_field(spl, 0, Value::Object(Some(arr)));
+            ctx.set_field(spl, 1, Value::Int(0));
+            ctx.set_field(spl, 2, Value::Int(0));
+            return Ok(Some(Value::Object(Some(spl))));
+        }
+    };
+    let this = resync_ts_view(ctx, this)?;
+    let this_pin = ctx.pin_native_root(this);
+    let (_, size, _) = ts_state(ctx, this);
+    // Allocate first, then RE-read the element table through the pin: the
+    // allocation can move it (same count -> allocate -> re-read discipline as
+    // `native_hs_to_array`).
+    let arr = alloc_ref_array(ctx, size as usize);
+    let arr_pin = ctx.pin_native_root(arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    let (data_opt, live_size, _) = ts_state(ctx, this);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let n = (live_size as usize).min(size as usize);
+    if let Some(data) = data_opt {
+        for i in 0..n {
+            ctx.set_array_element(arr, i, ctx.get_array_element(data, i));
+        }
+    }
+    let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    // The cursor end is the array's own length, so a shrunk-since-allocation
+    // table cannot leave trailing nulls inside the reported range.
+    ctx.set_field(spl, 2, Value::Int(n as i32));
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(spl))))
+}
+
 // -- Intermediate operations --
 
 /// Diagnostic-only tripwire for the pin/read-through-handle path shared by
@@ -49707,6 +49760,21 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
         registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
+        // `spliterator()` for the same reason `stream()` is here: both classes
+        // declare it, and the JDK body goes through `TreeMap.keySpliteratorFor`
+        // over fields our layout keeps in the side-table. Without this,
+        // `treeSet.spliterator()` and `treeMap.keySet().spliterator()` threw
+        // `NullPointerException: ... "java.util.TreeMap$NavigableSubMap
+        // .keySpliterator()" because "sm" is null` — and `spliterator` was
+        // already in `force_native_over_real_jdk_bytecode` for
+        // `java/util/TreeMap$KeySet`, which does nothing without a native to
+        // prefer.
+        registry.register(
+            c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_ts_spliterator,
+        );
         // Descending/poll views — read the backing `m` TreeMap in real JDK, which
         // CratonVM's native TreeSet never populates (state lives in the side-table),
         // so the inherited bytecode NPEs on a null `m`. Drive them from `ts_state`.
