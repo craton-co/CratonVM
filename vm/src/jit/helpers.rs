@@ -5048,6 +5048,7 @@ pub unsafe extern "C" fn jit_ldc_class_cp(
     crate::runtime::interpreter::site_cache::site_stats::bump(
         crate::runtime::interpreter::site_cache::site_stats::JIT_LDC_MISS,
     );
+    jit_safepoint_flush_satb(vm_ptr);
     let target_id = match jit_resolve_cp_class(vm, holder_cid, cp_idx as u16, false) {
         Ok(id) => id,
         // A FAILED resolution is deliberately not recorded: JVMS §5.4.3 says
@@ -5191,6 +5192,7 @@ pub unsafe extern "C" fn jit_ldc_string_cp(vm_ptr: i64, holder_class_id: i64, cp
         return bits;
     }
     crate::runtime::interpreter::site_cache::site_stats::bump(crate::runtime::interpreter::site_cache::site_stats::JIT_LDC_MISS);
+    jit_safepoint_flush_satb(vm_ptr);
     // Cold, once per site: re-read the literal. Owned before the lock is
     // dropped, because `create_java_string` allocates and must not run under
     // the class-manager read lock (`create_exception_object` re-enters it).
