@@ -6,10 +6,41 @@ on this host, 2026-08-20: HotSpot 25.0.3+9 at
 `C:/craton/target-jdkonly-h2/release/cratonvm.exe` built from this branch. The
 mechanism in §3 is read from the tree, not inferred from the numbers.
 
+> ## CORRECTION, same day, measured — the sentence that was here was wrong
+>
+> The original text read: *"the `--jdk-only` arm is 104/104 with all twelve
+> cells below still wrong, because strict mode does not take this path."*
+> **The second half of that was never measured.** §4's probe was run in the
+> default mode only, and the claim about strict mode was inferred from the arm
+> being green rather than from asking it. Lane H4 pointed out that it is also
+> self-contradictory: `RImmutableFactoryTypes` is in `CORE_CLASSES`
+> (`run.sh:177`) and therefore *in* the strict arm, so a green strict arm and a
+> wrong `AbstractMap` cell cannot both be true.
+>
+> **Re-run under `--jdk-only`, 22 receivers × 9 type tests, diffed whole
+> against the HotSpot column: IDENTICAL. All twelve cells are already right in
+> strict mode.**
+>
+> That inverts this record's conclusion. Strict mode refuses the
+> `cratonvm/internal/Unmodifiable*` producers outright, so `Map.of(...)` there
+> IS a real `ImmutableCollections$Map1`, `is_subclass_of` walks a real chain,
+> and there is nothing to fix. The defect is **compatible-mode only, on both
+> faces**, and §5's framing of this record as "a specification for the wave-2
+> cluster retag" does not survive: a retag cannot improve strict mode (already
+> exact) and, per `H4-1` §3, cannot improve compatible mode either, because
+> `allowed_in(Compatible)` is unconditionally true and the kind is discarded
+> there. **The twelve cells are not acceptance criteria for a retag. They are a
+> compatible-mode defect whose fix has to be something else.**
+>
+> The lesson is this directory's oldest one and I walked into it while writing a
+> record about somebody else walking into it: *a green gate is evidence about
+> the question it asked.* I had the probe, the binary and the flag in hand, and
+> inferred instead of spending one command. See `HANDOFF-20260819.md` §3.
+
 **This is a `--real-jdk` (compatible-mode) defect. It does not move strict
-mode** — the `--jdk-only` arm is 104/104 with all twelve cells below still
-wrong, because strict mode does not take this path. Per `HANDOFF-20260819.md`
-§1, do not read it as `--jdk-only` progress.
+mode** — measured: under `--jdk-only` every cell in §4 already matches HotSpot.
+Per `HANDOFF-20260819.md` §1, do not read anything here as `--jdk-only`
+progress.
 
 Lane H0 (orchestrator), 2026-08-20.
 
@@ -154,14 +185,27 @@ containers — what fails is a PARTIAL retag. When `Map.of(...)` returns a real
 `ImmutableCollections$Map1`, `is_subclass_of` walks a real chain and all twelve
 cells come right with no rule to keep in step, because there is only one rule.
 
-That work is now unblocked: contract §8's ban on `native-builtins/src/lib.rs`
-was lifted for wave 2 on 2026-08-20, which was the structural blocker `G88-1`
-§6 identified (the Properties/Hashtable half of the cluster is 67 registrations
-in `native-builtins` against 49 in `native-collections`).
+**WITHDRAWN, measured 2026-08-20 (see the correction banner at the top).** The
+paragraph that stood here said this work was "now unblocked" by the wave-2
+authorisation and that §4's twelve cells were "the acceptance criteria for that
+cluster change". Both halves are false:
 
-**So this record is a specification, not a complaint.** The twelve cells in §4
-are the acceptance criteria for that cluster change, and they are already
-written down.
+* the twelve cells are **already right under `--jdk-only`**, so a strict-mode
+  change has nothing to earn there;
+* `H4-1` §2 measured that `native-builtins/src/lib.rs` contains **zero**
+  `java/util/Properties` or `java/util/Hashtable` registrations — the 67 are in
+  `properties_sidetable.rs` (35), `deprecated_util.rs` (12),
+  `deprecated_io_util.rs` (7) and `wildfly_naming.rs` (3). Re-verified here:
+  that file has two occurrences of either name and neither is a registration.
+  **`G88-1` §6 conflated the crate with the file.** Contract §8 names one file,
+  and the Properties/Hashtable cluster was never inside it — so §8 was never
+  the blocker for that row, and lifting it did not unblock this.
+
+What remains true is §3: the display rule and the type rule read different
+state, and a static superclass link cannot serve both receivers. What is now
+open is **which** mechanism should fix the compatible-mode face, given that
+`NativeKind` demonstrably cannot — `H4-1` §3 shows the kind is discarded in
+Compatible mode entirely.
 
 ## 6. What this corrects
 
