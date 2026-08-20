@@ -5562,6 +5562,43 @@ impl Compiler {
                         // operand stack, computes into EAX and pushes the
                         // result. All emitted code is bit-identical to the
                         // JDK semantics (verified by intrinsic_int_bits.rs).
+                        // --- FP_BITS: Double bit reinterpretation ---
+                        //
+                        // One `MOVQ` each. These replaced 361 million checked
+                        // native-bridge crossings in one run of
+                        // `PSquarePercentileTest`; see the FP_BITS region in
+                        // `jit/src/lib.rs` for the census.
+                        //
+                        // RAW semantics come free: `MOVQ` moves all 64 bits,
+                        // NaN payload included, which is exactly what
+                        // `doubleToRawLongBits` is specified to return. The
+                        // canonicalising `doubleToLongBits` is not matched by
+                        // the resolver and so cannot reach here.
+                        else if callee_entry
+                            == crate::JitIntrinsic::DoubleToRawLongBits.as_entry()
+                        {
+                            // Double.doubleToRawLongBits(d): the argument's
+                            // 64 bits, unchanged, as a long.
+                            let arg = self.pop_stack();
+                            match arg {
+                                StackSlot::Xmm(xmm) => self.emit_movq_rax_from_xmm(xmm),
+                                // A frame slot or GPR already holds the raw
+                                // 64-bit pattern -- the JIT stores a double
+                                // as its bits -- so this is a plain load and
+                                // no XMM round trip is needed.
+                                _ => self.load_slot_to_reg(RAX, arg),
+                            }
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == crate::JitIntrinsic::LongBitsToDouble.as_entry()
+                        {
+                            // Double.longBitsToDouble(bits): the mirror.
+                            let arg = self.pop_stack();
+                            self.flush_xmm0_slots();
+                            self.load_slot_to_reg(RAX, arg);
+                            self.emit_movq_xmm_from_rax(0);
+                            self.stack_push(StackSlot::Xmm(0), false);
+                        }
                         else if callee_entry == crate::JitIntrinsic::IntBitCount.as_entry() {
                             // Integer.bitCount(i): POPCNT EAX, EAX. The
                             // matcher only registers this when has_popcnt()
