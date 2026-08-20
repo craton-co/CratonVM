@@ -76,6 +76,37 @@ Deliberately NOT done here: re-freezing 1611 → 1614 would turn a gate that has
 been blind for a day into a gate that has been blind for a day and then
 rubber-stamped.
 
+## Three more gates were red on dev in the same pass
+
+Found by running the two crates' suites either side of a
+`git checkout origin/dev -- <src>` control, which is the only way to tell
+"my change broke it" from "it was already broken". None of these is the TLS
+branch's; each was measured with dev's own sources under the same test binary.
+
+| crate | test | control (dev sources) |
+|---|---|---|
+| `cratonvm-native-builtins` | `lang_class::tests::null_receiver_on_an_instance_field_outranks_the_access_refusal` | FAILED |
+| `cratonvm-native-io` | `io_tests::fis_close_marks_closed_and_is_idempotent` | FAILED |
+| `cratonvm-native-io` | `io_tests::fis_read_bytes_zero_length_answers_zero_on_a_closed_stream` | FAILED |
+| `cratonvm-native-io` | `io_tests::fis_skip_consults_the_descriptor_before_the_count` | FAILED |
+
+A fourth, `lang_math::tests::canonical_wrapper_if_cached_follows_the_configured_integer_bound`,
+was fixed rather than filed — it was a one-line `i32` overflow in
+`canonical_wrapper_if_cached`'s index computation
+(`i32::MAX - INTEGER_CACHE_LOW`), where the contract is a cache MISS. Release
+builds wrap and miss anyway, so only the debug gate was red.
+
+The three `fis_*` rows share a prefix and are almost certainly one cause; they
+are listed separately because that has not been checked.
+
+**The pattern, not the rows.** Five distinct unit-test gates were red on dev at
+once, and one of them was a compile error that had been masking a sixth. This
+is the same shape as the 2026-08-18 finding that four native-builtins gates were
+red on dev simultaneously. A crate suite that nobody runs to green stops being
+a gate; the cheapest fix is to run `cargo test -p <crate>` on the crates a
+change touches, and to control any failure against `origin/dev` sources before
+believing it is yours.
+
 ## Repro
 
 ```bash

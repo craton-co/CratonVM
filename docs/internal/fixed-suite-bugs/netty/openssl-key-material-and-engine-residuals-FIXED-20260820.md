@@ -466,6 +466,45 @@ the array-rooting sweeps recorded below; what remained after them was never a
 key-material problem at all, which is why the sweeps kept not closing it.
 
 
+### No regression, and the one class that looked like one
+
+The lock change is not scoped to TLS: it rewrites how EVERY selector operation
+in the VM takes the process-wide registry, so a green `ParameterizedSslHandlerTest`
+is not evidence that nothing else moved. Same class selection the
+`foreign-nio-subclass` fix used, and for the same reason — everything under
+`channel.nio` / `channel.socket` / `test.udt` / `resolver.dns`, plus every class
+whose NAME contains Socket / Server / EventLoop / Selector. **142 classes**, one
+fork per class, both binaries, per-class `@@RESULT` diffed:
+
+```
+                PASS  FAIL  NOTESTS  ABORTED  HANG
+base (dev)        88    44        8        2     0
+fix (branch)      87    44        8        2     1
+```
+
+The 44 FAILs are the same 44, byte-identical. The whole diff is one line, and it
+is a timeout rather than a failure: `AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest`,
+`PASS 128/128 in 255 s` on base against the sweep's 300 s cap, `HANG` on the
+branch.
+
+That class was then re-run on its own, interleaved ABBA, 3 rounds, 700 s cap:
+
+```
+i=1 base 260s   fix 270s   fix 250s   base 253s
+i=2 base 254s   fix 250s   fix 253s   base 333s   <- base, over the sweep's cap
+i=3 base 273s   fix 247s   fix 272s   base 260s
+```
+
+**12 of 12 runs pass 128/128, on both arms.** The class simply takes 247–333 s,
+and one BASE run took 333 s — above the same 300 s cap that produced the
+"HANG". It was the cap, not the change; the sweep's cap is too tight for this
+class and the diff would have gone the other way just as easily.
+
+Worth keeping as a shape: a sweep-level `HANG` on a class whose passing time
+sits within ~15% of the cap is a coin toss, not a result. The re-run that settles
+it has to be the SAME binary, several times, not the two arms once each.
+
+
 ### The environment: this host could not run OpenSSL, for either VM
 
 **Still true on dev today**, and it is now a command rather than a paragraph to
