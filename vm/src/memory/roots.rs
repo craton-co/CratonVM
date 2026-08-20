@@ -151,6 +151,14 @@ pub fn scan_section_of(index: usize) -> &'static str {
     best
 }
 
+/// `CRATONVM_DBG_JIT_ROOTSCAN` gate, resolved once. The print it guards runs
+/// per collection, not per native call, so a cached bool is the whole cost on a
+/// default run.
+fn dbg_jit_rootscan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some())
+}
+
 pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     if scan_marks_enabled() {
         SCAN_MARKS.lock().clear();
@@ -877,6 +885,33 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         for r in &roots[jit_scan_start..] {
             cratonvm_gc::gc_quiescence::add_pinned_jit_root(r.as_ptr() as usize);
         }
+    }
+    // `CRATONVM_DBG_JIT_ROOTSCAN=1` — one line per COLLECTION naming why this
+    // cycle's JIT pin set came out the size it did.
+    //
+    // G1's `[g1][PINS]` line reports the pin count at the point the collection
+    // set is built, which is downstream of every way the count can be zero and
+    // cannot tell them apart: the scan was skipped (`precise_only`), the scan
+    // ran against an empty chain (`chain=0`), or the scan walked a band and
+    // every candidate failed `is_object_address` (`chain>0 added=0`). Those are
+    // three different defects and the collector-side line reads identically for
+    // all three. See
+    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    if dbg_jit_rootscan() {
+        let frames = crate::jit::conservative_roots::active_compiled_frames();
+        let labels: Vec<&str> = frames.iter().map(|(_, l, _)| l.as_str()).collect();
+        eprintln!(
+            "[jitroots] precise_only={precise_only} moving_young={moving_young} \
+             osr_fb={osr_fb} incomplete={incomplete} chain={chain} any_jit={any_jit} \
+             scan_added={added} is_g1={is_g1} frames={labels:?}",
+            precise_only = moving_young_precise_only,
+            osr_fb = moving_young_osr_fallback,
+            incomplete = cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete(),
+            chain = crate::jit::conservative_roots::current_thread_jit_depth(),
+            any_jit = crate::jit::conservative_roots::any_thread_in_jit(),
+            added = roots.len() - jit_scan_start,
+            is_g1 = shared.mem.heap.is_g1(),
+        );
     }
 
     mark_scan_section(roots.len(), "14b: Shadow-stack precise roots (CRATONVM_SHADOW_STACK). JIT code");
