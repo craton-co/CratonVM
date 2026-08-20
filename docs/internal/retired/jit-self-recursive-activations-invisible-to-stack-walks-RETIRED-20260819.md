@@ -3,7 +3,7 @@
 **RETIRED 2026-08-19.** The defect this page was opened for is fixed, along with
 two more found underneath it. What remained is a different mechanism and has its
 own page:
-`docs/known-issues/jit/jit-compiled-frame-between-chain-entries-is-invisible-20260819.md`.
+`../fixed-suite-bugs/jit/jit-compiled-frame-between-chain-entries-FIXED-20260819.md`.
 
 Three fixes came out of this page, each with a kill switch and a regression
 guard:
