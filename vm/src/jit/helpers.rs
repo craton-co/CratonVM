@@ -12197,10 +12197,7 @@ unsafe fn try_varhandle_instance_field_read(
     args_slice: &[i64],
     thread: &mut JvmThread,
 ) -> Option<i64> {
-    if !matches!(
-        info.method_name,
-        "get" | "getVolatile" | "getOpaque" | "getAcquire"
-    ) {
+    if !cratonvm_jit::VARHANDLE_READ_MODES.contains(&info.method_name) {
         return None;
     }
     // [VarHandle, receiver] and nothing else: a coordinate-carrying access
@@ -12213,6 +12210,32 @@ unsafe fn try_varhandle_instance_field_read(
     if vh_raw == 0 || recv_raw == 0 {
         return None;
     }
+    varhandle_instance_field_read_bits(vm, vh_raw, recv_raw, info.return_type, Some(thread))
+}
+
+/// The read itself, shared by the funnel route above and the thin direct-call
+/// helpers below so the two cannot drift apart in what they consider a
+/// servable handle.
+///
+/// `site_ret` is the CALL SITE's declared return type — `info.return_type` on
+/// the funnel route, the slot's baked return kind on the direct route. It is
+/// what the funnel would have unboxed the erased `Object` result against, so
+/// disagreeing with the variable's own kind is a refusal rather than a
+/// conversion.
+///
+/// `thread` is required only to publish an OBJECT result as a handoff root;
+/// a primitive-returning caller may pass `None`, and then a reference-valued
+/// variable is declined instead of being returned unrooted.
+///
+/// SAFETY: `vh_raw`/`recv_raw` are raw references from a live compiled frame;
+/// both are heap-validated here before any dereference.
+unsafe fn varhandle_instance_field_read_bits(
+    vm: &SharedVm,
+    vh_raw: u64,
+    recv_raw: u64,
+    site_ret: u8,
+    thread: Option<&mut JvmThread>,
+) -> Option<i64> {
     let vh = vm.mem.heap.is_object_address(vh_raw as usize)?;
     let receiver = vm.mem.heap.is_object_address(recv_raw as usize)?;
     // The GC-stable key `vh_meta_get` files the handle under. Mirrors
@@ -12224,9 +12247,6 @@ unsafe fn try_varhandle_instance_field_read(
     });
     let plan = cratonvm_native_builtins::lang_invoke::varhandle_instance_field_plan(key)?;
     // Reference/primitive agreement between the variable and the call site.
-    // `info.return_type` is the site's own descriptor return, which is what
-    // the funnel would have unboxed against.
-    let site_ret = info.return_type;
     let site_is_ref = matches!(site_ret, b'L' | b'[');
     let plan_is_ref = plan.value_desc == b'L';
     if site_is_ref != plan_is_ref || (!site_is_ref && site_ret != plan.value_desc) {
@@ -12246,8 +12266,10 @@ unsafe fn try_varhandle_instance_field_read(
             // Object-return handoff root, same contract as every other JIT
             // native fast path (see `jit_integer_value_of_direct`): the
             // reference is live only in a register until the caller stores
-            // it, so it has to be reachable across that window.
-            thread.native_pending_return = Some(obj);
+            // it, so it has to be reachable across that window. With no
+            // thread borrow there is nowhere to publish it, so the read is
+            // declined rather than handed back unrooted.
+            thread?.native_pending_return = Some(obj);
             obj.as_ptr() as i64
         }
         Value::Object(None) => 0,
@@ -12256,6 +12278,184 @@ unsafe fn try_varhandle_instance_field_read(
         // unexpected here goes back to the funnel rather than being guessed at.
         _ => return None,
     })
+}
+
+
+// ---------------------------------------------------------------------------
+// `VarHandle` read-mode thin direct-call helpers.
+//
+// The JIT half is `cratonvm_jit::VARHANDLE_READ_DIRECT_FNS` and the two
+// recognitions that read it (`jit::try_compile`'s single-pass ladder and
+// `jit_bridge::compile_osr_artifact`). This half is the callee: a
+// `(vm_ptr, varhandle, receiver)` `extern "C"` function per
+// (access mode, primitive return kind) slot.
+//
+// One implementation, reached two ways. `try_varhandle_instance_field_read`
+// below serves the SAME read from inside `jit_invoke_dispatch`, for every site
+// this bind declines and for the interpreter's dispatches; both call
+// `varhandle_instance_field_read_bits`, so the two routes cannot drift apart
+// in what they consider a servable handle.
+// ---------------------------------------------------------------------------
+
+/// Erased call-site descriptors for [`VARHANDLE_READ_INFOS`], indexed by the
+/// return-kind half of a slot.
+///
+/// A baked direct call has no `JitInvokeInfo` of its own (see
+/// `bytecode_walk.rs`: `info_ptr` is `None` for a thin helper), so the cold arm
+/// cannot hand the generic dispatcher the site's real descriptor. These stand
+/// in for it, and for a PRIMITIVE return that substitution is not observable:
+/// the descriptor's only readers are the argument decode (one reference
+/// coordinate either way), `unbox_poly_return_checked`'s return-type rules and
+/// `coerce_native_return`, and all three see the identical return char. It is
+/// observable for a REFERENCE return — `varhandle_reference_return_mismatch`
+/// compares against the site's declared class — which is exactly why the bind
+/// refuses those and leaves them on the funnel with their real info.
+const VARHANDLE_READ_DESCRIPTORS: [&str; 8] = [
+    "(Ljava/lang/Object;)Z",
+    "(Ljava/lang/Object;)B",
+    "(Ljava/lang/Object;)C",
+    "(Ljava/lang/Object;)S",
+    "(Ljava/lang/Object;)I",
+    "(Ljava/lang/Object;)J",
+    "(Ljava/lang/Object;)F",
+    "(Ljava/lang/Object;)D",
+];
+
+/// Synthetic call sites for the cold arm of the `VarHandle` read helpers, one
+/// per slot. `static`, not a stack temporary: `jit_invoke_dispatch` keys its
+/// per-site memos on `(vm_identity, info address)`, so the address has to be
+/// process-stable — the same contract `INTEGER_INT_VALUE_INFO` and
+/// `PRECONDITIONS_CHECK_INDEX_INFO` are statics for.
+static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS] = [
+    vh_read_info(0, 0), vh_read_info(0, 1), vh_read_info(0, 2), vh_read_info(0, 3),
+    vh_read_info(0, 4), vh_read_info(0, 5), vh_read_info(0, 6), vh_read_info(0, 7),
+    vh_read_info(1, 0), vh_read_info(1, 1), vh_read_info(1, 2), vh_read_info(1, 3),
+    vh_read_info(1, 4), vh_read_info(1, 5), vh_read_info(1, 6), vh_read_info(1, 7),
+    vh_read_info(2, 0), vh_read_info(2, 1), vh_read_info(2, 2), vh_read_info(2, 3),
+    vh_read_info(2, 4), vh_read_info(2, 5), vh_read_info(2, 6), vh_read_info(2, 7),
+    vh_read_info(3, 0), vh_read_info(3, 1), vh_read_info(3, 2), vh_read_info(3, 3),
+    vh_read_info(3, 4), vh_read_info(3, 5), vh_read_info(3, 6), vh_read_info(3, 7),
+];
+
+/// One entry of [`VARHANDLE_READ_INFOS`]. `num_jit_args: 2` counts the
+/// receiver — the `VarHandle` itself — plus the single coordinate, matching
+/// `INTEGER_INT_VALUE_INFO`'s `1` for a zero-argument `invokevirtual`.
+const fn vh_read_info(mode: usize, ret: usize) -> JitInvokeInfo {
+    JitInvokeInfo {
+        class_name: "java/lang/invoke/VarHandle",
+        method_name: cratonvm_jit::VARHANDLE_READ_MODES[mode],
+        descriptor: VARHANDLE_READ_DESCRIPTORS[ret],
+        num_jit_args: 2,
+        return_type: cratonvm_jit::VARHANDLE_READ_RETURNS[ret],
+        invoke_kind: 0,
+        declaring_class_id: 0,
+    }
+}
+
+/// `VarHandle` reads served by a thin direct call, and the ones that had to be
+/// handed back to the generic dispatcher.
+///
+/// Both halves are needed, and a run with a non-zero site count and a zero hit
+/// count is the specific failure this pair exists to name: the bind landed at
+/// compile time and every execution declined. `declines` non-zero with `hits`
+/// non-zero is normal — the first call on a handle resolves its slot inside the
+/// native, so it declines and the second call qualifies.
+pub static VARHANDLE_READ_DIRECT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static VARHANDLE_READ_DIRECT_DECLINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(served, declined)` counts for the `VarHandle` read direct helpers.
+pub fn varhandle_read_direct_counts() -> (u64, u64) {
+    (
+        VARHANDLE_READ_DIRECT_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        VARHANDLE_READ_DIRECT_DECLINES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Body of every [`VARHANDLE_READ_DIRECT_FNS`] slot.
+///
+/// Fast path: the handle describes a resolved instance field whose kind agrees
+/// with the call site's return, and the answer is one field load. Everything
+/// else — a null handle or coordinate, an unresolved or non-instance-field
+/// handle, a kind disagreement — falls through to the generic dispatcher with
+/// this slot's synthetic call site, so the value, the exception and the
+/// `VarHandle` access-mode rules are the registered native's rather than a
+/// copy of them.
+///
+/// # SAFETY
+///
+/// Called only from JIT-compiled code, with a `vm_ptr` compiled against this
+/// live VM and two raw references the compiled frame is holding.
+unsafe fn varhandle_read_direct_impl(vm_ptr: i64, vh: i64, receiver: i64, slot: usize) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let site_ret =
+        cratonvm_jit::VARHANDLE_READ_RETURNS[slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len()];
+    // No SATB flush and no reference-argument forwarding, unlike
+    // `jit_invoke_dispatch`: this arm cannot allocate, cannot reach a
+    // safepoint, and returns a primitive. It also takes no thread borrow —
+    // a primitive result needs no `native_pending_return` handoff root, which
+    // is the only thing the funnel's copy of this read wants a thread for.
+    // The cold arm below does all of that, because it IS the funnel.
+    if vh != 0 && receiver != 0 {
+        if let Some(bits) =
+            varhandle_instance_field_read_bits(vm, vh as u64, receiver as u64, site_ret, None)
+        {
+            VARHANDLE_READ_DIRECT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return bits;
+        }
+    }
+    VARHANDLE_READ_DIRECT_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [vh, receiver];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &VARHANDLE_READ_INFOS[slot] as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
+    )
+}
+
+/// The thin direct-call target for slot `SLOT` of
+/// `cratonvm_jit::VARHANDLE_READ_DIRECT_FNS`.
+///
+/// One monomorphisation per slot, so the slot — and with it the site's return
+/// kind and the synthetic call site the cold arm uses — is a compile-time
+/// constant in the emitted `CALL`'s target rather than an argument the JIT has
+/// no way to pass (a `JitDirectCall` carries no site constant).
+///
+/// # SAFETY
+///
+/// See [`varhandle_read_direct_impl`].
+pub unsafe extern "C" fn jit_varhandle_read_direct<const SLOT: usize>(
+    vm_ptr: i64,
+    vh: i64,
+    receiver: i64,
+) -> i64 {
+    varhandle_read_direct_impl(vm_ptr, vh, receiver, SLOT)
+}
+
+/// Addresses of every [`jit_varhandle_read_direct`] monomorphisation, in slot
+/// order.
+fn varhandle_read_direct_fns() -> [usize; cratonvm_jit::VARHANDLE_READ_SLOTS] {
+    macro_rules! slots {
+        ($($slot:literal),* $(,)?) => {
+            [$( jit_varhandle_read_direct::<$slot> as *const () as usize ),*]
+        };
+    }
+    slots!(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31,
+    )
+}
+
+/// The thin direct-call helper address for one slot, for the OSR door — which
+/// takes helper addresses directly rather than through the jit-crate cells,
+/// because it can run before `build_helpers` has published them.
+pub fn varhandle_read_direct_fn(slot: usize) -> usize {
+    varhandle_read_direct_fns()[slot]
 }
 
 /// Try to compile a callee method from a JitInvokeInfo.
@@ -12572,6 +12772,238 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     )
 }
 
+/// Synthetic call-site info for [`jit_long_value_of_direct`]'s error path —
+/// same role as [`INTEGER_VALUE_OF_INFO`], and read only for diagnostics and
+/// exception context.
+static LONG_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Long",
+    method_name: "valueOf",
+    descriptor: "(J)Ljava/lang/Long;",
+    num_jit_args: 1,
+    return_type: b'L',
+    invoke_kind: 3,
+    declaring_class_id: 0,
+};
+
+/// Synthetic call-site info for [`jit_long_long_value_direct`]'s
+/// generic-dispatch fallback (a non-null receiver that fails heap validation —
+/// defensive parity with [`INTEGER_INT_VALUE_INFO`]).
+static LONG_LONG_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/Long",
+    method_name: "longValue",
+    descriptor: "()J",
+    num_jit_args: 1,
+    return_type: b'J',
+    invoke_kind: 0,
+    declaring_class_id: 0,
+};
+
+thread_local! {
+    /// Real `java/lang/Long` class discovered from the first ordinary
+    /// `valueOf` result in each VM, as `(vm_identity, class id)` — the
+    /// `Long` twin of [`INTEGER_WRAPPER_CLASS_CACHE`], and separate from it
+    /// because the two wrappers are different classes with different layouts.
+    static LONG_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Thin direct-call target for JIT `invokestatic Long.valueOf(J)` sites
+/// (registered into `cratonvm_jit::LONG_VALUE_OF_DIRECT_FN` by
+/// `build_helpers`; the recognition lives in `jit::try_compile`).
+///
+/// Line-for-line the same contract as [`jit_integer_value_of_direct`], against
+/// the same registered native's semantics
+/// (`lang_math.rs::native_long_value_of`, reached here through
+/// `intrinsics::long::intrinsic_long_value_of`, which is a verbatim delegation
+/// to it):
+///
+///  * out-of-cache values allocate a fresh wrapper through the mutator's normal
+///    TLAB path and publish it via `native_pending_return` (the established
+///    JIT→native object-return handoff root);
+///  * `-128..=127`, the cold pre-discovery case, and any class-redefine window
+///    route through `safe_native_call` to the canonical native callback, so the
+///    JLS `Long`-cache identity contract is that native's, not a copy of it;
+///  * errors (OOM) route through `handle_jit_dispatch_error` exactly like the
+///    dispatch helper.
+///
+/// The argument arrives as a full 64-bit word — unlike the `Integer` twin
+/// there is no `as i32` narrowing step, and there must not be one: the JIT
+/// passes a category-2 value in one operand slot.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i64 {
+    // Same Rust<->JIT boundary bookkeeping as `jit_invoke_dispatch`.
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if !(-128..=127).contains(&value) {
+        let vm_key = vm.vm_identity;
+        let cached_class = LONG_WRAPPER_CLASS_CACHE.with(|cache| {
+            cache
+                .get()
+                .filter(|(cached_vm, _)| *cached_vm == vm_key)
+                .map(|(_, raw)| ClassId::new(raw))
+                .filter(|class_id| !class_was_redefined(vm, *class_id))
+        });
+        if let Some(class_id) = cached_class {
+            if let Some((thread, _guard)) = jit_thread_mut() {
+                thread_local! {
+                    // (vm_key, class_id, slots). The exact-class redefine gate
+                    // above prevents use after that class's layout changes.
+                    static LONG_ALLOC_SLOTS: std::cell::Cell<Option<(usize, u32, u32)>> =
+                        const { std::cell::Cell::new(None) };
+                }
+                let slots = LONG_ALLOC_SLOTS.with(|cache| {
+                    if let Some((vk, cid, slots)) = cache.get() {
+                        if vk == vm_key && cid == class_id.as_u32() {
+                            return slots as usize;
+                        }
+                    }
+                    let resolved = vm
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .map(|c| c.num_total_fields.max(1))
+                        .unwrap_or(1);
+                    // Cast: field counts are far below u32::MAX.
+                    cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
+                    resolved
+                });
+                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+                    crate::runtime::interpreter::tlab_alloc_object(
+                        thread,
+                        vm,
+                        class_id,
+                        slots,
+                        requested_size,
+                    )
+                } else {
+                    None
+                };
+                if let Some(object) = tlab_object {
+                    // Raw primitive-cell write, exactly as the `Integer` twin
+                    // does and for the same reason: this arm JUST allocated
+                    // `object` through the legacy TLAB path (`init_object_header`,
+                    // zeroed 16-byte `Value` cells), so field 0 is the `Value`
+                    // cell at `HEADER_SIZE`. A primitive store takes no write
+                    // barrier.
+                    // SAFETY: `object` is a live legacy-layout allocation with
+                    // >= 1 slot (`slots.max(1)` above); the cell is exclusively
+                    // ours until published below.
+                    unsafe {
+                        std::ptr::write(
+                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                            Value::Long(value),
+                        );
+                    }
+                    thread.native_pending_return = Some(object);
+                    return object.as_ptr() as i64;
+                }
+                use cratonvm_native_api::NativeContext as _;
+                let object = {
+                    // Reborrow: `thread` is used again after this arm for the
+                    // pending-return publication.
+                    let mut ctx = crate::vm::NativeContextImpl {
+                        shared: vm,
+                        thread: &mut *thread,
+                    };
+                    ctx.alloc_object(class_id, 1)
+                };
+                // Descriptor-typed write (`Long.value`, field 0, `J`) — this
+                // cold arm's allocator may pick a non-legacy layout, so keep
+                // the layout-aware store.
+                vm.mem.heap.set_field_as(object, 0, Value::Long(value), b'J');
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+        }
+    }
+    // Cold / in-cache-range / redefine-window path: canonical native callback
+    // via the full safe-native-call wrapper (identity cache; also discovers the
+    // real wrapper ClassId for the fast path above).
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        // No JIT thread context — signal the deopt sentinel; the caller's
+        // post-invoke check bails to the interpreter, which re-dispatches.
+        return i64::MIN;
+    };
+    let arg = Value::Long(value);
+    let result = match crate::vm::safe_native_call_prevalidated_objects(
+        vm,
+        thread,
+        cratonvm_native_builtins::intrinsics::long::intrinsic_long_value_of,
+        std::slice::from_ref(&arg),
+    ) {
+        Ok(value) => value,
+        Err(error) => return handle_jit_dispatch_error(vm, thread, error, &LONG_VALUE_OF_INFO),
+    };
+    match result {
+        Some(Value::Object(Some(object))) => {
+            LONG_WRAPPER_CLASS_CACHE.with(|cache| {
+                cache.set(Some((
+                    vm.vm_identity,
+                    vm.mem.heap.class_id_of(object).as_u32(),
+                )))
+            });
+            object.as_ptr() as i64
+        }
+        _ => 0,
+    }
+}
+
+/// Thin direct-call target for JIT `invokevirtual Long.longValue()` sites whose
+/// constant-pool class is exactly `java/lang/Long` (a `final` class, so the site
+/// is statically monomorphic — no receiver guard needed; only `null` remains,
+/// which throws NPE per JVMS).
+///
+/// Mirrors [`jit_integer_int_value_direct`] and the registered
+/// `lang_math.rs::native_wrapper_long_value` it stands in for, INCLUDING that
+/// native's `Value::Int` arm: reflection can legally leave an int-tagged raw
+/// slot in a `Long` wrapper, and a `()J` caller must see the widened value
+/// rather than the compact tag bits. Dropping that arm here would make the fast
+/// path disagree with the funnel on exactly the receiver the funnel was written
+/// for.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    let raw = receiver as u64;
+    if raw == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if (raw & 0x7) == 0 && raw < (1u64 << 48) {
+        // The arena-membership probe stays, for the reason the `Integer` twin
+        // states: nothing on this path has read the receiver's header yet, so
+        // it is the only thing between a fabricated argument and the
+        // `get_field` dereference.
+        if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
+            match vm.mem.heap.get_field(object, 0) {
+                Value::Long(value) => return value,
+                Value::Int(value) => return i64::from(value),
+                // Anything else is a shape the registered native answers 0 for;
+                // hand it to the generic dispatcher rather than guessing, so the
+                // two paths cannot disagree.
+                _ => {}
+            }
+        }
+    }
+    // Defensive fallback: hand the call to the generic dispatcher (same
+    // machinery the non-direct site would have used).
+    let args = [receiver];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &LONG_LONG_VALUE_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        1,
+    )
+}
+
 /// Synthetic call-site info for [`jit_preconditions_check_index_direct`]'s
 /// cold arm — the out-of-range case, which must throw exactly what the
 /// registered native throws.
@@ -12598,7 +13030,7 @@ static PRECONDITIONS_CHECK_INDEX_INFO: JitInvokeInfo = JitInvokeInfo {
 /// `List` bounds check, and it is a compare and a branch: paying the ~160 ns
 /// generic native funnel for it is the single largest rung under
 /// `HttpContentDecompressorTest.testZipBomb`
-/// (docs/known-issues/netty/httpcontentdecompressortest-hang-20260816.md).
+/// (httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md).
 ///
 /// Fast path: `0 <= index < length` returns `index`, with no funnel, no
 /// argument buffer, no `safe_native_call` wrapper. **Everything else — an
@@ -12832,13 +13264,17 @@ static STRING_LATIN1_LOWER_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
 /// this VM simply does not resolve and is not marked.
 ///
 /// [`NativeMethodRegistry::record_invocation`]: cratonvm_native_api::NativeMethodRegistry::record_invocation
-const DIRECT_CALL_HELPER_NATIVES: [(&str, &str, &str); 8] = [
+const DIRECT_CALL_HELPER_NATIVES: [(&str, &str, &str); 10] = [
     // `jit_integer_value_of_direct` — TLAB-allocated wrapper, and the cold arm
     // that calls `intrinsic_integer_value_of` through `safe_native_call`
     // directly. Neither counts.
     ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
     // `jit_integer_int_value_direct` — heap-validated field-0 read.
     ("java/lang/Integer", "intValue", "()I"),
+    // `jit_long_value_of_direct` / `jit_long_long_value_direct` — the `Long`
+    // twins of the two rows above, on the same terms.
+    ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;"),
+    ("java/lang/Long", "longValue", "()J"),
     // `jit_hashmap_put_direct` / `jit_hashmap_get_direct` — the overlay probe
     // and the `safe_native_call_prevalidated_objects` arm below it.
     (
@@ -16733,6 +17169,8 @@ mod tests {
         for info in [
             &INTEGER_VALUE_OF_INFO,
             &INTEGER_INT_VALUE_INFO,
+            &LONG_VALUE_OF_INFO,
+            &LONG_LONG_VALUE_INFO,
             &HASHMAP_PUT_DIRECT_INFO,
             &HASHMAP_GET_DIRECT_INFO,
             &CONCURRENT_HASHMAP_GET_DIRECT_INFO,
@@ -18966,6 +19404,10 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         cratonvm_jit::set_integer_int_value_direct_fn(
             jit_integer_int_value_direct as *const () as usize,
         );
+        cratonvm_jit::set_long_value_of_direct_fn(jit_long_value_of_direct as *const () as usize);
+        cratonvm_jit::set_long_long_value_direct_fn(
+            jit_long_long_value_direct as *const () as usize,
+        );
         cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
         cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
         cratonvm_jit::set_string_latin1_lower_direct_fn(
@@ -18996,6 +19438,11 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         cratonvm_jit::set_reachability_fence_direct_fn(
             jit_reachability_fence_direct as *const () as usize,
         );
+        // The 32 `VarHandle` read-mode slots. Published as one array so a slot
+        // can never be wired to the WRONG monomorphisation: the order here is
+        // `varhandle_read_helper_slot`'s order by construction, not by a
+        // hand-kept list of `set_*` calls in the right sequence.
+        cratonvm_jit::set_varhandle_read_direct_fns(&varhandle_read_direct_fns());
     }
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
@@ -20211,5 +20658,82 @@ mod g12_compiled_aastore_asks_the_shared_predicate {
              25.0.3 (MEASURED, RArrayStoreInterfaces s12) in both tiers; the \
              compiled tier reads this predicate and nothing else"
         );
+    }
+}
+
+#[cfg(test)]
+mod varhandle_read_direct_helper_tables {
+    use super::*;
+
+    /// Every slot has its OWN monomorphisation.
+    ///
+    /// The slot is the only thing that tells one of these helpers from another
+    /// — it picks the return kind the read is checked against and the synthetic
+    /// call site the cold arm dispatches through. Two slots sharing an address
+    /// would not fail to compile and would not fail loudly: a `getAcquire`
+    /// site returning `J` would run `get`'s `Z` body, read the right field and
+    /// return the wrong width.
+    #[test]
+    fn the_thirty_two_slots_are_thirty_two_distinct_functions() {
+        let addrs = varhandle_read_direct_fns();
+        let unique: std::collections::HashSet<usize> = addrs.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            cratonvm_jit::VARHANDLE_READ_SLOTS,
+            "slot monomorphisations collapsed onto {} addresses",
+            unique.len(),
+        );
+        assert!(addrs.iter().all(|a| *a != 0));
+        for (slot, addr) in addrs.iter().enumerate() {
+            assert_eq!(varhandle_read_direct_fn(slot), *addr, "slot {slot}");
+        }
+    }
+
+    /// The synthetic call site at a slot describes the SAME (mode, return kind)
+    /// pair `cratonvm_jit::varhandle_read_helper_slot` decodes that slot as.
+    ///
+    /// This is the seam between the two crates: the JIT picks a slot from the
+    /// site's name and descriptor, and the cold arm hands the generic
+    /// dispatcher this table's entry for that slot. If they disagree, a
+    /// declined `getAcquire` read is dispatched as a `get` — the same value on
+    /// this VM, but the wrong method name in every exception and census the
+    /// dispatch produces, and a real divergence the day the two modes stop
+    /// sharing a callback.
+    #[test]
+    fn each_synthetic_call_site_matches_its_slot() {
+        for (slot, info) in VARHANDLE_READ_INFOS.iter().enumerate() {
+            let mode = slot / cratonvm_jit::VARHANDLE_READ_RETURNS.len();
+            let ret = slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len();
+            assert_eq!(info.class_name, "java/lang/invoke/VarHandle");
+            assert_eq!(info.method_name, cratonvm_jit::VARHANDLE_READ_MODES[mode]);
+            assert_eq!(info.return_type, cratonvm_jit::VARHANDLE_READ_RETURNS[ret]);
+            assert_eq!(info.invoke_kind, 0, "a read mode is an invokevirtual site");
+            // The receiver (the handle) plus one coordinate.
+            assert_eq!(info.num_jit_args, 2);
+            // And the round trip: the recognition maps this info's own name and
+            // descriptor back to this slot.
+            assert_eq!(
+                cratonvm_jit::varhandle_read_helper_slot(info.method_name, info.descriptor),
+                Some(slot),
+            );
+        }
+    }
+
+    /// The erased descriptors carry a primitive return and exactly one
+    /// reference coordinate — the substitution the cold arm is only allowed to
+    /// make because a primitive return makes it unobservable. A reference
+    /// return here would silently disable `unbox_poly_return_checked`'s W6-1
+    /// rule for every declined read.
+    #[test]
+    fn no_synthetic_call_site_carries_a_reference_return() {
+        for info in VARHANDLE_READ_INFOS.iter() {
+            assert!(
+                !matches!(info.return_type, b'L' | b'[' | b'V'),
+                "{} returns {}",
+                info.descriptor,
+                info.return_type as char,
+            );
+            assert!(info.descriptor.starts_with("(Ljava/lang/Object;)"));
+        }
     }
 }
