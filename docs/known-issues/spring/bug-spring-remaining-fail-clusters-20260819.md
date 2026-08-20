@@ -14,7 +14,9 @@ variants) left over after accounting for:
   `fixed-suite-bugs/spring/bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`.
   Independently reverified 2026-08-20 against a fresh `dev`-tip build: fixed.
 
-That leaves roughly 11 classes plus whichever of the "plausibly related"
+That leaves roughly 10 classes (one more, `FileNativeConfigurationWriterTests`,
+was confirmed NOT a CratonVM bug on 2026-08-20 and moved out — see
+`not-cratonvm-bugs-consolidated.md`) plus whichever of the "plausibly related"
 Groovy/JRuby classes below turn out to share the (now-fixed) `asSpreader`
 root cause — reverify those against `dev` tip before investigating them as a
 separate open issue. Each item below is a distinct signature, not
@@ -60,17 +62,13 @@ validation throws when a custom check rejects the reconstructed object — the
 specific validation that's failing isn't visible from the one-line failcause;
 needs the full stack trace.
 
-## `FileNativeConfigurationWriterTests` — all 5 test methods fail with a bare `AssertionError`
-```
-lambdaConfig() / reflectionConfig() / resourceConfig() / jniConfig() / serializationConfig()
-  java.lang.AssertionError:  (no message captured)
-```
-All 5 methods in this AOT-native-image-config-writer test class fail
-identically with no message text in the pooled summary — likely a JSON/text
-output comparison (`assertThatJson(...)`-style) whose failure detail is in
-the assertion's own multi-line diff, not the summary line. Needs the full
-test output to see what's actually being compared and how CratonVM's output
-differs.
+## `FileNativeConfigurationWriterTests` — RESOLVED: confirmed NOT a CratonVM bug (2026-08-20)
+Rechecked under stock HotSpot 25 on the same Azure host as part of the
+2026-08-20 88-class HotSpot baseline: fails identically, all 5 methods,
+`java.lang.AssertionError: \nUnexpected: comment` — a JSON-fixture/parser
+issue (a comment token in a fixture a strict JSON parser rejects), not
+VM-specific. Moved to
+`not-cratonvm-bugs-consolidated.md`.
 
 ## `WebClientIntegrationTests` — Reactor `VerifySubscriber` timeout
 ```
