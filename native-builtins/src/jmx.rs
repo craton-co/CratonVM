@@ -4041,10 +4041,49 @@ fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Re
     ctx.set_field(obj, 7, Value::Long(vm_start_epoch_ms() as i64));
     ctx.set_field(obj, 8, Value::Long(uptime_ms() as i64));
     // field 9 = inputArguments (empty ArrayList)
+    //
+    // Slots 0..=9 above are a CratonVM-fabricated carrier and the indices are
+    // legitimate: `java.lang.management.RuntimeMXBean` is an INTERFACE, so the
+    // real JDK layout it is stamped with has ZERO instance fields and there is
+    // nothing to collide with. `java.util.ArrayList` is the opposite case.
+    //
+    // H6-B, 2026-08-20. `javap -p java.util.ArrayList` / `java.util.AbstractList`
+    // on JDK 25.0.3+9, instance fields in declaration order:
+    //
+    //     0  protected transient int      modCount      (AbstractList)
+    //     1  transient java.lang.Object[] elementData   (ArrayList)
+    //     2  private int                  size          (ArrayList)
+    //
+    // The fixed `0 = array, 1 = size` used here is the SYNTHETIC carrier's
+    // convention. Against the real layout -- which is what the widening in
+    // `try_alloc_concurrent_synthetic` hands back in real-JDK mode -- it put an
+    // OOP into `modCount` (an int) and an `Int` into `elementData` (a
+    // reference the GC scans as an oop). That is not a wrong answer, it is the
+    // heap-corruption species of `docs/architecture/natives-over-real-jdk-classes.md`
+    // §5: `Int(0)` in a reference slot is a bogus pointer for the collector to
+    // mark and move.
+    //
+    // The other two `java/util/ArrayList` allocations in this file (the
+    // component-list registration and `init_notification_emitter_support`)
+    // already write by NAME. This was the one call site that did not -- the
+    // "correct helper exists but only one call site uses it" shape, inverted.
+    //
+    // Resolve the INDEX by name and keep the fixed indices only as the
+    // fallback, rather than switching to `set_field_by_name`: that setter is a
+    // documented NO-OP when the field is absent, and the synthetic carrier
+    // mints fields with no names, so a blind switch would silently drop both
+    // writes there.
     let args_list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let empty_arr = ctx.new_ref_array(ClassId::new(0), 0);
-    ctx.set_field(args_list, 0, Value::Object(Some(empty_arr)));
-    ctx.set_field(args_list, 1, Value::Int(0));
+    let list_cid = ctx.class_id_of_object(args_list);
+    let elem_slot = ctx
+        .resolve_field_index_by_class_id(list_cid, "elementData")
+        .unwrap_or(0);
+    let size_slot = ctx
+        .resolve_field_index_by_class_id(list_cid, "size")
+        .unwrap_or(1);
+    ctx.set_field(args_list, elem_slot, Value::Object(Some(empty_arr)));
+    ctx.set_field(args_list, size_slot, Value::Int(0));
     ctx.set_field(obj, 9, Value::Object(Some(args_list)));
     Ok(())
 }
