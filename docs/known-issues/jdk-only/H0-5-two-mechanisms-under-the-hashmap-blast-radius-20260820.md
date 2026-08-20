@@ -71,8 +71,45 @@ container at all. Both are consequences of the VM owning state that real
 bytecode expects to find in fields, but the repair is not the same: one needs
 the `table` populated, the other needs `this$0` written when the view is minted.
 
-**This is the single most actionable finding in the blast-radius work so far**,
-because it names a field rather than a subsystem.
+### CORRECTION, same day — this is confirmation, not discovery
+
+I first wrote that this was *"the single most actionable finding in the
+blast-radius work so far"* and that the VM had simply failed to link the view.
+**Then I grepped for `this$0` and found the tree already documents it, in
+detail, in three places** — including a note lane `H4-1` added earlier the same
+day:
+
+> *"A carrier is minted by a LIVE native with its list state at undeclared slots
+> and `this$0` left null. **Refuse this registrar's rows for a carrier whose
+> producer is still `Bridge` and the real JDK body runs instead —
+> `TreeMap$Values.size()` dereferences that null `this$0`.** So the split has to
+> be per carrier family, keyed on whether the producing registrar moved, not per
+> registrar."*
+> — `native-collections/src/lib.rs`, above `register_map_view_carrier_natives`
+
+and, from `G22-1` N2 (**MEASURED**, and older):
+
+> *"the reason CratonVM reported `HashMap$Values.this$0 == null` where HotSpot
+> reports the backing map"*
+
+So `this$0` being null on a view carrier is **known, deliberate and contained**:
+the registrar's rows exist precisely to stop real JDK bodies reading that null,
+and `force_native_over_real_jdk_bytecode` is paired with it. **Arming the dial
+removes the containment**, the real bodies run, and they hit exactly what the
+comment says they will.
+
+**What my measurement adds is smaller than I claimed, and still worth having:**
+it is the first *run* evidence of the predicted failure rather than a source
+argument; it puts vector names against it; and §6 measures which families it
+actually reaches, which no record had. **What it is not is a missing line
+somebody forgot.** The repair is the migration itself — write a real `this$0`
+when the carrier is minted, which means the producing registrar has to move
+first, which is the constraint `H4-1` already stated.
+
+I am leaving the wrong sentence quoted above rather than deleting it, because
+the error is this directory's standing one and I made it while writing a record
+about other people making it: **I asserted a cause without checking whether the
+tree already knew.** One `grep this$0` would have cost thirty seconds.
 
 ## 4. Mechanism B — a fabricated class reaching a real array store
 
@@ -152,9 +189,11 @@ I did not test.*
 
 ## 7. NOMINATIONS
 
-* **N1 — find the mint site for `HashMap`'s view/iterator carriers and check
-  whether `this$0` is written.** Four vectors and a named field; this is the
-  most specific lead the blast-radius work has produced.
+* **N1 — ANSWERED by grep, see §3's correction.** `this$0` is deliberately left
+  null and the registrar's rows exist to contain it. The real nomination is
+  `H4-1`'s: **the split must be per carrier family, keyed on whether the
+  PRODUCING registrar moved** — `MAP_VIEW_CARRIERS` spans four ownership
+  families, so retagging that one registrar is a partial retag of three of them.
 * **N2 — find the single producer of `cratonvm.synthetic.AnonymousObject$4`.**
   Four consumers name it; one grep should name the producer.
 * **N3 — DONE, see §6.** A reaches `LinkedHashMap` and `Hashtable` but not
