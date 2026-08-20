@@ -12294,21 +12294,77 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
 //
 // Each is a VM-side reimplementation of a registered native, baked straight
 // into the emitted `CALL` — no dispatch helper, and so no policy check, on the
-// path. None of them carries an internal JDK-only check, deliberately: under
-// `JdkOnly` they are unreachable, gated twice and both gates upstream of any
-// code that could execute.
+// path.
 //
-//  1. `build_helpers` does not register their addresses at all under
-//     `JdkOnly`, so the `*_DIRECT_FN` cells stay `0` — the established
-//     "not wired, use the generic dispatch helper" sentinel.
-//  2. `jit::direct_native_helper` refuses to bind a non-zero address once
-//     `set_jit_execution_policy` has latched strict, and records a
-//     `NativeShadowsBytecode` violation when it does.
+// # H12-1: the two gates this comment used to claim were BOTH false
 //
-// Adding a third, per-invocation check inside these bodies would put a policy
-// read on the hottest boxing/collection paths in the VM to defend against a
-// state that cannot occur. If either gate above is ever removed, this comment
-// is the reason these bodies look unguarded.
+// What stood here until 2026-08-20 said these bodies need no internal JDK-only
+// check because "under `JdkOnly` they are unreachable, gated twice and both
+// gates upstream of any code that could execute", naming:
+//
+//   1. `build_helpers` does not register their addresses under `JdkOnly`, so
+//      the `*_DIRECT_FN` cells stay `0`; and
+//   2. `jit::direct_native_helper` refuses to bind a non-zero address.
+//
+// **Gate 1 has not existed since 2026-08-06.** `jit/src/lib.rs`'s own module
+// comment states the opposite in as many words: *"the `*_DIRECT_FN` helper
+// addresses are registered **unconditionally** (2026-08-06) … and the bind
+// decision is threaded per compilation as an argument instead"*. The paragraph
+// above was not updated when its own premise was deleted. `jit/src/lib.rs`'s
+// JDK-ONLY-NOTE item 3 still lists withholding them as an OPEN ask, which is
+// the same fact from the other side.
+//
+// **Gate 2 exists and works — at ONE of the three compile doors.**
+// `direct_native_helper` is called only from `try_compile_inner`, i.e.
+// `CompileDoor::MethodEntry` (both its single-pass and IR ladders). The other
+// two doors in `jit::compile_gate`'s three-door table reach
+// `x64::compile_with_param_slots` directly and carry their own hand-copied
+// direct-call ladders, neither of which asks any policy question:
+//
+//   * `CompileDoor::Osr` — `vm/src/runtime/interpreter/jit_bridge.rs`, which
+//     binds `jit_hashmap_get_direct`, `jit_hashmap_put_direct`,
+//     `jit_thread_current_thread_direct`, `jit_preconditions_check_index_direct`
+//     and `jit_reachability_fence_direct`;
+//   * `CompileDoor::EagerFirstCall` — `vm/src/runtime/interpreter.rs`, which
+//     binds `jit_integer_value_of_direct` and `jit_integer_int_value_direct`.
+//
+// Both take the helper's address as `crate::jit::helpers::NAME as *const () as
+// usize` rather than reading the `*_DIRECT_FN` cell, and both say in a comment
+// that they do so *because* `build_helpers` publishes those cells too late for
+// the first compile. So gate 1 would not have covered them even when it
+// existed, and gate 2 never saw them.
+//
+// MEASURED, `--jdk-only`, binary at fe59bf9d9, `CRATONVM_INTRINSIC_STATS=1`, a
+// loop inside a once-invoked method:
+//
+//     compiled Thread.currentThread direct calls: 298000
+//       (sites bound per compile door: single-pass 0/7, IR 0/0, OSR 1)
+//
+// The MethodEntry door examined seven `invokestatic` sites and refused all
+// seven; the OSR door bound one and compiled code then called it 298 000
+// times. `java/lang/Thread.currentThread()Ljava/lang/Thread;` is `bridge` in
+// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, and so are `HashMap.get`,
+// `HashMap.put`, `Preconditions.checkIndex` and `Reference.reachabilityFence`.
+// A `--real-jdk` run of the same probe reports the identical `OSR 1`: the OSR
+// door does not know which mode it is in.
+//
+// # Why the check is per-invocation and here, rather than at the binds
+//
+// A bind-time check has to be written once per door, and the record of this
+// file is that a fourth door — or a fifth ladder in an existing one — arrives
+// before anyone revisits the gate. `compile_gate`'s own module doc calls that
+// out: three doors, and each grew its hand-copied subset of the admission
+// checks "reactively after its own bug". A check in the callee is the one
+// shape that cannot be forgotten by a door that has not been written yet.
+//
+// It costs one relaxed policy read per call, on the compatible arm, ahead of
+// work that already includes an object-address probe and a class comparison.
+// That cost is NOT measured — see the H12-1 record's verification plan, which
+// names the A/B that must run before this is called free.
+//
+// This does not replace gate 2. `direct_native_helper` is still the right
+// place to refuse, because a refusal there costs nothing at run time; this is
+// the backstop for the doors that never ask it.
 //
 // JDK-ONLY-WAVE2 §4, layering half CLOSED 2026-08-06/08-10. The ask was that
 // the compile-time recognition in `jit::try_compile` consult the shared
@@ -12317,8 +12373,61 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
 // because it cannot see `NativeKind`. Both halves landed:
 // `direct_native_helper` takes an `intrinsic_resolver` the VM answers out of
 // the registry's kind, and the policy is threaded per compilation rather than
-// read from the latch. The gates above are those, not a mirror.
+// read from the latch. Gate 2 is that; gate 1 is gone.
 // ---------------------------------------------------------------------------
+
+/// Times a thin direct-call helper declined to serve its own fast path because
+/// the calling VM is in `JdkOnly` and the helper shadows a `Bridge`
+/// registration.
+///
+/// # Reading a zero
+///
+/// A zero here is ambiguous on its own and must be read beside a bind counter,
+/// for exactly the reason [`JIT_FUNNEL_BYPASS_HITS`]' doc gives about inert
+/// fast paths. The two readings are:
+///
+/// | this | `thread_current_thread_bound_sites().2` (OSR binds) | meaning |
+/// |---|---|---|
+/// | 0 | 0 | no compiled site bound a guarded helper — the run says nothing |
+/// | 0 | >0 | a compatible-mode run, or a strict run where the bound sites never executed |
+/// | >0 | >0 | the backstop fired: a door bound in strict mode and this refused at the call |
+///
+/// The third row is the expected shape of a `--jdk-only` run whose hot loop is
+/// OSR-compiled, until the OSR and eager doors are taught to ask
+/// `jit::direct_native_helper` at bind time (H12-1 §OUT-OF-FILE O1/O2). When
+/// they are, this drops to the first row and the counter becomes the evidence
+/// that it did.
+pub static JIT_DIRECT_HELPER_JDK_ONLY_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of thin direct-call helper invocations refused under `JdkOnly`.
+pub fn jit_direct_helper_jdk_only_refusals() -> u64 {
+    JIT_DIRECT_HELPER_JDK_ONLY_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a thin direct-call helper that shadows a `Bridge` registration must
+/// decline its fast path for `vm` and route to the generic dispatch helper.
+///
+/// The callee-side half of the JDK-only direct-helper gate — see the module
+/// block above for why it exists on this side at all, and for the measurement
+/// that showed the compile-time half covering only one of three doors.
+///
+/// Applies **only** to helpers whose registered triple is `Bridge`.
+/// `jit_integer_value_of_direct` and `jit_integer_int_value_direct` are
+/// deliberately NOT guarded: `java/lang/Integer.valueOf(I)` and
+/// `java/lang/Integer.intValue()` are both `intrinsic` in
+/// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, which is §1.4's
+/// reviewed exception — the one kind `direct_native_helper` also admits under
+/// `JdkOnly`. Guarding them here would be stricter than the contract and would
+/// cost the eager-first-call door its only two binds.
+#[inline]
+fn jit_direct_helper_refused(vm: &SharedVm) -> bool {
+    if crate::vm::dispatch_policy(vm).is_jdk_only() {
+        JIT_DIRECT_HELPER_JDK_ONLY_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    false
+}
 
 /// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites
 /// (registered into `cratonvm_jit::INTEGER_VALUE_OF_DIRECT_FN` by
@@ -12617,9 +12726,17 @@ pub unsafe extern "C" fn jit_preconditions_check_index_direct(
     formatter: i64,
 ) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
+    // H12-1. `jdk/internal/util/Preconditions.checkIndex(IILjava/util/function/BiFunction;)I`
+    // is `bridge`, and the OSR door binds this helper with no policy question.
+    // Declining takes the same generic dispatcher the throwing case already
+    // uses, so the refusal costs a route, not a contract.
+    //
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM,
+    // and the fall-through below already passes it to `jit_invoke_dispatch`.
+    let vm = &*(vm_ptr as *const SharedVm);
     let i = index as i32;
     let n = length as i32;
-    if i >= 0 && n >= 0 && i < n {
+    if i >= 0 && n >= 0 && i < n && !jit_direct_helper_refused(vm) {
         return i as i64;
     }
     // Throwing case (and any shape this fast path declines to judge): the
@@ -12729,22 +12846,41 @@ pub unsafe extern "C" fn jit_thread_current_thread_direct(vm_ptr: i64) -> i64 {
     // the fast arm below cannot allocate or enter the GC barrier, and the
     // cold arm's `jit_invoke_dispatch` performs its own.
     crate::jit::conservative_roots::note_jit_boundary();
-    if let Some((thread, _guard)) = jit_thread_mut() {
-        if let Some(obj) = thread.java_thread_obj {
-            // Mirror `safe_native_call`'s object-return handoff root, exactly
-            // as `call_integer_native_raw` does. The mirror is already rooted
-            // per-thread, so this is the diagnostic/contract half rather than
-            // a liveness requirement — but a returned object that is NOT in
-            // `native_pending_return` is a shape every other object-returning
-            // JIT edge here avoids, and nothing is gained by being the
-            // exception.
-            thread.native_pending_return = Some(obj);
-            JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return obj.as_ptr() as i64;
+    // H12-1. `java/lang/Thread.currentThread()Ljava/lang/Thread;` is `bridge`,
+    // and this is the helper the OSR door was MEASURED binding under
+    // `--jdk-only` (298 000 calls, `OSR 1`, single-pass `0/7`). Declining here
+    // takes the cold arm below — `jit_invoke_dispatch` with the synthetic
+    // call-site info — which this function's doc already describes as
+    // "byte-for-byte the route the site took before this helper existed", and
+    // which is policy-checked.
+    //
+    // Checked up front rather than beside the `java_thread_obj` read: in strict
+    // mode this helper must never serve, so every call IS a refusal, and the
+    // only calls the counter over-reports relative to "fast arm suppressed" are
+    // the ones with no thread mirror yet — at most one per thread.
+    //
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM,
+    // and the cold arm below already passes it to `jit_invoke_dispatch`.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if !jit_direct_helper_refused(vm) {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            if let Some(obj) = thread.java_thread_obj {
+                // Mirror `safe_native_call`'s object-return handoff root,
+                // exactly as `call_integer_native_raw` does. The mirror is
+                // already rooted per-thread, so this is the diagnostic/contract
+                // half rather than a liveness requirement — but a returned
+                // object that is NOT in `native_pending_return` is a shape
+                // every other object-returning JIT edge here avoids, and
+                // nothing is gained by being the exception.
+                thread.native_pending_return = Some(obj);
+                JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return obj.as_ptr() as i64;
+            }
         }
     }
-    // No mirror yet (or no JIT thread context): the ordinary route, which is
-    // what this site did on every call before the fast arm existed.
+    // No mirror yet, no JIT thread context, or `JdkOnly` declined the fast arm:
+    // the ordinary route, which is what this site did on every call before the
+    // fast arm existed.
     jit_invoke_dispatch(
         vm_ptr,
         &THREAD_CURRENT_THREAD_INFO as *const JitInvokeInfo as i64,
@@ -13081,11 +13217,26 @@ pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
     'fast: {
+        // H12-1. Both rows this ladder touches —
+        // `java/util/concurrent/ConcurrentMap.get` at the call site and
+        // `java/util/concurrent/ConcurrentHashMap.get`, whose `native_chm_get`
+        // actually runs — are `bridge`. No compile door binds this helper
+        // today (the OSR ladder does not recognise `ConcurrentMap`, and
+        // `direct_native_helper_for_impl` refuses it at MethodEntry), so this
+        // is the one guard here that is a backstop rather than a live fix.
+        // It is written anyway, because H7-1 §4a's point is that the pair is
+        // right by a coincidence of tagging that a retag is meant to change.
+        //
+        // After the receiver screens, for the counter reason spelled out in
+        // `jit_hashmap_get_direct`.
         if receiver == 0
             || (receiver as u64 & 0x7) != 0
             || (receiver as u64) >= (1u64 << 48)
             || !jit_concurrent_hashmap_receiver_is_exact(vm, receiver)
         {
+            break 'fast;
+        }
+        if jit_direct_helper_refused(vm) {
             break 'fast;
         }
         let Some(recv) = vm.mem.heap.is_object_address(receiver as usize) else {
@@ -13179,6 +13330,19 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
             break 'fast;
         }
         if !jit_hashmap_receiver_is_exact(vm, receiver) {
+            break 'fast;
+        }
+        // H12-1. `java/util/HashMap.get` is `bridge`, so under `JdkOnly` the
+        // real `java.util.HashMap` bytecode is authoritative and this helper
+        // must not answer. `break 'fast` is the route every non-exact receiver
+        // already takes, and `jit_invoke_dispatch` below is policy-checked.
+        //
+        // Placed AFTER the receiver screens on purpose, so
+        // `JIT_DIRECT_HELPER_JDK_ONLY_REFUSALS` counts calls the fast path
+        // would otherwise have SERVED. In front of them it would also count
+        // every call that was going to `break 'fast` anyway, and a counter that
+        // inflates is a counter nobody can read a ratio out of.
+        if jit_direct_helper_refused(vm) {
             break 'fast;
         }
         let key_val = if key == 0 {
@@ -13423,6 +13587,15 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
             break 'fast;
         }
         if !jit_hashmap_receiver_is_exact(vm, receiver) {
+            break 'fast;
+        }
+        // H12-1. `java/util/HashMap.put` is `bridge`; see the sibling comment
+        // in `jit_hashmap_get_direct`, including why this sits after the
+        // receiver screens. This one matters more than the read: the OSR door
+        // binds it, and a put is a MUTATION, so a strict-mode execution of this
+        // body writes through CratonVM's native into a map the interpreter
+        // reads with real bytecode.
+        if jit_direct_helper_refused(vm) {
             break 'fast;
         }
         let mut vals = [Value::Object(None); 2];
