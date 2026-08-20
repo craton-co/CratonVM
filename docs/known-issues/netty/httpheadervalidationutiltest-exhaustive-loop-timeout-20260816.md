@@ -245,7 +245,7 @@ Unchanged from the 2026-08-17 revision, and still worth not repeating:
 * [`httpresponsestatustest-exhaustive-loop-timeout-20260816.md`](httpresponsestatustest-exhaustive-loop-timeout-20260816.md)
   — the sibling. Genuinely a different problem: no `try` anywhere, so it compiled
   all along and its residual is the non-nesting inliner.
-* [`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)
+* `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` (retired 2026-08-20)
   — the native-call floor this class's `ByteBuffer.putInt` pays once per
   iteration.
 * [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)

@@ -711,7 +711,7 @@ per-method JUnit `@Timeout` of 120 s was never met in any run.
    nothing more, which retires this page's earlier "37 ns, six times a compiled
    virtual call" reading. `Enum.ordinal()` and `Object.equals` remain registered
    natives on the ~160 ns funnel
-   ([`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)),
+   (`httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` (retired 2026-08-20)),
    but this chain reaches neither.
 
 ## Two notes on this page's own probes, for the next reader
@@ -770,7 +770,7 @@ java @common.args ProgressRunner \
 * `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`
   — the defect the sibling page turned out to be, fixed 2026-08-17. This loop has
   no `try`, which is why it is compiled and merely slow.
-* [`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)
+* `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` (retired 2026-08-20)
   — the per-call floor for anything reaching a registered native, which is what
   prices `Enum.ordinal`/`Object.equals` above.
 * [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)

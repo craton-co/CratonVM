@@ -101,6 +101,17 @@ const ALLOWED: &[(&str, &str)] = &[
         "kind 1: the name of a `libcratonvm` C ABI integer constant, matched \
          here only because a unit test asserts the diagnostic message names it",
     ),
+    (
+        "CRATONVM_RATCHET_ROWS",
+        "kind 4: a TEST-HARNESS dump switch, not a VM knob. \
+         `native-builtins/tests/stub_ratchet.rs` reads it with a raw \
+         `std::env::var_os` to turn its row-level stub census on — 1386 lines \
+         that answer \"WHICH stubs are the N over the baseline\", which the \
+         bare count in the gate output cannot. Nothing under any `src/` reads \
+         it, so declaring it would put one test binary's debug print on the \
+         runtime flag surface and hand it a `CRATONVM_DBG=` token the VM would \
+         never consult.",
+    ),
     // `CRATONVM_FOO` — the stand-in name in the `flags` module docs — is
     // deliberately *not* here: it only ever appears inside prose, which
     // `is_comment_line` already drops, and a row for it would be dead on

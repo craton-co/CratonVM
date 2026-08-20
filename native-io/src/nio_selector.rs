@@ -2421,20 +2421,18 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     let id = selector_open();
     // Bind the (real-JDK-layout) selector object to its native id by GC-stable
     // identity hash — its int slots are reference-typed and would coerce to
-    // null (see `sel_obj_ids`). The field writes below are kept as a
-    // best-effort legacy path but are not relied upon.
+    // null (see `sel_obj_ids`). Do NOT also write `SI_ID`/`SI_OPEN_FLAG`
+    // through `set_field`: on this real `sun/nio/ch/SelectorImpl` allocation
+    // those indices are `AbstractSelector.selectorOpen`/`SelectorImpl.
+    // selectedKeys` (both reference-typed), so an `Int` store there is
+    // silently descriptor-coerced to `null` — nulling `selectedKeys` breaks
+    // every direct (non-Netty-reflection) caller of `Selector.selectedKeys()`.
+    // See docs/known-issues/jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md.
     sel_obj_ids()
         .write()
         .entry(ctx.identity_hash_code(obj))
         .or_default()
         .push(SelectorObjId { object: obj, id });
-    let n = ctx.object_num_fields(obj);
-    if n > SI_ID {
-        ctx.set_field(obj, SI_ID, Value::Int(id));
-    }
-    if n > SI_OPEN_FLAG {
-        ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(1));
-    }
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -2592,9 +2590,9 @@ fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if remove_bucket {
         ids.remove(&hash);
     }
-    if ctx.object_num_fields(obj) > SI_OPEN_FLAG {
-        ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(0));
-    }
+    // See `selector_open_native`: on a real `SelectorImpl`, `SI_OPEN_FLAG`
+    // aliases the reference-typed `selectedKeys` field, so do not write an
+    // `Int` there. Openness lives entirely in `SelectorState` via `selector_close`.
     Ok(None)
 }
 

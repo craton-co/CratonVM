@@ -153,7 +153,7 @@ Two distinct costs are visible, and only one belongs to this page:
 * **~31% is a whole-VM JIT issue, not a bc-java one.** Every compiled `getfield`
   takes the checked helper, which runs a full heap-membership validation per
   field read. Split out to
-  known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md
+  fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md
   — it costs every field-dense compiled workload on every collector, and fixing
   it has ZGC coloured-pointer hazards this page should not carry.
 * **~47% is the SHA-256 round schedule itself**, running as ~2 500 bytecodes per

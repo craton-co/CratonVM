@@ -196,6 +196,31 @@ impl Graphics2DState {
         self.renderer.set_color(argb);
     }
 
+    /// The current colour as packed ARGB — what `Graphics.getColor()` answers.
+    ///
+    /// Read from `paint` rather than the renderer, so that a `Paint` which is
+    /// not a solid colour still reports the last solid colour set, which is
+    /// what the JDK does (`getColor` is documented in terms of the colour, and
+    /// a gradient paint leaves it unchanged).
+    pub fn color(&self) -> u32 {
+        match self.paint {
+            Paint::Solid(argb) => argb,
+            _ => 0xFF_000000,
+        }
+    }
+
+    /// The background colour used by `clearRect`.
+    pub fn background(&self) -> u32 {
+        self.background
+    }
+
+    pub fn set_background(&mut self, argb: u32) {
+        if self.disposed {
+            return;
+        }
+        self.background = argb;
+    }
+
     pub fn set_paint(&mut self, paint: Paint) {
         if self.disposed {
             return;

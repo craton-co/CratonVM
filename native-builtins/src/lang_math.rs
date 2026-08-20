@@ -6919,13 +6919,23 @@ fn read_string_arg_npe(
 ) -> Result<String, cratonvm_types::error::MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(obj))) => Ok(ctx.read_string(*obj).unwrap_or_default()),
-        _ => Err(
-            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
-        ),
+        // HotSpot's helpful NPE, naming the JDK's own local in
+        // `FloatingDecimal.readJavaFormatString`. Shared by all four entry
+        // points — `Double`/`Float` x `parseX`/`valueOf` — which is measured,
+        // not assumed: this helper serves all four and they all say `"in"`.
+        _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.length()\" because \"in\" is null".to_string(),
+            ),
+        }
+        .into()),
     }
 }
 
 fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeError> {
+    if s.trim().is_empty() {
+        return Err(java_nfe_empty());
+    }
     let (body, neg) = match java_float_head(s) {
         JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
         JavaFloatHead::Word { nan: true, .. } => return Ok(f32::NAN),
@@ -6951,7 +6961,25 @@ fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeErro
     Ok(if neg { -v } else { v })
 }
 
+/// `NumberFormatException("empty String")` — the message the floating-point
+/// parsers use for an input that is empty AFTER trimming, in place of the
+/// `For input string: "..."` every other malformed input gets.
+///
+/// Measured across all four entry points (`Double`/`Float` x
+/// `parseX`/`valueOf`) and for a BLANK string as well as an empty one: the JDK
+/// trims first and then finds nothing, so `"   "` is also "empty String". The
+/// integral parsers do NOT share this — `Integer.parseInt("")` is
+/// `For input string: ""` — which is why this cannot be hoisted.
+fn java_nfe_empty() -> cratonvm_types::error::RuntimeError {
+    cratonvm_types::error::RuntimeError::NumberFormatException {
+        message: "empty String".to_string(),
+    }
+}
+
 fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeError> {
+    if s.trim().is_empty() {
+        return Err(java_nfe_empty());
+    }
     let (body, neg) = match java_float_head(s) {
         JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
         JavaFloatHead::Word { nan: true, .. } => return Ok(f64::NAN),

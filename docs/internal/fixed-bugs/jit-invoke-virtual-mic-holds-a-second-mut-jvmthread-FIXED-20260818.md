@@ -136,7 +136,7 @@ arm and is what answers "does release have the same overlap". The matching
 GREEN arm — same release binary, same `prove-borrow` counter, fix applied —
 did not build: `cratonvm-cli` failed twice more on this host for the
 page-file reason described in
-known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
 The fix's effect is therefore demonstrated in the **dev** profile (2 → 0) and
 by construction — the inner `jit_thread_mut()` no longer exists, so there is no
 second borrow left to count — but the release zero is not measured, and this

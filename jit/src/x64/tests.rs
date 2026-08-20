@@ -112,6 +112,91 @@ fn estimate_max_stack_counts_ldc_family_and_dup_pushes() {
     );
 }
 
+/// A spill slot a BURIED operand-stack entry still owns must not be handed out
+/// again by the next push.
+///
+/// `invalidate_callee_saved` reserves ONE fresh slot at the top of the spill
+/// reserve and repoints EVERY entry that reads the register at it — including
+/// entries buried under the top of the stack, and including two entries at the
+/// same shared slot. `pop_stack` then reclaimed on `off == next_spill_offset -
+/// 8` alone, which assumes the top entry owns the topmost slot. Popping the
+/// shallower of two aliases satisfied that test while the deeper alias still
+/// read the slot, so the next `push_stack` was handed it and the pushed value
+/// overwrote the buried operand.
+///
+/// Measured consequence: `kotlin.reflect...KotlinTypeFactory
+/// .simpleTypeWithNonTrivialMemberScope` — five `astore`/`istore` pops into
+/// locals 7..11 (an invalidation each) with four earlier operands still on the
+/// stack — passed a null where its caller had pushed
+/// `Collections.emptyList()`, i.e.
+/// `InvocableHandlerMethodKotlinTests.genericParameter()` in the Spring
+/// Framework suite.
+#[test]
+fn pop_does_not_reclaim_a_slot_a_buried_entry_still_owns() {
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut compiler = Compiler::new(
+        "buried-spill-alias-test".to_string(),
+        ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    // Two entries reading the same callee-saved register, one buried under the
+    // other — the shape `aload N; ...; aload N` leaves behind.
+    compiler.stack_push(StackSlot::CalleeSaved(R12), true);
+    compiler.stack_push(StackSlot::CalleeSaved(R12), true);
+
+    // The store that overwrites R12 materialises both to ONE shared slot.
+    compiler.invalidate_callee_saved(R12);
+    let shared = match compiler.stack[0] {
+        StackSlot::Frame(off) => off,
+        other => panic!("buried entry not materialised: {other:?}"),
+    };
+    assert!(
+        matches!(compiler.stack[1], StackSlot::Frame(off) if off == shared),
+        "both aliases should share one spill slot, got {:?}",
+        compiler.stack[1]
+    );
+
+    // Pop the shallower alias. The buried one still reads `shared`.
+    let popped = compiler.pop_stack();
+    assert!(
+        matches!(popped, StackSlot::Frame(off) if off == shared),
+        "expected the shared slot on top, got {popped:?}"
+    );
+
+    let pushed = compiler.push_stack().expect("push after pop");
+    assert!(
+        !matches!(pushed, StackSlot::Frame(off) if off == shared),
+        "push reused spill slot {shared}, which the buried entry {:?} still reads",
+        compiler.stack[0]
+    );
+}
+
 #[test]
 fn push_stack_refuses_to_cross_spill_limit() {
     let alloc_result = crate::regalloc::RegAllocResult {
