@@ -11,7 +11,7 @@ variants) left over after accounting for:
   turned out to be **already fixed** on `dev` before this sweep even
   finished (commit `d766af065`, merged 2026-08-19 23:16, `dev` tip
   `b97c40d97`) — see
-  `docs/internal/fixed-suite-bugs/spring/bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`.
+  `fixed-suite-bugs/spring/bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`.
   Independently reverified 2026-08-20 against a fresh `dev`-tip build: fixed.
 
 That leaves roughly 11 classes plus whichever of the "plausibly related"

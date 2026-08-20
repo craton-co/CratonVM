@@ -688,6 +688,74 @@
 //! `CRATONVM_ARGS=--jdk-only` over 102 vectors is the acceptance test, it
 //! rejected two of the seven the screen passed, and the commit that lands this
 //! records both numbers.
+//!
+//! # `sun/nio/fs/WindowsFileAttributes` — eight of nine, 2026-08-20 (H2-1)
+//!
+//! **Status: UNVERIFIED. No binary carrying this change has been built or
+//! run.** It is here rather than behind a switch because the alternative
+//! proves nothing: a default-off knob makes the next arm run measure the old
+//! behaviour. The revert is these eight rows, the `"sun/nio/fs/"` prefix, and
+//! the four tests that name them — one commit, and
+//! `docs/known-issues/jdk-only/H2-1-*` names it.
+//!
+//! `RFileTimes` rejected this prefix on 2026-08-19 with a diff that named its
+//! own cause:
+//!
+//! ```text
+//!   plain.readAttributes.lastModified
+//!     HotSpot   2021-01-01T00:00:00Z
+//!     CratonVM  1601-01-02T20:42:25.920Z
+//! ```
+//!
+//! 1601-01-01 is the Windows FILETIME epoch, and the arithmetic closes exactly:
+//! 1609459200000 (2021-01-01 in Unix millis) read as 100ns ticks since 1601 is
+//! 160945.92 seconds, i.e. 1601-01-02T20:42:25.920Z. The VM was writing
+//! Unix-epoch millis into `creationTime`/`lastAccessTime`/`lastWriteTime` and
+//! reading them back the same way — self-consistent, and agreeing with nothing.
+//! JDK 25 `java.base/sun/nio/fs/WindowsFileAttributes.java` reads them through
+//! `toFileTime`, which adds `WINDOWS_EPOCH_IN_100NS = -116444736000000000L` and
+//! scales by 100ns.
+//!
+//! `native-builtins/src/phases_late/nio_file.rs` now writes those three fields
+//! in FILETIME (taking the raw values straight off `MetadataExt` where a real
+//! file backs them), writes the real DOS attribute word into `fileAttrs` so
+//! `isReadOnly`/`isHidden`/`isArchive`/`isSystem` bytecode has something to
+//! test, and writes `reparseTag = IO_REPARSE_TAG_SYMLINK` for a link —
+//! `isSymbolicLink()` compares the TAG and never looks at
+//! `FILE_ATTRIBUTE_REPARSE_POINT`, so a carrier with only the bit read back as
+//! `isOther()`.
+//!
+//! **`fileKey()` is the ninth and is HELD**, and not out of caution: the real
+//! body is `return null;`. See
+//! `the_held_windows_attribute_triple_is_not_retired`.
+//!
+//! # `java/lang/ref/` — NOT retired, and this is the measurement
+//!
+//! The other prefix the 2026-08-19 arm rejected stays whole, on evidence rather
+//! than on the earlier failure. Its census-eligible set includes
+//! `Reference.<init>` and the three subclass constructors, and those are not
+//! shadows in this table's sense — they are the VM's only mutator-side call to
+//! `NativeContext::discover_reference`. Source-verified 2026-08-20: every
+//! caller of `discover_reference` outside the collectors' own tests lives in
+//! `native-builtins`, and nothing in `gc/` scans the heap for
+//! `java.lang.ref.Reference` instances. A reference whose constructor yields to
+//! real bytecode is therefore never discovered, never cleared, and
+//! `RClassUnloadSweep`'s `payload.class.unloaded` reads `false`. That is what
+//! the arm saw, and no amount of field population changes it.
+//!
+//! Retiring only the accessors is not the escape hatch it looks like: three of
+//! them carry VM work the real bytecode has no equivalent for —
+//! `Reference.get()`'s SATB keep-alive, `SoftReference.get()`'s LRU touch, and
+//! `Reference.enqueue()`'s `mark_reference_manually_enqueued` — each with a
+//! named in-tree defect behind it.
+//!
+//! What DID move for `java/lang/ref/` on 2026-08-20 is the state, in
+//! `native-builtins/src/reference.rs`: `ReferenceQueue.<init>` now creates the
+//! real `lock` (a field initialiser, so only the constructor can supply it, and
+//! every one of `enqueue`/`poll`/`remove` opens with `synchronized (lock)`),
+//! and `Reference.queue` now holds `ReferenceQueue.NULL_QUEUE` where the real
+//! constructor puts it instead of a raw null. Those are the preconditions a
+//! later retirement would need; they are not the retirement.
 
 /// Every `(class, method, descriptor)` retired as a §1.4 shadow.
 ///
@@ -1113,6 +1181,18 @@ static RETIRED_SHADOW_STATELESS_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/stream/Stream", "of", "(Ljava/lang/Object;)Ljava/util/stream/Stream;"),
     ("java/util/stream/Stream", "of", "([Ljava/lang/Object;)Ljava/util/stream/Stream;"),
     ("java/util/stream/Stream", "toList", "()Ljava/util/List;"),
+    // sun/nio/fs/WindowsFileAttributes — 8 of the 9 the 2026-08-19 census
+    // found, added 2026-08-20 (H2-1). `fileKey` is the ninth and is HELD;
+    // see the header block for why, and `the_held_windows_attribute_triple_
+    // is_not_retired` for the pin.
+    ("sun/nio/fs/WindowsFileAttributes", "creationTime", "()Ljava/nio/file/attribute/FileTime;"),
+    ("sun/nio/fs/WindowsFileAttributes", "isDirectory", "()Z"),
+    ("sun/nio/fs/WindowsFileAttributes", "isOther", "()Z"),
+    ("sun/nio/fs/WindowsFileAttributes", "isRegularFile", "()Z"),
+    ("sun/nio/fs/WindowsFileAttributes", "isSymbolicLink", "()Z"),
+    ("sun/nio/fs/WindowsFileAttributes", "lastAccessTime", "()Ljava/nio/file/attribute/FileTime;"),
+    ("sun/nio/fs/WindowsFileAttributes", "lastModifiedTime", "()Ljava/nio/file/attribute/FileTime;"),
+    ("sun/nio/fs/WindowsFileAttributes", "size", "()J"),
 ];
 
 /// Class-name prefixes any retired triple must fall under.
@@ -1130,6 +1210,11 @@ const RETIRED_SHADOW_PREFIXES: &[&str] = &[
     "java/lang/module/",
     "java/text/",
     "java/util/",
+    // 2026-08-20, H2-1. Deliberately the NARROW prefix and not `sun/nio/`:
+    // `sun/nio/ch/` scored 34/36 on the 2026-08-19 dial sweep and nothing
+    // under it is retirable. `java/lang/ref/` is still absent on purpose —
+    // see the `sun/nio/fs/` block in this module's header.
+    "sun/nio/fs/",
 ];
 
 /// Is this exact triple a retired §1.4 shadow?
@@ -1195,34 +1280,48 @@ mod tests {
         }
     }
 
-    /// The five prefixes that survived the 102-vector ARM are the five the
-    /// table uses — no more.
+    /// The prefixes the table is allowed to use, and nothing else.
     ///
-    /// This is the gate on scope creep, and it is deliberately keyed to the arm
-    /// rather than to the 36-vector screen: the screen passed `java/lang/ref/`
-    /// and `sun/nio/fs/`, and the arm failed them on `RClassUnloadSweep{,Gen}`
-    /// and `RFileTimes`. `java/nio/file/` and `java/math/` each cost a vector
-    /// on the screen alone and `jdk/internal/access/` cost 14, and nothing in
-    /// the code stops a later entry under any of them being appended to a table
-    /// whose prefix list already admits it. `java/util/` admits the whole
-    /// package tree, so the assertion is per-ENTRY, not per-prefix.
+    /// This is the gate on scope creep. Five of the six were keyed to the
+    /// 102-vector ARM on 2026-08-19 rather than to the 36-vector screen,
+    /// because the screen passed `java/lang/ref/` and `sun/nio/fs/` and the arm
+    /// failed them on `RClassUnloadSweep{,Gen}` and `RFileTimes`.
+    ///
+    /// **`sun/nio/fs/` is the sixth, added 2026-08-20 (H2-1), and it is the one
+    /// entry here NOT backed by an arm run.** The `RFileTimes` diff named its
+    /// own cause — a Unix-epoch millis value in a field the real class reads as
+    /// a Windows FILETIME — and that cause is fixed in
+    /// `native-builtins/src/phases_late/nio_file.rs`. Nothing has been built or
+    /// run since. Treat the eight entries as PREDICTED-retirable until an arm
+    /// says otherwise; `docs/known-issues/jdk-only/H2-1-*` names the exact
+    /// revert.
+    ///
+    /// `java/lang/ref/` is still absent, and that is a measured decision rather
+    /// than an omission — see the header.
+    ///
+    /// `java/nio/file/` and `java/math/` each cost a vector on the screen alone
+    /// and `jdk/internal/access/` cost 14, and nothing in the code stops a later
+    /// entry under any of them being appended to a table whose prefix list
+    /// already admits it. `java/util/` admits the whole package tree, so the
+    /// assertion is per-ENTRY, not per-prefix.
     #[test]
-    fn the_stateless_table_stays_inside_the_five_measured_prefixes() {
-        const SURVIVED_THE_ARM: &[&str] = &[
+    fn the_stateless_table_stays_inside_the_measured_prefixes() {
+        const ADJUDICATED: &[&str] = &[
             "java/lang/module/",
             "java/text/",
             "java/util/concurrent/atomic/",
             "java/util/concurrent/locks/",
             "java/util/stream/",
+            "sun/nio/fs/",
         ];
         for (c, m, d) in RETIRED_SHADOW_STATELESS_TRIPLES {
             assert!(
-                SURVIVED_THE_ARM.iter().any(|p| c.starts_with(p)),
-                "{c}.{m}{d} is outside the five prefixes that survived the \
-                 102-vector arm on 2026-08-19. Arm CRATONVM_ENFORCE_NATIVE_SHADOW \
-                 on its prefix, run regression-suite/run.sh with \
-                 CRATONVM_ARGS=--jdk-only, and record the number before adding it \
-                 — the 36-vector screen passed two prefixes the arm rejected."
+                ADJUDICATED.iter().any(|p| c.starts_with(p)),
+                "{c}.{m}{d} is outside the prefixes adjudicated for this table. \
+                 Arm CRATONVM_ENFORCE_NATIVE_SHADOW on its prefix, run \
+                 regression-suite/run.sh with CRATONVM_ARGS=--jdk-only, and \
+                 record the number before adding it — the 36-vector screen \
+                 passed two prefixes the arm rejected."
             );
         }
     }
@@ -1232,9 +1331,11 @@ mod tests {
     #[test]
     fn the_stateless_table_is_not_empty() {
         assert!(
-            RETIRED_SHADOW_STATELESS_TRIPLES.len() >= 220,
-            "expected 227 — the 2026-08-19 census's 255 less the 28 the 102-vector \
-             arm rejected (java/lang/ref/ 19, sun/nio/fs/ 9) — got {}",
+            RETIRED_SHADOW_STATELESS_TRIPLES.len() >= 235,
+            "expected 235 — the 2026-08-19 wave's 227 plus the eight \
+             sun/nio/fs/WindowsFileAttributes triples added 2026-08-20 (H2-1), \
+             which is the 2026-08-19 census's nine less the held `fileKey` — \
+             got {}",
             RETIRED_SHADOW_STATELESS_TRIPLES.len()
         );
         assert!(triple_is_retired_shadow(
@@ -1252,13 +1353,131 @@ mod tests {
                                           "(Ljava/util/Date;)Ljava/lang/String;"));
         assert!(!triple_is_retired_shadow("java/lang/module/ModuleDescriptor",
                                           "notAMethod", "()V"));
-        // HELD by the arm, and the prefix list no longer even admits them —
-        // belt and braces, because a widening of that list must not silently
-        // re-retire what RClassUnloadSweep and RFileTimes rejected.
+        // HELD by the arm, and the prefix list does not admit it — belt and
+        // braces, because a widening of that list must not silently re-retire
+        // what RClassUnloadSweep rejected.
         assert!(!triple_is_retired_shadow("java/lang/ref/Reference", "clear", "()V"));
+        // `sun/nio/fs/` IS in the prefix list as of 2026-08-20, so this arm now
+        // has to earn its answer from the table rather than from the prefix.
         assert!(!triple_is_retired_shadow("sun/nio/fs/WindowsFileAttributes",
-                                          "creationTime",
-                                          "()Ljava/nio/file/attribute/FileTime;"));
+                                          "notAMethod", "()V"));
+        assert!(!triple_is_retired_shadow("sun/nio/fs/WindowsPath", "toString",
+                                          "()Ljava/lang/String;"));
+    }
+
+    /// `java/lang/ref/` stays whole, and this is the record of WHY — the
+    /// header argues it, this fails if someone acts against it.
+    ///
+    /// The prefix's census-eligible set includes `Reference.<init>` and the
+    /// three subclass constructors, and those are not shadows in the sense this
+    /// table retires. They are the VM's ONLY mutator-side call to
+    /// `NativeContext::discover_reference`: nothing in the collectors scans for
+    /// `java.lang.ref.Reference` instances, so a reference whose constructor
+    /// yielded to real bytecode is never discovered, never cleared, and
+    /// `RClassUnloadSweep`'s `payload.class.unloaded` reads `false` — which is
+    /// exactly what the 2026-08-19 arm reported. Retiring the ACCESSORS alone
+    /// would leave `Reference.get()` without its SATB keep-alive,
+    /// `SoftReference.get()` without its LRU touch, and `Reference.enqueue()`
+    /// without `mark_reference_manually_enqueued`, each of which has a named
+    /// in-tree defect behind it.
+    #[test]
+    fn the_reference_subsystem_stays_whole() {
+        for (m, d) in [
+            ("<init>", "(Ljava/lang/Object;)V"),
+            ("<init>", "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V"),
+            ("get", "()Ljava/lang/Object;"),
+            ("clear", "()V"),
+            ("enqueue", "()Z"),
+            ("isEnqueued", "()Z"),
+            ("refersTo", "(Ljava/lang/Object;)Z"),
+        ] {
+            for c in [
+                "java/lang/ref/Reference",
+                "java/lang/ref/WeakReference",
+                "java/lang/ref/SoftReference",
+                "java/lang/ref/PhantomReference",
+            ] {
+                assert!(
+                    !triple_is_retired_shadow(c, m, d),
+                    "{c}.{m}{d} was retired. Reference constructors are the VM's \
+                     only reference-discovery hook; retiring them disables weak/\
+                     soft/phantom clearing outright."
+                );
+            }
+        }
+        for (m, d) in [
+            ("<init>", "()V"),
+            ("poll", "()Ljava/lang/ref/Reference;"),
+            ("remove", "()Ljava/lang/ref/Reference;"),
+            ("remove", "(J)Ljava/lang/ref/Reference;"),
+        ] {
+            assert!(!triple_is_retired_shadow("java/lang/ref/ReferenceQueue", m, d));
+        }
+    }
+
+    /// The ninth `WindowsFileAttributes` triple the 2026-08-19 census found,
+    /// and the one deliberately left live.
+    ///
+    /// JDK 25 `WindowsFileAttributes.fileKey()` is `return null;` — the Windows
+    /// provider has no file identity at all. CratonVM's native answers a real
+    /// `(volume, index)` key built from `GetFileInformationByHandle`, which is
+    /// what makes `FileTreeWalker.wouldLoop` able to see a symlink cycle on
+    /// this platform. Retiring it would be HotSpot-identical and strictly worse
+    /// behaviour, and it is not a state-population question at all: there is no
+    /// state the real body would read. That makes it a separate decision from
+    /// the eight above, so it is a separate row here.
+    ///
+    /// Same shape as `Logger.log`'s eighth overload in the first table: the
+    /// reason this list is per-TRIPLE.
+    #[test]
+    fn the_held_windows_attribute_triple_is_not_retired() {
+        assert!(!triple_is_retired_shadow(
+            "sun/nio/fs/WindowsFileAttributes",
+            "fileKey",
+            "()Ljava/lang/Object;"
+        ));
+        // The other eight are, so this test cannot pass by the table being empty.
+        assert!(triple_is_retired_shadow(
+            "sun/nio/fs/WindowsFileAttributes",
+            "lastModifiedTime",
+            "()Ljava/nio/file/attribute/FileTime;"
+        ));
+    }
+
+    /// `sun/nio/fs/UnixFileAttributes` carries the SAME nine registrations, and
+    /// none of them is retired.
+    ///
+    /// Not an oversight and not a Windows-only fix: the 2026-08-19 census held
+    /// them under `class never loaded in 36 vectors`, and `G88-1`'s rule is
+    /// that `class-not-loaded` is the absence of a verdict rather than a clean
+    /// one. The Unix carrier's state was already stored in the JDK's own
+    /// encoding (split `st_*_sec`/`st_*_nsec` pairs, `st_mode`), so there was
+    /// no FILETIME-shaped defect to fix there — but "no defect found by
+    /// inspection" is not the measurement this table takes entries on.
+    #[test]
+    fn the_unix_attribute_carrier_is_not_retired() {
+        for m in [
+            "creationTime",
+            "lastAccessTime",
+            "lastModifiedTime",
+            "isDirectory",
+            "isRegularFile",
+            "isSymbolicLink",
+            "isOther",
+            "size",
+            "fileKey",
+        ] {
+            assert!(
+                !triple_is_retired_shadow("sun/nio/fs/UnixFileAttributes", m, "()Z")
+                    && !triple_is_retired_shadow("sun/nio/fs/UnixFileAttributes", m, "()J")
+                    && !triple_is_retired_shadow(
+                        "sun/nio/fs/UnixFileAttributes",
+                        m,
+                        "()Ljava/nio/file/attribute/FileTime;"
+                    ),
+                "sun/nio/fs/UnixFileAttributes.{m} was retired without a Linux arm"
+            );
+        }
     }
 
     /// The table is binary-searched, so ordering is correctness.
