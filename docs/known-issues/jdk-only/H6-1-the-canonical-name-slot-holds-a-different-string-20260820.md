@@ -526,6 +526,38 @@ and the change should be reverted and re-derived rather than re-baselined.
    parent commit** — `[ctrl@orig commit]`, credit the fix only after the
    original commit reproduces.
 
+### 7.2b Why the in-file unit tests cannot move — checked, not assumed
+
+This lane could not build, so the mock's behaviour under the new
+`resolve_field_index_by_class_id` calls was established by reading rather than
+running. `[mock=slot table]` — `MockNativeContext` answers that method from a
+name-to-slot table, so a conversion from index to name can silently change what
+a unit test measures.
+
+```bash
+$ grep -n '"init"\|"used"\|"committed"\|"max"\|"elementData"\|"size"' \
+      native-builtins/src/test_utils.rs
+(no output)
+```
+
+None of the six names appears in any of the mock's tables. `java/util/ArrayList`
+is `instance_fields(4)` in `synthetic_stub_field_model`
+(`classloading/src/class_manager.rs:12497`) — **unnamed** `_f0.._f3` — so
+`mock_stub_model_field_slot` cannot match `elementData`/`size`;
+`java/lang/management/MemoryUsage` is not modelled at all; and
+`mock_jdk_field_slot`, the only class-agnostic arm, carries none of the six.
+
+**So every new lookup in this diff resolves to `None` under the mock and takes
+the `unwrap_or(<old fixed index>)` fallback.** PREDICTED: the `jmx.rs` test
+module is bit-identical before and after. *Falsified by* any test in that module
+changing verdict — which would mean a table arm was missed and the mock is now
+measuring a different slot than the VM.
+
+Note this cuts the other way too, and it is the reason N5 matters: a unit test
+under the mock **cannot** exercise the real-layout branch these conversions
+exist for. The mock proves the fallback is unchanged; only a real-JDK run
+exercises the fix.
+
 ### 7.3 The (a) experiment, which needs no code
 
 Once §2.5's blocker is cleared, the whole of (a) is one A/B in one binary:
