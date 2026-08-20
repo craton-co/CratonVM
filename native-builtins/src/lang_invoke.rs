@@ -7748,6 +7748,44 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
             let adapter = alloc_method_handle(ctx, "__adapter__", "spread", &desc, MH_KIND_SPREAD)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            // type(): asSpreader REPLACES the trailing `count` parameters with
+            // a SINGLE parameter of the array type — the exact inverse of
+            // `asCollector` above (HotSpot: `(A,B)R`.asSpreader(Object[],2) ->
+            // `(Object[])R`). Chain off the target's ADAPTED type, not its raw
+            // `MH_DESC`, so a stack of adapters tracks arity.
+            //
+            // Leaving `type` at the target's own signature is not a cosmetic
+            // gap. `alloc_method_handle` populates `type` from `desc`, so the
+            // spreader claimed the UNSPREAD shape, and the very next thing
+            // every real caller does is `asType` to the spread shape:
+            // Groovy's `IndyInterface.fallback` does
+            // `handle.asSpreader(Object[].class, arguments.length)
+            //  .asType(methodType(Object.class, Object[].class))`
+            // on every `invokedynamic` dispatch. `mh_astype_refusal` then
+            // refused a 2-param → 1-param conversion HotSpot never sees,
+            // throwing `WrongMethodTypeException: cannot convert
+            // MethodHandle(beans,Closure)Object to (Object[])Object` — the
+            // refusal was right, the type it was reading was wrong.
+            if let Some(tdesc) = mh_type_descriptor(ctx, target) {
+                if let Some((mut params, ret)) = split_descriptor_params(&tdesc) {
+                    let n = count.max(0) as usize;
+                    if params.len() >= n {
+                        params.truncate(params.len() - n);
+                        // The array type arg (args[1]) spelled as a descriptor.
+                        let arr_desc = match args.get(1) {
+                            Some(Value::Object(Some(arr_cls))) => {
+                                mirror_to_descriptor(ctx, *arr_cls).into_owned()
+                            }
+                            _ => "[Ljava/lang/Object;".to_string(),
+                        };
+                        params.push(arr_desc);
+                        let new_desc = format!("({}){}", params.concat(), ret);
+                        if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
+                            ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
+                        }
+                    }
+                }
+            }
             Ok(Some(Value::Object(Some(adapter))))
         },
     );
@@ -12081,6 +12119,32 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     ()
 }
 
+/// The `Class` mirror for one component of a method descriptor, named as
+/// [`descriptor_to_class_name`] spells it (`int`, `java/lang/String`, `[I`, …).
+///
+/// A `MethodType`'s parameter and return mirrors are the objects
+/// `java.lang.invoke` reasons about — `MethodTypeForm.canonicalize` erases a
+/// parameter to `Object` only when `!t.isPrimitive()` — so a mirror that
+/// misreports its own primitiveness corrupts every `MethodType` derived from
+/// this one. Resolve the real class first, and only then fall back to the
+/// VM's stand-in mirror factory.
+///
+/// The fallback is unavoidable: `class_id_by_name` answers `None` both for a
+/// name no loader has and for a name SEVERAL loaders define (a Groovy script
+/// class under `GroovyClassLoader$InnerLoader` is routinely both), and there
+/// is still a descriptor to spell. `class_id_by_name_delegated` is tried in
+/// between because it resolves the parent-delegation answer for an
+/// ordinary-application lookup where the plain search declines to pick.
+fn mirror_for_descriptor_name(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    if let Some(cid) = ctx.class_id_by_name(name) {
+        return ctx.get_class_mirror(cid);
+    }
+    if let Some(cid) = ctx.class_id_by_name_delegated(name) {
+        return ctx.get_class_mirror(cid);
+    }
+    ctx.primitive_class_mirror(name)
+}
+
 /// Build a MethodType object from a JVM method descriptor string.
 pub fn build_method_type_from_descriptor(
     ctx: &mut dyn NativeContext,
@@ -12100,11 +12164,7 @@ pub fn build_method_type_from_descriptor(
     let ret_name = descriptor_to_class_name(ret_str);
 
     // Create return type Class mirror
-    let ret_mirror = if let Some(cid) = ctx.class_id_by_name(&ret_name) {
-        ctx.get_class_mirror(cid)
-    } else {
-        ctx.primitive_class_mirror(&ret_name)
-    };
+    let ret_mirror = mirror_for_descriptor_name(ctx, &ret_name);
 
     // GC-safety: `new_array`/`primitive_class_mirror` (lazily allocates a
     // synthetic mirror on first use, same as `synthetic_class_mirror`)/
@@ -12124,11 +12184,7 @@ pub fn build_method_type_from_descriptor(
     // call; pin it too and re-read before each write.
     let arr_pin = ctx.pin_native_root(arr);
     for (i, pname) in param_names.iter().enumerate() {
-        let mirror = if let Some(cid) = ctx.class_id_by_name(pname) {
-            ctx.get_class_mirror(cid)
-        } else {
-            ctx.primitive_class_mirror(pname)
-        };
+        let mirror = mirror_for_descriptor_name(ctx, pname);
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
     }
