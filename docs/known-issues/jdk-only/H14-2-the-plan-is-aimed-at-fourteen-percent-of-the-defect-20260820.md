@@ -105,13 +105,17 @@ row that would claim it (**ARGUED mapping by package/class, MEASURED counts**):
 | P1 *JPMS / module semantics* | 2 | 0.1% |
 | **— no P-row claims them —** | **445** | **31.7%** |
 
-The unclaimed 445, broken out:
+The unclaimed 445, broken out. (The `java/lang/String*` group is 58 in the
+mapping above and 57 here: the difference is the single
+`java/lang/StringUTF16.getChars` row, which the CLOSED *Core `String` dispatch*
+row does name explicitly, so it is subtracted here and left in the table above
+where the mechanical package rule put it.)
 
 | unclaimed area | rows | note |
 |---|---:|---|
 | `java/lang` core + `java/lang/ref` | 168 | `Object`, `Class`, `Thread`, `Enum`, `System`, `Module`, `Runtime`, `StackTraceElement`, the boxed primitives, the reference types |
 | `java/io` streams | 99 | `File`, `FileOutputStream`, `ByteArray*Stream`, `Data*Stream`, `PrintStream`/`PrintWriter`, `BufferedWriter` — P1 *NIO, files, networking* is written about `java.nio` and `sun.nio.ch` |
-| `java/lang/StringBuilder` + `StringBuffer` | 58 | P1 *Core `String` dispatch* is **CLOSED** and is about `java/lang/String`; nothing claims the builders |
+| `java/lang/StringBuilder` (45) + `StringBuffer` (12) | 57 | P1 *Core `String` dispatch* is **CLOSED** and is about `java/lang/String`; nothing claims the builders. **`java/lang/String` itself contributes ZERO rows** — that row's forced-native list is a different mechanism and does not show up as a §1.4 shadow. The one `java/lang/StringUTF16.getChars` row IS named by that row and is counted there, not here |
 | `java/lang/invoke` | 56 | `MethodHandle`, `MethodHandles`, `Lookup`, `MethodType`, `VarHandle`, `MemberName` |
 | `java/math` | 24 | `BigInteger` |
 | `java/text` + `sun/util/calendar` | 14 | |

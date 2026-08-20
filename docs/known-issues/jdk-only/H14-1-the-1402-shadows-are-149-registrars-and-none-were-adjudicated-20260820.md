@@ -36,7 +36,8 @@ a distribution of a censored sample.
 ```text
 CV=C:/craton/target-jdkonly-h2/release/cratonvm.exe
 JDK="C:/Program Files/Microsoft/jdk-25.0.3.9-hotspot"
-CRATONVM_ARGS=--jdk-only CRATONVM_NATIVE_SHADOW_SINK_CAP=200000 bash regression-suite/run.sh
+CRATONVM_ARGS=--jdk-only bash regression-suite/run.sh
+  # CRATONVM_NATIVE_SHADOW_SINK_CAP=200000 was also set and was IGNORED — §1b
 
   REGRESSION SUITE: 104 passed, 0 failed
   JDK-ONLY CENSUS (104 of 104 per-vector reports written):
@@ -48,15 +49,37 @@ CRATONVM_ARGS=--jdk-only CRATONVM_NATIVE_SHADOW_SINK_CAP=200000 bash regression-
 ```
 
 Identical to `HANDOFF-20260820` §1 on every figure except
-`interpreter_shadow_unenforced` (**8702**, against the handoff's `8698`). The
-sink cap was raised to 200000 for this run and `saturation: none` on both, so
-the delta is not truncation; it is not investigated here and is stated rather
-than smoothed over.
+`interpreter_shadow_unenforced` (**8702**, against the handoff's `8698`).
+`saturation: none` on both runs, so the delta is not truncation; it is not
+investigated here and is stated rather than smoothed over.
 
 **Nothing is capped, sampled or truncated in what follows.** All 104 per-vector
 reports were captured (`run.sh` writes them to a PID-scoped directory and
 `rm -rf`s it at the end; they were poll-copied out while the run was live, and
-the count was checked against the summary's own `104 of 104`).
+the count was checked against the summary's own `104 of 104`). Headroom,
+MEASURED across all 104: **the fullest observation sink held 424 rows against a
+cap of 4096** (`RJdkBridge1`), and zero reports are `saturated`.
+
+### 1b. The cap knob silently ignored the value it was given, and one sub-sink still cannot report truncation
+
+Two things about the instrument that `H1-1`'s repair did not reach. Neither
+changes any number above; both would change one later.
+
+* **`CRATONVM_NATIVE_SHADOW_SINK_CAP=200000` was discarded without a word.**
+  `vm/src/vm/vm_exec.rs::jdk_only_native_shadow_cap` filters the parsed value
+  to `0 < n <= JDK_ONLY_NATIVE_SHADOW_CAP_MAX` (**65,536**) and otherwise
+  `unwrap_or`s the 4096 default. This run therefore used 4096, not 200000. The
+  tree *does* state the rule — the function's own doc comment says "anything
+  above … leaves the default in place", deliberately, so that "a diagnostic must
+  never be the thing that fails". But an operator who raises the cap *because
+  they are worried about a floor* gets the floor and no signal. Use a value
+  ≤ 65,536, or read `observation_sink.cap` back out of a report and check it.
+* **The `jit_compile` sub-sink reports `"truncated": null, "dropped": null`.**
+  `run.sh`'s saturation test is `grep -l '"truncated": true'`, and `null` can
+  never match it, so an overflow there is invisible to the census line — the
+  exact shape of the defect `H1-1` fixed for the other two sinks. MEASURED
+  today it does not bite: the largest `jit_compile.recorded` over all 104
+  reports is **2**, against a cap of 256. `jit_fastpath` is 0 everywhere.
 
 ### 1a. One instrument correction, small and real
 
@@ -421,3 +444,12 @@ census: **under `--jdk-only`, a native stands in front of the real
 * **N6 — the `interpreter_shadow_unenforced` 8702 has never been attributed to
   anything.** It is six times the size of the population this record classifies
   and no instrument in the tree buckets it.
+* **N7 — make an out-of-range `CRATONVM_NATIVE_SHADOW_SINK_CAP` say so** (§1b).
+  Silently substituting the default is the right *behaviour* and the wrong
+  *silence*: the operator setting it is by definition the one who does not trust
+  the default. One `eprintln!` on the discard path, or echo the effective cap in
+  the census line, which already has the number to hand.
+* **N8 — give the `jit_compile` sub-sink real `truncated`/`dropped` fields**
+  (§1b). `null` is unmatchable by the census's own saturation test, so that sink
+  is in the state the whole population was in before `H1-1`. It records 2 rows
+  today, which is why it is a nomination and not a finding.
