@@ -890,11 +890,21 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
     // private fields (`_ca_array`, `_compressed_storage`, ...) that this
     // synthetic 1-field `ObjectName` model never populates (construction is
     // always native-Bridge-shortcut, see `object_name_new`/`object_name_set_text`
-    // above) -- `_ca_array` in particular is a reference field, so an
-    // out-of-bounds read of it yields `null`, and real bytecode's
-    // `_ca_array.length` then NPEs. Implement these against the same
-    // canonical-string text model the rest of this file already uses
-    // (`object_name_parts`, `getDomain`, `getKeyProperty`) instead.
+    // above), so real bytecode's `_ca_array.length` NPEs. Implement these
+    // against the same canonical-string text model the rest of this file
+    // already uses (`object_name_parts`, `getDomain`, `getKeyProperty`)
+    // instead.
+    //
+    // CORRECTED, lane H6 (2026-08-20): this used to add "`_ca_array` in
+    // particular is a reference field, so an OUT-OF-BOUNDS read of it yields
+    // `null`". That mechanism no longer exists. `try_alloc_concurrent_synthetic`
+    // (`util_concurrent_ext.rs`) widens every allocation to
+    // `max(real_instance_field_count, requested)`, so against a real
+    // `java.management` image an `ObjectName` gets all FIVE slots here, not one
+    // -- the read is in bounds and the slot is genuinely null. Same NPE, and it
+    // matters which one it is: the old sentence also underwrites the P0 row's
+    // claim that "any write past slot 0 is silently discarded", which is stale
+    // for the same reason.
     r.register(
         cls,
         "getCanonicalKeyPropertyListString",
@@ -1001,6 +1011,41 @@ fn object_name_text(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
     }
 }
 
+/// Store this file's text model into the canonical-name slot.
+///
+/// **READ THIS BEFORE TRYING TO POPULATE `_kp_array` / `_ca_array` /
+/// `_propertyList` BY HAND (lane H6, 2026-08-20). That change is not merely
+/// laborious, it is UNSOUND, and the reason is here rather than in the record
+/// because this is the function that makes it unsound.**
+///
+/// The text this writes is the **source-order** name. The real JDK's
+/// `_canonicalName` holds the **key-sorted** name. Measured on this host,
+/// HotSpot 25.0.3+9, `new ObjectName("d:b=2,a=1,c=3")`:
+///
+/// ```text
+///   getCanonicalName() = d:a=1,b=2,c=3    (== _canonicalName, ObjectName.java:1452)
+///   toString()         = d:b=2,a=1,c=3    (source order, rebuilt from _kp_array)
+/// ```
+///
+/// The two models therefore put **different strings in the same field**, and
+/// every accessor in this file is written against the source-order one --
+/// `native_object_name_get_key_property_list_string` is *correct only because*
+/// of it.
+///
+/// That is what forbids populating the other three by hand:
+/// `javax.management.ObjectName$Property` (`javap -p`) is
+/// `{ int _key_index; int _key_length; int _value_length; }` with
+/// `getKeyString(String)` / `getValueString(String)` taking the name string as
+/// a PARAMETER. `_kp_array` and `_ca_array` are not independent data -- they
+/// are an **index into `_canonicalName`**. Filling them while this slot holds
+/// source-order text leaves the offsets pointing at the wrong characters, so
+/// `getKeyProperty()` would return silently wrong substrings instead of the
+/// NPE it returns today. A wrong answer that looks like an answer is worse
+/// than the null.
+///
+/// The whole family moves together or none of it does. See
+/// `docs/known-issues/jdk-only/H6-1-*` §2 for the migration and its
+/// precondition.
 fn object_name_set_text(ctx: &mut dyn NativeContext, obj: ObjectRef, text: String) {
     let slot = object_name_text_slot(ctx, obj);
     let s = ctx.create_string(&text);
@@ -1506,11 +1551,31 @@ fn native_object_name_get_canonical_key_property_list_string(
 }
 
 /// `ObjectName.getSerializedNameString()`: see `RKC-ObjectName-03` at the
-/// registration site. Real bytecode rebuilds this from `_canonicalName` and
-/// `_kp_array` byte-by-byte, but the result is simply the canonical name
-/// text (domain + sorted key properties, with the pattern suffix normalised
-/// to a bare `*` when there are no other properties) — exactly what
-/// `canonical_object_name_text` already computes for the synthetic model.
+/// registration site.
+///
+/// **CORRECTED, lane H6 (2026-08-20). This comment used to read "the result is
+/// simply the canonical name text (domain + sorted key properties)" and the
+/// body returned `canonical_object_name_text(..)`. Both were wrong**, and the
+/// oracle says so directly — HotSpot 25.0.3+9 on this host, `ONProbe`:
+///
+/// ```text
+/// new ObjectName("d:b=2,a=1,c=3")
+///   getCanonicalName()  = d:a=1,b=2,c=3     <- SORTED
+///   toString()          = d:b=2,a=1,c=3     <- SOURCE ORDER
+/// ```
+///
+/// and `ObjectName.java:1652` is `public String toString() { return
+/// getSerializedNameString(); }`. So `getSerializedNameString()` is the
+/// **source-order** text, not the canonical one: the real body walks `_kp_array`
+/// (which is in source order) pulling substrings out of `_canonicalName`
+/// (which is in canonical order) — that is the whole reason the two arrays
+/// exist. Returning the canonical form here made every serialized `ObjectName`
+/// on the jmxmp wire disagree with HotSpot on any name whose keys were not
+/// already sorted, which is the exact path `RKC-ObjectName-03` was written for.
+///
+/// In this file's text model the source-order text is `object_name_text` itself,
+/// so this is now the same answer `native_object_name_to_string` gives — which
+/// is what the JDK's own one-line `toString()` asserts.
 fn native_object_name_get_serialized_name_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1520,8 +1585,7 @@ fn native_object_name_get_serialized_name_string(
         _ => return Ok(Some(Value::Object(None))),
     };
     let text = object_name_text(ctx, this);
-    let canonical = canonical_object_name_text(&text);
-    let s = ctx.create_string(&canonical);
+    let s = ctx.create_string(&text);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -3845,8 +3909,24 @@ fn platform_mxbean_object_name_text(
         // The collector bean is a NAMED platform bean: its ObjectName carries
         // the collector's own name, which `init_gc_mxbean_fields` puts in
         // slot 0. `java.lang:type=GarbageCollector,name=<getName()>` is the
-        // key order the JDK builds and the order `getCanonicalName()` sorts
-        // to, so the text is already canonical.
+        // key order the JDK builds, i.e. the SOURCE order -- which is what
+        // this file's text model wants (see `object_name_set_text`).
+        //
+        // CORRECTED, lane H6 (2026-08-20): this used to end "...and the order
+        // `getCanonicalName()` sorts to, so the text is already canonical."
+        // That is false, and it is the only multi-property text this function
+        // produces, so it was the one case the claim had to get right.
+        // Measured, HotSpot 25.0.3+9 on this host:
+        //
+        //   new ObjectName("java.lang:type=GarbageCollector,name=G1 Young Generation")
+        //     getCanonicalName()         = java.lang:name=G1 Young Generation,type=GarbageCollector
+        //     getKeyPropertyListString() = type=GarbageCollector,name=G1 Young Generation
+        //
+        // Canonical sorts by key, and `name` < `type`. The text below is
+        // therefore source order, NOT canonical. Nothing here needs changing --
+        // `native_object_name_get_canonical_name` canonicalises on read -- but
+        // a future lane that "stops fabricating" must not carry this sentence
+        // forward as a licence to treat the two orders as interchangeable.
         "java/lang/management/GarbageCollectorMXBean" => {
             let name = match ctx.get_field(this, 0) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
