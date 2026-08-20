@@ -5203,7 +5203,10 @@ fn ir_vs_singlepass_string_ldc() {
     let code = vec![0x12, 0x01, 0xb0];
     let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         match cp {
-            1 => Some(cratonvm_jit::JitLdcConstant::String("hello".to_string())),
+            1 => Some(cratonvm_jit::JitLdcConstant::String {
+                holder_class_id: 0,
+                cp_idx: 1,
+            }),
             _ => None,
         }
     };
@@ -5275,7 +5278,10 @@ fn string_ldc_with_the_helper_unwired_stays_on_single_pass() {
     let code = vec![0x12, 0x01, 0xb0];
     let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         match cp {
-            1 => Some(cratonvm_jit::JitLdcConstant::String("hello".to_string())),
+            1 => Some(cratonvm_jit::JitLdcConstant::String {
+                holder_class_id: 0,
+                cp_idx: 1,
+            }),
             _ => None,
         }
     };

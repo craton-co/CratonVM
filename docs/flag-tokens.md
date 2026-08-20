@@ -688,6 +688,7 @@ export inherited from a parent shell.
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
+| `compiled-ldc-const-cache` | `CRATONVM_JIT_COMPILED_LDC_CONST_CACHE` |
 | `new-site-cache` | `CRATONVM_JIT_NO_NEW_SITE_CACHE` |
 | `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
 | `unreg-memo-hiwater` | `CRATONVM_JIT_UNREG_MEMO_HIWATER` |

@@ -7689,7 +7689,19 @@ pub enum JitLdcConstant {
     /// `cp_ldc2w_resolver`'s `(bits, is_double)` already has, for the same
     /// reason.
     Immediate { bits: i64, is_float: bool },
-    String(String),
+    /// A `CONSTANT_String` entry: `ldc "…"` pushes the interned literal.
+    ///
+    /// Carries the *referencing* class id and the CP index rather than the
+    /// literal's text, for the reason [`Self::ClassMirror`] carries them plus
+    /// one that is specific to strings: JVMS §5.4.3 resolves a constant-pool
+    /// entry once and records the result, the record is keyed
+    /// `(class, cp index)`, and the text is not that key. Carrying the bytes
+    /// instead made every execution re-derive the answer through the string
+    /// pool's `RwLock` and a hash of the whole literal.
+    String {
+        holder_class_id: u32,
+        cp_idx: u16,
+    },
     /// A `CONSTANT_Class` entry: `ldc <Class>` pushes that class's mirror.
     ///
     /// Carries the *referencing* class id and the CP index rather than a
@@ -17125,28 +17137,30 @@ fn try_compile_inner(
         //     under `ir_emit_fp`, mirroring the `ldc2_w` gate directly above —
         //     the builder would otherwise emit an `Op::ConstF`/`Float` into a
         //     graph the FP tier is switched off for.
-        //   * `String` → the interned-literal SITE (`bytes`, `len`), not a
-        //     reference: the value is materialised by `helpers.ldc_string` on
-        //     every execution, because an `ObjectRef` baked at compile time can
-        //     relocate between two runs of the body.
+        //   * `String` → the CP-indexed SITE, served by
+        //     `helpers.ldc_string_cp`: the value is materialised at run time
+        //     because an `ObjectRef` baked at compile time can relocate between
+        //     two runs of the body, and it is keyed by the SITE rather than by
+        //     the literal's bytes because that is the key JVMS §5.4.3's
+        //     recorded resolution is filed under.
         //   * `ClassMirror` → the CP-indexed site, served by
         //     `helpers.ldc_class_cp` for the same reason plus one more:
         //     resolution can load a class, which runs arbitrary Java.
         //
         // A pc absent from all three (no resolver, a `MethodHandle` /
-        // `MethodType` / condy entry, an unwired class helper, or a float with
-        // the FP gate off) makes the builder's 0x12/0x13 arm bail that method
-        // to single-pass — the pre-existing behaviour, only narrower.
+        // `MethodType` / condy entry, an unwired class or string helper, or a
+        // float with the FP gate off) makes the builder's 0x12/0x13 arm bail
+        // that method to single-pass — the pre-existing behaviour, only
+        // narrower.
         //
-        // Keep-alive for the string-literal bytes whose ADDRESS the lowered
-        // body bakes as an imm64. Moved onto the finished `CompiledMethod`
-        // below, next to the `Op::Call` info boxes, so the pointer cannot
-        // outlive its pointee.
-        let mut ir_ldc_strings: Vec<Box<str>> = Vec::new();
+        // The `ir_ldc_strings` keep-alive that stood here is GONE with the
+        // bytes it kept alive: an `ldc <String>` site no longer bakes an
+        // address into the body, so there is nothing for the artifact to
+        // outlive.
         // cov-05: `instanceof`/`checkcast` target class-name bytes, whose
         // ADDRESS the lowered body bakes as an imm64 argument to
-        // `helpers.instanceof_check`/`helpers.checkcast`. Unlike
-        // `ir_ldc_strings` immediately above, these are NOT kept alive on the
+        // `helpers.instanceof_check`/`helpers.checkcast`. These are NOT kept
+        // alive on the
         // `CompiledMethod`: they are interned process-wide by
         // `intern_typecheck_class_name`, because the type-check helpers
         // memoize on the `(ptr, len)` pair in thread-locals that outlive any
@@ -17162,7 +17176,7 @@ fn try_compile_inner(
             if let Some(resolver) = cp_ldc_resolver {
                 let mut imm: std::collections::HashMap<usize, (i64, bool)> =
                     std::collections::HashMap::new();
-                let mut strs: std::collections::HashMap<usize, (usize, usize)> =
+                let mut strs: std::collections::HashMap<usize, (u32, u16)> =
                     std::collections::HashMap::new();
                 let mut classes: std::collections::HashMap<usize, (u32, u16)> =
                     std::collections::HashMap::new();
@@ -17173,10 +17187,17 @@ fn try_compile_inner(
                                 imm.insert(pc, (bits, is_float));
                             }
                         }
-                        Some(JitLdcConstant::String(text)) => {
-                            let boxed: Box<str> = text.into_boxed_str();
-                            strs.insert(pc, (boxed.as_ptr() as usize, boxed.len()));
-                            ir_ldc_strings.push(boxed);
+                        Some(JitLdcConstant::String {
+                            holder_class_id,
+                            cp_idx,
+                        }) => {
+                            // `ldc_string_cp` is an OptionalPtr, exactly like
+                            // `ldc_class_cp` below: omit the site rather than
+                            // plan a CALL to address 0, and let the builder
+                            // bail the method.
+                            if helpers.ldc_string_cp != 0 {
+                                strs.insert(pc, (holder_class_id, cp_idx));
+                            }
                         }
                         Some(JitLdcConstant::ClassMirror {
                             holder_class_id,
@@ -18661,14 +18682,11 @@ fn try_compile_inner(
                             compiled._jit_strings = ir_call_strings;
                             compiled.has_dispatch = true;
                         }
-                        // cov-01: the same keep-alive obligation for an
-                        // `ldc <String>` site, whose UTF-8 bytes' ADDRESS is
-                        // baked into the body as an imm64 argument to
-                        // `helpers.ldc_string`. `append`, never assign — the
-                        // call strings may already be installed above, and
-                        // dropping either list frees memory the emitted code
-                        // still names.
-                        compiled._jit_strings.append(&mut ir_ldc_strings);
+                        // cov-01's `ldc <String>` keep-alive stood here and is
+                        // GONE: the site is CP-indexed now, so the body bakes a
+                        // `(class id, cp index)` pair rather than the literal's
+                        // address, and there are no bytes for the artifact to
+                        // outlive.
                         // cov-05: `instanceof`/`checkcast` target class names
                         // deliberately do NOT appear here — they are interned
                         // for the life of the process instead, so the
@@ -19061,7 +19079,7 @@ fn try_compile_inner(
     // With no resolver at all, `ldc_info` stays empty and the 0x12/0x13
     // codegen arm bails per-site instead.
     let mut ldc_info: Vec<(usize, i64)> = Vec::new();
-    let mut ldc_string_info: Vec<(usize, *const u8, usize)> = Vec::new();
+    let mut ldc_string_info: Vec<(usize, u32, u16)> = Vec::new();
     let mut ldc_class_info: Vec<(usize, u32, u16)> = Vec::new();
     // The `is_float`/`is_double` halves the codegen throws away. The deopt
     // operand-stack snapshot has no consuming opcode to ask for the width, so
@@ -19092,12 +19110,18 @@ fn try_compile_inner(
                         }
                         ldc_class_info.push((pc, holder_class_id, cp_idx));
                     }
-                    Some(JitLdcConstant::String(text)) => {
-                        let boxed: Box<str> = text.into_boxed_str();
-                        let ptr = boxed.as_ptr();
-                        let len = boxed.len();
-                        owned_strings.push(boxed);
-                        ldc_string_info.push((pc, ptr, len));
+                    Some(JitLdcConstant::String {
+                        holder_class_id,
+                        cp_idx,
+                    }) => {
+                        // Same OptionalPtr guard the `ClassMirror` arm above
+                        // takes: a hand-built test table leaves the helper 0,
+                        // and then this site keeps the historical whole-compile
+                        // bail rather than emitting a CALL to address 0.
+                        if helpers.ldc_string_cp == 0 {
+                            jitc_bail!("ldc_string_helper_unwired")
+                        }
+                        ldc_string_info.push((pc, holder_class_id, cp_idx));
                     }
                     None => {
                         // RBC.7 — same permanent-bail class as RBC.4 (scan
