@@ -385,9 +385,9 @@ static JDK_ONLY_NATIVE_SHADOW_ATTEMPTS: std::sync::atomic::AtomicU64 =
 /// would make `interpreter_bytecode_preferred` report shadows it did not
 /// prevent, which is the exact blindness this pair exists to remove.
 ///
-/// **A floor, not an exact count**, unlike every other counter in this file —
-/// see [`jdk_only_native_shadow_unenforced`] for why, and say "floor" wherever
-/// it is quoted.
+/// **Distinct triples, not events**, unlike every other counter in this file —
+/// see [`jdk_only_native_shadow_unenforced`] for why. It was additionally a
+/// floor (frozen by sink saturation) until 2026-08-20; it is not any more.
 static JDK_ONLY_NATIVE_SHADOW_UNENFORCED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -410,7 +410,37 @@ pub const JDK_ONLY_SHADOW_UNENFORCED_TAG: &str =
 /// Read through [`jdk_only_native_shadow_cap`], never directly: an operator can
 /// raise it, and a site that reads this constant would report the default while
 /// the sink obeyed something else.
-pub const JDK_ONLY_NATIVE_SHADOW_CAP: usize = 256;
+///
+/// # Why 4096 and not 256
+///
+/// It was 256 until 2026-08-20. At that value **3 of the 36 `--jdk-only`
+/// regression vectors saturated it**, which made every
+/// `native-shadows-bytecode` figure quoted anywhere in
+/// `docs/known-issues/jdk-only/` a floor — including the headline "980 -> 943",
+/// which is a difference of two censored measurements (`G90-1` §1, §8 N1).
+///
+/// The argument that used to sit below this constant — that raising the default
+/// "costs every strict run more memory" — is wrong, and the correction is the
+/// reason this number could move at all. The sink is a `Vec` that is **grown by
+/// `push`**: its memory is proportional to the number of distinct observations
+/// actually recorded, not to the ceiling. A run with 80 shadows allocates 80
+/// rows whether the cap is 256 or 4096. The cap only bounds the WORST case, and
+/// the worst case at 4096 is ~4096 x (three `String`s + a `&'static str`), call
+/// it under a megabyte on a VM that has just mapped a JDK image. That is not a
+/// change to the shipping configuration's cost; it is a change to the ceiling
+/// nobody reaches.
+///
+/// 4096 is chosen against the measured populations rather than picked round:
+/// the union of `native-won` triples over ALL 36 vectors is 943 (`G90-1` §1),
+/// the largest single-vector population measured is the embedded-Tomcat census
+/// below, and both recorders share this one sink. A ceiling four times the
+/// whole-corpus union is one no single vector is expected to reach.
+///
+/// **PREDICTED, not measured:** that no `--jdk-only` regression vector saturates
+/// at 4096. What falsifies it is a report with `observation_sink.truncated:
+/// true` — which now says so in the file, which is the actual fix here. A bigger
+/// cap is still a cap; the drop counter and the flag are the load-bearing half.
+pub const JDK_ONLY_NATIVE_SHADOW_CAP: usize = 4096;
 
 /// Ceiling on the operator override below. 65,536 distinct triples is more than
 /// twice the whole registry, so it cannot be reached by a real workload — it is
@@ -421,23 +451,27 @@ const JDK_ONLY_NATIVE_SHADOW_CAP_MAX: usize = 65_536;
 ///
 /// # Why this is an override and not a bigger constant
 ///
-/// 256 is right for the workload the sink was designed against — a probe or a
+/// 256 was right for the workload the sink was designed against — a probe or a
 /// regression vector, where the population fits and the list is the answer. It
-/// is **not enough for an application**, and that is measured rather than
+/// was **not enough for an application**, and that is measured rather than
 /// argued: embedded Tomcat booting, serving one GET and one 404, and shutting
-/// down under `--jdk-only` saturates it, with 188 distinct `native-won` triples
+/// down under `--jdk-only` saturated it, with 188 distinct `native-won` triples
 /// recorded before the sink stopped learning — against 58 for the reflection
 /// vector G60-1 §1 counted. So the record's §5 N3 ("run this report against an
-/// application, not a vector") cannot be *completed* at 256: the answer arrives
-/// truncated, and narrowing the workload until it fits is the opposite of what
-/// N3 asks for.
+/// application, not a vector") could not be *completed* at 256: the answer
+/// arrived truncated, and narrowing the workload until it fits is the opposite
+/// of what N3 asks for.
 ///
-/// Raising the default instead was the alternative and is worse. The cap bounds
-/// a process-global `Vec` that every strict dispatch can push to, on a VM whose
-/// contract §2 forbids new process globals for compatibility state and whose
-/// existing two are already logged as violations to remove. A default nobody
-/// asked for that costs every strict run more memory is a change to the shipping
-/// configuration; an override is a change to the instrument.
+/// **CORRECTION, 2026-08-20.** This doc used to argue that raising the default
+/// "was the alternative and is worse", because "a default nobody asked for that
+/// costs every strict run more memory is a change to the shipping
+/// configuration". That reasoning does not survive reading `Vec::push`: the
+/// sink's memory is proportional to the observations it actually holds, not to
+/// its ceiling, so raising the ceiling costs a run that never reaches it exactly
+/// nothing. The default is now 4096 — see [`JDK_ONLY_NATIVE_SHADOW_CAP`] — and
+/// this override remains, for the census run that wants a bigger sink still.
+/// The contract §2 point about process globals is untouched by either: the
+/// global existed before this constant did and is unaffected by its value.
 ///
 /// Read once, at the first observation. `CRATONVM_NATIVE_SHADOW_SINK_CAP=0`, a
 /// non-numeric value, or anything above
@@ -488,6 +522,29 @@ static JDK_ONLY_NATIVE_SHADOW_FILTER: [std::sync::atomic::AtomicU64;
 static JDK_ONLY_NATIVE_SHADOW_FULL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Distinct observations the sink had no room for — the number that converts
+/// `violations[]` from a floor into a total.
+///
+/// **Monotonic, and it keeps counting past the cap.** That is the whole point:
+/// a boolean says the list is short, this says *by how much*, and
+/// `recorded + dropped` is the population the run actually saw. Before
+/// 2026-08-20 the only signal was [`JDK_ONLY_NATIVE_SHADOW_FULL`], and every
+/// count in `docs/known-issues/jdk-only/` was a floor for that reason
+/// (`G90-1` §8 N1).
+///
+/// **What it counts, precisely, and what it does not.** It is incremented by
+/// [`offer_native_shadow_observation`] on an offer that reaches a full buffer
+/// **and was not absorbed by the filter** — so repeats of an already-offered
+/// triple do not inflate it, and it approximates the number of distinct dropped
+/// triples. It is not exact: the filter is
+/// [`JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS`] wide, so once the dropped population
+/// exceeds it, collisions can count one triple twice. It is therefore an upper
+/// bound on distinct-dropped and a lower bound on nothing — quote it as
+/// "approximately, and never fewer than", and prefer raising
+/// `CRATONVM_NATIVE_SHADOW_SINK_CAP` until it reads zero.
+static JDK_ONLY_NATIVE_SHADOW_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 static JDK_ONLY_NATIVE_SHADOWS: std::sync::OnceLock<
     parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>>,
 > = std::sync::OnceLock::new();
@@ -522,14 +579,24 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
 /// How many times a `Bridge` dispatched in front of concrete bytecode under
 /// `JdkOnly` — §1.4's shadow observed but not enforced.
 ///
-/// **A FLOOR, not an exact count**, and the one counter here that is. Finding a
-/// shadow costs a class-manager read lock and a hierarchy walk, so step 1 only
-/// pays it while the answer can still teach something: once a triple is in the
-/// observation sink the walk is skipped, and once the sink SATURATES (256 rows,
-/// shared with `interpreter_bytecode_preferred`'s) it is skipped for every
-/// triple and this stops advancing. A workload that saturates the sink — the
-/// three strict probes all do — has more shadows than this reports, and the
-/// `bridge-ran-over-bytecode` rows in `violations[]` are the identities.
+/// **A count of DISTINCT triples, not of events** — and, until 2026-08-20, a
+/// floor on top of that. Finding a shadow costs a class-manager read lock and a
+/// hierarchy walk, so step 1 only pays it while the answer can still teach
+/// something: once a triple is in the observation sink the walk is skipped.
+///
+/// **The second truncation is gone.** It used to ALSO stop advancing the moment
+/// the sink saturated, because `jdk_only_shadow_already_observed` answered
+/// `true` for every triple once the buffer was full — so a workload that
+/// overflowed the list silently stopped counting as well. That short-circuit is
+/// removed; the walk is now skipped per-triple (via the filter) and not
+/// per-run, so this keeps advancing past saturation and the sink reports what
+/// it could not NAME through
+/// [`jdk_only_native_shadow_sink_dropped`] instead.
+///
+/// It is still not an event count and must not be quoted as one: ten million
+/// dispatches of one shadowed triple contribute 1 here and 10,000,000 to
+/// [`jdk_only_native_shadow_attempts`]. The `bridge-ran-over-bytecode` rows in
+/// `violations[]` are the identities, capped; this is their count, uncapped.
 ///
 /// The alternative, walking on every strict `Bridge` dispatch forever to keep
 /// the number exact, buys an exact count of something already known to be large
@@ -560,13 +627,35 @@ pub fn jdk_only_native_shadow_unenforced() -> u64 {
 /// finds no room, so it means "something WAS dropped", which is the fact a
 /// reader needs. Reading it costs one relaxed load and is never hot.
 ///
-/// Once it is true the sink teaches nothing further and
-/// [`jdk_only_shadow_already_observed`] answers `true` for every triple, which
-/// is also what freezes [`jdk_only_native_shadow_unenforced`] -- so this flag is
-/// simultaneously the "the list is a floor" and the "the counter is a floor"
-/// signal. Both facts, one bit.
+/// Once it is true the sink's LIST teaches nothing further -- but, since
+/// 2026-08-20, the counting does not stop with it. See
+/// [`JDK_ONLY_NATIVE_SHADOW_DROPPED`] and
+/// [`jdk_only_shadow_already_observed`]: the producer keeps discovering
+/// distinct triples past saturation, so
+/// [`jdk_only_native_shadow_unenforced`] keeps advancing and
+/// `recorded + dropped` is the population rather than `recorded` alone.
+///
+/// **One bit is not enough, which is why this is no longer the only signal.**
+/// A boolean says the list is short; it cannot say by how much, and a reader
+/// who saw it had no way to turn a floor into a number. Read it together with
+/// [`jdk_only_native_shadow_sink_dropped`], which is what the report's
+/// `observation_sink.dropped` carries.
 pub fn jdk_only_native_shadow_sink_saturated() -> bool {
     JDK_ONLY_NATIVE_SHADOW_FULL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many distinct observations were offered to the sink and found no room.
+///
+/// Zero on any run that did not saturate — and a run that reports non-zero here
+/// is telling you `violations[]` is short by about this much. See
+/// [`JDK_ONLY_NATIVE_SHADOW_DROPPED`] for what "about" means and why it is not
+/// exact.
+///
+/// The fix for a non-zero value is `CRATONVM_NATIVE_SHADOW_SINK_CAP=<bigger>`,
+/// not narrowing the workload — narrowing the workload is what made every
+/// figure in `docs/known-issues/jdk-only/` a floor in the first place.
+pub fn jdk_only_native_shadow_sink_dropped() -> u64 {
+    JDK_ONLY_NATIVE_SHADOW_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How many distinct observations the sink is holding right now.
@@ -588,6 +677,30 @@ pub fn jdk_only_native_shadow_sink_len() -> usize {
 /// recorded. Advisory in both directions — a filter collision answers `false`
 /// for a triple that was recorded, which costs one redundant walk and one
 /// redundant offer that the buffer dedups. Never a correctness input.
+///
+/// # The saturation short-circuit that used to live here, and why it is gone
+///
+/// Until 2026-08-20 this function opened with
+/// `if JDK_ONLY_NATIVE_SHADOW_FULL { return true; }` — once the sink filled,
+/// every triple answered "already seen", the caller stopped walking, and
+/// [`jdk_only_native_shadow_unenforced`] froze. That single line is why every
+/// shadow figure in `docs/known-issues/jdk-only/` is a floor: the instrument
+/// stopped measuring at the moment it ran out of room to *name* what it
+/// measured, and conflated the two.
+///
+/// It is now answered from the filter in both states.
+/// [`offer_native_shadow_observation`] publishes the digest of a DROPPED triple
+/// as well as a retained one, so a saturated run still answers `true` for
+/// everything it has already seen and pays no repeat walks — it only pays one
+/// walk for each genuinely new triple, which is the same cost profile an
+/// unsaturated run pays for its first [`jdk_only_native_shadow_cap`] triples.
+///
+/// **The residual cost, stated rather than hidden.** The filter is only
+/// [`JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS`] wide and is deliberately not resized
+/// with the cap, so a run whose distinct-shadow population greatly exceeds that
+/// will evict entries and re-walk them. The remedy is to raise
+/// `CRATONVM_NATIVE_SHADOW_SINK_CAP` so the sink never saturates at all; a
+/// wider filter is nominated, not done.
 pub fn jdk_only_shadow_already_observed(
     class: &str,
     method: &str,
@@ -595,9 +708,6 @@ pub fn jdk_only_shadow_already_observed(
     kind_tag: &str,
 ) -> bool {
     use std::sync::atomic::Ordering;
-    if JDK_ONLY_NATIVE_SHADOW_FULL.load(Ordering::Relaxed) {
-        return true;
-    }
     let digest = jdk_only_shadow_digest(class, method, descriptor, kind_tag);
     JDK_ONLY_NATIVE_SHADOW_FILTER[(digest as usize) & (JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS - 1)]
         .load(Ordering::Relaxed)
@@ -651,13 +761,24 @@ fn offer_native_shadow_observation(
 ) {
     use std::sync::atomic::Ordering;
 
-    if JDK_ONLY_NATIVE_SHADOW_FULL.load(Ordering::Relaxed) {
-        return;
-    }
+    // The filter is consulted FIRST, in both the full and the not-full state.
+    // It is what keeps `JDK_ONLY_NATIVE_SHADOW_DROPPED` a count of distinct
+    // triples rather than of dispatch events: a repeat of a triple already
+    // offered — retained or dropped — returns here and increments nothing.
     let digest = jdk_only_shadow_digest(class, method, descriptor, kind_tag);
     let slot =
         &JDK_ONLY_NATIVE_SHADOW_FILTER[(digest as usize) & (JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS - 1)];
     if slot.load(Ordering::Relaxed) == digest {
+        return;
+    }
+
+    // Saturated: count it and publish the digest anyway. Publishing is what
+    // makes `jdk_only_shadow_already_observed` able to stop the caller
+    // re-walking this triple now that it no longer short-circuits on the full
+    // flag, and it is why this counter does not run away.
+    if JDK_ONLY_NATIVE_SHADOW_FULL.load(Ordering::Relaxed) {
+        JDK_ONLY_NATIVE_SHADOW_DROPPED.fetch_add(1, Ordering::Relaxed);
+        slot.store(digest, Ordering::Relaxed);
         return;
     }
 
@@ -669,14 +790,21 @@ fn offer_native_shadow_observation(
     };
     let mut recorded = jdk_only_native_shadows().lock();
     if recorded.len() >= jdk_only_native_shadow_cap() {
+        // The transition into saturation. `FULL` is the flag every other reader
+        // consults; this offer is itself the first drop, so it counts too —
+        // otherwise a report could say `truncated: true, dropped: 0`, which is
+        // a contradiction a reader would have to resolve by guessing.
         JDK_ONLY_NATIVE_SHADOW_FULL.store(true, Ordering::Relaxed);
+        JDK_ONLY_NATIVE_SHADOW_DROPPED.fetch_add(1, Ordering::Relaxed);
+        slot.store(digest, Ordering::Relaxed);
         return;
     }
     if !recorded.contains(&violation) {
         recorded.push(violation);
     }
     // Published last: a reader that sees the digest is guaranteed the triple
-    // has already been offered to the buffer.
+    // has already been OFFERED to the buffer — which since 2026-08-20 means
+    // "retained or counted as dropped", not "retained".
     slot.store(digest, Ordering::Relaxed);
 }
 
@@ -31705,5 +31833,157 @@ mod tests {
         assert!(!general_dispatch_census_already_declared(2, 8, c));
         reset_general_dispatch_census_memo();
         assert!(!general_dispatch_census_already_declared(2, 8, c));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JDK-ONLY-WAVE2 — the real-protected-stub allow-list is ONE predicate, and
+// this is the check that keeps it one.
+//
+// The P0 row *Native-first dispatch and hard-coded overrides* in
+// `docs/jdk-only-runtime-services.md` describes two hand-maintained copies of
+// that allow-list — an inline `matches!` here marked `COPY 1 OF 2` with 11
+// classes, and `real_protected_stub_class` with 10 — and asks that they be
+// "reconciled, not merged". **That premise expired on 2026-08-04.** There is
+// one predicate (`native_override.rs :: real_protected_stub_class_common`,
+// TWELVE entries), `java/util/StringJoiner` is protected on both paths, no
+// `COPY 1 OF 2` marker exists anywhere in the tree, and the symbol does not
+// live in the file the row names. See
+// `docs/known-issues/jdk-only/H1-1-the-sink-that-capped-every-count-20260820.md`
+// and `G86-1`.
+//
+// What survived the reconciliation is a COMMENT above the call site saying "Do
+// NOT re-inline a copy here". A premise in a comment is not a compile-time
+// link, and re-inlining a copy is precisely how the divergence arose the first
+// time — a warm/cold split in which a native's yield-to-real-bytecode verdict
+// depended on how many times its call site had executed. So the module below
+// asserts the property the comment asks for, against the working tree, on
+// every `cargo test`.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod real_protected_stub_single_predicate_witness {
+    /// Read one repo-relative `vm/...` path out of the WORKING TREE.
+    ///
+    /// Same shape as `native_override.rs`'s own `vm_src`, deliberately: a
+    /// source witness reads the tree it was compiled from, and duplicating six
+    /// lines is cheaper than exporting a test helper across two modules.
+    fn vm_src(rel: &str) -> String {
+        let under_crate = rel
+            .strip_prefix("vm/")
+            .expect("scan paths are vm-crate paths");
+        let path = format!("{}/{under_crate}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+    }
+
+    /// This file, with THIS MODULE cut off.
+    ///
+    /// The module declaration above is the first occurrence of its own name in
+    /// the file, so everything before it is the compiled body. Without the cut,
+    /// a future raw-string spelling of `ALLOWLIST_LITERALS` would be found by
+    /// the very test that searches for it and the assertion could never pass —
+    /// the classic way a source-witness test becomes unfalsifiable.
+    fn vm_exec_body() -> String {
+        let src = vm_src("vm/src/vm/vm_exec.rs");
+        src.split("mod real_protected_stub_single_predicate_witness")
+            .next()
+            .expect("split always yields at least one piece")
+            .to_string()
+    }
+
+    /// Ten of the twelve class-name literals `real_protected_stub_class_common`
+    /// holds, quoted exactly as a `matches!` arm would spell them.
+    ///
+    /// **Two are deliberately absent**, and the reason is a finding rather than
+    /// an exclusion for convenience: `"java/lang/management/ManagementFactory"`
+    /// and `"java/util/concurrent/ThreadPoolExecutor"` legitimately appear in
+    /// `invoke_on_class_shared_inner` — in a SEPARATE, method-scoped table with
+    /// the OPPOSITE polarity (force the native to win OVER real bytecode),
+    /// alongside `org/apache/juli/*` and `org/jboss/logmanager/Logger` entries.
+    /// That table is a third hard-coded override surface the P0 row does not
+    /// mention; including its two shared names here would make this test fail
+    /// on a tree that is correct.
+    const ALLOWLIST_LITERALS: &[&str] = &[
+        "\"java/util/concurrent/locks/ReentrantLock\"",
+        "\"java/util/concurrent/LinkedBlockingDeque\"",
+        "\"java/util/concurrent/atomic/AtomicBoolean\"",
+        "\"java/util/EnumSet\"",
+        "\"java/time/Instant\"",
+        "\"java/time/ZonedDateTime\"",
+        "\"java/io/FileInputStream\"",
+        "\"java/lang/ref/Cleaner\"",
+        "\"java/lang/ref/Cleaner$Cleanable\"",
+        "\"java/util/StringJoiner\"",
+    ];
+
+    /// The cold path holds no second copy of the allow-list.
+    ///
+    /// Searching for the QUOTED literal, not the bare class name: the bare name
+    /// appears in the call site's own comment, which recounts the divergence
+    /// this test exists to prevent. A comment naming `StringJoiner` is the
+    /// history; a `matches!` arm spelling the quoted literal is the defect.
+    #[test]
+    fn the_cold_path_re_inlines_no_copy_of_the_allowlist() {
+        let body = vm_exec_body();
+        for literal in ALLOWLIST_LITERALS {
+            assert!(
+                !body.contains(literal),
+                "vm_exec.rs spells the allow-list literal {literal}. That is the \
+                 re-inlined second copy the 2026-08-04 centralisation removed: two \
+                 hand-maintained lists made a SyntheticStub native's \
+                 yield-to-real-bytecode verdict depend on how many times its call site \
+                 had executed. Call \
+                 `crate::runtime::interpreter::real_protected_stub_class` instead, and \
+                 if the class genuinely needs a per-path answer, add it to \
+                 `real_protected_stub_class_common` with a stated reason rather than \
+                 forking the list."
+            );
+        }
+    }
+
+    /// And it asks the one predicate exactly once.
+    ///
+    /// A second call site is not a defect by itself, but it is how a second
+    /// POLICY starts: the first divergence began as a second reader that then
+    /// grew its own list. If a legitimate second consumer appears, raise this
+    /// number deliberately and say why — that is the whole value of freezing it.
+    #[test]
+    fn the_cold_path_asks_the_one_predicate_exactly_once() {
+        let body = vm_exec_body();
+        let calls = body.matches("real_protected_stub_class(").count();
+        assert_eq!(
+            calls, 1,
+            "vm_exec.rs calls real_protected_stub_class {calls} time(s); it called it \
+             once when this was frozen. See this module's banner."
+        );
+    }
+
+    /// Exactly one definition of the predicate exists, and it is not in the file
+    /// the P0 row names.
+    ///
+    /// `docs/jdk-only-runtime-services.md` attributes `real_protected_stub_class`
+    /// to `vm/src/runtime/interpreter/invoke.rs`. It is in `native_override.rs`.
+    /// A row that names the wrong file sends its reader looking for a list that
+    /// is not there, and "I could not find it" reads as "it was already removed".
+    #[test]
+    fn exactly_one_definition_of_the_predicate_exists() {
+        let overrides = vm_src("vm/src/runtime/interpreter/native_override.rs");
+        assert_eq!(
+            overrides
+                .matches("fn real_protected_stub_class_common")
+                .count(),
+            1,
+            "native_override.rs must hold exactly one definition of \
+             real_protected_stub_class_common — it is the single list both dispatch \
+             paths read"
+        );
+        let invoke = vm_src("vm/src/runtime/interpreter/invoke.rs");
+        assert!(
+            !invoke.contains("fn real_protected_stub_class"),
+            "invoke.rs now defines real_protected_stub_class. The P0 *Native-first \
+             dispatch* row has always claimed it lives here and it never did; if the \
+             symbol has genuinely moved, update that row rather than leaving two \
+             possible homes for one predicate."
+        );
     }
 }
