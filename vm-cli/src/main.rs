@@ -182,6 +182,18 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // Compiled local exception handlers. `sites-emitted` counts STUBS, not
+        // catches; `entered` is the only number that says a `catch` block ran
+        // in compiled code, and `propagated` is its correct-but-not-a-win
+        // sibling. Zeros printed, for the same reason as the line above.
+        eprintln!(
+            "[cratonvm] local handlers: {}",
+            cratonvm_jit::metrics::local_handler_counts()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every
         // fall-through crosses. The two lines above count EMISSIONS, which is

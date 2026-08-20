@@ -114,7 +114,7 @@ use crate::JitRuntimeHelpers;
 /// (Revision `2` shipped the 60-field table; the `monitor_enter`/`monitor_exit`
 /// append that made it 62 did not bump this constant, because at the time
 /// nothing checked it. `ABI_REVISIONS` is that check.)
-pub const JIT_HELPERS_ABI_VERSION: u32 = 6;
+pub const JIT_HELPERS_ABI_VERSION: u32 = 7;
 
 /// Size in bytes of the helper table under [`JIT_HELPERS_ABI_VERSION`].
 ///
@@ -686,6 +686,13 @@ helper_fn_slots! {
     // NOT the store: the caller keeps the inline MOV, the SATB pre-write
     // barrier and the card mark. See `JitRuntimeHelpers::aastore_type_check`.
     HelperFnAastoreTypeCheck, aastore_type_check, aastore_type_check_fn, (i64, i64, i64) -> i64;
+    // Compiled local exception handlers -- (vm_ptr, site_ptr, out_exc_slot) ->
+    // the index of the matching candidate in this throwing bci's own handler
+    // list, or `-1` to propagate. The third argument is a WRITABLE frame
+    // address, not a value: on a hit the helper stores the throwable there,
+    // which is the operand slot the handler block starts from. See
+    // `JitRuntimeHelpers::local_handler_lookup`.
+    HelperFnLocalHandlerLookup, local_handler_lookup, local_handler_lookup_fn, (i64, i64, i64) -> i64;
 }
 
 // ---------------------------------------------------------------------
@@ -808,6 +815,10 @@ helper_field_table! {
     // reference STORES and G1/ZGC keep it empty on purpose (G1-2); this one
     // answers the READ question -- is this address mapped -- and G1 does fill it.
     (read_bounds_addr,               Constant, false),
+    // Optional: 0 makes the single-pass backend arm no local-handler stubs, so
+    // every caught exception keeps leaving compiled code through the reason-9
+    // deopt / shared-sentinel route -- the pre-feature behaviour.
+    (local_handler_lookup,           Function, false),
 }
 
 // ---------------------------------------------------------------------
@@ -828,7 +839,7 @@ const _: () = assert!(
 
 // Pin the literal count so a *removal* also has to touch this line.
 const _: () = assert!(
-    NUM_HELPER_FIELDS == 65,
+    NUM_HELPER_FIELDS == 66,
     "JitRuntimeHelpers field count changed — bump JIT_HELPERS_ABI_VERSION, the \
      literal here, and the size literal below",
 );
@@ -836,8 +847,8 @@ const _: () = assert!(
 // Pin the literal size and alignment. The JIT bakes `disp32` offsets derived
 // from this layout into RWX memory; a silent change here is a wild call.
 const _: () = assert!(
-    JIT_HELPERS_ABI_SIZE == 520,
-    "JitRuntimeHelpers size changed (expected 65 * 8 = 520) — the JIT's baked \
+    JIT_HELPERS_ABI_SIZE == 528,
+    "JitRuntimeHelpers size changed (expected 66 * 8 = 528) — the JIT's baked \
      helper offsets are now wrong; bump JIT_HELPERS_ABI_VERSION deliberately",
 );
 const _: () = assert!(
@@ -998,6 +1009,7 @@ pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("ldc_class_cp", 496),
     ("aastore_type_check", 504),
     ("read_bounds_addr", 512),
+    ("local_handler_lookup", 520),
 ];
 
 // Every golden row must name the descriptor row at the same index AND agree
@@ -1103,6 +1115,14 @@ pub const ABI_REVISIONS: &[HelperAbiRevision] = &[
         version: 6,
         num_fields: 65,
         size: 520,
+    },
+    // v7 -- appended `local_handler_lookup`, which is what lets a compiled
+    // frame enter its OWN `catch` block instead of deopting out to run it
+    // interpreted. Optional: a zero slot arms no local-handler stubs at all.
+    HelperAbiRevision {
+        version: 7,
+        num_fields: 66,
+        size: 528,
     },
 ];
 
@@ -1311,7 +1331,7 @@ const _: () = {
         }
         i += 1;
     }
-    assert!(functions == 55, "callable-slot count changed");
+    assert!(functions == 56, "callable-slot count changed");
     assert!(
         offsets == 4,
         "the number of displacement slots changed — an Offset slot is baked as \
@@ -1333,7 +1353,7 @@ const _: () = {
     // The runtime test below (`functions - required == 12`) was already on
     // the new number; this const was the only site still carrying 13.
     assert!(
-        optional_fns == 12,
+        optional_fns == 13,
         "the optional-callable count changed — every optional slot MUST have a \
          zero check at its emitter call site; confirm the new one does before \
          updating this number",
@@ -1679,6 +1699,7 @@ mod tests {
             ("ldc_class_cp", offset_of!(H, ldc_class_cp)),
             ("aastore_type_check", offset_of!(H, aastore_type_check)),
             ("read_bounds_addr", offset_of!(H, read_bounds_addr)),
+            ("local_handler_lookup", offset_of!(H, local_handler_lookup)),
         ];
 
         assert_eq!(HELPER_FIELDS.len(), probes.len());
@@ -1742,7 +1763,7 @@ mod tests {
         }
         // The last golden offset plus one stride is the whole table.
         let (last_name, last_offset) = GOLDEN_HELPER_OFFSETS[H::NUM_FIELDS - 1];
-        assert_eq!(last_name, "read_bounds_addr");
+        assert_eq!(last_name, "local_handler_lookup");
         assert_eq!(last_offset + HELPER_FIELD_STRIDE, JIT_HELPERS_ABI_SIZE);
     }
 

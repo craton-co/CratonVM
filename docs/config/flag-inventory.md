@@ -1150,6 +1150,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_INLINE_GETFIELD` | JIT | `CRATONVM_JIT=inline-getfield` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_INLINE_NEST` | JIT | `CRATONVM_JIT=inline-nest` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_INLINE_SELF_GUARD` | JIT | `CRATONVM_JIT=inline-self-guard` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_LOCAL_HANDLERS` | JIT | `CRATONVM_JIT=local-handlers` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_CALL` | JIT | `CRATONVM_JIT=ir-call` | opt-in | off | behaviour | snapshot | difftest, vm |
 | `CRATONVM_JIT_IR_CALL_SPECIAL` | JIT | `CRATONVM_JIT=ir-call-special` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_IR_CALL_VIRTUAL` | JIT | `CRATONVM_JIT=ir-call-virtual` | opt-in | off | behaviour | snapshot | vm |

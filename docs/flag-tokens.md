@@ -654,6 +654,7 @@ export inherited from a parent shell.
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
 | `inline-call-dispatch` | `CRATONVM_JIT_INLINE_CALL_DISPATCH` |
 | `inline-splice-devirt` | `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` |
+| `local-handlers` | `CRATONVM_JIT_LOCAL_HANDLERS` |
 | `osr-seed-frame-slots` | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` |
 | `osr-strip-all-high-halves` | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` |
 | `osr-single-pc` | `CRATONVM_JIT_OSR_SINGLE_PC` |

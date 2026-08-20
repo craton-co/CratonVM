@@ -1184,6 +1184,24 @@ pub struct JitRuntimeHelpers {
     /// checked `jit_getfield` helper, which is the pre-fix behaviour. Appended
     /// at the END of the struct so all prior golden offsets stay stable.
     pub read_bounds_addr: usize,
+    /// Compiled local exception handlers — address of
+    /// `extern "C" fn(vm_ptr: i64, site_ptr: i64, out_exc: *mut i64) -> i64`
+    /// (`vm/src/jit/helpers.rs::jit_local_handler_lookup`).
+    ///
+    /// Called from a per-throwing-bci stub the instant a fallible site returns
+    /// the `i64::MIN` sentinel. It answers which of THIS method's own
+    /// exception-table entries takes the pending throwable — index into the
+    /// site's compile-time candidate list, or `-1` for "this frame does not
+    /// catch it" — and on a hit stores the throwable into the frame slot the
+    /// handler's operand stack starts at.
+    ///
+    /// `0` = not wired (hand-built test tables, or the feature switched off)
+    /// → the backend arms no local-handler stubs at all and every caught
+    /// exception takes the reason-9 deopt / shared-sentinel route out of
+    /// compiled code, which is the behaviour that predates the feature.
+    /// Appended at the END of the struct so all prior golden offsets stay
+    /// stable.
+    pub local_handler_lookup: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1364,6 +1382,10 @@ helper_fields! {
     // immediate by the guarded inline getfield READ path. Deliberately a
     // DIFFERENT table from region_bounds_addr above -- see the field doc.
     (read_bounds_addr,               FieldKind::Offset),
+    // Optional: 0 makes the single-pass backend arm no local-handler stubs, so
+    // every caught exception keeps leaving compiled code — the pre-feature
+    // behaviour.
+    (local_handler_lookup,           FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1389,7 +1411,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 65,
+    JitRuntimeHelpers::NUM_FIELDS == 66,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1784,6 +1806,7 @@ mod tests {
             ldc_class_cp: 0x11B8,
             aastore_type_check: 0x11C0,
             read_bounds_addr: 0x11C8,
+            local_handler_lookup: 0x11D0,
         }
     }
 
@@ -2021,6 +2044,7 @@ mod tests {
             ldc_class_cp: 0,
             aastore_type_check: 0,
             read_bounds_addr: 0,
+            local_handler_lookup: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2520,6 +2544,11 @@ mod tests {
                 "read_bounds_addr",
                 std::mem::offset_of!(JitRuntimeHelpers, read_bounds_addr),
             ),
+            (
+                65,
+                "local_handler_lookup",
+                std::mem::offset_of!(JitRuntimeHelpers, local_handler_lookup),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2780,6 +2809,7 @@ mod tests {
             "set_throw_bci" => h.set_throw_bci = 0,
             "aastore_type_check" => h.aastore_type_check = 0,
             "read_bounds_addr" => h.read_bounds_addr = 0,
+            "local_handler_lookup" => h.local_handler_lookup = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }
