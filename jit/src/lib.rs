@@ -1791,7 +1791,8 @@ pub fn deopt_real_enabled() -> bool {
 }
 
 /// Enter a compiled method's OWN `catch` block from compiled code
-/// (`CRATONVM_JIT_LOCAL_HANDLERS`, **default-OFF**). Read-once cached.
+/// (`CRATONVM_JIT_LOCAL_HANDLERS`, **default-ON; `=0` restores the old
+/// route**). Read-once cached.
 ///
 /// With this off — the state this VM shipped in until 2026-08-20 — no `catch`
 /// block anywhere runs in compiled code. A caught exception leaves the
@@ -1806,20 +1807,37 @@ pub fn deopt_real_enabled() -> bool {
 /// compiled handler block, staying in the same frame — so the locals need no
 /// reconstruction because they were never left behind.
 ///
-/// Default-OFF because it changes what the emitter puts in the image (handler
-/// bodies were dead code before it) and because the arm is what makes an A/B
-/// on ONE binary possible. `docs/known-issues/netty/
+/// It shipped OFF for one day, which was long enough to measure it. What the
+/// flip rests on:
+///
+/// * `probes/OsrExcRateProbe`, one binary, two interleaved rounds: **1246-1377
+///   -> 60-120 ns per caught exception**, ~12x, with `sink` and `caught`
+///   byte-identical in every arm (HotSpot on the same host: 4.6-8);
+/// * `probes/LocalHandlerShapeProbe`, eight handler shapes including two typed
+///   handlers over one range, a strict-subclass catch, a propagating throw, a
+///   `finally`, a nested `try`, a rethrowing handler and a locals-survive
+///   arm: the same digest under HotSpot, under `--nojit`, and with this off
+///   and on;
+/// * the whole netty `codec-http` suite, 103 classes: **identical result
+///   sets**;
+/// * `regression-suite/run.sh`, 64 vectors: identical, 63 pass and the one
+///   pre-existing `RImmutableFactoryTypes` failure that is also there on
+///   unmodified `dev`.
+///
+/// `=0` (also `false`/`off`/`no`) restores the old route, so one binary still
+/// has two arms — which is how the two OSR-admission defects this feature
+/// exposed were found. `docs/known-issues/netty/
 /// httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md` is the
 /// class it was written for.
 pub fn local_handlers_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(
         || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LOCAL_HANDLERS") {
-            Ok(v) => matches!(
+            Ok(v) => !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
+                "0" | "false" | "off" | "no"
             ),
-            Err(_) => false,
+            Err(_) => true,
         },
     )
 }
