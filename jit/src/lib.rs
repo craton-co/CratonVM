@@ -4084,7 +4084,20 @@ impl CompiledMethod {
                     format!("deopt point at bci {} holds monitors", p.bci),
                 ));
             }
-            if let Some(slot) = deopt::first_unresumable_slot(fs) {
+            // A RETHROW point is asked a NARROWER question, because it is
+            // consumed differently: `take_exceptional_frame` hands its `bci`
+            // and `locals` to the handler-frame builder, which then pushes
+            // `[exception]` as the operand stack by JVMS §2.10. The recorded
+            // stack is never read, so an entry in it that could not be typed
+            // describes nothing that will be reconstructed — and this veto is
+            // ARTIFACT-WIDE, so one such entry at one throwing bci costs the
+            // whole method its OSR entry. See `first_unresumable_local`.
+            let unresumable = if p.semantics.rethrow_exception {
+                deopt::first_unresumable_local(fs)
+            } else {
+                deopt::first_unresumable_slot(fs)
+            };
+            if let Some(slot) = unresumable {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
                     format!(

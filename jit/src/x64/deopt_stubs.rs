@@ -172,6 +172,16 @@ impl Compiler {
             .chain(self.ldc2w_info.iter().map(|&(pc, _)| pc))
             .collect();
 
+        // Handler bodies are live code exactly when local handlers are armed,
+        // and then the analysis has to type them: otherwise every deopt point
+        // inside a `catch` block falls back to `Unsupported` and vetoes the
+        // whole artifact's OSR entry. Empty otherwise, so an unarmed compile is
+        // byte-identical.
+        let handler_pcs: Vec<usize> = self
+            .local_handler_table
+            .iter()
+            .map(|(_, _, handler_pc, _)| *handler_pc)
+            .collect();
         let inputs = StackKindInputs {
             field_types,
             static_types,
@@ -179,6 +189,7 @@ impl Compiler {
             ldc_refs: &ldc_refs,
             ldc_fp: &self.ldc_fp_pcs,
             ldc_resolved: &ldc_resolved,
+            handler_pcs: &handler_pcs,
         };
         self.stack_kinds = analyze(code, code_len, &inputs);
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
@@ -1471,10 +1482,12 @@ impl Compiler {
         throw_bci: usize,
         precise_exc_stub: bool,
     ) {
-        if let Some(site_idx) = self.local_handler_site_for(throw_bci) {
-            self.local_handler_stubs
-                .push((patch_offset, site_idx, throw_bci, precise_exc_stub));
-            return;
+        if self.local_handler_propagate_survives_a_call(throw_bci) {
+            if let Some(site_idx) = self.local_handler_site_for(throw_bci) {
+                self.local_handler_stubs
+                    .push((patch_offset, site_idx, throw_bci, precise_exc_stub));
+                return;
+            }
         }
         if precise_exc_stub {
             self.deopt_stubs.push((patch_offset, throw_bci, 9));
@@ -1544,6 +1557,48 @@ impl Compiler {
         // allocation-failure GC and to construct the OOME — which only the
         // dispatch-aware entry path (`set_jit_thread`) provides.
         self.emitted_alloc_oom_check = true;
+    }
+
+    /// Would this bci's propagate edge still describe the right frame after a
+    /// C-ABI `CALL` runs on it?
+    ///
+    /// A local-handler stub puts a helper `CALL` between the trapping
+    /// instruction and the reason-9 stub it may fall through to. That stub
+    /// reconstructs register-homed values by spilling the live register file
+    /// AT THE STUB, so any value homed in a CALLER-saved register would be read
+    /// back as whatever the helper left there.
+    ///
+    /// Today nothing can be: Java locals are coloured only into
+    /// [`LOCAL_REGS`]/[`LOCAL_XMMS`], which are callee-saved on both ABIs the
+    /// backend targets, and every operand-stack value has been flushed to a
+    /// frame slot by the `flush_scratch_registers` that precedes the fallible
+    /// call. This check is therefore expected to pass for every site — which is
+    /// exactly why it is worth having: the argument is two invariants deep and
+    /// neither is stated where a future register-allocator change would read
+    /// it. A site it refuses simply keeps the pre-feature route.
+    fn local_handler_propagate_survives_a_call(&self, throw_bci: usize) -> bool {
+        if self.local_handler_table.is_empty() {
+            return false;
+        }
+        let Some(point) = self
+            .deopt_points
+            .iter()
+            .rev()
+            .find(|p| p.bci as usize == throw_bci && p.semantics.rethrow_exception)
+        else {
+            // No precise frame at this bci: the propagate edge is the shared
+            // sentinel exit, which reloads everything it needs.
+            return true;
+        };
+        crate::deopt::frame_state_register_homes(&point.frame_state)
+            .into_iter()
+            .all(|(reg, is_xmm)| {
+                if is_xmm {
+                    LOCAL_XMMS.contains(&reg)
+                } else {
+                    LOCAL_REGS.contains(&reg)
+                }
+            })
     }
 
     /// The site index for a throw at `throw_bci` that this method's own
