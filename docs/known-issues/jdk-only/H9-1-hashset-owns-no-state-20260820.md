@@ -774,3 +774,49 @@ exactly the identity-test failure `H9` describes, since real
 **Not verified here:** `H9`'s predicted post-fix result (103/104 armed), which
 needs the build; its O1/O2/O3 out-of-file claims; and its `RMapGcStress`
 mechanism. Those are the merging lane's job and are tracked separately.
+
+### The three out-of-file blockers, checked in source (lane H0)
+
+Source-only verification; no build was needed for any of these.
+
+**O2 — CONFIRMED, and it is exactly two.** `java/util/HashSet` +
+`spliterator` + `()Ljava/util/Spliterator;` is registered twice, from two
+crates, with two different implementations:
+
+| site | registrar | implementation |
+|---|---|---|
+| `native-collections/src/lib.rs:16247` | `register_hashset_natives`, looping `SET_CLASSES` | `native_hs_spliterator` |
+| `native-builtins/src/phases_late/streams.rs:3634` | the `p59` stream phase | `p59_hashset_spliterator` |
+
+The third `spliterator` registration in `native-collections`
+(`register_set_view_carrier_natives`, line 16356) is **not** a duplicate: its
+loop is `SET_VIEW_CARRIERS`, which is `HashMap$KeySet`, `HashMap$EntrySet`, the
+two `LinkedHashMap` views, the two `Hashtable` views and
+`ConcurrentHashMap$EntrySetView` — `java/util/HashSet` is not among them. Worth
+stating because two of the three sites look identical at a glance and only the
+loop variable distinguishes them.
+
+Which of the two wins is registration-order-dependent and is **NOT settled
+here** — it needs `--dump-native-registry` on a binary, and the binary was
+mid-rebuild. This is the tree's recorded duplicate-registration hazard
+(`register_io_natives` registering `FileInputStream.read([BII)I` twice in one
+function, the later ambient-`Bridge` silently winning), so *"read the dump
+before touching either"* is the right instruction and it is still outstanding.
+
+**O3 — CONFIRMED.** `vm/src/runtime/interpreter.rs:969`:
+
+```rust
+"java/util/Set" | "java/util/Collection" => "java/util/HashSet",
+```
+
+Both interfaces mint a `java/util/HashSet` receiver, and an in-file test
+(`the_substituted_interfaces_are_exactly_these_six`) pins that mapping as
+intentional. After a `HashSet` retirement those receivers meet real bytecode
+over a `map` field nobody wrote. **Blocking, as `H9` states.**
+
+**"Zero JIT helpers touch the set surface" — CONFIRMED.**
+`vm/src/jit/helpers.rs` names `java/util/HashMap` (via `ObjectNativeKind::HashMap`
+and `hashmap_native_callback`), `Matcher` and `StringBuilder`. There is no
+`java/util/HashSet` anywhere in it; the `FxHashSet` at line 8044 is a Rust
+container, not the Java class. So `H4-1` O1 genuinely does not gate this family,
+and lane `H12`'s JIT work and this lane do not overlap.
