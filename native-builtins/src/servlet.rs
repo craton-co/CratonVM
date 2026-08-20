@@ -2092,7 +2092,14 @@ pub(crate) struct TlsEntry {
     /// Per-stream mutex, deliberately NOT guarded by `s2_registry()`: a
     /// blocking TLS read/write must not hold the process-wide socket
     /// registry lock (see `s2_tls_read`'s doc comment).
-    pub(crate) stream: Arc<parking_lot::Mutex<TlsClientStream>>,
+    ///
+    /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Its two acquisitions
+    /// (`s2_tls_read`, `s2_tls_write`) each hold it across exactly one
+    /// `read`/`write` on the underlying stream and then `drop(guard)`; both
+    /// release `s2_registry()` before taking it, which is the ordering the
+    /// field comment above already required in prose. Nothing under the guard
+    /// touches a `NativeContext`.
+    pub(crate) stream: Arc<cratonvm_types::lock_order::OrderedPlMutex<TlsClientStream>>,
     /// A `try_clone`d handle on the same underlying socket, for fd-level
     /// operations (`shutdownInput/Output`, `set/getSoTimeout`) that must NOT
     /// wait on `stream`'s mutex — `shutdownInput` is exactly how a caller
@@ -2345,7 +2352,7 @@ pub(crate) fn s2_tls_connect_on(
 
     let raw = tls_stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Native(tls_stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Native(tls_stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2425,7 +2432,7 @@ pub(crate) fn s2_legacy_dsa_tls_connect_on(
     let peer_cert_chain_der = openssl_peer_chain_der(stream.ssl()).map_err(|e| hs(&e))?;
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Openssl(stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Openssl(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2654,7 +2661,7 @@ pub(crate) fn s2_openssl_tls_connect_on(
 
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Openssl(stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Openssl(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -2967,7 +2974,7 @@ pub(crate) fn s2_schannel_tls_connect_on(
         .map(|p| String::from_utf8_lossy(&p).into_owned());
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Schannel(stream))),
+        stream: Arc::new(cratonvm_types::lock_order::OrderedPlMutex::new(TlsClientStream::Schannel(stream), cratonvm_types::lock_order::LockLevel::Scratch)),
         raw,
         peer_host: host.to_string(),
         peer_port: port,
@@ -3523,8 +3530,44 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Result<Option<ObjectR
     // `gaps/crash-01-arraylist-capacity-oom-abend.md`. Found via
     // H2's `org.h2.test.db.TestOutOfMemory`, whose MVStore-on-memFS workload
     // allocates ~76 MB buffers until the heap is gone.
-    let Some(arr) = ctx.try_new_array(ArrayElementType::Byte, cap) else {
-        return Ok(None);
+    //
+    // RECLAIM AND RETRY, not one shot (H2 `TestBenchmark`, 2026-08-18). Being
+    // *fallible* stopped the abort; it did not make the refusal honest.
+    // `try_new_array` deliberately does not collect -- see
+    // `runtime::native_oom` -- so this native reported `OutOfMemoryError` on
+    // the FIRST refusal, while the two paths that allocate an array from
+    // bytecode (`gc_alloc_array`, `jit_newarray`) both run a ladder: retire
+    // the TLAB, force a collection, retry, `last_ditch_reclaim`, retry again,
+    // and only then throw. `ByteBuffer.allocate` is shadowed by this native in
+    // real-JDK mode too, so its backing array never sees that ladder.
+    //
+    // Measured: MVStore's background writer grows a `WriteBuffer` to
+    // 10,616,832 bytes at `-Xmx1g` on ZGC. The arena has no hole that big at
+    // that instant (498 KiB largest, 348 MB free across 30k spans) and the
+    // request was refused -- with the heap 97% free once the collection nobody
+    // asked for finally ran. Repeating the identical `ByteBuffer.allocate` one
+    // Java statement later succeeded on the first attempt, and the class also
+    // passes under `--nojit`, at `-Xmx2g`, and on the generational collector:
+    // a spurious refusal, not an exhausted heap.
+    //
+    // Calling `reclaim_before_alloc_retry` is legal HERE specifically, and the
+    // precondition is the caller's to prove: this is the native's first
+    // allocation, so it holds no unpinned `ObjectRef` in a Rust local for a
+    // collection to dangle or sweep. Note that the very next allocation below
+    // must NOT do this -- `arr` is live by then, which is exactly why it is
+    // pinned across it.
+    let arr = match ctx.try_new_array(ArrayElementType::Byte, cap) {
+        Some(a) => a,
+        None => {
+            let reclaimed = ctx.reclaim_before_alloc_retry();
+            match reclaimed
+                .then(|| ctx.try_new_array(ArrayElementType::Byte, cap))
+                .flatten()
+            {
+                Some(a) => a,
+                None => return Ok(None),
+            }
+        }
     };
     // GC-safety: `alloc_concurrent_synthetic` below allocates and can
     // trigger a collection that relocates `arr` (read again by
@@ -6008,8 +6051,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let cap = requested as usize;
         match s2_bb_alloc(ctx, cap)? {
             Some(buf) => Ok(Some(Value::Object(Some(buf)))),
+            // The message names the site and the size. It used to be a bare
+            // "Java heap space", which is also what the pre-allocated singleton
+            // OOME carries and what three unrelated natives throw -- so the
+            // string identified nothing. Chasing the H2 `TestBenchmark` refusal
+            // cost a run per candidate site purely to find out which of them had
+            // produced it; the two bytecode paths already name themselves
+            // ("alloc_array length N"), and this is the third allocator of
+            // caller-sized arrays.
             None => Err(RuntimeError::OutOfMemoryError {
-                message: "Java heap space".to_string(),
+                message: format!("Java heap space (ByteBuffer.allocate {cap})"),
             }
             .into()),
         }

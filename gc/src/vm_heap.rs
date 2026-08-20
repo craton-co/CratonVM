@@ -476,6 +476,10 @@ impl VmHeap {
         // KINDOF-SENTINEL: see `kind_of` below — same idiom, same observed
         // sentinel (`0xFFFFFFFFFFFFFFFF`) reaching this dispatch unchecked.
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            // The `ClassId(0)` this returns is what the H2 residual's own
+            // `checkcast` reporter had to be taught to look past — see
+            // `note_dead_base_deref`, which reports the swallow instead.
+            self.note_dead_base_deref(obj, "class_id_of");
             return ClassId::new(0);
         }
         dispatch!(self, class_id_of(obj))
@@ -991,6 +995,7 @@ impl VmHeap {
     // independently rather than trusting an already-validated caller.
     pub fn kind_of(&self, obj: ObjectRef) -> ObjectKind {
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            self.note_dead_base_deref(obj, "kind_of");
             return ObjectKind::Object;
         }
         dispatch!(self, kind_of(obj))
@@ -1010,9 +1015,75 @@ impl VmHeap {
 
     pub fn element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
+            self.note_dead_base_deref(obj, "element_type_of");
             return ArrayElementType::Reference;
         }
         dispatch!(self, element_type_of(obj))
+    }
+
+    /// `CRATONVM_DBG_VACATED_FRAMES`: somebody just dereferenced an address
+    /// that is **not a live object base**, and the sentinel guards above
+    /// swallowed it into a default.
+    ///
+    /// This is the EARLY face of the stale-holder family, and the one every
+    /// other instrument is blind to. A holder left naming an address the slide
+    /// vacated reads a zeroed corpse until the allocator hands the span out
+    /// again: `is_object_address` says no, `class_id_of` answers `ClassId(0)`,
+    /// `kind_of` answers `Object`, and the caller carries on with a plausible
+    /// default. Nothing is thrown, so nothing is reported — and by the time the
+    /// address IS re-issued and the failure becomes visible as a
+    /// `ClassCastException`, the exact vacated ledger has already dropped the
+    /// entry (that pruning is what makes it exact) and every consumption-point
+    /// detector goes quiet. That gap is why the H2 MVStore-writer residual
+    /// could be measured, cornered to "a raw ObjectRef in VM-side state", and
+    /// still not named.
+    ///
+    /// The backtrace is the whole point: it names the Rust frame holding the
+    /// reference, which is the one fact none of the Java-side evidence carries.
+    /// `moved_to` distinguishes the two reasons an address fails the live-base
+    /// test — the collector moved the object (a stale holder, this defect) or
+    /// the value was never an object at all (the `0xFFFF..` sentinel family the
+    /// guards above were originally written for).
+    #[cold]
+    fn note_dead_base_deref(&self, obj: ObjectRef, site: &'static str) {
+        if !crate::gc_quiescence::vacated_frames_enabled() {
+            return;
+        }
+        let addr = obj.as_ptr() as usize;
+        // Null is not a stale holder; it is the ordinary absent reference, and
+        // reporting it would bury the signal.
+        if addr == 0 {
+            return;
+        }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 24 {
+            return;
+        }
+        let moved_to = crate::gc_quiescence::was_vacated(addr)
+            .or_else(|| self.zgc_forwarded_after_slide(addr));
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            site,
+            obj = format!("{addr:#x}"),
+            moved_to = moved_to.map(|a| format!("{a:#x}")).unwrap_or_else(|| "<unknown>".into()),
+            was_vacated = moved_to.is_some(),
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "a dereference of an address that is NOT a live object base was \
+             swallowed into a default. When `was_vacated` is true this is a \
+             holder the collector moved out from under and nothing repaired — \
+             the caller in the backtrace is the one holding it.",
+        );
+    }
+
+    /// ZGC's slide ledger, for [`Self::note_dead_base_deref`]. `None` on every
+    /// other backend (they leave a forwarding word instead, which
+    /// `load_and_forward` reads).
+    fn zgc_forwarded_after_slide(&self, addr: usize) -> Option<usize> {
+        match self {
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.forwarded_after_slide(addr),
+            _ => None,
+        }
     }
 
     pub fn identity_hash_code(&self, obj: ObjectRef) -> i32 {

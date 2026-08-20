@@ -644,12 +644,52 @@ pub(crate) fn native_string_intern(
 /// practice bounded by how many distinct lone-surrogate strings a program
 /// interns, which is a set every measurement in this tree has found empty
 /// outside a test.
-fn surrogate_intern_pool() -> &'static std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>
-{
+///
+/// **One table, two callers.** `String.intern()` reaches it through
+/// [`intern_unrepresentable`] below; the interpreter's `ldc` of a
+/// surrogate-bearing *literal* reaches it through
+/// [`surrogate_intern_probe`] / [`surrogate_intern_claim`], which exist
+/// because that caller lives in the `vm` crate and holds a `SharedVm` rather
+/// than a `NativeContext`. It has to be the SAME table: JVMS §5.1 interns
+/// string literals, so `"\uD800" == "\uD800"` and
+/// `LITERAL == LITERAL.intern()` are both required to hold, and two tables
+/// would answer the second one `false`.
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both acquisitions —
+/// [`surrogate_intern_probe`]'s read and [`surrogate_intern_claim`]'s
+/// `entry().or_insert()` — copy a `usize` handle out and drop the guard in the
+/// same statement, so neither can hold it across a call back into the VM.
+fn surrogate_intern_pool(
+) -> &'static cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<Vec<u16>, usize>> {
     static P: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<Vec<u16>, usize>>,
+        cratonvm_types::lock_order::OrderedMutex<std::collections::HashMap<Vec<u16>, usize>>,
     > = std::sync::OnceLock::new();
-    P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    P.get_or_init(|| cratonvm_types::lock_order::OrderedMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
+}
+
+/// The global-root handle already canonical for `units`, if any.
+///
+/// Read half of the pool, for a caller that owns a different root API. A hit
+/// lets `ldc` skip allocating the `String` at all.
+pub fn surrogate_intern_probe(units: &[u16]) -> Option<usize> {
+    let pool = surrogate_intern_pool().lock().ok()?;
+    pool.get(units).copied()
+}
+
+/// Publish `handle` as the canonical instance for `units`, returning whichever
+/// handle won. A caller whose handle lost must release it.
+///
+/// Write half of [`surrogate_intern_probe`]. Takes the handle rather than the
+/// `ObjectRef` for the reason the module comment gives: the collector owns the
+/// reference, and a raw `ObjectRef` parked in a `static` would be a stale
+/// address after the next relocating cycle.
+pub fn surrogate_intern_claim(units: Vec<u16>, handle: usize) -> usize {
+    match surrogate_intern_pool().lock() {
+        Ok(mut pool) => *pool.entry(units).or_insert(handle),
+        // A poisoned pool must not silently de-intern: returning the caller's
+        // own handle keeps this call's identity self-consistent, which is the
+        // same direction `intern_unrepresentable` takes on the same failure.
+        Err(_) => handle,
+    }
 }
 
 /// Canonical instance for a string the Rust-text pools cannot represent.
@@ -665,13 +705,15 @@ fn intern_unrepresentable(
     this: cratonvm_types::ObjectRef,
     units: Vec<u16>,
 ) -> cratonvm_types::ObjectRef {
+    // Probe before rooting: an already-interned literal (the common case once
+    // `ldc` populates this table) costs one lock and no root traffic.
+    if let Some(winner) = surrogate_intern_probe(&units) {
+        if let Some(obj) = ctx.resolve_global_root(winner) {
+            return obj;
+        }
+    }
     let handle = ctx.add_global_root(this);
-    let winner = {
-        let Ok(mut pool) = surrogate_intern_pool().lock() else {
-            return this;
-        };
-        *pool.entry(units).or_insert(handle)
-    };
+    let winner = surrogate_intern_claim(units, handle);
     if winner != handle {
         ctx.remove_global_root(handle);
     }
@@ -2158,7 +2200,12 @@ fn invoke_to_string_units_opt(
                     let formatted = if name == "java/lang/Boolean" {
                         if v != 0 { "true" } else { "false" }.to_string()
                     } else if name == "java/lang/Character" {
-                        char::from_u32(v as u32).unwrap_or('?').to_string()
+                        // A boxed `Character` can hold a lone surrogate --
+                        // `Character.valueOf('\ud800')` is legal -- and
+                        // `char::from_u32` rejects exactly those, so this
+                        // printed '?' for a value it could have passed through
+                        // untouched. Emit the raw unit.
+                        return Ok(Some(vec![v as u16]));
                     } else if name == "java/lang/Byte" {
                         (v as i8).to_string()
                     } else if name == "java/lang/Short" {
@@ -2271,13 +2318,27 @@ pub(crate) fn native_sb_append_object(
     // in-tree exemplar in the insert-CharSequence native.
     let mut scope = NativeHandleScope::new(ctx);
     let this_handle = scope.root(this);
-    let text = match args.get(1) {
-        Some(Value::Object(Some(obj))) => invoke_to_string(&mut *scope, *obj)?,
-        Some(Value::Object(None)) => "null".to_string(),
-        _ => "null".to_string(),
+    // UNITS, not text. `invoke_to_string` returns a Rust `String`, which cannot
+    // hold an unpaired UTF-16 surrogate -- so `sb.append(someObject)` replaced
+    // one with U+FFFD while `sb.append(someString)` right beside it did not.
+    //
+    // `invoke_to_string_units` is its exact twin, same `"null"` fallback and
+    // all, and it sits DIRECTLY ABOVE this function. It was built by `G26` for
+    // this hazard and this caller never switched to it -- the same
+    // mechanism-without-a-consumer shape as `G58-1`'s `BaisEvent` and `G51-1`'s
+    // `record_local_cert_chain`, except here the consumer existed and kept
+    // calling the lossy one.
+    //
+    // This is the last mile of the collection renderers: real JDK
+    // `AbstractCollection.toString` is a `sb.append(e)` loop over `Object`, so
+    // `Arrays.asList(s).toString()` and any nested collection came back through
+    // here and lost the unit that native-collections had just preserved.
+    let units = match args.get(1) {
+        Some(Value::Object(Some(obj))) => invoke_to_string_units(&mut *scope, *obj)?,
+        _ => "null".encode_utf16().collect(),
     };
     let this = scope.get(&this_handle);
-    let this = sb_append_str(&mut *scope, this, &text);
+    let this = sb_append_chars(&mut *scope, this, &units);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -11265,6 +11326,23 @@ fn fmt_general_units(
             if ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(*obj)) {
                 return Ok(read_string_chars(ctx, *obj));
             }
+            // Every OTHER object: `%s` is `String.valueOf(arg)` ==
+            // `arg.toString()`, and that result can hold an unpaired surrogate
+            // exactly as a String argument can -- `String.format("%s", x)` where
+            // `x.toString()` returns one, and any boxed `Character` holding one.
+            // `format_arg` renders it and hands back a Rust `String`, so the
+            // unit was already gone by the time this function saw it.
+            //
+            // These are the SAME two calls `format_arg`'s own `%s` arm makes,
+            // in the same order, differing only in reading the result as units
+            // -- so the two cannot disagree about anything except the loss.
+            return match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => Ok(ctx
+                    .read_string_units(s)
+                    .unwrap_or_else(|| "null".encode_utf16().collect())),
+                Ok(_) => Ok("null".encode_utf16().collect()),
+                Err(err) => Err(err),
+            };
         }
     }
     let rendered = format_arg(ctx, val, spec)?;

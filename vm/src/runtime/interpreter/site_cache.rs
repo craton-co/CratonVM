@@ -316,6 +316,40 @@ pub type FieldSiteCache = SiteCache<cratonvm_classloading::resolution::ResolvedF
 /// Per-thread resolved-method sites; see [`MethodSiteInfo`].
 pub type MethodSiteCache = SiteCache<MethodSiteInfo>;
 
+/// Per-thread resolved **cast** sites — the target `ClassId` of a `checkcast`
+/// or `instanceof`.
+///
+/// # Why this is not [`ClassSiteCache`]
+///
+/// It stores less and it would be tempting to share the `new` table, since both
+/// map `(referencing class, cp index)` to a resolved class. **They must not
+/// share it.** The same `CONSTANT_Class` entry can be referenced by a `new` and
+/// by a `checkcast` in one class, so one table would let a `checkcast` fill
+/// answer a `new` — and [`ClassSiteCache`]'s hit path deliberately skips the
+/// initialization check on the grounds that a fill only happens after
+/// `ensure_class_initialized_shared` returned `Ok`. A `checkcast` must NOT
+/// initialize its target (JVMS §6.5 `checkcast` performs resolution, not
+/// initialization), so a `checkcast` fill cannot carry that guarantee, and a
+/// `new` served from one would allocate an uninitialized class.
+///
+/// Separate tables keep each cache's precondition its own.
+///
+/// # What a hit is allowed to answer
+///
+/// Only the resolution. The assignability test still runs on every execution —
+/// a hit removes the `String` for the class name, the loader-aware
+/// `resolve_class_loader_aware`, and one of the two `class_manager` read
+/// acquisitions, and nothing else.
+///
+/// A hit is taken only when the receiver is not an array (arrays answer through
+/// descriptor-based assignability, which needs the name) and only when
+/// `is_subclass_of` says yes. A negative `is_subclass_of` falls through to the
+/// full path, because the five fail-open fallbacks after it
+/// (`loader_aware_name_assignable`, `synthetic_implements`,
+/// `proxy_instance_satisfies_target`, …) are name-based. So the cache
+/// accelerates the assignable case and leaves every refusal exactly as it was.
+pub type CastSiteCache = SiteCache<ClassId>;
+
 /// `CRATONVM_DBG=field-site` — prove the site caches are actually firing before
 /// anyone times them.
 ///
@@ -343,8 +377,40 @@ pub mod site_stats {
     /// cache cannot help, and saying so is the difference between "measured no
     /// effect" and "never fired".
     pub const NEW_REJECT_LOADER: usize = 10;
+    pub const CAST_HIT: usize = 11;
+    pub const CAST_MISS: usize = 12;
+    pub const CAST_FILL: usize = 13;
+    /// A cast site refused a FILL: a loader-namespaced referencing class or an
+    /// array target, whose answer is not a property of the (class, index) pair
+    /// alone. Same reason the `new` counterpart exists — it separates "measured
+    /// no effect" from "never fired".
+    pub const CAST_REJECT_LOADER: usize = 14;
+    /// A cast site HIT whose answer could not be used: `is_subclass_of` said no
+    /// (or the receiver was an array), so the full name-based path ran anyway.
+    ///
+    /// This is deliberately NOT counted as a loader rejection. It dominates any
+    /// workload that asks negative `instanceof` questions — a torture probe
+    /// here reports 26,446 of these against 34 fills — and folding the two
+    /// together would read as "the cache is being refused for loader reasons"
+    /// when what is actually happening is that the cache is answering, and the
+    /// answer is `false`. A counter whose name implies the wrong cause is the
+    /// same defect as a counter that does not fire.
+    pub const CAST_UNUSABLE: usize = 15;
+    /// An `ldc` answered from the recorded-resolution store — the whole
+    /// instruction, before the class_manager lock.
+    pub const LDC_HIT: usize = 16;
+    /// An `ldc` that had to resolve. Non-zero with `LDC_HIT` at zero would
+    /// mean the store is never being written, which is a different defect
+    /// from a cache that is written and never read.
+    pub const LDC_MISS: usize = 17;
+    /// An `ldc` result written to the store. Every tag `ldc` can push records,
+    /// including `Integer`/`Float`: an unrecorded tag would MISS the probe on
+    /// every execution and then resolve anyway, so the probe would be pure
+    /// added cost for it. `ldc2_w` does not probe or record — see
+    /// `constants::execute_ldc2w`.
+    pub const LDC_FILL: usize = 18;
 
-    const N: usize = 11;
+    const N: usize = 19;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -370,7 +436,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -383,6 +449,14 @@ pub mod site_stats {
             COUNTS[NEW_MISS].load(Ordering::Relaxed),
             COUNTS[NEW_FILL].load(Ordering::Relaxed),
             COUNTS[NEW_REJECT_LOADER].load(Ordering::Relaxed),
+            COUNTS[CAST_HIT].load(Ordering::Relaxed),
+            COUNTS[CAST_MISS].load(Ordering::Relaxed),
+            COUNTS[CAST_FILL].load(Ordering::Relaxed),
+            COUNTS[CAST_REJECT_LOADER].load(Ordering::Relaxed),
+            COUNTS[CAST_UNUSABLE].load(Ordering::Relaxed),
+            COUNTS[LDC_HIT].load(Ordering::Relaxed),
+            COUNTS[LDC_MISS].load(Ordering::Relaxed),
+            COUNTS[LDC_FILL].load(Ordering::Relaxed),
         );
     }
 

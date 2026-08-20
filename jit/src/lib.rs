@@ -2987,6 +2987,111 @@ impl CompiledMethod {
             .expect("call_with_heap: invalid JIT entry or arg count (use try_call_with_context for the fallible variant)")
     }
 
+    /// The receiver class this artifact's inline cache installed at `bci`, when
+    /// that installation is evidence the site is monomorphic.
+    ///
+    /// WHY THIS EXISTS. Devirtualising a call inside a spliced body needs to
+    /// know which body the receiver dispatches to, and the obvious source —
+    /// `MethodProfile::receivers`, keyed by the executing method's own bci — is
+    /// EMPTY at exactly the sites that matter. Measured 2026-08-18: the
+    /// eager-callee-chain compiles a method like
+    /// `AssertionUtils.objectsAreEqual` before it ever executes its
+    /// `invokevirtual equals` interpreted, so nothing is recorded there. The
+    /// evidence exists one layer down — that compiled method's own MIC
+    /// installed the receiver on its first call and has been serving it since.
+    ///
+    /// WHAT COUNTS AS EVIDENCE, and why it is STRUCTURAL rather than statistical.
+    /// The first cut of this asked for `hits + misses >= 64` with an 80% hit
+    /// rate, mirroring the profile's dominance bar. That bar can essentially
+    /// never be met, and it selects backwards. `record_hit` is called from the
+    /// dispatch HELPER (`vm/src/jit/helpers.rs`); the JIT-emitted inline MIC
+    /// compares the class id and calls the cached entry in machine code without
+    /// ever entering it. So a hot, well-behaved monomorphic site reads
+    /// `h0:m1` — one helper entry to install, then silence — which is exactly
+    /// what the trace showed for `objectsAreEqual`, and a hit-rate bar would
+    /// admit only sites that are thrashing THROUGH the helper.
+    ///
+    /// The structural property is stronger than any counter anyway: a populated
+    /// MIC slot is monomorphic FOR ITS LIFETIME by construction. `update()`
+    /// reserves an empty slot with a CAS and never retargets a populated one —
+    /// "a different receiver simply takes the ordinary helper path" — because
+    /// retargeting could pair one receiver's class guard with another's entry.
+    /// So the class id in a populated slot is the one and only class that slot
+    /// ever installed.
+    ///
+    /// Three things are therefore required, and each rules out a real shape:
+    ///
+    ///  * a populated, not-mid-installation `cached_class_id` — an empty slot
+    ///    has seen nothing, and `INSTALLING_CLASS_ID` is what a concurrent
+    ///    reader observes mid-publication;
+    ///  * a non-zero `cached_entry_ptr` — `prepopulate` seeds a class id from
+    ///    profile data with the entry still 0, which is a guard HINT and not an
+    ///    observation. Accepting it would launder a profile guess back in as if
+    ///    it were runtime evidence;
+    ///  * `misses` at or below [`MIC_TO_PIC_THRESHOLD`] — every helper entry
+    ///    after the install is a receiver this slot could not serve, which is
+    ///    the same signal `needs_pic_promotion` uses to declare the site
+    ///    polymorphic. This is the ONE thing the counters do measure honestly.
+    ///
+    /// WHAT IT PROMISES. Nothing about the future — it is speculation, and the
+    /// consumer must guard on the class id it returns. A wrong answer costs the
+    /// guard's miss edge, never correctness.
+    pub fn dominant_receiver_at_bci(&self, bci: usize) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        // A PIC at this bci means the adaptive recompiler already concluded the
+        // site is polymorphic. Its own MIC may still hold whichever receiver it
+        // installed first, and guarding on that would be guarding on the least
+        // informative of several.
+        if self
+            ._jit_pic_slots
+            .iter()
+            .any(|p| p.bci == bci && p.misses.load(Ordering::Relaxed) > 0)
+        {
+            return None;
+        }
+        for slot in &self._jit_mic_slots {
+            if slot.bci != bci {
+                continue;
+            }
+            let class_id = slot.cached_class_id.load(Ordering::Relaxed);
+            if class_id == 0 || class_id == JitMICSlot::INSTALLING_CLASS_ID {
+                continue;
+            }
+            if slot.cached_entry_ptr.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            if slot.misses.load(Ordering::Relaxed) > MIC_TO_PIC_THRESHOLD {
+                continue;
+            }
+            return Some(class_id);
+        }
+        None
+    }
+
+    /// `(bci, cached_class_id, hits, misses)` for every MIC slot, for the
+    /// `CRATONVM_DBG_JITC` trace.
+    ///
+    /// `dominant_receiver_at_bci` returning `None` has three causes needing
+    /// three different fixes — no slot at this bci (a compile-ORDER problem), a
+    /// slot with too few samples (a WARM-UP problem), and a slot that thrashes
+    /// (not fixable, and correctly refused). A bare `None` cannot tell them
+    /// apart, and guessing which one it was is how a session spends a build
+    /// cycle on the wrong hypothesis.
+    pub fn mic_slot_census(&self) -> Vec<(usize, u32, u64, u64)> {
+        use std::sync::atomic::Ordering;
+        self._jit_mic_slots
+            .iter()
+            .map(|s| {
+                (
+                    s.bci,
+                    s.cached_class_id.load(Ordering::Relaxed),
+                    s.hits.load(Ordering::Relaxed),
+                    s.misses.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
     /// True when this artifact recorded a safe OSR entry point for `entry_pc`
     /// (i.e. [`osr_enter`](Self::osr_enter) at that pc would not bail).
     /// Lets the interpreter's OSR trigger reuse a cached compile instead of
@@ -5350,6 +5455,87 @@ pub struct InlineInvokeTarget {
     /// picks a different method with the same name. The enclosing method's id
     /// would be the wrong answer whenever the callee comes from another loader.
     pub declaring_class_id: u32,
+    /// `(compiled entry address, callee takes the VM context)` when this target
+    /// could be bound to a raw `CALL` at plan time, `None` when it could not.
+    ///
+    /// This is what makes a call-carrying splice pay for itself. Measured
+    /// 2026-08-18: emitting an admitted call through the blind
+    /// `jit_invoke_dispatch` took the JUnit assertion chain from 47 to 163-266
+    /// ns/iter, because the call it replaced was ALREADY direct-bound — a raw
+    /// `CALL` to a compiled entry — and the helper resolves by name on every
+    /// execution. Removing a ~4 ns frame does not pay for a ~175 ns downgrade.
+    ///
+    /// Filled by the same `callee_compiler` / `direct_callee_lookup` resolver
+    /// the top-level `direct_calls` planning uses, so every one of its refusal
+    /// gates (FJP blocklist, native shadow, callee exception table,
+    /// `synchronized`, JVMS §5.5 static-init, indy trap, eager-chain depth /
+    /// cycle / fan-out) applies here unchanged and in the same order.
+    ///
+    /// KEEP-ALIVE CONTRACT: an entry recorded here MUST reach
+    /// `CompiledMethod::_direct_callee_entries`, which is what pins the callee
+    /// artifact (`prepare_for_publication`) and what the invalidation reverse
+    /// closure walks to evict a caller whose callee was withdrawn.
+    /// `try_compile_inner` does that for every site, nested ones included; a
+    /// baked address that skipped it is a use-after-free waiting for a tier-up.
+    pub direct_entry: Option<(usize, bool)>,
+}
+
+/// One call inside a spliced body, resolved and interned for the emitter.
+///
+/// Two shapes, and the emitter prefers the first:
+///
+///  * `direct_entry != 0` — a raw `CALL` to the callee's compiled entry, the
+///    same thing the top-level `direct_calls` path emits. `info_addr` is still
+///    needed: a baked direct call has no dispatch-helper frame to recover its
+///    arguments from when the callee deopts, so
+///    `emit_inline_callee_deopt_check` reads them out of a service copy keyed
+///    by this `JitInvokeInfo`.
+///  * `direct_entry == 0` — the blind `jit_invoke_dispatch` helper. Only
+///    reachable with `CRATONVM_JIT_INLINE_CALL_DISPATCH` on, because it is a
+///    measured 3.5x pessimisation on an already-direct-bound chain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ResolvedInlineInvoke {
+    /// Bytecode pc in the CALLEE's own code, which is the space the emitter's
+    /// inner walk indexes.
+    pub callee_pc: usize,
+    /// `*const JitInvokeInfo` as an address. Never 0 for a recorded site.
+    pub info_addr: usize,
+    /// Compiled callee entry for a direct `CALL`, or 0 for "dispatch".
+    pub direct_entry: usize,
+    /// Whether that entry expects the VM context as its first argument.
+    pub direct_needs_context: bool,
+    /// Operand slots the call consumes, receiver included.
+    pub num_jit_args: usize,
+    /// Descriptor return byte (`b'V'` for void).
+    pub return_type: u8,
+}
+
+/// A call inside a spliced body that is spliced IN TURN rather than called.
+///
+/// `guard_class_id` is what makes this more than a recursion:
+///
+///  * `0` — the target is statically bound (`invokestatic` / `invokespecial`),
+///    so there is exactly one body and the splice is unconditional.
+///  * non-zero — the target is `invokevirtual` / `invokeinterface`, and this is
+///    the receiver class the CALLEE's own profile says dominates that site. The
+///    emitter guards the splice with an exact class-id compare and sends the
+///    miss edge to the ordinary call, exactly as PGO-02 does one level up.
+///
+/// Why the callee's OWN profile is the right source, and why this needed no
+/// re-keyed (caller pc, callee pc) profile after all: receiver types are
+/// recorded by the interpreter against the bci of the method that is EXECUTING.
+/// A call inside `objectsAreEqual` is therefore already profiled under
+/// `objectsAreEqual`'s own `MethodKey` at its own bci — which is precisely the
+/// (method, pc) pair a nested site names. The enclosing method's profile never
+/// had this information and never could.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct NestedInlineSite {
+    /// Bytecode pc in the enclosing CALLEE's code.
+    pub callee_pc: usize,
+    /// Exact receiver class the splice is guarded on, or 0 for no guard.
+    pub guard_class_id: u32,
+    /// The body to splice.
+    pub site: InlineSite,
 }
 
 /// Resolved metadata for a method eligible for inlining at a specific call site.
@@ -5414,25 +5600,26 @@ pub struct InlineSite {
     /// reads [`Self::resolved_invoke_infos`], which `try_compile_inner` derives
     /// from it.
     pub invoke_targets: Vec<(usize, InlineInvokeTarget)>,
-    /// `(callee_pc, *const JitInvokeInfo as usize)` — the interned form of
-    /// [`Self::invoke_targets`], filled by `try_compile_inner` immediately
-    /// before backend emission and read by `try_emit_inline_body`'s invoke arm.
+    /// The interned form of [`Self::invoke_targets`], filled by
+    /// `try_compile_inner` immediately before backend emission and read by
+    /// `try_emit_inline_body`'s invoke arm.
     ///
-    /// A `usize` rather than a raw pointer so the struct keeps its derived
-    /// `Clone`/`Eq`/`Debug` and stays `Send`: an `InlineSite` is planning data
-    /// that may be cloned into an `InlinePlan` and moved between threads, while
-    /// the pointer is only ever dereferenced inside the one compile that
-    /// interned it. Empty on every path that does not intern (planning,
-    /// tests, and every compile with the gate off), and an empty vector makes
-    /// the emitter's invoke arm bail exactly as it did before it existed.
+    /// Addresses are `usize` rather than raw pointers so the struct keeps its
+    /// derived `Clone`/`Eq`/`Debug` and stays `Send`: an `InlineSite` is
+    /// planning data that may be cloned into an `InlinePlan` and moved between
+    /// threads, while the pointers are only ever dereferenced inside the one
+    /// compile that interned them. Empty on every path that does not intern
+    /// (planning, tests, and every compile with the gate off), and an empty
+    /// vector makes the emitter's invoke arm bail exactly as it did before it
+    /// existed.
     ///
-    /// SAFETY CONTRACT: the pointee lives in this compile's
+    /// SAFETY CONTRACT: `info_addr`'s pointee lives in this compile's
     /// `_jit_invoke_infos` arena, which `try_compile_inner` moves into the
     /// `CompiledMethod` — so it outlives the emitted code, which bakes the
     /// address as an immediate. An `InlineSite` that escapes that compile
     /// (a cached plan) must not carry these; nothing repopulates them, and
     /// `try_compile_inner` overwrites the vector wholesale on every compile.
-    pub resolved_invoke_infos: Vec<(usize, usize)>,
+    pub resolved_invoke_infos: Vec<ResolvedInlineInvoke>,
     /// Calls the callee body makes that are themselves SPLICED rather than
     /// dispatched, keyed by CALLEE pc — the nesting step.
     ///
@@ -5444,7 +5631,7 @@ pub struct InlineSite {
     ///
     /// Depth is bounded by the resolver (`MAX_INLINE_NEST_DEPTH`); this vector
     /// is empty at the deepest admitted level, which terminates the recursion.
-    pub nested_sites: Vec<(usize, InlineSite)>,
+    pub nested_sites: Vec<NestedInlineSite>,
 }
 
 /// How many levels of splice-inside-a-splice the resolver will plan.
@@ -5473,6 +5660,7 @@ pub(crate) fn intern_inline_invoke_targets(
     site: &mut InlineSite,
     owned_strings: &mut Vec<Box<str>>,
     owned_invoke_infos: &mut Vec<Box<JitInvokeInfo>>,
+    direct_callee_entries: &mut Vec<usize>,
 ) {
     // Wholesale, never additive: an `InlineSite` may have been CLONED from
     // a cached plan that already carries pointers from an earlier compile,
@@ -5505,13 +5693,36 @@ pub(crate) fn intern_inline_invoke_targets(
         });
         let info_ptr: *const JitInvokeInfo = &*info;
         owned_invoke_infos.push(info);
-        site.resolved_invoke_infos
-            .push((*callee_pc, info_ptr as usize)); // Cast: pointer parked in a Send-able plan; deref only inside this compile
+        let (direct_entry, direct_needs_context) = target.direct_entry.unwrap_or((0, false));
+        // THE KEEP-ALIVE STEP, and the one whose omission has no symptom until
+        // a tier-up. `_direct_callee_entries` is what `prepare_for_publication`
+        // pins the callee artifact through, and what the invalidation reverse
+        // closure walks to evict this caller when that callee is withdrawn. A
+        // spliced direct call bakes the same kind of address a top-level one
+        // does and needs the same registration; skipping it leaves a raw `CALL`
+        // into freed code.
+        if direct_entry != 0 {
+            direct_callee_entries.push(direct_entry);
+        }
+        site.resolved_invoke_infos.push(ResolvedInlineInvoke {
+            callee_pc: *callee_pc,
+            // Cast: pointer parked in a Send-able plan; deref only inside this compile
+            info_addr: info_ptr as usize,
+            direct_entry,
+            direct_needs_context,
+            num_jit_args: target.num_jit_args,
+            return_type: target.return_type,
+        });
     }
     // A nested body's calls need the same treatment; the resolver bounds
     // the depth (`MAX_INLINE_NEST_DEPTH`), so this terminates.
-    for (_, nested) in site.nested_sites.iter_mut() {
-        intern_inline_invoke_targets(nested, owned_strings, owned_invoke_infos);
+    for nested in site.nested_sites.iter_mut() {
+        intern_inline_invoke_targets(
+            &mut nested.site,
+            owned_strings,
+            owned_invoke_infos,
+            direct_callee_entries,
+        );
     }
 }
 
@@ -5571,7 +5782,7 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
     // Charged per NON-nested call only. A nested call's cost arrives through
     // `nested_expansion` below, which is the nested body's own estimate; adding
     // both would double-charge the same call site.
-    let nested_pcs: Vec<usize> = site.nested_sites.iter().map(|(pc, _)| *pc).collect();
+    let nested_pcs: Vec<usize> = site.nested_sites.iter().map(|n| n.callee_pc).collect();
     let dispatch_cost = site
         .invoke_targets
         .iter()
@@ -5587,9 +5798,14 @@ pub fn inline_site_expansion_cost_tiered(site: &InlineSite, site_is_hot: bool) -
     let nested_expansion = site
         .nested_sites
         .iter()
-        .map(|(_, nested)| {
-            inline_site_expansion_cost_tiered(nested, site_is_hot)
+        .map(|nested| {
+            // A guarded nested splice also emits the compare, the null check
+            // and the miss-edge jump; 8 is the same order the guarded-virtual
+            // planner charges one level up.
+            let guard_cost = if nested.guard_class_id != 0 { 8 } else { 0 };
+            inline_site_expansion_cost_tiered(&nested.site, site_is_hot)
                 .unwrap_or(MAX_INLINE_EXPANSION_COST_HOT)
+                .saturating_add(guard_cost)
         })
         .fold(0usize, |a, b| a.saturating_add(b));
     let cost = site
@@ -8056,15 +8272,15 @@ pub enum JitIntrinsic {
     // is local and not externally observed.
     StringEquals,    // equals(Ljava/lang/Object;)Z
     StringCompareTo, // compareTo(Ljava/lang/String;)I
-    // `indexOf(I)I` — the codegen for this variant still exists in
-    // `x64/bytecode_walk.rs`, but `try_resolve_string_intrinsic` no longer
-    // hands the entry out, so nothing reaches it. Its inline body masks the
-    // needle to `ch & 0xFFFF`, which is not what the JDK does — the gate is
-    // `Character.isValidCodePoint`, applied BEFORE any narrowing, and a
-    // supplementary `ch` is matched as a surrogate PAIR. See the retirement
-    // note in `try_resolve_string_intrinsic` for the measured rows and for
-    // what restoring the fast path would take.
-    StringIndexOfChar, // indexOf(I)I — NOT handed out; see above
+    // `indexOf(I)I` — handed out again (E27-1 N2b, 2026-08-18), but only for a
+    // call site whose needle the backend can prove is a compile-time constant
+    // in `0..=0xFFFF`. The inline body scans for one UTF-16 code unit, which is
+    // the JDK's answer on exactly that range and NOT outside it (the gate is
+    // `Character.isValidCodePoint` before any narrowing, and a supplementary
+    // `ch` matches a surrogate PAIR). The screen is
+    // `x64/bytecode_walk.rs::prev_insn_int_const`; a site that fails it is not
+    // intrinsified and dispatches normally, with no deopt involved.
+    StringIndexOfChar, // indexOf(I)I — constant BMP needles only
     StringIndexOfStr,  // indexOf(Ljava/lang/String;)I
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
@@ -8129,7 +8345,32 @@ pub enum JitIntrinsic {
     Crc32UpdateByte,   // CRC32.update(I)V
     Crc32UpdateBytes,  // CRC32.update([BII)V
                        // ===== INTRINSIC REGION END: CRC32 =====
+
+    // ===== INTRINSIC REGION BEGIN: FP_BITS =====
+    // `Double.doubleToRawLongBits` / `Double.longBitsToDouble` — the two
+    // halves of a bit reinterpretation, one `MOVQ` each.
+    //
+    // Added 2026-08-19 from a `--dump-native-registry` census of
+    // `PSquarePercentileTest`, which reported 466,400,490 native BRIDGE
+    // invocations for the class and named these two as 361M of them:
+    //
+    //     203,434,476  java/lang/Double.doubleToRawLongBits(D)J
+    //     157,756,624  java/lang/Double.longBitsToDouble(J)D
+    //
+    // Both were `kind: "bridge"` -- the checked native funnel -- for an
+    // operation that is a single register move.
+    //
+    // **RAW only, and that is load-bearing.** `doubleToRawLongBits` is
+    // specified to hand back the exact bit pattern, NaN payload included,
+    // which is what `MOVQ` does. Its sibling `doubleToLongBits`
+    // CANONICALISES every NaN to `0x7ff8000000000000` and must NOT be
+    // matched here; the resolver names one method and not the other on
+    // purpose, and a test pins that.
+    DoubleToRawLongBits, // Double.doubleToRawLongBits(D)J
+    LongBitsToDouble,    // Double.longBitsToDouble(J)D
+                         // ===== INTRINSIC REGION END: FP_BITS =====
 }
+
 
 impl JitIntrinsic {
     /// Map this intrinsic onto the `JitDirectCall.entry` sentinel space.
@@ -9203,8 +9444,27 @@ pub fn try_resolve_intrinsic(
     }
     // ===== INTRINSIC REGION END: CRC32 =====
 
+    // ===== INTRINSIC REGION BEGIN: FP_BITS =====
+    // See the enum region of the same tag for the census that motivated this
+    // and for why only the RAW conversion is admitted.
+    if class == "java/lang/Double" {
+        let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+            ("doubleToRawLongBits", "(D)J") => {
+                Some((JitIntrinsic::DoubleToRawLongBits, 1, b'J'))
+            }
+            ("longBitsToDouble", "(J)D") => Some((JitIntrinsic::LongBitsToDouble, 1, b'D')),
+            // `doubleToLongBits` canonicalises NaN and is deliberately absent.
+            _ => None,
+        };
+        if let Some((intrinsic, num_params, ret)) = hit {
+            return Some((intrinsic.as_entry(), num_params, ret));
+        }
+    }
+    // ===== INTRINSIC REGION END: FP_BITS =====
+
     None
 }
+
 
 /// Layout-aware matcher for the `java/lang/String` call-site intrinsics
 /// (the STRING_ACCESS and STRING_SEARCH families).
@@ -9431,58 +9691,49 @@ pub fn try_resolve_string_intrinsic(
     //   * indexOf(String)     — naive O(n*m) substring search from 0; an
     //     empty needle returns 0.
     //
-    // `indexOf(I)` is deliberately NOT recognised — see the block below.
+    // `indexOf(I)` is recognised only for a constant BMP needle — see below.
     if is_string {
         let search_hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
             ("equals", "(Ljava/lang/Object;)Z") => Some((JitIntrinsic::StringEquals, 1, b'Z')),
             ("compareTo", "(Ljava/lang/String;)I") => {
                 Some((JitIntrinsic::StringCompareTo, 1, b'I'))
             }
-            // `indexOf(I)` — RETIRED, deliberately not intrinsified here.
+            // `indexOf(I)` — intrinsified again as of E27-1 N2b (2026-08-18),
+            // but ONLY where the backend can prove the needle is a
+            // compile-time constant in `0..=0xFFFF`. That screen lives in
+            // `x64/bytecode_walk.rs` (`prev_insn_int_const`), not here: this
+            // function sees a name and a descriptor, never an operand.
             //
-            // The inline body masks the needle to `ch & 0xFFFF` and the comment
-            // that used to stand here called that "bit-identical to native
-            // `String.indexOf(int)`". Both halves were false. The JDK does not
-            // narrow `ch`: it gates on `Character.isValidCodePoint` FIRST, then
-            // scans for one code unit if `ch <= 0xFFFF` and for the SURROGATE
-            // PAIR if `ch >= 0x10000`. Measured on OpenJDK 25.0.3+9 (this
-            // lane's `scratchpad/e27/E27Probe.java`):
+            // Why the range is the whole question. The inline body scans for
+            // ONE UTF-16 code unit. The JDK does not narrow `ch` — it gates on
+            // `Character.isValidCodePoint` FIRST, then scans for one code unit
+            // if `ch <= 0xFFFF` and for the SURROGATE PAIR if `ch >= 0x10000`.
+            // Measured on OpenJDK 25.0.3+9:
             //
             //     "abc".indexOf(0x10061)   -1     masking finds 'a' at 0
             //     "￿q".indexOf(-1)    -1     masking finds U+FFFF at 0
             //     mixed.indexOf(0x10437)    3     the pair, not its low half at 1
             //
-            // The `indexOf(-1)` row is the one that rejects the plausible wrong
-            // fix: `(char) -1` IS `0xFFFF` and the receiver DOES hold `0xFFFF`,
-            // yet HotSpot answers -1 — so the rule is the validity gate, not a
-            // narrowing cast.
+            // The `indexOf(-1)` row rejects the plausible wrong fix: `(char) -1`
+            // IS `0xFFFF` and the receiver DOES hold `0xFFFF`, yet HotSpot
+            // answers -1 — so the rule is the validity gate, not a narrowing
+            // cast. Inside `0..=0xFFFF` all three rows are vacuous and the
+            // single-code-unit scan IS `code_point_needle`'s answer, including
+            // for a lone surrogate.
             //
-            // E18-1 rewrote the native side onto ONE `code_point_needle`
-            // predicate plus two shared scanners, replacing four divergent
-            // copies of this single JVMS rule. Re-implementing the gate here
-            // would make a fifth. Dropping the recognition sends the call site
-            // through ordinary dispatch to that one predicate instead, which is
-            // the only way this door can carry the rule without owning a copy
-            // of it — `jit/src/lib.rs` is below `native-builtins` in the crate
-            // graph and cannot call `code_point_needle` directly.
+            // The retirement this replaces was right to remove the unscreened
+            // form: E18-1 had reduced the rule to ONE predicate in
+            // `native-builtins`, and `jit/src/lib.rs` is below that crate in
+            // the graph and cannot call it. A screen that admits only the
+            // range where no rule is needed is not a fifth copy of it.
             //
-            // Verified before landing: ordinary dispatch reaches a CORRECT
-            // implementation in both modes. In real-JDK mode a `Bridge`-kind
-            // `java/lang/String` native is dropped at registration
-            // (`native-api/src/registry.rs`, `drop_real_layout_synthetic`), so
-            // nothing shadows the real JDK's own `String.indexOf(int)`
-            // bytecode; in synthetic-jdk mode `register_synthetic_overrides`
-            // last-write-wins with `native_string_index_of`, which is the
-            // `code_point_needle` body.
-            //
-            // This costs the inline scan on a hot method. Restoring it is a
-            // codegen change, not a recognition change: emit the fast path
-            // under a runtime screen (`ch < 0 || ch > 0xFFFF` -> deopt), which
-            // admits exactly the range where a single-code-unit scan already IS
-            // the whole answer and defers every other case to the predicate.
-            // That belongs in `x64/bytecode_walk.rs` and is nominated as N2b in
-            // `docs/known-issues/jdk-only/`
-            // `E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy.md`.
+            // A declined site is not deoptimised — it is simply not
+            // intrinsified, and dispatches exactly as it does today. The
+            // runtime-screen-plus-deopt design the first draft of N2b proposed
+            // would have invalidated the enclosing compiled METHOD on every
+            // out-of-range needle and then barred it from compilation; see
+            // `prev_insn_int_const` and the page's N2b section.
+            ("indexOf", "(I)I") => Some((JitIntrinsic::StringIndexOfChar, 1, b'I')),
             ("indexOf", "(Ljava/lang/String;)I") => Some((JitIntrinsic::StringIndexOfStr, 1, b'I')),
             _ => None,
         };
@@ -9639,6 +9890,23 @@ pub struct JitMICSlot {
     /// Keeps a compiled cache target alive while generated code can load its
     /// raw entry pointer. Native targets have no owner and leave this empty.
     compiled_owner: parking_lot::Mutex<Option<Arc<CompiledMethod>>>,
+    /// The bytecode index this slot's call site lives at, or `usize::MAX` for a
+    /// slot with no site (tests, and the loop-unroll clones that share a site
+    /// with their original).
+    ///
+    /// The compiler builds `mic_slots` as `(pc, *const JitMICSlot)` but the
+    /// artifact keeps only `_jit_mic_slots: Vec<Box<JitMICSlot>>`, so the
+    /// pc→slot mapping was DISCARDED at publication. That mapping is the only
+    /// receiver evidence that exists for a method compiled by the
+    /// eager-callee-chain before it ever ran its virtual calls interpreted —
+    /// its `MethodProfile::receivers` map is empty at exactly those pcs (see
+    /// `jit_inline_splice_devirt`). Recording it here costs one `usize` per
+    /// slot and makes [`CompiledMethod::dominant_receiver_at_bci`] possible.
+    ///
+    /// A TAIL field on purpose: `cached_class_id` (0), `cached_entry_ptr` (8)
+    /// and `cached_needs_context` (16) are read by generated code at fixed
+    /// offsets, so nothing may be inserted before them.
+    pub bci: usize,
 }
 
 impl JitMICSlot {
@@ -9648,7 +9916,7 @@ impl JitMICSlot {
     /// keeping the guard non-matching until *all* companion fields are ready
     /// makes the publication atomic from its point of view. Class ids are
     /// allocated densely from zero and never use this all-ones reservation.
-    const INSTALLING_CLASS_ID: u32 = u32::MAX;
+    pub(crate) const INSTALLING_CLASS_ID: u32 = u32::MAX;
     /// Byte offset of [`Self::cached_class_id`] from the start of the
     /// struct. JIT codegen uses this to emit
     /// `MOV eax, [mic_ptr + CACHED_CLASS_ID_OFFSET]`.
@@ -9673,6 +9941,15 @@ impl JitMICSlot {
             misses: std::sync::atomic::AtomicU64::new(0),
             cached_class_name: parking_lot::Mutex::new(None),
             compiled_owner: parking_lot::Mutex::new(None),
+            bci: usize::MAX,
+        }
+    }
+
+    /// [`Self::new`] for a slot that serves a known call site.
+    pub fn new_at(bci: usize) -> Self {
+        Self {
+            bci,
+            ..Self::new()
         }
     }
 
@@ -9958,6 +10235,18 @@ pub struct JitPICSlot {
     compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_PIC_ENTRIES],
     /// Strong owners for the generated hashed table's raw entry pointers.
     mega_compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_MEGA_ENTRIES],
+    /// The bytecode index this slot's call site lives at, or `usize::MAX` for a
+    /// slot with no site. Mirrors [`JitMICSlot::bci`]; read by
+    /// [`CompiledMethod::dominant_receiver_at_bci`] to refuse a site the
+    /// adaptive recompiler already declared polymorphic.
+    ///
+    /// LAST FIELD, and it has to be. Everything above it up to and including
+    /// the `mega_*` arrays is addressed by generated code at the fixed offsets
+    /// in `MEGA_CLASS_IDS_OFFSET` and friends. Putting this after `misses` —
+    /// where it reads naturally — moved `MEGA_CLASS_IDS_OFFSET` from 96 to 104
+    /// and every megamorphic-stub load with it.
+    /// `test_jit_mega_offsets_match_generated_stub_contract` caught it.
+    pub bci: usize,
 }
 
 /// Miss count on a `JitMICSlot` at which the adaptive recompiler
@@ -9997,6 +10286,11 @@ impl JitPICSlot {
     pub const fn mega_base_index(class_id: u32) -> usize {
         (((class_id.wrapping_mul(Self::MEGA_HASH_MULTIPLIER)) >> Self::MEGA_SET_SHIFT) as usize)
             * JIT_MEGA_WAYS
+    }
+
+    /// [`Self::new`] for a slot that serves a known call site.
+    pub fn new_at(bci: usize) -> Self {
+        Self { bci, ..Self::new() }
     }
 
     /// Create an empty PIC slot.
@@ -10047,6 +10341,7 @@ impl JitPICSlot {
                 parking_lot::Mutex::new(None),
             ],
             mega_compiled_owners: std::array::from_fn(|_| parking_lot::Mutex::new(None)),
+            bci: usize::MAX,
         }
     }
 
@@ -10378,7 +10673,7 @@ impl JitPICSlot {
 /// MICs (`cached_class_id == 0`) produce an empty PIC, which is still
 /// valid — its first miss fills slot 0 naturally.
 pub fn promote_mic_to_pic(mic: &JitMICSlot, jdk_only: bool) -> Box<JitPICSlot> {
-    let pic = Box::new(JitPICSlot::new());
+    let pic = Box::new(JitPICSlot::new_at(mic.bci));
     pic.seed_from_mic(mic, jdk_only);
     pic
 }
@@ -17506,7 +17801,7 @@ fn try_compile_inner(
                             && num_args >= 1
                             && num_args + 1 <= ir_entry_abi_reg_count()
                         {
-                            let mic = Box::new(JitMICSlot::new());
+                            let mic = Box::new(JitMICSlot::new_at(pc));
                             // Seed from the receiver-type profile exactly as the
                             // single-pass planner does: a site with a dominant
                             // receiver lands in the MIC (and, via
@@ -17523,7 +17818,7 @@ fn try_compile_inner(
                                     }
                                 }
                             }
-                            let pic = Box::new(JitPICSlot::new());
+                            let pic = Box::new(JitPICSlot::new_at(pc));
                             // `mic` was just built by `JitMICSlot::new()`, so its
                             // `cached_entry_ptr` is 0 and `jit_entry_publishable`
                             // short-circuits before it reads the policy at all —
@@ -18891,6 +19186,25 @@ fn try_compile_inner(
                                 receiver_callee_resolver: Some(&receiver_body),
                             });
                             inline_tally.record(&plan);
+                            // Name the planner's verdict per site. The RESOLVER
+                            // names its own refusals now; this is the other half
+                            // — a site whose body resolved fine can still be
+                            // refused here on budget or policy, and a bare
+                            // `nested-splice=0` cannot tell the two apart.
+                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+                            {
+                                eprintln!(
+                                    "[cratonvm-jitc] inline-plan pc={pc} {}.{}{}: {:?} (cost={:?} budget_left={})",
+                                    class_name,
+                                    method_name,
+                                    descriptor,
+                                    plan.verdict,
+                                    cp_site
+                                        .as_ref()
+                                        .and_then(crate::inline_site_expansion_cost),
+                                    inline_budget_remaining,
+                                );
+                            }
                             // PGO-02: the backend emits both speculative
                             // verdicts now — Monomorphic (one guard) and
                             // Bimorphic (a two-guard chain sharing one receiver
@@ -19855,7 +20169,10 @@ fn try_compile_inner(
             // signature that appeared in the active-cycle registry permanently
             // use blind `jit_invoke_dispatch`, including OSR bodies.
             if invoke_kind_uses_inline_cache(invoke_kind) {
-                let mic = Box::new(JitMICSlot::new());
+                // `new_at(pc)`, not `new()`: the artifact keeps only the boxes,
+                // so the bci has to travel inside the slot or it is lost at
+                // publication. See `JitMICSlot::bci`.
+                let mic = Box::new(JitMICSlot::new_at(pc));
                 if let Some(prof) = profile {
                     if let Some(receiver_counts) = prof.receivers.get(&pc) {
                         if let Some(dom_class_id) = profile::dominant_receiver(receiver_counts, 80)
@@ -19880,7 +20197,7 @@ fn try_compile_inner(
                 // slot 0 with class_id only (entry_ptr stays 0 →
                 // first dispatch still rings the helper, which
                 // installs entry_ptr; thereafter the cascade hits).
-                let pic = Box::new(JitPICSlot::new());
+                let pic = Box::new(JitPICSlot::new_at(pc));
                 // Fresh MIC: `cached_entry_ptr` is 0, so the seeded entry
                 // short-circuits `jit_entry_publishable` before any policy
                 // branch. See the matching note on the IR planner's seed.
@@ -20103,11 +20420,21 @@ fn try_compile_inner(
     // Done HERE, after `precise_exception_frames` has had its chance to
     // `inline_sites.clear()`, so a cleared plan interns nothing at all.
     for site in inline_sites.values_mut() {
-        intern_inline_invoke_targets(site, &mut owned_strings, &mut owned_invoke_infos);
+        intern_inline_invoke_targets(
+            site,
+            &mut owned_strings,
+            &mut owned_invoke_infos,
+            &mut direct_callee_entries,
+        );
     }
     for variants in inline_guard_variants.values_mut() {
         for (_, site) in variants.iter_mut() {
-            intern_inline_invoke_targets(site, &mut owned_strings, &mut owned_invoke_infos);
+            intern_inline_invoke_targets(
+                site,
+                &mut owned_strings,
+                &mut owned_invoke_infos,
+                &mut direct_callee_entries,
+            );
         }
     }
 
@@ -30229,6 +30556,131 @@ mod code_cache_lifetime_tests {
 /// `invalidate_for_class` runs on EVERY class definition and almost never
 /// matches, so it now refuses before scanning when no published body names the
 /// class. That is only sound while the set is a true over-approximation of what
+/// Reading a devirtualisation target out of a compiled method's own inline
+/// cache — the evidence that exists when the receiver PROFILE does not.
+///
+/// Every case here is a refusal except the last, because the value of this
+/// accessor is entirely in what it declines to answer: it feeds a class-id
+/// guard, and a guard built on a thrashing cache spends a compare and a branch
+/// to reach the ordinary call anyway.
+#[cfg(test)]
+mod mic_devirt_evidence {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// One artifact carrying one MIC slot in a chosen state.
+    ///
+    /// `entry` defaults non-zero in every helper below that means "installed",
+    /// because a zero entry is `prepopulate`'s guard HINT rather than an
+    /// observation — see the accessor's doc comment.
+    fn artifact_with(bci: usize, class_id: u32, entry: u64, misses: u64) -> CompiledMethod {
+        let mut cm = CompiledMethod::new(ExecutableBuffer::new(64).unwrap());
+        let slot = Box::new(JitMICSlot::new_at(bci));
+        slot.cached_class_id.store(class_id, Ordering::Relaxed);
+        slot.cached_entry_ptr.store(entry, Ordering::Relaxed);
+        slot.misses.store(misses, Ordering::Relaxed);
+        cm._jit_mic_slots.push(slot);
+        cm
+    }
+
+    const ENTRY: u64 = 0x4000;
+
+    /// The shape that matters, and the one a statistical bar would have thrown
+    /// away: installed once, then served from machine code forever, so `hits`
+    /// is 0 and `misses` is 1. This is what `objectsAreEqual` actually looks
+    /// like — measured, `bci16:cls1167:h0:m1`.
+    #[test]
+    fn an_installed_slot_is_evidence_even_with_zero_recorded_hits() {
+        let cm = artifact_with(16, 77, ENTRY, 1);
+        assert_eq!(cm._jit_mic_slots[0].hits.load(Ordering::Relaxed), 0);
+        assert_eq!(cm.dominant_receiver_at_bci(16), Some(77));
+    }
+
+    /// The bci is the whole point. Before `JitMICSlot::bci` existed the
+    /// artifact kept the boxes and threw the pc mapping away, so there was no
+    /// way to ask this question at all — every slot looked like every other.
+    #[test]
+    fn a_slot_for_another_bci_does_not_answer_for_this_one() {
+        let cm = artifact_with(16, 77, ENTRY, 1);
+        assert_eq!(cm.dominant_receiver_at_bci(20), None);
+    }
+
+    /// A class id with no installed entry is `prepopulate`'s seed from PROFILE
+    /// data — a guard hint, not an observation. Accepting it would launder a
+    /// profile guess back in dressed as runtime evidence, which is exactly the
+    /// thing this accessor exists to substitute for.
+    #[test]
+    fn a_seeded_class_with_no_installed_entry_is_not_evidence() {
+        let cm = artifact_with(16, 77, 0, 0);
+        assert_eq!(cm.dominant_receiver_at_bci(16), None);
+        // The same slot, once something is actually installed, answers.
+        let cm = artifact_with(16, 77, ENTRY, 0);
+        assert_eq!(cm.dominant_receiver_at_bci(16), Some(77));
+    }
+
+    /// Misses past the PIC-promotion threshold mean the site has seen
+    /// receivers this slot could not serve. That is the one thing these
+    /// counters measure honestly — the helper is entered on every one.
+    #[test]
+    fn misses_past_the_pic_promotion_threshold_are_not_evidence() {
+        let cm = artifact_with(16, 77, ENTRY, MIC_TO_PIC_THRESHOLD);
+        assert_eq!(cm.dominant_receiver_at_bci(16), Some(77));
+        let cm = artifact_with(16, 77, ENTRY, MIC_TO_PIC_THRESHOLD + 1);
+        assert_eq!(cm.dominant_receiver_at_bci(16), None);
+    }
+
+    /// A PIC that has taken a miss at this bci means the adaptive recompiler
+    /// already concluded the site is polymorphic. The MIC beside it still holds
+    /// whichever receiver it installed FIRST, which is the least informative of
+    /// several — guarding on it would be guarding on an accident of ordering.
+    #[test]
+    fn a_polymorphic_site_is_not_evidence_even_though_its_mic_is_populated() {
+        let mut cm = artifact_with(16, 77, ENTRY, 1);
+        assert_eq!(cm.dominant_receiver_at_bci(16), Some(77));
+        let pic = Box::new(JitPICSlot::new_at(16));
+        pic.misses.store(5, Ordering::Relaxed);
+        cm._jit_pic_slots.push(pic);
+        assert_eq!(cm.dominant_receiver_at_bci(16), None);
+    }
+
+    /// ...but a PIC at a DIFFERENT bci says nothing about this one, and an
+    /// unused PIC (no misses) is not a polymorphism verdict either.
+    #[test]
+    fn an_unrelated_or_unused_pic_does_not_veto() {
+        let mut cm = artifact_with(16, 77, ENTRY, 1);
+        let elsewhere = Box::new(JitPICSlot::new_at(99));
+        elsewhere.misses.store(5, Ordering::Relaxed);
+        cm._jit_pic_slots.push(elsewhere);
+        assert_eq!(cm.dominant_receiver_at_bci(16), Some(77));
+        cm._jit_pic_slots.push(Box::new(JitPICSlot::new_at(16)));
+        assert_eq!(cm.dominant_receiver_at_bci(16), Some(77));
+    }
+
+    /// An unpopulated slot, and one caught mid-publication, are both "no
+    /// answer" rather than class 0 / class u32::MAX. The installing sentinel is
+    /// the one a concurrent reader can actually observe.
+    #[test]
+    fn an_empty_or_installing_slot_is_not_evidence() {
+        let cm = artifact_with(16, 0, ENTRY, 0);
+        assert_eq!(cm.dominant_receiver_at_bci(16), None);
+        let cm = artifact_with(16, JitMICSlot::INSTALLING_CLASS_ID, ENTRY, 0);
+        assert_eq!(cm.dominant_receiver_at_bci(16), None);
+    }
+
+    /// A slot with no site — the loop-unroll clones and every test helper —
+    /// must not answer for bci `usize::MAX` or for anything else.
+    #[test]
+    fn a_siteless_slot_answers_for_nothing() {
+        let mut cm = CompiledMethod::new(ExecutableBuffer::new(64).unwrap());
+        let slot = Box::new(JitMICSlot::new());
+        slot.cached_class_id.store(77, Ordering::Relaxed);
+        slot.cached_entry_ptr.store(ENTRY, Ordering::Relaxed);
+        cm._jit_mic_slots.push(slot);
+        assert_eq!(cm.dominant_receiver_at_bci(0), None);
+        assert_eq!(cm.dominant_receiver_at_bci(16), None);
+    }
+}
+
 /// the maps contain, and the failure mode if it is not — a real CHA
 /// invalidation silently skipped, leaving a devirtualised call bound to a
 /// method that now has a second implementor — is a miscompile, not a slowdown.

@@ -833,13 +833,12 @@ pub(super) fn execute_invokevirtual_vtable_fast(
     // category-2 long arg whose NaN-box bit pattern collides with a tagged
     // sub-tag (BC safegcd 0xFFFC_… accumulators). See
     // gaps/bc-ec-mod-mododdinverse-investigation.md.
-    let arg_desc_byte = |i: usize| -> u8 {
-        if i == 0 {
-            b'L'
-        } else {
-            nth_param_tag_byte(&entry_cached.method_descriptor, i - 1)
-        }
-    };
+    // ONE forward scan for the whole descriptor. This closure used to call
+    // `nth_param_tag_byte` per argument, and that rescans from `(` each time,
+    // so popping N args cost O(N^2) tokenising of a string fixed per call site.
+    let param_tags = ParamTags::of(&entry_cached.method_descriptor);
+    let arg_desc_byte =
+        |i: usize| -> u8 { param_tags.get_with_receiver(&entry_cached.method_descriptor, i) };
     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
     let mut args_vec: Vec<Value> = Vec::new();
     let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {
@@ -1729,13 +1728,13 @@ pub(super) fn execute_invokevirtual_cached(
                     // = 'L'); pop_unchecked()/to_value() dropped the high bits
                     // of collision-pattern long args. See
                     // gaps/bc-ec-mod-mododdinverse-investigation.md.
-                    let arg_desc_byte = |i: usize| -> u8 {
-                        if i == 0 {
-                            b'L'
-                        } else {
-                            nth_param_tag_byte(&cached.method_descriptor, i - 1)
-                        }
-                    };
+                    // ONE forward scan; the per-argument form rescanned from `(` each time.
+
+                    let param_tags = ParamTags::of(&cached.method_descriptor);
+
+                    let arg_desc_byte =
+
+                        |i: usize| -> u8 { param_tags.get_with_receiver(&cached.method_descriptor, i) };
                     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
                     let mut args_vec: Vec<Value> = Vec::new();
                     let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {
@@ -2531,13 +2530,13 @@ pub(super) fn execute_invokevirtual_cached(
             // Decode args bit-exact via parameter descriptors (receiver = 'L');
             // pop_unchecked()/to_value() dropped the high bits of collision-
             // pattern long args. See gaps/bc-ec-mod-mododdinverse-investigation.md.
-            let arg_desc_byte = |i: usize| -> u8 {
-                if i == 0 {
-                    b'L'
-                } else {
-                    nth_param_tag_byte(&cached.method_descriptor, i - 1)
-                }
-            };
+            // ONE forward scan; the per-argument form rescanned from `(` each time.
+
+            let param_tags = ParamTags::of(&cached.method_descriptor);
+
+            let arg_desc_byte =
+
+                |i: usize| -> u8 { param_tags.get_with_receiver(&cached.method_descriptor, i) };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
             let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {

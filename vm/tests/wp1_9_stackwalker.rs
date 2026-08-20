@@ -390,3 +390,63 @@ fn stackwalker_log4j_deep_repeated_walks_finish_under_jit() {
         "{LOG4J_STRESS_PROBE} did not complete the repeated deep walk stress\n\n{combined}"
     );
 }
+
+const SELFREC_FRAMES_PROBE: &str = "JitSelfRecursionFramesProbe";
+const SELFREC_FRAMES_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A directly self-recursive method's activations must stay visible to
+/// `Throwable.getStackTrace()` after it tiers up.
+///
+/// Before `conservative_roots::active_compiled_frames` walked the saved-RBP
+/// chain, `JIT_ENTRY_CHAIN`'s one-entry-per-interpreter->JIT-boundary rule made
+/// 64 nested activations report as ONE frame: the probe's early (interpreted)
+/// rounds saw 67 and its later (compiled) rounds saw 3. The probe compares its
+/// own first and last round, so it needs no hard-coded depth and cannot pass
+/// vacuously on a VM that never compiles anything — a run where nothing tiers
+/// up reports equal counts for the honest reason.
+///
+/// `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES=1` restores the collapse, which is how
+/// this assertion was confirmed to bite.
+#[test]
+fn self_recursive_activations_survive_tier_up() {
+    let (stdout, combined) = run_stackwalker_probe(SELFREC_FRAMES_PROBE, SELFREC_FRAMES_TIMEOUT);
+    if stdout.is_empty() {
+        return;
+    }
+    assert!(
+        stdout.contains("SELFREC_FRAMES_OK"),
+        "{SELFREC_FRAMES_PROBE}: a self-recursive method's frames changed count across \
+         tier-up (or the computed answers changed). The compiled rounds must report the \
+         same depth as the interpreted ones.\n\n{combined}"
+    );
+}
+
+const OSR_DEDUPE_PROBE: &str = "JitOsrFrameDedupeProbe";
+const OSR_DEDUPE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// An OSR'd method must appear ONCE on the stack, not twice.
+///
+/// An OSR transfer leaves the interpreter `Frame` in place and adds a compiled
+/// chain entry for the same activation; the trace reported both, so `SWCross`
+/// read 69 frames where HotSpot reads 68 and its first two entries were both
+/// `main`. `drop_osr_continuations` suppresses the compiled half, keyed on
+/// `can_osr_enter(frame.pc)` — the interpreter frame of an OSR continuation is
+/// parked at the back-edge it jumped from, where an interpreted CALLER of the
+/// same method would be parked at an invoke.
+///
+/// The probe counts its own `main` frames, so it needs no HotSpot comparison
+/// and a VM that never OSRs passes honestly. `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE=1`
+/// restores the duplicate, which is how this assertion was confirmed to bite.
+#[test]
+fn an_osr_continuation_is_not_reported_twice() {
+    let (stdout, combined) = run_stackwalker_probe(OSR_DEDUPE_PROBE, OSR_DEDUPE_TIMEOUT);
+    if stdout.is_empty() {
+        return;
+    }
+    assert!(
+        stdout.contains("OSR_DEDUPE_OK"),
+        "{OSR_DEDUPE_PROBE}: an OSR'd method appeared more than once on its own stack —          the interpreter frame and the compiled chain entry describe ONE activation.
+
+{combined}"
+    );
+}

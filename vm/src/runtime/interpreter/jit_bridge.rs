@@ -3276,7 +3276,42 @@ pub(super) fn jit_native_shadow_is_final_wrapper_unbox(
     )
 }
 
+/// The `java.lang.Double` bit reinterpretations the JIT now lowers itself.
+///
+/// Same shape of exemption as [`jit_native_shadow_is_final_wrapper_unbox`] and
+/// for a stronger version of the same reason. The seal exists because a
+/// compiled direct call bypasses the interpreter's native-vs-bytecode
+/// decision; for these two there is nothing to bypass, because the compiled
+/// form is not a call at all. `try_resolve_intrinsic`'s FP_BITS region lowers
+/// each to a single `MOVQ` that is bit-exact with the native it replaces --
+/// including the NaN payload, which is the whole content of the RAW contract.
+///
+/// Both are `public static native` on a `final` class, so no override can
+/// exist and the target is unambiguous.
+///
+/// Without this the intrinsic could never fire on the workload it was built
+/// for: `jit_method_calls_native_shadowed` seals a method out of the JIT for
+/// CONTAINING the call, and the intrinsic only resolves once the method is
+/// admitted to a compile. Measured on `PSquarePercentileTest`, whose
+/// `--dump-native-registry` census reported 361M invocations of exactly these
+/// two.
+///
+/// `doubleToLongBits` is absent, matching the resolver: it canonicalises NaN,
+/// so no `MOVQ` implements it.
+pub(super) fn jit_native_shadow_is_intrinsified_fp_bits(
+    target_class: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    target_class == "java/lang/Double"
+        && matches!(
+            (method_name, descriptor),
+            ("doubleToRawLongBits", "(D)J") | ("longBitsToDouble", "(J)D")
+        )
+}
+
 pub(super) fn jit_invoke_targets_native_shadow(
+
     shared: &SharedVm,
     caller_class_id: ClassId,
     cp_idx: u16,
@@ -3333,6 +3368,9 @@ pub(super) fn jit_invoke_targets_native_shadow(
     };
 
     if jit_native_shadow_is_final_wrapper_unbox(&target_class, &method_name, &descriptor) {
+        return false;
+    }
+    if jit_native_shadow_is_intrinsified_fp_bits(&target_class, &method_name, &descriptor) {
         return false;
     }
     // A compiled direct call bypasses the interpreter's native-vs-bytecode
@@ -4026,6 +4064,13 @@ pub(super) fn try_jit_upgrade_with_gate(
             cp_class,
             name,
             desc,
+            // No direct-bind resolver on the guarded-virtual path: the
+            // closure that owns it is declared further down this function, and
+            // a spliced body reached through a receiver guard is planned before
+            // it exists. The consequence is a REFUSAL, never a downgrade — a
+            // call-carrying body with nothing to bind to is not admitted at all
+            // (see the admission rule in `resolve_inline_site_from`).
+            None,
         )
     };
     // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
@@ -4508,7 +4553,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             // spliced behind it. See `resolve_receiver_inline_site`.
             let c_receiver_inline_resolver =
                 |cid: u32, cp_class: &str, name: &str, desc: &str| {
-                    resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc)
+                    resolve_receiver_inline_site(shared, callee_cid, cid, cp_class, name, desc, None)
                 };
             // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
             // (opt-out: CRATONVM_JIT_SCALAR_NEW=0).
@@ -4781,6 +4826,12 @@ pub(super) fn try_jit_upgrade_with_gate(
             callee_class,
             callee_method,
             callee_desc,
+            // The calls INSIDE the body about to be spliced get the same
+            // direct-bind treatment this method's own call sites get. Without
+            // it a spliced call falls to the blind dispatch helper, which is a
+            // measured 3.5x loss on an already-direct-bound chain — see
+            // `jit_inline_call_dispatch`.
+            Some(&callee_compiler),
         )
     };
     // Main-path small-method inlining is GATED default-OFF behind
@@ -5842,6 +5893,13 @@ pub(super) fn try_jit_compile_callee_slow(
             cp_class,
             name,
             desc,
+            // No direct-bind resolver on the guarded-virtual path: the
+            // closure that owns it is declared further down this function, and
+            // a spliced body reached through a receiver guard is planned before
+            // it exists. The consequence is a REFUSAL, never a downgrade — a
+            // call-carrying body with nothing to bind to is not admitted at all
+            // (see the admission rule in `resolve_inline_site_from`).
+            None,
         )
     };
     // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
@@ -5934,20 +5992,6 @@ pub(super) fn try_jit_compile_callee_slow(
         shared.jit.profile_store.get_profile(&profile_key)
     };
     let helpers = crate::jit::helpers::build_helpers_for(shared);
-
-    // Build inline resolver for method inlining (Session 31)
-    let inline_resolver = |callee_class: &str,
-                           callee_method: &str,
-                           callee_desc: &str|
-     -> Option<cratonvm_jit::InlineSite> {
-        resolve_inline_site(
-            shared,
-            cached.declaring_class_id,
-            callee_class,
-            callee_method,
-            callee_desc,
-        )
-    };
 
     // Resolve java/lang/String's field layout for the JIT String call-site
     // intrinsics (see `resolve_string_field_layout`).
@@ -6187,6 +6231,27 @@ pub(super) fn try_jit_compile_callee_slow(
             .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
     };
     
+    // Build inline resolver for method inlining (Session 31).
+    //
+    // Declared HERE rather than beside the other resolvers above because it
+    // borrows `direct_callee_lookup`: the calls inside a body about to be
+    // spliced get the same lookup-only direct binding this method's own call
+    // sites get, and a spliced call that falls to the blind dispatch helper
+    // instead is a measured 3.5x loss (see `jit_inline_call_dispatch`).
+    let inline_resolver = |callee_class: &str,
+                           callee_method: &str,
+                           callee_desc: &str|
+     -> Option<cratonvm_jit::InlineSite> {
+        resolve_inline_site(
+            shared,
+            cached.declaring_class_id,
+            callee_class,
+            callee_method,
+            callee_desc,
+            Some(&direct_callee_lookup),
+        )
+    };
+
     let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         &cached,
         Some(&resolver),
@@ -6863,12 +6928,24 @@ pub fn jit_panic_to_exception(
 /// Resolution starts at the CONSTANT-POOL class, which is the right answer for
 /// `invokestatic`/`invokespecial` and the wrong one for a guarded virtual or
 /// interface site — see [`resolve_receiver_inline_site`].
+/// The plan-time direct-bind resolver an inline site consults for the calls
+/// inside the body it is about to splice.
+///
+/// Exactly the closure shape the top-level `direct_calls` planning already uses
+/// — `callee_compiler` on the mutator door, `direct_callee_lookup` on the
+/// background one — so a spliced call inherits every one of their refusal gates
+/// unchanged: FJP blocklist, native shadow, callee exception table,
+/// `synchronized`, JVMS §5.5 static-init, indy trap, and the eager-callee-chain
+/// depth / cycle / fan-out bounds. Answers `(compiled entry, needs context)`.
+pub(super) type InlineDirectBind<'a> = &'a dyn Fn(&str, &str, &str) -> Option<(usize, bool)>;
+
 pub(super) fn resolve_inline_site(
     shared: &SharedVm,
     requesting_class_id: ClassId,
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
+    direct_bind: Option<InlineDirectBind<'_>>,
 ) -> Option<cratonvm_jit::InlineSite> {
     resolve_inline_site_from(
         shared,
@@ -6878,6 +6955,7 @@ pub(super) fn resolve_inline_site(
         callee_method,
         callee_desc,
         0,
+        direct_bind,
     )
 }
 
@@ -6913,6 +6991,7 @@ pub(super) fn resolve_receiver_inline_site(
     cp_class: &str,
     callee_method: &str,
     callee_desc: &str,
+    direct_bind: Option<InlineDirectBind<'_>>,
 ) -> Option<cratonvm_jit::InlineSite> {
     resolve_inline_site_from(
         shared,
@@ -6922,6 +7001,7 @@ pub(super) fn resolve_receiver_inline_site(
         callee_method,
         callee_desc,
         0,
+        direct_bind,
     )
 }
 
@@ -6945,8 +7025,24 @@ fn resolve_inline_site_from(
     callee_method: &str,
     callee_desc: &str,
     nest_depth: usize,
+    direct_bind: Option<InlineDirectBind<'_>>,
 ) -> Option<cratonvm_jit::InlineSite> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
+
+    // Name every refusal. This function has two dozen `return None`s and a
+    // caller that can only see "refused"; two build cycles were spent today
+    // guessing which one fired.
+    macro_rules! no {
+        ($why:expr) => {{
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] inline-resolve REFUSED {}.{}{} depth={}: {}",
+                    callee_class, callee_method, callee_desc, nest_depth, $why
+                );
+            }
+            return None;
+        }};
+    }
 
     // A registered native shadows the classfile body. Inlining that bytecode
     // would bypass the native completely, just as compiling the method itself
@@ -6956,13 +7052,31 @@ fn resolve_inline_site_from(
     // inline the empty-looking JDK body, so a JIT-created map silently dropped
     // every put after tier-up. The callee compiler already has this own-class
     // guard; keep the inline resolver aligned with it.
-    if shared
-        .natives
-        .native_methods
-        .find(callee_class, callee_method, callee_desc)
-        .is_some()
+    //
+    // CONSTANT-POOL RESOLUTION ONLY. `callee_class` is the DECLARED class, and
+    // for a receiver-resolved site that is a supertype which may own no body at
+    // all — `java/lang/Object` for an `equals` call site, say. Refusing there
+    // refuses every override too, including the plain-bytecode one the receiver
+    // actually dispatches to.
+    //
+    // Measured 2026-08-18: this is what stopped devirtualisation inside a
+    // splice from ever firing. The MIC evidence named the receiver class,
+    // resolution found its real `equals` override, and the site was still
+    // refused — `inline-resolve REFUSED java/lang/Object.equals: native-shadow`
+    // — because `java/lang/Object.equals` has a registered native and that is
+    // the name the constant pool carries. `objectsAreEqual` then refused in
+    // turn, because a call in it was "neither spliced nor direct-bound".
+    //
+    // The SELECTED method is checked below against its own declaring class,
+    // unconditionally, which is the precise form of this rule.
+    if receiver_class_id.is_none()
+        && shared
+            .natives
+            .native_methods
+            .find(callee_class, callee_method, callee_desc)
+            .is_some()
     {
-        return None;
+        no!("native-shadow");
     }
 
     // Taken BEFORE the class-manager guard. Holding two of this subsystem's
@@ -6976,12 +7090,15 @@ fn resolve_inline_site_from(
             .read()
             .contains_key(&receiver_id)
         {
-            return None;
+            no!("receiver-is-lambda-proxy");
         }
     }
 
     let cm = shared.classes.class_manager.read();
-    let cp_class_id = cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
+    let Some(cp_class_id) = cm.find_class_by_name_for_class(callee_class, requesting_class_id)
+    else {
+        no!("cp-class-not-loaded");
+    };
     let store = cm.class_store();
     // Where the JVMS method-selection walk starts. For a guarded site that is
     // the RUNTIME receiver class; `find_method_recursive` performs the
@@ -6990,19 +7107,23 @@ fn resolve_inline_site_from(
     // redirects to the receiver id for interface calls.
     let search_start = receiver_class_id.unwrap_or(cp_class_id);
     if let Some(receiver_id) = receiver_class_id {
-        let receiver = store.get(receiver_id)?;
+        let Some(receiver) = store.get(receiver_id) else {
+            no!("receiver-class-not-in-store");
+        };
         // A guard admits an EXACT class, so an interface or an array class is
         // never a class a receiver can have here.
         if receiver.is_interface() || receiver.name.starts_with('[') {
-            return None;
+            no!("receiver-is-interface-or-array");
         }
     }
-    let (method, declaring_id) = crate::classloading::find_method_recursive(
+    let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
         search_start,
         callee_method,
         callee_desc,
         store,
-    )?;
+    ) else {
+        no!("method-not-found-from-search-start");
+    };
     if let Some(receiver_id) = receiver_class_id {
         if !receiver_resolution_is_dispatch_faithful(
             store,
@@ -7012,23 +7133,36 @@ fn resolve_inline_site_from(
             method,
             callee_method,
         ) {
-            return None;
+            no!(format!(
+                "receiver-resolution-not-dispatch-faithful (selected on class id {})",
+                declaring_id.as_u32()
+            ));
         }
     }
-    // Same rule for an inherited native: resolution may start at a subclass
-    // while the executable override is registered on the declaring class.
-    // Checking exactly the declaring class still permits a real bytecode
-    // override on an intermediate subclass, matching
-    // `try_jit_compile_callee_slow`.
-    let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
-    if declaring_class_name != callee_class
-        && shared
-            .natives
-            .native_methods
-            .find(declaring_class_name, callee_method, callee_desc)
-            .is_some()
+    // The same rule, applied to the method actually SELECTED rather than the
+    // one the constant pool names. Resolution may start at a subclass while the
+    // executable override is registered on the declaring class, and it may
+    // equally start at a supertype whose own method is native while the
+    // receiver's override is ordinary bytecode.
+    //
+    // UNCONDITIONAL, where it used to be guarded by
+    // `declaring_class_name != callee_class`. That guard was load-bearing only
+    // because the early check above covered the equal case; now that the early
+    // check runs for constant-pool resolution only, this one has to cover both
+    // — otherwise a receiver-resolved site whose selection lands back on the
+    // declared class would splice bytecode a native shadows. Checking exactly
+    // the declaring class still permits a real bytecode override on an
+    // intermediate subclass, matching `try_jit_compile_callee_slow`.
+    let Some(declaring_class_name) = store.get(declaring_id).map(|c| &*c.name) else {
+        no!("declaring-class-not-in-store");
+    };
+    if shared
+        .natives
+        .native_methods
+        .find(declaring_class_name, callee_method, callee_desc)
+        .is_some()
     {
-        return None;
+        no!("native-shadow-on-selected-method");
     }
     // The class the SPLICED BODY belongs to, which is what an invalidation
     // dependency must name. For a constant-pool resolution this stays the
@@ -7043,15 +7177,17 @@ fn resolve_inline_site_from(
     };
 
     if method.is_synchronized() {
-        return None;
+        no!("synchronized");
     }
-    let code_attr = method.code()?;
+    let Some(code_attr) = method.code() else {
+        no!("selected-method-has-no-code");
+    };
     let code_len = code_attr.code.len();
     if code_len > cratonvm_jit::MAX_INLINE_BYTECODE_SIZE {
-        return None;
+        no!("too-large");
     }
     if !code_attr.exception_table.is_empty() {
-        return None;
+        no!("callee-exception-table");
     }
     let is_static = method.is_static();
     // jit-inline-clinit-gap fix (2026-07-17): inlining a static method's
@@ -7080,7 +7216,7 @@ fn resolve_inline_site_from(
             .map(crate::vm::is_class_initialized_fast)
             .unwrap_or(false);
         if !declaring_class_initialized {
-            return None;
+            no!("static-declaring-class-not-initialized");
         }
     }
     let callee_max_locals = code_attr.max_locals as usize; // Widening: u16 to usize
@@ -7125,11 +7261,11 @@ fn resolve_inline_site_from(
     let mut invoke_sites: Vec<(usize, u16, u8)> = Vec::new();
     while scan_pc < code_len {
         match code[scan_pc] {
-            0xaa | 0xab => return None,        // tableswitch, lookupswitch
-            0xbb | 0xbd | 0xc5 => return None, // new, anewarray, multianewarray
-            0xbf => return None,               // athrow
-            0xc0 | 0xc1 => return None,        // checkcast, instanceof
-            0xc2 | 0xc3 => return None,        // monitorenter, monitorexit
+            0xaa | 0xab => no!("tableswitch/lookupswitch"),
+            0xbb | 0xbd | 0xc5 => no!("new/anewarray/multianewarray"),
+            0xbf => no!("athrow"),
+            0xc0 | 0xc1 => no!("checkcast/instanceof"),
+            0xc2 | 0xc3 => no!("monitorenter/monitorexit"),
             // invokevirtual / invokestatic / invokeinterface inside the
             // spliced body. These used to reject the site outright — the
             // emitter had no arm for them and, more fundamentally, nothing
@@ -7167,7 +7303,7 @@ fn resolve_inline_site_from(
                 scan_pc += 3;
                 continue;
             }
-            0xba => return None, // invokedynamic
+            0xba => no!("invokedynamic"),
             // Array loads/stores + arraylength need a bounds check (and AIOOBE
             // path) that the inline codegen (`x64::try_emit_inline_body`) does
             // NOT emit — it bails on these. Rejecting them HERE keeps the
@@ -7175,9 +7311,9 @@ fn resolve_inline_site_from(
             // mid-inline instead stays on the cheaper direct-call path rather
             // than being planned, rolled back, and downgraded to the
             // dispatch-helper fallback. (Array-load inlining is a follow-up.)
-            0x2e..=0x35 => return None, // iaload..saload
-            0x4f..=0x56 => return None, // iastore..sastore
-            0xbe => return None,        // arraylength
+            0x2e..=0x35 => no!("array-load"),
+            0x4f..=0x56 => no!("array-store"),
+            0xbe => no!("arraylength"),
             0xb4 | 0xb5 => {
                 has_field_ops = true;
                 scan_pc += 3;
@@ -7215,7 +7351,9 @@ fn resolve_inline_site_from(
         scan_pc += inline_instr_length(code, scan_pc);
     }
 
-    let callee_class_info = cm.get_class(declaring_id)?;
+    let Some(callee_class_info) = cm.get_class(declaring_id) else {
+        no!("declaring-class-info-unavailable");
+    };
 
     // Validate the deferred invokespecial sites: every one must be a
     // resolver-PROVEN no-op super-constructor call, or the whole callee is
@@ -7324,6 +7462,11 @@ fn resolve_inline_site_from(
                 return_type: cratonvm_jit::return_type(target_desc),
                 invoke_kind,
                 declaring_class_id: declaring_id.as_u32(),
+                // Resolved below, once `cm` is dropped: the direct-bind
+                // resolver takes `class_manager` itself (and may COMPILE the
+                // callee), so calling it under this read guard is the same
+                // self-deadlock the field-resolution phase is split out for.
+                direct_entry: None,
             },
         ));
     }
@@ -7526,24 +7669,186 @@ fn resolve_inline_site_from(
     // A nested site is ADDITIVE: the pc keeps its `invoke_targets` entry too,
     // so a nested splice that bails mid-body inside the emitter falls back to
     // the ordinary call rather than failing the outer splice.
-    let mut nested_sites: Vec<(usize, cratonvm_jit::InlineSite)> = Vec::new();
+    let mut nested_sites: Vec<cratonvm_jit::NestedInlineSite> = Vec::new();
     if nest_depth + 1 < cratonvm_jit::MAX_INLINE_NEST_DEPTH
         && crate::runtime::env_cache::jit_inline_nest()
     {
+        // The CALLEE's own receiver profile, fetched once for the whole body.
+        //
+        // This is the piece that makes devirtualising inside a splice possible
+        // at all, and it needed no new profiling: receiver types are recorded
+        // against the bci of the method that is EXECUTING, so a virtual call
+        // inside `objectsAreEqual` is already profiled under
+        // `objectsAreEqual`'s own `MethodKey` at its own bci — exactly the
+        // (method, pc) pair a nested site names. The enclosing method's profile
+        // never had this and never could, which is why re-keying it by
+        // (caller pc, callee pc) was the wrong shape to reach for.
+        let callee_profile = if crate::runtime::env_cache::jit_inline_splice_devirt() {
+            shared
+                .jit
+                .profile_store
+                .get_profile(&crate::jit::profile::MethodKey {
+                    class_id: declaring_id.as_u32(),
+                    method_name: Arc::from(callee_method),
+                    descriptor: Arc::from(callee_desc),
+                })
+        } else {
+            None
+        };
         for (ipc, target) in &invoke_targets {
-            if target.invoke_kind != 1 && target.invoke_kind != 3 {
-                continue;
-            }
-            if let Some(nested) = resolve_inline_site_from(
-                shared,
-                declaring_id,
-                None,
-                &target.class_name,
-                &target.method_name,
-                &target.descriptor,
-                nest_depth + 1,
-            ) {
-                nested_sites.push((*ipc, nested));
+            match target.invoke_kind {
+                // Statically bound: one body, no guard.
+                1 | 3 => {
+                    let nested = resolve_inline_site_from(
+                        shared,
+                        declaring_id,
+                        None,
+                        &target.class_name,
+                        &target.method_name,
+                        &target.descriptor,
+                        nest_depth + 1,
+                        direct_bind,
+                    );
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] nest-static {}.{}{} at callee_pc={} depth={} -> {}",
+                            target.class_name,
+                            target.method_name,
+                            target.descriptor,
+                            ipc,
+                            nest_depth + 1,
+                            if nested.is_some() { "SPLICED" } else { "refused" },
+                        );
+                    }
+                    if let Some(nested) = nested {
+                        nested_sites.push(cratonvm_jit::NestedInlineSite {
+                            callee_pc: *ipc,
+                            guard_class_id: 0,
+                            site: nested,
+                        });
+                    }
+                }
+                // Virtual / interface: one body per receiver class, so a splice
+                // needs a guard and the profile has to name the class.
+                0 | 2 => {
+                    // THE GATE, and it belongs here rather than only on the
+                    // profile fetch below. Gating just the profile left the MIC
+                    // fallback running with `CRATONVM_JIT_INLINE_SPLICE_DEVIRT`
+                    // OFF, so devirtualisation happened whenever nesting did and
+                    // the flag's two arms were byte-identical — measured
+                    // 2026-08-18, `nested-splice-guarded=1` in both. A switch
+                    // that does not switch anything is worse than no switch: it
+                    // makes an A/B report "no difference" for a feature that was
+                    // on in both arms.
+                    if !crate::runtime::env_cache::jit_inline_splice_devirt() {
+                        continue;
+                    }
+                    // TWO sources, in this order, and the second is the one
+                    // that actually answers for this workload.
+                    //
+                    //  1. the CALLEE's own receiver profile, keyed by its own
+                    //     bci. The right key — receiver types are recorded
+                    //     against the executing method — but measured
+                    //     2026-08-18 it is EMPTY at exactly these sites: the
+                    //     eager-callee-chain compiles a method like
+                    //     `objectsAreEqual` before it ever runs its
+                    //     `invokevirtual equals` interpreted, so nothing is
+                    //     recorded. It is also gated off entirely unless
+                    //     `CRATONVM_TIER_PGO` is set.
+                    //  2. the CALLEE's COMPILED ARTIFACT's inline cache at that
+                    //     bci. A method that skipped the interpreter has been
+                    //     caching its receiver on every compiled call since,
+                    //     which is the same evidence one layer down — and it is
+                    //     available precisely when (1) is not.
+                    //
+                    // Both are speculation; the class-id guard is what makes
+                    // either safe, and a wrong guess costs the miss edge.
+                    let profile_dom = callee_profile
+                        .as_ref()
+                        .and_then(|p| p.receivers.get(ipc))
+                        // Same 80% bar as the top-level guarded-virtual planner.
+                        .and_then(|counts| crate::jit::profile::dominant_receiver(counts, 80));
+                    let (dom, evidence) = match profile_dom {
+                        Some(d) => (d, "profile"),
+                        None => {
+                            let artifact = shared.jit.jit_cache.read().get(
+                                &Arc::from(callee_class),
+                                &Arc::from(callee_method),
+                                &Arc::from(callee_desc),
+                                declaring_id,
+                            );
+                            let from_cache = artifact.as_ref().and_then(|cm| {
+                                cm.dominant_receiver_at_bci(*ipc)
+                            });
+                            match from_cache {
+                                Some(d) => (d, "mic"),
+                                None => {
+                                    if crate::runtime::env_cache::dbg_jitc() {
+                                        // Distinguish the three ways this can
+                                        // answer nothing — no artifact at all,
+                                        // an artifact with no slot at this bci,
+                                        // and a slot that failed the dominance
+                                        // bar — because they call for three
+                                        // different fixes.
+                                        let detail = match artifact.as_ref() {
+                                            None => "no-artifact".to_string(),
+                                            Some(cm) => format!(
+                                                "artifact slots=[{}]",
+                                                cm.mic_slot_census()
+                                                    .iter()
+                                                    .map(|(b, c, h, m)| format!(
+                                                        "bci{b}:cls{c}:h{h}:m{m}"
+                                                    ))
+                                                    .collect::<Vec<_>>()
+                                                    .join(",")
+                                            ),
+                                        };
+                                        eprintln!(
+                                            "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> no evidence (profile={} mic: {})",
+                                            target.class_name,
+                                            target.method_name,
+                                            target.descriptor,
+                                            ipc,
+                                            if callee_profile.is_some() { "empty" } else { "absent" },
+                                            detail,
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] nest-virtual {}.{}{} at callee_pc={} -> guard on class {} (from {})",
+                            target.class_name, target.method_name, target.descriptor, ipc, dom,
+                            evidence,
+                        );
+                    }
+                    // Resolve the body that receiver ACTUALLY dispatches to,
+                    // not the constant-pool one: the guard certifies the
+                    // subclass, so splicing the superclass's method behind it
+                    // is silent wrong code at every overriding site. This is
+                    // the same contract `resolve_receiver_inline_site`
+                    // documents, and it applies verbatim one level down.
+                    if let Some(nested) = resolve_inline_site_from(
+                        shared,
+                        declaring_id,
+                        Some(ClassId::new(dom)),
+                        &target.class_name,
+                        &target.method_name,
+                        &target.descriptor,
+                        nest_depth + 1,
+                        direct_bind,
+                    ) {
+                        nested_sites.push(cratonvm_jit::NestedInlineSite {
+                            callee_pc: *ipc,
+                            guard_class_id: dom,
+                            site: nested,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -7563,12 +7868,75 @@ fn resolve_inline_site_from(
     // during emission bails the enclosing splice instead of quietly becoming a
     // dispatch. Refusing costs the site its inline; admitting it costs 3.5x.
     let mut invoke_targets = invoke_targets;
-    if !invoke_targets.is_empty() && !crate::runtime::env_cache::jit_inline_call_dispatch() {
-        let nested_pcs: Vec<usize> = nested_sites.iter().map(|(pc, _)| *pc).collect();
-        if invoke_targets.iter().any(|(pc, _)| !nested_pcs.contains(pc)) {
-            return None;
+
+    // Direct-bind whatever the same resolver the TOP LEVEL uses will bind.
+    //
+    // Runs after `drop(cm)` and after the nested resolution, and it must:
+    // `callee_compiler` / `direct_callee_lookup` take `class_manager` for
+    // reading and may transitively COMPILE the callee, which takes it for
+    // writing. Both bounds that recursion themselves (depth, cycle, fan-out),
+    // which is why reusing them is better than writing a lookup here.
+    //
+    // Skipped for a pc that is already NESTED — a spliced body beats a call,
+    // and asking would compile a callee whose code this site is not going to
+    // emit. Skipped for virtual/interface kinds: a direct bind names one body,
+    // and those select on the runtime receiver (that is what
+    // `resolve_receiver_inline_site` and the guarded-virtual path are for).
+    if let Some(bind) = direct_bind {
+        let nested_pcs: Vec<usize> = nested_sites.iter().map(|n| n.callee_pc).collect();
+        for (ipc, target) in invoke_targets.iter_mut() {
+            if nested_pcs.contains(ipc) {
+                continue;
+            }
+            if target.invoke_kind != 1 && target.invoke_kind != 3 {
+                continue;
+            }
+            target.direct_entry =
+                bind(&target.class_name, &target.method_name, &target.descriptor);
         }
-        invoke_targets.clear();
+    }
+
+    // A spliced call must not be WORSE than the call it replaced.
+    //
+    // Measured 2026-08-18 (see `jit_inline_call_dispatch`): the chain this
+    // whole line of work targets is already direct-bound, so emitting an
+    // admitted call through the blind dispatch helper traded a ~4 ns raw CALL
+    // for a ~175 ns name resolution — `assertFull` 47 -> 163-266 ns/iter, with
+    // `disp_calls` going from 3 870 to 2 003 361 over 2 000 000 iterations.
+    // Splicing away one frame does not pay for downgrading the call inside it.
+    //
+    // So unless the fallback is explicitly re-enabled, every call in the body
+    // must be either SPLICED IN TURN or DIRECT-BOUND; a site with one that is
+    // neither is refused whole. Refusing costs the site its inline; admitting
+    // it costs 3.5x.
+    if !crate::runtime::env_cache::jit_inline_call_dispatch() {
+        let nested_pcs: Vec<usize> = nested_sites.iter().map(|n| n.callee_pc).collect();
+        if let Some((pc, t)) = invoke_targets
+            .iter()
+            .find(|(pc, t)| t.direct_entry.is_none() && !nested_pcs.contains(pc))
+        {
+            no!(format!(
+                "call at callee_pc={} to {}.{}{} (kind {}) is neither spliced nor direct-bound",
+                pc, t.class_name, t.method_name, t.descriptor, t.invoke_kind
+            ));
+        }
+        // A GUARDED nested splice keeps its dispatch entry no matter what: the
+        // guard's miss edge has to go somewhere, and for a virtual site there
+        // is no direct bind to send it to. That is the same bargain PGO-02
+        // makes one level up — the cold edge pays the helper, the hot edge pays
+        // nothing — and it is only a bargain while the guard actually holds,
+        // which is what the 80% dominance bar above is for.
+        //
+        // An UNGUARDED nested pc with no direct bind loses its entry, so a
+        // nested splice that bails at emission time bails the enclosing splice
+        // rather than degrading to the helper. One that IS direct-bound keeps
+        // it: falling back to a raw CALL is not a downgrade.
+        let guarded_pcs: Vec<usize> = nested_sites
+            .iter()
+            .filter(|n| n.guard_class_id != 0)
+            .map(|n| n.callee_pc)
+            .collect();
+        invoke_targets.retain(|(pc, t)| t.direct_entry.is_some() || guarded_pcs.contains(pc));
     }
 
     Some(cratonvm_jit::InlineSite {
@@ -7791,14 +8159,14 @@ pub(super) fn jit_saved_args_to_values(
 ) -> Vec<Value> {
     let is_static = cached.is_static;
     let mut out = Vec::with_capacity(np);
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&cached.method_descriptor);
     for i in 0..np {
         let (cv, is_long) = saved_args[i];
         let desc_byte = if is_static {
-            nth_param_tag_byte(&cached.method_descriptor, i)
-        } else if i == 0 {
-            b'L' // receiver
+            param_tags.get(&cached.method_descriptor, i)
         } else {
-            nth_param_tag_byte(&cached.method_descriptor, i - 1)
+            param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
         out.push(decode_arg_kind_aware(cv, is_long, desc_byte));
     }
@@ -7977,17 +8345,17 @@ pub(super) fn execute_jit_call(
     // that arm for the underflow this prevents.
     let mut saved_args: [(CompactValue, bool); JIT_ABI_MAX_JAVA_ARGS] =
         [(CompactValue::zero(), false); JIT_ABI_MAX_JAVA_ARGS];
+    // ONE forward scan, hoisted out of this per-argument loop.
+    let param_tags = ParamTags::of(&cached.method_descriptor);
     for i in (0..np).rev() {
         let (cv, is_long) = thread.frames[frame_idx]
             .stack
             .pop_compact_with_long_mark_unchecked();
         saved_args[i] = (cv, is_long);
         let desc_byte = if is_static {
-            nth_param_tag_byte(&cached.method_descriptor, i)
-        } else if i == 0 {
-            b'L' // receiver
+            param_tags.get(&cached.method_descriptor, i)
         } else {
-            nth_param_tag_byte(&cached.method_descriptor, i - 1)
+            param_tags.get_with_receiver(&cached.method_descriptor, i)
         };
         let v = decode_arg_kind_aware(cv, is_long, desc_byte);
         jit_args[i] = match v {

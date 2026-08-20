@@ -1,9 +1,9 @@
 # Every JIT `getfield` takes the checked helper — TWO independent guard clauses fail, one per collector family
 
 ## Status
-**FIXED for every collector that can be fixed today; ZGC's residual is blocked
-on a different design and is tracked here.** Two independent defects, one per
-collector family, and both of the actionable ones are closed:
+**FIXED on every collector. ZGC's residual closed 2026-08-19; the design it was
+said to be blocked on turned out to describe a tree that does not exist yet.**
+Three defects, one per collector family, all closed:
 
 * **Generational** (`legacy-layout-receiver`, defect 2) — closed 2026-08-18 on
   the reader side: 68 722 450 helper calls -> **0**, 3.07x.
@@ -12,13 +12,37 @@ collector family, and both of the actionable ones are closed:
   0**. Wall clock improved in 6 of 6 pinned interleaved pairs, 1.33x-2.14x; see
   item 2 for why that is quoted as a range and why the first version of this
   line said 2.35x.
-* **ZGC** — still 56.9M, still 100% `outside-published-bounds`, and
-  deliberately so. A compact reference slot there holds
-  `Z_COLORED_TAG | colour | offset`, not a pointer, so inlining its load is the
-  use-after-free `feature-designs/zgc-jit-load-barrier.md` exists to stop. ZGC
-  publishes nothing into the read table for exactly that reason. **This page
-  stays open only as the record of that residual**; the fix is the ZGC JIT load
-  barrier, not anything in the getfield arms.
+* **ZGC** — **CLOSED 2026-08-19.** The engagement counter reads a literal zero
+  on the default collector: `probes/AccessorDispatchProbe.java` at 3 rounds x
+  2 000 000 goes **17.8-18.0 M helper calls → 0** across three interleaved
+  reps, and `probes/BobyqaOne.java` goes **2 125 738 → 0**. `receiverFieldTax`
+  falls 14.7/15.2/17.8 ns → 5.1/9.3/5.4 ns on a loaded host.
+
+  This bullet used to read "still 56.9M, and deliberately so", because a
+  compact reference slot under ZGC was said to hold
+  `Z_COLORED_TAG | colour | offset` rather than a pointer. **That premise is
+  true of the relocating ZGC `feature-designs/zgc-jit-load-barrier.md` designs
+  and false of the one that runs.**
+  `feature-designs/zgc-reference-slot-representation.md` opens with the
+  measured position — *"Reference slots are plain pointers; nothing in the heap
+  stores a colored word"* — and `ZgcRealHeap::set_barrier_color`, the sole
+  writer of the coloured state, has **no non-test caller**, so the barrier this
+  residual was waiting on is never armed in a real process.
+
+  So ZGC publishes its arena envelope, and the publish is COUPLED to the
+  barrier rather than betting on it: arming CLEARS `JIT_READ_BOUNDS`, disarming
+  refills it. That is strictly stronger than the emission-time gate it joins,
+  because the emitted containment sequence reads the table at runtime — an
+  empty table disarms sequences that are ALREADY COMPILED, which
+  `narrow_oops_block_inline_fields` cannot reach. Default ON,
+  `CRATONVM_ZGC_NO_JIT_READ_BOUNDS=1` restores helper-only reads.
+
+  **What it is worth, stated honestly.** On a field-dense kernel it is the whole
+  residual. On `BobyqaOne` it is ~1.08x of wall clock and no more, because
+  2.1 M helper calls at ~10 ns is 21 ms of a 25-second run — that workload's
+  real defect was an OSR admission failure, recorded in
+  fixed-bugs/osr-entry-deferred-to-an-oop-mask-that-never-ran-FIXED-20260819.md.
+  A count going to zero is not by itself a speedup of anything in particular.
 
 On all three collectors the inline path is engaged for **every primitive field
 read** — 0 primitive misses, measured two independent ways — and the entire
@@ -252,7 +276,7 @@ overhead today.**
 ## Step 1 is DONE — the counter, and the price (2026-08-18)
 
 Both came from `probes/AccessorDispatchProbe.java`, built for
-[`../perf/bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md`](../perf/bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md),
+fixed-suite-bugs/bug-commonsmath-bobyqa-numeric-kernel-was-an-osr-admission-failure-FIXED-20260819.md,
 whose whole 80x gap turned out to be this page.
 
 **The counter.** `jit_getfield` increments `GETFIELD_HELPER_CALLS`, printed as

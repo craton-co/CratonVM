@@ -106,6 +106,7 @@ fn maybe_dump_shutdown_reports() {
     // is what proves the lever is live before anyone times it — an inert gate
     // reports `hit=0` here rather than hiding inside a timing wash.
     cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
+    cratonvm_vm::runtime::interpreter::invoke_phases::dump();
 
     // The G1 live-region memo's tally, self-gated on
     // `CRATONVM_DBG_G1_LIVE_MEMO`. Same argument as the line above, and it is
@@ -136,6 +137,18 @@ fn maybe_dump_shutdown_reports() {
     // nothing incremented it.
     cratonvm_classloading::define_census::dump();
 
+    // The lambda tier-up / inline-cache-thunk census, on
+    // `CRATONVM_DBG=lambda-jit`.
+    //
+    // At exit and not merely periodically, because the periodic report fires
+    // every 200 000 eligible dispatches (or 100 000 direct calls) and no
+    // ordinary application workload comes near either: a census over 24 Tomcat
+    // JUnit classes — 129 s of real work, one of them driving 21 HTTP tests
+    // against a live connector — printed nothing whatsoever, and "no lambda
+    // activity" is not a reading that silence can support. See
+    // `runtime::interpreter::report_lambda_census_at_exit`.
+    cratonvm_vm::runtime::interpreter::report_lambda_census_at_exit();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
@@ -161,10 +174,22 @@ fn maybe_dump_shutdown_reports() {
         // JIT-side only: these are the sites `helpers.rs` tags by hand. The
         // whole-VM per-caller census that used to print beneath this was
         // retired once it had answered — it cost 3.4x on ZGC, which is how
-        // this page's first round of numbers came out wrong.
+        // the getfield page's first round of numbers came out wrong.
         eprintln!(
             "[cratonvm] membership walks by JIT site: {}",
             cratonvm_vm::jit::helpers::membership_walks_by_site()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // What the SPLICED-CALL emitter actually emitted, per arm. Zeros are
+        // printed: a feature measuring "no different from the arm below it" and
+        // a feature that never fired look identical in a timing table, and this
+        // is the only line that separates them.
+        eprintln!(
+            "[cratonvm] inline call arms: {}",
+            cratonvm_jit::metrics::inline_call_arm_emits()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
                 .collect::<Vec<_>>()
@@ -3719,6 +3744,40 @@ fn run() -> Result<()> {
         // confusing `NoSuchMethodError` instead of a clear configuration error.
         let p = std::path::Path::new(jh);
         if !p.is_dir() {
+            // Under `--jdk-only` this must carry the strict framing. Contract §8
+            // (docs/feature-designs/jdk-only-mode.md) requires the JdkOnly
+            // failure to name "--jdk-only, the searched paths and the accepted
+            // JDK layout".
+            //
+            // MEASURED (G82-1): the sibling branch — a `--java-home` that EXISTS
+            // but is not a runtime image — does all three, via
+            // `require_jdk_image_for_jdk_only`. This one never reaches it: a
+            // nonexistent path fails here, during argument parsing, so the run's
+            // own trailer reads `jdk mode: <not yet resolved>` and the message
+            // mentions neither the policy nor why there is no fallback. That is
+            // the branch a TYPO takes, i.e. the commonest way to arrive here.
+            //
+            // Both branches refuse and neither fabricates, so closure rule 5 held
+            // either way; this is about §8's wording, which only one of them met.
+            if args.jdk_only {
+                anyhow::bail!(
+                    "--jdk-only: --java-home path does not exist or is not a \
+                     directory: {jh}\n\
+                     Under --jdk-only real class bytes are authoritative, so there \
+                     is nothing to fall back to — the run cannot continue without a \
+                     real JDK image.\n\
+                     An acceptable JDK root must contain either:\n  \
+                       * jmods/java.base.jmod   (a full JDK 9+ installation), or\n  \
+                       * lib/modules            (a JRE or jlink-trimmed runtime image)\n\
+                     Fix by one of:\n  \
+                       * pass --java-home <PATH> pointing at a JDK 9+ root;\n  \
+                       * set JAVA_HOME (or CRATONVM_JAVA_HOME, which wins over it);\n  \
+                       * or drop --jdk-only to run with the default compatibility \
+                     behaviour.\n\
+                     --synthetic-jdk is not an escape here: it conflicts with \
+                     --jdk-only and is rejected before this point."
+                );
+            }
             anyhow::bail!(
                 "--java-home path does not exist or is not a directory: {jh}\n\
                  Provide a valid JDK installation (must contain `jmods/` or `lib/modules`)."

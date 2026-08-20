@@ -879,7 +879,21 @@ fn flush_pending_surrogate(
 // strict path is only safe once that layer exists.
 pub fn register_stream_encoder_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // RETAGGED to match this file's own JDK-ONLY-CLASSIFY verdict above,
+    // which already reads "stub": `sun.nio.cs.StreamEncoder` declares no
+    // ACC_NATIVE method on JDK 25 and every registration here shadows
+    // concrete bytecode. Only the TAG disagreed with the classification.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`): registrations 12,
+    // invocations 0, overwrote 0, and 0 ACC_NATIVE targets.
+    //
+    // The comment above says "do not DELETE before that layer is real";
+    // this does not delete. Under `--jdk-only` a SyntheticStub is refused,
+    // which is the "structured MissingNative from the sun.nio.ch layer"
+    // that comment calls the honest outcome — instead of a silent charset
+    // re-implementation standing in for it. Under --real-jdk nothing
+    // changes: the stub still registers and still answers.
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let se = "sun/nio/cs/StreamEncoder";
 
     registry.register(

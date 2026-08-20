@@ -325,6 +325,31 @@ const ENTRY_ABI_REGS: &[u8] = &[1, 2, 8, 9]; // RCX, RDX, R8, R9
 #[cfg(not(target_os = "windows"))]
 const ENTRY_ABI_REGS: &[u8] = &[7, 6, 2, 1, 8, 9]; // RDI, RSI, RDX, RCX, R8, R9
 
+/// Size of the outgoing stack-argument block for a call with `stack_arg_count`
+/// arguments past the entry-ABI register file, and the RSP-relative
+/// displacement the first of them goes to.
+///
+/// Mirrors `x64::frames::stack_arg_block_size` exactly, and for the same two
+/// reasons: Win64 requires 32 bytes of caller shadow space below the outgoing
+/// arguments even when there are none, and RSP must stay 16-byte aligned at the
+/// `CALL`, so the raw size is rounded up.
+///
+/// Returns `(0, _)` when nothing goes on the stack, so a call whose arguments
+/// all fit registers emits no `SUB RSP` at all and is byte-identical to what
+/// this backend produced before the stack path existed.
+fn stack_arg_block_size(stack_arg_count: usize) -> (i32, i32) {
+    #[cfg(target_os = "windows")]
+    let (shadow, base) = (32i32, 32i32);
+    #[cfg(not(target_os = "windows"))]
+    let (shadow, base) = (0i32, 0i32);
+    if stack_arg_count == 0 {
+        return (0, base);
+    }
+    // Cast: a callee's parameter count is bounded by the JVMS 255-slot limit.
+    let raw = shadow + (stack_arg_count as i32) * 8;
+    ((raw + 15) & !15, base)
+}
+
 /// How many incoming argument slots this backend's prologue can actually
 /// deposit — the context pointer (when present) plus the Java arguments,
 /// receiver included.
@@ -3231,9 +3256,32 @@ fn reloc_emit_enabled() -> bool {
     /// RAX), which is exactly how each argument is already stored in its frame
     /// slot. Every source is memory, so loading straight into the ABI registers
     /// cannot inter-clobber; `RAX` (the indirect-call target scratch) is not an
-    /// argument register on either ABI. The caller must have verified that
-    /// `num_args + needs_context <= ENTRY_ABI_REGS.len()`, since there is no
-    /// stack-argument path here.
+    /// argument register on either ABI.
+    ///
+    /// # Arguments past the register file
+    ///
+    /// Arguments beyond `ENTRY_ABI_REGS` travel on the stack, exactly as the
+    /// single-pass backend's `x64::frames::emit_stack_arg_setup` marshals them:
+    /// reserve the block (Win64 shadow space included, rounded to 16 so the
+    /// `CALL` stays aligned), materialise the stack args through `RAX` FIRST,
+    /// then load the register args, then `CALL`, then release the block. Every
+    /// source is `[rbp - off]`, which `SUB RSP` does not disturb, so the two
+    /// passes cannot interfere.
+    ///
+    /// This is what the `HttpContentDecompressorTest` page was blocked on: a
+    /// `ByteBuffer` accessor's remaining native rungs are
+    /// `ScopedMemoryAccess.put*Unaligned`, which need **seven** incoming slots
+    /// (receiver + five arguments + the context pointer) and so could not be
+    /// bound to a thin direct helper at this door while the lowering was
+    /// register-only.
+    ///
+    /// Note the asymmetry with the *callee* side: `emit_prologue` still reads
+    /// incoming arguments out of `ENTRY_ABI_REGS` only, and `lower()` still
+    /// refuses a graph with more parameters than that. That is unchanged and
+    /// deliberate — the callees this widened path reaches are `extern "C"`
+    /// thin VM helpers, which read their stack arguments the way the platform
+    /// C ABI says. A JIT-compiled callee still cannot receive one, which is why
+    /// the caller of this function keeps its own capacity check for that case.
     ///
     /// SAFETY: `entry` is a code address produced by this JIT for the resolved
     /// callee; `lib.rs` records it in `CompiledMethod::_direct_callee_entries`,
@@ -3255,21 +3303,68 @@ fn reloc_emit_enabled() -> bool {
             self.load_to_rax(self.slot_of(arg));
             self.store_rax(self.args_stage_top_off - (i as i32) * 8);
         }
-        let base = if callee_needs_ctx {
+        let base = usize::from(callee_needs_ctx);
+        // Java arguments that fit the register file, and the remainder that
+        // must be pushed. `saturating_sub` rather than a subtraction: a callee
+        // taking the context pointer plus fewer arguments than the file holds
+        // leaves `reg_capacity > num_args`, which is the ordinary case.
+        let reg_capacity = ENTRY_ABI_REGS.len() - base;
+        let stack_args = num_args.saturating_sub(reg_capacity);
+        let (total_sub, base_disp) = stack_arg_block_size(stack_args);
+        if total_sub > 0 {
+            self.emit_sub_rsp_imm32(total_sub);
+        }
+        // Materialise the stack arguments before the register pass: this uses
+        // RAX as the transfer scratch, and the register pass must be the last
+        // thing before the `CALL` so nothing can clobber an ABI register after
+        // it is loaded.
+        for k in 0..stack_args {
+            let arg = inputs[2 + reg_capacity + k];
+            self.load_to_rax(self.slot_of(arg));
+            // Cast: a stack-arg index is bounded by the callee's parameter
+            // count, so `k * 8` cannot overflow an x86-64 displacement.
+            self.emit_mov_rsp_disp_from_rax(base_disp + (k as i32) * 8);
+        }
+        if callee_needs_ctx {
             self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
-            1
-        } else {
-            0
-        };
-        for i in 0..num_args {
+        }
+        for i in 0..num_args.min(reg_capacity) {
             let arg = inputs[2 + i];
             self.load_reg_from_frame(ENTRY_ABI_REGS[base + i], self.slot_of(arg));
         }
         // MOV RAX, entry ; CALL RAX.
         self.emit_mov_reg_imm64(RAX, entry as u64);
         self.buf.emit(&[0xFF, 0xD0]);
+        // Release the block BEFORE anything else runs. The deopt service below
+        // calls back into the VM and relies on the frame's own reserved shadow
+        // space at `[rsp, rsp+32)`; leaving RSP lowered would point that at the
+        // (now dead) stack-argument block instead.
+        if total_sub > 0 {
+            self.emit_add_rsp_imm32(total_sub);
+        }
         self.emit_inline_callee_deopt_service(info_ptr, num_args);
         self.emit_call_return_check(slot, ty);
+    }
+
+    /// `SUB RSP, imm32` — reserve a call's outgoing stack-argument block.
+    fn emit_sub_rsp_imm32(&mut self, bytes: i32) {
+        self.buf.emit(&[0x48, 0x81, 0xEC]);
+        self.buf.emit(&bytes.to_le_bytes());
+    }
+
+    /// `ADD RSP, imm32` — release the block reserved by [`Self::emit_sub_rsp_imm32`].
+    fn emit_add_rsp_imm32(&mut self, bytes: i32) {
+        self.buf.emit(&[0x48, 0x81, 0xC4]);
+        self.buf.emit(&bytes.to_le_bytes());
+    }
+
+    /// `MOV qword [RSP + disp32], RAX` — place one outgoing stack argument.
+    ///
+    /// RSP-relative addressing needs a SIB byte (`ModRM.rm = 100`); `0x24` is
+    /// `base = RSP, index = none`.
+    fn emit_mov_rsp_disp_from_rax(&mut self, disp: i32) {
+        self.buf.emit(&[0x48, 0x89, 0x84, 0x24]);
+        self.buf.emit(&disp.to_le_bytes());
     }
 
     /// Service an exceptional return from an inline cached compiled callee.
@@ -5074,17 +5169,29 @@ fn reloc_emit_enabled() -> bool {
                 // IR direct-call lowering: a statically-bound site whose callee
                 // was eagerly compiled becomes a raw `CALL` into that callee's
                 // entry — no `jit_invoke_dispatch` round trip. See
-                // `emit_direct_cross_call`. There is no stack-argument path, so a
-                // site whose args do not fit the entry ABI register file falls
-                // through to the (unchanged) helper dispatch below rather than
-                // being dropped. `lower_data_node` has no post-`match` code, so
-                // an early `return` here fully handles the node.
+                // `emit_direct_cross_call`, which now marshals arguments past
+                // the entry-ABI register file onto the stack, so an over-wide
+                // site is bound rather than dropped back to helper dispatch.
+                //
+                // Why that is sound for BOTH callee kinds this map holds:
+                //
+                //  * a thin `extern "C"` VM helper reads its stack arguments
+                //    the way the platform C ABI says, and always could — the
+                //    register-only lowering was the sole obstacle;
+                //  * a JIT-compiled callee with more parameters than the
+                //    register file can only have a SINGLE-PASS body, because
+                //    `lower()` refuses such a graph outright (see
+                //    `incoming_abi_reg_capacity`) — and the single-pass
+                //    prologue reads stack-passed parameters through
+                //    `emit_load_caller_arg`, at the offsets
+                //    `stack_arg_block_size` writes them to.
+                //
+                // `lower_data_node` has no post-`match` code, so an early
+                // `return` here fully handles the node.
                 if let Some(&(entry, callee_needs_ctx)) =
                     node.bytecode_pc.and_then(|pc| self.direct_calls.get(&pc))
                 {
-                    if entry != 0
-                        && num_args + usize::from(callee_needs_ctx) <= ENTRY_ABI_REGS.len()
-                    {
+                    if entry != 0 {
                         self.emit_direct_cross_call(
                             &node.inputs,
                             slot,
@@ -10932,6 +11039,179 @@ mod tests {
         .expect("virtual-call method must lower")
         .code_bytes()
         .to_vec()
+    }
+
+    /// Lower one `invokestatic` with `n` int parameters as a DIRECT call to
+    /// `entry`, and return the emitted bytes.
+    ///
+    /// `needs_ctx` picks whether the callee takes the hidden VM context
+    /// pointer in `abi[0]`, which is what decides how many Java arguments are
+    /// left for the register file.
+    fn lower_direct_call_with_n_args(n: usize, entry: usize, needs_ctx: bool) -> Vec<u8> {
+        assert!((1..=8).contains(&n));
+        // The arguments are CONSTANTS, not this method's parameters. A caller
+        // with `n` parameters would be refused outright by `lower()` when `n`
+        // exceeds `incoming_abi_reg_capacity()` — which is exactly the case
+        // under test — and the refusal is about the PROLOGUE, a different
+        // question from the one these tests ask.
+        let mut code: Vec<u8> = Vec::new();
+        for _ in 0..n {
+            code.push(0x03); // iconst_0
+        }
+        let invoke_pc = code.len();
+        code.extend_from_slice(&[0xb8, 0x00, 0x02]); // invokestatic #2
+        code.push(0xac); // ireturn
+        let code_len = code.len();
+        // `IrBuilder::build` reads a little past the end for operand fetch.
+        code.extend_from_slice(&[0x00, 0x00]);
+
+        let info: &'static JitInvokeInfo = Box::leak(Box::new(JitInvokeInfo {
+            class_name: "pkg/Wide",
+            method_name: "f",
+            descriptor: "(IIIIIII)I",
+            num_jit_args: n,
+            return_type: b'I',
+            invoke_kind: 3, // static — the statically bound, directly bindable kind
+            declaring_class_id: 0,
+        }));
+
+        let mut builder = IrBuilder::new(0, 1);
+        builder.set_param_types(&[]);
+        let mut invoke_info = HashMap::new();
+        invoke_info.insert(
+            invoke_pc,
+            (info as *const JitInvokeInfo as usize, n, b'I'),
+        );
+        builder.set_invoke_info(invoke_info);
+        let graph = builder.build(&code, code_len).expect("IR build of wide call");
+        let schedule = ir_schedule::schedule(&graph);
+
+        let mut helpers = no_helpers();
+        helpers.invoke_dispatch = 0x1111_2222_3333_4440;
+
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let mut direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        direct.insert(invoke_pc, (entry, needs_ctx));
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let no_compact: HashMap<usize, (u32, bool, u8)> = HashMap::new();
+        lower_inner(
+            &graph,
+            &schedule,
+            0,
+            1,
+            &helpers,
+            &empty_hints,
+            None,
+            &direct,
+            &no_ic,
+            &no_compact,
+        )
+        .expect("wide direct call must lower")
+        .code_bytes()
+        .to_vec()
+    }
+
+    /// A direct call whose arguments do not all fit `ENTRY_ABI_REGS` marshals
+    /// the remainder on the stack instead of falling back to the dispatch
+    /// helper.
+    ///
+    /// This is the blocker `httpcontentdecompressortest-hang-20260816.md`
+    /// named: `emit_direct_cross_call` was register-only, so a site needing
+    /// seven incoming slots kept the full `jit_invoke_dispatch` round trip no
+    /// matter what the binding side had resolved. The map entry was recorded
+    /// and then silently dropped by the lowerer — nothing warned.
+    ///
+    /// The assertion is structural rather than a byte-for-byte golden: the
+    /// block size differs by platform (Win64 reserves 32 bytes of shadow
+    /// space below the outgoing arguments, SysV none) and so does how many
+    /// arguments are left over, and pinning both would only restate
+    /// `stack_arg_block_size`.
+    #[test]
+    fn a_direct_call_past_the_register_file_marshals_its_tail_on_the_stack() {
+        crate::x64::set_moving_young_override(Some(false));
+        const ENTRY: usize = 0x7fff_0000_0000_5000;
+        let n = ENTRY_ABI_REGS.len() + 2; // context + n args exceeds the file
+        let code = lower_direct_call_with_n_args(n, ENTRY, true);
+
+        assert!(
+            contains_seq(&code, &(ENTRY as u64).to_le_bytes()),
+            "the site must bake the callee entry, not fall back to dispatch"
+        );
+        assert!(
+            !contains_seq(&code, &0x1111_2222_3333_4440u64.to_le_bytes()),
+            "a bound direct site must not also emit the dispatch helper call"
+        );
+
+        // SUB RSP, imm32 / ADD RSP, imm32 with the SAME immediate: the block
+        // is reserved and released around one call, so an unbalanced pair
+        // would leave the frame's RSP permanently low.
+        //
+        // The FIRST `SUB RSP, imm32` in any body is the prologue's own frame
+        // allocation, which shares this encoding — hence `skip(1)` rather than
+        // `position`. Taking the first would assert against `frame_size` and
+        // pass whether or not a stack-argument block was ever emitted.
+        let subs: Vec<usize> = code
+            .windows(3)
+            .enumerate()
+            .filter(|(_, w)| *w == [0x48, 0x81, 0xEC])
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            subs.len() >= 2,
+            "the prologue's frame allocation plus a stack-argument block: got {} SUB RSP",
+            subs.len()
+        );
+        let sub_at = subs[1];
+        let add_at = code
+            .windows(3)
+            .position(|w| w == [0x48, 0x81, 0xC4])
+            .expect("the stack-argument block must be released");
+        let sub_imm = i32::from_le_bytes(code[sub_at + 3..sub_at + 7].try_into().unwrap());
+        let add_imm = i32::from_le_bytes(code[add_at + 3..add_at + 7].try_into().unwrap());
+        assert_eq!(sub_imm, add_imm, "the reserve and the release must match");
+        assert!(sub_imm > 0, "a stack-argument block must be non-empty here");
+        assert_eq!(
+            sub_imm % 16,
+            0,
+            "RSP must stay 16-byte aligned at the CALL, so the block is a multiple of 16"
+        );
+        assert!(add_at > sub_at, "the release must follow the reserve");
+
+        // One `MOV [RSP + disp32], RAX` per argument past the register file.
+        let stack_args = n - (ENTRY_ABI_REGS.len() - 1);
+        assert_eq!(
+            count_seq(&code, &[0x48, 0x89, 0x84, 0x24]),
+            stack_args,
+            "every argument past the entry-ABI register file must be stored to the block"
+        );
+    }
+
+    /// The same lowering with arguments that DO fit emits no stack block at
+    /// all — the narrow path is unchanged.
+    ///
+    /// Without this the test above would pass just as well against a backend
+    /// that reserved a block on every direct call, which is a pessimisation of
+    /// every call site in the tree.
+    #[test]
+    fn a_direct_call_within_the_register_file_reserves_no_stack_block() {
+        crate::x64::set_moving_young_override(Some(false));
+        const ENTRY: usize = 0x7fff_0000_0000_5000;
+        let code = lower_direct_call_with_n_args(ENTRY_ABI_REGS.len() - 1, ENTRY, true);
+        assert!(
+            contains_seq(&code, &(ENTRY as u64).to_le_bytes()),
+            "the narrow site must still bind directly"
+        );
+        assert_eq!(
+            count_seq(&code, &[0x48, 0x81, 0xEC]),
+            1,
+            "only the prologue's own frame allocation — a call whose arguments \
+             all fit registers must add no second SUB RSP"
+        );
+        assert_eq!(
+            count_seq(&code, &[0x48, 0x89, 0x84, 0x24]),
+            0,
+            "a call whose arguments all fit registers must store nothing to the stack"
+        );
     }
 
     /// A self-recursive call must not PUBLISH to the shadow stack.

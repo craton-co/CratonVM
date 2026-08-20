@@ -3085,11 +3085,16 @@ type ScopedValueCache<const N: usize> =
 /// index computed against the latched bound is always in range.
 type ScopedIntegerCache = std::collections::HashMap<usize, Vec<Option<cratonvm_types::ObjectRef>>>;
 
-static INTEGER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedIntegerCache>> =
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`, like the rest of this
+/// family. Safe only BECAUSE `INTEGER_CACHE_HIGH` is unordered:
+/// `resolve_integer_cache_high` holds that guard across this acquisition. If
+/// `INTEGER_CACHE_HIGH` is ever given a level it must be a HIGHER one, never an
+/// equal — see its own comment for why it has none today.
+static INTEGER_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedIntegerCache>> =
     std::sync::OnceLock::new();
 
-fn integer_cache() -> &'static parking_lot::Mutex<ScopedIntegerCache> {
-    INTEGER_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn integer_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedIntegerCache> {
+    INTEGER_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// `IntegerCache.low` — `-128`, and NOT configurable. `jdk25src/java.base/
@@ -3113,6 +3118,22 @@ const INTEGER_CACHE_HIGH_PROPERTY: &str = "java.lang.Integer.IntegerCache.high";
 /// VM-scoped rather than a process-global `OnceLock`: a `OnceLock` latches the
 /// FIRST VM's answer for the lifetime of the process, and this crate's Rust
 /// tests build several independent VMs in one binary.
+///
+/// NO LOCK LEVEL, deliberately — and it is the one member of this family that
+/// could not take one. `resolve_integer_cache_high` holds this guard across
+/// `integer_cache().lock()`, so this is the OUTER lock of a two-lock nest and
+/// `INTEGER_CACHE` is the inner one. A level is a claim that no lock at or
+/// below it is held when this one is taken, and the ordering it implies runs
+/// the other way: the inner lock would have to sit BELOW this one. `Scratch`
+/// is the floor, so stamping `Scratch` here would demand a level that cannot
+/// exist, and any higher level would be a claim about the VM's own hierarchy
+/// that this cache has no business making.
+///
+/// The nesting is load-bearing, not incidental: `high` and the matching
+/// `entries` must be installed atomically or two racing threads can publish a
+/// `high` whose cache is the wrong length. So the fix is to restructure the
+/// publish, not to relabel the lock — the same verdict `java_recordings` and
+/// `boot_layer_memo` got, and it stays in the §A6 backlog for the same reason.
 static INTEGER_CACHE_HIGH: std::sync::OnceLock<
     parking_lot::Mutex<std::collections::HashMap<usize, i32>>,
 > = std::sync::OnceLock::new();
@@ -3207,22 +3228,22 @@ fn integer_cache_bound(ctx: &mut dyn NativeContext) -> i32 {
     high
 }
 
-static BOOLEAN_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<2>>> =
+static BOOLEAN_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<2>>> =
     std::sync::OnceLock::new();
 
-fn boolean_cache() -> &'static parking_lot::Mutex<ScopedValueCache<2>> {
-    BOOLEAN_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn boolean_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<2>> {
+    BOOLEAN_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// `LongCache` for `Long.valueOf(long)` — JLS §5.1.7 mandates the canonical
 /// cached instance for values in [-128, 127] so `Long.valueOf(x) ==
 /// Long.valueOf(x)` holds. Shared across threads but VM-scoped and GC-scanned
 /// for the same reasons documented above for `INTEGER_CACHE`.
-static LONG_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+static LONG_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>> =
     std::sync::OnceLock::new();
 
-fn long_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
-    LONG_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn long_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>> {
+    LONG_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 // ---------------------------------------------------------------------------
@@ -3258,29 +3279,29 @@ fn long_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
 
 /// `CharacterCache` for `Character.valueOf(char)`. 128 slots indexed by the
 /// code unit itself — there is no offset because the low bound is zero.
-static CHARACTER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<128>>> =
+static CHARACTER_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<128>>> =
     std::sync::OnceLock::new();
 
-fn character_cache() -> &'static parking_lot::Mutex<ScopedValueCache<128>> {
-    CHARACTER_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn character_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<128>> {
+    CHARACTER_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// `ByteCache` for `Byte.valueOf(byte)`. 256 slots indexed by `b + 128`, and
 /// unlike every other cache in this file it covers the type's ENTIRE domain.
-static BYTE_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+static BYTE_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>> =
     std::sync::OnceLock::new();
 
-fn byte_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
-    BYTE_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn byte_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>> {
+    BYTE_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// `ShortCache` for `Short.valueOf(short)`. 256 slots indexed by `s + 128`,
 /// covering -128..=127 out of a 65,536-value domain.
-static SHORT_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+static SHORT_CACHE: std::sync::OnceLock<cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>>> =
     std::sync::OnceLock::new();
 
-fn short_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
-    SHORT_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn short_cache() -> &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<256>> {
+    SHORT_CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
 /// The canonical-instance dance, once, for the caches added above.
@@ -3293,7 +3314,7 @@ fn short_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
 /// it must hold for. The loser's allocation is unreachable and collectible.
 fn cached_wrapper_box<const N: usize>(
     ctx: &mut dyn NativeContext,
-    cache: &'static parking_lot::Mutex<ScopedValueCache<N>>,
+    cache: &'static cratonvm_types::lock_order::OrderedPlMutex<ScopedValueCache<N>>,
     idx: usize,
     class_name: &'static str,
     value: Value,
@@ -3341,7 +3362,7 @@ fn cached_wrapper_box<const N: usize>(
 /// call sites below are unchanged and no cache can acquire a second, separate
 /// hook — which is the failure this function was factored out to prevent.
 fn scan_one_cache<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
-    cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+    cache: &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<usize, C>>,
     vm_identity: usize,
     out: &mut Vec<cratonvm_types::ObjectRef>,
 ) {
@@ -3355,7 +3376,7 @@ fn scan_one_cache<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
 
 /// Remap one cache's entries for `vm_identity` through the GC pointer map.
 fn update_one_cache<C: AsMut<[Option<cratonvm_types::ObjectRef>]>>(
-    cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+    cache: &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<usize, C>>,
     vm_identity: usize,
     pointer_map: &cratonvm_types::PointerMap,
 ) {
@@ -3440,7 +3461,7 @@ pub fn canonical_wrapper_if_cached(
     v: Value,
 ) -> Option<cratonvm_types::ObjectRef> {
     fn read<C: AsRef<[Option<cratonvm_types::ObjectRef>]>>(
-        cache: &'static parking_lot::Mutex<std::collections::HashMap<usize, C>>,
+        cache: &'static cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<usize, C>>,
         vm_identity: usize,
         idx: usize,
     ) -> Option<cratonvm_types::ObjectRef> {
@@ -6889,13 +6910,23 @@ fn read_string_arg_npe(
 ) -> Result<String, cratonvm_types::error::MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(obj))) => Ok(ctx.read_string(*obj).unwrap_or_default()),
-        _ => Err(
-            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
-        ),
+        // HotSpot's helpful NPE, naming the JDK's own local in
+        // `FloatingDecimal.readJavaFormatString`. Shared by all four entry
+        // points — `Double`/`Float` x `parseX`/`valueOf` — which is measured,
+        // not assumed: this helper serves all four and they all say `"in"`.
+        _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.length()\" because \"in\" is null".to_string(),
+            ),
+        }
+        .into()),
     }
 }
 
 fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeError> {
+    if s.trim().is_empty() {
+        return Err(java_nfe_empty());
+    }
     let (body, neg) = match java_float_head(s) {
         JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
         JavaFloatHead::Word { nan: true, .. } => return Ok(f32::NAN),
@@ -6921,7 +6952,25 @@ fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeErro
     Ok(if neg { -v } else { v })
 }
 
+/// `NumberFormatException("empty String")` — the message the floating-point
+/// parsers use for an input that is empty AFTER trimming, in place of the
+/// `For input string: "..."` every other malformed input gets.
+///
+/// Measured across all four entry points (`Double`/`Float` x
+/// `parseX`/`valueOf`) and for a BLANK string as well as an empty one: the JDK
+/// trims first and then finds nothing, so `"   "` is also "empty String". The
+/// integral parsers do NOT share this — `Integer.parseInt("")` is
+/// `For input string: ""` — which is why this cannot be hoisted.
+fn java_nfe_empty() -> cratonvm_types::error::RuntimeError {
+    cratonvm_types::error::RuntimeError::NumberFormatException {
+        message: "empty String".to_string(),
+    }
+}
+
 fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeError> {
+    if s.trim().is_empty() {
+        return Err(java_nfe_empty());
+    }
     let (body, neg) = match java_float_head(s) {
         JavaFloatHead::Malformed => return Err(java_nfe_float(s)),
         JavaFloatHead::Word { nan: true, .. } => return Ok(f64::NAN),

@@ -473,9 +473,21 @@ fn component_fast_path(ctx: &mut dyn NativeContext, obj: ObjectRef) -> u8 {
 /// it is computed once per class there and would cost nothing. That is
 /// nominated rather than taken here: `native-api` and `vm` are not this lane's
 /// files.
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. The read copies a `bool`
+/// out and the write inserts an already-built `Box<[bool]>`; the one
+/// `NativeContext` call in this function (`record_components`) runs BETWEEN
+/// them, with no guard held.
+///
+/// Still a `LazyLock`: `OrderedPlRwLock::new` IS `const`, but
+/// `HashMap::new` is not, so the pair cannot initialise a `static`.
 static BOOLEAN_COMPONENTS: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::HashMap<u32, Box<[bool]>>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    cratonvm_types::lock_order::OrderedPlRwLock<std::collections::HashMap<u32, Box<[bool]>>>,
+> = std::sync::LazyLock::new(|| {
+    cratonvm_types::lock_order::OrderedPlRwLock::new(
+        std::collections::HashMap::new(),
+        cratonvm_types::lock_order::LockLevel::Scratch,
+    )
+});
 
 /// `true` if component `component_index` of `class_id` is declared `boolean`.
 fn is_boolean_component(
@@ -484,10 +496,12 @@ fn is_boolean_component(
     component_index: usize,
 ) -> bool {
     let key = class_id.as_u32();
-    if let Ok(map) = BOOLEAN_COMPONENTS.read() {
-        if let Some(flags) = map.get(&key) {
-            return flags.get(component_index).copied().unwrap_or(false);
-        }
+    if let Some(hit) = {
+        let map = BOOLEAN_COMPONENTS.read();
+        map.get(&key)
+            .map(|flags| flags.get(component_index).copied().unwrap_or(false))
+    } {
+        return hit;
     }
     let flags: Box<[bool]> = ctx
         .record_components(class_id)
@@ -495,9 +509,7 @@ fn is_boolean_component(
         .map(|(_, descriptor)| descriptor == "Z")
         .collect();
     let answer = flags.get(component_index).copied().unwrap_or(false);
-    if let Ok(mut map) = BOOLEAN_COMPONENTS.write() {
-        map.insert(key, flags);
-    }
+    BOOLEAN_COMPONENTS.write().insert(key, flags);
     answer
 }
 

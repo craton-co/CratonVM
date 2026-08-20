@@ -354,8 +354,10 @@ pub(super) fn execute_invokestatic(
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
+    // ONE forward scan, hoisted out of the per-argument loop below.
+    let param_tags = ParamTags::of(&method_descriptor);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
+        let pd_byte = param_tags.get(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
@@ -1307,10 +1309,17 @@ pub(super) fn execute_invokestatic_cached(
     // Thread-local invoke cache — no locking needed. invokestatic uses
     // is_special=false since static calls never collide cp_index with
     // invokespecial in the same class (different CP entries semantically).
+    let ph_t0 = crate::runtime::interpreter::invoke_phases::now();
     let target = match thread.invoke_cache.get(caller_class_id, cp_index, false) {
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
+    let ph_t1 = crate::runtime::interpreter::invoke_phases::now();
+    crate::runtime::interpreter::invoke_phases::charge(
+        crate::runtime::interpreter::invoke_phases::P_IC_LOOKUP,
+        ph_t0,
+        ph_t1,
+    );
     // JVMTI redefine guard (static): never serve a cached native/intrinsic
     // SHADOW for a static method whose declaring class an agent has redefined
     // (e.g. Mockito `mockStatic(X)` woves X's static methods) — evict and
@@ -1501,11 +1510,17 @@ pub(super) fn execute_invokestatic_cached(
                 &cached,
             )
         }
+        // Bound BY VALUE, not `ref`: the entry `Arc` cloned out of the invoke
+        // cache above is owned by `target`, which dies at the end of this arm,
+        // so the frame can take it by MOVE. Bound by reference it had to be
+        // cloned again — two atomic refcount bumps per call (and two matching
+        // decrements on pop) where one is the minimum, since the cache keeps
+        // its own and the frame needs its own.
         CachedInvokeTarget::Bytecode {
-            ref cached,
-            gate: ref entry_gate,
+            cached,
+            gate: entry_gate,
         } => {
-            if cached_static_owner_stale(shared, caller_class_id, cached) {
+            if cached_static_owner_stale(shared, caller_class_id, &cached) {
                 thread.invoke_cache.evict(caller_class_id, cp_index, false);
                 return Ok(CachedCallResult::CacheMiss);
             }
@@ -1717,7 +1732,7 @@ pub(super) fn execute_invokestatic_cached(
                     // declaring class, so a future `redefine_class` must
                     // invalidate this JIT entry too.
                     let upgrade_result =
-                        try_jit_upgrade_with_gate(shared, cached, entry_gate.clone());
+                        try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone());
                     if upgrade_result.is_none() && crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
                             "[cratonvm-jitc] upgrade-FAIL {}.{}{} invoc_count={}",
@@ -1778,24 +1793,51 @@ pub(super) fn execute_invokestatic_cached(
             // dropping the high bits before it reached the callee's locals.
             // The non-cached `execute_invokestatic` path already decodes this
             // way. See gaps/bc-ec-mod-mododdinverse-investigation.md.
-            const MAX_INLINE_ARGS: usize = 16;
+            // 8, not 16. `args_buf` is `[Value; MAX_INLINE_ARGS]` and `Value`
+            // is 16 bytes, so at 16 this initialised 256 BYTES on every call
+            // regardless of how many arguments the callee actually takes. The
+            // phase instrument charged 60.9 cyc/call to argument handling on a
+            // workload of nothing but ZERO-argument calls, which is what that
+            // initialisation costs. Eight covers essentially every method and
+            // wider ones still spill to `args_vec` exactly as before.
+            const MAX_INLINE_ARGS: usize = 8;
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
-            let pd_byte = |i: usize| -> u8 { nth_param_tag_byte(&cached.method_descriptor, i) };
-            let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
+            let ph_t2 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_GUARDS,
+                ph_t1,
+                ph_t2,
+            );
+            // A zero-argument call builds no buffer and scans no descriptor at
+            // all. `invokestatic` of a no-arg method is a very common shape and
+            // it was paying for both. `args_buf` is deliberately declared
+            // WITHOUT an initialiser so the 128 bytes are written only on the
+            // path that uses them.
+            let mut args_buf: [Value; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
-            let args_slice: &mut [Value] = if num_params <= MAX_INLINE_ARGS {
+            let args_slice: &mut [Value] = if num_params == 0 {
+                &mut []
+            } else if num_params <= MAX_INLINE_ARGS {
+                // ONE forward scan; the per-argument form rescanned from `(` each time.
+                let param_tags = ParamTags::of(&cached.method_descriptor);
+                args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
                 for i in (0..num_params).rev() {
                     args_buf[i] = thread.frames[frame_idx]
                         .stack
-                        .pop_arg_for_descriptor_checked(pd_byte(i))?;
+                        .pop_arg_for_descriptor_checked(
+                            param_tags.get(&cached.method_descriptor, i),
+                        )?;
                 }
                 &mut args_buf[..num_params]
             } else {
+                let param_tags = ParamTags::of(&cached.method_descriptor);
                 args_vec.resize(num_params, Value::Uninitialized);
                 for i in (0..num_params).rev() {
                     args_vec[i] = thread.frames[frame_idx]
                         .stack
-                        .pop_arg_for_descriptor_checked(pd_byte(i))?;
+                        .pop_arg_for_descriptor_checked(
+                            param_tags.get(&cached.method_descriptor, i),
+                        )?;
                 }
                 &mut args_vec
             };
@@ -1837,8 +1879,14 @@ pub(super) fn execute_invokestatic_cached(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 (cached.max_stack as usize).max(16) + 8,
             );
+            let ph_t3 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_ARGS,
+                ph_t2,
+                ph_t3,
+            );
             let mut frame = Frame::new_pooled_cached(
-                cached.clone(),
+                cached,
                 args_slice,
                 &mut thread.locals_pool,
                 &mut thread.stacks_pool,
@@ -1853,7 +1901,20 @@ pub(super) fn execute_invokestatic_cached(
                     frame.method_descriptor()
                 );
             }
+            let ph_t4 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_FRAME_BUILD,
+                ph_t3,
+                ph_t4,
+            );
             push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+            let ph_t5 = crate::runtime::interpreter::invoke_phases::now();
+            crate::runtime::interpreter::invoke_phases::charge(
+                crate::runtime::interpreter::invoke_phases::P_PUSH,
+                ph_t4,
+                ph_t5,
+            );
+            crate::runtime::interpreter::invoke_phases::count_call();
             Ok(CachedCallResult::FramePushed)
         }
         _ => Ok(CachedCallResult::CacheMiss),

@@ -1426,6 +1426,21 @@ struct DbbElemFields {
     is_read_only: usize,
     /// `java.nio.Buffer.position` — the cursor the relative accessors bump.
     position: usize,
+    /// `java.nio.ByteBuffer.bigEndian` — the order the WIDE accessors below
+    /// encode with. `ByteBuffer.order(ByteOrder)` writes it, and the JDK's own
+    /// `getLong(int)` passes it straight to
+    /// `ScopedMemoryAccess.getLongUnaligned`, so honouring it is not an
+    /// embellishment: a native that assumed big-endian would silently return
+    /// byte-swapped values for every `order(LITTLE_ENDIAN)` buffer.
+    ///
+    /// `Option`, and deliberately NOT a `?` in the constructor below. The four
+    /// fields above are what the BYTE accessors need and have needed since
+    /// 2026-08-05; folding a fifth resolution into the same `?` would mean an
+    /// image without a `bigEndian` field — synthetic-JDK mode, where
+    /// `java/nio/ByteBuffer` is this VM's own class — silently sending the
+    /// byte accessors back to bytecode as well. A missing `bigEndian` bails
+    /// only the wide accessors, which is the blast radius it earns.
+    big_endian: Option<usize>,
 }
 
 /// `CRATONVM_DBG_DBB_ELEM` — per-accessor census for the element natives.
@@ -1539,6 +1554,7 @@ fn dbb_elem_fields(ctx: &mut dyn NativeContext) -> Option<DbbElemFields> {
             limit: ctx.resolve_field_index(CLASS, "limit")?,
             is_read_only: ctx.resolve_field_index(CLASS, "isReadOnly")?,
             position: ctx.resolve_field_index(CLASS, "position")?,
+            big_endian: ctx.resolve_field_index(CLASS, "bigEndian"),
         })
     })
 }
@@ -1633,6 +1649,247 @@ fn dbb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     }
     elem_census::served(elem_census::PUT_ABS, addr);
     // `put(int, byte)` returns `this`.
+    Ok(Some(Value::Object(Some(this))))
+}
+
+// ── Wide absolute accessors (`getLong(int)` and friends) ─────────────────
+//
+// WHY THESE EXIST, measured rather than assumed. `--dump-native-registry`'s
+// invocation census on `probes/NioAccessorRate.java` (2026-08-18, current dev,
+// 1 600 000 operations per arm) says what one `DirectByteBuffer.putLong(int,
+// long)` actually executes:
+//
+//   | invocations | native                                     |
+//   |------------:|--------------------------------------------|
+//   |   4 800 000 | `java/nio/DirectByteBuffer.session()`       |
+//   |   3 200 000 | `ScopedMemoryAccess.putLongUnaligned(…)`    |
+//   |   1 600 000 | `java/nio/HeapByteBuffer.session()`         |
+//   |   1 600 000 | `ScopedMemoryAccess.getLongUnaligned(…)`    |
+//   |   1 600 000 | `ScopedMemoryAccess.putIntUnaligned(…)`     |
+//
+// which is exactly **two native calls per wide accessor** — `session()` (a
+// shim returning the constant `null`, registered for the checkcast reason
+// documented at its own registration in `native-builtins/src/lib.rs`) and the
+// `ScopedMemoryAccess` store itself. Against that, the single-byte
+// `put(int, byte)` already served here is **one** native call, and the two
+// measure 616 ns and 271 ns per operation on the same host and the same
+// binary. The arithmetic closes on ~290 ns per registered-native call: the
+// wide accessors are not paying for width, they are paying for the extra rung.
+//
+// Serving them here removes both rungs at once. The JDK's `getLong(int)` body
+// is `SCOPED_MEMORY_ACCESS.getLongUnaligned(session(), null, ix(checkIndex(i,
+// 8)), bigEndian)` inside a `reachabilityFence`, and every part of that is
+// reproduced below out of the same fields the byte accessors already read.
+//
+// The refusals are deliberately the SAME as the byte accessors': an
+// unresolvable layout, an out-of-range index, a read-only receiver, or an
+// address the memory layer declines all bail to the real class-file body, so
+// the exception this VM raises is always the JDK's own. See the block comment
+// above `DbbElemFields` for why that bail is also why these cannot claim LEAF.
+//
+// `DirectByteBufferR` overrides every `put*` with a throwing body, so the
+// hierarchy walk never reaches the `put` registrations for a read-only
+// receiver; the `for_write` check below is the belt to that braces.
+
+/// Resolve one wide absolute access: bounds-check `index` for `nb` bytes the
+/// way `Buffer.checkIndex(int, int)` does, and answer the element address plus
+/// the buffer's byte order.
+///
+/// `Buffer.checkIndex(i, nb)` is `Preconditions.checkIndex(i, limit - nb + 1,
+/// …)`, i.e. `0 <= i && i + nb <= limit`. Written as `index > limit - nb` so
+/// no addition can overflow for a hostile `index`.
+fn dbb_wide_addr(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    index: i32,
+    nb: i32,
+    for_write: bool,
+) -> Option<(i64, bool)> {
+    let fields = dbb_elem_fields(ctx)?;
+    let big_endian_slot = fields.big_endian?;
+    let mut vals = [Value::Int(0); 4];
+    ctx.get_fields_typed(
+        this,
+        &[
+            (fields.limit, b'I'),
+            (fields.address, b'J'),
+            (fields.is_read_only, b'Z'),
+            (big_endian_slot, b'Z'),
+        ],
+        &mut vals,
+    );
+    let Value::Int(limit) = vals[0] else {
+        return None;
+    };
+    if index < 0 || limit < nb || index > limit - nb {
+        return None;
+    }
+    if for_write {
+        // `Value::Int(0)` is the only shape that proves writability.
+        if !matches!(vals[2], Value::Int(0)) {
+            return None;
+        }
+    }
+    let Value::Int(be) = vals[3] else {
+        return None;
+    };
+    let Value::Long(address) = vals[1] else {
+        return None;
+    };
+    if address <= 0 {
+        return None;
+    }
+    // `index` is non-negative and `address` positive, so this cannot wrap.
+    Some((address.checked_add(i64::from(index))?, be != 0))
+}
+
+/// Read `nb` bytes (2, 4 or 8) at `addr` and assemble them in `big_endian`
+/// order into the low bits of an `i64`.
+fn dbb_wide_load(
+    ctx: &mut dyn NativeContext,
+    addr: i64,
+    nb: usize,
+    big_endian: bool,
+) -> Option<i64> {
+    let mut buf = [0u8; 8];
+    if !ctx.copy_from_native_memory(addr, &mut buf[..nb]) {
+        return None;
+    }
+    let mut acc: u64 = 0;
+    if big_endian {
+        for &b in &buf[..nb] {
+            acc = (acc << 8) | u64::from(b);
+        }
+    } else {
+        for (i, &b) in buf[..nb].iter().enumerate() {
+            acc |= u64::from(b) << (8 * i);
+        }
+    }
+    // Cast: a bit pattern; the caller narrows and extends per its Java type.
+    Some(acc as i64)
+}
+
+/// Store the low `nb` bytes of `bits` at `addr` in `big_endian` order.
+fn dbb_wide_store(
+    ctx: &mut dyn NativeContext,
+    addr: i64,
+    nb: usize,
+    big_endian: bool,
+    bits: i64,
+) -> bool {
+    let mut buf = [0u8; 8];
+    // Cast: a bit pattern, not a magnitude.
+    let raw = bits as u64;
+    for (i, slot) in buf[..nb].iter_mut().enumerate() {
+        let shift = if big_endian { 8 * (nb - 1 - i) } else { 8 * i };
+        // Cast: truncation to one byte is the intent.
+        *slot = (raw >> shift) as u8;
+    }
+    ctx.copy_to_native_memory(addr, &buf[..nb])
+}
+
+/// The Java-visible shape of one wide accessor: how many bytes it moves, and
+/// how the assembled bits become a `Value` (or come from one).
+#[derive(Clone, Copy)]
+enum WideKind {
+    /// `short` — sign-extended into an int slot.
+    Short,
+    /// `char` — zero-extended into an int slot.
+    Char,
+    Int,
+    Long,
+    Float,
+    Double,
+}
+
+impl WideKind {
+    fn width(self) -> usize {
+        match self {
+            WideKind::Short | WideKind::Char => 2,
+            WideKind::Int | WideKind::Float => 4,
+            WideKind::Long | WideKind::Double => 8,
+        }
+    }
+
+    /// Turn the loaded bits into the `Value` the descriptor promises.
+    fn to_value(self, bits: i64) -> Value {
+        match self {
+            // Cast chain: take the low 16 bits, then sign- or zero-extend, the
+            // way `getShort`/`getChar` differ in the JDK.
+            WideKind::Short => Value::Int(i32::from(bits as u16 as i16)),
+            WideKind::Char => Value::Int(i32::from(bits as u16)),
+            WideKind::Int => Value::Int(bits as i32),
+            WideKind::Long => Value::Long(bits),
+            WideKind::Float => Value::Float(f32::from_bits(bits as u32)),
+            WideKind::Double => Value::Double(f64::from_bits(bits as u64)),
+        }
+    }
+
+    /// Turn the argument `Value` into the bits to store, or `None` when the
+    /// operand is not the shape the descriptor declares — which bails to the
+    /// class-file body rather than storing a guess.
+    fn from_value(self, v: Value) -> Option<i64> {
+        Some(match (self, v) {
+            (WideKind::Short | WideKind::Char, Value::Int(x)) => i64::from(x as u16),
+            (WideKind::Int, Value::Int(x)) => i64::from(x as u32),
+            (WideKind::Long, Value::Long(x)) => x,
+            (WideKind::Float, Value::Float(x)) => i64::from(x.to_bits()),
+            // Cast: a bit pattern, re-read as an i64 by the store.
+            (WideKind::Double, Value::Double(x)) => x.to_bits() as i64,
+            _ => return None,
+        })
+    }
+}
+
+/// One registered wide getter. `name`/`descriptor` are used only to bail back
+/// to the class-file body, so they must match the registration exactly.
+fn dbb_wide_get(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    kind: WideKind,
+    name: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let Some(this) = arg_obj(args, 0) else {
+        return Ok(Some(kind.to_value(0)));
+    };
+    let Some(Value::Int(index)) = args.get(1).copied() else {
+        return ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]);
+    };
+    // Cast: `width()` is 2, 4 or 8.
+    let Some((addr, be)) = dbb_wide_addr(ctx, this, index, kind.width() as i32, false) else {
+        return ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]);
+    };
+    let Some(bits) = dbb_wide_load(ctx, addr, kind.width(), be) else {
+        return ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]);
+    };
+    Ok(Some(kind.to_value(bits)))
+}
+
+/// One registered wide setter. Returns `this`, as every `ByteBuffer.put*` does.
+fn dbb_wide_put(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    kind: WideKind,
+    name: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let Some(this) = arg_obj(args, 0) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (Some(Value::Int(index)), Some(raw)) = (args.get(1).copied(), args.get(2).copied()) else {
+        return ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]);
+    };
+    let Some(bits) = kind.from_value(raw) else {
+        return ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]);
+    };
+    // Cast: `width()` is 2, 4 or 8.
+    let Some((addr, be)) = dbb_wide_addr(ctx, this, index, kind.width() as i32, true) else {
+        return ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]);
+    };
+    if !dbb_wide_store(ctx, addr, kind.width(), be, bits) {
+        return ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]);
+    }
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1774,6 +2031,54 @@ fn dbb_commit_position(ctx: &mut dyn NativeContext, this: ObjectRef, new_positio
 /// Register the WP3.5 DirectByteBuffer + Cleaner natives.  Idempotent:
 /// safe to call multiple times.  See module docs for FQN list and
 /// caveats around partial WP1.10 Cleaner integration.
+/// Define and register the twelve wide absolute accessors.
+///
+/// The registry stores a bare `fn` pointer, so each triple needs its own
+/// monomorphic function — a closure capturing `name`/`descriptor` (which the
+/// bail path needs to reach the class-file body) cannot coerce to one. The
+/// macro writes those twelve functions so the table and the registrations
+/// cannot drift apart.
+macro_rules! dbb_wide_accessors {
+    (
+        get { $($gfn:ident => ($gname:literal, $gdesc:literal, $gkind:expr)),* $(,)? }
+        put { $($pfn:ident => ($pname:literal, $pdesc:literal, $pkind:expr)),* $(,)? }
+    ) => {
+        $(
+            fn $gfn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                dbb_wide_get(ctx, args, $gkind, $gname, $gdesc)
+            }
+        )*
+        $(
+            fn $pfn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                dbb_wide_put(ctx, args, $pkind, $pname, $pdesc)
+            }
+        )*
+        fn dbb_register_wide(r: &mut NativeMethodRegistry) {
+            $( r.register("java/nio/DirectByteBuffer", $gname, $gdesc, $gfn); )*
+            $( r.register("java/nio/DirectByteBuffer", $pname, $pdesc, $pfn); )*
+        }
+    };
+}
+
+dbb_wide_accessors! {
+    get {
+        dbb_get_short_abs  => ("getShort",  "(I)S", WideKind::Short),
+        dbb_get_char_abs   => ("getChar",   "(I)C", WideKind::Char),
+        dbb_get_int_abs    => ("getInt",    "(I)I", WideKind::Int),
+        dbb_get_long_abs   => ("getLong",   "(I)J", WideKind::Long),
+        dbb_get_float_abs  => ("getFloat",  "(I)F", WideKind::Float),
+        dbb_get_double_abs => ("getDouble", "(I)D", WideKind::Double),
+    }
+    put {
+        dbb_put_short_abs  => ("putShort",  "(IS)Ljava/nio/ByteBuffer;", WideKind::Short),
+        dbb_put_char_abs   => ("putChar",   "(IC)Ljava/nio/ByteBuffer;", WideKind::Char),
+        dbb_put_int_abs    => ("putInt",    "(II)Ljava/nio/ByteBuffer;", WideKind::Int),
+        dbb_put_long_abs   => ("putLong",   "(IJ)Ljava/nio/ByteBuffer;", WideKind::Long),
+        dbb_put_float_abs  => ("putFloat",  "(IF)Ljava/nio/ByteBuffer;", WideKind::Float),
+        dbb_put_double_abs => ("putDouble", "(ID)Ljava/nio/ByteBuffer;", WideKind::Double),
+    }
+}
+
 pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1914,6 +2219,17 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
         "(IB)Ljava/nio/ByteBuffer;",
         dbb_put_abs,
     );
+    // The WIDE absolute accessors — see the block comment above
+    // `dbb_wide_addr` for the invocation census that motivates them. Same
+    // receiver-class reasoning as the byte pair above: registered on
+    // `DirectByteBuffer` only, because `DirectByteBufferR` declares its own
+    // throwing `put*` bodies and inherits the getters.
+    //
+    // One named `fn` per triple rather than a loop over a table: the registry
+    // takes a bare `fn` pointer, so a closure that captured the name and the
+    // descriptor cannot be registered — and those two are exactly what the
+    // bail path needs to reach the class-file body.
+    dbb_register_wide(r);
     r.register("java/nio/DirectByteBuffer", "get", "()B", dbb_get_rel);
     r.register(
         "java/nio/DirectByteBuffer",

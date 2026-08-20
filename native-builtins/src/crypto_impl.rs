@@ -5173,10 +5173,15 @@ struct CurveParams {
 
 impl NistCurve {
     fn params(&'static self) -> &'static CurveParams {
+        // LOCK LEVEL (lock-discipline ratchet): `Scratch`. `params` takes
+        // `&'static self` and has no `NativeContext` at all, so the guard
+        // cannot span a re-entry into the VM by construction — the body under
+        // it is `hex_to_biguint` and a `Box::leak`, both pure.
         static CACHE: std::sync::OnceLock<
-            parking_lot::Mutex<std::collections::HashMap<&'static str, &'static CurveParams>>,
+            cratonvm_types::lock_order::OrderedPlMutex<std::collections::HashMap<&'static str, &'static CurveParams>>,
         > = std::sync::OnceLock::new();
-        let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let cache =
+            CACHE.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(std::collections::HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch));
         let mut guard = cache.lock();
         if let Some(found) = guard.get(self.name) {
             return found;

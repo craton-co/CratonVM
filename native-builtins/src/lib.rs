@@ -8263,79 +8263,26 @@ pub fn register_essential_natives_with_shims(
     register_xerces_cmstateset_intrinsics(registry);
     register_xerces_xml_parser_intrinsics(registry);
     register_liquibase_checksum_intrinsics(registry);
-    registry.register("java/lang/String", "indexOf", "(I)I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let ch = match args.get(1) {
-            Some(Value::Int(v)) => *v as u32,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let s = ctx.read_string(this).unwrap_or_default();
-        let needle = match char::from_u32(ch) {
-            Some(c) => c,
-            None => return Ok(Some(Value::Int(-1))),
-        };
-        for (i, c) in s.chars().enumerate() {
-            if c == needle {
-                return Ok(Some(Value::Int(i as i32)));
-            }
-        }
-        Ok(Some(Value::Int(-1)))
-    });
-    registry.register("java/lang/String", "lastIndexOf", "(I)I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let ch = match args.get(1) {
-            Some(Value::Int(v)) => *v as u32,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let s = ctx.read_string(this).unwrap_or_default();
-        let needle = match char::from_u32(ch) {
-            Some(c) => c,
-            None => return Ok(Some(Value::Int(-1))),
-        };
-        let mut last = -1i32;
-        for (i, c) in s.chars().enumerate() {
-            if c == needle {
-                last = i as i32;
-            }
-        }
-        Ok(Some(Value::Int(last)))
-    });
-    registry.register("java/lang/String", "lastIndexOf", "(II)I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let ch = match args.get(1) {
-            Some(Value::Int(v)) => *v as u32,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let from = match args.get(2) {
-            Some(Value::Int(v)) => *v as i32,
-            _ => 0,
-        };
-        let s = ctx.read_string(this).unwrap_or_default();
-        let needle = match char::from_u32(ch) {
-            Some(c) => c,
-            None => return Ok(Some(Value::Int(-1))),
-        };
-        let mut last = -1i32;
-        for (i, c) in s.chars().enumerate() {
-            let ii = i as i32;
-            if ii > from {
-                break;
-            }
-            if c == needle {
-                last = ii;
-            }
-        }
-        Ok(Some(Value::Int(last)))
-    });
+    // E27-1 N2c: these four were hand-rolled closures over
+    // `s.chars().enumerate()`, which yields a CODE POINT index, not a UTF-16
+    // one — `"x\u{10437}yz".indexOf('z')` answered 3 where HotSpot answers 4,
+    // off by one for every supplementary character before the hit, and `-1`
+    // for every lone surrogate (`char::from_u32` rejects them). They were
+    // copies six through NINE of a rule E18-1 had already put in exactly one
+    // place, `lang_string.rs`'s `code_point_needle`.
+    //
+    // Rewired rather than deleted. Deleting needs them to be unreachable in
+    // EVERY configuration, and they are only provably dead in two of the
+    // three: real-JDK mode drops them (they are `Bridge`-kind on
+    // `java/lang/String`, and `registry.rs`'s adjudication drops all but
+    // `intern`), and a `synthetic-jdk` build has
+    // `register_synthetic_overrides` re-register the same four later and win.
+    // The third — feature off, drop-real-layout off — has neither mechanism.
+    // Pointing them at the canonical natives is correct in all three and
+    // needs no such proof.
+    registry.register("java/lang/String", "indexOf", "(I)I", native_string_index_of);
+    registry.register("java/lang/String", "lastIndexOf", "(I)I", native_string_last_index_of_char);
+    registry.register("java/lang/String", "lastIndexOf", "(II)I", lang_string::native_string_last_index_of_from);
     registry.register(
         "java/lang/String",
         "lastIndexOf",
@@ -8357,35 +8304,7 @@ pub fn register_essential_natives_with_shims(
             }
         },
     );
-    registry.register("java/lang/String", "indexOf", "(II)I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let ch = match args.get(1) {
-            Some(Value::Int(v)) => *v as u32,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let from = match args.get(2) {
-            Some(Value::Int(v)) => *v as i32,
-            _ => 0,
-        };
-        let s = ctx.read_string(this).unwrap_or_default();
-        let needle = match char::from_u32(ch) {
-            Some(c) => c,
-            None => return Ok(Some(Value::Int(-1))),
-        };
-        for (i, c) in s.chars().enumerate() {
-            let ii = i as i32;
-            if ii < from {
-                continue;
-            }
-            if c == needle {
-                return Ok(Some(Value::Int(ii)));
-            }
-        }
-        Ok(Some(Value::Int(-1)))
-    });
+    registry.register("java/lang/String", "indexOf", "(II)I", lang_string::native_string_index_of_from);
 
     // KEEP (W3), with the risk bounded rather than hand-waved.
     // RKC16N.9: org/jboss/modules/Module.<clinit> PC 154 invokes
@@ -26511,45 +26430,13 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if ctx.heap_kind_of(this) == cratonvm_types::ObjectKind::Array {
         let class_id = ctx.class_id_of_object(this);
         let element_type = ctx.heap_element_type_of(this);
-        // Primitive-array type-name constants — `&'static str` so the eight
-        // common branches do not allocate at all (the previous code called
-        // `.to_string()` on each, adding a per-call heap alloc on every
-        // `Object.getClass()` against a primitive array).
-        const ARRAY_BOOLEAN: &str = "[Z";
-        const ARRAY_CHAR: &str = "[C";
-        const ARRAY_FLOAT: &str = "[F";
-        const ARRAY_DOUBLE: &str = "[D";
-        const ARRAY_BYTE: &str = "[B";
-        const ARRAY_SHORT: &str = "[S";
-        const ARRAY_INT: &str = "[I";
-        const ARRAY_LONG: &str = "[J";
-        // For primitive arrays we hold a `&'static str`; for reference
-        // arrays we synthesise the array descriptor (one alloc, unavoidable
-        // because the component class name is dynamic). `Cow` lets us pass
-        // either uniformly to `class_id_by_name` / `load_class` /
-        // `primitive_class_mirror` without an extra copy.
-        let array_class_name: std::borrow::Cow<'static, str> = match element_type {
-            cratonvm_types::ArrayElementType::Boolean => std::borrow::Cow::Borrowed(ARRAY_BOOLEAN),
-            cratonvm_types::ArrayElementType::Char => std::borrow::Cow::Borrowed(ARRAY_CHAR),
-            cratonvm_types::ArrayElementType::Float => std::borrow::Cow::Borrowed(ARRAY_FLOAT),
-            cratonvm_types::ArrayElementType::Double => std::borrow::Cow::Borrowed(ARRAY_DOUBLE),
-            cratonvm_types::ArrayElementType::Byte => std::borrow::Cow::Borrowed(ARRAY_BYTE),
-            cratonvm_types::ArrayElementType::Short => std::borrow::Cow::Borrowed(ARRAY_SHORT),
-            cratonvm_types::ArrayElementType::Int => std::borrow::Cow::Borrowed(ARRAY_INT),
-            cratonvm_types::ArrayElementType::Long => std::borrow::Cow::Borrowed(ARRAY_LONG),
-            cratonvm_types::ArrayElementType::Reference => {
-                // Component class_id is stored in the array header
-                let comp_name = ctx
-                    .class_name_of_id(class_id)
-                    .unwrap_or_else(|| "java/lang/Object".to_string());
-                if comp_name.starts_with('[') {
-                    // Multi-dimensional array: prepend another '['
-                    std::borrow::Cow::Owned(format!("[{comp_name}"))
-                } else {
-                    std::borrow::Cow::Owned(format!("[L{comp_name};"))
-                }
-            }
-        };
+        // The name computation moved to `lang_class::array_class_internal_name`
+        // (G69-1) so the reflection messages can ask the same question and get
+        // the same answer -- they were asking `class_name_of_id` instead, which
+        // on an array answers the COMPONENT's name. Still `Cow`, so the eight
+        // primitive branches still do not allocate.
+        let _ = element_type;
+        let array_class_name = crate::lang_class::array_class_internal_name(ctx, this);
         // Create a class mirror with the array type name.  We need a real
         // (non-primitive) class mirror so that `Class.isPrimitive()` returns
         // false and the identity matches the `Foo[].class` literal — both
@@ -27209,16 +27096,36 @@ fn native_object_wait_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let timeout_ms = match args.get(1) {
-        Some(Value::Long(ms)) => {
-            if *ms > 0 {
-                Some(*ms as u64)
-            } else {
-                None
-            }
-        }
-        _ => None,
+    let millis = match args.get(1) {
+        Some(Value::Long(ms)) => *ms,
+        // WP4.5 tag erasure, as in `native_thread_sleep`: a long popped
+        // generically comes back tagged Double with the bits intact.
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Int(i)) => *i as i64,
+        _ => 0,
     };
+    // G72-1: a NEGATIVE timeout is an error, not a long wait.
+    //
+    // This arm used to fold `ms <= 0` into `None`, and `monitor_wait` reads
+    // `None` as "wait forever" -- so `o.wait(-5)` on a held monitor parked the
+    // thread with nobody to notify it and the VM never exited. A hang is worse
+    // than a wrong value: it presents as "the application stopped", far from
+    // the call, and the ordinary way to reach it is `deadline - now()` on a
+    // deadline that has already passed.
+    //
+    // ZERO still means forever (JLS 17.2), which is why the test is `< 0` and
+    // not `<= 0`. The rule was already written down in the doc comment of
+    // `native_object_wait_timeout_nanos` directly below -- stated correctly and
+    // implemented in that function only.
+    if millis < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "timeout value is negative".to_string(),
+            }
+            .into(),
+        );
+    }
+    let timeout_ms = if millis > 0 { Some(millis as u64) } else { None };
     ctx.monitor_wait(this, timeout_ms)
 }
 
@@ -27252,7 +27159,10 @@ fn native_object_wait_timeout_nanos(
     if millis < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Object.wait: timeout value is negative".to_string(),
+                // NOT "timeout value is negative" -- that is `wait(long)`'s
+                // wording. The two-arg overload says `timeoutMillis`.
+                // Measured on Temurin 25.0.3; the pair is in `scratchpad/g74/Z.java`.
+                message: "timeoutMillis value is negative".to_string(),
             }
             .into(),
         );
@@ -27260,7 +27170,7 @@ fn native_object_wait_timeout_nanos(
     if !(0..=999_999).contains(&nanos) {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Object.wait: nanosecond timeout value out of range".to_string(),
+                message: "nanosecond timeout value out of range".to_string(),
             }
             .into(),
         );
@@ -37880,7 +37790,44 @@ fn native_heap_bytebuffer_allocate(
     args: &[Value],
 ) -> MethodCallResult {
     let capacity = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-    let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, capacity);
+    // Reclaim-and-retry, not one shot. `ByteBuffer.allocate` is shadowed by
+    // this native even in real-JDK mode, so the backing array does NOT go
+    // through `newarray` — it never sees the try / force-a-GC / try /
+    // last-ditch / try ladder that `gc_alloc_array` and `jit_newarray` run.
+    // It got one attempt and reported `OutOfMemoryError`.
+    //
+    // H2 `TestBenchmark` at `-Xmx1g` on ZGC is what that costs: MVStore's
+    // background writer grows a `WriteBuffer` to 10,616,832 bytes, the arena
+    // has no hole that big *at that instant* (498 KiB largest, 348 MB free and
+    // shredded across 30k spans), and the VM threw — with the heap 97% free
+    // once the collection that was never asked for finally ran. Repeating the
+    // identical `ByteBuffer.allocate` one Java statement later succeeded on the
+    // first try; the same class passes under `--nojit`, at `-Xmx2g`, and on the
+    // generational collector, which is the shape of a spurious refusal rather
+    // than an exhausted heap.
+    //
+    // Calling `reclaim_before_alloc_retry` is legal HERE specifically: this is
+    // the native's first allocation, so it holds no unpinned `ObjectRef` in a
+    // Rust local for a collection to dangle or sweep. See the trait method for
+    // why that precondition belongs to the caller. Everything allocated after
+    // this point is pinned (`bytes_pin` below), so a later failure must not
+    // reclaim — and does not.
+    let elem = cratonvm_types::ArrayElementType::Byte;
+    let bytes = match ctx.try_new_array(elem, capacity) {
+        Some(b) => b,
+        None => {
+            let retry = ctx.reclaim_before_alloc_retry();
+            match retry.then(|| ctx.try_new_array(elem, capacity)).flatten() {
+                Some(b) => b,
+                None => {
+                    return Err(RuntimeError::OutOfMemoryError {
+                        message: format!("Java heap space (ByteBuffer.allocate {capacity})"),
+                    }
+                    .into())
+                }
+            }
+        }
+    };
     let bytes_pin = ctx.pin_native_root(bytes);
     let bytes = ctx.read_native_pin(bytes_pin, bytes);
     let result = native_byte_buffer_wrap_bytes_offset_len(

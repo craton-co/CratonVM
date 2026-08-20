@@ -99,6 +99,20 @@ pub mod lookup_census {
     /// `resolve_id_with_descriptor_quirks` — the `#[cold]` rewrite arm.
     pub const QUIRKS: usize = 4;
     /// One bytecode-level invoke reaching `try_stackless_invoke`.
+    ///
+    /// **This is NOT a general per-invoke denominator, and `lookups_per_invoke`
+    /// must not be read as "registry probes per Java call".** Measured
+    /// 2026-08-18 on `probes/LambdaCompositionProbe.java` at four workload
+    /// sizes: `find` scaled perfectly linearly (151 254 / 231 254 / 391 254 /
+    /// 711 254) while this counter stayed pinned at **966 in all four runs**.
+    /// The lookups that workload generates do not come through this entry
+    /// point at all, so the printed ratio grew 162 -> 742 purely because the
+    /// numerator moved and the denominator could not.
+    ///
+    /// The reliable reading is the MARGINAL rate: run two sizes and divide the
+    /// difference in `find` by the difference in work. That gave exactly 4.0
+    /// lookups per composition stage, with a fixed ~71 k boot cost — a fact
+    /// the ratio line could not have produced at any single size.
     pub const INVOKE_STACKLESS: usize = 5;
     /// One call reaching `invoke_or_native`, the general resolver.
     pub const INVOKE_GENERAL: usize = 6;
@@ -166,8 +180,59 @@ pub mod lookup_census {
         }
     }
 
+    /// Tally of MISSED lookup triples — the question the ratio cannot answer:
+    /// not "how many", but "which".
+    ///
+    /// A miss is `find` returning `None` after both the exact probe and the
+    /// descriptor-quirk rewrite failed. Measured on `LambdaCompositionProbe`
+    /// those are ~100% of all `find` calls and exactly 4.0 per composition
+    /// stage, so the top rows here name the four — and a triple like
+    /// `java/util/concurrent/CompletableFuture.thenApply` identifies its caller
+    /// far more directly than a stack would. Which matters, because `perf`'s
+    /// dwarf unwinding through these frames yields bogus return addresses and
+    /// gives no callers at all.
+    ///
+    /// Behind the same `CRATONVM_DBG=native-lookups` gate, and allocating only
+    /// when it is on.
+    static MISSES: OnceLock<parking_lot::Mutex<std::collections::HashMap<String, u64>>> =
+        OnceLock::new();
+
+    /// Record one missed triple. Gated; a disabled run does not allocate.
+    #[inline]
+    pub fn note_miss(class_name: &str, method_name: &str, descriptor: &str) {
+        if !enabled() {
+            return;
+        }
+        record_miss(class_name, method_name, descriptor);
+    }
+
+    #[cold]
+    fn record_miss(class_name: &str, method_name: &str, descriptor: &str) {
+        let map = MISSES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let key = format!("{class_name}.{method_name}{descriptor}");
+        *map.lock().entry(key).or_insert(0) += 1;
+    }
+
+    /// The `n` most-missed triples, hottest first.
+    fn top_misses(n: usize) -> Vec<(String, u64)> {
+        let Some(map) = MISSES.get() else {
+            return Vec::new();
+        };
+        let mut v: Vec<(String, u64)> = map.lock().iter().map(|(k, c)| (k.clone(), *c)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(n);
+        v
+    }
+
     /// Print the census and the ratio it exists to produce. Safe to call when
     /// disabled — it prints nothing.
+    ///
+    /// **Read `lookups_per_invoke` with the caveat on [`INVOKE_STACKLESS`].**
+    /// It is lookups over *stackless-entry invokes*, not over Java calls, and
+    /// on a workload whose lookups arrive by another path the denominator is
+    /// constant while the numerator scales — which makes the ratio grow with
+    /// the workload and mean nothing. Take two sizes and use the marginal
+    /// rate.
     pub fn report(tag: &str) {
         if !enabled() {
             return;
@@ -188,6 +253,9 @@ pub mod lookup_census {
             "[native-lookups {tag}] lookups={lookups} invokes={invokes} \
              lookups_per_invoke={per_invoke:.2}{parts}"
         );
+        for (triple, count) in top_misses(12) {
+            eprintln!("[native-lookups {tag}] miss {count:>10}  {triple}");
+        }
     }
 }
 
@@ -2771,6 +2839,54 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
         Some(self.new_array(element_type, length))
     }
 
+    /// Reclaim the heap and report whether a retry is worth making, for a
+    /// native whose `try_new_array` / `try_new_ref_array` / `alloc_object`
+    /// just returned `None`.
+    ///
+    /// # Why this is not simply done inside the allocators
+    ///
+    /// The fallible native allocators deliberately do NOT collect. A native
+    /// holds raw `ObjectRef`s in Rust locals, and those are in no GC root set:
+    /// a collection triggered underneath one would relocate them (dangling the
+    /// locals) or sweep them (freeing live objects). See `runtime::native_oom`,
+    /// whose whole design follows from that rule. So the allocators get exactly
+    /// one attempt and then report failure — which is correct for them and, on
+    /// its own, wrong for the program.
+    ///
+    /// What the rule costs, measured: the interpreter's `gc_alloc_array` and
+    /// the JIT's `jit_newarray` both run a LADDER on a failed allocation —
+    /// retire the TLAB, force a collection, retry, `last_ditch_reclaim`, retry
+    /// again — and only then throw. A native allocating the same array gets no
+    /// ladder at all, so it reports `OutOfMemoryError` on the first refusal.
+    /// On H2 `TestBenchmark` (`-Xmx1g`, ZGC) that surfaced as a 10 MiB
+    /// `ByteBuffer.allocate` failing with the heap **97% free**: the arena had
+    /// no hole that big at that instant, the collection that would have opened
+    /// one had not been asked for, and repeating the identical allocation one
+    /// Java statement later succeeded immediately.
+    ///
+    /// # The precondition, which the CALLER owns
+    ///
+    /// Only call this when **this native holds no unpinned `ObjectRef` in a
+    /// Rust local** — i.e. at an allocation performed before the native has
+    /// acquired any heap reference, or with everything it holds pinned through
+    /// [`pin_native_root`](Self::pin_native_root). At that point the collection
+    /// is exactly as safe as the one the interpreter runs between two
+    /// bytecodes. A native that has already stashed a bare `ObjectRef` must NOT
+    /// call this; it must report OOM as before.
+    ///
+    /// That is why this is a separate call rather than a retry folded into the
+    /// allocators: the allocators cannot see their caller's locals, and the
+    /// caller can.
+    ///
+    /// Returns `false` when no reclamation was attempted or the heap is
+    /// GC-thrashing past the overhead limit — in which case the caller should
+    /// surface `OutOfMemoryError` without a retry, rather than spin. The
+    /// default is `false` so mock/non-VM contexts keep their current
+    /// single-attempt behaviour.
+    fn reclaim_before_alloc_retry(&mut self) -> bool {
+        false
+    }
+
     /// Component (element) class id of an array class `class_id`, or `None` if
     /// it is not an array class. Lets natives allocate a typed array matching a
     /// given array `Class` — e.g. `Arrays.copyOf(T[], n, a.getClass())` /
@@ -3143,7 +3259,46 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     }
 
     /// Read a Java String object back to a Rust String.
+    ///
+    /// LOSSY BY CONSTRUCTION for one input: a Rust `String` cannot hold an
+    /// unpaired UTF-16 surrogate, so any text containing one comes back with
+    /// U+FFFD substituted. That is fine wherever the result is only inspected
+    /// (a class name, a charset name, a flag) and wrong wherever it is handed
+    /// back to Java. Use [`read_string_units`] there.
     fn read_string(&self, obj: ObjectRef) -> Option<String>;
+
+    /// Read a Java String object as UTF-16 code units, losing nothing.
+    ///
+    /// The units-exact counterpart of [`read_string`], and the fourth member of
+    /// the units-exact family beside [`read_char_array_into`],
+    /// [`write_char_array_from`] and [`init_string_from_units`]. `G55-1` N3
+    /// nominated it because `native-collections` cannot decode a String itself
+    /// -- it does not depend on `native-builtins`, and a local decoder would be
+    /// a second encoding of the compact-string layout.
+    ///
+    /// The default is deliberately LOSSY -- it is `read_string` widened -- so
+    /// that no implementation regresses by not overriding it, and so the
+    /// surrogate hazard stays exactly where it already was for anyone who does
+    /// not. The VM overrides it with the real reader.
+    fn read_string_units(&self, obj: ObjectRef) -> Option<Vec<u16>> {
+        self.read_string(obj).map(|s| s.encode_utf16().collect())
+    }
+
+    /// Build a fresh Java String from UTF-16 code units, losing nothing.
+    ///
+    /// The write half of [`read_string_units`], and the reason a units-exact
+    /// READER alone would not have been enough: a value read without loss and
+    /// then written back through [`create_string`] is lossy again at the last
+    /// step. NOT [`init_string_from_units`], which fills an ALREADY-ALLOCATED
+    /// receiver and assumes the `char[]` layout -- a real JDK `String` is
+    /// `byte[]` plus a coder, so that default is wrong for the mode this
+    /// matters most in.
+    ///
+    /// Default is lossy for the same reason as above.
+    fn create_string_from_units(&mut self, units: &[u16]) -> ObjectRef {
+        let text = String::from_utf16_lossy(units);
+        self.create_string(&text)
+    }
 
     /// Return the raw Java `String.hashCode()` for a confirmed String object.
     /// `None` means "no hash was computed": `obj` is not a String, or an
@@ -8384,7 +8539,11 @@ impl NativeMethodRegistry {
         // we short-circuit: only walk the variant logic when the
         // descriptor *actually* has a quirk worth rewriting. Clean
         // descriptors return `None` with zero allocation.
-        Self::find_with_descriptor_quirks(self, class_name, method_name, descriptor)
+        let quirked = Self::find_with_descriptor_quirks(self, class_name, method_name, descriptor);
+        if quirked.is_none() {
+            lookup_census::note_miss(class_name, method_name, descriptor);
+        }
+        quirked
     }
 
     /// Cold path of `find`: try compatibility-rewritten descriptor

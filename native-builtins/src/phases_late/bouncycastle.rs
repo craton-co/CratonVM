@@ -8635,8 +8635,12 @@ struct BcSha256Slots {
 /// Keyed on `ClassId` rather than cached unconditionally because the same class
 /// name can be loaded by two class loaders (two `ClassId`s, two layouts); a
 /// mismatch simply re-resolves rather than reading the wrong slots.
-static BC_SHA256_SLOTS: std::sync::RwLock<Option<(u32, BcSha256Slots)>> =
-    std::sync::RwLock::new(None);
+/// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Both acquisitions copy a
+/// `Copy` payload out in the same statement; every `NativeContext` call in
+/// `bc_sha256_slots` (`class_id_of_object`, `declared_fields`) runs with no
+/// guard held.
+static BC_SHA256_SLOTS: cratonvm_types::lock_order::OrderedPlRwLock<Option<(u32, BcSha256Slots)>> =
+    cratonvm_types::lock_order::OrderedPlRwLock::new(None, cratonvm_types::lock_order::LockLevel::Scratch);
 
 fn bc_sha256_slots(
     ctx: &dyn NativeContext,
@@ -8644,11 +8648,9 @@ fn bc_sha256_slots(
 ) -> Result<BcSha256Slots, MethodCallFailed> {
     let class_id = ctx.class_id_of_object(this);
     let key = class_id.as_u32();
-    if let Ok(guard) = BC_SHA256_SLOTS.read() {
-        if let Some((cached_key, slots)) = *guard {
-            if cached_key == key {
-                return Ok(slots);
-            }
+    if let Some((cached_key, slots)) = *BC_SHA256_SLOTS.read() {
+        if cached_key == key {
+            return Ok(slots);
         }
     }
     let bad = |what: &str| -> MethodCallFailed {
@@ -8676,9 +8678,7 @@ fn bc_sha256_slots(
         x: index_of("X").ok_or_else(|| bad("X"))?,
         x_off: index_of("xOff").ok_or_else(|| bad("xOff"))?,
     };
-    if let Ok(mut guard) = BC_SHA256_SLOTS.write() {
-        *guard = Some((key, slots));
-    }
+    *BC_SHA256_SLOTS.write() = Some((key, slots));
     Ok(slots)
 }
 

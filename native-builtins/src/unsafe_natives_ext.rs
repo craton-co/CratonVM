@@ -4162,7 +4162,16 @@ mod unsafe_arena {
         next_addr: Mutex<i64>,
         /// Blocks whose REAL pointer has been handed to native code, and how
         /// many times. See [`ArenaStore::real_ptr`].
-        translated: Mutex<BTreeMap<i64, u64>>,
+        ///
+        /// LOCK LEVEL (lock-discipline ratchet): `Scratch`. Every acquisition
+        /// is a single statement over a `BTreeMap<i64, u64>` with no
+        /// `NativeContext` in scope.
+        ///
+        /// It is safely `Scratch` only BECAUSE the enclosing lock is
+        /// unordered: `real_ptr` holds `inner.write()` across this
+        /// acquisition. Same caveat the JFR tables carry — if `inner` is ever
+        /// given a level it must be a HIGHER one than this, never an equal.
+        translated: cratonvm_types::lock_order::OrderedPlMutex<BTreeMap<i64, u64>>,
     }
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4185,7 +4194,7 @@ mod unsafe_arena {
             Self {
                 inner: RwLock::new(BTreeMap::new()),
                 next_addr: Mutex::new(ARENA_BASE),
-                translated: Mutex::new(BTreeMap::new()),
+                translated: cratonvm_types::lock_order::OrderedPlMutex::new(BTreeMap::new(), cratonvm_types::lock_order::LockLevel::Scratch),
             }
         }
 

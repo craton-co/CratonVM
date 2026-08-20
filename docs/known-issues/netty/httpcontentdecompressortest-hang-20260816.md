@@ -1,324 +1,305 @@
-# `HttpContentDecompressorTest` — `testZipBomb` moves 256 MiB through `ByteBuffer` accessors that cost ~260 ns each
+# `HttpContentDecompressorTest` — every test PASSES; the wall is `snappy`, and it was never the `ByteBuffer` accessors
 
-**Status: OPEN, throughput. Diagnosed 2026-08-17** (was: observed but
-undiagnosed, 2026-08-16). Original measurement 2026-08-16 on commit
-`3ef3eb744`; diagnosis 2026-08-17 on `cf141b8a8`, Windows host, release build,
-G1, real-JDK mode, cross-checked against HotSpot 25 on the same host.
+**Status: OPEN on throughput, RE-DIAGNOSED 2026-08-18. The cause this page's
+previous title named is CLOSED and was not the class's wall.** Three things
+changed at once, so read them separately:
 
-## Summary
+* the `ByteBuffer` absolute accessors this page blamed are **fixed** — a wide
+  one was two native calls and is now one, measured 2.2-2.7x (§ "The
+  accessors, fixed");
+* the class no longer fails or hangs on its own terms — **all 8 tests report
+  SUCCESSFUL** when JUnit's per-method budget is lifted (§ "Every test
+  passes");
+* and 88% of the class's 642 s is **one parameterisation, `snappy`**, whose
+  cost is neither `writeZero` nor `ByteBuffer` (§ "The wall is snappy").
 
-| | found | ok | failed | wall |
-|---|---|---|---|---|
-| CratonVM G1 (isolated) | 0 | 0 | 0 | **HANG, rc=124 @ 180s** |
-| HotSpot 25 (isolated) | 8 | 8 | 0 | 11.8s |
+Measured 2026-08-18 on Azure host 2 (Linux x86_64, 8 cores, JDK 25), release
+build, one binary per arm, load average recorded beside every number.
+Cross-checked against HotSpot 25 on the same host and the same classpath.
 
-## It is one test, and it is slow rather than stuck
+## Every test passes
 
-The 2026-08-16 page could not say which of the four tests the process was
-inside, because the harness prints a line only for a *failing* test. Running
-the class under a per-test-progress launcher (`@@BEGIN` / `@@END` around every
-individual test) answers it in one run:
+`probes/PerTestProgressRunner.java` prints `@@BEGIN` before each individual
+test and `@@END` with its wall time, so a run killed at a cap still names what
+was in flight. The whole class, real-JDK mode, engine-default collector,
+`-Djunit.jupiter.execution.timeout.mode=disabled`, host load 3.9-6.5:
 
-```
-@@BEGIN  ...testZipBomb(java.lang.String)/[test-template-invocation:#1]
-@@END    FAILED 193144ms ...#1
-         java.util.concurrent.TimeoutException: testZipBomb timed out after 120 seconds
-@@BEGIN  ...testZipBomb(java.lang.String)/[test-template-invocation:#2]
-```
+| test | ms | 2026-08-17 page |
+|---|---:|---|
+| `testZipBomb` #1 `gzip` | 18 739 | **193 144** |
+| `testZipBomb` #2 `deflate` | 16 578 | not reached |
+| `testZipBomb` #3 `br` | 18 535 | not reached |
+| `testZipBomb` #4 `zstd` | 18 022 | not reached |
+| **`testZipBomb` #5 `snappy`** | **566 348** | not reached |
+| `testBrotliDecodingHonorsMaxAllocationAsOutputCap` | 3 531 | not reached |
+| `testInvokeReadWhenNotProduceMessage` | 6 | not reached |
+| `testFlowControlHandlerEmitsOneMessagePerRead` | 5 | not reached |
+| **class total** | **642 322** | HANG @ 180 s |
 
-Parameterization **#1 is `gzip`**. It takes 193 s, and JUnit's 120 s default
-timeout *does* fire on it; the harness's 180 s process cap then kills the run
-while `#2` (`deflate`) is starting. So this is not a hang and not a livelock —
-it is throughput, and the class needs five such parameterizations plus three
-other tests.
+Every one of the eight is `SUCCESSFUL`. There is no failure and no livelock in
+this class — only a budget it exceeds, and 88% of that budget is `#5`.
 
-## Where the 193 s goes
+`gzip` moving 193 s -> 18.7 s is `dev`'s accumulated work between 2026-08-17
+and 2026-08-18, not anything on this page's branch; the arithmetic below shows
+why this page's own fix could not have done it.
 
-`probes/NettyZipBombPhases.java` runs `testZipBomb`'s phases with a settable
-chunk count. Marginal cost per 1 MiB chunk:
+The class STILL exceeds the harness's cap — a 900 s run on 2026-08-18 with the
+suite runner's default JUnit budget reported `HANG=1` — so this page stays
+open. What it is open ON has changed completely.
 
-| phase | HotSpot | CratonVM | ratio |
-|---|---|---|---|
-| compress (`writeOutbound` of one 1 MiB `HttpContent`) | 4.3 ms/MiB | **345 ms/MiB** | 80x |
-| decompress | ~0.2 ms/MiB | ~15 ms/MiB | 75x |
+## The accessors, fixed
 
-Splitting the per-chunk work further (alloc / fill / pipeline write):
+### The census, re-taken
 
-| | HotSpot | CratonVM |
-|---|---|---|
-| `alloc.buffer(1 MiB)` | 2.8 ms/MiB | 1.3 ms/MiB |
-| **`buffer.writeZero(1 MiB)`** | **0.3 ms/MiB** | **534 ms/MiB** |
-| `ch.writeOutbound(...)` | 5.7 ms/MiB | 14.0 ms/MiB |
+`--dump-native-registry` reports a per-native invocation count.
+`probes/NioAccessorRate.java`, 1 600 000 operations per arm, current `dev`:
 
-`writeZero` is the whole cost, and it is **1780x**. It is not a codec problem —
-the zlib primitives are within 1.3x (`CRC32.update` 0.37 vs 0.04 ms/MiB,
-`Deflater.deflate` 5.42 vs 4.05 ms/MiB, `Deflater` SYNC_FLUSH loop 5.88 vs
-4.28 ms/MiB).
-
-## `writeZero` is a loop of `ByteBuffer` accessors, and each one is a native call
-
-`AbstractByteBuf.writeZero(int)` is `length >>> 3` calls to `_setLong`, i.e.
-**131 072 per MiB**, and the test moves 256 MiB — 33.5 million of them per
-parameterization. netty selects its *non-Unsafe* `PooledDirectByteBuf` here
-(see "What was ruled out"), whose `_setLong` is
-`java.nio.ByteBuffer.putLong(int, long)`, which CratonVM services with a
-registered native.
-
-`probes/NioAccessorRate.java`, same host:
-
-| op | HotSpot | CratonVM | ratio |
-|---|---|---|---|
-| `byte[]` store | 0.16 ns | 4.53 ns | 28x |
-| `ByteBuffer.put(int,byte)` direct | 0.29 ns | **282 ns** | 970x |
-| `ByteBuffer.put(int,byte)` heap | 0.45 ns | 221 ns | 490x |
-| `ByteBuffer.putInt(int,int)` direct | — | ~900 ns | — |
-| **`ByteBuffer.putLong(int,long)` direct** | 0.30 ns | **1088 ns** | **3600x** |
-| **`ByteBuffer.putLong(int,long)` heap** | 0.28 ns | **1058 ns** | **3800x** |
-| `ByteBuffer.getLong(int)` direct | 0.49 ns | 1430 ns | 2900x |
-
-131 072 x ~1090 ns is 143 ms/MiB from `putLong` alone; the `EmbeddedChannel`
-allocator's buffer measured 534 ms/MiB — the same shape at a different buffer
-kind. Either way 256 MiB of it does not fit in 180 s.
-
-## One `putLong` is SEVEN native calls
-
-`--dump-native-registry` reports a per-native invocation count, so the question
-"what does one accessor actually execute" is answerable without a profiler.
-Running `NioAccessorRate` (800 000 ops per arm) and dumping:
-
-| invocations | native | registered by |
-|---:|---|---|
-| 4 000 000 | `jdk/internal/util/Preconditions.checkIndex(IILjava/util/function/BiFunction;)I` | `native-builtins/src/preconditions.rs:404` |
-| 3 200 000 | `java/lang/ref/Reference.reachabilityFence(Ljava/lang/Object;)V` | `native-builtins/src/lib.rs:14012` |
-| 2 400 000 | `java/nio/DirectByteBuffer.session()Ljdk/internal/foreign/MemorySessionImpl;` | `native-builtins/src/lib.rs:19560` |
-| 1 600 000 | `jdk/internal/misc/ScopedMemoryAccess.putLongUnaligned(...)` | `native-builtins/src/lib.rs:15697` |
-| 800 000 | `java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;` | `native-io/src/direct_buffer.rs:1908` |
-| 800 000 | `java/nio/HeapByteBuffer.session()...` | `native-builtins/src/lib.rs:19560` |
-| 800 000 | `ScopedMemoryAccess.getLongUnaligned(...)` / `putIntUnaligned(...)` | `native-builtins/src/lib.rs:15679` |
-
-That is **~7 native calls for one `ByteBuffer.putLong(int,long)`**, at the
-~160 ns funnel cost each — which is where 1088 ns comes from, arithmetic that
-closes.
-
-And **three of the four hottest are trivial or literally constant**:
-
-* `Reference.reachabilityFence` is `black_box(arg); Ok(None)` — a no-op. HotSpot
-  intrinsifies it to *nothing at all*. 3.2 M calls, ~2 per accessor.
-* `DirectByteBuffer.session()` is `Ok(Some(Value::Object(None)))` — it returns
-  the constant `null`. 2.4 M calls.
-* `Preconditions.checkIndex(int,int,BiFunction)` is
-  `if (index < 0 || index >= length) throw; return index;`. 4 M calls.
-
-Together they are 9.6 M of the ~11.2 M native calls in that run. `put(int,byte)`
-at ~260 ns is the same story with fewer rungs.
-
-**A single-byte `put` already costs ~260-280 ns** — one native call, one stored
-byte. That per-call floor, multiplied by the rung count above, is the finding.
-
-## Two of the four rungs are FIXED (2026-08-17); the class is still over
-
-`Preconditions.checkIndex` and `Reference.reachabilityFence` are now bound to
-thin `*_DIRECT_FN` helpers (`jit_preconditions_check_index_direct`,
-`jit_reachability_fence_direct`) instead of going through the generic native
-funnel. Measured on `probes/HotNativeRungRate.java`, same host, HotSpot 25 for
-scale:
-
-Measured as a SAME-BINARY A/B on the kill switch
-(`CRATONVM_JIT='-census-direct-helpers'`, default on), which is the only form
-of this comparison that is trustworthy — see "A cross-binary A/B is not an A/B"
-below:
-
-| rung | HotSpot | helpers off | helpers on | ratio |
-|---|---|---|---|---|
-| `Objects.checkIndex` (-> `Preconditions.checkIndex`) | 0.27 ns | 143.58 ns | **23.71 ns** | **6.1x** |
-| `Reference.reachabilityFence` | 0.28 ns | 150.73 ns | **23.51 ns** | **6.4x** |
-
-The invocation census confirms it is the bind and not the timing:
-`Preconditions.checkIndex` 4 000 000 -> **1 174** invocations,
-`Reference.reachabilityFence` 3 200 000 -> **163 090**; and the bind counter
-goes `checkIndex=2 reachabilityFence=2` to `0 0` with the switch.
-
-### A cross-binary A/B is not an A/B
-
-The first numbers taken for this section were 352 ns and 361 ns "before", giving
-18x and 19x. They were measured against the binary in the main worktree, which
-was **a day older than the branch** — so they carried every unrelated change
-that landed on `dev` in between, and they overstate the effect by ~2.5x. The
-same mistake showed up much more loudly on CratonBench, where that pairing
-reported ~13-19% "regressions" on `arithmetic` and `fib` — phases that contain
-no `checkIndex` and no `reachabilityFence` call at all, so the binds cannot
-have caused them.
-
-The kill switch was added for exactly this reason: one binary, one gate. The
-6.1x/6.4x above are that measurement.
-
-**THREE doors, and only the third one mattered for the fence.** Wiring the
-single-pass ladder and the IR path left the counter at
-`Preconditions.checkIndex=2 Reference.reachabilityFence=0` while the fence's
-cost sat unchanged at 142 ns. `checkIndex` had landed anyway because it is
-reached through `Objects.checkIndex`, a JDK method the method-entry door
-compiles, so the bind happened inside the callee; `reachabilityFence` has no
-such intermediary and a hot loop calls it directly — and a hot loop's body is
-compiled by the **OSR door** in
-`vm/src/runtime/interpreter/jit_bridge.rs::compile_osr_artifact`, which runs its
-own callee-binding loop rather than `jit::try_compile`'s ladder. Only after
-wiring that third door did the fence move 142 -> 18.88 ns.
-`CRATONVM_DBG=jit-method-stats` now prints
-`JIT thin direct-helper binds: ...` unconditionally, including at zero, so this
-is a counter question rather than a timing question.
-
-**CratonBench is unaffected, and the census says so without the clock.** With
-the helpers on, CratonBench binds **zero** sites
-(`Preconditions.checkIndex=0 Reference.reachabilityFence=0`) and neither native
-is invoked in either arm — it has no call sites for them. Every phase's checksum
-is identical across HotSpot, helpers-off and helpers-on. That matters because
-the host's own spread on a FIXED configuration reached 74% on `arithmetic`
-(7526 ms against 13088 ms, same binary, same flags), which is larger than any
-per-phase effect a timing A/B could have claimed. On a loaded host the bind
-counter and the invocation census answer "did this touch the workload" and the
-clock does not.
-
-**End to end, this did not retire the page.** Interleaved, two rounds,
-`NettyZipBombPhases gzip 32`: compress 21389/15653 ms before against
-18508/16580 ms after — inside the noise. `ByteBuffer` accessors improved
-roughly 1.5-2.4x (direct `putLong` ~1400 -> ~1000 ns, heap `put(byte)` ~283 ->
-~114 ns), which is what removing 2 rungs of ~6 predicts, and not enough.
-
-**The census head has moved, and names the remaining work:**
-
-| invocations (800 000 ops) | native |
+| invocations | native |
 |---:|---|
-| 2 400 000 | `java/nio/DirectByteBuffer.session()Ljdk/internal/foreign/MemorySessionImpl;` |
-| 1 600 000 | `jdk/internal/misc/ScopedMemoryAccess.putLongUnaligned(...)` |
-| 800 000 | `ScopedMemoryAccess.getLongUnaligned` / `putIntUnaligned` |
-| 800 000 | `java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;` |
+| 4 800 000 | `java/nio/DirectByteBuffer.session()` |
+| 3 200 000 | `jdk/internal/misc/ScopedMemoryAccess.putLongUnaligned(…)` |
+| 1 600 000 | `java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;` |
+| 1 600 000 | `java/nio/HeapByteBuffer.session()` |
+| 1 600 000 | `ScopedMemoryAccess.getLongUnaligned(…)` |
+| 1 600 000 | `ScopedMemoryAccess.putIntUnaligned(…)` |
+| 83 140 | `java/lang/ref/Reference.reachabilityFence(…)` |
+| 1 187 | `jdk/internal/util/Preconditions.checkIndex(…)` |
 
-`session()` is the new number one and is `Ok(Some(Value::Object(None)))` — it
-returns the constant `null` — but it is an **`invokevirtual`**, so it cannot use
-the `invoke_kind == 3` bind these two used; it needs the guarded-virtual direct
-call (`JitDirectCall::guard_class_id`) or a receiver-typed variant.
-`ScopedMemoryAccess.*Unaligned` is the actual store and must stay a native, but
-one native per accessor is the floor, and a thin helper would price it at ~15 ns
-rather than ~160.
+The last two rows are the 2026-08-17 thin-helper binds, confirmed live by the
+census rather than by a clock: 4 000 000 -> 1 187 and 3 200 000 -> 83 140.
 
-### The next two rungs cannot be bound until the IR path can spill arguments
+Divide through and the ratios are exact, which is what makes the rest of this
+section arithmetic rather than a hypothesis:
 
-Attempted 2026-08-17 and **reverted**, with the census as the reason. Thin direct
-helpers for the two names at the head of the table above — `Buffer.session()`
-(constant `null`) and `ScopedMemoryAccess.putIntUnaligned`/`getIntUnaligned` (the
-store and load themselves) — were written and bound in the single-pass ladder and
-in the OSR door, exactly like `checkIndex` and `reachabilityFence`. They bound
-**one** site between them, and the invocation census was byte-identical with the
-switch on and off:
+* one **wide** absolute accessor = **2** native calls (`session()` plus the
+  `ScopedMemoryAccess` store);
+* one **byte** absolute accessor = **1** native call (`DirectByteBuffer.put(IB)`,
+  served in `native-io/src/direct_buffer.rs` since 2026-08-05).
 
-| invocations (200 000 ops) | helpers ON | helpers OFF |
-|---|---:|---:|
-| `DirectByteBuffer.session()` | 1 200 000 | 1 200 000 |
-| `ScopedMemoryAccess.putLongUnaligned` | 800 000 | 800 000 |
-| `ScopedMemoryAccess.putIntUnaligned` | 400 000 | 400 000 |
-| `HeapByteBuffer.session()` | 399 999 | 400 000 |
+And the measured costs, same binary, same run: direct `putLong` **290 ns**,
+direct `put(byte)` **121 ns**. Two rungs against one, at ~145 ns per rung. The
+accessors were never paying for WIDTH. They were paying for the extra rung.
 
-The reason is the **third door again, but a different third door**: these JDK
-accessor methods are compiled by the OPTIMIZING (IR) pipeline
-(`CRATONVM_DBG_IR_COMPILES=1` shows `HeapByteBuffer.put`, `HeapByteBuffer.ix`,
-`DirectByteBuffer.putInt` each "admitted to the optimizing pipeline"), and the IR
-path has no thin-helper bind for a virtual site — nor can it get one for these:
-`ir_lower::emit_direct_cross_call` is register-only and requires
-`num_args + needs_context <= ENTRY_ABI_REGS.len()`, which is **4 on Windows**.
-`putIntUnaligned` needs 7 (receiver + five arguments + the context pointer).
+That also retires this page's own headline number. It said `putLong` cost
+1088 ns and `put(byte)` 282 ns; on current `dev` at a comparable host load they
+are 290 and 121. Those numbers moved with the host and with `dev`, and the
+earlier ones were taken at a load this page did not record.
 
-So the next step for this page is not another helper. It is **stack-argument
-marshalling in the IR direct-call lowering**, for which the single-pass
-`x64::frames::emit_stack_arg_setup` (Win64 shadow space, 16-byte alignment,
-materialise-stack-args-then-registers) is a working model. Only after that can
-the store rungs be priced.
+### The fix, and its A/B
+
+`java/nio/DirectByteBuffer`'s wide absolute accessors — `get/putShort`,
+`get/putChar`, `get/putInt`, `get/putLong`, `get/putFloat`, `get/putDouble` —
+are now served alongside the byte pair already there, out of the same fields
+plus `bigEndian`. That collapses `session()` and the `ScopedMemoryAccess` store
+into one native call.
+
+Interleaved, two rounds, one binary per arm, host load 5.5-5.8:
+
+| arm | before r1 | after r1 | before r2 | after r2 |
+|---|---:|---:|---:|---:|
+| direct `putInt` | 288.65 | **131.19** | 290.37 | **131.40** |
+| direct `putLong` | 299.42 | **132.31** | 290.66 | **136.92** |
+| direct `getLong` | 311.53 | **116.75** | 317.85 | **120.15** |
+| *control* direct `put(byte)` | 121.09 | 119.46 | 122.36 | 120.88 |
+| *control* heap `put(byte)` | 37.03 | 36.00 | 36.34 | 41.52 |
+| *control* heap `putLong` (not served) | 393.69 | 376.46 | 391.28 | 415.50 |
+
+**2.2-2.7x**, and the three controls do not move — including heap `putLong`,
+which is the same width through the same two rungs on a class this change does
+not register. A repeat in a different window reproduced it exactly: 290.30 ->
+134.02 (`putLong`), 384.96 -> 116.28 (`getLong`).
+
+The refusals are the byte accessors' refusals — unresolvable layout, index out
+of range, read-only receiver, an address the memory layer declines — so the
+exception this VM raises is always the JDK class-file body's own.
+
+### It does not move this class, and the census said so first
+
+Interleaved A/B on the class's actual work, `NettyZipBombPhases snappy 8`, G1,
+two rounds: 18 586 / 18 716 ms before against 18 734 / 23 075 ms after — inside
+the run-to-run spread, with the spread itself larger than any effect.
+
+That is not a disappointment, it is a prediction confirming. The native census
+of the snappy phase (below) shows the path uses `DirectByteBuffer.get(int)` —
+the BYTE accessor, one native call, served since 2026-08-05 — 4 261 826 times,
+and the wide accessors barely at all.
+
+**An earlier reading of this same comparison claimed 1.45x, and it was wrong.**
+Two rounds under the engine-default collector gave 14 629 / 15 740 ms before
+against 10 083 / 10 043 after, which looks like a clean result and is not one:
+repeating the baseline in a later window put the *unchanged* binary at
+10 936 ms. The host drifted between the pairs. The accessor table above
+survives that test — it reproduces at two different loads with its own controls
+flat — and this one did not.
+
+## The wall is snappy
+
+`testZipBomb`'s five parameterisations are the encodings netty offers: `gzip`,
+`deflate`, `br`, `zstd`, `snappy`. The first four are 16-19 s each. The fifth
+is 566 s.
+
+`NettyZipBombPhases` reproduces it away from JUnit, 8 MiB, G1, host load ~5:
+
+| | CratonVM | HotSpot 25 | ratio |
+|---|---:|---:|---:|
+| `snappy` compress | 6 650 ms | 158 ms | **42x** |
+| `snappy` decompress | 11 643 ms | 193 ms | **60x** |
+| `gzip` compress (16 MiB) | 885 ms | 131 ms | 6.8x |
+| `gzip` decompress (16 MiB) | 358 ms | 53 ms | 6.8x |
+
+`gzip` is 6.8x because its kernel is this VM's zlib natives, which are near
+parity. `snappy` is netty's own pure Java — so it measures compiled-Java
+throughput on a byte-shuffling loop, and there it is **7-9x worse than this
+VM's general ratio**. That gap is the thing to explain; the 6.8x is not.
+
+### What snappy executes: 26.7 M native calls per 4 MiB
+
+`--dump-native-registry` on `NettyZipBombPhases snappy 4`:
+
+| invocations | native |
+|---:|---|
+| **21 368 822** | `java/lang/invoke/VarHandle.get([Ljava/lang/Object;)Ljava/lang/Object;` |
+| 4 261 826 | `java/nio/DirectByteBuffer.get(I)B` |
+| 523 872 | `java/lang/invoke/VarHandle.set([Ljava/lang/Object;)V` |
+| 197 536 | `java/nio/DirectByteBuffer.put(IB)Ljava/nio/ByteBuffer;` |
+| 132 791 | `java/lang/Enum.ordinal()I` |
+| | **26 673 142 total** |
+
+That is **~5.1 `VarHandle.get` and ~1 `DirectByteBuffer.get` per output byte**.
+
+`VarHandle.get` is netty 4.2's reference-count check: `AbstractByteBuf`'s
+checked accessors call `ensureAccessible()` -> `refCnt()`, and in 4.2 that
+field is read through a `VarHandle` rather than the `AtomicIntegerFieldUpdater`
+the 2026-08-17 page measured. That page saw this and parked it — "`refCnt` is a
+real and large defect for every *checked* netty accessor; it is just not this
+page's". It is this page's now: with `writeZero` no longer the cost, the
+checked accessors are what is left.
+
+A `perf record` of the same phase agrees and adds nothing a counter did not.
+The profile is flat and its head is the funnel itself —
+`try_jit_site_cached_native_dispatch` 6.9%, `forward_jit_reference_args` 3.8%,
+`try_varhandle_instance_field_read` 3.2%, `safe_native_call_impl` 2.5% — plus
+ZGC's `is_object_address` and `ZObjectStarts::contains` at 10% combined, which
+is the same funnel's receiver validation.
+
+There is already a fast path for this native
+(`vm/src/jit/helpers.rs::try_varhandle_instance_field_read`, keyed on the
+handle's identity hash, no name lookup). It sits INSIDE the generic funnel, so
+it saves the field resolution and pays the ~145 ns call floor anyway. Pricing
+it the way `Preconditions.checkIndex` and `Reference.reachabilityFence` were
+priced — a thin `*_DIRECT_FN` bind, measured at 143 -> 23 ns for those two — is
+the next measurable step. By the arithmetic above it is worth roughly a quarter
+of this class, not all of it.
+
+### The collector is not the variable
+
+G1 against ZGC on the same snappy phase, both arms: 18 586 / 18 716 (G1)
+against 17 607 / 16 520 (ZGC). The
+`every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817`
+residual is ZGC-only and would have shown here as a G1 advantage; it does not.
+`getfield helper calls: 35 287 469` in a 12 s snappy run is real and is that
+page's, but it is not what separates these arms.
+
+## The IR stack-argument blocker is CLOSED
+
+The 2026-08-17 page ended by naming one blocker: `emit_direct_cross_call` in
+the IR (optimizing) backend was register-only and required
+`num_args + needs_context <= ENTRY_ABI_REGS.len()`, which is 4 on Windows, so
+`ScopedMemoryAccess.putIntUnaligned` — receiver plus five arguments plus the
+context pointer, seven slots — could not be bound to a thin helper at the door
+that compiles it.
+
+It marshals arguments past the register file onto the stack now, mirroring the
+single-pass backend's `x64::frames::emit_stack_arg_setup` exactly: reserve the
+block (Win64 shadow space included, rounded to 16 so the `CALL` stays aligned),
+materialise the stack arguments through RAX first, then the register arguments,
+then `CALL`, then release. Every source is `[rbp - off]`, which `SUB RSP` does
+not disturb.
+
+Two things that were true before and still are, because they are why this is
+sound:
+
+* the CALLEE side is unchanged — `lower()` still refuses a graph with more
+  parameters than `incoming_abi_reg_capacity()`, so a JIT-compiled callee with
+  more parameters than the register file can only have a SINGLE-PASS body, and
+  that prologue reads stack-passed parameters through `emit_load_caller_arg` at
+  the offsets `stack_arg_block_size` writes them to;
+* a thin `extern "C"` VM helper reads its stack arguments the way the platform
+  C ABI says, and always could.
+
+Pinned by `a_direct_call_past_the_register_file_marshals_its_tail_on_the_stack`
+and its narrow-path sibling in `jit/src/ir_lower.rs`, and verified by BREAKING
+what they guard: restoring the old register-file gate fails the first and
+leaves the second passing.
+
+Note what this does NOT do. With the wide accessors served natively the
+`ScopedMemoryAccess` rungs are off the `DirectByteBuffer` path entirely, so
+nothing on that path uses the new lowering. Its live consumer is the ordinary
+one — any statically-bound Java callee with more arguments than the register
+file, whose `direct_calls` entry the binding side had already resolved and the
+lowerer silently dropped.
 
 ## What was ruled out, with the measurement that ruled it out
 
-* **Per-byte storage re-resolution in `servlet.rs`.** `s2_bb_write8` /
-  `s2_bb_read8` really did call `s2_bb_put_byte` / `s2_bb_get_byte` once per
-  byte, each re-resolving the backing store through up to three NAME-keyed field
-  lookups (`hb`, `offset`, `address`) — 8x redundant work per `putLong`. It
-  looked like the answer. Rewriting all six accessors to resolve storage ONCE
-  (`s2_bb_read_n` / `s2_bb_write_n`, landed 2026-08-17) moved `direct putLong`
-  from 918 to 943 and from 864 to 877 ns/op, interleaved, two rounds — nothing.
-  **The reason is that those natives are not on this path at all.** The
-  invocation census above shows the real-JDK `DirectByteBuffer` / `HeapByteBuffer`
-  bytecode running instead, served by `native-io/src/direct_buffer.rs` and the
-  `ScopedMemoryAccess` / `session` / `Preconditions` / `reachabilityFence`
-  natives; `java/nio/ByteBuffer.putLong` (the `servlet.rs` registration) records
-  **zero** invocations in the probe. The rewrite is kept — it is strictly less
-  work on the paths it *does* serve and it is pinned by
-  `probes/NioAccessorOracle.java` — but it is **not** a fix for this page, and
-  the census, not the microbenchmark, is what proved that. Ask
-  `--dump-native-registry` which native actually serves a call before optimizing
-  one.
-* **netty refusing `sun.misc.Unsafe`.** netty does select the non-Unsafe
-  `PooledDirectByteBuf` on CratonVM, and `-Dio.netty.noUnsafe=false` cuts the
-  compress phase 11499 -> 1735 ms (6.6x). But **HotSpot 25 reports the identical
-  `hasUnsafe()=false` with the identical cause** — "sun.misc.Unsafe: unavailable
-  (io.netty.noUnsafe=true by default on Java 25+)". That is netty's own Java-25
-  policy on both VMs, so the non-Unsafe path is the path HotSpot also takes, and
-  HotSpot still runs `writeZero` at 0.3 ms/MiB. Not a CratonVM defect, and not a
-  legitimate accommodation either.
-* **The compression codec.** See the zlib table above — 1.3x.
-* **Leak detection / `refCnt` on this path.** netty's own
-  `-Dio.netty.buffer.checkAccessible=false` drops `ByteBuf.setByte` from 3065 to
-  668 ns, so the `ensureAccessible()` -> `refCnt()` ->
-  `AtomicIntegerFieldUpdater.get` chain *is* ~2400 ns per checked accessor
-  (`AIFU.get` alone measures 701 ns against HotSpot's 0.21, and
-  `AIFU.compareAndSet` 752 ns against 4.66). But `writeZero` uses the unchecked
-  `_setLong`, and its cost was **unchanged** by that switch — 1097 / 1068 /
-  1101 ns across baseline, `checkAccessible=false`, and `+checkBounds=false`.
-  `refCnt` is a real and large defect for every *checked* netty accessor; it is
-  just not this page's.
-
-## What would fix it
-
-The per-call native floor. Two in-tree data points size the prize, measured in
-one process and in both compile doors: `AtomicInteger.getAndIncrement`, which
-has a JIT intrinsic, costs **5.3 ns**; `AtomicInteger.get`, which does not,
-costs **160 ns**. The same funnel prices every other trivial accessor —
-`sun.misc.Unsafe.getInt` 573 ns, `Unsafe.getIntVolatile` 614 ns,
-`Enum.ordinal` 222 ns, `Object.getClass` 220 ns, `Object.equals` 190 ns,
-`Object.hashCode` 173 ns — all registered natives whose real JDK bodies are one
-or two bytecodes.
-
-Bringing `ByteBuffer`'s absolute accessors onto that intrinsic ladder, or onto
-the thin `*_DIRECT_FN` helper pattern already used for `Integer.valueOf`,
-`Integer.intValue`, the two `HashMap` fast paths and `Thread.currentThread`, is
-what takes `writeZero` from 534 ms/MiB to something that fits: at the intrinsic
-rate the 33.5 M `putLong` calls per parameterization cost ~0.2 s instead of
-~36 s.
-
-Note the scope caveat recorded at the IR direct-call site in `jit/src/lib.rs`:
-those six existing helpers are still single-pass-only, and wiring one into the
-optimizing tier "changes what the optimizing tier emits on a measured hot path".
-Any such addition needs an interleaved A/B at both doors.
+* **`writeZero`, and the 1780x this page was built on.** The 2026-08-17 page
+  measured `buffer.writeZero(1 MiB)` at 534 ms/MiB against HotSpot's 0.3 and
+  called it "the whole cost". On current `dev` the enclosing compress phase is
+  **55 ms/MiB**, and the wide-accessor fix — exactly the fix that hypothesis
+  prescribed — does not move it at all. The `EmbeddedChannel` allocator's
+  buffer is not reached through `ByteBuffer.putLong` on this path; the census
+  names `DirectByteBuffer.get(int)` and `VarHandle.get` instead.
+* **netty refusing `sun.misc.Unsafe`.** Unchanged from 2026-08-17: HotSpot 25
+  reports the identical `hasUnsafe()=false` with the identical cause, so the
+  non-Unsafe path is the path HotSpot also takes.
+* **The compression codec, for `gzip`.** Still within 1.3x — and that is
+  precisely why `snappy`, which has no native kernel, is 42-60x while `gzip` is
+  6.8x.
+* **The collector.** See "The collector is not the variable".
 
 ## Repro
 
 ```bash
 cd apps/netty-suite-runner
 printf 'io.netty.handler.codec.http.HttpContentDecompressorTest\n' > /tmp/one.txt
-./run-netty-suite.sh --list /tmp/one.txt --gc g1 --shards 1 --out runs/repro
-./run-netty-suite.sh --list /tmp/one.txt --hotspot --shards 1 --out runs/repro
+./run-netty-suite.sh --list /tmp/one.txt --gc g1 --shards 1 --timeout 900 --out runs/repro
 ```
 
-The three probes that carry the numbers above (compile against the suite
-classpath in `apps/netty-suite-runner/cp-javac.args`):
+Per-test decomposition, which is the only form that says WHICH test the budget
+went to (the suite harness prints a line only for a failing test):
 
 ```bash
-cratonvm --java-home <jdk> @common.args NettyZipBombPhases gzip 32
-cratonvm --java-home <jdk> @common.args NioAccessorRate 4000000 40
-cratonvm --java-home <jdk> -cp . NioAccessorOracle   # must print HotSpot's TOTAL exactly
+cratonvm --java-home <jdk> -cp <suite-cp> -Djunit.jupiter.execution.timeout.mode=disabled PerTestProgressRunner io.netty.handler.codec.http.HttpContentDecompressorTest
 ```
+
+The probes that carry the numbers above:
+
+```bash
+cratonvm --java-home <jdk> -cp <suite-cp> NettyZipBombPhases snappy 8
+```
+
+```bash
+cratonvm --java-home <jdk> -cp <suite-cp> NioAccessorRate 800000 20
+```
+
+```bash
+cratonvm --java-home <jdk> -cp <suite-cp> --dump-native-registry=/tmp/reg.json NettyZipBombPhases snappy 4
+```
+
+```bash
+cratonvm --java-home <jdk> -cp . NioAccessorOracle
+```
+
+`NioAccessorOracle` must print HotSpot's TOTAL exactly; it is the correctness
+pin for every accessor this page touches.
 
 ## Related
 
 * `httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`,
   `httpresponsestatustest-exhaustive-loop-timeout-20260816.md` — the other two
-  `codec-http` walls from the same batch. Different mechanism: those are
-  compiled-code call cost, this one is native-call cost.
+  `codec-http` walls from the same batch. After this re-diagnosis they are the
+  SAME mechanism as what is left here rather than a different one: per-call
+  cost in compiled code.
+* `every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md`
+  — owns the ZGC `getfield` residual this class also pays.
 * `adaptive-bytebuf-allocator-throughput-20260812.md` — the same per-entry
   transfer machinery, reached from a different netty class.

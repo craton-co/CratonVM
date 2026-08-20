@@ -1921,6 +1921,14 @@ fn execute_string_concat<S: AsRef<[u16]>>(
                 };
                 match units {
                     Some(u) => result.extend_from_slice(&u),
+                    // A boxed `Character` can itself BE an unpaired surrogate,
+                    // and `value_to_string` renders one through a Rust `char`,
+                    // which cannot hold it -- `"" + Character.valueOf('\u{d800}')`
+                    // came out as `?`, not even U+FFFD. It is one unit by
+                    // definition, so emit it directly.
+                    None if boxed_char_unit(shared, &arg_val).is_some() => {
+                        result.push(boxed_char_unit(shared, &arg_val).unwrap_or(0));
+                    }
                     None => {
                         let s = value_to_string(shared, Some(thread), &arg_val, arg_type);
                         result.extend(s.encode_utf16());
@@ -3048,6 +3056,37 @@ fn execute_record_object_method(
 /// primitives via their textual form, references via the VIRTUAL `toString`
 /// (`String.valueOf`, i.e. `null` → "null", else `component.toString()`). The
 /// String content fast path avoids a Java invoke for the common case.
+/// The single UTF-16 unit of a boxed `java.lang.Character`, or `None` for
+/// anything else.
+///
+/// Exists because that one wrapper is the only object whose whole value can be
+/// an unpaired surrogate, which no `String`-returning renderer can carry.
+fn boxed_char_unit(shared: &SharedVm, val: &Value) -> Option<u16> {
+    let Value::Object(Some(obj)) = val else {
+        return None;
+    };
+    if shared.mem.heap.kind_of(*obj) == crate::memory::heap::ObjectKind::Array {
+        return None;
+    }
+    if shared.mem.heap.get_header(*obj).num_slots() as usize != 1 {
+        return None;
+    }
+    let name = shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(shared.mem.heap.class_id_of(*obj))
+        .map(|c| c.name.clone())
+        .unwrap_or_default();
+    if name.as_ref() != "java/lang/Character" {
+        return None;
+    }
+    match shared.mem.heap.get_field(*obj, 0) {
+        Value::Int(v) => Some(v as u16),
+        _ => None,
+    }
+}
+
 fn value_to_string_deep(
     ctx: &mut NativeContextImpl<'_>,
     v: &Value,

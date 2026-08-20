@@ -1452,6 +1452,180 @@ fn sc_open_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Object(Some(ch))))
 }
 
+
+/// The classes CratonVM's own NIO factories allocate their objects AS.
+/// `sc_open` / `ssc_open` / the accept path allocate the ABSTRACT
+/// `java/nio/channels/{Socket,ServerSocket}Channel` directly, and
+/// `nio_selector::selector_open_native` allocates `sun/nio/ch/SelectorImpl`;
+/// the remaining `sun.nio.ch.*Impl` spellings are the ones our natives are
+/// additionally registered under, for callers that resolve against them.
+const CRATONVM_NIO_CLASSES: &[&str] = &[
+    "java/nio/channels/SocketChannel",
+    "sun/nio/ch/SocketChannelImpl",
+    "java/nio/channels/ServerSocketChannel",
+    "sun/nio/ch/ServerSocketChannelImpl",
+    "java/nio/channels/DatagramChannel",
+    "sun/nio/ch/DatagramChannelImpl",
+    "java/nio/channels/Selector",
+    "sun/nio/ch/SelectorImpl",
+    "java/nio/channels/SelectionKey",
+    "sun/nio/ch/SelectionKeyImpl",
+];
+
+/// Is this receiver a channel/selector that somebody ELSE implemented?
+///
+/// The natives in this crate are registered on the ABSTRACT JDK classes
+/// (`java/nio/channels/SocketChannel`, `Selector`, ...) because that is the
+/// class CratonVM's own factories allocate. But the interpreter resolves a
+/// native by walking the receiver's SUPERCLASS chain (`invoke_or_native` in
+/// vm/src/vm/vm_exec.rs, and its mirror in
+/// vm/src/runtime/interpreter/dispatch_virtual.rs), so a registration on
+/// `SocketChannel` also answers for every third-party SUBCLASS of it -- out of
+/// CratonVM's own side tables, which know nothing about that object.
+///
+/// barchart-udt is the case that exposed this. `com.barchart.udt.nio
+/// .SocketChannelUDT extends java.nio.channels.SocketChannel` and does not
+/// declare `isOpen()`: it inherits the JDK's `final
+/// AbstractInterruptibleChannel.isOpen()`. So `isOpen()` was answered by
+/// `sc_is_open` reading an absent `chan_fields` row -- `false`, on a UDT socket
+/// the library had just opened. Netty's `AbstractChannel.register0` closes any
+/// channel whose `isOpen()` is false, so every UDT channel died at
+/// registration and `NioUdtByteRendezvousChannelTest.basicEcho()` moved 0 bytes
+/// in 120s where HotSpot moves 1MB in 5s.
+///
+/// Only the natives standing in front of a REAL JDK implementation need the
+/// guard. Where the JDK method is abstract (`read`, `connect`, `bind`,
+/// `accept`, `select`, ...) a foreign subclass must declare it itself, and the
+/// superclass walk already stops at that declaration before it reaches us.
+///
+/// Deliberately keyed on the receiver's CLASS, not on presence in
+/// `chan_fields`: `cf_clear` drops a channel's row on close, so a table probe
+/// would call our own just-closed channel "foreign" and re-enter the JDK's
+/// `close()` bytecode.
+pub(crate) fn foreign_nio_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(this);
+    match ctx.class_name_arc_of_id(cid) {
+        Some(name) => !CRATONVM_NIO_CLASSES.contains(&&*name),
+        // Unknown class: keep the pre-existing behaviour rather than guess.
+        None => false,
+    }
+}
+
+/// Body shared by every foreign-receiver guard: when `args[0]` is not one of
+/// ours, run the method the receiver really resolves -- its own override or
+/// the JDK's inherited implementation -- and never our state.
+/// `Some(result)` means the call was handled here.
+pub(crate) fn foreign_nio_delegate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if !foreign_nio_receiver(ctx, this) {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, method, descriptor, &args[1..]))
+}
+
+/// `isOpen()` -- guarded; the JDK's is `final` on `AbstractInterruptibleChannel`.
+fn g_sc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(ctx, args, "isOpen", "()Z") {
+        Some(r) => r,
+        None => sc_is_open(ctx, args),
+    }
+}
+
+/// `isBlocking()` -- guarded; the JDK's is `final` on `AbstractSelectableChannel`.
+fn g_sc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(ctx, args, "isBlocking", "()Z") {
+        Some(r) => r,
+        None => sc_is_blocking(ctx, args),
+    }
+}
+
+/// `configureBlocking(boolean)` -- guarded; `final` on
+/// `AbstractSelectableChannel`, which then calls the subclass's own
+/// `implConfigureBlocking`.
+fn g_sc_configure_blocking_sc(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(
+        ctx,
+        args,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/SelectableChannel;",
+    ) {
+        Some(r) => r,
+        None => sc_configure_blocking(ctx, args),
+    }
+}
+
+/// The `AbstractSelectableChannel`-returning spelling of the same method.
+fn g_sc_configure_blocking_asc(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(
+        ctx,
+        args,
+        "configureBlocking",
+        "(Z)Ljava/nio/channels/spi/AbstractSelectableChannel;",
+    ) {
+        Some(r) => r,
+        None => sc_configure_blocking(ctx, args),
+    }
+}
+
+/// `close()` -- guarded; `final` on `AbstractInterruptibleChannel`, which
+/// drives the subclass's own `implCloseChannel`/`implCloseSelectableChannel`.
+fn g_sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(ctx, args, "close", "()V") {
+        Some(r) => r,
+        None => sc_close(ctx, args),
+    }
+}
+
+/// `implCloseChannel()` -- guarded; implemented on `AbstractSelectableChannel`.
+fn g_sc_impl_close_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(ctx, args, "implCloseChannel", "()V") {
+        Some(r) => r,
+        None => sc_close(ctx, args),
+    }
+}
+
+/// `ServerSocketChannel.close()` -- see [`g_sc_close`].
+fn g_ssc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(ctx, args, "close", "()V") {
+        Some(r) => r,
+        None => ssc_close(ctx, args),
+    }
+}
+
+/// `ServerSocketChannel.implCloseChannel()` -- see [`g_sc_impl_close_channel`].
+fn g_ssc_impl_close_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(ctx, args, "implCloseChannel", "()V") {
+        Some(r) => r,
+        None => ssc_close(ctx, args),
+    }
+}
+
+/// `read(ByteBuffer[])` -- guarded; `final` on `SocketChannel` itself, so the
+/// superclass walk's "parent has BOTH bytecode and a native -> native wins"
+/// rule hands it to us even for a foreign subclass.
+fn g_sc_read_buffers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(ctx, args, "read", "([Ljava/nio/ByteBuffer;)J") {
+        Some(r) => r,
+        None => sc_read_scattering(ctx, args),
+    }
+}
+
+/// `write(ByteBuffer[])` -- see [`g_sc_read_buffers`].
+fn g_sc_write_buffers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match foreign_nio_delegate(ctx, args, "write", "([Ljava/nio/ByteBuffer;)J") {
+        Some(r) => r,
+        None => sc_write_gathering(ctx, args),
+    }
+}
+
 fn sc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
         Some(o) => Ok(Some(cf_get(ctx, o, F_OPEN))),
@@ -4834,8 +5008,8 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/SocketChannel;",
             sc_open_family,
         );
-        r.register(c, "isOpen", "()Z", sc_is_open);
-        r.register(c, "isBlocking", "()Z", sc_is_blocking);
+        r.register(c, "isOpen", "()Z", g_sc_is_open);
+        r.register(c, "isBlocking", "()Z", g_sc_is_blocking);
         r.register(c, "isConnected", "()Z", sc_is_connected);
         r.register(c, "socket", "()Ljava/net/Socket;", sc_socket);
         r.register(
@@ -4871,15 +5045,15 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             c,
             "configureBlocking",
             "(Z)Ljava/nio/channels/SelectableChannel;",
-            sc_configure_blocking,
+            g_sc_configure_blocking_sc,
         );
         r.register(
             c,
             "configureBlocking",
             "(Z)Ljava/nio/channels/spi/AbstractSelectableChannel;",
-            sc_configure_blocking,
+            g_sc_configure_blocking_asc,
         );
-        r.register(c, "close", "()V", sc_close);
+        r.register(c, "close", "()V", g_sc_close);
         // The reactor (and JDK code) often closes via the FINAL
         // `AbstractInterruptibleChannel.close()` rather than the overridable
         // `SocketChannel.close()`. That bytecode runs (closeLock seeded by
@@ -4889,7 +5063,7 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         // hitting an AbstractMethodError. (`AbstractSelectableChannel.implCloseChannel`
         // then cancels keys under keyLock with keyCount==0 — a no-op for us.)
         r.register(c, "implCloseSelectableChannel", "()V", sc_close);
-        r.register(c, "implCloseChannel", "()V", sc_close);
+        r.register(c, "implCloseChannel", "()V", g_sc_impl_close_channel);
         r.register(c, "connect", "(Ljava/net/SocketAddress;)Z", sc_connect);
         // `SocketChannel.bind` covariantly returns SocketChannel. Hazelcast
         // reaches it through SocketAdaptor.bind before registering its client
@@ -4948,14 +5122,14 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         // 3-arg slice form and the 1-arg convenience form. Tomcat's websocket
         // write path flushes header+body via the gathering form (DF03).
         r.register(c, "read", "([Ljava/nio/ByteBuffer;II)J", sc_read_scattering);
-        r.register(c, "read", "([Ljava/nio/ByteBuffer;)J", sc_read_scattering);
+        r.register(c, "read", "([Ljava/nio/ByteBuffer;)J", g_sc_read_buffers);
         r.register(
             c,
             "write",
             "([Ljava/nio/ByteBuffer;II)J",
             sc_write_gathering,
         );
-        r.register(c, "write", "([Ljava/nio/ByteBuffer;)J", sc_write_gathering);
+        r.register(c, "write", "([Ljava/nio/ByteBuffer;)J", g_sc_write_buffers);
         r.register(
             c,
             "setOption",
@@ -5012,8 +5186,8 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             ssc_open_family,
         );
         r.register(c, "socket", "()Ljava/net/ServerSocket;", ssc_socket);
-        r.register(c, "isOpen", "()Z", sc_is_open);
-        r.register(c, "isBlocking", "()Z", sc_is_blocking);
+        r.register(c, "isOpen", "()Z", g_sc_is_open);
+        r.register(c, "isBlocking", "()Z", g_sc_is_blocking);
         // `isBound()Z` is not declared on the abstract `ServerSocketChannel`, but
         // `sun.nio.ch.ServerSocketAdaptor.isBound()` (returned by `socket()`) and
         // Netty's `NioServerSocketChannel.isActive()` call it on our channel
@@ -5025,19 +5199,19 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             c,
             "configureBlocking",
             "(Z)Ljava/nio/channels/SelectableChannel;",
-            sc_configure_blocking,
+            g_sc_configure_blocking_sc,
         );
         r.register(
             c,
             "configureBlocking",
             "(Z)Ljava/nio/channels/spi/AbstractSelectableChannel;",
-            sc_configure_blocking,
+            g_sc_configure_blocking_asc,
         );
-        r.register(c, "close", "()V", ssc_close);
+        r.register(c, "close", "()V", g_ssc_close);
         // See the SocketChannel loop: handle the real-close abstract hooks so a
         // close via the final AbstractInterruptibleChannel.close() completes.
         r.register(c, "implCloseSelectableChannel", "()V", ssc_close);
-        r.register(c, "implCloseChannel", "()V", ssc_close);
+        r.register(c, "implCloseChannel", "()V", g_ssc_impl_close_channel);
         r.register(
             c,
             "bind",

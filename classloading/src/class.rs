@@ -964,7 +964,16 @@ impl Class {
         if self.id == other_id {
             return true;
         }
-        let mut visited: FxHashSet<ClassId> = FxHashSet::default();
+        // Pre-sized, not `default()`. A `default()` table starts at capacity 0
+        // and REHASHES as the walk inserts: `hashbrown`'s `reserve_rehash` for
+        // `(ClassId, ())` measured 2.18% of `LambdaCompositionProbe`, with its
+        // callers `jit_invoke_virtual_mic` and
+        // `try_jit_site_cached_native_dispatch` — i.e. the JIT invoke path pays
+        // it per call. 16 covers the real-JDK interface DAGs this walks
+        // (`CompletableFuture`, `Function`, the `Collection` family) without a
+        // single resize.
+        let mut visited: FxHashSet<ClassId> =
+            FxHashSet::with_capacity_and_hasher(16, Default::default());
         self.is_subclass_of_inner(other_id, store, 0, &mut visited)
     }
 

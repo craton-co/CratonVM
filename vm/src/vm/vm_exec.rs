@@ -2780,6 +2780,63 @@ fn forward_boundary_value(heap: &crate::memory::VmHeap, value: Value) -> Value {
     }
 }
 
+/// Forward every reference ARGUMENT a native hands to a callback.
+///
+/// The companion to [`forward_boundary_value`], and the gap it leaves. Every
+/// `NativeContext` entry point forwards its RECEIVER, and the write entry points
+/// were taught to forward their VALUE; the `invoke_*` family passed `args`
+/// straight through. So a native that read an object, called back into Java, and
+/// then passed that object to a second callback handed a **stale pointer into a
+/// Java frame** — from where it is stored, compared, or `checkcast`-ed with
+/// nothing on the path to repair it.
+///
+/// This is the generic form of a defect fixed one native at a time five times
+/// over (`h2_comparison_compare`, `h2_comparison_get_value`,
+/// `h2_parser_test_token_fast`, `h2_condition_and_or_get_value`,
+/// `h2_coalesce_function_get_value` — see
+/// `known-issues/h2/bug-h2-testmultithread-mvstore-writer-object-identity-20260816.md`).
+/// A native may hold raw `ObjectRef`s across its own Rust code — the STW census
+/// waits for `NativeRunning` — but a callback into Java ends that protection,
+/// and this is the one boundary every such argument must cross.
+///
+/// **It does not make per-site pinning unnecessary.** It repairs the value ON
+/// THE WAY IN; the native's own Rust local stays stale, so anything that
+/// compares it by identity, reads a field off it, or passes it somewhere else
+/// still needs a pin and a re-read. What it removes is the worst outcome — the
+/// stale pointer escaping into the heap.
+///
+/// Allocates only when something actually moved: the common case walks the
+/// arguments, finds every one already current, and returns the caller's slice
+/// untouched.
+#[inline]
+fn forward_boundary_args<'a>(
+    heap: &crate::memory::VmHeap,
+    args: &'a [Value],
+    buf: &'a mut Vec<Value>,
+) -> &'a [Value] {
+    let mut forwarded = false;
+    for (index, value) in args.iter().enumerate() {
+        let Value::Object(Some(obj)) = value else {
+            continue;
+        };
+        let moved = heap.load_and_forward(*obj);
+        if moved == *obj {
+            continue;
+        }
+        if !forwarded {
+            buf.clear();
+            buf.extend_from_slice(args);
+            forwarded = true;
+        }
+        buf[index] = Value::Object(Some(moved));
+    }
+    if forwarded {
+        buf.as_slice()
+    } else {
+        args
+    }
+}
+
 pub fn safe_native_call(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -9876,6 +9933,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+                let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_shared(
             self.shared,
             self.thread,
@@ -9894,6 +9953,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+                let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_by_class_id_shared(
             self.shared,
             self.thread,
@@ -9915,6 +9976,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // `class_name` with no virtual dispatch and no iface/abstract retarget
         // to the receiver's concrete class. Required for `Lookup.findSpecial`
         // private-to-private calls and default-method super-call patterns.
+                let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_shared(
             self.shared,
             self.thread,
@@ -9938,6 +10001,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // `Method.invoke` dispatch of private / cross-package package-private
         // instance methods, which has the identical loader-identity
         // requirement. See the trait method's doc comment.
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_shared_on_class(
             self.shared,
             self.thread,
@@ -9956,6 +10021,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         invoke_special_bytecode_only_shared(
             self.shared,
             self.thread,
@@ -10078,6 +10145,11 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
+        // Arguments as well as the receiver: see `forward_boundary_args`. This
+        // is the entry point the H2 natives use, and the one whose unforwarded
+        // `session` argument is the MVStore-writer page's headline verdict.
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         let mut receiver = self.shared.mem.heap.load_and_forward(receiver);
         let mut receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
         if let Some(recovered) = recover_stale_lambda_receiver_from_native_pins(
@@ -10862,6 +10934,8 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         // infinite recursion (confirmed via a depth-counter probe: `execute`
         // called itself on the same receiver until the native stack
         // overflowed) instead of actually reaching bytecode.
+        let mut fwd_buf: Vec<Value> = Vec::new();
+        let args = forward_boundary_args(&self.shared.mem.heap, args, &mut fwd_buf);
         let receiver = self.shared.mem.heap.load_and_forward(receiver);
         let class_id = self.shared.mem.heap.class_id_of(receiver);
         let declaring_class_id = {
@@ -11924,6 +11998,26 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             .try_alloc_array_full(ClassId::new(0), element_type, length)
     }
 
+    fn reclaim_before_alloc_retry(&mut self) -> bool {
+        // The same ladder `gc_alloc_array` (interpreter) and `jit_newarray`
+        // (JIT) run between their failed attempts. See the trait method for the
+        // precondition the CALLER is responsible for — this function cannot
+        // check it, because the locals at risk are the caller's.
+        //
+        // Order matches the interpreter's exactly, and the overhead-limit check
+        // sits between the two reclaim steps for the reason it does there: once
+        // consecutive forced collections stop freeing anything, more of them are
+        // a death spiral, and OOM is the honest answer. Reporting `false` there
+        // rather than `true` is what keeps this from becoming that spiral.
+        self.thread.tlab.retire();
+        crate::runtime::interpreter::maybe_gc_forced_pub(self.shared, self.thread);
+        if crate::runtime::interpreter::gc_overhead_limit_exceeded(self.shared) {
+            return false;
+        }
+        crate::runtime::interpreter::last_ditch_reclaim(self.shared, self.thread);
+        true
+    }
+
     fn array_component_class_id(&self, class_id: ClassId) -> Option<ClassId> {
         // `array_info` is `Some` only for array classes; its `component_class_id`
         // is the immediate element type (e.g. `String[]` for `String[][]`).
@@ -12610,6 +12704,32 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             return None;
         }
         compact_java_strings_equal(self.shared, a, b)
+    }
+
+    fn read_string_units(&self, obj: ObjectRef) -> Option<Vec<u16>> {
+        // Guarded exactly as `read_string` is, and for the same reason its own
+        // comment gives: the structural reader duck-types a String from field
+        // 0, and a CratonVM synthetic `StringBuilder` is also char[]-backed
+        // with an OVER-allocated buffer, so a shape test alone would decode the
+        // buffer's capacity as text. `read_java_string_units` shares
+        // `read_string`'s guards below the surface -- they were factored out of
+        // the `str` reader precisely so the two cannot drift -- but the class
+        // identity test is this layer's, so it is applied here too.
+        if is_real_java_string(&self.shared, obj) {
+            if let Some(units) =
+                super::vm_object::read_java_string_units(&self.shared.mem.heap, obj)
+            {
+                return Some(units);
+            }
+        }
+        // Not a confirmed String, or unreadable as one: fall back to the same
+        // answer the trait default would have given, which is what every
+        // non-String caller of this already expects.
+        self.read_string(obj).map(|s| s.encode_utf16().collect())
+    }
+
+    fn create_string_from_units(&mut self, units: &[u16]) -> ObjectRef {
+        super::create_java_string_from_units(self.shared, units)
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -14799,6 +14919,32 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         let Some(tid) = tid else {
             return Vec::new();
         };
+        // A RUNNING target has published nothing worth reading.
+        //
+        // The deposit points are the BLOCKING ones, so the snapshot below
+        // answers "where is this thread parked" and nothing else. Ask about a
+        // thread that is not parked and the answer is an empty array (it never
+        // blocked) or the call site where it blocked LAST — a confident wrong
+        // answer. Measured against HotSpot on a spin loop through three named
+        // methods, sampled every 2 ms: HotSpot named the running method on all
+        // ~840 samples; this returned `<empty>` on 1471 of 1495 and the running
+        // method on none. Every in-process sampling profiler, thread dump and
+        // hang diagnostic that inspects another thread was reading that.
+        //
+        // So ask the target to publish, by taking the pause that makes it —
+        // another thread cannot walk `JvmThread::frames`, which its own thread
+        // owns. Skipped when the target is parked: that is both the common case
+        // for a thread dump and the one whose deposit is ALREADY current, so the
+        // pause would stop the world to re-derive a stack we already have.
+        // Skipped too when another STW owns the world
+        // (`stw_publish_frame_traces` returns false), where this read degrades
+        // to exactly the behaviour it had before.
+        if !self.shared.threads.thread_registry.is_blocked(tid) {
+            crate::runtime::interpreter::stw_publish_frame_traces(
+                self.shared,
+                self.thread.thread_id,
+            );
+        }
         // CR-CLO-1 (`arch-2026-07-26/cross-owner-closeout.md` §6).
         //
         // Two stale comments used to sit here. The first claimed line numbers
