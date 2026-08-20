@@ -116,16 +116,70 @@ cratonvm --java-home <jdk25> -XX:+UseG1GC --Xmx 1g \
 ~100s, deterministic. `CRATONVM_JIT_DENY=java/lang/StringLatin1.newString`
 turns it green; `--Xmx 8g` turns it green; `-XX:+UseZGC` turns it green.
 
-## Candidate fixes, in increasing ambition
+## Two fixes were tried. Both are refuted, and that narrows the third.
 
-1. **Refuse to evacuate when the publication cannot be trusted.** If
-   `jit_active` and the pin set is empty, run the pause mark-only. Minimal,
-   restores the generational collector's stance, and costs throughput on every
-   JIT-triggered pause whose frame genuinely holds nothing — needs measuring
-   before it is defaulted on.
-2. **Make the conservative scan cover what it claims to.** Find why this frame's
-   reference is not at an 8-byte aligned spill slot the scan walks. This is the
-   real fix; the contract in `conservative_roots`'s header is the thing that is
-   false.
-3. Precise oop maps for JIT frames under G1, which the module header already
-   names as the eventual answer.
+### Attempt 1 — refuse to evacuate when the publication is empty: OOMs
+
+Implemented as a default-ON kill switch (`CRATONVM_GC=-jit-safe-cset`): when
+`jit_active` and `pinned_jit_root_count() == 0`, build an empty CSet and let the
+pause run mark-only, which is the generational collector's stance.
+
+It does remove the wrong answer — `IllegalFormatConversionException` is gone —
+and the kill switch flips it straight back, so the guard is demonstrably what
+changed the behaviour. But it replaces one failure with another:
+
+```text
+Tests run: 14,  Failures: 0,  Errors: 8
+java.lang.OutOfMemoryError: Java heap space (new_object class_id 64 fields 18)
+```
+
+**Not shippable.** In this workload almost every young pause has a JIT frame
+active and an empty publication, so "skip evacuation" means "never evacuate",
+and a 1g heap fills. Trading a wrong answer for an `OutOfMemoryError` is not a
+fix. The change was reverted; it is recorded here because the *correctness* half
+of it is a clean positive control for the mechanism.
+
+### Attempt 2 — widen the conservative scan: does not help
+
+`CRATONVM_DBG_FULLSTACK_SCAN` already exists for exactly this question. Its own
+comment states the decision rule:
+
+> if this makes a live object visible … the missed root WAS on the stack but
+> outside the JIT chain's bounds (a range bug); if corruption persists, the
+> missed root is not on the stack at all
+
+Scanning the **entire** native stack instead of the per-entry
+`[scanner_sp, entry_sp)` ranges changes nothing — same failure, twice, and the
+pause still logs `pin_addrs=0`:
+
+```text
+PLAIN            FAIL   empty-pin pauses: 1
+FULLSTACK        FAIL   empty-pin pauses: 1
+FULLSTACK_AGAIN  FAIL   empty-pin pauses: 1
+```
+
+So **this is not a scan-range bug**, and widening the conservative scan cannot
+reach the reference. By the flag's own rule the missed root is not on the native
+stack at all — it lives in a callee-saved register (or is materialisable only
+from one) at the moment of the pause, which is precisely the case conservative
+stack scanning cannot cover and `pin_addrs=0` was faithfully reporting.
+
+That `pin_addrs` stays 0 even with the whole stack scanned is worth stating
+plainly: the publication is not dropping roots it found, it is finding none,
+because there are none *to find on the stack*.
+
+### What is left
+
+**Precise oop maps for JIT frames under G1** — which `conservative_roots`'s
+header already names as the eventual answer and which the two experiments above
+now leave as the only candidate that can work. Until then G1 remains exposed on
+any compiled frame that keeps its only reference in a register across an
+allocation, and the practical mitigations are the ones already measured:
+`-XX:+UseZGC` (the default), `--nojit`, or a heap large enough to avoid the
+pause.
+
+A narrower interim option worth measuring, if G1 correctness is wanted before
+oop maps land: make the empty-publication guard **evacuate but bound the CSet**
+rather than skip it entirely — e.g. keep evacuating regions that no thread could
+have referenced since the last safepoint — so the heap still drains. That is a
+design question, not a patch.
