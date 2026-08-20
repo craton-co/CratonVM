@@ -379,6 +379,7 @@ export inherited from a parent shell.
 | `osr-bind` | `CRATONVM_DBG_OSR_BIND` |
 | `osr-frame-trace` | `CRATONVM_DBG_OSR_FRAME_TRACE` |
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
+| `osr-slots` | `CRATONVM_DBG_OSR_SLOTS` |
 | `osr-seed-collision` | `CRATONVM_DBG_OSR_SEED_COLLISION` |
 | `overlay` | `CRATONVM_DBG_OVERLAY` |
 | `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
@@ -644,6 +645,8 @@ export inherited from a parent shell.
 | `osr` | `CRATONVM_JIT_OSR` |
 | `osr-athrow` | `CRATONVM_JIT_OSR_ATHROW` |
 | `osr-dead-locals` | `CRATONVM_JIT_OSR_DEAD_LOCALS` |
+| `osr-ambiguous-dead` | `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD` |
+| `osr-refined-ref` | `CRATONVM_JIT_NO_OSR_REFINED_REF` |
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
@@ -788,6 +791,7 @@ export inherited from a parent shell.
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
 | `zgc-parmark` | `CRATONVM_ZGC_PARMARK` |
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
+| `zgc-jit-read-bounds` | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
 | `zgc-generational` | `CRATONVM_ZGC_GENERATIONAL` |

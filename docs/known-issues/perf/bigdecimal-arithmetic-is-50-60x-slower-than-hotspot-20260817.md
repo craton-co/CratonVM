@@ -11,6 +11,40 @@ and in 4 of 7 timed runs, and still exceeded 90 s in the other 3 under heavier
 host load, so call this borderline rather than closed. The remaining ~32x is not
 bignum-specific and is tracked on the two pages under "Related".**
 
+**UPDATE 2026-08-19 — the witness class is off the border, and neither fix was
+bignum-specific.** Two general VM changes landed on
+`fix/commons-math-residuals-20260819`, both found by re-profiling THIS class:
+
+| symbol | before | after |
+|---|---:|---:|
+| `MonitorTable::prune_dead` | 5.36% | **1.65%** |
+| `is_class_initialized_via_manager` | 3.11% | **absent from the top 12** |
+
+* `prune_dead` is handed the sweep's exact dead-address set and took two sharded
+  hashmap locks per element to remove nothing — this class inflates no monitor
+  at all. It now surveys the 64 shards once and skips any address whose shard is
+  empty.
+* The class-initialized memo was a 64-entry `Vec`, linear-scanned, FIFO-evicted
+  with `remove(0)`. Past 64 hot classes it thrashes: scan all 64, miss, take the
+  process-wide `class_manager` `RwLock` anyway — the acquire the memo exists to
+  avoid. Now an uncapped `FxHashSet`.
+
+Wall clock, standalone, three interleaved pairs on a shared host:
+
+| | before | after |
+|---|---:|---:|
+| `LegendreHighPrecisionTest` | 87.5 / 123.9 / 95.8 s | **80.7 / 79.7 / 81.8 s** |
+
+Three of three pairs favour the fix, and the after-arm's spread is 2.1 s against
+the before-arm's 36.4 s — the class is no longer sitting where host load decides
+its verdict. **Call the witness closed at the 90 s budget; the underlying ~20x
+against HotSpot is not.**
+
+The other class this page's suite-consequence section names,
+`PSquarePercentileTest`, moved 164.0 / 171.2 / 131.2 s → 149.7 / 147.1 / 124.2 s
+(3 of 3 pairs) and is still over budget. It is the one commons-math class that
+is, and its profile is allocation rate, not bignum.
+
 Found triaging the Apache Commons Math test suite
 (the suite run recorded in retired/commons-math-suite-run-RETIRED-20260818.md): `LegendreHighPrecisionTest` (2 JUnit
 methods, computing 60-digit-precision Gauss-Legendre quadrature rules via
@@ -267,8 +301,13 @@ within noise (154 s / 158 s / 142 s). The cost is allocation and access RATE,
 not collector choice or heap size.
 
 So the residual is the general "make native->heap interaction cheap" problem —
-the same verdict `bobyqa-numeric-kernel-is-80x-slower-than-hotspot` reaches from
-a workload with no bignum in it at all. Further work belongs there, not here.
+and this sentence used to add "the same verdict
+`bobyqa-numeric-kernel-is-80x-slower-than-hotspot` reaches from a workload with
+no bignum in it at all", offered as corroboration. **Withdraw that half.** That
+page's verdict was wrong -- its workload was an OSR admission failure, fixed
+2026-08-19 -- so the corroboration was two pages sharing one mistake, not two
+independent measurements agreeing. The residual named here stands on this
+page's own profile alone.
 
 The suite consequence, measured on all 310 `commons-math-legacy` test classes
 (one class per process, 90 s cap, real-JDK backend, JIT on, default GC):

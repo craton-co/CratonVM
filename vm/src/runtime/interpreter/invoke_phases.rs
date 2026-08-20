@@ -62,13 +62,39 @@ pub const P_FRAME_BUILD: usize = 3;
 /// plus two gated listener checks.
 pub const P_PUSH: usize = 4;
 
-const N: usize = 5;
+/// The whole `ireturn`/`return` arm: popping the return value, the JVMTI
+/// method-exit hook, the frame recycle, and pushing the value to the caller.
+///
+/// This exists because the call-side phases summed to only about HALF an
+/// uninstrumented call, and the remainder was attributed to "the callee body
+/// and the return path" without either being measured. An unmeasured half is
+/// not a small residual; it is where the answer might be.
+pub const P_RET_TOTAL: usize = 5;
+/// `pop_and_recycle_frame` alone, the dominant suspect inside `P_RET_TOTAL`:
+/// `Frame`'s `Drop` (two `Arc` decrements — `code` and the cached method) plus
+/// routing four `Vec` headers back to the thread-local pools.
+pub const P_RET_RECYCLE: usize = 6;
+/// CALIBRATION: two back-to-back `now()` calls measuring nothing at all.
+///
+/// Every other phase is inflated by roughly one `rdtsc` latency, and
+/// `P_RET_TOTAL` by THREE, because it brackets the nested `P_RET_RECYCLE`
+/// pair. Comparing a nested phase against a flat one without accounting for
+/// that is not like-for-like, and at a plausible ~25 cyc per read it is enough
+/// to invert the ranking. So the overhead is measured on this workload rather
+/// than assumed, and `dump` prints each phase both raw and
+/// overhead-corrected.
+pub const P_CALIB: usize = 7;
+
+const N: usize = 8;
 const NAMES: [&str; N] = [
     "ic_lookup   ",
     "guards      ",
     "args        ",
     "frame_build ",
     "frame_push  ",
+    "ret_total   ",
+    "  ret_recycle",
+    "CALIB(noop) ",
 ];
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -133,7 +159,18 @@ pub fn dump() {
         eprintln!("[invoke-phases] calls=0 — the instrumented path never ran");
         return;
     }
-    let total: u64 = (0..N).map(|i| CYCLES[i].load(Ordering::Relaxed)).sum();
+    // `P_RET_RECYCLE` is NESTED inside `P_RET_TOTAL`, so it is excluded from the
+    // total and its percentage is of the total rather than an additional slice.
+    // Summing all seven would double-count it and quietly inflate the whole
+    // table.
+    let total: u64 = (0..N)
+        .filter(|i| *i != P_RET_RECYCLE && *i != P_CALIB)
+        .map(|i| CYCLES[i].load(Ordering::Relaxed))
+        .sum();
+    // Measured cost of ONE `now()` pair on this workload. Each flat phase
+    // carries one; `P_RET_TOTAL` carries three, because it brackets the nested
+    // `P_RET_RECYCLE` pair.
+    let calib = CYCLES[P_CALIB].load(Ordering::Relaxed) as f64 / calls as f64;
     eprintln!("[invoke-phases] instrumented invokestatic calls={calls} total_cycles={total}");
     for i in 0..N {
         let c = CYCLES[i].load(Ordering::Relaxed);
@@ -143,7 +180,18 @@ pub fn dump() {
         } else {
             100.0 * c as f64 / total as f64
         };
-        eprintln!("[invoke-phases]   {} {per:8.1} cyc/call  {pct:5.1}%", NAMES[i]);
+        let overhead = if i == P_CALIB {
+            0.0
+        } else if i == P_RET_TOTAL {
+            calib * 3.0
+        } else {
+            calib
+        };
+        let corrected = (per - overhead).max(0.0);
+        eprintln!(
+            "[invoke-phases]   {} {per:8.1} raw  {corrected:8.1} corrected  {pct:5.1}% raw",
+            NAMES[i]
+        );
     }
     eprintln!(
         "[invoke-phases]   {:8.1} cyc/call measured (rdtsc overhead INCLUDED; ranking, not costing)",
