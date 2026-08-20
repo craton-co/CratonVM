@@ -765,11 +765,54 @@ use cratonvm_types::compat::CompatibilityMode;
 /// baseline — and it is the test that matters, because it is the one that
 /// rejected 28 further triples the 36-vector screen had passed
 /// (`java/lang/ref/`, `sun/nio/fs/`; see `G90-1` §5).
+///
+/// # H3-1 REBASELINE REQUIRED — 2026-08-20, NOT YET MEASURED
+///
+/// **Old value 1622, expected delta −7, expected new value 1615.** The seven
+/// `java.util.function` default/static-method stubs `G89-1` N1 nominated were
+/// DELETED from `native-builtins/src/phases_late/streams.rs`
+/// (`Predicate.{and,or,negate,not}`, `Consumer.andThen`,
+/// `BinaryOperator.{maxBy,minBy}`), so both this count and
+/// [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`] fall by the same 7 — a genuine
+/// **removal**, not a relabel, which is exactly the case the two-column rule
+/// exists to distinguish.
+///
+/// **The number above is deliberately left at 1622 and is NOT to be taken as
+/// the post-change count.** H3-1 could not build or run; a slack-free ratchet
+/// with a hand-written value that lands too HIGH silently re-admits that many
+/// new stubs, and one written from arithmetic rather than a run is exactly the
+/// species this file's own history records ("a constant derived by arithmetic
+/// from the other configuration sat six above the truth for a week"). Leaving
+/// it high is the safe direction: the assert is `<=`, so the run PASSES and
+/// prints `IMPROVED`-shaped output plus the exact constant to paste.
+///
+/// The one command that recomputes it — run BOTH, paste BOTH:
+///
+/// ```text
+/// cargo test -p cratonvm-native-builtins --features management \
+///     --test stub_ratchet synthetic_stub_count_does_not_regress -- --nocapture
+/// cargo test -p cratonvm-native-builtins \
+///     --test stub_ratchet synthetic_stub_count_does_not_regress -- --nocapture
+/// ```
+///
+/// Each prints `stub-ratchet: const <NAME>: usize = <n>;` — paste that line.
+/// Anything other than −7 in either configuration is a finding to attribute
+/// before re-freezing: use `CRATONVM_RATCHET_ROWS=1` on this commit and on
+/// `26e4b5db4` and diff the sorted `stub-ratchet(row):` lines.
 const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1622;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
+///
+/// **H3-1 REBASELINE REQUIRED — old value 1611, expected delta −7, expected new
+/// value 1604.** Not measured; see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for
+/// the reason the guess is not written here and for the command that
+/// recomputes it. The seven deleted rows are in
+/// `native-builtins/src/phases_late/streams.rs`, which is in BOTH resolves, so
+/// the delta is the same −7 in both — but measure it, do not derive it: this
+/// constant's own history has a case of one derived from the other sitting six
+/// above the truth for a week.
 const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1611;
 
 /// The TOTAL registration count each baseline above was measured beside.
@@ -786,9 +829,22 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1611;
 /// The 2026-08-19 re-freeze is the first case for its own 78 and the second
 /// (partly) for the 31 it inherited, and neither could be told from the other
 /// by the frozen count alone.
+///
+/// A THIRD case exists and 2026-08-20 is the first instance of it: **total DOWN
+/// by about the stub delta -> registrations were DELETED.** That is the only
+/// direction in which re-freezing records work rather than absorbing it, and it
+/// is what H3-1's seven deletions produce.
+///
+/// **H3-1 REBASELINE REQUIRED — old value 13160, expected delta −7, expected
+/// new value 13153.** Not measured. Recomputed by the same two commands as
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
+/// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
 const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13160;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
+///
+/// **H3-1 REBASELINE REQUIRED — old value 12792, expected delta −7, expected
+/// new value 12785.** Not measured.
 #[allow(dead_code)]
 const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12792;
 
@@ -1130,6 +1186,20 @@ fn synthetic_stub_count_does_not_regress() {
         .collect::<Vec<_>>()
         .join(", ");
 
+    // The re-freeze target, computed once so the failure message below can be
+    // written entirely with INLINE format captures and carry no positional
+    // arguments at all.
+    //
+    // That is not a style preference. Between 2026-08-19 and 2026-08-20 this
+    // `assert!` did not PARSE: merge `26e4b5db4` spliced the tail of the old
+    // message onto the head of the new one and left BOTH argument lists, so the
+    // first string literal ended at `stub-ratchet.md.",` and the very next token
+    // was `{BASELINE_SYNTHETIC_STUBS}. A change added ...`, which is not an
+    // expression. `rustfmt --check` reports `unknown start of token: \` at the
+    // seam. A message with no positional arguments cannot be mis-spliced that
+    // way and cannot drift out of step with its argument count.
+    let refreeze = synthetic + SLACK;
+
     assert!(
         synthetic <= BASELINE_SYNTHETIC_STUBS,
         "STUB-RATCHET in the {MEASURED_CONFIG} configuration: {synthetic} \
@@ -1138,7 +1208,8 @@ fn synthetic_stub_count_does_not_regress() {
          \n\
          FIRST, find out WHICH rows, because this number cannot tell you why it \
          moved. Run `dump_synthetic_stubs` here and at the commit that last set \
-         `{BASELINE_CONST}`, and diff the sorted `@@STUB` lines.\n\
+         `{BASELINE_CONST}`, and diff the sorted `@@STUB` lines. This run already \
+         printed the per-file breakdown; the top eight are: {breakdown}\n\
          \n\
          Then read each added triple, because there are TWO causes and they want \
          opposite responses:\n\
@@ -1153,26 +1224,17 @@ fn synthetic_stub_count_does_not_regress() {
          registration site's own comment before assuming (a). On 2026-08-19, 30 \
          of 33 added rows were (b).\n\
          \n\
+         CLASSIFY IT WITH THE SECOND COLUMN: total registrations are {total}, and \
+         this baseline was measured beside {MEASURED_TOTAL_REGISTRATIONS}. A total \
+         that did NOT move means existing fakes were relabelled (welcome; \
+         re-freeze with the list). A total UP by roughly the stub delta means new \
+         fakes were registered — the regression this gate exists for. A total \
+         DOWN by roughly the stub delta means registrations were DELETED, which \
+         is the only case where re-freezing records work rather than absorbing \
+         it.\n\
+         \n\
          Re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
-         {synthetic} + SLACK ({}) only with that account written down. See \
-         stub-ratchet.md.",
-         {BASELINE_SYNTHETIC_STUBS}. A change added a NEW synthetic stub. Make the new \
-         native a real Bridge/Intrinsic (correct behavior) instead of a fake — do NOT \
-         just raise the baseline. If the stub is genuinely, unavoidably needed, \
-         re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
-         {synthetic} + SLACK ({}) and explain why in the PR. See \
-         stub-ratchet.md.\n\nWHERE THEY ARE (top 8 files): {}\n\nA retag that \
-         moves an already-fake native from `Bridge` to `SyntheticStub` also \
-         raises this number, and is the one rise that is an IMPROVEMENT — the \
-         157 -> 165 note on `BASELINE_SYNTHETIC_STUBS_MANAGEMENT` is the \
-         precedent. Say which of the two happened before touching the \
-         constant.\n\nCLASSIFY IT: total registrations are {total}, and this \
-         baseline was measured beside {MEASURED_TOTAL_REGISTRATIONS}. A total \
-         that did NOT move means existing fakes were relabelled (welcome, \
-         re-freeze with the list); a total up by roughly the stub delta means \
-         new fakes were registered (the regression this gate exists for).",
-        synthetic + SLACK,
-        breakdown,
+         {refreeze} only with that account written down. See stub-ratchet.md.",
     );
 }
 
