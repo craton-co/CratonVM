@@ -2077,13 +2077,19 @@ fn native_fd_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     //     one of which is a socket dispatcher", so a close error there would be
     //     fd release rather than data loss. **The dump refutes the premise.**
     //     `--dump-native-registry` in `--jdk-only` on this tree (2026-08-17)
-    //     reports the `sun/nio/ch/UnixDispatcher.close0` registration made
-    //     twenty lines below this function's own registration with
-    //     `owns_slot: false` — `native-io/src/net.rs:4188`'s registration of the
-    //     same triple runs later and wins. So this body serves exactly ONE
-    //     triple, `java/io/FileDescriptor.close0()V` (`owns_slot: true`), whose
+    //     reported the `sun/nio/ch/UnixDispatcher.close0` registration that
+    //     then sat twenty lines below this function's own registration with
+    //     `owns_slot: false` — `net.rs`'s registration of the same triple runs
+    //     later and wins. So this body serves exactly ONE triple,
+    //     `java/io/FileDescriptor.close0()V` (`owns_slot: true`), whose
     //     receivers are file-stream descriptors. There is no socket on the
     //     other end of it.
+    //
+    //     That dead `UnixDispatcher.close0` registration has since been
+    //     DELETED (H8-1, 2026-08-20), so the "exactly ONE triple" claim is now
+    //     true of the source and not only of the dump. The block comment where
+    //     it used to sit — grep `UnixDispatcher` in `register_io_natives` —
+    //     records why it must not come back.
     //
     //     With the premise gone the blast radius is the same provably-empty one
     //     the flush half already argued: `FdTable::close` answers `Ok(())` for
@@ -6720,49 +6726,45 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         NativeKind::Bridge,
     );
 
-    // sun.nio.ch.UnixDispatcher.close0(FileDescriptor) — the static
-    // NativeDispatcher-family close used by java.net.MulticastSocket's
-    // underlying DatagramChannelImpl (reached e.g. via JGroups'
-    // DiagnosticsHandler/UDP transport standing up a multicast socket).
-    // `UnixDispatcher.init()` was already a no-op above since our socket
-    // I/O doesn't route through a native dispatcher table, but `close0`
-    // itself was never registered, so a real MulticastSocket close hit an
-    // UnsatisfiedLinkError. Same calling convention as the instance
-    // `FileDescriptor.close0()V` above — `args[0]` is the FileDescriptor
-    // either way (an explicit static parameter here vs. `this` there) —
-    // so the same handler applies unchanged.
+    // `sun/nio/ch/UnixDispatcher.close0(Ljava/io/FileDescriptor;)V` IS NOT
+    // REGISTERED HERE, and the deleted registration that used to sit at this
+    // point must not come back. It bound `native_fd_close0` — the body
+    // immediately above, which closes a `ctx.fd_table()` entry — to a triple
+    // whose receivers are NIO SOCKET descriptors, which this crate does not
+    // keep in the fd table at all. `net.rs` keeps them in `net_sockets()`, and
+    // `next_net_fd()` (net.rs, ~line 827) starts its counter at `0x4000_0000`
+    // with the stated reason "so there's no collision with the
+    // `FileDescriptorTable` counter". The two id spaces are therefore DISJOINT
+    // BY CONSTRUCTION: had this registration ever won, `FdTable::flush`/`close`
+    // would have missed on every socket id, the OS socket would have stayed
+    // open, and the only visible effect would have been `fd`/`handle` set to
+    // `-1` — a leak that reports success.
     //
-    // THIS REGISTRATION DOES NOT SURVIVE BOOT, and the paragraph above
-    // describes a callback that never runs (H5-1, 2026-08-20). It is the one
-    // cross-function duplicate in this crate whose two sites carry DIFFERENT
-    // callbacks: `net.rs`'s `register_sun_nio_ch_net` registers the same
-    // triple with `net_close`, and it runs LATER in the same boot —
+    // It never won. `net.rs`'s `register_sun_nio_ch_net` registers the same
+    // triple with `net_close`, and it runs LATER in the same boot:
     // `register_io_natives` reaches `nio_native::register_t16_channel_overrides`
     // hundreds of lines below this point, and that function's last statement is
-    // `crate::net::register_sun_nio_ch_net(r)`. `register()` is
-    // last-write-wins, so `net_close` owns the slot and `native_fd_close0`
-    // below is dead here.
-    //
-    // Independently MEASURED before this comment was written: see the
+    // `crate::net::register_sun_nio_ch_net(r)` — the only call site of it in
+    // the workspace. `register()` is last-write-wins, so `net_close` has always
+    // owned the slot. MEASURED before this comment was written: see the
     // `--dump-native-registry` note earlier in this file (2026-08-17,
-    // `--jdk-only`), which reports this exact registration with
-    // `owns_slot: false` and names `net.rs`'s registration as the winner. That
-    // note cites `native-io/src/net.rs:4188`; the line has since drifted to
-    // 4178 — grep for `"sun/nio/ch/UnixDispatcher"` in `net.rs` rather than
-    // trusting either number.
+    // `--jdk-only`), which reports the deleted registration with
+    // `owns_slot: false` and names `net.rs`'s as the winner.
     //
-    // Left in place rather than deleted: removing it is a pure no-op TODAY
-    // (the slot already holds `net_close`), but it is the only fallback if the
-    // `register_sun_nio_ch_net` call is ever gated. Whether `net_close`
-    // actually serves the MulticastSocket path this comment was written for is
-    // an open question that needs a run, not a source read.
-    registry.register_with_kind(
-        "sun/nio/ch/UnixDispatcher",
-        "close0",
-        "(Ljava/io/FileDescriptor;)V",
-        native_fd_close0,
-        NativeKind::Bridge,
-    );
+    // `net_close` is also the right winner on the merits, not merely the
+    // surviving one: it closes the `net_sockets()` entry the fd id actually
+    // names, and it is the sibling of the `preClose0` registration three lines
+    // below it in `net.rs`, which closes the SAME registry. A "fallback if
+    // `register_sun_nio_ch_net` is ever gated" — the reason the previous
+    // comment gave for leaving the dead line in place — would have been a
+    // fallback that leaks the socket, so there is nothing here worth keeping.
+    // Grep `"sun/nio/ch/UnixDispatcher"` in `net.rs` for the live rows rather
+    // than trusting a line number.
+    //
+    // What this does NOT answer, and a source read cannot: whether `net_close`
+    // actually serves the `java.net.MulticastSocket.close()` path the deleted
+    // registration was originally written for (H5-1 §10.N3). That still needs
+    // a run. H8-1, 2026-08-20.
 
     /// Platform `sockaddr_in`/`sockaddr_in6` ABI facts for the
     /// `sun.nio.ch.NativeSocketAddress` probes below. Unix reads them off
