@@ -19,7 +19,7 @@ import java.util.Map;
  * `@@TESTFAIL` line per failure. Neither survives a run killed at the wall
  * cap, so a class that exceeds its budget produces no evidence at all about
  * WHICH of its tests was running — which is what
- * `docs/known-issues/netty/httpcontentdecompressortest-hang-20260816.md` had
+ * `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` had
  * to work around by hand.
  *
  * `@@BEGIN` is flushed before the test body runs, so the last `@@BEGIN` with
