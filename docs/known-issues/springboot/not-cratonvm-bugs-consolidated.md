@@ -60,7 +60,7 @@ sweep surfaced (Jetty JSP class-loading, and a Groovy-closure
 those two is now believed fixed by `dev` commit `d766af065` (2026-08-19,
 the same fix that resolved the identical `MethodHandle.asSpreader` cluster
 found independently in Spring Framework's own 2026-08-19 sweep — see
-`docs/internal/fixed-suite-bugs/spring/bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`),
+`bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`),
 not yet reverified against Spring Boot's own classes specifically.
 
 ## Related

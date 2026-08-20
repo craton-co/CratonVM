@@ -25,7 +25,7 @@ are genuine CratonVM-specific divergences, tracked in:
   OPEN).
 * `bug-spring-remaining-fail-clusters-20260819.md` — the remaining ~11
   singleton/small-cluster classes, individually triaged.
-* `docs/internal/fixed-suite-bugs/spring/bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`
+* `bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`
   — ~11 more classes, `MethodHandle.asSpreader`, confirmed **already fixed**
   on `dev` before this HotSpot baseline was even run (so they no longer
   appear in a fresh CratonVM rerun — not counted as "not a CratonVM bug",

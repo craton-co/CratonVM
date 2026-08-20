@@ -12930,7 +12930,7 @@ static PRECONDITIONS_CHECK_INDEX_INFO: JitInvokeInfo = JitInvokeInfo {
 /// `List` bounds check, and it is a compare and a branch: paying the ~160 ns
 /// generic native funnel for it is the single largest rung under
 /// `HttpContentDecompressorTest.testZipBomb`
-/// (docs/known-issues/netty/httpcontentdecompressortest-hang-20260816.md).
+/// (httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md).
 ///
 /// Fast path: `0 <= index < length` returns `index`, with no funnel, no
 /// argument buffer, no `safe_native_call` wrapper. **Everything else — an

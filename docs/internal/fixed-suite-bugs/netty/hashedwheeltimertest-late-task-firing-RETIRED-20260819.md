@@ -128,7 +128,7 @@ per expired task.**
 
 `perf record -F 999`, same workload, aggregated over all threads — the head is
 the native funnel and the collector's receiver validation inside it, which is
-the same shape `httpcontentdecompressortest-hang-20260816.md` recorded for
+the same shape `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` recorded for
 snappy:
 
 ```
@@ -246,6 +246,6 @@ where a correct wheel and a slow VM look different.
 ## Related
 
 * `known-issues/netty/fail-hang-crash-rerun-20260817.md` — where this was first flagged.
-* `httpcontentdecompressortest-hang-20260816.md` — the same funnel profile from a different netty class.
+* `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` — the same funnel profile from a different netty class.
 * `retired/uncontended-reentrantlock-pair-mostly-unattributed-RETIRED-20260805.md` — what an uncontended AQS pair costs and why.
 * `fixed-bugs/native-funnel-fixed-cost-is-the-remaining-wall-RETIRED-20260806.md` — the residual this class's 1.5× belongs to.

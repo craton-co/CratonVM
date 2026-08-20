@@ -152,7 +152,7 @@ top rows:
 `VarHandle.get` at 29 % of all native calls is netty 4.2's reference-count check
 — `AbstractByteBuf`'s checked accessors call `ensureAccessible()` → `refCnt()`,
 and 4.2 reads that field through a `VarHandle`. That is the *identical*
-signature `httpcontentdecompressortest-hang-20260816.md` recorded for snappy
+signature `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` recorded for snappy
 (21 368 822 `VarHandle.get` per 4 MiB, ~5.1 per output byte), from a different
 netty class, on the same codec. The `ByteBuffer`/`ScopedMemoryAccess` cluster
 below it is one bulk copy plus its six-native preamble, in a constant 7:1 ratio.
@@ -165,7 +165,7 @@ flat profile whose head is the interpreter and the native-registry lookup
 **Disposition:** no new defect. This class is a second member of the snappy
 per-call-cost list, with a smaller budget (5 s) than the compression cluster's
 180 s cap. It needs ~2× on that path to clear its own `await`. That belongs to
-`httpcontentdecompressortest-hang-20260816.md`, which already names the next
+`httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md`, which already names the next
 measurable step for it.
 
 ---
@@ -199,5 +199,5 @@ the unmodified copy and the classpath order is the whole mechanism.
 
 * `known-issues/netty/fail-hang-crash-rerun-20260817.md` — where this cluster was flagged.
 * `ea-flag-ignored-so-assert-never-fires-20260812-FIXED.md` — the VM half of the `-ea` fix, and the page that predicted this harness change would be safe once it landed.
-* `httpcontentdecompressortest-hang-20260816.md` — owns the snappy residual.
+* `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` — owns the snappy residual.
 * `compression-testhugedecompress-shared-timeout-20260816.md` — the sibling class list on the same wall.

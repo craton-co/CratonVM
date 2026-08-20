@@ -11084,7 +11084,7 @@ mod tests {
     /// the remainder on the stack instead of falling back to the dispatch
     /// helper.
     ///
-    /// This is the blocker `httpcontentdecompressortest-hang-20260816.md`
+    /// This is the blocker `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md`
     /// named: `emit_direct_cross_call` was register-only, so a site needing
     /// seven incoming slots kept the full `jit_invoke_dispatch` round trip no
     /// matter what the binding side had resolved. The map entry was recorded
