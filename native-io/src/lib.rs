@@ -6566,27 +6566,39 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         native_fis_read_bytes,
         NativeKind::Bridge,
     );
-    // The real JDK public bulk-read wrapper delegates to readBytes. Annotation
-    // scanning reaches this signature directly, so route it to the same native
-    // implementation when selected by the interpreter bridge policy.
+    // JDK-ONLY-CLASSIFY: RESOLVED 2026-08-20 (H5-1). The duplicate
+    // `FileInputStream.read([BII)I` registration that used to sit here — the
+    // repo's named instance of the last-write-wins overwrite hazard — is
+    // DELETED. What stood here was:
     //
-    // JDK-ONLY-CLASSIFY: unknown — needs census. CONCRETE OVERWRITE HAZARD, and
-    // the cleanest example in the repo of why `overwrote` belongs in the census.
-    // `FileInputStream.read([BII)I` is registered TWICE in this one function:
-    // once inside the `SyntheticStub` block above and again here under the
-    // ambient `Bridge`. Registration is last-write-wins, so this line silently
-    // upgrades that entry to `Bridge` and the earlier stub tag never appears in
-    // the final registry — invisible to `dump_registrations` and to any grep.
-    // `read([BII)I` is NOT ACC_NATIVE in JDK 25 (only the private `readBytes`
-    // is), so `Bridge` is the wrong tag on the merits; but silently demoting it
-    // would also change which of the two callbacks wins, so this must be
-    // resolved with `overwrote` + `invocations`, not by deleting a line.
-    registry.register(
-        "java/io/FileInputStream",
-        "read",
-        "([BII)I",
-        native_fis_read_bytes,
-    );
+    //     registry.register("java/io/FileInputStream", "read", "([BII)I",
+    //                       native_fis_read_bytes);
+    //
+    // registered under the ambient `Bridge` this function sets at its head, and
+    // it silently overwrote the `SyntheticStub`-tagged registration of the SAME
+    // triple with the SAME callback ~85 lines above (the public-surface block).
+    //
+    // Two facts settle which of the two is correct, and neither was in the
+    // comment this replaces:
+    //
+    //  1. `javap -p -s java.io.FileInputStream` on JDK 25.0.3+9 shows
+    //     `public int read(byte[], int, int)` with a `Code` attribute and NO
+    //     `ACC_NATIVE`; the only native bulk read is the private
+    //     `readBytes([BII)I`, which IS bridged (register_with_kind above).
+    //     So §1.5 has nothing for `read([BII)I` to bind to and `Bridge` was
+    //     wrong on the merits.
+    //  2. BOTH registrations named `native_fis_read_bytes`. The old comment's
+    //     reason for keeping the line — "silently demoting it would also change
+    //     which of the two callbacks wins" — was false: there is only one
+    //     callback. Deleting the line changes the slot's KIND and nothing else.
+    //
+    // Effect of the deletion: the triple keeps `native_fis_read_bytes` and
+    // reverts to the `SyntheticStub` tag its six public-surface siblings
+    // (`read()`, `read([B)`, `available()`, `skip(J)`, `close()`,
+    // `<init>(String)`) already carry, which is what makes `vm_exec` prefer the
+    // real bytecode. Under `--jdk-only` a `SyntheticStub` is refused at
+    // registration, so the real `read([BII)I` bytecode runs and calls the
+    // genuine `readBytes` bridge — one `Bridge`-tagged shadow retired.
     registry.register_with_kind(
         "java/io/FileInputStream",
         "skip0",
