@@ -641,7 +641,27 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
-    match find(&name_str) {
+    Ok(Some(match provider_object_named(ctx, &name_str)? {
+        Some(p) => Value::Object(Some(p)),
+        None => Value::Object(None),
+    }))
+}
+
+/// The installed `Provider` object for `name`, or `None` when no provider by
+/// that name is installed — the body of `Security.getProvider(String)`,
+/// callable from a native that needs to ATTACH a provider rather than answer
+/// one.
+///
+/// Extracted so `javax.net.ssl.SSLContext.getProvider()` cannot grow a second
+/// copy of the "prefer the object the application actually registered" rule
+/// below; that rule is what makes `assertSame(added, ...)` and
+/// `instanceof BouncyCastleProvider` work, and a second implementation of it
+/// would be a second chance to get it wrong.
+pub(crate) fn provider_object_named(
+    ctx: &mut dyn NativeContext,
+    name_str: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    match find(name_str) {
         Some((ver, coverage)) => {
             // A provider the application registered itself must come back as
             // THE SAME OBJECT it passed to `Security.addProvider`. The JDK's
@@ -657,14 +677,13 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             // service/creator maps) was unreachable through it. The registered
             // object is already pinned by `remember_real_provider`, so
             // preferring it costs no extra rooting.
-            if let Some(real) = resolve_real_provider(ctx, &name_str) {
-                return Ok(Some(Value::Object(Some(real))));
+            if let Some(real) = resolve_real_provider(ctx, name_str) {
+                return Ok(Some(real));
             }
-            let p = make_provider(ctx, &name_str, ver, coverage);
-            Ok(Some(Value::Object(Some(p?))))
+            Ok(Some(make_provider(ctx, name_str, ver, coverage)?))
         }
         // JDK contract: return null for unknown name.
-        None => Ok(Some(Value::Object(None))),
+        None => Ok(None),
     }
 }
 

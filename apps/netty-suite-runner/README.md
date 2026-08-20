@@ -47,9 +47,10 @@ a specific native transport — built clean.
 the repo at all was force-added (`git add -f`), the same way
 `apps/hib-suite-runner/run-hib.sh` and `apps/h2database-suite-runner/run-h2-suite.sh`
 already are. Tracked: this README, `run-netty-suite.sh`, `gen-module-args.sh`,
-`CratonRunner.java`, and the three `.tsv` side-tables. NOT tracked, because they
-are host-specific generated output: `common.args`, `module-args/`, `testlist.txt`,
-`passed.txt`, `others.txt`, `runs/`, `target/`, `*.class`, `hs_err_pid*.log`.
+`gen-openssl-args.sh`, `CratonRunner.java`, and the three `.tsv` side-tables.
+NOT tracked, because they are host-specific generated output: `common.args`,
+`module-args/`, `testlist.txt`, `passed.txt`, `others.txt`, `runs/`, `target/`,
+`*.class`, `hs_err_pid*.log`.
 
 - `CratonRunner.java` — identical (module-name comments aside) to the
   Windows-host `apps/netty-suite-runner/CratonRunner.java`: JUnit Platform
@@ -81,6 +82,22 @@ are host-specific generated output: `common.args`, `module-args/`, `testlist.txt
     classpath: the 17 `NativeImageHandlerMetadataTest` copies. Each runs with the
     module directory as cwd and `module-args/<artifactId>.args` as its argfile.
     `--no-module-scope` disables it for A/B (with it: PASS; without: FAIL).
+- `gen-openssl-args.sh` — derives an argfile whose classpath can actually reach
+  netty's OPENSSL paths. **`common.args` as generated cannot**, and the way that
+  presents is not an error: `OpenSsl.isAvailable()` is false, JUnit never
+  generates the OPENSSL parameterisations, and the classes that exist to test
+  them read as clean PASSES while running a fraction of their tests —
+  `ParameterizedSslHandlerTest` reports success at **7 of 63**. Two halves, and
+  only the first is obvious: add `netty-tcnative-boringssl-static-<ver>-<os>.jar`
+  (statically linked, so the host's own OpenSSL version stops mattering to the
+  3.2.0-requiring dynamic artifact), AND remove the dynamic
+  `netty-tcnative-<ver>-<os>.jar` — with both present netty finds the dynamic
+  one and `isAvailable()` stays false whatever their order. `--bc18` also drops
+  the three `*-jdk15on-1.70` jars, which `common.args` lists ahead of
+  `bcprov-jdk18on-1.84` and which make `bctls-jdk18on-1.84` die in
+  `TlsUtils.<clinit>` on both VMs. Verify with
+  `java @<out> OpenSslAvailabilityProbe` (`probes/`) before trusting any number
+  out of those classes.
 - `gen-module-args.sh` — regenerates `module-args/<artifactId>.args` from the
   table above, one Maven-faithful single-module test classpath each
   (`mvn -o dependency:build-classpath -DincludeScope=test`, plus the module's own
