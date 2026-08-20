@@ -10276,32 +10276,36 @@ impl G1Collector {
     /// was using goes into the collection set. The failure surfaces four frames
     /// later as `IllegalFormatConversionException: d != java.lang.Object`.
     ///
-    /// # Why refusing on it is a LEVER and not the fix — measured
+    /// # This predicate only means what it says because of the fix in `roots.rs`
     ///
-    /// The obvious repair is to decline the pause (candidate fix 1 in the bug
-    /// record), and it does stop the corruption. It also does not work, for a
-    /// reason the measurement made obvious and reasoning had not: the empty
-    /// publication here is not a transient sampling artifact, it is a standing
-    /// property of that compiled frame. A refusal reclaims nothing, so the next
-    /// allocation re-triggers a pause that is still inside the same frame and
-    /// still publishes nothing. On `PolynomialTest` that is **1444 consecutive
-    /// refused pauses ending in `OutOfMemoryError` on 8 tests**, where the
-    /// unrefused run gave a wrong answer on 1. Same shape as
-    /// `CRATONVM_G1_COVERAGE_PIN`'s 330264 no-op pauses, reached from a
-    /// completely different predicate.
+    /// It was first written believing `pin_addrs=0` under a live compiled frame
+    /// meant the conservative scan had run and found nothing. It did not. The
+    /// scan was being SKIPPED: `collect_roots` took the precise-only branch
+    /// whenever the oop-map coverage proof passed, and G1's pin set is built
+    /// from that scan's output alone, so an empty publication was simply what
+    /// precise mode looked like from here. Measured with
+    /// `CRATONVM_DBG_JIT_ROOTSCAN`: `precise_only=true scan_added=0` on the
+    /// failing test, `precise_only=false scan_added=14` on a JIT-heavy probe
+    /// that never trips this predicate at all.
     ///
-    /// So `CRATONVM_G1_PIN_EMPTY_PUBLICATION` ships OFF, and the value of this
-    /// predicate is DISCRIMINATION rather than protection: the coverage lever
-    /// fires on ~99.99% of pauses and therefore identifies nothing, while
-    /// flipping this one changes `PolynomialTest`'s failure mode outright,
-    /// which is what pins the cause to evacuation under an empty publication.
-    /// Detection is counted on every run (`record_g1_pause_empty_jit_publication`,
-    /// ungated) because the rate of the unsafe state is worth knowing even when
-    /// nothing is done about it.
+    /// That is why refusing on it was ruinous before the fix — it refused every
+    /// precise-mode pause: 1444 consecutive no-op pauses on `PolynomialTest`
+    /// and `OutOfMemoryError` on 8 tests, the same wall
+    /// `CRATONVM_G1_COVERAGE_PIN` hits at its ~99.99% rate. The predicate was
+    /// detecting a MODE, not a defect.
     ///
-    /// The actual fix is candidate 2 — make the conservative scan cover what
-    /// its header claims — and this function's existence is an argument for it,
-    /// not a substitute.
+    /// `collect_roots` no longer lets G1 take that branch, so the conservative
+    /// scan always runs under this collector and an empty publication is once
+    /// again the thing this function claims: the scan ran and found nothing
+    /// while a compiled frame was live. That is a genuine anomaly and worth
+    /// counting — which is what `record_g1_pause_empty_jit_publication` does,
+    /// on every run, ungated.
+    ///
+    /// `CRATONVM_G1_PIN_EMPTY_PUBLICATION` remains OFF and remains a bisection
+    /// lever rather than protection: a refusal reclaims nothing, so it can only
+    /// buy time for a publication that later becomes non-empty. It is kept for
+    /// the case where this counter goes non-zero again and the question is once
+    /// more "is a relocation under an unproven root set what is failing here?".
     ///
     /// # What this does not catch
     ///
@@ -10345,10 +10349,10 @@ impl G1Collector {
     /// A pure function of its two inputs so both arms are testable —
     /// `gc_flags()` latches for the process, so a test cannot flip the lever
     /// from inside one. Same shape and same polarity as
-    /// [`Self::refuse_evacuation`]: both refusals are opt-in, for different
-    /// measured reasons — that one because its detection fires on ~99.99% of
-    /// pauses, this one because refusing on a PERSISTENT empty publication
-    /// starves the heap instead of saving it. See [`Self::empty_jit_publication`].
+    /// [`Self::refuse_evacuation`]: both refusals are opt-in, because neither
+    /// reclaims anything and a pause that frees nothing is re-triggered by the
+    /// next allocation. See [`Self::empty_jit_publication`] for what this one
+    /// turned out to be detecting before `collect_roots` was fixed.
     fn refuse_evacuation_for_empty_publication(detected: bool, lever_on: bool) -> bool {
         detected && lever_on
     }
@@ -14907,15 +14911,19 @@ mod tests {
     /// address. That is exactly the mechanism behind `PolynomialTest`
     /// formatting `%d` against a bare `java.lang.Object`.
     ///
-    /// It is not fixed by declining the pause, and the measurement is why:
-    /// under `CRATONVM_G1_PIN_EMPTY_PUBLICATION` the same test takes 1444
-    /// consecutive refused pauses and dies of `OutOfMemoryError` on 8 tests,
-    /// because the empty publication is a standing property of that compiled
-    /// frame rather than a transient one. The repair is to make the scan
-    /// publish what is there — candidate 2 in
-    /// `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
-    /// When that lands, this test should start failing, and its replacement is
-    /// the assertion that the address is unchanged.
+    /// What this does NOT say is that the state is reachable in production. It
+    /// is constructed here directly — `enter()` plus an empty pin map — because
+    /// the point is G1's response to it, not its cause. In a real run the pin
+    /// map is filled by `memory::roots::collect_roots`, which since the
+    /// precise-only fix always runs the conservative JIT scan under G1, so an
+    /// empty publication with a live frame should not occur at all. That is why
+    /// `record_g1_pause_empty_jit_publication` counts it on every run: this
+    /// test states the consequence if it ever does.
+    ///
+    /// Declining the pause is not the answer and the measurement says why:
+    /// under `CRATONVM_G1_PIN_EMPTY_PUBLICATION`, back when the state was
+    /// permanent, the same test took 1444 consecutive refused pauses and died
+    /// of `OutOfMemoryError` on 8 tests. A refusal reclaims nothing.
     ///
     /// Driven through `collect_garbage` because that is G1's single production
     /// entry to both object-moving paths, exactly as

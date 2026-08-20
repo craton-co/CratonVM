@@ -893,28 +893,26 @@ pub struct GcFlags {
     /// `StringLatin1.newString` reference out from under a compiled frame
     /// (`bug-g1-evacuates-live-jit-reference-20260819.md`).
     ///
-    /// **It ships OFF because refusing does not fix that, it only relocates the
-    /// symptom — measured, not assumed.** On the failing test itself
-    /// (`PolynomialTest`, `-XX:+UseG1GC --Xmx 1g`) the empty publication is not
-    /// a transient sampling artifact but a standing property of the compiled
-    /// frame, so every retry re-enters the same state: 1444 consecutive refused
-    /// pauses, nothing reclaimed, and the run ends in
-    /// `OutOfMemoryError: Java heap space` on 8 tests instead of the original
-    /// wrong answer on 1. A refusal can only buy time for a publication that
-    /// becomes non-empty, and this one never does.
+    /// **It ships OFF because a refusal reclaims nothing**, so it can only buy
+    /// time for a publication that later becomes non-empty. Measured before the
+    /// root-scan fix below, when the state was permanent: 1444 consecutive
+    /// refused pauses on `PolynomialTest` and `OutOfMemoryError` on 8 tests,
+    /// instead of the original wrong answer on 1.
     ///
-    /// What it IS good for, and where it beats [`Self::g1_coverage_pin`]:
-    /// discrimination. That lever fires on ~99.99% of pauses, so a failure
-    /// surviving it says little. This one fires only on the precise state, so
-    /// flipping it turns the `PolynomialTest` corruption into a *different*
-    /// failure — which is what identifies evacuation-under-an-empty-publication
-    /// as the cause rather than merely a correlate.
+    /// That measurement also showed the predicate was not detecting what it
+    /// claimed. `pin_addrs=0` was the ordinary appearance of PRECISE mode:
+    /// `collect_roots` skipped the conservative JIT scan whenever the oop-map
+    /// coverage proof passed, and G1's pin set is built from that scan alone.
+    /// The real repair was to stop G1 taking that branch (see
+    /// `CRATONVM_G1_PRECISE_ONLY_ROOTS`, which restores the broken behaviour
+    /// for A/B). With the scan always running under G1, an empty publication
+    /// means what this flag's name says again.
     ///
     /// The DETECTION counter
     /// (`gc_metrics::record_g1_pause_empty_jit_publication`) is deliberately
     /// NOT gated on this flag, so a normal run still reports how often the
-    /// unsafe state occurs. That rate is the thing to watch; the refusal is
-    /// not the fix.
+    /// state occurs. It should now be zero; the refusal is a bisection lever
+    /// for the day it is not.
     pub g1_pin_empty_publication: bool,
     /// `CRATONVM_G1_WORKERS` — override the G1 worker count, clamped to `>= 1`.
     /// [`parse::usize_min1`].

@@ -1334,10 +1334,12 @@ static G1_PAUSES_EMPTY_JIT_PUBLICATION: AtomicU64 = AtomicU64::new(0);
 /// evacuated against a root set it could not prove, which is worth counting on
 /// a normal run precisely because the shipped default does not decline it.
 ///
-/// Contrast `record_g1_pause_coverage`, whose rate is ~100% and therefore
-/// selects nothing. This one discriminates — measured 0 of 3 in-JIT pauses on
-/// `MovingYoungConcurrentProbe` (which publishes 18 addresses per pause) and 1
-/// of 1 on the `PolynomialTest` failure.
+/// Expected to be ZERO. G1 no longer skips the conservative JIT scan (see
+/// `memory::roots::collect_roots`), so a live compiled frame that publishes no
+/// pin means the scan ran over the frame's band and validated nothing in it.
+/// Before that fix this counter measured something else entirely — how often
+/// precise mode was active, which was every in-JIT pause on the workload it was
+/// written for.
 pub fn record_g1_pause_empty_jit_publication() {
     G1_PAUSES_EMPTY_JIT_PUBLICATION.fetch_add(1, Ordering::Relaxed);
 }
