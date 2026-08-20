@@ -148,13 +148,19 @@ the conservative path and gets pinned normally.
 
 ## The fix
 
-One term in `collect_roots`: G1 may not take the precise-only branch.
+One term in `collect_roots`: only the generational collector may take the
+precise-only branch.
 
 ```rust
 let moving_young_precise_only = moving_young
-    && (!shared.mem.heap.is_g1() || g1_precise_only_roots)   // <- added
+    && (shared.mem.heap.is_generational() || g1_precise_only_roots)   // <- added
     && ...
 ```
+
+Spelled `is_generational()`, not `!is_g1()`, because that is what the two
+SIBLING suppression sites already say — see "Both fixes are independently
+sufficient" below. It additionally excludes ZGC, which publishes no young-bounds
+table either and so also receives a vacuous proof.
 
 ABBA-interleaved on azure host 2, one binary, `CRATONVM_G1_PRECISE_ONLY_ROOTS=1`
 restoring the old behaviour:
@@ -174,15 +180,22 @@ Beyond the ABBA arms above, on azure host 2, `-XX:+UseG1GC --Xmx 1g`, JIT on:
 
 | check | result |
 |---|---|
-| generational (default collector), fix vs pristine base | PASS / PASS — a G1-only term, and the ntru test was never red there |
+| `-XX:+UseGenerationalGC`, fix vs pristine base | PASS / PASS — see "What the collectors actually do"; the ntru test was never red there |
 | 8 `bcjava-pass-list.txt` classes under G1, fix vs base | **8/8 identical**, same test counts (24, 17, 7, 19, 27, 1, 177, 1) |
 | `cargo test -p cratonvm-vm --lib` | 2576 passed, 0 failed |
 | `cargo test -p cratonvm-gc --lib` | 1684 passed, 0 failed |
 
-An earlier collateral attempt used `org.bouncycastle.{crypto,util}.test.RegressionTest`,
-which are not JUnit-3 suites: both arms reported `No tests found` and the rows
-proved nothing. Recorded because "both arms FAIL identically" reads as evidence
-of no regression and in that case was evidence of no test.
+Two harness faults are recorded rather than deleted, because both produced rows
+that READ as evidence:
+
+* an earlier collateral attempt used
+  `org.bouncycastle.{crypto,util}.test.RegressionTest`, which are not JUnit-3
+  suites — both arms reported `No tests found` and FAILED identically, which
+  reads as "no regression" and was "no test";
+* the first pass's control arms were labelled "generational" and were **ZGC**
+  runs, because a default build selects ZGC and
+  `GcAlgorithm::Generational`'s doc comment claimed otherwise. A control arm
+  named after a collector it did not run is worse than no control arm.
 
 ## Two things the earlier reading got wrong
 
@@ -217,20 +230,143 @@ ungated and should now read zero:
 [GC] g1 jit publication: pauses=N empty_while_in_jit=K (y%)
 ```
 
+## Why the coverage proof passed: the verifier was vacuous
+
+The proof is not merely trusting the codegen's `moving_young_coverage_complete`
+bit. `refresh_moving_young_coverage_for_current_thread` also runs a frame-band
+verifier — `moving_young_unpublished_frame_oop_present` — whose module block
+states exactly the defect this record is about:
+
+> A compiled frame holds oops in storage the abstract model does not describe:
+> SCALAR-REPLACED OBJECT FIELDS ... LICM HOIST SLOTS ... THE FULL-GPR SAFEPOINT
+> SPILL AREA. On the non-moving path all three are covered, because the
+> conservative frame scan reads every word of the frame. Under moving-young
+> `memory/roots.rs` SUPPRESSES that scan when the coverage proof passes.
+
+and which claims to remove the need to trust the bit. It is default-on.
+
+**It could not have found anything under G1.** Its residency test is
+`gen_heap::addr_in_published_young_regions`, which reads `JIT_REGION_BOUNDS`.
+That table has exactly one writer, `store_region_bounds_locked`, and it is
+generational-only — G1 leaves it empty deliberately (publishing it would make an
+inline reference-STORE fast path reachable and cost a CSet-excluded region its
+remembered-set edge, the G1-2 decision, stated in the `G1Collector`
+constructor), and ZGC fills neither table. Where the table is empty the test
+answers `false` for **every address in the process**, so the verifier walks every
+verifiable slot, classifies none of them as young, and returns "nothing
+unpublished" without having inspected anything.
+
+So the chain is: empty table → vacuous verifier → `incomplete=false` →
+`roots.rs` suppresses the conservative scan → G1's pin set is empty →
+`pin_addrs=0` → evacuate. A predicate that is false everywhere reads as absence.
+
+### The fail-closed fix
+
+The verifier already reports "not verified" for an unbounded band, a missing
+frame size, or an unresolvable shadow window. An unpublished residency table is
+the same class of "cannot inspect" and was the one case not failing closed. It
+does now, under a `YOUNG_BOUNDS_UNPUBLISHED` reason so the fallback histogram
+separates it from a real missed oop.
+`CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD=1` restores the vacuous pass.
+
+### Both fixes are independently sufficient
+
+Measured as a 2x2 in one binary, `-XX:+UseG1GC --Xmx 1g`, two rounds each:
+
+| collector term | bounds guard | `precise_only` | `incomplete` | result |
+|---|---|---|---|---|
+| on | on | false | false | PASS |
+| **off** | on | false | **true** | PASS |
+| on | **off** | false | false | PASS |
+| **off** | **off** | **true** | false | **FAIL** |
+
+The two reach the same place by different routes — the guard makes the proof
+fail closed, the collector term declines to act on a proof that still passes
+vacuously — and they are not redundant, because the proof has **three**
+consumers. `interpreter::update_root_snapshot` and
+`vm_exec::deposit_root_snapshot` suppress their own conservative scans on it
+too, and the guard is what fixes those; the collector term only fixes
+`collect_roots`.
+
+That third point also reframes the collector term. Both sibling sites already
+open with `heap.is_generational() && moving_young_enabled() && <proof>`.
+`collect_roots` was the one that had lost the term. It is not a new restriction,
+it is a drift repair, and the term is now spelled the same way as its siblings.
+
+## A second, independent way the table goes empty
+
+`Drop for GenerationalHeap` cleared both global tables **unconditionally**, so a
+heap going away wiped bounds a still-live heap had published. That was tolerable
+while the only reader was the JIT's inline getfield guard, where an empty table
+costs a helper call; it stopped being tolerable when a correctness predicate
+started reading the same table. Fixed: only the publisher clears, discriminated
+by the young-from base in slot 0. Unit-tested both ways.
+
+**Not** what made the table empty in the runs above — those were G1 and ZGC,
+which never publish it at all. Recorded because the mechanism is real and was
+found while chasing this, not because it explains this failure.
+
+## What the collectors actually do
+
+Measured with `CRATONVM_DBG_JIT_ROOTSCAN=1`, all fixes in:
+
+| collector | `ybounds` | `precise_only` | scan roots | ntru |
+|---|---|---|---|---|
+| G1 (`-XX:+UseG1GC`) | false | false | 42 | PASS |
+| default = **ZGC** | false | false | 22-36 | PASS |
+| `-XX:+UseGenerationalGC` | **true** | false | 33-49 | PASS |
+
+Two things to read off it. The generational collector publishes the table, so
+the guard is inert there — and it was already declining the precise-only path on
+this workload for other obligations (`incomplete=true` on 8 of 8 collections),
+so it loses nothing.
+
+And **the default collector is ZGC, not generational.** `VmConfig::default`
+selects `Zgc` whenever the `zgc` feature is on, which the release build has;
+`GcAlgorithm::Generational`'s doc comment claimed to be the default and was
+stale (corrected in the same change). Three control arms in the first pass of
+this investigation were recorded as "generational" and were ZGC runs.
+
+### Cost on the default collector
+
+The collector term makes ZGC always run the conservative scan, where the vacuous
+proof previously let it skip. ABBA, pristine base vs fix, default collector:
+
+| class | base | fix |
+|---|---|---|
+| `crypto.hash2curve.test.AllTests` (177 tests) | 70249 / 67818 ms | 68851 / 68735 ms |
+| `asn1.test.AllTests` (24 tests) | 9135 / 12820 ms | 11473 / 6496 ms |
+| `crypto.agreement.test.AllTests` (27 tests) | 1510 / 1505 ms | 1690 / 1580 ms |
+
+12 of 12 PASS with identical test counts. No regression is detectable, and the
+honest limit of that statement is the host: the two short classes vary by 2x
+run-to-run, so only the 70 s class resolves anything, and there the fix sits
+inside base's own spread. The mechanism agrees — the scan runs per collection
+and these workloads take single-digit collections.
+
 ## What is still open
 
-**The coverage proof's guarantee is narrower than the branch that spends it.**
-`refresh_moving_young_coverage_for_collection` returned `true` for this stack —
-`incomplete=false` in every arm — while `CRATONVM_DBG_VERIFY_OOP_MAPS` reports
-in-band object addresses that no oop map names, on a compiled method whose
-`fully_oop_covered` is `true`. (That oracle's own caveat is that the band it
-walks may include nested-JIT-callee slots, so treat its count as an upper bound,
-not a tally of missed oops. The 42-root A/B does not depend on it.)
+**Is the codegen's coverage bit itself sound?** This pass did not answer that.
+It established that the verifier which was supposed to check the bit could not
+run on two of the three collectors, and stopped the two suppression paths from
+depending on the unchecked answer. On the generational collector, where the
+verifier does run, it reports `incomplete=true` on this workload — so the bit
+was never load-bearing there either, and no run in this record has exercised
+"verifier ran, verifier passed, collector moved".
 
-The fix above stops **G1** depending on that proof. The generational
-moving-young path still does. Whether the proof is wrong, or merely proves
-something narrower than "every live reference on this stack is rewritable", is
-the next question — and it is a different bug from this one.
+`CRATONVM_DBG_VERIFY_OOP_MAPS` reports in-band object addresses no oop map
+names, on a method whose `fully_oop_covered` is `true`. Treat that as an upper
+bound, not a tally: the oracle builds its mapped set from ONE method's maps at
+ONE frame base, so a nested callee's correctly-mapped slots count as unmapped.
+Fixing that oracle to walk the RBP chain is the next concrete step if anyone
+wants the real number.
+
+**Two heaps at once still lose one.** Publication into `JIT_REGION_BOUNDS` is
+last-writer-wins with no registry of live heaps, so constructing a second
+generational heap leaves the first unrepresented. The fail-closed guard turns
+that into a non-moving cycle rather than a silent vacuous pass, which is the
+safe direction, but the table is still not a reliable answer to "is this address
+young".
 
 ## Repro
 
