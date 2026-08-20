@@ -242,118 +242,6 @@ macro_rules! dispatch {
     };
 }
 
-/// Every `VmHeap::is_object_address` call, from any caller. Diagnostic only.
-pub static IS_OBJECT_ADDRESS_CALLS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-
-/// Snapshot of [`IS_OBJECT_ADDRESS_CALLS`].
-pub fn is_object_address_calls() -> u64 {
-    IS_OBJECT_ADDRESS_CALLS.load(core::sync::atomic::Ordering::Relaxed)
-}
-
-/// Number of distinct call sites the per-caller census below can hold.
-///
-/// Overflow is silent, so [`is_object_address_callers`] reports how many
-/// slots were used and a full table means the census is INCOMPLETE.
-const CALLER_SLOTS: usize = 512;
-
-/// Per-CALLER census of [`VmHeap::is_object_address`], keyed by the
-/// `#[track_caller]` location of the call site.
-///
-/// The hand-tagged census in `vm/src/jit/helpers.rs` can only count sites
-/// somebody thought to tag. It accounted for 9.2% of the total, and the
-/// remaining 90.8% got attributed by guesswork twice — both times wrongly.
-/// This table cannot guess: every caller shows up named by file and line,
-/// because the location rides in with the call.
-///
-/// Open-addressed and lock-free, so it is safe to hit from the collector's
-/// own scans and from any thread. Keyed on the `&'static Location` POINTER:
-/// the compiler emits one static per call site, so pointer identity IS site
-/// identity, and the key needs no hashing beyond a shift.
-static CALLER_KEYS: [core::sync::atomic::AtomicUsize; CALLER_SLOTS] =
-    [const { core::sync::atomic::AtomicUsize::new(0) }; CALLER_SLOTS];
-static CALLER_IDS: [core::sync::atomic::AtomicU32; CALLER_SLOTS] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; CALLER_SLOTS];
-static CALLER_HITS: [core::sync::atomic::AtomicU64; CALLER_SLOTS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; CALLER_SLOTS];
-
-/// What was called, for the `id` column of the census.
-///
-/// `is_object_address` is the walk itself. The rest are the `VmHeap` header
-/// accessors that re-validate their `ObjectRef` argument before dispatching:
-/// the level-one census showed they are 82% of every walk in the process, and
-/// each has enough callers that "class_id_of is 13%" does not name a fix site
-/// on its own. Tagging them here answers WHO is asking.
-pub const CENSUS_FN_NAMES: [&str; 6] = [
-    "is_object_address",
-    "class_id_of",
-    "kind_of",
-    "element_type_of",
-    "identity_hash_code",
-    "load_and_forward",
-];
-
-#[inline]
-fn note_census_site(id: u32, loc: &'static core::panic::Location<'static>) {
-    use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
-    let key = loc as *const _ as usize;
-    let mut i = ((key >> 4) ^ ((id as usize) << 6)) % CALLER_SLOTS;
-    for _ in 0..CALLER_SLOTS {
-        let seen = CALLER_KEYS[i].load(Relaxed);
-        if seen == key && CALLER_IDS[i].load(Relaxed) == id {
-            CALLER_HITS[i].fetch_add(1, Relaxed);
-            return;
-        }
-        if seen == 0 {
-            let claimed = CALLER_KEYS[i].compare_exchange(0, key, AcqRel, Acquire);
-            if claimed.is_ok() {
-                CALLER_IDS[i].store(id, Relaxed);
-                CALLER_HITS[i].fetch_add(1, Relaxed);
-                return;
-            }
-        }
-        i = (i + 1) % CALLER_SLOTS;
-    }
-}
-
-/// Record one call to census function `id` made from `loc`.
-#[inline]
-pub fn note_accessor_call(id: u32, loc: &'static core::panic::Location<'static>) {
-    note_census_site(id, loc);
-}
-
-/// `(file, line, calls)` per call site, most-frequent first, plus the number
-/// of slots used out of [`CALLER_SLOTS`].
-pub fn is_object_address_callers() -> (Vec<(&'static str, u32, u64, &'static str)>, usize) {
-    use core::sync::atomic::Ordering::Relaxed;
-    let mut out: Vec<(&'static str, u32, u64, &'static str)> = Vec::new();
-    let mut used = 0usize;
-    for i in 0..CALLER_SLOTS {
-        let key = CALLER_KEYS[i].load(Relaxed);
-        if key == 0 {
-            continue;
-        }
-        used += 1;
-        let hits = CALLER_HITS[i].load(Relaxed);
-        if hits == 0 {
-            continue;
-        }
-        // SAFETY: the only writer is `note_is_object_address_caller`, which
-        // only ever stores a `&'static Location` it was handed.
-        let loc: &'static core::panic::Location<'static> =
-            unsafe { &*(key as *const core::panic::Location<'static>) };
-        let id = CALLER_IDS[i].load(Relaxed) as usize;
-        out.push((
-            loc.file(),
-            loc.line(),
-            hits,
-            CENSUS_FN_NAMES.get(id).copied().unwrap_or("?"),
-        ));
-    }
-    out.sort_by(|a, b| b.2.cmp(&a.2));
-    (out, used)
-}
-
 impl VmHeap {
     /// Create a new VmHeap with the specified backend and total capacity.
     pub fn new(backend: GcBackend, total_bytes: usize) -> Self {
@@ -584,9 +472,7 @@ impl VmHeap {
         dispatch!(self, get_header(obj))
     }
 
-    #[track_caller]
     pub fn class_id_of(&self, obj: ObjectRef) -> ClassId {
-        note_accessor_call(1, core::panic::Location::caller());
         // KINDOF-SENTINEL: see `kind_of` below — same idiom, same observed
         // sentinel (`0xFFFFFFFFFFFFFFFF`) reaching this dispatch unchecked.
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
@@ -628,15 +514,12 @@ impl VmHeap {
     /// `Some(ObjectRef)` only if `addr` lands on a live object header in
     /// this heap. See [`crate::gen_heap::GenerationalHeap::is_object_address`]
     /// for the full contract.
-    #[track_caller]
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
         // TOTAL walk counter, every caller. The per-site census in
         // `vm/src/jit/helpers.rs` tags only the JIT helpers; comparing its sum
         // against this says whether those sites are the whole story or a
         // fraction. Getting that backwards would mean optimising 3% while
         // claiming 12%.
-        IS_OBJECT_ADDRESS_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        note_census_site(0, core::panic::Location::caller());
         match self {
             VmHeap::Generational(h) => h.is_object_address(addr),
             VmHeap::G1(h) => h.is_object_address(addr),
@@ -926,10 +809,8 @@ impl VmHeap {
     /// UNvalidated even though the relocation table only holds live bases,
     /// because that keeps the flag's meaning to one sentence a caller can
     /// check rather than a chain of invariants it has to trust.
-    #[track_caller]
     #[inline]
     fn load_and_forward_inner(&self, obj: ObjectRef, pre_validated: bool) -> (ObjectRef, bool) {
-        note_accessor_call(5, core::panic::Location::caller());
         // KINDOF-SENTINEL: `obj` itself has been observed already invalid
         // here (not merely forwarded-to-garbage — see the forwarding-target
         // check below) when the caller's own value was reconstructed across
@@ -1025,7 +906,6 @@ impl VmHeap {
     }
 
     /// The software read barrier: repair `obj` if the collector moved it.
-    #[track_caller]
     #[inline]
     pub fn load_and_forward(&self, obj: ObjectRef) -> ObjectRef {
         self.load_and_forward_inner(obj, false).0
@@ -1039,7 +919,6 @@ impl VmHeap {
     /// twin would dereference a pointer nothing has checked. This variant
     /// hands the caller the one bit needed to tell the two cases apart, and
     /// costs nothing: the walk that decides it has already happened inside.
-    #[track_caller]
     #[inline]
     pub fn load_and_forward_checked(&self, obj: ObjectRef) -> (ObjectRef, bool) {
         self.load_and_forward_inner(obj, false)
@@ -1057,7 +936,6 @@ impl VmHeap {
     ///
     /// As [`Self::class_id_of_validated`]: `is_object_address` must have
     /// answered `Some` for `obj`, on this heap, with no intervening safepoint.
-    #[track_caller]
     #[inline]
     pub fn load_and_forward_validated(&self, obj: ObjectRef) -> ObjectRef {
         self.load_and_forward_inner(obj, true).0
@@ -1111,9 +989,7 @@ impl VmHeap {
     // hands back, but a corrupted header can also be reached directly
     // without ever going through that barrier, so each of these validates
     // independently rather than trusting an already-validated caller.
-    #[track_caller]
     pub fn kind_of(&self, obj: ObjectRef) -> ObjectKind {
-        note_accessor_call(2, core::panic::Location::caller());
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
             return ObjectKind::Object;
         }
@@ -1132,18 +1008,14 @@ impl VmHeap {
         dispatch!(self, element_type_of(obj))
     }
 
-    #[track_caller]
     pub fn element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
-        note_accessor_call(3, core::panic::Location::caller());
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
             return ArrayElementType::Reference;
         }
         dispatch!(self, element_type_of(obj))
     }
 
-    #[track_caller]
     pub fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        note_accessor_call(4, core::panic::Location::caller());
         // KINDOF-SENTINEL: see `kind_of` above.
         if self.is_object_address(obj.as_ptr() as usize).is_none() {
             return 0;

@@ -158,23 +158,17 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // JIT-side only: these are the sites `helpers.rs` tags by hand. The
+        // whole-VM per-caller census that used to print beneath this was
+        // retired once it had answered — it cost 3.4x on ZGC, which is how
+        // this page's first round of numbers came out wrong.
         eprintln!(
-            "[cratonvm] membership walks: TOTAL={} | by JIT site: {}",
-            cratonvm_vm::jit::helpers::total_membership_walks(),
+            "[cratonvm] membership walks by JIT site: {}",
             cratonvm_vm::jit::helpers::membership_walks_by_site()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
                 .collect::<Vec<_>>()
                 .join(" ")
-        );
-        let (by_caller, slots_used) = cratonvm_vm::jit::helpers::membership_walks_by_caller();
-        for (file, line, calls, what) in by_caller.iter().take(30) {
-            eprintln!("[cratonvm]   census {what} @ {file}:{line} = {calls}");
-        }
-        eprintln!(
-            "[cratonvm]   membership walk sites: {} distinct, {} of 512 slots used",
-            by_caller.len(),
-            slots_used
         );
         // The RECEIVER-SHAPE census: which guard clause each helper call
         // actually failed, counted at EXECUTION on the one path every
