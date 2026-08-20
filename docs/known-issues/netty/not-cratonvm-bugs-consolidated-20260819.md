@@ -29,16 +29,16 @@ this page is the index, not a replacement for them.
 | `io.netty.handler.codec.xml.NativeImageHandlerMetadataTest` | same | same | same |
 | `io.netty.handler.proxy.NativeImageHandlerMetadataTest` | same | same | same |
 | `io.netty.resolver.dns.NativeImageHandlerMetadataTest` | same | same | same |
-| `io.netty.buffer.AlignedPooledByteBufAllocatorTest` | `isDirectMemoryCacheAlignmentSupported()` assumption answers `false` on this host for both VMs | Direct HotSpot cross-check: `found=49 ok=21 aborted=28`, byte-identical to CratonVM | `buffer-alignment-abort-cluster-not-a-cratonvm-bug-20260819.md` |
-| `io.netty.buffer.AdvancedLeakAwareCompositeByteBufTest` | same assumption family | Internally consistent counts (`aborted=9`), not independently re-run on HotSpot | same |
-| `io.netty.buffer.BigEndianCompositeByteBufTest` | same | same (`aborted=9`) | same |
-| `io.netty.buffer.LittleEndianCompositeByteBufTest` | same | same (`aborted=9`) | same |
-| `io.netty.buffer.PooledByteBufAllocatorTest` | same | same (`aborted=2`) | same |
-| `io.netty.buffer.SimpleLeakAwareCompositeByteBufTest` | same | same (`aborted=9`) | same |
-| `io.netty.buffer.WrappedCompositeByteBufTest` | same | same (`aborted=9`) | same |
+| `io.netty.buffer.AlignedPooledByteBufAllocatorTest` | `isDirectMemoryCacheAlignmentSupported()` assumption answers `false` on this host for both VMs | Direct HotSpot cross-check: `found=49 ok=21 aborted=28`, byte-identical to CratonVM | `buffer-alignment-abort-cluster-CLOSED-20260819.md` |
+| `io.netty.buffer.AdvancedLeakAwareCompositeByteBufTest` | same assumption family | Direct HotSpot cross-check (2026-08-19): `found=506 ok=497 aborted=9`, byte-identical | same |
+| `io.netty.buffer.BigEndianCompositeByteBufTest` | same | Direct HotSpot cross-check: `found=496 ok=487 aborted=9`, byte-identical | same |
+| `io.netty.buffer.LittleEndianCompositeByteBufTest` | same | Direct HotSpot cross-check: `found=496 ok=487 aborted=9`, byte-identical | same |
+| `io.netty.buffer.PooledByteBufAllocatorTest` | same | Direct HotSpot cross-check: `found=47 ok=45 aborted=2`, byte-identical | same |
+| `io.netty.buffer.SimpleLeakAwareCompositeByteBufTest` | same | Direct HotSpot cross-check: `found=506 ok=497 aborted=9`, byte-identical | same |
+| `io.netty.buffer.WrappedCompositeByteBufTest` | same | Direct HotSpot cross-check: `found=496 ok=487 aborted=9`, byte-identical | same |
 | `io.netty.handler.codec.http2.WeightedFairQueueRemoteFlowControllerTest` | Harness never passes `-ea`; netty's own internal `assert` statements never fire on either VM | Direct HotSpot cross-check: identical `found=34 ok=28 failed=6`, same 6 methods | `http2-flowcontroller-and-datacompression-triage-20260819.md` |
 | `io.netty.handler.codec.http2.UniformStreamByteDistributorFlowControllerTest` | same `-ea` gap — inherits the identical test methods from the same base class | Not independently re-run on HotSpot; same mechanism and base class as the row above | same |
-| `io.netty.handler.ssl.BouncyCastleEngineAlpnTest` | BouncyCastle's JSSE provider (`org.bouncycastle.jsse.provider.SSLContext.TLSv1_3`) isn't resolvable from this environment's classpath | Direct HotSpot cross-check: identical `ClassNotFoundException`, `found=1 failed=1` both | `bouncycastlealpn-and-udt-echo-triage-20260819.md` |
+| `io.netty.handler.ssl.BouncyCastleEngineAlpnTest` | The fixture's `-cp` carries `bcprov-jdk15on-1.70.jar` AHEAD of `bcprov-jdk18on-1.84.jar`, so `bctls-1.84` resolves `NISTObjectIdentifiers` from 1.70 and dies in `TlsUtils.<clinit>` on the missing `id_ml_dsa_44` | Direct HotSpot cross-check: identical `NoSuchFieldError` from the identical BC frame, `found=1 failed=1` both. NOTE (2026-08-19): the earlier reading of this row said `ClassNotFoundException` on both — that was CratonVM's OWN, different failure, since fixed; and with the 1.70 jars dropped HotSpot PASSES while CratonVM does not | `foreign-nio-subclass-and-bc-provider-object-FIXED-20260819.md`, `sslcontext-natives-ignore-a-third-party-spi-20260819.md` |
 | `io.netty.handler.ssl.CloseNotifyTest` | `netty-tcnative`/OpenSSL not available in this environment | Direct HotSpot cross-check, isolated: identical `found=4 ok=2 aborted=2`, same `Assumption failed: OpenSSL is not available` | `hashedwheeltimertest-late-task-firing-20260819.md` |
 | `io.netty.handler.ssl.SslErrorTest` | same OpenSSL-unavailability, parameterization yields zero cases | Direct HotSpot cross-check, isolated: identical `found=0 started=0` | same |
 | `io.netty.pkitesting.CertificateBuilderTest` | Result set matches HotSpot exactly, in both directions | `ok=39 failed=28 aborted=7` on both VMs; failing-test-name sets identical (`comm`-verified) | `certificatebuildertest-fail-status-not-a-regression-20260816.md` |
