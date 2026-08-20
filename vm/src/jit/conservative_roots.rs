@@ -2560,6 +2560,26 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     if !moving_young_enabled() || band_verify_disabled() {
         return false;
     }
+    // The band scan's residency test is
+    // `gen_heap::addr_in_published_young_regions`, which reads
+    // `JIT_REGION_BOUNDS`. That table has one writer and it is
+    // generational-only — G1 deliberately keeps it empty, ZGC never fills it.
+    // Where it is empty the test answers `false` for EVERY address, so the scan
+    // below inspects every verifiable slot, classifies none of them as young,
+    // and returns "nothing unpublished" without having verified anything.
+    //
+    // That vacuous pass is not a theoretical hazard: it is how `PolynomialTest`
+    // got `incomplete=false` under `-XX:+UseG1GC`, which let `roots.rs`
+    // suppress the conservative scan, which left G1's pin set empty, which let
+    // the pause evacuate a region a live compiled frame still referenced.
+    //
+    // Fail closed, exactly as the module block above says this verifier does
+    // for an unbounded band or an unresolvable shadow window: an uninspectable
+    // frame reports "not verified", never "verified clean".
+    if bounds_guard_enabled() && !cratonvm_gc::gen_heap::published_young_regions_are_live() {
+        *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::YOUNG_BOUNDS_UNPUBLISHED;
+        return true;
+    }
     let scanner_sp = current_stack_pointer();
     let mut unverified = false;
     let mut unpublished = false;
@@ -2715,6 +2735,19 @@ fn report_unpublished_band_words(
 /// word. A MEASUREMENT INSTRUMENT: it is how "does the codegen model actually
 /// cover this workload?" is asked, and it is unsafe to run with if the answer
 /// is no. Not a supported configuration.
+/// `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD=1` — let the frame-band verifier run
+/// against an unpublished young-bounds table, i.e. let it pass vacuously.
+///
+/// The pre-fix behaviour, kept as an A/B arm. Unsafe on any collector that does
+/// not publish `JIT_REGION_BOUNDS`, which is every collector except the
+/// generational one.
+fn bounds_guard_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD").is_none()
+    })
+}
+
 fn band_verify_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY").is_some())

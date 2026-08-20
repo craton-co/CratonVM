@@ -1665,6 +1665,28 @@ thread_local! {
 /// the table (see [`JitRegionBoundsTable`]); both are states in which the
 /// generational young semispaces do not exist, so nothing can be young.
 #[inline]
+/// Whether [`JIT_REGION_BOUNDS`] carries any young pair at all.
+///
+/// [`addr_in_published_young_regions`] answers "is this address young?" by
+/// testing that table, so when the table is EMPTY it answers `false` for every
+/// address in the process — indistinguishable, at the call site, from "this
+/// address is not young". A caller that reads that as good news is measuring an
+/// unpublished table, not a clean frame.
+///
+/// The table has exactly one writer, `store_region_bounds_locked`, which is
+/// generational-only: G1 deliberately leaves it empty (see the `G1Collector`
+/// constructor's note on G1-2 — publishing it would make an inline reference
+/// STORE fast path reachable and cost a CSet-excluded region its remembered-set
+/// edge), and ZGC publishes neither table. So this returns `false` on every
+/// collector except the generational one, and any predicate built on
+/// `addr_in_published_young_regions` is VACUOUS there.
+///
+/// Exposed so such a predicate can fail closed instead of passing silently —
+/// see `conservative_roots::moving_young_unpublished_frame_oop_present`.
+pub fn published_young_regions_are_live() -> bool {
+    (0..2).any(|i| JIT_REGION_BOUNDS.words[i * 2].load(Ordering::Acquire) != 0)
+}
+
 pub fn addr_in_published_young_regions(addr: usize) -> bool {
     // words = [yf_base, yf_end, yt_base, yt_end, og_base, og_end]
     for i in 0..2 {
