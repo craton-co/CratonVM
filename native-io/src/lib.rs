@@ -8015,14 +8015,24 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     //    close()V` is also 0 across that union; the traffic these rows were
     //    imagined to carry does not exist.
     //
-    // 4. THE HAZARD. On the one path that can still reach them —
-    //    `execute_invoke_kind`'s `recv_is_bare_object` rescue, which
-    //    substitutes the CP class when a receiver arrives as a bare
-    //    `java/lang/Object` — `native_scanner_close`'s receiver guard rejects
-    //    the non-Scanner by returning `Ok(None)`. That is a COMPLETED void
-    //    call, not a fall-through (`MethodCallResult` has no "decline, run the
-    //    bytecode" value), so the `close()` is silently SWALLOWED.
-    //    `[decline masks]`.
+    // 4. THE HAZARD IS ALREADY DEFUSED, and not by this lane. `H8-1`
+    //    (`e9f08d42b`) replaced `native_scanner_close`'s `Ok(None)` decline
+    //    with a real yield through `invoke_virtual_bytecode_only`, so a
+    //    non-Scanner receiver that did arrive here now runs its own `close()`
+    //    instead of having it swallowed. Do not re-derive the swallow from an
+    //    older record: `H5-1` N2 and `HANDOFF-20260820` both describe the
+    //    pre-`e9f08d42b` body. What is left is dead weight, not damage.
+    //
+    // 4b. AND THERE IS A SECOND, INDEPENDENT BARRIER. `H8-1` found it from
+    //    source and this lane's measurement is the first run behind it: at
+    //    step 6 of `execute_invoke_kind` (`invoke.rs`, the
+    //    `!(declaring_is_interface && !is_static)` gate) and at `vm_exec.rs`'s
+    //    `override_cb` arm, a native whose RESOLVED DECLARING class is an
+    //    interface instance method is dropped outright unless the triple is on
+    //    `should_force_registered_native_over_bytecode`'s list. Neither of
+    //    these two triples is. So the rows are shut out at two different steps
+    //    for two different reasons — receiver-keying at step 1, the
+    //    interface-default gate at step 6.
     //
     // 5. WHY THE LINES ARE STILL HERE. `vm/src/vm/tests.rs`'s
     //    `auto_closeable_close_p70` does
@@ -12961,7 +12971,11 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     // The mechanism is the same one recorded at the foot of
     // `register_scanner_natives`: dispatch keys on the RECEIVER's class, and
     // the one fallback walk follows `superclass` links only, so it never
-    // reaches an interface. The 33 `DataInputStream`/`DataOutputStream` rows —
+    // reaches an interface. A SECOND, independent barrier sits at step 6 of
+    // `execute_invoke_kind` and at `vm_exec.rs`'s `override_cb` arm, both of
+    // which drop a native whose resolved declaring class is an interface
+    // instance method unless the triple is force-listed — none of these four
+    // is. The 33 `DataInputStream`/`DataOutputStream` rows —
     // the load-bearing half, the one whose 2026-08-19 retag broke
     // `RDataInputFastPull` — are untouched above and keep every one of those
     // 593 calls.
