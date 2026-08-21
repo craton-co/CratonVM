@@ -61,11 +61,58 @@ use std::time::Duration;
 ///    (`0x5c`), which the IR builder also refuses;
 ///  * the `finally` handler reads only a PARAMETER local, so RBC.6's
 ///    `local_handler_reads_unsafe_local` does not force the method back to the
-///    single-pass backend (where this defect does not exist).
+///    single-pass backend (where this defect does not exist);
+///  * **the increment is OUTSIDE the `try`** — added 2026-08-21, and the one
+///    constraint that is not obvious from reading the Java. See below.
 ///
 /// Any of those slipping would send `body` to a tier that was always correct
 /// here, and the test would pass vacuously. The anti-vacuity assertion below is
-/// what actually catches that.
+/// what actually catches that — and on 2026-08-17 it did, for four days, with
+/// nobody reading it.
+///
+/// # Why the increment sits outside the `try`
+///
+/// `jit::ir_unresumable_protected_trap` (landed 2026-08-17,
+/// `unresumable-unconditional-trap-mvmap-FIXED-20260802.md`) refuses the
+/// optimizing tier any method whose protected range contains BOTH a
+/// deopt-guarded opcode AND a side effect: the IR tier lowers array access to a
+/// deopt guard, `can_deopt_resume` is false on a production artifact, and
+/// replaying a range that has already committed a store is observably wrong.
+/// That rule is correct and this probe used to trip it. With
+/// `n[0] = n[0] + 1` inside the `try`, javac emits
+///
+///     Exception table: from 0 to 12 target 23 any
+///     4: iaload        <- deopt-guarded  (the reported trap)
+///     7: iastore       <- side effect
+///     9: invokestatic  <- side effect
+///
+/// so the range carries a trap and the method went to the single-pass backend,
+/// where this defect does not exist. Hoisting the increment above the `try`
+/// leaves the range as
+///
+///     Exception table: from 8 to 12 target 23 any
+///     8: iload_0
+///     9: invokestatic
+///
+/// — an invoke leaves through the `i64::MIN` sentinel and needs no resume, so
+/// the rule's first narrowing term excludes it and the tier takes the method
+/// again.
+///
+/// **This does not weaken the probe, and the direction matters.** The defect
+/// needs a protected range that does NOT span the whole method, because
+/// `find_jit_exception_handler` honours a catch-all only when its region does;
+/// the new range is 8..12 of a 35-byte method where the old one was 0..12, so
+/// the unknown-pc rule is if anything easier to hit. The balance is unchanged:
+/// the increment always runs, the decrement runs only if the `finally` does.
+/// Verified the way this tree requires — by BREAKING the thing under test:
+/// with the `jit_set_throw_bci` stamp removed from `ir_lower::emit_call_exc_stub`,
+/// this probe reports `caught=200000 leaked=397032` and the assertion below
+/// fires with its own message.
+///
+/// `leaked` exceeds `iters` because the increment runs TWICE on a skipped
+/// `finally`: once in the compiled frame and again when the interpreter replays
+/// the method from entry. That is a detail of the failure, not of the probe —
+/// the assertion is `leaked == 0`, and any non-zero value is the defect.
 const PROBE_SRC: &str = r#"
 public class IrExceptionStubThrowBciProbe {
     // The DISPATCHED callee whose throw exits `body` through the shared stub.
@@ -73,11 +120,14 @@ public class IrExceptionStubThrowBciProbe {
         throw new RuntimeException("x" + i);
     }
 
-    // The protected region starts at 0 but ends well before the method does —
-    // exactly the shape the unknown-pc rule refuses.
+    // The protected region covers only the dispatched call, and ends well
+    // before the method does — exactly the shape the unknown-pc rule refuses.
+    // The increment is deliberately ABOVE the `try` — see the Rust doc comment
+    // on PROBE_SRC. Moving it back inside sends this method to the single-pass
+    // backend and the test stops proving anything.
     static void body(int i, int[] n) {
+        n[0] = n[0] + 1;
         try {
-            n[0] = n[0] + 1;
             thrower(i);
         } finally {
             n[0] = n[0] - 1;
