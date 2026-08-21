@@ -454,9 +454,17 @@ them without further work:
 One Java thread waiting on a `DefaultChannelPromise` while five event loops sit
 in `NioIoHandler.select` is a completion that never arrives, not a lock. It is
 filed as
-`known-issues/netty/parameterizedsslhandlertest-closenotify-promise-never-completes-20260820.md`,
-with what it would take to close it — starting with a second observation,
-because one is one.
+`known-issues/netty/parameterizedsslhandlertest-promise-never-completes-20260820.md`,
+with what it would take to close it.
+
+**The second observation has since arrived, and it moved that page's
+diagnosis.** A 20-run loop stalled once more — 2 in 28 overall — inside a
+DIFFERENT test method, and resolving both BCIs with `javap -c -l` shows the two
+waits are not the same thing: `testCloseNotify@230` is the client's CONNECT
+future, not the close path the page was originally named for, and
+`testAlertProducedAndSend@233` is an alert-delivery promise. The method name in
+the progress line had been read as the diagnosis; it only names the test that
+was running.
 
 Note what this means for the section's original subject. §D was written as a
 KEY-MATERIAL page: `NO_CERTIFICATE_SET`, "Unable to find key material for auth
@@ -649,5 +657,5 @@ told apart from a ticket that was never issued.
 - the retired `sslcontext-natives-ignore-a-third-party-spi` write-up — closed
   in the same branch; it is the reason `gen-openssl-args.sh` grew a `--bc18`
   mode.
-- `known-issues/netty/parameterizedsslhandlertest-closenotify-promise-never-completes-20260820.md`
+- `known-issues/netty/parameterizedsslhandlertest-promise-never-completes-20260820.md`
   — what is left of §D once the deadlock is gone, and a much narrower thing.

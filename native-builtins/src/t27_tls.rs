@@ -15599,10 +15599,84 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
     Ok(ses)
 }
 
+/// `getPeerHost()` as `String.valueOf` would render it — including the literal
+/// `null` HotSpot prints for an engine built by the no-arg `createSSLEngine()`.
+fn engine_peer_host_text(ctx: &mut dyn NativeContext, engine: ObjectRef) -> String {
+    match ctx.invoke_virtual(engine, "getPeerHost", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_else(|| "null".into()),
+        _ => "null".to_string(),
+    }
+}
+
+/// `getPeerPort()`. A CratonVM engine that never had a host recorded reads the
+/// field, which `createSSLEngine()` seeds to -1 — the value
+/// `javax.net.ssl.SSLEngine`'s own field initialiser uses, and the one HotSpot
+/// prints.
+fn engine_peer_port_text(ctx: &mut dyn NativeContext, engine: ObjectRef) -> String {
+    match ctx.invoke_virtual(engine, "getPeerPort", "()I", &[]) {
+        Ok(Some(v)) => v.as_int().unwrap_or(-1).to_string(),
+        _ => "-1".to_string(),
+    }
+}
+
+/// The session, rendered by its own `toString()`.
+///
+/// Deliberately a virtual call and not a local format: the `Session(...)` shape
+/// is JSSE's `SSLSessionImpl.toString()` and belongs in one place. A session
+/// this engine cannot produce renders as `null`, which is what string
+/// concatenation of a null reference does.
+fn engine_session_text(ctx: &mut dyn NativeContext, engine: ObjectRef) -> String {
+    let session = match ctx.invoke_virtual(engine, "getSession", "()Ljavax/net/ssl/SSLSession;", &[])
+    {
+        Ok(Some(Value::Object(Some(sess)))) => sess,
+        _ => return "null".to_string(),
+    };
+    match ctx.invoke_virtual(session, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_else(|| "null".into()),
+        _ => "null".to_string(),
+    }
+}
+
 fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls_impl = "sun/security/ssl/SSLEngineImpl";
+
+    // toString() — NOT one of the methods this file used to register, so the
+    // real JDK body ran, and JDK 25's is
+    //
+    //     "SSLEngine[hostname=" + getPeerHost() + ", port=" + getPeerPort()
+    //             + ", " + conContext.conSession + "]"
+    //
+    // `conContext` is a `TransportContext` that only SunJSSE's own constructor
+    // chain creates, and CratonVM never runs it. So `String.valueOf(engine)` —
+    // any log line, assertion message or `IllegalStateException("… " + engine)`
+    // that mentions an engine — threw
+    // `NullPointerException: Cannot read field "conSession" because
+    // "this.conContext" is null`, from inside the failure path rather than
+    // from the code under test. Measured against HotSpot 25 with
+    // `probes/SslContextSpiProbe.java`.
+    //
+    // Rebuilt from the engine's OWN accessors. `getPeerHost`/`getPeerPort` have
+    // no native here, so they run the JDK's field reads — and those fields are
+    // real: `set_engine_peer_host` writes `peerHost`/`peerPort` as well as the
+    // side table, and `createSSLEngine()`'s no-arg form seeds `peerPort = -1`
+    // exactly as `javax.net.ssl.SSLEngine`'s own field initialiser does. The
+    // session half goes through `getSession().toString()` rather than being
+    // formatted here, so the `Session(...)` shape lives in ONE place (the
+    // `javax/net/ssl/SSLSession` registration in `register_ssl_session_real`)
+    // and `String.valueOf(session)` is right on its own too.
+    r.register(cls_impl, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let text = format!(
+            "SSLEngine[hostname={}, port={}, {}]",
+            engine_peer_host_text(ctx, this),
+            engine_peer_port_text(ctx, this),
+            engine_session_text(ctx, this),
+        );
+        let s = ctx.create_string(&text);
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     // Constructor — allocates an engine_id slot in the side-table.
     r.register(cls_impl, "<init>", "()V", |ctx, args| {
@@ -19193,6 +19267,37 @@ fn fire_session_binding(
 
 fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     let cls = "javax/net/ssl/SSLSession";
+
+    // toString() — JSSE's `SSLSessionImpl.toString()` is
+    // `"Session(" + creationTime + "|" + getCipherSuite() + ")"`, and it is the
+    // tail of `SSLEngineImpl.toString()` / `SSLSocketImpl.toString()` as well as
+    // an answer in its own right. CratonVM's session objects carry the bare
+    // `javax/net/ssl/SSLSession` INTERFACE as their class, so with no
+    // registration here a virtual `toString()` resolves to `Object.toString()`
+    // and prints an identity hash — which is not wrong so much as useless, and
+    // it is the half of `SSLEngine.toString()` a reader actually wants.
+    //
+    // Both fields come from this file's own accessors, so a session that cannot
+    // answer one still renders rather than throwing: JSSE's own creationTime is
+    // a `long` and its cipher suite is never null (it is
+    // `SSL_NULL_WITH_NULL_NULL` before a handshake), so 0 and the JSSE null
+    // suite are the values that make the string mean what it means.
+    r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let created = match ctx.invoke_virtual(this, "getCreationTime", "()J", &[]) {
+            Ok(Some(v)) => v.as_long().unwrap_or(0),
+            _ => 0,
+        };
+        let suite = match ctx.invoke_virtual(this, "getCipherSuite", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx
+                .read_string(s)
+                .unwrap_or_else(|| crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into()),
+            _ => crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string(),
+        };
+        let text = format!("Session({created}|{suite})");
+        let s = ctx.create_string(&text);
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     // getPeerCertificates() — the client certificate chain, for mTLS. Tomcat's
     // SSLAuthenticator / coyote SSLSupport reads this to authenticate the
