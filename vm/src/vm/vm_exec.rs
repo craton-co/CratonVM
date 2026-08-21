@@ -473,12 +473,20 @@ const JDK_ONLY_NATIVE_SHADOW_CAP_MAX: usize = 65_536;
 /// The contract §2 point about process globals is untouched by either: the
 /// global existed before this constant did and is unaffected by its value.
 ///
-/// Read once, at the first observation. `CRATONVM_NATIVE_SHADOW_SINK_CAP=0`, a
-/// non-numeric value, or anything above
-/// [`JDK_ONLY_NATIVE_SHADOW_CAP_MAX`] leaves the default in place — a
-/// diagnostic must never be the thing that fails, and a cap of zero would
-/// silently report an empty population as a complete one, which is the exact
-/// failure this whole area exists to remove.
+/// Read once, at the first observation. `CRATONVM_NATIVE_SHADOW_SINK_CAP=0`, an
+/// empty or a non-numeric value leaves the default in place — a diagnostic must
+/// never be the thing that fails, and a cap of zero would silently report an
+/// empty population as a complete one, which is the exact failure this whole
+/// area exists to remove.
+///
+/// **CORRECTION, 2026-08-21 (WORKER-5).** A value ABOVE
+/// [`JDK_ONLY_NATIVE_SHADOW_CAP_MAX`] used to fall back to the default too, so
+/// `…=200000` produced 4096 — smaller than the ceiling it was trying to exceed
+/// — and printed nothing. That is self-inflicted: `vm-cli`'s own saturation
+/// advice prints `(recorded + dropped) * 2`, which exceeds 65,536 for any
+/// workload with more than ~32,768 shadows. Such a value is now CLAMPED to the
+/// ceiling, and every rejected or adjusted value prints one `[cratonvm]` line.
+/// See [`cratonvm_types::flags::resolve_capped_usize`].
 ///
 /// **The filter is deliberately NOT resized with it.**
 /// [`JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS`] stays 512, so above that the filter
@@ -496,11 +504,12 @@ pub fn jdk_only_native_shadow_cap() -> usize {
         // than the latched snapshot every other knob is served from ---
         // `types/tests/flag_declaration_guard.rs` documents that split, and it is
         // the reason an undeclared read site is a defect rather than untidiness.
-        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_SHADOW_SINK_CAP")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| *n > 0 && *n <= JDK_ONLY_NATIVE_SHADOW_CAP_MAX)
-            .unwrap_or(JDK_ONLY_NATIVE_SHADOW_CAP)
+        cratonvm_types::flags::resolve_capped_usize(
+            "CRATONVM_NATIVE_SHADOW_SINK_CAP",
+            "interpreter observation sink",
+            JDK_ONLY_NATIVE_SHADOW_CAP,
+            JDK_ONLY_NATIVE_SHADOW_CAP_MAX,
+        )
     })
 }
 
