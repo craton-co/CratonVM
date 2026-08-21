@@ -97,6 +97,30 @@ delete a known `new_ref_array(ClassId::new(0), 0)` site and confirm the number
 moves by exactly one. `v1` was caught precisely because a lane deleted two sites
 and watched the count *not move*. Do that before trusting the new number.
 
+### 2a. That falsifier has now been run against the CURRENT gate, by accident
+
+`H23-2`'s fix removed a sentinel array site from this crate —
+`alloc_bucket_table`'s `try_new_ref_array(ClassId::new(0), cap)`, which is the
+allocation behind every `HashMap.table` in the VM. Direct count of the array
+sentinel in `native-collections/src/lib.rs`: **12 before, 11 after.**
+
+The gate, on the same two trees:
+
+```
+before   by fn : alloc_object=173 new_ref_array=29 alloc_object_of=1   ok
+after    by fn : alloc_object=173 new_ref_array=29 alloc_object_of=1   ok
+```
+
+**Unchanged, and green, rc=0.** The site removed was one of the 123 the gate
+cannot see, because its length argument was the variable `cap` rather than a
+literal — the sixth row of §1's distribution.
+
+So this is not a projection any more: the flagship defect this gate exists to
+watch was fixed, and the gate reported *nothing*. That is the same experiment
+that caught `v1`, with the same result, one column over. It is also the reason
+§6.1 is the highest-priority nomination in this record — a gate that cannot
+register the fix cannot register the regression either.
+
 ---
 
 ## 3. A measured defect from the excluded group
