@@ -1,6 +1,7 @@
 # A statically-bound callee with an exception table pays the dispatch funnel — 10.2x, and an OSR body cannot escape it at all
 
-**Status: OPEN, with the measurement its own switch has been waiting for.**
+**Status: OPEN — root-caused and measured; the flip is NOT recommended on this
+evidence, and the OSR half is untouched.**
 Found 2026-08-21 while pricing `ir_unresumable_protected_trap`, where a hot
 method with a `try`/`finally` measured ~12.8x the same arithmetic without one on
 BOTH tiers. That gap is not the tier and not that rule. It is this.
@@ -73,24 +74,69 @@ Note what this does NOT claim. The 10.2x is per-CALL on a callee of this shape;
 it is not a workload number. The previous page in this chain
 (`ir-unresumable-trap-refusal-cost-ANSWERED-20260821.md`) is a worked example of
 why those differ — a 0.43 % population turned a real per-method refusal into
-nothing measurable. **Someone should census how many such call sites a real
-workload executes before sizing this.** The census instrument already exists:
-`direct callee binds: N bound, M left on the dispatch helper` plus
-`bind refused, callee-exception-table: K`.
+nothing measurable. The census below asks exactly that question of this
+refusal, using `direct callee binds: N bound, M left on the dispatch helper`
+plus `bind refused, callee-exception-table: K` — and gets the same answer.
+
+## The census, and why the flip is NOT justified on this evidence
+
+Done 2026-08-21, same binary, real netty classes, `CRATONVM_DBG=intrinsic-stats`:
+
+| class | ms | bound | left on helper | of which `callee-exception-table` |
+|---|---:|---:|---:|---:|
+| `handler.ssl.SslHandlerTest` | 75 670 | 1 587 | 1 252 | **228** |
+| `handler.codec.http2.Http2MultiplexCodecTest` | 46 388 | 1 920 | 877 | 73 |
+| `handler.codec.compression.ZstdDecoderTest` | 12 996 | 592 | 356 | 38 |
+| `util.concurrent.NonStickyEventExecutorGroupTest` | 34 532 | 219 | 187 | 22 |
+| `buffer.SimpleLeakAwareByteBufTest` | 81 715 | 2 221 | 931 | 18 |
+| `buffer.BigEndianHeapByteBufTest` | 20 267 | 1 523 | 732 | 17 |
+| `handler.codec.http.HttpContentCompressorTest` | 6 966 | 96 | 117 | 3 |
+
+`native-shadow` dominates every one of these (671 of 732 on the last).
+
+Then ABBA on the two best candidates, one binary:
+
+| class | ban kept | ban lifted | within-arm spread |
+|---|---:|---:|---|
+| `BigEndianHeapByteBufTest` | 23 609 / 22 293 | 21 274 / 23 728 | ~10 % |
+| `SslHandlerTest` (228 refusals) | 39 646 / 31 643 | 44 101 / 36 174 | ~39 % |
+
+**No measurable workload effect**, on the class chosen precisely because it
+refuses 13x more than the others. Correctness holds in both arms —
+`ok=414 failed=0` and `ok=53 failed=0 aborted=1`, identical.
+
+So the switch's "pending its own measurement" is **answered, in the negative**:
+the per-call multiplier is 10.2x and real, the population is 3-228 sites per
+class, and the two do not multiply into anything a workload can see. Flipping
+the default would be a consistency argument — the static door being 11x worse
+than the virtual door for the same callee shape is genuinely ugly — not a
+measured win. **Do not flip it on this evidence.**
+
+### Why the two findings are coupled
+
+The gate applies only to callees reached through `callee_compiler` — i.e. from
+an ORDINARY compiled frame. A hot loop is an OSR body, and an OSR body never
+consults the gate at all (finding 2). So the sites that could benefit most from
+a direct call are **systematically excluded from the population the switch can
+act on**: what is left is, by construction, the colder half.
+
+That is a real possibility and this page does not claim it as fact — but it
+means "lift the ban and measure" cannot answer the question while the OSR gap
+stands. **The OSR gap should be closed first, and the flip re-measured after**,
+rather than the flip being retried on more workloads.
 
 ## Next steps, in order
 
-1. **Census** `callee-exception-table` refusals and their execution counts on a
-   real workload (tomcat, netty suite, h2). The per-call number above is the
-   multiplier; the census is the population.
-2. **Flip `direct_call_exc_table_publish_enabled` to default-ON** if the census
-   supports it. It is one line, and the interlocks it needs are already written
-   and enforced: `sp_ic_deopt_check_mode() == On`, and the emitter must have
-   reserved the contiguous service-argument slots that
-   `emit_inline_callee_deopt_check` needs (a site that cannot is a compile
-   failure, `direct-call-service-slots`, not an unserviced raw edge). **This
-   needs the vm suite run, not just the probe** — it changes codegen for every
-   statically bound exception-table callee.
+1. ~~**Census**~~ — done, above.
+2. **Do NOT flip `direct_call_exc_table_publish_enabled` yet** — the census
+   does not support it. If it is ever flipped on consistency grounds it is one
+   line, and the interlocks it needs are already written and enforced
+   (`sp_ic_deopt_check_mode() == On`, plus the contiguous service-argument slots
+   `emit_inline_callee_deopt_check` needs — a site that cannot reserve them is a
+   compile failure, `direct-call-service-slots`, not an unserviced raw edge).
+   That flip still needs the vm suite, not just the probe: it changes codegen
+   for every statically bound exception-table callee. The two real classes run
+   here are evidence it is SAFE, not evidence it is worth it.
 3. **Give OSR bodies the direct-bind ladder**, or record why they cannot have
    it. This is the larger of the two and it is independent of the switch.
 
