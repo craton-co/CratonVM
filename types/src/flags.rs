@@ -2667,20 +2667,26 @@ pub fn resolve_capped_usize(name: &str, what: &str, default: usize, max: usize) 
     match trimmed.parse::<usize>() {
         Ok(n) if n == 0 => {
             eprintln!(
-                "[cratonvm] warning: {name}=0 is not a usable {what} cap — a cap of zero                  reports an empty population as a complete one. Using the default {default}."
+                "[cratonvm] warning: {name}=0 is not a usable {what} cap — a cap of \
+                 zero reports an empty population as a complete one. Using \
+                 the default {default}."
             );
             default
         }
         Ok(n) if n > max => {
             eprintln!(
-                "[cratonvm] warning: {name}={n} exceeds the {what} ceiling of {max};                  CLAMPED to {max}. (It used to fall back to the default {default}, which is                  smaller than the ceiling and said nothing.)"
+                "[cratonvm] warning: {name}={n} exceeds the {what} ceiling of {max}; \
+                 CLAMPED to {max}. (It used to fall back to the default \
+                 {default}, which is smaller than the ceiling and said \
+                 nothing.)"
             );
             max
         }
         Ok(n) => n,
         Err(_) => {
             eprintln!(
-                "[cratonvm] warning: {name}={trimmed:?} is not a number — the {what} cap                  stays at the default {default}."
+                "[cratonvm] warning: {name}={trimmed:?} is not a number — the {what} \
+                 cap stays at the default {default}."
             );
             default
         }
