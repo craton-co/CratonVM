@@ -4517,6 +4517,22 @@ fn p64_hf_char_array_units(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u16> 
         .collect()
 }
 
+/// `java/util/HexFormat` for the **synthetic-jdk build only**.
+///
+/// H22-1, 2026-08-21: this used to be shipping-reachable as well —
+/// `lib.rs::register_hex_format_real_jdk_natives` called it LAST so the
+/// corrected twin would beat that function's own 16 broken registrations
+/// (W8-C15-2). Both that function and that call site are gone: `HexFormat` has
+/// real JDK 25 bytecode, and MEASURED with the class armed under
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW`, a 30-assertion probe over the whole
+/// public surface is byte-identical to HotSpot 25.0.3+9.
+///
+/// It survives because the `synthetic-jdk` build has no `HexFormat` bytecode
+/// to fall back to, and it stays reachable from `register_phase64_natives`. It
+/// is listed in `registrar_reachability.rs`'s `SYNTHETIC_ONLY_CLOSURE`; giving
+/// it a shipping call site again means removing it from that list, and means
+/// arguing with the measurement above.
+/// docs/known-issues/jdk-only/H22-1-*.md
 pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);

@@ -20,12 +20,17 @@
 //! `register_synthetic_overrides`, so the two shipping modes ran a *different*
 //! `structLayout` implementation (`phases_late/foreign_ffm.rs`) from the one
 //! every test covered, and the one that ships was wrong six ways.
-//! `phases_late::register_p64_hex_format` was the same shape and has since been
-//! promoted — `lib.rs::register_hex_format_real_jdk_natives` now calls it from
-//! `register_essential_natives_with_shims`, deliberately LAST because
-//! `register()` is last-write-wins. Both are pinned as controls in
-//! [`the_scanner_is_not_vacuous`], one positive and one negative, so this file
-//! cannot pass by finding nothing.
+//! `phases_late::register_p64_hex_format` was the same shape and was promoted
+//! by W8-C15-2 — but H22-1 (2026-08-21) reversed that promotion, because the
+//! reason to promote it had expired: `java/util/HexFormat` has real JDK 25
+//! bytecode, that bytecode is now byte-identical to HotSpot on a 30-assertion
+//! probe, and the promotion's own carrier — `register_hex_format_real_jdk_natives`,
+//! all 16 of whose registrations were `owns_slot: false` — is deleted. So
+//! `register_p64_hex_format` is synthetic-only again, deliberately, and the
+//! NEGATIVE control moved to `register_throwable_subclass_natives`.
+//! A control is re-pointed when the thing it pins changes answer; the two are
+//! pinned in [`the_scanner_is_not_vacuous`], one positive and one negative,
+//! so this file cannot pass by finding nothing.
 //!
 //! # What this gate is, and what already existed
 //!
@@ -166,6 +171,9 @@ use std::sync::OnceLock;
 /// row, wire the family onto the shipping path — and read the
 /// `register_p64_hex_format` promotion first, because `register()` is
 /// last-write-wins and call ORDER decides which implementation survives.
+/// (H22-1 reversed that promotion: read its UN-promotion too, because a
+/// "REAL-JDK BYTECODE" verdict here is a claim that retiring the family is
+/// safe, and H22-2 measured two families where the same verdict was wrong.)
 const DELIBERATE_SYNTHETIC_ONLY_FAMILIES: &[(&str, &str)] = &[
     ("register_aot_natives",
      "REAL-JDK BYTECODE: all 1 exclusive classes exist in JDK 25 and declare no native method; drift exposure in FAMILY_DRIFT_EXPOSURE"),
@@ -583,6 +591,16 @@ const SYNTHETIC_ONLY_CLOSURE: &[&str] = &[
     "register_p63_service_loader",
     "register_p63_weak_hash_map",
     "register_p64_collectors_teeing",
+    // H22-1, 2026-08-21: ENTERED the synthetic-only arm deliberately. Its one
+    // shipping call site was the tail of `lib.rs::register_hex_format_real_jdk_natives`,
+    // and that whole function was deleted when `java/util/HexFormat` was
+    // retired to real JDK bytecode. It stays reachable from
+    // `register_phase64_natives` because the `synthetic-jdk` build has no
+    // HexFormat bytecode to fall back to. This is the ratchet moving in the
+    // direction the list's doc comment calls "a name entering", and it is the
+    // reason `CONTROL_NEGATIVE` was re-pointed off this name in the same
+    // commit. docs/known-issues/jdk-only/H22-1-*.md
+    "register_p64_hex_format",
     "register_p64_math_clamp",
     "register_p64_random_generator",
     "register_p64_sequenced_collections",
@@ -781,11 +799,29 @@ const MIN_CRATE_FILES: usize = 120;
 /// The two-sided control pair, from the record that motivated this file.
 ///
 /// `register_pe_panama` MUST be synthetic-only (the live defect) and
-/// `register_p64_hex_format` MUST NOT be (the remediated twin). If the scanner
-/// ever answers the same way for both, it has stopped discriminating and every
+/// `register_throwable_subclass_natives` MUST NOT be. If the scanner ever
+/// answers the same way for both, it has stopped discriminating and every
 /// other assertion in this file is worthless.
+///
+/// H22-1, 2026-08-21 — the negative control USED to be `register_p64_hex_format`,
+/// promoted onto the shipping path by W8-C15-2. That promotion has been
+/// reversed: `java/util/HexFormat` is retired to real JDK bytecode and
+/// `register_p64_hex_format` is now synthetic-only and listed in
+/// [`SYNTHETIC_ONLY_CLOSURE`]. A control must be re-pointed when the thing it
+/// pins changes answer, never left in place to pass vacuously — a name the
+/// scanner cannot find is *also* "not in `synthetic_only`", so the old
+/// assertion would still have been green while measuring nothing.
+///
+/// `register_throwable_subclass_natives` is the replacement because its
+/// shipping reachability is structural rather than incidental: it is called
+/// from `register_essential_natives`, which `register_essential_natives_with_shims`
+/// — the real-JDK arm's entry point — calls unconditionally, and its own call
+/// site carries the comment "Wired here in `register_essential_natives`
+/// (universal) so the natives are reachable in BOTH synthetic-jdk and real-JDK
+/// feature configurations". H22-2 measured why it is NOT a retirement
+/// candidate, so it is not about to move either.
 const CONTROL_POSITIVE: &str = "register_pe_panama";
-const CONTROL_NEGATIVE: &str = "register_p64_hex_format";
+const CONTROL_NEGATIVE: &str = "register_throwable_subclass_natives";
 
 // ===========================================================================
 // SECTION 2 — the scanner
@@ -1652,14 +1688,30 @@ fn the_scanner_is_not_vacuous() {
          every other assertion in this file is worthless.\n    {}",
         describe(a, CONTROL_POSITIVE)
     );
+    // The negative control must be FOUND on the shipping side, not merely
+    // absent from the synthetic-only side. H22-1: a deleted registrar is also
+    // "not synthetic-only", so `!contains` alone can pass while measuring
+    // nothing — which is exactly what would have happened to the previous
+    // control, `register_p64_hex_format`, had it been deleted rather than
+    // moved.
+    assert!(
+        a.shipping.contains(CONTROL_NEGATIVE),
+        "NEGATIVE CONTROL VACUOUS: `{CONTROL_NEGATIVE}` is not in the shipping-reachable set \
+         at all, so the assertion below would pass without measuring anything. Either the \
+         registrar was renamed or deleted — re-point this control at another registrar the \
+         shipping entry point calls unconditionally — or the scanner has stopped resolving \
+         call sites.\n    {}",
+        describe(a, CONTROL_NEGATIVE)
+    );
     assert!(
         !a.synthetic_only.contains(CONTROL_NEGATIVE),
-        "NEGATIVE CONTROL FAILED: `{CONTROL_NEGATIVE}` is reported synthetic-only. It was \
-         promoted onto the shipping path by W8-C15-2 — `register_hex_format_real_jdk_natives` \
-         calls it LAST from `register_essential_natives_with_shims`, deliberately last because \
-         `register()` is last-write-wins and the phases_late family would otherwise only win \
-         in synthetic-jdk mode. If that call was removed, this is the regression; if the \
-         scanner answers 'synthetic-only' for everything, it has stopped discriminating.\n    {}",
+        "NEGATIVE CONTROL FAILED: `{CONTROL_NEGATIVE}` is reported synthetic-only. It is \
+         called from `register_essential_natives`, which `register_essential_natives_with_shims` \
+         — the real-JDK arm's entry point — calls unconditionally, and its call site says so \
+         out loud (\"Wired here in `register_essential_natives` (universal) so the natives are \
+         reachable in BOTH synthetic-jdk and real-JDK feature configurations\"). If that call \
+         was moved behind a `cfg` or deleted, this is the regression; if the scanner answers \
+         'synthetic-only' for everything, it has stopped discriminating.\n    {}",
         describe(a, CONTROL_NEGATIVE)
     );
 }
