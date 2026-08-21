@@ -2674,6 +2674,14 @@ impl VmHeap {
             // -- and compaction is this collector's only defragmentation, so
             // that is a number somebody needs to see.
             let skipped_jit = h.relocation_skipped_jit();
+            // ...and its counterpart since 2026-08-21: cycles that compacted
+            // WITH a compiled frame live, on the collection's per-cycle
+            // coverage proof. `skipped_jit` alone can no longer distinguish
+            // "this workload is never JIT-quiet, so it never defragments" from
+            // "it is never JIT-quiet and defragments anyway, on the proof", and
+            // those are the before and after of the H2
+            // `TestKillProcessWhileWriting` OutOfMemoryError.
+            let proven_jit = h.relocation_on_proven_jit();
             // A retained TLAB chunk would be arena the collector cannot see,
             // and on a compacting heap that is a correctness problem rather
             // than a bookkeeping one. It reads zero on every workload measured
@@ -2686,6 +2694,7 @@ impl VmHeap {
                  driver_passes={driver_passes} mark_fallbacks={mark_fallbacks} \
                  compaction_cycles={compactions} objects_relocated={relocated} \
                  relocation_skipped_jit={skipped_jit} \
+                 relocation_on_proven_jit={proven_jit} \
                  tlab_retire_skipped={tlab_skipped}"
             );
             // CONCURRENT marking, on its own line and with five fields rather
