@@ -520,3 +520,60 @@ turns, now closed off by direct measurement rather than by argument.
 This session made no code changes — docs and a probe only. `apps/hibernate-reactive`
 is a gitignored vendor checkout; the temporary instrumentation used to gather
 this section's traces was not committed.
+
+---
+
+## 5. 2026-08-21 — full rerun of the 18 non-passed classes on the idle Azure host, current dev tip
+
+All 18 classes named as non-passed in
+[RESULTS-20260820-3gc-postgres-local.md](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
+rerun against `dev@77e712ec6` + this session's docs-only branch (same binary
+as section 4, `cratonvm-hibidle`), on the idle Azure host, default (ZGC)
+collector.
+
+**9 now PASS** (all previously FAIL/CRASH/HANG on the original Windows
+3-GC run): `UUIDAsBinaryTypeTest`, `ORMReactivePersistenceTest`,
+`MultithreadedIdentityGenerationTest`, `IdentityGeneratorWithColumnTransformerTest`,
+`NoLiveTransactionValidationErrorTest`, `OneToOneIdClassParentIdClassTest`,
+`ReactiveMultitenantTest`, `MutationDelegateIdentityTest`,
+`it.quarkus.qe.database.DatabaseHibernateReactiveTest`. The last two are the
+`nio_selector.rs` fix (section 1) landing cleanly; `ORMReactivePersistenceTest`
+and `DatabaseHibernateReactiveTest` passing confirms
+[the not-a-CratonVM-bug doc](hibernate-and-hibernate-reactive-not-cratonvm-bugs.md)'s
+own claim that both were the Windows box's timezone/locale, not CratonVM —
+this Azure host is UTC/`en` and both pass here as predicted.
+
+**9 still FAIL**, genuinely — not a Docker/Testcontainers artifact, see the
+harness-bug note below: `techempower.TechEmpowerTest`,
+`MultithreadedInsertionWithLazyConnectionTest` (both already-known
+lambda-dispatch-timeout family, [residual-seven doc](residual-seven-after-the-afc-fix-20260817.md)),
+`OneToManyTest`, `QuerySpecificationTest`, `ReactiveStatelessProxyUpdateTest`,
+`CriteriaMutationQueryTest`, `ReactiveStatelessWithBatchTest`,
+`FilterWithPaginationTest`, `RowIdUpdateAndDeleteTest` — the persistence-context
+cascade family sections 2-4 investigate. `QuerySpecificationTest` is a new
+name to that family's list (it was previously only flagged as a `generational`-only
+fail in the original 3-GC run, not one of the "7 new" GC-independent ones);
+worth folding in as an eighth member next time someone works this.
+
+### A harness bug found in passing: `run-hibernate-reactive-suite.sh`'s
+`NO-DB` signature detection greps the whole shard log, not the current class
+
+All 9 failures above were first reported by the runner as
+`NO-DB: connection-refused` — which would mean "no DB reachable, not a VM
+result" per the script's own documented convention. **That label is wrong.**
+Every one of the 9 raw logs shows a normal `@@RESULT ... found=N ok=M failed=2`
+line with real assertion failures (`@@TESTFAIL` for named test methods), not
+a connection failure — the same "Unmanaged instance passed to remove()"-shaped
+cascade this whole page investigates. The bug: `run_shard()`'s sig-detection
+(`run-hibernate-reactive-suite.sh`, the `if grep -qm1 ... "$tmp" "$RAW"` line)
+checks the **whole shard's cumulative `raw.log`** (`$RAW`), not just the
+current class's own temp output (`$tmp`) — so once any earlier class in a
+shard prints something matching `Connection refused|Could not find a valid
+Docker|ConnectException|No Docker environment` anywhere in its own stack
+trace or log output, every later class in that same shard gets mislabeled
+`NO-DB` regardless of its own real outcome. Confirmed by checking `found=0`
+(the script's own `NOTESTS`/no-DB signal) against the actual counts: none of
+the 9 have `found=0`. This script is gitignored (only `class-overrides.tsv`
+is force-tracked), so no fix is committed here — flagging it so the next
+`results.tsv` isn't read at face value. The one-line fix is to grep only
+`"$tmp"`, not `"$tmp" "$RAW"`.
