@@ -9753,6 +9753,30 @@ fn map_bucket_index(hash: i32, capacity: i32) -> usize {
 /// by the same helper for the same reason — see [`hm_node_class_id`].
 const HM_NODE_CLASS: &str = "java/util/HashMap$Node";
 
+/// The real JDK class a `java.util.Hashtable.table` is an array of, and the
+/// class of every node in its chains.
+///
+/// MEASURED (`H23-2` §2, re-measured this lane on `vm-com2w-base` against
+/// HotSpot 25.0.3+9, one case per process): a three-entry `Hashtable` on
+/// HotSpot has `table.getClass() == [Ljava.util.Hashtable$Entry;` and nodes of
+/// `java.util.Hashtable$Entry`; on CratonVM it had `[Ljava.lang.Object;` and
+/// nodes of `java.util.HashMap$Node`. `Hashtable$Entry.isAssignableFrom(
+/// HashMap$Node)` is **false on both VMs**, so the node half had to move first
+/// — the same order `H16`/`H23` established for `HashMap`.
+///
+/// The two layouts are identical, which is why this is a pure class-identity
+/// change and not a slot migration (`javap -p`, JDK 25):
+///
+/// ```text
+///   java.util.HashMap$Node      final int hash; final K key; V value; HashMap$Node next
+///   java.util.Hashtable$Entry   final int hash; final K key; V value; Hashtable$Entry next
+/// ```
+///
+/// So `NODE_FIELD_HASH`/`_KEY`/`_VALUE`/`_NEXT` address the right slots on
+/// either class and `get_node_key`'s `Int@0 = JDK layout` sniff still routes
+/// correctly.
+const HT_ENTRY_CLASS: &str = "java/util/Hashtable$Entry";
+
 thread_local! {
     /// Per-VM memo for [`HM_NODE_CLASS`]'s `ClassId`: `(vm_identity, answer)`.
     ///
@@ -9768,6 +9792,13 @@ thread_local! {
     /// `ClassId` minted by one is meaningless in another. A process-global
     /// `OnceLock` here would latch the FIRST VM's answer forever.
     static HM_NODE_CLASS_MEMO: std::cell::Cell<Option<(usize, Option<ClassId>)>> =
+        const { std::cell::Cell::new(None) };
+
+    /// Per-VM memo for [`HT_ENTRY_CLASS`]'s `ClassId`. Same shape, same
+    /// negative-caching rule and same `vm_identity` scoping as
+    /// [`HM_NODE_CLASS_MEMO`]; a separate cell rather than a map because there
+    /// are exactly two of these and a `Cell` read is the whole hot path.
+    static HT_ENTRY_CLASS_MEMO: std::cell::Cell<Option<(usize, Option<ClassId>)>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -9794,6 +9825,80 @@ fn hm_node_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
     let answer = chm_real_class(ctx, HM_NODE_CLASS);
     HM_NODE_CLASS_MEMO.with(|c| c.set(Some((vm, answer))));
     answer
+}
+
+/// [`HT_ENTRY_CLASS`]'s `ClassId`, or `None` when this image has no real one.
+///
+/// The `Hashtable` twin of [`hm_node_class_id`], and everything that doc says
+/// about `chm_real_class` refusing a fabricated stand-in, about caching the
+/// NEGATIVE, and about the GC contract applies here unchanged.
+fn ht_entry_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
+    let vm = ctx.vm_identity();
+    if let Some((cached_vm, answer)) = HT_ENTRY_CLASS_MEMO.with(|c| c.get()) {
+        if cached_vm == vm {
+            return answer;
+        }
+    }
+    let answer = chm_real_class(ctx, HT_ENTRY_CLASS);
+    HT_ENTRY_CLASS_MEMO.with(|c| c.set(Some((vm, answer))));
+    answer
+}
+
+/// The chain-node / bucket-table component class for `this`, as ONE decision.
+///
+/// [`map_node_class_for`] and [`bucket_table_component`] must never disagree:
+/// the invariant the whole cluster turns on is
+///
+/// > **A table may be typed only if every node that can enter it is real.**
+///
+/// and the cheapest way to hold it is to derive both answers from one
+/// function, so a receiver family added to one is added to the other by
+/// construction. `H23-2` §3a's decline existed precisely because the two were
+/// separate and only one half had moved.
+///
+/// Returns the sentinel `ClassId::new(0)` for a receiver whose table is
+/// legitimately untyped (`IdentityHashMap`), whose table is built elsewhere
+/// (`ConcurrentHashMap`, `Properties`), or on an image with no real class.
+fn map_carrier_class_for_receiver(ctx: &mut dyn NativeContext, this: ObjectRef) -> ClassId {
+    // `IdentityHashMap`: `Object[]` is correct, not a defect. It stores keys
+    // and values FLAT in one array rather than in nodes, and HotSpot's own
+    // table is `[Ljava.lang.Object;`. MEASURED identical on both VMs.
+    if is_identity_map_receiver(ctx, this) {
+        return ClassId::new(0);
+    }
+    // `ConcurrentHashMap`: its real table is `[Ljava/util/concurrent/
+    // ConcurrentHashMap$Node;`, a DIFFERENT class, built and typed separately
+    // by `chm_publish_real_table_pinned`. The arrays reached through the
+    // generic path for a CHM receiver are its per-SEGMENT bucket tables — a
+    // CratonVM-internal shape with no HotSpot counterpart — so typing them
+    // `HashMap$Node` would be INVENTING a component type, not restoring one.
+    if is_chm_receiver(ctx, this) {
+        return ClassId::new(0);
+    }
+    // `Hashtable` and its ordinary subclasses. `uses_native_hashtable_layout`
+    // deliberately EXCLUDES `Properties`, which JDK 25 backs with a separate
+    // `ConcurrentHashMap` and which this VM backs with a Rust side-table: a
+    // `Properties` bucket table holds no nodes at all (MEASURED: `occupied=0`
+    // with `size=2`), so there is nothing for a component type to describe and
+    // HotSpot leaves the inherited `table` field null.
+    if uses_native_hashtable_layout(ctx, this) {
+        return match ht_entry_class_id(ctx) {
+            Some(cid) => cid,
+            None => ClassId::new(0),
+        };
+    }
+    if is_hashtable_receiver(ctx, this) {
+        // `Properties` (or a subclass): side-table backed, table stays untyped.
+        return ClassId::new(0);
+    }
+    // `HashMap`, and `LinkedHashMap` — which shares `HashMap`'s INHERITED
+    // `table` field, so its component is `HashMap$Node` and not
+    // `LinkedHashMap$Entry`. Its nodes are a subclass, so the store is
+    // covariant-legal; MEASURED on both VMs (`H23-2` §4a).
+    match hm_node_class_id(ctx) {
+        Some(cid) => cid,
+        None => ClassId::new(0),
+    }
 }
 
 /// Which class the ordinary `put` path's chain node is allocated with.
@@ -9832,18 +9937,26 @@ fn hm_node_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
 /// Only the `Value` VARIANT is read, never the address inside it. A moving
 /// collection can relocate an `Object(Some(_))` but cannot turn it into an
 /// `Int`, so deciding here and allocating after is sound with no refresh.
-fn map_node_class_for(ctx: &mut dyn NativeContext, key: Value, value: Value) -> ClassId {
+///
+/// # On the RECEIVER argument
+///
+/// A node's class is not one constant: a `Hashtable` chain holds
+/// `java.util.Hashtable$Entry`, not `java.util.HashMap$Node`, and
+/// `Hashtable$Entry.isAssignableFrom(HashMap$Node)` is **false on both VMs**.
+/// The receiver is therefore part of the question, and it is answered by
+/// [`map_carrier_class_for_receiver`] — the SAME function
+/// [`bucket_table_component`] calls, so the node and the array holding it can
+/// no longer disagree by omission.
+fn map_node_class_for(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: Value,
+    value: Value,
+) -> ClassId {
     if !matches!(key, Value::Object(_)) || !matches!(value, Value::Object(_)) {
         return ClassId::new(0);
     }
-    // A `match` rather than `unwrap_or`/`unwrap_or_else`: `or_fun_call` and
-    // `unnecessary_lazy_evaluations` disagree about which of those two is the
-    // right spelling, and `cargo clippy --workspace --all-targets -- -D
-    // warnings` is a blocking gate.
-    match hm_node_class_id(ctx) {
-        Some(cid) => cid,
-        None => ClassId::new(0),
-    }
+    map_carrier_class_for_receiver(ctx, this)
 }
 
 /// The class a receiver's bucket table is an array **OF** — the other half of
@@ -9896,12 +10009,14 @@ fn map_node_class_for(ctx: &mut dyn NativeContext, key: Value, value: Value) -> 
 ///   * `IdentityHashMap` is **legitimately** `Object[]` on HotSpot too — it
 ///     stores keys and values flat in one array rather than in nodes. The
 ///     sentinel is the RIGHT answer there and must not be "fixed".
-///   * `Hashtable`/`Properties` want `Hashtable$Entry`, and this VM's Hashtable
-///     nodes are currently `HashMap$Node` (MEASURED, same probe). Typing that
-///     table would be exactly the armed hybrid above: `HashMap$Node` is not a
-///     subclass of `Hashtable$Entry`, so a real `Hashtable.rehash()` would
-///     throw on it. **Node-class-first applies again** — declined here and
-///     nominated in `H23-2` §6.
+///   * `Hashtable` wants `Hashtable$Entry`, and `H23-2` §3a DECLINED it because
+///     this VM's Hashtable nodes were `HashMap$Node` — the armed hybrid, since
+///     `HashMap$Node` is not a subclass of `Hashtable$Entry` by any route.
+///     **That decline is now spent**: `map_carrier_class_for_receiver` moves the
+///     node half and the array half together, so a `Hashtable` receiver gets
+///     `Hashtable$Entry` in BOTH answers or in neither. `Properties` is still
+///     declined, for a different reason — its entries live in a side-table and
+///     its bucket array holds nothing at all.
 ///
 /// # Both modes
 ///
@@ -9915,29 +10030,67 @@ fn map_node_class_for(ctx: &mut dyn NativeContext, key: Value, value: Value) -> 
 /// allocate; callers must hold their cross-allocation roots pinned and re-read
 /// `this` afterwards. Later calls are a `Cell` read.
 fn bucket_table_component(ctx: &mut dyn NativeContext, this: ObjectRef) -> ClassId {
-    // `Hashtable`/`Properties`: right component type, wrong node class. See the
-    // third bullet above — typing this ahead of the node fix ARMS it.
-    if is_hashtable_receiver(ctx, this) {
-        return ClassId::new(0);
+    map_carrier_class_for_receiver(ctx, this)
+}
+
+/// Replace a receiver's TYPED bucket table with an untyped `Object[]` of the
+/// same length and contents, and republish it.
+///
+/// # Why this exists — `H23-2` §7.1, and the residual it declined to close
+///
+/// The invariant is *"a table may be typed only if every node that can enter it
+/// is real"*. [`map_node_class_for`] holds it in one direction and cannot hold
+/// it in the other: a mapping whose key or value is a non-`Object` `Value`
+/// keeps the untyped carrier, because a real `$Node` declares both slots
+/// `Ljava/lang/Object;` and `coerce_field_value_by_descriptor` would null the
+/// primitive. So a Rust-private producer CAN, in principle, put a fabricated
+/// node into a table that a Java-visible put already typed.
+///
+/// `H23-2` §4b measured that case at **0 in 14 shapes** from Java — every one
+/// of `HashSet.add(null)`, boxed-`Integer` values, `int`->`int` maps and their
+/// resizes yielded a real node — and §7.1 then declined to WRITE the repair,
+/// on the grounds that an unexercised GC-sensitive reallocation is a worse risk
+/// than the measured residual. That judgement was right about the risk and
+/// wrong about the ceiling: `0 in 14` is not a proof, the remaining producers
+/// are the 42 direct `native_map_put_pub` call sites that are *not obliged to
+/// store an object*, and none of them is reachable from a Java probe.
+///
+/// # Why the risk argument is different now
+///
+/// The WORST case of this path is that a map's table reverts to `Object[]` —
+/// which is exactly the state every map in this VM was in before `H23` landed,
+/// i.e. a known-good configuration, not a novel one. It cannot lose a mapping:
+/// every element is copied and the chain links are untouched. And it cannot
+/// loop: the replacement array's header class id is the sentinel, so the
+/// caller's `== want` test is false on the next put, forever.
+///
+/// GC: `new_ref_array` allocates. The caller passes its LIVE pins for `this`
+/// and the table; both are re-read here and the caller must re-read its own
+/// copies afterwards.
+fn degrade_bucket_table_to_untyped(
+    ctx: &mut dyn NativeContext,
+    this_pin: usize,
+    this: ObjectRef,
+    buckets_pin: usize,
+    buckets: ObjectRef,
+    cap: i32,
+) {
+    let len = cap.max(0) as usize;
+    let untyped = ctx.new_ref_array(ClassId::new(0), len);
+    let untyped_pin = ctx.pin_native_root(untyped);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
+    let untyped = ctx.read_native_pin(untyped_pin, untyped);
+    for i in 0..len {
+        // Only chain HEADS live in the array; a node linked through
+        // `NODE_FIELD_NEXT` is reached from its head and is not copied here.
+        let head = ctx.get_array_element(buckets, i);
+        let untyped = ctx.read_native_pin(untyped_pin, untyped);
+        ctx.set_array_element(untyped, i, head);
     }
-    // `IdentityHashMap`: `Object[]` is correct, not a defect.
-    if is_identity_map_receiver(ctx, this) {
-        return ClassId::new(0);
-    }
-    // `ConcurrentHashMap`: its table is `[Ljava/util/concurrent/
-    // ConcurrentHashMap$Node;`, a DIFFERENT class, and it is already built
-    // correctly and separately by `chm_publish_real_table_pinned`. The arrays
-    // reached through this path for a CHM receiver are its per-SEGMENT bucket
-    // tables, which are a CratonVM-internal shape with no HotSpot counterpart
-    // — typing those `HashMap$Node` would be inventing a component type rather
-    // than restoring one. Decline; the segment tables are nominated separately.
-    if is_chm_receiver(ctx, this) {
-        return ClassId::new(0);
-    }
-    match hm_node_class_id(ctx) {
-        Some(cid) => cid,
-        None => ClassId::new(0),
-    }
+    let this = ctx.read_native_pin(this_pin, this);
+    let untyped = ctx.read_native_pin(untyped_pin, untyped);
+    publish_map_table(ctx, this, untyped, cap);
+    ctx.unpin_native_roots(untyped_pin);
 }
 
 /// Allocate a HashMap$Node entry using the REAL JDK field layout
@@ -11066,7 +11219,22 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // GC-safety: `alloc_ref_array` is a collection point and `this` is a
         // bare local, so every store below must use a re-read reference.
         let this_pin = ctx.pin_native_root(this);
-        let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+        // THE FOURTH ALLOCATION SITE, and the one a `new Hashtable()` actually
+        // takes. `H23` typed three sites and missed the no-arg `HashMap()`
+        // constructor; this arm is the same shape one family over, and it was
+        // MEASURED live: with the node half moved and the other sites routed
+        // through `map_carrier_class_for_receiver`, a 3-entry `Hashtable` still
+        // reported `tableCls=[Ljava.lang.Object;` while a 40-entry one — which
+        // had been through `map_resize` — reported
+        // `[Ljava.util.Hashtable$Entry;`. The initial table is allocated here
+        // and nowhere else, because this arm returns before the generic path.
+        //
+        // GC: `map_carrier_class_for_receiver` can load a class and therefore
+        // collect, so it runs inside the pin region with `this` re-read after.
+        let this = ctx.read_native_pin(this_pin, this);
+        let component = map_carrier_class_for_receiver(ctx, this);
+        let this = ctx.read_native_pin(this_pin, this);
+        let buckets = ctx.new_ref_array(component, MAP_DEFAULT_CAPACITY);
         let buckets_pin = ctx.pin_native_root(buckets);
         let this = ctx.read_native_pin(this_pin, this);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
@@ -12141,7 +12309,37 @@ fn native_map_put_evict_pinned(
     // has bound its node to the REAL `java/util/LinkedHashMap$Entry` since
     // `7bf427af1`, and that probe's set-membership, map-view, serialization and
     // 2000-entry-resize sections all pass over it.
-    let node_cid = map_node_class_for(ctx, key_val, value);
+    let node_cid = map_node_class_for(ctx, this, key_val, value);
+    // `H23-2` §7.1's enforcement, written. `node_cid == 0` means this mapping
+    // carries a primitive `Value` and gets the untyped carrier; if the table it
+    // is about to head is typed to the class this receiver's REAL nodes use,
+    // the pair would be the armed hybrid the invariant exists to forbid. Retype
+    // the table down instead of typing the node up — a fabrication in an
+    // `Object[]` is today's pre-`H23` state and reads back correctly, while a
+    // fabrication in a `Node[]` misleads everything that trusts the component.
+    //
+    // `class_id_of_object` on a reference array answers the COMPONENT class id
+    // (`VmHeap::class_id_of` returns the header field `new_ref_array` wrote),
+    // so the test is one header read and no allocation on the hot path. It is
+    // also self-limiting: the replacement array carries the sentinel id, which
+    // is never equal to `want`.
+    if node_cid == ClassId::new(0) {
+        let want = map_carrier_class_for_receiver(ctx, this);
+        let this = ctx.read_native_pin(this_pin, this);
+        let buckets_now = ctx.read_native_pin(buckets_pin, buckets);
+        if want != ClassId::new(0) && ctx.class_id_of_object(buckets_now) == want {
+            degrade_bucket_table_to_untyped(
+                ctx,
+                this_pin,
+                this,
+                buckets_pin,
+                buckets_now,
+                cap,
+            );
+        }
+    }
+    // Every reference used below is re-read from a live pin, so the two
+    // possibly-allocating calls above need no additional refresh here.
     let new_node = ctx.alloc_object(node_cid, NODE_NUM_FIELDS);
     // Keep the node and both object values rooted through population and
     // refresh every reference immediately before its store. The later
