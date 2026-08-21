@@ -886,7 +886,7 @@ CP="$(cat module/spring-boot-integration/build/cratonvm-test-cp.txt);<sb>/sb-run
 
 ## Related
 
-- `docs/known-issues/h2/h2-update-path-throughput-20260802.md` — names the
+- `performance/h2-update-path-throughput-RETIRED-20260821.md` — names the
   non-moving fallback as a scaling target on an unrelated workload; same
   mechanism seen as throughput rather than as failure.
 - `fixed-suite-bugs/springboot/flyway-integration-300s-margin-RETIRED-20260810.md`

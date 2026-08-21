@@ -355,7 +355,7 @@ fn publish_region_snapshot(regions: &JitCodeRegion) {
 /// UPDATE path that is 1.54% of CPU (`perf`, flat self-attribution,
 /// 2026-08-21); at 25 threads it is a serialisation point on a path with
 /// nothing else to serialise on, which is the shape
-/// `docs/known-issues/h2/h2-update-path-throughput-20260802.md` calls
+/// `performance/h2-update-path-throughput-RETIRED-20260821.md` calls
 /// "genuinely scaling rather than constant-factor work".
 ///
 /// The memo takes the lock out of the steady state without weakening the check:
