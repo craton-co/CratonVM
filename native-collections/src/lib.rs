@@ -3329,12 +3329,25 @@ fn rooted_across1<T>(
 /// on demand — matching HotSpot's "constructor succeeds, no throw". The caller
 /// must use the returned `actual_cap` for `__capacity`/`threshold` so they stay
 /// consistent with the real table length.
-fn alloc_bucket_table(ctx: &mut dyn NativeContext, cap: usize) -> (ObjectRef, usize) {
-    match ctx.try_new_ref_array(ClassId::new(0), cap) {
+///
+/// `component` is the class the table is an array OF — see
+/// [`bucket_table_component`], which is the only thing that should compute it.
+/// `ClassId::new(0)` is the untyped sentinel and yields today's `Object[]`.
+/// **Both arms below take it**: the reduced-capacity fallback used to spell its
+/// allocation `alloc_ref_array`, which hard-codes the sentinel, so a map that
+/// lost the capacity race would have silently kept an `Object[]` while every
+/// other map got a typed one — a divergence visible only under memory pressure,
+/// which is the worst place to find one.
+fn alloc_bucket_table(
+    ctx: &mut dyn NativeContext,
+    component: ClassId,
+    cap: usize,
+) -> (ObjectRef, usize) {
+    match ctx.try_new_ref_array(component, cap) {
         Some(table) => (table, cap),
         None => {
             let small = MAP_DEFAULT_CAPACITY;
-            (alloc_ref_array(ctx, small), small)
+            (ctx.new_ref_array(component, small), small)
         }
     }
 }
@@ -9833,6 +9846,100 @@ fn map_node_class_for(ctx: &mut dyn NativeContext, key: Value, value: Value) -> 
     }
 }
 
+/// The class a receiver's bucket table is an array **OF** — the other half of
+/// [`map_node_class_for`].
+///
+/// # The two halves fail in opposite directions
+///
+/// `H16` made the NODES real. The array holding them stayed `Object[]`, because
+/// `alloc_bucket_table` allocated it with the untyped-allocation sentinel. That
+/// pair is wrong in a way neither half shows alone, and the two failure modes
+/// point opposite ways:
+///
+///   * a FABRICATED node in a REAL `Node[]` throws `ArrayStoreException` — real
+///     `HashMap.resize()` at `HashMap.java:719` is the site (`H0-6` §7); and
+///   * a REAL node in an `Object[]` stores fine, but `table.getClass()` is
+///     `[Ljava.lang.Object;` where HotSpot says `[Ljava.util.HashMap$Node;`,
+///     and anything reading the component type is misled.
+///
+/// So node-class-first was the only safe order, and the invariant this function
+/// exists to hold is:
+///
+/// > **A table may be typed only if every node that can enter it is real.**
+///
+/// [`chm_publish_real_table_pinned`] already implements that invariant for CHM,
+/// all-or-nothing: any entry with a primitive key or value and it abandons the
+/// publish rather than emit a typed array holding a fabrication.
+///
+/// # Why this is per-RECEIVER and not one constant
+///
+/// MEASURED on HotSpot 25.0.3+9, one case per process
+/// (`scratchpad/h23/Family.java`) — the declared and runtime component type of
+/// each family's `table`, and the class of its nodes:
+///
+/// ```text
+///   HashMap           [Ljava/util/HashMap$Node;         HashMap$Node
+///   LinkedHashMap     [Ljava/util/HashMap$Node;         LinkedHashMap$Entry  (a SUBCLASS)
+///   Hashtable         [Ljava/util/Hashtable$Entry;      Hashtable$Entry
+///   Properties        [Ljava/util/Hashtable$Entry;      (table lazily null)
+///   IdentityHashMap   [Ljava/lang/Object;               keys/values stored FLAT
+/// ```
+///
+/// Three consequences, and each one is a rule below:
+///
+///   * `LinkedHashMap` shares `HashMap`'s **inherited** `table` field, so one
+///     component type serves both callers of [`alloc_bucket_table`]. Its
+///     `LinkedHashMap$Entry` nodes are a subclass of `HashMap$Node`, so the
+///     store is covariant-legal — `aastore_element_assignable`'s by-name
+///     superclass walk resolves it, and `lhm_alloc_node` has bound to the real
+///     `java/util/LinkedHashMap$Entry` since `7bf427af1`.
+///   * `IdentityHashMap` is **legitimately** `Object[]` on HotSpot too — it
+///     stores keys and values flat in one array rather than in nodes. The
+///     sentinel is the RIGHT answer there and must not be "fixed".
+///   * `Hashtable`/`Properties` want `Hashtable$Entry`, and this VM's Hashtable
+///     nodes are currently `HashMap$Node` (MEASURED, same probe). Typing that
+///     table would be exactly the armed hybrid above: `HashMap$Node` is not a
+///     subclass of `Hashtable$Entry`, so a real `Hashtable.rehash()` would
+///     throw on it. **Node-class-first applies again** — declined here and
+///     nominated in `H23-2` §6.
+///
+/// # Both modes
+///
+/// Under `synthetic-jdk` there is no real `java/util/HashMap$Node`, so
+/// [`hm_node_class_id`] answers `None` (a resolved NEGATIVE, memoised) and this
+/// returns the sentinel — the table stays `Object[]`, exactly as today. That is
+/// also what a real-JDK image returns if the class somehow will not resolve, so
+/// the fallback is one path, not a mode switch.
+///
+/// GC: the first call per VM per thread can LOAD a class and therefore
+/// allocate; callers must hold their cross-allocation roots pinned and re-read
+/// `this` afterwards. Later calls are a `Cell` read.
+fn bucket_table_component(ctx: &mut dyn NativeContext, this: ObjectRef) -> ClassId {
+    // `Hashtable`/`Properties`: right component type, wrong node class. See the
+    // third bullet above — typing this ahead of the node fix ARMS it.
+    if is_hashtable_receiver(ctx, this) {
+        return ClassId::new(0);
+    }
+    // `IdentityHashMap`: `Object[]` is correct, not a defect.
+    if is_identity_map_receiver(ctx, this) {
+        return ClassId::new(0);
+    }
+    // `ConcurrentHashMap`: its table is `[Ljava/util/concurrent/
+    // ConcurrentHashMap$Node;`, a DIFFERENT class, and it is already built
+    // correctly and separately by `chm_publish_real_table_pinned`. The arrays
+    // reached through this path for a CHM receiver are its per-SEGMENT bucket
+    // tables, which are a CratonVM-internal shape with no HotSpot counterpart
+    // — typing those `HashMap$Node` would be inventing a component type rather
+    // than restoring one. Decline; the segment tables are nominated separately.
+    if is_chm_receiver(ctx, this) {
+        return ClassId::new(0);
+    }
+    match hm_node_class_id(ctx) {
+        Some(cid) => cid,
+        None => ClassId::new(0),
+    }
+}
+
 /// Allocate a HashMap$Node entry using the REAL JDK field layout
 /// (slot 0 = hash:I, slot 1 = key, slot 2 = value, slot 3 = next).
 ///
@@ -10134,8 +10241,19 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
     // split loop below reuses existing nodes (no further allocation), so one
     // re-read suffices; nodes reached via the re-read `old_b` are already
     // forwarded. The only early `return` (MAX_CAPACITY) is above this pin.
+    //
+    // The component class must be carried across a resize or the table would be
+    // typed at construction and revert to `Object[]` on first growth — a
+    // divergence that appears only once a map exceeds its load factor, i.e. in
+    // exactly the maps big enough for anyone to look at. The split loop below
+    // REUSES the existing nodes, so the new table inherits the old table's
+    // contents unchanged and the "every node is real" invariant carries over
+    // with them; deriving the type from the receiver keeps this consistent with
+    // `alloc_bucket_table` rather than introducing a second rule.
     let this_pin = ctx.pin_native_root(this);
-    let new_buckets = alloc_ref_array(ctx, new_cap as usize);
+    let component = bucket_table_component(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
+    let new_buckets = ctx.new_ref_array(component, new_cap as usize);
     let this = ctx.read_native_pin(this_pin, this);
     let old_buckets = map_state(ctx, this).0;
 
@@ -11113,7 +11231,13 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // through the stores is harmless and keeps every store using a re-read
     // reference.
     let this_pin = ctx.pin_native_root(this);
-    let (buckets, cap) = alloc_bucket_table(ctx, cap);
+    // Resolve the table's component class BEFORE the allocation below, and
+    // re-read `this` after it: the first `bucket_table_component` per VM per
+    // thread can load `java/util/HashMap$Node`, which allocates and can
+    // therefore move `this`. Every later call is a `Cell` read.
+    let component = bucket_table_component(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
+    let (buckets, cap) = alloc_bucket_table(ctx, component, cap);
     let buckets_pin = ctx.pin_native_root(buckets);
     let this = ctx.read_native_pin(this_pin, this);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
@@ -38948,7 +39072,15 @@ fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     // Cap the eager bucket-table allocation to what the heap can hold (see
     // `alloc_bucket_table`); `cap` is rebound to the actual table length so
     // `__capacity`/`threshold` stay consistent and the map grows on demand.
-    let (buckets, cap) = alloc_bucket_table(ctx, cap);
+    // `LinkedHashMap` inherits `HashMap`'s `table` field, so its component type
+    // is `java/util/HashMap$Node` and NOT `LinkedHashMap$Entry` — MEASURED on
+    // HotSpot, where `LinkedHashMap.table` is `[Ljava.util.HashMap$Node;` while
+    // its nodes are `LinkedHashMap$Entry`. The nodes are a SUBCLASS, so the
+    // store is covariant-legal. `bucket_table_component` returns the one type
+    // that serves both callers; see its table.
+    let component = bucket_table_component(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
+    let (buckets, cap) = alloc_bucket_table(ctx, component, cap);
     let this = ctx.read_native_pin(this_pin, this);
     lhm_set(
         ctx,
