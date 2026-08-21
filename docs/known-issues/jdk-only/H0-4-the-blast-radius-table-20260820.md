@@ -160,3 +160,47 @@ measuring it.
 * **N4 — re-derive the row's "order: `native-awt` first, `native-collections`
   last and subdivided by collection family"** against §3. The subdivision is
   right; the ordering within it was never measured.
+
+---
+
+## 7. CORRECTION to §4 (lane H0, 2026-08-20) — the table is populated; ITERATION is what breaks
+
+§4 concluded that `RMapGcStress` is *"real bytecode iterating a table the VM
+never populated — 3000 inserts went to a side structure"*. **That is wrong, and
+lane `H13` caught it.** I re-measured rather than take the correction on trust,
+and `H13` is right.
+
+Probe saved as `regression-suite/probes/HashMapArmedStressProbe.java`: 3000
+`String`-keyed puts into a `HashMap`, then `size()`, then 3000 `get()`s, then
+both iterations. Armed `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/HashMap`,
+`--jdk-only`:
+
+| | HotSpot | CratonVM armed |
+|---|---:|---|
+| `size()` | 3000 | **3000** |
+| 3000 × `get()` returning the right value | 3000 | **3000** |
+| `entrySet()` iteration | 3000 | **`ClassCastException` after 0** |
+| `keySet()` iteration | 3000 | **1** |
+
+**The inserts did not go anywhere else.** The table holds all 3000 and real
+bytecode reads every one of them back correctly. What fails is walking it.
+
+**Why the wrong conclusion was tempting, and what it cost.** §4 reasoned from a
+vector's symptom — `iterated 1 != 3000` — to a cause, without running the two
+cheap discriminators (`size()` and `get()`) that separate "never stored" from
+"stored but unwalkable". Those two commands would have taken a minute. The
+false cause then propagated: it is the sentence `HANDOFF-20260820` §6b item 2
+quotes, and it argued for the wrong repair — populating a table that was never
+empty.
+
+**The right statement, which converges with `H0-6`:** the nodes are stored, and
+they are the wrong *class*. `H0-6` §7 measured that `AnonymousObject$4` **is**
+the `HashMap.Node`. So `entrySet()` throws `ClassCastException` because the node
+cannot be cast to `Map.Entry`, and `keySet()` yields 1 because the walk over
+those nodes cannot follow `next`. **One root — the node's class identity — with
+`size`/`get` unaffected because those paths never type the node.**
+
+This also re-reads §4's own evidence: the "lost value" under `Hashtable` and the
+`Iterator.next()` NPE under `HashSet` are iteration failures too, not storage
+failures. The "one defect, four faces" conclusion **survives**; only its
+mechanism was wrong.
