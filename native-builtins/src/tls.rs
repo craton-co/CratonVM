@@ -465,11 +465,27 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
     );
 
     // init(KeyManager[], TrustManager[], SecureRandom) -> void
+    //
+    // The `jca::ssl_context_spi` guards on this and the seven registrations
+    // below are inert in synthetic-JDK mode — there is no real
+    // `javax.net.ssl.SSLContext` bytecode, so no receiver ever carries a
+    // `contextSpi` — and are here because the boundary must hold in ALL THREE
+    // registration sets. Whichever set wins last-write-wins is a property of
+    // the boot order, not of this file, and a mode change that made this one
+    // live must not silently re-open the defect.
     r.register(
         cls,
         "init",
         "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineInit",
+                "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             let km_present = match args.get(1) {
                 Some(Value::Object(Some(_))) => 1,
@@ -492,6 +508,14 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "createSSLEngine",
         "()Ljavax/net/ssl/SSLEngine;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineCreateSSLEngine",
+                "()Ljavax/net/ssl/SSLEngine;",
+            ) {
+                return r;
+            }
             let eng = alloc_ssl_engine(ctx)?;
             Ok(Some(Value::Object(Some(eng))))
         },
@@ -503,6 +527,14 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "createSSLEngine",
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineCreateSSLEngine",
+                "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+            ) {
+                return r;
+            }
             let eng = alloc_ssl_engine(ctx)?;
             // Store peer host
             if let Some(Value::Object(Some(host_ref))) = args.get(1) {
@@ -530,6 +562,14 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "getSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetSocketFactory",
+                "()Ljavax/net/ssl/SSLSocketFactory;",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             require_initialized_context(ctx, this, "getSocketFactory()")?;
             let sf = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 2)?;
@@ -543,6 +583,14 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "getServerSocketFactory",
         "()Ljavax/net/ssl/SSLServerSocketFactory;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetServerSocketFactory",
+                "()Ljavax/net/ssl/SSLServerSocketFactory;",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             require_initialized_context(ctx, this, "getServerSocketFactory()")?;
             let ssf = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 2)?;
@@ -556,6 +604,14 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "getDefaultSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineGetDefaultSSLParameters",
+                "()Ljavax/net/ssl/SSLParameters;",
+            ) {
+                return r;
+            }
             let p = alloc_ssl_parameters(ctx)?;
             Ok(Some(Value::Object(Some(p))))
         },
@@ -567,6 +623,14 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         "getSupportedSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineGetSupportedSSLParameters",
+                "()Ljavax/net/ssl/SSLParameters;",
+            ) {
+                return r;
+            }
             let p = alloc_ssl_parameters(ctx)?;
             Ok(Some(Value::Object(Some(p))))
         },
@@ -574,6 +638,9 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
 
     // getProtocol() -> String
     r.register(cls, "getProtocol", "()Ljava/lang/String;", |ctx, args| {
+        if let Some(v) = crate::jca::ssl_context_spi::real_context_protocol(ctx, args) {
+            return Ok(Some(v));
+        }
         let this = obj_arg(args, 0)?;
         let idx = match ctx.get_field(this, CTX_PROTOCOL_IDX) {
             Value::Int(i) => i,
@@ -582,6 +649,14 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(ctx_protocol_name(idx));
         Ok(Some(Value::Object(Some(s))))
     });
+
+    // getProvider() -> Provider. See `jca::ssl_context_spi`.
+    r.register(
+        cls,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        |ctx, args| crate::jca::ssl_context_spi::ssl_context_provider(ctx, args),
+    );
     r.set_category(__prev_cat);
     ()
 }
