@@ -9371,10 +9371,26 @@ pub unsafe extern "C" fn jit_local_handler_lookup(
     {
         return -1;
     }
-    let Some((thread, _guard)) = jit_thread_mut() else {
+    // Read the pending throwable WITHOUT taking a `&mut JvmThread`, and hold no
+    // thread borrow across the resolution below.
+    //
+    // `local_handler_index_slow` can run `load_class_concurrent` for a catch
+    // type this VM has not seen — arbitrary Java, therefore allocation,
+    // therefore a collection that walks this very thread's roots. Holding a
+    // `&mut JvmThread` across that is the aliasing shape `jit_thread_mut`'s own
+    // debug guard exists to catch. Nothing here needs one: the class id is all
+    // the resolution consumes, and the throwable is re-read from the thread
+    // afterwards — a moving collector rewrites `jit_pending_exception` in
+    // place, so a copy taken before the resolution would be stale anyway.
+    let thread_ptr = current_jit_thread_ptr();
+    if thread_ptr.is_null() {
         return -1;
-    };
-    let Some(exc) = thread.jit_pending_exception else {
+    }
+    // SAFETY: this OS thread's own `JvmThread`, installed by `set_jit_thread`
+    // and alive for the whole JIT call. A shared-reference-shaped read of an
+    // `Option`, creating no aliasing `&mut` — the same argument
+    // `jit_pending_exception_is_set` makes for the same field.
+    let Some(exc) = (*thread_ptr).jit_pending_exception else {
         return -1;
     };
     // SAFETY: `vm_ptr` is the hidden context argument the compiled method was
@@ -9400,13 +9416,23 @@ pub unsafe extern "C" fn jit_local_handler_lookup(
         );
         return -1;
     }
-    cratonvm_jit::metrics::note_local_handler(cratonvm_jit::metrics::LOCAL_HANDLER_ENTERED);
     // Committed: take the throwable and publish it where the handler's operand
-    // stack expects it. Nothing between here and the handler's first
-    // instruction can safepoint, and the emitter marked that slot as an oop, so
-    // the first safepoint inside the handler sees it.
+    // stack expects it. Re-read through the thread rather than reusing `exc`,
+    // which the resolution above may have left stale. Nothing between here and
+    // the handler's first instruction can safepoint, and the emitter marked
+    // that slot as an oop, so the first safepoint inside the handler sees it.
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        // Unreachable: `current_jit_thread_ptr` was non-null above and this is
+        // the same thread. Refuse rather than assume — a `-1` here is the
+        // ordinary propagate path, which is always correct.
+        cratonvm_jit::metrics::note_local_handler(
+            cratonvm_jit::metrics::LOCAL_HANDLER_PROPAGATED,
+        );
+        return -1;
+    };
     let taken = take_jit_pending_exception(thread);
     debug_assert!(taken.is_some(), "the peek above proved one was pending");
+    cratonvm_jit::metrics::note_local_handler(cratonvm_jit::metrics::LOCAL_HANDLER_ENTERED);
     JIT_SIGNALS.with(|s| s.athrow_bci.set(-1));
     // Cast: an object reference is a raw address in a JIT frame slot, exactly
     // as every allocating helper returns one.
