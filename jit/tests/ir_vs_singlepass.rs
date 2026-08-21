@@ -175,6 +175,7 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         // (both tiers) bake `read_bounds_addr`, while the inline reference
         // putfield arms keep baking `region_bounds_addr` above.
         read_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
+        local_handler_lookup: 0,
         native_stack_floor_fn: native_stack_floor as *const () as usize,
         ldc_string: s,
         // Reached through emit_call_absolute, so a 0 here is a null CALL
@@ -2981,6 +2982,7 @@ fn frem_helpers() -> JitRuntimeHelpers {
         self_call_stack_guard: 0,
         region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
         read_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
+        local_handler_lookup: 0,
         native_stack_floor_fn: 0,
         ..dummy_helpers()
     }

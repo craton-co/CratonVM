@@ -1,12 +1,13 @@
 # One x509 unit test has failed twice under heavy parallel load, and no mechanism has been found
 
-**Status:** OPEN (re-filed 2026-08-18). Not root-caused, **not reproduced**, and
-now with its lead hypothesis disproved. Successor to
+**Status:** OPEN (re-filed 2026-08-18, advanced 2026-08-20). Still **not
+reproduced**. Two things changed on 2026-08-20: the failure text is now known to
+be **unrecoverable**, so nobody should look for it again; and the suite's one
+load-sensitive process-wide hazard has been **named** — the page's previous
+rule-out of it does not hold. Successor to
 `unit-test-load-sensitive-flakes-20260815.md`, which paired this with a monitor
-test that IS root-caused and fixed — see the internal record
-`monitor-inflation-test-timed-its-contention-instead-of-arranging-it-FIXED-20260818`.
-This page is narrower on purpose: the two had nothing in common but their
-symptom, and keeping them together implied a shared cause that does not exist.
+test that IS root-caused and fixed — see
+`fixed-bugs/monitor-inflation-test-timed-its-contention-instead-of-arranging-it-FIXED-20260818.md`.
 
 | test | crate | shape |
 | --- | --- | --- |
@@ -30,69 +31,179 @@ during an unrelated build.
 | whole `--lib` at `--test-threads=32` with the `vm` suite running concurrently (2026-08-18) | pass ×5 |
 | the test body ×640, 16 threads, one process (2026-08-18) | pass |
 | the test body interleaved with `validate_chain_real_rsa_sha256_signature_passes` ×640, 16 threads (2026-08-18) | pass |
+| **whole `--lib`, EIGHT-core host, workspace release rebuild in parallel, load average 8–15 (2026-08-20)** | **pass ×8** |
 
-**The failure text has never been captured.** Both sightings came from CI-gate
-logs that record the test NAME and the `test result:` line but not the panic
-body. The test is already self-diagnosing if it ever fires again — its rejection
-arm is `panic!("expected NotImplemented for Ed25519, got {:?}", other)` — so the
-gap is the CI log capture, not the assertion.
+That last row is the arm the page asked for — the sightings were on 8 cores and
+every earlier reproduction attempt was on a 32-core host, so "a smaller box may
+matter more than a busier one" was the open lead. It does not: 8 runs of the
+page's own recipe, on 8 cores, at load averages of 8.1–14.5 with a full
+workspace rebuild churning beside it, and the test passed every time. Runs took
+95–201 s each against 170 s idle, so the contention was real and variable.
 
-## What has been ruled out
+## The failure text is gone — stop looking for it
 
-Carried forward from the original page:
+The previous revision called this "the cheapest next step and it needs no
+reproduction: find the two original CI-gate runs and check whether their logs
+preserved any panic bodies at all." Done, 2026-08-20, and the answer is no:
 
-* **The shared keypair `OnceLock`.** `get_or_init` is atomic and the value is
-  immutable afterwards; a bad key would also fail the sibling RSA tests.
-* **Certificate validity windows.** Leaf 2020→2030, anchor 2000→2049; no
-  plausible scheduling delay moves `SystemTime::now()` out of range.
-* **The `x509_manager` registries.** `KM_REGISTRY` / `TM_REGISTRY` / the two id
-  counters are process-global, but this test builds a local
-  `TrustManagerState::default()` and never registers it.
+```
+grep -rn "validate_chain_unknown_signature_oid_reports_not_implemented \.\.\. FAILED" /data   -> 0 hits
+grep -rn "validate_chain_unknown_signature_oid_reports_not_implemented stdout"        /data   -> 0 hits
+```
 
-Added 2026-08-18:
+About twenty logs across the host mention the test; every one of them is a
+PASSING run. No surviving artefact anywhere records it failing, and none
+contains a panic body for it. Whatever the two sightings were, their text did
+not outlive them. **This avenue is closed** — the next person should spend their
+time on the two below instead.
 
-* **Hypothesis 1 — a shared-name collision between the two concurrent
-  "Real RSA Root" tests — is disproved, two ways.**
-  *By construction:* `validate_chain(chain, trust)` is a function of the DER
-  slice and a `&TrustManagerState` the caller owns. Nothing in the trust path
-  caches or indexes by subject name or public key across calls; the anchors map
-  lives inside that local state, and `insert_anchor` only ever writes to it.
-  *Empirically:* 640 executions of the two tests deliberately interleaved across
-  16 threads in one process, zero failures.
-* **No process-global state anywhere on the path.** `validate_chain` reads no
-  environment variable and no runtime flag, so the crate's `set_var`-using tests
-  (`jboss_logmanager`, `proxy_selector`, the `JBOSS_HOME` pair) cannot reach it.
-  `crypto_impl`'s statics are the JNI-facing key/cert stores, which this path
-  does not touch, and `Rsa::generate_keypair` uses a local `SecureRandom::new()`
-  rather than a shared RNG.
+## The premise that the crate is broadly red is stale
 
-**So there is currently no known mechanism by which concurrency can change this
-test's result.** That is a real finding, not a shrug: it means the next
-investigation should not start by re-reading `x509_manager` for a racy global.
+The previous revision warned that "`test result: FAILED` is useless as a trigger
+here — this crate's `--lib` is broadly red on dev for unrelated reasons, so
+every run trips it", counting ~25 unrelated failures on 2026-08-18. On dev
+`0902b7def` (2026-08-20) that is no longer true:
 
-## What has NOT been done, and what to try next
+```
+test result: FAILED. 4130 passed; 1 failed; 7 ignored; finished in 169.71s
+```
 
-The failure text, still. Everything above narrows *where* it cannot be; none of
-it explains two observed failures.
+One failure, and it is
+`lang_class::tests::null_receiver_on_an_instance_field_outranks_the_access_refusal`
+— unrelated to this path. Keying detection on the test NAME is still the right
+thing to do, but the noise floor it was defending against is now a single known
+row, which makes a fresh sighting far easier to spot.
 
-Given that the test's own inputs are local and immutable, the two readings left
-are:
+## The test is deterministic given a sane clock
 
-1. **Something outside this test disturbed the process** — the crate's `--lib`
-   carries ~25 unrelated failures on dev as of 2026-08-18, and a CI-gate log
-   that records only names and the `test result:` line cannot distinguish "this
-   test asserted and lost" from "this test was collateral". Confirm what the
-   panic body actually was before assuming the former. **This is the cheapest
-   next step and it needs no reproduction:** find the two original CI-gate runs
-   and check whether their logs preserved any panic bodies at all.
-2. **A defect in code the test merely passes through**, surfacing only under
-   real memory/CPU pressure — the original page's hypothesis 2 (debug-build
-   timing) is an amplifier, not a mechanism, so this would need naming a
-   specific piece of shared state. None has been found.
+This is a structural argument rather than another passing run, and it is what
+turns the previous revision's "no known mechanism" into something the next
+investigation can actually use.
 
-Note for whoever runs the repro: on a 32-core host it did not reproduce under
-any arm tried, including deliberate oversubscription. The two sightings were on
-**8 cores**; a smaller box may matter more than a busier one.
+**The OID dispatch is total.** `verify_one_link`'s final `else` returns
+`NotImplemented { at, oid }` for a *totally unrecognised* OID, and the arm above
+it returns the same for the known-but-unimplemented set that contains
+`OID_SIG_ED25519`. There is no OID that reaches the cryptographic verifier by
+accident and no registry that could make one — the dispatch is a chain of `==`
+against `const` byte slices, so nothing any other test does can add an Ed25519
+implementation at runtime. It follows that the assertion can only lose if
+`validate_chain` returns **before** the dispatch, or returns `Ok`.
+
+Everything that can do that is a pure function of two inputs:
+
+* **the DER bytes**, which are a pure function of the shared RSA keypair;
+* **`SystemTime::now()`**, read once in `validate_ordered_chain` step 2.
+
+`validate_chain` takes `&TrustManagerState` and the test owns a local
+`TrustManagerState::default()`. The module's only process-global state is
+`KM_REGISTRY` / `TM_REGISTRY` / `NEXT_KM_ID` / `NEXT_TM_ID` plus the two
+identity maps, and this path reads none of them. The rebuild fallback
+(`rebuild_path`) is structured to turn a rejection only into an acceptance and
+returns `None` when the presented order already is the path, which it is here.
+
+**The keypair is sound, quantitatively.** The previous revision ruled out the
+shared `OnceLock` on the grounds that "a bad key would also fail the sibling RSA
+tests" — an argument that cannot be checked against a CI log that lists only
+names. The stronger form: `Rsa::gen_prime` accepts a candidate only after
+`is_probably_prime(&candidate, 20, rng)`, so the chance of a composite modulus
+factor is at most 4⁻²⁰ ≈ 10⁻¹². Two sightings in ~50 runs is ten orders of
+magnitude away from that. The keypair is not the mechanism.
+
+**The clock has a four-year margin**, and one hole. The leaf is
+2001-01-01 → 2030-01-01 against a 2026 clock, so no scheduling delay moves it
+out of range; the root is a stored anchor and is skipped by the clock check
+entirely. The hole is the read itself:
+
+```rust
+let now = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_secs() as i64)
+    .unwrap_or(0);
+```
+
+If `duration_since` ever fails, `now` silently becomes **0** and *every*
+non-anchor certificate in *every* chain is rejected `NotYetValid`. That needs a
+pre-1970 clock so it is not this flake, but it is the only way the pure path can
+produce a wrong verdict, and it fails to a maximally confusing error. Worth
+fixing on its own account.
+
+## The rule-out of the `set_var` tests does not hold
+
+The previous revision dismissed the crate's environment-mutating tests like
+this: "`validate_chain` reads no environment variable and no runtime flag, so
+the crate's `set_var`-using tests (`jboss_logmanager`, `proxy_selector`, the
+`JBOSS_HOME` pair) cannot reach it."
+
+That is an argument about variable **visibility**. The hazard is a **data race
+on the environment block**. `std::env::set_var` and `remove_var` are documented
+as sound only in single-threaded programs, and are `unsafe` in edition 2024, for
+exactly this reason: glibc's `setenv` may `realloc` the `environ` array and free
+the old one, so a concurrent `getenv` on any other thread — including calls made
+from inside libc, the runtime, or the panic/backtrace machinery — can read freed
+memory. It does not matter that `validate_chain` never asks for a variable.
+
+This suite does that, at scale, while ~4,130 tests run on parallel threads in
+the same process:
+
+| site | `environ` mutations per call |
+| --- | ---: |
+| `proxy_selector::tests::with_proxy_env` | up to **16** — 8 `remove_var`, up to 8 `set_var`, then 8 restores |
+| `lib.rs::tests::with_jboss_env` | 2 per call, plus 2 to restore |
+| `jboss_logmanager::tests` (block-2c pair) | 1 `set_var`, 2 `remove_var` |
+
+Each site takes a lock first — and each takes a **different** lock:
+`proxy_selector::env_test_lock`, `lib.rs::env_lock`, and `jboss_logmanager`'s own
+`lock()` are three independent mutexes. So they do not serialise even against
+each other, let alone against the other four thousand tests, none of which hold
+any of them. The comment on `with_jboss_env` already records one bug this
+pattern caused (assertions that "held for the wrong reason"), which is evidence
+the pattern is hard to reason about rather than evidence it is contained.
+
+**This does not prove causation** — nothing here shows a corrupted `environ`
+turning `NotImplemented` into another `TrustError`, and the far more likely
+manifestation is a crash or a wrong answer in a test that *does* read the
+environment. What it does mean is that the previous revision's headline —
+"there is currently no known mechanism by which concurrency can change this
+test's result" — is no longer accurate. There is a known, load-sensitive,
+process-wide mechanism in this suite, it is undefined behaviour, and it was
+ruled out for a reason that does not apply.
+
+## What to try next
+
+1. ~~**Remove the UB**~~ — done 2026-08-20. `VmFlags` now carries
+   `undeclared_edits`, so `with_thread_overrides` reaches names the inventory
+   does not declare, and all three sites were converted:
+   `proxy_selector::tests::with_proxy_env` (up to 16 `environ` mutations per
+   call) and `lib.rs::tests::with_jboss_env` to `with_thread_overrides`, and
+   `jboss_logmanager`'s block-2c pair to the guard form (`override_thread`).
+   **`grep -rn "std::env::set_var\|std::env::remove_var" native-builtins/src/`
+   now returns only a doc comment.** The two local mutexes that used to guard
+   the writes are gone with them — they never protected anything, since the
+   race was against the other four thousand tests, not against each other.
+
+   Production reads are unchanged: `runtime_var`/`runtime_var_os` consult the
+   new map only while `overrides_active()` is true, and a snapshot built from
+   the real environment carries none. Guarded by
+   `an_undeclared_name_is_overridable_without_writing_to_environ`, which
+   asserts both directions (set, and "as if unset") and that `environ` is never
+   written.
+
+   `cargo test -p cratonvm-types` 575 passed / 0 failed;
+   `cargo test -p cratonvm-native-builtins --lib` 4130 passed / 1 failed — the
+   same unrelated `lang_class` row as before the change; `proxy_selector` 19/0
+   and `jboss` 112/0 in isolation.
+
+   **What this does NOT settle:** the flake still has not reproduced, so this
+   removes a confound rather than proving a cause. The next sighting is now
+   worth much more, because the suite no longer contains a known data race that
+   could explain an arbitrary result anywhere in it.
+2. ~~**Fix the `unwrap_or(0)` clock read**~~ — done 2026-08-20. The read now
+   negates the error's duration instead of clamping, so a pre-epoch clock
+   reports a truthful negative timestamp rather than silently becoming
+   1970-01-01. The suite is unchanged either side of it: 4130 passed / 1 failed
+   (the unrelated `lang_class` row) before and after.
+3. Do **not** re-read `x509_manager` for a racy global, and do **not** go
+   looking for the original CI-gate logs. Both are closed above.
 
 ## Repro
 
@@ -102,19 +213,22 @@ cargo test -p cratonvm-native-builtins --lib \
   x509_manager::tests::validate_chain_unknown_signature_oid_reports_not_implemented
 cargo test -p cratonvm-native-builtins --lib -- --test-threads=1
 
-# the arm that has failed twice: full lib, default parallelism, box already busy
-cargo build --workspace -j8 &          # the contention both sightings had
+# the arm that has failed twice: full lib, default parallelism, box already busy.
+# Use an EIGHT-core host; 8 runs of this on 2026-08-20 did not reproduce.
+cargo build --workspace --release -j8 &   # a second heavy cargo run, other profile
 for i in $(seq 1 20); do
-  cargo test -p cratonvm-native-builtins --lib > /tmp/x509-$i.log 2>&1 || {
-    echo "caught in run $i"; break; }
+  cargo test -p cratonvm-native-builtins --lib > /tmp/x509-$i.log 2>&1
+  sed -n '/^failures:$/,/^test result/p' /tmp/x509-$i.log \
+    | grep -q validate_chain_unknown_signature_oid && { echo "caught in run $i"; break; }
 done
 ```
 
-**Detect the right thing.** `test result: FAILED` is useless as a trigger here —
-this crate's `--lib` is broadly red on dev for unrelated reasons, so every run
-trips it. Grep the failure list for the test name instead:
-
-```bash
-sed -n '/^failures:$/,/^test result/p' /tmp/x509-$i.log \
-  | grep -q validate_chain_unknown_signature_oid && echo "caught"
-```
+**Detect the right thing.** Key on the test NAME inside the failures block, not
+on `test result: FAILED` — the crate still carries one unrelated red row
+(`lang_class::tests::null_receiver_on_an_instance_field_outranks_the_access_refusal`),
+so every run trips the summary line. And if it ever does fire, **keep the whole
+log**: the test's rejection arm is
+`panic!("expected NotImplemented for Ed25519, got {:?}", other)`, so the body
+names the actual `TrustError` — which, by the argument above, is the single
+piece of evidence that would distinguish "this test asserted and lost" from
+"this test was collateral".

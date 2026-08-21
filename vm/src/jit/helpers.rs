@@ -9497,6 +9497,179 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     i64::MIN // deopt sentinel — interpreter drains the pending exception
 }
 
+/// Which of THIS compiled method's own `catch` blocks takes the pending
+/// throwable — the runtime half of the compiled-local-handler feature.
+///
+/// Called from a local-handler stub the moment a fallible site returned the
+/// `i64::MIN` sentinel, with `site_ptr` naming the throwing bci's candidate
+/// handlers (already filtered at compile time to the exception-table entries
+/// whose `[start_pc, end_pc)` covers it, in table order).
+///
+/// Returns the index of the first matching candidate, having *taken* the
+/// pending exception and stored its raw address into `*out_exc` — the frame
+/// slot the handler's operand stack starts at, so the stub only has to jump.
+/// Returns `-1` for "this frame does not catch it", leaving every signal
+/// exactly as it found them, so the stub falls through to the reason-9 /
+/// shared-sentinel edge that ran before this feature existed.
+///
+/// # What it deliberately refuses
+///
+/// Only an already-constructed throwable stashed in `jit_pending_exception` can
+/// be entered locally. A pending NPE / AIOOBE / `ArithmeticException` signal is
+/// a *request* to build a throwable that the interpreter's drain fulfils, and a
+/// bare deopt (or a stashed IR-deopt frame) is not an exception at all. Each of
+/// those answers `-1` and takes the old route unchanged — which is what makes
+/// this addition unable to change any program's observable behaviour except by
+/// being faster.
+///
+/// # Matching
+///
+/// The rule is `find_jit_exception_handler`'s, restricted to one bci: table
+/// order, catch-all (`catch_type == 0`, an empty name here) matches anything, a
+/// typed entry matches when the throwable's class is assignable to the catch
+/// class resolved through the compiled method's own declaring class. The
+/// class-manager work sits behind a monomorphic cache on the site, because a
+/// throwing loop throws the same class every time and the read lock plus the
+/// name resolution is most of the cost otherwise.
+///
+/// SAFETY: `site_ptr` points to a `JitLocalHandlerSite` owned by the running
+/// `CompiledMethod` (kept alive by `_jit_local_handler_sites` for as long as
+/// its machine code is reachable); `out_exc` points into the live JIT frame.
+/// Both are produced by the emitter and never by Java data.
+pub unsafe extern "C" fn jit_local_handler_lookup(
+    vm_ptr: i64,
+    site_ptr: i64,
+    out_exc: *mut i64,
+) -> i64 {
+    if vm_ptr == 0 || site_ptr == 0 || out_exc.is_null() {
+        return -1;
+    }
+    // Crossing back out of JIT code to touch the class manager and (possibly)
+    // load a catch class — the same boundary note every other helper makes.
+    crate::jit::conservative_roots::note_jit_boundary();
+    // SAFETY: emitted by the compiler from `CompiledMethod`-owned data.
+    let site = &*(site_ptr as *const cratonvm_jit::JitLocalHandlerSite);
+    // A signal that is not yet a throwable, or no throwable at all, is not
+    // ours: leave every flag alone and let the old route run.
+    if JIT_SIGNALS.with(|s| {
+        s.npe.get() || s.aioobe.get().is_some() || s.arithmetic.get() || s.deopt.get()
+    }) || cratonvm_jit::deopt::has_last_deopt()
+    {
+        return -1;
+    }
+    // Read the pending throwable WITHOUT taking a `&mut JvmThread`, and hold no
+    // thread borrow across the resolution below.
+    //
+    // `local_handler_index_slow` can run `load_class_concurrent` for a catch
+    // type this VM has not seen — arbitrary Java, therefore allocation,
+    // therefore a collection that walks this very thread's roots. Holding a
+    // `&mut JvmThread` across that is the aliasing shape `jit_thread_mut`'s own
+    // debug guard exists to catch. Nothing here needs one: the class id is all
+    // the resolution consumes, and the throwable is re-read from the thread
+    // afterwards — a moving collector rewrites `jit_pending_exception` in
+    // place, so a copy taken before the resolution would be stale anyway.
+    let thread_ptr = current_jit_thread_ptr();
+    if thread_ptr.is_null() {
+        return -1;
+    }
+    // SAFETY: this OS thread's own `JvmThread`, installed by `set_jit_thread`
+    // and alive for the whole JIT call. A shared-reference-shaped read of an
+    // `Option`, creating no aliasing `&mut` — the same argument
+    // `jit_pending_exception_is_set` makes for the same field.
+    let Some(exc) = (*thread_ptr).jit_pending_exception else {
+        return -1;
+    };
+    // SAFETY: `vm_ptr` is the hidden context argument the compiled method was
+    // entered with, i.e. the `SharedVm` the interpreter handed it.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let exc_class_id = vm.mem.heap.class_id_of(exc);
+    let index = match cratonvm_jit::JitLocalHandlerSite::decode_cache(
+        site.cache.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        Some((cached_class, cached_index)) if cached_class == exc_class_id.as_u32() => cached_index,
+        _ => {
+            let resolved = local_handler_index_slow(vm, site, exc_class_id);
+            site.cache.store(
+                cratonvm_jit::JitLocalHandlerSite::encode_cache(exc_class_id.as_u32(), resolved),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            resolved
+        }
+    };
+    if index < 0 {
+        cratonvm_jit::metrics::note_local_handler(
+            cratonvm_jit::metrics::LOCAL_HANDLER_PROPAGATED,
+        );
+        return -1;
+    }
+    // Committed: take the throwable and publish it where the handler's operand
+    // stack expects it. Re-read through the thread rather than reusing `exc`,
+    // which the resolution above may have left stale. Nothing between here and
+    // the handler's first instruction can safepoint, and the emitter marked
+    // that slot as an oop, so the first safepoint inside the handler sees it.
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        // Unreachable: `current_jit_thread_ptr` was non-null above and this is
+        // the same thread. Refuse rather than assume — a `-1` here is the
+        // ordinary propagate path, which is always correct.
+        cratonvm_jit::metrics::note_local_handler(
+            cratonvm_jit::metrics::LOCAL_HANDLER_PROPAGATED,
+        );
+        return -1;
+    };
+    let taken = take_jit_pending_exception(thread);
+    debug_assert!(taken.is_some(), "the peek above proved one was pending");
+    cratonvm_jit::metrics::note_local_handler(cratonvm_jit::metrics::LOCAL_HANDLER_ENTERED);
+    JIT_SIGNALS.with(|s| s.athrow_bci.set(-1));
+    // Cast: an object reference is a raw address in a JIT frame slot, exactly
+    // as every allocating helper returns one.
+    *out_exc = taken.map_or(0, |e| e.as_ptr() as i64);
+    // Widening: a candidate index, single digits.
+    index as i64
+}
+
+/// The uncached half of [`jit_local_handler_lookup`]: walk this site's
+/// candidates in exception-table order and answer with the first whose catch
+/// type is assignable from `exc_class_id`, or `-1`.
+#[cold]
+#[inline(never)]
+fn local_handler_index_slow(
+    vm: &SharedVm,
+    site: &cratonvm_jit::JitLocalHandlerSite,
+    exc_class_id: ClassId,
+) -> i32 {
+    let mut cm = vm.classes.class_manager.read();
+    for (i, (catch_name, _handler_bci)) in site.candidates.iter().enumerate() {
+        if catch_name.is_empty() {
+            // `catch_type == 0` — a `finally` / catch-all. Matches anything.
+            // Cast: candidate counts are single digits.
+            return i as i32;
+        }
+        let catch_class_id =
+            match cm.find_class_by_name_for_class(catch_name, ClassId::new(site.declaring_class_id))
+            {
+                Some(id) => id,
+                None => {
+                    drop(cm);
+                    let loaded = vm.load_class_concurrent(catch_name);
+                    cm = vm.classes.class_manager.read();
+                    match loaded {
+                        Ok(id) => id,
+                        // Unresolvable catch type: the interpreter's own search
+                        // skips it rather than treating it as a match.
+                        Err(_) => continue,
+                    }
+                }
+            };
+        if cm.is_subclass_of(exc_class_id, catch_class_id)
+            || cm.is_subclass_of_by_name(exc_class_id, catch_name)
+        {
+            // Cast: candidate counts are single digits.
+            return i as i32;
+        }
+    }
+    -1
+}
+
 // ---------------------------------------------------------------------------
 // JDK-only policy for the JIT's own by-name native fast paths
 // (`docs/feature-designs/jdk-only-mode.md` §1, §7, §10)
@@ -19766,6 +19939,13 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // is what keeps inline reference reads unreachable there until the
         // ZGC JIT load barrier lands.
         read_bounds_addr: cratonvm_gc::jit_read_bounds_addr(),
+        // Compiled local exception handlers. Wired unconditionally: the
+        // backend only arms a stub when `local_handlers_enabled()` says so, so
+        // a wired-but-unused address costs nothing, and having ONE gate (the
+        // flag) rather than two (flag + wiring) is what keeps
+        // "the feature reports itself on while being structurally inert" off
+        // the table.
+        local_handler_lookup: jit_local_handler_lookup as *const () as usize,
         // Inline self-recursion check — leaf floor-query helper (see the
         // jit-api field doc; prologue-called once per self-recursive method).
         native_stack_floor_fn: jit_native_stack_floor as *const () as usize,

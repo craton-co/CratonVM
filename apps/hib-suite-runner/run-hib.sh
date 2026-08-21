@@ -89,6 +89,27 @@ SHARDS="${SHARDS:-6}"               # parallel forks per mode
 TIMEOUT="${TIMEOUT:-300}"          # per-class wall cap (s) -> HANG
 OUTROOT="${OUTROOT:-$HERE/runs}"
 USE_OVERRIDES=1                     # --no-overrides disables the table (A/B)
+# --pg-worker-base <N> (0 = off): assigns each shard s (0-based) its own
+# Postgres worker database hibernate_orm_test_<N+s+1> via a direct
+# -Dhibernate.connection.url override, bypassing GradleParallelTestingResolver's
+# $worker templating entirely. That resolver keys its worker-id sequence file
+# by the JVM's PARENT PID (see GradleParallelTestingResolver.getWorkerID) --
+# under this harness's fork-per-class model every invocation gets a fresh
+# parent (a new `timeout` process), so the sequence file is always empty and
+# every fork resolves to worker=1 regardless of maxParallelForks. Concurrent
+# shards -- let alone concurrent GC arms run via separate --pg-worker-base
+# offsets -- would otherwise all hit hibernate_orm_test_1 at once. A literal
+# resolved URL with no "$worker" substring passes through
+# GradleParallelTestingConnectionCreatorFactoryImpl.resolveUrl() unchanged
+# (nothing to replace), and system properties override hibernate.properties
+# (Environment's own documented precedence), so this cleanly wins.
+#
+# Empty string = disabled. NOT 0 -- 0 is a legitimate base (the first GC arm's
+# shards land on workers 1..N). An earlier version used 0 as the disabled
+# sentinel, which silently disabled isolation for whichever arm was launched
+# with --pg-worker-base 0: all its shards fell through to the resolver's
+# always-worker=1 default and collided on hibernate_orm_test_1 concurrently.
+PG_WORKER_BASE="${PG_WORKER_BASE:-}"
 
 CATEGORY="passed"
 JITMODE="on"
@@ -327,6 +348,7 @@ fi
 SHOW_OVERRIDES=0
 SHOW_BENIGN_ABORTS=0
 SHOW_SYSPROPS=0
+EXPLICIT_LIST=""
 while [ $# -gt 0 ]; do
   case "$1" in
     categorize) shift;;
@@ -343,8 +365,10 @@ while [ $# -gt 0 ]; do
     --all-modes) ALLMODES=1; shift;;
     --timeout)  TIMEOUT="$2"; shift 2;;
     --shards)   SHARDS="$2"; shift 2;;
+    --pg-worker-base) PG_WORKER_BASE="$2"; shift 2;;
     --bin)      CV_BIN="$2"; shift 2;;
     --out)      OUTROOT="$2"; shift 2;;
+    --list)     EXPLICIT_LIST="$2"; shift 2;;
     -h|--help)  usage; exit 0;;
     *) echo "unknown option: $1" >&2; usage; exit 2;;
   esac
@@ -368,6 +392,7 @@ ORIG_PWD="$PWD"
 abspath() { case "$1" in /*|[A-Za-z]:[/\\]*) printf '%s' "$1";; *) printf '%s/%s' "$ORIG_PWD" "$1";; esac; }
 CV_BIN="$(abspath "$CV_BIN")"
 OUTROOT="$(abspath "$OUTROOT")"
+[ -n "$EXPLICIT_LIST" ] && EXPLICIT_LIST="$(abspath "$EXPLICIT_LIST")"
 cd "$HERE" || { echo "ERROR: cannot cd to fixture dir: $HERE" >&2; exit 1; }
 
 [ -f "$CV_BIN" ] || { echo "ERROR: cratonvm binary not found: $CV_BIN (set --bin or CV_BIN)" >&2; exit 1; }
@@ -389,18 +414,25 @@ TS="$(date +%Y%m%d-%H%M%S)"
 # args: $1=listfile $2=shard-outdir ; reads global VMFLAGS_BASE array plus the
 # CLASS_TIMEOUT_OVERRIDE / CLASS_FLAGS_OVERRIDE tables
 run_shard() {
-  local LIST="$1" OUT="$2"
+  local LIST="$1" OUT="$2" SHARD_IDX="${3:-0}"
   mkdir -p "$OUT"
   local RAW="$OUT/raw.log" TSV="$OUT/results.tsv"
   : > "$RAW"
   printf 'idx\tclass\tstatus\tfound\tok\tfailed\taborted\tskipped\tms\tsig\n' > "$TSV"
   local idx=0 cls tmp rc
+  # see PG_WORKER_BASE's definition above for why this bypasses the resolver
+  local -a PG_URL_FLAG=()
+  if [ -n "$PG_WORKER_BASE" ]; then
+    local worker_n=$((PG_WORKER_BASE + SHARD_IDX + 1))
+    PG_URL_FLAG=(-Dhibernate.connection.url="jdbc:postgresql://localhost/hibernate_orm_test_${worker_n}?preparedStatementCacheQueries=0&escapeSyntaxCallMode=callIfNoReturn")
+    echo "[pg-worker] shard $SHARD_IDX -> hibernate_orm_test_${worker_n}" >> "$RAW"
+  fi
   while IFS= read -r cls; do
     [ -z "$cls" ] && continue
     # --- per-class accommodation (class-overrides.tsv) ------------------------
     # timeout is a floor: a run that already asks for longer keeps its own value.
     local cls_to cls_fl eff_to f
-    local -a eff_flags=("${VMFLAGS_BASE[@]}")
+    local -a eff_flags=("${VMFLAGS_BASE[@]}" "${PG_URL_FLAG[@]}")
     cls_to="${CLASS_TIMEOUT_OVERRIDE[$cls]:-}"
     cls_fl="${CLASS_FLAGS_OVERRIDE[$cls]:-}"
     eff_to="$TIMEOUT"
@@ -478,7 +510,7 @@ run_mode() {
   local t0; t0=$(date +%s)
   local s pids=()
   for ((s=0; s<SHARDS; s++)); do awk -v n="$SHARDS" -v r="$s" 'NR%n==r' "$SLICE" > "$MODE/shard-$s.txt"; done
-  for ((s=0; s<SHARDS; s++)); do ( run_shard "$MODE/shard-$s.txt" "$MODE/shard-$s" ) & pids+=($!); done
+  for ((s=0; s<SHARDS; s++)); do ( run_shard "$MODE/shard-$s.txt" "$MODE/shard-$s" "$s" ) & pids+=($!); done
   for p in "${pids[@]}"; do wait "$p"; done
   local t1; t1=$(date +%s); local secs=$((t1-t0))
   # merge
@@ -493,7 +525,9 @@ run_mode() {
 }
 
 # --- resolve category list ---------------------------------------------------
-if [ "$CATEGORIZE" = 1 ]; then
+if [ -n "$EXPLICIT_LIST" ]; then
+  SRCLIST="$EXPLICIT_LIST"
+elif [ "$CATEGORIZE" = 1 ]; then
   SRCLIST="$HERE/testlist.txt"
 else
   case "$CATEGORY" in
