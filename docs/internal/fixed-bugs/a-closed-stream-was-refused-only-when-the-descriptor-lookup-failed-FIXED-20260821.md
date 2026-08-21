@@ -143,7 +143,58 @@ red about `Map.of(...) instanceof Collection`, with no `java.io` in it.
 `stub-ratchet` record names as the acceptance test, and several of these bodies
 are the JDK 25 descriptors the SHIPPING modes reach.
 
-<!--H2AB-->
+### The broad workload: H2, 218 classes, both binaries
+
+`java.io` is reached by everything, and this change can only turn a silent
+success into a throw — so the risk it carries is a FALSE refusal on a live
+stream, which no unit test can see. H2 is the file-I/O-heaviest suite in the
+tree. One fork per class, `--category all --count 0`, both binaries, and the
+binaries are ONE COMMIT apart: `fix` is the branch head, `base` is its own
+merge-base, both built in the same worktree.
+
+```
+base  218 rows  176 PASS
+fix   218 rows  178 PASS
+
+diff (class + status):
+  org.h2.test.db.TestTempTables                 HANG -> PASS
+  org.h2.test.jdbc.TestConcurrentConnectionUsage  FAIL -> PASS
+```
+
+**No regression. And neither difference survives as an attributable
+improvement** — both were re-run ABBA, five rounds:
+
+| class | base | fix |
+|---|---|---|
+| `TestTempTables` | **9 / 9 PASS** | **10 / 10 PASS** |
+| `TestConcurrentConnectionUsage` | 8 PASS, **1 FAIL** | 10 / 10 PASS |
+
+* `TestTempTables` passes on BOTH arms every time, at 229–292 s on base against
+  a **300 s cap**. The sweep's HANG was the cap. It is named in
+  `known-issues/h2/hangs-true-vs-perfcliff-20260821.md` as a perf cliff that
+  clears at a 5× cap, i.e. exactly the class whose wall sits on the boundary —
+  the coin-toss shape a one-run-per-arm sweep cannot resolve.
+* `TestConcurrentConnectionUsage` failed once in nine on base and never in ten
+  on fix. One in nine is a flake; that split is nowhere near a result, and
+  claiming the change fixed it would be inventing a win out of noise.
+
+So the reading is the boring one, which is the right one: **218 classes, zero
+regressions, and nothing else demonstrated.**
+
+**A methodological note, because the first attempt at this was wrong.** Take one
+reported `IDENTICAL` — and it was worthless. The runner's `JDK25` defaults to
+`/home/victor/jdk25`, which does not exist on this host, so all 218 classes
+"failed" in 7 seconds on BOTH arms and the diff was empty because both sides
+were. That is the same trap recorded on the netty consolidated table the day
+before: *two arms running nothing is not two arms agreeing.* The rerun sets
+`JDK25`, was smoke-tested on three classes first, and refuses to diff at all if
+either arm returns fewer than 200 rows.
+
+The second attempt also needed correcting before it said anything: `results.tsv`
+carries a per-run output path, so a raw `diff` reports every one of 218 rows as
+changed. Compare class and status, not the file.
+
+
 
 ## Repro
 
