@@ -262,3 +262,48 @@ one-defect-with-four-faces (§4) and the node-class mechanism (§7) both stand.
 **What does not survive is reading §1 as "the migration order".** It is six
 priced cells out of a 1402-row population whose real distribution `H14-2` now
 carries.
+
+---
+
+## 9. THIRD CORRECTION (2026-08-21) — the instrument does not simulate a retirement
+
+`H16-3` measured, and lane H0 independently reproduced, that
+**`CRATONVM_ENFORCE_NATIVE_SHADOW` yields to real bytecode exactly ONCE per
+process** — not per call site, not per receiver.
+
+Three `HashMap`s, three puts each, one process, armed `java/util/HashMap`,
+`HashMap.table` read reflectively:
+
+| | `table` class | real `Node` | fabricated |
+|---|---|---:|---:|
+| HotSpot | `[Ljava.util.HashMap$Node;` | 3 | 0 |
+| CratonVM unarmed | `[Ljava.lang.Object;` | 0 | 3 |
+| **armed, map1** | **`[Ljava.util.HashMap$Node;`** | **1** | **2** |
+| armed, map2 | `[Ljava.lang.Object;` | 0 | 3 |
+| armed, map3 | `[Ljava.lang.Object;` | 0 | 1 |
+
+**So §1's cells price a HYBRID state that no retirement can reach.** `map1` is a
+real `Node[]` holding one real node and two fabrications — internally
+inconsistent in a way neither the current VM nor a fully-retired VM produces.
+
+**The direction of the error is not knowable from this**, and I am not claiming
+the numbers are too high or too low: a hybrid table can be worse than
+uniform-fabricated (a real `Node[]` rejects a store an `Object[]` accepts) or
+better (one fewer fabrication). What is knowable is that **"arming costs N
+vectors" is not the proposition "retiring costs N vectors"**, and this table has
+been read as the second for two days.
+
+**What survives, and it is not nothing.** A cell that reports a **failure** is
+still reporting an observed wrong behaviour — `H22`'s `StringBuilder` and
+`Throwable` refusals get *stronger*, not weaker. It is the clean **zeros** that
+become unreliable, because a state that yields once may simply not have yielded
+anywhere that mattered.
+
+### This is the third correction to this record in two days
+
+§7 corrected its mechanism, §8 corrected its coverage and its cost ordering, and
+§9 corrects the instrument. **The measurements were all real; the conclusions
+drawn from them were repeatedly wider than the measurement supported.** That is
+worth saying plainly at the bottom of the most-cited page in this directory:
+*this table earned its authority from being the first thing measured, not from
+being the right thing measured.*
