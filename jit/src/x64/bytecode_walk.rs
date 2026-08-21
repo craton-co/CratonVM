@@ -7432,7 +7432,12 @@ impl Compiler {
                         let is_tail_call = pc + 3 < code_len
                             && matches!(code[pc + 3], 0xac..=0xb0) // ireturn..areturn
                             && !branch_targets[pc + 3]
-                            && !self.pc_is_protected(pc);
+                            && !self.pc_is_protected(pc)
+                            // `-self-tailcall` demotes this to the raw
+                            // self-recursive CALL below, restoring one native
+                            // frame per activation. Off is the HotSpot-faithful
+                            // answer; on is the default.
+                            && self_tailcall_enabled();
 
                         // jit-invokedynamic-groovy-regression fix: a method
                         // containing a live invokedynamic site (compiled as an

@@ -689,6 +689,33 @@ pub mod npe_action {
     /// `sastore` into a null `short[]`.
     pub const ASTORE_SHORT: u8 = 17;
 }
+/// Bit the JIT may set in `jit_getfield`'s `field_index` argument to say
+/// **"this receiver is already proven to be an oop"**.
+///
+/// When set, the helper skips its `is_object_address` heap-membership walk.
+/// Everything else — the pending-NPE contract, the slot bounds check, the
+/// compact/legacy layout split, the read and the reference decode — is
+/// unchanged, so this carries no new colouring or layout exposure. It is
+/// purely "skip one validation".
+///
+/// # Why a flag bit and not a second helper slot
+///
+/// `helpers_abi.rs` pins [`JitRuntimeHelpers`]'s field count, byte size and
+/// golden offsets with const assertions plus an ABI version, precisely so the
+/// offsets the JIT bakes cannot move. A one-bit argument flag needs none of
+/// that. `field_index` is a small non-negative slot index — a class-file field
+/// table is `u16`-sized — so bit 62 cannot collide with a real index.
+///
+/// # Why skipping the walk is sound
+///
+/// The walk is validation against a stale/garbage receiver from a miscompiled
+/// frame. The emitter sets this only where the IR's type lattice types the base
+/// node `IrType::Ref` — the same proof the PRIMITIVE trusted-oop arm already
+/// relies on, and that arm goes further and performs a raw inline load off this
+/// very receiver. `plausible_heap_pointer` still runs either way, so null and
+/// unaligned/out-of-range bits are still refused.
+pub const GETFIELD_RECEIVER_PROVEN_OOP: u64 = 1 << 62;
+
 
 /// Function pointer table for JIT runtime callbacks.
 ///

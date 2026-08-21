@@ -1,11 +1,14 @@
 import java.nio.CharBuffer;
 import java.text.Normalizer;
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.StringReader;
 import java.math.BigInteger;
 import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -20,6 +23,13 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.Vector;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Optional;
+import java.util.PriorityQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLongArray;
 
@@ -1772,6 +1782,30 @@ public class RJdkBridge1 {
     // reshapes it. Every assertion here is on the CHAR VALUES, never on a
     // printed form.
     // ------------------------------------------------------------------
+    /**
+     * Assert that a rendered collection string carries the lone surrogate of
+     * {@link #LONE_HI} at {@code idx}, rather than the U+FFFD a lossy
+     * round-trip through host text leaves behind.
+     *
+     * <p>{@code idx == 100} means "find it anywhere": a {@code keySet()} view
+     * of a one-entry map renders the KEY, and this family reuses one map whose
+     * key is ordinary text -- so that row asserts the absence of U+FFFD rather
+     * than a position. Every other row knows exactly where the unit belongs.
+     */
+    static void ckCarries(String what, String rendered, int idx) {
+        if (idx == 100) {
+            check(rendered.indexOf('\uFFFD') < 0,
+                    what + " must not contain U+FFFD, got: " + rendered);
+            return;
+        }
+        check(rendered.length() > idx && rendered.charAt(idx) == 0xD800,
+                what + " must carry the lone surrogate at " + idx + ", got charAt(" + idx + ")="
+                        + (rendered.length() > idx
+                                ? Integer.toHexString(rendered.charAt(idx))
+                                : "<short:" + rendered.length() + ">")
+                        + " in: " + rendered);
+    }
+
     static void surrog() {
         step("surrog", "StringBuilder.append(lone high surrogate)");
         StringBuilder s = new StringBuilder();
@@ -1953,7 +1987,350 @@ public class RJdkBridge1 {
                 "CharBuffer.wrap(char[]).toString() must carry the surrogate, got charAt(1)="
                         + Integer.toHexString(cbs.charAt(1)));
 
-        sectionEnd("surrog", 34);
+        // -- every COLLECTION renderer, which is one defect in seventeen places
+        // Each of these bottoms out in `obj_to_display_units` in
+        // native-collections. It used to return a Rust `String`, which cannot
+        // hold an unpaired surrogate, so all seventeen substituted U+FFFD.
+        // `G63-1` measured three of them and refused to fix only those three;
+        // these rows are the other fourteen, so a partial conversion cannot
+        // pass. 21 of 29 probe rows diverged before the fix.
+        step("surrog", "every collection toString with a lone surrogate");
+        List<String> csList = new ArrayList<>();
+        csList.add(LONE_HI);
+        ckCarries("ArrayList.toString", csList.toString(), 2);
+        ckCarries("Arrays.asList().toString", Arrays.asList(LONE_HI, "z").toString(), 2);
+        ckCarries("Arrays.toString(Object[])", Arrays.toString(new String[] {LONE_HI}), 2);
+
+        Map<String, String> csMap = new HashMap<>();
+        csMap.put("k", LONE_HI);
+        ckCarries("HashMap.toString value", csMap.toString(), 4);
+        ckCarries("HashMap.toString key", new HashMap<>(Map.of(LONE_HI, "v")).toString(), 2);
+        ckCarries("keySet() view toString", csMap.keySet().toString(), 100);
+        ckCarries("values() view toString", csMap.values().toString(), 2);
+
+        Map<String, String> csLhm = new LinkedHashMap<>();
+        csLhm.put("k", LONE_HI);
+        ckCarries("LinkedHashMap.toString", csLhm.toString(), 4);
+
+        LinkedList<String> csLl = new LinkedList<>();
+        csLl.add(LONE_HI);
+        ckCarries("LinkedList.toString", csLl.toString(), 2);
+        ArrayDeque<String> csAd = new ArrayDeque<>();
+        csAd.add(LONE_HI);
+        ckCarries("ArrayDeque.toString", csAd.toString(), 2);
+        PriorityQueue<String> csPq = new PriorityQueue<>();
+        csPq.add(LONE_HI);
+        ckCarries("PriorityQueue.toString", csPq.toString(), 2);
+
+        TreeMap<String, String> csTm = new TreeMap<>();
+        csTm.put("k", LONE_HI);
+        ckCarries("TreeMap.toString", csTm.toString(), 4);
+        TreeSet<String> csTs = new TreeSet<>();
+        csTs.add(LONE_HI);
+        ckCarries("TreeSet.toString", csTs.toString(), 2);
+
+        Map<String, String> csChm = new ConcurrentHashMap<>();
+        csChm.put("k", LONE_HI);
+        ckCarries("ConcurrentHashMap.toString", csChm.toString(), 4);
+        Set<String> csKsv = ConcurrentHashMap.newKeySet();
+        csKsv.add(LONE_HI);
+        ckCarries("ConcurrentHashMap.KeySetView.toString", csKsv.toString(), 2);
+
+        ckCarries("Optional.toString", Optional.of(LONE_HI).toString(), 10);
+
+        // A nested collection reaches the element's OWN toString() through
+        // virtual dispatch -- a different arm of the same function.
+        List<List<String>> csNested = new ArrayList<>();
+        csNested.add(csList);
+        ckCarries("nested List.toString dispatches the element's toString", csNested.toString(), 3);
+
+        // A boxed Character CAN itself be a lone surrogate. This one did not
+        // print U+FFFD -- it printed '?', from a `char::from_u32().unwrap_or`
+        // that cannot represent the value at all.
+        List<Character> csChars = new ArrayList<>();
+        csChars.add((char) 0xD800);
+        String cs = csChars.toString();
+        check(cs.length() == 3 && cs.charAt(1) == 0xD800,
+                "a boxed Character holding a lone surrogate must print as that unit, got charAt(1)="
+                        + Integer.toHexString(cs.charAt(1)));
+
+        // Controls: ordinary text, a REAL surrogate pair, and numbers must all
+        // be untouched by a units-level renderer.
+        check("[ab, cd]".equals(new ArrayList<>(List.of("ab", "cd")).toString()),
+                "ordinary element text must be unchanged");
+        check("[1, 2.5, 3]".equals(new ArrayList<>(List.of(1, 2.5, 3L)).toString()),
+                "boxed numbers must still render Java-style, incl. the trailing .0");
+        String pair = new ArrayList<>(List.of("\uD83D\uDE00")).toString();
+        check(pair.length() == 4 && pair.charAt(1) == 0xD83D && pair.charAt(2) == 0xDE00,
+                "a WELL-FORMED surrogate pair must survive as two units, not be reshaped");
+        check("Optional.empty".equals(Optional.empty().toString()),
+                "Optional.empty has no element to render");
+
+        // -- the three routes that reach text WITHOUT going through a String --
+        // Sweep 8 asked the append/insert siblings and the surfaces G63-1 N4
+        // named: 38 of 42 rows were already exact, including every
+        // StringBuilder/StringBuffer overload, Base64, URLEncoder, Collator,
+        // MessageDigest, java.time and chars()/codePoints(). These are the
+        // three that were not, and they share a shape: the value never IS a
+        // String, so the units path that carries a String argument was
+        // never on.
+        step("surrog", "boxed Character, string concat and %s");
+
+        // A boxed Character can itself BE an unpaired surrogate. This one
+        // rendered '?', not even U+FFFD -- a Rust char cannot hold the value at
+        // all, and the fallback substituted a character that means something
+        // else.
+        Character boxedLone = Character.valueOf((char) 0xD800);
+        String cat = "" + boxedLone;
+        check(cat.length() == 1 && cat.charAt(0) == 0xD800,
+                "string concat of a boxed Character must carry the unit, got "
+                        + Integer.toHexString(cat.length() == 1 ? cat.charAt(0) : -1));
+
+        // %s is String.valueOf(arg) == arg.toString(). A STRING argument was
+        // already exact; every other object went through a renderer that
+        // returns host text.
+        String fs = String.format("%s", boxedLone);
+        check(fs.length() == 1 && fs.charAt(0) == 0xD800,
+                "%s of a boxed Character must carry the unit, got "
+                        + Integer.toHexString(fs.length() == 1 ? fs.charAt(0) : -1));
+        String fo = String.format("%s", new Object() {
+            @Override
+            public String toString() {
+                return LONE_HI;
+            }
+        });
+        ckCarries("%s of an object whose toString carries one", fo, 1);
+
+        // CharBuffer.wrap(CharSequence) STORES what it reads, so a lossy read
+        // meant it could not give back the sequence it was handed. G63-1 N2
+        // measured the char[] overload and left this one open.
+        String cbw = CharBuffer.wrap((CharSequence) LONE_HI).toString();
+        ckCarries("CharBuffer.wrap(CharSequence).toString()", cbw, 1);
+
+        // Controls for the same three routes.
+        check("Z".equals("" + Character.valueOf('Z')),
+                "ordinary boxed Character concat must be unchanged");
+        check("ok|q".equals(String.format("%s|%c", "ok", 'q')),
+                "ordinary %s and %c must be unchanged");
+        String pairWrap = CharBuffer.wrap((CharSequence) "\uD83D\uDE00").toString();
+        check(pairWrap.length() == 2 && pairWrap.charAt(0) == 0xD83D,
+                "a well-formed pair through CharBuffer.wrap must stay two units");
+
+        // -- URL.toString rebuilds the external form, and rebuilt it as text --
+        // Under --jdk-only the real JDK constructor fills the component fields,
+        // so getPath()/getFile() were always exact; only this reconstruction
+        // goes through us, and it assembled a Rust String. G75-1 N2 — a second,
+        // narrower defect than the URI parse (N1), found by asking why the two
+        // disagreed rather than assuming one cause.
+        step("surrog", "URL.toString/toExternalForm with a lone surrogate");
+        URL lurl;
+        URL plain;
+        try {
+            lurl = new URL("http://h.example/" + LONE_HI);
+            plain = new URL("http://h.example/ok");
+        } catch (Exception e) {
+            throw new AssertionError("URL construction must succeed: " + e);
+        }
+        ckCarries("URL.toString()", lurl.toString(), 18);
+        ckCarries("URL.toExternalForm()", lurl.toExternalForm(), 18);
+        // The two that were ALREADY right, kept as the rows that locate the
+        // defect: components exact, reconstruction not.
+        ckCarries("URL.getPath() was already exact", lurl.getPath(), 2);
+        ckCarries("URL.getFile() was already exact", lurl.getFile(), 2);
+        check("http://h.example/ok".equals(plain.toString()),
+                "an ordinary URL must round-trip unchanged");
+
+        // -- every URI ACCESSOR re-parses the raw text ------------------------
+        // G75-1 N1. The loss was never in url_parse: each getter reads the raw
+        // string and re-parses it, so a read_string in the getter re-lost the
+        // unit whatever the parse had done. Converted to units end to end, with
+        // ONE splitter — the &str spellings are wrappers over it now.
+        step("surrog", "URI accessors with a lone surrogate");
+        URI lu;
+        URI lu2;
+        try {
+            lu = new URI("http", "h.example", "/" + LONE_HI, LONE_HI, LONE_HI);
+            lu2 = new URI("http://h.example/" + LONE_HI);
+        } catch (URISyntaxException e) {
+            throw new AssertionError("URI construction must succeed: " + e);
+        }
+        ckCarries("URI.getPath()", lu.getPath(), 2);
+        ckCarries("URI.getRawPath()", lu.getRawPath(), 2);
+        ckCarries("URI.getQuery()", lu.getQuery(), 1);
+        ckCarries("URI.getRawQuery()", lu.getRawQuery(), 1);
+        ckCarries("URI.getFragment()", lu.getFragment(), 1);
+        ckCarries("URI.getSchemeSpecificPart()", lu.getSchemeSpecificPart(), 100);
+        ckCarries("URI.getRawSchemeSpecificPart()", lu.getRawSchemeSpecificPart(), 100);
+        // The SINGLE-string constructor took a different route: its component
+        // FIELDS won over the parse, so fixing the getters alone left it wrong.
+        ckCarries("URI(String).getPath()", lu2.getPath(), 2);
+        ckCarries("URI(String).getRawPath()", lu2.getRawPath(), 2);
+        // ...and URL.toURI() re-encoded the string it already held.
+        try {
+            ckCarries("URL.toURI().getPath()",
+                    new java.net.URL("http://h.example/" + LONE_HI).toURI().getPath(), 2);
+        } catch (Exception e) {
+            throw new AssertionError("URL.toURI must succeed: " + e);
+        }
+        // Controls: the ASCII-constrained components, and ordinary text.
+        check("http".equals(lu.getScheme()), "the scheme must be unchanged");
+        check("h.example".equals(lu.getHost()), "the host must be unchanged");
+        try {
+            URI plainUri = new URI("http://h.example/ok?q=1#f");
+            check("/ok".equals(plainUri.getPath()) && "q=1".equals(plainUri.getQuery())
+                            && "f".equals(plainUri.getFragment()),
+                    "an ordinary URI must parse unchanged");
+            check("/a b".equals(new URI("http://h/a%20b").getPath()),
+                    "percent-decoding must still work");
+        } catch (URISyntaxException e) {
+            throw new AssertionError("control URI construction must succeed: " + e);
+        }
+
+
+        // -- java.io.File is a STRING WRAPPER, and the string round-tripped --
+        // G70-1 N1. The read_string caller audit narrowed 2904 grep hits to the
+        // 18 sites that both round-trip a value to Java AND are invoked under
+        // --jdk-only (a static scan joined to --dump-native-registry counts).
+        // java.io.File was the dominant family. `<init>` normalises the path
+        // and writes it straight BACK into a Java field, so the value is not
+        // inspected -- it is handed back, three times over: at construction, at
+        // the field read, and once more in getName(), which went through
+        // std::path + to_string_lossy.
+        step("surrog", "java.io.File path round trip with a lone surrogate");
+        char sep = File.separatorChar;
+        File lone = new File("d/" + LONE_HI);
+        // "d" sep "a" D800 "b" -- the unit lands at index 3.
+        ckCarries("File.getPath()", lone.getPath(), 3);
+        ckCarries("File.toString()", lone.toString(), 3);
+        ckCarries("File.getName()", lone.getName(), 1);
+        ckCarries("File.getParent()", new File(LONE_HI + "/x").getParent(), 1);
+        ckCarries("new File(String,String).getPath()", new File("p", LONE_HI).getPath(), 3);
+        ckCarries("new File(File,String).getPath()",
+                new File(new File("p"), LONE_HI).getPath(), 3);
+
+        // The substitution was not only a rendering fault. equals/hashCode/
+        // compareTo are computed FROM the path, so a file named with a lone
+        // surrogate and one named with a literal U+FFFD COLLIDED: equal, same
+        // hash, compareTo 0. A substitution in a key is a merge, not a typo.
+        File fffd = new File("d/a�b");
+        check(!lone.equals(fffd),
+                "a lone-surrogate path must NOT equal the same path with U+FFFD");
+        check(lone.hashCode() != fffd.hashCode(),
+                "distinct paths must not share a hash once the unit survives");
+        check(lone.compareTo(fffd) != 0,
+                "compareTo must separate a lone surrogate from U+FFFD");
+        check(lone.equals(new File("d/" + LONE_HI)),
+                "an equal path must still be equal to itself");
+
+        // File.hashCode is `path.hashCode() ^ 1234321` (WinNTFileSystem folds
+        // case first). The old body hashed UTF-8 BYTES and omitted the mixing
+        // constant, so new File("AB") answered 2081 where HotSpot answers
+        // 1235376. Both halves are asserted here, per platform.
+        boolean win = sep == '\\';
+        int want = (win ? "ab".hashCode() : "AB".hashCode()) ^ 1234321;
+        check(new File("AB").hashCode() == want,
+                "File.hashCode must be path.hashCode() ^ 1234321 (case-folded on "
+                        + "Windows), got " + new File("AB").hashCode() + " want " + want);
+        check(new File("ab").equals(new File("AB")) == win,
+                "File equality is case-insensitive on Windows and exact elsewhere");
+
+        // Controls: an ASCII path and a WELL-FORMED pair must be untouched by
+        // the units conversion -- the rows that would catch it breaking what
+        // already worked.
+        check(new File("d/plain.txt").getPath().equals("d" + sep + "plain.txt"),
+                "an ordinary ASCII path must be unchanged by the units conversion");
+        check("plain.txt".equals(new File("d/plain.txt").getName()),
+                "an ordinary basename must be unchanged");
+        String fpair = new File("d/😀").getPath();
+        check(fpair.length() == 4 && fpair.charAt(2) == 0xD83D && fpair.charAt(3) == 0xDE00,
+                "a well-formed pair in a path must stay two units");
+
+
+        // The root prefix is where a units conversion of the path helpers can
+        // silently regress, and no relative-path row can see it: `getParent`
+        // and `getName` both consult java.io.File's `prefixLength`, so `C:\`
+        // has a NULL parent and an EMPTY name while `C:x` has parent `C:` with
+        // no separator present at all. The first conversion got all three
+        // wrong. These rows exist so the next one cannot.
+        step("surrog", "File root-prefix contracts (getParent/getName)");
+        String BS = String.valueOf((char) 92);
+        File absF = win ? new File("C:" + BS + "x") : new File("/x");
+        check((win ? "C:" + BS : "/").equals(absF.getParent()),
+                "the parent of a root-anchored path is the root itself, got " + absF.getParent());
+        File rootF = win ? new File("C:" + BS) : new File("/");
+        check(rootF.getParent() == null,
+                "a root has no parent, got " + rootF.getParent());
+        check("".equals(rootF.getName()),
+                "a root has an empty name, got [" + rootF.getName() + "]");
+        check(win ? "C:".equals(new File("C:x").getParent())
+                  : new File("x").getParent() == null,
+                "a drive-relative path has a parent with no separator in it");
+
+        // -- URI.relativize REBUILDS a path, and rebuilt it as text -----------
+        // G75-1 N3. The accessor conversion (N1) fixed twelve of thirteen rows
+        // and left this one, because relativize is the single URI operation
+        // that reassembles a path from segments instead of selecting a range of
+        // one -- dot-segment removal and recomposition, both splitting on ASCII
+        // '/'. Reassembly is where a lossy spelling puts the substitution back.
+        step("surrog", "URI.relativize with a lone surrogate");
+        URI relBase;
+        URI relTarget;
+        URI relBase2;
+        URI relTarget2;
+        try {
+            relBase = URI.create("http://h.example/");
+            relTarget = new URI("http://h.example/" + LONE_HI);
+            relBase2 = URI.create("http://h.example/d/");
+            relTarget2 = new URI("http://h.example/d/" + LONE_HI + "?q=" + LONE_HI
+                    + "#f" + LONE_HI);
+        } catch (URISyntaxException e) {
+            throw new AssertionError("URI construction must succeed: " + e);
+        }
+        ckCarries("URI.relativize().toString()", relBase.relativize(relTarget).toString(), 1);
+        ckCarries("URI.relativize().getPath()", relBase.relativize(relTarget).getPath(), 1);
+        // The query and the fragment ride through the SAME recomposition.
+        URI rel2 = relBase2.relativize(relTarget2);
+        ckCarries("relativize().getQuery()", rel2.getQuery(), 3);
+        ckCarries("relativize().getFragment()", rel2.getFragment(), 2);
+        ckCarries("relativize().toString() with query+fragment", rel2.toString(), 1);
+
+        // Controls: relativization itself must still work, including the
+        // dot-segment removal the units rewrite touched.
+        try {
+            check("x/y".equals(URI.create("http://h.example/d/")
+                            .relativize(new URI("http://h.example/d/x/y")).toString()),
+                    "ordinary relativization must be unchanged");
+            check("c".equals(URI.create("http://h.example/a/")
+                            .relativize(new URI("http://h.example/a/b/../c")).toString()),
+                    "dot-segment removal must still collapse b/.. -> nothing");
+            check("http://other.example/z".equals(URI.create("http://h.example/")
+                            .relativize(new URI("http://other.example/z")).toString()),
+                    "a non-prefix target must come back unchanged");
+        } catch (URISyntaxException e) {
+            throw new AssertionError("URI construction must succeed: " + e);
+        }
+
+
+        // The FOURTH File constructor, and the one the audit did not reach: it
+        // was invoked zero times across the corpus, so it never entered the
+        // live set that the dataflow-plus-registry filter produced. G70-1 N2
+        // says a sibling next to a fixed method is not thereby fixed. It was
+        // asked rather than assumed, and it diverged.
+        step("surrog", "new File(URI) with a lone surrogate");
+        File uriFile;
+        File uriPlain;
+        try {
+            uriFile = new File(new URI("file:///d/" + LONE_HI));
+            uriPlain = new File(new URI("file:///d/p.txt"));
+        } catch (URISyntaxException e) {
+            throw new AssertionError("URI construction must succeed: " + e);
+        }
+        ckCarries("new File(URI).getPath()", uriFile.getPath(), 4);
+        check(uriPlain.getPath().endsWith("d" + BS + "p.txt")
+                        || uriPlain.getPath().endsWith("d/p.txt"),
+                "an ordinary file: URI must still yield its path, got " + uriPlain.getPath());
+
+        sectionEnd("surrog", 111);
     }
 
     static final int SFF = 15;

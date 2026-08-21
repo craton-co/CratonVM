@@ -275,7 +275,7 @@ cratonvm --java-home <jdk> -cp . LocalHandlerShapeProbe 200000
 * [`httpresponsestatustest-exhaustive-loop-timeout-20260816.md`](httpresponsestatustest-exhaustive-loop-timeout-20260816.md)
   — the sibling, which is 7% off its wall rather than an order of magnitude, and
   which carries the measurement that the OSR door plans no inline sites.
-* [`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)
+* `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` (retired 2026-08-20)
   — the native-call floor this class's `ByteBuffer.putInt` pays once per
   iteration.
 * [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)

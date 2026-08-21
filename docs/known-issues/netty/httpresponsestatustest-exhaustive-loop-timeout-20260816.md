@@ -259,7 +259,7 @@ it). Any arm added here must still be checked against `CRATONVM_DBG_JITC=1` for
   remaining wall is a different defect entirely: 1.67 `ReceiverTypeChanged`
   deopts per iteration ending in `MakeNotCompilable`, with a per-bci de-spec
   registry that is written for that reason and never read.
-* [`httpcontentdecompressortest-hang-20260816.md`](httpcontentdecompressortest-hang-20260816.md)
+* `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` (retired 2026-08-20)
   — the per-call floor for anything reaching a registered native, which is what
   prices `Enum.ordinal` above.
 * [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)

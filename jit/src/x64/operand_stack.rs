@@ -144,9 +144,45 @@ impl Compiler {
         if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
             self.stack_oop_marks_exact = true;
         }
-        // Reclaim spill space if this was a Frame slot at the top
+        // Reclaim spill space if this was a Frame slot at the top — and only if
+        // no entry still on the stack lives at or above it.
+        //
+        // The bare `off == next_spill_offset - 8` test assumed spill offsets are
+        // handed out in stack order, so the top entry always owns the topmost
+        // slot. `invalidate_callee_saved` breaks that assumption: it reserves ONE
+        // fresh slot at the top of the reserve and repoints EVERY matching
+        // entry at it, including entries buried under the top of the stack. A
+        // pop of a shallower `Frame` entry then rewound the cursor past a slot a
+        // DEEPER entry still owned, and the next `push_stack` handed the same
+        // offset out again — the pushed value overwrote the buried one, and the
+        // buried entry read back whatever the new owner had stored.
+        //
+        // The shape it was measured on is `kotlin.reflect...KotlinTypeFactory
+        // .simpleTypeWithNonTrivialMemberScope`, whose kotlinc-generated body
+        // pops five operands into locals 7..11 (`astore`/`istore`, each one an
+        // invalidation) while four earlier operands still sit on the stack, then
+        // reloads all five to build a lambda and finally calls a constructor
+        // with the four buried ones. The buried `arguments` operand arrived null
+        // — `NullPointerException: Parameter specified as non-null is null:
+        // method ...SimpleTypeImpl.<init>, parameter arguments` — which is
+        // `InvocableHandlerMethodKotlinTests.genericParameter()` in the Spring
+        // Framework suite. It needs at least four colourable locals to appear
+        // (`CRATONVM_JIT_LOCAL_REGS=3` passes, `=4` fails) and disappears under
+        // `--nojit` and `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=0`.
+        //
+        // The added scan is over the simulated stack, which is short, and it can
+        // only ever DELAY a reclaim: a slot nobody references is still freed on
+        // the next pop that tops out at it. Frame usage can rise for a method
+        // that invalidates a lot, which `checked_spill_range_end` already bounds
+        // — an exhausted reserve fails the compile and falls back to the
+        // interpreter rather than emitting a wrong body.
         if let StackSlot::Frame(off) = slot {
-            if off == self.next_spill_offset - 8 {
+            if off == self.next_spill_offset - 8
+                && !self
+                    .stack
+                    .iter()
+                    .any(|s| matches!(s, StackSlot::Frame(o) if *o >= off))
+            {
                 self.next_spill_offset -= 8;
             }
         }

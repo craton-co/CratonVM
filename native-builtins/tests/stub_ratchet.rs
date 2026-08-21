@@ -640,34 +640,162 @@ use cratonvm_types::compat::CompatibilityMode;
 /// first post-merge run this way: **exactly +2 over these constants is (d)
 /// landing and is the expected result — re-freeze to 1289 / 1279 and delete
 /// this section. Any other delta is a finding to attribute.**
-/// Re-frozen 1287 -> 1318 on 2026-08-19. See the module doc's
-/// "the count rose 31 and NOT ONE new fake was written": 30 of the 33 added
-/// rows are `Bridge` -> `SyntheticStub` re-labels of registrations that already
-/// existed, and every one of them is a documented improvement. MEASURED in this
-/// configuration (`--features management`), not derived from the other one —
-/// the arithmetic-instead-of-measurement trap is recorded immediately above.
-/// Re-frozen 1318 -> 1321 on 2026-08-19 (same day, second move). The three are
-/// `getTrustedAttributes`, `isInitializing` and `entryFor` on
-/// `cratonvm/internal/ss/JavaUtilJarAccess$1` — interface methods that were not
-/// registered AT ALL, so the carrier answered them with an `AbstractMethodError`.
-/// Registering them is case (b) in this gate's own failure message: the carrier
-/// is in `NO_IMAGE_JDK_RECEIVERS`, so every row on it is re-tagged
-/// `SyntheticStub` and dropped under `--jdk-only` whatever the body does. Three
-/// honest rows that strict mode drops beat three abstract methods that throw.
-/// MEASURED with `--features management`.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1321;
+/// # 1287 / 1277 -> 1396 / 1386, 2026-08-19 — 78 relabels and 31 inherited
+///
+/// **The gate had been RED since before this session and was therefore gating
+/// nothing.** `G83-1` recorded it 31 over its baseline on 2026-08-19 and
+/// stopped there, because naming the 31 needed a script nobody had written. A
+/// failing assert cannot notice a 32nd stub: every synthetic stub added between
+/// 2026-08-14 and today entered a tree whose ratchet was already failing. That
+/// is the reason to re-freeze, and the enumeration below is the price of doing
+/// it honestly — a re-freeze that does not say what it absorbs is how the 31
+/// got in.
+///
+/// ## How this was measured
+///
+/// [`synthetic_by_file`] and the `CRATONVM_RATCHET_ROWS=1` row dump added to
+/// [`synthetic_stub_count_does_not_regress`] were run at THREE commits in a
+/// detached worktree — `8c6801820` (where 1277 was frozen, 2026-08-14),
+/// `8a7e2727f` (the last commit before this session), and HEAD — and the row
+/// sets diffed by `(file, class, method, descriptor)`:
+///
+/// ```text
+///   8c6801820   1277 stubs / 12780 rows
+///   8a7e2727f   1308 stubs / 12792 rows     +31 stubs, +12 rows
+///   HEAD        1386 stubs / 12792 rows     +78 stubs,   0 rows
+/// ```
+///
+/// **The row-count column is the whole argument.** A relabel keeps its row and
+/// moves only its kind; a genuinely new fake adds a row. This gate freezes one
+/// number and so cannot tell the two apart — and they have opposite signs. The
+/// second column can, and it is why the two deltas below are read differently.
+///
+/// ## The 78 (this session): every one a relabel, total registrations unchanged
+///
+/// 78 rows added, **0 removed, and the registry is the same 12792 rows it was**.
+/// Not one new native was registered; 78 already-registered fakes stopped
+/// claiming to be `Bridge`. This is the direction the *157 -> 165* note above
+/// records as the gate becoming more honest, at 10x the scale:
+///
+/// ```text
+///   +28  native-collections/src/lib.rs      java/util/Vector, all 28   (5546e0b7c)
+///   +27  native-io/src/watch.rs             the WatchService surface   (G88-1 §9)
+///   +12  native-io/src/stream_encoder.rs    sun/nio/cs StreamEncoder
+///   +10  native-io/src/stream_decoder.rs    sun/nio/cs StreamDecoder
+///   +1   native-io/src/lib.rs               the string reader/writer shim
+/// ```
+///
+/// The `watch.rs` 27 are the retag `G88-1` §9 declined for want of an exercise
+/// and `G85-1` §3b's rule refused to accept unverified; `RJdkWatchService`
+/// (13 checks, scheduled) is that exercise. Note that this census is a THIRD
+/// instrument agreeing with `--dump-native-registry` and the arms on the same
+/// 27 — the in-process boot replay, which neither of the other two is.
+///
+/// It also disagrees usefully with the runtime dump on scale: the dump reported
+/// 460 `native-collections` stubs "was 0", this replay had 432 of them before
+/// the session started. Both are right about their own population. Neither is
+/// "the" number, which is the standing reason this file names its configuration
+/// beside every count.
+///
+/// ## The 31 (inherited, 2026-08-14 .. 2026-08-18): named, not absorbed silently
+///
+/// 35 rows added, 4 removed, and the registry grew by 12 — so **at most 12 of
+/// the 35 are new registrations and at least 23 are relabels**. They are not
+/// this change's work and are re-frozen only because the alternative is a gate
+/// that stays dead. By file:
+///
+/// ```text
+///   +14  native-collections/src/lib.rs
+///          java/util/ArrayList x12 (<init> x3, add, clear, contains, get,
+///          isEmpty, iterator, size, toArray x2), Arrays$ArrayList.iterator,
+///          Collections.synchronizedMap
+///   +8   native-builtins/src/lib.rs
+///          java/lang/Runtime.exec x6 (every overload),
+///          java/util/ArrayList.{<init>(I)V, iterator}
+///   +7   native-builtins/src/phases_late/streams.rs
+///          Predicate.{and,or,negate,not}, Consumer.andThen,
+///          BinaryOperator.{minBy,maxBy}
+///   +1   native-builtins/src/shared_secrets_bridge.rs   (+5 rows, -4 rows)
+///   +1   native-builtins/src/phases_late/ssl_security.rs
+///          javax/net/ssl/SSLSocketInputStream.skip(J)J
+/// ```
+///
+/// The seven in `phases_late/streams.rs` are the same shape as the eight that
+/// moved this constant 157 -> 165: `java.util.function` DEFAULT methods, which
+/// no JDK declares `native` and which real bytecode already implements as one
+/// line returning a lambda. They are the strongest removal candidates in the 31
+/// and the cheapest, being interface defaults with no state.
+///
+/// **The prediction in the merge note above is discharged, and it was off by
+/// one.** That note said "exactly +2 over these constants is (d) landing …
+/// any other delta is a finding to attribute". Measured: (d)'s file moved +5
+/// rows and -4, i.e. **+1**, not +2 — and 30 further stubs arrived from other
+/// merges in the same window. That is the attribution it asked for.
+///
+/// ## What must NOT be read into this re-freeze
+///
+/// It does not adjudicate the 31 as necessary. `G83-1` N1 stands — find them
+/// and remove them — and it is now actionable rather than a search, because the
+/// list is above. Nor does it license a future re-freeze: the next rise must
+/// come with the same two columns (stubs AND rows) and the same enumeration,
+/// which is why the failure message now prints the per-file breakdown itself.
+/// # 1396 / 1386 -> 1622 / 1611, 2026-08-19 — the §1.4 shadow wave, and the
+/// first time the two-column rule adjudicated a change instead of explaining one
+///
+/// 227 triples over five subsystems were RETIRED as contract §1.4 shadows
+/// (`native-api/src/retired_shadow.rs`, `G90-1`): a native standing in front of
+/// concrete JDK bytecode now yields to it under `--jdk-only`. Retirement is
+/// implemented as a re-tag to `SyntheticStub` at registration, so this count
+/// rises by exactly the number retired on the boot path — **+226 management,
+/// +225 no-management, and the registry did not grow by ONE ROW** (13160 and
+/// 12792, both unchanged).
+///
+/// That is the whole adjudication, and it took no recollection of what the
+/// change did. The rule added above on the same day says a relabel keeps its
+/// row while a new fake adds one; the row column did not move; therefore every
+/// one of the 226 is a relabel. The *157 -> 165* note further up argues the
+/// same conclusion in eight paragraphs of prose about eight registrations,
+/// because at the time there was no second number to point at.
+///
+/// **Read the direction correctly.** This is the largest single rise this
+/// constant has ever taken and it is the most correct the registry has been:
+/// 227 fakes stopped claiming to be `Bridge` AND stopped shadowing real
+/// bytecode under `--jdk-only`. The acceptance test is
+/// `regression-suite/run.sh` with `CRATONVM_ARGS=--jdk-only` — 102 / 102, the
+/// baseline — and it is the test that matters, because it is the one that
+/// rejected 28 further triples the 36-vector screen had passed
+/// (`java/lang/ref/`, `sun/nio/fs/`; see `G90-1` §5).
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1622;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
-/// Re-frozen 1277 -> 1308 on 2026-08-19, alongside
-/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] and for the same reason. Both were
-/// measured; the delta is +31 in each, which is itself the check that the 31
-/// are not in the ten `jmx::*` registrars that separate the two.
-/// Re-frozen 1308 -> 1311 on 2026-08-19 alongside
-/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`], same three rows, same reason. +3 in
-/// both configurations, both measured.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1311;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1611;
+
+/// The TOTAL registration count each baseline above was measured beside.
+///
+/// Not asserted — a new `Bridge` legitimately raises it, so a gate here would
+/// fire on correct work. It exists so a failure can be CLASSIFIED: compare the
+/// live total against this, and
+///
+///   * total UNCHANGED, stubs up  -> existing fakes were relabelled. Welcome.
+///     Re-freeze and say which, as the 2026-08-19 note above does.
+///   * total UP by about the stub delta -> new fakes were registered. This is
+///     the regression the gate exists for. Do not re-freeze.
+///
+/// The 2026-08-19 re-freeze is the first case for its own 78 and the second
+/// (partly) for the 31 it inherited, and neither could be told from the other
+/// by the frozen count alone.
+#[allow(dead_code)]
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13160;
+/// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
+#[allow(dead_code)]
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12792;
+
+#[cfg(feature = "management")]
+const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
+#[cfg(not(feature = "management"))]
+const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT;
 
 // Both constants are compiled in both configurations on purpose: a reader
 // re-freezing one can see the other, and neither can be edited by accident
@@ -774,6 +902,39 @@ fn census() -> (usize, usize) {
         .filter(|(_, _, _, kind)| *kind == NativeKind::SyntheticStub)
         .count();
     (synthetic, rows.len())
+}
+
+/// The same census, grouped by the SOURCE FILE that registered each
+/// `SyntheticStub` row.
+///
+/// The bare count this gate freezes says *that* the population moved; it never
+/// said *where*, and the difference is the whole cost of acting on a red
+/// ratchet. G83-1 recorded the gate sitting 31 over its baseline with nobody
+/// able to name the 31 without writing a one-off script first; this makes the
+/// breakdown fall out of the failing run itself.
+///
+/// Keyed by file, not by registrar function: `registered_by` carries
+/// `file:line`, and the line is the `register*` call site, not the enclosing
+/// `fn register_…`. Recovering the function needs per-crate source parsing (the
+/// limitation `regression-suite/probes/cluster-map.py` states for the same
+/// reason). File granularity is enough to answer "which subsystem moved", which
+/// is what a red ratchet actually asks.
+fn synthetic_by_file() -> Vec<(String, usize)> {
+    let mut registry = NativeMethodRegistry::new();
+    register_boot_path(&mut registry);
+    let mut per_file: std::collections::BTreeMap<String, usize> = Default::default();
+    for r in registry.census() {
+        if r.kind != NativeKind::SyntheticStub {
+            continue;
+        }
+        let at = r.registered_by.as_deref().unwrap_or("<unknown>");
+        let file = at.replace('\\', "/");
+        let file = file.rsplit_once(':').map_or(file.as_str(), |(f, _)| f).to_string();
+        *per_file.entry(file).or_default() += 1;
+    }
+    let mut out: Vec<_> = per_file.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// THE GATE FOR STEP 3 OF
@@ -933,6 +1094,42 @@ fn synthetic_stub_count_does_not_regress() {
     );
     println!("stub-ratchet: const {BASELINE_CONST}: usize = {synthetic};");
 
+    // WHERE the population lives, not just how big it is. Printed on every run,
+    // pass or fail: a green ratchet whose composition shifted underneath it is
+    // the case a single number is structurally unable to show.
+    let by_file = synthetic_by_file();
+    for (file, n) in &by_file {
+        println!("stub-ratchet(by-file): {n:>5}  {file}");
+    }
+    // ROW-LEVEL dump, off by default (1386 lines is not gate output). Set
+    // `CRATONVM_RATCHET_ROWS=1` to diff two commits' populations by NAME rather
+    // than by count — the question "which stubs are the N over the baseline"
+    // that a bare number cannot answer.
+    if std::env::var_os("CRATONVM_RATCHET_ROWS").is_some() {
+        let mut registry = NativeMethodRegistry::new();
+        register_boot_path(&mut registry);
+        let mut rows: Vec<String> = registry
+            .census()
+            .into_iter()
+            .filter(|r| r.kind == NativeKind::SyntheticStub)
+            .map(|r| {
+                let at = r.registered_by.as_deref().unwrap_or("<unknown>").replace('\\', "/");
+                let file = at.rsplit_once(':').map_or(at.clone(), |(f, _)| f.to_string());
+                format!("{}|{}{}|{}", file, r.class, r.name, r.descriptor)
+            })
+            .collect();
+        rows.sort();
+        for r in rows {
+            println!("stub-ratchet(row): {r}");
+        }
+    }
+    let breakdown = by_file
+        .iter()
+        .take(8)
+        .map(|(f, n)| format!("{n} {f}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     assert!(
         synthetic <= BASELINE_SYNTHETIC_STUBS,
         "STUB-RATCHET in the {MEASURED_CONFIG} configuration: {synthetic} \
@@ -958,8 +1155,11 @@ fn synthetic_stub_count_does_not_regress() {
          \n\
          Re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
          {synthetic} + SLACK ({}) only with that account written down. See \
-         stub-ratchet.md.",
+         stub-ratchet.md.\n\
+         \n\
+         WHERE THEY ARE (top 8 files): {}",
         synthetic + SLACK,
+        breakdown,
     );
 }
 

@@ -1334,8 +1334,12 @@ pub fn dump_method_stats_to_stderr() {
     // that made an earlier ByteBuffer accessor rewrite read as a no-op when in
     // fact it was on a path with zero invocations.
     let (check_index_sites, fence_sites) = crate::census_direct_helper_sites();
+    let (long_value_of_sites, long_long_value_sites) = crate::long_box_direct_helper_sites();
+    let (vh_read_sp, vh_read_osr) = crate::varhandle_read_direct_helper_sites();
     eprintln!(
-        "[cratonvm] JIT thin direct-helper binds: Preconditions.checkIndex={check_index_sites} Reference.reachabilityFence={fence_sites}",
+        "[cratonvm] JIT thin direct-helper binds: Preconditions.checkIndex={check_index_sites} \
+         Reference.reachabilityFence={fence_sites} Long.valueOf={long_value_of_sites} \
+         Long.longValue={long_long_value_sites} VarHandle.read={vh_read_sp}/{vh_read_osr}",
     );
     let shadow_census = crate::jit_native_shadow_cause_census();
     if !shadow_census.is_empty() {

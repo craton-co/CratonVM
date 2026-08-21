@@ -2371,7 +2371,7 @@ fn reloc_emit_enabled() -> bool {
     /// `plan_object_alloc`, so a class with a perfectly good registered compact
     /// layout is still allocated legacy. An arm that inlines only compact
     /// receivers therefore inlines almost nothing. See
-    /// known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+    /// fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
     ///
     /// The legacy read is the uniform 16-byte `Value` cell at
     /// `HEADER_SIZE + field_index * SLOT_SIZE`, transcribed from the
@@ -2599,9 +2599,40 @@ fn reloc_emit_enabled() -> bool {
         for p in slow {
             self.patch_rel32_to_here(p);
         }
+        // For a REFERENCE field whose base node the IR already types `Ref`, use
+        // the helper that skips the `is_object_address` membership walk.
+        //
+        // The walk is validation against a stale receiver, and the proof we
+        // have here is the same one the PRIMITIVE trusted-oop arm above relies
+        // on — an arm that goes further and does a raw inline load off this
+        // very receiver. Handing it to a helper instead is a strictly weaker
+        // use of the same trust.
+        //
+        // This changes only the SLOW path. The inline path is untouched, so
+        // Generational — where containment passes and the inline ref load is
+        // taken — sees no difference at all. It is ZGC and G1, which publish no
+        // read bounds for reference loads, that take this path on 100% of
+        // reference accesses, and there the walk was the largest single cost of
+        // a field-dense run (`ZObjectStarts::contains` 11.1% +
+        // `is_object_address` 9.5% on `dev` @800d17cc8).
+        //
+        // `contains` is already a tight bitmap probe; the cost is one
+        // cache-missing random probe per access, so the fix is to stop asking,
+        // not to ask faster.
+        // Carried in `field_index`, NOT a new helper slot: `helpers_abi.rs`
+        // pins the table's field count, byte size and golden offsets with const
+        // assertions and an ABI version, all of which exist to keep the layout
+        // the JIT bakes frozen. A one-bit argument flag needs none of that, and
+        // the index is a small non-negative slot number with 62 spare bits.
+        let base_is_proven_oop = self.graph.nodes[base as usize].ty == IrType::Ref;
+        let arg2 = if ref_node && base_is_proven_oop {
+            field_index as u64 | cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP
+        } else {
+            field_index as u64
+        };
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
-        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as u64);
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], arg2);
         self.emit_mov_reg_imm64(RAX, self.getfield as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         self.emit_mov_reg_imm64(R10, i64::MIN as u64);
@@ -11084,7 +11115,7 @@ mod tests {
     /// the remainder on the stack instead of falling back to the dispatch
     /// helper.
     ///
-    /// This is the blocker `httpcontentdecompressortest-hang-20260816.md`
+    /// This is the blocker `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md`
     /// named: `emit_direct_cross_call` was register-only, so a site needing
     /// seven incoming slots kept the full `jit_invoke_dispatch` round trip no
     /// matter what the binding side had resolved. The map entry was recorded

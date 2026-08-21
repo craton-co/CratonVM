@@ -540,9 +540,106 @@ impl Drop for SelectorState {
 
 /// Process-wide selector registry. Keyed by an integer id we allocate at
 /// `Selector.open()`.
+///
+/// **Do not call `.read()` on this directly — use [`selectors_read`].** See its
+/// doc comment for the deadlock that rule exists to stop; the one legitimate
+/// `.write()` is [`selectors_open_write`].
 fn selectors() -> &'static RwLock<HashMap<i32, Mutex<SelectorState>>> {
     static REG: OnceLock<RwLock<HashMap<i32, Mutex<SelectorState>>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+thread_local! {
+    /// How many [`SelectorsRead`] guards this thread currently holds.
+    static SELECTORS_READ_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A read guard on the selector registry that knows whether it is NESTED.
+///
+/// `parking_lot::RwLock::read()` is deliberately **not** recursive-safe: it
+/// blocks whenever a writer is queued, so that writers cannot starve. A thread
+/// that already holds a read guard and calls `read()` again therefore parks
+/// behind that writer — and the writer is waiting for the guard that same
+/// parked thread is still holding. Nothing breaks the cycle.
+///
+/// That is not hypothetical. It is what `ParameterizedSslHandlerTest` had been
+/// stalling on since at least 2026-08-13, measured with `gdb -p` on a stuck
+/// process (2026-08-20, Azure Linux host, 26 threads):
+///
+/// ```text
+///  Thread 6  sk_cancel_public (3491: read HELD) -> selector_cancel (read) -> PARKED
+///  Thread 3  selector_open -> RwLock::write -> wait_for_readers            -> PARKED
+///  20 others open_flag / kernel_select_linux phase 3 -> read              -> PARKED
+/// ```
+///
+/// Every selector operation in the VM stops, with no exception and no failure:
+/// the class does not fail, it stops. HotSpot has no such lock and runs the
+/// same 63 tests in 3.4s.
+///
+/// The rule this type enforces: the FIRST acquisition on a thread takes the
+/// fair `read()`, so writers still cannot starve; a NESTED one takes
+/// `read_recursive()`, which never queues behind a writer. A nested
+/// `read_recursive()` cannot block at all — a writer cannot hold the lock while
+/// this thread holds a read guard — so the cycle above cannot form.
+///
+/// The counter is one thread-local `Cell` bump per acquisition, live in release
+/// as well as debug. A `#[cfg(debug_assertions)]` check would have said nothing
+/// about the release binary the suites actually run.
+struct SelectorsRead {
+    guard: parking_lot::RwLockReadGuard<'static, HashMap<i32, Mutex<SelectorState>>>,
+}
+
+impl std::ops::Deref for SelectorsRead {
+    type Target = HashMap<i32, Mutex<SelectorState>>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl Drop for SelectorsRead {
+    fn drop(&mut self) {
+        SELECTORS_READ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Read the selector registry. See [`SelectorsRead`].
+fn selectors_read() -> SelectorsRead {
+    // Read the depth, acquire, THEN bump it: the counter must only ever
+    // describe guards this thread actually holds, so a thread parked in the
+    // fair `read()` below is not already counted as holding one.
+    let nested = SELECTORS_READ_DEPTH.with(|d| d.get()) > 0;
+    let guard = if nested {
+        // Cannot block: a writer cannot hold the lock while this thread
+        // holds a read guard, and `read_recursive` does not queue behind a
+        // WAITING writer.
+        selectors().read_recursive()
+    } else {
+        selectors().read()
+    };
+    SELECTORS_READ_DEPTH.with(|d| d.set(d.get() + 1));
+    SelectorsRead { guard }
+}
+
+/// Is this thread inside a [`selectors_read`] guard? Exposed for the
+/// lock-discipline tests and for [`selectors_open_write`]'s assertion.
+fn selectors_read_depth() -> u32 {
+    SELECTORS_READ_DEPTH.with(|d| d.get())
+}
+
+/// The registry's single writer, `Selector.open()`.
+///
+/// Taking the write lock while this thread holds a read guard is an
+/// unconditional self-deadlock (parking_lot RwLocks are not upgradable in
+/// place), so it is asserted rather than left to be discovered by a stuck
+/// process. There is exactly one caller and it holds nothing.
+fn selectors_open_write(
+) -> parking_lot::RwLockWriteGuard<'static, HashMap<i32, Mutex<SelectorState>>> {
+    debug_assert_eq!(
+        selectors_read_depth(),
+        0,
+        "selectors(): taking the write lock while holding a read guard self-deadlocks"
+    );
+    selectors().write()
 }
 
 fn next_selector_id() -> i32 {
@@ -610,9 +707,7 @@ fn closed_selector_typed(ctx: &mut dyn NativeContext) -> MethodCallFailed {
 /// tests and for `sun.nio.ch.SelectorProvider.openSelector0()` callers.
 pub fn selector_open() -> i32 {
     let id = next_selector_id();
-    selectors()
-        .write()
-        .insert(id, Mutex::new(SelectorState::new()));
+    selectors_open_write().insert(id, Mutex::new(SelectorState::new()));
     id
 }
 
@@ -624,7 +719,7 @@ pub fn selector_open() -> i32 {
 /// reference. Instead we mark the state closed in-place and explicitly
 /// release every owned OS handle here. The Mutex stays in the HashMap.
 pub fn selector_close(id: i32) {
-    let regs = selectors().read();
+    let regs = selectors_read();
     if let Some(s) = regs.get(&id) {
         let mut st = s.lock();
         if !st.open {
@@ -655,7 +750,7 @@ pub fn selector_close(id: i32) {
 
 /// Wakeup a concurrently-blocked select.
 pub fn selector_wakeup(id: i32) -> Result<(), MethodCallFailed> {
-    let regs = selectors().read();
+    let regs = selectors_read();
     // A closed or unknown selector is a NO-OP, matching jdk-25 — see
     // `selector_wakeup_native` for the measurement and for what raising here
     // cost (a `vertx.close()` that never completes).
@@ -725,7 +820,7 @@ pub fn selector_wakeup(id: i32) -> Result<(), MethodCallFailed> {
 /// bind()` sequence) matches nothing and this is a no-op.
 pub fn selector_refresh_udp(net_fd: i32, fresh: &UdpSocket) {
     let ids: Vec<i32> = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         regs.iter()
             .filter(|(_, s)| {
                 let st = s.lock();
@@ -736,7 +831,7 @@ pub fn selector_refresh_udp(net_fd: i32, fresh: &UdpSocket) {
     };
     for id in ids {
         let previous = {
-            let regs = selectors().read();
+            let regs = selectors_read();
             regs.get(&id).and_then(|s| {
                 let st = s.lock();
                 st.keys
@@ -792,7 +887,7 @@ pub fn selector_register(
         Some(SelectableKind::RawListener(h)) => SelectableHandle::RawListener(h),
         None => SelectableHandle::Dummy,
     };
-    let regs = selectors().read();
+    let regs = selectors_read();
     let Some(s) = regs.get(&id) else {
         return Err(closed_selector());
     };
@@ -901,7 +996,7 @@ pub fn selector_register(
 /// slot. Every caller that has the SelectionKey in hand must resolve through
 /// the key object, which is stable for the life of the registration.
 fn slot_of_key_obj(key_obj: ObjectRef) -> Option<(i32, i32)> {
-    let regs = selectors().read();
+    let regs = selectors_read();
     for (sel_id, sel) in regs.iter() {
         let st = sel.lock();
         if let Some(fd) = st
@@ -918,7 +1013,7 @@ fn slot_of_key_obj(key_obj: ObjectRef) -> Option<(i32, i32)> {
 
 /// Update interestOps on an already-registered key.
 pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), MethodCallFailed> {
-    let regs = selectors().read();
+    let regs = selectors_read();
     let Some(s) = regs.get(&id) else {
         return Err(closed_selector());
     };
@@ -1038,7 +1133,7 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
 
 /// Mark a key cancelled. It is removed on the next `select()`.
 pub fn selector_cancel(id: i32, net_fd: i32) {
-    let regs = selectors().read();
+    let regs = selectors_read();
     if let Some(s) = regs.get(&id) {
         let mut st = s.lock();
         if let Some(k) = st.keys.get_mut(&net_fd) {
@@ -1064,7 +1159,7 @@ pub fn selector_cancel(id: i32, net_fd: i32) {
 /// Takes only the selector locks (never `tcp_registry`), so it composes with the
 /// select path's `selectors → tcp_registry` lock order without inversion.
 pub fn deregister_fd_everywhere(net_fd: i32) {
-    let regs = selectors().read();
+    let regs = selectors_read();
     for (_sel_id, sel) in regs.iter() {
         let mut st = sel.lock();
         st.keys.remove(&net_fd);
@@ -1085,7 +1180,7 @@ pub fn deregister_channel_everywhere(ctx: &mut dyn NativeContext, channel: Objec
     // and `sk_table()` must not be reached under `sel.lock()` (the canonical
     // order is selectors() before sk_table(), and the hash call can allocate).
     let candidates: Vec<(i32, ObjectRef)> = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         regs.iter()
             .flat_map(|(sel_id, sel)| {
                 let st = sel.lock();
@@ -1106,7 +1201,7 @@ pub fn deregister_channel_everywhere(ctx: &mut dyn NativeContext, channel: Objec
         if !owns {
             continue;
         }
-        let regs = selectors().read();
+        let regs = selectors_read();
         if let Some(sel) = regs.get(&sel_id) {
             let mut st = sel.lock();
             let slot = st
@@ -1185,7 +1280,7 @@ fn finish_in_flight_linux_select_locked(st: &mut SelectorState) {
 
 #[cfg(target_os = "linux")]
 fn finish_in_flight_linux_select(id: i32) {
-    let regs = selectors().read();
+    let regs = selectors_read();
     if let Some(s) = regs.get(&id) {
         let mut st = s.lock();
         finish_in_flight_linux_select_locked(&mut st);
@@ -1205,7 +1300,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
     // candidates. Interest bits intentionally remain live for phase 3. Then
     // release the lock so wakeup() can hit it during the actual epoll_wait.
     let (efd, connect_candidates) = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         let Some(s) = regs.get(&id) else {
             return Err(closed_selector());
         };
@@ -1321,12 +1416,20 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
             return Ok(0);
         }
         // A close can race the wait. It is a wakeup, not an I/O error.
-        if selectors()
-            .read()
-            .get(&id)
-            .map(|s| !s.lock().open)
-            .unwrap_or(true)
-        {
+        //
+        // `let closed = ...;` on its own line, NOT inside the `if` condition: a
+        // temporary created in a condition lives until the end of the whole
+        // `if` STATEMENT, so the guard would still be held inside the body —
+        // and `finish_in_flight_linux_select` takes the same lock. That is the
+        // same recursive-read shape `SelectorsRead` documents, on a path that
+        // an `epoll_wait` racing a selector close reaches routinely (EBADF).
+        let closed = {
+            selectors_read()
+                .get(&id)
+                .map(|s| !s.lock().open)
+                .unwrap_or(true)
+        };
+        if closed {
             finish_in_flight_linux_select(id);
             return Ok(0);
         }
@@ -1336,7 +1439,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
 
     // Phase 3: re-acquire lock, apply ready bits, drain wakeup pipe,
     // accept any pending listener connections.
-    let regs = selectors().read();
+    let regs = selectors_read();
     let Some(s) = regs.get(&id) else {
         return Err(closed_selector());
     };
@@ -1483,7 +1586,7 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
     // Phase 1: snapshot under lock — pollfd entries plus the wakeup
     // receiver socket + interest/listener metadata, then drop the lock.
     let (mut pollfds, key_index, wakeup_idx, connect_candidates) = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         let Some(s) = regs.get(&id) else {
             return Err(closed_selector());
         };
@@ -1622,7 +1725,7 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
             let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
             while Instant::now() < deadline {
                 {
-                    let regs = selectors().read();
+                    let regs = selectors_read();
                     if let Some(s) = regs.get(&id) {
                         let mut st = s.lock();
                         if !st.open {
@@ -1646,7 +1749,7 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
         unsafe { WSAPoll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout_ms) }
     };
     if n < 0 {
-        let regs = selectors().read();
+        let regs = selectors_read();
         if let Some(s) = regs.get(&id) {
             let mut st = s.lock();
             st.in_flight_selects = st.in_flight_selects.saturating_sub(1);
@@ -1656,7 +1759,7 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
     }
 
     // Phase 3: re-acquire lock, translate revents -> readyOps.
-    let regs = selectors().read();
+    let regs = selectors_read();
     let Some(s) = regs.get(&id) else {
         return Err(closed_selector());
     };
@@ -1760,7 +1863,7 @@ fn kernel_select_windows(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFail
 fn kernel_select_poll(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed> {
     // Phase 1: snapshot.
     let (mut pollfds, key_index, wakeup_recv_fd) = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         let Some(s) = regs.get(&id) else {
             return Err(closed_selector());
         };
@@ -1842,7 +1945,7 @@ fn kernel_select_poll(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed>
     }
 
     // Phase 3: translate.
-    let regs = selectors().read();
+    let regs = selectors_read();
     let Some(s) = regs.get(&id) else {
         return Err(closed_selector());
     };
@@ -2043,7 +2146,7 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
 /// can still report readable for stream-half checks.
 #[allow(dead_code)]
 fn probe_cycle(id: i32) -> Result<i32, MethodCallFailed> {
-    let regs = selectors().read();
+    let regs = selectors_read();
     let Some(s) = regs.get(&id) else {
         return Err(closed_selector());
     };
@@ -2098,7 +2201,7 @@ pub fn selector_select(id: i32, timeout_ms: i64) -> Result<i32, MethodCallFailed
 
     // Short-circuit a pre-existing wakeup before we blot the syscall.
     {
-        let regs = selectors().read();
+        let regs = selectors_read();
         let Some(s) = regs.get(&id) else {
             return Err(closed_selector());
         };
@@ -2184,7 +2287,7 @@ pub fn selector_select(id: i32, timeout_ms: i64) -> Result<i32, MethodCallFailed
                 break n;
             }
             {
-                let regs = selectors().read();
+                let regs = selectors_read();
                 let Some(s) = regs.get(&id) else {
                     return Err(closed_selector());
                 };
@@ -2208,7 +2311,7 @@ pub fn selector_select(id: i32, timeout_ms: i64) -> Result<i32, MethodCallFailed
 
 /// Peek the size of the registered key map. Exposed for tests.
 pub fn selector_key_count(id: i32) -> usize {
-    let regs = selectors().read();
+    let regs = selectors_read();
     regs.get(&id).map(|s| s.lock().keys.len()).unwrap_or(0)
 }
 
@@ -2216,7 +2319,7 @@ pub fn selector_key_count(id: i32) -> usize {
 /// ServerSocketChannelImpl uses this to retrieve the stream that `select`
 /// handed back from `listener.accept()`.
 pub fn take_pending_accepted(id: i32, listener_fd: i32) -> Option<TcpStream> {
-    let regs = selectors().read();
+    let regs = selectors_read();
     let s = regs.get(&id)?;
     let mut st = s.lock();
     let pos = st
@@ -2232,7 +2335,7 @@ pub fn take_pending_accepted(id: i32, listener_fd: i32) -> Option<TcpStream> {
 /// `ServerSocketChannel.accept()` so the user-visible accept call returns
 /// the connection that the selector loop already drained.
 pub fn take_any_pending_accepted(listener_fd: i32) -> Option<TcpStream> {
-    let regs = selectors().read();
+    let regs = selectors_read();
     for (_id, s) in regs.iter() {
         let mut st = s.lock();
         if let Some(pos) = st
@@ -2291,7 +2394,7 @@ fn selector_id_from_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
 fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
     let id = selector_id_from_obj(ctx, obj);
     if id != 0 {
-        if let Some(open) = selectors().read().get(&id).map(|s| s.lock().open) {
+        if let Some(open) = selectors_read().get(&id).map(|s| s.lock().open) {
             return open;
         }
     }
@@ -2318,20 +2421,18 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     let id = selector_open();
     // Bind the (real-JDK-layout) selector object to its native id by GC-stable
     // identity hash — its int slots are reference-typed and would coerce to
-    // null (see `sel_obj_ids`). The field writes below are kept as a
-    // best-effort legacy path but are not relied upon.
+    // null (see `sel_obj_ids`). Do NOT also write `SI_ID`/`SI_OPEN_FLAG`
+    // through `set_field`: on this real `sun/nio/ch/SelectorImpl` allocation
+    // those indices are `AbstractSelector.selectorOpen`/`SelectorImpl.
+    // selectedKeys` (both reference-typed), so an `Int` store there is
+    // silently descriptor-coerced to `null` — nulling `selectedKeys` breaks
+    // every direct (non-Netty-reflection) caller of `Selector.selectedKeys()`.
+    // See docs/known-issues/jdk-only/G30-1-the-silent-reference-slot-coercion-20260817.md.
     sel_obj_ids()
         .write()
         .entry(ctx.identity_hash_code(obj))
         .or_default()
         .push(SelectorObjId { object: obj, id });
-    let n = ctx.object_num_fields(obj);
-    if n > SI_ID {
-        ctx.set_field(obj, SI_ID, Value::Int(id));
-    }
-    if n > SI_OPEN_FLAG {
-        ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(1));
-    }
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -2489,9 +2590,9 @@ fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if remove_bucket {
         ids.remove(&hash);
     }
-    if ctx.object_num_fields(obj) > SI_OPEN_FLAG {
-        ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(0));
-    }
+    // See `selector_open_native`: on a real `SelectorImpl`, `SI_OPEN_FLAG`
+    // aliases the reference-typed `selectedKeys` field, so do not write an
+    // `Int` there. Openness lives entirely in `SelectorState` via `selector_close`.
     Ok(None)
 }
 
@@ -2544,7 +2645,7 @@ fn selector_wakeup_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
     // Snapshot keys that currently have no pollable OS handle but want events.
     let candidates: Vec<(i32, ObjectRef)> = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         let Some(s) = regs.get(&id) else {
             return;
         };
@@ -2587,7 +2688,7 @@ fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
                 SelectableHandle::RawListener(h)
             }
         };
-        let regs = selectors().read();
+        let regs = selectors_read();
         let Some(s) = regs.get(&id) else {
             return;
         };
@@ -2686,7 +2787,7 @@ fn apply_ready_ops(_ctx: &mut dyn NativeContext, id: i32) {
     // C27: side-table is keyed by the SelectionKey's identity hash
     // code; carry the hash through instead of a raw pointer.
     let snap: Vec<(ObjectRef, i32)> = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         let Some(s) = regs.get(&id) else { return };
         let st = s.lock();
         st.keys
@@ -2725,7 +2826,7 @@ fn populate_selected_keys_field(ctx: &mut dyn NativeContext, selector: ObjectRef
     // Collect ready key objects OUTSIDE the selectors() lock — invoke_virtual runs
     // Java bytecode (Set.add) that may re-enter selector code.
     let ready: Vec<ObjectRef> = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         let Some(s) = regs.get(&id) else { return };
         let st = s.lock();
         st.keys
@@ -2875,7 +2976,7 @@ pub fn sk_table_update_after_gc<S: std::hash::BuildHasher>(
     // Lock order: `selectors()` before `sk_table()` (matches
     // `apply_ready_ops` which takes the same pair in this order).
     {
-        let regs = selectors().read();
+        let regs = selectors_read();
         for sel in regs.values() {
             let mut st = sel.lock();
             for k in st.keys.values_mut() {
@@ -2939,7 +3040,7 @@ pub fn gc_scan_selector_roots(roots: &mut Vec<cratonvm_types::ObjectRef>) {
     // `sk_table_update_after_gc` and `apply_ready_ops`, so a concurrent GC
     // hook can never deadlock against the remap path.
     {
-        let regs = selectors().read();
+        let regs = selectors_read();
         for sel in regs.values() {
             let st = sel.lock();
             for k in st.keys.values() {
@@ -3118,7 +3219,7 @@ fn channel_key_for_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let net_fd = crate::socket_channel::channel_net_fd(ctx, channel)
         .or_else(|| crate::datagram_channel_fd(ctx, channel));
     let candidates: Vec<(i32, ObjectRef)> = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         let Some(s) = regs.get(&sel_id) else {
             return Ok(Some(Value::Object(None)));
         };
@@ -3177,7 +3278,7 @@ fn key_set_interest_ops_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         s.interest_ops = ops;
     });
     let target: Option<(i32, i32)> = {
-        let regs = selectors().read();
+        let regs = selectors_read();
         let mut found = None;
         for (sel_id, sel) in regs.iter() {
             let mut st = sel.lock();
@@ -3394,7 +3495,7 @@ fn sk_set_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // interest there, then drop the lock before the OS-level update.
     if known {
         let target: Option<(i32, i32)> = {
-            let regs = selectors().read();
+            let regs = selectors_read();
             let mut found = None;
             for (sel_id, sel) in regs.iter() {
                 let mut st = sel.lock();
@@ -3488,20 +3589,23 @@ fn sk_cancel_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     });
     // Walk all selectors looking for this key and mark cancelled.
     // C27: identity-hash comparison instead of raw-pointer comparison.
-    let regs = selectors().read();
-    for (sel_id, sel) in regs.iter() {
-        let mut st = sel.lock();
-        let Some(target) = st
-            .keys
-            .iter()
-            .find(|(_, k)| k.key_obj == Some(this))
-            .map(|(fd, _)| *fd)
-        else {
-            continue;
-        };
-        drop(st);
-        selector_cancel(*sel_id, target);
-        break;
+    //
+    // The registry guard is dropped BEFORE `selector_cancel`, which takes it
+    // again. `SelectorsRead` now makes that nesting safe, but this call was the
+    // measured half of the deadlock in `SelectorsRead`'s doc comment and there
+    // is no reason for it to nest: the search only needs the guard.
+    let found = {
+        let regs = selectors_read();
+        regs.iter().find_map(|(sel_id, sel)| {
+            let st = sel.lock();
+            st.keys
+                .iter()
+                .find(|(_, k)| k.key_obj == Some(this))
+                .map(|(fd, _)| (*sel_id, *fd))
+        })
+    };
+    if let Some((sel_id, target)) = found {
+        selector_cancel(sel_id, target);
     }
     Ok(None)
 }
@@ -3521,7 +3625,7 @@ fn selector_selected_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let key_objs: Vec<ObjectRef> = if id == 0 {
         Vec::new()
     } else {
-        let regs = selectors().read();
+        let regs = selectors_read();
         match regs.get(&id) {
             Some(s) => s
                 .lock()
@@ -3551,7 +3655,7 @@ fn selector_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let key_objs: Vec<ObjectRef> = if id == 0 {
         Vec::new()
     } else {
-        let regs = selectors().read();
+        let regs = selectors_read();
         match regs.get(&id) {
             Some(s) => s
                 .lock()
@@ -4559,6 +4663,162 @@ mod tests {
         NEXT.fetch_add(1, Ordering::SeqCst)
     }
 
+
+    // --- selector-registry lock discipline ---------------------------------
+    //
+    // `ParameterizedSslHandlerTest` stalled for a week on a three-way deadlock
+    // in this registry; `SelectorsRead`'s doc comment carries the measured
+    // `gdb -p` dump. These two tests pin both halves of the rule that closed
+    // it. They are `#[test]`s rather than a comment because the failure mode
+    // is a process that STOPS: nothing throws, nothing fails, and a suite
+    // reading exit codes sees a timeout with no cause.
+
+    /// MUST NOT DEADLOCK — a nested read while a writer is queued.
+    ///
+    /// `parking_lot::RwLock::read()` blocks whenever a writer is waiting, so
+    /// that writers cannot starve. A thread that already holds a read guard
+    /// and calls `read()` again therefore parks behind that writer, and the
+    /// writer is waiting for the guard that same parked thread still holds.
+    /// `selectors_read()` takes `read_recursive()` for the nested acquisition,
+    /// which never queues behind a writer.
+    ///
+    /// The nested read runs on a SPAWNED thread with a bounded `recv_timeout`,
+    /// so a regression FAILS the suite instead of hanging it forever — which
+    /// is exactly what the defect did to the netty class.
+    #[test]
+    fn a_nested_selectors_read_does_not_deadlock_behind_a_queued_writer() {
+        let _wall_clock = wall_clock_guard();
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Hold the OUTER guard on a worker thread, ask a second thread for the
+        // write lock, then take the NESTED guard on the SAME worker. The whole
+        // sequence has to live on one thread because the depth counter — and
+        // the deadlock — are per-thread.
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<usize>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let worker = thread::spawn(move || {
+            let outer = selectors_read();
+            let outer_len = outer.len();
+            ready_tx.send(()).unwrap();
+            // Give the writer time to actually queue. If it has not queued yet
+            // the test still passes — it just stops being a regression test
+            // for this run, which is why the writer is joined below.
+            release_rx.recv_timeout(Duration::from_secs(5)).ok();
+            let inner = selectors_read();
+            let n = inner.len() + outer_len;
+            done_tx.send(n).unwrap();
+            drop(inner);
+            drop(outer);
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(5)).expect("outer guard taken");
+        let writer = thread::spawn(|| {
+            // `selector_open` is the registry's only writer.
+            selector_open()
+        });
+        // The writer is now queued (or about to be); let the worker nest.
+        thread::sleep(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+
+        // 20s is far beyond any legitimate wait for a `HashMap::len()` under a
+        // lock; before the fix this never completes at all.
+        let n = done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("nested selectors_read() deadlocked behind the queued writer");
+        assert!(n < usize::MAX, "sanity: got a length back ({n})");
+        worker.join().unwrap();
+        let id = writer.join().unwrap();
+        assert!(id > 0, "the writer must have completed too, not starved");
+    }
+
+    /// The counter that decides `read()` vs `read_recursive()` — both
+    /// directions, so a tracker that only ever counted up (and so sent every
+    /// acquisition down the recursive path, reintroducing writer starvation)
+    /// would fail here.
+    #[test]
+    fn the_selectors_read_depth_tracks_nesting_in_both_directions() {
+        assert_eq!(selectors_read_depth(), 0, "a fresh thread holds nothing");
+        let a = selectors_read();
+        assert_eq!(selectors_read_depth(), 1);
+        {
+            let b = selectors_read();
+            assert_eq!(selectors_read_depth(), 2);
+            drop(b);
+        }
+        assert_eq!(selectors_read_depth(), 1, "the nested guard released");
+        drop(a);
+        assert_eq!(selectors_read_depth(), 0, "the outer guard released");
+    }
+
+    /// `SelectionKey.cancel()` must not still hold the registry guard when it
+    /// calls `selector_cancel`, which takes the same lock.
+    ///
+    /// This is the exact call pair the `gdb` dump caught (`sk_cancel_public`
+    /// 3491 holding, `selector_cancel` 1041 parked). `SelectorsRead` makes the
+    /// nesting survivable; this asserts the path does not nest at all, so the
+    /// hot path keeps the FAIR lock and writers keep their protection from
+    /// starvation.
+    #[test]
+    fn selector_cancel_runs_with_no_registry_guard_held() {
+        let id = selector_open();
+        let fd = fake_fd();
+        selector_register(id, fd, OP_READ, None, 0x6c0c, None).unwrap();
+
+        // Mirror `sk_cancel_public`'s search-then-cancel, and assert the
+        // guard is gone before the call. `selector_cancel` itself asserts
+        // nothing; the depth reading here is what pins the shape.
+        let found = {
+            let regs = selectors_read();
+            assert_eq!(selectors_read_depth(), 1, "the search holds the guard");
+            // Scoped to THIS selector: the registry is process-wide and the
+            // test harness runs these in parallel.
+            regs.get(&id).and_then(|sel| {
+                let st = sel.lock();
+                st.keys.keys().next().map(|k| (id, *k))
+            })
+        };
+        assert_eq!(
+            selectors_read_depth(),
+            0,
+            "the guard must be dropped before selector_cancel is called"
+        );
+        let (sel_id, target) = found.expect("the registration is findable");
+        selector_cancel(sel_id, target);
+
+        let regs = selectors_read();
+        let st = regs.get(&sel_id).unwrap().lock();
+        assert!(
+            st.keys.get(&target).map(|k| k.cancelled).unwrap_or(false),
+            "the key must actually be marked cancelled"
+        );
+        drop(st);
+        drop(regs);
+        selector_close(sel_id);
+    }
+
+    /// Serialises the tests that measure WALL CLOCK against each other and
+    /// against the one test that deliberately queues a WRITER on the
+    /// process-wide selector registry.
+    ///
+    /// `a_nested_selectors_read_does_not_deadlock_behind_a_queued_writer` has
+    /// to queue a writer to reproduce the deadlock it guards, and while a
+    /// writer is queued every `selectors_read()` in the process waits — a
+    /// neighbour's `selector_select(id, 0)` included. Measured: adding that
+    /// test made `t19_7_a_select_now_non_blocking` (budget 50 ms) fail in the
+    /// full-suite run and pass in isolation, which is the classic shape of a
+    /// timing test that has acquired a neighbour.
+    ///
+    /// This is not a workaround for the deadlock test: `selector_open` already
+    /// took the write lock before it existed, so these eight have always been
+    /// perturbing each other; the new test only made it visible.
+    fn wall_clock_guard() -> parking_lot::MutexGuard<'static, ()> {
+        static WALL_CLOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        WALL_CLOCK.get_or_init(|| Mutex::new(())).lock()
+    }
+
     /// Create a connected client/server TcpStream pair bound to 127.0.0.1:0.
     /// Returns (client, server).
     fn make_stream_pair() -> (TcpStream, TcpStream) {
@@ -4656,7 +4916,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selector_key_count(id), 1);
-        let regs = selectors().read();
+        let regs = selectors_read();
         let st = regs.get(&id).unwrap().lock();
         let k = st.keys.get(&fd).unwrap();
         assert_eq!(k.interest_ops, OP_ACCEPT);
@@ -4688,6 +4948,7 @@ mod tests {
 
     #[test]
     fn t19_7_a_select_now_non_blocking() {
+        let _wall_clock = wall_clock_guard();
         let id = selector_open();
         let start = Instant::now();
         let r = selector_select(id, 0).unwrap();
@@ -4699,6 +4960,7 @@ mod tests {
 
     #[test]
     fn t19_7_a_select_with_timeout_respects_deadline() {
+        let _wall_clock = wall_clock_guard();
         let id = selector_open();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let fd = fake_fd();
@@ -4744,6 +5006,7 @@ mod tests {
     /// counts.
     #[test]
     fn set_interest_before_a_select_does_not_shorten_it() {
+        let _wall_clock = wall_clock_guard();
         let id = selector_open();
         let (_client, server) = make_stream_pair();
         let fd = fake_fd();
@@ -4778,6 +5041,7 @@ mod tests {
     /// the two tests are written together and neither is meaningful alone.
     #[test]
     fn set_interest_wakes_a_select_that_is_already_parked() {
+        let _wall_clock = wall_clock_guard();
         let id = selector_open();
         let (_client, server) = make_stream_pair();
         let fd = fake_fd();
@@ -4826,7 +5090,7 @@ mod tests {
         let n = selector_select(id, 500).unwrap();
         assert_eq!(n, 1);
 
-        let regs = selectors().read();
+        let regs = selectors_read();
         let st = regs.get(&id).unwrap().lock();
         let k = st.keys.get(&server_fd).unwrap();
         assert_eq!(k.ready_ops & OP_READ, OP_READ);
@@ -4838,6 +5102,7 @@ mod tests {
 
     #[test]
     fn t19_7_a_wakeup_unblocks_concurrent_select() {
+        let _wall_clock = wall_clock_guard();
         let id = selector_open();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let fd = fake_fd();
@@ -4935,6 +5200,7 @@ mod tests {
 
     #[test]
     fn t19_7_a_wakeup_before_select_returns_immediately() {
+        let _wall_clock = wall_clock_guard();
         let id = selector_open();
         selector_wakeup(id).unwrap();
         let start = Instant::now();
@@ -4966,6 +5232,7 @@ mod tests {
     /// short-circuit fires before the syscall.)
     #[test]
     fn nio_selector_indefinite_block_path_honors_wakeup() {
+        let _wall_clock = wall_clock_guard();
         let id = selector_open();
         selector_wakeup(id).unwrap();
         let start = Instant::now();
@@ -5007,6 +5274,7 @@ mod tests {
     /// floors below are missed by more than an order of magnitude.
     #[test]
     fn select_zero_maps_to_the_indefinite_wait_not_a_poll() {
+        let _wall_clock = wall_clock_guard();
         const ITERS: u32 = 8;
 
         let id = selector_open();

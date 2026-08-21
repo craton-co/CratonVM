@@ -58,7 +58,7 @@ mask read `oop_reached=false oop_mask=0x0` at every snapshot in the method.
 `BobyqaOne` **2 125 738 → 0**. Worth ~1.08x of `BobyqaOne`'s wall clock and no
 more — a count reaching zero is not a speedup of anything in particular. Closes
 the ZGC row of
-`known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md`.
+`fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md`.
 
 ### 3. `MonitorTable::prune_dead` walked every dead address to remove nothing
 

@@ -59,7 +59,7 @@
  *                        rather than a pointer, so an inline raw load of a
  *                        REFERENCE field is barred where a primitive one is not
  *                        (`zgc_read_barrier_blocks_inline_fields`,
- *                        known-issues/jit/every-jit-getfield-takes-the-helper-…).
+ *                        fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md).
  *                        `primFieldGet` vs `plainGetter` is that distinction
  *                        priced, and it is what says whether the fix is a
  *                        per-field-KIND gate or something larger.

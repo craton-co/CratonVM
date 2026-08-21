@@ -239,9 +239,27 @@ jobs:
       - name: Default-feature native registry surface (no workspace unification)
         run: cargo test -p cratonvm-native-builtins --lib
 
+      # BOTH configurations, because the file freezes two constants and only one
+      # of them was ever run here. `BASELINE_SYNTHETIC_STUBS_MANAGEMENT` is the
+      # SHIPPING registry — `cratonvm-cli` enables `management`, so the ten
+      # `jmx::*` registrars and their 10 stub rows are in the binary users run
+      # and were in nothing CI adjudicated. Measured 2026-08-19 after the §1.4
+      # shadow wave: no-management 1611 stubs / 12792 rows, management 1622 /
+      # 13160. Both configurations report BOTH numbers, which is the point —
+      # the row count is what separates a relabel (welcome) from a new fake
+      # (the regression this gate exists for).
+      #
+      # This is the same shape as the two scope defects the ratchet file
+      # records against itself — a gate that names a population wider than the
+      # one it measures. A count baseline cannot notice a registration outside
+      # its own scope, and the shipping resolve was outside it.
       - name: Synthetic-stub ratchet
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
+        shell: bash
+        run: |
+          cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
+          cargo test -p cratonvm-native-builtins --features management \
+              --test stub_ratchet -- --nocapture
 
       # The stub ratchet's sibling, and BLOCKING for the same reasons it is.
       # Contract 1.5 defines a `Bridge` by its `ACC_NATIVE` target; 10,069 of the
