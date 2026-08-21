@@ -1,12 +1,12 @@
 # `TestRandomMapOps` — `ClassCastException: String cannot be cast to Map$Entry`, not yet root-caused
 
 ## Status
-**OPEN 2026-08-21.** Found while triaging `hangs-true-vs-perfcliff-20260821.md`
-(now retired). Not previously flagged: the 2026-08-18 census listed this class
-as CratonVM-side but wall-clock (`cap` at 300s, needing only >2.2x — the
-smallest multiplier of the 22 CratonVM-side rows, "close to clearing"). It
-now clears in comparable time to HotSpot's own ~137s — and gets a wrong
-answer instead.
+**OPEN 2026-08-21.** Found while triaging
+`hangs-true-vs-perfcliff-RESOLVED-20260821.md`. Not previously flagged: the
+2026-08-18 census listed this class as CratonVM-side but wall-clock (`cap` at
+300s, needing only >2.2x — the smallest multiplier of the 22 CratonVM-side
+rows, "close to clearing"). It now clears in comparable time to HotSpot's own
+~137s — and gets a wrong answer instead.
 
 ## Symptom
 `org.h2.test.store.TestRandomMapOps`, default config (ZGC + JIT),
