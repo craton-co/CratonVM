@@ -40,13 +40,24 @@ public final class OsrVsEntryInlineProbe {
 
     static int sink;
 
-    /** The `testHttpStatusClassValueOf` body, one exhaustive rung. */
+    /**
+     * The `testHttpStatusClassValueOf` body, one exhaustive rung.
+     *
+     * The accumulator is a reference identity test, NOT `c.ordinal()`:
+     * `Enum.ordinal` is a REGISTERED NATIVE on the ~160 ns funnel, and the
+     * first cut of this probe used it. That put ~100 ns of native call in
+     * front of every arm and the whole thing read 143-146 ns/iter with every
+     * arm inside every other arm's noise — a probe measuring the one thing it
+     * was not asking about. The real test method calls no native.
+     */
     private static void body(int from, int count) {
         for (int k = 0; k < count; k++) {
             int code = from + k;
             HttpStatusClass c = HttpStatusClass.valueOf(code);
             assertEquals(HttpStatusClass.UNKNOWN, c);
-            sink += c.ordinal();
+            if (c == HttpStatusClass.UNKNOWN) {
+                sink++;
+            }
         }
     }
 
@@ -56,7 +67,9 @@ public final class OsrVsEntryInlineProbe {
             int code = Integer.MIN_VALUE + k;
             HttpStatusClass c = HttpStatusClass.valueOf(code);
             assertEquals(HttpStatusClass.UNKNOWN, c);
-            sink += c.ordinal();
+            if (c == HttpStatusClass.UNKNOWN) {
+                sink++;
+            }
         }
     }
 
