@@ -2182,10 +2182,22 @@ fn validate_ordered_chain(
         parsed.push(parse_certificate(der).map_err(TrustError::Parse)?);
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    // `duration_since(UNIX_EPOCH)` is an `Err` exactly when the clock reads
+    // BEFORE 1970, and its error carries how far before. The previous
+    // `.unwrap_or(0)` threw that away and clamped to 1970-01-01, which is not a
+    // neutral default: every certificate in every chain has a `notBefore` after
+    // it, so a pre-epoch clock rejected every chain `NotYetValid` while
+    // reporting a timestamp the machine never had. Negate the error's duration
+    // instead — `now` is then the real signed seconds-since-epoch, the
+    // comparisons below stay truthful, and a machine whose clock says 1969
+    // gets `NotYetValid` because it IS before the certificate's validity, not
+    // because the value was swallowed.
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        // Cast: `as i64` on a pre-epoch offset that would overflow means a
+        // clock more than 292 billion years off; saturate rather than wrap.
+        Err(e) => -(e.duration().as_secs().min(i64::MAX as u64) as i64),
+    };
 
     // Step 2: clock check — for the certificates on the PATH.
     //
@@ -5052,8 +5064,8 @@ fn get_client_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// writes into the vacated slots. What the live array keeps is whatever the
 /// collector left there — usually `null`.
 ///
-/// This is the same defect
-/// `openssl-key-material-and-engine-residuals-20260813.md` §D recorded against
+/// This is the same defect the `openssl-key-material-and-engine-residuals`
+/// write-up (now retired) recorded in its §D against
 /// `getAcceptedIssuers`, at the two methods it did NOT sweep:
 /// `getServerAliases` and `getClientAliases`. A null-riddled alias array is
 /// exactly what netty's `OpenSslKeyMaterialProvider` turns into

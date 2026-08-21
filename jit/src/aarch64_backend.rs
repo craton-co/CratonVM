@@ -1152,6 +1152,7 @@ impl Arm64Backend {
             ldc_refs: &refs,
             ldc_fp: &refs,
             ldc_resolved: &refs,
+            handler_pcs: &[],
         };
         analyze(bytecode, bytecode.len(), &inputs)
     }

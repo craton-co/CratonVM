@@ -371,6 +371,13 @@ const DRIFT_GATE: &str = "tests/registrar_drift.rs";
 /// A row of `0` is a real claim — the family drifts on nothing — and it is the
 /// claim that was false for `ByteArrayOutputStream`, so zeros are pinned like
 /// any other value rather than omitted.
+///
+/// **Re-taken 2026-08-20, one row: `register_tls_natives` 50 -> 51.** Paired
+/// with the `+1` on `registrar_drift.rs`'s `BASELINE_TOTAL_DRIFT` — the new
+/// triple is `javax/net/ssl/SSLContext.getProvider()Ljava/security/Provider;`,
+/// and that constant's doc says what it is and why all three registration sets
+/// carry it. This table is derived from `DRIFT_TRIPLES`, so the move is the
+/// ratchet working, not a second decision.
 const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_aot_natives", 1),
     ("register_atomic_boolean_natives", 8),
@@ -442,7 +449,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_t39_stax", 11),
     ("register_time_extras_natives", 1),
     ("register_time_natives", 16),
-    ("register_tls_natives", 50),
+    ("register_tls_natives", 51),
     ("register_unsafe_define_class", 2),
     ("register_vector_api_natives", 0),
 ];
