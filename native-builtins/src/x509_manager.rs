@@ -5052,8 +5052,8 @@ fn get_client_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// writes into the vacated slots. What the live array keeps is whatever the
 /// collector left there — usually `null`.
 ///
-/// This is the same defect
-/// `openssl-key-material-and-engine-residuals-20260813.md` §D recorded against
+/// This is the same defect the `openssl-key-material-and-engine-residuals`
+/// write-up (now retired) recorded in its §D against
 /// `getAcceptedIssuers`, at the two methods it did NOT sweep:
 /// `getServerAliases` and `getClientAliases`. A null-riddled alias array is
 /// exactly what netty's `OpenSslKeyMaterialProvider` turns into

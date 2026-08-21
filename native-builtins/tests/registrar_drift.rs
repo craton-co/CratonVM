@@ -236,12 +236,27 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// source of truth: if the table is edited by hand and this is not re-taken,
 /// `the_baseline_is_well_formed` fails. Both are regenerated together by the
 /// printer in `retake`.
-const BASELINE_TOTAL_DRIFT: usize = 1_232;
+///
+/// **Re-taken 2026-08-20, +1: `javax/net/ssl/SSLContext.getProvider
+/// ()Ljava/security/Provider;`.** That method had no registration at all until
+/// then, so the real bytecode answered it -- `return provider;`, slot 0, which
+/// is the PROTOCOL on every synthetic `SSLContext` layout, and `getProvider()`
+/// handed back a `java.lang.String`. It is now registered in all three sets
+/// (`tls::register_ssl_context`, `phases_late::ssl_security::register_p68_ssl`,
+/// `net_phase_e::register_re6_ssl_context`), which is what makes it drift.
+///
+/// This row answers the gate's first question -- "do the two bodies agree?" --
+/// with YES, structurally rather than by inspection: all three registrations
+/// are the SAME free function, `jca::ssl_context_spi::ssl_context_provider`,
+/// forwarded verbatim. There is one body; last-write-wins picks between three
+/// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
+/// `SSLContext` surface is deliberately registered three times over.
+const BASELINE_TOTAL_DRIFT: usize = 1_233;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1_368;
+const BASELINE_TOTAL_PAIRS: usize = 1_369;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -2182,6 +2197,7 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("javax/net/ssl/SSLContext", "getDefaultSSLParameters", "()Ljavax/net/ssl/SSLParameters;"),
             ("javax/net/ssl/SSLContext", "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;"),
             ("javax/net/ssl/SSLContext", "getProtocol", "()Ljava/lang/String;"),
+            ("javax/net/ssl/SSLContext", "getProvider", "()Ljava/security/Provider;"),
             ("javax/net/ssl/SSLContext", "getServerSocketFactory", "()Ljavax/net/ssl/SSLServerSocketFactory;"),
             ("javax/net/ssl/SSLContext", "getSocketFactory", "()Ljavax/net/ssl/SSLSocketFactory;"),
             ("javax/net/ssl/SSLContext", "getSupportedSSLParameters", "()Ljavax/net/ssl/SSLParameters;"),
