@@ -16593,6 +16593,94 @@ fn precise_virtual_invokes_enabled() -> bool {
 /// "before the trap in pc order": the witness is a **loop**, where a store at a
 /// lower pc executes on the iteration *after* the one that traps. Pc order is
 /// not execution order, and the cheap conservative answer is the correct one.
+/// `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD=0` — **MEASUREMENT ONLY, AND
+/// UNSOUND.** Stop declining the optimizing tier to a protected range that
+/// carries an unresumable trap, and let it compile the method anyway.
+///
+/// # Do not ship a workload with this off
+///
+/// The refusal exists because the IR tier lowers array/field access and
+/// division to a **deopt guard**, `can_deopt_resume` is false on a production
+/// artifact, and the interpreter's fallback is to replay the method from entry
+/// — which it refuses when the range has already committed a store, raising a
+/// hard `InternalError`. With this switch off, a method whose trap ACTUALLY
+/// FIRES inside such a range gets that `InternalError` instead of the exception
+/// the program expected. Nothing about that changes here; the switch does not
+/// make the deopt resumable, it only stops the compiler from avoiding it.
+///
+/// # Why it exists anyway
+///
+/// The refusal has never had a price. `ir_unresumable_protected_trap`'s own
+/// doc argues the trade honestly — *"declining here is not 'stay interpreted' —
+/// it is 'use the backend that handles this shape', at single-pass code
+/// quality"* — but nobody has measured what that costs on a workload, and the
+/// shape it declines (`try { buf[i] = x; flush(); } finally { … }`) is ordinary
+/// Java. Scoping the deopt-resume capability without that number is guesswork.
+///
+/// The static shape is what the refusal keys on; the unsoundness only bites if
+/// the trap FIRES. On a workload that does not throw AIOOBE/NPE inside those
+/// ranges — the common case — an arm with this off is a correct program and a
+/// fair measurement of what the refusal costs. A workload that DOES trap there
+/// will fail loudly with the `InternalError`, and that failure is itself the
+/// answer for that workload.
+pub fn ir_unresumable_trap_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Methods whose bytecode carries the unresumable-trap SHAPE, and methods the
+/// guard actually declined because of it.
+///
+/// Two counters and not one, because the A/B needs both halves. With the guard
+/// off, `shape` keeps counting and `refused` goes to zero — which is what says
+/// the OFF arm moved exactly `shape` methods and not some other number. A
+/// single counter cannot tell "the shape is rare" from "the switch is not
+/// wired".
+pub static IR_UNRESUMABLE_TRAP_SHAPE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static IR_UNRESUMABLE_TRAP_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(shape seen, actually declined)` for the unresumable-trap refusal.
+pub fn ir_unresumable_trap_counts() -> (u64, u64) {
+    (
+        IR_UNRESUMABLE_TRAP_SHAPE.load(std::sync::atomic::Ordering::Relaxed),
+        IR_UNRESUMABLE_TRAP_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// The admission GATE for [`ir_unresumable_protected_trap`]: applies the
+/// measurement switch and keeps the census.
+///
+/// Called from the eligibility conjunction ONLY — exactly once per compile
+/// attempt. The diagnostic ladder above deliberately calls the raw scan
+/// instead: it runs a second time under `CRATONVM_DBG_IR_COMPILES` /
+/// `metrics.is_enabled()`, and counting there would double every number the
+/// moment somebody turned the diagnostic on.
+fn ir_unresumable_trap_declines(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+) -> bool {
+    if ir_unresumable_protected_trap(code, code_len, exception_table).is_none() {
+        return false;
+    }
+    IR_UNRESUMABLE_TRAP_SHAPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !ir_unresumable_trap_guard_enabled() {
+        return false;
+    }
+    IR_UNRESUMABLE_TRAP_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 fn ir_unresumable_protected_trap(
     code: &[u8],
     code_len: usize,
@@ -17311,8 +17399,9 @@ fn try_compile_inner(
         } else if precise_exception_frames {
             "precise exception frames required (RBC.6: a handler reads a non-parameter local)"
                 .to_string()
-        } else if let Some((pc, op)) =
-            ir_unresumable_protected_trap(code, code_len, &cached.exception_table)
+        } else if let Some((pc, op)) = ir_unresumable_trap_guard_enabled()
+            .then(|| ir_unresumable_protected_trap(code, code_len, &cached.exception_table))
+            .flatten()
         {
             format!(
                 "an inline trap this tier deopts on (pc={pc}, opcode={op:#04x}) sits in a \
@@ -17481,7 +17570,7 @@ fn try_compile_inner(
         // unresumable deopt — see `ir_unresumable_protected_trap`. Falls
         // through to the single-pass backend, which throws and routes through
         // the exception table instead of deopting.
-        && ir_unresumable_protected_trap(code, code_len, &cached.exception_table).is_none()
+        && !ir_unresumable_trap_declines(code, code_len, &cached.exception_table)
         && ((!method_uses_category2(code, code_len, &cached.method_descriptor)
                 // inc 30: the pure int/long/ref IR path stays FP-free, so a
                 // float-using (cat-1) method is no longer admitted here — it

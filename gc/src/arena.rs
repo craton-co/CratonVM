@@ -394,6 +394,47 @@ const COALESCE_THRESHOLD_MAX: usize = 1 << 20;
 /// loudly (bounded) at the birth site so the producer is identifiable.
 static FL_ALIGN_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Region tripwire: a SMALL-object allocation that lands at or above
+/// [`Arena::high_cursor`], i.e. inside the large-object region.
+///
+/// The two ends exist so that "at the high end a large object's only possible
+/// neighbours are other large objects, which are rarer by orders of magnitude,
+/// so the holes they leave stay large" (`ZGC_LARGE_OBJECT_MIN`). One long-lived
+/// 80-byte object up there caps every hole in that region at the distance to
+/// its neighbour — which is the whole failure the split was introduced to
+/// prevent, re-created from the other side.
+///
+/// MEASURED, which is why this exists rather than a comment: on
+/// `org.h2.test.store.TestKillProcessWhileWriting` at `--Xmx 1g`, a
+/// 1,048,592-byte `ByteBuffer.allocate` raised `OutOfMemoryError` with 97 % of
+/// the heap free, and the collector's own fragmentation report named the wall:
+/// `104 live bytes in 1 run(s) are all that stand between 1204192 free bytes
+/// spread over 1204296 bytes of contiguous arena`, occupants
+/// `java/lang/String` (80 B) and `java/lang/Object` (24 B) — inside the high
+/// region.
+static REGION_LEAK_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Count of small allocations placed in the large-object region, for a test or
+/// a caller that wants the fact rather than the log line.
+pub fn small_allocations_in_large_region() -> usize {
+    REGION_LEAK_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cold]
+fn warn_small_alloc_in_high_region(site: &str, offset: usize, size: usize, high_cursor: usize) {
+    use std::sync::atomic::Ordering;
+    let n = REGION_LEAK_HITS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        tracing::warn!(
+            "arena REGION tripwire [{site}]: a {size}-byte allocation landed at \
+             offset={offset}, at or above high_cursor={high_cursor} — i.e. inside the \
+             large-object region, whose whole purpose is to hold only objects too big \
+             for a TLAB. One small survivor there caps every hole in that region and \
+             is how a multi-megabyte request fails on a mostly-free heap."
+        );
+    }
+}
+
 #[cold]
 fn warn_unaligned_block(site: &str, offset: usize, size: usize) {
     use std::sync::atomic::Ordering;
@@ -762,6 +803,20 @@ impl Arena {
         if (block.offset | block.size) & 7 != 0 {
             warn_unaligned_block("route", block.offset, block.size);
         }
+        // A block from the large-object region published on a LOW tier is the
+        // other half of the region tripwire: from there `alloc` will hand it to
+        // a small object, and the split the two ends exist to enforce is gone.
+        // `add_free_block` routes by region before it gets here; the direct
+        // callers (split remainders) do not, which is why the check is here and
+        // not only there.
+        if self.is_high(block.offset) {
+            warn_small_alloc_in_high_region(
+                "route-low-listed-high-block",
+                block.offset,
+                block.size,
+                self.high_cursor,
+            );
+        }
         if block.size < LARGE_BLOCK_MIN {
             let k = small_bucket_for(block.size);
             self.free_small[k].push(block);
@@ -1078,6 +1133,7 @@ impl Arena {
                 for r in remainders.into_iter().flatten() {
                     self.push_block_routed(r);
                 }
+                self.note_region_leak("free-list", alloc_offset, alloc_size);
                 // SAFETY: `alloc_offset + alloc_size` lies within the consumed
                 // block, which came from a region inside the buffer.
                 return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
@@ -1141,6 +1197,7 @@ impl Arena {
                 // no young cycle will reclaim it — see `prefer_bump`.
                 self.free_list_after_bump += 1;
             }
+            self.note_region_leak("free-list-retry", alloc_offset, alloc_size);
             // SAFETY: `alloc_offset + alloc_size` lies within the consumed
             // block, which came from a region inside the buffer.
             return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
@@ -1184,6 +1241,7 @@ impl Arena {
                 for r in remainders.into_iter().flatten() {
                     self.push_block_routed(r);
                 }
+                self.note_region_leak("free-list-coalesced", alloc_offset, alloc_size);
                 // SAFETY: as above — inside the consumed block.
                 return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
             }
@@ -1235,6 +1293,19 @@ impl Arena {
     #[inline]
     fn is_high(&self, offset: usize) -> bool {
         offset >= self.high_cursor
+    }
+
+    /// Report a LOW-path allocation that landed in the large-object region.
+    ///
+    /// One comparison against a field already in cache, on paths that are
+    /// already off the bump fast path. An arena that never called
+    /// [`Self::alloc_high`] has `high_cursor == capacity`, so this can never
+    /// fire for the generational or G1 backends.
+    #[inline]
+    fn note_region_leak(&self, site: &str, offset: usize, size: usize) {
+        if self.is_high(offset) {
+            warn_small_alloc_in_high_region(site, offset, size, self.high_cursor);
+        }
     }
 
     /// **Large-object allocation: bump DOWN from the top of the arena.**

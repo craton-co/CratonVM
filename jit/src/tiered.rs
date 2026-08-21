@@ -1210,6 +1210,25 @@ pub fn dump_method_stats_to_stderr() {
                 .join(" ")
         );
     }
+    // The unresumable-trap refusal's census, printed UNCONDITIONALLY and
+    // including zeros — before the `DIAG_CORE` early return, like the rows
+    // above it, so a run that never built a tiered manager still reports.
+    //
+    // `shape` counts methods whose protected range carries a trap this tier
+    // lowers to an unresumable deopt; `refused` counts the ones the guard
+    // actually declined the optimizing tier to. They diverge only under
+    // `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD=0` (measurement only, and unsound
+    // — see that switch's doc), where `refused` drops to zero while `shape`
+    // keeps counting. That difference IS the size of the A/B: it names how many
+    // methods the OFF arm moved, so a flat wall-clock result can be read as
+    // "the refusal is cheap here" instead of "the switch did nothing".
+    //
+    // Suppressing the zero line was the first draft and was wrong: a silent
+    // instrument cannot be told from an absent one.
+    {
+        let (shape, refused) = crate::ir_unresumable_trap_counts();
+        eprintln!("[cratonvm] IR unresumable-trap refusal: shape={shape} refused={refused}");
+    }
     let Some(core) = DIAG_CORE.get() else {
         return;
     };

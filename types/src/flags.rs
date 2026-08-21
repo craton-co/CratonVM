@@ -884,6 +884,39 @@ pub struct GcFlags {
     /// deliberately not gated on this flag — the counters report the rate in
     /// both arms.
     pub g1_coverage_pin: bool,
+    /// `CRATONVM_G1_PIN_EMPTY_PUBLICATION` — **diagnostic bisection lever,
+    /// default OFF.** Make G1 refuse to evacuate on any pause that runs with a
+    /// live compiled frame and an EMPTY conservative JIT root publication, by
+    /// forcing an empty collection set.
+    ///
+    /// The state it detects is a real defect: with `jit_active=true`,
+    /// `pin_addrs=0` is being consumed as "there are no JIT roots" when it
+    /// actually means "the conservative scan found none", which is unknown, not
+    /// none. Evacuating against it is what moved a live
+    /// `StringLatin1.newString` reference out from under a compiled frame
+    /// (`bug-g1-evacuates-live-jit-reference-20260819.md`).
+    ///
+    /// **It ships OFF because a refusal reclaims nothing**, so it can only buy
+    /// time for a publication that later becomes non-empty. Measured before the
+    /// root-scan fix below, when the state was permanent: 1444 consecutive
+    /// refused pauses on `PolynomialTest` and `OutOfMemoryError` on 8 tests,
+    /// instead of the original wrong answer on 1.
+    ///
+    /// That measurement also showed the predicate was not detecting what it
+    /// claimed. `pin_addrs=0` was the ordinary appearance of PRECISE mode:
+    /// `collect_roots` skipped the conservative JIT scan whenever the oop-map
+    /// coverage proof passed, and G1's pin set is built from that scan alone.
+    /// The real repair was to stop G1 taking that branch (see
+    /// `CRATONVM_G1_PRECISE_ONLY_ROOTS`, which restores the broken behaviour
+    /// for A/B). With the scan always running under G1, an empty publication
+    /// means what this flag's name says again.
+    ///
+    /// The DETECTION counter
+    /// (`gc_metrics::record_g1_pause_empty_jit_publication`) is deliberately
+    /// NOT gated on this flag, so a normal run still reports how often the
+    /// state occurs. It should now be zero; the refusal is a bisection lever
+    /// for the day it is not.
+    pub g1_pin_empty_publication: bool,
     /// `CRATONVM_G1_WORKERS` — override the G1 worker count, clamped to `>= 1`.
     /// [`parse::usize_min1`].
     pub g1_workers: Option<usize>,
@@ -1069,6 +1102,7 @@ impl GcFlags {
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
+            g1_pin_empty_publication: present(src, "CRATONVM_G1_PIN_EMPTY_PUBLICATION"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
             gc_sweep_anchor_stride: usize_opt(src, "CRATONVM_GC_SWEEP_ANCHOR_STRIDE")
                 .filter(|&n| n >= 64)

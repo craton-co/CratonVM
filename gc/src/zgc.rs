@@ -4174,6 +4174,7 @@ impl ZgcRealHeap {
         self.relocation_skipped_jit.load(Ordering::Relaxed)
     }
 
+
     /// Lifetime count of TLAB cells a retire could not lock.
     pub fn tlab_retire_skipped(&self) -> usize {
         self.tlab_retire_skipped_total.load(Ordering::Relaxed)
@@ -5571,7 +5572,9 @@ impl ZgcRealHeap {
             None => true,
         }
     }
+}
 
+impl ZgcRealHeap {
     /// Compact the low end of the arena at a stop-the-world, after the mark.
     /// Phase 4 of the ZGC maturity plan.
     ///
@@ -5691,6 +5694,52 @@ impl ZgcRealHeap {
         // person argues with a measurement rather than re-deriving the fear.
         // Correctness settles it regardless: a slide under a live compiled
         // frame corrupts the heap, and fragmentation only wastes it.
+        // ---- A PER-CYCLE REFUSAL WAS TRIED HERE AND WITHDRAWN (2026-08-21) --
+        //
+        // The blunt form below costs real work, and the cost is measured: on
+        // `org.h2.test.store.TestKillProcessWhileWriting` at `--Xmx 1g` the
+        // DEFAULT configuration (this collector, JIT on) throws
+        // `OutOfMemoryError: Java heap space (ByteBuffer.allocate 1048576)` with
+        // 97 % of the heap free, because `is_active()` is true from the moment
+        // the JIT threshold trips and so this function declines on every cycle
+        // -- and compaction is the only defragmentation there is here. The same
+        // class passes with `--nojit`, on the generational collector, and on
+        // HotSpot. See
+        // `internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`.
+        //
+        // The obvious repair is the one `gen_heap::collect_garbage_inner` made
+        // on 2026-07-26: refuse on the collection's PER-CYCLE COVERAGE PROOF
+        // instead of on the existence of a compiled frame. It was implemented,
+        // and it makes the class pass. It is NOT sound on this collector, and
+        // the reason is left here so nobody re-derives it:
+        //
+        //   * `memory::roots::collect_roots` computes that proof inside a `&&`
+        //     chain whose second term is
+        //     `heap.is_generational() || g1_precise_only_roots`. Rust
+        //     short-circuits, so on a ZGC cycle
+        //     `refresh_moving_young_coverage_for_collection()` is NEVER CALLED,
+        //     and the published verdict stays at the value
+        //     `begin_moving_young_coverage_cycle` reset it to -- `false`,
+        //     meaning "complete". Reading it here reads a proof nobody ran.
+        //   * Running it anyway would not help: the band scan's residency test
+        //     reads `JIT_REGION_BOUNDS`, which "ZGC never fills"
+        //     (`conservative_roots::moving_young_unpublished_frame_oop_present`),
+        //     so the verifier fails closed for this collector by design.
+        //
+        // `known-issues/gc/bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`
+        // calls ZGC's verdict "a vacuous coverage proof" in as many words. So
+        // this collector has no proof to consult, and until it has one the
+        // honest answer is the blunt refusal: fragmentation wastes a heap, a
+        // slide behind an unrewritable frame corrupts one.
+        //
+        // What would lift it, in the order a session should try:
+        //   1. make `collect_roots` run the proof for ZGC as well -- compute the
+        //      verdict without taking the conservative-scan suppression -- AND
+        //   2. give ZGC a young-bounds publication the band verifier can read,
+        //      so the verifier stops failing closed; OR
+        //   3. stage (b) of `feature-designs/zgc-jit-load-barrier.md`, after
+        //      which relocation under compiled code needs no proof at all.
+        // Only 1+2 together, or 3, make the verdict mean anything here.
         if crate::gc_quiescence::is_active()
             || crate::gc_quiescence::unregistered_jit_frame_on_stack()
         {
@@ -18048,7 +18097,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// **No object may be relocated while a compiled frame is live.**
+    /// **No object may be relocated while a compiled frame is live — including
+    /// when this collection's coverage verdict says the frame is fine.**
     ///
     /// A JIT frame can hold an object pointer in a register or a spill slot.
     /// The collector cannot find those and cannot rewrite them, so an object a
@@ -18056,16 +18106,26 @@ pub(crate) mod tests {
     /// non-moving sweep for exactly this reason and G1 reads the same flag;
     /// ZGC read it zero times and slid anyway.
     ///
-    /// Asserted both ways in ONE test, because only the pair is meaningful: a
+    /// The second half is the 2026-08-21 addition, and it pins a WITHDRAWAL
+    /// rather than a feature. Refusing on the per-cycle coverage proof instead
+    /// — the repair `gen_heap` made on 2026-07-26 — was implemented, made
+    /// `TestKillProcessWhileWriting` pass, and is unsound here: on a ZGC cycle
+    /// `roots.rs` short-circuits before running the proof, so the verdict this
+    /// test sets is exactly the vacuous `false` the collector would have read.
+    /// A future session will have the same idea; this half is what tells it the
+    /// idea was tried. See `relocate_stw`'s own comment for the two things that
+    /// have to change first.
+    ///
+    /// Asserted three ways in ONE test, because only the set is meaningful: a
     /// heap that never relocates would satisfy the refusal trivially, and a
     /// fixture too dense for the selector would satisfy it by accident. The
-    /// second half proves the same fixture DOES relocate once the guard is
-    /// dropped, so the first half is measuring the guard and not the fixture.
+    /// third part proves the same fixture DOES relocate once the guard is
+    /// dropped, so the first two are measuring the guard and not the fixture.
     ///
     /// The exact edit that trips it: remove the `is_active()` early return
     /// from `relocate_stw`.
     #[test]
-    fn a_live_compiled_frame_forbids_relocation_and_only_that_forbids_it() {
+    fn a_live_compiled_frame_forbids_relocation_whatever_the_coverage_verdict_says() {
         const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
         const FIELDS: usize = 500;
 
@@ -18095,7 +18155,7 @@ pub(crate) mod tests {
                 .count()
         };
 
-        // --- guard held: nothing may move ---------------------------------
+        // --- 1. frame live, coverage says INCOMPLETE: nothing may move -----
         let (heap, mut roots, pre) = build();
         // SAFETY: these unit tests run the heap single-threaded.
         let stw = unsafe { StopTheWorldToken::new() };
@@ -18104,25 +18164,58 @@ pub(crate) mod tests {
             crate::gc_quiescence::is_active(),
             "the fixture must actually arm quiescence, or the refusal is untested"
         );
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete();
+        assert!(
+            crate::gc_quiescence::moving_young_coverage_incomplete(),
+            "the fixture must actually mark this cycle unproven"
+        );
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
             || {
                 heap.collect_garbage(&stw, &mut roots, &NoMonitors);
             },
         );
-        let _ = guard_depth;
-        crate::gc_quiescence::leave();
         let moved_under_guard = moved_count(&roots, &pre);
         assert_eq!(
             moved_under_guard, 0,
-            "{moved_under_guard} object(s) were relocated while a compiled              frame was live -- their pointers may sit in registers or spill              slots that no rewrite pass can reach"
+            "{moved_under_guard} object(s) were relocated behind a compiled frame whose oops this cycle did not prove rewritable -- their pointers may sit in registers or spill slots that no rewrite pass can reach"
         );
         assert!(
             heap.relocation_skipped_jit.load(Ordering::Relaxed) > 0,
-            "nothing moved, but the JIT refusal never fired -- the fixture is              passing for some other reason (check page occupancy against              max_live_occupancy)"
+            "nothing moved, but the JIT refusal never fired -- the fixture is passing for some other reason (check page occupancy against max_live_occupancy)"
         );
 
-        // --- guard released: the SAME fixture must move ---------------------
+        // --- 2. frame live, coverage says COMPLETE: still nothing may move -
+        //
+        // The withdrawal, pinned. `begin_moving_young_coverage_cycle` leaves
+        // the verdict at "complete", which is EXACTLY the state a real ZGC
+        // cycle is in -- `roots.rs` short-circuits before running the proof for
+        // this collector, so the verdict is vacuous rather than earned. A
+        // refusal that consults it would relocate here.
+        let (heap_vacuous, mut roots_vacuous, pre_vacuous) = build();
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        assert!(
+            crate::gc_quiescence::is_active()
+                && !crate::gc_quiescence::moving_young_coverage_incomplete(),
+            "this half needs a live frame AND a verdict of complete, or it tests something else"
+        );
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
+            || {
+                heap_vacuous.collect_garbage(&stw, &mut roots_vacuous, &NoMonitors);
+            },
+        );
+        assert_eq!(
+            moved_count(&roots_vacuous, &pre_vacuous),
+            0,
+            "objects moved behind a live compiled frame on the strength of the coverage verdict. On a ZGC cycle that verdict is never computed (roots.rs short-circuits on is_generational), so it is a vacuous false, not a proof -- see relocate_stw"
+        );
+
+        let _ = guard_depth;
+        crate::gc_quiescence::leave();
+
+        // --- 3. guard released: the SAME fixture must move ------------------
         let (heap2, mut roots2, pre2) = build();
         assert!(
             !crate::gc_quiescence::is_active(),
