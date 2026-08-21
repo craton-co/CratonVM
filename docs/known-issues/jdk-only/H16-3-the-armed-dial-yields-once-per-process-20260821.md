@@ -206,3 +206,77 @@ they were checked. No other CHM bulk op in the file mints a carrier.
   requires `H16-2`'s guard to be total first, or the array store will refuse the
   fallback carriers. This is `H16-2` N1 and is repeated here because it is what
   the armed n=13 row is about.
+
+---
+
+## INDEPENDENT REPRODUCTION (lane H0, 2026-08-21) — confirmed, with the hybrid table photographed
+
+Probe: three `HashMap`s in one process, three puts each, reading `HashMap.table`
+reflectively (`--add-opens java.base/java.util=ALL-UNNAMED`) and classifying
+every bucket. Binary `cratonvm-r6.exe`, oracle HotSpot 25.0.3+9.
+
+| | `table` array class | real `HashMap$Node` | fabricated | null |
+|---|---|---:|---:|---:|
+| **HotSpot**, all three maps | `[Ljava.util.HashMap$Node;` | 3 / 3 / 1 | 0 | — |
+| **CratonVM unarmed**, all three | `[Ljava.lang.Object;` | **0** | 3 / 3 / 1 | — |
+| **CratonVM armed, map1** | **`[Ljava.util.HashMap$Node;`** | **1** | **2** | 13 |
+| **CratonVM armed, map2** | `[Ljava.lang.Object;` | 0 | 3 | 13 |
+| **CratonVM armed, map3** | `[Ljava.lang.Object;` | 0 | 1 | 15 |
+
+**This record's claim is confirmed exactly.** The yield happens **once in the
+whole process** — the first put of the first map — and everything after it
+reverts to the fabricated path.
+
+### The hybrid is a state no retirement can produce, and it may be worse than either endpoint
+
+`map1` armed is a **real `Node[]` holding one real `Node` and two
+`AnonymousObject$4`s.** That is not "half retired". It is a table that is
+internally inconsistent in a way neither the current VM nor a fully-retired VM
+would ever produce:
+
+* the **unarmed** state is uniform — `Object[]` full of fabrications, which is
+  wrong but self-consistent, and `size()`/`get()` work (`H0-4` §7);
+* a **fully retired** state would be uniform the other way — `Node[]` full of
+  real nodes;
+* the **armed** state is neither, and an array store of a fabricated node into a
+  real `Node[]` is exactly the `ArrayStoreException` in `H0-6` §7.
+
+### What this does to every armed number in this directory
+
+**`CRATONVM_ENFORCE_NATIVE_SHADOW` is the instrument the entire effort has
+priced with**, and this says it does not simulate a retirement. It simulates
+*one* retirement, once, and then stops.
+
+Affected, and this is not a small list: `H0-4`'s six-family table (81/104 for
+`HashMap` and the rest), `H0-3`'s CHM eleven, `H14-3`'s **thirteen** arms
+including the five "free" registrars and `Properties` at 65/104, and every
+`H15`/`H22` armed measurement.
+
+**I am not claiming those numbers are too high or too low, because the direction
+is not knowable from this.** A hybrid table can be worse than uniform-fabricated
+(a real `Node[]` rejects a fabricated store that an `Object[]` accepts) *or*
+better (one real node is one fewer fabrication). **What can be said is that they
+do not measure what they were read as measuring**, and that "arming costs N
+vectors" is not the same proposition as "retiring costs N vectors".
+
+### Two things this does NOT overturn
+
+* **`H22`'s refusals stand and get stronger.** `StringBuilder` losing every
+  append silently, and `Throwable` costing 61 of 61 stack traces, are *observed
+  wrong behaviours* under the dial. A defect found in a hybrid state is still a
+  defect found; it is the clean *zeros* that become unreliable, not the
+  failures. A cell that says "this breaks" is more trustworthy than a cell that
+  says "this is free".
+* **The unarmed row is untouched**, and it carries its own finding: **the
+  `table` array is `[Ljava.lang.Object;` in every unarmed case**, where JDK 25
+  declares `[Ljava.util.HashMap$Node;`. That is the `new_ref_array` half of the
+  sentinel census (`H0-6` §10) — 29 sites tree-wide — and it is a defect in the
+  shipping default configuration, not only under the dial.
+
+### NOMINATION
+
+**N1 — find why it yields once.** A process-global latch is the obvious suspect,
+and this repository has a standing note that *a process-global `OnceLock` latches
+a guess forever*. If the yield decision is memoised per process rather than per
+call, that is a one-line class of bug with a very large blast radius on the
+instrument, not on the VM.
