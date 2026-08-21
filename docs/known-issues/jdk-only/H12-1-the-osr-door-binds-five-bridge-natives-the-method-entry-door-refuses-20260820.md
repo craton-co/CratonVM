@@ -576,3 +576,47 @@ are the only genuine second store under `java.util.HashMap`, and neither H7-1's
 analysis, nor `RMapResizeGc`, nor any of my three probes establishes whether it
 was even active. Until something says "the overlay served N of M gets", a green
 map vector is evidence about the `table` walk only.
+
+---
+
+## INDEPENDENT REPRODUCTION (lane H0, 2026-08-20)
+
+Reproduced from scratch on the pristine binary at `fe59bf9d9` — which does not
+contain `9b7ad0f07` — with a probe written without reading this lane's fixture:
+a single `static long hot()`, **called exactly once**, containing a 300,000-iteration
+loop over `Thread.currentThread().hashCode()`. Called once, so the MethodEntry
+door cannot be what tiers it up; 300,000 iterations, so OSR must.
+
+```
+CRATONVM_INTRINSIC_STATS=1 cratonvm.exe <mode> -cp . OsrDoor
+```
+
+| mode | `Thread.currentThread` direct calls | single-pass | IR | OSR |
+|---|---:|---|---|---:|
+| `--jdk-only` | **298,000** | **0/7** | 0/0 | **1** |
+| `--real-jdk` | **298,000** | 0/0 | 0/0 | **1** |
+| `--jdk-only --nojit` | 0 | 0/0 | 0/0 | 0 |
+
+**Every number matches this record, including the 298,000.** Three things it
+establishes on its own:
+
+1. **The MethodEntry guard is real and it fired.** `0/7` — seven `invokestatic`
+   sites examined in strict mode, seven refused. Anyone auditing only that door
+   would correctly conclude strict mode refuses these binds.
+2. **The OSR door bound anyway**, and compiled code then made 298,000 calls
+   through a `bridge` row **under `--jdk-only`**.
+3. **`--real-jdk` is byte-identical on the OSR column.** The door does not
+   consult the mode. The `0/7` vs `0/0` difference in the *single-pass* column
+   is the only place the two modes differ at all, which is precisely why an
+   audit of that door reads as reassuring.
+
+This is the `HANDOFF-20260820` §7 item 4 hole, found at the door that item did
+not name — it named `vm/src/jit/helpers.rs`'s six helpers, and `H7-1` then
+correctly showed those six are not the problem. **Both were right about their
+own door and the hole was in the third one.** `the-osr-door-is-the-third-compile-door`
+is a standing note in this project and it was still missed by two audits.
+
+**What this does NOT show, and the record above is straight about it:** no wrong
+*value* was witnessed. The probe's answer agrees with HotSpot. The exposure is
+latent — an open door, not a live miscompile — and it becomes live exactly when
+the rows it binds stop being `bridge`, which is what the retag plan proposes.
