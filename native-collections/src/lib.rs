@@ -9823,7 +9823,14 @@ fn map_node_class_for(ctx: &mut dyn NativeContext, key: Value, value: Value) -> 
     if !matches!(key, Value::Object(_)) || !matches!(value, Value::Object(_)) {
         return ClassId::new(0);
     }
-    hm_node_class_id(ctx).unwrap_or_else(|| ClassId::new(0))
+    // A `match` rather than `unwrap_or`/`unwrap_or_else`: `or_fun_call` and
+    // `unnecessary_lazy_evaluations` disagree about which of those two is the
+    // right spelling, and `cargo clippy --workspace --all-targets -- -D
+    // warnings` is a blocking gate.
+    match hm_node_class_id(ctx) {
+        Some(cid) => cid,
+        None => ClassId::new(0),
+    }
 }
 
 /// Allocate a HashMap$Node entry using the REAL JDK field layout
