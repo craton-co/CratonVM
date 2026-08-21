@@ -766,9 +766,16 @@ use cratonvm_types::compat::CompatibilityMode;
 /// rejected 28 further triples the 36-vector screen had passed
 /// (`java/lang/ref/`, `sun/nio/fs/`; see `G90-1` §5).
 ///
-/// # H3-1 REBASELINE (DONE 2026-08-20 by H0, see the RE-FREEZE note) — 2026-08-20, NOT YET MEASURED
+/// # H3-1 REBASELINE — SUPERSEDED BY THE `H0 RE-FREEZE` NOTE BELOW
 ///
-/// **Old value 1622, expected delta −7, expected new value 1615.** The seven
+/// **This block is H3-1's PREDICTION, kept for the reasoning in it. The
+/// prediction was WRONG and the measured outcome is in the next section —
+/// read that one for the current value.** Predicted: old 1622, delta −7,
+/// new 1615. Measured: **+4, not −7**, and the constant below is 1626.
+/// The prediction is left standing rather than deleted because the reason
+/// it was wrong is the useful part: it assumed the only change was its own
+/// seven deletions, and a gate that had not run since 2026-08-14 was
+/// hiding three other movements.** The seven
 /// `java.util.function` default/static-method stubs `G89-1` N1 nominated were
 /// DELETED from `native-builtins/src/phases_late/streams.rs`
 /// (`Predicate.{and,or,negate,not}`, `Consumer.andThen`,
@@ -850,8 +857,9 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1626;
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
 ///
-/// **H3-1 REBASELINE (DONE 2026-08-20 by H0, see the RE-FREEZE note) — old value 1611, expected delta −7, expected new
-/// value 1604.** Not measured; see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for
+/// **H3-1 REBASELINE — SUPERSEDED. Predicted 1604 (old 1611, delta −7);
+/// MEASURED 1615, the same +4 as the management resolve. The prediction
+/// below is kept for its reasoning, not its number.** Originally not measured; see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for
 /// the reason the guess is not written here and for the command that
 /// recomputes it. The seven deleted rows are in
 /// `native-builtins/src/phases_late/streams.rs`, which is in BOTH resolves, so
@@ -880,16 +888,19 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1615;
 /// direction in which re-freezing records work rather than absorbing it, and it
 /// is what H3-1's seven deletions produce.
 ///
-/// **H3-1 REBASELINE (DONE 2026-08-20 by H0, see the RE-FREEZE note) — old value 13160, expected delta −7, expected
-/// new value 13153.** Not measured. Recomputed by the same two commands as
+/// **H3-1 REBASELINE — SUPERSEDED. Predicted 13153 (old 13160, delta −7);
+/// MEASURED 13225, i.e. **+65**, because ~61 non-stub registrations landed
+/// on `dev` concurrently and this gate could not see them while it was
+/// unparseable. That is case one of the three classified above — rows up,
+/// stubs flat — and it is NOT a stub regression.** Recomputed by the same two commands as
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
 /// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
 const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13225;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
-/// **H3-1 REBASELINE (DONE 2026-08-20 by H0, see the RE-FREEZE note) — old value 12792, expected delta −7, expected
-/// new value 12785.** Not measured.
+/// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
+/// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
 const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12857;
 
