@@ -5058,9 +5058,6 @@ pub unsafe extern "C" fn jit_ldc_class_cp(
     };
     let mirror = crate::vm::get_or_create_class_mirror(vm, target_id);
     record_ldc_reference(vm, holder_cid, idx, mirror);
-    crate::runtime::interpreter::site_cache::site_stats::bump(
-        crate::runtime::interpreter::site_cache::site_stats::JIT_LDC_FILL,
-    );
     mirror.as_ptr() as i64
 }
 
@@ -5133,6 +5130,11 @@ unsafe fn recorded_ldc_reference(vm: &SharedVm, holder: ClassId, cp_idx: u16) ->
 }
 
 /// Record this `ldc` site's resolution, so the next execution is a probe.
+///
+/// Bumps the fill counter ITSELF, and only when the write actually happened.
+/// Counting the attempt instead reported `fill=4 796 969` on a run with the
+/// switch OFF, which had recorded nothing — a counter whose name implies the
+/// wrong fact, and the exact shape the site-cache stats exist to make visible.
 unsafe fn record_ldc_reference(vm: &SharedVm, holder: ClassId, cp_idx: u16, obj: ObjectRef) {
     if !compiled_ldc_const_cache_enabled() {
         return;
@@ -5142,6 +5144,9 @@ unsafe fn record_ldc_reference(vm: &SharedVm, holder: ClassId, cp_idx: u16, obj:
         holder,
         cp_idx,
         Value::Object(Some(obj)),
+    );
+    crate::runtime::interpreter::site_cache::site_stats::bump(
+        crate::runtime::interpreter::site_cache::site_stats::JIT_LDC_FILL,
     );
 }
 
@@ -5219,7 +5224,6 @@ pub unsafe extern "C" fn jit_ldc_string_cp(vm_ptr: i64, holder_class_id: i64, cp
     };
     let obj = crate::vm::create_java_string(vm, &text);
     record_ldc_reference(vm, holder, idx, obj);
-    crate::runtime::interpreter::site_cache::site_stats::bump(crate::runtime::interpreter::site_cache::site_stats::JIT_LDC_FILL);
     obj.as_ptr() as i64
 }
 
