@@ -518,3 +518,46 @@ cannot answer a proxy question the interpreter can. Whether that is reachable
 tier-dependent wrong answer, which is the exact defect shape `H7-1` N1's
 proposed `RJitMapTierDiff` vector was designed to catch and which nothing
 currently catches.
+
+---
+
+## INDEPENDENT REPRODUCTION (lane H0, 2026-08-20)
+
+On the round-5 binary, compatible mode, probe saved as
+`regression-suite/probes/OpcodeVsReflectionProbe.java`. Each cell prints
+`instanceof` and `Class.isInstance` **for the same receiver and the same type**,
+so a divergence is visible without a HotSpot column at all.
+
+| receiver | test | HotSpot | CratonVM `instanceof` / `isInstance` |
+|---|---|---|---|
+| `Map.of()`, `Map.of(k,v)`, `Map.copyOf` | `AbstractMap` | true | **`false` / `true`** |
+| `List.of()`, `List.of(1,2,3)` | `AbstractCollection` | true | **`false` / `true`** |
+| `List.of()`, `List.of(1,2,3)` | `RandomAccess` | true | **`false` / `true`** |
+| `Set.of(x)` | `AbstractCollection` | true | **`false` / `true`** |
+| `Collections.unmodifiableList` | `RandomAccess` | true | **`false` / `true`** |
+
+**Seven of seven receivers diverge, in the direction this record states.** The
+two paths disagree *with each other* on one object at one instant — the
+`a-reflective-native-and-its-bytecode-opcode-are-twins-that-drift` species,
+and here the twins have drifted far enough that the object's own answer depends
+on which door asked.
+
+**Method note, because my first attempt got the wrong answer.** I first probed
+`instanceof Map`, `instanceof List`, `instanceof Set`, `instanceof Function`,
+`instanceof Comparator` across nine receivers and found **zero** divergence —
+and had I stopped there I would have recorded "not reproduced" against a lane
+that was right. Those are *interfaces*; the twelve cells are **abstract
+superclasses** (`AbstractMap`, `AbstractCollection`) and `RandomAccess`. The
+probe reported its own reach, not the defect. `a-narrow-probe-reports-its-own-reach`
+is a standing note in this project and it still cost me a wrong conclusion I
+nearly published.
+
+**Two things the same run establishes in passing:**
+
+* **`H15-3`'s `Function.andThen` stand-in is real and visible by class name:**
+  `f.andThen(g).getClass()` is `java.util.function.Function$AndThen` on
+  CratonVM against `Function$$Lambda/0x…` on HotSpot.
+* `Comparator.naturalOrder().reversed()` yields
+  `java.util.Collections$ReverseComparator2` where HotSpot on the *same JDK*
+  yields `Collections$ReverseComparator`. Not investigated, not in any record I
+  can find, and noted here only so it is written down somewhere.
