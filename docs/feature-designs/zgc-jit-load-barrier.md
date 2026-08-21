@@ -1084,3 +1084,46 @@ Marked explicitly rather than guessed.
    be healed with a CAS, so `getstatic` may need the non-healing fallback arm
    that study's option (e) provides per-slot. Not resolved here.
 
+
+## The getfield residual this blocks
+
+Recorded here 2026-08-20, when
+`fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md`
+was retired. Everything on that page that could be fixed without this barrier
+was fixed; what is left is this, and it is a property of the slot
+representation rather than of the getfield arms:
+
+| collector | JIT `getfield` helper calls | failing guard clause | primitive misses |
+|---|---:|---|---:|
+| Generational | **0** | — | 0 |
+| G1 | **0** | — | 0 |
+| ZGC | **56 930 918** | 100% `outside-published-bounds` | **0** |
+
+`SHA256Digest` x200 000, one binary, counted at execution on the one path every
+fall-through crosses. Every one of those calls is a **reference** read; the
+inline path is engaged for every primitive field read on all three collectors.
+
+ZGC publishes nothing into `JIT_REGION_BOUNDS`, so the containment clause fails
+for every receiver, every time. That is not a bug to fix in the guard: a compact
+reference slot on ZGC holds `Z_COLORED_TAG | colour | offset` rather than a
+pointer, so an inlined load of it is exactly the use-after-free this design
+exists to prevent. **Publishing bounds to make the check pass would be the
+defect**, not the fix.
+
+So the ZGC number moves when this barrier lands, and not before. Two things
+already landed against the same residual WITHOUT touching the inline path or the
+colouring, both by removing redundant validation of the RECEIVER (which the IR
+already types `Ref`) rather than by inlining the loaded VALUE:
+
+* stop asking `is_object_address` on a proven-oop receiver — 34 470 791 of
+  34 470 791 helper calls take it, ~1.05x on ZGC;
+* validate ONCE per native accessor call rather than two or three times —
+  64 248 919 -> 38 879 898 walks, 1.07x on ZGC and 1.11x on Generational, 5 of 5
+  interleaved pairs each (`CRATONVM_GC_NO_VALIDATE_ONCE=1` A/Bs it in one
+  binary).
+
+Neither is a precedent for inlining a coloured load, and the retired page says
+so in the same words. After both, `jit_getfield`'s own body is still 16.31% of a
+ZGC profile of that kernel, and the membership walk is no longer the largest
+single item — per-call native dispatch is
+(`try_jit_site_cached_native_dispatch` 8.81% + `safe_native_call_impl` 8.33%).

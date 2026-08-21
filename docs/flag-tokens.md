@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-462 tokens.
+465 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -379,8 +379,8 @@ export inherited from a parent shell.
 | `osr-bind` | `CRATONVM_DBG_OSR_BIND` |
 | `osr-frame-trace` | `CRATONVM_DBG_OSR_FRAME_TRACE` |
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
-| `osr-slots` | `CRATONVM_DBG_OSR_SLOTS` |
 | `osr-seed-collision` | `CRATONVM_DBG_OSR_SEED_COLLISION` |
+| `osr-slots` | `CRATONVM_DBG_OSR_SLOTS` |
 | `overlay` | `CRATONVM_DBG_OVERLAY` |
 | `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
@@ -470,6 +470,7 @@ export inherited from a parent shell.
 | `stw-expected-ids` | `CRATONVM_DBG_STW_EXPECTED_IDS` |
 | `stw-native-ring` | `CRATONVM_DBG_STW_NATIVE_RING` |
 | `surefire-ipc-dbg` | `CRATONVM_SUREFIRE_IPC_DBG` |
+| `swchain` | `CRATONVM_DBG_SWCHAIN` |
 | `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `sweep-referrers` | `CRATONVM_DBG_SWEEP_REFERRERS` |
@@ -525,11 +526,12 @@ export inherited from a parent shell.
 | `youngscan` | `CRATONVM_DBG_YOUNGSCAN` |
 | `youngstate` | `CRATONVM_DBG_YOUNGSTATE` |
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
+| `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `g1-dbg-rset` | `CRATONVM_G1_DBG_RSET` |
 
 ## `CRATONVM_JIT`
 
-192 tokens.
+204 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -615,6 +617,7 @@ export inherited from a parent shell.
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
 | `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |
+| `osr-frame-dedupe` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` |
 | `strict-install-epoch` | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` |
 | `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
 | `kernel-reg-osr` | `CRATONVM_JIT_KERNEL_REG_OSR` |
@@ -623,6 +626,8 @@ export inherited from a parent shell.
 | `local-liveness` | `CRATONVM_NO_LOCAL_LIVENESS` |
 | `local-regs` | `CRATONVM_JIT_LOCAL_REGS` |
 | `long-intrinsics` | `CRATONVM_JIT_NO_LONG_INTRINSICS` |
+| `long-box-direct-helpers` | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` |
+| `varhandle-read-direct-helpers` | `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
 | `main-inline` | `CRATONVM_JIT_MAIN_INLINE` |
 | `matrix-dot` | `CRATONVM_JIT_MATRIX_DOT` |
@@ -653,6 +658,7 @@ export inherited from a parent shell.
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
 | `inline-call-dispatch` | `CRATONVM_JIT_INLINE_CALL_DISPATCH` |
 | `inline-splice-devirt` | `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` |
+| `local-handlers` | `CRATONVM_JIT_LOCAL_HANDLERS` |
 | `osr-seed-frame-slots` | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` |
 | `osr-strip-all-high-halves` | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` |
 | `osr-single-pc` | `CRATONVM_JIT_OSR_SINGLE_PC` |
@@ -681,7 +687,6 @@ export inherited from a parent shell.
 | `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
-| `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `new-site-cache` | `CRATONVM_JIT_NO_NEW_SITE_CACHE` |
@@ -703,6 +708,7 @@ export inherited from a parent shell.
 | `slot-mirror` | `CRATONVM_JIT_NO_SLOT_MIRROR` |
 | `sp-coalesce` | `CRATONVM_SP_NO_COALESCE` |
 | `sp-inline-ic` | `CRATONVM_JIT_SP_INLINE_IC` |
+| `self-tailcall` | `CRATONVM_JIT_SELF_TAILCALL` |
 | `sp-tailcall` | `CRATONVM_JIT_SP_TAILCALL` |
 | `spec-bce` | `CRATONVM_JIT_NO_SPEC_BCE` |
 | `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
@@ -739,7 +745,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-59 tokens.
+61 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -803,6 +809,7 @@ export inherited from a parent shell.
 | `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
+| `validate-once` | `CRATONVM_GC_NO_VALIDATE_ONCE` |
 
 ## `CRATONVM_REAL`
 

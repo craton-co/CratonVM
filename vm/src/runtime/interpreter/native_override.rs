@@ -2848,6 +2848,40 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // The serialization hooks of the immutable-collection carriers, for the
+    // same reason one class over. `List.of`/`Set.of`/`Map.of`/`copyOf` return a
+    // CratonVM-minted object whose `getClass()` aliases to one of these six
+    // real JDK classes, and each of them declares its own `writeReplace()` -
+    // a body that reads `e0`/`e1`/`elements`/`table`, the fields the carrier
+    // does not populate. Left to the real bytecode it wrote a `java.util.
+    // CollSer` holding this VM's `(backing, immutable-marker)` slot pair, and
+    // reading that back threw `InvalidObjectException: invalid object` (20 of
+    // the 52 rows of `probes/CollectionSerProbe.java`; Spring's
+    // `AnnotationTransactionAttributeSourceTests.serializable()` is the suite
+    // case). `CollSer.readResolve` is here too because its `IMM_MAP` arm builds
+    // through `new MapN<>(array)` - a real constructor whose `table` none of
+    // the map natives read. `Collections$UnmodifiableRandomAccessList` is the
+    // one non-immutable member: it is the only `Collections$Unmodifiable*`
+    // wrapper that declares a `writeReplace`, and its native declines the
+    // replacement so it joins the siblings that already round-trip.
+    // Registrations: `register_immutable_serialization_natives` in
+    // native-collections. Companion entry in the `vm_exec` twin.
+    if matches!(
+        class_name,
+        "java/util/ImmutableCollections$List12"
+            | "java/util/ImmutableCollections$ListN"
+            | "java/util/ImmutableCollections$Set12"
+            | "java/util/ImmutableCollections$SetN"
+            | "java/util/ImmutableCollections$Map1"
+            | "java/util/ImmutableCollections$MapN"
+            | "java/util/Collections$UnmodifiableRandomAccessList"
+    ) && method_name == "writeReplace"
+    {
+        return true;
+    }
+    if class_name == "java/util/CollSer" && method_name == "readResolve" {
+        return true;
+    }
     // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
     // allow-list. JarFile inherits these operations from ZipFile, so a
     // subclass `super.close()` resolves to the real ZipFile bytecode after

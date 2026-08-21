@@ -150,6 +150,24 @@ pub(crate) struct StackKindInputs<'a> {
     /// therefore `Int`" — a guess, which rule 2 of this module's safety
     /// argument forbids. A pc that is not here stays `Unknown`.
     pub(crate) ldc_resolved: &'a FxHashSet<usize>,
+    /// Exception-table `handler_pc`s to seed as extra ENTRY points, each with
+    /// the JVMS §2.10 handler-entry stack: exactly one reference, the
+    /// throwable.
+    ///
+    /// An exception edge is a predecessor no branch instruction names, so
+    /// without this a handler body is unreached, the analysis has no state
+    /// there, and every deopt point inside one falls back to `Unsupported` —
+    /// which, because `osr_exit_policy` is artifact-wide, costs the WHOLE
+    /// method its OSR entry. That is not hypothetical: it is what a
+    /// `catch (E e) { g(-1, x); }` inside a method that also touches a `long`
+    /// does, and `HttpHeaderValidationUtilTest`'s exhaustive loops are exactly
+    /// that shape.
+    ///
+    /// Seeding is not a guess. JVMS fixes the handler-entry stack completely,
+    /// and a handler also reachable by ordinary control flow at a different
+    /// depth still poisons through the ordinary merge. Empty for every caller
+    /// that emits no handler bodies, and byte-identical there.
+    pub(crate) handler_pcs: &'a [usize],
 }
 
 /// Run the analysis. `None` results are normal: an unmodelled construct poisons
@@ -167,6 +185,17 @@ pub(crate) fn analyze(code: &[u8], code_len: usize, inputs: &StackKindInputs<'_>
     let mut poisoned: Vec<bool> = vec![false; code_len];
     let mut work: Vec<usize> = vec![0];
     in_state[0] = Some(Vec::new());
+    // Handler entries are entry points too — see `StackKindInputs::handler_pcs`.
+    // Seeded before the walk so the JVMS state is what any later merge is
+    // merged AGAINST, rather than something a fall-through path gets to define
+    // first.
+    for &handler_pc in inputs.handler_pcs {
+        if handler_pc >= code_len || in_state[handler_pc].is_some() {
+            continue;
+        }
+        in_state[handler_pc] = Some(vec![StackKind::Ref]);
+        work.push(handler_pc);
+    }
 
     // Bounded: each pc can be re-queued only when its state actually changed,
     // and the merge is monotone downward (equal -> keep, differ -> Unknown,
@@ -731,6 +760,7 @@ mod tests {
             ldc_refs: &ldc_refs,
             ldc_fp: &FxHashSet::default(),
             ldc_resolved: &FxHashSet::default(),
+            handler_pcs: &[],
         };
         analyze(code, code.len(), &inputs)
     }
@@ -754,10 +784,93 @@ mod tests {
             ldc_refs: &ldc_refs,
             ldc_fp: &fp,
             ldc_resolved: &resolved,
+            handler_pcs: &[],
         };
         analyze(code, code.len(), &inputs)
     }
 
+
+    /// [`run`] with exception-handler entry points seeded.
+    fn run_with_handlers(
+        code: &[u8],
+        calls: FxHashMap<usize, (usize, u8)>,
+        handler_pcs: &[usize],
+    ) -> StackKindMap {
+        let (ldc_refs, types, _) = no_meta();
+        let inputs = StackKindInputs {
+            field_types: types.clone(),
+            static_types: types,
+            calls,
+            ldc_refs: &ldc_refs,
+            ldc_fp: &FxHashSet::default(),
+            ldc_resolved: &FxHashSet::default(),
+            handler_pcs,
+        };
+        analyze(code, code.len(), &inputs)
+    }
+
+    /// A handler body is reached by an edge no branch instruction names, so
+    /// without a seed the analysis has no state there and every deopt point in
+    /// a `catch` block falls back to `Unsupported` — which vetoes the whole
+    /// artifact's OSR entry, because `osr_exit_policy` is artifact-wide.
+    ///
+    /// The seed is not a guess: JVMS §2.10 fixes the handler-entry stack at
+    /// exactly one reference.
+    #[test]
+    fn a_handler_entry_is_seeded_with_the_throwable() {
+        // 0: return
+        // 1: astore_0     <- handler_pc; entry stack is [Ref]
+        // 2: iconst_m1
+        // 3: return
+        let code = [0xb1u8, 0x4b, 0x02, 0xb1];
+        let without = run_with_handlers(&code, FxHashMap::default(), &[]);
+        assert_eq!(
+            without.get(1),
+            None,
+            "unseeded, a handler body is unreached and has no answer at all"
+        );
+
+        let with = run_with_handlers(&code, FxHashMap::default(), &[1]);
+        assert_eq!(with.get(1), Some(&[StackKind::Ref][..]));
+        assert_eq!(
+            with.get(2),
+            Some(&[][..]),
+            "the `astore_0` consumed it, so the stack is empty at pc 2"
+        );
+        assert_eq!(
+            with.get(3),
+            Some(&[StackKind::Int][..]),
+            "and the typing carries on through the handler body"
+        );
+    }
+
+    /// A handler pc that ordinary control flow also reaches at a different
+    /// depth still poisons — the seed goes through the same merge as any other
+    /// incoming edge, so it cannot launder a disagreement into an answer.
+    #[test]
+    fn a_handler_entry_that_disagrees_with_a_branch_still_poisons() {
+        // 0: iconst_0   1: goto +3 (-> 4)   4: pop   5: return
+        // pc 4 is reached by the goto with depth 1 AND seeded with depth 1 but
+        // a different KIND, which merges to Unknown rather than poisoning; pc 5
+        // is where the depths would differ if the seed were wrong.
+        let code = [0x03u8, 0xa7, 0x00, 0x03, 0x57, 0xb1];
+        let merged = run_with_handlers(&code, FxHashMap::default(), &[4]);
+        assert_eq!(
+            merged.get(4),
+            Some(&[StackKind::Unknown][..]),
+            "one path says Int and the other says Ref: the merge must forget, not pick"
+        );
+
+        // 0: iconst_0   1: iconst_0   2: goto +3 (-> 5)   5: return
+        // Here the branch arrives with depth 2 and the seed says depth 1.
+        let code = [0x03u8, 0x03, 0xa7, 0x00, 0x03, 0xb1];
+        let poisoned = run_with_handlers(&code, FxHashMap::default(), &[5]);
+        assert_eq!(
+            poisoned.get(5),
+            None,
+            "a depth disagreement is not representable and must not be answered"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // The category-dependent dup family.
@@ -1059,6 +1172,7 @@ mod tests {
             ldc_refs: &FxHashSet::default(),
             ldc_fp: &FxHashSet::default(),
             ldc_resolved: &ldc_resolved,
+            handler_pcs: &[],
         };
         let m = analyze(&code, code.len(), &inputs);
 

@@ -2200,7 +2200,12 @@ fn invoke_to_string_units_opt(
                     let formatted = if name == "java/lang/Boolean" {
                         if v != 0 { "true" } else { "false" }.to_string()
                     } else if name == "java/lang/Character" {
-                        char::from_u32(v as u32).unwrap_or('?').to_string()
+                        // A boxed `Character` can hold a lone surrogate --
+                        // `Character.valueOf('\ud800')` is legal -- and
+                        // `char::from_u32` rejects exactly those, so this
+                        // printed '?' for a value it could have passed through
+                        // untouched. Emit the raw unit.
+                        return Ok(Some(vec![v as u16]));
                     } else if name == "java/lang/Byte" {
                         (v as i8).to_string()
                     } else if name == "java/lang/Short" {
@@ -2313,13 +2318,27 @@ pub(crate) fn native_sb_append_object(
     // in-tree exemplar in the insert-CharSequence native.
     let mut scope = NativeHandleScope::new(ctx);
     let this_handle = scope.root(this);
-    let text = match args.get(1) {
-        Some(Value::Object(Some(obj))) => invoke_to_string(&mut *scope, *obj)?,
-        Some(Value::Object(None)) => "null".to_string(),
-        _ => "null".to_string(),
+    // UNITS, not text. `invoke_to_string` returns a Rust `String`, which cannot
+    // hold an unpaired UTF-16 surrogate -- so `sb.append(someObject)` replaced
+    // one with U+FFFD while `sb.append(someString)` right beside it did not.
+    //
+    // `invoke_to_string_units` is its exact twin, same `"null"` fallback and
+    // all, and it sits DIRECTLY ABOVE this function. It was built by `G26` for
+    // this hazard and this caller never switched to it -- the same
+    // mechanism-without-a-consumer shape as `G58-1`'s `BaisEvent` and `G51-1`'s
+    // `record_local_cert_chain`, except here the consumer existed and kept
+    // calling the lossy one.
+    //
+    // This is the last mile of the collection renderers: real JDK
+    // `AbstractCollection.toString` is a `sb.append(e)` loop over `Object`, so
+    // `Arrays.asList(s).toString()` and any nested collection came back through
+    // here and lost the unit that native-collections had just preserved.
+    let units = match args.get(1) {
+        Some(Value::Object(Some(obj))) => invoke_to_string_units(&mut *scope, *obj)?,
+        _ => "null".encode_utf16().collect(),
     };
     let this = scope.get(&this_handle);
-    let this = sb_append_str(&mut *scope, this, &text);
+    let this = sb_append_chars(&mut *scope, this, &units);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -11307,6 +11326,23 @@ fn fmt_general_units(
             if ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(*obj)) {
                 return Ok(read_string_chars(ctx, *obj));
             }
+            // Every OTHER object: `%s` is `String.valueOf(arg)` ==
+            // `arg.toString()`, and that result can hold an unpaired surrogate
+            // exactly as a String argument can -- `String.format("%s", x)` where
+            // `x.toString()` returns one, and any boxed `Character` holding one.
+            // `format_arg` renders it and hands back a Rust `String`, so the
+            // unit was already gone by the time this function saw it.
+            //
+            // These are the SAME two calls `format_arg`'s own `%s` arm makes,
+            // in the same order, differing only in reading the result as units
+            // -- so the two cannot disagree about anything except the loss.
+            return match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => Ok(ctx
+                    .read_string_units(s)
+                    .unwrap_or_else(|| "null".encode_utf16().collect())),
+                Ok(_) => Ok("null".encode_utf16().collect()),
+                Err(err) => Err(err),
+            };
         }
     }
     let rendered = format_arg(ctx, val, spec)?;

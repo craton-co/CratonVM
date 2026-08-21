@@ -886,17 +886,39 @@ fn io_err_nio(e: io::Error, path: &str) -> MethodCallFailed {
 /// caller-supplied `off + len` cannot overflow `usize` and wrap past the
 /// bounds check. `off`/`len` are the *raw* Java `int` values.
 fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
-    if off < 0 || len < 0 {
-        return Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::aioobe_index_only(if off < 0 { off } else { len }),
-        )));
+    // G76-1: this is `Objects.checkFromIndexSize(off, len, b.length)`, which the
+    // comment at the call site already said. Two things were wrong with the
+    // rendering of it:
+    //
+    //   * the TYPE. It raised `ArrayIndexOutOfBoundsException`; HotSpot raises
+    //     the base `IndexOutOfBoundsException`. `AIOOBE extends IOOBE`, so a
+    //     `catch (IndexOutOfBoundsException)` was unaffected and only code
+    //     testing the exact class could see it — which is why it survived.
+    //   * the MESSAGE. `Array index out of range: 6` names a fabricated index
+    //     (`off + len`); the JDK names the whole RANGE and the array length,
+    //     and uses ONE format for all four failure modes. Measured on
+    //     `ByteArrayInputStream.read`, `ByteArrayOutputStream.write` and
+    //     `StringReader.read`, negative and past-the-end alike:
+    //         Range [5, 5 + 1) out of bounds for length 2
+    //         Range [0, 0 + -1) out of bounds for length 2
+    //     Note the second: a negative LENGTH is printed verbatim inside the
+    //     range rather than reported on its own, so there is no special case
+    //     here even though there looks like there should be.
+    fn out_of_bounds(off: i32, len: i32, arr_len: usize) -> MethodCallFailed {
+        MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IndexOutOfBoundsException {
+                message: Some(format!(
+                    "Range [{off}, {off} + {len}) out of bounds for length {arr_len}"
+                )),
+            },
+        ))
     }
-    let end = (off as usize).checked_add(len as usize);
-    match end {
+    if off < 0 || len < 0 {
+        return Err(out_of_bounds(off, len, arr_len));
+    }
+    match (off as usize).checked_add(len as usize) {
         Some(end) if end <= arr_len => Ok(()),
-        _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
-            RuntimeError::aioobe_index_only(off.saturating_add(len)),
-        ))),
+        _ => Err(out_of_bounds(off, len, arr_len)),
     }
 }
 
@@ -4011,6 +4033,20 @@ fn native_baos_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // A VALIDATION gap, not a message one: a negative capacity fell through to
+    // the default and the constructor SUCCEEDED, where the JDK refuses it.
+    // Same species as `G68-1`'s `createTempFile`, and the guard `*v > 0` is
+    // what hid it — it made "negative" and "unspecified" the same case.
+    if let Some(Value::Int(v)) = args.get(1) {
+        if *v < 0 {
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!("Negative initial size: {v}"),
+                }
+                .into(),
+            );
+        }
+    }
     let cap = match args.get(1) {
         Some(Value::Int(v)) if *v > 0 => *v as usize,
         _ => BAOS_DEFAULT_CAPACITY,
@@ -7637,6 +7673,22 @@ fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 // Tagged `Bridge` purely by inheritance from `register_io_natives`.
 fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
+    // RETAG ATTEMPTED 2026-08-19 AND REVERTED — the classification above is
+    // right and the tag is nevertheless LOAD-BEARING, the same shape the
+    // `FileInputStream` block in this file already calls out.
+    //
+    // `java.util.Scanner` declares no ACC_NATIVE method, so "stub" is the
+    // correct verdict. But this VM OWNS a Scanner's state: the source is an
+    // `Arc<str>` and the tokenizer is a Rust regex engine over `&str` (see
+    // known-issues/jdk-only/G71-1). Refuse the shim under `--jdk-only` and the
+    // real bytecode runs against a Scanner whose real fields were never
+    // populated:
+    //
+    //   RJdkIntrinsics3: findWithinHorizon(String, 0) expected "42", got null
+    //
+    // So a correct classification does NOT imply the registrar can be retagged.
+    // That needs the state to move first (G88-1 §5) — retiring the Rust
+    // tokenizer, which is wave-2 work.
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Scanner";
 
@@ -11826,7 +11878,18 @@ fn sw_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: usize) {
 // stub-tagged inner block should stay, the surrounding `Bridge` should not.
 fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // RETAGGED to match the JDK-ONLY-CLASSIFY verdict above, which already
+    // reads "stub" for java.io.StringReader/StringWriter. Only the TAG disagreed.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`): registrations 1,
+    // invocations 0, 0 ACC_NATIVE targets.
+    //
+    // Note what this REMOVES: some of these registrations sit on
+    // `java/lang/AutoCloseable` and `java/io/Closeable` — interfaces, so the
+    // shim was deciding dispatch for every USER class implementing them, not
+    // just for the JDK's. Refusing it under `--jdk-only` narrows that blast
+    // radius rather than widening it.
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // RDR-MIGRATION 2026-06-01: these StringReader natives track state in the
     // GC-stable `SR_STATE` side table (not object fields — see the comment
     // above `SR_STATE`), so they work against either the synthetic stub or a
@@ -12585,6 +12648,29 @@ const DOS_WRITTEN_FIELD: &str = "written";
 // `register_io_natives`.
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
+    // RETAG ATTEMPTED 2026-08-19 AND REVERTED — LOAD-BEARING, like
+    // `register_scanner_natives`. The verdict above is right and the tag is
+    // still doing work.
+    //
+    // The classification holds: 0 ACC_NATIVE, 25 of 37 shadow concrete
+    // bytecode, and 4 land on the `DataInput`/`DataOutput` INTERFACES (so this
+    // shim decides dispatch for every USER implementor — worth removing on its
+    // own, once it can be). And unlike the cold registrars, this one is
+    // genuinely exercised: 1039 invocations, five vectors.
+    //
+    // Retagged, that exercise reported the answer immediately:
+    //
+    //   RDataInputFastPull: skipped.next = -19
+    //
+    // The stream's position state is this VM's, not the real object's — see the
+    // 2-field synthetic layout documented at the top of this section, and the
+    // `written` slot fallback below it, which exists precisely because a
+    // synthetically-allocated `DataOutputStream` has no field NAMES to address.
+    // Refuse the shim and real bytecode reads a position it never wrote.
+    //
+    // Third instance of the same shape (G88-1 §8, with `scanner`): "stub"
+    // describes what the code IS; load-bearing describes what the VM DEPENDS
+    // ON. The state must move first, which is wave-2 work.
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let dis = "java/io/DataInputStream";
     // <init> intentionally not registered: real JDK bytecode correctly initializes
@@ -13362,7 +13448,10 @@ fn native_dis_read_fully_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 fn eof_exception() -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::EOFException {
-        message: "Unexpected EOF".to_string(),
+        // HotSpot's `DataInputStream` throws the no-arg constructor: the
+        // message is NULL. "Unexpected EOF" was ours and reads like a JDK
+        // string, which is what kept it.
+        message: String::new(),
     }))
 }
 
@@ -22727,9 +22816,30 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         .into());
     }
 
+    // MEASURED (Sweep18): a WatchService may only watch a DIRECTORY. HotSpot
+    // throws `NotDirectoryException` for a regular file; this accepted it and
+    // returned a live key that could never fire, which is the "fabricated
+    // success" shape rather than a refusal.
+    if !Path::new(&path_str).is_dir() {
+        return Err(RuntimeError::NotDirectoryException {
+            path: path_str.clone(),
+        }
+        .into());
+    }
+
     // Read the event kind bitmask. `watch_event_kind_bit` handles both the
     // real `StandardWatchEventKinds` singletons and the synthetic stand-ins.
     let kinds_len = ctx.array_length(kinds_arr);
+    // MEASURED (Sweep18): registering with NO event kinds is an
+    // `IllegalArgumentException` on HotSpot — `AbstractWatchService.register`
+    // rejects an empty set before it reaches the OS. This returned a valid key
+    // for a watch that can never fire.
+    if kinds_len == 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "no events to register".into(),
+        }
+        .into());
+    }
     let mut event_mask = 0i32;
     for i in 0..kinds_len {
         if let Value::Object(Some(kind)) = ctx.get_array_element(kinds_arr, i) {

@@ -148,7 +148,16 @@ radius, narrow evidence.
 
 ## 5. NOMINATIONS
 
-**N1 — `G55-1` N3, restated with its real cost and its real shape.** The
+**N1 — DONE 2026-08-18 at `1410c0a4b`**, in
+`G70-1-the-refactor-i-refused-twice-and-then-did-20260818.md`. Two
+corrections to what is written below: it needed **two** trait methods, not
+one — a value read losslessly and written back through `create_string` is
+lossy again at the last step, and `init_string_from_units` cannot stand in
+because it assumes the `char[]` layout a real JDK String does not use. And
+the population was **21 of 29 probe rows**, not the three §3 measured. Kept
+in full below because the reasoning for refusing it at the time was right.
+
+**N1 (original text) — `G55-1` N3, restated with its real cost and its real shape.** The
 `native-api` half is ~15 lines and §4 gives it in full. The work is the
 `native-collections` half: make `obj_to_display_string` return `Vec<u16>`, add
 a lossy adapter for the callers that genuinely want text, and take all

@@ -1544,9 +1544,42 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
             .heap
             .set_field(mirror, idx, Value::Object(Some(name_obj)));
     }
-    // primitive → true (1): this IS a primitive mirror.
+    // primitive → 1 ONLY when `prim_name` really is one of the nine primitive
+    // type names. This function is not only the primitive-mirror factory: it
+    // is also the VM's generic *stand-in* mirror factory, reached whenever a
+    // native has a class NAME it could not resolve to a `ClassId` and still
+    // has to hand Java code a `Class` object (`build_method_type_from_
+    // descriptor`'s `class_id_by_name` miss, the array-mirror minting in
+    // `lang_class.rs`, `getPrimitiveClass`-shaped shims, …). Writing `1`
+    // unconditionally made every one of those stand-ins claim to be primitive.
+    //
+    // The damage is not cosmetic. `Class.isPrimitive()` is load-bearing inside
+    // `java.lang.invoke`: `MethodTypeForm.canonicalize(t, ERASE)` erases a
+    // reference parameter to `Object` only when `!t.isPrimitive()`, so a
+    // stand-in that lies makes `findForm` believe an unerased `MethodType` is
+    // already erased, hand it straight to `new MethodTypeForm(mt)`, and die in
+    // `Wrapper.forPrimitiveType(<that class>)` with
+    // `IllegalArgumentException: not primitive: <name>`. That is the exact
+    // failure Groovy's `IndyInterface` fallback hit on every `invokedynamic`
+    // call site whose receiver is a script class the by-name lookup cannot see
+    // (`GroovyClassLoader$InnerLoader` defines it), and the reason the message
+    // reads `not primitive: beans` rather than `not primitive: class beans` —
+    // `Class.toString()` drops the `"class "` prefix precisely when
+    // `isPrimitive()` is true, so the message is its own proof.
+    // `int[].class.isPrimitive()` was wrong for the same reason.
+    //
+    // `mirror_is_primitive` still answers `true` for the nine real primitives
+    // through its name fallback, so nothing that depends on a genuine
+    // primitive mirror changes.
+    let is_real_primitive = matches!(
+        prim_name,
+        "int" | "long" | "float" | "double" | "boolean" | "byte" | "char" | "short" | "void"
+    );
     if let Some(idx) = slots.primitive {
-        shared.mem.heap.set_field(mirror, idx, Value::Int(1));
+        shared
+            .mem
+            .heap
+            .set_field(mirror, idx, Value::Int(i32::from(is_real_primitive)));
     }
     // classRedefinedCount → 0.
     if let Some(idx) = slots.class_redefined_count {

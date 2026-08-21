@@ -641,7 +641,27 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
-    match find(&name_str) {
+    Ok(Some(match provider_object_named(ctx, &name_str)? {
+        Some(p) => Value::Object(Some(p)),
+        None => Value::Object(None),
+    }))
+}
+
+/// The installed `Provider` object for `name`, or `None` when no provider by
+/// that name is installed — the body of `Security.getProvider(String)`,
+/// callable from a native that needs to ATTACH a provider rather than answer
+/// one.
+///
+/// Extracted so `javax.net.ssl.SSLContext.getProvider()` cannot grow a second
+/// copy of the "prefer the object the application actually registered" rule
+/// below; that rule is what makes `assertSame(added, ...)` and
+/// `instanceof BouncyCastleProvider` work, and a second implementation of it
+/// would be a second chance to get it wrong.
+pub(crate) fn provider_object_named(
+    ctx: &mut dyn NativeContext,
+    name_str: &str,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    match find(name_str) {
         Some((ver, coverage)) => {
             // A provider the application registered itself must come back as
             // THE SAME OBJECT it passed to `Security.addProvider`. The JDK's
@@ -657,14 +677,13 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             // service/creator maps) was unreachable through it. The registered
             // object is already pinned by `remember_real_provider`, so
             // preferring it costs no extra rooting.
-            if let Some(real) = resolve_real_provider(ctx, &name_str) {
-                return Ok(Some(Value::Object(Some(real))));
+            if let Some(real) = resolve_real_provider(ctx, name_str) {
+                return Ok(Some(real));
             }
-            let p = make_provider(ctx, &name_str, ver, coverage);
-            Ok(Some(Value::Object(Some(p?))))
+            Ok(Some(make_provider(ctx, name_str, ver, coverage)?))
         }
         // JDK contract: return null for unknown name.
-        None => Ok(Some(Value::Object(None))),
+        None => Ok(None),
     }
 }
 
@@ -4695,6 +4714,106 @@ fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) ->
     }
 }
 
+/// `Provider.getService(String, String)`, as the JDK declares it.
+const PROVIDER_GET_SERVICE_DESC: &str =
+    "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Provider$Service;";
+
+/// Resolve `(type, algorithm)` through a Provider OBJECT that declares its own
+/// `getService`, exactly as `sun.security.jca.GetInstance` does: call the
+/// override, then `newInstance(null)` on whatever `Provider$Service` it hands
+/// back — both virtually, so a `Provider$Service` SUBCLASS runs its own
+/// instantiation logic. Returns `Ok(None)` when this provider does not override
+/// `getService` (our own synthetics never do) or when the override answers
+/// null, leaving the caller on its side-table path.
+///
+/// Why this exists: a provider that overrides `getService` may register a
+/// legacy `put` value that is a MARKER, not a loadable class name, and keep the
+/// real factory somewhere only its own `Service` subclass can see. BouncyCastle's
+/// JSSE provider is exactly that shape — `addAlgorithmImplementation` puts
+/// `"org.bouncycastle.jsse.provider.SSLContext.TLSv1_3"` under the legacy key
+/// `SSLContext.TLSv1.3` and stashes the real factory in a private `creatorMap`
+/// that only `BouncyCastleJsseProvider$BcJsseService.newInstance` consults.
+/// Resolving it out of OUR service map instead reached `Class.forName` on that
+/// marker, so `SSLContext.getInstance("TLSv1.3", new BouncyCastleJsseProvider())`
+/// died with `ClassNotFoundException: org.bouncycastle.jsse.provider
+/// .SSLContext.TLSv1_3` where HotSpot ran BC's creator (netty's
+/// `BouncyCastleEngineAlpnTest`).
+///
+/// The side-table path is still the default for everything else: it hands back a
+/// `GetInstance$Instance` built from the Rust-side `ServiceEntry` without a
+/// `Provider$Service` round-trip, whose synthetic's className slot is not
+/// GC-stable (see `build_jca_instance`).
+fn provider_declared_service_instance(
+    ctx: &mut dyn NativeContext,
+    provider: ObjectRef,
+    type_str: &str,
+    algo: &str,
+) -> Result<Option<MethodCallResult>, MethodCallFailed> {
+    let cid = ctx.class_id_of_object(provider);
+    if !ctx.class_declares_method(cid, "getService", PROVIDER_GET_SERVICE_DESC) {
+        return Ok(None);
+    }
+    // Every `create_string` below can move the receiver, so pin first and
+    // re-read through the pin after each allocation.
+    let prov_pin = ctx.pin_native_root(provider);
+    let type_s0 = ctx.create_string(type_str);
+    let type_pin = ctx.pin_native_root(type_s0);
+    let algo_s0 = ctx.create_string(algo);
+    let algo_pin = ctx.pin_native_root(algo_s0);
+    let provider = ctx.read_native_pin(prov_pin, provider);
+    let type_s = ctx.read_native_pin(type_pin, type_s0);
+    let algo_s = ctx.read_native_pin(algo_pin, algo_s0);
+    let svc = match ctx.invoke_virtual(
+        provider,
+        "getService",
+        PROVIDER_GET_SERVICE_DESC,
+        &[Value::Object(Some(type_s)), Value::Object(Some(algo_s))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        // Null is the JDK's "this provider does not offer that algorithm"
+        // answer; the caller turns it into NoSuchAlgorithmException itself.
+        Ok(_) => {
+            ctx.unpin_native_roots(prov_pin);
+            return Ok(None);
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(prov_pin);
+            return Err(e);
+        }
+    };
+    let svc_pin = ctx.pin_native_root(svc);
+    let svc = ctx.read_native_pin(svc_pin, svc);
+    // A throw here (BC's `ProvSSLContextSpi.<clinit>` raising on a mismatched
+    // bcprov, for one) is the provider's own failure and must reach the caller
+    // unchanged — that IS the HotSpot behaviour.
+    let impl_ref = match ctx.invoke_virtual(
+        svc,
+        "newInstance",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(None)],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        Ok(_) => {
+            ctx.unpin_native_roots(prov_pin);
+            return Ok(None);
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(prov_pin);
+            return Err(e);
+        }
+    };
+    let impl_pin = ctx.pin_native_root(impl_ref);
+    let provider = ctx.read_native_pin(prov_pin, provider);
+    let impl_ref = ctx.read_native_pin(impl_pin, impl_ref);
+    let inst = ctx.new_object_initialized(
+        "sun/security/jca/GetInstance$Instance",
+        "(Ljava/security/Provider;Ljava/lang/Object;)V",
+        &[Value::Object(Some(provider)), Value::Object(Some(impl_ref))],
+    );
+    ctx.unpin_native_roots(prov_pin);
+    Ok(Some(inst))
+}
+
 fn getinstance_instance_provider_obj(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4702,12 +4821,23 @@ fn getinstance_instance_provider_obj(
     // (String type, Class clazz, String algorithm, Provider provider)
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 2);
-    let provider = match args.get(3) {
-        Some(Value::Object(Some(p))) => read_provider_name_version(ctx, *p)
+    // Read the name BEFORE anything allocates: `provider_declared_service_instance`
+    // pins its own receiver, but `p` here would go stale across it otherwise.
+    let prov_ref = match args.get(3) {
+        Some(Value::Object(Some(p))) => Some(*p),
+        _ => None,
+    };
+    let provider = match prov_ref {
+        Some(p) => read_provider_name_version(ctx, p)
             .map(|(n, _)| n)
             .unwrap_or_default(),
-        _ => String::new(),
+        None => String::new(),
     };
+    if let Some(p) = prov_ref {
+        if let Some(r) = provider_declared_service_instance(ctx, p, &type_str, &algo)? {
+            return r;
+        }
+    }
     match build_jca_instance(ctx, &provider, &type_str, &algo)? {
         Some(r) => r,
         None => Err(throw_no_such_algorithm(

@@ -45,3 +45,25 @@
 # Stock HotSpot 25 on this host: found=232 started=232 ok=216 failed=0
 # aborted=16 skipped=0 — identical.
 io.netty.resolver.dns.DnsNameResolverTest	232	216	16
+#
+# The io.netty.buffer alignment cluster: seven classes whose only aborts come
+# from one capability assumption,
+#   assumeTrue(PooledByteBufAllocator.isDirectMemoryCacheAlignmentSupported())
+# which answers false on this host for BOTH VMs. AlignedPooledByteBufAllocatorTest
+# gates EVERY test method (and its newAllocator override) on it, hence 28 of 49;
+# the other six only reach it through the subset of parameterizations that ask
+# for an aligned pooled allocator, hence 9 (or 2) out of ~500.
+#
+# All seven measured on stock HotSpot 25 on this host, one class per fork, same
+# classpath: found/ok/aborted below are byte-for-byte what CratonVM reports.
+# Only AlignedPooledByteBufAllocatorTest had been cross-checked before; the
+# other six were an inference in
+# fixed-suite-bugs/netty/buffer-alignment-abort-cluster-CLOSED-20260819.md
+# until this table was written.
+io.netty.buffer.AdvancedLeakAwareCompositeByteBufTest	506	497	9
+io.netty.buffer.AlignedPooledByteBufAllocatorTest	49	21	28
+io.netty.buffer.BigEndianCompositeByteBufTest	496	487	9
+io.netty.buffer.LittleEndianCompositeByteBufTest	496	487	9
+io.netty.buffer.PooledByteBufAllocatorTest	47	45	2
+io.netty.buffer.SimpleLeakAwareCompositeByteBufTest	506	497	9
+io.netty.buffer.WrappedCompositeByteBufTest	496	487	9

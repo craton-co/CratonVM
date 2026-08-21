@@ -1070,6 +1070,33 @@ pub(super) fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // `Long.valueOf(J)` — the twin of the `Integer.valueOf(I)`
+                    // recognition directly above, at this door for the same
+                    // stated reason: an OSR body is where a hot boxing loop
+                    // actually runs. `num_params: 1`, not 2 — the JIT counts one
+                    // operand slot per PARAMETER, not JVMS category-2 pairs.
+                    if invoke_kind == 3
+                        && cratonvm_jit::long_box_direct_helpers_enabled()
+                        && target_class == "java/lang/Long"
+                        && mn == "valueOf"
+                        && desc == "(J)Ljava/lang/Long;"
+                    {
+                        let entry =
+                            crate::jit::helpers::jit_long_value_of_direct as *const () as usize;
+                        cratonvm_jit::LONG_VALUE_OF_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
                     // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
                     // `AtomicInteger` read-modify-write family, through the
                     // SAME matcher `jit::try_compile_inner` uses so the two
@@ -1144,6 +1171,81 @@ pub(super) fn compile_osr_artifact(
                             },
                         ));
                         continue;
+                    }
+                    // `Long.longValue()` — the twin of `Integer.intValue()`
+                    // directly above. `java/lang/Long` is `final` on the same
+                    // terms, so a site declared against it is statically
+                    // monomorphic and needs no receiver guard; the helper
+                    // handles the null-receiver NPE and declines anything that
+                    // fails heap validation to the generic dispatcher.
+                    if invoke_kind == 0
+                        && cratonvm_jit::long_box_direct_helpers_enabled()
+                        && target_class == "java/lang/Long"
+                        && mn == "longValue"
+                        && desc == "()J"
+                    {
+                        let entry =
+                            crate::jit::helpers::jit_long_long_value_direct as *const () as usize;
+                        cratonvm_jit::LONG_LONG_VALUE_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                return_type: b'J',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // `VarHandle` read modes on an instance field with a
+                    // primitive return — parity with `jit::try_compile`'s
+                    // recognition (see `cratonvm_jit::VARHANDLE_READ_DIRECT_FNS`).
+                    //
+                    // THIS is the load-bearing door for the workload that
+                    // motivates the bind. netty checks `refCnt` on every
+                    // buffer accessor, so the reads happen inside the
+                    // byte-transfer LOOPS of `SnappyFrameDecoder` and
+                    // `ByteToMessageDecoder`, and a loop body is what OSR
+                    // compiles. A single-pass-only bind would report sites and
+                    // move nothing.
+                    //
+                    // Unlike its neighbours here this one asks the policy
+                    // question, because the answer is not the same for every
+                    // bind: the four read modes are registered
+                    // `NativeKind::Bridge`, which JDK-ONLY-WAVE2 §1.4 does not
+                    // permit a compile-time bake of. `dispatch_policy` is the
+                    // same source `jit::try_compile`'s `jdk_only` argument comes
+                    // from, so both doors refuse together.
+                    if invoke_kind == 0
+                        && cratonvm_jit::varhandle_read_direct_helpers_enabled()
+                        && target_class == "java/lang/invoke/VarHandle"
+                        && !crate::vm::dispatch_policy(shared).is_jdk_only()
+                    {
+                        if let Some(slot) = cratonvm_jit::varhandle_read_helper_slot(&mn, &desc) {
+                            // The helper address is taken directly rather than
+                            // read out of the jit-crate cell, for the
+                            // registration-order reason spelled out on the
+                            // `Integer.valueOf` recognition above: this path can
+                            // run before `build_helpers` has published them.
+                            let entry = crate::jit::helpers::varhandle_read_direct_fn(slot);
+                            cratonvm_jit::VARHANDLE_READ_SITES_OSR
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: cratonvm_jit::VARHANDLE_READ_RETURNS
+                                        [slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len()],
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
                     }
                     // Exact-HashMap `put`/`get` thin direct calls — parity
                     // with `jit::try_compile`'s recognition (guard-free: the
@@ -1940,6 +2042,51 @@ pub(super) fn compile_osr_artifact(
                     })
                     .collect(),
             );
+            // ── Compiled local exception handlers, OSR tier ─────────────────
+            //
+            // The same table a fourth time, with catch TYPES, so this artifact
+            // can run its own `catch` blocks instead of leaving compiled code
+            // for every one of them.
+            //
+            // This door matters MORE than the method-entry one, not less: a
+            // `@Test` body is invoked once, so OSR is its only route out of the
+            // interpreter, and `HttpHeaderValidationUtilTest`'s two exhaustive
+            // loops — the class this feature was written for — are exactly that
+            // shape. Staging it only in `jit::try_compile` would have left the
+            // feature structurally inert on the population it exists for.
+            //
+            // Staged only when every catch type resolves: a partial table would
+            // make a site answer "propagate" where the real table has a match —
+            // a slower answer arrived at by a lie.
+            if cratonvm_jit::local_handlers_enabled() && !osr_exception_table.is_empty() {
+                let cm_lock = shared.classes.class_manager.read();
+                let table = cm_lock.get_class(class_id).and_then(|class| {
+                    let mut rows: Vec<(usize, usize, usize, &'static str)> =
+                        Vec::with_capacity(osr_exception_table.len());
+                    for e in osr_exception_table.iter() {
+                        let name: &'static str = if e.catch_type == 0 {
+                            ""
+                        } else {
+                            match class.constant_pool.get_class_name(e.catch_type) {
+                                Some(n) => cratonvm_jit::intern_catch_type_name(n),
+                                None => return None,
+                            }
+                        };
+                        rows.push((
+                            // Widening: classfile pcs are u16.
+                            e.start_pc as usize,
+                            e.end_pc as usize,
+                            e.handler_pc as usize,
+                            name,
+                        ));
+                    }
+                    Some(rows)
+                });
+                drop(cm_lock);
+                if let Some(table) = table {
+                    crate::jit::x64::set_pending_local_handler_table(table, class_id.as_u32());
+                }
+            }
             // This artifact's install epoch was stamped by the `compile_gate`
             // admission at the top of this closure — before the class loading
             // and constant-pool resolution above, not here. A witness opened at
@@ -3276,7 +3423,42 @@ pub(super) fn jit_native_shadow_is_final_wrapper_unbox(
     )
 }
 
+/// The `java.lang.Double` bit reinterpretations the JIT now lowers itself.
+///
+/// Same shape of exemption as [`jit_native_shadow_is_final_wrapper_unbox`] and
+/// for a stronger version of the same reason. The seal exists because a
+/// compiled direct call bypasses the interpreter's native-vs-bytecode
+/// decision; for these two there is nothing to bypass, because the compiled
+/// form is not a call at all. `try_resolve_intrinsic`'s FP_BITS region lowers
+/// each to a single `MOVQ` that is bit-exact with the native it replaces --
+/// including the NaN payload, which is the whole content of the RAW contract.
+///
+/// Both are `public static native` on a `final` class, so no override can
+/// exist and the target is unambiguous.
+///
+/// Without this the intrinsic could never fire on the workload it was built
+/// for: `jit_method_calls_native_shadowed` seals a method out of the JIT for
+/// CONTAINING the call, and the intrinsic only resolves once the method is
+/// admitted to a compile. Measured on `PSquarePercentileTest`, whose
+/// `--dump-native-registry` census reported 361M invocations of exactly these
+/// two.
+///
+/// `doubleToLongBits` is absent, matching the resolver: it canonicalises NaN,
+/// so no `MOVQ` implements it.
+pub(super) fn jit_native_shadow_is_intrinsified_fp_bits(
+    target_class: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    target_class == "java/lang/Double"
+        && matches!(
+            (method_name, descriptor),
+            ("doubleToRawLongBits", "(D)J") | ("longBitsToDouble", "(J)D")
+        )
+}
+
 pub(super) fn jit_invoke_targets_native_shadow(
+
     shared: &SharedVm,
     caller_class_id: ClassId,
     cp_idx: u16,
@@ -3333,6 +3515,9 @@ pub(super) fn jit_invoke_targets_native_shadow(
     };
 
     if jit_native_shadow_is_final_wrapper_unbox(&target_class, &method_name, &descriptor) {
+        return false;
+    }
+    if jit_native_shadow_is_intrinsified_fp_bits(&target_class, &method_name, &descriptor) {
         return false;
     }
     // A compiled direct call bypasses the interpreter's native-vs-bytecode

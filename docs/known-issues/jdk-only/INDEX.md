@@ -969,3 +969,136 @@ Three of those are worth reading before acting anywhere in this tree:
   application (embedded Tomcat, booting and serving under `--jdk-only`) puts the
   population at **521 native-won triples**, so one vector was about a ninth of
   it, and the report now says out loud when its own list is truncated.
+* **`G69-1`** — 82 rows where **the exception type and the precedence were both
+  already exact and the sentence was wrong on every one**. A reflective field
+  refusal is diagnosed by reading its message, and ours named neither the field
+  nor the value (`Can not set static final field via Field.set: Field typed
+  setter`). Five grammars, three of them deliberately non-uniform — the
+  bad-receiver form carries `final`, the conversion form drops the modifiers and
+  quotes the name, and the generic `set` names a bad RECEIVER where every other
+  row names the value. Also the one thing nobody was looking for: **an array's
+  `class_id_of_object` is the COMPONENT's id**, so `int[]` printed as
+  `java.lang.Object` and `String[][]` lost a dimension. `Object.getClass()` had
+  always computed the descriptor itself; that computation is now shared. Read §8
+  N1 before trusting any of the other 306 sites that name an object by its class
+  id, and §7 before believing a `0 of 100` suite run.
+* **`G70-1`** — the `native-collections` units refactor, **done whole**.
+  Seventeen `toString` families all bottomed out in one function that returned
+  a Rust `String`, which cannot hold an unpaired UTF-16 surrogate: **21 of 29
+  probe rows diverged**, where `G63-1` had sampled three. Two corrections to
+  that record's plan — it needs TWO trait methods (a lossless read written back
+  through a lossy constructor is still lossy), and `init_string_from_units`
+  cannot stand in for the second because it assumes the `char[]` layout a real
+  JDK String does not use. Then the part worth reading: **two rows survived the
+  whole-family fix**, because real JDK `AbstractCollection.toString` is a
+  `sb.append(e)` loop and `StringBuilder.append(Object)` was still calling the
+  lossy reader — whose units-exact twin was built by `G26` and sits directly
+  above it, unused. A family fix that stops at the crate boundary is not whole.
+* **`G71-1`** — surrogate sweep 8, and the first sweep whose NEGATIVE result is
+  the bigger half: **38 of 42 rows were already exact**, including every
+  `StringBuilder`/`StringBuffer` `append`/`insert` overload, `Base64`,
+  `URLEncoder`, `Collator`, `MessageDigest`, `java.time` and
+  `chars()`/`codePoints()`. `G70-1` N2 supposed those siblings were suspect;
+  they were not. The four that failed share one shape — **the value never IS a
+  String**, so the units path that already carries a String argument was never
+  on: a boxed `Character` (which rendered `?`, not U+FFFD), `%s` of any
+  non-String object, and `CharBuffer.wrap(CharSequence)`, which lost the units
+  twice in one branch. `Scanner.nextLine()` is the fourth and is **left
+  unfixed and unrowed** — its buffer is host text end to end. Also read §
+  "toolchain" before trusting a build failure here: `-C lto=fat` crashes rustc
+  on this tree AND on unmodified HEAD, so a red build is not evidence about a
+  change.
+* **`G72-1`** — sweep 9 on the exception-contract axis `G68-1` N3 and `G69-1` N3
+  both nominated, and it **could not finish**: `Object.wait(-5)` on a held
+  monitor **blocks forever** where HotSpot throws `IllegalArgumentException`, so
+  29 of 33 rows have never been measured on CratonVM. A negative timeout is not
+  a long wait, it is an error — and `Thread.sleep(-1)` silently succeeds for the
+  same missing check while `Thread.join(-1)` right beside it is correct. A hang
+  is worse than a wrong value: it presents as "the application stopped", far
+  from the call. NOT FIXED. The oracle column for all 29 unmeasured rows is in
+  §4 so the next pass is a diff, not a measurement exercise.
+* **`G73-1`** — sweep 10 closes the exception-contract axis `G68-1` opened:
+  `Method.invoke` and `Constructor.newInstance`, 31 rows, **23 already exact**
+  — every `InvocationTargetException` wrapping, the access checks, argument
+  widening/narrowing, and the whole `java.lang.reflect.Array` family. Four
+  message defects fixed, and the one that is not a message: **`Constructor`
+  dropped the CAUSE that `Method` attaches**, so the same bad argument produced
+  different exceptions through the two doors and Spring's
+  `getCause() instanceof NPE` branch took the wrong arm. The logic was inline
+  in one and absent in the other; it is a shared helper now. Two residues are
+  left deliberately unfaked — their text names JDK internals
+  (`sun.invoke.util.ValueConversions`, a module/loader-qualified
+  `ClassCastException`), and inventing that is not transcription.
+* **`G74-1`** — two nominations CLOSED by measuring instead of assuming, and a
+  retraction. **`G69-1` N1** (306 sites naming an object by its class id, which
+  on an array is the COMPONENT's) is a mostly-NEGATIVE result: sweep 11, 51
+  rows, **50 already exact** — names across dimensions, component types,
+  assignability, `forName` round trips, `reflect.Array`, clone, arrays inside
+  collections. One live site, `Class.cast`, fixed. The premise was right and
+  the scale was wrong; do not re-audit 306 sites expecting a harvest.
+  **`G71-1`'s Scanner residue is DECIDED, not deferred**: its source is an
+  `Arc<str>` and the tokenizer runs a Rust regex engine over `&str`, so units
+  would need a hybrid representation — the cost is the regex boundary, not the
+  buffer. **RETRACTED: the fat-LTO build was never broken.** Four commits say a
+  release binary could not be produced on this host; that was `G72-1`'s own
+  leaked `cratonvm.exe`, and `-C lto=fat` builds clean once it is gone.
+* **`G75-1`** — `URI`/`URL` components and unpaired surrogates, measured on a
+  26-row probe and split into two defects that looked like one. **N2 is FIXED**:
+  `URL.toString()`/`toExternalForm()` rebuilt the external form as host text,
+  while `getPath()`/`getFile()` were exact — under `--jdk-only` the real JDK
+  constructor fills the components and only the reconstruction is ours. **N1 is
+  measured, costed and deliberately NOT started**: the URI parse loses the unit
+  three steps upstream of `url_parse`, in ten callers that read their arguments
+  with `read_string`, and a half-converted parse mis-slices EVERY URI rather
+  than only the ones with surrogates. Read §3 before reaching for the
+  positional-substitution trick — it works and it is a trick. Read the N2 entry
+  before editing any `URL`/`URI` native: I fixed the wrong twin first, and the
+  registry dump would have said so in one command.
+* **`TIMEOUT=420` — I ran a whole session without it and got away with it until
+  I did not.** `HANDOFF-20260812` says it is not optional on this host
+  (`RMapGcStress` needs ~4m55s against a 120 s default) and a retired record
+  calls the vector "a load flake [that] read as a result in both directions".
+  On a non-LTO binary it fit under 120 s and every arm was green; on the
+  fat-LTO binary it straddled the line and failed 2 runs of 4, which reads
+  exactly like a regression from whatever you just changed. It is not. Set
+  `TIMEOUT=420` on every arm, and when a GC-stress vector fails intermittently,
+  check the timeout before the diff — the documented answer was already written
+  down and the cost of not reading it was an hour.
+* **`G76-1`** — sweep 13, a fresh axis: what a failed PARSE says and what a
+  closed or out-of-range STREAM does. 48 rows, **42 already exact** (every
+  integral/radix/BigInteger/BigDecimal message, read-after-close on four stream
+  types, mark/reset). Six defects, two of them not messages: **`new
+  ByteArrayOutputStream(-1)` succeeded** — the guard `if v > 0` made "negative"
+  and "unspecified" the same case — and a bad read range raised
+  `ArrayIndexOutOfBoundsException` where HotSpot raises the BASE
+  `IndexOutOfBoundsException`, which survived precisely because `AIOOBE extends
+  IOOBE` and every `catch` still matched. The float parsers say `empty String`
+  where the integral ones say `For input string: ""`; both are vector rows, so
+  the difference cannot be simplified away. `EOFException` carries a null
+  message — an empty message is not the empty string, the same distinction
+  `G72-1` needed.
+* **`G77-1`** — two sweeps that found **nothing**, recorded because the
+  alternative is somebody probing them again. String bounds messages, case
+  mapping (including `ß`→`SS`, the `ﬁ` ligature, final sigma, Turkish `i`/`I`,
+  surrogate pairs and lone surrogates) and comparison: **44 rows exact**.
+  Serialization round trips, back-reference identity, `transient`, every
+  refusal, and the stream header: **20 rows exact**. Six preceding
+  contract sweeps found a defect within the first ten rows every time; these
+  two are unrelated to each other and to those six. The cheap message-shaped
+  hunt has reached diminishing returns — see §4 N2 for the three question
+  SHAPES never asked (concurrency, GC pressure, scale), which is where a next
+  sweep should go rather than at another subject.
+- [G78-1](G78-1-the-read-string-audit-and-the-file-that-merged-20260818.md) — the `read_string` caller audit: 2904 grep hits narrowed to 18 by dataflow and registry measurement; `java.io.File` lost the unit three times over and MERGED two distinct paths in equals/hashCode/compareTo. Closes G70-1 N1. 18 rows -> 2.
+- [G79-1](G79-1-the-census-that-was-said-not-to-exist-20260818.md) — the P0 over-tagging census EXISTS today (`--dump-native-registry` + a class-loading probe). `native-awt` measured: 187 registrations not 122, 22 genuine bridges not 10, and the "names absent methods" count is inflated ~4x by inheritance and placement. The suite has ZERO AWT coverage, so the arms cannot adjudicate a retag.
+- [G80-1](G80-1-the-first-awt-measurement-20260818.md) — the first AWT differential measurement: 10 of 25 headless rows diverged, 7 fixed (opaque-image alpha lost on read, an invented AIOOBE message, three unregistered `Graphics` methods raising AbstractMethodError). The 3 left are one design decision: `BufferedImage.getRaster()`/`getColorModel()` return null. Changes the P0 retag order.
+- [G81-1](G81-1-the-first-closed-row-20260819.md) — **the first CLOSED row in the table**: P2 "Headful AWT" → CLOSED(5), test named. 13 of 14 headful operations were ALREADY conformant while the row sat OPEN; the fourteenth threw an NPE, which fails rule 5 too (it demands a specification-consistent error, not any error). Route was written in the row's own required-resolution column all along.
+- [G82-1](G82-1-the-run-that-closed-a-p0-row-20260819.md) — **the first CLOSED P0 row**: *Real boot-image requirement* → CLOSED(5). It was waiting on nothing but execution — its own provenance note admitted "no cargo command was run this session". Four legs run and recorded; both cited tests now actually pass. Also corrects the row: there are TWO refusal messages, and the commoner user mistake gets the less informative one.
+- [G83-1](G83-1-the-ratchet-was-already-red-20260819.md) — the stub ratchet a P0 row cites as evidence has been FAILING (1308 vs a frozen 1277, SLACK 0), pre-existing and unnoticed because nobody ran it. The row's `157` matches neither baseline nor either measured population (1330 default / 0 strict). The strict zero is a DROP, not a resolution — and retagging a fake to Bridge improves both metrics while making the VM less correct.
+- [G84-1](G84-1-what-the-strict-report-actually-says-20260819.md) — `--jdk-only-report` counts exactly what three P0 rows argue about, and none of them cites it. One strict run: `compatibility_classes: 0`, ONE compatibility-class request in total (`cratonvm/stream/LazyOp`), `native-shadows-bytecode: 104`, `interpreter_shadow_unenforced: 77`. Explains why I did NOT close the fallback-policy row despite the evidence.
+- [G85-1](G85-1-six-retags-that-were-no-ops-20260819.md) — **CORRECTION**: six native-collections retags were NO-OPS (an inner explicit `set_category(Bridge)` overrode the call-site wrapper), so the session's real over-tagging figure is 54, not 433. Green arms and 127,920-check spot-checks cannot distinguish a safe retag from an inert one; the missing test was re-dumping the registry. Keeps the NotDeclaredSplit findings, which stand independently.
+- [G86-1](G86-1-the-two-lists-are-one-and-already-dead-20260819.md) — the P0 *Duplicate dispatch* row's "two lists that disagree" were centralised into ONE predicate and the StringJoiner exception retired on 2026-08-04; and under `--jdk-only` the list cannot fire at all (its guard needs a SyntheticStub, of which strict mode registers zero). Does NOT close the row — the JIT is a third location and is untouched.
+- [G87-1](G87-1-the-jit-third-location-measured-20260819.md) — the P0 *Duplicate dispatch* row's JIT "third location", measured under strict: 0 direct native binds, 0 inline-cache natives, and 38 fast-path admissions REFUSED (the field name reads as the opposite of what it counts). Live in `--real-jdk`, neutralised in `--jdk-only`. Does NOT close the row.
+- [G88-1](G88-1-the-state-map-that-gates-the-row-20260819.md) — retagged eight collection registrars at once to find out which classes carry REAL state: **all five collection vectors broke**. VM-owned state is pervasive, not a LinkedHashMap quirk. The safe-retag rule in one line: stateless surfaces or real-state objects retag; VM-owned containers do not. Shows four P0 rows are facets of ONE project — the VM owns state belonging to real JDK objects.
+- [G89-1](G89-1-the-red-ratchet-named-and-re-lit-20260819.md) — the stub ratchet had been failing in BLOCKING CI since 2026-08-14, so for five days it adjudicated nothing. All 109 excess stubs named at three commits. **The finding is a second column**: a relabel keeps its row and moves only its kind, a new fake adds one, and a single frozen count cannot separate two opposite-signed events. 78 relabels (registry unchanged at 12792 rows), 31 inherited and enumerated. Plus a scope defect — the file freezes two constants and CI ran one, the unrun one being the SHIPPING resolve.
+- [G90-1](G90-1-the-dial-and-the-arm-227-shadows-retired-20260819.md) — **227 §1.4 shadows retired.** The P0 over-tagging row's `104` is one vector's and counts `bytecode-won` successes with `native-won` failures; the defect over 36 vectors is 980, itself a floor. `CRATONVM_ENFORCE_NATIVE_SHADOW` takes a PREFIX list and nobody had swept it — the documented whole-VM catastrophe (1/36) is real and **not evenly distributed** (seven prefixes at 36/36). The finding worth more than the 227: the 36-vector screen passed two prefixes the 102-vector arm rejected, because the screen corpus asked those subsystems nothing.
+- [HANDOFF-20260819](HANDOFF-20260819.md) — where the goal stands, the four-step method that produced G90-1, the instruments and what each lies about, how to run the arms without losing an hour, and the standing traps.

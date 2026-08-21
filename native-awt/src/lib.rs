@@ -112,5 +112,5 @@ use cratonvm_native_api::{NativeKind, NativeMethodRegistry};
 // retired/l5-native-io-bridge-residuals-RETIRED-20260810.md.
 /// Register all AWT/Swing/Java2D native methods with the VM.
 pub fn register_awt_natives(registry: &mut NativeMethodRegistry) {
-    registry.with_category(NativeKind::Bridge, natives::register_all);
+    registry.with_category(NativeKind::SyntheticStub, natives::register_all);
 }

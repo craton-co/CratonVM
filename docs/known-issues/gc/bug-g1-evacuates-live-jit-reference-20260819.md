@@ -382,3 +382,134 @@ names the cause. On the pre-fix tree, `CRATONVM_JIT_DENY=java/lang/StringLatin1.
 turns it green, `--Xmx 8g` turns it green, and `-XX:+UseZGC` turns it green.
 
 Drivers used for the measurements above: `/data/h2ki-{build,run,rate2,instr,c2,fix2,reg}.sh`.
+## Two fixes were tried. Both are refuted, and that narrows the third.
+
+### Attempt 1 — refuse to evacuate when the publication is empty: OOMs
+
+Implemented as a default-ON kill switch (`CRATONVM_GC=-jit-safe-cset`): when
+`jit_active` and `pinned_jit_root_count() == 0`, build an empty CSet and let the
+pause run mark-only, which is the generational collector's stance.
+
+It does remove the wrong answer — `IllegalFormatConversionException` is gone —
+and the kill switch flips it straight back, so the guard is demonstrably what
+changed the behaviour. But it replaces one failure with another:
+
+```text
+Tests run: 14,  Failures: 0,  Errors: 8
+java.lang.OutOfMemoryError: Java heap space (new_object class_id 64 fields 18)
+```
+
+**Not shippable.** In this workload almost every young pause has a JIT frame
+active and an empty publication, so "skip evacuation" means "never evacuate",
+and a 1g heap fills. Trading a wrong answer for an `OutOfMemoryError` is not a
+fix. The change was reverted; it is recorded here because the *correctness* half
+of it is a clean positive control for the mechanism.
+
+### Attempt 2 — widen the conservative scan: does not help
+
+`CRATONVM_DBG_FULLSTACK_SCAN` already exists for exactly this question. Its own
+comment states the decision rule:
+
+> if this makes a live object visible … the missed root WAS on the stack but
+> outside the JIT chain's bounds (a range bug); if corruption persists, the
+> missed root is not on the stack at all
+
+Scanning the **entire** native stack instead of the per-entry
+`[scanner_sp, entry_sp)` ranges changes nothing — same failure, twice, and the
+pause still logs `pin_addrs=0`:
+
+```text
+PLAIN            FAIL   empty-pin pauses: 1
+FULLSTACK        FAIL   empty-pin pauses: 1
+FULLSTACK_AGAIN  FAIL   empty-pin pauses: 1
+```
+
+So **this is not a scan-range bug**, and widening the conservative scan cannot
+reach the reference. By the flag's own rule the missed root is not on the native
+stack at all — it lives in a callee-saved register (or is materialisable only
+from one) at the moment of the pause, which is precisely the case conservative
+stack scanning cannot cover and `pin_addrs=0` was faithfully reporting.
+
+That `pin_addrs` stays 0 even with the whole stack scanned is worth stating
+plainly: the publication is not dropping roots it found, it is finding none,
+because there are none *to find on the stack*.
+
+### What is left
+
+**Precise oop maps for JIT frames under G1** — which `conservative_roots`'s
+header already names as the eventual answer and which the two experiments above
+now leave as the only candidate that can work. Until then G1 remains exposed on
+any compiled frame that keeps its only reference in a register across an
+allocation, and the practical mitigations are the ones already measured:
+`-XX:+UseZGC` (the default), `--nojit`, or a heap large enough to avoid the
+pause.
+
+A narrower interim option worth measuring, if G1 correctness is wanted before
+oop maps land: make the empty-publication guard **evacuate but bound the CSet**
+rather than skip it entirely — e.g. keep evacuating regions that no thread could
+have referenced since the last safepoint — so the heap still drains. That is a
+design question, not a patch.
+
+## Attempt 2's instrument could not fire, so its conclusion does not hold
+
+Attempt 1 above is confirmed independently — the same guard, built separately,
+produced the same `Tests run: 14, Errors: 8` OOM. It ships as an opt-in lever
+(`CRATONVM_G1_PIN_EMPTY_PUBLICATION`, default OFF), not as a fix.
+
+Attempt 2 is a different matter. `CRATONVM_DBG_FULLSTACK_SCAN` has **exactly one
+reader**, at the top of `conservative_roots::scan_active_jit_frames`:
+
+```console
+$ grep -n 'dbg_fullstack_scan()' vm/src/jit/conservative_roots.rs
+3639:    if dbg_fullstack_scan() {
+```
+
+And `scan_active_jit_frames` is the call `collect_roots` **skips** whenever
+`moving_young_precise_only` holds — which is exactly the state this bug occurs
+in. So on the failing run the flag was read by a function that never executed.
+The three arms were not three experiments; they were the same run three times,
+which is why they report an identical `empty-pin pauses: 1`.
+
+The flag's decision rule is sound, but it was never applied: neither branch of
+"if this makes the object visible … if corruption persists …" was actually
+tested. See `a-narrow-probe-reports-its-own-reach-not-the-defect`.
+
+### What the scan finds when it is allowed to run
+
+`CRATONVM_DBG_JIT_ROOTSCAN=1`, one line per collection:
+
+```text
+precise_only=true   incomplete=false  chain=2  scan_added=0    <- as shipped: skipped
+precise_only=false  incomplete=false  chain=2  scan_added=42   <- forced to run
+```
+
+Forty-two conservative roots on the stack the previous section concluded had
+none. The reference is reachable to a conservative scan because
+`safepoint_reg_spill_all` blind-spills every used callee-saved GPR into a frame
+slot before each GC-capable call — so a register-resident oop *is* on the stack
+by the time the pause happens. That is the mechanism the "callee-saved register"
+reading missed.
+
+End-to-end, ABBA-interleaved, one binary, flag flipped:
+
+```text
+r1-fix PASS   r2-fix PASS   r3-fix PASS      precise_only=false  scan_added=42
+r1-ctl FAIL   r2-ctl FAIL   r3-ctl FAIL      precise_only=true   scan_added=0
+```
+
+(`ctl` = `CRATONVM_G1_PRECISE_ONLY_ROOTS=1`, which restores the pre-fix branch.)
+
+So precise oop maps were **not** the only remaining option. Two things shipped
+instead, and the bug is closed:
+
+1. **G1 no longer takes the precise-only branch** (`collect_roots`). The two
+   collectors protect a JIT-held oop by opposite means — the generational one by
+   rewriting what the maps name, G1 by pinning what the conservative scan
+   publishes. Skipping that scan left G1 with no protection rather than a
+   different one.
+2. **The coverage proof itself was unsound**, and is now fixed: it asserted a map
+   EXISTS per safepoint, not that the map lists every live oop, and the thing it
+   failed to describe was the staged invoke-argument buffer. Recorded separately
+   in `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`.
+
+The interim option floated above — "evacuate but bound the CSet" — is not needed.

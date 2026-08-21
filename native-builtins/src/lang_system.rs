@@ -1217,7 +1217,7 @@ pub(crate) fn native_thread_sleep_millis_nanos(
     if millis < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.sleep: timeout value is negative".to_string(),
+                message: "timeout value is negative".to_string(),
             }
             .into(),
         );
@@ -1225,7 +1225,7 @@ pub(crate) fn native_thread_sleep_millis_nanos(
     if !(0..=999_999).contains(&nanos) {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.sleep: nanosecond timeout value out of range".to_string(),
+                message: "nanosecond timeout value out of range".to_string(),
             }
             .into(),
         );
@@ -1245,6 +1245,32 @@ pub(crate) fn native_thread_sleep_millis_nanos(
     native_thread_sleep_nanos(ctx, &delegate_args)
 }
 
+/// `InterruptedException("sleep interrupted")`, which is what HotSpot throws
+/// out of `Thread.sleep` — and the message is the whole reason this exists.
+///
+/// `RuntimeError::InterruptedException` is a UNIT variant: it can carry no
+/// text, and every thrower of it therefore produced a null message. That is
+/// right for `Object.wait` and `Thread.join`, which is presumably why nobody
+/// noticed, and wrong for `sleep` alone. Materialising the exception with its
+/// `String` constructor is the same route `G68-1` used for
+/// `InstantiationException`; falling back to the unit variant keeps the throw
+/// even if the class cannot be built.
+fn sleep_interrupted(ctx: &mut dyn NativeContext) -> cratonvm_types::error::MethodCallFailed {
+    let msg = ctx.create_string("sleep interrupted");
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/lang/InterruptedException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg))],
+    ) {
+        return cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::MethodCallFailed::InternalError(
+        cratonvm_types::error::VmError::Runtime(
+            cratonvm_types::error::RuntimeError::InterruptedException,
+        ),
+    )
+}
+
 pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // WP4.5 вЂ” invokestatic uses generic `pop()` which type-erases the Long
     // bit-pattern down to `Value::Double` via `CompactValue::to_value()`.
@@ -1256,6 +1282,18 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Int(i)) => *i as i64,
         _ => 0,
     };
+    // G72-1: same missing check as `Object.wait(long)` had, and the same
+    // sibling-knew-better shape -- `native_thread_sleep_millis_nanos` above has
+    // it. A negative sleep silently succeeded here because the whole body is
+    // guarded by `millis > 0` and nothing else looked at the value.
+    if millis < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "timeout value is negative".to_string(),
+            }
+            .into(),
+        );
+    }
     if millis > 0 {
         // Keycloak Gap 9 localization (CRATONVM_DBG_SLEEP_TRACE): a worker is
         // stuck in a Thread.sleep poll-loop; sample the Java caller chain so we
@@ -1278,11 +1316,7 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
         // Check interrupted before sleeping
         if ctx.is_interrupted(true) {
-            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Runtime(
-                    cratonvm_types::error::RuntimeError::InterruptedException,
-                ),
-            ));
+            return Err(sleep_interrupted(ctx));
         }
         // NEW-15.4: virtual-thread aware sleep.
         //
@@ -1520,7 +1554,9 @@ pub(crate) fn native_thread_start0(
     // `container.onExit(this)`. See W7-27-thread-exit-java-cleanup.md §13.
     if thread_already_started(ctx, this) {
         return Err(RuntimeError::IllegalThreadStateException {
-            message: "Thread.start: this thread has already been started".to_string(),
+            // HotSpot throws the no-arg constructor here: the message is
+            // NULL, not a description. Measured.
+            message: String::new(),
         }
         .into());
     }
@@ -1685,7 +1721,7 @@ pub(crate) fn native_thread_join_timed(
     if millis < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.join: timeout value is negative".to_string(),
+                message: "timeout value is negative".to_string(),
             }
             .into(),
         );
@@ -1759,7 +1795,7 @@ pub(crate) fn native_thread_join_millis_nanos(
     if millis < 0 {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.join: timeout value is negative".to_string(),
+                message: "timeout value is negative".to_string(),
             }
             .into(),
         );
@@ -1767,7 +1803,7 @@ pub(crate) fn native_thread_join_millis_nanos(
     if !(0..=999_999).contains(&nanos) {
         return Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Thread.join: nanosecond timeout value out of range".to_string(),
+                message: "nanosecond timeout value out of range".to_string(),
             }
             .into(),
         );

@@ -2689,7 +2689,27 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_optional_natives(registry);
     register_collections_utility_natives(registry);
     register_map_entry_natives(registry);
-    register_factory_natives(registry);
+    // RETAGGED per subsystem — second of the twelve AMBIENT-inheriting
+    // registrars (see the note at `register_comparator_natives`; the other 48
+    // set their own category and a call-site wrapper is inert on them, G85-1).
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, default mode):
+    //   registrations 36 | invocations 61 | overwrote 0
+    //   real target: 36 DECLARED WITH CODE, 0 not-declared-here, 0 ACC_NATIVE
+    //
+    // Every row shadows a concrete real implementation — rule 4 with no
+    // residue. It is LIVE (61 dispatches), so unlike Comparator this does not
+    // rest on "nothing depends on it"; it rests on `List.of`/`Map.of`/`Set.of`
+    // having complete real bytecode and on heavy arm coverage.
+    //
+    // Note for whoever reads a red `RImmutableFactoryTypes`: that vector was
+    // ALREADY failing in `SUITE=all` before this change, and is one of the five
+    // long-standing baseline failures. The tag move and the arm result were
+    // both checked against that baseline rather than assumed.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_factory_natives,
+    );
     register_stream_natives(registry);
     register_collectors_natives(registry);
     register_int_stream_natives(registry);
@@ -2697,7 +2717,26 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_double_stream_natives(registry);
     register_interface_natives(registry);
     register_copy_constructor_natives(registry);
-    register_comparator_natives(registry);
+    // RETAGGED per subsystem (P0 "wholesale Bridge over-tagging").
+    //
+    // This registrar is one of the TWELVE in this crate that INHERIT the
+    // ambient tag. The other 48 set their own `set_category(Bridge)` at their
+    // head, which silently overrides a call-site wrapper — six retags written
+    // that way on 2026-08-19 were no-ops and were reverted (G85-1). The
+    // call-site technique only works here, and the tag move is verified from a
+    // registry dump rather than inferred from green arms.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, default mode):
+    //   registrations 14 | invocations 0 | overwrote 0
+    //   real target: 12 declared with code, 2 not-declared-here, 0 ACC_NATIVE
+    //
+    // Rule 4: `java.util.Comparator`'s implementations are pure Java with no
+    // VM boundary to bridge to, and nothing in the corpus depends on these
+    // shims answering.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_comparator_natives,
+    );
     register_string_joiner_natives(registry);
     register_random_natives(registry);
     register_optional_int_natives(registry);
@@ -2716,7 +2755,35 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_concurrent_hashmap_natives(registry);
     register_properties_natives(registry);
     register_collections_extras_natives(registry);
-    register_unmodifiable_natives(registry);
+    // RETAGGED per subsystem — the largest single win available on the ambient
+    // path, and the evidence is unusually direct.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, default mode):
+    //   registrations 300 | overwrote 2
+    //   all 300 target ELEVEN `cratonvm/internal/Unmodifiable*` classes —
+    //   VM-INTERNAL STAND-INS that no JDK declares. There is nothing to bridge
+    //   to: a native registered against a class this VM invented is a
+    //   compatibility shim by definition, which is exactly what this file's
+    //   header says of the crate as a whole.
+    //
+    // And under `--jdk-only` they are already inert. Measured directly:
+    //
+    //   Collections.unmodifiableList(...).getClass().getName()
+    //     HotSpot   java.util.Collections$UnmodifiableRandomAccessList
+    //     CratonVM  java.util.Collections$UnmodifiableRandomAccessList
+    //
+    // — plus the same for `unmodifiableMap`, the delegating reads, and the
+    // `UnsupportedOperationException` on mutation. Strict mode already answers
+    // this surface from real bytecode and never reaches the stand-ins, so
+    // dropping them removes dead weight rather than changing behaviour.
+    //
+    // This registrar is one of the twelve that INHERIT the ambient tag, so the
+    // call-site wrapper takes effect; the other 48 override it (G85-1). The tag
+    // move is asserted from a dump, not inferred from green arms.
+    registry.with_category(
+        cratonvm_native_api::NativeKind::SyntheticStub,
+        register_unmodifiable_natives,
+    );
     register_set_from_map_natives(registry);
     // BlockingQueue family (LinkedBlockingQueue, ArrayBlockingQueue,
     // ConcurrentLinkedQueue, ConcurrentLinkedDeque) is overridden with a
@@ -3615,6 +3682,68 @@ fn java_float_to_string(v: f32) -> String {
     }
 }
 
+/// A rendered display value in UTF-16 code units.
+///
+/// Every `toString` in this file used to build a Rust `String`, and a Rust
+/// `String` cannot hold an unpaired UTF-16 surrogate -- so all seventeen of
+/// them substituted U+FFFD for text a Java program is entitled to keep.
+/// `G63-1` section 3 measured three of them (`list_toString`, `map_toString`,
+/// `arrays_toString`) and named the other fourteen as the reason not to fix
+/// only those three: they are one defect in seventeen places, and converting a
+/// subset would have left siblings that are wrong in exactly the same way while
+/// looking like the question had been settled.
+type Units = Vec<u16>;
+
+/// An ASCII/BMP literal (the punctuation these renderers emit) as units.
+fn units_of(s: &str) -> Units {
+    s.encode_utf16().collect()
+}
+
+fn push_lit(buf: &mut Units, s: &str) {
+    buf.extend(s.encode_utf16());
+}
+
+/// `parts` joined by `sep`.
+fn join_units(parts: &[Units], sep: &[u16]) -> Units {
+    let total = parts.iter().map(|p| p.len()).sum::<usize>()
+        + sep.len() * parts.len().saturating_sub(1);
+    let mut out = Units::with_capacity(total);
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(sep);
+        }
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+/// `open + parts.join(sep) + close` -- `[a, b, c]`, `{k=v, k=v}`.
+fn wrap_join(open: &str, parts: &[Units], sep: &str, close: &str) -> Units {
+    let mut out = units_of(open);
+    out.extend_from_slice(&join_units(parts, &units_of(sep)));
+    push_lit(&mut out, close);
+    out
+}
+
+/// `k=v` for one map entry.
+fn entry_units(k: &[u16], v: &[u16]) -> Units {
+    let mut out = Units::with_capacity(k.len() + v.len() + 1);
+    out.extend_from_slice(k);
+    out.push(u16::from(b'='));
+    out.extend_from_slice(v);
+    out
+}
+
+/// Read a Java String field as units, for the delimiter/prefix/suffix a
+/// `Collectors.joining` carries. They are Java Strings like any other and can
+/// hold the same unpaired surrogate the elements can.
+fn read_units_field(ctx: &dyn NativeContext, obj: ObjectRef, field: usize) -> Units {
+    match ctx.get_field(obj, field) {
+        Value::Object(Some(r)) => ctx.read_string_units(r).unwrap_or_default(),
+        _ => Units::new(),
+    }
+}
+
 /// Try to read an object's string representation for display purposes.
 ///
 /// For objects that are not plain strings or primitives, this calls
@@ -3629,15 +3758,19 @@ fn java_float_to_string(v: f32) -> String {
 /// `toString()` came out of `list.toString()` looking like ordinary output.
 /// HotSpot propagates — `AbstractCollection.toString` is a bare
 /// `sb.append(e)` loop with no catch.
-fn obj_to_display_string(
+fn obj_to_display_units(
     ctx: &mut dyn NativeContext,
     val: &Value,
-) -> Result<String, MethodCallFailed> {
+) -> Result<Units, MethodCallFailed> {
     Ok(match val {
-        Value::Object(None) => "null".to_string(),
+        Value::Object(None) => units_of("null"),
         Value::Object(Some(obj)) => {
-            // Fast path: if it's a Java String, read it directly
-            if let Some(s) = ctx.read_string(*obj) {
+            // Fast path: if it's a Java String, read it directly -- in UNITS.
+            // This line and the `toString()` result below are the only two
+            // places a caller's own text enters this function, and they were
+            // both `read_string`, so both dropped an unpaired surrogate. Every
+            // other arm here renders a number or a class name and cannot.
+            if let Some(s) = ctx.read_string_units(*obj) {
                 return Ok(s);
             }
 
@@ -3668,24 +3801,30 @@ fn obj_to_display_string(
                 if is_wrapper {
                     match ctx.get_field(*obj, 0) {
                         Value::Int(v) => {
+                            // A boxed `Character` CAN be a lone surrogate --
+                            // `Character.valueOf('\ud800')` is legal and prints
+                            // as one unit. `char::from_u32` rejects exactly
+                            // those, and the old `unwrap_or('?')` turned them
+                            // into a question mark. Emitting the raw unit is
+                            // both simpler and correct.
                             return Ok(if name.contains("Boolean") {
-                                if v != 0 { "true" } else { "false" }.to_string()
+                                units_of(if v != 0 { "true" } else { "false" })
                             } else if name.contains("Character") {
-                                char::from_u32(v as u32).unwrap_or('?').to_string()
+                                vec![v as u16]
                             } else if name.contains("Byte") {
-                                (v as i8).to_string()
+                                units_of(&(v as i8).to_string())
                             } else if name.contains("Short") {
-                                (v as i16).to_string()
+                                units_of(&(v as i16).to_string())
                             } else {
-                                v.to_string()
+                                units_of(&v.to_string())
                             });
                         }
-                        Value::Long(v) => return Ok(v.to_string()),
+                        Value::Long(v) => return Ok(units_of(&v.to_string())),
                         // Fix (item 4): Java shortest-round-trip formatting,
                         // not Rust's default `{}` (which omits the trailing
                         // `.0` and uses `inf`/`NaN` spellings).
-                        Value::Float(v) => return Ok(java_float_to_string(v)),
-                        Value::Double(v) => return Ok(java_double_to_string(v)),
+                        Value::Float(v) => return Ok(units_of(&java_float_to_string(v))),
+                        Value::Double(v) => return Ok(units_of(&java_double_to_string(v))),
                         _ => {}
                     }
                 }
@@ -3694,8 +3833,8 @@ fn obj_to_display_string(
             // Call toString() via virtual dispatch
             match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[]) {
                 Ok(Some(Value::Object(Some(str_ref)))) => ctx
-                    .read_string(str_ref)
-                    .unwrap_or_else(|| "null".to_string()),
+                    .read_string_units(str_ref)
+                    .unwrap_or_else(|| units_of("null")),
                 Err(e) => return Err(e),
                 _ => {
                     // Final fallback: ClassName@hash. Arrays render the JVMS
@@ -3711,17 +3850,17 @@ fn obj_to_display_string(
                             .unwrap_or_else(|| "?".to_string())
                     };
                     let hash = ctx.identity_hash_code(*obj);
-                    format!("{}@{:x}", class_name.replace('/', "."), hash)
+                    units_of(&format!("{}@{:x}", class_name.replace('/', "."), hash))
                 }
             }
         }
-        Value::Int(v) => v.to_string(),
-        Value::Long(v) => v.to_string(),
+        Value::Int(v) => units_of(&v.to_string()),
+        Value::Long(v) => units_of(&v.to_string()),
         // Fix (item 4): Java shortest-round-trip formatting (see the boxed
         // wrapper arms above) for bare primitive floats/doubles too.
-        Value::Float(v) => java_float_to_string(*v),
-        Value::Double(v) => java_double_to_string(*v),
-        _ => "?".to_string(),
+        Value::Float(v) => units_of(&java_float_to_string(*v)),
+        Value::Double(v) => units_of(&java_double_to_string(*v)),
+        _ => units_of("?"),
     })
 }
 
@@ -6350,8 +6489,29 @@ fn al_or_collection_elements_pinned(
 ) -> Result<Vec<Value>, MethodCallFailed> {
     let mut elems = collect_collection_elements(ctx, this)?;
     let this = ctx.read_native_pin(this_pin, this);
+    let suspect = !elems.is_empty() && heuristic_snapshot_is_suspect(ctx, this, &elems);
+    // `CRATONVM_DBG_TOARRAY`: the layout-probe answer as it stands BEFORE
+    // either re-derivation below can overwrite it. Reading `nulls` beside
+    // `suspect` is what separates "the probe found nothing" (`heuristic_len=0`,
+    // falls through to the `size()`+real-iterator path) from "the probe found
+    // holes and the guard caught them" — the two ways a `toArray`-family answer
+    // goes wrong, which are indistinguishable from the caller.
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
+        let cid = ctx.class_id_of_object(this);
+        let nm = ctx
+            .class_name_arc_of_id(cid)
+            .map_or_else(|| "<unknown>".to_string(), |a| a.to_string());
+        let nulls = elems
+            .iter()
+            .filter(|v| matches!(v, Value::Object(None)))
+            .count();
+        eprintln!(
+            "[DBG_TOARRAY] al_or_collection_elements recv={nm} heuristic_len={} nulls={nulls} suspect={suspect}",
+            elems.len()
+        );
+    }
     if !elems.is_empty() {
-        if heuristic_snapshot_is_suspect(ctx, this, &elems) {
+        if suspect {
             let this = ctx.read_native_pin(this_pin, this);
             // The `?` matters here even though we already hold `elems`:
             // `heuristic_snapshot_is_suspect` has just said the snapshot in
@@ -6385,6 +6545,24 @@ fn al_or_collection_elements_pinned(
 /// through the bytecode's `Arrays.copyOf(elementData, size, a.getClass())`
 /// path which NPEs on synthetic ArrayLists.
 pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `CRATONVM_DBG_TOARRAY`, at the very top so it reports the calls the
+    // routes below divert as well as the ones that reach the body. The
+    // ABSENCE of this line is itself a finding: this native is registered on
+    // `java/util/AbstractCollection` by `register_collections_natives`, but
+    // real-JDK mode registers `real_jdk_to_array_typed` (`vm/src/vm/
+    // vm_init.rs`) over the top of it, so a silent trace on a real-JDK run
+    // means the OTHER implementation is the one under investigation.
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
+        let cls = match args.first() {
+            Some(Value::Object(Some(o))) => {
+                let cid = ctx.class_id_of_object(*o);
+                ctx.class_name_arc_of_id(cid)
+                    .map_or_else(|| "<unknown>".to_string(), |a| a.to_string())
+            }
+            _ => "<null>".to_string(),
+        };
+        eprintln!("[DBG_TOARRAY] native_al_to_array_typed ENTER recv={cls}");
+    }
     if let Some(r) = ksv_route(ctx, args, native_ksv_to_array_typed) {
         return r;
     }
@@ -6765,23 +6943,20 @@ pub fn native_al_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let size = size as usize;
     // Pre-size: "[" + N elements averaging ~16 chars each + (N-1) ", " + "]".
     // Single allocation avoids the intermediate Vec<String> + join() walk.
-    let mut text = String::with_capacity(2 + size.saturating_mul(18));
-    text.push('[');
+    let mut text = Units::with_capacity(2 + size.saturating_mul(18));
+    text.push(u16::from(b'['));
     if let Some(d) = data {
         for i in 0..size {
             if i > 0 {
-                text.push_str(", ");
+                push_lit(&mut text, ", ");
             }
             let val = ctx.get_array_element(d, i);
-            // Hoisted out of the `write!` argument so the `?` is an ordinary
-            // statement rather than a return out of a macro expansion.
-            let d = obj_to_display_string(ctx, &val)?;
-            // `write!` into a String never fails; ignore the Result.
-            let _ = write!(text, "{}", d);
+            let d = obj_to_display_units(ctx, &val)?;
+            text.extend_from_slice(&d);
         }
     }
-    text.push(']');
-    let s = ctx.create_string(&text);
+    text.push(u16::from(b']'));
+    let s = ctx.create_string_from_units(&text);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -8322,18 +8497,18 @@ fn native_asl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // ArrayList's, so the ArrayList toString cannot be reused directly).
     let buf = asl_snapshot(ctx, this)?;
     let len = ctx.array_length(buf);
-    let mut text = String::with_capacity(2 + len.saturating_mul(18));
-    text.push('[');
+    let mut text = Units::with_capacity(2 + len.saturating_mul(18));
+    text.push(u16::from(b'['));
     for i in 0..len {
         if i > 0 {
-            text.push_str(", ");
+            push_lit(&mut text, ", ");
         }
         let val = ctx.get_array_element(buf, i);
-        let d = obj_to_display_string(ctx, &val)?;
-        let _ = write!(text, "{}", d);
+        let d = obj_to_display_units(ctx, &val)?;
+        text.extend_from_slice(&d);
     }
-    text.push(']');
-    let s = ctx.create_string(&text);
+    text.push(u16::from(b']'));
+    let s = ctx.create_string_from_units(&text);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -13353,12 +13528,12 @@ fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let entries = map_collect_entries(ctx, this);
     let mut parts = Vec::with_capacity(entries.len());
     for (key, value) in &entries {
-        let ks = obj_to_display_string(ctx, key)?;
-        let vs = obj_to_display_string(ctx, value)?;
-        parts.push(format!("{}={}", ks, vs));
+        let ks = obj_to_display_units(ctx, key)?;
+        let vs = obj_to_display_units(ctx, value)?;
+        parts.push(entry_units(&ks, &vs));
     }
-    let text = format!("{{{}}}", parts.join(", "));
-    let s = ctx.create_string(&text);
+    let text = wrap_join("{", &parts, ", ", "}");
+    let s = ctx.create_string_from_units(&text);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -16043,6 +16218,15 @@ fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/Collection;)Z",
             native_hs_contains_all,
         );
+        // `ConcurrentHashMap$EntrySetView` DECLARES `removeIf`, so without this
+        // the receiver-has-own-bytecode rule ran `map.removeEntryIf(filter)`
+        // over a view whose `map` field is null. See `native_hs_remove_if`.
+        r.register(
+            c,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            native_hs_remove_if,
+        );
     }
     r.set_category(__prev_cat);
 }
@@ -17049,10 +17233,10 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let keys = collect_view_snapshot_ordered(ctx, backing)?;
     let mut parts = Vec::with_capacity(keys.len());
     for k in &keys {
-        parts.push(obj_to_display_string(ctx, k)?);
+        parts.push(obj_to_display_units(ctx, k)?);
     }
-    let text = format!("[{}]", parts.join(", "));
-    let s = ctx.create_string(&text);
+    let text = wrap_join("[", &parts, ", ", "]");
+    let s = ctx.create_string_from_units(&text);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -17734,17 +17918,17 @@ fn native_arrays_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let len = ctx.array_length(arr);
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
-    // obj_to_display_string can dispatch toString and move `arr`.
+    // obj_to_display_units can dispatch toString and move `arr`.
     let arr_pin = ctx.pin_native_root(arr);
     let mut parts = Vec::with_capacity(len);
     for i in 0..len {
         let arr = ctx.read_native_pin(arr_pin, arr);
         let val = ctx.get_array_element(arr, i);
-        parts.push(obj_to_display_string(ctx, &val)?);
+        parts.push(obj_to_display_units(ctx, &val)?);
     }
     ctx.unpin_native_roots(arr_pin);
-    let text = format!("[{}]", parts.join(", "));
-    let s = ctx.create_string(&text);
+    let text = wrap_join("[", &parts, ", ", "]");
+    let s = ctx.create_string_from_units(&text);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -18266,13 +18450,16 @@ fn native_opt_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
     let s = match val {
-        _ if opt_value_is_empty(val) => "Optional.empty".to_string(),
+        _ if opt_value_is_empty(val) => units_of("Optional.empty"),
         _ => {
-            let display = obj_to_display_string(ctx, &val)?;
-            format!("Optional[{display}]")
+            let display = obj_to_display_units(ctx, &val)?;
+            let mut out = units_of("Optional[");
+            out.extend_from_slice(&display);
+            out.push(u16::from(b']'));
+            out
         }
     };
-    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    Ok(Some(Value::Object(Some(ctx.create_string_from_units(&s)))))
 }
 
 // ===========================================================================
@@ -20704,6 +20891,8 @@ fn register_factory_natives(r: &mut NativeMethodRegistry) {
         native_map_of_entries,
     );
     r.set_category(__prev_cat);
+    // The write and read halves of what the factories above produce.
+    register_immutable_serialization_natives(r);
 }
 
 /// Generic `List.of` for fixed-arity overloads: every positional arg is an
@@ -21186,6 +21375,327 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let k2 = args.get(2).copied().unwrap_or(Value::Object(None));
     let v2 = args.get(3).copied().unwrap_or(Value::Object(None));
     of_map(ctx, &[(k1, v1), (k2, v2)])
+}
+
+// ===========================================================================
+// Serialization of the immutable collection carriers
+// ===========================================================================
+//
+// `List.of`/`Set.of`/`Map.of`/`copyOf` hand back a CratonVM-minted carrier
+// stamped with a `cratonvm/internal/Unmodifiable*` class that `getClass()`
+// aliases to the size-discriminated real JDK class (`ImmutableCollections$
+// List12`/`ListN`/`Set12`/`SetN`/`Map1`/`MapN`) - see `collection_display_kind`
+// in native-builtins. Its state is this crate's `(backing, immutable-marker)`
+// slot pair, NOT the `e0`/`e1`/`elements`/`table` fields those JDK classes
+// declare.
+//
+// Serialization is the one place that difference escaped. `ObjectOutputStream`
+// looks the object's class up by its ALIASED name, finds the real
+// `writeReplace()` those six classes declare, and runs it - over a receiver
+// whose declared fields were never populated. The `java.util.CollSer` it built
+// therefore carried this crate's slots instead of the elements:
+//
+// ```text
+//                       HotSpot        CratonVM (before)
+//   List.of("a")        [a]            [[a], 1]   <- (backing, marker)
+//   Set.of("a","b")     [a, b]         InvalidObjectException: invalid object
+//   Map.of("a","1")     {a=1}          InvalidObjectException: invalid object
+// ```
+//
+// 20 of the 52 rows of `probes/CollectionSerProbe.java` failed this way, and it
+// is why Spring's `AnnotationTransactionAttributeSourceTests.serializable()`
+// died in `CollSer.readResolve` with `InvalidObjectException: invalid object`
+// (its cause an NPE out of `Set.of(array)`, which rejects the null elements a
+// null `elements` field produced).
+//
+// The fix is the pair below: `writeReplace` builds the `CollSer` from the
+// receiver's OWN public surface (`toArray()`, `entrySet()`) so it is correct
+// for a CratonVM carrier and for a genuine JDK instance alike, and
+// `CollSer.readResolve` rebuilds through `of_list`/`of_set`/`of_map` so the
+// result is a CratonVM carrier rather than a real `MapN` whose `table` these
+// natives cannot read. Both need an entry in BOTH force-native gates
+// (`force_native_over_real_jdk_bytecode` and its `vm_exec` twin), because each
+// class declares the method itself and the reflective `Method.invoke` route
+// `ObjectStreamClass` uses has no bytecode PC to key an invoke-cache entry on.
+
+/// `java.util.CollSer`'s tag values (java.base, `ImmutableCollections.java`).
+/// The low 8 bits pick the shape; the high 24 are reserved and written zero.
+const COLLSER_CLASS: &str = "java/util/CollSer";
+const COLLSER_IMM_LIST: i32 = 1;
+const COLLSER_IMM_SET: i32 = 2;
+const COLLSER_IMM_MAP: i32 = 3;
+const COLLSER_IMM_LIST_NULLS: i32 = 4;
+
+/// Snapshot a collection receiver's elements through its own `toArray()`.
+///
+/// Deliberately a virtual dispatch and not a slot read: this native is reached
+/// for a CratonVM-minted carrier AND for a genuine java.base-built instance of
+/// the same class, and only the receiver knows which it is.
+fn collser_elements(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
+    let arr = match ctx.invoke_virtual(this, "toArray", "()[Ljava/lang/Object;", &[])? {
+        Some(Value::Object(Some(a))) => a,
+        _ => return Ok(Vec::new()),
+    };
+    let len = ctx.array_length(arr);
+    Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+}
+
+/// Build the `java.util.CollSer` replacement object for `tag` over `elems`.
+///
+/// GC-SAFETY: `alloc_ref_array` and `new_object` both allocate, so the elements
+/// are pinned before the first of them and the array across the second.
+fn make_collser(ctx: &mut dyn NativeContext, tag: i32, elems: &[Value]) -> MethodCallResult {
+    let (base, handles) = pin_value_slice(ctx, elems);
+    let arr = alloc_ref_array(ctx, elems.len());
+    let arr_pin = ctx.pin_native_root(arr);
+    let base = if base == usize::MAX { arr_pin } else { base };
+    for (i, e) in elems.iter().enumerate() {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let v = read_pinned_elem(ctx, handles[i], *e);
+        ctx.set_array_element(arr, i, v);
+    }
+    let ser = match ctx.new_object(COLLSER_CLASS) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        Ok(_) => {
+            ctx.unpin_native_roots(base);
+            return Ok(Some(Value::Object(None)));
+        }
+        Err(e) => {
+            ctx.unpin_native_roots(base);
+            return Err(e);
+        }
+    };
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(base);
+    // By name, not by slot: `tag`/`array` are java.base's field names and this
+    // is a real JDK object, so a positional guess would be the same class of
+    // mistake this whole fix is about.
+    ctx.set_field_by_name(ser, "tag", Value::Int(tag));
+    ctx.set_field_by_name(ser, "array", Value::Object(Some(arr)));
+    Ok(Some(Value::Object(Some(ser))))
+}
+
+/// `ImmutableCollections$List12.writeReplace()` / `$ListN.writeReplace()`.
+///
+/// `IMM_LIST_NULLS` when any element is null - `List.of` cannot produce one,
+/// but the nulls-allowed lists java.base builds through
+/// `listFromTrustedArrayNullsAllowed` share these carriers, and `List.of(array)`
+/// on the read side rejects nulls with an NPE that surfaces as exactly the
+/// opaque `InvalidObjectException` this fixes.
+fn native_imm_list_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elems = collser_elements(ctx, this)?;
+    let tag = if elems.iter().any(|e| matches!(e, Value::Object(None))) {
+        COLLSER_IMM_LIST_NULLS
+    } else {
+        COLLSER_IMM_LIST
+    };
+    make_collser(ctx, tag, &elems)
+}
+
+/// `ImmutableCollections$Set12.writeReplace()` / `$SetN.writeReplace()`.
+fn native_imm_set_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let elems = collser_elements(ctx, this)?;
+    make_collser(ctx, COLLSER_IMM_SET, &elems)
+}
+
+/// `ImmutableCollections$Map1.writeReplace()` / `$MapN.writeReplace()`.
+///
+/// The array is `k0, v0, k1, v1, ...`, so its length is twice the size - the
+/// layout `CollSer.readResolve`'s `IMM_MAP` arm reads back.
+fn native_imm_map_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // `entrySet()` then `getKey`/`getValue` per entry, for the same reason
+    // `native_map_of_entries` does it: the entry objects may be any
+    // `Map.Entry` implementation, and a positional read would assume one.
+    let entries = match ctx.invoke_virtual(this, "entrySet", "()Ljava/util/Set;", &[])? {
+        Some(Value::Object(Some(es))) => collser_elements(ctx, es)?,
+        _ => Vec::new(),
+    };
+    let (base, handles) = pin_value_slice(ctx, &entries);
+    let mut flat: Vec<Value> = Vec::with_capacity(entries.len() * 2);
+    let mut failure = None;
+    for i in 0..entries.len() {
+        // Re-read the entry from its pin before EACH dispatch: `getKey` can
+        // itself allocate and relocate the entry the `getValue` call needs.
+        let e = match read_pinned_elem(ctx, handles[i], entries[i]) {
+            Value::Object(Some(o)) => o,
+            _ => continue,
+        };
+        let k = match ctx.invoke_virtual(e, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
+        let k_pin = pin_value(ctx, k);
+        let e = match read_pinned_elem(ctx, handles[i], entries[i]) {
+            Value::Object(Some(o)) => o,
+            _ => continue,
+        };
+        let v = match ctx.invoke_virtual(e, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
+        flat.push(read_pinned_elem(ctx, k_pin, k));
+        flat.push(v);
+    }
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    make_collser(ctx, COLLSER_IMM_MAP, &flat)
+}
+
+/// `Collections$UnmodifiableRandomAccessList.writeReplace()`.
+///
+/// The JDK body is `new UnmodifiableList<>(list)` - it downgrades the
+/// RandomAccess wrapper to the plain one so the stream never names a class that
+/// exists only to carry the marker interface, and `UnmodifiableList.readResolve`
+/// puts it back. Over a CratonVM carrier `this.list` is unset, so the stream got
+/// a wrapper around null and reading it back threw NPE.
+///
+/// Answering `this` is the whole fix: the plain `Collections$Unmodifiable{List,
+/// Set,Map,Collection,SortedSet,NavigableSet}` carriers declare no
+/// `writeReplace` and already round-trip correctly - `probes/
+/// CollectionSerProbe.java`'s `unmodifiableList(LinkedList)` row, the
+/// non-RandomAccess twin of the failing one, passes - so declining the
+/// replacement puts the RandomAccess list on that same working path.
+fn native_unmod_ral_write_replace(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+}
+
+/// `java.util.CollSer.readResolve()`.
+///
+/// The real body rebuilds through `List.of`/`Set.of` (natives here, fine) but
+/// through `new ImmutableCollections.Map1<>(k, v)` / `new MapN<>(array)` for
+/// maps - real constructors, producing a real `table`-backed object that every
+/// map native in this crate then reads as empty (`NullPointerException: Cannot
+/// read the array length because "this.table" is null`). Rebuilding through
+/// `of_map` keeps the deserialized map a CratonVM carrier, which is what the
+/// rest of the VM - and `getClass()` - already agrees on.
+///
+/// A tag this does not recognise is handed back untouched rather than turned
+/// into an exception of this native's choosing: `readResolve` answering a
+/// `CollSer` is the corrupt-stream case, and inventing a message the JDK does
+/// not use would only obscure it.
+fn native_collser_read_resolve(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let tag = match ctx.get_field_by_name(this, "tag") {
+        Value::Int(t) => t & 0xff,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let arr = match ctx.get_field_by_name(this, "array") {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let len = ctx.array_length(arr);
+    let elems: Vec<Value> = (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+    match tag {
+        COLLSER_IMM_LIST | COLLSER_IMM_LIST_NULLS => of_list_allowing_nulls(ctx, &elems, tag),
+        COLLSER_IMM_SET => of_set(ctx, &elems),
+        COLLSER_IMM_MAP => {
+            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elems.len() / 2);
+            let mut i = 0;
+            while i + 1 < elems.len() {
+                pairs.push((elems[i], elems[i + 1]));
+                i += 2;
+            }
+            of_map(ctx, &pairs)
+        }
+        _ => Ok(Some(Value::Object(Some(this)))),
+    }
+}
+
+/// `of_list`, but honouring `IMM_LIST_NULLS`: that tag exists precisely because
+/// the list is allowed to hold nulls, so `of_list`'s null rejection - correct
+/// for `List.of` - must not run for it.
+fn of_list_allowing_nulls(
+    ctx: &mut dyn NativeContext,
+    elems: &[Value],
+    tag: i32,
+) -> MethodCallResult {
+    if tag == COLLSER_IMM_LIST_NULLS {
+        let r = make_list_of(ctx, elems);
+        return freeze_result(ctx, UNMOD_LIST_CLASS, r);
+    }
+    of_list(ctx, elems)
+}
+
+/// Register the serialization hooks above, from the same registrar that
+/// installs `List.of`/`Set.of`/`Map.of`: these are the write and read halves of
+/// what those factories produce.
+fn register_immutable_serialization_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for c in [
+        "java/util/ImmutableCollections$List12",
+        "java/util/ImmutableCollections$ListN",
+    ] {
+        r.register(
+            c,
+            "writeReplace",
+            "()Ljava/lang/Object;",
+            native_imm_list_write_replace,
+        );
+    }
+    for c in [
+        "java/util/ImmutableCollections$Set12",
+        "java/util/ImmutableCollections$SetN",
+    ] {
+        r.register(
+            c,
+            "writeReplace",
+            "()Ljava/lang/Object;",
+            native_imm_set_write_replace,
+        );
+    }
+    for c in [
+        "java/util/ImmutableCollections$Map1",
+        "java/util/ImmutableCollections$MapN",
+    ] {
+        r.register(
+            c,
+            "writeReplace",
+            "()Ljava/lang/Object;",
+            native_imm_map_write_replace,
+        );
+    }
+    r.register(
+        "java/util/Collections$UnmodifiableRandomAccessList",
+        "writeReplace",
+        "()Ljava/lang/Object;",
+        native_unmod_ral_write_replace,
+    );
+    r.register(
+        COLLSER_CLASS,
+        "readResolve",
+        "()Ljava/lang/Object;",
+        native_collser_read_resolve,
+    );
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -24323,6 +24833,59 @@ fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Object(Some(stream))))
 }
 
+/// `TreeSet.spliterator()` / `TreeMap$KeySet.spliterator()` — the same sorted
+/// snapshot [`native_ts_stream`] takes, in the three-field synthetic
+/// `java/util/Spliterator` shape [`native_hs_spliterator`] produces.
+///
+/// The comment on `native_ts_stream` above explains why `stream()` needs an
+/// override; `spliterator()` needs it for the same reason and did not have one.
+/// Both classes DECLARE `spliterator()`, so the receiver-has-own-bytecode rule
+/// ran the JDK body — `TreeMap.keySpliteratorFor(m)` — against fields our
+/// layout keeps in the `ts_array_table` side-table instead, and every caller
+/// got `NullPointerException: Cannot invoke
+/// "java.util.TreeMap$NavigableSubMap.keySpliterator()" because "sm" is null`.
+/// `force_native_over_real_jdk_bytecode` already listed `spliterator` for
+/// `java/util/TreeMap$KeySet`; as ever, a gate entry is not a registration.
+fn native_ts_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+            ctx.set_field(spl, 0, Value::Object(Some(arr)));
+            ctx.set_field(spl, 1, Value::Int(0));
+            ctx.set_field(spl, 2, Value::Int(0));
+            return Ok(Some(Value::Object(Some(spl))));
+        }
+    };
+    let this = resync_ts_view(ctx, this)?;
+    let this_pin = ctx.pin_native_root(this);
+    let (_, size, _) = ts_state(ctx, this);
+    // Allocate first, then RE-read the element table through the pin: the
+    // allocation can move it (same count -> allocate -> re-read discipline as
+    // `native_hs_to_array`).
+    let arr = alloc_ref_array(ctx, size as usize);
+    let arr_pin = ctx.pin_native_root(arr);
+    let this = ctx.read_native_pin(this_pin, this);
+    let (data_opt, live_size, _) = ts_state(ctx, this);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let n = (live_size as usize).min(size as usize);
+    if let Some(data) = data_opt {
+        for i in 0..n {
+            ctx.set_array_element(arr, i, ctx.get_array_element(data, i));
+        }
+    }
+    let spl = try_alloc_synthetic(ctx, "java/util/Spliterator", 3)?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    // The cursor end is the array's own length, so a shrunk-since-allocation
+    // table cannot leave trailing nulls inside the reported range.
+    ctx.set_field(spl, 2, Value::Int(n as i32));
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(spl))))
+}
+
 // -- Intermediate operations --
 
 /// Diagnostic-only tripwire for the pin/read-through-handle path shared by
@@ -24656,7 +25219,7 @@ fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
     };
 
-    // GC-SAFETY: key extraction (`obj_to_display_string` → `toString`) allocates
+    // GC-SAFETY: key extraction (`obj_to_display_units` → `toString`) allocates
     // and can trigger a moving young GC that relocates the elements out from under
     // this bare Rust `Vec`. Pin the elements, precompute each key by re-reading
     // from its pin handle, sort an index permutation (keys are plain, no further
@@ -24694,12 +25257,18 @@ fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // closure has to keep returning a `Result` for the sort key, and a
         // refused element `toString()` must abort the sort instead of ordering
         // the stream by a fabricated `ClassName@hash`.
-        let keys: Vec<String> = (0..elements.len())
+        // Units, not text -- and this one is an ORDERING, not a display. Java
+        // compares Strings by UTF-16 code unit (`String.compareTo`), and
+        // `Vec<u16>` compares lexicographically by unit, so the units key is
+        // the closer match as well as the lossless one: two elements whose
+        // renderings differ only in an unpaired surrogate used to collapse to
+        // the same U+FFFD key and sort arbitrarily.
+        let keys: Vec<Units> = (0..elements.len())
             .map(|i| {
                 let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
-                obj_to_display_string(ctx, &e)
+                obj_to_display_units(ctx, &e)
             })
-            .collect::<Result<Vec<String>, MethodCallFailed>>()?;
+            .collect::<Result<Vec<Units>, MethodCallFailed>>()?;
         idx.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
     }
     let sorted: Vec<Value> = idx
@@ -26845,13 +27414,10 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(container)),
     };
     let coll = collector_fn_source(ctx, this);
-    let read_str = |ctx: &dyn NativeContext, field: usize| -> String {
+    let read_str = |ctx: &dyn NativeContext, field: usize| -> Units {
         match coll {
-            Value::Object(Some(c)) => match ctx.get_field(c, field) {
-                Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
-                _ => String::new(),
-            },
-            _ => String::new(),
+            Value::Object(Some(c)) => read_units_field(ctx, c, field),
+            _ => Units::new(),
         }
     };
     let container_values = |ctx: &dyn NativeContext| -> Vec<Value> {
@@ -26873,8 +27439,10 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             let elements = container_values(ctx);
             let mut parts = Vec::with_capacity(elements.len());
             for elem in &elements {
-                parts.push(obj_to_display_string(ctx, elem)?);
+                parts.push(obj_to_display_units(ctx, elem)?);
             }
+            // The delimiter, prefix and suffix are Java Strings too, and carry
+            // the same hazard the elements do.
             let (delim, prefix, suffix) = if tag == COLLECTOR_TAG_JOINING_DELIM {
                 (
                     read_str(ctx, COLLECTOR_FIELD_ARG1),
@@ -26882,10 +27450,12 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                     read_str(ctx, COLLECTOR_FIELD_ARG3),
                 )
             } else {
-                (String::new(), String::new(), String::new())
+                (Units::new(), Units::new(), Units::new())
             };
-            let joined = format!("{}{}{}", prefix, parts.join(&delim), suffix);
-            let s = ctx.create_string(&joined);
+            let mut joined = prefix;
+            joined.extend_from_slice(&join_units(&parts, &delim));
+            joined.extend_from_slice(&suffix);
+            let s = ctx.create_string_from_units(&joined);
             Ok(Some(Value::Object(Some(s))))
         }
         Some(COLLECTOR_TAG_COUNTING) => {
@@ -27874,18 +28444,15 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 // cceres3: pin across GC-capable call (stream stale-at-store wave)
                 for i in 0..elements.len() {
                     let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                    parts.push(obj_to_display_string(ctx, &elem)?);
+                    parts.push(obj_to_display_units(ctx, &elem)?);
                 }
-                let joined = parts.join("");
-                let s = ctx.create_string(&joined);
+                let joined = join_units(&parts, &[]);
+                let s = ctx.create_string_from_units(&joined);
                 Ok(Some(Value::Object(Some(s))))
             }
             COLLECTOR_TAG_JOINING_DELIM => {
-                let read = |ctx: &dyn NativeContext, field: usize| -> String {
-                    match ctx.get_field(collector, field) {
-                        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
-                        _ => String::new(),
-                    }
+                let read = |ctx: &dyn NativeContext, field: usize| -> Units {
+                    read_units_field(ctx, collector, field)
                 };
                 let delim_str = read(ctx, COLLECTOR_FIELD_ARG1);
                 // ARG2 = prefix, ARG3 = suffix for the 3-arg
@@ -27900,10 +28467,12 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 // cceres3: pin across GC-capable call (stream stale-at-store wave)
                 for i in 0..elements.len() {
                     let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                    parts.push(obj_to_display_string(ctx, &elem)?);
+                    parts.push(obj_to_display_units(ctx, &elem)?);
                 }
-                let joined = format!("{}{}{}", prefix, parts.join(&delim_str), suffix);
-                let s = ctx.create_string(&joined);
+                let mut joined = prefix;
+                joined.extend_from_slice(&join_units(&parts, &delim_str));
+                joined.extend_from_slice(&suffix);
+                let s = ctx.create_string_from_units(&joined);
                 Ok(Some(Value::Object(Some(s))))
             }
             COLLECTOR_TAG_TO_MAP => {
@@ -37611,14 +38180,14 @@ fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     while let Some(cur) = cur_opt {
         let elem = ctx.get_field(cur, LL_NODE_ELEM);
-        parts.push(obj_to_display_string(ctx, &elem)?);
+        parts.push(obj_to_display_units(ctx, &elem)?);
         cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
             Value::Object(Some(r)) => Some(r),
             _ => None,
         };
     }
-    let text = format!("[{}]", parts.join(", "));
-    let s = ctx.create_string(&text);
+    let text = wrap_join("[", &parts, ", ", "]");
+    let s = ctx.create_string_from_units(&text);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -39276,13 +39845,13 @@ fn native_lhm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let ks = obj_to_display_string(ctx, &key)?;
-        let vs = obj_to_display_string(ctx, &val)?;
-        parts.push(format!("{ks}={vs}"));
+        let ks = obj_to_display_units(ctx, &key)?;
+        let vs = obj_to_display_units(ctx, &val)?;
+        parts.push(entry_units(&ks, &vs));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
-    let s = format!("{{{}}}", parts.join(", "));
-    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    let s = wrap_join("{", &parts, ", ", "}");
+    Ok(Some(Value::Object(Some(ctx.create_string_from_units(&s)))))
 }
 
 fn native_lhm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -40342,12 +40911,12 @@ fn native_ad_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(Some(ctx.create_string("[]"))))),
     };
     let elems = ad_collect_elements(ctx, this);
-    let parts: Vec<String> = elems
+    let parts: Vec<Units> = elems
         .iter()
-        .map(|e| obj_to_display_string(ctx, e))
-        .collect::<Result<Vec<String>, MethodCallFailed>>()?;
-    let s = format!("[{}]", parts.join(", "));
-    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        .map(|e| obj_to_display_units(ctx, e))
+        .collect::<Result<Vec<Units>, MethodCallFailed>>()?;
+    let s = wrap_join("[", &parts, ", ", "]");
+    Ok(Some(Value::Object(Some(ctx.create_string_from_units(&s)))))
 }
 
 fn native_ad_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -40913,11 +41482,11 @@ fn native_pq_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if let Some(buf) = data {
         for i in 0..(size as usize) {
             let elem = ctx.get_array_element(buf, i);
-            parts.push(obj_to_display_string(ctx, &elem)?);
+            parts.push(obj_to_display_units(ctx, &elem)?);
         }
     }
-    let s = format!("[{}]", parts.join(", "));
-    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    let s = wrap_join("[", &parts, ", ", "]");
+    Ok(Some(Value::Object(Some(ctx.create_string_from_units(&s)))))
 }
 
 // ===========================================================================
@@ -40926,7 +41495,25 @@ fn native_pq_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn register_vector_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // RETAGGED (P0 "wholesale Bridge over-tagging"). This is one of the 48
+    // registrars that set their OWN category rather than inheriting the
+    // ambient one, so a call-site wrapper is inert on it (G85-1) and the line
+    // itself has to change.
+    //
+    // That is not overriding somebody's judgement. This crate's header says
+    // the tag "is not a per-registration judgement: it is a dynamic ambient
+    // assignment that every callee in this file inherits", and the local
+    // save/restore here carries NO rationale — it is the same idiom repeated,
+    // not a decision about `java.util.Vector`.
+    //
+    // MEASURED 2026-08-19 (`--dump-native-registry`, default mode):
+    //   registrations 28 | invocations 0 | overwrote 0
+    //   real target: 28 CONCRETE BYTECODE, 0 not-declared-here, 0 ACC_NATIVE
+    //
+    // The cleanest profile in the crate: every row shadows a complete real
+    // implementation, nothing is abstract, nothing depends on these winning,
+    // and nothing invoked them. Rule 4 with no residue.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/Vector";
 
     r.register(c, "<init>", "()V", native_al_init);
@@ -42238,6 +42825,82 @@ fn native_hs_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
+}
+
+/// `Collection.removeIf(Predicate)` over a HashSet-layout receiver — including
+/// every [`SET_VIEW_CARRIERS`] keySet/entrySet view, where removal has to write
+/// THROUGH to the backing map (`native_hs_remove` does that).
+///
+/// Registered because `ConcurrentHashMap$EntrySetView` *declares* `removeIf`,
+/// so the receiver-has-own-bytecode rule ran the JDK body —
+/// `return map.removeEntryIf(filter)` — over a CratonVM-minted view whose
+/// `map` field is null (the view's state is the backing set in that slot), and
+/// every caller got `NullPointerException: Cannot invoke
+/// "java.util.concurrent.ConcurrentHashMap.removeEntryIf(...)" because
+/// "this.map" is null`. Spring's `DefaultContextCache.remove` does exactly
+/// `this.contextMap.entrySet().removeIf(..)` from a `@DirtiesContext`
+/// `afterTestClass` callback, which is what made three
+/// `core/spring-boot-test` classes report `containersFailed=1` while every
+/// test in them passed. The other carriers do not declare `removeIf` and were
+/// inheriting `Collection`'s iterator-based default, which already worked —
+/// registering here makes the whole family agree rather than leaving one
+/// member's correctness resting on the JDK not overriding a default.
+///
+/// Note that `force_native_over_real_jdk_bytecode` ALREADY listed `removeIf`
+/// for these classes: the gate said "prefer the native" and there was no
+/// native to prefer, so the lookup fell through to the very bytecode the gate
+/// exists to avoid. A gate entry is not a registration.
+fn native_hs_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // RULE F, ahead of the route — see the note in `native_hs_for_each`.
+    reject_null_functional(args.get(1))?;
+    if let Some(r) = ksv_route(ctx, args, native_ksv_remove_if) {
+        return r;
+    }
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pred = match args.get(1) {
+        Some(Value::Object(Some(p))) => *p,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    // GC-safety: `test` and the write-through `native_hs_remove` both run
+    // arbitrary Java. Pin the receiver, the predicate and every element, and
+    // re-read each through its pin per iteration. The body is a closure so an
+    // early `?` cannot skip the unpin.
+    let this_pin = ctx.pin_native_root(this);
+    let pred_pin = ctx.pin_native_root(pred);
+    let result = (|| -> MethodCallResult {
+        let this_now = ctx.read_native_pin(this_pin, this);
+        resync_view_set(ctx, this_now)?;
+        let this_now = ctx.read_native_pin(this_pin, this);
+        let backing = match hs_backing_map(ctx, this_now) {
+            Some(m) => m,
+            None => return Ok(Some(Value::Int(0))),
+        };
+        // For an entrySet-kind view these "keys" ARE the `Map.Entry` objects,
+        // which is what the predicate is handed and what `native_hs_remove`
+        // resolves back to a source-map key.
+        let elems = collect_view_snapshot_ordered(ctx, backing)?;
+        let (_, handles) = pin_value_slice(ctx, &elems);
+        let mut modified = false;
+        for (i, elem) in elems.iter().enumerate() {
+            let p = ctx.read_native_pin(pred_pin, pred);
+            let e = read_pinned_elem(ctx, handles[i], *elem);
+            let verdict = ctx.invoke_virtual(p, "test", "(Ljava/lang/Object;)Z", &[e])?;
+            if !matches!(verdict, Some(Value::Int(1))) {
+                continue;
+            }
+            let this_now = ctx.read_native_pin(this_pin, this);
+            let e = read_pinned_elem(ctx, handles[i], *elem);
+            if native_hs_remove(ctx, &[Value::Object(Some(this_now)), e])? == Some(Value::Int(1)) {
+                modified = true;
+            }
+        }
+        Ok(Some(Value::Int(i32::from(modified))))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -47254,24 +47917,26 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     tm_sync_native_state(ctx, this)?;
     let pairs = tm_collect_pairs(ctx, this);
-    // Family-1 stale-ObjectRef fix (2026-07-31): `obj_to_display_string`
+    // Family-1 stale-ObjectRef fix (2026-07-31): `obj_to_display_units`
     // dispatches each element's real `toString()`, which allocates — every
     // not-yet-rendered entry can move under it.
     let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let mut buf = String::from("{");
+    let mut buf = units_of("{");
     for i in 0..pinned_pairs.len() {
         if i > 0 {
-            buf.push_str(", ");
+            push_lit(&mut buf, ", ");
         }
         let (k, _) = pinned_pairs.get(&*ctx, i);
-        buf.push_str(&obj_to_display_string(ctx, &k)?);
-        buf.push('=');
+        let ku = obj_to_display_units(ctx, &k)?;
+        buf.extend_from_slice(&ku);
+        buf.push(u16::from(b'='));
         let (_, v) = pinned_pairs.get(&*ctx, i);
-        buf.push_str(&obj_to_display_string(ctx, &v)?);
+        let vu = obj_to_display_units(ctx, &v)?;
+        buf.extend_from_slice(&vu);
     }
     ctx.unpin_native_roots(pinned_pairs.base());
-    buf.push('}');
-    let s = ctx.create_string(&buf);
+    buf.push(u16::from(b'}'));
+    let s = ctx.create_string_from_units(&buf);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -48422,18 +49087,19 @@ fn native_ts_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let this = resync_ts_view(ctx, this)?;
     let (data_opt, size, _) = ts_state(ctx, this);
-    let mut buf = String::from("[");
+    let mut buf = units_of("[");
     if let Some(data) = data_opt {
         for i in 0..(size as usize) {
             if i > 0 {
-                buf.push_str(", ");
+                push_lit(&mut buf, ", ");
             }
             let v = ctx.get_array_element(data, i);
-            buf.push_str(&obj_to_display_string(ctx, &v)?);
+            let vu = obj_to_display_units(ctx, &v)?;
+            buf.extend_from_slice(&vu);
         }
     }
-    buf.push(']');
-    let s = ctx.create_string(&buf);
+    buf.push(u16::from(b']'));
+    let s = ctx.create_string_from_units(&buf);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -49583,6 +50249,21 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
         registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
+        // `spliterator()` for the same reason `stream()` is here: both classes
+        // declare it, and the JDK body goes through `TreeMap.keySpliteratorFor`
+        // over fields our layout keeps in the side-table. Without this,
+        // `treeSet.spliterator()` and `treeMap.keySet().spliterator()` threw
+        // `NullPointerException: ... "java.util.TreeMap$NavigableSubMap
+        // .keySpliterator()" because "sm" is null` — and `spliterator` was
+        // already in `force_native_over_real_jdk_bytecode` for
+        // `java/util/TreeMap$KeySet`, which does nothing without a native to
+        // prefer.
+        registry.register(
+            c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_ts_spliterator,
+        );
         // Descending/poll views — read the backing `m` TreeMap in real JDK, which
         // CratonVM's native TreeSet never populates (state lives in the side-table),
         // so the inherited bytecode NPEs on a null `m`. Drive them from `ts_state`.
@@ -52098,12 +52779,12 @@ fn native_chm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let entries = chm_collect_all_entries(ctx, this);
     let mut parts = Vec::with_capacity(entries.len());
     for (key, value) in &entries {
-        let k = crate::obj_to_display_string(ctx, key)?;
-        let v = crate::obj_to_display_string(ctx, value)?;
-        parts.push(format!("{}={}", k, v));
+        let k = crate::obj_to_display_units(ctx, key)?;
+        let v = crate::obj_to_display_units(ctx, value)?;
+        parts.push(crate::entry_units(&k, &v));
     }
-    let s = format!("{{{}}}", parts.join(", "));
-    let sref = ctx.create_string(&s);
+    let s = crate::wrap_join("{", &parts, ", ", "}");
+    let sref = ctx.create_string_from_units(&s);
     Ok(Some(Value::Object(Some(sref))))
 }
 
@@ -53134,19 +53815,19 @@ fn native_ksv_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     let elems = ksv_collect(ctx, this);
-    // `obj_to_display_string` dispatches `toString()`, which allocates — pin
+    // `obj_to_display_units` dispatches `toString()`, which allocates — pin
     // every element and re-read it at the point of use.
     let (elems_pin, handles) = pin_value_slice(ctx, &elems);
     let mut parts = Vec::with_capacity(elems.len());
     for i in 0..elems.len() {
         let e = read_pinned_elem(ctx, handles[i], elems[i]);
-        parts.push(obj_to_display_string(ctx, &e)?);
+        parts.push(obj_to_display_units(ctx, &e)?);
     }
     if elems_pin != usize::MAX {
         ctx.unpin_native_roots(elems_pin);
     }
-    let text = format!("[{}]", parts.join(", "));
-    let s = ctx.create_string(&text);
+    let text = wrap_join("[", &parts, ", ", "]");
+    let s = ctx.create_string_from_units(&text);
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -65423,6 +66104,49 @@ mod tests {
             r.find(c, "stream", "()Ljava/util/stream/Stream;").is_some(),
             "AL stream"
         );
+    }
+
+    /// Every [`SET_VIEW_CARRIERS`] entry must have a `removeIf` body.
+    ///
+    /// Both force-native gates (`force_native_over_real_jdk_bytecode` and its
+    /// `vm_exec` twin) list `removeIf` for these classes, and a gate entry with
+    /// nothing registered behind it does not throw — it DECLINES and the call
+    /// runs the real JDK bytecode. On `ConcurrentHashMap$EntrySetView`, the one
+    /// carrier that declares `removeIf` itself, that bytecode is
+    /// `return map.removeEntryIf(f)` over a `map` field a CratonVM-minted view
+    /// leaves null, so every `chm.entrySet().removeIf(...)` threw NPE. It cost
+    /// 66 of the 88 FAIL classes common to all three GC variants of the
+    /// 2026-08-19 Spring Framework sweep. Behavioural oracle:
+    /// `probes/ViewRemoveIfProbe.expected.txt`.
+    #[test]
+    fn set_view_carrier_remove_if_registered() {
+        let r = build_registry();
+        for c in SET_VIEW_CARRIERS {
+            assert!(
+                r.find(c, "removeIf", "(Ljava/util/function/Predicate;)Z")
+                    .is_some(),
+                "{c} has a removeIf force-native gate entry with no body behind it"
+            );
+        }
+    }
+
+    /// The set carriers' remaining mutators, for the same reason — each is
+    /// listed by both gates, so each needs a body or the gate silently hands
+    /// the call back to real JDK bytecode written against a null `this$0`.
+    #[test]
+    fn set_view_carrier_mutators_registered() {
+        let r = build_registry();
+        for c in SET_VIEW_CARRIERS {
+            for (m, d) in [
+                ("remove", "(Ljava/lang/Object;)Z"),
+                ("clear", "()V"),
+                ("addAll", "(Ljava/util/Collection;)Z"),
+                ("removeAll", "(Ljava/util/Collection;)Z"),
+                ("retainAll", "(Ljava/util/Collection;)Z"),
+            ] {
+                assert!(r.find(c, m, d).is_some(), "{c}.{m}{d} unregistered");
+            }
+        }
     }
 
     #[test]

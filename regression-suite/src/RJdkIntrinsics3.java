@@ -1,5 +1,9 @@
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.PrintStream;
+import java.lang.reflect.Field;
+import java.io.File;
 import java.io.StringReader;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -2407,6 +2411,22 @@ public class RJdkIntrinsics3 {
     // none of them justifies a family. They are here because the alternative
     // is that they stay at zero callers forever.
     // ========================================================================
+    public static class MiscHolder {
+        public MiscHolder() { }
+
+        public MiscHolder(int a) { }
+
+        public int takesInt(int a) {
+            return a;
+        }
+
+        public void m(int i) {}
+    }
+
+    abstract static class MiscAbstract {
+        MiscAbstract() {}
+    }
+
     static void misc() {
         // -- String(StringBuilder): a SNAPSHOT, not a view ---------------------
         StringBuilder sb = new StringBuilder("abc");
@@ -2486,7 +2506,397 @@ public class RJdkIntrinsics3 {
         check(df.format(new Date(1610712000000L)).equals(sdf.format(new Date(1610712000000L))),
                 "misc: the DateFormat-typed and SimpleDateFormat-typed call sites must agree");
 
-        sectionEnd("misc", 21);
+        // -- File.createTempFile validates its prefix -------------------------
+        // A VALIDATION contract, not a message one: this VM created the file.
+        t = null;
+        try {
+            sinkO = File.createTempFile("m", ".t");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:createTempFile short prefix", t, "java.lang.IllegalArgumentException");
+        ckS("misc:createTempFile short prefix message", t == null ? null : t.getMessage(),
+                "Prefix string \"m\" too short: length must be at least 3");
+        t = null;
+        try {
+            sinkO = File.createTempFile(null, ".t");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:createTempFile null prefix", t, "java.lang.NullPointerException");
+
+        // -- NoSuchMethodException names the class AND the signature -----------
+        // The separator is a bare comma and an array renders as getName()
+        // (`[I`), not `int[]`; both were measured after being guessed wrong.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("nope");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:NoSuchMethodException no-arg message", t == null ? null : t.getMessage(),
+                "RJdkIntrinsics3$MiscHolder.nope()");
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("nope", int.class, String.class);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:NoSuchMethodException signature message", t == null ? null : t.getMessage(),
+                "RJdkIntrinsics3$MiscHolder.nope(int,java.lang.String)");
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("nope", int[].class);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:NoSuchMethodException array parameter renders as getName", 
+                t == null ? null : t.getMessage(),
+                "RJdkIntrinsics3$MiscHolder.nope([I)");
+
+        // -- InstantiationException is a TYPE, not a word in a message ---------
+        // catch (InstantiationException) must match; the message is null for an
+        // abstract class and getName() for an interface.
+        t = null;
+        try {
+            sinkO = MiscAbstract.class.newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.newInstance on abstract", t, "java.lang.InstantiationException");
+        ckS("misc:Class.newInstance on abstract has a null message",
+                t == null ? "no throw" : String.valueOf(t.getMessage()), "null");
+        t = null;
+        try {
+            sinkO = Runnable.class.newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.newInstance on interface", t, "java.lang.InstantiationException");
+        ckS("misc:Class.newInstance on interface names it", t == null ? null : t.getMessage(),
+                "java.lang.Runnable");
+
+        // A PRIMITIVE mirror carries no class id -- there is no `int` class to
+        // resolve -- and that was reported as "receiver is not a Class mirror".
+        // It is one: `int.class` is a Class, and the answer is the same
+        // InstantiationException every other uninstantiable type gets.
+        t = null;
+        try {
+            sinkO = int.class.newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.newInstance on int.class", t, "java.lang.InstantiationException");
+        ckS("misc:Class.newInstance on int.class names the primitive",
+                t == null ? null : t.getMessage(), "int");
+        t = null;
+        try {
+            sinkO = void.class.newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.newInstance on void.class", t, "java.lang.InstantiationException");
+        ckS("misc:Class.newInstance on void.class names it",
+                t == null ? null : t.getMessage(), "void");
+
+        // -- a negative timeout is an error, not a long wait ------------------
+        // `o.wait(-5)` on a held monitor USED TO BLOCK FOREVER: the arm folded
+        // `ms <= 0` into "wait forever" and the thread parked with nobody to
+        // notify it. If that regresses, this family HANGS rather than failing,
+        // and the harness reports a 120s timeout — which is the correct and
+        // only possible signal for a liveness defect.
+        //
+        // Zero really does mean forever (JLS 17.2), so the contract is `< 0`.
+        final Object mon = new Object();
+        t = null;
+        try {
+            Thread.sleep(-1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Thread.sleep(-1)", t, "java.lang.IllegalArgumentException");
+        ckS("misc:Thread.sleep(-1) message", t == null ? null : t.getMessage(),
+                "timeout value is negative");
+        t = null;
+        try {
+            synchronized (mon) {
+                mon.wait(-5);
+            }
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Object.wait(-5) refuses instead of hanging", t,
+                "java.lang.IllegalArgumentException");
+        ckS("misc:Object.wait(-5) message", t == null ? null : t.getMessage(),
+                "timeout value is negative");
+        // The two overloads do NOT use the same noun. Measured, not composed.
+        t = null;
+        try {
+            synchronized (mon) {
+                mon.wait(-5, 0);
+            }
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:Object.wait(-5,0) says timeoutMillis, not timeout",
+                t == null ? null : t.getMessage(), "timeoutMillis value is negative");
+        // Zero is still an indefinite wait, so it must NOT be refused — asserted
+        // by a notify from another thread rather than by waiting for one.
+        t = null;
+        try {
+            synchronized (mon) {
+                mon.wait(1);
+            }
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Object.wait(1) is a real timed wait, not a refusal", t, "none");
+
+        // -- the messages around it -------------------------------------------
+        t = null;
+        try {
+            mon.wait();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:wait() without the monitor", t, "java.lang.IllegalMonitorStateException");
+        ckS("misc:wait() without the monitor message", t == null ? null : t.getMessage(),
+                "current thread is not owner");
+        t = null;
+        try {
+            Thread th = new Thread(() -> { });
+            th.start();
+            th.join();
+            th.start();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Thread.start() twice", t, "java.lang.IllegalThreadStateException");
+        ckS("misc:Thread.start() twice has a NULL message",
+                t == null ? "no throw" : String.valueOf(t.getMessage()), "null");
+        t = null;
+        try {
+            Thread.currentThread().interrupt();
+            Thread.sleep(1);
+        } catch (Throwable x) {
+            t = x;
+        } finally {
+            Thread.interrupted();
+        }
+        ckX("misc:sleep after interrupt", t, "java.lang.InterruptedException");
+        ckS("misc:sleep after interrupt names the operation",
+                t == null ? null : t.getMessage(), "sleep interrupted");
+        t = null;
+        try {
+            sinkO = Class.forName(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.forName(null)", t, "java.lang.NullPointerException");
+        ckS("misc:Class.forName(null) has a NULL message",
+                t == null ? "no throw" : String.valueOf(t.getMessage()), "null");
+
+        // -- what a reflective CALL says when it refuses ----------------------
+        // Sweep 10 (scratchpad/g75/M.java, 31 rows): 23 were already exact,
+        // including all the InvocationTargetException wrapping, the access
+        // checks, widening/narrowing, and the whole java.lang.reflect.Array
+        // family. These are the ones that were not.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("takesInt", int.class).invoke(new MiscHolder());
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Method.invoke with too few arguments", t,
+                "java.lang.IllegalArgumentException");
+        // Bare, and the counts run GOT then EXPECTED — the opposite order to
+        // how anyone writes it. Ours named the class and method, which is more
+        // useful and is not what a caller matching the text sees.
+        ckS("misc:Method.invoke arity message", t == null ? null : t.getMessage(),
+                "wrong number of arguments: 0 expected: 1");
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("takesInt", int.class)
+                    .invoke(new MiscHolder(), 1, 2);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:Method.invoke arity message counts the SURPLUS too",
+                t == null ? null : t.getMessage(), "wrong number of arguments: 2 expected: 1");
+        // Constructor uses the SAME sentence — HotSpot does not distinguish.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getConstructor(int.class).newInstance();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:Constructor.newInstance arity message is the same sentence",
+                t == null ? null : t.getMessage(), "wrong number of arguments: 0 expected: 1");
+
+        // A null receiver is HotSpot's helpful NPE, naming the JDK's own local.
+        // NOTE the variable is `obj` here and `o` in Field.set — two call sites,
+        // two names, neither derivable from the other.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("takesInt", int.class).invoke(null, 1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Method.invoke with a null receiver", t, "java.lang.NullPointerException");
+        ckS("misc:Method.invoke null-receiver message", t == null ? null : t.getMessage(),
+                "Cannot invoke \"Object.getClass()\" because \"obj\" is null");
+
+        // The refusal carries a CAUSE, and frameworks branch on it: Spring's
+        // InvocableHandlerMethod tests `getCause() instanceof NPE`. Method.invoke
+        // attached one and Constructor.newInstance dropped it, so the same bad
+        // argument produced different exceptions through the two doors.
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getMethod("takesInt", int.class)
+                    .invoke(new MiscHolder(), (Object) null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:Method.invoke null-into-primitive cause",
+                t == null || t.getCause() == null ? "none" : t.getCause().getClass().getName(),
+                "java.lang.NullPointerException");
+        t = null;
+        try {
+            sinkO = MiscHolder.class.getConstructor(int.class).newInstance((Object) null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Constructor.newInstance null-into-primitive", t,
+                "java.lang.IllegalArgumentException");
+        ckS("misc:Constructor.newInstance carries the SAME cause as Method.invoke",
+                t == null || t.getCause() == null ? "none" : t.getCause().getClass().getName(),
+                "java.lang.NullPointerException");
+
+        // -- an array's class is not its component's --------------------------
+        // Sweep 11 (scratchpad/g76/A.java, 51 rows) audited G69-1 N1's claim
+        // that `class_id_of_object(array)` answers the COMPONENT's id. Array
+        // identity turned out to be in good shape — 50 of 51 exact, including
+        // getName/getSimpleName/getCanonicalName across dimensions, component
+        // types, assignability, forName round trips and reflect.Array. THIS is
+        // the one live site: the cast refusal named the component.
+        t = null;
+        try {
+            sinkO = Object[].class.cast(new int[] {1});
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Class.cast of an int[] to Object[]", t, "java.lang.ClassCastException");
+        ckS("misc:the cast refusal names the ARRAY, not its component",
+                t == null ? null : t.getMessage(), "Cannot cast [I to [Ljava.lang.Object;");
+        // The control that makes the row above mean something: a non-array
+        // receiver was always right, so the fix is about arrays specifically.
+        t = null;
+        try {
+            sinkO = Integer.class.cast("s");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:a non-array cast refusal was already correct",
+                t == null ? null : t.getMessage(),
+                "Cannot cast java.lang.String to java.lang.Integer");
+
+        // -- what a failed PARSE says, and what a bad RANGE says ---------------
+        // Sweep 13 (scratchpad/g78/N.java, 48 rows): 42 already exact — every
+        // Integer/Long/radix/BigInteger/BigDecimal message, stream-after-close
+        // semantics and mark/reset. These are the six that were not.
+        t = null;
+        try {
+            sinkD = Double.parseDouble("");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Double.parseDouble(\"\")", t, "java.lang.NumberFormatException");
+        ckS("misc:the float parsers say 'empty String'", t == null ? null : t.getMessage(),
+                "empty String");
+        // ...and a BLANK string is empty too — the JDK trims first.
+        t = null;
+        try {
+            sinkD = Double.parseDouble("   ");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:a blank float parse is also 'empty String'",
+                t == null ? null : t.getMessage(), "empty String");
+        // The CONTROL that makes the two rows above mean something: the
+        // INTEGRAL parsers do not share the message, so it cannot be hoisted.
+        t = null;
+        try {
+            sinkI = Integer.parseInt("");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:the integral parsers do NOT say 'empty String'",
+                t == null ? null : t.getMessage(), "For input string: \"\"");
+        t = null;
+        try {
+            sinkF = Float.parseFloat(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:Float.parseFloat(null)", t, "java.lang.NullPointerException");
+        ckS("misc:the null float parse names the JDK's own local",
+                t == null ? null : t.getMessage(),
+                "Cannot invoke \"String.length()\" because \"in\" is null");
+
+        // EOFException carries NO message; "Unexpected EOF" was ours and reads
+        // like a JDK string, which is what kept it.
+        t = null;
+        try {
+            sinkI = new DataInputStream(new ByteArrayInputStream(new byte[] {1})).readInt();
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:DataInputStream.readInt past the end", t, "java.io.EOFException");
+        ckS("misc:EOFException has a NULL message",
+                t == null ? "no throw" : String.valueOf(t.getMessage()), "null");
+
+        // Objects.checkFromIndexSize: the BASE IndexOutOfBoundsException, and
+        // one message format for every failure mode — including a negative
+        // length, which prints verbatim INSIDE the range rather than alone.
+        t = null;
+        try {
+            sinkI = new ByteArrayInputStream(new byte[] {1}).read(new byte[2], 5, 1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:a bad read range is the BASE IndexOutOfBoundsException",
+                t == null ? null : t.getClass().getName(), "java.lang.IndexOutOfBoundsException");
+        ckS("misc:the range message names the range and the length",
+                t == null ? null : t.getMessage(), "Range [5, 5 + 1) out of bounds for length 2");
+        t = null;
+        try {
+            sinkI = new ByteArrayInputStream(new byte[] {1}).read(new byte[2], 0, -1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("misc:a NEGATIVE length prints inside the range, not on its own",
+                t == null ? null : t.getMessage(), "Range [0, 0 + -1) out of bounds for length 2");
+
+        // A validation gap, not a message one: this used to SUCCEED.
+        t = null;
+        try {
+            sinkO = new ByteArrayOutputStream(-1);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:new ByteArrayOutputStream(-1)", t, "java.lang.IllegalArgumentException");
+        ckS("misc:negative capacity message", t == null ? null : t.getMessage(),
+                "Negative initial size: -1");
+        // Zero is LEGAL — the control that stops the guard becoming `<= 0`.
+        t = null;
+        try {
+            sinkO = new ByteArrayOutputStream(0);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("misc:new ByteArrayOutputStream(0) is legal", t, "none");
+
+        sectionEnd("misc", 75);
     }
 
     // ========================================================================
@@ -2903,7 +3313,253 @@ public class RJdkIntrinsics3 {
     static final String[] FAMILIES = {
         "objects", "boxid", "boxconv", "bitops", "strictd", "mathd", "bigdec", "bigint",
         "logrec", "tlocal", "fmtobj", "inet", "regex", "misc", "bufslice", "mathexact",
+        "refmsg",
     };
+
+    // 17. refmsg -- what a reflective FIELD refusal SAYS.
+    //
+    // The exception types and their precedence were already exact: 71 probe
+    // rows across `scratchpad/g71/{PD,PE,PF,PG}.java` agreed with HotSpot on
+    // every one, and disagreed on every message. So these rows assert TEXT, and
+    // they are here because the text is the whole diagnostic: a framework that
+    // fails to set a field prints this sentence and nothing else.
+    //
+    // Five grammars, and they are deliberately NOT uniform -- three of the rows
+    // below exist only to pin an asymmetry that a tidier renderer would erase:
+    //   * the bad-receiver rows carry `final`, the conversion rows do not;
+    //   * the conversion rows QUOTE the field name, nothing else does;
+    //   * the generic `set` names a bad RECEIVER after `to`, where every other
+    //     row in that position names the value.
+    // Each was measured after being got wrong or nearly guessed.
+    static class RefHolder {
+        static final int I = 3;
+        static final long J = 4L;
+        static final char C = 'a';
+        static final String L = "s";
+        static final int[] AR = new int[] {1};
+        public int nf = 1;
+        public String sref = "a";
+        public final int fin = 1;
+    }
+
+    static class RefOther {
+    }
+
+    static Field rf(String n) throws Exception {
+        Field x = RefHolder.class.getDeclaredField(n);
+        x.setAccessible(true);
+        return x;
+    }
+
+    /** The message of whatever {@code op} threw, or a marker naming what went wrong instead. */
+    static String msgOf(Throwable t) {
+        return t == null ? "no throw" : String.valueOf(t.getMessage());
+    }
+
+    static void refmsg() throws Exception {
+        Throwable t;
+        RefHolder h = new RefHolder();
+        final String D = "RJdkIntrinsics3$RefHolder";
+        final String O = "RJdkIntrinsics3$RefOther";
+
+        // -- GRAMMAR 1, typed setter: the value prints as (type)value ----------
+        // A LEGAL widening reports the FIELD's type and the WIDENED value, so a
+        // char written into an int field prints the number, not the character.
+        step("refmsg", "setInt on a static final int");
+        t = null;
+        try {
+            rf("I").setInt(null, 9);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:setInt on static final", t, "java.lang.IllegalAccessException");
+        ckS("refmsg:setInt on static final message", msgOf(t),
+                "Can not set static final int field " + D + ".I to (int)9");
+        t = null;
+        try {
+            rf("I").setChar(null, 'z');
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:setChar into an int field widens and prints the NUMBER", msgOf(t),
+                "Can not set static final int field " + D + ".I to (int)122");
+        t = null;
+        try {
+            rf("C").setChar(null, 'z');
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:setChar into a char field prints the CHARACTER", msgOf(t),
+                "Can not set static final char field " + D + ".C to (char)z");
+
+        // An ILLEGAL widening is refused a rank EARLIER, before any conversion,
+        // so it reports the SETTER's type -- and it is an IllegalArgumentException
+        // where the row above is an IllegalAccessException, on the same field.
+        t = null;
+        try {
+            rf("I").setLong(null, 9L);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:setLong into an int field", t, "java.lang.IllegalArgumentException");
+        ckS("refmsg:an ILLEGAL widening reports the SETTER's type", msgOf(t),
+                "Can not set static final int field " + D + ".I to (long)9");
+        t = null;
+        try {
+            rf("I").setFloat(null, 9f);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:setFloat prints Java's float spelling", msgOf(t),
+                "Can not set static final int field " + D + ".I to (float)9.0");
+
+        // -- GRAMMAR 1, generic setter: the value prints as its CLASS ----------
+        t = null;
+        try {
+            rf("I").set(null, 9);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:set(Object) names the argument's CLASS", msgOf(t),
+                "Can not set static final int field " + D + ".I to java.lang.Integer");
+        t = null;
+        try {
+            rf("L").set(null, null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:set(Object) with null says 'null value'", msgOf(t),
+                "Can not set static final java.lang.String field " + D + ".L to null value");
+        // An ARRAY field's type is getName() -- `[I`, not `int[]`. Reaching for
+        // the `int[]` speller is the mistake G68-1 made in NoSuchMethodException.
+        t = null;
+        try {
+            rf("AR").set(null, new int[] {2});
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:an array field and an array value both render as getName()", msgOf(t),
+                "Can not set static final [I field " + D + ".AR to [I");
+        t = null;
+        try {
+            rf("L").set(null, new String[][] {});
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:a nested array argument renders as [[L...;", msgOf(t),
+                "Can not set static final java.lang.String field " + D
+                        + ".L to [[Ljava.lang.String;");
+
+        // -- rank 6: the same grammar on a NON-final field ---------------------
+        // Not "argument type mismatch", which is Method.invoke's message and was
+        // being applied one caller too widely.
+        t = null;
+        try {
+            rf("nf").set(h, "x");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:set a String into an int field", t, "java.lang.IllegalArgumentException");
+        ckS("refmsg:a non-final refusal names the field too", msgOf(t),
+                "Can not set int field " + D + ".nf to java.lang.String");
+        t = null;
+        try {
+            rf("nf").set(h, null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:null into a primitive field", msgOf(t),
+                "Can not set int field " + D + ".nf to null value");
+
+        // -- GRAMMAR 2 and 3: a bad RECEIVER prints "on"... --------------------
+        // ...and DOES carry `final`, which the conversion grammar below does not.
+        t = null;
+        try {
+            rf("fin").setInt(new RefOther(), 9);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:typed set with a wrong receiver", t, "java.lang.IllegalArgumentException");
+        ckS("refmsg:a bad receiver prints 'on' AND carries final", msgOf(t),
+                "Can not set final int field " + D + ".fin on " + O);
+        t = null;
+        try {
+            rf("fin").getInt(new RefOther());
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:a bad receiver on a getter says 'get ... on'", msgOf(t),
+                "Can not get final int field " + D + ".fin on " + O);
+
+        // ...EXCEPT the generic setter, which prints the RECEIVER after "to" --
+        // in the sentence position every other rank-6 row fills with the value.
+        // The argument here is a distinctive String and is still not named.
+        t = null;
+        try {
+            rf("nf").set(new RefOther(), "ARG");
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:generic set names a bad RECEIVER after 'to', not the value", msgOf(t),
+                "Can not set int field " + D + ".nf to " + O);
+
+        // -- GRAMMAR 4: quoted name, and NO modifiers --------------------------
+        // Measured on a static final field, which prints neither modifier --
+        // the one grammar of the five that drops them.
+        t = null;
+        try {
+            rf("I").getByte(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:getByte on an int field", t, "java.lang.IllegalArgumentException");
+        ckS("refmsg:the conversion grammar QUOTES the name and drops the modifiers", msgOf(t),
+                "Attempt to get int field \"" + D + ".I\" with illegal data type conversion to byte");
+        t = null;
+        try {
+            rf("sref").getLong(h);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:a reference field cannot be read by a typed getter", msgOf(t),
+                "Attempt to get java.lang.String field \"" + D
+                        + ".sref\" with illegal data type conversion to long");
+
+        // -- GRAMMAR 5: a null receiver is a NullPointerException with a NULL
+        // message -- on four of the five entry points.
+        t = null;
+        try {
+            rf("nf").getInt(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckX("refmsg:typed get with a null receiver", t, "java.lang.NullPointerException");
+        ckS("refmsg:...and its message is null", msgOf(t), "null");
+        t = null;
+        try {
+            rf("nf").get(null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:generic get with a null receiver is also null", msgOf(t), "null");
+        t = null;
+        try {
+            rf("nf").setInt(null, 9);
+        } catch (Throwable x) {
+            t = x;
+        }
+        ckS("refmsg:typed set with a null receiver is also null", msgOf(t), "null");
+
+        // -- what must still SUCCEED -------------------------------------------
+        // A legal widening read, and an instance final that setAccessible really
+        // does unlock -- so these rows are not "reflection always throws".
+        ckI("refmsg:getLong widens an int field", (int) rf("nf").getLong(h), 1);
+        rf("fin").setInt(h, 41);
+        ckI("refmsg:an INSTANCE final is writable after setAccessible(true)",
+                rf("fin").getInt(h), 41);
+
+        sectionEnd("refmsg", 27);
+    }
 
     static void runFamily(String name) throws Exception {
         if ("objects".equals(name)) {
@@ -2938,6 +3594,8 @@ public class RJdkIntrinsics3 {
             bufslice();
         } else if ("mathexact".equals(name)) {
             mathexact();
+        } else if ("refmsg".equals(name)) {
+            refmsg();
         } else {
             throw new AssertionError("unknown family: " + name);
         }

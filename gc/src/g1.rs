@@ -11093,7 +11093,10 @@ impl G1Collector {
         if let Some((_, storage)) = compact {
             unsafe { cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed) }
         } else {
-            unsafe { cratonvm_types::read_value_atomic(ptr as *const Value) }
+            // Discriminant-screened, like `gen_heap::read_slot` — see
+            // `heap::read_value_cell_checked` for why the unscreened read made
+            // one corrupt cell fatal here and merely loud on Generational.
+            unsafe { crate::heap::read_value_cell_checked(ptr as *const Value, "g1::get_field") }
         }
     }
 }

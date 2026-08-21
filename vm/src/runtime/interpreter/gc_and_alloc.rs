@@ -3791,7 +3791,7 @@ pub(super) fn tlab_alloc_shaped_inner(
 /// only report that names legacy allocations — which is exactly what happened
 /// to `org/bouncycastle/crypto/digests/SHA256Digest`, 100% of `jit_getfield`'s
 /// receivers on Generational and nowhere in the census. See
-/// known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+/// fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
 ///
 /// Sixteen slots, linear scan, first-come, and only touched under
 /// `CRATONVM_DBG_COMPACT_LEGACY`: the registry lookup it performs is far too

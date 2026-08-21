@@ -11483,9 +11483,15 @@ impl GarbageCollector for ZgcRealHeap {
             return Value::Object(None);
         }
         // SAFETY: index validated < num_slots, so the slot is within bounds.
+        //
+        // Discriminant-screened and per-word atomic, matching the other three
+        // legacy-cell readers. This site was the least guarded of the four — a
+        // bare non-atomic `std::ptr::read::<Value>`, so it both tore against a
+        // concurrent plain writer and transmuted a corrupt cell into a `Value`
+        // that is UB to match on. See `heap::read_value_cell_checked`.
         unsafe {
             let ptr = obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE);
-            std::ptr::read(ptr as *const Value)
+            crate::heap::read_value_cell_checked(ptr as *const Value, "zgc::get_field")
         }
     }
 
@@ -15174,7 +15180,7 @@ pub(crate) mod tests {
     /// reads a "header" made of the new tenant's payload. That is the failure
     /// `rewrite_target_is_walkable` reports, and it has been seen in
     /// production with the offending headers decoding as String character
-    /// data (`docs/known-issues/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
+    /// data (`docs/known-issues/gc/zgc-rewrite-pass-walks-off-a-reference-array-20260815.md`).
     ///
     /// **Read this test for what it is.** It asserts the property that failure
     /// violates; it does not reproduce that failure. The guard it covers HAS
