@@ -518,6 +518,9 @@ fn test_helpers() -> JitRuntimeHelpers {
         self_call_stack_guard: 0,
         region_bounds_addr: 0,
         read_bounds_addr: 0,
+        // Compiled local handlers are never armed in a backend unit test: the
+        // feature is flag-gated and the tables here are hand-built.
+        local_handler_lookup: 0,
         native_stack_floor_fn: 0,
         ldc_string: sentinel,
         // Unwired (0) — CRATONVM_JIT_SAFEPOINT_POLLS is off by default,
@@ -546,6 +549,11 @@ fn test_helpers() -> JitRuntimeHelpers {
         // `required` in `jit-api`, so 0 would fail `validate()` rather than
         // select a different lowering.
         aastore_type_check: sentinel,
+        // Unwired (0), for the same reason `ldc_class_cp` is: these tests
+        // build no string-`ldc` site, and 0 makes the backend refuse one
+        // rather than emit a null CALL. `ldc_string` above stays sentinel-wired
+        // because its slot is `required` in `jit-api`; nothing calls it.
+        ldc_string_cp: 0,
     }
 }
 

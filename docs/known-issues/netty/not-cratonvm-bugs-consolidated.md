@@ -10,6 +10,20 @@ its split-out cluster docs) plus two carried-forward verdicts from the
 2026-08-16 doc sweep. Each entry links to the doc with the full evidence;
 this page is the index, not a replacement for them.
 
+> **One entry has been WITHDRAWN (2026-08-20), and the reason applies to any
+> future one.** `SslErrorTest` was cleared on "identical `found=0 started=0`" —
+> a real cross-check, correctly performed, whose conclusion was wrong.
+> **Two VMs running nothing is not two VMs agreeing.** The class generated zero
+> parameterisations because `OpenSsl.isAvailable()` was false, which was the
+> fixture's CLASSPATH rather than the host (see `gen-openssl-args.sh`); with it
+> corrected, HotSpot passes 72 and CratonVM fails 12.
+>
+> Before adding a row here, check that the class actually RAN. A `found` count
+> of 0, or one far below the class's own parameterisation count, disqualifies
+> the comparison no matter how identical the two sides look. `CloseNotifyTest`
+> below is the benign version of the same thing: it was cleared on a matching
+> pair of `aborted` counts, and on the corrected classpath both VMs simply pass.
+
 | class | why it's not a CratonVM bug | evidence | doc |
 |---|---|---|---|
 | `io.netty.channel.NativeImageHandlerMetadataTest` | Resource path computed from Maven `groupId`/`artifactId` metadata this non-Maven harness never populates — literal `null/null` in the path on both VMs | Direct HotSpot cross-check: identical `AssertionFailedError`, identical `null/null` path | `nativeimagehandlermetadatatest-not-a-cratonvm-bug-20260819.md` |
@@ -38,9 +52,9 @@ this page is the index, not a replacement for them.
 | `io.netty.buffer.WrappedCompositeByteBufTest` | same | Direct HotSpot cross-check: `found=496 ok=487 aborted=9`, byte-identical | same |
 | ~~`io.netty.handler.codec.http2.WeightedFairQueueRemoteFlowControllerTest`~~ | **RESOLVED 2026-08-19 — row retired, not carried.** The harness gap was fixed rather than accepted: `common.args` passes `-ea` now, and both classes are `found=34 ok=34 failed=0` on CratonVM. They are PASSING classes, not not-a-bug classes. | Deterministic, 3 isolated reruns per arm, after a full-suite `-ea` A/B found no other class affected | `http2-flowcontroller-ea-and-datacompression-snappy-20260819.md` |
 | ~~`io.netty.handler.codec.http2.UniformStreamByteDistributorFlowControllerTest`~~ | same — RESOLVED, see the row above | same | same |
-| `io.netty.handler.ssl.BouncyCastleEngineAlpnTest` | The fixture's `-cp` carries `bcprov-jdk15on-1.70.jar` AHEAD of `bcprov-jdk18on-1.84.jar`, so `bctls-1.84` resolves `NISTObjectIdentifiers` from 1.70 and dies in `TlsUtils.<clinit>` on the missing `id_ml_dsa_44` | Direct HotSpot cross-check: identical `NoSuchFieldError` from the identical BC frame, `found=1 failed=1` both. NOTE (2026-08-19): the earlier reading of this row said `ClassNotFoundException` on both — that was CratonVM's OWN, different failure, since fixed; and with the 1.70 jars dropped HotSpot PASSES while CratonVM does not | `foreign-nio-subclass-and-bc-provider-object-FIXED-20260819.md`, `sslcontext-natives-ignore-a-third-party-spi-20260819.md` |
-| `io.netty.handler.ssl.CloseNotifyTest` | `netty-tcnative`/OpenSSL not available in this environment | Direct HotSpot cross-check, isolated: identical `found=4 ok=2 aborted=2`, same `Assumption failed: OpenSSL is not available` | `hashedwheeltimertest-late-task-firing-RETIRED-20260819.md` |
-| `io.netty.handler.ssl.SslErrorTest` | same OpenSSL-unavailability, parameterization yields zero cases | Direct HotSpot cross-check, isolated: identical `found=0 started=0` | same |
+| `io.netty.handler.ssl.BouncyCastleEngineAlpnTest` | The fixture's `-cp` carries `bcprov-jdk15on-1.70.jar` AHEAD of `bcprov-jdk18on-1.84.jar`, so `bctls-1.84` resolves `NISTObjectIdentifiers` from 1.70 and dies in `TlsUtils.<clinit>` on the missing `id_ml_dsa_44` | Direct HotSpot cross-check: identical `NoSuchFieldError` from the identical BC frame, `found=1 failed=1` both. **RESOLVED 2026-08-20 on the corrected classpath — both VMs now PASS** (`gen-openssl-args.sh --bc18`, one fork each: HotSpot `ok=1 failed=0 ms=877`, CratonVM `ok=1 failed=0 ms=711`). The 2026-08-19 note said "with the 1.70 jars dropped HotSpot PASSES while CratonVM does not"; that remainder was a real CratonVM defect and is fixed — see the retired SSLContext-SPI page. This row is now ONLY about the fixture's jar order | `foreign-nio-subclass-and-bc-provider-object-FIXED-20260819.md`, `sslcontext-natives-ignore-a-third-party-spi-FIXED-20260820.md` |
+| `io.netty.handler.ssl.CloseNotifyTest` | ~~`netty-tcnative`/OpenSSL not available in this environment~~ — it was the CLASSPATH, not the environment | Was: identical `found=4 ok=2 aborted=2` on both, same `Assumption failed: OpenSSL is not available`. **RE-TAKEN 2026-08-20 with `gen-openssl-args.sh`: `found=4 ok=4` on both VMs.** The row is still not-a-CratonVM-bug, but for a different reason — nothing is skipped any more, and everything passes | `hashedwheeltimertest-late-task-firing-RETIRED-20260819.md`, `openssl-key-material-and-engine-residuals-FIXED-20260820.md` §D |
+| ~~`io.netty.handler.ssl.SslErrorTest`~~ **— WITHDRAWN 2026-08-20, this IS a CratonVM bug** | The cross-check was `found=0 started=0` on both VMs, and that is not agreement — it is two VMs running nothing. The parameterisation yielded zero cases because `OpenSsl.isAvailable()` was false, which was the CLASSPATH | **RE-TAKEN with `gen-openssl-args.sh`: HotSpot `found=72 ok=72`, CratonVM `found=72 ok=60 failed=12`.** All 12 were `clientProvider = JDK` client-side certificate rejections answering `TLSV1_ALERT_ACCESS_DENIED` where a certificate alert is required. **FIXED 2026-08-21 — 72/72, matching HotSpot** | `ssl-client-sends-access-denied-for-every-trust-rejection-FIXED-20260821.md` |
 | `io.netty.pkitesting.CertificateBuilderTest` | Result set matches HotSpot exactly, in both directions | `ok=39 failed=28 aborted=7` on both VMs; failing-test-name sets identical (`comm`-verified) | `certificatebuildertest-fail-status-not-a-regression-20260816.md` |
 | `io.netty.handler.ssl.PemEncodedTest` | `1 ok / 2 aborted` is steady-state-correct — two intentional `assumeFalse` skips, not a regression | Isolated on G1: `1 ok / 2 aborted` identical on CratonVM and HotSpot | `pemencodedtest-aborted-status-not-a-regression-20260816.md` |
 

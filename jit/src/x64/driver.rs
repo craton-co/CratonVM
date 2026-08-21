@@ -42,6 +42,21 @@ thread_local! {
     /// identical codegen there. See `find_bypassable_loop_headers`.
     static PENDING_EXCEPTION_RANGES: std::cell::RefCell<Vec<(usize, usize, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// `(start_pc, end_pc, handler_pc, catch type name)` of this method's
+    /// exception table, staged for the next `compile_with_param_slots` on this
+    /// thread and consumed at its entry.
+    ///
+    /// The same table as `PENDING_EXCEPTION_RANGES` plus the one thing a
+    /// compiled `catch` needs and a liveness analysis does not: WHICH
+    /// throwables each entry takes. An EMPTY name is `catch_type == 0`, the
+    /// catch-all. Empty vector ⇒ no local handlers, byte-identical codegen.
+    static PENDING_LOCAL_HANDLER_TABLE: std::cell::RefCell<
+        Vec<(usize, usize, usize, &'static str)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+    /// The compiling method's declaring class id, staged beside the table
+    /// above: a catch-type NAME is not a class identity, and this is the loader
+    /// context it resolves through at runtime.
+    static PENDING_LOCAL_HANDLER_CLASS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Stage the compact-field-info for the next [`compile`] call on this thread.
@@ -67,6 +82,23 @@ pub(crate) fn set_pending_verified_max_stack(max_stack: usize) {
 /// RBC.6b lift needs. See that door's comment.
 pub fn set_pending_exception_ranges(ranges: Vec<(usize, usize, usize)>) {
     PENDING_EXCEPTION_RANGES.with(|c| *c.borrow_mut() = ranges);
+}
+
+/// Stage this method's exception table WITH catch types, so the backend can
+/// emit its own `catch` blocks and enter them from compiled code.
+///
+/// `(start_pc, end_pc, handler_pc, catch type name)`; an empty name is a
+/// catch-all (`catch_type == 0`). The names must outlive the compiled code —
+/// callers pass process-wide interned strings, the same ones `checkcast` sites
+/// use. One-shot, taken at backend entry like every other staged request, so a
+/// front-end bail cannot leak one method's handlers into the next compile on
+/// this worker thread. Staging nothing is the pre-feature behaviour.
+pub fn set_pending_local_handler_table(
+    table: Vec<(usize, usize, usize, &'static str)>,
+    declaring_class_id: u32,
+) {
+    PENDING_LOCAL_HANDLER_TABLE.with(|c| *c.borrow_mut() = table);
+    PENDING_LOCAL_HANDLER_CLASS.with(|c| c.set(declaring_class_id));
 }
 
 /// Compile a JVM bytecode method to x86-64 machine code.
@@ -324,7 +356,7 @@ pub fn compile_with_param_slots(
     // `Vec::new()` and the cascade is simply not emitted at any pc.
     pic_slots: Vec<(usize, *const crate::JitPICSlot)>,
     ldc_info: Vec<(usize, i64)>,
-    ldc_string_info: Vec<(usize, *const u8, usize)>,
+    ldc_string_info: Vec<(usize, u32, u16)>,
     // Class-`ldc` sites — see `ldc_class_info` on the compiler struct. Served
     // by the CP-indexed `ldc_class_cp` helper; disjoint from `ldc_info` and
     // `ldc_string_info`.
@@ -452,6 +484,11 @@ pub fn compile_with_param_slots(
     // compile on this worker thread.
     let exception_ranges: Vec<(usize, usize, usize)> =
         PENDING_EXCEPTION_RANGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    // Same one-shot discipline. Taken unconditionally — even when the feature
+    // is off — so a staged table can never survive into a later compile.
+    let staged_local_handlers: Vec<(usize, usize, usize, &'static str)> =
+        PENDING_LOCAL_HANDLER_TABLE.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let staged_local_handler_class = PENDING_LOCAL_HANDLER_CLASS.with(|c| c.replace(0));
     // Consume the pure-kernel GPR local-homes request FIRST so an early bail
     // below can never leak it into an unrelated later compile on this thread.
     let kernel_reg_homes_requested = KERNEL_REG_HOMES_REQUEST.with(|c| c.take());
@@ -1388,6 +1425,42 @@ pub fn compile_with_param_slots(
         protected_ranges,
     );
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
+    // ── Compiled local exception handlers ────────────────────────────────
+    //
+    // Arm only where every prerequisite is a fact rather than a hope, because
+    // the failure mode of getting one wrong is a `catch` block entered on a
+    // frame that does not describe it:
+    //
+    //  * the helper is wired — without it there is nothing to ask;
+    //  * `precise_exception_frames`, which is what puts the exception-table
+    //    edges into the interference graph (`ra_handlers` above). A local
+    //    homed in a callee-saved register keeps ONE home for the whole method,
+    //    so entering a handler mid-method finds every local where the handler's
+    //    code expects it — but only because that modelling stopped two
+    //    simultaneously-live locals sharing a register across the protected
+    //    range. It is also the flag under which a throwing site publishes the
+    //    reason-9 frame this feature falls back to;
+    //  * `needs_heap`, because the stub passes the hidden `SharedVm` pointer
+    //    from `heap_local_offset` and without the flag that slot is `[rbp-0]`,
+    //    the saved RBP. Every method with an `invoke*` sets it, which is every
+    //    method that can throw into its own handler from a call;
+    //  * no bytecode loop rewrite in effect — the staged table is in
+    //    INTERPRETER bci space and a rewrite moves everything into output-pc
+    //    space. `exception_ranges` gets remapped for the analyses; a handler
+    //    ENTRY has no single image under a transform that copies loop bodies,
+    //    so refuse rather than pick a copy.
+    let local_handlers_armed = crate::local_handlers_enabled()
+        && helpers.local_handler_lookup != 0
+        && precise_exception_frames
+        && needs_heap
+        && loop_xform.is_none()
+        && !staged_local_handlers.is_empty();
+    crate::note_local_handlers_armed(local_handlers_armed);
+    if local_handlers_armed {
+        crate::metrics::note_local_handler(crate::metrics::LOCAL_HANDLER_METHOD_ARMED);
+        compiler.local_handler_table = staged_local_handlers;
+        compiler.local_handler_class_id = staged_local_handler_class;
+    }
     // Safepoint publication plan (arch-2026-07-26 R1). Built here rather than
     // inside `Compiler::new` because it needs `code` and `param_oop_mask`,
     // neither of which that constructor receives. `compiler.local_assignments`
@@ -2059,8 +2132,13 @@ pub fn compile_with_param_slots(
         // `jit_ldc_class_cp` needs `jit_thread_mut()` for the same reason the
         // two above do: the resolution it performs may run a user
         // `ClassLoader.loadClass`, and a failure has to publish a pending
-        // exception on this thread.
-        || !compiler.ldc_class_info.is_empty();
+        // exception on this thread. `jit_ldc_string_cp` joins it for the
+        // second half of that reason only — it loads nothing, but its
+        // defensive "the CP entry is no longer readable" arm publishes an
+        // `InternalError` through the same channel, and `emit_post_alloc_oom_check`
+        // is emitted at its site either way.
+        || !compiler.ldc_class_info.is_empty()
+        || !compiler.ldc_string_info.is_empty();
     // Snapshot the frame partition and the label BEFORE `compiler.buf` is moved
     // into the artifact (which partially moves `compiler`).
     let frame_layout = compiler.frame_layout();
@@ -2302,6 +2380,12 @@ pub fn compile_with_param_slots(
     // contents.
     cm._jit_mic_slots.extend(compiler.cloned_mic_slots);
     cm._jit_pic_slots.extend(compiler.cloned_pic_slots);
+    // The local-handler stubs baked each of these addresses as an immediate.
+    // Moving them onto the artifact is what keeps those pointers valid for
+    // exactly as long as the machine code that reads them — and what frees them
+    // with it on tier-up or invalidation. Empty on every compile that armed no
+    // local handlers.
+    cm._jit_local_handler_sites = compiler.local_handler_sites;
 
     Some(cm)
 }

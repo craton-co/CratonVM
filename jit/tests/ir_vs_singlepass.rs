@@ -175,6 +175,7 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         // (both tiers) bake `read_bounds_addr`, while the inline reference
         // putfield arms keep baking `region_bounds_addr` above.
         read_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
+        local_handler_lookup: 0,
         native_stack_floor_fn: native_stack_floor as *const () as usize,
         ldc_string: s,
         // Reached through emit_call_absolute, so a 0 here is a null CALL
@@ -2981,6 +2982,7 @@ fn frem_helpers() -> JitRuntimeHelpers {
         self_call_stack_guard: 0,
         region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
         read_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
+        local_handler_lookup: 0,
         native_stack_floor_fn: 0,
         ..dummy_helpers()
     }
@@ -5150,18 +5152,16 @@ fn ir_vs_singlepass_arraylength_null_faults() {
 // (`feature-designs/c2/ir-coverage-survey-20260803.md`) — the largest single
 // opcode in the survey.
 
-/// `jit_ldc_string(vm, bytes, len)` stand-in. Returns a value derived from BOTH
-/// pointer arguments (the literal's first byte and its length) so a site that
-/// baked the wrong address or the wrong length is distinguishable from one that
-/// baked the right ones — a stub returning a constant would pass either way.
+/// `jit_ldc_string_cp(vm, holder_class_id, cp_idx)` stand-in. Returns a value
+/// derived from BOTH baked immediates, so a site that baked the wrong class id
+/// or the wrong index is distinguishable from one that baked the right ones —
+/// a stub returning a constant would pass either way.
 ///
-/// # Safety
-/// `bytes`/`len` are the literal the compiler baked, owned by the artifact.
-unsafe extern "C" fn fake_ldc_string(_vm: i64, bytes: *const u8, len: usize) -> i64 {
-    if bytes.is_null() {
-        return 0;
-    }
-    (len as i64) * 1000 + i64::from(*bytes)
+/// The predecessor took `(bytes, len)` and derived its answer from the
+/// literal's first byte and length. Both shapes test the same property: that
+/// the two backends bake the same operands and call the same helper with them.
+unsafe extern "C" fn fake_ldc_string_cp(_vm: i64, holder: i64, cp_idx: i64) -> i64 {
+    holder * 100_000 + cp_idx + 1
 }
 
 /// `jit_ldc_class_cp(vm, holder_class_id, cp_idx)` stand-in, likewise derived
@@ -5203,12 +5203,15 @@ fn ir_vs_singlepass_string_ldc() {
     let code = vec![0x12, 0x01, 0xb0];
     let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         match cp {
-            1 => Some(cratonvm_jit::JitLdcConstant::String("hello".to_string())),
+            1 => Some(cratonvm_jit::JitLdcConstant::String {
+                holder_class_id: 0,
+                cp_idx: 1,
+            }),
             _ => None,
         }
     };
     let mut helpers = dummy_helpers();
-    helpers.ldc_string = fake_ldc_string as *const () as usize;
+    helpers.ldc_string_cp = fake_ldc_string_cp as *const () as usize;
     let cm = cached("sldcv", "()Ljava/lang/Object;", code, 1, 0);
     let ir = compile_ldc(&cm, &helpers, true, false, &ldc).expect("IR String ldc");
     let sp = compile_ldc(&cm, &helpers, false, false, &ldc).expect("single-pass String ldc");
@@ -5216,9 +5219,12 @@ fn ir_vs_singlepass_string_ldc() {
         ir.used_ir_backend,
         "cov-01: a String `ldc` must reach the optimizing backend"
     );
-    // 5 bytes, first byte 'h' (104). Both backends must have baked the same
-    // (address, length) pair and called the same helper with it.
-    let expected = 5 * 1000 + i64::from(b'h');
+    // holder 0, cp#1. Both backends must have baked the same (class id, CP
+    // index) pair and called the same helper with it. The `+ 1` in the stub
+    // keeps the answer non-zero: a `0` return is the site's
+    // pending-exception convention and would take the exception path instead
+    // of being pushed.
+    let expected = 0 * 100_000 + 1 + 1;
     assert_eq!(call_with_dummy_context(&ir, &[]), expected, "IR String ldc");
     assert_eq!(
         call_with_dummy_context(&sp, &[]),
@@ -5260,35 +5266,42 @@ fn ir_vs_singlepass_class_ldc() {
 
 #[test]
 fn string_ldc_with_the_helper_unwired_stays_on_single_pass() {
-    // The fail-closed rung for `Op::ConstString`. `helpers.ldc_string` is 0 only
-    // in a synthetic table like this one, but `lower_inner` must refuse rather
-    // than emit `CALL 0` — the same guard, and the same history, as the monitor
-    // helper's.
+    // The fail-closed rung for `Op::ConstString`. `helpers.ldc_string_cp` is 0
+    // only in a synthetic table like this one, but `lower_inner` must refuse
+    // rather than emit `CALL 0` — the same guard, and the same history, as the
+    // monitor helper's.
     //
-    // The edit that trips it: delete the `ldc_string` row from `lower_inner`'s
-    // constant-pool helper loop.
+    // The edit that trips it: delete the `ldc_string_cp` row from
+    // `lower_inner`'s constant-pool helper loop, or the matching guard in the
+    // single-pass planner.
     //
-    // Deliberately not CALLED: the single-pass body this falls back to would
-    // itself emit a call to address 0. That asymmetry is the single-pass
-    // backend's — it treats `ldc_string` as always wired, which in production it
-    // is — and is not this lane's to change.
+    // The ASYMMETRY this test used to record is GONE. It was written against
+    // `helpers.ldc_string`, a RequiredPtr the single-pass backend treated as
+    // always wired — so the fallback body would itself have called address 0,
+    // and the result could not be invoked. Since 2026-08-20 the site is served
+    // by the OptionalPtr `ldc_string_cp` and the single-pass planner bails the
+    // whole compile on the same condition (`ldc_string_helper_unwired`), so
+    // `compile_ldc` may legitimately answer `None` here.
     let code = vec![0x12, 0x01, 0xb0];
     let ldc = |cp: u16| -> Option<cratonvm_jit::JitLdcConstant> {
         match cp {
-            1 => Some(cratonvm_jit::JitLdcConstant::String("hello".to_string())),
+            1 => Some(cratonvm_jit::JitLdcConstant::String {
+                holder_class_id: 0,
+                cp_idx: 1,
+            }),
             _ => None,
         }
     };
     let mut helpers = dummy_helpers();
-    helpers.ldc_string = 0;
+    helpers.ldc_string_cp = 0;
     let cm = cached("sldcoff", "()Ljava/lang/Object;", code, 1, 0);
-    let compiled =
-        compile_ldc(&cm, &helpers, true, false, &ldc).expect("single-pass still produces a body");
-    assert!(
-        !compiled.used_ir_backend,
-        "cov-01: an `ldc <String>` with `ldc_string` unwired must refuse the IR \
-         graph rather than emit a CALL through address zero"
-    );
+    if let Some(compiled) = compile_ldc(&cm, &helpers, true, false, &ldc) {
+        assert!(
+            !compiled.used_ir_backend,
+            "cov-01: an `ldc <String>` with `ldc_string_cp` unwired must refuse \
+             the IR graph rather than emit a CALL through address zero"
+        );
+    }
 }
 
 /// [`compile_opt`] plus a `cp_static_field_resolver`, so the IR builder can

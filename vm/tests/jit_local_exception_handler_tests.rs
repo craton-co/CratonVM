@@ -35,6 +35,7 @@ fn test_resources_dir() -> String {
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
     std::path::Path::new(&format!("{dir}/cratonvm/JitLocalHandler.class")).exists()
+        && std::path::Path::new(&format!("{dir}/cratonvm/JitSelfRecursiveHandler.class")).exists()
 }
 
 /// Every VM in this file, and there is deliberately only one shape of them.
@@ -116,6 +117,45 @@ fn invoke_checksum(method: &str) -> i32 {
 // Golden values below were computed by running the byte-identical
 // `JitLocalHandler.java` fixture under a real JDK (`java`), package
 // `cratonvm`, driver printing each `*Checksum()` method's return value.
+
+/// `invoke_checksum`'s sibling for the self-recursive fixture, which lives in
+/// its own class because its shape needs `java.lang.reflect` and a small class
+/// hierarchy rather than another method on `JitLocalHandler`.
+fn invoke_self_rec_checksum(method: &str) -> i32 {
+    let mut vm = test_vm();
+    let result = vm.invoke("cratonvm/JitSelfRecursiveHandler", method, "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(v))) => v,
+        other => panic!("{method} returned unexpected value: {other:?}"),
+    }
+}
+
+#[test]
+fn test_jit_self_recursive_activation_catches_its_own_callee_throw() {
+    require_class_files!();
+    require_class_library!();
+    // A compiled frame never dispatches to its own handler — the interpreter's
+    // post-return drain does, keyed on the bci `jit_set_throw_bci` stamped.
+    // That slot is per-THREAD and carries no activation identity, so in a
+    // self-recursive chain the outermost frame's stamp (its own recursive call
+    // site, outside the try) overwrote the inner frame's (the real throw site,
+    // inside it). The drain then read "outside every protected range", which it
+    // treats as a definite "this method cannot catch it", and propagated past a
+    // `catch` that covers the throw.
+    //
+    // Before the fix this test does not return a wrong number — it panics,
+    // because the `NoSuchMethodException` escapes `main`. The two tests both
+    // routes needed are `route_jit_signal_exception` (the drain) and
+    // `run_jit_callee_handler` (the JIT-to-JIT sibling); this fixture exercises
+    // both, and fixing only one leaves it throwing.
+    //
+    // Shape: `org.codehaus.groovy.reflection.stdclasses.CachedSAMClass
+    // .hasUsableImplementation`. Golden value from a real JDK.
+    assert_eq!(
+        invoke_self_rec_checksum("selfRecursiveCalleeThrowChecksum"),
+        80_000
+    );
+}
 
 #[test]
 fn test_jit_rethrow_as_different_type() {

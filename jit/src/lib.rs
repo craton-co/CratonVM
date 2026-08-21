@@ -1200,6 +1200,32 @@ pub fn intern_typecheck_target(name: &str, target_class_id: Option<u32>) -> (*co
     (interned.as_ptr(), interned.len())
 }
 
+/// Process-wide intern table for compiled local handlers' catch-type names.
+///
+/// A `JitLocalHandlerSite` holds `&'static str` catch types and outlives no
+/// particular compile, so the bytes cannot be owned by the artifact's
+/// `_jit_strings` (which is freed on tier-up while a *newer* artifact for the
+/// same method may still name the same catch type). A leaked intern is what
+/// every other by-name JIT site does — see [`intern_typecheck_target`] — and
+/// the population is bounded by the distinct catch types in the program.
+static CATCH_TYPE_NAME_INTERN: std::sync::OnceLock<
+    parking_lot::Mutex<rustc_hash::FxHashSet<&'static str>>,
+> = std::sync::OnceLock::new();
+
+/// Intern a catch-type name for a [`JitLocalHandlerSite`].
+pub fn intern_catch_type_name(name: &str) -> &'static str {
+    let table = CATCH_TYPE_NAME_INTERN.get_or_init(|| parking_lot::Mutex::new(Default::default()));
+    let mut table = table.lock();
+    match table.get(name) {
+        Some(existing) => existing,
+        None => {
+            let leaked: &'static str = Box::leak(String::from(name).into_boxed_str());
+            table.insert(leaked);
+            leaked
+        }
+    }
+}
+
 /// The `ClassId` the site whose class name lives at `name_ptr` resolved to at
 /// compile time, if it resolved at all.
 #[inline]
@@ -1764,6 +1790,98 @@ pub fn deopt_real_enabled() -> bool {
     )
 }
 
+/// Enter a compiled method's OWN `catch` block from compiled code
+/// (`CRATONVM_JIT_LOCAL_HANDLERS`, **default-ON; `=0` restores the old
+/// route**). Read-once cached.
+///
+/// With this off — the state this VM shipped in until 2026-08-20 — no `catch`
+/// block anywhere runs in compiled code. A caught exception leaves the
+/// artifact: reason-9 deopt, exceptional-frame reconstruction, an interpreted
+/// handler, and inside an OSR'd loop a re-entry at the next hot back edge.
+/// `probes/OsrExcRateProbe.java` prices that round trip at ~2 900 ns per catch
+/// against HotSpot's 6.7-16.
+///
+/// With it on, a throwing site inside one of this method's own protected
+/// ranges branches to a stub that asks
+/// [`JitLocalHandlerSite`] which handler applies and jumps straight into the
+/// compiled handler block, staying in the same frame — so the locals need no
+/// reconstruction because they were never left behind.
+///
+/// It shipped OFF for one day, which was long enough to measure it. What the
+/// flip rests on:
+///
+/// * `probes/OsrExcRateProbe`, one binary, two interleaved rounds: **1246-1377
+///   -> 60-120 ns per caught exception**, ~12x, with `sink` and `caught`
+///   byte-identical in every arm (HotSpot on the same host: 4.6-8);
+/// * `probes/LocalHandlerShapeProbe`, eight handler shapes including two typed
+///   handlers over one range, a strict-subclass catch, a propagating throw, a
+///   `finally`, a nested `try`, a rethrowing handler and a locals-survive
+///   arm: the same digest under HotSpot, under `--nojit`, and with this off
+///   and on;
+/// * the whole netty `codec-http` suite, 103 classes: **identical result
+///   sets**;
+/// * `regression-suite/run.sh`, 64 vectors: identical, 63 pass and the one
+///   pre-existing `RImmutableFactoryTypes` failure that is also there on
+///   unmodified `dev`.
+///
+/// `=0` (also `false`/`off`/`no`) restores the old route, so one binary still
+/// has two arms — which is how the two OSR-admission defects this feature
+/// exposed were found. `docs/known-issues/netty/
+/// httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md` is the
+/// class it was written for.
+pub fn local_handlers_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LOCAL_HANDLERS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+thread_local! {
+    /// Set for the duration of one compile that armed local handlers, so the
+    /// compile door can tell "this method refused for some unrelated reason"
+    /// from "this method refused with handler bodies newly in the image".
+    static LOCAL_HANDLERS_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Disarm local handlers for the NEXT compile on this thread. The compile
+    /// door sets it after a failed armed compile and retries once; see
+    /// [`disarm_local_handlers_once`].
+    static LOCAL_HANDLERS_DISARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Did the compile that just ran on this thread put handler bodies in the
+/// image? Read by the compile door to decide whether a refusal is worth
+/// retrying without them.
+pub fn local_handlers_were_armed() -> bool {
+    LOCAL_HANDLERS_ARMED.with(std::cell::Cell::get)
+}
+
+/// Record whether the compile now starting armed local handlers.
+pub fn note_local_handlers_armed(armed: bool) {
+    LOCAL_HANDLERS_ARMED.with(|c| c.set(armed));
+}
+
+/// Suppress local handlers for the next compile on this thread.
+///
+/// The feature emits handler bodies that were previously dead code, so a
+/// construct the single-pass emitter cannot model inside a `catch` block would
+/// turn a method that compiles today into one that does not — trading a
+/// throughput win for the loss of compilation entirely. The compile door
+/// therefore retries once with this set, which makes the feature unable to cost
+/// any method its artifact: the worst case is one wasted compile.
+pub fn disarm_local_handlers_once() {
+    LOCAL_HANDLERS_DISARMED.with(|c| c.set(true));
+}
+
+/// Take (clear) the one-shot disarm request.
+pub fn take_local_handlers_disarmed() -> bool {
+    LOCAL_HANDLERS_DISARMED.with(std::cell::Cell::take)
+}
+
 /// activate-ir-optimizer Front 3.2: guard-surviving scalar replacement
 /// (`CRATONVM_SCALAR_DEOPT`, default-OFF, read-once). When ON *and*
 /// `deopt_real_enabled()`, the IR lowerer emits a `FrameValue::VirtualObject`
@@ -2091,6 +2209,10 @@ pub struct CompiledMethod {
     /// Owned `JitInvokeInfo` structs. JIT code references these via raw pointers;
     /// they are freed when this `CompiledMethod` is dropped.
     pub _jit_invoke_infos: Vec<Box<JitInvokeInfo>>,
+    /// Owned [`JitLocalHandlerSite`] records, one per throwing bci this method
+    /// can catch itself. The local-handler stubs bake a raw pointer to each;
+    /// they are freed when this `CompiledMethod` is dropped.
+    pub _jit_local_handler_sites: Vec<Box<JitLocalHandlerSite>>,
     /// Owned monomorphic inline cache slots. JIT code references these via raw
     /// pointers; they are freed when this `CompiledMethod` is dropped.
     pub _jit_mic_slots: Vec<Box<JitMICSlot>>,
@@ -2533,6 +2655,7 @@ impl CompiledMethod {
             entry,
             needs_context: false,
             _jit_strings: Vec::new(),
+            _jit_local_handler_sites: Vec::new(),
             _jit_invoke_infos: Vec::new(),
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
@@ -2605,6 +2728,7 @@ impl CompiledMethod {
             entry,
             needs_context: true,
             _jit_strings: Vec::new(),
+            _jit_local_handler_sites: Vec::new(),
             _jit_invoke_infos: Vec::new(),
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
@@ -3978,7 +4102,20 @@ impl CompiledMethod {
                     format!("deopt point at bci {} holds monitors", p.bci),
                 ));
             }
-            if let Some(slot) = deopt::first_unresumable_slot(fs) {
+            // A RETHROW point is asked a NARROWER question, because it is
+            // consumed differently: `take_exceptional_frame` hands its `bci`
+            // and `locals` to the handler-frame builder, which then pushes
+            // `[exception]` as the operand stack by JVMS §2.10. The recorded
+            // stack is never read, so an entry in it that could not be typed
+            // describes nothing that will be reconstructed — and this veto is
+            // ARTIFACT-WIDE, so one such entry at one throwing bci costs the
+            // whole method its OSR entry. See `first_unresumable_local`.
+            let unresumable = if p.semantics.rethrow_exception {
+                deopt::first_unresumable_local(fs)
+            } else {
+                deopt::first_unresumable_slot(fs)
+            };
+            if let Some(slot) = unresumable {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
                     format!(
@@ -7689,7 +7826,19 @@ pub enum JitLdcConstant {
     /// `cp_ldc2w_resolver`'s `(bits, is_double)` already has, for the same
     /// reason.
     Immediate { bits: i64, is_float: bool },
-    String(String),
+    /// A `CONSTANT_String` entry: `ldc "…"` pushes the interned literal.
+    ///
+    /// Carries the *referencing* class id and the CP index rather than the
+    /// literal's text, for the reason [`Self::ClassMirror`] carries them plus
+    /// one that is specific to strings: JVMS §5.4.3 resolves a constant-pool
+    /// entry once and records the result, the record is keyed
+    /// `(class, cp index)`, and the text is not that key. Carrying the bytes
+    /// instead made every execution re-derive the answer through the string
+    /// pool's `RwLock` and a hash of the whole literal.
+    String {
+        holder_class_id: u32,
+        cp_idx: u16,
+    },
     /// A `CONSTANT_Class` entry: `ldc <Class>` pushes that class's mirror.
     ///
     /// Carries the *referencing* class id and the CP index rather than a
@@ -8088,6 +8237,81 @@ pub struct JitInvokeInfo {
     /// (the `Integer.valueOf` / `HashMap.get` direct-dispatch statics) uses it,
     /// and they name JDK classes that only ever have one definition.
     pub declaring_class_id: u32,
+}
+
+/// Every handler in THIS method's own exception table that can catch a throw at
+/// one bci — so a compiled frame can enter its own `catch` block without
+/// leaving compiled code.
+///
+/// ## Why this exists
+///
+/// Until 2026-08-20 nothing in this VM ran a `catch` block in compiled code. A
+/// caught exception left the artifact entirely: reason-9 deopt, exceptional
+/// frame reconstruction, an interpreted handler, and — inside an OSR'd loop —
+/// a re-entry at the next hot back edge. Priced on
+/// `probes/OsrExcRateProbe.java` that round trip is **~2 900 ns per catch**
+/// against HotSpot's 6.7-16, and at `HttpHeaderValidationUtilTest`'s measured
+/// 7.7% throw rate it is 223 ns of a 21 ns/iteration budget — the largest
+/// single item on that class by an order of magnitude.
+///
+/// ## What the stub does with it
+///
+/// The compiled body's post-invoke sentinel edge branches to a per-site stub
+/// which calls `jit_local_handler_lookup(vm, site, out_exc)`. That returns the
+/// index into [`Self::candidates`] of the first handler whose catch type
+/// matches the pending throwable — JVMS order, so the answer is the
+/// interpreter's answer — or `-1`. On `-1` the stub falls through to exactly
+/// the edge that would have run before (the reason-9 deopt stub or the shared
+/// sentinel exit), so nothing about the propagating case changes. On a hit the
+/// helper has already stored the throwable into the frame slot the handler's
+/// operand stack starts at, and the stub jumps to the handler's compiled code.
+///
+/// ## The cache
+///
+/// One `u64`, not two `u32`s, and that is load-bearing: a reader must never be
+/// able to pair one throwable's class id with another's index. `0` is empty;
+/// otherwise the top bit is set, bits 32..62 hold the class id and the low 32
+/// hold the index (`-1` for "no local handler", which is worth caching too — a
+/// site that keeps propagating must not re-resolve catch types every time).
+pub struct JitLocalHandlerSite {
+    /// `(catch type name, handler bci)` in exception-table order, restricted to
+    /// the entries whose `[start_pc, end_pc)` covers [`Self::throw_bci`]. An
+    /// EMPTY name is a catch-all (`catch_type == 0`, i.e. `finally`), which
+    /// matches every throwable.
+    pub candidates: Vec<(&'static str, u32)>,
+    /// The class this method is declared in. A catch-type NAME is not a class
+    /// identity — two loaders can each define one — so the name is resolved
+    /// through this class's loader, exactly as `find_jit_exception_handler`
+    /// does for the interpreted route.
+    pub declaring_class_id: u32,
+    /// The throwing bci this site guards. Diagnostics only; the candidate list
+    /// was already filtered by it at compile time.
+    pub throw_bci: u32,
+    /// Monomorphic `(exception class id -> candidate index)` cache. See the
+    /// type doc for the encoding.
+    pub cache: std::sync::atomic::AtomicU64,
+}
+
+impl JitLocalHandlerSite {
+    /// `cache` is empty.
+    pub const CACHE_EMPTY: u64 = 0;
+
+    /// Encode a `(class id, index)` pair for [`Self::cache`].
+    #[inline]
+    pub fn encode_cache(class_id: u32, index: i32) -> u64 {
+        // Cast: the index is packed as raw bits and decoded back as `i32`.
+        (1u64 << 63) | ((class_id as u64) << 32) | (index as u32 as u64)
+    }
+
+    /// Decode [`Self::cache`], or `None` when it is empty.
+    #[inline]
+    pub fn decode_cache(raw: u64) -> Option<(u32, i32)> {
+        if raw & (1u64 << 63) == 0 {
+            return None;
+        }
+        // Cast: exact inverse of `encode_cache`.
+        Some((((raw >> 32) & 0x7fff_ffff) as u32, raw as u32 as i32))
+    }
 }
 
 /// Enumeration of every JIT call-site intrinsic.
@@ -15485,6 +15709,76 @@ pub fn try_compile_with_invokespecial_resolver(
         intrinsic_resolver,
     );
 
+    // ── The compiled-local-handler safety net ───────────────────────────
+    //
+    // Arming local handlers puts `catch` bodies into the emitted image; before
+    // the feature they were dead code the walk skipped. So a construct the
+    // single-pass emitter cannot model inside a `catch` block — one that has
+    // never had to be modelled anywhere, because no handler body was ever
+    // emitted — would turn a method that compiles today into one that does
+    // not, trading a throughput win for the loss of compilation entirely.
+    //
+    // Retry once with the feature suppressed. That makes the worst case one
+    // wasted compile rather than a permanently interpreted method, and it is
+    // paid only on the failure path: a method that compiles armed never gets
+    // here, and a method that fails for an unrelated reason retries once and
+    // fails the same way. The bail site is cleared first so the retry's own
+    // refusal (or success) is what the bail-list and the stats table see.
+    let result = match result {
+        Some(cm) => Some(cm),
+        None if local_handlers_were_armed() => {
+            let _ = take_jit_bail_site();
+            disarm_local_handlers_once();
+            let mut retry_backend_attempted = false;
+            let retried = try_compile_inner(
+                cached,
+                cp_class_name_resolver,
+                cp_field_resolver,
+                cp_static_field_resolver,
+                cp_invoke_resolver,
+                cp_invokespecial_owner_resolver,
+                callee_compiler,
+                cp_new_resolver,
+                cp_ldc_resolver,
+                cp_ldc2w_resolver,
+                profile,
+                helpers,
+                inline_resolver,
+                string_layout_resolver,
+                cp_invoke_class_id_resolver,
+                cp_elidable_init_resolver,
+                optimize,
+                ir_emit_calls,
+                ir_emit_special_calls,
+                ir_emit_long,
+                ir_emit_virtual_calls,
+                ir_emit_fp,
+                cp_invokedynamic_descriptor_resolver,
+                class_id_name_resolver,
+                receiver_inline_resolver,
+                &mut retry_backend_attempted,
+                self_call_identity_stable,
+                &admission,
+                jdk_only,
+                intrinsic_resolver,
+            );
+            backend_attempted |= retry_backend_attempted;
+            if retried.is_some() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+            {
+                eprintln!(
+                    "[cratonvm-jitc] local-handlers: {}.{}{} refused with handler bodies in the image; compiled without them",
+                    cached.class_name, cached.method_name, cached.method_descriptor,
+                );
+            }
+            retried
+        }
+        None => None,
+    };
+    // The disarm is one-shot and consumed by the staging site, but a retry that
+    // never reached it (an early resolver bail) would leave it set for the next
+    // unrelated method on this thread.
+    let _ = take_local_handlers_disarmed();
+
     // Take once and use for all three sinks: the bail-list decision below, the
     // trace line (only when `CRATONVM_DBG_JITC` is on), and the per-method
     // store the end-of-run stats table reads (always, so the reason survives
@@ -17125,28 +17419,30 @@ fn try_compile_inner(
         //     under `ir_emit_fp`, mirroring the `ldc2_w` gate directly above —
         //     the builder would otherwise emit an `Op::ConstF`/`Float` into a
         //     graph the FP tier is switched off for.
-        //   * `String` → the interned-literal SITE (`bytes`, `len`), not a
-        //     reference: the value is materialised by `helpers.ldc_string` on
-        //     every execution, because an `ObjectRef` baked at compile time can
-        //     relocate between two runs of the body.
+        //   * `String` → the CP-indexed SITE, served by
+        //     `helpers.ldc_string_cp`: the value is materialised at run time
+        //     because an `ObjectRef` baked at compile time can relocate between
+        //     two runs of the body, and it is keyed by the SITE rather than by
+        //     the literal's bytes because that is the key JVMS §5.4.3's
+        //     recorded resolution is filed under.
         //   * `ClassMirror` → the CP-indexed site, served by
         //     `helpers.ldc_class_cp` for the same reason plus one more:
         //     resolution can load a class, which runs arbitrary Java.
         //
         // A pc absent from all three (no resolver, a `MethodHandle` /
-        // `MethodType` / condy entry, an unwired class helper, or a float with
-        // the FP gate off) makes the builder's 0x12/0x13 arm bail that method
-        // to single-pass — the pre-existing behaviour, only narrower.
+        // `MethodType` / condy entry, an unwired class or string helper, or a
+        // float with the FP gate off) makes the builder's 0x12/0x13 arm bail
+        // that method to single-pass — the pre-existing behaviour, only
+        // narrower.
         //
-        // Keep-alive for the string-literal bytes whose ADDRESS the lowered
-        // body bakes as an imm64. Moved onto the finished `CompiledMethod`
-        // below, next to the `Op::Call` info boxes, so the pointer cannot
-        // outlive its pointee.
-        let mut ir_ldc_strings: Vec<Box<str>> = Vec::new();
+        // The `ir_ldc_strings` keep-alive that stood here is GONE with the
+        // bytes it kept alive: an `ldc <String>` site no longer bakes an
+        // address into the body, so there is nothing for the artifact to
+        // outlive.
         // cov-05: `instanceof`/`checkcast` target class-name bytes, whose
         // ADDRESS the lowered body bakes as an imm64 argument to
-        // `helpers.instanceof_check`/`helpers.checkcast`. Unlike
-        // `ir_ldc_strings` immediately above, these are NOT kept alive on the
+        // `helpers.instanceof_check`/`helpers.checkcast`. These are NOT kept
+        // alive on the
         // `CompiledMethod`: they are interned process-wide by
         // `intern_typecheck_class_name`, because the type-check helpers
         // memoize on the `(ptr, len)` pair in thread-locals that outlive any
@@ -17162,7 +17458,7 @@ fn try_compile_inner(
             if let Some(resolver) = cp_ldc_resolver {
                 let mut imm: std::collections::HashMap<usize, (i64, bool)> =
                     std::collections::HashMap::new();
-                let mut strs: std::collections::HashMap<usize, (usize, usize)> =
+                let mut strs: std::collections::HashMap<usize, (u32, u16)> =
                     std::collections::HashMap::new();
                 let mut classes: std::collections::HashMap<usize, (u32, u16)> =
                     std::collections::HashMap::new();
@@ -17173,10 +17469,17 @@ fn try_compile_inner(
                                 imm.insert(pc, (bits, is_float));
                             }
                         }
-                        Some(JitLdcConstant::String(text)) => {
-                            let boxed: Box<str> = text.into_boxed_str();
-                            strs.insert(pc, (boxed.as_ptr() as usize, boxed.len()));
-                            ir_ldc_strings.push(boxed);
+                        Some(JitLdcConstant::String {
+                            holder_class_id,
+                            cp_idx,
+                        }) => {
+                            // `ldc_string_cp` is an OptionalPtr, exactly like
+                            // `ldc_class_cp` below: omit the site rather than
+                            // plan a CALL to address 0, and let the builder
+                            // bail the method.
+                            if helpers.ldc_string_cp != 0 {
+                                strs.insert(pc, (holder_class_id, cp_idx));
+                            }
                         }
                         Some(JitLdcConstant::ClassMirror {
                             holder_class_id,
@@ -18661,14 +18964,11 @@ fn try_compile_inner(
                             compiled._jit_strings = ir_call_strings;
                             compiled.has_dispatch = true;
                         }
-                        // cov-01: the same keep-alive obligation for an
-                        // `ldc <String>` site, whose UTF-8 bytes' ADDRESS is
-                        // baked into the body as an imm64 argument to
-                        // `helpers.ldc_string`. `append`, never assign — the
-                        // call strings may already be installed above, and
-                        // dropping either list frees memory the emitted code
-                        // still names.
-                        compiled._jit_strings.append(&mut ir_ldc_strings);
+                        // cov-01's `ldc <String>` keep-alive stood here and is
+                        // GONE: the site is CP-indexed now, so the body bakes a
+                        // `(class id, cp index)` pair rather than the literal's
+                        // address, and there are no bytes for the artifact to
+                        // outlive.
                         // cov-05: `instanceof`/`checkcast` target class names
                         // deliberately do NOT appear here — they are interned
                         // for the life of the process instead, so the
@@ -19061,7 +19361,7 @@ fn try_compile_inner(
     // With no resolver at all, `ldc_info` stays empty and the 0x12/0x13
     // codegen arm bails per-site instead.
     let mut ldc_info: Vec<(usize, i64)> = Vec::new();
-    let mut ldc_string_info: Vec<(usize, *const u8, usize)> = Vec::new();
+    let mut ldc_string_info: Vec<(usize, u32, u16)> = Vec::new();
     let mut ldc_class_info: Vec<(usize, u32, u16)> = Vec::new();
     // The `is_float`/`is_double` halves the codegen throws away. The deopt
     // operand-stack snapshot has no consuming opcode to ask for the width, so
@@ -19092,12 +19392,18 @@ fn try_compile_inner(
                         }
                         ldc_class_info.push((pc, holder_class_id, cp_idx));
                     }
-                    Some(JitLdcConstant::String(text)) => {
-                        let boxed: Box<str> = text.into_boxed_str();
-                        let ptr = boxed.as_ptr();
-                        let len = boxed.len();
-                        owned_strings.push(boxed);
-                        ldc_string_info.push((pc, ptr, len));
+                    Some(JitLdcConstant::String {
+                        holder_class_id,
+                        cp_idx,
+                    }) => {
+                        // Same OptionalPtr guard the `ClassMirror` arm above
+                        // takes: a hand-built test table leaves the helper 0,
+                        // and then this site keeps the historical whole-compile
+                        // bail rather than emitting a CALL to address 0.
+                        if helpers.ldc_string_cp == 0 {
+                            jitc_bail!("ldc_string_helper_unwired")
+                        }
+                        ldc_string_info.push((pc, holder_class_id, cp_idx));
                     }
                     None => {
                         // RBC.7 — same permanent-bail class as RBC.4 (scan
@@ -20811,6 +21117,50 @@ fn try_compile_inner(
             })
             .collect(),
     );
+    // The same table again, with the one thing a compiled `catch` needs that
+    // no liveness analysis does: WHICH throwables each entry takes.
+    //
+    // Staged only when the feature is on and the front end can name every
+    // catch type — a table with one unresolvable entry is staged as nothing at
+    // all, because a site built from a partial table would silently answer
+    // "propagate" where the real table has a match. `catch_type == 0` is a
+    // catch-all and carries the empty name rather than a resolution.
+    //
+    // `take_local_handlers_disarmed` is the retry channel: a compile that
+    // refused with handler bodies in the image comes back through here once
+    // with them suppressed, so the feature can cost a method throughput but
+    // never its artifact.
+    let local_handlers_requested = local_handlers_enabled()
+        && !cached.exception_table.is_empty()
+        && !take_local_handlers_disarmed();
+    if local_handlers_requested {
+        let mut table: Vec<(usize, usize, usize, &'static str)> =
+            Vec::with_capacity(cached.exception_table.len());
+        let mut resolvable = true;
+        for e in cached.exception_table.iter() {
+            let name: &'static str = if e.catch_type == 0 {
+                ""
+            } else {
+                match cp_class_name_resolver.as_ref().and_then(|r| r(e.catch_type)) {
+                    Some(n) => intern_catch_type_name(&n),
+                    None => {
+                        resolvable = false;
+                        break;
+                    }
+                }
+            };
+            table.push((
+                // Widening: classfile pcs are u16.
+                e.start_pc as usize,
+                e.end_pc as usize,
+                e.handler_pc as usize,
+                name,
+            ));
+        }
+        if resolvable {
+            x64::set_pending_local_handler_table(table, cached.declaring_class_id.as_u32());
+        }
+    }
     // Phase 10 (single-pass backend). Like `lower_inner`, this one call does
     // selection, encoding and buffer install together. The guard also covers
     // the `?` below: a backend bail is a compilation that spent this time.
@@ -31333,6 +31683,49 @@ mod mic_devirt_evidence {
 /// invalidation silently skipped, leaving a devirtualised call bound to a
 /// method that now has a second implementor — is a miscompile, not a slowdown.
 /// So each case below is the equivalence, not the speed.
+#[cfg(test)]
+mod local_handler_site_cache {
+    use super::*;
+
+    /// The whole reason the cache is ONE `u64` and not two `u32`s: a reader
+    /// must never be able to pair one throwable's class id with another
+    /// throwable's answer. Round-tripping every field together is what says
+    /// the packing has that property.
+    #[test]
+    fn the_cache_round_trips_class_and_index_together() {
+        for (class_id, index) in [(1u32, 0i32), (0, 3), (0x7fff_ffff, -1), (1163, 2)] {
+            let raw = JitLocalHandlerSite::encode_cache(class_id, index);
+            assert_ne!(
+                raw,
+                JitLocalHandlerSite::CACHE_EMPTY,
+                "a populated cache must be distinguishable from an empty one, \
+                 including for class id 0 and index -1"
+            );
+            assert_eq!(
+                JitLocalHandlerSite::decode_cache(raw),
+                Some((class_id, index)),
+                "class {class_id} / index {index} did not survive the packing"
+            );
+        }
+    }
+
+    /// `-1` — "this frame does not catch it" — is worth caching: a site that
+    /// keeps propagating must not re-resolve its catch types on every throw.
+    /// So the empty state cannot be "index is negative"; it is its own bit.
+    #[test]
+    fn an_empty_cache_is_not_a_cached_propagate() {
+        assert_eq!(
+            JitLocalHandlerSite::decode_cache(JitLocalHandlerSite::CACHE_EMPTY),
+            None
+        );
+        let cached_propagate = JitLocalHandlerSite::encode_cache(7, -1);
+        assert_eq!(
+            JitLocalHandlerSite::decode_cache(cached_propagate),
+            Some((7, -1))
+        );
+    }
+}
+
 #[cfg(test)]
 mod invalidate_early_out {
     use super::*;

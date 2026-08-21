@@ -274,16 +274,19 @@ pub enum Op {
     // the correctness requirement. An `ObjectRef` baked at compile time is
     // stale the moment a relocating collector moves it, and `<clinit>` is a
     // side effect the constant owes on first touch. See each variant.
-    /// `ldc <String>` — the interned literal at (`bytes`, `len`). Inputs
-    /// `[ctrl, mem]`, result `Ref`.
+    /// `ldc <String>` — the interned literal named at `cp_idx` in
+    /// `holder_class_id`'s constant pool. Inputs `[ctrl, mem]`, result `Ref`.
     ///
-    /// Lowered as a call to `helpers.ldc_string`, which consults the VM string
-    /// pool. The bytes live in the compiling artifact (`_jit_strings`), so the
-    /// baked address outlives the code; the *object* is fetched fresh every
-    /// execution, because the pool is rewritten after a moving collection.
+    /// Lowered as a call to `helpers.ldc_string_cp`. CP-indexed rather than
+    /// bytes-indexed because that is the key JVMS §5.4.3's recorded resolution
+    /// is filed under; the predecessor shape baked the literal's UTF-8 and so
+    /// had to re-derive the object through the string pool on every execution.
+    /// The object is still fetched at run time — a baked `ObjectRef` is stale
+    /// the moment a relocating collector moves it — but now from a record
+    /// keyed by the site rather than by the literal's content.
     ConstString {
-        bytes: usize,
-        len: usize,
+        holder_class_id: u32,
+        cp_idx: u16,
     },
 
     /// `ldc <Class>` — the mirror of the class named at `cp_idx` in
@@ -3770,7 +3773,7 @@ pub struct IrBuilder {
     /// [`Self::set_ldc_string_info`]. The caller owns the bytes for the
     /// artifact's lifetime; see [`Op::ConstString`] for why the object itself
     /// is re-fetched on every execution instead.
-    ldc_string_info: HashMap<usize, (usize, usize)>,
+    ldc_string_info: HashMap<usize, (u32, u16)>,
     /// cov-01 increment 3: resolved `ldc <Class>` sites
     /// (`pc → (holder_class_id, cp_idx)`). Set by
     /// [`Self::set_ldc_class_info`]; a site whose helper is unwired is simply
@@ -3902,7 +3905,7 @@ impl IrBuilder {
     /// cov-01 increment 2: supply resolved `ldc <String>` sites
     /// (`pc → (bytes, len)`). The caller must keep the bytes alive for the
     /// artifact's lifetime — the lowered body bakes their address.
-    pub fn set_ldc_string_info(&mut self, info: HashMap<usize, (usize, usize)>) {
+    pub fn set_ldc_string_info(&mut self, info: HashMap<usize, (u32, u16)>) {
         self.ldc_string_info = info;
     }
 
@@ -6397,9 +6400,14 @@ impl IrBuilder {
                         };
                         self.push(c);
                         pc += width;
-                    } else if let Some(&(bytes, len)) = self.ldc_string_info.get(&pc) {
+                    } else if let Some(&(holder_class_id, cp_idx)) =
+                        self.ldc_string_info.get(&pc)
+                    {
                         let s = self.graph.add(
-                            Op::ConstString { bytes, len },
+                            Op::ConstString {
+                                holder_class_id,
+                                cp_idx,
+                            },
                             IrType::Ref,
                             vec![self.ctrl, self.mem],
                             Some(pc),
@@ -9482,7 +9490,14 @@ mod tests {
             (Op::Call { info_ptr: 0 }, 2, MemAccess::Opaque),
             // cov-01 — the same classification `Op::Call` has, for the same
             // reason: the helper each lowers to can run arbitrary Java.
-            (Op::ConstString { bytes: 0, len: 0 }, 2, MemAccess::Opaque),
+            (
+                Op::ConstString {
+                    holder_class_id: 0,
+                    cp_idx: 0,
+                },
+                2,
+                MemAccess::Opaque,
+            ),
             (
                 Op::ConstClass {
                     holder_class_id: 0,

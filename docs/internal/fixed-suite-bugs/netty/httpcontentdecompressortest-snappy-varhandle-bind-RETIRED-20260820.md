@@ -230,7 +230,7 @@ Flat self-time, same profile, grouped:
 | **13.4 %** | `G1Collector::is_addr_in_live_region` (8.70) + `is_object_address` (4.73) | heap address validation, ~198 M calls per 4 MiB (`CRATONVM_DBG=g1-live-memo`); the memo hits 99.9 %, so this is volume, not misses |
 | 8.0 % | `try_jit_site_cached_native_dispatch`, `safe_native_call_impl`, `decode_dispatch_values_into`, `forward_jit_reference_args`, `jit_invoke_virtual_mic`, `coerce_native_return` | the residual native funnel — 7.47 M calls, of which `DirectByteBuffer.get(I)B` is 4.26 M and interpreted `VarHandle.get` 2.16 M |
 | 7.2 % | `get_field_as`, `get_field_raw`, `coerce_field_value_for_slot`, `load_and_forward` | field-access machinery |
-| ~5 % | `create_java_string` + `HashMap<String, ObjectRef>::get` + `__memcmp_evex_movbe` | **compiled `ldc "literal"`** — new page, `known-issues/jit/compiled-ldc-re-derives-its-constant-every-execution-20260820.md` |
+| ~5 % | `create_java_string` + `HashMap<String, ObjectRef>::get` + `__memcmp_evex_movbe` | **compiled `ldc "literal"`** — `compiled-ldc-re-derived-its-constant-every-execution-FIXED-20260820.md`. NOTE (2026-08-20): this cluster is real and the row it produced was NOT marginal. Replacing the pool lookup with the recorded resolution left `ldc "literal"` at 16.6 ns, unchanged — ~16.5 ns is the helper call itself, not either lookup. The `ldc <Class>` half of that page IS 4.05x. |
 | 5.2 % | `varhandle_instance_field_read_bits` + `jit_varhandle_read_direct` | this page's own fix, at 58 ns/read |
 
 ### Why no combination of these closes the class
@@ -357,9 +357,12 @@ serves.
 
 ## Related
 
-* `compiled-ldc-re-derives-its-constant-every-execution-20260820.md` — the
-  ~5 % this page's profile found and could not attribute to anything already
-  known.
+* `compiled-ldc-re-derived-its-constant-every-execution-FIXED-20260820.md` —
+  the ~5 % this page's profile found and could not attribute to anything
+  already known. Since FIXED, with one of its two halves measuring flat: the
+  string rung this profile pointed at did not move, because the pool lookup and
+  the recorded lookup cost the same and both are smaller than the call that
+  reaches them.
 * `httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`,
   `httpresponsestatustest-exhaustive-loop-timeout-20260816.md` — the other two
   `codec-http` walls, the same mechanism.

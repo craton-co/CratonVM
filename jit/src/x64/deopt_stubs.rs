@@ -17,6 +17,16 @@
 
 use super::*;
 
+/// How many handlers one throwing bci may have before a compiled local
+/// dispatch declines it.
+///
+/// The stub tests candidates with one `CMP`/`JE` pair each, so this is the
+/// length of the ladder a throw walks before propagating. Four covers every
+/// shape javac emits for a `try` with several `catch` clauses plus its
+/// synthetic `finally` copy; past it the interpreted route is correct and a
+/// throw that deep in a ladder is not the hot case this exists for.
+const MAX_LOCAL_HANDLER_CANDIDATES: usize = 4;
+
 /// Default-ON: a per-bci `Ambiguous` local in an exception-free method is
 /// published `Undefined` rather than `Unsupported`. See the call site for the
 /// JVMS argument. `CRATONVM_JIT_NO_OSR_AMBIGUOUS_DEAD=1` is the kill switch.
@@ -162,6 +172,16 @@ impl Compiler {
             .chain(self.ldc2w_info.iter().map(|&(pc, _)| pc))
             .collect();
 
+        // Handler bodies are live code exactly when local handlers are armed,
+        // and then the analysis has to type them: otherwise every deopt point
+        // inside a `catch` block falls back to `Unsupported` and vetoes the
+        // whole artifact's OSR entry. Empty otherwise, so an unarmed compile is
+        // byte-identical.
+        let handler_pcs: Vec<usize> = self
+            .local_handler_table
+            .iter()
+            .map(|(_, _, handler_pc, _)| *handler_pc)
+            .collect();
         let inputs = StackKindInputs {
             field_types,
             static_types,
@@ -169,6 +189,7 @@ impl Compiler {
             ldc_refs: &ldc_refs,
             ldc_fp: &self.ldc_fp_pcs,
             ldc_resolved: &ldc_resolved,
+            handler_pcs: &handler_pcs,
         };
         self.stack_kinds = analyze(code, code_len, &inputs);
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
@@ -1423,12 +1444,7 @@ impl Compiler {
             self.buf.emit(&[0x0F, 0x85]);
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-            if precise_exc_stub {
-                self.deopt_stubs.push((patch_offset, throw_bci, 9));
-            } else {
-                self.exception_check_stubs
-                    .push((patch_offset, self.dbg_last_pc));
-            }
+            self.record_exception_check_edge(patch_offset, throw_bci, precise_exc_stub);
             // .keep: patch the JNE above to land here (self-relative ⇒ copy-safe).
             let keep_off = self.buf.pos();
             let rel = (keep_off as i32) - (keep_patch as i32 + 4); // Cast: rel32 displacement
@@ -1438,12 +1454,46 @@ impl Compiler {
             self.buf.emit(&[0x0F, 0x84]);
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-            if precise_exc_stub {
-                self.deopt_stubs.push((patch_offset, throw_bci, 9));
-            } else {
-                self.exception_check_stubs
-                    .push((patch_offset, self.dbg_last_pc));
+            self.record_exception_check_edge(patch_offset, throw_bci, precise_exc_stub);
+        }
+    }
+
+    /// Where a fallible site's "the callee threw" edge goes.
+    ///
+    /// Three destinations, in the order they are preferred:
+    ///
+    ///  1. **A local-handler stub**, when this method's own exception table can
+    ///     catch at `throw_bci` and compiled local handlers are armed. That
+    ///     stub asks the runtime which `catch` applies and — on a hit — jumps
+    ///     into the compiled handler block without ever leaving the frame.
+    ///     Its own miss edge comes back through this same function's other two
+    ///     arms, so nothing about the propagating case changes.
+    ///  2. **The reason-9 deopt stub**, when this bci published a precise
+    ///     exceptional frame.
+    ///  3. **The shared sentinel exit** otherwise.
+    ///
+    /// Extracted so the plain and the `J`/`D` sentinel-disambiguation arms of
+    /// `emit_post_invoke_exception_check` cannot drift: they had the same
+    /// two-arm choice written out twice, and a third destination written twice
+    /// is a third destination that will eventually be written once.
+    pub(super) fn record_exception_check_edge(
+        &mut self,
+        patch_offset: usize,
+        throw_bci: usize,
+        precise_exc_stub: bool,
+    ) {
+        if self.local_handler_propagate_survives_a_call(throw_bci) {
+            if let Some(site_idx) = self.local_handler_site_for(throw_bci) {
+                self.local_handler_stubs
+                    .push((patch_offset, site_idx, throw_bci, precise_exc_stub));
+                return;
             }
+        }
+        if precise_exc_stub {
+            self.deopt_stubs.push((patch_offset, throw_bci, 9));
+        } else {
+            self.exception_check_stubs
+                .push((patch_offset, self.dbg_last_pc));
         }
     }
 
@@ -1498,17 +1548,211 @@ impl Compiler {
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        if precise_exc_stub {
-            self.deopt_stubs.push((patch_offset, throw_bci, 9));
-        } else {
-            self.exception_check_stubs
-                .push((patch_offset, self.dbg_last_pc));
-        }
+        // An allocation failure stashes a real `OutOfMemoryError` object, so a
+        // `catch (OutOfMemoryError)` / `finally` guarding this bci is as
+        // enterable in compiled code as a callee's throw.
+        self.record_exception_check_edge(patch_offset, throw_bci, precise_exc_stub);
         // Force `has_dispatch` (see the field doc): the fallible `jit_newarray`
         // helper needs the per-thread `JIT_THREAD` TLS set — both to run the
         // allocation-failure GC and to construct the OOME — which only the
         // dispatch-aware entry path (`set_jit_thread`) provides.
         self.emitted_alloc_oom_check = true;
+    }
+
+    /// Would this bci's propagate edge still describe the right frame after a
+    /// C-ABI `CALL` runs on it?
+    ///
+    /// A local-handler stub puts a helper `CALL` between the trapping
+    /// instruction and the reason-9 stub it may fall through to. That stub
+    /// reconstructs register-homed values by spilling the live register file
+    /// AT THE STUB, so any value homed in a CALLER-saved register would be read
+    /// back as whatever the helper left there.
+    ///
+    /// Today nothing can be: Java locals are coloured only into
+    /// [`LOCAL_REGS`]/[`LOCAL_XMMS`], which are callee-saved on both ABIs the
+    /// backend targets, and every operand-stack value has been flushed to a
+    /// frame slot by the `flush_scratch_registers` that precedes the fallible
+    /// call. This check is therefore expected to pass for every site — which is
+    /// exactly why it is worth having: the argument is two invariants deep and
+    /// neither is stated where a future register-allocator change would read
+    /// it. A site it refuses simply keeps the pre-feature route.
+    fn local_handler_propagate_survives_a_call(&self, throw_bci: usize) -> bool {
+        if self.local_handler_table.is_empty() {
+            return false;
+        }
+        let Some(point) = self
+            .deopt_points
+            .iter()
+            .rev()
+            .find(|p| p.bci as usize == throw_bci && p.semantics.rethrow_exception)
+        else {
+            // No precise frame at this bci: the propagate edge is the shared
+            // sentinel exit, which reloads everything it needs.
+            return true;
+        };
+        crate::deopt::frame_state_register_homes(&point.frame_state)
+            .into_iter()
+            .all(|(reg, is_xmm)| {
+                if is_xmm {
+                    LOCAL_XMMS.contains(&reg)
+                } else {
+                    LOCAL_REGS.contains(&reg)
+                }
+            })
+    }
+
+    /// The site index for a throw at `throw_bci` that this method's own
+    /// exception table can catch, creating it on first use — or `None` when
+    /// local handlers are disarmed, when no entry covers the bci, or when the
+    /// candidate list is longer than a stub is willing to test inline.
+    ///
+    /// Keyed by bci so two fallible operations at the same bci share ONE site
+    /// and therefore one monomorphic cache.
+    pub(super) fn local_handler_site_for(&mut self, throw_bci: usize) -> Option<usize> {
+        if self.local_handler_table.is_empty() {
+            return None;
+        }
+        if let Some(&idx) = self.local_handler_site_by_bci.get(&throw_bci) {
+            return Some(idx);
+        }
+        // Exception-table ORDER is the matching order — JVMS §2.10, and the
+        // same order `find_jit_exception_handler` walks. Filtering preserves
+        // it, so the runtime answer is the interpreter's answer.
+        let candidates: Vec<(&'static str, u32)> = self
+            .local_handler_table
+            .iter()
+            .filter(|(start, end, _, _)| throw_bci >= *start && throw_bci < *end)
+            // Cast: a handler pc is a bci, which fits u32 by classfile limits.
+            .map(|(_, _, handler, name)| (*name, *handler as u32))
+            .collect();
+        // A stub tests candidates with one CMP/JE each, so a pathological
+        // table would emit an unbounded ladder. Past the bound the old route
+        // is correct and the throw is not hot enough to matter.
+        if candidates.is_empty() || candidates.len() > MAX_LOCAL_HANDLER_CANDIDATES {
+            return None;
+        }
+        let idx = self.local_handler_sites.len();
+        self.local_handler_sites
+            .push(Box::new(crate::JitLocalHandlerSite {
+                candidates,
+                declaring_class_id: self.local_handler_class_id,
+                // Cast: a bci fits u32 by classfile limits.
+                throw_bci: throw_bci as u32,
+                cache: std::sync::atomic::AtomicU64::new(
+                    crate::JitLocalHandlerSite::CACHE_EMPTY,
+                ),
+            }));
+        self.local_handler_site_by_bci.insert(throw_bci, idx);
+        Some(idx)
+    }
+
+    /// Emit one out-of-line stub per local-handler site: ask the runtime which
+    /// of this method's own `catch` blocks takes the pending throwable, and
+    /// either jump into it or fall through to the edge that ran before this
+    /// feature existed.
+    ///
+    /// Emitted BEFORE `emit_exception_check_stub` / `emit_deopt_stubs` so the
+    /// propagate edge can be recorded as an ordinary entry in either of those
+    /// lists — the stub does not duplicate their epilogues, it branches to
+    /// them.
+    ///
+    /// The shape, per site:
+    ///
+    /// ```text
+    ///   MOV  arg0, [rbp - heap_local_offset]   ; SharedVm
+    ///   MOV  arg1, imm64 &JitLocalHandlerSite
+    ///   LEA  arg2, [rbp - operand_slot_0]      ; where to put the throwable
+    ///   CALL jit_local_handler_lookup
+    ///   TEST EAX, EAX
+    ///   JS   propagate                         ; -1: not ours
+    ///   CMP  EAX, 0 ; JE handler_0
+    ///   CMP  EAX, 1 ; JE handler_1
+    ///   ...
+    ///   JMP  propagate                         ; unreachable; fail-closed
+    /// ```
+    ///
+    /// The handler jumps go through `forward_patches`, so they resolve against
+    /// `pc_to_native[handler_bci]` exactly like any other branch — which is
+    /// why this runs after the body walk has placed those blocks.
+    pub(super) fn emit_local_handler_stubs(&mut self) {
+        if self.local_handler_stubs.is_empty() {
+            return;
+        }
+        // A stub is out-of-line code reached by a branch, so no register/slot
+        // pairing recorded in the body can describe it.
+        self.slot_mirror = None;
+        // Slot 0 of the operand stack: where a handler's `[exception]` lives,
+        // and what the revived handler block's reconstructed stack names.
+        let operand_slot_0 = self.base_spill_offset;
+        let stubs = std::mem::take(&mut self.local_handler_stubs);
+        for (patch_offset, site_idx, throw_bci, precise) in stubs {
+            crate::metrics::note_local_handler(crate::metrics::LOCAL_HANDLER_SITE_EMITTED);
+            let stub_offset = self.buf.pos();
+            // Cast: x86-64 rel32 displacement.
+            let rel32 = (stub_offset as i32) - (patch_offset as i32 + 4);
+            self.buf.try_patch_i32(patch_offset, rel32).ok(); // on Err the buffer is marked overflowed; the compile bails
+            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+            // The site is owned by `local_handler_sites`, which is moved onto
+            // the published `CompiledMethod` — so this address outlives the
+            // machine code that bakes it and is freed with it.
+            let site_ptr = std::ptr::addr_of!(*self.local_handler_sites[site_idx]) as i64; // Cast: JIT ABI convention
+            self.emit_mov_imm64(ARG_REGS[1], site_ptr);
+            // LEA arg2, [rbp - operand_slot_0]
+            self.rex_w_r(ARG_REGS[2]);
+            self.buf.emit_byte(0x8D);
+            self.modrm_rbp_disp(ARG_REGS[2], operand_slot_0);
+            self.emit_call_absolute(self.helpers.local_handler_lookup);
+            // TEST EAX, EAX (85 C0) — the result is a small index or -1, so
+            // the 32-bit form is enough and the sign flag carries the answer.
+            self.buf.emit(&[0x85, 0xC0]);
+            // JS propagate (0F 88 rel32)
+            self.buf.emit(&[0x0F, 0x88]);
+            let propagate_patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            self.record_local_handler_propagate_edge(propagate_patch, throw_bci, precise);
+            let handlers: Vec<u32> = self.local_handler_sites[site_idx]
+                .candidates
+                .iter()
+                .map(|(_, handler)| *handler)
+                .collect();
+            for (i, handler_bci) in handlers.iter().enumerate() {
+                // CMP EAX, imm8 (83 F8 ib) — the index is bounded by
+                // MAX_LOCAL_HANDLER_CANDIDATES.
+                // Cast: bounded by MAX_LOCAL_HANDLER_CANDIDATES.
+                self.buf.emit(&[0x83, 0xF8, i as u8]);
+                // JE handler (0F 84 rel32), resolved against pc_to_native.
+                self.buf.emit(&[0x0F, 0x84]);
+                let patch = self.buf.pos();
+                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                // Widening: a handler bci indexes `pc_to_native`.
+                self.forward_patches.push((patch, *handler_bci as usize));
+            }
+            // Unreachable: the helper only returns an index it was given.
+            // Emitted anyway so a future candidate-list change cannot make the
+            // stub fall off its own end into the next one.
+            self.buf.emit(&[0xE9]);
+            let tail_patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            self.record_local_handler_propagate_edge(tail_patch, throw_bci, precise);
+        }
+    }
+
+    /// Record a branch out of a local-handler stub onto the route a caught
+    /// exception took before this feature existed — the reason-9 deopt stub
+    /// when this bci published a precise exceptional frame, the shared
+    /// sentinel exit otherwise. Exactly the two arms
+    /// `emit_post_invoke_exception_check` chooses between.
+    fn record_local_handler_propagate_edge(
+        &mut self,
+        patch_offset: usize,
+        throw_bci: usize,
+        precise: bool,
+    ) {
+        if precise {
+            self.deopt_stubs.push((patch_offset, throw_bci, 9));
+        } else {
+            self.exception_check_stubs.push((patch_offset, throw_bci));
+        }
     }
 
     /// Emit the single shared out-of-line stub for post-invoke exception

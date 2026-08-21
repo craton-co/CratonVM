@@ -531,7 +531,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-204 tokens.
+208 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -658,6 +658,7 @@ export inherited from a parent shell.
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
 | `inline-call-dispatch` | `CRATONVM_JIT_INLINE_CALL_DISPATCH` |
 | `inline-splice-devirt` | `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` |
+| `local-handlers` | `CRATONVM_JIT_LOCAL_HANDLERS` |
 | `osr-seed-frame-slots` | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS` |
 | `osr-strip-all-high-halves` | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` |
 | `osr-single-pc` | `CRATONVM_JIT_OSR_SINGLE_PC` |
@@ -688,6 +689,7 @@ export inherited from a parent shell.
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
+| `compiled-ldc-const-cache` | `CRATONVM_JIT_COMPILED_LDC_CONST_CACHE` |
 | `new-site-cache` | `CRATONVM_JIT_NO_NEW_SITE_CACHE` |
 | `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
 | `unreg-memo-hiwater` | `CRATONVM_JIT_UNREG_MEMO_HIWATER` |

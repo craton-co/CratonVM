@@ -2307,7 +2307,67 @@ unsafe fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
 /// # Safety
 /// The pointer must be valid and 8-byte aligned.
 unsafe fn read_slot(ptr: *mut u8) -> Value {
-    cratonvm_types::read_value_atomic(ptr as *const Value)
+    read_value_cell_checked(ptr as *const Value, "heap::read_slot")
+}
+
+/// Read a legacy 16-byte `Value` cell, screening the discriminant first.
+///
+/// # why this is not `read_value_atomic`
+///
+/// `gen_heap::read_slot` has validated the discriminant since `HIB-CV-32`; the
+/// other three legacy-cell readers did not — `heap::read_slot` and
+/// `g1::get_field` used the unchecked `read_value_atomic`, and `zgc::get_field`
+/// used a bare non-atomic `std::ptr::read`. That asymmetry is not a style
+/// difference, it decides whether a heap reference-integrity defect is
+/// *reported* or *fatal*, and it is why one defect presented as two unrelated
+/// outcomes:
+///
+/// `JsonMarshallerTests` reads a `String.value` field through a stale receiver
+/// whose memory has been swept and handed to something else, so the cell holds
+/// two heap pointers (`raw0=0x…3c50a5d8 raw1=0x…3c7218e0`) rather than a
+/// `(tag, payload)` pair. Generational screened it, returned null, logged, and
+/// the class passed 17/17. ZGC and G1 transmuted it and handed the result to a
+/// `match`, whose jump-table load is `[table + disc*4]` with no bounds check
+/// because Rust guarantees an in-range discriminant — so the low word of a heap
+/// pointer became the index. The faulting address is exactly that arithmetic:
+/// `r10=0x00007FF7EEFFB914` (table) `+ rax=0x440A7D38` (the bogus discriminant)
+/// `* 4 = 0x00007FF8FF29ADF4`, the address in the SIGSEGV report.
+///
+/// Screening here does NOT fix the producer — the stale receiver is a separate,
+/// still-open defect that is present under Generational too, where this guard is
+/// the only reason its green looks clean. What it fixes is that the same corrupt
+/// cell must not be a localizable diagnostic on one collector and an
+/// unrecoverable crash on the others.
+///
+/// # Safety
+/// The pointer must be valid, readable for 16 bytes, and 8-byte aligned.
+pub(crate) unsafe fn read_value_cell_checked(ptr: *const Value, site: &'static str) -> Value {
+    match cratonvm_types::read_value_checked_atomic(ptr) {
+        Some(v) => v,
+        None => {
+            static CORRUPT_HITS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = CORRUPT_HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 32 || gc_flags().diag_hib32 {
+                // SAFETY: caller contract — 16 readable, 8-byte-aligned bytes.
+                // Read atomically per word so the diagnostic itself cannot tear
+                // against a concurrent plain writer (PLAIN-SLOT TEARING FIX).
+                let raw0 = (*(ptr as *const std::sync::atomic::AtomicU64)).load(Ordering::Relaxed);
+                let raw1 = (*((ptr as *const u8).add(8) as *const std::sync::atomic::AtomicU64))
+                    .load(Ordering::Relaxed);
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    slot = ?ptr,
+                    raw0 = format!("{raw0:#018x}"),
+                    raw1 = format!("{raw1:#018x}"),
+                    "{site}: corrupt Value cell (out-of-range discriminant) — \
+                     returning null instead of a UB-on-match Value. Heap \
+                     reference-integrity defect (see HIB-CV-32).",
+                );
+            }
+            Value::Object(None)
+        }
+    }
 }
 
 /// Write a `Value` into a slot.

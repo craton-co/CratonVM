@@ -1021,6 +1021,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-call-dispatch", on_key: Some("CRATONVM_JIT_INLINE_CALL_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-splice-devirt", on_key: Some("CRATONVM_JIT_INLINE_SPLICE_DEVIRT"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "local-handlers", on_key: Some("CRATONVM_JIT_LOCAL_HANDLERS"), off_key: None, off_word: None },
     // Default-**OFF**, unlike their neighbour `osr-dead-locals` four rows up —
     // the contrast is the reason these two carry a comment at all.
     // `jit::osr_always_seed_frame_slot` and `jit::osr_single_pc_entry_only`
@@ -1085,6 +1086,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "invoke-phases", on_key: Some("CRATONVM_DBG_INVOKE_PHASES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "param-tag-scan", on_key: None, off_key: Some("CRATONVM_JIT_NO_PARAM_TAG_SCAN"), off_word: None },
     E { group: Group::JIT, token: "ldc-const-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_LDC_CONST_CACHE"), off_word: None },
+    E { group: Group::JIT, token: "compiled-ldc-const-cache", on_key: Some("CRATONVM_JIT_COMPILED_LDC_CONST_CACHE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "new-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_SITE_CACHE"), off_word: None },
     E { group: Group::JIT, token: "site-cache", on_key: Some("CRATONVM_JIT_SITE_CACHE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unreg-memo-hiwater", on_key: Some("CRATONVM_JIT_UNREG_MEMO_HIWATER"), off_key: None, off_word: None },

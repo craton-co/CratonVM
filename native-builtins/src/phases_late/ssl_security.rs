@@ -3470,6 +3470,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "init",
         "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
         |ctx, args| {
+            // Third-party SPI: its own `engineInit`. See
+            // `jca::ssl_context_spi` for the boundary, and for why this guard
+            // is on all three `javax/net/ssl/SSLContext` registration sets
+            // rather than only on whichever wins last-write-wins today.
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineInit",
+                "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             let km_arg = args.get(1).copied().unwrap_or(Value::Object(None));
             let tm_arg = args.get(2).copied().unwrap_or(Value::Object(None));
@@ -3625,6 +3637,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetSocketFactory",
+                "()Ljavax/net/ssl/SSLSocketFactory;",
+            ) {
+                return r;
+            }
             // Field 0 is the originating SSLContext, matching the factory
             // shape consumed by the HttpURLConnection TLS bridge.
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1)?;
@@ -3650,6 +3670,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getServerSocketFactory",
         "()Ljavax/net/ssl/SSLServerSocketFactory;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineGetServerSocketFactory",
+                "()Ljavax/net/ssl/SSLServerSocketFactory;",
+            ) {
+                return r;
+            }
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -3659,15 +3687,35 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getProtocol",
         "()Ljava/lang/String;",
         |ctx, args| {
+            // Slot 0 is this registration's own synthetic protocol string; on
+            // a REAL `javax.net.ssl.SSLContext` it is `provider`. See the
+            // twin in `net_phase_e::register_re6_ssl_context`.
+            if let Some(v) = crate::jca::ssl_context_spi::real_context_protocol(ctx, args) {
+                return Ok(Some(v));
+            }
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
     r.register(
         ctx_class,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        |ctx, args| crate::jca::ssl_context_spi::ssl_context_provider(ctx, args),
+    );
+    r.register(
+        ctx_class,
         "createSSLEngine",
         "()Ljavax/net/ssl/SSLEngine;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineCreateSSLEngine",
+                "()Ljavax/net/ssl/SSLEngine;",
+            ) {
+                return r;
+            }
             let obj = ssleng_alloc(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -3677,6 +3725,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "createSSLEngine",
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineCreateSSLEngine",
+                "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
+            ) {
+                return r;
+            }
             let obj = ssleng_alloc(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
