@@ -1341,6 +1341,17 @@ pub fn dump_method_stats_to_stderr() {
          Reference.reachabilityFence={fence_sites} Long.valueOf={long_value_of_sites} \
          Long.longValue={long_long_value_sites} VarHandle.read={vh_read_sp}/{vh_read_osr}",
     );
+    let (untrap_shape, untrap_refused) = crate::ir_unresumable_trap_counts();
+    if untrap_shape != 0 {
+        // `shape` counts the methods whose protected range carries an
+        // unresumable trap; `refused` counts the ones the guard actually
+        // declined the optimizing tier to. They differ only under
+        // `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD=0`, which is the measurement
+        // arm — see that switch's doc for why it is unsound to ship.
+        eprintln!(
+            "[cratonvm] IR unresumable-trap refusal: shape={untrap_shape} refused={untrap_refused}",
+        );
+    }
     let shadow_census = crate::jit_native_shadow_cause_census();
     if !shadow_census.is_empty() {
         eprintln!(
