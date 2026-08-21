@@ -1,9 +1,18 @@
-# The stub ratchet has not been running, and it is three over its baseline
+# The stub ratchet had not been running, and it was three over its baseline
 
-**Status: OPEN.** Found 2026-08-20 while merging current dev into an unrelated
-TLS branch. Two facts, and the first explains the second.
+**Status: FIXED 2026-08-21.** Found 2026-08-20 while merging current dev into an
+unrelated TLS branch. Two facts, and the first explains the second.
 
-## 1. `native-builtins/tests/stub_ratchet.rs` does not compile on dev
+The compile break was repaired the day it was found; the three rows were
+identified and the baselines re-frozen on 2026-08-21, with the account in the
+constant's own doc comment. Both configurations are green:
+
+```
+cargo test -p cratonvm-native-builtins --test stub_ratchet                        11 passed
+cargo test -p cratonvm-native-builtins --features management --test stub_ratchet  11 passed
+```
+
+## 1. `native-builtins/tests/stub_ratchet.rs` did not compile on dev
 
 ```
 error: unknown start of token: \
@@ -29,7 +38,7 @@ deleted and the one sentence from it that the call still passes an argument for
 surviving message. Nothing else about the message is invented — the new text was
 already complete on its own; it was two format arguments and one `{}`.
 
-## 2. With it compiling, the ratchet is RED by three
+## 2. With it compiling, the ratchet was RED by three
 
 ```
 STUB-RATCHET in the no-management configuration: 1614 SyntheticStub natives
@@ -55,28 +64,65 @@ invisible to this census, which walks `register_essential_natives`, and that
 registrar is only reached from the `synthetic-jdk`-gated
 `register_synthetic_overrides`.)
 
-## What it would take to close
+## The three rows, and why the gate's own dichotomy did not fit them
 
-The test says it itself, and the instruction is worth following rather than
-short-cutting:
+`dump_synthetic_stubs` did not exist at the freeze commit `083998c7b` — it was
+added later — so the page's original recipe was not directly runnable. The
+substitute is honest and cheap: graft the CURRENT test onto that commit's tree.
+`census_rows` is byte-identical between the two, so the graft measures
+`083998c7b`'s registry and nothing else.
 
-> FIRST, find out WHICH rows, because this number cannot tell you why it moved.
-> Run `dump_synthetic_stubs` here and at the commit that last set
-> `BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT`, and diff the sorted `@@STUB` lines.
+```text
+cratonvm/internal/ss/JavaUtilJarAccess$1.entryFor(Ljava/util/jar/JarFile;Ljava/lang/String;)Ljava/util/jar/JarEntry;
+cratonvm/internal/ss/JavaUtilJarAccess$1.getTrustedAttributes(Ljava/util/jar/Manifest;Ljava/lang/String;)Ljava/util/jar/Attributes;
+cratonvm/internal/ss/JavaUtilJarAccess$1.isInitializing()Z
+```
 
-So: build `083998c7b`, run `dump_synthetic_stubs` there and on dev, diff. Then
-classify each of the three — a NEW fake (implement it properly, do not raise the
-baseline) or a `Bridge`→`SyntheticStub` RETAG of something already fake (an
-improvement, re-freeze with the list). The `stub-ratchet` record notes that on
-2026-08-19, 30 of 33 added rows were the second kind, so the prior is retag —
-but a prior is not a measurement, and **the baseline must not be re-frozen
-without the row list.**
+Three added, **zero removed**, from `392e6990a` (2026-08-19), which completed
+`jdk.internal.access.JavaUtilJarAccess`: the carrier had two of its five methods
+and the other three were abstract on a synthetic class, so a caller reaching one
+got an `AbstractMethodError`.
 
-Deliberately NOT done here: re-freezing 1611 → 1614 would turn a gate that has
-been blind for a day into a gate that has been blind for a day and then
-rubber-stamped.
+**The two-column rule did not adjudicate this one, and that is the finding.**
+The file's own classifier is:
 
-## Three more gates were red on dev in the same pass
+> * total UNCHANGED, stubs up → existing fakes were relabelled. Welcome.
+> * total UP by about the stub delta → new fakes were registered. Do not re-freeze.
+
+Measured: totals moved 12792 → **12885** (no-management) and 13160 → **13253**
+(management), i.e. **+93 rows against +3 stubs**. Neither case. It is 90 new
+`Bridge` rows and 3 new stubs, and the 3 are genuinely new registrations.
+
+By the letter, that is case (a) — "do NOT just raise the baseline". Both of
+case (a)'s remedies are unavailable here, and not by accident:
+
+* **"make the new native a real `Bridge`/`Intrinsic`" would be wrong.**
+  `cratonvm/internal/ss/JavaUtilJarAccess$1` is on
+  `no_image_receiver::VM_MINTED_STAND_IN_RECEIVERS`, and `F33-1` decided
+  deliberately that a factory and the carrier it hands out share one kind — so
+  the whole thing is refused under `--jdk-only`. Tagging these three `Bridge`
+  would keep a fake carrier alive in strict mode, which is the exact defect that
+  page exists to record.
+* **"fix the underlying VM gap so real bytecode runs" has nothing to run.** The
+  receiver's class exists only inside CratonVM and has no bytecode at all. There
+  is no JDK body behind `entryFor` to yield to.
+
+So the alternative to these three stubs is not real bytecode — it is the
+`AbstractMethodError` they were added to stop, and `--jdk-only` behaviour is
+identical either way because the carrier is dropped whole in both.
+
+**The third case, now written into the constant's doc comment:** a stub added to
+a receiver that strict mode already refuses IN ITS ENTIRETY costs strict mode
+nothing. Ask what mints the receiver before applying the dichotomy; if the owner
+is a listed stand-in, the row count is the only thing that moved, and completing
+its interface is a fix rather than a regression.
+
+All four constants re-frozen together — both stub baselines AND both
+`MEASURED_TOTAL_REGISTRATIONS`, because a re-freeze that leaves the totals stale
+disarms the classifier for the next reader.
+
+## Three more gates were red on dev in the same pass, and are still open
+
 
 Found by running the two crates' suites either side of a
 `git checkout origin/dev -- <src>` control, which is the only way to tell
