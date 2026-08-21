@@ -121,7 +121,7 @@ All four constants re-frozen together — both stub baselines AND both
 `MEASURED_TOTAL_REGISTRATIONS`, because a re-freeze that leaves the totals stale
 disarms the classifier for the next reader.
 
-## Three more gates were red on dev in the same pass, and are still open
+## Three more gates were red on dev in the same pass — one fixed, three still open
 
 
 Found by running the two crates' suites either side of a
@@ -136,17 +136,72 @@ branch's; each was measured with dev's own sources under the same test binary.
 | `cratonvm-native-io` | `io_tests::fis_read_bytes_zero_length_answers_zero_on_a_closed_stream` | FAILED |
 | `cratonvm-native-io` | `io_tests::fis_skip_consults_the_descriptor_before_the_count` | FAILED |
 
-A fourth, `lang_math::tests::canonical_wrapper_if_cached_follows_the_configured_integer_bound`,
-was fixed rather than filed — it was a one-line `i32` overflow in
-`canonical_wrapper_if_cached`'s index computation
-(`i32::MAX - INTEGER_CACHE_LOW`), where the contract is a cache MISS. Release
-builds wrap and miss anyway, so only the debug gate was red.
+Two were fixed rather than filed, both one-liners with no production behaviour
+change:
 
-The three `fis_*` rows share a prefix and are almost certainly one cause; they
-are listed separately because that has not been checked.
+* `lang_math::…_follows_the_configured_integer_bound` — an `i32` overflow in
+  `canonical_wrapper_if_cached`'s index computation
+  (`i32::MAX - INTEGER_CACHE_LOW`) where the contract is a cache MISS. Release
+  builds wrap and miss anyway, so only the debug gate was red.
+* `lang_class::null_receiver_on_an_instance_field_outranks_the_access_refusal` —
+  **the TEST was wrong and the production message was right all along.** It
+  asserted `format!("{err:?}").contains("because \"o\" is null")`, and `Debug`
+  for a `String` ESCAPES its quotes, so the rendering carries
+  `because \"o\" is null` while the needle was unescaped. It could never have
+  passed. Now compared against the `ENSURE_OBJ_NPE` constant the same call
+  passes in — strictly stronger than the substring, because it pins the
+  `Object.getClass()` half that names WHICH dereference HotSpot reports.
 
-**The pattern, not the rows.** Five distinct unit-test gates were red on dev at
-once, and one of them was a compile error that had been masking a sixth. This
+## The three `fis_*` rows are one cause, and it is not the test
+
+Diagnosed 2026-08-21, **not fixed here** — see below for why.
+
+All three assert that a positively-marked closed `FileInputStream` refuses
+`read()`, `read(byte[])` and `skip()`. Each of those bodies is shaped:
+
+```rust
+let fd = match fis_get_fd(ctx, this) {
+    Some(fd) => fd,
+    None if fis_is_closed(ctx, this) => return Err(io_stream_closed()),
+    None => return Ok(...),          // the benign answer
+};
+```
+
+and each carries a comment saying "Only a positively-marked close is refused".
+**That is not what the code does.** `fis_is_closed` is consulted only when the
+DESCRIPTOR lookup already failed, so a stream whose close wrote the closed
+marker while `FileDescriptor.fd` still reads as a number takes the `Some(fd)`
+arm and performs the I/O. `io_stream_is_closed` has two independent grounds —
+`(fd < 0 && handle < 0)`, or a negative marker in slot 0 — and only the first
+can ever be reached from these bodies.
+
+That is exactly the failure family the comments cite
+(`G4-1-the-io-and-nio-fabricated-success-sweep`): a closed stream answering EOF
+instead of throwing makes `while ((n = in.read()) != -1)` exit cleanly and the
+copy come out silently truncated.
+
+**The mock is faithful, which is the part worth stating.** `native-io`'s
+`MockNativeContext` keeps `set_field_by_name` in a side map keyed by
+`(ptr, name)`, disjoint from the indexed `get_field(this, 0)` slots — so a test
+that sets `fd` by name and a marker written by index do not alias. That is what
+production looks like when the two writes land in different places, and it is
+why these tests see the hole.
+
+**Scope, and why it is filed rather than fixed here.** The same shape is at TEN
+sites — five `fis_*` and five `fos_*` (`native-io/src/lib.rs`, the
+`None if f{i,o}s_is_closed` arms). Fixing three would leave the family
+inconsistent, which is worse than either extreme, and fixing ten is a behaviour
+change across every `java.io` consumer in the suites — it wants its own branch
+and its own regression run, not a ride inside a netty TLS change.
+
+The fix, when someone takes it: hoist the closed check ABOVE the descriptor
+lookup at all ten, in one shared helper so they cannot drift. One carve-out must
+survive — `native_fis_read_bytes`'s `is_empty_transfer(len)` early return has to
+stay in front of the closed check, because HotSpot measurably answers
+`read(b, 0, 0)` on a closed stream with `0` and no throw.
+
+**The pattern, not the rows.** Six distinct unit-test gates were red on dev at
+once, and one of them was a compile error that had been masking a seventh. This
 is the same shape as the 2026-08-18 finding that four native-builtins gates were
 red on dev simultaneously. A crate suite that nobody runs to green stops being
 a gate; the cheapest fix is to run `cargo test -p <crate>` on the crates a
