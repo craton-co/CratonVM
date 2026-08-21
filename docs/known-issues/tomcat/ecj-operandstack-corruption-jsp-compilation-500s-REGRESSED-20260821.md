@@ -1,8 +1,54 @@
 # ECJ's own `OperandStack.pop()` threw `AssertionError: Unexpected operand at stack top` while compiling JSPs — a JIT direct-call result parked at the wrong operand-stack depth
 
+**Status: REGRESSED (2026-08-21).** The identical `AssertionError: Unexpected
+operand at stack top` signature is back, on the current `dev` tip
+(`5b606e85e`, freshly built), on all three GC collectors. The 2026-08-06 fix
+below is still present in `jit/src/x64/bytecode_walk.rs` (both the
+spill-cursor-reclaim comment and the `direct_jit_callee_calls_enabled` gate
+are unchanged in the current tree) — this is not a revert. Either the original
+fix covered only some of the triggering call shapes, or something added since
+2026-08-06 reintroduces the same class of spill-cursor bug through a
+different arm. Not re-isolated this session; the original doc's isolation
+method (below) is the template for whoever picks this up.
+
+## 2026-08-21 recurrence
+
+Full 640-class Tomcat suite, 3 GCs (ZGC/G1/Generational), 1 shard each, Azure,
+`dev@5b606e85e`. Same signature, same classes as the original report, hitting
+all three collectors identically (not GC-specific):
+
+`org.apache.jasper.compiler.TestCompiler`,
+`org.apache.jasper.compiler.TestEncodingDetector`,
+`org.apache.jasper.compiler.TestJspDocumentParser`,
+`org.apache.jasper.compiler.TestParser`,
+`org.apache.jasper.runtime.TestJspContextWrapper`,
+`org.apache.jasper.tagplugins.jstl.core.TestForEach`,
+`org.apache.jasper.tagplugins.jstl.core.TestOut`,
+`org.apache.jasper.tagplugins.jstl.core.TestSet`,
+`org.apache.jasper.TestJspCompilationContext`,
+`org.apache.catalina.core.TestStandardContextResources` — plus
+`jakarta.el.TestCompositeELResolver` failing downstream with `expected:<200>
+but was:<500>`, consistent with the same JSP-compilation 500 surfacing
+through a different assertion.
+
+None of these were in the 2026-08-14 non-passed census
+(`known-issues/tomcat/nonpassed-class-census.md`), which ran after this fix
+landed — so the fix held for at least that one run and regressed sometime
+between 2026-08-14 and today. Not bisected.
+
+**Next step:** re-run the original isolation table (below, "How it was
+isolated") against current `dev` on `TestEncodingDetector` — if
+`CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` still clears it, the family is the same;
+if not, this is a related-but-distinct spill-cursor bug in a newer code path
+and needs its own isolation.
+
+---
+
+# Original record (2026-08-06), preserved below
+
 | | |
 |---|---|
-| **Status** | ✅ **FIXED** — 2026-08-06, `jit/src/x64/bytecode_walk.rs` (both direct-call arms) |
+| **Status at the time** | ✅ FIXED — 2026-08-06, `jit/src/x64/bytecode_walk.rs` (both direct-call arms) |
 | **Severity** | high — any test that compiles a JSP was at risk; hit correctness (500s) and throughput (classes that retried/recompiled ran far longer) |
 | **HotSpot** | PASS on every class checked |
 | **CratonVM** | FAIL/HANG before the fix, reproduced deterministically; PASS after |
