@@ -34276,6 +34276,41 @@ fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Object;",
         native_comparator_write_replace,
     );
+    // H0 (2026-08-21) — the last standing `SUITE=all` failure.
+    //
+    // MEASURED on r10, Compatible mode: `Comparator.comparingInt(String::length)`
+    // returns `java.util.Comparator$Native` and `naturalOrder()` returns the same,
+    // where HotSpot 25.0.3+9 returns `Comparator$$Lambda` and
+    // `Comparators$NaturalOrderComparator`. Every VALUE is right — compare/sort
+    // results match the oracle exactly — and only the CLASS is fabricated, which
+    // is why no value-diffing vector ever saw it and `RJdkFunctionCombinators`
+    // catches it with a `getClass().getName()` screen (`notFabricated`, :392).
+    //
+    // Under `--jdk-only` this registrar is already dropped (it is `SyntheticStub`
+    // above) and the real bytecode runs, which is why the vector PASSES strict and
+    // fails only Compatible — `H15-1`'s pattern, now for the fifth time. This
+    // guard finishes the job for a real image.
+    //
+    // WHY THE WHOLE `java/util/Comparator` BLOCK MOVES TOGETHER, and not just the
+    // factories: these registrations are one cluster, not eight rows. The
+    // factories MINT `Comparator$Native`, and `reversed`/`thenComparing*` are
+    // registered *because* that synthetic receiver has no real interface
+    // hierarchy or default-method bytecode (see the comment at
+    // `thenComparingInt` below — unregistering them once produced
+    // `AbstractMethodError: ... has no Code attribute` in Groovy/ANTLR4's
+    // `ParserATNSimulator.STATE_ALT_SORT_COMPARATOR`). Guard the factories alone
+    // and the defaults survive to intercept calls on REAL lambdas, with bodies
+    // that expect a tagged receiver. `H4-1`'s rule: the unit of work is the
+    // ownership cluster, not the registrar row.
+    //
+    // `Comparator$Native.compare`/`writeReplace` above stay registered
+    // unconditionally: that class does not exist on a real image, so the rows are
+    // unreachable there, and under `synthetic-jdk` they are the implementation.
+    //
+    // PRICE, from `H24-3` §5 and NOT yet measured at the time of writing: this is
+    // a PATH SWITCH, not a deletion. Natural-ordered `TreeMap`/`sort` move from
+    // Rust `natural_compare` to real `compareTo` bytecode. The arms are the test.
+    if !registry.drops_real_layout_synthetic() {
     registry.register(
         "java/util/Comparator",
         "naturalOrder",
@@ -34356,6 +34391,7 @@ fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/Comparator;",
         native_comparator_then_comparing_double,
     );
+    } // end `if !drops_real_layout_synthetic()` — see the block comment above.
     registry.set_category(__prev_cat);
 }
 
