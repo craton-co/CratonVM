@@ -171,6 +171,19 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // The `validate_code_ptr` memo's engagement, on the same switch and for
+        // the same reason as every counter above it. The memo replaced a global
+        // `Mutex` taken on EVERY compiled call; a run where `hits` is 0 has the
+        // lock back and would still time within noise of one where it is not.
+        {
+            let (hits, misses) = cratonvm_jit::code_ptr_memo_stats();
+            eprintln!(
+                "[cratonvm] code-ptr memo: hits={hits} misses={misses} enabled={} \
+                 region_epoch={}",
+                cratonvm_jit::code_ptr_memo_enabled(),
+                cratonvm_jit::code_ptr_regions_epoch()
+            );
+        }
         // JIT-side only: these are the sites `helpers.rs` tags by hand. The
         // whole-VM per-caller census that used to print beneath this was
         // retired once it had answered — it cost 3.4x on ZGC, which is how

@@ -165,6 +165,8 @@ impl JitCodeRegion {
         // Insert maintaining the sorted-by-start invariant.
         let idx = self.regions.partition_point(|&(s, _)| s < start);
         self.regions.insert(idx, (start, end));
+        bump_regions_epoch();
+        publish_region_snapshot(self);
     }
 
     fn deregister(&mut self, ptr: *const u8) {
@@ -175,19 +177,35 @@ impl JitCodeRegion {
         if lo < self.regions.len() && self.regions[lo].0 == addr {
             self.regions.remove(lo);
         }
+        // Bumped unconditionally, including when nothing was removed. A
+        // deregister that found nothing left the list unchanged, so the extra
+        // bump only costs the memo a refill -- and getting the "did it change?"
+        // predicate wrong in the other direction is a stale memo.
+        bump_regions_epoch();
+        publish_region_snapshot(self);
     }
 
     fn contains(&self, ptr: *const u8) -> bool {
-        let addr = ptr as usize;
-        // Binary search: find the last region whose start <= addr, then check
-        // it covers `addr`. Non-overlapping + sorted means this is the only
-        // candidate region.
+        self.region_containing(ptr as usize).is_some()
+    }
+
+    /// The region covering `addr`, or `None`.
+    ///
+    /// Binary search: find the last region whose start <= addr, then check it
+    /// covers `addr`. Non-overlapping + sorted means this is the only candidate
+    /// region.
+    ///
+    /// Returns the BOUNDS rather than a bool because [`validate_code_ptr`]'s
+    /// per-thread memo remembers the region it landed in, so the next pointer
+    /// into the same compiled body answers from a register compare instead of
+    /// re-taking the global lock.
+    fn region_containing(&self, addr: usize) -> Option<(usize, usize)> {
         let idx = self.regions.partition_point(|&(s, _)| s <= addr);
         if idx == 0 {
-            return false;
+            return None;
         }
         let (start, end) = self.regions[idx - 1];
-        addr >= start && addr < end
+        (addr >= start && addr < end).then_some((start, end))
     }
 }
 
@@ -196,10 +214,153 @@ fn jit_code_regions() -> &'static Mutex<JitCodeRegion> {
     REGIONS.get_or_init(|| Mutex::new(JitCodeRegion::new()))
 }
 
+/// Generation of the JIT code region list.
+///
+/// Bumped by [`JitCodeRegion::register`] and [`JitCodeRegion::deregister`],
+/// which are the ONLY two mutators and both run with `jit_code_regions()`'s
+/// lock held. So a reader that observes the same value at two moments has
+/// observed a region list that was byte-identical throughout -- which is the
+/// whole soundness argument for the per-thread memo in [`validate_code_ptr`].
+///
+/// Starts at 0 and only ever rises, so `u64::MAX` is available as the memo's
+/// "never filled" sentinel: one bump per `ExecutableBuffer` create or drop, so
+/// reaching it would take 2^64 compiles.
+static REGIONS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that the region list changed. Called with the lock held.
+#[inline]
+fn bump_regions_epoch() {
+    REGIONS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Hits and misses on the [`validate_code_ptr`] memo, so a run can say whether
+/// the fast path is being taken at all rather than leaving that to a timing
+/// wash. A feature that reports itself on while contributing nothing looks
+/// identical to one that helps, in a table of wall times.
+///
+/// GATED, and that is not a style choice. A `fetch_add` on a process-global
+/// `AtomicU64` per compiled call is precisely the shape of serialisation this
+/// change exists to remove: the first cut of the memo counted unconditionally
+/// and would have replaced a `Mutex` with a contended cache line, which at 25
+/// threads is not obviously the better of the two. It is read once through a
+/// `OnceLock` and is a relaxed load plus a not-taken branch when off.
+static CODE_PTR_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CODE_PTR_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether to count snapshot hits/misses. `CRATONVM_DBG_JIT_METHOD_STATS`, the
+/// same switch that prints them.
+#[inline]
+fn code_ptr_memo_census_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(v) = ON.get() {
+        return *v;
+    }
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_METHOD_STATS").is_some()
+    })
+}
+
+#[inline]
+fn note_code_ptr_memo(hit: bool) {
+    if !code_ptr_memo_census_enabled() {
+        return;
+    }
+    let c = if hit {
+        &CODE_PTR_MEMO_HITS
+    } else {
+        &CODE_PTR_MEMO_MISSES
+    };
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(hits, misses)` on the code-pointer memo this run. Both are zero unless
+/// `CRATONVM_DBG_JIT_METHOD_STATS` was set — see the counters' doc.
+pub fn code_ptr_memo_stats() -> (u64, u64) {
+    (
+        CODE_PTR_MEMO_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        CODE_PTR_MEMO_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// How many times the region list has changed this run. Printed beside the
+/// hit/miss pair because the two failure modes look identical from the ratio
+/// alone: a memo that is too NARROW (several hot regions, one slot) and a memo
+/// whose epoch churns (every compile flushes every thread) both read as "mostly
+/// misses", and they want opposite fixes.
+pub fn code_ptr_regions_epoch() -> u64 {
+    REGIONS_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Default-ON kill switch for the memo: `CRATONVM_JIT=-code-ptr-memo`.
+///
+/// Exists so the change can be A/B-ed inside ONE binary. A cross-binary
+/// comparison of a ~1.5% symbol, on a host whose run-to-run spread on this
+/// workload is 20%, is not a measurement.
+pub fn code_ptr_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CODE_PTR_MEMO").is_none()
+    })
+}
+
+/// Lock-free snapshot of the region list, for [`validate_code_ptr`].
+///
+/// # Why a snapshot and not a memo
+///
+/// The first two cuts of this were a per-thread memo of the last region(s) this
+/// thread validated into, and both were measured and both were too narrow.
+/// Every compiled method gets its own [`ExecutableBuffer`], so a thread running
+/// interpreted Java calls into a rotating set of regions and a small cache is
+/// evicted by the next call. On `H2UpdateScaleProbe 1 2000 10000`:
+///
+/// | memo | hits | misses | hit rate |
+/// |---|---:|---:|---:|
+/// | 1 way | 263 299 | 3 225 254 | **7.5 %** |
+/// | 16 ways, direct-mapped on the page | 1 163 588 | 2 477 691 | **32 %** |
+///
+/// A 32 % hit rate is a fast path that pays for itself twice and delivers once.
+/// The `region_epoch` printed beside those counters was **1 838** against 3.6 M
+/// calls, which is the number that decides the design: the list barely changes,
+/// so the right structure is not a cache of PART of it but a whole immutable
+/// copy that readers share and a writer replaces. That is
+/// read-copy-update, which is what `ArcSwap` is, and `JitCache::methods`
+/// already uses it for the identical shape one screen down.
+///
+/// The snapshot is rebuilt under `jit_code_regions()`'s lock by whichever
+/// mutator changed the list, so a reader never sees a torn one and never takes
+/// a lock at all.
+static JIT_CODE_REGION_SNAPSHOT: std::sync::OnceLock<arc_swap::ArcSwap<Vec<(usize, usize)>>> =
+    std::sync::OnceLock::new();
+
+fn jit_code_region_snapshot() -> &'static arc_swap::ArcSwap<Vec<(usize, usize)>> {
+    JIT_CODE_REGION_SNAPSHOT.get_or_init(|| arc_swap::ArcSwap::from_pointee(Vec::new()))
+}
+
+/// Republish the snapshot. Called with `jit_code_regions()`'s lock held, by the
+/// two mutators, so the copy taken here is of a list nobody is editing.
+fn publish_region_snapshot(regions: &JitCodeRegion) {
+    jit_code_region_snapshot().store(std::sync::Arc::new(regions.regions.clone()));
+}
+
 /// Validate that a pointer is safe to transmute to a function pointer.
 ///
 /// Checks: non-null, properly aligned, and falls within a known JIT code region.
 /// Returns `Ok(())` if valid, or a descriptive error string.
+///
+/// # Why this is not just a lock and a binary search
+///
+/// It is on EVERY compiled call -- `CompiledMethod::try_call` and
+/// `try_call_with_context` both validate the entry they are about to jump to --
+/// and it took a global `std::sync::Mutex` to do it. Single-threaded on the H2
+/// UPDATE path that is 1.54% of CPU (`perf`, flat self-attribution,
+/// 2026-08-21); at 25 threads it is a serialisation point on a path with
+/// nothing else to serialise on, which is the shape
+/// `docs/known-issues/h2/h2-update-path-throughput-20260802.md` calls
+/// "genuinely scaling rather than constant-factor work".
+///
+/// The memo takes the lock out of the steady state without weakening the check:
+/// see [`CODE_PTR_MEMO`] for why an epoch match is a stronger statement than the
+/// locked lookup makes, not a weaker one.
 pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
     if ptr.is_null() {
         return Err("null JIT code pointer");
@@ -209,11 +370,42 @@ pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
     if (ptr as usize) % 4 != 0 {
         return Err("misaligned JIT code pointer");
     }
+    let addr = ptr as usize;
+    if code_ptr_memo_enabled() {
+        // One `ArcSwap` load and a binary search over the thread's borrowed
+        // snapshot. No lock, no allocation, and -- unlike the memo this
+        // replaced -- an exact answer on the FIRST probe of every region, so
+        // there is no hit rate to be disappointed by.
+        let snapshot = jit_code_region_snapshot().load();
+        let hit = region_containing_in(&snapshot, addr).is_some();
+        note_code_ptr_memo(hit);
+        if hit {
+            return Ok(());
+        }
+        // A miss here is not automatically an error: the snapshot is published
+        // by the mutators, and `JitCodeRegion::new()`'s empty initial value is
+        // live until the first `ExecutableBuffer` exists. Fall through to the
+        // authoritative locked lookup rather than reporting a region that
+        // exists as absent -- the snapshot is an accelerator, never the source
+        // of truth.
+    }
     let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
     if !regions.contains(ptr) {
         return Err("JIT code pointer outside known code regions");
     }
     Ok(())
+}
+
+/// [`JitCodeRegion::region_containing`] over a bare sorted slice, so the
+/// snapshot and the locked list run the identical search.
+#[inline]
+fn region_containing_in(regions: &[(usize, usize)], addr: usize) -> Option<(usize, usize)> {
+    let idx = regions.partition_point(|&(s, _)| s <= addr);
+    if idx == 0 {
+        return None;
+    }
+    let (start, end) = regions[idx - 1];
+    (addr >= start && addr < end).then_some((start, end))
 }
 
 pub use cratonvm_jit_api::{count_param_slots, CachedBytecodeMethod, JitRuntimeHelpers};
@@ -25802,6 +25994,122 @@ mod tests {
     }
 
     // ── validate_code_ptr tests ─────────────────────────────────────
+
+    /// The memo must not change any ANSWER, only the cost of reaching it.
+    ///
+    /// Both arms are exercised in one process on purpose: routing this through
+    /// `CRATONVM_JIT_NO_CODE_PTR_MEMO` would be a `set_var` race against every
+    /// other test in this binary (see
+    /// `reference_set_var_in_a_parallel_test_suite_is_a_data_race`), so the
+    /// test drives the two implementations directly instead.
+    #[test]
+    fn code_ptr_memo_agrees_with_the_locked_lookup_on_every_probe() {
+        // A real region, so both arms have something to find.
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let base = buf.as_ptr() as usize;
+        let probes = [
+            base,
+            base + 4,
+            base + 4092,
+            base + 4096, // one past the end
+            base.wrapping_sub(4),
+            0x1000,
+        ];
+        for p in probes {
+            let ptr = p as *const u8;
+            let memo_answer = validate_code_ptr(ptr).is_ok();
+            let locked_answer = {
+                let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+                !ptr.is_null() && (p % 4 == 0) && regions.contains(ptr)
+            };
+            assert_eq!(
+                memo_answer, locked_answer,
+                "memo and locked lookup disagree at {p:#x} (region {base:#x}..{:#x})",
+                base + 4096
+            );
+        }
+        // A second pass, now that the memo is warm, must give the same answers:
+        // a warm memo that starts admitting addresses outside its region is the
+        // failure this whole design has to exclude.
+        for p in probes {
+            let ptr = p as *const u8;
+            let memo_answer = validate_code_ptr(ptr).is_ok();
+            let locked_answer = {
+                let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+                !ptr.is_null() && (p % 4 == 0) && regions.contains(ptr)
+            };
+            assert_eq!(memo_answer, locked_answer, "warm memo disagrees at {p:#x}");
+        }
+    }
+
+    /// A dropped buffer must stop validating, memo or no memo.
+    ///
+    /// This is the one thing an address-keyed cache can get wrong, and the only
+    /// reason [`REGIONS_EPOCH`] exists. Without the epoch the memo would keep
+    /// admitting a pointer into a region that has been unmapped -- and the
+    /// caller's next act is `transmute` and `call`.
+    #[test]
+    fn dropping_a_region_invalidates_a_warm_memo() {
+        let (base, len) = {
+            let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+            let base = buf.as_ptr() as usize;
+            // Warm the memo on this region.
+            assert!(
+                validate_code_ptr(base as *const u8).is_ok(),
+                "a live region must validate"
+            );
+            (base, 4096usize)
+        };
+        // `buf` is dropped: `deregister` ran and bumped the epoch.
+        let _ = len;
+        assert!(
+            validate_code_ptr(base as *const u8).is_err(),
+            "a pointer into an unmapped region must stop validating even though \
+             the memo was warm for it"
+        );
+    }
+
+    /// The epoch is what the memo trusts, so it must actually move.
+    #[test]
+    fn registering_and_deregistering_move_the_regions_epoch() {
+        let before = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let after_register = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            after_register > before,
+            "register must bump the epoch ({before} -> {after_register})"
+        );
+        drop(buf);
+        let after_drop = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            after_drop > after_register,
+            "deregister must bump the epoch ({after_register} -> {after_drop})"
+        );
+    }
+
+    /// The kill switch's `off_key` must be the key the reader reads.
+    ///
+    /// Mirrors `native_site_cache_default_is_on_and_the_kill_switch_kills`: a
+    /// kill switch wired to a key nothing reads is a switch that reports itself
+    /// present and does nothing.
+    #[test]
+    fn code_ptr_memo_default_is_on_and_its_kill_switch_is_declared() {
+        assert!(
+            code_ptr_memo_enabled(),
+            "the memo is default-ON; no test in this binary sets \
+             CRATONVM_JIT_NO_CODE_PTR_MEMO"
+        );
+        let entry = cratonvm_types::flag_groups::INVENTORY
+            .iter()
+            .find(|e| e.token == "code-ptr-memo")
+            .expect("code-ptr-memo must be a declared JIT token");
+        assert_eq!(
+            entry.off_key,
+            Some("CRATONVM_JIT_NO_CODE_PTR_MEMO"),
+            "the kill switch's off_key must be the key `code_ptr_memo_enabled` reads"
+        );
+        assert_eq!(entry.on_key, None, "a default-ON kill switch has no on_key");
+    }
 
     #[test]
     fn test_validate_code_ptr_null() {
