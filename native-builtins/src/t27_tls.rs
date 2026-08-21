@@ -2515,13 +2515,23 @@ impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifie
                 mark_trust_check_done(engine_id);
                 Ok(rustls::client::danger::ServerCertVerified::assertion())
             }
-            Some(Ok(TrustOutcome::Rejected(detail))) => {
+            Some(Ok(TrustOutcome::Rejected(detail, alert))) => {
                 mark_trust_check_done(engine_id);
                 if crate::nbflags().dbg_tls_auth_ok {
-                    eprintln!("[dbg-tls-auth] (in-handshake) TrustManager rejected: {detail}");
+                    eprintln!(
+                        "[dbg-tls-auth] (in-handshake) TrustManager rejected: {detail} \
+                         -> alert {:?}",
+                        alert.alert_description()
+                    );
                 }
+                // NOT `ApplicationVerificationFailure`, which rustls maps to
+                // `access_denied` — a POLICY refusal, not a certificate one.
+                // That is what this path sent for every rejection, and it cost
+                // `SslErrorTest` 12 of its 72 tests where HotSpot passes all
+                // 72. `crate::tls_cert_alert` transcribes JSSE's own
+                // `CertificateMessage.getCertificateAlert`.
                 Err(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::ApplicationVerificationFailure,
+                    alert.certificate_error(detail),
                 ))
             }
             // A Java `Error` (not `Exception`) came out of the manager. JSSE lets
@@ -14492,8 +14502,14 @@ enum TrustCheckMode {
 enum TrustOutcome {
     Accepted,
     /// Rejected, with the reason already recorded via
-    /// `set_last_trust_rejection_detail`.
-    Rejected(String),
+    /// `set_last_trust_rejection_detail`, and the alert JSSE would raise for
+    /// the manager's exception.
+    ///
+    /// The alert is computed where the exception is still in hand, NOT at the
+    /// point of use: `reject_peer_with_fatal_alert` runs on the unwinding path
+    /// and may not call Java, and the verifier-time arm is inside rustls's own
+    /// state machine. See `crate::tls_cert_alert`.
+    Rejected(String, crate::tls_cert_alert::JsseCertAlert),
 }
 
 fn engine_run_trust_check(
@@ -14513,7 +14529,7 @@ fn engine_run_trust_check(
         // Kept as a belt-and-braces arm rather than an `unreachable!` so a
         // future edit that changes that cannot turn into a panic in a TLS
         // handshake.
-        TrustOutcome::Rejected(detail) => Err(crate::phases_early::throw_jca_exc(
+        TrustOutcome::Rejected(detail, _alert) => Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLHandshakeException",
             &format!("TrustManager rejected the peer certificate chain: {detail}"),
@@ -14626,6 +14642,9 @@ fn engine_consult_trust_managers(
     }
     let mut rejected = false;
     let mut rejection: Option<String> = None;
+    // JSSE's default when nothing overrides it — see `crate::tls_cert_alert`.
+    // Only meaningful when `rejected`, and set on the same branch that sets it.
+    let mut rejection_alert = crate::tls_cert_alert::JsseCertAlert::CertificateUnknown;
     // See `IN_TRUST_CHECK`. Cleared on every exit path below — the early
     // `return Err(e)` for a propagating `Error` clears it too.
     IN_TRUST_CHECK.with(|c| c.set(true));
@@ -14710,6 +14729,19 @@ fn engine_consult_trust_managers(
                 }
                 other => format!("{other:?}"),
             });
+            // Which alert this becomes is decided HERE, while the exception is
+            // still an object and Java can still be called. Both consumers run
+            // somewhere that cannot do either: `reject_peer_with_fatal_alert`
+            // is on the unwinding path, and the verifier-time arm is inside
+            // rustls's state machine.
+            rejection_alert = match &e {
+                cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) => {
+                    crate::tls_cert_alert::jsse_cert_alert_for(ctx, *exc)
+                }
+                // Not an exception at all (an internal error): JSSE has no
+                // opinion, and `certificate_unknown` is its default.
+                _ => crate::tls_cert_alert::JsseCertAlert::CertificateUnknown,
+            };
             rejected = true;
             break;
         }
@@ -14724,9 +14756,9 @@ fn engine_consult_trust_managers(
         if mode == TrustCheckMode::InVerifier {
             // No `reject_peer_with_fatal_alert` and no throw: rustls is about to
             // do the equivalent, correctly, from inside its own state machine.
-            return Ok(TrustOutcome::Rejected(detail));
+            return Ok(TrustOutcome::Rejected(detail, rejection_alert));
         }
-        reject_peer_with_fatal_alert(pending.engine_id);
+        reject_peer_with_fatal_alert(pending.engine_id, rejection_alert);
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLHandshakeException",
@@ -14760,10 +14792,13 @@ fn engine_consult_trust_managers(
 ///
 /// Takes no `NativeContext` and calls no Java: it must be safe to run on the
 /// rejection path, which is already unwinding.
-fn reject_peer_with_fatal_alert(engine_id: i32) {
+fn reject_peer_with_fatal_alert(
+    engine_id: i32,
+    alert: crate::tls_cert_alert::JsseCertAlert,
+) {
     with_engine(engine_id, |s| {
         if let Some(c) = s.conn.as_mut() {
-            c.queue_fatal_alert(rustls::AlertDescription::CertificateUnknown);
+            c.queue_fatal_alert(alert.alert_description());
         }
     });
 }
@@ -14988,7 +15023,19 @@ fn engine_check_endpoint_identity(
             set_last_trust_rejection_detail(&detail);
             // Same reasoning as the TrustManager rejection above: the peer has
             // to be told, or it sees an unexplained close.
-            reject_peer_with_fatal_alert(pending.engine_id);
+            // `certificate_unknown`, which is what this line sent before the
+            // alert became a parameter: JSSE reaches an identity failure as a
+            // `CertificateException` out of `checkServerTrusted` with no
+            // `CertPathValidatorException` cause, so `getCertificateAlert`
+            // leaves its default in place. Named rather than implied, because
+            // the VERIFIER-time twin of this check (in
+            // `PassthroughServerCertVerifier`) answers `NotValidForNameContext`
+            // and therefore `bad_certificate` — the two disagree, JSSE agrees
+            // with this one, and nothing has measured the difference yet.
+            reject_peer_with_fatal_alert(
+                pending.engine_id,
+                crate::tls_cert_alert::JsseCertAlert::CertificateUnknown,
+            );
             Err(crate::phases_early::throw_jca_exc(
                 ctx,
                 "javax/net/ssl/SSLHandshakeException",

@@ -4190,6 +4190,12 @@ pub mod jmx_openmbean;
 pub mod date_format_fast;
 pub mod t27_tls;
 pub mod t27_tls_cbc;
+// Which TLS alert a client-side `TrustManager` rejection becomes. Shared by the
+// verifier-time path (`PassthroughServerCertVerifier::verify_server_cert`) and
+// the post-handshake one (`reject_peer_with_fatal_alert`), which had already
+// drifted apart once — the newer path answered `access_denied` for every
+// rejection where the older one answered `certificate_unknown`.
+pub mod tls_cert_alert;
 pub mod t3_impl;
 pub mod tls;
 // Deny-by-default guard for the JSSE socket-factory surface: an
