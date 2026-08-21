@@ -146,3 +146,81 @@ confound in the brief rather than in the VM.
 * **N4 — `regression-suite/probes/ChmConsistencyProbe.java` is confounded as
   filed.** Either split it per process or annotate it. Leaving it as-is invites
   the next reader to re-derive my error.
+
+---
+
+## 7. CORRECTION (lane H17, 2026-08-21) — the mechanism in §3 is wrong, and §3's open puzzle is now answered
+
+§3 said the effect is a yield "**exactly once per process**". **That is not the
+mechanism**, and lane `H17` — which also retracted its own first record mid-lane
+for the same error — found the real one.
+
+### The witness reports one BIT, and three of us read it as a COUNT
+
+The `HashMap.table` array class answers *"did this map's FIRST insert run real
+bytecode?"* — **one bit per map, not a yield counter.** `H16-3` read it as a
+count, I repeated that reading in §3, and `H17-1` §2 did too before catching
+itself. The census from a single armed run shows **four distinct triples on
+`HashMap` each winning bytecode**, which a once-per-process model cannot produce.
+
+**So "exactly one differs" was an artifact of a one-bit witness**, on top of the
+case-ordering artifact this record already documents. Two layers of instrument
+error stacked, and the second was invisible until the first was removed.
+
+### What is actually true — VERIFIED independently
+
+```
+$ git grep -n "jdk_only_enforce_shadow_for" -- '*.rs'
+vm/src/runtime/env_cache.rs:752:            pub fn jdk_only_enforce_shadow_for(...)   <- definition
+vm/src/runtime/interpreter/native_override.rs:2499:  /// … doc comment
+vm/src/runtime/interpreter/native_override.rs:7433:  strict_bridge && … enforce_shadow_for(class_name);
+```
+
+**One definition, one doc mention, exactly ONE live call site** — inside
+`resolve_step1_native`. So:
+
+> **Arming a class does not arm the class. It arms that class's COLD, step-1
+> dispatches.** Warm invoke-cache entries, the force-native interceptor,
+> reflective `Method.invoke` and JIT binds are all outside the dial's reach *by
+> construction*.
+
+### This answers the polarity asymmetry §3 left open
+
+§3 recorded, and declined to explain, that **puts break on the first map while
+reads succeed on the first read**. Under the correct mechanism there is no
+asymmetry to explain: **the FIRST use of a call site is a cold dispatch and is
+dialled; later uses hit the warm cache and are not.** Whether being dialled
+helps or hurts depends on the operation — a put through real bytecode over
+VM-owned state fails, a read through it may succeed. Same mechanism, opposite
+outcomes, no contradiction.
+
+I flagged that asymmetry rather than smoothing it over, and it turned out to be
+the thread that named the cause.
+
+### Both of the fix hypotheses I put in H17's brief were wrong
+
+I briefed the lane that the dedup was probably short-circuiting enforcement, and
+pointed at `env_cache`'s `OnceLock`s. Measured:
+
+* `ask = strict_bridge && (enforce || !already_observed)` — **`enforce ||`
+  short-circuits, so the doc comment's stated intent holds exactly as written.**
+  No one-line bug there.
+* the `OnceLock`s latch only the **scope string** — static config, correct to
+  latch.
+
+The lane disproved its own brief before doing the work, which is the outcome a
+brief should make possible.
+
+### The instrument is in worse shape than "it yields once"
+
+`H17` measured that **four of the six witnesses this directory has used are
+blind on a current binary** — bucket head class (because `H16-2` taught the
+native to mint real `HashMap$Node`s, so the witness now agrees in both
+directions), `modCount`, `hashCode()` counts and `equals()` counts. Only the
+`table` array class still discriminates, and only coarsely. The census is a
+**deduplicated presence set with no counts**, and under `enforce` it records only
+the bytecode-won half.
+
+**A fix to the VM removed a witness.** That is worth carrying: as the VM gets
+more correct, the instruments built to detect its incorrectness stop working,
+silently.
