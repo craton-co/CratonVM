@@ -311,7 +311,7 @@ diagnosis is complete for this class: nothing else in it carries the shape.
 
 ## Related
 
-* `h2-update-path-throughput-20260802.md` (and the retired
+* `h2-update-path-throughput-RETIRED-20260821.md` (and the retired
   `bug-h2-testmultithread-concurrent-update-timeout` write-up) — the same class's
   throughput problem, which this now hides: the class cannot reach
   `testConcurrentUpdate` at all on an affected binary.
