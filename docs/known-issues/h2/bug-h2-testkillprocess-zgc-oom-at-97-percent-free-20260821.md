@@ -220,6 +220,29 @@ that declined.
 * `gc/src/arena.rs::warn_small_alloc_in_high_region`, a tripwire on a small
   allocation landing in the large-object region — see *Still open*.
 
+## Also confirmed, 2026-08-21: four more classes hit the identical signature
+
+Found while triaging `docs/known-issues/h2/hangs-true-vs-perfcliff-20260821.md`
+(the 48-class FAIL/HANG-union rerun), on the same `dev` tip, same `--Xmx 1g`,
+default config (ZGC + JIT). None of these four were suspected of this
+mechanism going in — each was simply re-run to settle "true hang or perf
+cliff", and each turned out to be neither: a fast, spurious `OutOfMemoryError`
+from the identical fragmentation wall.
+
+| class | request | rc | wall | signature |
+|---|---|---|---:|---|
+| `org.h2.test.db.TestOpenClose` | `ByteBuffer.allocate 1048576` (1 MB), `FileStore.getWriteBuffer` | 1 | 2:04 | `MVStoreException` → `MVStore.panic`, uncaught, process exits |
+| `org.h2.test.store.TestMVStoreTool` | `anewarray component 604 length 32768` | 1 | 1:33 | same `MVStore.panic` path, this time through the **bytecode** `anewarray` ladder — confirms the full try/GC/try/reclaim ladder runs and still cannot find the hole |
+| `org.h2.test.store.TestMVStoreCachePerformance` | `Capacity: 2097152` (2 MB) | 1 | 5:55, 7 OOM/arena lines | same `MVStoreException` → `MVStore.panic` shape |
+| `org.h2.test.jdbc.TestCachedQueryResults` | `native reference array of length 32768` (256 KB) | 124 (killed at cap) | ran the full 40 min cap | **not a crash — a livelock.** The test's own code catches the `OutOfMemoryError` (this looks like intentional cache-eviction-under-pressure testing) and retries. Because the fragmentation that caused the first failure never clears — this collector does not compact — every retry fails identically. **23,468** occurrences of the same `native_oom` WARN between the first one (6 min in) and the process being killed at the 2400 s cap, roughly 12/s, across 5-6 threads all doing it at once. This is the only one of the four that does not crash outright, and it is the only one of the ten classes `hangs-true-vs-perfcliff-20260821.md` originally listed as "still HANG" that is genuinely stuck — not on a deadlock, but on an allocation that this collector configuration has made permanently unsatisfiable. |
+
+Two things this adds to the record:
+
+* **The `s2_bb_alloc` fix (`bug-h2-testbenchmark-writebuffer-oom-at-1g-FIXED-20260818.md`) is not what's missing here.** `TestMVStoreTool`'s failure goes through the bytecode `anewarray` path, which already runs the full retry ladder (`gc_alloc_array`) — and it still fails. The ladder is not the gap; the collector's refusal to compact while any thread holds a live JIT frame is, exactly as this page already found.
+* **`TestCachedQueryResults` reclassifies one of `hangs-true-vs-perfcliff-20260821.md`'s ten "still HANG" rows.** That page's own framing was "none of the ten are confirmed as a true stuck/deadlocked hang, but neither is that ruled out." This is the one row where it should have been ruled *in* — not a deadlock (threads are burning CPU, not blocked), but a livelock with the same practical consequence: it will never finish, no matter how long the cap. See that page's retirement writeup for the other nine, which really are just slow.
+
+None of the four needed a fresh repro to confirm — the existing `grep -c 'arena allocation failed'` / `grep 'zgc frag:'` / `OutOfMemoryError` triage from this page's own "Reproduction" section was sufficient run unmodified against each class.
+
 ## Still open
 
 * **The defect itself.** The class fails on `dev`.

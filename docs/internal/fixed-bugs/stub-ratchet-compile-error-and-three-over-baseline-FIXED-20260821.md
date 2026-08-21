@@ -121,7 +121,7 @@ All four constants re-frozen together — both stub baselines AND both
 `MEASURED_TOTAL_REGISTRATIONS`, because a re-freeze that leaves the totals stale
 disarms the classifier for the next reader.
 
-## Four more gates were red on dev in the same pass — two fixed, two still open (four tests)
+## Four more gates were red on dev in the same pass — three fixed, one still open
 
 
 Found by running the two crates' suites either side of a
@@ -132,9 +132,9 @@ branch's; each was measured with dev's own sources under the same test binary.
 | crate | test | control (dev sources) |
 |---|---|---|
 | `cratonvm-native-builtins` | `lang_class::tests::null_receiver_on_an_instance_field_outranks_the_access_refusal` | FAILED |
-| `cratonvm-native-io` | `io_tests::fis_close_marks_closed_and_is_idempotent` | FAILED |
-| `cratonvm-native-io` | `io_tests::fis_read_bytes_zero_length_answers_zero_on_a_closed_stream` | FAILED |
-| `cratonvm-native-io` | `io_tests::fis_skip_consults_the_descriptor_before_the_count` | FAILED |
+| `cratonvm-native-io` | `io_tests::fis_close_marks_closed_and_is_idempotent` | FAILED — **fixed 2026-08-21** |
+| `cratonvm-native-io` | `io_tests::fis_read_bytes_zero_length_answers_zero_on_a_closed_stream` | FAILED — **fixed 2026-08-21** |
+| `cratonvm-native-io` | `io_tests::fis_skip_consults_the_descriptor_before_the_count` | FAILED — **fixed 2026-08-21** |
 | `cratonvm-native-builtins` | `proxy_selector::tests::env_proxy_lookup_respects_case_insensitive_windows_storage` | FAILED (**Windows only**; arrived 2026-08-21 with a later dev merge) |
 
 Two were fixed rather than filed, both one-liners with no production behaviour
@@ -155,7 +155,12 @@ change:
 
 ## The three `fis_*` rows are one cause, and it is not the test
 
-Diagnosed 2026-08-21, **not fixed here** — see below for why.
+Diagnosed 2026-08-21 and deliberately not fixed here. **FIXED the same day on
+`fix/io-closed-stream-precedence-20260821`** once it had a branch of its own —
+see `a-closed-stream-was-refused-only-when-the-descriptor-lookup-failed-FIXED-20260821.md`
+for the oracle, the ten sites and the regression arms. The diagnosis below is
+what that branch started from, and it held: all ten sites, one helper, and the
+`read(b, 0, 0)` carve-out survived.
 
 All three assert that a positively-marked closed `FileInputStream` refuses
 `read()`, `read(byte[])` and `skip()`. Each of those bodies is shaped:
