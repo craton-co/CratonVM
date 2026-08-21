@@ -1945,15 +1945,20 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
 
     // --- MethodHandle (1-field: name=0 for debugging) ---
     let mh = "java/lang/invoke/MethodHandle";
-    r.register(
-        mh,
-        "type",
-        "()Ljava/lang/invoke/MethodType;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
+    // `type()` is NOT registered here. It was, with a body that returned
+    // `ctx.get_field(this, 0)` raw, and it never ran once:
+    // `register_t4_method_handle_invoke` runs after this registrar on every
+    // boot arm (`vm/src/vm/vm_init.rs` :2594 and :3298, and
+    // `native-builtins/src/lib.rs`'s synthetic chain) and registers the same
+    // triple with the C19 body that prefers the real-JDK `type` field and
+    // falls back to the synthetic descriptor.
+    //
+    // MEASURED, `--dump-native-registry --explain-jdk-only --jdk-only`:
+    // `java/lang/invoke/MethodHandle.type()Ljava/lang/invoke/MethodType;`
+    // appears twice, `owns_slot=false` here and `owns_slot=true` there.
+    // Deleting the loser is inert; leaving it in place is a landmine, because a
+    // lane retiring the WINNER on a census row would promote this raw slot-0
+    // read in its place.
     r.register(mh, "toString", "()Ljava/lang/String;", |ctx, _args| {
         let s = ctx.create_string("MethodHandle");
         Ok(Some(Value::Object(Some(s))))
@@ -2035,21 +2040,30 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     });
 
     // --- MethodHandles (static utility) ---
+    //
+    // `lookup()` and `privateLookupIn(Class, Lookup)` are NOT registered here,
+    // and the reason is the header comment thirty lines below this one, which
+    // already stated the rule: *"we do not provide stub overrides here — the
+    // real ones take precedence and a stub would only run if the late phase is
+    // not also invoked"*. These two were violations of it, and they were the
+    // dangerous kind.
+    //
+    // Both stubs allocated a bare `MethodHandles$Lookup` and returned it with
+    // slot 0 — the lookup class — NEVER WRITTEN. That is verbatim defect #1 in
+    // `native-builtins/tests/duplicate_registration_gate.rs`'s header: *"a
+    // placeholder registered late shadowed the real implementation; the
+    // returned Lookup's slot 0 was never written, so lookupClass() answered
+    // null. Broke RJdkHidden AND RJdkStrict."*
+    //
+    // MEASURED, `--dump-native-registry --explain-jdk-only --jdk-only`: both
+    // triples appear twice, `owns_slot=false` here and `owns_slot=true` in
+    // `register_p63_method_handles_lookup`, which runs immediately after this
+    // registrar on every boot arm — `vm/src/vm/vm_init.rs` :2588 and :3295,
+    // and `phases_late.rs::register_phase63_natives` for the synthetic chain.
+    // So the deletion is inert TODAY and removes the promotion hazard for
+    // tomorrow.
     let mhs = "java/lang/invoke/MethodHandles";
-    r.register(
-        mhs,
-        "lookup",
-        "()Ljava/lang/invoke/MethodHandles$Lookup;",
-        |ctx, _args| {
-            let lookup =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
-            Ok(Some(Value::Object(Some(lookup))))
-        },
-    );
-    r.register(mhs, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", |ctx, _args| {
-        let lookup = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
-        Ok(Some(Value::Object(Some(lookup))))
-    });
+    let _ = mhs;
 
     // NOT REGISTERED HERE: `MethodHandles.arrayElementVarHandle`.
     //
@@ -2189,11 +2203,11 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // stub overrides here — the real ones take precedence and a stub would
     // only run if the late phase is not also invoked (which would indicate
     // a broken VM startup).
-    let lk = "java/lang/invoke/MethodHandles$Lookup";
-    r.register(lk, "lookupClass", "()Ljava/lang/Class;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
+    //
+    // `MethodHandles$Lookup.lookupClass()` is NOT registered here either — the
+    // third of the same set, `owns_slot=false` in the dump, overwritten by
+    // `register_p63_method_handles_lookup`. It is the READ side of the null
+    // slot 0 the two deleted stubs above produced, so all three went together.
 
     // Lookup.defineHiddenClass: NOT registered here, deliberately.
     //
@@ -2221,6 +2235,18 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // its side-table meta. `sun.security.provider.SHA3.<clinit>` chains
     // `byteArrayViewVarHandle(...).withInvokeExactBehavior()`, which would
     // otherwise hit AbstractMethodError on our synthetic VarHandle.
+    //
+    // DO NOT RETIRE — these two and `accessModeTypeUncached` below are
+    // `declared, NO Code, not ACC_NATIVE` on all nine supported images
+    // (MEASURED, `javap -p --system <image> java.lang.invoke.VarHandle`;
+    // re-derivable with `scripts/jdk-only-no-image-methods.py`). The standard
+    // retirement argument — "real JDK bytecode is behind it, so deleting the
+    // native leaves something to run" — is FALSE for them: this registration is
+    // the only implementation that exists for the receiver, and the sentence
+    // above about `AbstractMethodError` is what the retirement would restore.
+    // `H14-1` 4 sized that bucket at 2 rows because the corpus dispatched 2;
+    // `H25-2` measured the registry and found 1,405 over 193 classes. These are
+    // three of them, marked per `H25-2` N3.
     r.register(
         vh,
         "withInvokeExactBehavior",
@@ -12152,6 +12178,11 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // do not subclass BoundMethodHandle still get rebind() called by JDK
     // internals (e.g. Invokers, LambdaForm specialization). Return self so the
     // chain continues without "no Code attribute" internal errors.
+    //
+    // DO NOT RETIRE. Confirmed against all nine supported images: `rebind()` is
+    // `abstract` on `java.lang.invoke.MethodHandle` on every one of them, so
+    // there is no bytecode to fall back to and the comment above describes the
+    // exact failure a retirement would restore. `H25-2` N3.
     r.register(
         mh,
         "rebind",

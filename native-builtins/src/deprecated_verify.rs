@@ -16,6 +16,32 @@ use cratonvm_types::Value;
 // T8.5.1 — Round-trip test
 // ---------------------------------------------------------------------------
 
+/// What the SUPPORTED JDK IMAGES say about a deprecated triple.
+///
+/// The manifest below used to assert one thing about every row — "this is
+/// registered" — and `H25-3` R2 refused a set of retirements because of it:
+/// six of its `java/lang` entries name methods JDK 25 does not declare, and
+/// this list asserted they stay registered forever. The column is the fix
+/// nominated there (`H25-3` N2): adjudicate the manifest against the images
+/// instead of maintaining it by hand.
+///
+/// The verdicts are MEASURED, not read off a changelog:
+/// `javap -p --system <image> <class>` over all nine supported images —
+/// JDK 17.0.20, 21.0.12 and 25.0.4 x linux/windows/macos —
+/// re-derivable with `scripts/jdk-only-no-image-methods.py`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageStatus {
+    /// At least one supported image declares the triple. The registration is
+    /// a §1.5 bridge (or a deliberate cross-version one, like `Thread.stop0`,
+    /// which only JDK 17 declares) and MUST stay.
+    Declared,
+    /// NO supported image declares it, anywhere on the receiver's hierarchy.
+    /// A native standing in front of a method that does not exist can never
+    /// be dispatched, so it must NOT be registered — and the test below
+    /// asserts its absence rather than its presence.
+    AbsentFromAllSupportedImages,
+}
+
 /// List of all deprecated APIs we implemented, in the form
 /// `(class, method, descriptor, expected_behavior)`.
 #[derive(Debug, Clone)]
@@ -24,70 +50,75 @@ struct DeprecatedApi {
     method: &'static str,
     descriptor: &'static str,
     section: &'static str,
+    images: ImageStatus,
 }
 
 /// Complete manifest of every deprecated native method registered in T8.
 fn deprecated_api_manifest() -> Vec<DeprecatedApi> {
     vec![
         // ── T8.1 — java.lang.* ──────────────────────────────────────────
-        DeprecatedApi { class: "java/lang/Thread", method: "stop0", descriptor: "(Ljava/lang/Object;)V", section: "T8.1.1" },
-        DeprecatedApi { class: "java/lang/Thread", method: "stop", descriptor: "()V", section: "T8.1.1" },
-        DeprecatedApi { class: "java/lang/Thread", method: "suspend0", descriptor: "()V", section: "T8.1.2" },
-        DeprecatedApi { class: "java/lang/Thread", method: "resume0", descriptor: "()V", section: "T8.1.2" },
-        DeprecatedApi { class: "java/lang/Thread", method: "destroy", descriptor: "()V", section: "T8.1.3" },
-        DeprecatedApi { class: "java/lang/Thread", method: "countStackFrames", descriptor: "()I", section: "T8.1.4" },
-        DeprecatedApi { class: "java/lang/Runtime", method: "runFinalization", descriptor: "()V", section: "T8.1.6" },
-        DeprecatedApi { class: "java/lang/System", method: "runFinalization", descriptor: "()V", section: "T8.1.6" },
-        DeprecatedApi { class: "java/lang/System", method: "runFinalizersOnExit", descriptor: "(Z)V", section: "T8.1.7" },
-        DeprecatedApi { class: "java/lang/ClassLoader", method: "defineClass", descriptor: "([BII)Ljava/lang/Class;", section: "T8.1.9" },
-        DeprecatedApi { class: "java/lang/Compiler", method: "compileClass", descriptor: "(Ljava/lang/Class;)Z", section: "T8.1.10" },
-        DeprecatedApi { class: "java/lang/Compiler", method: "compileClasses", descriptor: "(Ljava/lang/String;)Z", section: "T8.1.10" },
-        DeprecatedApi { class: "java/lang/Compiler", method: "enable", descriptor: "()V", section: "T8.1.10" },
-        DeprecatedApi { class: "java/lang/Compiler", method: "disable", descriptor: "()V", section: "T8.1.10" },
-        DeprecatedApi { class: "java/lang/Compiler", method: "command", descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;", section: "T8.1.10" },
+        DeprecatedApi { class: "java/lang/Thread", method: "stop0", descriptor: "(Ljava/lang/Object;)V", images: ImageStatus::Declared, section: "T8.1.1" },
+        // `Thread.stop()V` is deliberately absent from this manifest: every
+        // supported image declares it WITH a `Code` attribute, so the real
+        // bytecode serves it and CratonVM registers no native. Retired
+        // 2026-08-21 together with its duplicate in `lib.rs`; see the note at
+        // `deprecated_lang.rs`.
+        DeprecatedApi { class: "java/lang/Thread", method: "suspend0", descriptor: "()V", images: ImageStatus::Declared, section: "T8.1.2" },
+        DeprecatedApi { class: "java/lang/Thread", method: "resume0", descriptor: "()V", images: ImageStatus::Declared, section: "T8.1.2" },
+        DeprecatedApi { class: "java/lang/Thread", method: "destroy", descriptor: "()V", images: ImageStatus::AbsentFromAllSupportedImages, section: "T8.1.3" },
+        DeprecatedApi { class: "java/lang/Thread", method: "countStackFrames", descriptor: "()I", images: ImageStatus::Declared, section: "T8.1.4" },
+        DeprecatedApi { class: "java/lang/Runtime", method: "runFinalization", descriptor: "()V", images: ImageStatus::Declared, section: "T8.1.6" },
+        DeprecatedApi { class: "java/lang/System", method: "runFinalization", descriptor: "()V", images: ImageStatus::Declared, section: "T8.1.6" },
+        DeprecatedApi { class: "java/lang/System", method: "runFinalizersOnExit", descriptor: "(Z)V", images: ImageStatus::AbsentFromAllSupportedImages, section: "T8.1.7" },
+        DeprecatedApi { class: "java/lang/ClassLoader", method: "defineClass", descriptor: "([BII)Ljava/lang/Class;", images: ImageStatus::Declared, section: "T8.1.9" },
+        DeprecatedApi { class: "java/lang/Compiler", method: "compileClass", descriptor: "(Ljava/lang/Class;)Z", images: ImageStatus::Declared, section: "T8.1.10" },
+        DeprecatedApi { class: "java/lang/Compiler", method: "compileClasses", descriptor: "(Ljava/lang/String;)Z", images: ImageStatus::Declared, section: "T8.1.10" },
+        DeprecatedApi { class: "java/lang/Compiler", method: "enable", descriptor: "()V", images: ImageStatus::Declared, section: "T8.1.10" },
+        DeprecatedApi { class: "java/lang/Compiler", method: "disable", descriptor: "()V", images: ImageStatus::Declared, section: "T8.1.10" },
+        DeprecatedApi { class: "java/lang/Compiler", method: "command", descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;", images: ImageStatus::Declared, section: "T8.1.10" },
 
         // ── T8.1.8 — SecurityManager (in security_manager.rs) ──────────
-        DeprecatedApi { class: "java/lang/SecurityManager", method: "checkPermission", descriptor: "(Ljava/security/Permission;)V", section: "T8.1.8" },
-        DeprecatedApi { class: "java/lang/SecurityManager", method: "checkRead", descriptor: "(Ljava/lang/String;)V", section: "T8.1.8" },
-        DeprecatedApi { class: "java/lang/SecurityManager", method: "checkWrite", descriptor: "(Ljava/lang/String;)V", section: "T8.1.8" },
-        DeprecatedApi { class: "java/lang/SecurityManager", method: "checkExit", descriptor: "(I)V", section: "T8.1.8" },
+        DeprecatedApi { class: "java/lang/SecurityManager", method: "checkPermission", descriptor: "(Ljava/security/Permission;)V", images: ImageStatus::Declared, section: "T8.1.8" },
+        DeprecatedApi { class: "java/lang/SecurityManager", method: "checkRead", descriptor: "(Ljava/lang/String;)V", images: ImageStatus::Declared, section: "T8.1.8" },
+        DeprecatedApi { class: "java/lang/SecurityManager", method: "checkWrite", descriptor: "(Ljava/lang/String;)V", images: ImageStatus::Declared, section: "T8.1.8" },
+        DeprecatedApi { class: "java/lang/SecurityManager", method: "checkExit", descriptor: "(I)V", images: ImageStatus::Declared, section: "T8.1.8" },
 
         // ── T8.2 — java.io / java.util / java.text ─────────────────────
-        DeprecatedApi { class: "java/util/Date", method: "<init>", descriptor: "(III)V", section: "T8.2.1" },
-        DeprecatedApi { class: "java/util/Date", method: "<init>", descriptor: "(IIIII)V", section: "T8.2.1" },
-        DeprecatedApi { class: "java/util/Date", method: "<init>", descriptor: "(IIIIII)V", section: "T8.2.1" },
-        DeprecatedApi { class: "java/util/Date", method: "getYear", descriptor: "()I", section: "T8.2.2" },
-        DeprecatedApi { class: "java/util/Date", method: "getMonth", descriptor: "()I", section: "T8.2.2" },
-        DeprecatedApi { class: "java/util/Date", method: "getDate", descriptor: "()I", section: "T8.2.2" },
-        DeprecatedApi { class: "java/util/Date", method: "getDay", descriptor: "()I", section: "T8.2.2" },
-        DeprecatedApi { class: "java/util/Date", method: "getHours", descriptor: "()I", section: "T8.2.2" },
-        DeprecatedApi { class: "java/util/Date", method: "getMinutes", descriptor: "()I", section: "T8.2.2" },
-        DeprecatedApi { class: "java/util/Date", method: "getSeconds", descriptor: "()I", section: "T8.2.2" },
-        DeprecatedApi { class: "java/lang/String", method: "<init>", descriptor: "([BIII)V", section: "T8.2.3" },
-        DeprecatedApi { class: "java/lang/String", method: "getBytes", descriptor: "(II[BI)V", section: "T8.2.4" },
-        DeprecatedApi { class: "java/lang/Character", method: "isJavaLetter", descriptor: "(C)Z", section: "T8.2.5" },
-        DeprecatedApi { class: "java/lang/Character", method: "isJavaLetterOrDigit", descriptor: "(C)Z", section: "T8.2.5" },
-        DeprecatedApi { class: "java/lang/Character", method: "isSpace", descriptor: "(C)Z", section: "T8.2.5" },
-        DeprecatedApi { class: "java/lang/Class", method: "newInstance", descriptor: "()Ljava/lang/Object;", section: "T8.2.6" },
-        DeprecatedApi { class: "java/lang/Number", method: "byteValue", descriptor: "()B", section: "T8.2.7" },
-        DeprecatedApi { class: "java/lang/Number", method: "shortValue", descriptor: "()S", section: "T8.2.7" },
-        DeprecatedApi { class: "java/io/StringBufferInputStream", method: "read", descriptor: "()I", section: "T8.2.10" },
-        DeprecatedApi { class: "java/io/LineNumberInputStream", method: "getLineNumber", descriptor: "()I", section: "T8.2.11" },
-        DeprecatedApi { class: "java/net/URLDecoder", method: "decode", descriptor: "(Ljava/lang/String;)Ljava/lang/String;", section: "T8.2.13" },
-        DeprecatedApi { class: "java/net/URLEncoder", method: "encode", descriptor: "(Ljava/lang/String;)Ljava/lang/String;", section: "T8.2.14" },
+        DeprecatedApi { class: "java/util/Date", method: "<init>", descriptor: "(III)V", images: ImageStatus::Declared, section: "T8.2.1" },
+        DeprecatedApi { class: "java/util/Date", method: "<init>", descriptor: "(IIIII)V", images: ImageStatus::Declared, section: "T8.2.1" },
+        DeprecatedApi { class: "java/util/Date", method: "<init>", descriptor: "(IIIIII)V", images: ImageStatus::Declared, section: "T8.2.1" },
+        DeprecatedApi { class: "java/util/Date", method: "getYear", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.2" },
+        DeprecatedApi { class: "java/util/Date", method: "getMonth", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.2" },
+        DeprecatedApi { class: "java/util/Date", method: "getDate", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.2" },
+        DeprecatedApi { class: "java/util/Date", method: "getDay", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.2" },
+        DeprecatedApi { class: "java/util/Date", method: "getHours", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.2" },
+        DeprecatedApi { class: "java/util/Date", method: "getMinutes", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.2" },
+        DeprecatedApi { class: "java/util/Date", method: "getSeconds", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.2" },
+        DeprecatedApi { class: "java/lang/String", method: "<init>", descriptor: "([BIII)V", images: ImageStatus::Declared, section: "T8.2.3" },
+        DeprecatedApi { class: "java/lang/String", method: "getBytes", descriptor: "(II[BI)V", images: ImageStatus::Declared, section: "T8.2.4" },
+        DeprecatedApi { class: "java/lang/Character", method: "isJavaLetter", descriptor: "(C)Z", images: ImageStatus::Declared, section: "T8.2.5" },
+        DeprecatedApi { class: "java/lang/Character", method: "isJavaLetterOrDigit", descriptor: "(C)Z", images: ImageStatus::Declared, section: "T8.2.5" },
+        DeprecatedApi { class: "java/lang/Character", method: "isSpace", descriptor: "(C)Z", images: ImageStatus::Declared, section: "T8.2.5" },
+        DeprecatedApi { class: "java/lang/Class", method: "newInstance", descriptor: "()Ljava/lang/Object;", images: ImageStatus::Declared, section: "T8.2.6" },
+        DeprecatedApi { class: "java/lang/Number", method: "byteValue", descriptor: "()B", images: ImageStatus::Declared, section: "T8.2.7" },
+        DeprecatedApi { class: "java/lang/Number", method: "shortValue", descriptor: "()S", images: ImageStatus::Declared, section: "T8.2.7" },
+        DeprecatedApi { class: "java/io/StringBufferInputStream", method: "read", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.10" },
+        DeprecatedApi { class: "java/io/LineNumberInputStream", method: "getLineNumber", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.11" },
+        DeprecatedApi { class: "java/net/URLDecoder", method: "decode", descriptor: "(Ljava/lang/String;)Ljava/lang/String;", images: ImageStatus::Declared, section: "T8.2.13" },
+        DeprecatedApi { class: "java/net/URLEncoder", method: "encode", descriptor: "(Ljava/lang/String;)Ljava/lang/String;", images: ImageStatus::Declared, section: "T8.2.14" },
 
         // ── T8.3 — java.beans / java.rmi ────────────────────────────────
-        DeprecatedApi { class: "java/beans/Beans", method: "instantiate", descriptor: "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Object;", section: "T8.3.1" },
-        DeprecatedApi { class: "java/rmi/server/RemoteRef", method: "getRefClass", descriptor: "(Ljava/io/ObjectOutput;)Ljava/lang/String;", section: "T8.3.2" },
+        DeprecatedApi { class: "java/beans/Beans", method: "instantiate", descriptor: "(Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/Object;", images: ImageStatus::Declared, section: "T8.3.1" },
+        DeprecatedApi { class: "java/rmi/server/RemoteRef", method: "getRefClass", descriptor: "(Ljava/io/ObjectOutput;)Ljava/lang/String;", images: ImageStatus::Declared, section: "T8.3.2" },
 
         // ── T8.4 — sun.* / jdk.internal.* ──────────────────────────────
-        DeprecatedApi { class: "sun/misc/Unsafe", method: "defineClass", descriptor: "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", section: "T8.4.1" },
-        DeprecatedApi { class: "sun/misc/Unsafe", method: "allocateMemory", descriptor: "(J)J", section: "T8.4.2" },
-        DeprecatedApi { class: "sun/misc/Unsafe", method: "freeMemory", descriptor: "(J)V", section: "T8.4.2" },
-        DeprecatedApi { class: "sun/misc/Unsafe", method: "reallocateMemory", descriptor: "(JJ)J", section: "T8.4.2" },
-        DeprecatedApi { class: "sun/reflect/Reflection", method: "getCallerClass", descriptor: "(I)Ljava/lang/Class;", section: "T8.4.3" },
-        DeprecatedApi { class: "sun/misc/Signal", method: "handle", descriptor: "(Lsun/misc/Signal;Lsun/misc/SignalHandler;)Lsun/misc/SignalHandler;", section: "T8.4.4" },
-        DeprecatedApi { class: "sun/misc/Signal", method: "raise", descriptor: "(Lsun/misc/Signal;)V", section: "T8.4.4" },
+        DeprecatedApi { class: "sun/misc/Unsafe", method: "defineClass", descriptor: "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", images: ImageStatus::Declared, section: "T8.4.1" },
+        DeprecatedApi { class: "sun/misc/Unsafe", method: "allocateMemory", descriptor: "(J)J", images: ImageStatus::Declared, section: "T8.4.2" },
+        DeprecatedApi { class: "sun/misc/Unsafe", method: "freeMemory", descriptor: "(J)V", images: ImageStatus::Declared, section: "T8.4.2" },
+        DeprecatedApi { class: "sun/misc/Unsafe", method: "reallocateMemory", descriptor: "(JJ)J", images: ImageStatus::Declared, section: "T8.4.2" },
+        DeprecatedApi { class: "sun/reflect/Reflection", method: "getCallerClass", descriptor: "(I)Ljava/lang/Class;", images: ImageStatus::Declared, section: "T8.4.3" },
+        DeprecatedApi { class: "sun/misc/Signal", method: "handle", descriptor: "(Lsun/misc/Signal;Lsun/misc/SignalHandler;)Lsun/misc/SignalHandler;", images: ImageStatus::Declared, section: "T8.4.4" },
+        DeprecatedApi { class: "sun/misc/Signal", method: "raise", descriptor: "(Lsun/misc/Signal;)V", images: ImageStatus::Declared, section: "T8.4.4" },
     ]
 }
 
@@ -130,15 +161,20 @@ fn build_deprecated_registry() -> NativeMethodRegistry {
 fn jdk25_deprecated_api_checklist() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         // java.lang
-        ("java/lang/Thread", "stop", "()V"),
+        //
+        // `stop`, `destroy` and `runFinalizersOnExit` are NOT here, and their
+        // absence is load-bearing: `register_missing_deprecated_shims` below
+        // registers a throwing shim for every entry of this list that is not
+        // already registered, so leaving them in would have re-registered the
+        // rows retired on 2026-08-21 under a different body. `stop` is served
+        // by real bytecode on every supported image; the other two are
+        // declared by none.
         ("java/lang/Thread", "stop0", "(Ljava/lang/Object;)V"),
         ("java/lang/Thread", "suspend0", "()V"),
         ("java/lang/Thread", "resume0", "()V"),
-        ("java/lang/Thread", "destroy", "()V"),
         ("java/lang/Thread", "countStackFrames", "()I"),
         ("java/lang/Runtime", "runFinalization", "()V"),
         ("java/lang/System", "runFinalization", "()V"),
-        ("java/lang/System", "runFinalizersOnExit", "(Z)V"),
         ("java/lang/Compiler", "compileClass", "(Ljava/lang/Class;)Z"),
         (
             "java/lang/Compiler",
@@ -261,12 +297,27 @@ mod tests {
         let manifest = deprecated_api_manifest();
         let mut missing = Vec::new();
 
+        let mut must_not_be_registered = Vec::new();
+
         for api in &manifest {
-            if r.find(api.class, api.method, api.descriptor).is_none() {
-                missing.push(format!(
+            let found = r.find(api.class, api.method, api.descriptor).is_some();
+            match api.images {
+                ImageStatus::Declared if !found => missing.push(format!(
                     "{} {}.{}{}",
                     api.section, api.class, api.method, api.descriptor
-                ));
+                )),
+                // The other direction, and it is the half this test did not
+                // have: a native registered in front of a method NO supported
+                // image declares can never be dispatched, and asserting it
+                // stays registered is what blocked the retirement in `H25-3`
+                // R2. Assert the absence instead.
+                ImageStatus::AbsentFromAllSupportedImages if found => {
+                    must_not_be_registered.push(format!(
+                        "{} {}.{}{}",
+                        api.section, api.class, api.method, api.descriptor
+                    ))
+                }
+                _ => {}
             }
         }
 
@@ -274,6 +325,12 @@ mod tests {
             missing.is_empty(),
             "Missing deprecated API registrations:\n{}",
             missing.join("\n")
+        );
+        assert!(
+            must_not_be_registered.is_empty(),
+            "Registered in front of a method NO supported JDK image declares \
+             (see ImageStatus::AbsentFromAllSupportedImages):\n{}",
+            must_not_be_registered.join("\n")
         );
     }
 
@@ -301,27 +358,51 @@ mod tests {
     #[test]
     fn t85_1_api_count_at_least_45() {
         let manifest = deprecated_api_manifest();
+        // 46 before 2026-08-21; `Thread.stop()V` left the manifest entirely
+        // (real bytecode serves it on every supported image) and two rows
+        // stayed with `AbsentFromAllSupportedImages`.
         assert!(
-            manifest.len() >= 45,
-            "Expected at least 45 deprecated APIs, found {}",
+            manifest.len() >= 44,
+            "Expected at least 44 deprecated APIs, found {}",
             manifest.len()
         );
     }
 
+    /// Every `AbsentFromAllSupportedImages` row must be one this crate does
+    /// NOT register, and there must be at least one — an empty set would mean
+    /// the column had quietly become decorative.
+    #[test]
+    fn t85_1_absent_from_images_rows_are_not_registered() {
+        let r = build_deprecated_registry();
+        let absent: Vec<_> = deprecated_api_manifest()
+            .into_iter()
+            .filter(|a| a.images == ImageStatus::AbsentFromAllSupportedImages)
+            .collect();
+        assert!(
+            !absent.is_empty(),
+            "the ImageStatus column has no AbsentFromAllSupportedImages row left"
+        );
+        for api in absent {
+            assert!(
+                r.find(api.class, api.method, api.descriptor).is_none(),
+                "{}.{}{} is registered, but no supported image declares it",
+                api.class,
+                api.method,
+                api.descriptor
+            );
+        }
+    }
+
     // ── T8.5.2 — Behavioral round-trips ─────────────────────────────────
 
+    /// Retired 2026-08-21: no supported image declares `Thread.destroy()V`, so
+    /// there is nothing for a native to stand in front of and the VM's own
+    /// `NoSuchMethodError` is the answer. This asserts the absence, which is
+    /// the property that can regress.
     #[test]
-    fn t85_2_thread_destroy_throws_no_such_method() {
+    fn t85_2_thread_destroy_is_retired() {
         let r = build_deprecated_registry();
-        let f = r.find("java/lang/Thread", "destroy", "()V").unwrap();
-        let mut ctx = MockNativeContext::new();
-        let result = f(&mut ctx, &[]);
-        assert!(result.is_err(), "Thread.destroy() should throw");
-        let err = format!("{:?}", result.unwrap_err());
-        assert!(
-            err.contains("NoSuchMethodError") || err.contains("removed"),
-            "Should throw NoSuchMethodError, got: {err}"
-        );
+        assert!(r.find("java/lang/Thread", "destroy", "()V").is_none());
     }
 
     #[test]
