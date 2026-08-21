@@ -1,0 +1,5 @@
+# untyped-alloc ratchet baseline
+# regenerate: scripts/untyped-alloc-ratchet.sh --update
+# see docs/known-issues/jdk-only/H0-6-the-fabrication-surface-is-growing-20260820.md
+sites=84
+widths=1 2 3 4 5 6 8 12
