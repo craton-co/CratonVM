@@ -189,7 +189,11 @@ is the standing note: a narrow probe reports its own reach, not the defect.
 
 **REFUSED.** The arm was not run, both because the finding does not depend on it
 and because another lane's `cratonvm.exe` was resident throughout this session
-(§4).
+(§4). **`H17-2`, merged into this branch after these records were drafted, adds
+a second and independent reason not to trust such an arm:** the dial is wired to
+**one** dispatch door, so a zero from it is silent about every call that does not
+reach step 1 cold. For this block the two failures compound — an empty corpus
+measured through a partial instrument.
 
 `Package.equals` additionally carries the correction in `H25-2` §3.3: it is
 `H14-1`'s *inherited* verdict, for which the standing prescription is *relocate

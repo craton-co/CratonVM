@@ -130,6 +130,13 @@ row.
    registrar's *retirable* rows, because the dial also removed twenty-one
    implementations that have no bytecode behind them. `H14-3` §6 already says
    the dial is not the retirement — this quantifies by how much for that row.
+
+   **`H17-2` (landed while this record was being written) sharpens the same
+   point from the other side:** the dial is wired to **one** dispatch door, so
+   arming a class only affects calls that reach step 1 cold. An arm is therefore
+   BOTH over-broad (it suppresses the 21 `Path` implementations a source
+   retirement would keep) and under-broad (it misses the other doors a source
+   retirement would close). It is not a bound in either direction.
 2. **`H14-1` §4's three verbs need a fourth and a fifth.** *Retire* (1244),
    *relocate* (156), *do not touch* (2) — plus `H25-1`'s **dead / near-miss**
    (342) and this record's **needs a receiver answer** (1,405). A plan with one
