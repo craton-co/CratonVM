@@ -180,8 +180,22 @@ Falsifiers, in the order they should be checked:
    and nothing else.
 3. **`RJdkServices` goes red, or `ToolProvider.getSystemJavaCompiler()` returns
    null.** That is §4 realised. **MEASURED GREEN pre-fix today.**
-4. **`--jdk-only` moves off 105/105.** It should not: strict mode reaches this
-   native the same way and the rule is mode-independent.
+4. **`--jdk-only` moves off 105/105.** It should not — but **not** for the
+   reason a first reading suggests, and I got this wrong before measuring it.
+
+   **MEASURED today on `r8`:** `--jdk-only` gives
+   `PASS RServiceLoaderDoubleSource (1266 checks)` while Compatible mode fails.
+   So strict mode is not merely "unaffected" — it *already passes*, which
+   confirms `H15-1`'s five-of-five framing for this vector as well. The reason
+   is `H15-1` §3's mechanism C: strict mode drops the **whole native
+   `ServiceLoader`** as a `SyntheticStub`, and the real JDK bytecode never
+   consults CratonVM's module registry at all.
+
+   That matters for what this change is: **`ModuleRegistry::service_providers`
+   is on the Compatible path only.** The fix cannot move the strict arm in
+   either direction, because strict mode does not call it. A strict-arm change
+   of any kind would therefore mean something unrelated moved — and would be a
+   genuine surprise rather than a graded failure.
 
 **NOT PREDICTED:** that the vector reaches `PASS` rather than merely getting
 past `:490`. `classPathModuleSeparation` is the last section it runs, so there
