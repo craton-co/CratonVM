@@ -982,6 +982,12 @@ impl Monitor {
         thread_id: ThreadId,
         timeout_ms: Option<u64>,
         interrupted: Option<&std::sync::atomic::AtomicBool>,
+        // DIAGNOSTIC ONLY (netty promise stall): the object this monitor was
+        // reached through, so the poll loop can re-read its mark word and prove
+        // whether the waiter has been ORPHANED — parked on a monitor the object
+        // no longer points at, so any later `notifyAll()` inflates a different
+        // one and never reaches here. Carries no semantics.
+        waited_on: Option<ObjectRef>,
     ) -> Result<bool, MonitorError> {
         let mut state = self.state.lock();
         if state.owner != Some(thread_id) {
@@ -1016,6 +1022,7 @@ impl Monitor {
         let poll_interval = std::time::Duration::from_millis(5);
         let mut was_interrupted = false;
         let mut frames_dumped = false;
+        let mut orphan_reported = false;
         match timeout_ms {
             Some(ms) if ms > 0 => {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
@@ -1117,6 +1124,36 @@ impl Monitor {
                         {
                             emit_wait_site_frames(thread_id);
                             frames_dumped = true;
+                        }
+                        // ORPHAN CHECK (diagnostic). The 30 s-spurious-wakeup A/B
+                        // proved the awaited promise is ALREADY complete while
+                        // this thread stays parked, i.e. a `notifyAll()` never
+                        // reached it. The one way that happens with a correct
+                        // condvar is that the notifier resolved a DIFFERENT
+                        // monitor: `notify_all` re-reads the object's mark word,
+                        // so if that word stops pointing at `self` the notify
+                        // lands on a freshly inflated monitor and this waiter is
+                        // orphaned for good. Re-read it on the existing 5 ms poll
+                        // and say so once.
+                        if !orphan_reported {
+                            if let Some(obj) = waited_on {
+                                let cur = header_of(obj).mark_word.load(Ordering::Acquire);
+                                let still_ours = monitor_ptr_from_mark(cur)
+                                    .is_some_and(|p| std::ptr::eq(p, self as *const Monitor));
+                                if !still_ours {
+                                    orphan_reported = true;
+                                    eprintln!(
+                                        "[MONITOR-ORPHAN] thread {thread_id:?} is parked in \
+                                         Object.wait() on a monitor the object no longer points \
+                                         at — obj={:p} mark_state={} monitor={:p}. Any later \
+                                         notify()/notifyAll() inflates a DIFFERENT monitor and \
+                                         cannot reach this waiter.",
+                                        obj.as_ptr(),
+                                        ObjectHeader::mark_state(cur),
+                                        self as *const Monitor,
+                                    );
+                                }
+                            }
                         }
                         // If the condvar was signalled (not timed out), break
                         // to allow the caller to re-check its condition.
@@ -1968,7 +2005,7 @@ impl MonitorTable {
     ) -> Result<bool, MethodCallFailed> {
         let monitor = self.ensure_inflated(obj_ref, thread_id)?;
         monitor
-            .wait(thread_id, timeout_ms, interrupted)
+            .wait(thread_id, timeout_ms, interrupted, Some(obj_ref))
             .map_err(|MonitorError::NotOwner| {
                 MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::IllegalMonitorStateException {
