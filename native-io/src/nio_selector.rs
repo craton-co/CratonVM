@@ -4642,6 +4642,72 @@ pub fn register_nio_selector(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
+// Watchdog selector census
+// ---------------------------------------------------------------------------
+
+/// Dump every selector's registered-key state to stderr.
+///
+/// Called by the CLI watchdog (`--stack-dump-on-timeout`) right after the
+/// per-thread stack dumps, so a run that stalled records WHY the reactor had
+/// nothing to hand its waiting promise.
+///
+/// The netty `ParameterizedSslHandlerTest` stall this exists for shows a
+/// reactor parked in `NioIoHandler.select` — i.e. alive and working — while a
+/// Java thread waits forever on a promise. The two competing explanations are
+/// "readiness was never reported for this channel" and "readiness was reported
+/// and netty did not act on it", and nothing in a thread dump separates them.
+/// `interest_ops` vs `ready_ops` per key does, at the moment of the stall.
+///
+/// # why a census and not tracing
+///
+/// `CRATONVM_DBG_SELECTOR=1` prints per select cycle. It is chatty enough to
+/// change the timing of the very race being chased, so a run that stops
+/// stalling under it is evidence about the instrument, not the defect. This
+/// costs nothing until the watchdog fires.
+///
+/// Every lock here is a `try_lock`. The watchdog runs while the process is
+/// wedged, and a diagnostic that can itself block is worse than no diagnostic:
+/// a selector lock held by the stalled thread would turn a dump into a second
+/// hang. A skipped line is an acceptable loss; a hang is not.
+pub fn dump_selector_state_to_stderr() {
+    let Some(regs) = selectors().try_read() else {
+        eprintln!("=== selector census: registry lock held; skipped ===");
+        return;
+    };
+    eprintln!("=== selector census: {} selector(s) ===", regs.len());
+    for (id, sel) in regs.iter() {
+        let Some(st) = sel.try_lock() else {
+            eprintln!("  selector id={id}: state lock held; skipped");
+            continue;
+        };
+        eprintln!(
+            "  selector id={id} open={} woken={} in_flight_selects={} keys={}",
+            st.open,
+            st.woken,
+            st.in_flight_selects,
+            st.keys.len()
+        );
+        for (slot, k) in st.keys.iter() {
+            // `slot` is the map key: for a channel registered before it had a
+            // socket this is a placeholder, not an fd. `alloc_unresolved_fd`
+            // walks DOWN from `UNRESOLVED_FD_BASE` (-1000), so a placeholder is
+            // `<=` it. Worth printing, because the Linux connect probe filters
+            // on `k.net_fd > 0` and therefore skips every such key.
+            let unresolved = *slot <= UNRESOLVED_FD_BASE;
+            eprintln!(
+                "    slot={slot}{} net_fd={} interest=0x{:x} ready=0x{:x} cancelled={} listener={}",
+                if unresolved { " (UNRESOLVED)" } else { "" },
+                k.net_fd,
+                k.interest_ops,
+                k.ready_ops,
+                k.cancelled,
+                k.handle.is_listener(),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

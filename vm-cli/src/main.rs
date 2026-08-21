@@ -180,6 +180,19 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // The `validate_code_ptr` memo's engagement, on the same switch and for
+        // the same reason as every counter above it. The memo replaced a global
+        // `Mutex` taken on EVERY compiled call; a run where `hits` is 0 has the
+        // lock back and would still time within noise of one where it is not.
+        {
+            let (hits, misses) = cratonvm_jit::code_ptr_memo_stats();
+            eprintln!(
+                "[cratonvm] code-ptr memo: hits={hits} misses={misses} enabled={} \
+                 region_epoch={}",
+                cratonvm_jit::code_ptr_memo_enabled(),
+                cratonvm_jit::code_ptr_regions_epoch()
+            );
+        }
         // JIT-side only: these are the sites `helpers.rs` tags by hand. The
         // whole-VM per-caller census that used to print beneath this was
         // retired once it had answered — it cost 3.4x on ZGC, which is how
@@ -4473,6 +4486,12 @@ fn run() -> Result<()> {
                 // RUNNING-and-silent one (JIT-compiled code or a long native
                 // call). See `SharedVm::dump_thread_summary_after_dumps`.
                 shared_for_watchdog.dump_thread_summary_after_dumps();
+                // A stall whose reactor threads are parked in `select` — i.e.
+                // working — is not explained by any thread dump: the question
+                // is what the selector had to hand them, and `interest_ops` vs
+                // `ready_ops` per registered key answers it at the moment of
+                // the stall. Costs nothing until this deadline fires.
+                cratonvm_native_io::nio_selector::dump_selector_state_to_stderr();
                 eprintln!(
                     "=== T19.H1 watchdog: {total_acks} thread(s) dumped; \
                      aborting process ==="

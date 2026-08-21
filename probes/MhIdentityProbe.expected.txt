@@ -1,0 +1,64 @@
+# HotSpot oracle for probes/MhIdentityProbe.java
+#
+# Temurin 25.0.3+9 (/data/toolchain/jdk-25), captured 2026-08-21.
+#
+# `MethodHandle` adapters are PURE — each returns a NEW handle and leaves the
+# receiver as it was. CratonVM models a handle as one mutable object, so this
+# probe measures which adapters honour that.
+#
+# I03/I04/I09/I10/I28 failed before `mh_clone_handle` /
+# `mh_with_varargs_marking` (native-builtins/src/lang_invoke.rs):
+# `asFixedArity()` and `asVarargsCollector()` flipped the marking on the
+# RECEIVER, so one library adapting a shared handle changed how every other
+# holder dispatched it. I28 is that hazard end to end — a handle that stopped
+# collecting its arguments after an unrelated `asFixedArity()`, which is
+# exactly the shape Spring's `FunctionReference` is exposed to (it re-reads
+# `isVarargsCollector()` on every evaluation of one long-lived registered
+# handle).
+#
+# THREE rows still diverge on CratonVM, and are recorded in
+# docs/known-issues/spring/ :
+#
+#   I13/I14  `asType` still adapts THE RECEIVER IN PLACE and returns it. It is
+#            on every hot MethodHandle path and several shims
+#            (`explicitCastArguments`, `mh_astype_refusal`) are written against
+#            that, so converting it is its own change with its own measurement.
+#
+#   I06      A fixed-arity handle still collects: CratonVM derives varargs
+#            behaviour from the runtime argument shape at dispatch, so an
+#            over-long argument list is gathered rather than refused with
+#            `WrongMethodTypeException`. Same leniency as MhVarargsNullProbe's
+#            B06 row.
+#
+# I05/I17-I26 are the controls that already passed: `asCollector`,
+# `asSpreader` and `dropArguments` DO mint new handles.
+#
+I01 a.isVarargsCollector = true
+I02 b.isVarargsCollector = false
+I03 a.isVarargsCollector AFTER asFixedArity = true
+I04 a==b = false
+I05 a.iwa(x,y) AFTER asFixedArity = [x, y]
+I06 b.iwa(x,y) = THREW java.lang.invoke.WrongMethodTypeException: cannot convert MethodHandle(String[])String to (Object,Object)Object
+I07 c.isVarargsCollector = false
+I08 d.isVarargsCollector = true
+I09 c.isVarargsCollector AFTER asVarargsCollector = false
+I10 c==d = false
+I11 e.type = (String[])String
+I12 f.type = (Object)Object
+I13 e.type AFTER asType = (String[])String
+I14 e==f = false
+I15 e.isVarargsCollector AFTER asType = true
+I16 e.iwa(x,y) AFTER asType = [x, y]
+I17 h.type = (String,String)String
+I18 g.type AFTER asCollector = (String[])String
+I19 g.isVarargsCollector AFTER asCollector = true
+I20 g.iwa(x,y) AFTER asCollector = [x, y]
+I21 j.type = (String[])String
+I22 i.type AFTER asSpreader = (String[])String
+I23 i.iwa(x,y) AFTER asSpreader = [x, y]
+I24 m.type = (int,String[])String
+I25 k.type AFTER dropArguments = (String[])String
+I26 k.iwa(x,y) AFTER dropArguments = [x, y]
+I27 eval#1 = [null]
+I28 eval#2 after someone else adapted = [null]
+I29 ignored.isVarargsCollector = false

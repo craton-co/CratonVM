@@ -1,0 +1,90 @@
+# HotSpot oracle for probes/MhVarargsNullProbe.java
+#
+# Temurin 25.0.3+9 (/data/toolchain/jdk-25), captured 2026-08-21.
+#
+# 12 rows failed on CratonVM before the generic-entry rule in
+# native-builtins/src/lang_invoke.rs (`MH_GENERIC_SPREAD` /
+# `collect_trailing_varargs`'s `null_collects`) and the varargs collection the
+# MH_KIND_CONSTRUCTOR arm of `mh_dispatch` never did:
+#   B01 B07 B08 B10 B11 B16 B17 B18 D01 D02 D04 E07, plus the E-row
+#   instrumentation that `asFixedArity`'s in-place marking had corrupted.
+# Row B01 is Spring's `#varargsFunctionHandle(null)`
+# (VariableAndFunctionTests.functionViaMethodHandleForStaticMethodThatAccepts
+# OnlyVarargs), the reported failure.
+#
+# FOUR rows still diverge on CratonVM, deliberately, and are recorded in
+# docs/known-issues/spring/ :
+#
+#   B06  vf.iwa(new String[0])
+#        HotSpot collects UNCONDITIONALLY on the generic entry, so an
+#        already-packed array becomes the single ELEMENT of a new one and the
+#        cast throws. CratonVM keeps its packed-call passthrough: the `null`
+#        half of the rule turns a working program into a wrong one, the packed
+#        half would turn a working program into a CCE.
+#
+#   C03  vf.invoke((Object)null)
+#   C07  mx.invoke(a,(Object)null)
+#   C09  ov.invoke((Object)null)
+#        The inexact `invoke` door. HotSpot decides from the CALL SITE's static
+#        parameter type, which CratonVM's signature-polymorphic shim is not
+#        handed — `vm_exec`'s poly-dispatch block has it in `descriptor` but
+#        there is no channel from there into a native. Note C02
+#        (`invoke((String[])null)`) is the row that would break if this door
+#        simply started collecting, so the two cannot both be right without
+#        that channel.
+#
+# The counterparts that must NOT collect are the controls: C01/C02/C06/C08/C10
+# (the exact door names the array type) and D03 (`asFixedArity()` un-marks the
+# handle).
+#
+A01 vf.isVarargsCollector = true
+A02 mx.isVarargsCollector = true
+A03 fx.isVarargsCollector = false
+A04 inst.isVarargsCollector = true
+A05 ctor.isVarargsCollector = true
+A06 vf.type = (String[])String
+B01 vf.iwa(null) = [null]
+B02 vf.iwa() = []
+B03 vf.iwa(a) = [a]
+B04 vf.iwa(a,null,b) = [a, null, b]
+B05 vf.iwa(null,null) = [null, null]
+B06 vf.iwa(new String[0]) = THREW java.lang.ClassCastException: Cannot cast [Ljava.lang.String; to java.lang.String
+B07 vf.iwaList([null]) = [null]
+B08 mx.iwa(a,null) = a|[null]
+B09 mx.iwa(a) = a|[]
+B10 mx.iwa(null,null) = null|[null]
+B11 ov.iwa(null) = [null]
+B12 ov.iwa(null,null) = [null, null]
+B13 iv.iwa(1,2) = [1, 2]
+B14 iv.iwa() = []
+B15 fx.iwa(null) [non-varargs param] = fixed:null
+B16 inst.iwa(recv,null) = i:[null]
+B17 ctor.iwa(null) = H[null]
+B18 ctor.iwa(a,b) = H[a, b]
+C01 vf.invokeExact((String[])null) = null
+C02 vf.invoke((String[])null) = null
+C03 vf.invoke((Object)null) = [null]
+C04 vf.invoke(a,b) = [a, b]
+C05 vf.invoke() = []
+C06 fx.invokeExact((String[])null) = fixed:null
+C07 mx.invoke(a,(Object)null) = a|[null]
+C08 mx.invokeExact(a,(String[])null) = a|null
+C09 ov.invoke((Object)null) = [null]
+C10 ov.invokeExact((Object[])null) = null
+D01 vf.asType((Object)Object).iwa(null) = [null]
+D02 vf.asType((String[])String).iwa(null) = [null]
+D03 vf.asFixedArity().iwa(null) = null
+D04 fx.asVarargsCollector(String[]).iwa(null) = fixed:[null]
+D05 vf.asCollector(String[],1).iwa(null) = [null]
+E01 spel(#f(null)) = [null]   <- iwa[null]
+E02 spel(#f()) = []   <- iwa[]
+E03 spel(#f(a)) = [a]   <- iwa[a]
+E04 spel(#f(new String[0])) = []   <- iwa[]
+E05 spel(#f(a,null,b)) = [a, null, b]   <- iwa[a, null, b]
+E06 spel(#f(a,b,c)) = [a, b, c]   <- iwa[a, b, c]
+E07 spel-mixed(#m(a,null)) = a|[null]   <- iwa[a, null]
+E08 spel-mixed(#m(a)) = a|[]   <- iwa[a]
+F01 Method.invoke(null-array) = null
+F02 Method.invoke(new String[]{null}) = [null]
+F03 plain java varargsFunction((String[])null) = null
+F04 plain java varargsFunction(null-as-element) = [null]
