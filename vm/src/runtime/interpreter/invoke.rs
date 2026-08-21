@@ -4225,6 +4225,7 @@ pub(super) fn try_stackless_invoke(
                 .kind_of_id(id)
                 .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
             match crate::vm::resolve_native_dispatch_wave1(
+                crate::vm::DispatchDoor::StacklessForce,
                 crate::vm::dispatch_policy(shared),
                 &class_name_arc,
                 method_name,

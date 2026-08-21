@@ -242,6 +242,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "callee-deopt", on_key: Some("CRATONVM_DBG_CALLEE_DEOPT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "layout-alias", on_key: Some("CRATONVM_DBG_LAYOUT_ALIAS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "check-override", on_key: Some("CRATONVM_DBG_CHECK_OVERRIDE"), off_key: None, off_word: None },
+    // The enforcement dial's per-door census. The TOTALS print on any armed
+    // run without this; the token adds the per-triple rows.
+    E { group: Group::DBG, token: "dial-doors", on_key: Some("CRATONVM_DBG_DIAL_DOORS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "direct-memory", on_key: Some("CRATONVM_DBG_DM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupx-trace", on_key: Some("CRATONVM_DBG_DUPX_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "read0-latency", on_key: Some("CRATONVM_DBG_READ0LAT"), off_key: None, off_word: None },
