@@ -51039,9 +51039,12 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
                 let source = ctx.read_native_pin(this_pin, this);
                 // The carrier handed to the `Consumer` MUST be a real
-                // `Map.Entry`. This line used to be
-                // `alloc_object(ClassId::new(0), NODE_NUM_FIELDS)` with the key
-                // and value written at the NODE slots (1 and 2), which produced
+                // `Map.Entry`. This line used to be the untyped-allocation
+                // sentinel at width `NODE_NUM_FIELDS` — spelled out here would
+                // be a FALSE POSITIVE for `scripts/untyped-alloc-ratchet.sh`,
+                // which greps source text and cannot tell a comment from a call
+                // (`H16-1` §5) — with the key and value written at the NODE
+                // slots (1 and 2), which produced
                 // a `cratonvm/synthetic/AnonymousObject$4` — an object that
                 // implements nothing. MEASURED on `cratonvm-r5.exe`,
                 // `--jdk-only`, UNARMED, against HotSpot 25.0.3+9 (H16-3):

@@ -118,6 +118,40 @@ because of how the defect is shaped* (`H1-1`'s capped sink, `H0-4`'s fraction
 gate, `H0-6` §2's self-consistent substitution) — and this time the instrument
 is the one built to catch that species.
 
+### 4a. CONFIRMED by doing it
+
+`292dcab08` removes two production sentinel sites from
+`native-collections/src/lib.rs` — the node line (11874, qualified spelling,
+non-literal width) and the `ConcurrentHashMap.forEachEntry` carrier (50910,
+unqualified spelling, non-literal width). Measured on the tree before and after:
+
+```text
+                                    before   after
+  ratchet's own report (A)             84      84      unchanged
+  every production sentinel site      230     228      -2
+```
+
+**The blocking gate reports the identical number across a commit that removed
+two of the sites it exists to watch.** That is the prediction of §2 and §4,
+executed rather than argued.
+
+## 4b. The pattern also has FALSE POSITIVES, and this lane created one
+
+While writing the replacement comment at the `forEachEntry` site I wrote the old
+call *verbatim* to say what it used to be — and the census counted the comment
+as a site (229 instead of 228). Reworded so it does not spell the pattern.
+
+The shipped script's header already reasons carefully about this hazard in the
+path-vs-content direction — *"`-h` drops the path, which turns a path filter
+into a CONTENT filter … and would silently drop any legitimate site whose line
+happens to contain the substring — `latest`, `fastest`, a `// tested by`
+comment. Caught by cross-checking two methods against one revision and getting
+84 vs 87."* The same reasoning applies to the pattern itself and was not made:
+a `git grep` over source text cannot tell a call from a comment quoting one, and
+the sites most likely to be quoted in a comment are exactly the ones somebody is
+migrating. N1's widened pattern will make this worse, not better, because the
+qualified spelling appears in prose too.
+
 ## 5. What this does NOT establish
 
 * **230 is a grep count, not a defect count.** The script's own caveat applies
@@ -159,3 +193,8 @@ is the one built to catch that species.
 * **N5 — three sites use width `0`.** `PAT`'s `[1-9]` excludes them by
   construction, and a zero-width untyped object is a shape nobody has
   described. Not investigated here.
+* **N6 — exclude comment lines**, or the widened pattern of N1 will count the
+  prose of every migration that documents what it removed (§4b). `git grep -n`
+  plus a `grep -v '^\s*//'` on the matched line is enough for Rust's line
+  comments; a block comment would still slip through, and that is a limit worth
+  writing down rather than pretending away.
