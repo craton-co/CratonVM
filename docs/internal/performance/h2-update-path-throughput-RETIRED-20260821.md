@@ -142,6 +142,30 @@ contention term — this page's own discipline note 8.
 | — | 0.44 % | `RawRwLock::lock_shared_slow` |
 | 0.26 % | 0.28 % | `SharedVm::load_class_concurrent_for` |
 
+### Re-verified after merging 51 dev commits
+
+The table above is `ba36a7afa`. Between taking it and retiring the page, `dev`
+moved 51 commits — including `4e8e8afe5`, a real ZGC fix (it refused to compact
+whenever the JIT was warm and threw `OutOfMemoryError` on a 97 %-free heap), and
+its partial revert `4b84a4117`. A collector fix of that size is exactly the kind
+of thing that invalidates a profile, so the 1-thread arm was re-taken on the
+merged tree (load 7.3-9.4, hence the higher absolutes):
+
+| symbol | `ba36a7afa` | merged | Δ |
+|---|---:|---:|---:|
+| `execute_frame_from_index` | 4.97 % | 4.42 % | −0.55 |
+| `execute_invokevirtual_cached` | 3.19 % | 3.32 % | +0.13 |
+| `zgc::ZObjectStarts::contains` | 2.97 % | 3.03 % | +0.06 |
+| `__memcmp_evex_movbe` | 2.51 % | 2.74 % | +0.23 |
+| `invoke_on_class_shared_inner` | 2.43 % | 2.46 % | +0.03 |
+| `zgc::ZgcRealHeap::is_object_address` | 1.58 % | 1.69 % | +0.11 |
+| `jit::validate_code_ptr` | 1.30 % | 1.33 % | +0.03 |
+| `record_object_ref_payload_slow` | 1.14 % | 1.18 % | +0.04 |
+
+**Nothing moves by more than half a point.** The shape is not sensitive to the
+collector fix, and the verdicts in §1 stand on the merged tree, not only on the
+ref they were taken at.
+
 **The top symbol is 4.97 % and there is almost no contention term.** Going from
 1 to 4 threads moves nothing by more than half a point, and the only symbols
 that exist *because* of contention — `lock_shared_slow` and `lock_slow` — total
