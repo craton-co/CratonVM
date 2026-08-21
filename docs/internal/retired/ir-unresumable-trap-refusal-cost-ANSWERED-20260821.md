@@ -115,12 +115,18 @@ costs **13.5 ns/iter**; wrapped in `try`/`finally` it costs **174** — about
 So the expensive thing about these methods is not which backend compiles them.
 It is having an exception table at all.
 
-**The cause is not established here and should not be guessed at.** Inlining is
-the obvious hypothesis — a callee with an exception table being refused for
-inlining would produce exactly this shape — but `CRATONVM_DBG_JITC` emits no
-inline decision for either method, so it was not confirmed, and a 12.8x claim
-deserves better than an untested mechanism. The next step is an inline-decision
-diagnostic for these two callees, not a rewrite of anything.
+**ROOT-CAUSED 2026-08-21 — and it was NOT inlining.** See
+`static-exception-table-callee-pays-the-funnel-20260821.md`. Both callees are
+compiled and NEITHER is inlined (an OSR body passes an empty `inline_sites`
+map), so the inlining hypothesis recorded here was wrong. What actually happens
+is that a statically-bound callee declaring an exception table is barred from a
+baked direct `CALL` and takes `jit_invoke_dispatch` instead — observed directly,
+1 187 000 funnel entries for the guarded callee against zero for the unguarded
+one. Lifting that ban (`CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=1`) moves the rung
+107.30 -> 10.57 ns/op, 10.2x, controls flat.
+
+Recorded here as an untested hypothesis and now replaced by a measured
+mechanism, which is the point of having written it that way.
 
 That gap is worth roughly 160 ns/iter on every hot `try`-carrying method. This
 rule is worth < 8. Anyone scoping work in this area should take the first
