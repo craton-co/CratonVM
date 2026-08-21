@@ -99,6 +99,33 @@ streams, and so is `flush()` on a closed `FileOutputStream`.
 and the three pre-existing reds FAIL, while the two twins pass on both arms —
 which is exactly their job.
 
+## What this deliberately leaves open
+
+The fixture that bites is `slot 0 == Int(0)` — an unwritten reference slot —
+being accepted by `f{i,o}s_get_fd`'s LEGACY arm as descriptor 0. Descriptor 0
+is **stdin**. So the same arm says that a `FileInputStream` which reached these
+natives without its `fd` field ever being written reads from the process's
+standard input rather than failing.
+
+The closed half of that is fixed here: such a stream, once marked closed, is now
+refused before the lookup runs. The OPEN half is not, and it is a different
+defect with a different fix — tightening the legacy arm to `v > 0`.
+
+That looks safe on inspection and is **not** done here, for two reasons worth
+stating rather than leaving as an omission:
+
+* it has no failing test and no reproduction, only an inspection argument, and
+  this branch's whole method was to measure first;
+* the two other stdin routes (`System.in`'s slot-1 `fd + 1` encoding, where
+  "0 means unset" is called out explicitly, and the `get_system_stream("in")`
+  identity check) exist precisely BECAUSE 0 is ambiguous in a slot — which is
+  evidence the tightening is right, and also evidence that the legacy arm is
+  load-bearing for some caller that has not been identified.
+
+Anyone taking it should start by asking which receivers actually reach
+`f{i,o}s_get_fd` with slot 0 an `Int` at all, since the real-JDK layout puts a
+`FileDescriptor` reference there.
+
 ## Measurements
 
 ```
