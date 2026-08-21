@@ -3218,63 +3218,122 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
     // one is the copy a `Compatible` run actually dispatches. Both are tagged
     // the same way on purpose — a strict run must not depend on which of two
     // registrars ran last.
+    // NOT REGISTERED AGAINST A REAL JDK IMAGE (H19, 2026-08-21).
+    //
+    // The `SyntheticStub` tag made `--jdk-only` drop `compose`/`andThen` and
+    // run the real default methods; it left `Compatible` / `--real-jdk`
+    // dispatching a stand-in the comment above already says is unnecessary
+    // ("So there IS a working real-bytecode fallback"). Registering these two
+    // only when the registry is NOT being populated for a real image finishes
+    // that 2026-08-05 change in the mode it did not reach.
+    //
+    // MEASURED 2026-08-21 (`C:/craton/cratonvm-r5.exe`, oracle HotSpot
+    // 25.0.3+9), one probe, three arms — TWO divergences per method, not one:
+    //
+    //   f.andThen(g).getClass()  HotSpot Function$$Lambda/0x… | --jdk-only
+    //     Function$$Lambda/0x… | Compatible java.util.function.Function$AndThen
+    //   f.compose(g).getClass()  HotSpot Function$$Lambda/0x… | --jdk-only
+    //     Function$$Lambda/0x… | Compatible java.util.function.Function$Compose
+    //   f.andThen(null)          HotSpot NullPointerException | --jdk-only
+    //     NullPointerException | Compatible RETURNS, does not throw
+    //   f.compose(null)          same shape
+    //
+    // The computed values were right in all three arms (`andThen` 30,
+    // `compose` 21), which is why only a CLASS-NAME screen or a null-contract
+    // check can see this: the stand-in does the arithmetic correctly and lies
+    // about its identity and its argument checking.
+    //
+    // The null half is the part no record predicted. `Objects.requireNonNull`
+    // lives in the default method's bytecode, so a native that replaces the
+    // method silently drops it — and `Predicate.and`/`or`, `Consumer.andThen`
+    // and `BinaryOperator.maxBy` all DO throw here, because H3-1 deleted their
+    // stand-ins on 2026-08-20. That contrast is the measurement: seven rows
+    // went, these two stayed, and the difference is visible from Java.
+    //
+    // WHY A GUARD AND NOT A DELETION (H15-3 §2.4 proposed deletion): four
+    // tests in `vm/src/vm/tests.rs` — `m3_function_and_then_creates_composite`,
+    // `m3_function_and_then_apply_chains_correctly`,
+    // `m3_function_compose_creates_composite`,
+    // `m3_function_compose_apply_chains_correctly` — reach these exact triples
+    // through `call_native`, which PANICS on an absent registration, and two of
+    // them `assert_eq!` the composite's class name against the stand-in. That
+    // file is not this lane's to edit and
+    // `cargo test -p cratonvm-vm --lib --features synthetic-jdk` blocks CI.
+    // Its registry is `NativeMethodRegistry::new()` and never calls
+    // `set_drop_real_layout_synthetic`, so the guard leaves it alone — as it
+    // leaves the synthetic-JDK image, which has no `Function` bytecode to fall
+    // back to. (H15-3 §4 N4 named two of the four; the other two are
+    // `compose`'s and fail the same way.)
+    //
+    // `identity()` is NOT guarded here on purpose: `register_function_identity_
+    // natives` in `native-builtins/src/lib.rs` registers it again, later, and
+    // registration is last-write-wins, so guarding only this copy would change
+    // nothing. It also does not need to be — MEASURED, `Function.identity()`,
+    // `UnaryOperator.identity()` and `BinaryOperator.maxBy`/`minBy` already
+    // return real lambdas in Compatible mode DESPITE being registered, and why
+    // the static factories do not fire while these two default methods do is
+    // unexplained. See the record's NOMINATIONS.
+    //
+    // docs/known-issues/jdk-only/H19-1-three-stand-ins-retired-against-a-real-image-20260821.md §2
     let __func_prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let func = "java/util/function/Function";
-    r.register(
-        func,
-        "compose",
-        "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let before = args[1];
-            // Pin across the composite alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let this_pin = ctx.pin_native_root(this);
-            let before_pin = pinned_object_value(ctx, before);
-            let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
-                ctx,
-                "java/util/function/Function$Compose",
-                2,
-            )?;
-            let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(
-                composite,
-                1,
-                read_pinned_object_value(ctx, before_pin, before),
-            );
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(composite))))
-        },
-    );
-    r.register(
-        func,
-        "andThen",
-        "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let after = args[1];
-            // Pin across the composite alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let this_pin = ctx.pin_native_root(this);
-            let after_pin = pinned_object_value(ctx, after);
-            let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
-                ctx,
-                "java/util/function/Function$AndThen",
-                2,
-            )?;
-            let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(
-                composite,
-                1,
-                read_pinned_object_value(ctx, after_pin, after),
-            );
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(composite))))
-        },
-    );
+    if !r.drops_real_layout_synthetic() {
+        r.register(
+            func,
+            "compose",
+            "(Ljava/util/function/Function;)Ljava/util/function/Function;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let before = args[1];
+                // Pin across the composite alloc below — a moving young GC there
+                // would relocate them (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
+                let before_pin = pinned_object_value(ctx, before);
+                let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
+                    ctx,
+                    "java/util/function/Function$Compose",
+                    2,
+                )?;
+                let this = ctx.read_native_pin(this_pin, this);
+                ctx.set_field(composite, 0, Value::Object(Some(this)));
+                ctx.set_field(
+                    composite,
+                    1,
+                    read_pinned_object_value(ctx, before_pin, before),
+                );
+                ctx.unpin_native_roots(this_pin);
+                Ok(Some(Value::Object(Some(composite))))
+            },
+        );
+        r.register(
+            func,
+            "andThen",
+            "(Ljava/util/function/Function;)Ljava/util/function/Function;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let after = args[1];
+                // Pin across the composite alloc below — a moving young GC there
+                // would relocate them (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
+                let after_pin = pinned_object_value(ctx, after);
+                let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
+                    ctx,
+                    "java/util/function/Function$AndThen",
+                    2,
+                )?;
+                let this = ctx.read_native_pin(this_pin, this);
+                ctx.set_field(composite, 0, Value::Object(Some(this)));
+                ctx.set_field(
+                    composite,
+                    1,
+                    read_pinned_object_value(ctx, after_pin, after),
+                );
+                ctx.unpin_native_roots(this_pin);
+                Ok(Some(Value::Object(Some(composite))))
+            },
+        );
+    }
     // Function.identity()
     r.register(
         func,

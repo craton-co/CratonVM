@@ -12429,6 +12429,284 @@ fn jit_direct_helper_refused(vm: &SharedVm) -> bool {
     false
 }
 
+// ===========================================================================
+// H20-1 — the bind-time half: one enumerated address source for every compile
+// door, and a `match` the compiler will not let anyone leave incomplete.
+//
+// # Why the enforcement is here and not on `JitDirectCall`
+//
+// `H12-1` N1 asked for `CompileAdmission`'s trick to be applied to
+// `JitDirectCall`: make it un-constructible outside a constructor that takes a
+// policy witness. The analogy is right about the *problem* and wrong about the
+// *place*, for a reason that is a property of the backend rather than of taste.
+//
+// `CompileAdmission` works because it is consumed at a choke point DOWNSTREAM
+// of every door (`x64::compile_with_param_slots`) and the refusal is safe
+// there: the caller's fallback — "do not compile, keep interpreting" — is
+// universal and every door already handles it.
+//
+// A direct-bind refusal has no such downstream point. `x64/driver.rs`'s
+// `reserve_stack_floor` walk states the backend's rule in its own words: *"a
+// raw self-call site is an `invokestatic` pc with neither an invoke-info entry
+// nor a direct-call plan"*. Every ladder — this crate's two and
+// `try_compile_inner`'s two — pushes its row and then `continue`s PAST the
+// `invoke_info` construction for that pc (`jit_bridge.rs`'s pushes are at
+// 1243/1371/1435, all after the ladder). So a row deleted after the door
+// leaves the pc with no metadata at all, and the `0xb8` arm compiles
+// `Thread.currentThread()` as a call to the enclosing method. Filtering
+// downstream would replace an open door with a wild jump.
+//
+// `try_compile_inner` already has the only safe shape, and it is the model:
+//
+//     let entry = direct_native_helper(..);      // 0 == refused
+//     if entry != 0 { direct_calls.push(..); continue; }
+//     // falls through to the code that builds `invoke_info` for this pc
+//
+// So the token has to ride on the ENTRY ADDRESS, obtained at the bind site,
+// before the `continue`. That is what [`admit_direct_native_entry`] is:
+// `Option<usize>`, `None` meaning "fall through", which is byte-for-byte the
+// `entry == 0` sentinel the MethodEntry ladder has always used.
+//
+// # What is compiler-enforced, and what is not
+//
+// Enforced by this file:
+//   * a tenth thin helper cannot be added without stating its registered kind
+//     — [`DirectNativeShadow`] is matched exhaustively in three places;
+//   * a door cannot ask for an address without naming which VM it is compiling
+//     for, because that is the only parameter.
+//
+// Enforced by `jit::compile_gate`:
+//   * a fourth `CompileDoor` cannot be added without answering
+//     `builds_direct_calls`;
+//   * a door that never declares a `DirectCallPolicy` has its rows counted by
+//     `undeclared_direct_bind_rows`.
+//
+// NOT enforced, and named so it is not mistaken for enforced: the raw items
+// below are still `pub`, so a ladder can still take
+// `helpers::jit_hashmap_get_direct as *const () as usize` and skip this
+// function — which is what both direct doors do today. Making them
+// `pub(in crate::jit)` is what closes it, and it is a compile error in
+// `vm/src/runtime/interpreter/jit_bridge.rs` and
+// `vm/src/runtime/interpreter.rs` until those two ladders are converted. Lane
+// H20 owns neither and was forbidden to build; H20-1 §6 O1/O2 specify the
+// change. `direct_bind_source_witness` below is the stand-in that makes a NEW
+// raw address-take a red test rather than a thing a reviewer has to notice.
+// ===========================================================================
+
+/// A thin direct-call helper that stands in front of a **registered native**,
+/// enumerated so the policy question can be asked once per helper instead of
+/// once per door.
+///
+/// Membership rule, and it is narrower than "everything in `direct_calls`":
+/// a variant belongs here iff the emitted `CALL` reaches a VM-side body that
+/// re-implements a row in the native registry. That excludes
+/// `Math.sqrt` (lowered to `SQRTSD`, shadows nothing), the `String`/`CRC32`
+/// call-site intrinsics and the `JitIntrinsic` sentinels, and the
+/// `AtomicInteger` family (resolved by `try_resolve_atomic_intrinsic`, which
+/// carries its own admission). Those owe no policy question and listing them
+/// here would invite a "fix" that is not one — `H12-2` §1's last bullet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectNativeShadow {
+    /// `java/lang/Thread.currentThread()Ljava/lang/Thread;`
+    ThreadCurrentThread,
+    /// `jdk/internal/util/Preconditions.checkIndex(IILjava/util/function/BiFunction;)I`
+    PreconditionsCheckIndex,
+    /// `java/lang/ref/Reference.reachabilityFence(Ljava/lang/Object;)V`
+    ReachabilityFence,
+    /// `java/lang/Integer.valueOf(I)Ljava/lang/Integer;`
+    IntegerValueOf,
+    /// `java/lang/Integer.intValue()I`
+    IntegerIntValue,
+    /// `java/util/HashMap.get(Ljava/lang/Object;)Ljava/lang/Object;`
+    HashMapGet,
+    /// `java/util/HashMap.put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;`
+    HashMapPut,
+    /// `java/util/concurrent/ConcurrentHashMap.get(Ljava/lang/Object;)Ljava/lang/Object;`
+    ConcurrentHashMapGet,
+    /// `java/lang/StringLatin1.toLowerCase(...)` — bound by the MethodEntry
+    /// single-pass ladder only; listed so the enumeration is the whole
+    /// population rather than the part two doors happen to bind.
+    StringLatin1ToLowerCase,
+}
+
+impl DirectNativeShadow {
+    /// Every shadow, for the tests and the source witness.
+    pub const ALL: [DirectNativeShadow; 9] = [
+        DirectNativeShadow::ThreadCurrentThread,
+        DirectNativeShadow::PreconditionsCheckIndex,
+        DirectNativeShadow::ReachabilityFence,
+        DirectNativeShadow::IntegerValueOf,
+        DirectNativeShadow::IntegerIntValue,
+        DirectNativeShadow::HashMapGet,
+        DirectNativeShadow::HashMapPut,
+        DirectNativeShadow::ConcurrentHashMapGet,
+        DirectNativeShadow::StringLatin1ToLowerCase,
+    ];
+
+    /// The registered triple whose native this helper re-implements.
+    ///
+    /// For `ConcurrentHashMapGet` this is the **implementing** class, not the
+    /// `java/util/concurrent/ConcurrentMap` interface the call site names —
+    /// H7-1's finding, and the reason `direct_native_helper_for_impl` exists.
+    /// A policy question asked about the interface row is a question about a
+    /// registration that does not run.
+    pub const fn triple(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            DirectNativeShadow::ThreadCurrentThread => (
+                "java/lang/Thread",
+                "currentThread",
+                "()Ljava/lang/Thread;",
+            ),
+            DirectNativeShadow::PreconditionsCheckIndex => (
+                "jdk/internal/util/Preconditions",
+                "checkIndex",
+                "(IILjava/util/function/BiFunction;)I",
+            ),
+            DirectNativeShadow::ReachabilityFence => (
+                "java/lang/ref/Reference",
+                "reachabilityFence",
+                "(Ljava/lang/Object;)V",
+            ),
+            DirectNativeShadow::IntegerValueOf => (
+                "java/lang/Integer",
+                "valueOf",
+                "(I)Ljava/lang/Integer;",
+            ),
+            DirectNativeShadow::IntegerIntValue => ("java/lang/Integer", "intValue", "()I"),
+            DirectNativeShadow::HashMapGet => (
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            DirectNativeShadow::HashMapPut => (
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            DirectNativeShadow::ConcurrentHashMapGet => (
+                "java/util/concurrent/ConcurrentHashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            DirectNativeShadow::StringLatin1ToLowerCase => (
+                "java/lang/StringLatin1",
+                "toLowerCase",
+                "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+            ),
+        }
+    }
+
+    /// The Rust item name, so a refusal and the source witness can both name
+    /// the same symbol the ladders name.
+    pub const fn helper_symbol(self) -> &'static str {
+        match self {
+            DirectNativeShadow::ThreadCurrentThread => "jit_thread_current_thread_direct",
+            DirectNativeShadow::PreconditionsCheckIndex => {
+                "jit_preconditions_check_index_direct"
+            }
+            DirectNativeShadow::ReachabilityFence => "jit_reachability_fence_direct",
+            DirectNativeShadow::IntegerValueOf => "jit_integer_value_of_direct",
+            DirectNativeShadow::IntegerIntValue => "jit_integer_int_value_direct",
+            DirectNativeShadow::HashMapGet => "jit_hashmap_get_direct",
+            DirectNativeShadow::HashMapPut => "jit_hashmap_put_direct",
+            DirectNativeShadow::ConcurrentHashMapGet => "jit_concurrent_hashmap_get_direct",
+            DirectNativeShadow::StringLatin1ToLowerCase => "jit_string_latin1_to_lower_direct",
+        }
+    }
+
+    /// The helper's entry address.
+    ///
+    /// Taken as `NAME as *const () as usize` rather than read out of the
+    /// `*_DIRECT_FN` cell, for the reason both direct doors already state: a
+    /// door can run before `build_helpers` has published those cells, so a cell
+    /// read yields `0` on the first compile in a process and the bind is
+    /// silently skipped. Process-invariant either way — the cells hold exactly
+    /// these addresses (`build_helpers`, registered unconditionally since
+    /// 2026-08-06).
+    ///
+    /// Private on purpose. The address is only ever handed out by
+    /// [`admit_direct_native_entry`], which is the whole point of this type.
+    fn entry_addr(self) -> usize {
+        match self {
+            DirectNativeShadow::ThreadCurrentThread => {
+                jit_thread_current_thread_direct as *const () as usize
+            }
+            DirectNativeShadow::PreconditionsCheckIndex => {
+                jit_preconditions_check_index_direct as *const () as usize
+            }
+            DirectNativeShadow::ReachabilityFence => {
+                jit_reachability_fence_direct as *const () as usize
+            }
+            DirectNativeShadow::IntegerValueOf => {
+                jit_integer_value_of_direct as *const () as usize
+            }
+            DirectNativeShadow::IntegerIntValue => {
+                jit_integer_int_value_direct as *const () as usize
+            }
+            DirectNativeShadow::HashMapGet => jit_hashmap_get_direct as *const () as usize,
+            DirectNativeShadow::HashMapPut => jit_hashmap_put_direct as *const () as usize,
+            DirectNativeShadow::ConcurrentHashMapGet => {
+                jit_concurrent_hashmap_get_direct as *const () as usize
+            }
+            DirectNativeShadow::StringLatin1ToLowerCase => {
+                jit_string_latin1_to_lower_direct as *const () as usize
+            }
+        }
+    }
+}
+
+/// Is this triple a reviewed `NativeKind::Intrinsic` in `vm`'s registry?
+///
+/// The canonical copy of the closure `jit_bridge.rs` writes out three times
+/// (4656, 4856, 6226) to hand to `jit::direct_native_helper`. Hoisted here so
+/// the compile-time answer and the callee-side answer come from one predicate:
+/// `a-serviceability-predicate-must-mirror-the-dispatch-it-guards`.
+///
+/// Fail-closed: `false` for `Bridge`, for `SyntheticStub`, and for anything
+/// unregistered.
+pub fn is_reviewed_intrinsic_native(
+    vm: &SharedVm,
+    class: &str,
+    method: &str,
+    descriptor: &str,
+) -> bool {
+    let registry = &vm.natives.native_methods;
+    registry
+        .resolve_id(class, method, descriptor)
+        .and_then(|id| registry.kind_of_id(id))
+        .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
+}
+
+/// The one sanctioned way for a compile door to obtain a thin direct-call
+/// helper's entry address.
+///
+/// `Some(addr)` — bind it. `None` — **fall through**, do not `continue`: the
+/// site must still get its `invoke_info` or the backend reads the pc as a raw
+/// self-call. See the module block above for the backend's own statement of
+/// that rule; it is the reason this returns an `Option` at the bind site
+/// instead of the plan being filtered later.
+///
+/// The policy is derived from `vm` rather than passed in, so a door cannot
+/// supply the wrong one; the registry kind is asked about the triple whose
+/// native actually runs. Under `JdkOnly` a refusal is recorded through
+/// `cratonvm_jit::record_jdk_only_direct_native_refusal`, i.e. into the same
+/// counter and the same `--jdk-only-report` violation list the MethodEntry
+/// door's refusals land in.
+///
+/// Compile-time only — never called from emitted code. One registry lookup on
+/// the strict arm, per recognised site, per compilation.
+pub fn admit_direct_native_entry(vm: &SharedVm, shadow: DirectNativeShadow) -> Option<usize> {
+    let (class, method, descriptor) = shadow.triple();
+    let policy = cratonvm_jit::compile_gate::DirectCallPolicy::from_jdk_only(
+        crate::vm::dispatch_policy(vm).is_jdk_only(),
+    );
+    if !policy.admits_shadow_bind(is_reviewed_intrinsic_native(vm, class, method, descriptor)) {
+        cratonvm_jit::record_jdk_only_direct_native_refusal(class, method, descriptor);
+        return None;
+    }
+    Some(shadow.entry_addr())
+}
+
 /// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites
 /// (registered into `cratonvm_jit::INTEGER_VALUE_OF_DIRECT_FN` by
 /// `build_helpers`; the recognition lives in `jit::try_compile`).
@@ -19221,15 +19499,29 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     // Every helper in this block is a **VM-side reimplementation of a
     // registered native** that the JIT bakes straight into the emitted `CALL`.
     // Under `JdkOnly` that is `NativeShadowsBytecode` by construction (§1 rule
-    // 4: concrete bytecode wins), so they are not registered at all. Belt and
-    // braces: `jit::direct_native_helper` already refuses to *bind* a non-zero
-    // address once the policy is latched, and leaving the address at `0` makes
-    // that refusal unreachable rather than merely correct — one fewer way for
-    // a compile path to reach a baked native. `0` is the established "not
-    // wired, use the generic dispatch helper" sentinel every one of these
-    // recognition sites already handles, so the fallback is the ordinary
-    // policy-checked `jit_invoke_dispatch` route, not a stub and not a wild
-    // jump.
+    // 4: concrete bytecode wins).
+    //
+    // H20-1 — WHAT THIS PARAGRAPH USED TO SAY, AND WHY IT WAS DELETED.
+    //
+    // Until 2026-08-21 it continued: "…so they are not registered at all. Belt
+    // and braces: `jit::direct_native_helper` already refuses to *bind* a
+    // non-zero address once the policy is latched, and leaving the address at
+    // `0` makes that refusal unreachable rather than merely correct."
+    //
+    // Fifteen lines below, the registration block says "Registered
+    // UNCONDITIONALLY as of 2026-08-06 (JDK-ONLY-WAVE2 §2)". Both sentences
+    // have been in this function, contradicting each other, since that commit.
+    // `H12-1` found and rewrote the OTHER copy of the same stale claim (the
+    // thin-helper module block ~7 000 lines up); this one it did not see. Two
+    // copies of one deleted premise is the shape of
+    // `a-premise-in-a-comment-is-not-a-compile-time-link`: the commit that
+    // removed the fact could not be made to visit either sentence that
+    // depended on it.
+    //
+    // The refusal that IS real is `jit::direct_native_helper`, at ONE of the
+    // three compile doors, plus the callee-side backstop `H12-1` landed in the
+    // helper bodies. `admit_direct_native_entry` above is the bind-time source
+    // the other two doors must switch to; O1/O2 in the H20-1 record.
     //
     // Deliberately NOT skipped under `JdkOnly`:
     //  * `set_indy_string_concat_fn` — a `StringConcatFactory` *bootstrap*
@@ -20505,5 +20797,149 @@ mod g12_compiled_aastore_asks_the_shared_predicate {
              25.0.3 (MEASURED, RArrayStoreInterfaces s12) in both tiers; the \
              compiled tier reads this predicate and nothing else"
         );
+    }
+}
+
+// ===========================================================================
+// H20-1 — the source witness for the enforcement this lane could not land.
+//
+// Making the nine raw helper items `pub(in crate::jit)` is what would make a
+// door that skips `admit_direct_native_entry` a compile error. That change is a
+// compile error in `vm/src/runtime/interpreter/jit_bridge.rs` and
+// `vm/src/runtime/interpreter.rs` until both ladders are converted, and lane
+// H20 owned neither file and was forbidden to build. Until O1/O2 land, this is
+// the guard: a ladder that takes a raw address is a RED TEST, not something a
+// reviewer has to notice.
+//
+// A frozen count, not a ban, precisely because the nine existing takes are
+// legitimate-for-now. `a-premise-in-a-comment-is-not-a-compile-time-link` is
+// the defect class this whole lane is about, and a comment saying "do not add
+// another one" would be another instance of it.
+// ===========================================================================
+#[cfg(test)]
+mod direct_bind_source_witness {
+    use super::DirectNativeShadow;
+
+    /// Working-tree path of a file under the `vm` crate.
+    ///
+    /// `CARGO_MANIFEST_DIR` is `<repo>/vm`, so these read the SOURCE, not a
+    /// build artifact — `source-witness-tests-read-the-working-tree`. An edit
+    /// that has not been rebuilt still fails this test, which is the point.
+    fn vm_src(rel: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+    }
+
+    /// Count code (non-comment) occurrences of `crate::jit::helpers::<sym>` for
+    /// any enumerated shadow.
+    ///
+    /// Comment lines are excluded by their trimmed prefix rather than by a
+    /// parser: both doors reference these symbols in prose right beside the
+    /// code, and a count that included prose would move whenever someone
+    /// improved a comment. CR is trimmed too, so a CRLF checkout does not
+    /// change the answer — `windows-crlf-breaks-source-witness-tests`.
+    fn raw_address_takes(rel: &str) -> Vec<(usize, String)> {
+        let path = vm_src(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let mut hits = Vec::new();
+        for (i, raw) in text.lines().enumerate() {
+            let line = raw.trim_end_matches('\r').trim_start();
+            if line.starts_with("//") {
+                continue;
+            }
+            for shadow in DirectNativeShadow::ALL {
+                let needle = format!("crate::jit::helpers::{}", shadow.helper_symbol());
+                if line.contains(&needle) {
+                    hits.push((i + 1, shadow.helper_symbol().to_string()));
+                }
+            }
+        }
+        hits
+    }
+
+    /// The OSR door takes seven raw addresses and the eager first-call door two.
+    ///
+    /// MEASURED from the working tree at H20's commit; five of the OSR seven
+    /// are `bridge` rows (`H12-2` 1). If this number goes UP, a new ladder
+    /// bound a helper without asking `admit_direct_native_entry` — the exact
+    /// event `H12-1` says keeps happening and nothing catches. If it goes DOWN,
+    /// O1/O2 are landing and the baseline should be lowered in the same commit;
+    /// at zero, delete this module and make the nine items
+    /// `pub(in crate::jit)`, which is strictly better than any test.
+    #[test]
+    fn the_two_direct_doors_take_exactly_the_addresses_h12_measured() {
+        let osr = raw_address_takes("src/runtime/interpreter/jit_bridge.rs");
+        let eager = raw_address_takes("src/runtime/interpreter.rs");
+        assert_eq!(
+            osr.len(),
+            7,
+            "OSR ladder raw address-takes changed; found {osr:?}. \
+             Up = a new unguarded bind (H12-1). Down = O1 landing; lower this \
+             number in the same commit."
+        );
+        assert_eq!(
+            eager.len(),
+            2,
+            "eager first-call ladder raw address-takes changed; found {eager:?}. \
+             Both of its binds are `intrinsic` today, so it is incidentally \
+             correct and structurally unguarded (H12-1 2c)."
+        );
+    }
+
+    /// Every enumerated shadow has a distinct symbol, triple and address.
+    ///
+    /// A duplicated address would mean two variants naming one helper, which
+    /// would make a refusal for one silently refuse the other;
+    /// `duplicate-native-registrations-verify-which-wins` is the adjacent trap.
+    #[test]
+    fn the_enumeration_is_injective() {
+        let mut symbols: Vec<&str> = DirectNativeShadow::ALL
+            .iter()
+            .map(|s| s.helper_symbol())
+            .collect();
+        symbols.sort_unstable();
+        symbols.dedup();
+        assert_eq!(symbols.len(), DirectNativeShadow::ALL.len());
+
+        let mut triples: Vec<(&str, &str, &str)> =
+            DirectNativeShadow::ALL.iter().map(|s| s.triple()).collect();
+        triples.sort_unstable();
+        triples.dedup();
+        assert_eq!(triples.len(), DirectNativeShadow::ALL.len());
+
+        let mut addrs: Vec<usize> = DirectNativeShadow::ALL
+            .iter()
+            .map(|s| s.entry_addr())
+            .collect();
+        assert!(
+            addrs.iter().all(|&a| a != 0),
+            "a shadow's address is never 0; 0 is the ladders' \"not wired\" sentinel"
+        );
+        addrs.sort_unstable();
+        addrs.dedup();
+        assert_eq!(
+            addrs.len(),
+            DirectNativeShadow::ALL.len(),
+            "two variants resolve to one helper address"
+        );
+    }
+
+    /// The enumerated symbol names are the names the ladders actually write.
+    ///
+    /// `helper_symbol` is a string, so it can drift from the item it names.
+    /// This pins it to the working tree: every symbol must be declared here.
+    #[test]
+    fn every_enumerated_symbol_is_a_real_item_in_this_file() {
+        let path = vm_src("src/jit/helpers.rs");
+        let text = std::fs::read_to_string(&path).expect("read helpers.rs");
+        for shadow in DirectNativeShadow::ALL {
+            let decl = format!("extern \"C\" fn {}(", shadow.helper_symbol());
+            assert!(
+                text.contains(&decl),
+                "{:?} names `{}`, which is not declared in this file",
+                shadow,
+                shadow.helper_symbol()
+            );
+        }
     }
 }

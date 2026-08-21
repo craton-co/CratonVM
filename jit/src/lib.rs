@@ -8649,9 +8649,15 @@ pub fn jdk_only_jit_violations() -> Vec<cratonvm_types::error::JdkOnlyViolation>
 /// `#[cold]` + `#[inline(never)]`, mirroring `vm_exec.rs`'s reject helpers: the
 /// `String` allocations here exist only on the reject path and are never
 /// reachable in Compatible mode.
+/// H20-1: `pub` so the OSR and eager first-call ladders — which live in the VM
+/// crate and cannot reach [`direct_native_helper`] at all — record their
+/// refusals in the SAME violation list and the SAME counter as the MethodEntry
+/// door. Two doors refusing the same triple into two different reports would be
+/// a per-door `--jdk-only-report`, which is exactly the drift
+/// `compile_gate`'s module doc says keeps happening here.
 #[cold]
 #[inline(never)]
-fn record_jdk_only_direct_native_refusal(class: &str, method: &str, descriptor: &str) {
+pub fn record_jdk_only_direct_native_refusal(class: &str, method: &str, descriptor: &str) {
     JDK_ONLY_DIRECT_NATIVE_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut recorded = jdk_only_violations().lock();
     if recorded.len() >= JDK_ONLY_VIOLATION_CAP {
@@ -8822,10 +8828,25 @@ fn direct_native_helper_for_impl(
 //
 //  3. `vm/src/jit/helpers.rs::build_helpers` — must call
 //     [`set_jit_execution_policy`] with `config.execution_policy()` BEFORE the
-//     first compilation, and should skip the `set_*_direct_fn` registrations
-//     entirely under `JdkOnly` (belt and braces: this crate already refuses to
-//     bind them, but not registering them at all makes the refusal
-//     unreachable rather than merely correct).
+//     first compilation.
+//
+//     This item used to continue: "and should skip the `set_*_direct_fn`
+//     registrations entirely under `JdkOnly` (belt and braces …)".
+//     **WITHDRAWN 2026-08-21 (H20-1), for two independent reasons.**
+//
+//     (a) It asks for something that was deliberately deleted. The module
+//     comment ~300 lines above this one records the `*_DIRECT_FN` cells being
+//     registered *unconditionally* as of 2026-08-06, because withholding a
+//     process-invariant `fn` address was never per-VM protection — it was a
+//     process-wide side effect on every other VM in the process. Re-adding it
+//     would re-introduce that bug. An open ask for a closed decision is how
+//     `vm/src/jit/helpers.rs` came to carry two contradictory paragraphs about
+//     the same registrations for two weeks.
+//
+//     (b) It would not have covered the doors that need covering. Item 7
+//     below: both direct doors take helper addresses as
+//     `NAME as *const () as usize`, never reading the cells, so zeroing the
+//     cells is invisible to them.
 //
 //  4. `cp_elidable_init_resolver` (supplied to `try_compile` by
 //     `vm/src/runtime/interpreter.rs`) decides whether a `<init>` may be
@@ -8843,6 +8864,28 @@ fn direct_native_helper_for_impl(
 //
 //  6. `MONITOR_ENTER_DIRECT_FN` / `MONITOR_EXIT_DIRECT_FN` are VM monitor
 //     services, not registered natives. Not a dispatch site; no action.
+//
+//  7. `vm/src/runtime/interpreter/jit_bridge.rs`'s OSR direct-call ladder and
+//     `vm/src/runtime/interpreter.rs`'s eager first-call ladder each build
+//     `direct_calls` themselves and hand it to `x64::compile_with_param_slots`,
+//     so neither reaches [`direct_native_helper`]. Both take helper addresses
+//     as `NAME as *const () as usize` rather than reading the `*_DIRECT_FN`
+//     cell, so item 3's withdrawn belt-and-braces would not have covered them
+//     either. MEASURED 2026-08-20: under `--jdk-only` the OSR door bound
+//     `jit_thread_current_thread_direct` (a `bridge` row) and compiled code
+//     called it 298 000 times while the MethodEntry door refused all seven
+//     sites it examined; `--real-jdk` reported the identical `OSR 1`. See
+//     H12-1.
+//
+//     The largest such paths in the tree, and the reason items 1-6 read as a
+//     complete list for three months while they were not.
+//
+//     The remedy is [`compile_gate::CompileAdmission::admits_direct_bind`] plus
+//     `vm/src/jit/helpers.rs::admit_direct_native_entry`, called AT THE BIND
+//     SITE. It cannot be applied downstream: a row removed after the door
+//     leaves the pc with neither invoke-info nor a direct-call plan, which
+//     `x64/driver.rs`'s `reserve_stack_floor` walk defines as a raw self-call.
+//     See H20-1.
 // ---------------------------------------------------------------------------
 
 /// Process-global pointer to the VM-side

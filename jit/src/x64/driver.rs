@@ -426,8 +426,25 @@ pub fn compile_with_param_slots(
     // the gate; this counter stops a door written *with*
     // `CompileAdmission::for_backend_test()`, which the type system cannot
     // tell apart from a real one.
-    let _ = admission;
     crate::compile_gate::note_backend_entry();
+    // H20-1. The direct-call half of the same two-layer idea, and the reason
+    // `admission` is no longer a `let _ =`.
+    //
+    // This counts; it deliberately does NOT filter. A row dropped here would be
+    // unsound: `reserve_stack_floor` below keys a raw self-call site on an
+    // `invokestatic` pc with *neither* an invoke-info entry *nor* a direct-call
+    // plan, and every ladder pushes its row and then `continue`s past the
+    // `invoke_info` construction for that pc — so deleting a row at this point
+    // leaves the pc with no metadata at all and the `0xb8` arm compiles
+    // `Thread.currentThread()` as a call to the enclosing method. The refusal
+    // has to happen at the bind site, where falling through still builds the
+    // fallback; see `CompileAdmission::admits_direct_bind`.
+    //
+    // What it buys: the first per-door count of direct-call rows from a door
+    // that never asked the JDK-only question. `H12-1` N2 — the OSR door's
+    // HashMap binds had no counter, which is why a prediction about them was
+    // unfalsifiable.
+    crate::compile_gate::note_direct_binds(admission, direct_calls.len());
     // A class-`ldc` calls a helper that takes the VM context as its first
     // argument, exactly like a string-`ldc`, so it forces the context form of
     // the artifact too.
