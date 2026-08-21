@@ -366,3 +366,214 @@ re-deriving it.
    in isolation, repeated ≥10x) before being trusted — this record's own §2
    theory looked equally plausible from a smaller trace and turned out to be
    wrong.
+
+---
+
+## 4. CORRECTED 2026-08-21 — section 3's "duplicate array-loop dispatch" does not reproduce; two follow-on theories tried and refuted; the mechanism is still open
+
+Reproduced today on an idle Azure host (`azureuser@20.80.105.49`, 8 vCPU, load
+average ~0 before this session started, Docker/Postgres native — not Docker
+Desktop) specifically to get a race-free measurement after section 3.2 flagged
+the local Windows box as too contended and too easily perturbed by tracing to
+trust. That work paid off in an unexpected direction: **the pristine binary
+reproduces `FilterWithPaginationTest`'s failure 15/15 times on this box with
+NO instrumentation at all** (`failed=2` every run, ms=13000-18000) — this is
+not a rare race on this host, it is the default outcome. But the *mechanism*
+section 3 described from the Windows trace does not hold up under a clean,
+correlated trace taken here.
+
+### 4.1 The string-based TraceBuf from section 3 was itself a heisenbug filter — and the minimal one was not
+
+Repeating section 3.2's lesson but sharper: instrumenting `AsyncTrampoline
+.unroll()`/`ArrayLoop.next()` with the original `String`-concatenating
+`TraceBuf.add(String)` (allocating and formatting on every call) **dropped
+the reproduction rate to 0/15** on this otherwise-100%-reproducing box.
+Switching to a raw-`int[]`/`long[]` ring buffer with no allocation or string
+work in the hot path (`TraceBuf.add(int kind, int arg1, int arg2)`, format
+deferred to a JVM-shutdown dump) restored it to **15/15**. The race is this
+sensitive to added latency — a lesson for whoever instruments this class
+again: use primitive arrays, never build strings on the hot path, and always
+run a same-box pristine control alongside any instrumented run before
+trusting either.
+
+### 4.2 What the correlated trace actually shows
+
+Full run trace (`cratonvm-hibidle`, `dev@77e712ec6` + this session's
+`fix/hib-reactive-idle-repro-20260820` branch, no code changes): 36,314
+`[TRACEBUF2]` events for one `FilterWithPaginationTest` run, correlated by a
+per-`PassBack`-instance identity hash (`System.identityHashCode`) captured
+alongside every `unroll()`/`ArrayLoop.next()` step. Three loop episodes end
+in an exceptionally-completed `whenComplete` (`ex != null`) — matching the
+`failed=2` outcome plus one @AfterEach that also fails on a class that
+otherwise reports as passing further downstream in the same run.
+
+**Every `ArrayLoop.next()` dispatch in the whole run is unique.** Grepping
+every `DISPATCH(index, newCurrent)` event, no index is ever issued twice for
+the loop episode (`PassBack` identity) that goes on to throw. The one that
+`testOffsetWithStageWithBasicQuery`'s cleanup drives (`passback=28924`)
+dispatches index 0, then 1, then 2 — one `CALLF` each, in order, each
+correctly incrementing `ArrayLoop.current` before returning — and the
+`whenComplete` for index 2's own, singular dispatch comes back with
+`ex != null`. **There is no duplicate call anywhere in this trace.** Section
+3's claim that "index 2 of a 5-element array-loop runs twice" does not
+reproduce here; that record is corrected by this one, not amended.
+
+**Everything in this trace is one thread.** Every single event across all
+36,314 — three separate loop episodes' worth of exceptional completions
+included — carries the same `thread` identity hash. There is no second OS
+thread anywhere in this data. Section 2's original "timing/visibility" theory
+and section 3's "two racing trampoline instances" theory both assumed or
+required cross-thread activity to explain a plain, non-atomic field read
+seeing a stale value; neither is available here, because there is only one
+thread in play.
+
+**Many `deleteEntities()` cleanup loops from *different* test methods run
+concurrently, interleaved on that one thread.** The full timeline around the
+failure window shows loop episodes for nine distinct `PassBack` identities
+(`28986`, `28988`, `28991`, `28993`, `28995`, `28997`, `28998`, `28999`, plus
+the three that fail) all mid-flight within the same ~12ms window, their
+`CALLF`/`WHENCOMPLETE`/`STASH` steps woven together call-by-call as each
+one's tiny Postgres round trip resolves and hands control back to the event
+loop. `deleteEntities()` is `@AfterEach`; this is not one test's cleanup
+taking its time — it is **several different test methods' `@AfterEach`
+cleanups running at once**, all racing to delete-then-reinsert the exact same
+five hardcoded-id (`1..5`) `FamousPerson` rows that every test method in this
+class shares.
+
+### 4.3 The obvious next candidate — cross-test-method interleaving — is also refuted, directly
+
+The "many concurrent `PassBack` episodes on one thread" observation in 4.2
+naturally suggests overlapping `@AfterEach` calls: method N's cleanup still
+deleting id `3` while method N+1 has already re-inserted a fresh id `3`.
+**This was tested directly, not just inferred**, by adding a plain
+`AtomicInteger` around `deleteEntities()` itself — increment on entry, decrement
+on completion (success or exception), logged through the same non-blocking
+`int[]` `TraceBuf` — and re-running.
+
+**Result: `deleteEntities()` is never concurrent. All 35 calls across the run
+see `active=1`, every time, with no exception.** The interleaved `PassBack`
+episodes visible in 4.2's timeline belong to something else entirely — other
+`AsyncTrampoline`/`CompletionStages.loop` usage elsewhere in
+Hibernate/hibernate-reactive's own internals (query building, batch/connection
+plumbing) that happens to use small loops too, running on the same event-loop
+thread while one `deleteEntities()` call's own async gaps are open. They were
+never a second `deleteEntities()` call. **Section 4.3's own theory in the
+first draft of this correction — cross-test-method interleaving — is
+refuted by this measurement and is retracted, same session, before ever being
+committed as a finding.**
+
+### 4.4 Where this actually leaves the investigation
+
+Two candidate mechanisms are now directly refuted by measurement on a clean,
+correlated, single-threaded, race-free trace:
+
+* **Not** a duplicate `ArrayLoop.next()`/`unroll()` dispatch (section 3's
+  claim) — every index in every loop episode, including the three that fail,
+  is dispatched exactly once.
+* **Not** concurrent `deleteEntities()` calls racing on shared hardcoded ids
+  (this section's own first-draft theory) — confirmed always exactly one
+  active call.
+
+What remains true and unexplained: within **one single, uninterrupted,
+sequential, single-threaded synchronous chain** —
+`getResultList()` → (per this doc's own earlier session: `s.contains(o)` is
+`true` for every freshly-loaded entity, checked immediately) →
+`.thenCompose(list -> s.remove(...))` → `fetchAndDelete`'s own
+`source.contains(...)` check — the **same check on the same object in the
+same session** goes from `true` to `false` with no other code running in
+between on this thread, and no other thread active anywhere in the process
+during the window (4.2), and no concurrent `deleteEntities()` call to blame
+(4.3). That is closest to this doc's own section 2 framing, not section 3 or
+the first draft of this section 4 — both of those turned out to be wrong
+turns, now closed off by direct measurement rather than by argument.
+
+### 4.5 What the next session should do
+
+1. **The two refuted theories should not be re-tried** — both were checked
+   directly (4.2's per-index dispatch trace; 4.3's `AtomicInteger`
+   concurrency counter), not just argued from a symptom, so re-deriving them
+   from the same symptom will lead back to the same dead ends.
+2. **Instrument `EventSource.contains()`/the persistence-context identity map
+   itself**, not just its call sites — the mechanism has to be inside
+   `PersistenceContext`'s own entry map (Hibernate ORM core, not
+   hibernate-reactive), since the two checks bracketing the mystery
+   (the earlier `.thenApply` diagnostic in section 2, and `fetchAndDelete`'s own check)
+   are both plain, synchronous, same-thread, same-session calls into it. A
+   `#[track_caller]`-style instrumentation of `StatefulPersistenceContext
+   .getEntry`/`removeEntry`/whatever backs `contains()` (real Hibernate ORM
+   7.4.5 source, not vendored locally — would need decompiling or a
+   source jar) between the two checks would show what, if anything, touches
+   that map in between.
+3. Alternatively: single-step this exact sequence under a debugger (`jdb`
+   against the real HotSpot run first, to get a baseline of what *should*
+   happen, since the symptom needs a real CratonVM run to reproduce but a
+   HotSpot run to know what "correct" looks like at each step) rather than
+   more log-based tracing — the log-based approach has now spent three
+   documented rounds (§2, §3, this section) without landing the mechanism,
+   which is itself a signal to change technique.
+4. Whoever picks this up should still default to the raw-`int[]` `TraceBuf`
+   shape from 4.1 for anything measured on this Azure host, and should still
+   run a same-box pristine control before trusting any instrumented result —
+   both lessons from this session remain valid even though the theories built
+   on top of the first trace did not survive.
+
+This session made no code changes — docs and a probe only. `apps/hibernate-reactive`
+is a gitignored vendor checkout; the temporary instrumentation used to gather
+this section's traces was not committed.
+
+---
+
+## 5. 2026-08-21 — full rerun of the 18 non-passed classes on the idle Azure host, current dev tip
+
+All 18 classes named as non-passed in
+[RESULTS-20260820-3gc-postgres-local.md](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260820-3gc-postgres-local.md)
+rerun against `dev@77e712ec6` + this session's docs-only branch (same binary
+as section 4, `cratonvm-hibidle`), on the idle Azure host, default (ZGC)
+collector.
+
+**9 now PASS** (all previously FAIL/CRASH/HANG on the original Windows
+3-GC run): `UUIDAsBinaryTypeTest`, `ORMReactivePersistenceTest`,
+`MultithreadedIdentityGenerationTest`, `IdentityGeneratorWithColumnTransformerTest`,
+`NoLiveTransactionValidationErrorTest`, `OneToOneIdClassParentIdClassTest`,
+`ReactiveMultitenantTest`, `MutationDelegateIdentityTest`,
+`it.quarkus.qe.database.DatabaseHibernateReactiveTest`. The last two are the
+`nio_selector.rs` fix (section 1) landing cleanly; `ORMReactivePersistenceTest`
+and `DatabaseHibernateReactiveTest` passing confirms
+[the not-a-CratonVM-bug doc](hibernate-and-hibernate-reactive-not-cratonvm-bugs.md)'s
+own claim that both were the Windows box's timezone/locale, not CratonVM —
+this Azure host is UTC/`en` and both pass here as predicted.
+
+**9 still FAIL**, genuinely — not a Docker/Testcontainers artifact, see the
+harness-bug note below: `techempower.TechEmpowerTest`,
+`MultithreadedInsertionWithLazyConnectionTest` (both already-known
+lambda-dispatch-timeout family, [residual-seven doc](residual-seven-after-the-afc-fix-20260817.md)),
+`OneToManyTest`, `QuerySpecificationTest`, `ReactiveStatelessProxyUpdateTest`,
+`CriteriaMutationQueryTest`, `ReactiveStatelessWithBatchTest`,
+`FilterWithPaginationTest`, `RowIdUpdateAndDeleteTest` — the persistence-context
+cascade family sections 2-4 investigate. `QuerySpecificationTest` is a new
+name to that family's list (it was previously only flagged as a `generational`-only
+fail in the original 3-GC run, not one of the "7 new" GC-independent ones);
+worth folding in as an eighth member next time someone works this.
+
+### A harness bug found in passing: `run-hibernate-reactive-suite.sh`'s
+`NO-DB` signature detection greps the whole shard log, not the current class
+
+All 9 failures above were first reported by the runner as
+`NO-DB: connection-refused` — which would mean "no DB reachable, not a VM
+result" per the script's own documented convention. **That label is wrong.**
+Every one of the 9 raw logs shows a normal `@@RESULT ... found=N ok=M failed=2`
+line with real assertion failures (`@@TESTFAIL` for named test methods), not
+a connection failure — the same "Unmanaged instance passed to remove()"-shaped
+cascade this whole page investigates. The bug: `run_shard()`'s sig-detection
+(`run-hibernate-reactive-suite.sh`, the `if grep -qm1 ... "$tmp" "$RAW"` line)
+checks the **whole shard's cumulative `raw.log`** (`$RAW`), not just the
+current class's own temp output (`$tmp`) — so once any earlier class in a
+shard prints something matching `Connection refused|Could not find a valid
+Docker|ConnectException|No Docker environment` anywhere in its own stack
+trace or log output, every later class in that same shard gets mislabeled
+`NO-DB` regardless of its own real outcome. Confirmed by checking `found=0`
+(the script's own `NOTESTS`/no-DB signal) against the actual counts: none of
+the 9 have `found=0`. This script is gitignored (only `class-overrides.tsv`
+is force-tracked), so no fix is committed here — flagging it so the next
+`results.tsv` isn't read at face value. The one-line fix is to grep only
+`"$tmp"`, not `"$tmp" "$RAW"`.

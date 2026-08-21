@@ -549,6 +549,11 @@ fn test_helpers() -> JitRuntimeHelpers {
         // `required` in `jit-api`, so 0 would fail `validate()` rather than
         // select a different lowering.
         aastore_type_check: sentinel,
+        // Unwired (0), for the same reason `ldc_class_cp` is: these tests
+        // build no string-`ldc` site, and 0 makes the backend refuse one
+        // rather than emit a null CALL. `ldc_string` above stays sentinel-wired
+        // because its slot is `required` in `jit-api`; nothing calls it.
+        ldc_string_cp: 0,
     }
 }
 

@@ -145,10 +145,23 @@ fn ldc_const_cache_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LDC_CONST_CACHE").is_none()
-            && cratonvm_types::flags::runtime_var_os("CRATONVM_LDC_CLASSREF_TRACE").is_none()
-            && !crate::runtime::env_cache::dbg_toarray()
-            && !remap_trace_on()
+            && !ldc_const_cache_forced_off_by_diagnostics()
     })
+}
+
+/// The three DIAGNOSTIC switches that must see every `ldc` resolution happen,
+/// and therefore forbid answering one from a record.
+///
+/// Split out so the COMPILED `ldc` helpers
+/// (`vm::jit::helpers::jit_ldc_string_cp` / `jit_ldc_class_cp`) consult the
+/// same predicate rather than a copy of it. They have their own on/off switch
+/// — the two routes are separately measurable — but a trace that goes quiet on
+/// one of them and not the other is not a switch, it is a bug in the
+/// instrument.
+pub(crate) fn ldc_const_cache_forced_off_by_diagnostics() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_LDC_CLASSREF_TRACE").is_some()
+        || crate::runtime::env_cache::dbg_toarray()
+        || remap_trace_on()
 }
 
 /// [`record_cp_constant`], but only when the `ldc` constant cache is enabled.
@@ -502,6 +515,37 @@ pub(super) fn execute_ldc(
 /// migration: each constant tag that learned to cache used to add its own raw
 /// reach, so the file went from two sites to five without anyone deciding to.
 /// Everything else here calls one of these two.
+pub(crate) fn probe_recorded_cp_constant(
+    shared: &SharedVm,
+    class_id: ClassId,
+    cp_index: u16,
+) -> Option<Value> {
+    cached_cp_constant(shared, class_id, cp_index)
+}
+
+/// Counter-free write half of [`probe_recorded_cp_constant`], for the compiled
+/// `ldc` helpers.
+///
+/// The two `pub(crate)` wrappers exist so `vm::jit::helpers`' CP-indexed `ldc`
+/// helpers record into the SAME store on the SAME terms as the interpreter
+/// rather than reaching `shared.classes.resolution_cache` themselves — the
+/// bypass this file's own migration was written to stop. They are
+/// counter-free because the compiled route keeps its own hit/miss/fill triple:
+/// folding the two populations into one number would make "the interpreter is
+/// answering from the record" and "compiled code is" indistinguishable, and
+/// they are separately switchable.
+pub(crate) fn store_recorded_cp_constant(
+    shared: &SharedVm,
+    class_id: ClassId,
+    cp_index: u16,
+    value: Value,
+) {
+    let resolver = MemberResolver::new(shared);
+    let caller = resolver.scope(class_id);
+    let value = resolver.scope(value);
+    resolver.record_constant(caller, cp_index, value);
+}
+
 fn cached_cp_constant(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> Option<Value> {
     let resolver = MemberResolver::new(shared);
     let caller = resolver.scope(class_id);
@@ -515,10 +559,7 @@ fn cached_cp_constant(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> Op
 /// [`cached_cp_constant`].
 fn record_cp_constant(shared: &SharedVm, class_id: ClassId, cp_index: u16, value: Value) {
     super::site_cache::site_stats::bump(super::site_cache::site_stats::LDC_FILL);
-    let resolver = MemberResolver::new(shared);
-    let caller = resolver.scope(class_id);
-    let value = resolver.scope(value);
-    resolver.record_constant(caller, cp_index, value);
+    store_recorded_cp_constant(shared, class_id, cp_index, value);
 }
 
 /// JVMS §5.4.3.5 resolution of a `CONSTANT_MethodType`, shared by `ldc` and

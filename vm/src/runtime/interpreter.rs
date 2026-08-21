@@ -3017,7 +3017,7 @@ pub fn execute(
                     // Skip early compilation for methods with String/Class ldc —
                     // those will be handled by OSR which can wire callees as direct calls.
                     let mut ldc_info_early: Vec<(usize, i64)> = Vec::new();
-                    let mut ldc_string_info_early: Vec<(usize, *const u8, usize)> = Vec::new();
+                    let mut ldc_string_info_early: Vec<(usize, u32, u16)> = Vec::new();
                     let mut ldc_class_info_early: Vec<(usize, u32, u16)> = Vec::new();
                     // The `ldc`-family pcs whose constant is floating-point.
                     // Codegen types these by their consuming opcode, but the
@@ -3048,22 +3048,23 @@ pub fn execute(
                                             .is_none() =>
                                     {
                                         // Wired 2026-07-18, mirroring the OSR-artifact
-                                        // path: boxed text retained via
-                                        // `owned_jit_strings` -> `cm._jit_strings`;
-                                        // codegen materializes through
-                                        // `helpers.ldc_string`. Before this, ANY
-                                        // method with a string constant went into
-                                        // `jit_skip_set` here, which also blocked the
-                                        // hot-path `jit::try_compile` - OSR artifacts
-                                        // were such methods' ONLY compiled form.
+                                        // path. Before this, ANY method with a string
+                                        // constant went into `jit_skip_set` here, which
+                                        // also blocked the hot-path `jit::try_compile` -
+                                        // OSR artifacts were such methods' ONLY compiled
+                                        // form.
+                                        //
+                                        // The SITE is recorded, not the text: since
+                                        // 2026-08-20 codegen materialises through
+                                        // `helpers.ldc_string_cp`, which answers from
+                                        // the `(class, cp index)`-keyed record JVMS
+                                        // §5.4.3 requires. The `get_utf8` call is only
+                                        // the representability test the `get_utf8_wide`
+                                        // guard above pairs with.
                                         match class.constant_pool.get_utf8(*string_index) {
-                                            Some(s) => {
-                                                let boxed: Box<str> =
-                                                    s.to_string().into_boxed_str();
-                                                let ptr = boxed.as_ptr();
-                                                let len = boxed.len();
-                                                owned_jit_strings.push(boxed);
-                                                ldc_string_info_early.push((pc_ldc, ptr, len));
+                                            Some(_) => {
+                                                ldc_string_info_early
+                                                    .push((pc_ldc, class_id.as_u32(), cp_idx));
                                             }
                                             None => has_unsupported_ldc = true,
                                         }
@@ -4126,7 +4127,7 @@ pub fn execute(
             // The compiled body named a throw site of its own that no `try`
             // covers: nothing here can catch it, and the pc-unknown search
             // would match a typed row by exception class alone.
-            JitThrowPc::OutsideAllRanges => None,
+            JitThrowPc::OutsideAllRanges(_) => None,
             JitThrowPc::Unknown => {
                 find_exception_handler_pc_unknown(shared, &thread.frames[frame_idx], exc)
             }
@@ -8325,7 +8326,7 @@ pub use typecheck::*;
 // Moved to `interpreter/constants.rs`. The `pub use` keeps every
 // existing path resolving; a glob re-export caps each item at its own
 // declared visibility, so nothing here became more public than it was.
-mod constants;
+pub(crate) mod constants;
 pub use constants::*;
 // ---------------------------------------------------------------------------
 // Helper: Field resolution

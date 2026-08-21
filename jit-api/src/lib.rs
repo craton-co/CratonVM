@@ -1229,6 +1229,25 @@ pub struct JitRuntimeHelpers {
     /// Appended at the END of the struct so all prior golden offsets stay
     /// stable.
     pub local_handler_lookup: usize,
+
+    /// `ldc <String>` — the interned literal named at `cp_idx` in
+    /// `holder_class_id`'s constant pool.
+    ///
+    /// `extern "C" fn(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64`.
+    /// The CP-indexed twin of [`Self::ldc_class_cp`], and the SUPERSEDER of
+    /// [`Self::ldc_string`], which bakes the literal's UTF-8 bytes instead and
+    /// therefore has no key to answer from: JVMS §5.4.3 resolves a
+    /// constant-pool entry once and records the result, and the record is
+    /// keyed `(class, cp index)`. The bytes form re-derived the answer on every
+    /// execution — the string pool's `RwLock`, a hash of the literal's whole
+    /// content and a `memcmp` — measured at 18.4 ns against HotSpot's 0.2 ns
+    /// (`probes/LdcConstCostProbe.java`).
+    ///
+    /// `0` = not wired (hand-built test tables) → the backend refuses a
+    /// string-`ldc` site and bails the compile, exactly as an unwired
+    /// [`Self::ldc_class_cp`] makes it refuse a class-`ldc` site. Appended at
+    /// the END of the struct so all prior golden offsets stay stable.
+    pub ldc_string_cp: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1413,6 +1432,9 @@ helper_fields! {
     // every caught exception keeps leaving compiled code — the pre-feature
     // behaviour.
     (local_handler_lookup,           FieldKind::OptionalPtr),
+    // Optional: 0 makes both backends refuse a string-`ldc` site and bail the
+    // compile, the same way an unwired `ldc_class_cp` does for `ldc <Class>`.
+    (ldc_string_cp,                  FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1438,7 +1460,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 66,
+    JitRuntimeHelpers::NUM_FIELDS == 67,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1834,6 +1856,7 @@ mod tests {
             aastore_type_check: 0x11C0,
             read_bounds_addr: 0x11C8,
             local_handler_lookup: 0x11D0,
+            ldc_string_cp: 0x11D8,
         }
     }
 
@@ -2072,6 +2095,7 @@ mod tests {
             aastore_type_check: 0,
             read_bounds_addr: 0,
             local_handler_lookup: 0,
+            ldc_string_cp: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2247,8 +2271,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 65.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 65);
+        // And the macro-driven count is the canonical 67.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 67);
     }
 
     #[test]
@@ -2576,6 +2600,11 @@ mod tests {
                 "local_handler_lookup",
                 std::mem::offset_of!(JitRuntimeHelpers, local_handler_lookup),
             ),
+            (
+                66,
+                "ldc_string_cp",
+                std::mem::offset_of!(JitRuntimeHelpers, ldc_string_cp),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2630,7 +2659,7 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
-        assert_eq!(opt, 12, "optional-pointer count drifted");
+        assert_eq!(opt, 14, "optional-pointer count drifted");
         assert_eq!(off, 10, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
