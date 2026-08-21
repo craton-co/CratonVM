@@ -172,6 +172,31 @@ remedy in one place, which is worth keeping:
 - Re-run `SslErrorTest` on the corrected classpath. 72/72 is the target; HotSpot
   reaches it on this host.
 
+## No regression
+
+The alert change is on the client-side `TrustManager` rejection path, which
+every TLS class in the suite reaches, and the `SSLEngine.toString()` change that
+rides with it is on two registrations the whole engine surface can hit. So the
+guard is every SSL/TLS class in the netty testlist — **95 classes**, one fork
+per class, both binaries, per-class `@@RESULT` diffed:
+
+```
+=== diff base -> p2 ===
+79c79
+< io.netty.handler.ssl.SslErrorTest  found=72 started=72 ok=60 failed=12 aborted=0 skipped=0
+---
+> io.netty.handler.ssl.SslErrorTest  found=72 started=72 ok=72 failed=0 aborted=0 skipped=0
+```
+
+One line. It is the intended one, and nothing else in 95 classes moved.
+
+`ParameterizedSslHandlerTest` was run 10 times on the new binary as well, since
+it is the class this branch's siblings have been chasing: **10 of 10 at 63/63**,
+76–85 s. That is consistent with its known ~1-in-14 stall rate being unchanged
+and is **not** evidence that it improved — ten clean runs is what an unchanged
+1-in-14 usually looks like. See
+`known-issues/netty/parameterizedsslhandlertest-promise-never-completes-20260820.md`.
+
 ## Repro
 
 ```bash
