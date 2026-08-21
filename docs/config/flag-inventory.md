@@ -1148,12 +1148,12 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_GETSTATIC_HELPER` | JIT | `CRATONVM_JIT=getstatic-helper` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` | JIT | `CRATONVM_JIT=guarded-virtual-inline` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_INCLUSIVE_BCE` | JIT | `CRATONVM_JIT=inclusive-bce` | opt-in | off | behaviour | snapshot | jit |
-| `CRATONVM_JIT_INLINE_CALLS` | JIT | `CRATONVM_JIT=inline-calls` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_INLINE_CALLS` | JIT | `CRATONVM_JIT=inline-calls` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_INLINE_CALL_DISPATCH` | JIT | `CRATONVM_JIT=inline-call-dispatch` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_INLINE_GETFIELD` | JIT | `CRATONVM_JIT=inline-getfield` | opt-in | off | behaviour | snapshot | jit |
-| `CRATONVM_JIT_INLINE_NEST` | JIT | `CRATONVM_JIT=inline-nest` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_INLINE_NEST` | JIT | `CRATONVM_JIT=inline-nest` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_INLINE_SELF_GUARD` | JIT | `CRATONVM_JIT=inline-self-guard` | opt-in | off | behaviour | snapshot | jit |
-| `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` | JIT | `CRATONVM_JIT=inline-splice-devirt` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` | JIT | `CRATONVM_JIT=inline-splice-devirt` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_IR_CALL` | JIT | `CRATONVM_JIT=ir-call` | opt-in | off | behaviour | snapshot | difftest, vm |
 | `CRATONVM_JIT_IR_CALL_SPECIAL` | JIT | `CRATONVM_JIT=ir-call-special` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_IR_CALL_VIRTUAL` | JIT | `CRATONVM_JIT=ir-call-virtual` | opt-in | off | behaviour | snapshot | vm |
@@ -1176,6 +1176,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_LAMBDA_TIERUP` | JIT | `CRATONVM_JIT=lambda-tierup` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_LEAK_CODE` | JIT | `CRATONVM_JIT=leak-code` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LICM` | JIT | `CRATONVM_JIT=licm` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_LOCAL_HANDLERS` | JIT | `CRATONVM_JIT=local-handlers` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LOCAL_REGS` | JIT | `CRATONVM_JIT=local-regs` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` | JIT | `CRATONVM_JIT=long-box-direct-helpers` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LOOP_WORK_TIERUP` | JIT | `CRATONVM_JIT=loop-work-tierup` | opt-in | off | behaviour | snapshot | vm |

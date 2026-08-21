@@ -151,7 +151,14 @@ impl Compiler {
         // behind by a bailed splice would attach a caller frame to every later
         // point in the enclosing method.
         self.push_inline_scope(pc, site.callee_num_args);
+        let walk_at_checkpoint = self.inline_walk_at;
+        self.inline_walk_at = (usize::MAX, 0);
         let inline_ok = self.try_emit_inline_body(pc, site);
+        let bailed_at = self.inline_walk_at;
+        // A nested splice runs the same walk, so restore the enclosing walk's
+        // position on the way out: otherwise an inner body that finished
+        // cleanly would overwrite where the OUTER one stands.
+        self.inline_walk_at = walk_at_checkpoint;
         self.pop_inline_scope();
         self.slot_mirror_suppressed = mirror_suppressed_checkpoint;
         self.slot_mirror = None;
@@ -243,6 +250,24 @@ impl Compiler {
                 .truncate(null_check_store_stubs_checkpoint);
             self.deopt_points.truncate(deopt_points_checkpoint);
             crate::metrics::note_inline_call_arm(6);
+            // Name the rollback. The count alone ("outer-splice-rolled-back=1")
+            // says a planned splice was thrown away without saying by what, and
+            // that has stood as an open question on the netty exhaustive-loop
+            // pages since 2026-08-18.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                let (bail_pc, bail_op) = bailed_at;
+                if bail_pc == usize::MAX {
+                    eprintln!(
+                        "[cratonvm-jitc] inline-rollback {}.{}{} at pc={pc}: before the walk started (prologue/args/merge-region reservation) or refused by the deopt-metadata postcondition",
+                        site.class_name, site.method_name, site.descriptor,
+                    );
+                } else {
+                    eprintln!(
+                        "[cratonvm-jitc] inline-rollback {}.{}{} at pc={pc}: callee_pc={bail_pc} op=0x{bail_op:02x}",
+                        site.class_name, site.method_name, site.descriptor,
+                    );
+                }
+            }
             false
         }
     }
@@ -373,6 +398,9 @@ impl Compiler {
 
         while cpc < callee_len {
             let op = callee_code[cpc];
+            // Name the spot for a rollback report (see `inline_walk_at`). A
+            // bail leaves this at the instruction it died on.
+            self.inline_walk_at = (cpc, op);
 
             // Merge-point handling.
             //
