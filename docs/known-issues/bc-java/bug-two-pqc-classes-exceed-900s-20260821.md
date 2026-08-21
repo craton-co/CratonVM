@@ -15,6 +15,17 @@ attributable to the change that sweep was gating:
 `rc=124` is `timeout` killing a process that was still running, so neither is a
 crash. The runner records that as `HANG`, and **that label is wrong here.**
 
+A second, independent sweep (my delta applied to `origin/dev`, against pristine
+`origin/dev`, plus a G1 arm) reproduces 045 on all three:
+
+```text
+045  pqc.crypto.test.AllTests   dev=HANG|900  fix=HANG|900  g1fix=HANG|900   same
+```
+
+So it is not collector-specific and not attributable to any change on this
+branch — it exceeds the bound on stock `dev` under the default collector and
+under G1 alike.
+
 ## They were still making progress when killed
 
 A `timeout` kill cannot distinguish "wedged" from "not finished yet", which is
