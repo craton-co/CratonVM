@@ -2178,13 +2178,40 @@ impl<'a> Emitter<'a> {
         let b = self.stack.pop()?;
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::F32);
-        // div on f32 needs an explicit rounding mode in PTX; rn.f32
-        // family. AUDIT 2026-05-16/2026-07-11: PTX still has no
-        // `rem.f32` mnemonic, so this single-instruction `binop_f32`
-        // helper still has no `"rem.f32"` arm — `frem` (0x72) is not a
-        // `binop_f32` at all, it dispatches to the dedicated multi-
-        // instruction `frem_f32` helper instead (see its doc comment).
+        // Every float arithmetic mnemonic carries an EXPLICIT `.rn`
+        // rounding mode. `div` has always needed one (PTX has no bare
+        // `div.f32`), but `add`/`sub`/`mul` accept the bare form and
+        // default to round-to-nearest-even — which reads as "already
+        // correct" and is not. The PTX ISA makes the rounding modifier
+        // the switch that also controls CONTRACTION: an unrounded
+        // `mul.f32` feeding an unrounded `add.f32` may be fused by
+        // ptxas into a single `fma.rn.f32`, while an operation with an
+        // explicit rounding modifier is never contracted.
+        //
+        // AUDIT 2026-08-21, measured on sm_75 with `ptxas -O3`:
+        // `mul.f32` + `add.f32` compiled to one `FFMA`, whereas
+        // `mul.rn.f32` + `add.rn.f32` compiled to `FMUL` + `FADD`. The
+        // fused form rounds ONCE where JLS §15.17.1/§15.18.2 require
+        // the product to be rounded to float before the add, so every
+        // kernel containing an `a*b + c` chain silently computed a
+        // different (more accurate, but not Java) result on the device
+        // than on the CPU. That is the root cause of the 640x480
+        // ray-tracer checksum divergence recorded in
+        // `bench-gpu/results/`; the earlier fixtures stayed bit-exact
+        // only because none of them had a mul-then-add pair to
+        // contract. Java has an explicit `Math.fma` for the fused
+        // form, lowered by `fma_f32` — fusing is the programmer's call,
+        // never the backend's.
+        //
+        // AUDIT 2026-05-16/2026-07-11: PTX still has no `rem.f32`
+        // mnemonic, so this single-instruction `binop_f32` helper still
+        // has no `"rem.f32"` arm — `frem` (0x72) is not a `binop_f32`
+        // at all, it dispatches to the dedicated multi-instruction
+        // `frem_f32` helper instead (see its doc comment).
         let m = match mnemonic {
+            "add.f32" => "add.rn.f32",
+            "sub.f32" => "sub.rn.f32",
+            "mul.f32" => "mul.rn.f32",
             "div.f32" => "div.rn.f32",
             other => other,
         };
@@ -2197,7 +2224,13 @@ impl<'a> Emitter<'a> {
         let b = self.stack.pop()?;
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::F64);
+        // Same explicit-`.rn` rule as `binop_f32` — see its comment for
+        // why the bare mnemonics are a bit-exactness hazard rather than
+        // a harmless default.
         let m = match mnemonic {
+            "add.f64" => "add.rn.f64",
+            "sub.f64" => "sub.rn.f64",
+            "mul.f64" => "mul.rn.f64",
             "div.f64" => "div.rn.f64",
             other => other,
         };

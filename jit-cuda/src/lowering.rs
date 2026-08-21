@@ -944,12 +944,56 @@ mod tests {
         // Two float loads from arrays
         assert!(text.matches("ld.global.f32").count() >= 2);
         // One float multiply + one float add
-        assert!(text.contains("mul.f32"));
-        assert!(text.contains("add.f32"));
+        assert!(text.contains("mul.rn.f32"));
+        assert!(text.contains("add.rn.f32"));
         // One float store
         assert!(text.contains("st.global.f32"));
         // Bounds fail
         assert!(text.contains("L_bounds_fail:"));
+    }
+
+    /// Every float arithmetic instruction must carry an explicit
+    /// rounding modifier.
+    ///
+    /// This is not style. Per the PTX ISA, `mul`/`add`/`sub` written
+    /// WITHOUT a rounding modifier are eligible for contraction, and
+    /// ptxas -O3 does contract them: `mul.f32` + `add.f32` becomes one
+    /// `FFMA` on sm_75, which rounds once where JLS §15.17.1/§15.18.2
+    /// require the product to be rounded to float before the add. A
+    /// modifier-carrying instruction is never contracted, so the `.rn`
+    /// spelling is what keeps a lowered kernel bit-identical to the
+    /// interpreter. Asserting on the rendered text (rather than on the
+    /// SASS, which needs a CUDA toolkit) makes this a plain unit test
+    /// that runs everywhere. `saxpy` is the right fixture because
+    /// `a*x[i] + y[i]` is exactly the shape that contracts.
+    ///
+    /// See `emit::binop_f32`'s comment for the measurement this pins.
+    #[test]
+    fn float_arithmetic_always_carries_an_explicit_rounding_mode() {
+        let f32_kernel = lower_fixture("EligibleSaxpy", "saxpy", "(F[F[F[F)V").render();
+        let f64_kernel = lower_fixture_with_pool("EligibleLdcDouble", "fma", "([D[D)V").render();
+        for (class, method, text) in [
+            ("EligibleSaxpy", "saxpy", &f32_kernel),
+            ("EligibleLdcDouble", "fma", &f64_kernel),
+        ] {
+            for line in text.lines() {
+                let op = line.trim();
+                for bare in [
+                    "add.f32 ", "sub.f32 ", "mul.f32 ", "div.f32 ", "add.f64 ", "sub.f64 ",
+                    "mul.f64 ", "div.f64 ",
+                ] {
+                    assert!(
+                        !op.starts_with(bare),
+                        "{class}.{method}: `{op}` has no rounding modifier, so ptxas may \
+                         contract it into an FMA and break bit-exactness with the CPU path"
+                    );
+                }
+            }
+            assert!(
+                text.contains(".rn.f32") || text.contains(".rn.f64"),
+                "{class}.{method}: expected at least one rounded float op in:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -1689,8 +1733,8 @@ mod tests {
             text.contains(&lit2),
             "expected exact-bit float immediate {lit2} in:\n{text}"
         );
-        assert!(text.contains("mul.f32"));
-        assert!(text.contains("add.f32"));
+        assert!(text.contains("mul.rn.f32"));
+        assert!(text.contains("add.rn.f32"));
     }
 
     #[test]
@@ -1703,7 +1747,7 @@ mod tests {
             text.contains(&lit),
             "expected exact-bit double immediate {lit} in:\n{text}"
         );
-        assert!(text.contains("mul.f64"));
+        assert!(text.contains("mul.rn.f64"));
     }
 
     /// The CP-free `lower_method` entry point must not silently accept
@@ -1931,8 +1975,8 @@ mod tests {
         assert!(text.contains("abs.f32"), "missing float abs\n{text}");
         // Math.fma(float,float,float) → single-rounding fma.
         assert!(text.contains("fma.rn.f32"), "missing float fma\n{text}");
-        assert!(text.contains("mul.f32"));
-        assert!(text.contains("add.f32"));
+        assert!(text.contains("mul.rn.f32"));
+        assert!(text.contains("add.rn.f32"));
         assert!(text.contains("st.global.f32"));
     }
 
