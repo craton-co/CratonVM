@@ -249,3 +249,77 @@ unarmed. Stated as a lead, and handed to the lanes holding those vectors.*
   width-4 sites, separately.
 * **N2 is now more urgent, not less.** The "16 name a class WIDER than `N`"
   subset was measured against 49 sites and there are 84. Still **NOT DONE**.
+
+---
+
+## 10. CORRECTION (lane H0, 2026-08-21) — §3's 84 was 41% of the surface, and §4's top producer was the wrong file
+
+**Lane `H16` caught this by deleting two sentinel sites and watching the ratchet
+not move.** The method in §3 — and the blocking gate built from it in
+`scripts/untyped-alloc-ratchet.sh` — matched only the **bare** `ClassId::new(0)`
+spelling. The majority spelling in this tree is fully qualified,
+`cratonvm_types::ClassId::new(0)`, and there are two other allocator functions
+taking the same sentinel.
+
+**Measured over the same crate scope, same revision, all spellings:**
+
+| allocator | sites | what it fabricates |
+|---|---:|---|
+| `alloc_object` | 173 | an object whose CLASS is unknown → `AnonymousObject$N` |
+| `new_ref_array` | 29 | a reference ARRAY whose COMPONENT class is unknown → `Object[]` |
+| `alloc_object_of` | 1 | as `alloc_object` |
+| **total** | **203** | |
+
+**§3's `84` is 41% of `203`.** Every conclusion in §3 and §4 that rests on the
+absolute number is therefore understated, and the ratchet built from it was
+reporting a clean `ok` over 41% of its own subject.
+
+### §4's named top producer is wrong
+
+§4 says *"`util_concurrent_ext.rs` alone holds 24 — more than a quarter of the
+whole surface."* Measured with every spelling:
+
+| file | sites |
+|---|---:|
+| `native-builtins/src/t27_tls.rs` | **34** |
+| `native-builtins/src/util_concurrent_ext.rs` | 29 |
+| `native-builtins/src/lang_class.rs` | 15 |
+| `native-builtins/src/http_url_connection.rs` | 12 |
+| `native-collections/src/lib.rs` | 9 |
+
+**`t27_tls.rs` is the largest producer and appears in no record anywhere.** It is
+production source in `native-builtins/src/` despite the test-shaped name, which
+is very likely why it was never noticed — and it is the kind of file a
+`grep -v test` filter deletes silently. (This gate excludes test paths by
+pathspec precisely so that it cannot.)
+
+### The growth claim in §3 survives; the level does not
+
+§3's `49 → 84` was one method applied to two revisions, so **the growth is still
+sound as a growth**. What is not sound is reading `84` as the size of the
+surface. It is 203, and the honest statement is that **nobody has ever measured
+the level correctly until now**.
+
+### `new_ref_array` is not a footnote
+
+29 sites allocate a reference array with an **unknown component class**, i.e. an
+`Object[]` where the real class declares a typed array. That is the other half
+of `H0-6` §7's `ArrayStoreException`: `HashMap.table` is
+`[Ljava/lang/Object;` where JDK 25 declares `[Ljava/util/HashMap$Node;`. `H16`
+independently reports the same thing from the other end and nominates it as
+unfixed. **The node class and the array component type are two defects, and
+fixing only the first leaves the store failing.**
+
+### What the gate now does about it
+
+`scripts/untyped-alloc-ratchet.sh` was rewritten: extended-regex matching over
+**all three allocator spellings**, a **per-function breakdown** so a fourth
+spelling appears as a named line rather than hiding in a total, `WIDTHS` taken
+from the object allocators only (`new_ref_array`'s second argument is a LENGTH,
+not a field count — folding them made 16/32/64 read as three new carrier
+families), and a **zero-guard that exits 3**, because one revision of it printed
+`ok — no growth` with `rc=0` while matching nothing at all.
+
+Four successive versions of this gate each printed a confident wrong number.
+That is worth recording as its own finding: **the failure mode of a census is
+not usually a wrong answer, it is a confident partial one.**
