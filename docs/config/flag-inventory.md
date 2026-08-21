@@ -796,7 +796,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_JIT_ENTRY` | DBG | `CRATONVM_DBG=jit-entry` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_JIT_GEN` | DBG | `CRATONVM_DBG=jit-gen` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_JIT_LDC` | DBG | `CRATONVM_DBG=jit-ldc` | opt-in | off | diag | snapshot | vm |
-| `CRATONVM_DBG_JIT_METHOD_STATS` | DBG | `CRATONVM_DBG=jit-method-stats` | opt-in | off | diag | snapshot | types, vm |
+| `CRATONVM_DBG_JIT_METHOD_STATS` | DBG | `CRATONVM_DBG=jit-method-stats` | opt-in | off | diag | snapshot | jit, types, vm |
 | `CRATONVM_DBG_JIT_MIC` | DBG | `CRATONVM_DBG=jit-mic` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_JIT_NAMES` | DBG | `CRATONVM_DBG=jit-names` | opt-in | off | diag | snapshot | jit, vm |
 | `CRATONVM_DBG_JIT_PIN` | DBG | `CRATONVM_DBG=jit-pin` | opt-in | off | diag | snapshot | jit |
@@ -1203,6 +1203,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_NO_BCE` | JIT | `CRATONVM_JIT=bce` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` | JIT | `CRATONVM_JIT=callee-oop-flush` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_CAST_SITE_CACHE` | JIT | `CRATONVM_JIT=cast-site-cache` | opt-out | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_NO_CODE_PTR_MEMO` | JIT | `CRATONVM_JIT=code-ptr-memo` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUP2_X2` | JIT | `CRATONVM_JIT=dup2-x2` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUPX` | JIT | `CRATONVM_JIT=dupx` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_NO_DUP_X1` | JIT | `CRATONVM_JIT=dup-x1` | opt-out | on | behaviour | snapshot | jit |
@@ -1476,7 +1477,6 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` | GC | `CRATONVM_GC=zgc-jit-read-bounds` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_PARMARK` | GC | `CRATONVM_GC=zgc-parmark` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_RELOCATE` | GC | `CRATONVM_GC=zgc-relocate` | default-on | on | behaviour | snapshot | gc |
-| `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` | GC | `CRATONVM_GC=zgc-relocate-proven-jit` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_STARTBITS` | GC | `CRATONVM_GC=zgc-startbits` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_SWEEP_DEAD_RUNS` | GC | `CRATONVM_GC=zgc-sweep-dead-runs` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_SWEEP_HEADER_ZERO` | GC | `CRATONVM_GC=zgc-sweep-header-zero` | default-on | on | behaviour | snapshot | gc |

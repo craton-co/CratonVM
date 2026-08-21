@@ -3254,7 +3254,30 @@ pub(crate) fn uri_percent_decode_units(input: &[u16]) -> Vec<u16> {
 ///
 /// A `?` that appears AFTER the `#` belongs to the fragment, not to a query —
 /// the same precedence the text splitter applies.
+///
+/// An OPAQUE URI has NO query at all: its whole scheme-specific part is one
+/// undivided string in which `?` is an ordinary character, and only the
+/// fragment is split off it (`java.net.URI`'s `parse`/`parseHierarchical`
+/// split — `Parser.parse` only calls `parseHierarchical` when the SSP begins
+/// with `/`). `mailto:user@example.com?subject=hello` therefore has
+/// `getRawQuery() == null` and a scheme-specific part of
+/// `user@example.com?subject=hello`, which is exactly what Spring's
+/// `WebClientUtils.getRequestDescription` leans on — its
+/// `rawUserInfo == null && rawQuery == null && rawFragment == null` test is
+/// commented "also handles Opaque URI, which has only schemeSpecificPart".
+/// Answering `subject=hello` here sent it down the hierarchical rebuild, which
+/// has no path or host to append and produced `GET mailto:`
+/// (`WebClientUtilsTests.opaqueUriUnchanged`; `probes/OpaqueUriProbe.java`
+/// rows O01/O04/O09/O11/C01/C03).
+///
+/// Opacity is asked of [`uri_select_raw_path_units`] rather than spelled a
+/// second time here: "the path is null" IS the JDK's definition of an opaque
+/// URI, so the two can never drift apart. The `getQuery`/`getRawQuery`
+/// registrations already CLAIMED to handle this ("Opaque URIs keep a literal
+/// `?` inside the scheme-specific part"); they lost it when they moved off
+/// `uri_split` onto this splitter.
 pub(crate) fn uri_query_units(raw: &[u16]) -> Option<Vec<u16>> {
+    uri_select_raw_path_units(raw)?;
     let hash = u_find(raw, b'#');
     let q = u_find(raw, b'?').filter(|&qi| hash.is_none_or(|h| qi < h))?;
     let rest = &raw[q + 1..];
@@ -3313,6 +3336,17 @@ pub(crate) fn uri_select_raw_path_units(raw: &[u16]) -> Option<Vec<u16>> {
     };
     let end = u_find_any(after_auth, b"?#").unwrap_or(after_auth.len());
     Some(after_auth[..end].to_vec())
+}
+
+/// Is this URI text OPAQUE — absolute, with a scheme-specific part that does
+/// not begin with `/`?
+///
+/// Defined as "the path is null", which is how `java.net.URI` itself draws the
+/// line, so this can never disagree with [`uri_select_raw_path_units`].
+/// The empty string is a relative reference, not an opaque URI.
+pub(crate) fn uri_text_is_opaque(raw: &str) -> bool {
+    let units: Vec<u16> = raw.encode_utf16().collect();
+    uri_select_raw_path_units(&units).is_none()
 }
 
 /// Byte index of the scheme-terminating `:`, or `None` for a relative
@@ -3821,6 +3855,20 @@ fn uri_host_is_valid(host: &str) -> bool {
 
 /// RFC 3986 §5.2 — resolve a reference against a base URI string.
 fn uri_resolve_ref(base: &str, reference: &str) -> Result<String, MethodCallFailed> {
+    // `URI.resolve`'s very first act: "if (child.isOpaque() || base.isOpaque())
+    // return child" — verbatim, and BEFORE the empty-reference shortcut, since
+    // RFC 3986 §5 reference resolution is defined only over hierarchical URIs.
+    // An opaque base has no path to merge against, so nothing of it survives
+    // into the result. Measured: `URI.create("mailto:a@b").resolve("c@d")` is
+    // `c@d` on HotSpot and was `mailto:c@d` here
+    // (`probes/OpaqueUriProbe.java` row R01).
+    //
+    // Note the JDK returns the child UNNORMALIZED in this arm — it is the
+    // argument object itself, not a rebuild — so this returns the reference
+    // text verbatim rather than routing it through `uri_remove_dot_segments`.
+    if uri_text_is_opaque(reference) || uri_text_is_opaque(base) {
+        return Ok(reference.to_string());
+    }
     if reference.is_empty() {
         return Ok(base.to_string());
     }
@@ -4464,24 +4512,34 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // isAbsolute() → true if scheme is non-null
+    // isAbsolute() → true if scheme is non-null.
+    //
+    // "Has a colon somewhere" is NOT that test: a colon inside a relative
+    // reference's first path segment is an ordinary character, which is why
+    // `uri_scheme_colon` also demands an ALPHA start and an alphanumeric/`+-.`
+    // body before the colon. MEASURED on HotSpot 25:
+    // `URI.create("/redirect:account?q=1")` is neither absolute nor opaque,
+    // and both answered `true` here (`probes/OpaqueUriProbe.java` row H11) —
+    // the same relative-path-with-colon shape `uri_scheme_colon` was written
+    // for when it was added for Spring's redirect view names.
     r.register(uri, "isAbsolute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
-        let is_abs = raw.contains(':');
+        let is_abs = uri_scheme_colon(&raw).is_some();
         Ok(Some(Value::Int(if is_abs { 1 } else { 0 })))
     });
 
-    // isOpaque() → true if scheme-specific-part doesn't start with '/'
+    // isOpaque() → absolute, with a scheme-specific part that does not start
+    // with '/'. Delegated to `uri_text_is_opaque` so this can never disagree
+    // with the null-path rule `getPath`/`getRawQuery` are built on.
     r.register(uri, "isOpaque", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
-        let is_opaque = if let Some(i) = raw.find(':') {
-            !raw[i + 1..].starts_with('/')
+        Ok(Some(Value::Int(if uri_text_is_opaque(&raw) {
+            1
         } else {
-            false
-        };
-        Ok(Some(Value::Int(if is_opaque { 1 } else { 0 })))
+            0
+        })))
     });
 
     // toURL() → synthetic URL from raw string
@@ -20916,6 +20974,85 @@ mod tests {
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
+
+    /// An OPAQUE URI has no query — the `?` inside its scheme-specific part is
+    /// an ordinary character.
+    ///
+    /// Every row is a MEASURED HotSpot 25.0.3+9 `getRawQuery()` from
+    /// `probes/OpaqueUriProbe.java`, so a future reader can re-run rather than
+    /// re-derive. `mailto:user@example.com?subject=hello` is the one that broke
+    /// `WebClientUtilsTests.opaqueUriUnchanged`.
+    #[test]
+    fn an_opaque_uri_has_no_query() {
+        let q = |s: &str| {
+            let u: Vec<u16> = s.encode_utf16().collect();
+            uri_query_units(&u).map(|v| String::from_utf16_lossy(&v))
+        };
+        // MEASURED null on HotSpot — opaque.
+        assert_eq!(q("mailto:user@example.com?subject=hello"), None);
+        assert_eq!(q("mailto:a@b.com?s=1#frag"), None);
+        assert_eq!(q("classpath:foo/bar.xml?a=b"), None);
+        assert_eq!(q("http:comp.lang.java?q=1"), None);
+        assert_eq!(q("a:b/c?d=e"), None);
+        assert_eq!(q("mailto:?subject=hello"), None);
+        // MEASURED non-null on HotSpot — hierarchical, including the relative
+        // reference whose colon sits inside a path segment.
+        assert_eq!(
+            q("https://api.example.com/search?q=test&page=1"),
+            Some("q=test&page=1".into())
+        );
+        assert_eq!(q("https://host/page?q=1#section"), Some("q=1".into()));
+        assert_eq!(q("/api/search?q=test"), Some("q=test".into()));
+        assert_eq!(q("file:/tmp/x?a=b"), Some("a=b".into()));
+        assert_eq!(q("/redirect:account?q=1"), Some("q=1".into()));
+        assert_eq!(q("relative/path?q=1#f"), Some("q=1".into()));
+        // A `?` after the `#` belongs to the fragment, on both shapes.
+        assert_eq!(q("https://host/page#frag?param=value"), None);
+        assert_eq!(q("https://host/page"), None);
+    }
+
+    /// `isOpaque()` / `isAbsolute()` must ask the SCHEME rule, not whether a
+    /// colon appears anywhere. MEASURED rows from the same probe.
+    #[test]
+    fn a_colon_in_a_relative_path_is_not_a_scheme() {
+        assert!(uri_text_is_opaque("mailto:user@example.com?subject=hello"));
+        assert!(uri_text_is_opaque("urn:isbn:096139210x"));
+        assert!(uri_text_is_opaque("a:b/c?d=e"));
+        // H11 — HotSpot: isOpaque=false, isAbsolute=false. Both read `true`
+        // before this change.
+        assert!(!uri_text_is_opaque("/redirect:account?q=1"));
+        assert!(uri_scheme_colon("/redirect:account?q=1").is_none());
+        // H12 — a relative reference whose FIRST segment carries the colon IS
+        // parsed as a scheme by the JDK (`redirect` is a legal scheme name).
+        assert!(uri_text_is_opaque("redirect:account/x"));
+        // Hierarchical and relative controls.
+        assert!(!uri_text_is_opaque("https://host/page?q=1"));
+        assert!(!uri_text_is_opaque("file:/tmp/x"));
+        assert!(!uri_text_is_opaque("/api/search?q=test"));
+        assert!(!uri_text_is_opaque(""));
+        assert!(uri_scheme_colon("https://host/page").is_some());
+        assert!(uri_scheme_colon("relative/path?q=1#f").is_none());
+        // A scheme name may not start with a digit.
+        assert!(uri_scheme_colon("1abc:x").is_none());
+    }
+
+    /// An opaque base has no path to merge, so RFC 3986 §5 resolution does not
+    /// apply and `URI.resolve` hands back the child unchanged — its literal
+    /// first line, `if (child.isOpaque() || base.isOpaque()) return child`.
+    #[test]
+    fn resolving_against_an_opaque_base_yields_the_reference() {
+        let r = |b: &str, c: &str| uri_resolve_ref(b, c).unwrap();
+        // R01/R06/R07 — MEASURED on HotSpot.
+        assert_eq!(r("mailto:a@b", "c@d"), "c@d");
+        assert_eq!(r("mailto:a@b", "https://h/p"), "https://h/p");
+        assert_eq!(r("mailto:a@b", ""), "");
+        // R08 — an OPAQUE reference is returned verbatim off a hierarchical
+        // base, query and all.
+        assert_eq!(r("https://h/a/b", "mailto:c@d?x=1"), "mailto:c@d?x=1");
+        // The hierarchical path is untouched by the short-circuit.
+        assert_eq!(r("https://h/a/b", "c"), "https://h/a/c");
+        assert_eq!(r("https://h/a/b", "/d"), "https://h/d");
+    }
 
     /// Behavioural cover for [`gc_scan_ds_roots`] / [`gc_update_ds_refs`].
     ///

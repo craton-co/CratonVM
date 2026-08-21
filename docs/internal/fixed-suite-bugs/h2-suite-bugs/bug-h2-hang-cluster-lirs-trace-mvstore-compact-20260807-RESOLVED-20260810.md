@@ -168,7 +168,7 @@ Two readings fall out:
   and it is the only actionable number this page produced.
 
 That number belongs to the page that owns the throughput gap, not here: it is
-recorded on `docs/known-issues/h2/h2-update-path-throughput-20260802.md`, which
+recorded on `performance/h2-update-path-throughput-RETIRED-20260821.md`, which
 stays open.
 
 ## Reproducing
@@ -187,7 +187,7 @@ the two microbenches; run each against `java -Xint` on the same host in the
 same window, not against C2.
 
 ## Related
-* `../../../known-issues/h2/h2-update-path-throughput-20260802.md` — owns the
+* `../../performance/h2-update-path-throughput-RETIRED-20260821.md` — owns the
   constant factor, and now carries the per-call rung above.
 * `bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md` (this folder) —
   the row-iteration/commit cliff this page was split out of. Its flat 4%-max

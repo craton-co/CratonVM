@@ -5,7 +5,7 @@
 measurement it was built on is corrected. What remains — a constant factor, and
 a thread-scaling question this host turns out not to be able to answer — moved
 to
-`docs/known-issues/h2/h2-update-path-throughput-20260802.md`, stated as a
+`performance/h2-update-path-throughput-RETIRED-20260821.md`, stated as a
 throughput number rather than as a bug.
 
 Closed here:
@@ -170,7 +170,7 @@ entirely.
 
 ## Related
 
-* `h2-update-path-throughput-20260802.md` — the successor, carrying the residual
+* `h2-update-path-throughput-RETIRED-20260821.md` — the successor, carrying the residual
   numbers and the next targets.
 * the retired `unresumable-unconditional-trap-mvmap-FIXED-20260802` write-up — the two
   IR-tier defects that stopped this class running at all.
