@@ -204,3 +204,61 @@ This also re-reads §4's own evidence: the "lost value" under `Hashtable` and th
 `Iterator.next()` NPE under `HashSet` are iteration failures too, not storage
 failures. The "one defect, four faces" conclusion **survives**; only its
 mechanism was wrong.
+
+---
+
+## 8. SECOND CORRECTION (lane H14, 2026-08-21) — this table is not the cost ordering
+
+Two findings from the first full census of the 1402 change what this table may
+be used for. Both are `H14`'s; I am recording them here because **this table is
+the most-quoted artefact of the wave** and a reader who stops at §1 gets a wrong
+plan.
+
+### 8a. `java/util/Properties` is 65/104 — WORSE than `HashMap`
+
+`H14-3` armed thirteen registrars. `java/util/Properties` costs **39 vectors**
+against `HashMap`'s 22, with `RJdkHello` among the failures. **`HashMap` is not
+the floor and not the worst.** §3's "migration order, which is the point of the
+table" is ordered on six prefixes chosen because they were the collection
+families somebody had already named — not because they were the expensive ones.
+
+Anyone sequencing from §1 is sequencing from a **sample of six**, and the sample
+was not drawn to be representative.
+
+### 8b. The six prefixes are 14.3% of the defect
+
+`H14-2`, measured: the six families in §1 account for **200 of the 1402** rows,
+and **135 of the 149 registrars have ZERO rows under any of them.** A further
+**445 rows (31.7%)** are claimed by no P0/P1/P2 row at all — `java.lang` core
+168, `java.io` streams 99, `StringBuilder`/`StringBuffer` 57,
+`java.lang.invoke` 56.
+
+**So this table prices a seventh of the problem, and the effort's whole
+published queue is aimed at that seventh.** That is not a defect in the
+measurement — every number in §1 is still correct for what it measured — but it
+is a decisive limit on the conclusion, and §5's "what this does NOT establish"
+did not anticipate it. It should have: the six prefixes were the ones already
+under discussion, which is the definition of a convenience sample.
+
+### 8c. And §4's `RMapGcStress` netting needs a boundary
+
+`H14-3` found `RMapGcStress` failing in **12 of 13** of its arms with `rc=124` —
+a **TIMEOUT**, not an assertion failure: the vector needs **233 s unarmed**
+against a 120 s budget and passes armed at 600 s. **That is the clock, not a
+defect**, and netting it out of a cost cell would silently subtract a vector
+that was never objecting.
+
+`H14-3` is explicit that this is **not** the same `RMapGcStress` finding §4
+netted out — §4's were real assertion failures (`iterated 1 != 3000`, a lost
+value, an NPE from `Iterator.next()`). Both are true, and they are different
+runs of the same vector name. **When netting a shared row out of a cost table,
+check the failure MODE and not only the vector name.** §4 stands; this is a
+boundary on how its method may be reapplied.
+
+### What survives
+
+The 23× spread is real, the per-family numbers are real, and `RMapGcStress`-as-
+one-defect-with-four-faces (§4) and the node-class mechanism (§7) both stand.
+**What does not survive is reading §1 as "the migration order".** It is six
+priced cells out of a 1402-row population whose real distribution `H14-2` now
+carries.
