@@ -4127,7 +4127,7 @@ pub fn execute(
             // The compiled body named a throw site of its own that no `try`
             // covers: nothing here can catch it, and the pc-unknown search
             // would match a typed row by exception class alone.
-            JitThrowPc::OutsideAllRanges => None,
+            JitThrowPc::OutsideAllRanges(_) => None,
             JitThrowPc::Unknown => {
                 find_exception_handler_pc_unknown(shared, &thread.frames[frame_idx], exc)
             }

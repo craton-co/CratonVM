@@ -495,6 +495,100 @@ pub(super) fn find_exception_handler_impl(
 /// A matching but unmappable frame fails closed by propagating the exception;
 /// entering a handler with zeroed non-parameter locals would be a silent
 /// miscompile. A foreign nested-callee frame is restored for its owner.
+/// Does the stamped throw pc name a call to THIS SAME method — making the
+/// "outside every protected range" verdict a statement about the WRONG
+/// activation?
+///
+/// `jit_set_throw_bci` (`vm/src/jit/helpers.rs`) stamps a compiled frame's own
+/// call-site bci over whatever its callee left behind, so that frame's drain can
+/// range-check its own exception table. There is exactly ONE such slot per
+/// thread, and a compiled frame never dispatches to its own handler — the
+/// interpreter's post-return drain does. For a chain of DIFFERENT methods that
+/// is unambiguous: the outermost compiled frame is the one being drained, and
+/// the stamp it wrote is its own.
+///
+/// For a SELF-RECURSIVE chain it is not. Every activation writes the same slot,
+/// the outermost writer wins, and the pc the drain reads is the OUTERMOST call
+/// site while the throw happened in an inner activation whose own `catch` was
+/// never consulted. The two tests `jit_local_athrow_pc_kind` performs — a real
+/// instruction boundary, in this method's code — are satisfied by construction,
+/// because it IS this method's code. So a stamp that lands outside every
+/// protected range means "the outermost activation cannot catch it", which says
+/// nothing about the inner one that threw, and propagating on it skips a
+/// handler that should have run.
+///
+/// Measured on `probes/SelfRecCatchProbe.java`, the shape of Groovy's
+/// `CachedSAMClass.hasUsableImplementation` (walks a superclass chain with a
+/// tail self-call, wrapping `Class.getMethod` in `catch
+/// (NoSuchMethodException)`): the inner activation stamps bci 19, the `getMethod`
+/// call site inside the try; the outer stamps bci 69, its own self-call site
+/// outside it; the drain reads 69 and propagates, and the `NoSuchMethodException`
+/// escapes a `catch` that covers it. That is
+/// `GroovyMarkupViewTests`/`ViewResolutionIntegrationTests` in the Spring
+/// Framework suite, via a wrong SAM method, a null Groovy receiver and finally a
+/// `WrongMethodTypeException` out of `Selector.setCallSiteTarget`.
+///
+/// Answering `true` here does NOT claim a handler exists — it downgrades the
+/// verdict from "definitely not catchable here" to "cannot tell", which is the
+/// `usize::MAX` pc-unknown search the caller already runs for every stamp it
+/// cannot read. That search is deliberately conservative (it skips a catch-all
+/// whose region does not span the whole method, i.e. every javac `finally`), so
+/// the downgrade cannot swallow anything the unknown-pc path would not already
+/// have swallowed.
+///
+/// Fails CLOSED — an unreadable opcode, a malformed constant-pool entry or a
+/// missing class all answer `false`, leaving the propagate exactly as it was.
+fn stamp_is_an_ambiguous_self_call_site(
+    shared: &SharedVm,
+    cached: &CachedBytecodeMethod,
+    pc: usize,
+) -> bool {
+    // `cached.code` carries 2 bytes of speculative-read padding; `pc` has
+    // already been checked against the unpadded length and confirmed an
+    // instruction boundary by `jit_local_athrow_pc_kind`.
+    let Some(&opcode) = cached.code.get(pc) else {
+        return false;
+    };
+    // invokevirtual / invokespecial / invokestatic / invokeinterface. A stamp
+    // is only ever written at a call site, but read the opcode anyway rather
+    // than assume it.
+    if !matches!(opcode, 0xb6 | 0xb7 | 0xb8 | 0xb9) {
+        return false;
+    }
+    let (Some(&hi), Some(&lo)) = (cached.code.get(pc + 1), cached.code.get(pc + 2)) else {
+        return false;
+    };
+    let cp_index = u16::from_be_bytes([hi, lo]);
+    let manager = shared.classes.class_manager.read();
+    let Some(class) = manager.get_class(cached.declaring_class_id) else {
+        return false;
+    };
+    use cratonvm_reader::constant_pool::ConstantPoolEntry;
+    let cp = &class.constant_pool;
+    let (class_index, name_and_type_index) = match cp.get(cp_index) {
+        Some(
+            ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+            }
+            | ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+            },
+        ) => (*class_index, *name_and_type_index),
+        _ => return false,
+    };
+    let Some(target_class) = cp.get_class_name(class_index) else {
+        return false;
+    };
+    let Some((target_name, target_desc)) = cp.get_name_and_type(name_and_type_index) else {
+        return false;
+    };
+    target_class == &*cached.class_name
+        && target_name == &*cached.method_name
+        && target_desc == &*cached.method_descriptor
+}
+
 pub(super) fn route_jit_signal_exception(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -534,19 +628,30 @@ pub(super) fn route_jit_signal_exception(
         Some(_foreign) => None,
         None => None,
     };
-    if precise.is_none() && matches!(fallback_kind, JitThrowPc::OutsideAllRanges) {
+    if let (None, JitThrowPc::OutsideAllRanges(stamped_pc)) = (precise.as_ref(), &fallback_kind) {
         // The compiled body stamped a throw site of its OWN that lies inside no
         // protected range. That is not "pc unknown" — it is this method saying
         // it cannot catch this throw — and the pc-unknown search below would
         // match a typed row by exception class alone and swallow it. Propagate,
         // which is what the JVM does for a throw outside every `try`.
+        //
+        // Unless the stamp is a SELF-call site, in which case it does not say
+        // that: see `stamp_is_an_ambiguous_self_call_site`.
+        if !stamp_is_an_ambiguous_self_call_site(shared, cached, *stamped_pc) {
+            if crate::jit::helpers::rbc6_dbg() {
+                eprintln!(
+                    "[rbc6-dbg] route_jit_signal_exception PROPAGATE {}.{}{} — stamped throw pc {} is outside every protected range",
+                    cached.class_name, cached.method_name, cached.method_descriptor, stamped_pc,
+                );
+            }
+            return Err(MethodCallFailed::ExceptionThrown(exc));
+        }
         if crate::jit::helpers::rbc6_dbg() {
             eprintln!(
-                "[rbc6-dbg] route_jit_signal_exception PROPAGATE {}.{}{} — stamped throw pc is outside every protected range",
-                cached.class_name, cached.method_name, cached.method_descriptor,
+                "[rbc6-dbg] route_jit_signal_exception AMBIGUOUS-SELF-CALL {}.{}{} — stamped throw pc {} is this method's own recursive call site; falling back to the pc-unknown search",
+                cached.class_name, cached.method_name, cached.method_descriptor, stamped_pc,
             );
         }
-        return Err(MethodCallFailed::ExceptionThrown(exc));
     }
     let (throw_pc, locals) = match precise.as_ref() {
         Some((bci, locals)) => (*bci, locals.as_slice()),
@@ -669,7 +774,7 @@ pub(super) fn jit_local_athrow_pc_in_frame(frame: &Frame, athrow_bci: i64) -> Ji
     if in_a_protected_range {
         JitThrowPc::InRange(pc)
     } else {
-        JitThrowPc::OutsideAllRanges
+        JitThrowPc::OutsideAllRanges(pc)
     }
 }
 
@@ -690,8 +795,10 @@ pub(super) enum JitThrowPc {
     /// Inside one of this method's protected ranges — range-check with it.
     InRange(usize),
     /// A real instruction boundary here, but inside no protected range. This
-    /// method cannot catch the throw; propagate to the caller.
-    OutsideAllRanges,
+    /// method cannot catch the throw; propagate to the caller — UNLESS the pc
+    /// names a call to this same method, see
+    /// [`stamp_is_an_ambiguous_self_call_site`].
+    OutsideAllRanges(usize),
     /// No usable stamp (absent, past the end, not an instruction boundary, or a
     /// foreign method's). Fall back to the pc-unknown search.
     Unknown,
@@ -722,7 +829,7 @@ pub(super) fn jit_local_athrow_pc_kind(
     if in_a_protected_range {
         JitThrowPc::InRange(pc)
     } else {
-        JitThrowPc::OutsideAllRanges
+        JitThrowPc::OutsideAllRanges(pc)
     }
 }
 
@@ -1058,6 +1165,35 @@ pub(crate) fn run_jit_callee_handler(
     let (throw_pc, precise_locals) = match precise.as_ref() {
         Some((bci, locals)) => (*bci, Some(locals.as_slice())),
         None => (throw_pc, None),
+    };
+    // The same ambiguity `route_jit_signal_exception` handles, on the sibling
+    // route. `route_implicit_exc_through_callee` captures the stamp before
+    // clearing it and hands it here as "the callee's own throw site" — true for
+    // a callee that threw at a call site of its own, and NOT true when the
+    // callee is self-recursive and an inner activation of it is what actually
+    // threw. The pc then names the callee's own recursive call site, matches no
+    // protected range, and `find_jit_exception_handler` answers `NotCaught` for
+    // a handler that does cover the real throw. Downgrade to the pc-unknown
+    // search, exactly as the other route does, and for the same reason: this
+    // says "cannot tell", not "not caught". See
+    // [`stamp_is_an_ambiguous_self_call_site`].
+    let throw_pc = if throw_pc != usize::MAX
+        && !cached
+            .exception_table
+            .iter()
+            // Widening: u16 -> usize (non-negative, fits)
+            .any(|e| throw_pc >= e.start_pc as usize && throw_pc < e.end_pc as usize)
+        && stamp_is_an_ambiguous_self_call_site(shared, cached, throw_pc)
+    {
+        if crate::jit::helpers::rbc6_dbg() {
+            eprintln!(
+                "[rbc6-dbg] run_jit_callee_handler AMBIGUOUS-SELF-CALL {}.{}{} — stamped throw pc {} is the callee's own recursive call site; falling back to the pc-unknown search",
+                cached.class_name, cached.method_name, cached.method_descriptor, throw_pc,
+            );
+        }
+        usize::MAX
+    } else {
+        throw_pc
     };
     let Some(handler_pc) = find_jit_exception_handler(shared, cached, throw_pc, exc) else {
         return Err(CalleeHandlerMiss::NotCaught);
