@@ -11139,7 +11139,31 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // through the stores is harmless and keeps every store using a re-read
     // reference.
     let this_pin = ctx.pin_native_root(this);
-    let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+    // H23 COMPLETION (2026-08-21). This is the NO-ARG `HashMap()` constructor,
+    // and it was the site `H23`'s table typing missed — it typed
+    // `native_map_init_capacity` (the capacity-taking ctor), `map_resize` and
+    // `lhm_init_with_cap`, while the default constructor here still spelled its
+    // allocation `alloc_ref_array`, which hard-codes the untyped sentinel.
+    //
+    // MEASURED before this change, on a build that CONTAINED H23's fix: three
+    // `new HashMap<>()` + puts gave `tableCls=[Ljava.lang.Object;` with
+    // `real=3 fabricated=0` — real nodes (H16) inside an untyped array. HotSpot
+    // gives `[Ljava.util.HashMap$Node;`. The fix was in the binary, its three
+    // call sites were live, and `java.util.HashMap$Node` resolved fine at
+    // runtime; it simply was never asked, because the common path is this one.
+    //
+    // GC-SAFETY, and this is the hazard `H23-2` named as its least-confident
+    // falsifier: `bucket_table_component` can resolve a class and therefore
+    // COLLECT. It must run inside the pin region, with `this` re-read on both
+    // sides of it — the same discipline the allocation below already uses.
+    // `new_ref_array` is kept (rather than `alloc_bucket_table`) so the
+    // allocation shape and the infallibility of this path are unchanged; at
+    // `MAP_DEFAULT_CAPACITY` the reduced-capacity fallback would return the
+    // same 16 anyway.
+    let this = ctx.read_native_pin(this_pin, this);
+    let component = bucket_table_component(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
+    let buckets = ctx.new_ref_array(component, MAP_DEFAULT_CAPACITY);
     let buckets_pin = ctx.pin_native_root(buckets);
     let this = ctx.read_native_pin(this_pin, this);
     let buckets = ctx.read_native_pin(buckets_pin, buckets);
