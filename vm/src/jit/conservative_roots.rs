@@ -2622,10 +2622,11 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     if !moving_young_enabled() || band_verify_disabled() {
         return false;
     }
-    // The band scan's residency test is
+    // The band scan's residency test asks "could a moving cycle relocate the
+    // object at this address?", and until 2026-08-21 it asked that as
     // `gen_heap::addr_in_published_young_regions`, which reads
     // `JIT_REGION_BOUNDS`. That table has one writer and it is
-    // generational-only — G1 deliberately keeps it empty, ZGC never fills it.
+    // generational-only — G1 deliberately keeps it empty, ZGC never filled it.
     // Where it is empty the test answers `false` for EVERY address, so the scan
     // below inspects every verifiable slot, classifies none of them as young,
     // and returns "nothing unpublished" without having verified anything.
@@ -2635,10 +2636,20 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     // suppress the conservative scan, which left G1's pin set empty, which let
     // the pause evacuate a region a live compiled frame still referenced.
     //
+    // It now asks `gen_heap::addr_is_movable`, the union of that young table
+    // with `MOVABLE_BOUNDS` — a third table a collector fills to say what its
+    // relocating phase may move, precisely because filling `JIT_REGION_BOUNDS`
+    // to fix this verifier would silently re-enable an inline reference STORE
+    // fast path G1 and ZGC must not have. ZGC publishes its arena envelope
+    // there; generational still answers through the young table, so its
+    // behaviour is unchanged.
+    //
     // Fail closed, exactly as the module block above says this verifier does
     // for an unbounded band or an unresolvable shadow window: an uninspectable
-    // frame reports "not verified", never "verified clean".
-    if bounds_guard_enabled() && !cratonvm_gc::gen_heap::published_young_regions_are_live() {
+    // frame reports "not verified", never "verified clean". The gate is on the
+    // UNION being live, so a collector that publishes neither table still gets
+    // the refusal it had before rather than a quiet pass.
+    if bounds_guard_enabled() && !cratonvm_gc::gen_heap::movable_bounds_are_live() {
         *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::YOUNG_BOUNDS_UNPUBLISHED;
         return true;
     }
@@ -2775,7 +2786,7 @@ fn report_unpublished_band_words(
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
         if band_slot_is_verifiable(off, &cm.frame_layout, live_hi)
-            && cratonvm_gc::gen_heap::addr_in_published_young_regions(w)
+            && cratonvm_gc::gen_heap::addr_is_movable(w)
             && !published.contains(&w)
         {
             hits += 1;
@@ -2855,7 +2866,7 @@ fn band_has_unpublished_young_word(
         &cm.frame_layout,
         live_hi,
         published,
-        cratonvm_gc::gen_heap::addr_in_published_young_regions,
+        cratonvm_gc::gen_heap::addr_is_movable,
     )
 }
 

@@ -2,11 +2,16 @@
 
 ## Status
 
-**OPEN 2026-08-21 — root-caused and measured; the obvious fix was implemented,
-verified to work, and WITHDRAWN as unsound.** The mechanism below is settled.
-What is not available is a way to lift the refusal that causes it, because the
-proof such a fix must rest on is not computed for this collector. §"The fix that
-was withdrawn" says exactly what has to change first, in the order to try it.
+**STILL OPEN 2026-08-21, and the refusal is now lifted.** The mechanism below
+is settled. The two things that made the obvious fix unsound have both been
+built — the coverage proof is computed for this collector, and the frame-band
+verifier can classify an address under it — so `relocate_stw` consults the
+verdict and **ZGC compacts under live compiled frames for the first time: 21
+cycles, 203 007 objects, on the very run that used to compact zero times.**
+
+The class still fails. Twenty-one compactions are not enough, because a THIRD
+obligation blocks 89 % of collections, and the instrument added along the way
+names it: `osr-shadow-coverage-unproven`. See §"Where it stands now".
 
 ## Symptom
 
@@ -105,7 +110,7 @@ not this defect — and with a face that varies between runs: a null
 `FileChannel` in one, `OutOfMemoryError` in another. Separate open issue; see
 *Still open*.
 
-## The fix that was withdrawn
+## The fix, withdrawn once and then earned
 
 `gen_heap::collect_garbage_inner` had the identical `is_active()` term and
 deleted it on 2026-07-26 (`arch-2026-07-26/moving-young-precise-roots`), in a
@@ -126,8 +131,9 @@ configuration (`rc=0`, `oom=0`), the kill switch reproduces the original
 failure on the same binary, and the `TestMultiThread` corruption canary was
 0/6 against a base 1/6.
 
-**It is still unsound, and it was reverted.** Two independent reasons, both
-already written down in the tree:
+**It was unsound on the first attempt, and was reverted.** Two independent
+reasons, both already written down in the tree — and both since fixed (§"Where
+it stands now"):
 
 1. **The proof is never run for this collector.**
    `memory::roots::collect_roots` computes it inside a `&&` chain whose second
@@ -158,21 +164,84 @@ moves", and 6 clean runs cannot see that. Fragmentation wastes a heap; a slide
 behind an unrewritable frame corrupts one, so the tie is not broken by which
 one was observed.
 
-### What would actually lift it
+### What would actually lift it — 1 and 2 are DONE
 
-In the order a session should try them:
+1. **Make `collect_roots` run the proof for ZGC as well.** Done. It computed the
+   proof and the conservative-scan suppression in one short-circuiting `&&`
+   chain; they are two expressions now, and only the suppression is
+   collector-gated. `roots.rs`'s `the_coverage_proof_runs_for_every_collector`
+   is a source witness on the order, because the defect is a call that does not
+   happen and no runtime assertion can see one.
+2. **Give the band verifier something to classify addresses with.** Done, and
+   NOT by filling `JIT_REGION_BOUNDS`: that table's load-bearing second job is
+   the store-side "may an inline reference store skip the write barrier", which
+   G1 and ZGC answer by leaving it empty, so filling it to fix a verifier would
+   silently re-enable those stores. A third table, `MOVABLE_BOUNDS`, names what
+   a relocating collection may move; ZGC publishes its arena envelope into it at
+   construction, `addr_is_movable` is the union with the young table, and
+   `movable_bounds_are_live` is the fail-closed gate on the union.
+3. Stage (b) of `feature-designs/zgc-jit-load-barrier.md` remains the route that
+   needs no per-cycle proof at all.
 
-1. Make `collect_roots` run the proof for ZGC as well — compute and publish the
-   verdict *without* taking the conservative-scan suppression, which is a
-   separate decision — **and**
-2. give ZGC a young-bounds publication the band verifier can read, so
-   `moving_young_unpublished_frame_oop_present` stops failing closed; **or**
-3. stage (b) of `feature-designs/zgc-jit-load-barrier.md`, after which
-   relocation under compiled code needs no per-cycle proof at all.
+## Where it stands now
 
-Only 1 + 2 together, or 3, make the verdict mean anything here. The withdrawn
-patch is one small diff on top of any of them; `relocate_stw`'s comment carries
-the same list.
+Same class, default configuration, `--Xmx 1g`,
+`CRATONVM_DBG_JIT_ROOTSCAN=1 CRATONVM_GC_STATS=1`:
+
+```text
+jitroots lines=263          <- the proof RAN on 263 collections
+proven=true  21             <- and passed on 21
+proven=false 242
+
+[GC] zgc-features: compaction_cycles=21 objects_relocated=203007
+                   relocation_skipped_jit=242 relocation_on_proven_jit=20
+```
+
+**20 of the 21 compactions happened with a compiled frame live** — exactly the
+cycles the old refusal existed to reject. Before, all 263 declined and
+`compaction_cycles` was 0.
+
+`rc=1`, 4 `OutOfMemoryError`, 8 arena allocation failures: still failing.
+
+### The blocker, named
+
+The `[jitroots]` line now reports WHICH obligation was unmet, and the histogram
+over that run is unambiguous:
+
+| reason | cycles |
+|---|---:|
+| `osr-shadow-coverage-unproven` | **234** |
+| `none` (proven) | 21 |
+| `compiled-frame-oop-not-published` | 8 |
+
+Not the cross-thread peer handshake one would guess for a multi-threaded
+workload, and not the codegen's oop maps.
+`conservative_roots::moving_young_osr_shadow_fallback_needed` fires when a live
+compiled-via-OSR method has an incomplete shadow layout
+(`shadow_thread_slot_off` / `shadow_savetop_slot_off` / `shadow_off_in_thread`)
+**or** precise maps without `fully_oop_covered` and an exact `rbp`. H2's MVStore
+loops are OSR-compiled constantly, so this is the dominant shape here.
+
+**Which of those two disjuncts fires has not been measured.** That is the next
+step and it is a JIT-side question. Nothing here says the obligation is wrong —
+it is a refusal, and a refusal that fires is the safe direction.
+
+### What the other collectors do now
+
+* **Generational** — byte-identical. Its residency answer is the young table OR
+  an empty one, i.e. itself, and the old `&&` chain already evaluated every term
+  for it. `TestKillProcessWhileWriting` passes on both binaries (386 s / 360 s,
+  no OOM, no allocation failure).
+* **G1** — its verdict stops being a lie. Measured over one run of this class:
+  base reports `incomplete=false` 722 499 times and `incomplete=true` 1 169;
+  with the change, `incomplete=false` **0** and `incomplete=true` 886 790, all
+  `reason=young-bounds-unpublished-verifier-vacuous` — which is correct, since
+  G1 publishes neither table. Its behaviour is unchanged because
+  `refuse_evacuation` is gated on `CRATONVM_G1_COVERAGE_PIN`, default off; what
+  changed is that `record_g1_pause_coverage` stops measuring a vacuous verdict,
+  and G1's own "pause ran against a root set it could not prove" warning now
+  fires where it always applied. Both G1 arms hang at the 900 s cap on this
+  class, before and after — pre-existing, see *Still open*.
 
 ## What this corrects in the record
 
@@ -219,6 +288,21 @@ that declined.
   measuring the guard rather than an inert fixture.
 * `gc/src/arena.rs::warn_small_alloc_in_high_region`, a tripwire on a small
   allocation landing in the large-object region — see *Still open*.
+* `gc/src/zgc.rs::a_heap_that_publishes_no_movable_bounds_cannot_prove_coverage`
+  — the envelope is published, it covers this heap's own allocations, and a
+  dropped heap does not wipe bounds it did not publish. That third assertion
+  caught a real teardown bug on its first run: `ZgcRealHeap::drop` cleared
+  `JIT_READ_BOUNDS` unconditionally, so a short-lived heap wiped a live heap's
+  bounds — the same defect `GenerationalHeap::drop` was fixed for, with the
+  measured consequence that an empty table makes the verifier vacuous. Both ZGC
+  clears are owner-checked now.
+* `vm/src/memory/roots.rs::the_coverage_proof_runs_for_every_collector`.
+* Corruption A/B on `org.h2.test.db.TestMultiThread`, ABBA-interleaved, 6 reps
+  per arm, clean directory per rep: **0/6 on both**. The change relocates in a
+  configuration that previously never did, so this is the measurement that had
+  to be taken.
+* `cargo test --lib -p cratonvm-gc -p cratonvm-types -p cratonvm-vm`:
+  1685 + 573 + 2578 pass, 0 fail.
 
 ## Also confirmed, 2026-08-21: four more classes hit the identical signature
 
@@ -243,9 +327,43 @@ Two things this adds to the record:
 
 None of the four needed a fresh repro to confirm — the existing `grep -c 'arena allocation failed'` / `grep 'zgc frag:'` / `OutOfMemoryError` triage from this page's own "Reproduction" section was sufficient run unmodified against each class.
 
+## A fifth class, and a pre-existing bug this page's fix is not responsible for
+
+Re-verified 2026-08-21 on a clean rebuild of `fix/zgc-movable-bounds-20260821`
+merged onto same-day `dev`: `TestOpenClose` and `TestMVStoreCachePerformance`
+no longer hit the fast, clean `MVStoreException`/`OutOfMemoryError` crash this
+page describes — both now run for several minutes before failing, consistent
+with the 21/263 compactions this page already measured. `TestKillProcessWhileWriting`
+and `TestMVStoreTool` still fail via the identical clean OOM shape, just later
+(`failure_seq` roughly doubled — 32 vs the original 16 — before the ladder gives
+up), which is what "proof still incomplete on 89% of cycles" predicts.
+
+**`TestOpenClose` surfaced a second, unrelated defect once it stopped crashing
+immediately.** After several `arena allocation failed` warnings it throws:
+
+```
+Exception in thread "main" java/lang/Object
+(no Java stack frames were captured for this exception)
+```
+
+— not a real exception class, no captured frames, thrown from inside
+`FileStore.rewriteChunks` → `RandomAccessStore.doHousekeeping`'s background-writer
+lambda. **Confirmed pre-existing and unrelated to this page's fix**, not a new
+corruption it introduced: reproduces identically, same code path, same shape,
+with `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` (the kill switch that restores
+this page's exact pre-fix behavior) on the same binary. Something in
+exception-object construction goes wrong specifically when the housekeeping
+lambda's own OOM handling runs repeatedly — worth its own page, not filed here
+because the differential proves it isn't this defect.
+
 ## Still open
 
-* **The defect itself.** The class fails on `dev`.
+* **The defect itself.** The class fails on `dev` — `osr-shadow-coverage-unproven`
+  blocks 89% of collections; the coverage-proof and `MOVABLE_BOUNDS`
+  infrastructure is landed and sound (tests, kill-switch bisect, and a clean
+  corruption canary all confirm it), but it is not sufficient alone. Next step
+  is JIT-side: measure which of `moving_young_osr_shadow_fallback_needed`'s two
+  disjuncts fires for H2's OSR-compiled MVStore loops.
 * **The two small objects in the large-object region.** The fragmentation
   report placed an 80-byte `String` and a 24-byte `Object` above `high_cursor`,
   where `ZGC_LARGE_OBJECT_MIN`'s design says only large objects should live —
