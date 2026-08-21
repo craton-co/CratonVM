@@ -1,10 +1,114 @@
-# hibernate-orm JSON/XML function tests SIGSEGV under G1/ZGC, never under Generational — OPEN
+# hibernate-orm JSON/XML function tests SIGSEGV under G1/ZGC — NOT REPRODUCIBLE, and the code hypothesis is refuted
 
-**Status:** OPEN. Reproduced twice, independently, with 100% overlap: the
-6-way-concurrent full-suite run and a fully isolated 1-shard rerun both crash
-the exact same 7 classes on both G1 and ZGC, zero on Generational. Root cause
-not yet located — no symbolized native stack yet, no bisection to a specific
-JSON/XML code path done.
+**Status: NOT REPRODUCIBLE (2026-08-21). The 7 classes pass on both G1 and ZGC
+on the exact commit the crashing runs used, against the same host and the same
+harness. The crash was real — 14 observations across two runs — but its trigger
+is environmental and is no longer present. No VM defect has been demonstrated,
+and the "moving-collector pointer safety" reading in the original write-up is
+contradicted by the code history.**
+
+The original triage is preserved below the line. What follows is what was
+actually measured when it was picked up.
+
+## The decisive result
+
+`509710ba8` is the `dev` HEAD both crashing runs used. Rebuilt it from source
+(`md5 9ee1303259b0df1904ce9d74660c2239`) and re-ran all 7 classes through the
+same `run-hib.sh` argfile and wrappers, against the same live Postgres:
+
+| binary | G1 | ZGC |
+| --- | --- | --- |
+| `509710ba8` — **the crashing runs' own commit** | 7/7 pass | 7/7 pass |
+| current `dev` `5b606e85e` | 7/7 pass | 7/7 pass |
+
+`ok=N failed=0` on every one, and **`found`/`ok` match the HotSpot control
+class-for-class** (3, 5, 4, 5, 3, 34, 8), so these are real passes and not a
+suite that quietly ran fewer tests.
+
+Same commit, same host, same harness, same database server, opposite outcome.
+Whatever produced the crash was not in the VM revision.
+
+## What that rules out
+
+**The code.** Rebuilding the crashing runs' own commit is the control the
+original page never ran. It passes. So the range `509710ba8..5b606e85e` did not
+"fix" anything here, and no bisection of that range is worth doing.
+
+**The "moving-collector pointer safety" inference.** The original page reasoned
+from the always-G1-or-ZGC-never-Generational pattern to a relocation hazard.
+`git diff --stat 509710ba8..5b606e85e -- gc/src` is **empty** — not one line of
+collector code changed across the range. The inference was never supported by
+anything but the pattern, and the pattern is now unreproducible.
+
+**The JIT.** `--nojit` passes. So do both of the range's new switches
+(`CRATONVM_JIT_COMPILED_LDC_CONST_CACHE=0`, `CRATONVM_JIT_LOCAL_HANDLERS=0`) —
+neither brings the crash back, on either binary.
+
+**The harness invocation.** Reproduced through the literal
+`cratonvm-g1-wrapper.sh` / `cratonvm-zgc-wrapper.sh` (`-XX:+UseG1GC`, which
+normalizes to the same collector as `--XX:UseGc=G1`), not a hand-built command.
+Passes either way.
+
+**A database that isn't there.** Pointing `hibernate.connection.url` at a
+non-existent database yields `found=3 started=0 ok=0 failed=0` and `rc=0` on all
+three collectors *and on HotSpot* — a clean skip, no crash. An unreachable DB is
+not the trigger.
+
+**HotSpot** (the original page's step 4, never done): passes all of them, same
+counts. So there was never a HotSpot-vs-CratonVM divergence recorded for these.
+
+## What changed, and the standing hypothesis
+
+The Postgres container was restarted **after** both crashing runs and before
+these:
+
+```
+ZGC rerun finished    2026-08-20 22:02
+G1  rerun finished    2026-08-20 22:53
+postgres StartedAt    2026-08-21 00:29:59Z   (RestartCount=0 — stopped and started by hand)
+```
+
+Both crashing runs therefore ran against a Postgres instance that had just
+absorbed a 4548-class, 6-way-concurrent full suite (245 minutes) and was never
+restarted in between. The isolated rerun's own log carries 68
+`PSQLException`/`SQLException`/`FATAL`-class lines.
+
+So the standing hypothesis is **a degraded database server state, not
+concurrency of the client**. That is consistent with the original page's finding
+that removing client-side concurrency changed nothing — the second run was
+isolated, but it pointed at the *same un-restarted server*, so it did not
+actually vary the thing that mattered. "Full isolation rules out contention" was
+the wrong conclusion from a run that held the real variable fixed.
+
+Note this does **not** excuse the VM: a SIGSEGV is never an acceptable response
+to a misbehaving database. If the trigger can be recreated, there is very likely
+a real defect on that error path. It simply has not been demonstrated yet, and
+it is not where the original page pointed.
+
+## How to re-catch it
+
+Do not re-run the 7 classes in isolation — that has now been done eight
+different ways and always passes. Reproduce the *server* condition:
+
+1. Run the full 4548-class suite 6-way concurrent against a fresh Postgres, as
+   `full-pg-*-20260820-3gc-pg-v2` did.
+2. **Without restarting Postgres**, immediately re-run just these 7.
+3. If they crash, capture `CRATONVM_SYMBOLIZE=<RVA>` against that exact binary
+   *before* touching the container — the symbolized frame is the whole ask, and
+   it is unobtainable once the server is restarted.
+4. Record `docker inspect -f '{{.State.StartedAt}}'` in the run log so a future
+   reader can tell whether the server was recycled between arms.
+
+The harness should record the Postgres start time per run; without it, two runs
+that look identical can differ in the one variable that decides the outcome.
+
+---
+
+# Original triage (2026-08-20), preserved
+
+**Status at the time:** OPEN. Reproduced twice, independently, with 100%
+overlap: the 6-way-concurrent full-suite run and a fully isolated 1-shard rerun
+both crash the exact same 7 classes on both G1 and ZGC, zero on Generational.
 
 ## The 7 classes, identical on both runs
 
@@ -18,39 +122,26 @@ org.hibernate.orm.test.query.hql.JsonFunctionTests
 org.hibernate.orm.test.query.hql.XmlFunctionTests
 ```
 
-Every one of the 7 is JSON- or XML-function-related — no other class in
-either run showed this signature. `results.tsv` rows are `found=0 ok=0
-failed=0 aborted=0 skipped=0` for all of them: the crash happens before any
-`@Test` method runs, i.e. during class-level `@BeforeAll`/fixture setup, not
-inside a specific function assertion.
+`results.tsv` rows are `found=0 ok=0 failed=0 aborted=0 skipped=0` for all of
+them. (Note for future readers: those zeros are what the harness writes when
+there is **no** `@@RESULT` line at all, so they say nothing about how many tests
+were discovered — they are not evidence that the crash preceded discovery.)
 
-## Evidence trail
-
-**Run 1** — `apps/hib-suite-runner`, full 4548-class suite, 3 GCs, 6-way
-concurrent shards, live Postgres, `dev` HEAD `509710ba8`
-(`runs/full-pg-{zgc,g1,generational}-20260820-3gc-pg-v2`):
+**Run 1** — full 4548-class suite, 3 GCs, 6-way concurrent shards, live
+Postgres, `dev` HEAD `509710ba8`:
 
 | GC | CRASH count | classes |
 |---|---:|---|
-| ZGC (default) | 8 | the 7 above + `schemaupdate.MySQLLobSchemaCreationTest` (one-off, not reproduced elsewhere, not part of this record) |
+| ZGC (default) | 8 | the 7 above + `schemaupdate.MySQLLobSchemaCreationTest` (one-off) |
 | G1 | 7 | exactly the 7 above |
 | Generational | 0 | — |
 
-**Run 2** — same host, same `dev` HEAD, **isolated rerun**: just these 7
-classes (plus 24 other unrelated FAIL/HANG/CRASH survivors from run 1),
-**1 shard, no concurrency**, fresh Postgres
-(`runs/ofhc-{g1,zgc}-rerun-fhc-20260820`):
+**Run 2** — same host, same HEAD, isolated rerun, 1 shard, no concurrency:
 
 | GC | CRASH | wall |
 |---|---:|---:|
 | G1 | 7/31 (exactly the 7) | 83m20s |
 | ZGC | 7/31 (exactly the 7) | 32m32s |
-
-Full isolation (no concurrent shards, no Testcontainers/Docker contention,
-fresh DB) does not change the outcome at all — rules out resource contention
-as the cause, unlike most of the other FAIL/HANG noise in the same rerun
-(see the companion `hib-reactive` doc's contention findings from the same
-session for the contrast).
 
 ## Crash signature (`hs_err_pid3512.log`, G1 arm)
 
@@ -61,45 +152,7 @@ gc collector: g1
 jit: faulting pc not attributed to a compiled method
 ```
 
-`rc=139` (128+SIGSEGV) on the harness side, matching. The captured Java
-frames are all JUnit Platform / Jupiter engine bootstrapping
-(`SessionPerRequestLauncher.execute` → ... → `ClassBasedTestDescriptor
-.invokeBeforeAllMethods`) — consistent with the fault landing during
-`@BeforeAll`/fixture setup, before any hibernate-orm JSON/XML code the test
-itself exercises has necessarily run. The faulting PC is **not attributed to
-a compiled method**, and the native stack is offsets-only (no symbols by
-default). Every hs_err in this run shows the same shape; only one is quoted
-here.
-
-## What's NOT yet known
-
-* No symbolized stack — `CRATONVM_SYMBOLIZE=<RVAs> cratonvm` was not run
-  against this exact binary/crash yet.
-* Not confirmed whether the fault is actually inside JSON/XML-specific
-  native code, or something more generic that these 7 classes' fixture setup
-  happens to trigger (e.g. a moving-GC unsafe-pointer window during class
-  init that any sufficiently-shaped `@BeforeAll` could hit — the "always G1
-  or ZGC, never Generational" pattern points at a moving-collector pointer
-  safety issue, not a JSON/XML-domain bug per se, but that's an inference,
-  not yet verified).
-* Not checked against HotSpot (expected to pass — not yet confirmed for
-  these specific 7 classes on this exact fixture).
-* `MySQLLobSchemaCreationTest`'s one-off CRASH on ZGC-only (run 1, not
-  reproduced in run 2) is NOT part of this record — different class, only
-  seen once, not investigated.
-
-## Next steps
-
-1. Get a symbolized native stack: re-run one of the 7 (e.g. `JsonExistsTest`
-   in isolation) under G1 with `CRATONVM_SYMBOLIZE` against the exact crash
-   RVA, or attach a debugger/`CRATONVM_DBG_JIT_NAMES=1` to catch it live.
-2. Since the fault lands in `@BeforeAll`, check what these 7 classes'
-   fixtures share that the rest of the suite doesn't — likely a JSON/XML
-   Postgres type mapping or native codec registered once per class, touched
-   during schema/session setup rather than during an actual test body.
-3. Confirm the "moving collector only" read as a GC-safety bug (a raw
-   pointer held across a safepoint that G1/ZGC can relocate through, that
-   Generational's current non-moving-in-this-config behavior happens not to
-   disturb) rather than assuming it from the collector pattern alone.
-4. Verify against HotSpot on the identical classpath before spending further
-   time — not yet done.
+Captured Java frames were all JUnit Platform / Jupiter engine bootstrapping. The
+faulting PC was not attributed to a compiled method and the native stack was
+offsets-only — no symbolized stack was ever captured, which is why this page
+could not be closed on its own evidence.
