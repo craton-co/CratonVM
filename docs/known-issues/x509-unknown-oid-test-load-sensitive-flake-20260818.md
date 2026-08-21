@@ -170,16 +170,33 @@ ruled out for a reason that does not apply.
 
 ## What to try next
 
-1. **Remove the UB, then re-run the arm above.** This is worth doing whether or
-   not it explains the flake: it deletes a documented data race from the suite
-   that is being asked to explain a mystery. The obstacle is that
-   `flags::runtime_var_os` serves only **declared** flags from the latched
-   snapshot and falls through to live `std::env::var_os` for everything else —
-   and `JBOSS_HOME` and the eight proxy variables are undeclared, so
-   `with_thread_overrides` cannot cover them today. Extending the override layer
-   to undeclared names, or declaring these, is the actual work. `with_jboss_env`
-   already uses `with_thread_overrides` for the declared half of its pair, so
-   the shape of the fix is visible in the file.
+1. ~~**Remove the UB**~~ — done 2026-08-20. `VmFlags` now carries
+   `undeclared_edits`, so `with_thread_overrides` reaches names the inventory
+   does not declare, and all three sites were converted:
+   `proxy_selector::tests::with_proxy_env` (up to 16 `environ` mutations per
+   call) and `lib.rs::tests::with_jboss_env` to `with_thread_overrides`, and
+   `jboss_logmanager`'s block-2c pair to the guard form (`override_thread`).
+   **`grep -rn "std::env::set_var\|std::env::remove_var" native-builtins/src/`
+   now returns only a doc comment.** The two local mutexes that used to guard
+   the writes are gone with them — they never protected anything, since the
+   race was against the other four thousand tests, not against each other.
+
+   Production reads are unchanged: `runtime_var`/`runtime_var_os` consult the
+   new map only while `overrides_active()` is true, and a snapshot built from
+   the real environment carries none. Guarded by
+   `an_undeclared_name_is_overridable_without_writing_to_environ`, which
+   asserts both directions (set, and "as if unset") and that `environ` is never
+   written.
+
+   `cargo test -p cratonvm-types` 575 passed / 0 failed;
+   `cargo test -p cratonvm-native-builtins --lib` 4130 passed / 1 failed — the
+   same unrelated `lang_class` row as before the change; `proxy_selector` 19/0
+   and `jboss` 112/0 in isolation.
+
+   **What this does NOT settle:** the flake still has not reproduced, so this
+   removes a confound rather than proving a cause. The next sighting is now
+   worth much more, because the suite no longer contains a known data race that
+   could explain an arbitrary result anywhere in it.
 2. ~~**Fix the `unwrap_or(0)` clock read**~~ — done 2026-08-20. The read now
    negates the error's duration instead of clamping, so a pre-epoch clock
    reports a truthful negative timestamp rather than silently becoming
