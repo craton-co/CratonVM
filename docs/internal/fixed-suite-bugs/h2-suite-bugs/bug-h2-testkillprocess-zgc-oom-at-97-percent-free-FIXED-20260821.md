@@ -132,25 +132,40 @@ defragments" from "never JIT-quiet and defragments anyway, on the proof".
 
 ## Measured
 
-One class, one host, `--Xmx 1g`, each arm in its own working directory.
+One class, one host, `--Xmx 1g`, each arm in its own working directory. The
+"before" row is a separate binary built at the same `dev` base; every other row
+is the binary this landed as.
 
 | arm | rc | secs | `OutOfMemoryError` | arena alloc failures |
 |---|---|---:|---:|---:|
 | **ZGC + JIT — before** | **1 FAIL** | 162 | **4** | 9 |
-| **ZGC + JIT — after** | **0 PASS** | 363 | **0** | 5 |
-| ZGC + `--nojit` (relocation was already permitted) | 0 PASS | 813 | 0 | 0 |
-| ZGC + JIT, `CRATONVM_ZGC_RELOCATE=0` | 1 FAIL | 137 | 4 | 10 |
-| ZGC + JIT, `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` | 1 FAIL | 134 | 4 | 10 |
-| Generational + JIT | 0 PASS | 372 | 0 | 0 |
-| HotSpot JDK 25 | 0 PASS | 6 | 0 | 0 |
+| **ZGC + JIT — after** | **0 PASS** | 709 | **0** | 5 |
+| ZGC + `--nojit` (relocation was already permitted) | cap | 900 | 0 | 0 |
+| ZGC + JIT, `CRATONVM_ZGC_RELOCATE=0` | 1 FAIL | 174 | 4 | 10 |
+| ZGC + JIT, `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` | 1 FAIL | 186 | 4 | 8 |
+| Generational + JIT | 0 PASS | 466 | 0 | 0 |
+| G1 + JIT | 1 FAIL | 34 | 2 | 0 |
+| HotSpot JDK 25 | 0 PASS | 7 | 0 | 0 |
 
-Read the last two rows together with the first: the failure is **ZGC-specific**
-and **JIT-specific**, and the kill-switch row is the negative control — the same
-binary, the same host, the original failure back.
+Read the rows together: the failure is **ZGC-specific** and **JIT-specific**,
+and the kill-switch row is the negative control — the same binary, the same
+host, the original failure back.
 
 Allocation failures do not go to zero after the fix (5 remain). They stop being
 fatal: the ladder's collections now compact, so the retry finds a hole instead
-of exhausting the rungs.
+of exhausting the rungs. An earlier run of the same arm on a quieter host
+reported 0 of both.
+
+**The times are not comparable across rows.** This host runs many agents and
+its load moved between 4 and 16 during the sweep, which is also why the
+`--nojit` arm hit the 900 s cap here having finished in 813 s on an earlier run
+of the same matrix. Neither the `rc` nor the allocator counts move with load,
+which is why those are the columns the verdict rests on.
+
+**G1 fails this class on the before binary too** (31–43 s, no arena allocation
+failure), with a face that varies between runs — a null `FileChannel` in one,
+`OutOfMemoryError: Java heap space` in another. It is not this defect and not a
+regression from this fix; see *Still open* below.
 
 ## What this corrects in the record
 
@@ -188,6 +203,26 @@ diagnosis: `grep -c 'arena allocation failed'` and `grep 'zgc frag:'`.
 
 ## Regression cover
 
+Run on the merged tree (this branch + `origin/dev` at `cae49a85c`), which is
+what landed:
+
+* `cargo test --lib -p cratonvm-gc -p cratonvm-types -p cratonvm-native-builtins`
+  — 1677 + 573 + 4138 pass, 0 fail.
+* An 18-class H2 regression set — 16 PASS / 2 FAIL, the same two as the
+  unmodified base binary (`TestBnf`/`TestWeb`, the
+  `Sentence.MAX_PROCESSING_TIME` budget their own page records).
+* `org.h2.test.db.TestMultiThread`, this collector's known relocation-corruption
+  canary, ABBA-interleaved 6 reps per arm with a clean working directory per
+  rep: **base 1/6 corrupt, this branch 0/6**. The change enables relocation in a
+  configuration where it previously never ran, so this is the measurement that
+  had to be taken; it is not worse.
+* A wider 33-class H2 slice chosen for MVStore, file-lock, recovery and
+  concurrency coverage — the places a relocation change would show up — **32
+  PASS**, plus `TestReopen` at the 420 s cap. That one is the cap and not a
+  regression: re-run ABBA at 600 s in a clean directory per rep, it is **3/3
+  PASS on both the base and the merged binary**. This host was between load 4
+  and 16 throughout, and a cap is the first thing that moves.
+
 * `gc/src/zgc.rs::a_compiled_frame_forbids_relocation_only_when_its_coverage_is_unproven`
   asserts all four states — frame live + coverage incomplete → nothing moves;
   frame live + coverage complete → the same fixture moves; the kill switch →
@@ -201,12 +236,15 @@ diagnosis: `grep -c 'arena allocation failed'` and `grep 'zgc frag:'`.
 
 ## Still open, found on the way and NOT fixed here
 
-* **`-XX:+UseG1GC` fails this class for an unrelated reason**:
-  `NullPointerException: Cannot invoke "java.nio.channels.FileChannel.tryLock(...)"
-  because "this.channel" is null`, no OOM and no allocation failure. That is a
-  null in a reference slot, the shape
-  `G30-1-the-silent-reference-slot-coercion-20260817.md` describes, and it wants
-  its own investigation.
+* **`-XX:+UseG1GC` fails this class, on both the before and after binaries.**
+  In 31–43 s, with no arena allocation failure — so not this defect — and with a
+  face that varies between runs: `NullPointerException: Cannot invoke
+  "java.nio.channels.FileChannel.tryLock(...)" because "this.channel" is null`
+  in one, `OutOfMemoryError: Java heap space` in another. The null in a
+  reference slot is the shape
+  `G30-1-the-silent-reference-slot-coercion-20260817.md` describes. It wants its
+  own investigation; the varying face says to reproduce it several times before
+  believing any single one.
 * **The two small objects in the large-object region.** The fragmentation
   report placed an 80-byte `String` and a 24-byte `Object` above `high_cursor`,
   where `ZGC_LARGE_OBJECT_MIN`'s design says only large objects should live. A
