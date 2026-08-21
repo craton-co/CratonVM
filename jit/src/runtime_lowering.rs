@@ -362,16 +362,41 @@ fn emit_mov_imm32_sx(buf: &mut ExecutableBuffer, reg: u8, value: i32) {
 /// single stash slot for an unrelated sink to mis-attribute — see
 /// `jit_service_callee_deopt` in `vm/src/jit/helpers.rs`.
 ///
-/// No-ops when the runtime supplies no helper (hand-built test tables), which
-/// reproduces the previous behaviour exactly.
+/// `deopt_args_base` is the frame offset of outgoing argument 0 in a
+/// CONTIGUOUS descending block (argument `i` at `deopt_args_base - i * 8`)
+/// holding the same values as `arg_offsets`. It is a separate parameter
+/// because it is NOT interchangeable with `arg_offsets[0]`: the helper reads
+/// `num_args` consecutive 8-byte slots from the pointer it is handed, and only
+/// one of this function's two callers passes a contiguous block as
+/// `arg_offsets`.
+///
+/// The single-pass backend stages its outgoing arguments into one descending
+/// block and passes those offsets, so for it the two coincide. The IR lowerer
+/// passes each argument's own register-allocated home slot, which is not
+/// contiguous with its neighbours -- LEAing `arg_offsets[0]` there made the
+/// helper read unrelated frame words as arguments 1..n. That is a wrong-answer
+/// bug, not a crash: `jit_service_callee_deopt` rebuilds the callee's frame
+/// from those "arguments" to resume its catch block, so the handler ran with
+/// garbage in its incoming locals. Spring Boot's
+/// `BatchObservabilityBeanPostProcessor.postProcessAfterInitialization` -- a
+/// pass-through `BeanPostProcessor` whose `getBean` call always throws
+/// `NoSuchBeanDefinitionException` -- resumed its handler with `this` in local
+/// 1 and so returned ITSELF instead of the bean it was given, replacing a
+/// `Job` singleton with the post-processor
+/// (`BatchJdbcAutoConfigurationTests.testDefinesAndLaunchesLocalJob`).
+///
+/// No-ops when the runtime supplies no helper (hand-built test tables), or
+/// when the caller has no contiguous block to name, which reproduces the
+/// pre-service behaviour exactly (the sentinel keeps propagating).
 fn emit_callee_deopt_check(
     buf: &mut ExecutableBuffer,
     service_helper: usize,
     info_ptr: usize,
     context_offset: i32,
     arg_offsets: &[i32],
+    deopt_args_base: i32,
 ) {
-    if service_helper == 0 || info_ptr == 0 || arg_offsets.is_empty() {
+    if service_helper == 0 || info_ptr == 0 || arg_offsets.is_empty() || deopt_args_base == 0 {
         return;
     }
     // MOV R11, imm64(i64::MIN)
@@ -384,9 +409,10 @@ fn emit_callee_deopt_check(
     // (vm_ptr, info_ptr, args_ptr, num_args) in the platform C-ABI registers.
     emit_load_frame(buf, ENTRY_ABI_REGS[0], context_offset);
     emit_mov_imm64(buf, ENTRY_ABI_REGS[1], info_ptr as u64);
-    // `arg_offsets` descends from the block base, so element 0 is the highest
-    // slot — the same address `x64.rs`'s slow path LEAs for this helper.
-    emit_lea_frame(buf, ENTRY_ABI_REGS[2], arg_offsets[0]);
+    // The caller's contiguous staging block — NOT `arg_offsets[0]`, which is
+    // only the same address when the caller happens to stage its arguments in
+    // their home slots. See this function's doc comment.
+    emit_lea_frame(buf, ENTRY_ABI_REGS[2], deopt_args_base);
     // Cast: argument count to the helper's i32 parameter (bounded by the ABI
     // register table, so it always fits).
     emit_mov_imm32_sx(buf, ENTRY_ABI_REGS[3], arg_offsets.len() as i32);
@@ -403,6 +429,7 @@ pub(crate) fn emit_hashed_vtable_stub(
     frame_record: usize,
     service_helper: usize,
     info_ptr: usize,
+    deopt_args_base: i32,
 ) -> Vec<usize> {
     // This is a raw JIT-to-JIT call, exactly like the inline MIC/PIC hits.
     // It must obey the same master gate: the resolving helper enters the
@@ -490,7 +517,14 @@ pub(crate) fn emit_hashed_vtable_stub(
         // so marshalling cannot clobber the target loaded above.
         buf.emit(&[0x41, 0xFF, 0xD3]); // CALL R11
         emit_post_call_frame_republish(buf, frame_record);
-        emit_callee_deopt_check(buf, service_helper, info_ptr, context_offset, arg_offsets);
+        emit_callee_deopt_check(
+            buf,
+            service_helper,
+            info_ptr,
+            context_offset,
+            arg_offsets,
+            deopt_args_base,
+        );
         done_patches.push(emit_jmp(buf));
 
         if way == 0 {
@@ -538,6 +572,7 @@ mod tests {
             0,
             0,
             0,
+            32,
         );
         let bytes = buf.as_slice();
         let guard = [
@@ -560,6 +595,81 @@ mod tests {
         );
     }
 
+    /// `jit_service_callee_deopt` reads `num_args` CONSECUTIVE 8-byte slots
+    /// from the pointer this stub hands it and rebuilds the callee's incoming
+    /// locals from them, so it must be given the caller's contiguous staging
+    /// block. `arg_offsets` is NOT that block for the IR lowerer: those are
+    /// each argument's register-allocated home slot, and the words next to
+    /// them belong to unrelated values. LEAing `arg_offsets[0]` there resumed
+    /// a callee's catch block with `this` in local 1 -- see
+    /// [`emit_callee_deopt_check`].
+    #[test]
+    fn the_deopt_service_addresses_the_staging_block_not_the_first_home_slot() {
+        crate::x64::set_moving_young_override(Some(false));
+        let helper = 0x7fff_0000_0000_5000usize;
+        let stage_base = 512i32;
+        let mut buf = ExecutableBuffer::new(8192).expect("buffer");
+        // Home slots deliberately NON-contiguous, and a staging base that is
+        // neither of them -- the IR lowerer's real shape.
+        emit_hashed_vtable_stub(
+            &mut buf,
+            0x7fff_0000_0000_2000,
+            24,
+            &[96, 8],
+            0,
+            helper,
+            0x7fff_0000_0000_4000,
+            stage_base,
+        );
+        let bytes = buf.as_slice();
+        assert!(
+            bytes.windows(8).any(|w| w == (helper as u64).to_le_bytes()),
+            "the service helper must be baked, else this test proves nothing"
+        );
+        // `LEA reg, [RBP + disp32]` is `0x8D` + ModRM(mod=10, rm=101); the
+        // loads around it are `0x8B`, so the opcode alone separates them.
+        let lea_disp = |want: i32, bytes: &[u8]| {
+            bytes.windows(6).any(|w| {
+                w[0] == 0x8D && (w[1] & 0xC7) == 0x85 && w[2..6] == (-want).to_le_bytes()
+            })
+        };
+        assert!(
+            lea_disp(stage_base, bytes),
+            "the staging block base must be the argument pointer the helper is handed"
+        );
+        assert!(
+            !lea_disp(96, bytes),
+            "arg_offsets[0] must NOT be LEA'd as the argument block base"
+        );
+    }
+
+    /// …and with no staging block to name, nothing is serviced at all: the
+    /// sentinel keeps propagating, which is what happened before the service
+    /// existed. Emitting a read of an address the caller never populated is
+    /// the one outcome that is worse than not servicing.
+    #[test]
+    fn a_stub_with_no_staging_block_emits_no_service_call() {
+        crate::x64::set_moving_young_override(Some(false));
+        let helper = 0x7fff_0000_0000_5000usize;
+        let mut buf = ExecutableBuffer::new(8192).expect("buffer");
+        emit_hashed_vtable_stub(
+            &mut buf,
+            0x7fff_0000_0000_2000,
+            24,
+            &[96, 8],
+            0,
+            helper,
+            0x7fff_0000_0000_4000,
+            0,
+        );
+        assert!(
+            !buf.as_slice()
+                .windows(8)
+                .any(|w| w == (helper as u64).to_le_bytes()),
+            "no staging block means no service call"
+        );
+    }
+
     /// A null slot base must emit NOTHING. The alternative is `MOV R10, 0`
     /// followed by a load through it: a fault inside generated code on the first
     /// megamorphic dispatch, at a PC that names this method and an address that
@@ -571,7 +681,7 @@ mod tests {
         // default-ON. Mutating the process-global moving-young override would
         // be a side effect on every concurrently-running test for no benefit.
         let mut buf = ExecutableBuffer::new(4096).expect("buffer");
-        let patches = emit_hashed_vtable_stub(&mut buf, 0, 24, &[32, 40], 0, 0, 0);
+        let patches = emit_hashed_vtable_stub(&mut buf, 0, 24, &[32, 40], 0, 0, 0, 32);
         assert!(
             patches.is_empty(),
             "a refused stub must hand back no continuation patches"
@@ -589,7 +699,7 @@ mod tests {
     fn a_real_pic_slot_is_baked_as_the_probe_base() {
         let mut buf = ExecutableBuffer::new(4096).expect("buffer");
         let slot = 0x7fff_0000_0000_2000usize;
-        emit_hashed_vtable_stub(&mut buf, slot, 24, &[32, 40], 0, 0, 0);
+        emit_hashed_vtable_stub(&mut buf, slot, 24, &[32, 40], 0, 0, 0, 32);
         assert!(
             buf.as_slice()
                 .windows(8)
