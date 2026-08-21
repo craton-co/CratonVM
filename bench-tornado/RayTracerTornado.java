@@ -100,13 +100,21 @@ public class RayTracerTornado {
                 float best = Math.min(Math.min(hit0, hit1), Math.min(hit2, hit3));
 
                 // Normal at the hit point of whichever sphere won (weighted
-                // pick — exactly one of the four masks is 1.0 in practice
-                // since t-values are distinct; ties are a don't-care here).
-                float m0 = best == hit0 ? 1f : 0f;
-                float m1 = best == hit1 ? 1f : 0f;
-                float m2 = best == hit2 ? 1f : 0f;
-                float m3 = best == hit3 ? 1f : 0f;
-
+                // pick — at most one of the four masks is 1.0; two distinct
+                // spheres never yield the same t for one pixel, and ties are a
+                // don't-care here).
+                //
+                // A miss leaves every hit_i at the 1e9f sentinel, so `best == hit_i`
+                // is true for ALL FOUR and hitAny would come out 4, not 0 — the
+                // background branch below would then be dead code and every miss
+                // pixel would shade through 1e9f-scale arithmetic that saturates the
+                // clamp. Gate the masks on "something was actually hit" (still
+                // branchless: a select, like the rest of the kernel).
+                float anyHit = best < 1e9f ? 1f : 0f;
+                float m0 = (best == hit0 ? 1f : 0f) * anyHit;
+                float m1 = (best == hit1 ? 1f : 0f) * anyHit;
+                float m2 = (best == hit2 ? 1f : 0f) * anyHit;
+                float m3 = (best == hit3 ? 1f : 0f) * anyHit;
                 float hpx = rox + rdx * best, hpy = roy + rdy * best, hpz = roz + rdz * best;
                 float nx = (m0 * (hpx - sx0) / sr0) + (m1 * (hpx - sx1) / sr1)
                          + (m2 * (hpx - sx2) / sr2) + (m3 * (hpx - sx3) / sr3);
@@ -138,6 +146,10 @@ public class RayTracerTornado {
         final int width = args.length > 0 ? Integer.parseInt(args[0]) : 640;
         final int height = args.length > 1 ? Integer.parseInt(args[1]) : 480;
         final int iters = args.length > 2 ? Integer.parseInt(args[2]) : 10;
+        // Optional 4th arg: dump the frame as raw little-endian int32s, the
+        // same format RayTracerKernel writes, so the two toolchains' output
+        // can be diffed pixel by pixel rather than only by checksum.
+        final String dumpPath = args.length > 3 ? args[3] : null;
 
         IntArray out = new IntArray(width * height);
         FloatArray sph = new FloatArray(20);
@@ -177,6 +189,22 @@ public class RayTracerTornado {
             System.out.println("RAYTRACER_RESULT width=" + width + " height=" + height
                     + " n=" + (width * height) + " mean_ms=" + (meanNs / 1_000_000.0)
                     + " best_ms=" + (bestNs / 1_000_000.0) + " checksum=" + checksum);
+
+            if (dumpPath != null) {
+                int n = out.getSize();
+                byte[] raw = new byte[n * 4];
+                for (int i = 0; i < n; i++) {
+                    int v = out.get(i);
+                    raw[i * 4] = (byte) v;
+                    raw[i * 4 + 1] = (byte) (v >>> 8);
+                    raw[i * 4 + 2] = (byte) (v >>> 16);
+                    raw[i * 4 + 3] = (byte) (v >>> 24);
+                }
+                try (java.io.OutputStream os = new java.io.FileOutputStream(dumpPath)) {
+                    os.write(raw);
+                }
+                System.out.println("RAYTRACER_DUMP path=" + dumpPath + " bytes=" + raw.length);
+            }
         } catch (Exception e) {
             e.printStackTrace();
             System.exit(2);

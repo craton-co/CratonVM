@@ -12,7 +12,7 @@ import craton.gpu.AdmissionHint;
 public class RayTracerKernel {
 
     @GpuKernel(admit = AdmissionHint.ALLOW_INTRINSIC_CALLS)
-    public static void render(int width,
+    public static void render(int width, int height,
                                float camX, float camY, float camZ,
                                float sx0, float sy0, float sz0, float sr0, float sc0,
                                float sx1, float sy1, float sz1, float sr1, float sc1,
@@ -29,7 +29,7 @@ public class RayTracerKernel {
             int py = tid / width;
 
             float rox = camX + (px - width * 0.5f) * 0.01f;
-            float roy = camY + (py - width * 0.5f) * 0.01f;
+            float roy = camY + (py - height * 0.5f) * 0.01f;
             float roz = camZ;
 
             float dx0 = sx0 - rox, dy0 = sy0 - roy, dz0 = sz0 - roz;
@@ -74,11 +74,17 @@ public class RayTracerKernel {
 
             float best = Math.min(Math.min(hit0, hit1), Math.min(hit2, hit3));
 
-            float m0 = best == hit0 ? 1f : 0f;
-            float m1 = best == hit1 ? 1f : 0f;
-            float m2 = best == hit2 ? 1f : 0f;
-            float m3 = best == hit3 ? 1f : 0f;
-
+            // A miss leaves every hit_i at the 1e9f sentinel, so `best == hit_i`
+            // is true for ALL FOUR and hitAny would come out 4, not 0 — the
+            // background branch below would then be dead code and every miss
+            // pixel would shade through 1e9f-scale arithmetic that saturates the
+            // clamp. Gate the masks on "something was actually hit" (still
+            // branchless: a select, like the rest of the kernel).
+            float anyHit = best < 1e9f ? 1f : 0f;
+            float m0 = (best == hit0 ? 1f : 0f) * anyHit;
+            float m1 = (best == hit1 ? 1f : 0f) * anyHit;
+            float m2 = (best == hit2 ? 1f : 0f) * anyHit;
+            float m3 = (best == hit3 ? 1f : 0f) * anyHit;
             float hpx = rox + rdx * best, hpy = roy + rdy * best, hpz = roz + rdz * best;
             float nx = (m0 * (hpx - sx0) / sr0) + (m1 * (hpx - sx1) / sr1)
                      + (m2 * (hpx - sx2) / sr2) + (m3 * (hpx - sx3) / sr3);
@@ -105,6 +111,13 @@ public class RayTracerKernel {
         }
     }
 
+    /// `RayTracerKernel <width> <height> <iters> [dumpPath]`
+    ///
+    /// With a fourth argument the rendered frame is written to `dumpPath`
+    /// as raw little-endian `int32`s (one per pixel, row-major). That is
+    /// what makes a checksum disagreement diagnosable: dump the same frame
+    /// from the CPU and from `--gpu` and compare pixel by pixel, instead of
+    /// staring at two totals that differ by an unexplained amount.
     public static void main(String[] args) throws Exception {
         int width = args.length > 0 ? Integer.parseInt(args[0]) : 1920;
         int height = args.length > 1 ? Integer.parseInt(args[1]) : 1080;
@@ -112,9 +125,10 @@ public class RayTracerKernel {
         int[] out = new int[n];
 
         int iters = args.length > 2 ? Integer.parseInt(args[2]) : 10;
+        String dumpPath = args.length > 3 ? args[3] : null;
 
         // Warm-up: first call pays analyze+lower+PTX-cache-miss (excluded).
-        render(width, 0f, 0f, 5f,
+        render(width, height, 0f, 0f, 5f,
                 -1.5f, 0.5f, 0f, 1.0f, 1.0f,
                 1.5f, 0.5f, 0f, 1.0f, 0.6f,
                 0f, -1.0f, -1f, 0.8f, 0.3f,
@@ -124,7 +138,7 @@ public class RayTracerKernel {
         long totalNs = 0, bestNs = Long.MAX_VALUE;
         for (int it = 0; it < iters; it++) {
             long t0 = System.nanoTime();
-            render(width, 0f, 0f, 5f,
+            render(width, height, 0f, 0f, 5f,
                     -1.5f, 0.5f, 0f, 1.0f, 1.0f,
                     1.5f, 0.5f, 0f, 1.0f, 0.6f,
                     0f, -1.0f, -1f, 0.8f, 0.3f,
@@ -141,5 +155,20 @@ public class RayTracerKernel {
                 + " n=" + n + " mean_ms=" + (totalNs / (double) iters / 1_000_000.0)
                 + " best_ms=" + (bestNs / 1_000_000.0)
                 + " checksum=" + checksum);
+
+        if (dumpPath != null) {
+            byte[] raw = new byte[n * 4];
+            for (int i = 0; i < n; i++) {
+                int v = out[i];
+                raw[i * 4] = (byte) v;
+                raw[i * 4 + 1] = (byte) (v >>> 8);
+                raw[i * 4 + 2] = (byte) (v >>> 16);
+                raw[i * 4 + 3] = (byte) (v >>> 24);
+            }
+            try (java.io.OutputStream os = new java.io.FileOutputStream(dumpPath)) {
+                os.write(raw);
+            }
+            System.out.println("RAYTRACER_DUMP path=" + dumpPath + " bytes=" + raw.length);
+        }
     }
 }
