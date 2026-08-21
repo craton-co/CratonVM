@@ -1,7 +1,13 @@
-# W2 — the collection object model past `HashMap`
+# WORKER 5 — the instruments, and the multi-image question nobody has asked
 
-`HashMap` is done and verified against the oracle. You are doing the same for
-the families behind it, in the order the evidence supports.
+Everyone else's numbers depend on your work. Half the "findings" this week were
+instrument artifacts.
+
+> **Naming note.** These are `WORKER-n-*`, NOT `W<n>-*`. `W1`–`W8` is an
+> EXISTING namespace in this directory (`W2-1`, `W7-84`, `W8-E6-1`, … — the
+> historic wave records). The first draft of these files used it and would
+> have filed `W2-the-collection-object-model` directly beside
+> `W2-1-strict-refuses-the-synthetic-stream-stack.md`. Do not reuse it.
 
 ## 0. WHERE EVERYONE IS WORKING — read before you touch anything
 
@@ -19,14 +25,14 @@ behind** and one of them nearly re-derived a record already in its gap.
 
 | worker | owns | subject |
 |---|---|---|
-| **W1** | `vm/src/runtime/interpreter/**`, `vm/src/runtime/env_cache.rs` | the enforcement dial |
-| **W2** | `native-collections/src/lib.rs` | collection object model past `HashMap` |
-| **W3** | `native-builtins/src/lang_class.rs`, `lang_string.rs`, `lang_invoke.rs`, `deprecated_lang.rs` | the `java.lang` + `java.lang.invoke` unclaimed rows |
-| **W4** | `native-io/src/**`, `native-builtins/src/deprecated_io_util.rs`, `native-builtins/src/phases_late/io_streams.rs` | the `java.io` / NIO unclaimed rows |
-| **W5** | `regression-suite/probes/**`, `scripts/**`, `docs/` | multi-image triage + the instruments |
+| **WORKER 1** | `vm/src/runtime/interpreter/**`, `vm/src/runtime/env_cache.rs` | the enforcement dial |
+| **WORKER 2** | `native-collections/src/lib.rs` | collection object model past `HashMap` |
+| **WORKER 3** | `native-builtins/src/lang_class.rs`, `lang_string.rs`, `lang_invoke.rs`, `deprecated_lang.rs` | the `java.lang` + `java.lang.invoke` unclaimed rows |
+| **WORKER 4** | `native-io/src/**`, `native-builtins/src/deprecated_io_util.rs`, `native-builtins/src/phases_late/io_streams.rs` | the `java.io` / NIO unclaimed rows |
+| **WORKER 5** | `regression-suite/probes/**`, `scripts/**`, `docs/` | multi-image triage + the instruments |
 | **H0** | `regression-suite/run.sh`, `regression-suite/harness-guard.sh`, `native-collections/src/lib.rs :: register_comparator_natives` (in flight, lands first) | the last standing failure + harness |
 
-Everyone may create `docs/known-issues/jdk-only/W<n>-*.md`. **Nobody but H0
+Everyone may create `docs/known-issues/jdk-only/WORKER-<n>-NOTE-*.md`. **Nobody but H0
 touches `INDEX.md`** — put your index rows at the end of your own record and H0
 will move them.
 
@@ -104,69 +110,75 @@ a gate that reads 100%. That gap is the project.
 
 ---
 
-## 4. WHAT IS ALREADY DONE, and what it cost to learn
+## 4. WHY THIS LANE EXISTS
 
-`HashMap`'s internal representation now matches HotSpot **byte-for-byte in the
-default configuration**:
+A partial list of this week's measurement failures, all MEASURED:
 
-```
-CratonVM r10, --jdk-only, unarmed        HotSpot 25.0.3+9
-map1 [Ljava.util.HashMap$Node; real=3    map1 [Ljava.util.HashMap$Node; real=3
-map2 [Ljava.util.HashMap$Node; real=3    map2 [Ljava.util.HashMap$Node; real=3
-```
+* the enforcement dial reaches **one of four+ dispatch doors** (trap 2);
+* **four of six witnesses are blind** on a current binary, one of them *because
+  the VM was fixed* — `H16` taught the native to mint real `HashMap$Node`s, so
+  the bucket-head witness now agrees in both directions;
+* a supposed third CHM defect was **four order artifacts** of a multi-case probe
+  (`H0-8`);
+* the fabrication ratchet was wrong **six times**: 84 → 89 → *rc=0 while
+  matching nothing* → three invented carrier families → 29 of 147 arrays → 359;
+* the observation sink **capped at 256** and announced saturation through a
+  boolean nothing read, so every count published before 2026-08-20 is a FLOOR;
+* `run.sh`'s `477 bytecode-won` is **453 distinct triples**, 24 double-counted;
+* `CRATONVM_NATIVE_SHADOW_SINK_CAP=200000` is **silently discarded** (ceiling
+  65,536, no warning);
+* the `jit_compile` sub-sink reports `truncated: null`, which `run.sh`'s
+  saturation grep can never match.
 
-That took **two halves that both had to land**:
+## 5. YOUR TASK
 
-* **the node class** (`H16`) — `AnonymousObject$4` IS the `HashMap.Node`;
-* **the array component type** (`H23` + H0) — the table was
-  `[Ljava.lang.Object;`.
+### 5a. The multi-image sweep — this one changes other people's answers
 
-**They fail in opposite directions**, which is why half-fixed was not fixed: a
-fabricated node in a typed array throws `ArrayStoreException`; a real node in an
-`Object[]` stores fine but misleads everything that reads the component type.
-Node-class-first was the safe order; the reverse would have produced a real
-`Node[]` full of fabrications.
+`H25-1` found **342 registrations naming methods no JDK 25 image declares**, then
+corrected itself: `StringUTF16.isBigEndian` is kept **deliberately** for JDK
+17/21 images, with a 56-line comment saying so. **So 342 is a ONE-IMAGE UPPER
+BOUND and this host has only JDK 25.**
 
-**And the fix landed inert once before it worked.** `H23` typed
-`native_map_init_capacity`, `map_resize` and `lhm_init_with_cap` — but the
-**no-arg `HashMap()` constructor** still called `alloc_ref_array`, which
-hard-codes the sentinel. Three arms were green with the fix doing nothing.
-**Enumerate every allocation site on the path you are changing, including the
-ones reached through helpers.**
+**Get JDK 17 and 21 images and re-run the classification.** Until then, W3 and
+W4 cannot safely delete anything in that population — a row that is dead on 25
+may be load-bearing on 21. This is the single most unblocking thing you can do
+for the other lanes.
 
-## 5. YOUR TASK, in evidence order
+### 5b. Fix the harness's argument-error blindness
 
-1. **`Hashtable`.** `H23` DECLINED it, measured: its nodes are `HashMap$Node`
-   where HotSpot has `Hashtable$Entry`, and
-   `Hashtable$Entry.isAssignableFrom(HashMap$Node)` is **false on both VMs** —
-   typing that table without fixing the nodes arms exactly the hybrid. **The
-   node-half defect `H16` closed for `HashMap` is still open one family over.**
-   `H17` also found unarmed `Hashtable` is built by `HashMap`'s minter: length
-   16 with `HashMap$Node` heads, against HotSpot's 11 and `Hashtable$Entry`.
-2. **The view carriers.** `KeySet`/`EntrySet`/`Values` are minted with `this$0`
-   **deliberately null**, contained by registrar rows — containment that arming
-   removes. `H4-1`: the split must be **per carrier family, keyed on whether the
-   PRODUCING registrar moved**, and `MAP_VIEW_CARRIERS` spans four families, so
-   retagging that one registrar is a partial retag of three of them.
-3. **`TreeMap`.** `H0-5` §6 measured that mechanism A (null `this$0`) reaches
-   `LinkedHashMap` and `Hashtable` but **NOT `TreeMap`** — so `TreeMap` does not
-   ride along on that repair and needs its own diagnosis.
-4. **`ConcurrentHashMap`.** `H23` declined it too: `chm_publish_real_table`
-   already types the real table, and its node class is a *different* class
-   (`ConcurrentHashMap$Node`).
+Trap 1: a bad JDK path makes the VM die in argument parsing, and the harness
+prints a bare `cratonvm rc=1` — **indistinguishable from a real assertion
+failure.** The `sig` grep has **no pattern for "the VM could not parse its
+arguments"**. Add one. `H0` owns `run.sh` and `harness-guard.sh` — **send the
+patch, do not apply it.**
 
-**`IdentityHashMap` is CORRECT with `Object[]` — on HotSpot too.** Not a defect.
-Do not "fix" it.
+### 5c. The ratchet's structural limit
 
-## 6. A REGION H0 HOLDS BRIEFLY
+`scripts/untyped-alloc-ratchet.sh` v6 counts **direct spellings, not reach**.
+`alloc_ref_array` is ONE counted site with **159 callers**; routing a caller to
+a typed allocation removes a real fabrication and moves the number by zero —
+measured 2026-08-21. Either give it call-graph awareness or state the limit
+where people read the number, not only in the file header.
 
-H0 is landing a guard on `register_comparator_natives` in your file, to close
-the last standing `SUITE=all` failure. It lands before you start; `git pull` the
-branch and you will have it. **Everything else in the file is yours.**
+### 5d. Witnesses
 
-## 7. Acceptance
+Build a witness that survives the VM getting more correct. Every existing one
+was a coincidence of the VM being wrong in a visible way. **WORKER 1 may be unable to
+measure its own fix without this.**
 
-`105/105`, `104/105` (or better — see trap 6), `65/65`. **Verify with a
-reflective probe against HotSpot, not with the arms** — the corpus asks nothing
-about node classes or component types, and would have passed a completely inert
-fix. Predict what moves; name your falsifier.
+### 5e. Probe hygiene
+
+`regression-suite/probes/ChmConsistencyProbe.java` is **confounded as filed**
+(trap 3). `ChmOrderConfound{OrderTest,KeyOrder,DoorOrder}.java` are the
+order-swapped controls. Either split the first per process or annotate it —
+leaving it invites the next reader to re-derive a retracted finding.
+
+Four probes filed earlier this week **did not compile** — the public class name
+did not match the filename. All fixed; check any you add.
+
+## 6. Acceptance
+
+You mostly do not change VM behaviour, so the arms should not move: `105/105`,
+`104/105`, `65/65`. **Where you do change a gate, exercise every failure path
+and say so** — a gate that cannot fail is worse than no gate, and this project
+shipped five of those in one file.

@@ -1,7 +1,14 @@
-# W4 — the `java.io` / NIO rows, and the abstract receivers underneath them
+# WORKER 1 — the enforcement dial, and why nothing can be priced until it is fixed
 
-The P1 row's published remedy is disproved. The real defect is one layer down
-and you have the measurement that settles each row.
+**This is the highest-leverage item in the project.** Every retirement anyone has
+costed was costed with an instrument that does not do what the four records
+quoting it assume.
+
+> **Naming note.** These are `WORKER-n-*`, NOT `W<n>-*`. `W1`–`W8` is an
+> EXISTING namespace in this directory (`W2-1`, `W7-84`, `W8-E6-1`, … — the
+> historic wave records). The first draft of these files used it and would
+> have filed `W2-the-collection-object-model` directly beside
+> `W2-1-strict-refuses-the-synthetic-stream-stack.md`. Do not reuse it.
 
 ## 0. WHERE EVERYONE IS WORKING — read before you touch anything
 
@@ -19,14 +26,14 @@ behind** and one of them nearly re-derived a record already in its gap.
 
 | worker | owns | subject |
 |---|---|---|
-| **W1** | `vm/src/runtime/interpreter/**`, `vm/src/runtime/env_cache.rs` | the enforcement dial |
-| **W2** | `native-collections/src/lib.rs` | collection object model past `HashMap` |
-| **W3** | `native-builtins/src/lang_class.rs`, `lang_string.rs`, `lang_invoke.rs`, `deprecated_lang.rs` | the `java.lang` + `java.lang.invoke` unclaimed rows |
-| **W4** | `native-io/src/**`, `native-builtins/src/deprecated_io_util.rs`, `native-builtins/src/phases_late/io_streams.rs` | the `java.io` / NIO unclaimed rows |
-| **W5** | `regression-suite/probes/**`, `scripts/**`, `docs/` | multi-image triage + the instruments |
+| **WORKER 1** | `vm/src/runtime/interpreter/**`, `vm/src/runtime/env_cache.rs` | the enforcement dial |
+| **WORKER 2** | `native-collections/src/lib.rs` | collection object model past `HashMap` |
+| **WORKER 3** | `native-builtins/src/lang_class.rs`, `lang_string.rs`, `lang_invoke.rs`, `deprecated_lang.rs` | the `java.lang` + `java.lang.invoke` unclaimed rows |
+| **WORKER 4** | `native-io/src/**`, `native-builtins/src/deprecated_io_util.rs`, `native-builtins/src/phases_late/io_streams.rs` | the `java.io` / NIO unclaimed rows |
+| **WORKER 5** | `regression-suite/probes/**`, `scripts/**`, `docs/` | multi-image triage + the instruments |
 | **H0** | `regression-suite/run.sh`, `regression-suite/harness-guard.sh`, `native-collections/src/lib.rs :: register_comparator_natives` (in flight, lands first) | the last standing failure + harness |
 
-Everyone may create `docs/known-issues/jdk-only/W<n>-*.md`. **Nobody but H0
+Everyone may create `docs/known-issues/jdk-only/WORKER-<n>-NOTE-*.md`. **Nobody but H0
 touches `INDEX.md`** — put your index rows at the end of your own record and H0
 will move them.
 
@@ -104,62 +111,65 @@ a gate that reads 100%. That gap is the project.
 
 ---
 
-## 4. WHAT IS SETTLED, so you do not re-litigate it
+## 4. YOUR TASK
 
-**Native dispatch keys on the RECEIVER's class, not the constant-pool class**
-(`H11-1`, taken twice independently — source and run). A `Pipe` driven through
-`SourceChannel`/`SinkChannel`-typed locals gives the `sun/nio/ch/*Impl` rows
-`invocations: 1` and the abstract CP-named rows **0**. The fallback walk follows
-**`superclass` links only and never visits an interface.**
+`CRATONVM_ENFORCE_NATIVE_SHADOW=<prefix>` is meant to make contract §1.4
+enforced rather than counted — the native stops winning, real JDK bytecode runs,
+exactly as a permanent retirement would. **It does not.**
 
-That one answer makes ~200 abstract-class registrations decidable, and it
-**disproved the P1 remedy** ("move the natives onto the `sun.nio.ch.*Impl`
-classes"): `H11-2`'s live census is **36 abstract/interface classes, 334
-`native-io` rows**, of which
+`H17-2` MEASURED, and H0 verified by grep, that
+`jdk_only_enforce_shadow_for` has **exactly one live call site**:
 
-* **237 rows across 14 classes CANNOT MOVE** — the VM mints the receiver, so
-  relocating the registration strands it;
-* **at most 15 are genuinely movable**, two of those classes already
-  `sun.nio.ch`;
-* **for 55 rows, deleting the `native-io` line hands the slot to another
-  crate's incompatible body** instead of removing anything. `Pipe`'s six rows
-  are the sharp case.
+```
+env_cache.rs:752                      definition
+native_override.rs:2499               doc comment
+native_override.rs:7433               THE ONLY LIVE CALL   <- inside resolve_step1_native
+```
 
-**The real defect is that the VM instantiates abstract classes**, and `H21`
-proved it by fixing one: `Pipe.open()` returned `java.nio.channels.Pipe` with
-`Modifier.isAbstract == true` — **a receiver `new` cannot legally produce**
-(JVMS §6.5). It is now `sun.nio.ch.PipeImpl`, byte-identical to the oracle.
+So **arming a class arms only that class's cold, step-1 dispatches.** Warm
+invoke-cache entries, the force-native interceptor, reflective `Method.invoke`
+and JIT binds never ask.
 
-## 5. YOUR TASK
+### What that invalidated
 
-1. **Work the remaining 13 fabricated-receiver classes.** `H21` did one. Each is
-   the same one-line shape: `ensure_class_initialized` on an abstract or
-   interface type, then `alloc_object` on the result. **Grep every
-   `ensure_class_initialized` whose argument is abstract or an interface**
-   (`H21-1` N2).
-2. **`java.io` streams: 99 unclaimed rows** (`H14-2`), plus `deprecated_io_util.rs`
-   (25 sentinel sites) and `phases_late/io_streams.rs`.
-3. **`H11-3`'s blocked pair.** `Closeable`/`AutoCloseable` are as dead as the
-   four rows `H11` retired, but `vm/src/vm/tests.rs::auto_closeable_close_p70`
-   **calls the slot directly and its helper panics on an unregistered triple**.
-   You do not own that file — **write the two-file patch into your record**.
-4. **`H21-1` N3 is a free universal assertion nobody makes:**
-   `Modifier.isAbstract(o.getClass().getModifiers())` on any VM-minted receiver.
-   Any failure is a defect by JVMS §6.5 **with no oracle run required.**
+`H0-4`'s six-family table (`HashMap` 81/104 and the rest), `H0-3`'s CHM eleven,
+`H14-3`'s **thirteen** arms including the five "free" registrars and
+`Properties` at 65/104, and every `H15`/`H22` armed measurement. All of them
+price a **hybrid** state no retirement can reach: `H16-3` photographed a real
+`Node[]` holding one real node and two fabrications.
 
-## 6. Two method notes that cost other lanes
+**The direction of the error is not knowable** — a hybrid can be worse than
+uniform-fabricated or better. What holds is the asymmetry: **failures are real,
+zeros are unreliable.**
 
-* **A zero invocation count proves nothing alone.** `H11`'s four retirements
-  were licensed because `DataInputStream.readInt` took **540** invocations in
-  the same runs where the retired rows took 0. Always pair with a positive
-  control.
-* **A 50-line window is not an absence proof.** `H11-2` disproved `H5-1` N7 by
-  finding both "no fabrication site found" classes fabricated **inside
-  `native-io` itself**, four lines from the grep that missed them. Grep the
-  SYMBOL and use `git log -S`.
+### Deliverables
 
-## 7. Acceptance
+1. **Teach the other dispatch doors to consult the dial.** `H17-3` carries the
+   full specification, the two hazards, and an **instrumented-build-first** step
+   (four per-door counters) that turns every ARGUED claim in it into a number.
+   Do that step first.
+2. **Do not repeat the 2026-08-04 accident.** This file already paid for this
+   once: a `java/lang/String` arm was deleted because *"a method's behaviour
+   started depending on how many times its call site had run."* Wiring a door
+   naively reintroduces exactly that.
+3. **Fix the witnesses, or say which survive.** `H17` measured that **four of
+   six witnesses are blind on a current binary** — bucket head class,
+   `modCount`, `hashCode()` counts, `equals()` counts. One went blind **because
+   `H16` fixed the VM**. Only the `table` array class still discriminates, and
+   `H23`+H0 have now typed that too, so it may be blind by the time you read
+   this. **You may need to build a new witness before you can measure anything.**
+4. The census is a **deduplicated presence set with no counts**, and under
+   `enforce` it records only the bytecode-won half. Say whether that should
+   change.
 
-`105/105`, `104/105`, `65/65`. Price with
-`CRATONVM_ENFORCE_NATIVE_SHADOW` on `sun/nio/`, `java/nio/` and `java/io/`
-before and after — **but read trap 2 first: armed zeros are unreliable.**
+### Acceptance
+
+Unarmed arms must **not move**: `105/105`, `104/105`, `65/65`. This is a dial
+that is off by default — if the default configuration shifts, your change
+reached further than the dial.
+
+**Armed numbers are EXPECTED to get worse, and that is the point.** They will
+finally be the real price. Predict the direction and name your falsifier.
+`H17-1` predicts they go **down**, falsified if a fixed dial leaves `HashMap` at
+or above 81/104 — which would mean cold step-1 dispatches were already the
+overwhelming majority and `H0-4`'s table can stand.

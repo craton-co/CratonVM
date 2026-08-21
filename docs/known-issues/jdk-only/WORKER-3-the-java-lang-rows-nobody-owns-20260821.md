@@ -1,8 +1,12 @@
-# W1 — the enforcement dial, and why nothing can be priced until it is fixed
+# WORKER 3 — the `java.lang` and `java.lang.invoke` rows no plan points at
 
-**This is the highest-leverage item in the project.** Every retirement anyone has
-costed was costed with an instrument that does not do what the four records
-quoting it assume.
+The largest unowned block in the defect population.
+
+> **Naming note.** These are `WORKER-n-*`, NOT `W<n>-*`. `W1`–`W8` is an
+> EXISTING namespace in this directory (`W2-1`, `W7-84`, `W8-E6-1`, … — the
+> historic wave records). The first draft of these files used it and would
+> have filed `W2-the-collection-object-model` directly beside
+> `W2-1-strict-refuses-the-synthetic-stream-stack.md`. Do not reuse it.
 
 ## 0. WHERE EVERYONE IS WORKING — read before you touch anything
 
@@ -20,14 +24,14 @@ behind** and one of them nearly re-derived a record already in its gap.
 
 | worker | owns | subject |
 |---|---|---|
-| **W1** | `vm/src/runtime/interpreter/**`, `vm/src/runtime/env_cache.rs` | the enforcement dial |
-| **W2** | `native-collections/src/lib.rs` | collection object model past `HashMap` |
-| **W3** | `native-builtins/src/lang_class.rs`, `lang_string.rs`, `lang_invoke.rs`, `deprecated_lang.rs` | the `java.lang` + `java.lang.invoke` unclaimed rows |
-| **W4** | `native-io/src/**`, `native-builtins/src/deprecated_io_util.rs`, `native-builtins/src/phases_late/io_streams.rs` | the `java.io` / NIO unclaimed rows |
-| **W5** | `regression-suite/probes/**`, `scripts/**`, `docs/` | multi-image triage + the instruments |
+| **WORKER 1** | `vm/src/runtime/interpreter/**`, `vm/src/runtime/env_cache.rs` | the enforcement dial |
+| **WORKER 2** | `native-collections/src/lib.rs` | collection object model past `HashMap` |
+| **WORKER 3** | `native-builtins/src/lang_class.rs`, `lang_string.rs`, `lang_invoke.rs`, `deprecated_lang.rs` | the `java.lang` + `java.lang.invoke` unclaimed rows |
+| **WORKER 4** | `native-io/src/**`, `native-builtins/src/deprecated_io_util.rs`, `native-builtins/src/phases_late/io_streams.rs` | the `java.io` / NIO unclaimed rows |
+| **WORKER 5** | `regression-suite/probes/**`, `scripts/**`, `docs/` | multi-image triage + the instruments |
 | **H0** | `regression-suite/run.sh`, `regression-suite/harness-guard.sh`, `native-collections/src/lib.rs :: register_comparator_natives` (in flight, lands first) | the last standing failure + harness |
 
-Everyone may create `docs/known-issues/jdk-only/W<n>-*.md`. **Nobody but H0
+Everyone may create `docs/known-issues/jdk-only/WORKER-<n>-NOTE-*.md`. **Nobody but H0
 touches `INDEX.md`** — put your index rows at the end of your own record and H0
 will move them.
 
@@ -107,63 +111,67 @@ a gate that reads 100%. That gap is the project.
 
 ## 4. YOUR TASK
 
-`CRATONVM_ENFORCE_NATIVE_SHADOW=<prefix>` is meant to make contract §1.4
-enforced rather than counted — the native stops winning, real JDK bytecode runs,
-exactly as a permanent retirement would. **It does not.**
+`H14-2` measured that **445 rows (31.7%) are claimed by no P0/P1/P2 row at
+all**. Your share is the two biggest blocks:
 
-`H17-2` MEASURED, and H0 verified by grep, that
-`jdk_only_enforce_shadow_for` has **exactly one live call site**:
+| block | rows |
+|---|---:|
+| `java.lang` core | **168** |
+| `java.lang.invoke` | 56 |
+| `StringBuilder` / `StringBuffer` | 57 — **see the warning below** |
 
-```
-env_cache.rs:752                      definition
-native_override.rs:2499               doc comment
-native_override.rs:7433               THE ONLY LIVE CALL   <- inside resolve_step1_native
-```
+`H25` already adjudicated **all 214 owned registrations** in `lang_class.rs`,
+`lang_string.rs` and `deprecated_lang.rs`, retired **zero**, and produced **six
+refusals with evidence**. Read `H25-1`, `H25-2`, `H25-3` before doing anything —
+your job starts where that adjudication ends, and several of its refusals are
+blocked on files you now own.
 
-So **arming a class arms only that class's cold, step-1 dispatches.** Warm
-invoke-cache entries, the force-native interceptor, reflective `Method.invoke`
-and JIT binds never ask.
+### The strongest thing it found — R1, and it is a live wrong answer
 
-### What that invalidated
+**`Thread.stop()V` is double-registered.** The winner throws
+`UnsupportedOperationException`, matching JDK 25 bytecode. **The loser, at
+`lib.rs:14080`, silently interrupts the thread and returns.** Deleting the
+winner promotes the loser and scores as a census win. This is trap 4 in a new
+file, and it is the sharpest example of it anyone has found.
 
-`H0-4`'s six-family table (`HashMap` 81/104 and the rest), `H0-3`'s CHM eleven,
-`H14-3`'s **thirteen** arms including the five "free" registrars and
-`Properties` at 65/104, and every `H15`/`H22` armed measurement. All of them
-price a **hybrid** state no retirement can reach: `H16-3` photographed a real
-`Node[]` holding one real node and two fabrications.
+### A fourth verb, beyond `H14-1`'s three
 
-**The direction of the error is not knowable** — a hybrid can be worse than
-uniform-fabricated or better. What holds is the asymmetry: **failures are real,
-zeros are unreliable.**
+`H25-1`: **342 registrations name a method no JDK 25 image declares.** 314 own
+their slot, all at 0 invocations against a positive control of 49 non-zero rows
+in the same dump. 70 are `java/lang`. `javap -p` over all 102 receiver classes
+splits them **286 truly gone / 56 near-miss**, where the class declares the
+method *name* but no overload with the registered descriptor —
+`Unsafe.park(Object,long)` vs `park(boolean,long)`, `Paths.get(String)` vs
+`get(String,String...)`. Interceptions somebody intended that have **never once
+executed**.
 
-### Deliverables
+**They are invisible to the census by construction, so retiring them predicts a
+delta of ZERO — which is a PASS, not a failure.**
 
-1. **Teach the other dispatch doors to consult the dial.** `H17-3` carries the
-   full specification, the two hazards, and an **instrumented-build-first** step
-   (four per-door counters) that turns every ARGUED claim in it into a number.
-   Do that step first.
-2. **Do not repeat the 2026-08-04 accident.** This file already paid for this
-   once: a `java/lang/String` arm was deleted because *"a method's behaviour
-   started depending on how many times its call site had run."* Wiring a door
-   naively reintroduces exactly that.
-3. **Fix the witnesses, or say which survive.** `H17` measured that **four of
-   six witnesses are blind on a current binary** — bucket head class,
-   `modCount`, `hashCode()` counts, `equals()` counts. One went blind **because
-   `H16` fixed the VM**. Only the `table` array class still discriminates, and
-   `H23`+H0 have now typed that too, so it may be blind by the time you read
-   this. **You may need to build a new witness before you can measure anything.**
-4. The census is a **deduplicated presence set with no counts**, and under
-   `enforce` it records only the bytecode-won half. Say whether that should
-   change.
+**But 342 is a ONE-IMAGE upper bound**, and `H25` corrected itself on this:
+`lang_string.rs:12422` carries a 56-line comment headed *"On JDK 25 this
+registration never fires, and that is not a defect"* — `StringUTF16.isBigEndian`
+is kept deliberately for JDK 17/21 images. **WORKER 5 owns the multi-image sweep;
+coordinate with it before deleting anything in this class.**
 
-### Acceptance
+### ⚠ `StringBuilder` — do not retire, and know why
 
-Unarmed arms must **not move**: `105/105`, `104/105`, `65/65`. This is a dial
-that is off by default — if the default configuration shifts, your change
-reached further than the dial.
+`H14-3` priced `register_string_builder_natives` at **zero vectors**. `H22`
+measured what that zero conceals: armed across the three classes its registrar
+covers, **every `append` is silently discarded and `toString()` returns empty —
+no exception, `rc=0`.** H0 reproduced and isolated it: `StringBuilder` alone is
+fine, `AbstractStringBuilder` alone is fine, **together they break.**
 
-**Armed numbers are EXPECTED to get worse, and that is the point.** They will
-finally be the real price. Predict the direction and name your falsifier.
-`H17-1` predicts they go **down**, falsified if a fixed dial leaves `HashMap` at
-or above 81/104 — which would mean cold step-1 dispatches were already the
-overwhelming majority and `H0-4`'s table can stand.
+**It is 192 of the 214 registrations in `lang_string.rs` — 90% of your write
+surface.** (An earlier brief told a lane it was in someone else's file. It was
+not. That error is recorded in `H25-3`.)
+
+The zero is real and means nothing: **the corpus never asserts the CONTENT of a
+built string.**
+
+## 5. Acceptance
+
+`105/105`, `104/105`, `65/65`. Census is **1387** and should fall by roughly the
+rows you retire — but `H22` predicted −24 and measured −15, because **the census
+counts shadows actually DISPATCHED, not registrations removed.** Predict your
+delta and treat a smaller one as expected rather than as failure.

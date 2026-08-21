@@ -1,6 +1,13 @@
-# W3 — the `java.lang` and `java.lang.invoke` rows no plan points at
+# WORKER 4 — the `java.io` / NIO rows, and the abstract receivers underneath them
 
-The largest unowned block in the defect population.
+The P1 row's published remedy is disproved. The real defect is one layer down
+and you have the measurement that settles each row.
+
+> **Naming note.** These are `WORKER-n-*`, NOT `W<n>-*`. `W1`–`W8` is an
+> EXISTING namespace in this directory (`W2-1`, `W7-84`, `W8-E6-1`, … — the
+> historic wave records). The first draft of these files used it and would
+> have filed `W2-the-collection-object-model` directly beside
+> `W2-1-strict-refuses-the-synthetic-stream-stack.md`. Do not reuse it.
 
 ## 0. WHERE EVERYONE IS WORKING — read before you touch anything
 
@@ -18,14 +25,14 @@ behind** and one of them nearly re-derived a record already in its gap.
 
 | worker | owns | subject |
 |---|---|---|
-| **W1** | `vm/src/runtime/interpreter/**`, `vm/src/runtime/env_cache.rs` | the enforcement dial |
-| **W2** | `native-collections/src/lib.rs` | collection object model past `HashMap` |
-| **W3** | `native-builtins/src/lang_class.rs`, `lang_string.rs`, `lang_invoke.rs`, `deprecated_lang.rs` | the `java.lang` + `java.lang.invoke` unclaimed rows |
-| **W4** | `native-io/src/**`, `native-builtins/src/deprecated_io_util.rs`, `native-builtins/src/phases_late/io_streams.rs` | the `java.io` / NIO unclaimed rows |
-| **W5** | `regression-suite/probes/**`, `scripts/**`, `docs/` | multi-image triage + the instruments |
+| **WORKER 1** | `vm/src/runtime/interpreter/**`, `vm/src/runtime/env_cache.rs` | the enforcement dial |
+| **WORKER 2** | `native-collections/src/lib.rs` | collection object model past `HashMap` |
+| **WORKER 3** | `native-builtins/src/lang_class.rs`, `lang_string.rs`, `lang_invoke.rs`, `deprecated_lang.rs` | the `java.lang` + `java.lang.invoke` unclaimed rows |
+| **WORKER 4** | `native-io/src/**`, `native-builtins/src/deprecated_io_util.rs`, `native-builtins/src/phases_late/io_streams.rs` | the `java.io` / NIO unclaimed rows |
+| **WORKER 5** | `regression-suite/probes/**`, `scripts/**`, `docs/` | multi-image triage + the instruments |
 | **H0** | `regression-suite/run.sh`, `regression-suite/harness-guard.sh`, `native-collections/src/lib.rs :: register_comparator_natives` (in flight, lands first) | the last standing failure + harness |
 
-Everyone may create `docs/known-issues/jdk-only/W<n>-*.md`. **Nobody but H0
+Everyone may create `docs/known-issues/jdk-only/WORKER-<n>-NOTE-*.md`. **Nobody but H0
 touches `INDEX.md`** — put your index rows at the end of your own record and H0
 will move them.
 
@@ -103,69 +110,62 @@ a gate that reads 100%. That gap is the project.
 
 ---
 
-## 4. YOUR TASK
+## 4. WHAT IS SETTLED, so you do not re-litigate it
 
-`H14-2` measured that **445 rows (31.7%) are claimed by no P0/P1/P2 row at
-all**. Your share is the two biggest blocks:
+**Native dispatch keys on the RECEIVER's class, not the constant-pool class**
+(`H11-1`, taken twice independently — source and run). A `Pipe` driven through
+`SourceChannel`/`SinkChannel`-typed locals gives the `sun/nio/ch/*Impl` rows
+`invocations: 1` and the abstract CP-named rows **0**. The fallback walk follows
+**`superclass` links only and never visits an interface.**
 
-| block | rows |
-|---|---:|
-| `java.lang` core | **168** |
-| `java.lang.invoke` | 56 |
-| `StringBuilder` / `StringBuffer` | 57 — **see the warning below** |
+That one answer makes ~200 abstract-class registrations decidable, and it
+**disproved the P1 remedy** ("move the natives onto the `sun.nio.ch.*Impl`
+classes"): `H11-2`'s live census is **36 abstract/interface classes, 334
+`native-io` rows**, of which
 
-`H25` already adjudicated **all 214 owned registrations** in `lang_class.rs`,
-`lang_string.rs` and `deprecated_lang.rs`, retired **zero**, and produced **six
-refusals with evidence**. Read `H25-1`, `H25-2`, `H25-3` before doing anything —
-your job starts where that adjudication ends, and several of its refusals are
-blocked on files you now own.
+* **237 rows across 14 classes CANNOT MOVE** — the VM mints the receiver, so
+  relocating the registration strands it;
+* **at most 15 are genuinely movable**, two of those classes already
+  `sun.nio.ch`;
+* **for 55 rows, deleting the `native-io` line hands the slot to another
+  crate's incompatible body** instead of removing anything. `Pipe`'s six rows
+  are the sharp case.
 
-### The strongest thing it found — R1, and it is a live wrong answer
+**The real defect is that the VM instantiates abstract classes**, and `H21`
+proved it by fixing one: `Pipe.open()` returned `java.nio.channels.Pipe` with
+`Modifier.isAbstract == true` — **a receiver `new` cannot legally produce**
+(JVMS §6.5). It is now `sun.nio.ch.PipeImpl`, byte-identical to the oracle.
 
-**`Thread.stop()V` is double-registered.** The winner throws
-`UnsupportedOperationException`, matching JDK 25 bytecode. **The loser, at
-`lib.rs:14080`, silently interrupts the thread and returns.** Deleting the
-winner promotes the loser and scores as a census win. This is trap 4 in a new
-file, and it is the sharpest example of it anyone has found.
+## 5. YOUR TASK
 
-### A fourth verb, beyond `H14-1`'s three
+1. **Work the remaining 13 fabricated-receiver classes.** `H21` did one. Each is
+   the same one-line shape: `ensure_class_initialized` on an abstract or
+   interface type, then `alloc_object` on the result. **Grep every
+   `ensure_class_initialized` whose argument is abstract or an interface**
+   (`H21-1` N2).
+2. **`java.io` streams: 99 unclaimed rows** (`H14-2`), plus `deprecated_io_util.rs`
+   (25 sentinel sites) and `phases_late/io_streams.rs`.
+3. **`H11-3`'s blocked pair.** `Closeable`/`AutoCloseable` are as dead as the
+   four rows `H11` retired, but `vm/src/vm/tests.rs::auto_closeable_close_p70`
+   **calls the slot directly and its helper panics on an unregistered triple**.
+   You do not own that file — **write the two-file patch into your record**.
+4. **`H21-1` N3 is a free universal assertion nobody makes:**
+   `Modifier.isAbstract(o.getClass().getModifiers())` on any VM-minted receiver.
+   Any failure is a defect by JVMS §6.5 **with no oracle run required.**
 
-`H25-1`: **342 registrations name a method no JDK 25 image declares.** 314 own
-their slot, all at 0 invocations against a positive control of 49 non-zero rows
-in the same dump. 70 are `java/lang`. `javap -p` over all 102 receiver classes
-splits them **286 truly gone / 56 near-miss**, where the class declares the
-method *name* but no overload with the registered descriptor —
-`Unsafe.park(Object,long)` vs `park(boolean,long)`, `Paths.get(String)` vs
-`get(String,String...)`. Interceptions somebody intended that have **never once
-executed**.
+## 6. Two method notes that cost other lanes
 
-**They are invisible to the census by construction, so retiring them predicts a
-delta of ZERO — which is a PASS, not a failure.**
+* **A zero invocation count proves nothing alone.** `H11`'s four retirements
+  were licensed because `DataInputStream.readInt` took **540** invocations in
+  the same runs where the retired rows took 0. Always pair with a positive
+  control.
+* **A 50-line window is not an absence proof.** `H11-2` disproved `H5-1` N7 by
+  finding both "no fabrication site found" classes fabricated **inside
+  `native-io` itself**, four lines from the grep that missed them. Grep the
+  SYMBOL and use `git log -S`.
 
-**But 342 is a ONE-IMAGE upper bound**, and `H25` corrected itself on this:
-`lang_string.rs:12422` carries a 56-line comment headed *"On JDK 25 this
-registration never fires, and that is not a defect"* — `StringUTF16.isBigEndian`
-is kept deliberately for JDK 17/21 images. **W5 owns the multi-image sweep;
-coordinate with it before deleting anything in this class.**
+## 7. Acceptance
 
-### ⚠ `StringBuilder` — do not retire, and know why
-
-`H14-3` priced `register_string_builder_natives` at **zero vectors**. `H22`
-measured what that zero conceals: armed across the three classes its registrar
-covers, **every `append` is silently discarded and `toString()` returns empty —
-no exception, `rc=0`.** H0 reproduced and isolated it: `StringBuilder` alone is
-fine, `AbstractStringBuilder` alone is fine, **together they break.**
-
-**It is 192 of the 214 registrations in `lang_string.rs` — 90% of your write
-surface.** (An earlier brief told a lane it was in someone else's file. It was
-not. That error is recorded in `H25-3`.)
-
-The zero is real and means nothing: **the corpus never asserts the CONTENT of a
-built string.**
-
-## 5. Acceptance
-
-`105/105`, `104/105`, `65/65`. Census is **1387** and should fall by roughly the
-rows you retire — but `H22` predicted −24 and measured −15, because **the census
-counts shadows actually DISPATCHED, not registrations removed.** Predict your
-delta and treat a smaller one as expected rather than as failure.
+`105/105`, `104/105`, `65/65`. Price with
+`CRATONVM_ENFORCE_NATIVE_SHADOW` on `sun/nio/`, `java/nio/` and `java/io/`
+before and after — **but read trap 2 first: armed zeros are unreliable.**
