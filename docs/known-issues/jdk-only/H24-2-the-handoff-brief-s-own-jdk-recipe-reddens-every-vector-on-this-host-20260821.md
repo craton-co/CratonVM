@@ -157,3 +157,62 @@ in the native namespace there — but this lane ran nothing on Linux.
 * **N4 — a lane brief that hands out a shell recipe should hand out its expected
   output too.** `JDK` echoing `/c/...` versus `C:/...` is a one-glance check that
   no lane performed, this one included, until five green vectors went red.
+
+---
+
+## CONFIRMED INDEPENDENTLY (lane H0, 2026-08-21) — and the recipe is mine
+
+Reproduced on `cratonvm-r8.exe`, one vector, same binary, **only the spelling of
+an exported `JDK` changed**:
+
+```
+JDK exported in POSIX form      RJdkHello  FAIL  cratonvm rc=1
+   ( /c/Program Files/... )                HARNESS ERROR [G2] nothing survives extract()
+                                           HARNESS ERROR [G3] publishes no check count
+
+JDK exported in Windows form    RJdkHello  PASS
+   ( C:/Program Files/... )                REGRESSION SUITE: 1 passed, 0 failed
+```
+
+**This record is right, and the recipe it indicts is one I wrote into every lane
+brief this session.** `JDK="$(dirname "$(dirname "$(command -v javap)")")"`
+yields the MSYS POSIX spelling; `run.sh` exports `MSYS_NO_PATHCONV=1`, so it
+reaches `cratonvm.exe` unconverted and the VM dies in argument parsing. The
+harness's `sig` grep matches none of its six patterns and prints a bare
+`cratonvm rc=1` — **indistinguishable from a real assertion failure.**
+
+### The near-miss is the point
+
+This lane says it *"nearly reported them reverted"* — three vectors that closed
+this week. A lane following my brief, on a host where `JAVA_HOME` is unset,
+would have seen the entire corpus red and reported a catastrophic regression
+that did not exist.
+
+### Why the published baselines are NOT affected — checked, not assumed
+
+```
+JAVA_HOME (this shell) = C:\Program Files\Microsoft\jdk-25.0.3.9-hotspot
+run.sh line 83         = JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
+```
+
+The orchestrator never **exported** `JDK`, so `run.sh` fell through to
+`JAVA_HOME`, which is already the Windows spelling. **`105/105`, `103/105` and
+`65/65` stand.** Stated with the evidence rather than asserted, because "my
+numbers are fine" is exactly the claim that should not be taken on trust after a
+finding like this one.
+
+Note also that the failure is **narrower than "the recipe is poison"**: passed
+via `JAVA_HOME` the VM normalises *both* spellings and neither fails. It breaks
+only when exported as `JDK` and forwarded as an argument. That distinction
+matters, because it explains why the recipe survived a dozen lanes before biting.
+
+### The fix, and the wider lesson
+
+`cygpath -m "$(dirname "$(dirname "$(command -v javap)")")"` — verified to
+produce `C:/Program Files/...` and to pass.
+
+**A harness that renders a configuration error identically to a test failure
+will eventually be believed.** Two `HARNESS ERROR` lines fired here and both
+were true, but neither said "your JDK path is unusable" — they said the vector
+produced no output, which is downstream. The `sig` grep having no pattern for
+"the VM could not parse its arguments" is the actual gap.

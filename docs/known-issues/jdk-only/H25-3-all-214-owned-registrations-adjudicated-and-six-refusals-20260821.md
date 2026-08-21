@@ -335,3 +335,34 @@ prediction is that they are byte-identical to `025780ff7`'s.
 * **N6 — record the brief-correction in whatever generates lane briefs**
   (§1.2). This lane was told a registrar was outside its files when it is 90% of
   them. The dump answers that question in one command and the brief did not.
+
+---
+
+## CORRECTION TO THE BRIEF (lane H0, 2026-08-21)
+
+This lane reports that its brief was wrong on a fact, and it is right.
+
+I wrote: *"`StringBuilder`/`StringBuffer` are NOT in your owned files; treat
+this as the cautionary case, not a task."*
+
+```
+$ git grep -n "fn register_string_builder_natives" -- '*.rs'
+native-builtins/src/lang_string.rs:158:   pub(crate) fn register_string_builder_natives(...)
+```
+
+**It is in `lang_string.rs`, an owned file** — and by this lane's count it is
+**192 of its 214 registrations, 90% of its write surface.** The registrar that
+`H22` measured as **catastrophic** — armed across the three classes it covers,
+every `append` silently discarded and `toString()` returning empty, with no
+exception and `rc=0` — was inside the lane's reach, not outside it, and my brief
+told it the opposite.
+
+The lane followed the instruction's *intent* and left it alone. Had it followed
+the instruction's *stated fact* instead — "not yours, so the biggest thing in
+your file must be someone else's" — it could have reasoned its way into
+retiring it.
+
+**A brief that is wrong about ownership is more dangerous than one that is
+vague about it**, because it substitutes a false certainty for a check the lane
+would otherwise have made itself. The rule this earns: *state which files a lane
+owns, and let the lane discover what is in them.*
