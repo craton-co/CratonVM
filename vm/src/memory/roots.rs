@@ -967,7 +967,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
     if dbg_jit_rootscan() {
         let frames = crate::jit::conservative_roots::active_compiled_frames();
-        let labels: Vec<&str> = frames.iter().map(|(_, l, _)| l.as_str()).collect();
+        let labels: Vec<&str> = frames.iter().map(|(_, l, _, _)| l.as_str()).collect();
         eprintln!(
             "[jitroots] precise_only={precise_only} moving_young={moving_young} \
              osr_fb={osr_fb} incomplete={incomplete} chain={chain} any_jit={any_jit} \
