@@ -210,6 +210,48 @@ unsoundness whenever they fire, it is the correct direction, and it is measured
 to cost nothing here (`map_incomplete` never fired on any workload run). It is
 hardening, not the fix for the sites above.
 
+## Follow-up 2026-08-21: the verdict is now COMPUTED on every collector
+
+This record's §"What this does NOT establish" notes that true generational
+"reports `incomplete=true` for other obligations on every collection, so it
+never takes the suppression", and that "the two collectors where the proof *did*
+pass are G1 and ZGC". The second half had a simpler explanation than it looked:
+**the proof was never run on a G1 or ZGC cycle at all.**
+`memory::roots::collect_roots` computed it inside a short-circuiting `&&` chain
+whose second term was `heap.is_generational() || g1_precise_only_roots`, so
+`refresh_moving_young_coverage_for_collection()` was skipped and the published
+verdict stayed at the `false` — meaning *complete* — that
+`begin_moving_young_coverage_cycle` had reset it to. It did not pass; nobody
+asked.
+
+Two changes, both landed:
+
+* The proof and the conservative-scan SUPPRESSION are now separate expressions.
+  The proof mentions no collector and runs on every cycle; the suppression stays
+  generational-only, which is what
+  `bug-g1-evacuates-live-jit-reference-20260819.md` asked for.
+* `moving_young_unpublished_frame_oop_present`'s residency test asks
+  `gen_heap::addr_is_movable` — the union of the generational young table with a
+  new `MOVABLE_BOUNDS` table a collector fills to say what its relocating phase
+  may move. `JIT_REGION_BOUNDS` was deliberately NOT filled: its second,
+  load-bearing job is the inline-reference-store write-barrier gate that G1 and
+  ZGC answer by leaving it empty.
+
+Measured on one H2 class, `TestKillProcessWhileWriting`, per collection:
+
+| collector | before | after |
+|---|---|---|
+| G1 | `incomplete=false` 722 499 / `true` 1 169 | `false` **0** / `true` 886 790, all `young-bounds-unpublished-verifier-vacuous` |
+| ZGC | verdict never computed | proof ran on 263 cycles, passed 21 |
+
+G1's answer is now correct rather than clean: it publishes neither table, so the
+verifier honestly reports that it cannot classify. Its behaviour is unchanged —
+`refuse_evacuation` is gated on `CRATONVM_G1_COVERAGE_PIN`, default off — but
+`record_g1_pause_coverage` stops measuring a vacuous verdict.
+
+ZGC acts on it: `relocate_stw` now compacts when the proof holds. See
+`known-issues/h2/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`.
+
 ## Status of the suppression
 
 `precise_only_true` counted per run, with all fixes in:
