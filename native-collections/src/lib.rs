@@ -9734,6 +9734,105 @@ fn map_bucket_index(hash: i32, capacity: i32) -> usize {
     ((hash as u32) & ((capacity as u32).wrapping_sub(1))) as usize
 }
 
+/// The real JDK class a `java.util.HashMap.table` is an array of.
+///
+/// The `ConcurrentHashMap` twin is [`CHM_NODE_CLASS`], and the two are resolved
+/// by the same helper for the same reason — see [`hm_node_class_id`].
+const HM_NODE_CLASS: &str = "java/util/HashMap$Node";
+
+thread_local! {
+    /// Per-VM memo for [`HM_NODE_CLASS`]'s `ClassId`: `(vm_identity, answer)`.
+    ///
+    /// The inner `Option` is the answer, and its `None` is a resolved NEGATIVE
+    /// — this image has no real `java/util/HashMap$Node` — cached exactly like
+    /// the positive. Not caching the negative would put a
+    /// `class_id_by_name` + `ensure_class_initialized` + `class_name_of_id` on
+    /// every `put` of every `synthetic-jdk` build, which is the cost this memo
+    /// exists to remove.
+    ///
+    /// Scoped to `vm_identity` for the reason `RECEIVER_FACTS` is, and not for
+    /// a weaker one: a Rust test can build several `Vm`s in one process and a
+    /// `ClassId` minted by one is meaningless in another. A process-global
+    /// `OnceLock` here would latch the FIRST VM's answer forever.
+    static HM_NODE_CLASS_MEMO: std::cell::Cell<Option<(usize, Option<ClassId>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`HM_NODE_CLASS`]'s `ClassId`, or `None` when this image has no real one.
+///
+/// Resolution goes through [`chm_real_class`] — already in this file, already
+/// written against the `ensure-class-initialized-fabricates-instead-of-failing`
+/// trap: an `Ok` from `ensure_class_initialized` is not evidence the image has
+/// the class, so both `is_class_synthetic_stub` and the name the id resolves
+/// BACK to are checked. Binding a node to a FABRICATED `HashMap$Node` would be
+/// strictly worse than the untyped sentinel, because the sentinel at least
+/// declares no descriptors.
+///
+/// GC: the first call per VM per thread can LOAD a class and therefore
+/// allocate. Every caller must already hold its cross-allocation roots pinned.
+/// Subsequent calls are a `Cell` read — no lock, no allocation, no Java.
+fn hm_node_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
+    let vm = ctx.vm_identity();
+    if let Some((cached_vm, answer)) = HM_NODE_CLASS_MEMO.with(|c| c.get()) {
+        if cached_vm == vm {
+            return answer;
+        }
+    }
+    let answer = chm_real_class(ctx, HM_NODE_CLASS);
+    HM_NODE_CLASS_MEMO.with(|c| c.set(Some((vm, answer))));
+    answer
+}
+
+/// Which class the ordinary `put` path's chain node is allocated with.
+///
+/// # Why this is not unconditionally the real class
+///
+/// A real `java.util.HashMap$Node` declares `key` and `value` as
+/// `Ljava/lang/Object;`, and `coerce_field_value_by_descriptor`'s `b'L'` arm
+/// turns a primitive written at a reference slot into NULL (`gc/src/heap.rs`,
+/// and that rule is pinned by a test — it is not going to be relaxed). The
+/// ordinary put path is reached with a non-`Object` `Value` from two directions
+/// that are not hypothetical:
+///
+///   * `present_marker` keeps a legacy `Int(1)` for a NULL set element, because
+///     a null element has no reference to mark itself with; and
+///   * `materialize_hm_int_fast` re-puts every side-stored entry through
+///     `native_map_put_evict_pinned` with the `Value` its writer supplied, and
+///     `try_hm_int_fast_put` stores that `Value` verbatim. `jit_hashmap_put_direct`'s
+///     own doc comment counts 42 direct Rust `native_map_put_pub` call sites
+///     "that are not obliged to store an object".
+///
+/// So the split is the boundary between a **Java-visible** mapping and a
+/// **Rust-private** one, not a compromise. A primitive `Value` in a map is
+/// already unreadable from Java — `Map.get` returns `Ljava/lang/Object;` and
+/// the same coercion nulls it at the return boundary — so no bytecode can tell
+/// which class carries it, while every mapping bytecode CAN see is
+/// object-shaped and gets the real node.
+///
+/// This is the same rule, and the same direction of error,
+/// [`chm_publish_real_table`] already applies one screen over: *"a primitive in
+/// a slot a real `$Node` declares as a reference … returns `None` and the
+/// caller keeps today's snapshot carrier verbatim."*
+///
+/// # On inspecting `key`/`value` BEFORE the allocation
+///
+/// Only the `Value` VARIANT is read, never the address inside it. A moving
+/// collection can relocate an `Object(Some(_))` but cannot turn it into an
+/// `Int`, so deciding here and allocating after is sound with no refresh.
+fn map_node_class_for(ctx: &mut dyn NativeContext, key: Value, value: Value) -> ClassId {
+    if !matches!(key, Value::Object(_)) || !matches!(value, Value::Object(_)) {
+        return ClassId::new(0);
+    }
+    // A `match` rather than `unwrap_or`/`unwrap_or_else`: `or_fun_call` and
+    // `unnecessary_lazy_evaluations` disagree about which of those two is the
+    // right spelling, and `cargo clippy --workspace --all-targets -- -D
+    // warnings` is a blocking gate.
+    match hm_node_class_id(ctx) {
+        Some(cid) => cid,
+        None => ClassId::new(0),
+    }
+}
+
 /// Allocate a HashMap$Node entry using the REAL JDK field layout
 /// (slot 0 = hash:I, slot 1 = key, slot 2 = value, slot 3 = next).
 ///
@@ -11843,35 +11942,59 @@ fn native_map_put_evict_pinned(
     let value_pin = pin_value(ctx, value);
     // Create node — for null keys, store Value::Object(None) in key field.
     //
-    // LOAD-BEARING: `ClassId::new(0)` here is not laziness. It resolves to a
-    // `cratonvm/synthetic/AnonymousObject$4` (see `VmExec::alloc_object`),
-    // which declares no fields and therefore carries NO field descriptors — so
-    // `set_field` takes the raw path and stores every `Value` variant as
-    // written. Bind this to the real `java/util/HashMap$Node` (as
-    // `map_alloc_node` does) and the descriptor-aware path turns on: a
-    // primitive written to the value slot, declared `Ljava/lang/Object;`, is
-    // coerced to NULL.
+    // THE NODE'S CLASS IS THE DEFECT `H0-6` §7 MEASURED, and this line is its
+    // single producer. `ClassId::new(0)` resolves to a
+    // `cratonvm/synthetic/AnonymousObject$4` (`VmExec::alloc_object`), so the
+    // table real `java/util/HashMap` bytecode walks is full of objects that are
+    // not `HashMap$Node` and do not implement `Map.Entry`. Armed with
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/HashMap`, `size()` is 3000 and
+    // all 3000 `get()`s are right while `entrySet()` throws
+    // `ClassCastException` after 0 and `keySet()` yields 1 — the nodes are
+    // STORED and they are the wrong CLASS (`H0-4` §7, correcting §4's
+    // "the inserts went to a side structure", which was wrong).
     //
-    // That is not hypothetical. It is exactly what happened on the
-    // LinkedHashMap side when its node was switched to the real
-    // `java/util/LinkedHashMap$Entry` (`7bf427af1`, and Defect 3 of
-    // `fixed-suite-bugs/springboot/kafka-embedded-kraft-boundport-listeners-distinct-classcastexception-20260804-FIXED.md`):
-    // the Set PRESENT marker went to null and broke Jersey's
-    // `Resource.Builder.onBuildMethod`.
+    // [`map_node_class_for`] carries the whole argument for when the real class
+    // is used and when this keeps the sentinel; read it before touching this
+    // line. In one sentence: object-shaped mappings — every mapping bytecode
+    // can see — get the real `java/util/HashMap$Node`; a mapping carrying a
+    // primitive `Value` keeps the untyped carrier, because a real node's
+    // `Ljava/lang/Object;` value slot would coerce that primitive to null.
     //
-    // The marker is no longer the obstacle — every one now goes through
-    // `present_marker` and is a reference. But that was MEASURED to be
-    // necessary and NOT sufficient: building this line as
-    // `try_alloc_synthetic(ctx, "java/util/HashMap$Node", NODE_NUM_FIELDS)?` on top
-    // of the marker fix still fails `probes/LinkedHashMapNodeProbe.java` and
-    // `SetSurface`, including `Map$Entry.getKey()` coming back null and
-    // `keySet().remove` leaving the map unshrunk. Whatever else this node's
-    // real descriptors change has not been chased down.
+    // # What the previous revision of this comment said, and what was wrong
     //
-    // So: switching this class is its own validated project, not a tidy-up.
-    // `LinkedHashMapNodeProbe`'s set-membership and map-view sections are the
-    // guard — they go loudly red (9 failures) the moment this line changes.
-    let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
+    // It said the flip was MEASURED "necessary and NOT sufficient" — that on
+    // top of the marker fix it still failed `probes/LinkedHashMapNodeProbe.java`
+    // and `SetSurface` with `Map$Entry.getKey()` null and `keySet().remove`
+    // leaving the map unshrunk — and concluded "whatever else this node's real
+    // descriptors change has not been chased down". That measurement is
+    // `f8aff25bb`, 2026-08-04. It is 17 days and one repair old:
+    //
+    //   * The `Map$Entry.getKey()`-is-null half was hypothesised (H16) to be
+    //     the `java/util/Map$Entry` INTERFACE native — `native_entry_get_key`
+    //     reads slot 0, which on a real node is `hash:I`, not the key, and the
+    //     `Ljava/lang/Object;` return descriptor then nulls the `Int`.
+    //     **MEASURED AND DISPROVED** on `cratonvm-r5.exe`, `--jdk-only`: a
+    //     genuine reflectively-constructed `java.util.HashMap$Node` answers
+    //     `getKey`/`getValue`/`setValue`/`hashCode` identically to HotSpot
+    //     25.0.3+9, so that door does not open for a receiver whose own class
+    //     declares the method. The arm's source is in `H16-2`, §2.
+    //   * The `HashSet.remove`-reports-false half was the PRESENT marker, and
+    //     `11798a8a2` (`hs_present_marker_at`, 2026-08-20) landed the real
+    //     `java.util.HashSet.PRESENT` at all six HashSet-family producers —
+    //     AFTER that measurement was taken.
+    //
+    // So the 2026-08-04 result is not evidence about the tree of 2026-08-21,
+    // and the residual it named was never localised. `LinkedHashMapNodeProbe`
+    // is still the guard and it PASSES on `cratonvm-r5.exe` under `--jdk-only`
+    // today (H16, measured) — which is what makes a red after this change
+    // attributable rather than ambient.
+    //
+    // The LinkedHashMap side is the standing existence proof: `lhm_alloc_node`
+    // has bound its node to the REAL `java/util/LinkedHashMap$Entry` since
+    // `7bf427af1`, and that probe's set-membership, map-view, serialization and
+    // 2000-entry-resize sections all pass over it.
+    let node_cid = map_node_class_for(ctx, key_val, value);
+    let new_node = ctx.alloc_object(node_cid, NODE_NUM_FIELDS);
     // Keep the node and both object values rooted through population and
     // refresh every reference immediately before its store. The later
     // `[SETFIELD-GC]` epoch probe established that a plain ref store does not
@@ -50903,27 +51026,76 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let entries = chm_collect_all_entries(ctx, this);
+            // `this` is the entries' source map and is handed to every carrier
+            // below, so it has to survive the per-iteration allocation. It was
+            // previously read once and never used after the first allocation,
+            // which was only safe because nothing consumed it.
+            let this_pin = ctx.pin_native_root(this);
             let action_pin = ctx.pin_native_root(action);
             let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
             let (_, flat_pins) = pin_value_slice(ctx, &flat);
             for i in 0..entries.len() {
-                let entry = ctx.alloc_object(ClassId::new(0), NODE_NUM_FIELDS);
                 let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
                 let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
+                let source = ctx.read_native_pin(this_pin, this);
+                // The carrier handed to the `Consumer` MUST be a real
+                // `Map.Entry`. This line used to be the untyped-allocation
+                // sentinel at width `NODE_NUM_FIELDS` — spelled out here would
+                // be a FALSE POSITIVE for `scripts/untyped-alloc-ratchet.sh`,
+                // which greps source text and cannot tell a comment from a call
+                // (`H16-1` §5) — with the key and value written at the NODE
+                // slots (1 and 2), which produced
+                // a `cratonvm/synthetic/AnonymousObject$4` — an object that
+                // implements nothing. MEASURED on `cratonvm-r5.exe`,
+                // `--jdk-only`, UNARMED, against HotSpot 25.0.3+9 (H16-3):
+                //
+                //   HotSpot   entry cls=java.util.concurrent.ConcurrentHashMap$Node
+                //             key=k1 val=v1 … visited=2
+                //   CratonVM  ClassCastException: class
+                //             cratonvm.synthetic.AnonymousObject$4 cannot be cast
+                //             to class java.util.Map$Entry … after 0
+                //
+                // so `forEachEntry` was unusable for any consumer that does
+                // anything with its argument — which the parameter type makes
+                // every consumer. It also left slot 0 (`hash`) and slot 3
+                // (`next`) unwritten, so it was not even a well-formed node.
+                //
+                // `AbstractMap$SimpleEntry` with `source = this` is what every
+                // other entry-yielding path in this file already mints
+                // (`collect_entries_any`, `tm_make_entry`'s live twin), it is a
+                // real `Map.Entry` so reflection and `checkcast` both work, and
+                // the live-entry slot 2 gives `setValue` the write-through that
+                // HotSpot's `$Node` argument also has. It is NOT a
+                // `ConcurrentHashMap$Node`: a consumer that downcasts to the
+                // concrete node class still fails, and that is a smaller and
+                // louder gap than the one it replaces.
+                let entry = match alloc_live_entry(
+                    ctx,
+                    "java/util/AbstractMap$SimpleEntry",
+                    key,
+                    value,
+                    source,
+                ) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        ctx.unpin_native_roots(this_pin);
+                        return Err(err);
+                    }
+                };
                 let action = ctx.read_native_pin(action_pin, action);
-                ctx.set_field(entry, NODE_FIELD_KEY, key);
-                ctx.set_field(entry, NODE_FIELD_VALUE, value);
                 if let Err(e) = ctx.invoke_virtual(
                     action,
                     "accept",
                     "(Ljava/lang/Object;)V",
                     &[Value::Object(Some(entry))],
                 ) {
-                    ctx.unpin_native_roots(action_pin);
+                    // `this_pin` was taken BELOW `action_pin`, so unwinding to
+                    // it releases `action_pin` and the `flat` handles too.
+                    ctx.unpin_native_roots(this_pin);
                     return Err(e);
                 }
             }
-            ctx.unpin_native_roots(action_pin);
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );
