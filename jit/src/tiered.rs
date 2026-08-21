@@ -1210,6 +1210,25 @@ pub fn dump_method_stats_to_stderr() {
                 .join(" ")
         );
     }
+    // The unresumable-trap refusal's census, printed UNCONDITIONALLY and
+    // including zeros — before the `DIAG_CORE` early return, like the rows
+    // above it, so a run that never built a tiered manager still reports.
+    //
+    // `shape` counts methods whose protected range carries a trap this tier
+    // lowers to an unresumable deopt; `refused` counts the ones the guard
+    // actually declined the optimizing tier to. They diverge only under
+    // `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD=0` (measurement only, and unsound
+    // — see that switch's doc), where `refused` drops to zero while `shape`
+    // keeps counting. That difference IS the size of the A/B: it names how many
+    // methods the OFF arm moved, so a flat wall-clock result can be read as
+    // "the refusal is cheap here" instead of "the switch did nothing".
+    //
+    // Suppressing the zero line was the first draft and was wrong: a silent
+    // instrument cannot be told from an absent one.
+    {
+        let (shape, refused) = crate::ir_unresumable_trap_counts();
+        eprintln!("[cratonvm] IR unresumable-trap refusal: shape={shape} refused={refused}");
+    }
     let Some(core) = DIAG_CORE.get() else {
         return;
     };
@@ -1341,17 +1360,6 @@ pub fn dump_method_stats_to_stderr() {
          Reference.reachabilityFence={fence_sites} Long.valueOf={long_value_of_sites} \
          Long.longValue={long_long_value_sites} VarHandle.read={vh_read_sp}/{vh_read_osr}",
     );
-    let (untrap_shape, untrap_refused) = crate::ir_unresumable_trap_counts();
-    if untrap_shape != 0 {
-        // `shape` counts the methods whose protected range carries an
-        // unresumable trap; `refused` counts the ones the guard actually
-        // declined the optimizing tier to. They differ only under
-        // `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD=0`, which is the measurement
-        // arm — see that switch's doc for why it is unsound to ship.
-        eprintln!(
-            "[cratonvm] IR unresumable-trap refusal: shape={untrap_shape} refused={untrap_refused}",
-        );
-    }
     let shadow_census = crate::jit_native_shadow_cause_census();
     if !shadow_census.is_empty() {
         eprintln!(
