@@ -1721,7 +1721,7 @@ pub(super) fn compile_osr_artifact(
             // string constant (StringRegexOnly.run: `Pattern.compile("(\\d+)")`)
             // then interpreted its entire workload.
             let mut ldc_info2: Vec<(usize, i64)> = Vec::new();
-            let mut ldc_string_info2: Vec<(usize, *const u8, usize)> = Vec::new();
+            let mut ldc_string_info2: Vec<(usize, u32, u16)> = Vec::new();
             // Class-`ldc` sites, served at run time by `helpers.ldc_class_cp`.
             // Before this an OSR artifact refused any method containing one.
             let mut ldc_class_info2: Vec<(usize, u32, u16)> = Vec::new();
@@ -1744,13 +1744,13 @@ pub(super) fn compile_osr_artifact(
                         Some(ConstantPoolEntry::StringReference { string_index })
                             if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
                         {
+                            // The SITE, for the reason the `try_compile`
+                            // resolver records one: the recorded resolution is
+                            // keyed `(class, cp index)`. `get_utf8` is only the
+                            // representability test.
                             match class.constant_pool.get_utf8(*string_index) {
-                                Some(s) => {
-                                    let boxed: Box<str> = s.to_string().into_boxed_str();
-                                    let ptr = boxed.as_ptr();
-                                    let len = boxed.len();
-                                    owned_jit_strings2.push(boxed);
-                                    ldc_string_info2.push((pc, ptr, len));
+                                Some(_) => {
+                                    ldc_string_info2.push((pc, class_id.as_u32(), cp_idx));
                                     continue;
                                 }
                                 None => return None,
@@ -2042,6 +2042,51 @@ pub(super) fn compile_osr_artifact(
                     })
                     .collect(),
             );
+            // ── Compiled local exception handlers, OSR tier ─────────────────
+            //
+            // The same table a fourth time, with catch TYPES, so this artifact
+            // can run its own `catch` blocks instead of leaving compiled code
+            // for every one of them.
+            //
+            // This door matters MORE than the method-entry one, not less: a
+            // `@Test` body is invoked once, so OSR is its only route out of the
+            // interpreter, and `HttpHeaderValidationUtilTest`'s two exhaustive
+            // loops — the class this feature was written for — are exactly that
+            // shape. Staging it only in `jit::try_compile` would have left the
+            // feature structurally inert on the population it exists for.
+            //
+            // Staged only when every catch type resolves: a partial table would
+            // make a site answer "propagate" where the real table has a match —
+            // a slower answer arrived at by a lie.
+            if cratonvm_jit::local_handlers_enabled() && !osr_exception_table.is_empty() {
+                let cm_lock = shared.classes.class_manager.read();
+                let table = cm_lock.get_class(class_id).and_then(|class| {
+                    let mut rows: Vec<(usize, usize, usize, &'static str)> =
+                        Vec::with_capacity(osr_exception_table.len());
+                    for e in osr_exception_table.iter() {
+                        let name: &'static str = if e.catch_type == 0 {
+                            ""
+                        } else {
+                            match class.constant_pool.get_class_name(e.catch_type) {
+                                Some(n) => cratonvm_jit::intern_catch_type_name(n),
+                                None => return None,
+                            }
+                        };
+                        rows.push((
+                            // Widening: classfile pcs are u16.
+                            e.start_pc as usize,
+                            e.end_pc as usize,
+                            e.handler_pc as usize,
+                            name,
+                        ));
+                    }
+                    Some(rows)
+                });
+                drop(cm_lock);
+                if let Some(table) = table {
+                    crate::jit::x64::set_pending_local_handler_table(table, class_id.as_u32());
+                }
+            }
             // This artifact's install epoch was stamped by the `compile_gate`
             // admission at the top of this closure — before the class loading
             // and constant-pool resolution above, not here. A witness opened at
@@ -4251,10 +4296,18 @@ pub(super) fn try_jit_upgrade_with_gate(
             ConstantPoolEntry::StringReference { string_index }
                 if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
             {
+                // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
+                // `(class, cp index)`. `get_utf8` is only the representability
+                // test the `get_utf8_wide` guard above pairs with -- a
+                // lone-surrogate literal cannot be pooled on a Rust `String`
+                // and stays uncompilable, exactly as before.
                 class
                     .constant_pool
                     .get_utf8(*string_index)
-                    .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+                    .map(|_| cratonvm_jit::JitLdcConstant::String {
+                        holder_class_id: class_id.as_u32(),
+                        cp_idx,
+                    })
             }
             // `ldc <Class>`: the mirror is a heap object and the target class
             // may not be loaded yet, so report the SITE — referencing class id
@@ -4718,10 +4771,18 @@ pub(super) fn try_jit_upgrade_with_gate(
                     ConstantPoolEntry::StringReference { string_index }
                         if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
                     {
+                        // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
+                        // `(class, cp index)`. `get_utf8` is only the representability
+                        // test the `get_utf8_wide` guard above pairs with -- a
+                        // lone-surrogate literal cannot be pooled on a Rust `String`
+                        // and stays uncompilable, exactly as before.
                         class
                             .constant_pool
                             .get_utf8(*string_index)
-                            .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+                            .map(|_| cratonvm_jit::JitLdcConstant::String {
+                                holder_class_id: class_id.as_u32(),
+                                cp_idx,
+                            })
                     }
                     // `ldc <Class>` — see the matching arm in the enclosing
                     // method's resolver.
@@ -6065,10 +6126,18 @@ pub(super) fn try_jit_compile_callee_slow(
             ConstantPoolEntry::StringReference { string_index }
                 if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
             {
+                // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
+                // `(class, cp index)`. `get_utf8` is only the representability
+                // test the `get_utf8_wide` guard above pairs with -- a
+                // lone-surrogate literal cannot be pooled on a Rust `String`
+                // and stays uncompilable, exactly as before.
                 class
                     .constant_pool
                     .get_utf8(*string_index)
-                    .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+                    .map(|_| cratonvm_jit::JitLdcConstant::String {
+                        holder_class_id: cid.as_u32(),
+                        cp_idx,
+                    })
             }
             // `ldc <Class>`: the mirror is a heap object and the target class
             // may not be loaded yet, so report the SITE — referencing class id

@@ -1,199 +1,209 @@
-# `HttpHeaderValidationUtilTest` — the two exhaustive loops compile now; a caught exception still costs 2 900 ns
+# `HttpHeaderValidationUtilTest` — the caught exception is fixed; what is left is 1.67 deopts per iteration
 
-**Status: OPEN, throughput.** The blocker this page led with is CLOSED: both
-exhaustive `@Test` loops ran entirely interpreted because the OSR door refused
-any method with an exception table, and that refusal (`RBC.6b`) was lifted
-2026-08-17 — see the internal record
-`fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`.
-The class still exceeds the 180 s wall.
+**Status: OPEN, throughput — and the reason has moved for the third time.**
 
-Re-measured 2026-08-17 on `perf/osr-exception-table-and-nesting-inline-20260817`,
-**Azure Linux host** (the earlier numbers on this page came from a Windows host
-and do not transfer — see [The control, re-taken](#the-control-re-taken)),
-release build, G1, real-JDK mode, against HotSpot 25 on the same host.
+Two things this page led with are now CLOSED:
 
-## The control, re-taken
+* the two exhaustive `@Test` loops ran entirely interpreted, because the OSR
+  door refused any method with an exception table (`RBC.6b`, lifted
+  2026-08-17);
+* **a caught exception cost one OSR round trip, ~1 200-2 900 ns.** Compiled
+  local exception handlers landed 2026-08-20 and are default-ON
+  (`CRATONVM_JIT_LOCAL_HANDLERS`); a `catch` block in a compiled method now
+  runs in compiled code, in the same frame. On this class's own probe the OSR
+  round trips go **127 072 -> 0**.
 
-Every budget this page used to carry was derived from a Windows-host HotSpot run
-and from a sampling probe calibrated against it. On the Azure Linux host the
-real class is much faster than either said:
+What is left is a different defect, measured 2026-08-20 and named at the bottom
+of this page: **1.67 `ReceiverTypeChanged` deopts per loop iteration**, ending
+in `MakeNotCompilable`, on a receiver that is genuinely bimorphic. That, not the
+throw path and not the call chain, is now the whole gap.
+
+All numbers below: **Azure Linux host `vm1`, idle (load 0.0)**, 2026-08-20,
+release build, real-JDK mode, one binary with the flag off and on, against
+HotSpot 25 on the same host.
+
+## Where the class stands
 
 | | found | started | ok | wall |
 |---|---:|---:|---:|---:|
-| **HotSpot 25, whole class** | 5506 | 5506 | 5506 | **30.587 s** |
-| CratonVM G1, 2026-08-16 and still | 0 | 0 | 0 | **HANG, rc=124 @ 180 s** |
+| HotSpot 25, whole class | 5506 | 5506 | 5506 | **20.230 s** |
+| CratonVM, default (everything below ON) | — | — | — | **no `@@RESULT` at a 1500 s cap** |
 
-So the 180 s per-class wall allows CratonVM **5.9x HotSpot** on this class — not
-the ~2.06x this page previously computed from a 87.4 s figure, and not the ~69x
-its sibling gets. Over 8 589 934 592 iterations, 180 s is still
-**21 ns/iteration**; what changed is that HotSpot does it in **3.6 ns/iteration**
-here, not 8-9.
+The 180 s per-class wall over 8 589 934 592 iterations is **21 ns/iteration**;
+HotSpot does it in ~2.4. The class is still roughly an order of magnitude out,
+and the section that says why is [What is left](#what-is-left).
 
-**`probes/io/netty/handler/codec/http/HeaderValidationLoopRate.java` is not
-calibrated on this host and its absolute numbers must not be used.** It
-extrapolates the class to 476 s under HotSpot — 15x the 30.6 s the class actually
-takes. Its window sampling was tuned against the Windows-host distribution, and
-the throw rate it hits here is far above the real 7.7%. Read it only as a
-same-host ratio between two CratonVM binaries, and use `CratonRunner` on the real
-class for anything else. (That is the second instrument on this family of pages
-to have manufactured a result; the sibling page carries the note about
-`DecomposeProbe`'s 43 ns baseline.)
+**`probes/io/netty/handler/codec/http/HeaderValidationLoopRate.java` remains
+uncalibrated on this host and its ABSOLUTE numbers must not be used** — it hits
+a throw rate far above the real 7.7% and extrapolates the class to 10-15x what
+it costs. Read it only as a same-host, same-binary ratio between two arms, and
+use `CratonRunner` on the real class for anything else. Its COUNTERS, on the
+other hand, are exact, and everything decisive on this page below is a counter.
 
-## What the lift bought, and what it did not
+## FIXED: a caught exception no longer leaves compiled code
 
-`HeaderValidationLoopRate`, same host, same `n`, two binaries, interleaved:
+The finding this page carried was right and is now closed. The compiled body
+could not enter its own handler, so every caught exception left the artifact
+entirely — reason-9 deopt, exceptional-frame reconstruction, handler search,
+in-place transfer into the live interpreter frame — ran one interpreted
+iteration, and re-entered at the next hot back edge.
 
-| | value loop | name loop |
+`jit/src/x64/deopt_stubs.rs` now emits, at every throwing site inside one of the
+method's own protected ranges, a **local-handler stub**: it asks
+`jit_local_handler_lookup` which of that bci's candidate handlers takes the
+pending throwable (JVMS order, catch-all first-match, typed entries resolved
+through the compiling class's own loader — the same rule
+`find_jit_exception_handler` applies), and on a hit jumps straight into the
+compiled handler block with the throwable already stored in the frame slot the
+handler's operand stack starts at. On a miss it falls through to exactly the
+edge that ran before, so nothing about the propagating case changes.
+
+**Counted, on `HeaderValidationLoopRate` at `n=100 000`, one binary:**
+
+| | `CRATONVM_JIT_LOCAL_HANDLERS=0` | default (ON) |
 |---|---:|---:|
-| dev (`RBC.6b` in force — the loops are interpreted) | 26 361 ns/iter | 8 638 ns/iter |
-| this branch (the loops compile) | 14 410 ns/iter | 10 606 ns/iter |
+| `osr_entered` | 127 081 | **9** |
+| `osr_exception_handler_entered` | 127 072 | **0** |
+| `local handlers: entered` | 0 | **127 072** |
+| `local handlers: propagated` | 0 | 0 |
+| frame-deopt entries | 167 384 | 167 133 |
 
-Take the ratio, not the absolute: ~1.8x on the value loop, and the name loop is
-inside the run-to-run spread of a host that was running four other release builds
-throughout. The class still hangs at 180 s.
+Every catch is taken in compiled code and the OSR round trip is gone. The last
+row is the point of the rest of this page: **the deopts did not move**, because
+they were never the exception.
 
-That is a far smaller win than "an interpreted loop four to five orders of
-magnitude too slow" implies, and the reason is the finding below.
+`probes/OsrExcRateProbe.java` prices the throw itself. Five identical
+once-invoked loop bodies differing only in throw rate, so the rate=0 arm is the
+control and `(t(rate) - t(0)) x rate` is the per-throw cost. Two interleaved
+rounds:
 
-## The finding: a caught exception costs one OSR round trip
-
-The compiled body cannot enter its own handler. Every caught exception therefore
-**leaves compiled code entirely** — reason-9 deopt, exceptional-frame
-reconstruction, handler search, in-place transfer into the live interpreter
-frame — runs one interpreted iteration, and re-enters the artifact at the next
-hot back edge.
-
-Counted, not inferred. On `HeaderValidationLoopRate` at `n=1e6` the
-`[cratonvm] OSR lifecycle:` line reports `osr_entered=1080047` beside
-`osr_exception_handler_entered=1080038`: one OSR round trip per catch.
-
-`probes/OsrExcRateProbe.java` prices it. Five identical once-invoked loop bodies
-differing only in throw rate, so the rate=0 arm is the control and
-`(t(rate) - t(0)) x rate` is the per-throw cost:
-
-| throw rate | HotSpot ns/iter | CratonVM ns/iter | CratonVM ns per throw |
+| throw rate | HotSpot | flag OFF | flag ON |
 |---|---:|---:|---:|
-| 0 (control) | 1.88 | 71.91 | — |
-| 1/64 | 3.77 | 83.08 | **715** |
-| 1/8 | 3.91 | 400.28 | **2 627** |
-| 1/1 | 8.60 | 2 994.77 | **2 923** |
+| 1/64 | 44.6-45.8 ns | 1 173-1 286 ns | **77-117 ns** |
+| 1/8 | 7.8-8.0 ns | 1 186-1 195 ns | **89-94 ns** |
+| 1/1 | 3.2-3.4 ns | 1 200-1 257 ns | **93-100 ns** |
 
-HotSpot pays 6.7-16 ns. **This page's previous estimate of ~600 ns per
-throw/catch, from `probes/ThrowCostProbe.java`, understated it by ~5x** — that
-probe's `arm` is invoked once per rep and so is method-entry compiled, a
-different tier with a different exception route, and it has no rate sweep to
-separate an expensive throw from a slow loop.
+**~12.5x**, and the gap to HotSpot goes from ~250-370x to ~12-25x. `sink` and
+`caught` are byte-identical in every arm, so this is a speed result and not a
+correctness one.
 
-At the real 7.7% throw rate, 2 900 ns per throw is **223 ns/iteration on its
-own** — ten times the entire 21 ns budget. The throw path, not the call chain, is
-the largest single item on this class.
+On the class's own loops (`HeaderValidationLoopRate`, ratio only): the NAME loop
+goes **5 493-6 723 -> 3 486-3 508 ns/iter**, ~1.6-1.9x. The VALUE loop does not
+move at all, and the deopt census below is why.
 
-`perf record` on the throw-every-iteration arm says that cost is **flat**, not
-one target: interpreted field resolution for the one interpreted iteration each
-catch costs (`resolve_field_ref_loader_aware` 5.0%, `load_class_concurrent_for`
-3.4%, `is_class_initialized_via_manager` 2.5%, the class-manager read lock 2.4%,
-`hash_one::<&str>` plus sip `write` 3.7%, `memcmp` 2.4%), the OSR entry machinery
-(`try_osr_with_backoff` 3.7%, `osr_exit_policy` 3.3%,
-`route_osr_exception_out_of_artifact` 2.6%, `validate_osr_entry` 1.2%), and 8.6%
-in `mi_malloc`/`mi_free`. There is no 10x lever in that list.
+### Two OSR-admission defects fell out of building it
+
+Both were pre-existing, both are one-line refusals that had grown a second
+meaning, and both are why the feature engaged on nothing at all in its first two
+builds — caught by `methods-armed=0`, not by any test:
+
+* **`RBC.6` refused OSR for any method containing `athrow`** (`has_athrow`),
+  because an `athrow` inside a protected range had no compiled handler to go
+  to. With local handlers that premise is gone for exactly the methods that
+  have them, and the refusal is now conditional. It was also refusing methods
+  whose `athrow` is not in a protected range at all, which was never necessary
+  — the sibling page's own `StatusLoopArmsProbe` lost an arm to it.
+* **`osr_entry_bci_is_admissible` refused any OSR entry pc inside a protected
+  range.** Every `try { for (..) {..} } catch` in the language has its back edge
+  inside the `try`, so this refused OSR for the whole shape this class is made
+  of. The reason it gave — that the entry contract cannot describe a frame
+  mid-`try` — is about the HANDLER's frame, which is now the compiled frame's
+  own.
+
+Fixing the first without the second produced `methods-armed=2 sites-emitted=2
+entered=0`: armed, emitted, and never reached. A count of what was EMITTED is
+not a count of what RAN, and only the third counter said so.
+
+### What the feature deliberately does not cover
+
+* **`athrow` inside a `try`.** A `throw` statement caught by its own method
+  still leaves compiled code. Only sites that go through
+  `record_exception_check_edge` — a call, an allocation, a `checkcast` — get a
+  local-handler stub. This class throws from a CALLEE, which is the covered
+  case; a rethrowing handler is not.
+* **A pending NPE / AIOOBE / `ArithmeticException` signal**, which is a request
+  to BUILD a throwable rather than a throwable, and a bare deopt, which is not
+  an exception. Each answers "not mine" and takes the old route.
+* **A method the register allocator has not modelled handler edges for.** The
+  feature requires `precise_exception_frames`, which is what makes
+  `allocate_registers_with_handlers` see the exception edges; without them a
+  local jumping into a handler could read a register another local owns there.
 
 ## What is left
 
-1. **Compiled exception handlers** — enter the handler without leaving compiled
-   code. That is the whole of the 2 900 ns above and it is the largest item. The
-   obstacle is not the exception table (the OSR compile now stages it) but the
-   emitter's operand-stack model: the single-pass backend walks bytecode
-   linearly, so at `handler_pc` its simulated stack is whatever fell through, not
-   the JVMS `[exception]`. Nothing in this VM runs a handler in compiled code
-   today — the method-entry path re-enters the interpreter at the handler too
-   (`route_jit_exception_through_method`) — so this is not OSR-specific and would
-   pay off well beyond this class.
-2. ~~Two cheap, measured items on the OSR round trip.~~ **DONE 2026-08-17.**
-   `osr_exit_policy` was recomputed on every entry though it is a pure function
-   of the artifact (3.3% of the profile); it is memoised on the artifact now.
-   `try_osr` allocated three `String`s and three `Arc<str>`s per entry attempt
-   (part of the 8.6% in the allocator); the frame already held all three as
-   `Arc<str>`, so those are refcount bumps now. Worth **~8% at a 1/8 throw rate
-   and ~6% at 1/1** on `OsrExcRateProbe`, interleaved, two rounds, both agreeing
-   in direction — which is about what the profile predicted, and is also the
-   ceiling on this kind of work. The remaining round-trip cost is item (1).
-3. **21 ns/iteration** still needs the nesting inliner the sibling page is about,
-   and the floor is now measured rather than assumed. `probes/CallArgCostProbe.java`
-   (Azure host, deltas over its own no-call control): a compiled static call is
-   **4.13 ns**, one taking a reference **6.46**, a virtual one **8.19-8.96** —
-   against HotSpot's ~0, because HotSpot inlines all of them. Roughly ten call
-   frames therefore cost 40-80 ns before any of them does any work, and the whole
-   budget for the iteration is 21. No arrangement of real calls fits; not making
-   the calls is the only lever. The sibling page carries the sequenced blocker.
-   **All five steps landed 2026-08-18** — multi-frame deopt resume, a
-   multi-frame OSR-exit transfer with admission relaxed to match, the
-   single-pass scope stack, a real call inside a spliced body, and nesting — and
-   the inliner can now nest. **What that did NOT buy is speed, and the
-   measurement says why.**
+**One thing, and it is not on this page's previous list.**
+`CRATONVM_DBG_DEOPT=1` on `HeaderValidationLoopRate`, `n=100 000`:
+**167 133 frame-deopt entries — 1.67 per loop iteration**, and they are the same
+with the local-handler flag off (167 384), so they are pre-existing and this
+page simply never looked. The census names two sites:
 
-   Step 4's emitted call goes through the blind `jit_invoke_dispatch` helper,
-   because a spliced call has no `direct_calls` equivalent and no inline-cache
-   slot (both are keyed by CALLER pc). On `probes/AssertChainProbe`, one binary,
-   three interleaved rounds, that made the assertion chain **47 -> 163-266
-   ns/iter**, with `CRATONVM_DBG=mic-prof` showing `disp_calls` going
-   **3 870 -> 2 003 361** over 2 000 000 iterations. The premise was inverted:
-   the chain is already direct-bound, so splicing a body removes one frame worth
-   ~4 ns and downgrades the call inside it to a ~175 ns name resolution.
+```
+[cratonvm-deopt] HeaderValidationLoopRate.oldHeaderValueValidationAlgorithm:(Ljava/lang/CharSequence;)V
+                 reason=ReceiverTypeChanged bci=6 action=MakeNotCompilable
+[cratonvm-deopt] HttpHeaderValidationUtil.validateValidHeaderValue:(Ljava/lang/CharSequence;)I
+                 reason=ReceiverTypeChanged bci=1 action=MakeNotCompilable
+```
 
-   The dispatch fallback is therefore opt-in and off
-   (`CRATONVM_JIT_INLINE_CALL_DISPATCH`), so a call-carrying body is admitted
-   only when every call in it is itself spliced. Nesting then recovers the
-   baseline but does not beat it, because the chain's terminal
-   `UNKNOWN.equals(k)` is an `invokevirtual` and cannot nest.
+The receiver at those sites alternates between `AsciiString` and the
+`CharSequence` wrapper the test builds — the loop calls each validator with
+both, deliberately. So the speculation is not mis-tuned; it is **wrong about the
+program**, and no amount of recompiling fixes it. `recommend_action` gives
+`ReceiverTypeChanged` `RecompileAndReinterpret` on every occurrence until the
+per-method count crosses `max_deopts_per_method`, then `MakeNotCompilable` — so
+the method is recompiled per call for a while and then **barred from compilation
+permanently**. `jit/src/x64/bytecode_walk.rs`'s own header comment describes
+this exact trap for a different guard, and moves that screen to compile time to
+avoid it.
 
-   **Direct-binding a spliced call landed later the same day, and it is the
-   first thing in this line of work that made anything faster**: six
-   interleaved rounds, 6/6 faster, 45.1 -> 39.1 ns/iter on the assertion chain
-   (-13%), with `disp_calls` back to ~3 870 in every arm. On the sibling class
-   it turned an opaque `HANG` with `started=0` into `13 started, 12 ok` — real
-   but MARGINAL, at 171 s against a 180 s wall, and a later build put it back
-   over. The ns/iter number is the robust result; the class crossing the wall is
-   a boundary effect on top of it.
+**And the mechanism that was built to prevent it is inert here.** The per-bci
+de-spec registry does fire — the same census carries 482 of these:
 
-   Devirtualising inside a splice also landed and is **inert**, which the
-   engagement counters say outright (`nested-splice-guarded=0`, and
-   `nested-splice=0` — so nesting has never fired either). Two causes: profiling
-   is default-OFF behind `CRATONVM_TIER_PGO`, and with it on the receiver map is
-   still EMPTY at the sites that matter, because the eager-callee-chain compiles
-   those methods before they run their virtual calls interpreted. The next lever
-   is therefore a data problem: read the already-compiled callee's MIC/PIC slot,
-   which holds the receiver class the profile never recorded. That landed
-   2026-08-18 and DOES find the target (`guard on class 1167 (from mic)`), and
-   it exposed a resolver bug worth more than the feature — the native-shadow
-   gate was refusing every override of a shadowed method, which also affects
-   PGO-02's guarded-virtual path in the default build. The guarded splice still
-   does not fire, and the reason is now a FACT rather than a gate to hunt: with
-   every resolver and planner gate cleared, the emitter rolls the splice back
-   (`outer-splice-rolled-back=2`, every nested arm 0) because
-   `objectsAreEqual` carries a value across a branch merge
-   (`iconst_1; goto L; iconst_0; L: ireturn`), which `try_emit_inline_body` has
-   refused since commit 419a6f5. The call this work is about, at pc 16, is never
-   reached. **The next lever is operand-stack merging in the inline emitter**,
-   not more evidence or more binding. That landed the same day: the emitter
-   splices a value-producing merge now, which unblocked `objectsAreEqual` and
-   made the guarded splice fire for the first time
-   (`nested-splice-guarded=1`). Five interleaved rounds: **44.6 -> 33.8
-   ns/iter, −24%**, monotone, with codec-http identical off and on. Details and the full trace are on the
-   sibling page.
+```
+[cratonvm-deopt] per-bci de-spec: ...oldHeaderValueValidationAlgorithm bci=6
+                 (N deopts >= 4) — speculation suppressed on next compile
+                 (method stays compilable)
+```
 
-   The chain's first two steps were VM work rather than compiler work: an artifact
-   carrying an inlined caller scope cannot be OSR-entered at all
-   (`osr_exit_policy` refuses `caller.is_some()`, because the in-place OSR-exit
-   transfer is single-frame), and both these classes' hot methods are `@Test`
-   bodies for which OSR is the only door. So multi-frame resume and a multi-frame
-   OSR transfer come before inline scopes, calls inside spliced bodies, and
-   nesting — same work for both classes.
+but `despec_contains` is only ever CONSULTED at four places
+(`jit/src/x64/driver.rs`'s two loop-hoist gates and two intrinsic sites in
+`bytecode_walk.rs`), all of them speculative **bounds-check** elimination.
+Nothing on the receiver-guard path reads it. So the registry records the site,
+prints a line claiming the speculation is suppressed, the next compile emits the
+same receiver guard anyway, and the method is blacklisted regardless — a feature
+that reports itself on while being structurally inert, the same shape as the
+field-site cache that shipped switched off.
 
-An honest reading is that this class remains the furthest from reach of the three
-`codec-http` walls — which is what the 2026-08-17 revision concluded — but the
-reason has moved again. It is not "the loops never compile" (fixed), and it is
-not mainly the call chain; it is that every thirteenth iteration leaves compiled
-code and comes back.
+**The next lever is therefore to make receiver-type speculation consult the
+de-spec registry**, so a bci that has already deopted `PER_BCI_DESPEC_LIMIT`
+times is compiled without the guard and the method stays compiled. That is one
+read in the emitter and a policy arm in `recommend_action`; what makes it
+delicate rather than trivial is that the `MakeNotCompilable` escalation is
+load-bearing and was tuned by measurement (see the Tomcat
+`TestResponsePerformance` note on `DeoptReason::OsrExit`), so it needs its own
+A/B with the deopt count as the counter — **1.67 per iteration is the number to
+move.**
+
+Everything else this page used to list as remaining is either done or measured
+dead:
+
+1. ~~**Compiled exception handlers.**~~ **DONE 2026-08-20**, above.
+2. ~~Two cheap items on the OSR round trip.~~ DONE 2026-08-17.
+3. **The call chain and the 21 ns/iteration floor.** Unchanged and still real:
+   `probes/CallArgCostProbe.java` prices a compiled static call at **4.13 ns**,
+   one taking a reference at **6.46**, a virtual one at **8.19-8.96**, against
+   HotSpot's ~0. Ten call frames cost 40-80 ns before any of them works, and the
+   budget for the whole iteration is 21. But this is now the SECOND item, not
+   the first: at 1.67 deopts per iteration the call frames are not what the
+   iteration is spending its time on.
+4. **The inline chain the sibling page documents does not reach this loop, and
+   cannot.** `compile_osr_artifact` hands the backend an EMPTY `inline_sites`
+   map, so an OSR artifact splices nothing — ever — and a `@Test` body invoked
+   once has no other compiled form. Everything the sibling page's five steps
+   bought is collected inside the CALLEES. `probes/OsrVsEntryInlineProbe.java`
+   prices wiring the planner into the OSR door by running one loop body through
+   both doors in one process, and the answer is **no difference** (47.16 vs
+   47.43, 49.76 vs 53.99, 46.44 vs 47.23 ns/iter over three rounds, with
+   `CRATONVM_JIT_MAIN_INLINE` inert in both). Do not spend a session on it.
 
 ## Repro
 
@@ -206,45 +216,65 @@ timeout 1500 java @common.args CratonRunner io.netty.handler.codec.http.HttpHead
 timeout 1500 cratonvm --java-home <jdk> -Xmx1500m @common.args CratonRunner io.netty.handler.codec.http.HttpHeaderValidationUtilTest
 ```
 
+The A/B for the local-handler fix, one binary:
+
 ```bash
 cratonvm --java-home <jdk> -cp . OsrExcRateProbe 2000000
 ```
 
 ```bash
-CRATONVM_DBG=jit-method-stats cratonvm --java-home <jdk> @common.args io.netty.handler.codec.http.HeaderValidationLoopRate 1000000 2>&1 | grep 'OSR lifecycle'
+CRATONVM_JIT_LOCAL_HANDLERS=0 cratonvm --java-home <jdk> -cp . OsrExcRateProbe 2000000
 ```
 
+The counters that prove it:
+
 ```bash
-CRATONVM_JIT_OSR_EXC_TABLE=0 cratonvm --java-home <jdk> @common.args io.netty.handler.codec.http.HeaderValidationLoopRate 65536
+CRATONVM_DBG=jit-method-stats cratonvm --java-home <jdk> @common.args io.netty.handler.codec.http.HeaderValidationLoopRate 100000 2>&1 | grep -E 'local handlers|OSR lifecycle'
+```
+
+The deopt census that names what is left:
+
+```bash
+CRATONVM_DBG_DEOPT=1 cratonvm --java-home <jdk> @common.args io.netty.handler.codec.http.HeaderValidationLoopRate 20000 2>&1 | grep 'reason=' | sort | uniq -c | sort -rn | head
+```
+
+The eight-shape correctness gate for compiled handlers — two typed handlers over
+one range, a strict-subclass catch, a propagating throw, a `finally`, a nested
+`try`, a rethrowing handler, and a locals-survive arm — which must print the
+same digest under HotSpot, under `--nojit`, and with the flag off and on:
+
+```bash
+cratonvm --java-home <jdk> -cp . LocalHandlerShapeProbe 200000
 ```
 
 ## What was ruled out
 
-Unchanged from the 2026-08-17 revision, and still worth not repeating:
-
 * **The `ByteBuffer.putInt(0, i)` native floor.** Thin direct helpers for
   `Buffer.session()` and `ScopedMemoryAccess.{put,get}IntUnaligned` were written
-  and reverted, because the census says they never bind: those JDK accessors take
-  the optimizing (IR) pipeline, whose direct-call lowering is register-only
-  (`emit_direct_cross_call` requires `num_args + needs_context <= 4` on Windows),
-  so a 6-argument `putIntUnaligned` cannot be bound there at all. With the helpers
-  on and off, `--dump-native-registry` reports the identical census. Anyone
-  picking this up should start by giving the IR path stack-arg marshalling, not by
-  writing more helpers.
+  and reverted, because the census says they never bind: those JDK accessors
+  take the optimizing (IR) pipeline, whose direct-call lowering is register-only
+  (`emit_direct_cross_call` requires `num_args + needs_context <= 4` on
+  Windows), so a 6-argument `putIntUnaligned` cannot be bound there at all. With
+  the helpers on and off, `--dump-native-registry` reports the identical census.
+  Anyone picking this up should start by giving the IR path stack-arg
+  marshalling, not by writing more helpers.
 * **The 120 s JUnit method timeout not firing.** `common.args` sets
   `-Djunit.jupiter.execution.timeout.default=120s`, and Jupiter's default
-  `SAME_THREAD` mode cannot preempt a synchronous non-interruption-checking loop.
-  Not a separate defect.
+  `SAME_THREAD` mode cannot preempt a synchronous non-interruption-checking
+  loop. Not a separate defect. (The sibling class demonstrates the consequence:
+  it now runs 13/13 `ok` in 193.8 s with that property set.)
+* **Wiring the inline planner into the OSR door**, item 4 above — measured, not
+  argued.
 
 ## Related
 
 * `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`
-  — what this page's blocker turned out to be, and the fix. It also records the
-  two vacuous greens the fix passed through, both caught by an engagement counter
-  and neither visible in any correctness result.
+  — what this page's first blocker turned out to be, and the fix. It also
+  records the two vacuous greens the fix passed through, both caught by an
+  engagement counter and neither visible in any correctness result.
 * [`httpresponsestatustest-exhaustive-loop-timeout-20260816.md`](httpresponsestatustest-exhaustive-loop-timeout-20260816.md)
-  — the sibling. Genuinely a different problem: no `try` anywhere, so it compiled
-  all along and its residual is the non-nesting inliner.
+  — the sibling, which is 7% off its wall rather than an order of magnitude, and
+  which carries the measurement that the OSR door plans no inline sites.
 * `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md` (retired 2026-08-20)
   — the native-call floor this class's `ByteBuffer.putInt` pays once per
   iteration.

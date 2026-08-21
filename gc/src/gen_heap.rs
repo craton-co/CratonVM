@@ -17417,32 +17417,12 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
     // for a primitive slot) plus a rate-limited diagnostic, turning an
     // unrecoverable crash into a localizable one. The fast path is one aligned
     // 32-bit load + a predictable compare on top of the read already happening.
-    match cratonvm_types::read_value_checked_atomic(ptr as *const Value) {
-        Some(v) => v,
-        None => {
-            static CORRUPT_HITS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = CORRUPT_HITS.fetch_add(1, Ordering::Relaxed);
-            if n < 32 || gc_flags().diag_hib32 {
-                // SAFETY: `ptr` is a readable, 8-byte-aligned 16-byte slot
-                // (caller contract) -- read atomically (PLAIN-SLOT TEARING
-                // FIX, 2026-07-06) so this diagnostic dump itself can't tear
-                // against a concurrent plain writer on another thread.
-                let raw0 = (*(ptr as *const AtomicU64)).load(Ordering::Relaxed);
-                let raw1 = (*(ptr.add(8) as *const AtomicU64)).load(Ordering::Relaxed);
-                tracing::error!(
-                    target: "cratonvm::gc::guard",
-                    slot = ?ptr,
-                    raw0 = format!("{:#018x}", raw0),
-                    raw1 = format!("{:#018x}", raw1),
-                    "gen_heap::read_slot: corrupt Value cell (out-of-range \
-                     discriminant) — returning null instead of a UB-on-match \
-                     Value. Heap reference-integrity defect (see HIB-CV-32).",
-                );
-            }
-            Value::Object(None)
-        }
-    }
+    //
+    // The body now lives in `heap::read_value_cell_checked` so all four
+    // legacy-cell readers share ONE implementation. They did not, and the three
+    // that skipped this screen turned the same corrupt cell into a SIGSEGV while
+    // this one reported it — see that helper for the measurement.
+    crate::heap::read_value_cell_checked(ptr as *const Value, "gen_heap::read_slot")
 }
 
 /// Write a `Value` to a slot pointer.
