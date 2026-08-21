@@ -161,7 +161,17 @@ image verdict, and they change the verb:
 | 25 | `native-builtins/logging_shims.rs::register_printstream_fallback_natives` | 13 | 2 | 13 | 0 | 0 | **no** |
 
 **Nineteen of the top twenty-five have never been named as a retirement
-candidate anywhere in this directory.** `H14-3` prices thirteen of them.
+candidate anywhere in this directory.**
+
+**`H14-3` priced thirteen of them, and the answer is better than this table
+looks.** Rows 2, 3, 5, 7 and 13 above cost **zero vectors** — `StringBuilder`,
+the 26 exception classes, `ArrayDeque`, `HexFormat`, `Optional`, together 174
+rows and 12.4% of the whole defect. Rows 8, 9, 10 and 12 cost one vector each;
+row 6 (`BigInteger`) costs 2 and row 4 (the `java.nio.file` group) costs 5.
+Row 14, `java/util/Properties`, is **65 / 104** — worse than `HashMap` and the
+deepest dependency measured anywhere. Row 1, the monolith, is 28 / 104.
+**The ranking by rows and the ranking by cost are almost unrelated**, which is
+the argument for pricing before planning.
 
 ### 5a. The positive control that says retirement works, and the one that says it is partial
 
