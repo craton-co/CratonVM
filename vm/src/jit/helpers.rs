@@ -5027,10 +5027,10 @@ pub unsafe extern "C" fn jit_ldc_class_cp(
         return 0;
     }
     // Resolution can run a user `ClassLoader.loadClass`, i.e. arbitrary Java
-    // that can itself GC — cross the boundary before it, exactly as
-    // `jit_new_object_cp` does.
+    // that can itself GC — so the cold arm crosses the boundary the way
+    // `jit_new_object_cp` does. The SATB flush waits for that arm: a recorded
+    // hit is a map lookup and has nothing to flush.
     crate::jit::conservative_roots::note_jit_boundary();
-    jit_safepoint_flush_satb(vm_ptr);
     // SAFETY: see `jit_new_object_cp`.
     let vm = &*(vm_ptr as *const SharedVm);
     let holder_cid = ClassId::new(holder_class_id as u32);
@@ -5179,10 +5179,12 @@ pub unsafe extern "C" fn jit_ldc_string_cp(vm_ptr: i64, holder_class_id: i64, cp
     if vm_ptr == 0 {
         return 0;
     }
-    // Interning allocates and the miss path takes the class-manager lock, so
-    // cross the boundary exactly as `jit_ldc_class_cp` does.
+    // The Rust<->JIT boundary bookkeeping is owed on BOTH arms; the SATB flush
+    // is owed only on the COLD one. A recorded hit allocates nothing, reaches
+    // no safepoint and performs no reference store, so it has nothing to
+    // flush — the same split the `VarHandle` read helper's fast path takes.
+    // The cold arm interns, and flushes immediately before it does.
     crate::jit::conservative_roots::note_jit_boundary();
-    jit_safepoint_flush_satb(vm_ptr);
     // SAFETY: see `jit_ldc_class_cp`.
     let vm = &*(vm_ptr as *const SharedVm);
     let holder = ClassId::new(holder_class_id as u32);
