@@ -119,3 +119,26 @@ the right instinct and worth copying.
 * **N3 — `Modifier.isAbstract(o.getClass().getModifiers())` is a one-line
   universal assertion** and no vector makes it. Any VM-minted receiver failing
   it is a defect by JVMS §6.5, with no oracle run required.
+
+---
+
+## VERIFIED ON A BUILD (lane H0, 2026-08-21)
+
+Built at `757a9cf4f` (`cratonvm-r8.exe`, 0 errors), `--jdk-only`:
+
+```
+                        CratonVM                      HotSpot 25.0.3+9
+Pipe.open()   ->  sun.nio.ch.PipeImpl  abstract=false   sun.nio.ch.PipeImpl  abstract=false
+source        ->  sun.nio.ch.SourceChannelImpl          sun.nio.ch.SourceChannelImpl
+sink          ->  sun.nio.ch.SinkChannelImpl            sun.nio.ch.SinkChannelImpl
+```
+
+**Byte-identical to the oracle on all three lines**, against
+`java.nio.channels.Pipe` / `abstract=true` before. The VM no longer hands out an
+instance of an abstract class here.
+
+§5's caveat that "whether any vector exercises `Pipe.open()`'s class identity is
+unknown" is now moot for the fix itself — this probe exercises it directly — but
+remains true for the corpus, which still asks nothing about it. The
+`Modifier.isAbstract` assertion nominated in §6 N3 would have caught this defect
+with no oracle run at all, and is still not in the suite.

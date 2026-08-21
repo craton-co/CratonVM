@@ -341,3 +341,42 @@ a single-threaded measurement on a quiet host.
   and the COMMIT of the measurement in the comment itself. This one cost
   seventeen days of not attempting a fix, and the repair for one of its two
   named symptoms landed in this same directory the day before this lane opened.
+
+---
+
+## VERIFIED ON A BUILD (lane H0, 2026-08-21) — and it is a COMPATIBLE-mode win
+
+Built at `757a9cf4f` (`cratonvm-r8.exe`, 0 errors). Same probe as `H16-3`'s
+reproduction: three `HashMap`s, three puts each, `HashMap.table` read
+reflectively, **UNARMED `--jdk-only`**.
+
+| | before (`r6`) | after (`r8`) | HotSpot |
+|---|---|---|---|
+| map1 buckets | real 0, fabricated 3 | **real 3, fabricated 0** | real 3 |
+| map2 buckets | real 0, fabricated 3 | **real 3, fabricated 0** | real 3 |
+| map3 buckets | real 0, fabricated 1 | **real 1, fabricated 0** | real 1 |
+
+**Every node is now a real `java.util.HashMap$Node`, with no dial armed.** This
+is a fix in the shipping default configuration, not a strict-mode-only change
+and not something that needed the enforcement dial to matter — which is worth
+stating because `H16-3` had just shown that the dial measures a hybrid no
+retirement reaches. This result does not depend on the dial at all.
+
+### The array component type is still wrong, exactly as this lane nominated
+
+```
+tableCls = [Ljava.lang.Object;        CratonVM, after the fix
+tableCls = [Ljava.util.HashMap$Node;  HotSpot
+```
+
+So a real `Node` now lives inside an `Object[]`. That is the **`new_ref_array`**
+half of the sentinel — 29 sites tree-wide (`H0-6` §10) — and this lane said
+plainly it was nominating rather than fixing it. Confirmed outstanding.
+
+**Consequence worth being explicit about:** the two halves fail in opposite
+directions. A fabricated node in a real `Node[]` throws `ArrayStoreException`; a
+real node in an `Object[]` stores fine but leaves `getClass()` on the array
+wrong and any code reading the array's component type misled. **Fixing only one
+half does not make the pair correct**, and the order matters — node class first
+(done here) is the safe order, since the reverse would have produced a real
+`Node[]` full of fabrications, which is precisely the armed hybrid.
