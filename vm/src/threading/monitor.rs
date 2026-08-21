@@ -192,6 +192,18 @@ pub fn signal_stack_dump_to_waiters() {
 /// hot contended-enter path stays byte-for-byte unchanged in normal runs
 /// (plain `entry_condvar.wait`); the poll variant runs only under the flag.
 /// Read once and cached so the per-enter check is a single relaxed load.
+/// `CRATONVM_WAIT_SPURIOUS_MS=<n>` — see the call site in `Monitor::wait`.
+/// Diagnostic only; `None` (unset) leaves the wait loop unchanged.
+fn wait_spurious_ms() -> Option<u64> {
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_WAIT_SPURIOUS_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    })
+}
+
 pub fn mon_enter_dump_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_MONENTER").is_ok())
@@ -1061,8 +1073,31 @@ impl Monitor {
                 // Untimed wait. Loop with periodic interrupt checks until
                 // notify() wakes us or the interrupt flag is set.
                 if let Some(flag) = interrupted {
+                    // DIAGNOSTIC A/B (netty ParameterizedSslHandlerTest promise
+                    // stall, 2026-08-21). `CRATONVM_WAIT_SPURIOUS_MS=<n>` makes
+                    // this untimed wait return to Java after `n` ms even with no
+                    // notify. A spurious wakeup is explicitly permitted by
+                    // JLS 17.2.1, and every correct caller re-checks its
+                    // condition in a `while` loop — netty's
+                    // `DefaultPromise.awaitUninterruptibly` does exactly that.
+                    //
+                    // It exists to PARTITION the stall, on ONE binary, without a
+                    // cross-binary comparison: if the stall disappears under it,
+                    // the promise had already completed and the notification was
+                    // lost, so the defect is in this monitor. If the stall
+                    // survives, the promise was never completed and the defect is
+                    // upstream, in whatever should have run the task.
+                    //
+                    // Default OFF: unset leaves the loop byte-for-byte as it was.
+                    let spurious_after = wait_spurious_ms();
+                    let started = std::time::Instant::now();
                     loop {
                         let result = self.wait_condvar.wait_for(&mut state, poll_interval);
+                        if let Some(ms) = spurious_after {
+                            if started.elapsed() >= std::time::Duration::from_millis(ms) {
+                                break;
+                            }
+                        }
                         if flag.load(std::sync::atomic::Ordering::Acquire) {
                             was_interrupted = true;
                             // LOST-WAKEUP FIX (see the timed branch above): if a
