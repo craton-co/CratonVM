@@ -3433,8 +3433,42 @@ pub(crate) fn sb_read_chars(ctx: &dyn NativeContext, this: cratonvm_types::Objec
                 _ => 0,
             });
         }
+        return chars;
     }
-    chars
+    // `sb_state` yields `None` for a builder whose `value` is the real compact
+    // `byte[]`, and returning an empty vector here was NOT a refusal — it was a
+    // wrong answer with a plausible shape.
+    //
+    // The caller that matters is `native_string_init_abstract_string_builder`,
+    // i.e. `String(AbstractStringBuilder, Void)`. MEASURED, `javap -p -c
+    // --system <jdk-25> java.lang.StringBuilder`, that IS `toString()`:
+    //
+    // ```text
+    //    1: invokevirtual  Method length:()I
+    //    4: ifne  10
+    //    7: ldc   String ""            // the empty-builder fast path
+    //   16: invokespecial Method java/lang/String."<init>":(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V
+    // ```
+    //
+    // so any builder that real `AbstractStringBuilder` bytecode constructed —
+    // which the doc comment on that constructor already names ("Byte Buddy can
+    // execute that real bytecode while retransformation is in progress") —
+    // stringified to "". No exception, `rc=0`, and `length()` answering the
+    // right number the whole time.
+    //
+    // MEASURED reproduction with the `--jdk-only` enforcement dial armed on
+    // `java/lang/StringBuilder,java/lang/AbstractStringBuilder`:
+    // `value = byte[16]`, `coder = 0`, `count = 2`, `sb.length() == 2`, and
+    // `sb.toString().length() == 0` with a `byte[0]` behind it. That is the
+    // "every append silently discarded, `toString()` empty, `rc=0`" behaviour
+    // `H22` measured on `register_string_builder_natives`, and this is where it
+    // was produced.
+    //
+    // `sb_value_units` reads either layout, so the answer is now the builder's
+    // actual content in both.
+    let mut units = sb_value_units(ctx, this).unwrap_or_default();
+    units.truncate(count.min(units.len()));
+    units
 }
 
 /// Helper: write a Vec<u16> back into a StringBuilder, replacing all content.
