@@ -1,5 +1,5 @@
 import java.util.*;
-public class HmStress {
+public class HashMapArmedStressProbe {
     public static void main(String[] a) {
         HashMap<String,Integer> m = new HashMap<>();
         for (int i = 0; i < 3000; i++) m.put("k"+i, i);

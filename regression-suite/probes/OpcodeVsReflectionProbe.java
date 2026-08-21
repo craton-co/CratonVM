@@ -1,5 +1,5 @@
 import java.util.*;
-public class InstOf2 {
+public class OpcodeVsReflectionProbe {
     static void row(String tag, Object o) {
         boolean iAM = o instanceof AbstractMap,        rAM = AbstractMap.class.isInstance(o);
         boolean iAC = o instanceof AbstractCollection,  rAC = AbstractCollection.class.isInstance(o);

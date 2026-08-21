@@ -1,6 +1,6 @@
 import java.util.*;
 import java.util.stream.*;
-public class HsPresent2 {
+public class HashSetPresentProbe {
     static void chk(String tag, Set<String> s) {
         try {
             int before = s.size();

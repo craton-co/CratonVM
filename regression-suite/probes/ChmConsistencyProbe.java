@@ -1,6 +1,6 @@
 import java.util.*;
 import java.util.concurrent.*;
-public class ChmSeq {
+public class ChmConsistencyProbe {
     public static void main(String[] a) {
         ConcurrentHashMap<String,String> m1 = new ConcurrentHashMap<>();
         for (int i = 0; i < 4; i++) m1.put("k"+i, "v"+i);
