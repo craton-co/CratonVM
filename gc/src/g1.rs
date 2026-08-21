@@ -310,6 +310,17 @@ pub fn kept_seeds_rejected() -> usize {
 /// over-retains — the moving collectors have to screen it themselves.
 pub static NON_OBJECT_ROOT_SEEN: AtomicUsize = AtomicUsize::new(0);
 
+/// How many pauses have run with a live compiled frame and an EMPTY
+/// conservative JIT root publication — the state that forces
+/// `G1Collector::collect_garbage` to decline evacuation.
+///
+/// Drives the throttled warning only; the reported metric is
+/// `gc_metrics::g1_empty_jit_publication_count`, which this deliberately does
+/// not duplicate as a source of truth. Separate from `NON_OBJECT_ROOT_SEEN`
+/// because the two answer different questions: that one counts roots whose
+/// BYTES are not an object, this one counts pauses with no roots at all.
+pub static EMPTY_JIT_PUBLICATION_SEEN: AtomicUsize = AtomicUsize::new(0);
+
 /// How many of [`NON_OBJECT_ROOT_SEEN`] were nevertheless COPIED to a new
 /// address by `evacuate_object` — i.e. how many times the evacuator computed a
 /// size from garbage, memcpy'd that many bytes, installed a forwarding entry
@@ -10235,6 +10246,117 @@ impl G1Collector {
         coverage_incomplete.filter(|_| lever_on)
     }
 
+    /// Whether this pause is running with a live compiled frame AND an empty
+    /// conservative JIT root publication.
+    ///
+    /// # Why this is a fail-safe where `root_coverage_incomplete_reason` is a
+    /// diagnostic
+    ///
+    /// [`Self::root_coverage_incomplete_reason`]'s header argues at length that
+    /// every incomplete-coverage reason is nonetheless *backed by a
+    /// conservative scan whose roots G1 pins*, and it is right — which is why
+    /// its refusal is an opt-in lever that fires on ~99.9% of pauses and
+    /// selects nothing. But that argument has a premise: that the scan
+    /// published something. This predicate is the case where the premise is
+    /// false.
+    ///
+    /// With `jit_active=true`, `pin_addrs=0` is being consumed as "there are no
+    /// JIT roots". What it actually means is "the scan found none", which is
+    /// **unknown**, not **none**. An empty publication and a genuinely
+    /// reference-free compiled frame are indistinguishable at the point where
+    /// the collection set is built, and only one of them is safe to evacuate.
+    /// The generational collector never faces the question — it moves nothing
+    /// at all while any thread is in JIT. G1 moves everything it was not told
+    /// to pin, and is therefore exposed exactly when the telling comes up
+    /// empty.
+    ///
+    /// Measured instance: `PolynomialTest` under `-XX:+UseG1GC --Xmx 1g` takes
+    /// one young pause, at which `jit_active=true pin_addrs=0 pin_regions={}`,
+    /// and the region holding the object a compiled `StringLatin1.newString`
+    /// was using goes into the collection set. The failure surfaces four frames
+    /// later as `IllegalFormatConversionException: d != java.lang.Object`.
+    ///
+    /// # This predicate only means what it says because of the fix in `roots.rs`
+    ///
+    /// It was first written believing `pin_addrs=0` under a live compiled frame
+    /// meant the conservative scan had run and found nothing. It did not. The
+    /// scan was being SKIPPED: `collect_roots` took the precise-only branch
+    /// whenever the oop-map coverage proof passed, and G1's pin set is built
+    /// from that scan's output alone, so an empty publication was simply what
+    /// precise mode looked like from here. Measured with
+    /// `CRATONVM_DBG_JIT_ROOTSCAN`: `precise_only=true scan_added=0` on the
+    /// failing test, `precise_only=false scan_added=14` on a JIT-heavy probe
+    /// that never trips this predicate at all.
+    ///
+    /// That is why refusing on it was ruinous before the fix — it refused every
+    /// precise-mode pause: 1444 consecutive no-op pauses on `PolynomialTest`
+    /// and `OutOfMemoryError` on 8 tests, the same wall
+    /// `CRATONVM_G1_COVERAGE_PIN` hits at its ~99.99% rate. The predicate was
+    /// detecting a MODE, not a defect.
+    ///
+    /// `collect_roots` no longer lets G1 take that branch, so the conservative
+    /// scan always runs under this collector and an empty publication is once
+    /// again the thing this function claims: the scan ran and found nothing
+    /// while a compiled frame was live. That is a genuine anomaly and worth
+    /// counting — which is what `record_g1_pause_empty_jit_publication` does,
+    /// on every run, ungated.
+    ///
+    /// `CRATONVM_G1_PIN_EMPTY_PUBLICATION` remains OFF and remains a bisection
+    /// lever rather than protection: a refusal reclaims nothing, so it can only
+    /// buy time for a publication that later becomes non-empty. It is kept for
+    /// the case where this counter goes non-zero again and the question is once
+    /// more "is a relocation under an unproven root set what is failing here?".
+    ///
+    /// # What this does not catch
+    ///
+    /// Both halves are process-wide. `is_active()` is a striped global depth
+    /// with no thread identity, and the pin map is summed across every thread's
+    /// entry, so what this actually asks is "some thread is in JIT and NO
+    /// thread published anything". The stricter question — did EVERY thread
+    /// currently in JIT publish something? — needs per-thread accounting the
+    /// quiescence API does not expose: a peer in JIT that published nothing is
+    /// invisible here as soon as any OTHER thread published one address.
+    ///
+    /// That residual is narrower than the hole it closes and is not what the
+    /// `PolynomialTest` failure was (`pin_addrs=0` was the process-wide total),
+    /// but it is real, and it is a reason to prefer candidate fix 2 — repairing
+    /// the scan — over widening this predicate. See
+    /// `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    fn empty_jit_publication(&self) -> bool {
+        // "A compiled frame is live." `is_active()` counts only JIT entries
+        // that pushed a `JitEntryGuard`; a frame reached without one (the
+        // process entry point into app `main`, and the other A5 cases) holds
+        // the only reference to an object exactly as well. Ask both detectors,
+        // because either one saying yes makes an empty publication unsafe.
+        let frames_live = crate::gc_quiescence::is_active()
+            || crate::gc_quiescence::unregistered_jit_frame_on_stack();
+        if !frames_live {
+            return false;
+        }
+        // "The publication is empty." Both pin vocabularies, since either one
+        // being non-empty means the scan produced something for this pause to
+        // pin and the premise above holds again. This mirrors
+        // `jit_pinned_region_set`, which is the consumer whose empty result is
+        // the actual hazard — keep the two in step.
+        crate::gc_quiescence::pinned_jit_root_count() == 0
+            && self.jit_tlab_skip_regions.lock().is_empty()
+    }
+
+    /// Whether this pause must decline to evacuate because of an empty JIT root
+    /// publication: the detection from [`Self::empty_jit_publication`] AND the
+    /// opt-in `CRATONVM_G1_PIN_EMPTY_PUBLICATION` lever.
+    ///
+    /// A pure function of its two inputs so both arms are testable —
+    /// `gc_flags()` latches for the process, so a test cannot flip the lever
+    /// from inside one. Same shape and same polarity as
+    /// [`Self::refuse_evacuation`]: both refusals are opt-in, because neither
+    /// reclaims anything and a pause that frees nothing is re-triggered by the
+    /// next allocation. See [`Self::empty_jit_publication`] for what this one
+    /// turned out to be detecting before `collect_roots` was fixed.
+    fn refuse_evacuation_for_empty_publication(detected: bool, lever_on: bool) -> bool {
+        detected && lever_on
+    }
+
     /// [`Self::jit_pinned_region_set`] PLUS every region holding a root that is
     /// not the start of a live object.
     ///
@@ -11706,25 +11828,78 @@ impl GarbageCollector for G1Collector {
         // Only the REFUSAL is gated, and it is OFF by default — see
         // `root_coverage_incomplete_reason` for the measurement that says why.
         let refuse = Self::refuse_evacuation(coverage_incomplete, gc_flags().g1_coverage_pin);
+        // The second, NARROW detection: a compiled frame is live and the
+        // conservative scan published nothing to pin, so `pin_addrs=0` cannot be
+        // read as "no JIT roots". Counted on EVERY run; acting on it is opt-in
+        // (`CRATONVM_G1_PIN_EMPTY_PUBLICATION`) because refusing a pause whose
+        // publication is persistently empty starves the heap rather than saving
+        // it — see `empty_jit_publication` for the measurement.
+        let empty_publication = self.empty_jit_publication();
+        if empty_publication {
+            crate::gc_metrics::record_g1_pause_empty_jit_publication();
+            // Warn on the DETECTION, not the refusal: this is the state in
+            // which G1 evacuated a live JIT-held object, and it is worth saying
+            // so even on a run that goes on to evacuate anyway. First eight,
+            // then powers of two.
+            let n = EMPTY_JIT_PUBLICATION_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] pause #{n} ran with a live compiled frame and an EMPTY JIT \
+                     root publication: `pin_addrs=0` here means the conservative scan \
+                     found none, not that there are none, so this pause evacuated \
+                     against a root set it could not prove. The scan is what needs \
+                     repairing; CRATONVM_G1_PIN_EMPTY_PUBLICATION only declines the \
+                     pause, which on a persistently-empty publication trades the wrong \
+                     answer for an OutOfMemoryError."
+                );
+            }
+        }
+        let refuse_empty_publication = Self::refuse_evacuation_for_empty_publication(
+            empty_publication,
+            gc_flags().g1_pin_empty_publication,
+        );
+        if gc_flags().g1_dbg_pins && refuse_empty_publication {
+            eprintln!(
+                "[g1][PINS] pause REFUSED: jit_active={} unregistered_frame={} \
+                 pin_addrs=0 tlab_skips=0 -> empty CSet",
+                crate::gc_quiescence::is_active(),
+                crate::gc_quiescence::unregistered_jit_frame_on_stack(),
+            );
+        }
+        // Which refusal names this pause in the decision report. The
+        // empty-publication reason wins when both apply: it is the strictly
+        // more specific statement, and the coverage lever (opt-in, ~100% rate)
+        // subsumes this case whenever it is on, so recording IT here would hide
+        // every real instance behind a reason that means almost nothing.
+        let (decision, degraded_reason_bit) = if refuse_empty_publication {
+            (
+                crate::gc_metrics::decision_reason::NON_MOVING_G1_EMPTY_JIT_PUBLICATION,
+                crate::gc_metrics::g1_degraded::JIT_PUBLICATION_EMPTY,
+            )
+        } else if refuse.is_some() {
+            (
+                crate::gc_metrics::decision_reason::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE,
+                crate::gc_metrics::g1_degraded::ROOT_COVERAGE_INCOMPLETE,
+            )
+        } else {
+            (
+                crate::gc_metrics::decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
+                crate::gc_metrics::g1_degraded::NONE,
+            )
+        };
         crate::gc_metrics::record_collector_decision(
             "g1",
-            match refuse {
-                Some(_) => {
-                    crate::gc_metrics::decision_reason::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE
-                }
-                None => crate::gc_metrics::decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
-            },
+            decision,
             coverage_incomplete.unwrap_or(crate::gc_quiescence::incomplete_reason::NONE),
         );
-        if refuse.is_some() {
+        if refuse.is_some() || refuse_empty_publication {
             crate::gc_metrics::record_g1_cycle(
                 crate::gc_metrics::g1_cycle_kind::YOUNG,
                 0,
                 0,
                 0,
                 0,
-                crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET
-                    | crate::gc_metrics::g1_degraded::ROOT_COVERAGE_INCOMPLETE,
+                crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET | degraded_reason_bit,
             );
             self.native_alloc_pressure.store(false, Ordering::Relaxed);
             return GcResult {
@@ -14656,6 +14831,180 @@ mod tests {
             Some(crate::gc_quiescence::incomplete_reason::OSR_SHADOW),
         );
         crate::gc_quiescence::clear_force_non_moving_jit_roots();
+    }
+
+    /// The empty-publication fail-safe's two arms, stated on the pure decision
+    /// function for the same reason as `the_coverage_lever_gates_only_the_refusal`:
+    /// `gc_flags()` latches process-wide and a test cannot flip it from inside
+    /// one.
+    ///
+    /// Both G1 refusals are opt-in, for different measured reasons. The
+    /// coverage lever because its detection fires on ~99.99% of pauses and so
+    /// selects nothing; this one because refusing on a PERSISTENTLY empty
+    /// publication starves the heap — on `PolynomialTest` it turns one wrong
+    /// answer into 1444 no-op pauses and `OutOfMemoryError` on 8 tests.
+    #[test]
+    fn the_empty_publication_refusal_is_opt_in() {
+        assert!(
+            !G1Collector::refuse_evacuation_for_empty_publication(true, false),
+            "default: the unsafe state is DETECTED and counted, not acted on -- \
+             declining the pause does not repair the scan, it only trades a \
+             wrong answer for an OutOfMemoryError"
+        );
+        assert!(
+            G1Collector::refuse_evacuation_for_empty_publication(true, true),
+            "lever on: this pause must not evacuate, so a failure that survives \
+             it is not caused by evacuating under an empty publication"
+        );
+        assert!(
+            !G1Collector::refuse_evacuation_for_empty_publication(false, false),
+            "publication non-empty: the scan produced roots, pin them and \
+             evacuate the rest as usual"
+        );
+        assert!(
+            !G1Collector::refuse_evacuation_for_empty_publication(false, true),
+            "publication non-empty: the lever changes nothing here"
+        );
+    }
+
+    /// No compiled frame is live, so an empty publication is genuinely EMPTY
+    /// and not merely unobserved. This is the overwhelmingly common case and it
+    /// must not trip the fail-safe -- otherwise every pause on a `--nojit` run
+    /// would refuse to evacuate.
+    #[test]
+    fn a_pause_with_no_live_compiled_frame_is_not_an_empty_publication() {
+        let gc = make_collector();
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+        assert!(
+            !gc.empty_jit_publication(),
+            "no JIT frame live: pin_addrs=0 means none, not unknown"
+        );
+    }
+
+    /// An unregistered compiled frame counts as live. `is_active()` only sees
+    /// JIT entries that pushed a `JitEntryGuard`; a frame reached without one
+    /// holds the only reference to an object exactly as well, which is why
+    /// `empty_jit_publication` asks both detectors. Per-thread flag, so this
+    /// cannot disturb a concurrently-running test.
+    #[test]
+    fn an_unregistered_compiled_frame_also_makes_an_empty_publication_unsafe() {
+        let gc = make_collector();
+        crate::gc_quiescence::clear_pinned_jit_roots();
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+        assert!(!gc.empty_jit_publication());
+
+        crate::gc_quiescence::set_unregistered_jit_frame_on_stack();
+        let detected = gc.empty_jit_publication();
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+        assert!(
+            detected,
+            "an unregistered frame with nothing published is the same hazard as \
+             a registered one"
+        );
+    }
+
+    /// The end-to-end statement of what the SHIPPED default does, which is not
+    /// what a reader hoping for a fix would guess: G1 detects the unsafe state
+    /// and evacuates anyway.
+    ///
+    /// This is a live defect, deliberately pinned rather than papered over.
+    /// `empty_jit_publication()` is true — a compiled frame is running and the
+    /// conservative scan published nothing — and the object still moves, so a
+    /// register or spill slot holding the only reference now names the old
+    /// address. That is exactly the mechanism behind `PolynomialTest`
+    /// formatting `%d` against a bare `java.lang.Object`.
+    ///
+    /// What this does NOT say is that the state is reachable in production. It
+    /// is constructed here directly — `enter()` plus an empty pin map — because
+    /// the point is G1's response to it, not its cause. In a real run the pin
+    /// map is filled by `memory::roots::collect_roots`, which since the
+    /// precise-only fix always runs the conservative JIT scan under G1, so an
+    /// empty publication with a live frame should not occur at all. That is why
+    /// `record_g1_pause_empty_jit_publication` counts it on every run: this
+    /// test states the consequence if it ever does.
+    ///
+    /// Declining the pause is not the answer and the measurement says why:
+    /// under `CRATONVM_G1_PIN_EMPTY_PUBLICATION`, back when the state was
+    /// permanent, the same test took 1444 consecutive refused pauses and died
+    /// of `OutOfMemoryError` on 8 tests. A refusal reclaims nothing.
+    ///
+    /// Driven through `collect_garbage` because that is G1's single production
+    /// entry to both object-moving paths, exactly as
+    /// `incomplete_root_coverage_still_evacuates_by_default` is.
+    ///
+    /// Under `cfg(test)` the JIT-active depth is thread-local, so the `enter()`
+    /// here is invisible to other tests. The pin map is process-wide; this
+    /// thread clears its own entry, and no other gc test publishes one except
+    /// `zgc`'s, which clears again immediately.
+    #[test]
+    fn a_live_compiled_frame_with_an_empty_publication_still_evacuates_by_default() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(77));
+        let before = obj.as_ptr() as usize;
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::clear_pinned_jit_roots();
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+
+        crate::gc_quiescence::enter();
+        assert!(
+            gc.empty_jit_publication(),
+            "precondition: a compiled frame is live and nothing is published, \
+             which is the state the collector cannot safely evacuate against"
+        );
+        let mut roots = vec![obj];
+        let result = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+        crate::gc_quiescence::leave();
+
+        assert_eq!(
+            result.stats.objects_copied, 1,
+            "shipped default: the pause evacuates despite the unproven root set"
+        );
+        assert_ne!(
+            roots[0].as_ptr() as usize,
+            before,
+            "and the object MOVES -- the `roots` copy is rewritten, but a JIT \
+             register or spill slot holding the only reference is not, which is \
+             the defect this record is open for"
+        );
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(77));
+    }
+
+    /// The two refusals must stay distinguishable in the decision report. They
+    /// mean different things -- "the roots are not rewritable" (normal, ~100%
+    /// of pauses) versus "there were no roots and a compiled frame was running"
+    /// (rare, and the one that corrupts the heap) -- and a report that spells
+    /// them the same way is how the rare one gets triaged as the normal one.
+    #[test]
+    fn the_two_g1_refusals_are_distinguishable_in_the_report() {
+        use crate::gc_metrics::decision_reason as dr;
+        assert_ne!(
+            dr::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE,
+            dr::NON_MOVING_G1_EMPTY_JIT_PUBLICATION
+        );
+        assert_ne!(
+            dr::label(dr::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE),
+            dr::label(dr::NON_MOVING_G1_EMPTY_JIT_PUBLICATION)
+        );
+        assert_ne!(dr::label(dr::NON_MOVING_G1_EMPTY_JIT_PUBLICATION), "unknown");
+        assert!(
+            !dr::is_moving(dr::NON_MOVING_G1_EMPTY_JIT_PUBLICATION),
+            "the pause moves nothing, so it is not a moving young collection"
+        );
+
+        use crate::gc_metrics::g1_degraded as gd;
+        assert_eq!(
+            gd::labels(gd::EMPTY_COLLECTION_SET | gd::JIT_PUBLICATION_EMPTY).len(),
+            2,
+            "both bits are set on a refused pause and both must have labels"
+        );
+        assert_ne!(gd::ALL & gd::JIT_PUBLICATION_EMPTY, 0);
     }
 
     // -- Reference arrays as a generic Value store --
