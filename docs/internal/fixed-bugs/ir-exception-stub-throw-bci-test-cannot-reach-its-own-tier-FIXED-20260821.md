@@ -124,12 +124,22 @@ cannot deopt-resume.
 
 The rule's own doc names the trade honestly (*"declining here is not 'stay
 interpreted' — it is 'use the backend that handles this shape'"*), and it is the
-right call while `can_deopt_resume` is false. But the underlying capability —
-a precise resume on the IR path outside the narrow scalar-replacement case — is
-what would give that code back to C2. **Nobody has measured what it costs.** No
-workload number is attached to this refusal anywhere, including here; the shape
-is common enough that the number is worth taking before the capability is
-scoped.
+right call while `can_deopt_resume` is false.
+
+**MEASURED 2026-08-21 — and the answer is that this refusal is not the thing to
+scope work against.** See
+`ir-unresumable-trap-refusal-cost-ANSWERED-20260821.md`: the rule declines
+**62 of 14 421** admitted methods (0.43 %) across 30 netty classes, all of it
+lifecycle code rather than inner loops, and giving the tier back to a hot method
+of the declined shape moves it **0.24 %** (173.8 -> 174.2 ns/iter, inside a
+~8 ns spread, control flat). The guess in the paragraph above — that the shape
+is "common enough" to be worth the capability — was wrong, and the census is
+what says so.
+
+That measurement did surface something much larger and unrelated to this rule:
+the same arithmetic with an exception table costs ~12.8x the same arithmetic
+without one, identically on BOTH tiers. Cause not established. That is the
+number worth chasing.
 
 ## Related
 

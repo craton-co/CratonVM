@@ -2,14 +2,16 @@
 
 ## Status
 
-**STILL OPEN 2026-08-18, but no longer unexplained.** **Nine** real defects
-behind it have been found and fixed — three in the reference machinery (below),
-three in the stale-reference family the second pass went after (one of which
-this page had filed as a separate curiosity), and **three more of that same
-family in the fifth pass, 2026-08-18** (see *Fifth pass*), including the one
-that matches this page's own headline verdict. The failure
-itself still reproduces, and the mechanism now has a measured name instead of
-four candidate explanations.
+**STILL OPEN 2026-08-21, but no longer unexplained.** **Twenty-one** real
+defects behind it have been found and fixed — three in the reference machinery
+(below), three in the stale-reference family the second pass went after (one of
+which this page had filed as a separate curiosity), **three more of that same
+family in the fifth pass, 2026-08-18** (see *Fifth pass*) including the one that
+matches this page's own headline verdict, and **twelve in the sixth pass,
+2026-08-21**, which finishes the `apps_h2.rs` worklist and leaves a test that
+fails if a thirteenth is written (see *Sixth pass*). The failure itself still
+reproduces, and the mechanism now has a measured name instead of four candidate
+explanations.
 
 **What the failure IS, measured:** a live object relocated by the ZGC slide,
 with one holder never rewritten. The verdict comes out of the collector itself
@@ -227,6 +229,12 @@ describes, restated by a different instrument. (Checked against
 
 ### The remaining worklist, made concrete
 
+> **CLOSED 2026-08-21 by the sixth pass below.** The table is kept as the
+> record of what was outstanding; every row in it has been read, and the
+> `pin_audit_witness` test now fails if a new one appears. The sentence after
+> the table — that the same audit is owed by every OTHER native that calls back
+> into Java — is still open.
+
 `apps_h2.rs` alone has **15 more natives that call back into Java and pin
 nothing**. Not every one is a defect — a function that touches no reference
 after its callback is fine — but each has to be read, and all three fixed above
@@ -266,6 +274,125 @@ nothing thrown. `VmHeap::note_dead_base_deref` reports that swallow with a
 backtrace under the same flag. **It has not fired on any reproduced failure
 yet**, which says the stale reads seen here all land on re-issued memory rather
 than on the corpse. Recorded as an untriggered instrument, not as evidence.
+
+### Sixth pass (2026-08-21): the `apps_h2.rs` worklist is finished, and the file now ratchets
+
+The *remaining worklist, made concrete* table above is closed. Every native in
+`apps_h2.rs` that can move the heap has been read; twelve were repaired and the
+rest are named, with the reason each cannot go stale, in a test that fails if a
+thirteenth is written.
+
+**First, what changed under the worklist while it sat there.**
+`vm_exec.rs::forward_boundary_args` landed after the fifth pass and forwards
+every reference ARGUMENT a native hands to `invoke_*`, alongside the
+receiver-forwarding every `NativeContext` entry point already did and the
+value-forwarding the write entry points gained in the second pass. That removes
+the worst outcome — a stale pointer escaping into a Java frame — from every one
+of these sites at once, and its own doc says plainly that it *"does not make
+per-site pinning unnecessary."* It is also best-effort: `load_and_forward`
+repairs an address only while the collector still has a record of the move, and
+a re-issued address never reaches that table.
+
+So the residue this pass had to work is what **no** repair path covers:
+
+| shape | repaired by the boundary? |
+|---|---|
+| an `ObjectRef` compared by **identity** in Rust (`x == INSTANCE`, `nested != this`) | **no** — nothing on the path even sees it |
+| `ctx.class_id_of_object(x)` / `h2_class_name(x)` | **no** — `class_id_of` with no `load_and_forward` in front |
+| `ctx.read_string(x)` | **no** — resolves the class off the raw address |
+| receiver of any `ctx` call | yes (`load_and_forward`) |
+| argument to `ctx.invoke_*` | yes (`forward_boundary_args`) |
+| value stored by `set_field*` / `set_array_element` | yes (`forward_boundary_value`) |
+| `ctx.array_length` / `ctx.get_array_element` | yes (`load_and_forward`) |
+
+**The twelve.** Ordered by how bad a stale read is, not by file order.
+
+* **`h2_cardinality_expression_get_value`** — `ValueNull.INSTANCE` is read
+  before `arg.getValue(session)` and compared by IDENTITY after it. This is the
+  COALESCE shape from the fifth pass exactly: a stale `INSTANCE` compares
+  unequal to everything, so `CARDINALITY(NULL)` falls through to the type switch
+  instead of returning NULL. `session` is also passed as an argument after two
+  callbacks, and `value` is read RAW (`class_id_of_object`) after `getValueType`.
+* **`h2_value_is_false`** — `value` is compared by identity against
+  `ValueNull.INSTANCE` and `ValueBoolean.FALSE`, both obtained through
+  `h2_static_object`, which runs `<clinit>` the first time it sees the class.
+  A stale `value` matches neither and the predicate then answers from
+  `getBoolean()` on whatever now occupies the address.
+* **`table_filter_prepare_on`** — `this` is compared by identity against
+  `nestedJoin` and `join`; that comparison is the self-join guard that
+  terminates the recursion. `col` is an argument to `getColumnIndex` after
+  `getColumnId`, `session` is passed to the SECOND `optimizeCondition` after the
+  first has run, and `conds` / `index` are live across the whole pruning loop.
+* **`h2_constraint_run_existing_data_query`** — `this` is an argument to
+  `getShortDescription` after the entire prepare / query / close chain;
+  `sql_obj` is an argument to `Session.prepare` after
+  `startStatementWithinTransaction`; both `IndexColumn[]`s are read element-wise
+  inside the SQL builders.
+* **`h2_constraint_check_column_types`** — its doc comment argued no pin was
+  needed, and the argument was right about the window it considered (`getType()`
+  is a plain field getter, so nothing moves between reading the two `TypeInfo`s
+  and passing them). It did not consider the LOOP: `checkComparable` allocates,
+  so from the second iteration onward both arrays and `this` are held across a
+  mover. A premise-scoped guard is only as good as its premise, and the comment
+  now says which premise it is.
+* **`h2_constraint_check_existing_data`** — `session` is an argument to
+  `Table.getRowCount` after `getDatabase`, `isStarting` and the whole column-type
+  check; both refs are then handed to the query runner.
+* **`h2_index_columns_sql`, `h2_index_columns_is_not_null`,
+  `h2_index_column_join_sql`** — each walks an `IndexColumn[]` calling
+  `h2_sql_fragment` per element, which allocates a `StringBuilder` and calls
+  back into Java twice. The loop-carried array binding is **reassigned**, not
+  shadowed: a `let` inside the loop body dies with the iteration and the next
+  one would read the stale outer copy again, which is the mistake
+  `h2_parser_test_token_fast` was fixed for in the fifth pass.
+* **`h2_sql_fragment`** — `obj` is live across the `StringBuilder` allocation and
+  `sb` across `getSQL`. Both are receivers, so both are repaired today; pinned
+  anyway, because that repair had no forwarding word to read on the default
+  collector until 2026-08-17 and a pin costs nothing here.
+* **`h2_invalid_array_value`** — `trace_sql` is live across `create_string` and
+  is then an argument.
+* **`h2_db_exception`** — `arg_array` is live across a `create_string` per
+  message argument and is then an argument itself.
+* **`h2_parser_read`** — `s_obj` is live across `native_string_length` and is
+  then handed to `ctx.read_string`, one of the few `ctx` readers with no
+  `load_and_forward` in front of it.
+* **`h2_long_data_type_binary_search`** — `storage` is live across
+  `h2_boxed_long_value`, which falls back to a `Long.longValue()` callback when
+  the box is not laid out as expected. MVStore drives this per key.
+
+**Second, the file now ratchets.** `apps_h2::pin_audit_witness` reads
+`apps_h2.rs` with `include_str!` and fails if any top-level function that calls
+a heap-moving `ctx` operation pins nothing, unless it is named in
+`JUSTIFIED_UNPINNED` with the reason it cannot go stale. Seventeen are named
+there — "receiver-only", "hands its argument straight to the callee", "the
+string it creates is the very next call's argument". A companion test fails if
+that list names a function the file no longer defines, because a stale exception
+list is how an audit stops auditing, and a third feeds the same predicate a
+synthetic offender and a synthetic compliant function so a green cannot mean
+"the scan looks at nothing".
+
+This is deliberately a source witness rather than a behavioural test.
+`MockNativeContext` never relocates, so a mock-driven test would assert that a
+pin was *called*, not that it *helped* — and the fifth pass's `apps_h2` bugs
+were all found by reading the source with the barrier instrument pointed at it,
+not by a unit test.
+
+**What this does NOT claim.** The failure at the top of this page is not
+retired. The audit closes `apps_h2.rs`; the page's own next line — *"and
+`apps_h2.rs` is one file — the same audit is owed by every native that calls
+back into Java"* — is untouched, and the same scan over the other
+`native-builtins` files is the next tranche. No A/B is quoted for this pass
+either: at the rates this page has already measured (pre 3/16, post 2/16 for
+three producers), twelve more sites removed from one file cannot be separated
+from noise in any run budget available here. They are justified the way the
+fifth pass's were — as provable violations of the VM's own stated rule, which
+`NativeContext::pin_native_root` writes down.
+
+**Verified:** `cargo test -p cratonvm-native-builtins --lib apps_h2` (9/9,
+including the three witnesses); an 18-class H2 regression set spanning the
+constraint, table-filter, view, index and parser natives — 16 PASS / 2 FAIL
+before and after, the two being `TestBnf`/`TestWeb`, which fail on `dev` for the
+unrelated `Sentence.MAX_PROCESSING_TIME` reason their own page records.
 
 ## The three reference-machinery defects fixed on the way
 

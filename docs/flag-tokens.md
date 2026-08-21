@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-465 tokens.
+466 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -274,6 +274,7 @@ export inherited from a parent shell.
 | `jit-method-stats` | `CRATONVM_DBG_JIT_METHOD_STATS` |
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
+| `jit-rootscan` | `CRATONVM_DBG_JIT_ROOTSCAN` |
 | `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
 | `jit-pin` | `CRATONVM_DBG_JIT_PIN` |
 | `jit-putfield` | `CRATONVM_DBG_JIT_PUTFIELD` |
@@ -531,7 +532,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-208 tokens.
+211 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -543,6 +544,8 @@ export inherited from a parent shell.
 | `sp-inline-mic` | `CRATONVM_JIT_SP_INLINE_MIC` |
 | `sp-inline-pic` | `CRATONVM_JIT_SP_INLINE_PIC` |
 | `unreg-memo-gc-reset` | `CRATONVM_JIT_UNREG_MEMO_GC_RESET` |
+| `frame-bands` | `CRATONVM_JIT_NO_FRAME_BANDS` |
+| `oopmap-coverage-presence-only` | `CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY` |
 | `unreg-accept-residue` | `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE` |
 | `activation-global-mutex` | `CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX` |
 | `alloc-class-cache` | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` |
@@ -689,6 +692,7 @@ export inherited from a parent shell.
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
+| `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
 | `compiled-ldc-const-cache` | `CRATONVM_JIT_COMPILED_LDC_CONST_CACHE` |
 | `new-site-cache` | `CRATONVM_JIT_NO_NEW_SITE_CACHE` |
 | `site-cache` | `CRATONVM_JIT_SITE_CACHE` |
@@ -746,10 +750,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-61 tokens.
+65 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
@@ -760,6 +765,8 @@ export inherited from a parent shell.
 | `defrag-promote` | `CRATONVM_NO_DEFRAG_PROMOTE` |
 | `exact-refproc-survival` | `CRATONVM_NO_EXACT_REFPROC_SURVIVAL` |
 | `g1-coverage-pin` | `CRATONVM_G1_COVERAGE_PIN` |
+| `g1-pin-empty-publication` | `CRATONVM_G1_PIN_EMPTY_PUBLICATION` |
+| `g1-precise-only-roots` | `CRATONVM_G1_PRECISE_ONLY_ROOTS` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
 | `g1-live-region-memo` | `CRATONVM_G1_NO_LIVE_REGION_MEMO` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
@@ -797,6 +804,7 @@ export inherited from a parent shell.
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
 | `zgc-parmark` | `CRATONVM_ZGC_PARMARK` |
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
+| `zgc-relocate-proven-jit` | `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` |
 | `zgc-jit-read-bounds` | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |

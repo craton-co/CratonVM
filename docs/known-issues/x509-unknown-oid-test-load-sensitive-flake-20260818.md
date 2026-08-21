@@ -32,8 +32,19 @@ during an unrelated build.
 | the test body ×640, 16 threads, one process (2026-08-18) | pass |
 | the test body interleaved with `validate_chain_real_rsa_sha256_signature_passes` ×640, 16 threads (2026-08-18) | pass |
 | **whole `--lib`, EIGHT-core host, workspace release rebuild in parallel, load average 8–15 (2026-08-20)** | **pass ×8** |
+| **whole `--lib`, EIGHT-core host, ambient load 4.3–29.5, current dev with the `environ` UB REMOVED (2026-08-21)** | **pass ×25** |
 
-That last row is the arm the page asked for — the sightings were on 8 cores and
+The 2026-08-21 row is the same arm re-run after the UB was removed, and it is
+a different question rather than a longer version of the same one: the page now
+names that UB as the suite's one known load-sensitive hazard, so an arm with it
+gone is the first arm that is not confounded by it. 25 consecutive runs, every
+one `4134 passed; 0 failed`, at ambient load averages from 4.31 to 29.46 on 8
+cores (other sessions' builds, not manufactured), wall 71–134 s against ~170 s
+idle. It does not reproduce with the mechanism removed either — which is
+consistent both with the UB never having been the cause and with two sightings
+being too few to expect a hit in 25 runs. **Do not read it as an exoneration.**
+
+The 2026-08-20 row is the arm the page asked for — the sightings were on 8 cores and
 every earlier reproduction attempt was on a 32-core host, so "a smaller box may
 matter more than a busier one" was the open lead. It does not: 8 runs of the
 page's own recipe, on 8 cores, at load averages of 8.1–14.5 with a full
@@ -223,11 +234,13 @@ for i in $(seq 1 20); do
 done
 ```
 
-**Detect the right thing.** Key on the test NAME inside the failures block, not
-on `test result: FAILED` — the crate still carries one unrelated red row
-(`lang_class::tests::null_receiver_on_an_instance_field_outranks_the_access_refusal`),
-so every run trips the summary line. And if it ever does fire, **keep the whole
-log**: the test's rejection arm is
+**Detect the right thing.** As of 2026-08-21 the crate's `--lib` is **fully
+green** on dev — `4134 passed; 0 failed`, on 25 consecutive runs — so the
+`lang_class` row this section used to warn about is fixed, and
+`test result: FAILED` is a usable trigger again. Key on the test NAME inside the
+failures block anyway: it costs nothing, it names the right thing, and it keeps
+working the next time the crate goes red for an unrelated reason. And if it ever
+does fire, **keep the whole log**: the test's rejection arm is
 `panic!("expected NotImplemented for Ed25519, got {:?}", other)`, so the body
 names the actual `TrustError` — which, by the argument above, is the single
 piece of evidence that would distinguish "this test asserted and lost" from
