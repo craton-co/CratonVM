@@ -41,8 +41,8 @@ Everything this page ever pointed at, and where it stands on `dev` at
 | a call level costs **~700 ns**, 40-48x HotSpot `-Xint` | **IMPROVED to 291 ns, 27.4x.** §2. |
 | the flat **9.9-10.7x** per-statement band | **IMPROVED to 6.3-6.6x, and still flat.** §2. |
 | the INSERT loop at **10.5x** interpreter-to-interpreter | **IMPROVED to 8.2x.** §2. |
-| `TestLob` HANG, and "the five-class gap" | **HANDED OFF.** `TestLob` has its own page and its own HotSpot control showing the race fires on HotSpot too; it is row 3 of the ten classes still at the cap in `known-issues/h2/hangs-true-vs-perfcliff-20260821.md`. |
-| `TestMultiThread` flapping on `LOCK_TIMEOUT` | **HANDED OFF.** It **PASSes in 1390 s** at a 5x cap (same page). A timeout is a statement about wall-clock, not about being stuck. |
+| `TestLob` HANG, and "the five-class gap" | **ADJUDICATED, and not ours.** `fixed-suite-bugs/h2-suite-bugs/hangs-true-vs-perfcliff-RESOLVED-20260821.md` returns **not a CratonVM bug** — HotSpot fails identically, per the 40-class census §3 and the class's own dedicated page. The page's framing of it as this page's five-class residual is withdrawn. |
+| `TestMultiThread` flapping on `LOCK_TIMEOUT` | **HANDED OFF** to its own retired predecessor. The documented behaviour is that it *completes* — 643 s in the measurement in `bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md`, and `rc=1` after 554 s carrying a `TimeoutException` and nothing else. A timeout is a statement about wall-clock, not about being stuck, and the H2 hang triage's verdict over the whole family is that **zero classes are deadlocked or blocked**. |
 | `TestTransaction` at a 50 ms budget, 10 of 10 FAIL | **ALREADY SETTLED.** Not a correctness defect; `known-issues/h2/nonpassed-40-census-20260818.md` §"not a correctness bug". |
 | `MERGE ... USING` is not a defect and not a slow path | **UNCHANGED AND RE-CONFIRMED.** Its ratio still sits inside the band (§2), which is the test the page defined for it. |
 | no `org/h2/` JIT package ban to lift | **UNCHANGED.** |
@@ -477,9 +477,11 @@ CRATONVM_DBG=hotpath-counts     <cratonvm> ...   # force_native / resolve_method
 ## Related
 
 * `feature-designs/zgc-jit-load-barrier.md` — owns residual 1.
-* `known-issues/h2/hangs-true-vs-perfcliff-20260821.md` — owns every H2 class
-  this page ever quoted as a HANG, with direct evidence that six of them
-  recover at a 5x cap.
+* `fixed-suite-bugs/h2-suite-bugs/hangs-true-vs-perfcliff-RESOLVED-20260821.md`
+  — owns every H2 class this page ever quoted as a HANG, and resolves all ten:
+  **zero are deadlocked or blocked**, one is a genuine livelock, and the rest
+  are throughput cliffs still making progress or now passing outright. It is
+  the page that turns this one's "HANG" rows into verdicts.
 * `known-issues/h2/nonpassed-40-census-20260818.md` — the 40-class,
   three-collector census, and the `TestTransaction` adjudication.
 * `performance/vm-per-call-dispatch-cost-RETIRED-20260817.md` — §5 answers its
