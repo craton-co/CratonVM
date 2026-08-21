@@ -194,6 +194,56 @@ those five. They are excluded from any claim of unreachability.
 **337 of the 342 are on named, non-`Object` receivers** and are the population
 this record is about.
 
+### 1.6 At least one of the 342 is DELIBERATE, and the tree says so in a comment
+
+This is the most important qualification in this record and it was found by
+grepping before asserting, not by the dump.
+
+`java/lang/StringUTF16.isBigEndian()Z` (`lang_string.rs:12731`) is one of the
+342. It is also carrying a **56-line comment block** at `lang_string.rs:12422`
+whose own heading is:
+
+> `# On JDK 25 this registration never fires, and that is not a defect`
+
+and which records the identical census row this lane re-derived —
+
+```
+java/lang/StringUTF16.isBigEndian()Z   loaded: true  declared: FALSE
+                                       has_code: false  invocations: 0
+```
+
+— and then gives the reason to keep it:
+
+> So this stays registered for images that DO declare the method (JDK 17/21),
+> where it must give the same answer `UnsafeConstants` gives, which it does. A
+> census row reading `has_code: false` here means "absent from this image", not
+> "an unimplemented native something is waiting on".
+
+**So "declared nowhere" is a property of ONE IMAGE, and a registration can be
+correct precisely because another supported image declares the method.** This
+host carries exactly one JDK (`C:/Program Files/Microsoft/jdk-25.0.3.9-hotspot`);
+no JDK 17 or 21 image is installed, so **this lane could not run the multi-image
+sweep that would separate the deliberate rows from the dead ones.**
+
+Consequences, and they are not small:
+
+* **342 is an UPPER BOUND on what is retirable, not a work list.** The true
+  figure is 342 minus however many are cross-version registrations of the
+  `isBigEndian` shape.
+* **§5 N3 stops being a nice-to-have and becomes a precondition.** No row in
+  this population may be retired on the strength of a one-image measurement.
+* `no_image_receiver.rs` already learned this lesson at class granularity and
+  says so: `sun/nio/ch/KQueuePort` is on neither Linux nor Windows and on both
+  macOS images, and *"a two-platform sweep called it dead."* This record's sweep
+  is a **one**-platform, **one**-version sweep.
+
+The 56 near-misses of §2.2 are the sub-population least exposed to this, because
+a *descriptor* that no image declares is a different claim from a *method name*
+that one image dropped — but they are not immune either, and three of them
+(`Preconditions.checkIndex(II)I`, `Reflection.getCallerClass(I)`,
+`Unsafe.park(Ljava/lang/Object;J)V`) are exactly the shape of a signature that
+an older JDK did declare.
+
 ## 2. The tree already does this — at CLASS granularity
 
 The two dumps differ by 1,719 registrations, and among them are **all five
@@ -249,6 +299,55 @@ different cause, the "already does this at class granularity" framing weakens to
 "already achieves this at class granularity", and the nomination in §4 still
 stands on the image argument alone.
 
+## 2.2 The 342 split by WHY, and 56 of them are silent near-misses
+
+`javap -p` was run against the oracle image for **all 102 distinct receiver
+classes** (0 failures) and each dead row's method NAME checked against the
+class's declared methods:
+
+| why the triple is dead | rows |
+|---|---:|
+| **TRULY GONE** — the class declares no method of that name at all | **286** |
+| **NEAR-MISS** — the class declares that method NAME, but no overload with this descriptor | **56** |
+
+**The 56 near-misses are a different and more interesting defect.** They are not
+stubs for a removed API; they are **interceptions somebody intended to install,
+which silently never fire** because the descriptor does not match any overload
+the image declares. Nothing reports them. They are not in the 1402 (no
+dispatch, no shadow row), they are not `bytecode-won` (no dispatch at all), and
+the registry census counts them as registrations in good standing.
+
+A sample, with what the image actually declares:
+
+| registered triple | the image declares |
+|---|---|
+| `jdk/internal/misc/Unsafe.park(Ljava/lang/Object;J)V` | `park(boolean, long)` |
+| `jdk/internal/util/Preconditions.checkIndex(II)I` | `checkIndex(int, int, BiFunction)` |
+| `jdk/internal/reflect/Reflection.getCallerClass(I)…` | `getCallerClass()` — no-arg only |
+| `java/nio/file/Paths.get(Ljava/lang/String;)…` | `get(String, String...)` |
+| `java/nio/channels/DatagramChannel.bind(Ljava/net/SocketAddress;)V` | returns `DatagramChannel`, not `void` |
+| `java/lang/StringBuilder.repeat(Ljava/lang/String;I)…` | `repeat(CharSequence, int)` / `repeat(int, int)` |
+
+The last one is this lane's own file. `AbstractStringBuilder`, `StringBuilder`
+and `StringBuffer` each carry a `repeat(Ljava/lang/String;I)` registration from
+`lang_string.rs:534`; JDK 25 declares `repeat(CharSequence,int)`. **`String`
+implements `CharSequence`, so `sb.repeat("x", 3)` compiles and runs — against
+the real JDK bytecode, never against the native.** Three registrations that have
+never once executed.
+
+By file, the 56 concentrate in `lang_stackwalker.rs` (5), `panama.rs` (5),
+`shared_secrets_bridge.rs` (4), `deprecated_internal.rs` (4),
+`native-io/nio_native.rs` (4), then `lang_string.rs`, `inet_address.rs`,
+`classloader.rs`, `http_client.rs`, `preconditions.rs`, `file_channel.rs` and
+`native-io/lib.rs` at 3 each.
+
+**MEASURED that they exist and never fire on JDK 25; ARGUED that each is a
+mistake.** Some are certainly JDK-21-era signatures kept on purpose, exactly as
+§1.6 describes — `Preconditions.checkIndex(II)I` and
+`Reflection.getCallerClass(I)` both look like older-JDK shapes. Separating
+"deliberate cross-version" from "typo" needs the multi-image sweep, and until
+then **no near-miss should be deleted either**.
+
 ## 3. Why this is worth more than its row count
 
 The 342 are **not** in the 1402. A `native-shadows-bytecode` row is recorded
@@ -282,11 +381,19 @@ is the point:
   agree, but `reach≠defect` cuts both ways and no probe was run.
 * **The five `java/lang/Object` catch-alls are explicitly excluded** (§1.5) and
   nothing here says what should happen to them.
-* **342 is a count of registrations, not of defects.** Some of these stubs may
-  be load-bearing for `--synthetic-jdk`, where a fabricated carrier CAN declare
-  a method the real image does not. This record measures **only** the
-  `--jdk-only` dump. A method-granular gate MUST be strict-mode-only for exactly
-  that reason — `flag≠mode drops it` is the standing shape.
+* **342 is a count of registrations, not of defects, and it is an UPPER
+  BOUND** (§1.6). It is a ONE-image, ONE-platform measurement; at least one
+  member (`StringUTF16.isBigEndian`) is a documented, deliberate cross-version
+  registration that a JDK 17/21 image DOES declare. How many more are of that
+  shape is **unmeasured and unmeasurable on this host**, which carries only
+  `jdk-25.0.3.9-hotspot`.
+* Some of these stubs may also be load-bearing for `--synthetic-jdk`, where a
+  fabricated carrier CAN declare a method the real image does not. This record
+  measures **only** the `--jdk-only` dump. A method-granular gate MUST be
+  strict-mode-only for exactly that reason — `flag≠mode drops it`.
+* **The 56/286 near-miss split is MEASURED; calling any individual near-miss a
+  mistake is ARGUED** (§2.2). No near-miss was traced to the commit that wrote
+  it, and none was proven to be a typo rather than an older-JDK signature.
 * **No source was changed and nothing was built.** Every figure is from the
   prebuilt `025780ff7` binary.
 * **`invocations` is a lower bound** (§1.2) and no zero in this dump is
@@ -294,22 +401,32 @@ is the point:
 
 ## 5. NOMINATIONS
 
-* **N1 — add a METHOD-granular strict-mode gate**, the exact analogue of the
-  class-granular one §2 measures. A registration whose triple the image declares
-  nowhere on the receiver hierarchy is a contradiction under
-  `jdk-only-mode.md` §1.5 by the same sentence that already covers the class
-  case. It retires **342 registrations with no source deletion**, so it cannot
-  break a manifest test (§`H25-2`), cannot promote a losing duplicate into
-  service (`H22`), and needs no per-site review. Strict mode only.
-* **N2 — expect a census delta of ZERO and write that down before running it**
-  (§3). Whoever lands N1 will otherwise measure nothing and conclude nothing
+* **N1 — run the multi-image sweep FIRST; it is a precondition, not a
+  follow-up** (§1.6). `scripts/jdk-only-no-image-receivers.py` already sweeps
+  six images (Temurin 21.0.12+8 and 25.0.4+7 × linux/windows/macos) at class
+  granularity; it needs a **method-granular sibling**. This host has one JDK
+  installed and this lane could not run it. Until it runs, **342 is an upper
+  bound and no row in it may be deleted** — `StringUTF16.isBigEndian` is the
+  standing witness that a member of this population can be deliberate and
+  correct.
+* **N2 — then add a METHOD-granular strict-mode gate** driven by that sweep's
+  output, the exact analogue of the class-granular one §2 measures. A
+  registration whose triple **no supported image** declares anywhere on the
+  receiver hierarchy is a contradiction under `jdk-only-mode.md` §1.5 by the
+  same sentence that already covers the class case. A gate retires rows **with
+  no source deletion**, so it cannot break a manifest test (`H25-2` §2), cannot
+  promote a losing duplicate into service (`H22`, `H25-2` §1), and needs no
+  per-site review. Strict mode only — a `--synthetic-jdk` carrier CAN declare a
+  method the real image does not (`flag≠mode drops it`).
+* **N3 — expect a census delta of ZERO and write that down before running it**
+  (§3). Whoever lands N2 will otherwise measure nothing and conclude nothing
   happened.
-* **N3 — re-derive the 342 across the six images `no_image_receiver.rs`
-  already sweeps**, not just the one Windows JDK 25 image measured here. That
-  file's own history is the reason: `sun/nio/ch/KQueuePort` is on neither Linux
-  nor Windows and on both macOS images, and *"a two-platform sweep called it
-  dead"*. `scripts/jdk-only-no-image-receivers.py` already does the sweep; it
-  needs a method-granular sibling.
+* **N3a — the 56 near-misses deserve their own instrument** (§2.2), because a
+  near-miss is a *live bug report*: someone wrote an interception that has never
+  executed. A descriptor-level diff of every registration against the image,
+  emitted as a warning at registration time, would have caught all 56 at the
+  moment each was written. That is a different and cheaper gate than N2 and it
+  reports rather than removes, so it needs no multi-image sweep to be useful.
 * **N4 — 70 of the 342 are `java/lang`**, the top package, inside `H14-2` §4's
   168-row unclaimed `java.lang` core. That block still has no P0/P1/P2 row.
 * **N5 — trace the class-granular drop to a line** (§2.1) and put a comment at
