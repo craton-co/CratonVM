@@ -121,7 +121,7 @@ All four constants re-frozen together — both stub baselines AND both
 `MEASURED_TOTAL_REGISTRATIONS`, because a re-freeze that leaves the totals stale
 disarms the classifier for the next reader.
 
-## Three more gates were red on dev in the same pass — one fixed, three still open
+## Four more gates were red on dev in the same pass — two fixed, two still open (four tests)
 
 
 Found by running the two crates' suites either side of a
@@ -135,6 +135,7 @@ branch's; each was measured with dev's own sources under the same test binary.
 | `cratonvm-native-io` | `io_tests::fis_close_marks_closed_and_is_idempotent` | FAILED |
 | `cratonvm-native-io` | `io_tests::fis_read_bytes_zero_length_answers_zero_on_a_closed_stream` | FAILED |
 | `cratonvm-native-io` | `io_tests::fis_skip_consults_the_descriptor_before_the_count` | FAILED |
+| `cratonvm-native-builtins` | `proxy_selector::tests::env_proxy_lookup_respects_case_insensitive_windows_storage` | FAILED (**Windows only**; arrived 2026-08-21 with a later dev merge) |
 
 Two were fixed rather than filed, both one-liners with no production behaviour
 change:
@@ -199,14 +200,42 @@ lookup at all ten, in one shared helper so they cannot drift. One carve-out must
 survive — `native_fis_read_bytes`'s `is_empty_transfer(len)` early return has to
 stay in front of the closed check, because HotSpot measurably answers
 `read(b, 0, 0)` on a closed stream with `0` and no throw.
+**The pattern, not the rows.** Seven distinct unit-test gates were red on dev
+across two days, and one of them was a compile error that had been masking an
+eighth. This is the same shape as the 2026-08-18 finding that four
+native-builtins gates were red on dev simultaneously. A crate suite that nobody
+runs to green stops being a gate; the cheapest fix is to run
+`cargo test -p <crate>` on the crates a change touches, and to control any
+failure against `origin/dev` sources before believing it is yours.
 
-**The pattern, not the rows.** Six distinct unit-test gates were red on dev at
-once, and one of them was a compile error that had been masking a seventh. This
-is the same shape as the 2026-08-18 finding that four native-builtins gates were
-red on dev simultaneously. A crate suite that nobody runs to green stops being
-a gate; the cheapest fix is to run `cargo test -p <crate>` on the crates a
-change touches, and to control any failure against `origin/dev` sources before
-believing it is yours.
+## The proxy row is a test DOUBLE that stopped modelling Windows
+
+Separate from the `fis_*` family, and also filed rather than fixed, because
+unlike the other two test-side reds this one has no obviously-correct one-liner.
+
+`env_proxy_lookup_respects_case_insensitive_windows_storage` sets both
+`all_proxy` and `ALL_PROXY` and asserts the UPPERCASE value wins, on the stated
+grounds that "Windows stores environment keys case-insensitively, so the final
+assignment is the single value visible through either spelling". It now reads
+back the lowercase one.
+
+Production is not implicated. On real Windows `std::env::var` IS
+case-insensitive, so `read_settings` behaves as the test describes. What changed
+is the DOUBLE: `with_proxy_env` was rewritten to stop mutating `environ` at all
+("Nothing is written to `environ` now, so there is nothing to restore and
+nothing to race" — a good change, it removed a process-wide data race against
+every parallel test) and the thread-override map that replaced it is keyed
+case-SENSITIVELY. So the two spellings are two entries where Windows has one.
+
+`#[cfg(windows)]`, so the Azure Linux host never runs it; its
+`not(windows)` twin — `env_proxy_lookup_prefers_lowercase_when_both_are_set` —
+passes, because lowercase-wins is exactly what a case-sensitive map gives you.
+
+The fix is a decision, not a repair: either `with_thread_overrides` folds case
+on Windows so the double models `environ` (correct, but it is a shared helper
+with many callers), or this test stops claiming to exercise case-insensitive
+storage it can no longer reach. Whoever takes it should say which, rather than
+making the assertion agree with the double.
 
 ## Repro
 
