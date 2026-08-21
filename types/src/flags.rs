@@ -84,6 +84,9 @@ use std::collections::{HashMap, HashSet};
 /// resistance SipHash buys is not load-bearing here.
 type FxHashSetStr = rustc_hash::FxHashSet<&'static str>;
 type FxHashMapStr = rustc_hash::FxHashMap<String, OsString>;
+/// `name -> Some(value)` for an override that sets, `name -> None` for one
+/// that unsets. See [`VmFlags::undeclared_edit`].
+type FxHashMapStrOpt = rustc_hash::FxHashMap<String, Option<OsString>>;
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -2206,6 +2209,22 @@ pub struct VmFlags {
     /// not yet been converted to a typed field. Private so new code cannot
     /// widen the public configuration surface.
     legacy_values: MapSource,
+    /// Test overrides for names the inventory does NOT declare.
+    ///
+    /// **Empty in every snapshot built from the process environment**, so the
+    /// production read path is unchanged: [`runtime_var`] and
+    /// [`runtime_var_os`] consult this only while [`overrides_active`] is true.
+    ///
+    /// It exists so a test can override an ordinary process variable —
+    /// `JBOSS_HOME`, the proxy variables, `org.jboss.boot.log.file` — without
+    /// calling `std::env::set_var`. That call is sound only in a
+    /// single-threaded program (and `unsafe` in edition 2024) because `setenv`
+    /// may reallocate and free the `environ` array while another thread is
+    /// inside `getenv`; a `--lib` run doing it from three test modules across
+    /// thousands of parallel tests is a process-wide data race, not a local
+    /// one. Declared flags do not need this — they are already served from the
+    /// latched snapshot.
+    undeclared_edits: FxHashMapStrOpt,
 }
 
 impl VmFlags {
@@ -2221,11 +2240,24 @@ impl VmFlags {
             natives: NativeFlags::from_source(src),
             subsystems: crate::subsystem_config::SubsystemConfig::from_source(src),
             legacy_values: MapSource::declared_snapshot(src),
+            // Empty here by construction: only `from_env_with_edits` populates
+            // it, so a snapshot built from the real environment carries none
+            // and the production read path never consults it.
+            undeclared_edits: FxHashMapStrOpt::default(),
         }
     }
 
     fn legacy_var_os(&self, name: &str) -> Option<OsString> {
         self.legacy_values.get(name)
+    }
+
+    /// The override for an undeclared `name`, if this snapshot carries one.
+    ///
+    /// `Some(Some(v))` = overridden to `v`; `Some(None)` = overridden to
+    /// "as if unset"; `None` = not overridden, so the caller reads the real
+    /// environment. See [`VmFlags::undeclared_edits`].
+    fn undeclared_edit(&self, name: &str) -> Option<&Option<OsString>> {
+        self.undeclared_edits.get(name)
     }
 
     /// Build from the process environment.
@@ -2298,7 +2330,16 @@ impl VmFlags {
                 }
             }
         }
-        Self::from_source(&crate::flag_groups::resolve(&raw))
+        let mut cfg = Self::from_source(&crate::flag_groups::resolve(&raw));
+        // Edits naming something the inventory does not declare cannot survive
+        // `declared_snapshot`, so keep them here instead. Without this the only
+        // way to override such a name was to mutate `environ` — see the field.
+        cfg.undeclared_edits = edits
+            .iter()
+            .filter(|(name, _)| !declared_flag_names().contains(*name))
+            .map(|(name, value)| ((*name).to_string(), value.map(OsString::from)))
+            .collect();
+        cfg
     }
 }
 
@@ -2664,6 +2705,17 @@ pub fn runtime_var<K: AsRef<OsStr>>(key: K) -> Result<String, std::env::VarError
                 None => Err(std::env::VarError::NotPresent),
             };
         }
+        if overrides_active() {
+            if let Some(edit) = flags().undeclared_edit(name) {
+                return match edit {
+                    Some(value) => value
+                        .clone()
+                        .into_string()
+                        .map_err(std::env::VarError::NotUnicode),
+                    None => Err(std::env::VarError::NotPresent),
+                };
+            }
+        }
     }
     std::env::var(key)
 }
@@ -2682,6 +2734,11 @@ pub fn runtime_var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
     if let Some(name) = key.to_str() {
         if declared_flag_names().contains(name) {
             return flags().legacy_var_os(name);
+        }
+        if overrides_active() {
+            if let Some(edit) = flags().undeclared_edit(name) {
+                return edit.clone();
+            }
         }
     }
     std::env::var_os(key)
@@ -2784,6 +2841,54 @@ mod tests {
             Some(OsString::from("enabled"))
         );
         assert_eq!(f.legacy_var_os("CRATONVM_DBG_AIOOBE"), None);
+    }
+
+    /// An UNDECLARED name is overridable, so a test never has to write to
+    /// `environ` to arrange one.
+    ///
+    /// This is the whole point of `VmFlags::undeclared_edits`.
+    /// `std::env::set_var` is sound only in a single-threaded program — glibc's
+    /// `setenv` may reallocate and free the `environ` array while another
+    /// thread is inside `getenv` — and `native-builtins`' `--lib` was doing it
+    /// from three test modules while ~4,130 tests ran on parallel threads. The
+    /// override serves the same reads with no write at all.
+    #[test]
+    fn an_undeclared_name_is_overridable_without_writing_to_environ() {
+        // Deliberately not a `CRATONVM_*` name: this must exercise the
+        // undeclared path, and the declared path already has its own tests.
+        const NAME: &str = "cratonvm_undeclared_override_probe";
+        assert!(
+            std::env::var_os(NAME).is_none(),
+            "fixture name must not exist in the real environment"
+        );
+
+        with_thread_overrides(&[(NAME, Some("set-by-override"))], || {
+            assert_eq!(runtime_var(NAME).ok().as_deref(), Some("set-by-override"));
+            assert_eq!(
+                runtime_var_os(NAME),
+                Some(OsString::from("set-by-override"))
+            );
+        });
+
+        // The override wrote nothing, so the process environment is untouched
+        // and the read outside it is the real (absent) one.
+        assert!(std::env::var_os(NAME).is_none());
+        assert!(runtime_var_os(NAME).is_none());
+
+        // The other direction: an existing variable overridden to "as if
+        // unset". `PATH` is undeclared and always present.
+        assert!(std::env::var_os("PATH").is_some(), "PATH must be set");
+        with_thread_overrides(&[("PATH", None)], || {
+            assert!(
+                runtime_var_os("PATH").is_none(),
+                "an override to None must read as unset"
+            );
+            assert!(matches!(
+                runtime_var("PATH"),
+                Err(std::env::VarError::NotPresent)
+            ));
+        });
+        assert!(runtime_var_os("PATH").is_some(), "and it comes back after");
     }
 
     /// `synthetic_memoryusage_tostring` is served by the snapshot, and reads

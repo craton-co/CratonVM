@@ -1406,19 +1406,16 @@ impl Compiler {
                     if self.ldc_class_info_idx.contains_key(&pc) {
                         return false;
                     }
-                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    if let Some(&idx) = self.ldc_string_info_idx.get(&pc) {
-                        let (_, bytes, len) = self.ldc_string_info[idx];
-                        self.emit_pre_safepoint_spill();
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_imm64(ARG_REGS[1], bytes as i64);
-                        self.emit_mov_imm64(ARG_REGS[2], len as i64);
-                        self.emit_call_absolute(self.helpers.ldc_string);
-                        self.emit_oop_map_for_safepoint();
-                        self.push_from_rax();
-                        self.mark_top_as_oop();
+                    if self.emit_ldc_string(pc) {
                         pc += 2;
                         continue;
+                    }
+                    if self.ldc_string_info_idx.contains_key(&pc) {
+                        // Recognised as a string `ldc` and NOT emittable —
+                        // `ldc_string_cp` unwired, or no context slot. Bail the
+                        // site rather than fall through to `ldc_info`, which
+                        // does not hold this pc and would push a null.
+                        return false;
                     }
                     let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                     match val {
@@ -1440,19 +1437,16 @@ impl Compiler {
                     if self.ldc_class_info_idx.contains_key(&pc) {
                         return false;
                     }
-                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    if let Some(&idx) = self.ldc_string_info_idx.get(&pc) {
-                        let (_, bytes, len) = self.ldc_string_info[idx];
-                        self.emit_pre_safepoint_spill();
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_imm64(ARG_REGS[1], bytes as i64);
-                        self.emit_mov_imm64(ARG_REGS[2], len as i64);
-                        self.emit_call_absolute(self.helpers.ldc_string);
-                        self.emit_oop_map_for_safepoint();
-                        self.push_from_rax();
-                        self.mark_top_as_oop();
+                    if self.emit_ldc_string(pc) {
                         pc += 3;
                         continue;
+                    }
+                    if self.ldc_string_info_idx.contains_key(&pc) {
+                        // Recognised as a string `ldc` and NOT emittable —
+                        // `ldc_string_cp` unwired, or no context slot. Bail the
+                        // site rather than fall through to `ldc_info`, which
+                        // does not hold this pc and would push a null.
+                        return false;
                     }
                     let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                     match val {
