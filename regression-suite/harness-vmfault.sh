@@ -52,7 +52,7 @@
 # live here, so the change to `run.sh` is three small hunks: one `.` beside the
 # `harness-guard.sh` source, one `if` around the existing `sig` grep, and one
 # summary block. They are reproduced in
-# docs/known-issues/jdk-only/WORKER-5-2-*.md so H0 can read or revert them
+# docs/known-issues/jdk-only/WORKER-5-NOTE-2-*.md so H0 can read or revert them
 # without diffing. `git revert` of that commit plus deleting this file restores
 # the previous behaviour exactly; nothing else in the suite depends on it.
 #
