@@ -62,7 +62,7 @@ Three rows need reading rather than counting:
   CratonVM fails 12 of them, all `clientProvider = JDK` client-side rejections,
   all answering `TLSV1_ALERT_ACCESS_DENIED` where a certificate alert is
   required. Filed as
-  `known-issues/netty/ssl-client-sends-access-denied-for-every-trust-rejection-20260820.md`.
+  `fixed-suite-bugs/netty/ssl-client-sends-access-denied-for-every-trust-rejection-FIXED-20260821.md`.
 * `JdkSslEngineTest` now exceeds a 900 s cap on BOTH CratonVM binaries where
   HotSpot takes 97 s. Both arms, so it is not this branch — but the 755/821 this
   page's older columns record was measured on a classpath that generated far

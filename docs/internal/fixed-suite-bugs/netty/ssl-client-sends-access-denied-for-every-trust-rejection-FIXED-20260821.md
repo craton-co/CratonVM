@@ -1,8 +1,68 @@
 # A CratonVM TLS client answers every certificate rejection with `access_denied`
 
-**Status: OPEN.** Found 2026-08-20 on the Azure Linux host, the moment
-`OpenSsl.isAvailable()` became true. Present on dev `86b13ed4c` and unchanged by
-the branch that found it — the two arms' failure sets are identical.
+**Status: FIXED 2026-08-21**, branch `fix/netty-tls-residuals-20260821`, Azure
+Linux host. Found 2026-08-20, the moment `OpenSsl.isAvailable()` became true.
+
+```
+                     HotSpot 25   before   after
+SslErrorTest ok        72           60      72
+             failed     0           12       0
+```
+
+Six other TLS classes run beside it in the same batch are byte-identical before
+and after (`CloseNotifyTest`, `SslHandlerTest`, `SslContextBuilderTest`,
+`SniClientTest`, `JdkDelegatingPrivateKeyMethodTest`,
+`OpenSslPrivateKeyMethodTest`), and the 95-class SSL/TLS sweep is below.
+
+## The fix
+
+`jca`-adjacent `native-builtins/src/tls_cert_alert.rs` — a transcription of
+`sun.security.ssl.CertificateMessage.getCertificateAlert`, shared by the
+verifier-time path and the post-handshake one, which had already drifted apart
+once:
+
+```text
+(no CertPathValidatorException cause) -> certificate_unknown   (JSSE's default)
+REVOKED                               -> certificate_revoked
+UNDETERMINED_REVOCATION_STATUS        -> certificate_unknown
+EXPIRED                               -> certificate_expired
+INVALID_SIGNATURE, NOT_YET_VALID      -> bad_certificate
+ALGORITHM_CONSTRAINED                 -> unsupported_certificate
+                                         (bad_certificate on TLS 1.3 when the
+                                          message names MD5withX / SHA1withX)
+```
+
+**One constant would not have been the fix**, even though every one of the 12
+measured rows lands on the default. `certificate_unknown` is where JSSE STARTS,
+and a single constant would have been indistinguishable from a transcription
+until the first `CertPathValidatorException`-caused rejection, which no test in
+this suite produces.
+
+Two things that had to be decided rather than looked up:
+
+* **`NOT_YET_VALID` → `bad_certificate` is JSSE's answer, and rustls disagrees.**
+  rustls's own `CertificateError::NotValidYet` maps to `certificate_expired`.
+  JSSE is the platform being imitated, so `JsseCertAlert::certificate_error`
+  picks its rustls variant FOR ITS ALERT rather than for its name — two of the
+  five are a poor description of what happened (`BadEncoding`, `InvalidPurpose`)
+  and are commented as such. `every_alert_survives_the_rustls_mapping` asserts
+  each pair against rustls's own `From<CertificateError> for AlertDescription`,
+  so a rustls upgrade that re-tables the mapping fails the build instead of
+  silently changing what goes on the wire.
+* **`no_certificate_rejection_can_reach_access_denied`** is the defect as a
+  test, and it ends by asserting `ApplicationVerificationFailure` STILL maps to
+  `access_denied` — so it cannot pass by the alert becoming unreachable in
+  rustls rather than by CratonVM no longer sending it.
+
+Deliberately not modelled: JSSE substitutes `bad_certificate_status_response`
+for the two revocation reasons when OCSP stapling is active on the connection.
+The engine does not carry that bit to this point and inventing it would be a
+guess.
+
+Left open and named rather than implied: the verifier-time endpoint-identity arm
+answers `NotValidForNameContext` (`bad_certificate`) where the post-handshake one
+answers `certificate_unknown`. The two disagree, JSSE agrees with the second, and
+nothing has measured the difference.
 
 ## The measurement, and why nobody had seen it
 
@@ -78,7 +138,26 @@ certificate is required to say so with a certificate alert, and a middlebox,
 log, or peer implementation that distinguishes them will draw the wrong
 conclusion about why the handshake failed.
 
-## What it would take to close
+## What it took to close, against what the page predicted
+
+The page's three bullets were right about where to look and wrong about the
+remedy in one place, which is worth keeping:
+
+* "Find where the verifier's rejection is turned into an alert … A single
+  catch-all variant for every `CertificateException` is the shape to suspect
+  first" — correct, and it was exactly that:
+  `rustls::CertificateError::ApplicationVerificationFailure`, one arm, every
+  exception.
+* "Map the JDK's exception types onto the certificate alerts" — the mapping is
+  NOT on the exception type. JSSE branches on the `CertPathValidatorException`
+  CAUSE and its `getReason()`, and is indifferent to whether the manager threw
+  `CertificateExpiredException` or a bare `CertificateException`. A
+  type-switch would have produced `certificate_expired` for row 26, where
+  HotSpot sends `certificate_unknown`, and passed the netty test anyway
+  (it accepts "expired"). Reading `getCertificateAlert` was the difference.
+* "pin the mapping with a test per alert — six rows, not one" — done, as one
+  test over all five alerts plus the twin that pins `access_denied` is still
+  reachable.
 
 - Find where the verifier's rejection is turned into an alert. The trust check
   runs inside `verify_server_cert` (see the retired
