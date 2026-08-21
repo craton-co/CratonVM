@@ -326,3 +326,46 @@ straight through the JDK's own duplicate check.
 * **N5 — chain the cause in `kf_generate_private`.** See `H13-2` N1. Until it is
   chained, §2.3 cannot be measured by anybody, and the next lane will re-derive
   this section from scratch.
+
+---
+
+## INDEPENDENT REPRODUCTION (lane H0, 2026-08-20) — and one detail sharper than reported
+
+Probe written without reading this lane's fixture, on the binary at `fe59bf9d9`.
+Saved as `regression-suite/probes/ChmConsistencyProbe.java`.
+
+**Unarmed control: every row correct.** All of the below is dial-caused.
+
+| probe | HotSpot | CratonVM `--jdk-only` **armed** CHM |
+|---|---|---|
+| 4 back-to-back `put`, String keys | `size=4 keys=[k0,k1,k2,k3]` | **`size=1 keys=[]`** |
+| same 4 puts with `size()` between them | `size=4 keys=[k0..k3]` | `size=4 keys=[k0..k3]` |
+| same 4 puts with `Math.abs(1)` between them | `size=4 keys=[k0..k3]` | `size=4 keys=[k0..k3]` |
+| 4 puts, `Integer` keys | `size=4` | `size=4` |
+| one `putIfAbsent`, read via `ConcurrentHashMap` | `true / [only] / 1` | `true / [only] / 1` |
+| **the same map**, read via `Map` | `true / [only] / 1` | **`false / [] / 0`** |
+
+**Every claim in this record reproduces**, including the one that reads as
+impossible: **interposing a call that does nothing to the map — `Math.abs(1)` —
+between the puts makes all four persist.**
+
+**The detail this record understates.** It reports the back-to-back case as
+"size 1 (the first)". It is worse than that: **`size()` answers `1` while
+`keySet()` is EMPTY.** The map contradicts itself *through a single door*, so
+this is not only a door-vs-door disagreement — the size counter and the table
+disagree with each other. Any consumer that branches on `isEmpty()` versus
+`size()` gets two different answers about the same map, which is exactly the
+`CryptoPermissions.isEmpty()` path §4 traces into a dead JCE.
+
+**Why this matters for the plan more than mechanisms A and B do.** A and B fail
+*loudly* — an NPE, an `ArrayStoreException`. This one returns wrong answers
+quietly and inconsistently, and its trigger is **the instruction sequence around
+the put**, not the data. A vector can pass, be edited in a way that changes
+nothing semantically, and start failing. Two consequences worth stating:
+
+* **`--nojit` does not change it** (this record measured that, and I did not
+  re-check it), so the sequence dependence is not tier-up. Whatever caches or
+  defers the put lives below the JIT.
+* **String keys only.** `Integer` keys are correct at the same sites. So the
+  trigger involves key hashing or interning, which narrows the search a great
+  deal and is not stated as a lead anywhere yet.
