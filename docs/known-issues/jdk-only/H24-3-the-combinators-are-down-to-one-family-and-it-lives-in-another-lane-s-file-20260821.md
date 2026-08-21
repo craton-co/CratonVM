@@ -212,6 +212,16 @@ same change:
   sites were exercised, so this is cosmetic-plus-ratchet, not behavioural — but
   it is exactly the "deleting a native whose class is gone" follow-up
   `H15-3` §2.4 deferred, and it is now backed by a count instead of an argument.
+
+  **This lane deliberately did NOT do it, even though four of the rows are in
+  its own `streams.rs`.** `native-builtins/tests/stub_ratchet.rs` carries exact
+  counts with `SLACK: usize = 0` — `BASELINE_SYNTHETIC_STUBS` 1626/1615 and
+  `MEASURED_TOTAL_REGISTRATIONS` 13225/12857, per management-feature config.
+  Any deletion moves all four constants, and re-freezing them requires *running*
+  the test, which requires a build this lane may not do. Landing the deletion
+  without the re-freeze leaves the gate red for everyone. Whoever takes N2 must
+  take the re-freeze in the same commit, on a MEASURED and fully attributed
+  delta — the rule `e6d642f3b` landed for.
 * **N3 — `H15-3` §2.3's table should be marked superseded.** Three of its
   eleven rows describe registrations that no longer exist. A grep-derived table
   in a record is a snapshot, and this one is nine days stale in a directory
