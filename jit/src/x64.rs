@@ -910,6 +910,33 @@ struct Compiler {
     /// oop bits safely for non-moving GC, but moving-young must treat those
     /// safepoints as incomplete and fall back.
     stack_oop_marks_exact: bool,
+    /// Frame offsets of the STAGED INVOKE-ARGUMENT buffer slots that hold
+    /// references, for the safepoint map about to be emitted.
+    ///
+    /// Invoke arguments are popped off `self.stack` and written into a buffer
+    /// in the spill reserve BEFORE the call, so by the time
+    /// `emit_oop_map_for_safepoint` runs there is nothing left on the simulated
+    /// stack to name them — `emit_pre_safepoint_spill` says as much where it
+    /// publishes the conservative bound ("includes the staged invoke-argument
+    /// buffer ... live for the duration of the call"). They were covered by that
+    /// bound and by nothing else, which is why a frame could assert
+    /// `fully_oop_covered` while live argument oops sat unnamed in the
+    /// operand-spill region.
+    ///
+    /// Consumed (taken) by the next `emit_oop_map_for_safepoint`, exactly like
+    /// `pending_live_frame_hi`, so a staging site that emits no map cannot leak
+    /// its slots into a later safepoint's map.
+    pending_staged_arg_oops: Vec<i32>,
+    /// A reference argument was staged somewhere this compiler cannot name in
+    /// an oop map — the native-ABI outgoing-argument area
+    /// (`emit_stack_arg_setup`), the direct-call service slots, or an inlined
+    /// callee's parameter locals.
+    ///
+    /// Those areas are covered by the conservative scan and by nothing else, so
+    /// a method that stages a reference into one of them must not claim precise
+    /// coverage. Fail-closed: it makes the safepoint incomplete rather than
+    /// silently narrowing what the map describes.
+    pending_staged_args_unmapped: bool,
     /// T1.1.a — collected oop maps, indexed by native PC offset of the
     /// instruction *after* the safepoint call. Transferred to
     /// `CompiledMethod::oop_maps` at finalize time.
@@ -2514,6 +2541,8 @@ impl Compiler {
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
             stack_oop_marks_exact: true,
+            pending_staged_arg_oops: Vec::new(),
+            pending_staged_args_unmapped: false,
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
