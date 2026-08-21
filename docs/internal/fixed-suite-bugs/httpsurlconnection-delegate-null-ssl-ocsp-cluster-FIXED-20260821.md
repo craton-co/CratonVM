@@ -177,6 +177,11 @@ null`:
 
 **`delegate` NPE count is 0 in all 16. 12 of 16 fully green, 274 tests.**
 
+Re-measured on the exact merge commit (`812d925cb`, binary md5
+`cde71808145d3bb58d43dce6f79847b8`): row-for-row identical, including the four
+residuals. Two independent binaries agreeing on all sixteen rows is what makes
+the residual list a finding rather than one run's noise.
+
 Unit suites: `cratonvm-native-builtins` 4124 passed / 1 failed —
 `proxy_selector::tests::env_proxy_lookup_respects_case_insensitive_windows_storage`,
 which fails identically on this branch's merge base with the native-builtins

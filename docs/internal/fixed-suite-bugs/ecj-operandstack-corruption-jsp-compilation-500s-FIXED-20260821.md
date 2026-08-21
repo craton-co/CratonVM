@@ -171,7 +171,19 @@ the HTTPS/OCSP page — same session, different defect):
 
 **15 of 15 classes pass, 216 tests, zero `Unexpected operand at stack top`.**
 
-Unit suites: `cratonvm-jit` 2078 passed / 0 failed.
+Re-measured on the exact merge commit (`812d925cb`, binary md5
+`cde71808145d3bb58d43dce6f79847b8`): same result, with one bookkeeping caveat
+worth stating rather than hiding. In that run `TestGenerator` scored `rc=124`
+because the ECJ and SSL batches were running **concurrently on the same 8-core
+host** (load average 7). Re-run ALONE it is `OK (85 tests)`, `asserts=0`,
+**WALL = 934 s** against a 900 s cap — a 4 % overshoot, i.e. the sweep-hang
+coin toss, not a regression. That wall is the pre-existing embedded-server
+deployment throughput wall (`04-embedded-server-throughput-wall-OPEN.md`), which
+the 2026-08-06 record already attributed it to at 579 s. Zero assertions in
+either run, which is the thing this page is about.
+
+Unit suites: `cratonvm-jit` 2082 passed / 0 failed on the merge commit
+(2078 before merging current `dev`).
 
 ## A second defect this one was hiding
 
