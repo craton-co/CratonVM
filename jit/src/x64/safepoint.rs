@@ -1115,6 +1115,33 @@ impl Compiler {
                 }
             }
         }
+        // Stage 3 — the STAGED INVOKE-ARGUMENT buffer. These oops were popped
+        // off the simulated operand stack before the call, so neither loop above
+        // can see them; without this they were covered only by the conservative
+        // bound this safepoint publishes, while the method still claimed full
+        // precise coverage. Naming them here makes them precise roots, which
+        // also means a moving collection REWRITES them rather than merely
+        // marking them — the property the claim is actually spent on.
+        //
+        // Taken, not copied, so a staging site that emits no map cannot leak
+        // into a later safepoint (same discipline as `live_frame_hi`).
+        for off in std::mem::take(&mut self.pending_staged_arg_oops) {
+            match i16::try_from(off) {
+                Ok(i16_off) => {
+                    if !slots.contains(&i16_off) {
+                        slots.push(i16_off);
+                    }
+                }
+                Err(_) => map_incomplete = true,
+            }
+        }
+        // A reference staged somewhere no map can name it (native-ABI outgoing
+        // args, direct-call service slots, inlined-callee parameter locals).
+        // Fail closed.
+        if std::mem::take(&mut self.pending_staged_args_unmapped) {
+            map_incomplete = true;
+        }
+
         // Stage A.2 (precise oop maps, B-K fix) — under the precise gate, record
         // an entry for EVERY safepoint, including ones with no live oops (empty
         // `slots`). The default path keeps skipping empties (smaller metadata,

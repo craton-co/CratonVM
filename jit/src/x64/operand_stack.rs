@@ -123,6 +123,33 @@ impl Compiler {
             .or_insert(marks);
     }
 
+    /// Pop `n` invoke arguments, returning their slots (in call order) AND
+    /// whether each is a reference.
+    ///
+    /// `pop_stack` discards the oop mark it pops, which is fine everywhere the
+    /// value goes straight back onto the simulated stack — but invoke arguments
+    /// leave the stack model entirely and land in a staging buffer, and the
+    /// safepoint map has to name the reference ones. This is the only way to
+    /// learn which those are, since the marks are gone by the time the buffer
+    /// offsets are known.
+    ///
+    /// The mark is read BEFORE the pop, so it is the mark belonging to the slot
+    /// being popped. A short mark vector reads `false` here and additionally
+    /// makes `pop_stack` clear `stack_oop_marks_exact`, which
+    /// `emit_oop_map_for_safepoint` already treats as an incomplete map — so a
+    /// desync cannot turn into a silently unnamed argument.
+    pub(super) fn pop_invoke_args(&mut self, n: usize) -> (Vec<StackSlot>, Vec<bool>) {
+        let mut slots = Vec::with_capacity(n);
+        let mut oops = Vec::with_capacity(n);
+        for _ in 0..n {
+            oops.push(self.stack_oop_marks.last().copied().unwrap_or(false));
+            slots.push(self.pop_stack());
+        }
+        slots.reverse();
+        oops.reverse();
+        (slots, oops)
+    }
+
     /// Pop a value from the simulated operand stack.
     /// Returns `StackSlot::Frame(0)` and sets `self.failed` on underflow.
     pub(super) fn pop_stack(&mut self) -> StackSlot {
