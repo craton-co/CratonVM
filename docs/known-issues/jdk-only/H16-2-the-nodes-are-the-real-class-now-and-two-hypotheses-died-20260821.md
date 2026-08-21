@@ -257,10 +257,24 @@ java/lang/ArrayStoreException: cratonvm.synthetic.AnonymousObject$4
 for every `checkcast Map$Entry` in an `entrySet()` walk. So the vectors whose
 armed death is an `ArrayStoreException` or a `Map$Entry` cast should recover.
 
-**I am not predicting a number**, and the reason is `H16-3`: the armed state is
-a MIXED table — some puts go to real bytecode and some to the native, in the
-same map — and three probes over the same operation give three different armed
-outcomes. A cell measured on that state does not decompose cleanly.
+**The number, since one was asked for: 87 / 105, ARGUED, with a wide band.**
+The derivation, so it can be attacked rather than just compared: of `H0-4` §1's
+22 `HashMap` failures (23 net of `RMapGcStress`, which `H14-3` re-classified as a
+`rc=124` clock artefact), the ones whose armed death is an
+`ArrayStoreException` or a `Map$Entry` cast are the ones this reaches.
+`H0-6` §7 exhibits exactly one of those by name (`RJdkCollections`). I have no
+per-vector failure text for the other 21 — **I did not run them** — so the split
+between "dies on the node's class" and "dies on something else" is a guess, and
+I am guessing about a fifth: **+4, i.e. 83 → 87.** Anything in **84–92** I would
+call the prediction confirmed in kind.
+
+The band is wide because of `H16-3`: the armed state is a MIXED table — the
+first put in the process goes to real bytecode and every later one to the
+native, in the same map — and three probes over the same operation give three
+different armed outcomes (`ClassCastException` after 0; a silent 1-of-2; an NPE
+inside `HashMap$EntryIterator.<init>`). A cell measured on that state does not
+decompose cleanly, and a point estimate against it is arithmetic this directory
+keeps recording as false.
 
 **Falsifiers, in order of what each would mean:**
 
