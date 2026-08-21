@@ -110,15 +110,68 @@ from the consumer end: G1 skipped the conservative scan on this proof, published
 no pins, and evacuated a live `StringLatin1.newString` reference. That record's
 fix stops G1 depending on the bit. This record is the bit itself.
 
+## The frame has TWO coverage vocabularies, and the bit describes only one
+
+The three drops above are real, and closing them was tried — every one now sets
+`map_incomplete` and withholds the safepoint from `mapped_safepoint_pcs`
+(`30370b165`). **It changed nothing on the measured workload**, and that result
+is what identifies the actual mechanism:
+
+```text
+probe-fixed          DISTINCT sites=4 {"operand-spill": 4}  while_covered=20
+probe-presenceonly   DISTINCT sites=4 {"operand-spill": 4}  while_covered=20
+```
+
+Byte-identical arms means `map_incomplete` never fired: nothing was *dropped*.
+Those oops were never in the precise vocabulary to begin with.
+
+`emit_pre_safepoint_spill` says what the other vocabulary is. The conservative
+bound it publishes:
+
+> Includes the **staged invoke-argument buffer**, which sits above the operand
+> stack in the same spill reserve and is live for the duration of the call.
+
+and, twenty lines further down, the blind spill of every used callee-saved GPR:
+
+> an oop can also live in a callee-saved register as an operand-stack temporary
+> that survives the call, or via a value the per-slot oop tracker fails to tag
+
+Both are deliberate conservative coverage for oops the precise map does not
+name. Staged invoke arguments have already been popped off `self.stack` by the
+time the map is built, so no map can name them; they sit in the operand-spill
+reserve and are live across the call. That is exactly the measured signature —
+four adjacent slots in the operand-spill region, named by no map at any
+safepoint of the method (`wrong_map=0`), on a frame asserting full coverage.
+
+So the defect is not that the map loses entries. It is that **the frame is kept
+safe by two mechanisms and `fully_oop_covered` describes only one of them**, while
+being spent to suppress the other.
+
 ## The repair
 
-Making the bit *sufficient* is the real fix, and it is bounded: have
-`emit_oop_map_for_safepoint` refuse to claim a mapped safepoint when any of the
-three drops fires. Concretely, track a per-safepoint `lost_an_oop` and exclude
-that pc from `mapped_safepoint_pcs` — which flips `fully_oop_covered` to `false`
-for the method and returns it to the conservative backstop. That is the
-fail-closed direction the same function already takes for a missing paired
-spill (`live_frame_hi == 0` = "unknown", scan conservatively).
+`fully_oop_covered` must additionally require that nothing relies on the
+conservative vocabulary at any safepoint of the method — i.e. no staged
+invoke-argument buffer live across a call, and no blind-spilled callee-saved
+GPR carrying an untagged oop. A method that needs either cannot claim precise
+coverage.
 
-Wiring `stack_oop_marks_exact` into the predicate is the one-line subset of
-this and closes drop 1 alone.
+The fail-closed drop accounting in `30370b165` stays: those drops are genuine
+unsoundness whenever they fire, it is the correct direction, and it is measured
+to cost nothing here (`map_incomplete` never fired on any workload run). It is
+hardening, not the fix for the sites above.
+
+## Status of the suppression
+
+`precise_only_true` counted per run, with all fixes in:
+
+```text
+probe    G1 / generational      0    (never takes the suppression)
+ntru     G1                     0
+ntru     -XX:+UseGenerationalGC 1    <- first observed instance; test PASSED
+ntru     default (ZGC)          0
+```
+
+The single generational instance is the first time any run here has reached
+"verifier ran, verifier passed, collector moved". It did not corrupt, which is
+consistent with the mechanism above being latent rather than always fatal — the
+suppressed pause has to coincide with a staged-argument oop that actually moves.

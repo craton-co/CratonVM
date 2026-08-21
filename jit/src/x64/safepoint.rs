@@ -1043,7 +1043,16 @@ impl Compiler {
         let native_pc = self.buf.pos() as u32; // Cast: x86-64 immediate encoding
         let mut slots: Vec<i16> = Vec::new();
         // Whether this safepoint's map is known to be INCOMPLETE — some live
-        // oop could not be recorded. Every `continue`/failed-`if let` below is
+        // oop could not be recorded.
+        //
+        // MEASURED INERT on every workload run so far (probe and ntru, all
+        // three collectors): this never fires there, and the arms with and
+        // without it are byte-identical. It is fail-closed hardening for drops
+        // that ARE unsound whenever they happen — it is NOT the explanation for
+        // the never-mapped operand-spill slots those runs report. Those are
+        // staged invoke-arguments, which were never in this vocabulary to be
+        // dropped from. See
+        // `docs/known-issues/gc/bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`. Every `continue`/failed-`if let` below is
         // a silent omission, and until this existed none of them reached
         // `fully_oop_covered`, which tests only that each safepoint produced AN
         // entry (`safepoint_pcs ⊆ mapped_safepoint_pcs`). A safepoint whose map
