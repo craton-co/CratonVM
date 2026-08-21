@@ -20,11 +20,15 @@ variable:
   the same, merged with dev tip eadd845c4              85
 ```
 
-The 88 → 85 step is not a regression from this work. `dev` commit `9fdc0a3f7`
-flipped `CRATONVM_JIT_SELF_TAILCALL`'s default off, and two Groovy
-markup-template classes fail with that default and pass without it — on pristine
-`dev` tip and on the merged tree identically, binary for binary. It has its own
-page: `known-issues/spring/groovy-markup-self-tailcall-off-20260820.md`.
+The 88 → 85 step was not a regression from this work, and is now closed. `dev`
+commit `9fdc0a3f7` flipped `CRATONVM_JIT_SELF_TAILCALL`'s default off, which
+made a JIT exception-routing defect reachable: two compiled activations of one
+self-recursive method share `jit_set_throw_bci`'s single per-thread stamp, so the
+outer one's call site overwrote the inner one's throw site and an exception
+escaped a `catch` that covered it. Two Groovy markup-template classes failed on
+that. FIXED 2026-08-20 — see the retired
+`groovy-markup-self-tailcall-off-20260820` write-up; the same 90 classes now
+score **87**.
 
 Of the five classes not OK on the merged tree, then: two are that flag, one
 fails identically on HotSpot, one is the AOT/Mockito throughput wall, and one
@@ -204,9 +208,20 @@ Both classes were green on this branch before it merged `dev` tip, and both are
 red after — on pristine `dev` tip too. `dev`'s `9fdc0a3f7` flipped
 `CRATONVM_JIT_SELF_TAILCALL` off by default, and that flag alone decides the
 outcome on either tree (`CRATONVM_JIT_SELF_TAILCALL=1` → 10/10 and 7/7;
-`--nojit` likewise). Whether the elimination cures the defect or hides it is
-undetermined, so the item moves to its own page rather than being claimed here:
-`known-issues/spring/groovy-markup-self-tailcall-off-20260820.md`.
+`--nojit` likewise).
+
+Root-caused and FIXED the same day, in the retired
+`groovy-markup-self-tailcall-off-20260820` write-up: the elimination HIDES it
+rather than curing it. A compiled frame never dispatches to its own handler —
+the interpreter's drain does, keyed on a per-thread stamp with no activation
+identity — so in a self-recursive chain the outermost activation's stamp (its
+own recursive call site) overwrote the inner one's (the real throw site) and the
+drain concluded the method could not catch its own throw. The elimination turns
+the recursion into a `JMP`, leaving one activation and one stamp. Groovy's
+`CachedSAMClass.hasUsableImplementation` is the shape; the
+`WrongMethodTypeException` above is two hops downstream of the escaped
+`NoSuchMethodException`, not a defect in its own right, and the arity guess
+recorded here was wrong.
 
 ### 6. The "recheck against `dev` tip" Groovy/JRuby list — DONE
 
@@ -248,8 +263,10 @@ about an extra KEY, and the key is one Spring itself writes).
   `force_native_over_real_jdk_bytecode_memoized`). It was never one of this
   doc's clusters.
 * `FileNativeConfigurationWriterTests` — see above; HotSpot fails it identically.
-* `GroovyMarkupViewTests` and `ViewResolutionIntegrationTests` — item 5; a
-  `dev`-tip flag default, tracked separately.
+* `GroovyMarkupViewTests` and `ViewResolutionIntegrationTests` — item 5. FIXED
+  2026-08-20, one commit later: a self-recursive activation could not catch its
+  own callee's throw. See the retired
+  `groovy-markup-self-tailcall-off-20260820` write-up.
 * `WebClientIntegrationTests` — item 4; 2 of 5 isolated runs clean where it used
   to fail every run, the residual being a reactive-path deadline.
 

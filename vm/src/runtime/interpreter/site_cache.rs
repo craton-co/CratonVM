@@ -409,8 +409,22 @@ pub mod site_stats {
     /// added cost for it. `ldc2_w` does not probe or record — see
     /// `constants::execute_ldc2w`.
     pub const LDC_FILL: usize = 18;
+    /// The COMPILED `ldc` triple, kept separate from the interpreter's three
+    /// above. Two populations, two switches
+    /// (`CRATONVM_JIT_NO_LDC_CONST_CACHE` and
+    /// `CRATONVM_JIT_COMPILED_LDC_CONST_CACHE`), and the compiled one is the
+    /// one that was re-deriving its constant every execution until 2026-08-20
+    /// — folding them into one number would make "which route is answering
+    /// from the record" unanswerable, which is the whole question.
+    ///
+    /// `jit_fill` non-zero with `jit_hit`/`jit_miss` at zero is the specific
+    /// shape a kill switch that gates only the READ produces; it is why the
+    /// compiled switch gates the write too.
+    pub const JIT_LDC_HIT: usize = 19;
+    pub const JIT_LDC_MISS: usize = 20;
+    pub const JIT_LDC_FILL: usize = 21;
 
-    const N: usize = 19;
+    const N: usize = 22;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -436,7 +450,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -457,6 +471,9 @@ pub mod site_stats {
             COUNTS[LDC_HIT].load(Ordering::Relaxed),
             COUNTS[LDC_MISS].load(Ordering::Relaxed),
             COUNTS[LDC_FILL].load(Ordering::Relaxed),
+            COUNTS[JIT_LDC_HIT].load(Ordering::Relaxed),
+            COUNTS[JIT_LDC_MISS].load(Ordering::Relaxed),
+            COUNTS[JIT_LDC_FILL].load(Ordering::Relaxed),
         );
     }
 

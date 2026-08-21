@@ -743,10 +743,16 @@ struct Compiler {
     loop_unroll_hints: FxHashMap<usize, usize>,
     /// Resolved ldc/ldc_w constants: (bytecode_pc, i64 value).
     ldc_info: Vec<(usize, i64)>,
-    /// String ldc sites: (bytecode_pc, stable UTF-8 pointer, byte length).
-    /// The bytes are owned by the compiled method; code materializes the Java
-    /// object through `helpers.ldc_string` instead of baking an ObjectRef.
-    ldc_string_info: Vec<(usize, *const u8, usize)>,
+    /// String-`ldc` sites: `(bytecode_pc, referencing class id, CP index)`.
+    /// Served by `helpers.ldc_string_cp`, the exact twin of the class row
+    /// below — and CP-indexed for one more reason than the mirror is: JVMS
+    /// §5.4.3 resolves a constant-pool entry ONCE and records the result, and
+    /// that record is keyed `(class, cp index)`. The predecessor shape baked
+    /// the literal's UTF-8 bytes, which is a key the record cannot be read
+    /// with, so every execution re-derived the answer through the string
+    /// pool's lock and a hash of the whole literal (18.4 ns against HotSpot's
+    /// 0.2 — `probes/LdcConstCostProbe.java`).
+    ldc_string_info: Vec<(usize, u32, u16)>,
     /// Class-`ldc` sites: `(bytecode_pc, referencing class id, CP index)`.
     /// Served by `helpers.ldc_class_cp`, which resolves the target and
     /// returns its mirror — the mirror is a heap object, so it can neither be

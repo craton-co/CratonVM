@@ -1092,6 +1092,46 @@ impl Compiler {
     /// The mirror is re-fetched on every execution rather than baked, exactly
     /// as `helpers.ldc_string` re-interns its String: both are heap objects a
     /// relocating collector may move between two runs of this body.
+    /// `ldc <String>` — the interned literal named at `cp_idx` in
+    /// `holder_class_id`'s constant pool, materialised by
+    /// `helpers.ldc_string_cp`.
+    ///
+    /// The exact twin of [`Self::emit_ldc_class`] below, down to the stub: the
+    /// two helpers take the same `(vm_ptr, holder_class_id, cp_idx)` shape and
+    /// share the same `0 = pending exception` convention, so they share the
+    /// emitter. That is what keeps the two sites' ABIs from drifting apart.
+    ///
+    /// Returns `false` when the site is not a string `ldc`, when the helper is
+    /// unwired (a hand-built test table) or when the artifact has no context
+    /// slot — and then the caller bails the site exactly as it did before this
+    /// helper existed.
+    pub(super) fn emit_ldc_string(&mut self, pc: usize) -> bool {
+        let Some(&idx) = self.ldc_string_info_idx.get(&pc) else {
+            return false;
+        };
+        if self.helpers.ldc_string_cp == 0 || !self.needs_heap {
+            return false;
+        }
+        let (_, holder_class_id, cp_idx) = self.ldc_string_info[idx];
+        self.emit_pre_safepoint_spill();
+        crate::runtime_lowering::emit_ldc_class_cp_stub(
+            &mut self.buf,
+            self.heap_local_offset,
+            self.helpers.ldc_string_cp,
+            holder_class_id,
+            cp_idx,
+            self.helpers.frame_record,
+        );
+        // Interning allocates, so this is a real safepoint. A `0` return is a
+        // published pending exception (the constant-pool entry could not be
+        // re-read), not a value — the same convention `emit_ldc_class` takes.
+        self.emit_oop_map_for_safepoint();
+        self.emit_post_alloc_oom_check();
+        self.push_from_rax();
+        self.mark_top_as_oop();
+        true
+    }
+
     pub(super) fn emit_ldc_class(&mut self, pc: usize) -> bool {
         let Some(&idx) = self.ldc_class_info_idx.get(&pc) else {
             return false;

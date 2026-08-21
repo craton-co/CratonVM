@@ -15206,6 +15206,16 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                     let eng = ctx.read_native_pin(eng_pin, eng0);
                     crate::t27_tls::set_engine_peer_host(ctx, eng, host, port);
                 }
+            } else {
+                // `javax.net.ssl.SSLEngine` declares `private int peerPort = -1`
+                // and the no-arg `SSLEngine()` leaves it there, so HotSpot's
+                // `createSSLEngine()` engine reports port -1. A synthetic
+                // allocation leaves the slot at its untagged 0, which is a
+                // legal-looking port number that no caller asked for and which
+                // `SSLEngine.toString()` prints. `peerHost` needs no such seed:
+                // its default IS null.
+                let eng = ctx.read_native_pin(eng_pin, eng0);
+                ctx.set_field_by_name(eng, "peerPort", Value::Int(-1));
             }
             let eng = ctx.read_native_pin(eng_pin, eng0);
             ctx.unpin_native_roots(eng_pin);

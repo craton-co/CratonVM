@@ -356,7 +356,7 @@ pub fn compile_with_param_slots(
     // `Vec::new()` and the cascade is simply not emitted at any pc.
     pic_slots: Vec<(usize, *const crate::JitPICSlot)>,
     ldc_info: Vec<(usize, i64)>,
-    ldc_string_info: Vec<(usize, *const u8, usize)>,
+    ldc_string_info: Vec<(usize, u32, u16)>,
     // Class-`ldc` sites — see `ldc_class_info` on the compiler struct. Served
     // by the CP-indexed `ldc_class_cp` helper; disjoint from `ldc_info` and
     // `ldc_string_info`.
@@ -2132,8 +2132,13 @@ pub fn compile_with_param_slots(
         // `jit_ldc_class_cp` needs `jit_thread_mut()` for the same reason the
         // two above do: the resolution it performs may run a user
         // `ClassLoader.loadClass`, and a failure has to publish a pending
-        // exception on this thread.
-        || !compiler.ldc_class_info.is_empty();
+        // exception on this thread. `jit_ldc_string_cp` joins it for the
+        // second half of that reason only — it loads nothing, but its
+        // defensive "the CP entry is no longer readable" arm publishes an
+        // `InternalError` through the same channel, and `emit_post_alloc_oom_check`
+        // is emitted at its site either way.
+        || !compiler.ldc_class_info.is_empty()
+        || !compiler.ldc_string_info.is_empty();
     // Snapshot the frame partition and the label BEFORE `compiler.buf` is moved
     // into the artifact (which partially moves `compiler`).
     let frame_layout = compiler.frame_layout();
