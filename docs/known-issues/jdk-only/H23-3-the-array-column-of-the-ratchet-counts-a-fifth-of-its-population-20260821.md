@@ -235,3 +235,67 @@ would look next after `lang_class.rs`.
    `ClassCastException` — but it currently makes every component-type defect
    silent. A debug-gated counter of fail-open admissions would have surfaced
    both this and `H23-2`'s defect years earlier, and costs nothing when off.
+
+---
+
+## FIXED (lane H0, 2026-08-21) — v6, and the true population is 359
+
+This record is right, and the fix went further than its diagnosis because the
+recount surfaced two more dimensions.
+
+### What the gate now counts
+
+| | v1 | v5 (what this record measured) | **v6** |
+|---|---:|---:|---:|
+| object sites | 84 | 173 | **208** |
+| array sites | 0 | 29 | **151** |
+| **total** | **84** | **203** | **359** |
+
+**v5 saw 57% of the population; v1 saw 23%.**
+
+### Two dimensions this record's diagnosis did not name
+
+1. **A fourth allocator spelling.** `try_new_ref_array` — 4 sites — which no
+   version of the gate had ever matched.
+2. **Two functions take the sentinel and are NOT allocations.** `class_is` (a
+   comparison) and `define_class` (where the sentinel means *"no parent"*, not
+   *"unknown class"*). A blanket "any function name" pattern — the obvious fix
+   after v5 — counts both and **over**-reports, which is the same error in the
+   other direction.
+
+So the counting rule is now an explicit **allowlist**, with a per-function rule
+for the second argument:
+
+* `alloc_object` / `alloc_object_of` — count unless the width is a **literal
+  `0`**, because `vm_exec.rs` substitutes only when `num_fields > 0`. 21 such
+  sites exist and fabricate nothing.
+* `new_ref_array` / `try_new_ref_array` — count **regardless of length**,
+  including a literal `0` and, decisively, a **variable**. This record's
+  finding: an array length is naturally dynamic, so a literal-only pattern is
+  blind to most of the population *by construction*.
+
+**Unknown spellings are discovered but not counted.** The breakdown greps every
+function that takes the sentinel, so a new one appears as a named line and trips
+a new-spelling check that asks a human to classify it. That is the fail-safe
+direction — v1 and v2 were wrong precisely because a spelling they had never
+seen was silently *absent* rather than loudly *unclassified*.
+
+### The falsifier this record ran by accident is now the acceptance test
+
+`H23` removed the sentinel behind every `HashMap.table` and the gate still
+reported **29 → 29, green**. A `--selftest` mode now asserts both patterns match
+something, and the three failure paths are exercised and confirmed: array growth
+trips, object improvement reports, a new function spelling trips.
+
+### Six versions, and the shape of the error never changed
+
+Each version measured a fraction and printed a confident number: 41%, then a
+regex that matched nothing, then rc=0 while matching nothing at all, then three
+invented carrier families, then 19% of the array column. **The failure mode of a
+census is not a wrong answer — it is a confident partial one**, and it survived
+five rounds of a person who had written that sentence into the file's own header.
+
+The general lesson is worth more than the gate: **a census needs a falsifier it
+runs itself.** Every one of these was caught by an outsider deleting a site and
+watching the number fail to move. That test cost nothing and no version of the
+gate performed it on itself until now.

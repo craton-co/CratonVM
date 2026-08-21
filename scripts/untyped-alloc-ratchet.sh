@@ -1,68 +1,71 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# untyped-alloc-ratchet.sh — watch the fabricated-carrier surface.
+# untyped-alloc-ratchet.sh — watch the fabricated-carrier surface.  VERSION 6.
 #
-# WHAT IT COUNTS, and why this is not the stub ratchet
-# ----------------------------------------------------
-# `ClassId::new(0)` is the untyped-allocation sentinel. Passed to an object
-# allocator, the VM substitutes `cratonvm/synthetic/AnonymousObject$N`
-# (`vm/src/vm/vm_exec.rs`). The caller reached that line because it *resolved a
-# class and FAILED*, and it then hands the object out as an instance of the
-# class it named.
+# WHAT IT COUNTS
+# --------------
+# `ClassId::new(0)` is the untyped sentinel. Passed to an OBJECT allocator the
+# VM substitutes `cratonvm/synthetic/AnonymousObject$N` (`vm/src/vm/vm_exec.rs`);
+# passed to an ARRAY allocator it produces a bare `Object[]` where the real class
+# declares a typed array. The caller reached that line because it *resolved a
+# class and FAILED*, then handed the result out as the thing it named.
 #
-# `H0-6` measured what that costs: `AnonymousObject$4` IS the `HashMap.Node`
-# ({hash,key,value,next}), and real `HashMap.resize()` storing into a `Node[]`
-# throws `ArrayStoreException` on it. `H0-4` §7 then measured that the table is
-# fully populated and correct under `size()`/`get()` — it is ITERATION that
-# breaks, because the nodes are the wrong class.
+# `H0-6` §7: `AnonymousObject$4` IS the `HashMap.Node`. `H0-4` §7: the table is
+# fully populated and `size()`/`get()` are correct — ITERATION breaks, because
+# the nodes are the wrong class. `H23-1`: the array holding them was wrong too.
+# `native-builtins/tests/stub_ratchet.rs` cannot see any of this — it counts
+# REGISTRATIONS, and a substitution is not a registration.
 #
-# `native-builtins/tests/stub_ratchet.rs` CANNOT see any of this: it counts
-# REGISTRATIONS, and a substitution is not a registration. That is the gap.
+# THE COUNTING RULE, stated because five earlier versions each got it wrong
+# --------------------------------------------------------------------------
+# Match is by an explicit ALLOWLIST of allocator functions, with a per-function
+# rule for the second argument:
 #
-# THREE ALLOCATOR SPELLINGS, and each earlier version of this gate saw only some
-# ----------------------------------------------------------------------------
-#   alloc_object      an object whose CLASS is unknown      -> AnonymousObject$N
-#   alloc_object_of   the same, one call site
-#   new_ref_array     a reference ARRAY whose COMPONENT class is unknown -> Object[]
+#   alloc_object, alloc_object_of   COUNT unless the width is literal `0`.
+#                                   The VM substitutes only when `num_fields > 0`
+#                                   (`vm_exec.rs`), so a literal 0 fabricates
+#                                   nothing. 21 such sites exist.
+#   new_ref_array, try_new_ref_array  COUNT regardless of length — including a
+#                                   literal 0 and, crucially, a VARIABLE. An
+#                                   array length is naturally dynamic, so a
+#                                   literal-only pattern is blind to most of the
+#                                   population by construction: 29 of 147.
 #
-# `new_ref_array` is a different defect wearing the same sentinel, and it is not
-# cosmetic: it is why a `HashMap.table` is `[Ljava/lang/Object;` where the real
-# class declares `[Ljava/util/HashMap$Node;` — the array-store half of `H0-6`.
-# It gets its own column rather than being folded in, because retiring an object
-# fabrication and retiring an array component type are different work.
+# NOT allocators, deliberately excluded: `class_is` (a comparison) and
+# `define_class` (the sentinel means "no parent", not "unknown class"). A
+# blanket "any function name" pattern counts both and over-reports.
 #
-# THE HISTORY OF THIS FILE IS THE ARGUMENT FOR THE GUARDS IN IT
-# -------------------------------------------------------------
-#   v1  matched only the bare `ClassId::new(0)` spelling and counted 84 of 203
-#       — 41% — while printing a clean "ok". Lane `H16` caught it by deleting
-#       two sites and watching the number not move. The majority spelling is
-#       `cratonvm_types::ClassId::new(0)` (100 sites), and
-#       `native-builtins/src/t27_tls.rs` — production despite the test-shaped
-#       name — is the single largest producer at 35, none of them visible to v1.
-#   v2  widened the pattern but left `git grep` in BASIC regex, where `(` is a
-#       literal, so the new grouping matched nothing and the count moved to 89
-#       instead of 203.
-#   v3  dropped the `EXCL` definition in an edit and printed
-#       "IMPROVED by 84 … ok — no growth" with **rc=0 while matching NOTHING**.
-#   v4  folded `new_ref_array`'s second argument into WIDTHS, where it is an
-#       array LENGTH and not a field count, so 16/32/64 appeared as three new
-#       "carrier families" that do not exist.
+# UNKNOWN spellings are DISCOVERED but not counted: the breakdown greps every
+# function name that takes the sentinel, so a new allocator appears as a named
+# line and trips the new-spelling check, asking a human to classify it. That is
+# the fail-safe direction — v1 and v2 were wrong precisely because a spelling
+# they had never seen was silently absent rather than loudly unclassified.
 #
-# Every one of those printed a confident number. **A gate that measures a
-# FRACTION reads as good news** — this repository has a standing note saying
-# exactly that, and this file was written by a lane that had quoted it to five
-# others the same day. Hence the zero-guard below, the per-function breakdown,
-# and the unit separation. Prefer a permissive pattern: a new spelling is far
-# likelier than a false positive.
+# THE HISTORY IS THE ARGUMENT FOR THE GUARDS
+# ------------------------------------------
+#   v1  bare `ClassId::new(0)` only -> 84 of 203 (41%), printed a clean "ok".
+#       Caught by `H16` deleting two sites and watching the number not move.
+#   v2  widened the pattern, left `git grep` in BASIC regex where `(` is a
+#       literal -> the grouping matched nothing; 89 instead of 203.
+#   v3  an edit dropped `EXCL`; printed "IMPROVED by 84 … ok" with **rc=0 while
+#       matching NOTHING**.
+#   v4  folded `new_ref_array`'s LENGTH into WIDTHS, where it is a field count
+#       -> 16/32/64 appeared as three carrier families that do not exist.
+#   v5  required a positive literal length -> saw 29 of 147 array sites (19%).
+#       `H23` ran the falsifier BY ACCIDENT: its fix removed the sentinel behind
+#       every `HashMap.table` and the gate still reported 29 -> 29, green.
+#
+# Every one printed a confident number. **A gate that measures a FRACTION reads
+# as good news.** Hence: the zero-guard, the per-function breakdown, the unit
+# separation, and `--selftest`.
 #
 # WHAT THIS IS NOT: a grep over source text, not a runtime census. A site behind
-# `cfg`, a macro-generated call, or a non-literal width is invisible to it. It is
-# a ratchet against DRIFT, not a population count — do not quote its number as
-# the size of the problem. `CRATONVM_DBG_ANONALLOC=1` is the runtime instrument,
-# and `H0-6` §8 measured that it attributes only 4.4% of events, so neither is
+# `cfg` or generated by a macro is invisible. It ratchets DRIFT; do not quote it
+# as the size of the problem. `CRATONVM_DBG_ANONALLOC=1` is the runtime
+# instrument and `H0-6` §8 measured it attributing 4.4% of events, so neither is
 # authoritative alone.
 #
-# Usage:  scripts/untyped-alloc-ratchet.sh [--update]
+# Usage:  scripts/untyped-alloc-ratchet.sh [--update|--selftest]
 # Exit:   0 ok · 1 ratchet tripped · 2 no baseline · 3 gate is broken
 # ---------------------------------------------------------------------------
 set -u
@@ -70,48 +73,61 @@ set -u
 cd "$(dirname "$0")/.." || exit 3
 BASELINE="scripts/baselines/untyped-alloc-sites.txt"
 
-# `vm/` and `gc/` are excluded on purpose: their `ClassId::new(0)` uses are the
-# allocator and the collector themselves — where the sentinel is defined and
-# consumed rather than produced.
+# `vm/` and `gc/` are excluded on purpose: their sentinel uses are the allocator
+# and the collector themselves — where it is defined and consumed, not produced.
 CRATES="native-builtins/src native-collections/src native-io/src native-api/src
         native-builtins-crypto/src native-builtins-security/src native-awt/src"
 
-# Test-support paths are excluded by PATHSPEC, not by grepping the matched line
-# for "test": `-h` drops the path, which would turn a path filter into a CONTENT
-# filter — keeping `test_mock.rs` while dropping any real site whose line
-# contains "latest"/"fastest".
-#
-# `t27_tls.rs` is deliberately NOT excluded. It is production source.
+# Test-support paths excluded by PATHSPEC, never by grepping the matched line for
+# "test" — `-h` drops the path, turning a path filter into a CONTENT filter that
+# keeps `test_mock.rs` and drops any real site whose line says "latest".
+# `t27_tls.rs` is deliberately NOT excluded: production source, test-shaped name,
+# and the single largest producer in the tree.
 EXCL=':!*/tests/*  :!*test_*.rs  :!*_test.rs  :!*/test_utils.rs  :!*/test_mock.rs'
 
-PAT='[A-Za-z0-9_]+\(([A-Za-z0-9_]+::)*ClassId::new\(0\), *[1-9][0-9]*\)'
-OBJPAT='alloc_object(_of)?\(([A-Za-z0-9_]+::)*ClassId::new\(0\), *[1-9][0-9]*\)'
+SENT='\(([A-Za-z0-9_]+::)*ClassId::new\(0\), *'
+OBJ_PAT="alloc_object(_of)?${SENT}[^)]*\)"        # minus literal-0, filtered below
+ARR_PAT="(try_)?new_ref_array${SENT}[^)]*\)"      # any length, including a variable
+ANY_PAT="[A-Za-z0-9_]+${SENT}[^)]*\)"             # discovery only
 
-hits() {
-  # shellcheck disable=SC2086
-  git grep -hnE "$PAT" -- $CRATES $EXCL 2>/dev/null
-}
-
-breakdown() {
-  # shellcheck disable=SC2086
-  git grep -hoE "$PAT" -- $CRATES $EXCL 2>/dev/null \
-    | sed -E 's/\(.*//' | sort | uniq -c | sort -rn \
-    | awk '{printf "%s=%s ", $2, $1}'
-}
-
-SITES=$(hits | grep -c .)
-
-# WIDTHS from the OBJECT allocators only — see v4 in the history above.
 # shellcheck disable=SC2086
-WIDTHS=$(git grep -hoE "$OBJPAT" -- $CRATES $EXCL 2>/dev/null \
+objhits() { git grep -hnE "$OBJ_PAT" -- $CRATES $EXCL 2>/dev/null \
+              | grep -vE "alloc_object(_of)?${SENT}0\)"; }
+# shellcheck disable=SC2086
+arrhits() { git grep -hnE "$ARR_PAT" -- $CRATES $EXCL 2>/dev/null; }
+# shellcheck disable=SC2086
+breakdown() { git grep -hoE "$ANY_PAT" -- $CRATES $EXCL 2>/dev/null \
+              | sed -E 's/\(.*//' | sort | uniq -c | sort -rn \
+              | awk '{printf "%s=%s ", $2, $1}'; }
+
+if [ "${1:-}" = "--selftest" ]; then
+  echo "SELFTEST: exercising every failure path"
+  fails=0
+  o=$(objhits | grep -c .); a=$(arrhits | grep -c .)
+  [ "$o" -gt 0 ] || { echo "  FAIL object pattern matched nothing"; fails=1; }
+  [ "$a" -gt 0 ] || { echo "  FAIL array pattern matched nothing"; fails=1; }
+  case "$(breakdown)" in *alloc_object=*) ;; *) echo "  FAIL breakdown lost alloc_object"; fails=1;; esac
+  case "$(breakdown)" in *class_is=*) echo "  note: class_is discovered (expected, not counted)";; esac
+  echo "  objects=$o arrays=$a"
+  [ "$fails" -eq 0 ] && echo "  selftest OK" && exit 0
+  exit 3
+fi
+
+OBJ=$(objhits | grep -c .)
+ARR=$(arrhits | grep -c .)
+SITES=$((OBJ + ARR))
+
+# WIDTHS from the OBJECT allocators only, literal widths only. For an array the
+# second argument is a LENGTH, not a field count — v4 mixed the units and
+# invented three carrier families.
+# shellcheck disable=SC2086
+WIDTHS=$(git grep -hoE "alloc_object(_of)?${SENT}[1-9][0-9]*\)" -- $CRATES $EXCL 2>/dev/null \
   | sed -E 's/.*ClassId::new\(0\), *//; s/\).*//' | sort -n -u | tr '\n' ' ' | sed 's/ $//')
 
-# A ZERO is a broken pattern, not a clean tree. v3 printed "ok" at zero.
 if [ "$SITES" -eq 0 ]; then
-  echo "UNTYPED-ALLOC RATCHET: pattern matched ZERO sites."
+  echo "UNTYPED-ALLOC RATCHET: matched ZERO sites."
   echo "  That is a broken gate, not a clean tree — this sentinel is used"
-  echo "  throughout the native crates. Check PAT / EXCL / CRATES before"
-  echo "  trusting any number from this script."
+  echo "  throughout the native crates. Check the patterns, EXCL and CRATES."
   exit 3
 fi
 
@@ -120,64 +136,59 @@ BYFN=$(breakdown)
 if [ "${1:-}" = "--update" ]; then
   mkdir -p "$(dirname "$BASELINE")"
   {
-    echo "# untyped-alloc ratchet baseline"
+    echo "# untyped-alloc ratchet baseline (v6: objects + arrays, allowlisted)"
     echo "# regenerate: scripts/untyped-alloc-ratchet.sh --update"
-    echo "# see docs/known-issues/jdk-only/H0-6-the-fabrication-surface-is-growing-20260820.md"
+    echo "# see docs/known-issues/jdk-only/H0-6 and H23-3"
+    echo "objects=$OBJ"
+    echo "arrays=$ARR"
     echo "sites=$SITES"
     echo "widths=$WIDTHS"
     echo "byfn=$BYFN"
   } > "$BASELINE"
-  echo "baseline written: sites=$SITES widths=[$WIDTHS] byfn=[$BYFN]"
+  echo "baseline written: objects=$OBJ arrays=$ARR sites=$SITES widths=[$WIDTHS]"
   exit 0
 fi
 
-if [ ! -f "$BASELINE" ]; then
-  echo "UNTYPED-ALLOC RATCHET: no baseline at $BASELINE"
-  echo "  measured now: sites=$SITES widths=[$WIDTHS] byfn=[$BYFN]"
-  echo "  run: scripts/untyped-alloc-ratchet.sh --update"
-  exit 2
-fi
+[ -f "$BASELINE" ] || { echo "UNTYPED-ALLOC RATCHET: no baseline at $BASELINE"
+  echo "  measured now: objects=$OBJ arrays=$ARR sites=$SITES widths=[$WIDTHS]"
+  echo "  run: scripts/untyped-alloc-ratchet.sh --update"; exit 2; }
 
-B_SITES=$(sed -n 's/^sites=//p' "$BASELINE")
+B_OBJ=$(sed -n 's/^objects=//p' "$BASELINE"); B_OBJ=${B_OBJ:-0}
+B_ARR=$(sed -n 's/^arrays=//p' "$BASELINE");  B_ARR=${B_ARR:-0}
 B_WIDTHS=$(sed -n 's/^widths=//p' "$BASELINE")
 B_BYFN=$(sed -n 's/^byfn=//p' "$BASELINE")
 bad=0
 
 echo "UNTYPED-ALLOC RATCHET"
-echo "  sites  : $SITES (baseline $B_SITES)"
+echo "  objects: $OBJ (baseline $B_OBJ)      <- fabricated carriers"
+echo "  arrays : $ARR (baseline $B_ARR)      <- untyped component class"
 echo "  widths : [$WIDTHS] (baseline [$B_WIDTHS])"
-echo "  by fn  : $BYFN(baseline $B_BYFN)"
+echo "  by fn  : $BYFN"
 
-if [ "$SITES" -gt "$B_SITES" ]; then
-  echo "  TRIPPED: the fabricated-carrier surface GREW by $((SITES - B_SITES)) site(s)."
-  echo "    Each new site is a caller that resolved a class, failed, and will hand"
-  echo "    out an AnonymousObject\$N (or a bare Object[]) as that class. If the"
-  echo "    addition is deliberate, say why in the commit and re-baseline."
-  bad=1
-elif [ "$SITES" -lt "$B_SITES" ]; then
-  echo "  IMPROVED by $((B_SITES - SITES)) site(s) — re-baseline with --update so the"
-  echo "    gain is held. A ratchet only holds if clearing it is what makes it green."
-fi
-
-for w in $WIDTHS; do
-  case " $B_WIDTHS " in
-    *" $w "*) ;;
-    *) echo "  TRIPPED: NEW carrier width $w — a shape no baseline has seen."
-       echo "    Widths are families: width 4 is the HashMap.Node (H0-6 §7)."
-       bad=1 ;;
-  esac
+for pair in "object:$OBJ:$B_OBJ" "array:$ARR:$B_ARR"; do
+  k=${pair%%:*}; rest=${pair#*:}; now=${rest%%:*}; was=${rest#*:}
+  if [ "$now" -gt "$was" ]; then
+    echo "  TRIPPED: $k sites GREW by $((now - was))."
+    echo "    Each is a caller that resolved a class, failed, and hands out the"
+    echo "    wrong type. If deliberate, say why in the commit and re-baseline."
+    bad=1
+  elif [ "$now" -lt "$was" ]; then
+    echo "  IMPROVED: $k sites down $((was - now)) — re-baseline so the gain holds."
+  fi
 done
 
-# A new allocator SPELLING is the failure mode that produced v1 and v2. Catch it
-# as a named line rather than letting it hide inside the total.
+for w in $WIDTHS; do
+  case " $B_WIDTHS " in *" $w "*) ;;
+    *) echo "  TRIPPED: NEW carrier width $w — a shape no baseline has seen."
+       echo "    Widths are families: width 4 is the HashMap.Node (H0-6 §7)."; bad=1;; esac
+done
+
 for kv in $BYFN; do
   fn="${kv%%=*}"
-  case " $B_BYFN " in
-    *" $fn="*) ;;
-    *) echo "  TRIPPED: NEW allocator spelling '$fn' — no baseline has seen it."
-       echo "    Two earlier versions of this gate were wrong by exactly this."
-       bad=1 ;;
-  esac
+  case " $B_BYFN " in *" $fn="*) ;;
+    *) echo "  TRIPPED: NEW function '$fn' takes the sentinel — no baseline has it."
+       echo "    Classify it: allocator (add to the allowlist) or not (document why)."
+       echo "    Two earlier versions of this gate were wrong by exactly this."; bad=1;; esac
 done
 
 [ "$bad" -eq 0 ] && echo "  ok — no growth, no new widths, no new spellings."
