@@ -177,6 +177,31 @@ FIXES it** (§`H22-2` §3), which is the positive control that the dial bites at
 all. The third is wrong armed *and* unarmed, so it is not a shadow — it is a
 missing null check on a path both modes take. Neither is diagnosed here.
 
+### 5a. One side effect worth telling the GC investigation about
+
+The deleted `of()` fabricated its receiver with
+`try_alloc_concurrent_synthetic("java/util/HexFormat", 4)`. Grepping the tree
+for the class name afterwards turns up exactly one non-registration mention,
+`vm/src/runtime/interpreter.rs:573`:
+
+> the pre-GC young `0x4` was measured on `java/util/HexFormat` **fld[1]** and
+> `java/util/logging/Level`
+
+That is a stray-write victim watchlist, and `fld[1]` is slot 1 of a 4-slot
+object — i.e. the `prefix` slot of the fabricated carrier this commit removes.
+`zero-header-object-defeats-the-sweep-zero-span-screen` is the shape to compare
+it against. **Nothing is claimed here**: the watchlist entry is a debug aid, not
+a dispatch path, and it is one of two named victims. But whoever owns that
+investigation should know that one of the two objects it watches no longer
+exists in the shipping build, and that a `--jdk-only` run after this commit is a
+free negative control for them.
+
+Grep also confirms the retirement is complete: **no interpreter intrinsic, JIT
+thin helper or `native_override` entry binds `java/util/HexFormat`
+independently of the registry** (`jit-thin-direct-helpers-reimplement-natives`
+is the failure mode being ruled out). The registry was the only binding, so
+deleting the registrations is the whole retirement.
+
 ## 6. Census prediction
 
 `native-shadows-bytecode` counts rows a workload observed, not registrations.
