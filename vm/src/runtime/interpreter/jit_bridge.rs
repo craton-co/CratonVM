@@ -2042,6 +2042,51 @@ pub(super) fn compile_osr_artifact(
                     })
                     .collect(),
             );
+            // ── Compiled local exception handlers, OSR tier ─────────────────
+            //
+            // The same table a fourth time, with catch TYPES, so this artifact
+            // can run its own `catch` blocks instead of leaving compiled code
+            // for every one of them.
+            //
+            // This door matters MORE than the method-entry one, not less: a
+            // `@Test` body is invoked once, so OSR is its only route out of the
+            // interpreter, and `HttpHeaderValidationUtilTest`'s two exhaustive
+            // loops — the class this feature was written for — are exactly that
+            // shape. Staging it only in `jit::try_compile` would have left the
+            // feature structurally inert on the population it exists for.
+            //
+            // Staged only when every catch type resolves: a partial table would
+            // make a site answer "propagate" where the real table has a match —
+            // a slower answer arrived at by a lie.
+            if cratonvm_jit::local_handlers_enabled() && !osr_exception_table.is_empty() {
+                let cm_lock = shared.classes.class_manager.read();
+                let table = cm_lock.get_class(class_id).and_then(|class| {
+                    let mut rows: Vec<(usize, usize, usize, &'static str)> =
+                        Vec::with_capacity(osr_exception_table.len());
+                    for e in osr_exception_table.iter() {
+                        let name: &'static str = if e.catch_type == 0 {
+                            ""
+                        } else {
+                            match class.constant_pool.get_class_name(e.catch_type) {
+                                Some(n) => cratonvm_jit::intern_catch_type_name(n),
+                                None => return None,
+                            }
+                        };
+                        rows.push((
+                            // Widening: classfile pcs are u16.
+                            e.start_pc as usize,
+                            e.end_pc as usize,
+                            e.handler_pc as usize,
+                            name,
+                        ));
+                    }
+                    Some(rows)
+                });
+                drop(cm_lock);
+                if let Some(table) = table {
+                    crate::jit::x64::set_pending_local_handler_table(table, class_id.as_u32());
+                }
+            }
             // This artifact's install epoch was stamped by the `compile_gate`
             // admission at the top of this closure — before the class loading
             // and constant-pool resolution above, not here. A witness opened at

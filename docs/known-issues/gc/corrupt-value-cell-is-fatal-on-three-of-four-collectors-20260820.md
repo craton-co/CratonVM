@@ -100,6 +100,38 @@ concurrent plain writer.
 
 This makes the *outcome* uniform. It does not make it correct.
 
+## Confirmed on Linux too (2026-08-20)
+
+Rebuilt on the Azure host (`vm1`, 8 cores, glibc) at `509710ba8` and re-run
+against the fixture there, so the finding is not a Windows artefact:
+
+| binary | ZGC | G1 | Generational |
+| --- | --- | --- | --- |
+| pre-fix (`/data/bin/cratonvm-gtc-base`, built before the fix landed) | `rc=139` SIGSEGV | — | PASS 17/17 |
+| post-fix (`509710ba8`) | PASS 17/17 | PASS 17/17 | PASS 17/17 |
+
+Linux reproduces the collector split exactly as Windows did — same class, same
+crash, same collector passing.
+
+The causal link is the guard's own site label. On the fixed binary it fires
+**exactly once per run**, and the site names the collector's own reader:
+
+```
+ZGC           zgc::get_field: corrupt Value cell
+G1            g1::get_field: corrupt Value cell
+Generational  gen_heap::read_slot: corrupt Value cell
+```
+
+That is this page's claim in one line: three collectors reach the same corrupt
+cell through three different readers, and before this change only the
+`gen_heap` one screened it. It also confirms the Generational green was always
+a screened read, not an absent defect.
+
+The pre/post rows are different binaries — the screen has no kill switch, so a
+same-binary A/B is not available here (see the cross-binary-A/B caveat). The
+one-guard-hit-per-run evidence above is what ties the change to the outcome,
+not the binary swap.
+
 ## Still open — the producer
 
 Something hands `StringBuilder.append(Object)` a receiver whose memory has
