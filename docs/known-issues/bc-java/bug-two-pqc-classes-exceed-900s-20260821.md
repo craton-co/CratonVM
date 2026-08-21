@@ -41,10 +41,26 @@ the whole hazard in
   like.
 
 So the open question is not "where is it stuck" but "how much slower than
-HotSpot is it, and does it terminate at all". A 3600 s run of each against a
-HotSpot oracle on the same host is queued; this page will carry the ratio when
-it lands. **Until then the honest status is: exceeds 900 s, still progressing,
-completion unknown.**
+HotSpot is it, and does it terminate at all".
+
+## Measured against HotSpot: at least 22x, and neither finishes in an hour
+
+Same host, same fixture, `-Xmx 1g`, 3600 s ceiling:
+
+| class | HotSpot | CratonVM | recompiles |
+|---|---|---|---|
+| 045 `pqc.crypto.test` | **162 s, completes** | **3600 s, rc=124** | 16 |
+| 046 `pqc.jcajce.provider.test` | **155 s, completes** | **3601 s, rc=124** | 5 |
+
+HotSpot finishes both in under three minutes. CratonVM finishes neither in an
+hour, so the ratio is **> 22x** and is a lower bound, not a measurement — the
+runs were cut off, not completed. "Exceeds 900 s" understated this: raising the
+bound four-fold changed nothing.
+
+This also removes the last reading on which these could be deadlocks and leaves
+them squarely in the same category as the documented interpreter/throughput
+walls elsewhere in this tree: work that completes on HotSpot and does not
+complete here in any bound yet tried.
 
 ## Two independent leads visible in the logs
 
