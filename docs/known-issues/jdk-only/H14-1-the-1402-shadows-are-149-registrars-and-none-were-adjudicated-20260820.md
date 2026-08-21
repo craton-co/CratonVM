@@ -453,3 +453,67 @@ census: **under `--jdk-only`, a native stands in front of the real
   (§1b). `null` is unmatchable by the census's own saturation test, so that sink
   is in the state the whole population was in before `H1-1`. It records 2 rows
   today, which is why it is a nomination and not a finding.
+
+---
+
+## INDEPENDENT CHECK (lane H0, 2026-08-21) — and `kind_stated` is a usable triage SIGNAL
+
+Two of this record's structural claims verified from a different direction, on a
+registry dump of the round-5 binary rather than from the per-vector reports.
+
+**Different population, stated up front so the numbers are not misread.** This
+record's 1402 is the UNION of shadows actually DISPATCHED over 104 vectors.
+Mine is every registration in one tiny run whose real method is loaded, declared
+and has `Code` — a static, image-side shape test, 2775 rows. The two are not the
+same set and the counts should not be compared. **The structure is what
+transfers.**
+
+### 1. "`kind_stated` is `false` on all 1402" — CONFIRMED, and the contrast is the finding
+
+| population | n | `kind_stated: false` | `kind_stated: true` |
+|---|---:|---:|---:|
+| shadow-shaped (real method has `Code`) | 2775 | **2504 (90.2%)** | 271 |
+| legitimate bridges (real method `ACC_NATIVE`) | 206 | 1 | **205 (99.5%)** |
+
+**A near-perfect inverse correlation, and neither this record nor any other
+states it.** This record says nobody adjudicated the defect population; the
+other half is that somebody adjudicated almost the entire *legitimate*
+population. `kind_stated` is set by `register_with_kind` — an explicit human
+decision — against an inherited ambient `set_category`.
+
+So **`kind_stated` is not just an absence in the defect set; it is a usable
+discriminator across the whole registry.** Practical consequences:
+
+* **A cheap first-pass filter for any retirement wave**: `kind_stated: true`
+  rows are the ones somebody looked at, and 205 of 206 of them are correct.
+  Sorting by this puts the reviewed work at the bottom of the queue for free.
+* **A ratchet worth having**: a NEW registration with `kind_stated: false`
+  landing on a method the image declares with `Code` is, on this evidence, ~90%
+  likely to be a defect at birth. That is a gate that could refuse the defect
+  *at the moment it is written* rather than counting it a year later.
+* It also explains why a retag wave cannot work by sub-setting the defect
+  population on kind: there is no adjudicated sub-population inside it to
+  separate out. This record already says that; the table above is the reason.
+
+### 2. "2 rows must not be touched" — CONFIRMED against the image
+
+```
+$ javap -c java.nio.file.Path
+public interface java.nio.file.Path extends java.lang.Comparable<Path>, ...
+  public abstract boolean equals(java.lang.Object);
+  public abstract java.lang.String toString();
+```
+
+`Path` is an **interface** and both methods are `public abstract` with **no
+`Code` attribute**. So the registration is the only implementation, and a
+retirement driven by row counts would delete it and leave nothing. Exactly as
+this record warns.
+
+### 3. The duplicate-registration count, reconciled rather than disputed
+
+This record reports **162** triples registered more than once. Across the WHOLE
+registry I measure **878** (of 12,138 registrations, with 1,022 rows not owning
+their slot). **These agree**: 162 is the count within the 1402, 878 is the
+population-wide figure. Recorded because the two numbers will otherwise look
+like a contradiction to the next reader, and this directory has a standing habit
+of treating a denominator mismatch as a disagreement.
