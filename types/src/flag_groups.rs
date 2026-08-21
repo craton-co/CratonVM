@@ -1090,6 +1090,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "atomic-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_ATOMIC_INTRINSIC"), off_word: None },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None },
+    // Default-ON kill switch, hence `off_key` only:
+    // `CRATONVM_JIT=-code-ptr-memo` puts `jit::validate_code_ptr` back on the
+    // global `Mutex` it used to take on EVERY compiled call. It exists so the
+    // memo can be A/B-ed inside one binary -- a 1.5%-of-CPU symbol cannot be
+    // measured across two builds on a host whose run-to-run spread is 20%.
+    // See `cratonvm_jit::code_ptr_memo_enabled`.
+    E { group: Group::JIT, token: "code-ptr-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_CODE_PTR_MEMO"), off_word: None },
     E { group: Group::DBG, token: "invoke-phases", on_key: Some("CRATONVM_DBG_INVOKE_PHASES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "param-tag-scan", on_key: None, off_key: Some("CRATONVM_JIT_NO_PARAM_TAG_SCAN"), off_word: None },
     E { group: Group::JIT, token: "ldc-const-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_LDC_CONST_CACHE"), off_word: None },

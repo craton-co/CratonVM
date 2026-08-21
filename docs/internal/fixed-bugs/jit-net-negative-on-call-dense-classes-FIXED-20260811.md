@@ -221,7 +221,7 @@ a handful of monitors. Nothing accumulates.
 
 What remains is a plain throughput gap of ~5–10x HotSpot, and it already has an
 owner that characterises it correctly and independently:
-`docs/known-issues/h2/h2-update-path-throughput-20260802.md`, which states in as
+`performance/h2-update-path-throughput-RETIRED-20260821.md`, which states in as
 many words that **`testMergeUsing`'s 50 merges never warm up at all, which is why
 its failure is identical with and without the JIT**. That sentence and this
 measurement agree, and both say the class is not evidence about tier-up
