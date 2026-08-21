@@ -129,8 +129,24 @@ and lists it alongside megamorphic sites, `invokespecial` and interface-default
 dispatch as paths that reach
 `should_force_registered_native_over_bytecode` **instead of** step 1.
 
-The dial is read in exactly one place: `resolve_step1_native`, via
-`jdk_only_enforce_shadow_for(class_name)`. **No other door consults it.**
+**MEASURED, by grep over the whole tree** — this is the structural fact the rest
+of the record rests on, so it is verified rather than inferred:
+
+```text
+$ grep -rn "jdk_only_enforce_shadow_for" --include=*.rs .
+./vm/src/runtime/env_cache.rs:752:              pub fn jdk_only_enforce_shadow_for(..)   <-- definition
+./vm/src/runtime/interpreter/native_override.rs:2499:  ... doc comment ...
+./vm/src/runtime/interpreter/native_override.rs:7433:  strict_bridge && ..._enforce_shadow_for(class_name)
+
+$ grep -rn "jdk_only_enforce_shadow()" --include=*.rs .
+./vm/src/runtime/env_cache.rs:666:   pub fn jdk_only_enforce_shadow(..)       <-- definition
+./vm/src/runtime/env_cache.rs:755:   called only from _for, above
+```
+
+**The dial has exactly ONE live call site in the entire repository**, line 7433,
+inside `resolve_step1_native`. **No other door consults it** — not the
+force-native interceptor, not the cached-dispatch path, not the reflective path,
+not the JIT bind. That is not an inference from behaviour; it is the call graph.
 
 So the model is: **arming a class does not arm the class. It arms the subset of
 that class's dispatches that reach step 1**, and every dispatch served by a warm
@@ -149,9 +165,18 @@ This **replaces** two earlier explanations:
   *reached* step 1. §4 says they need not. **The function is no longer the prime
   suspect; the routing to it is.**
 
-**This is ARGUED. I did not build and did not instrument any door.** What §4
-establishes is a behavioural fact about the reflective door; the extension to
-warm invoke-cache entries is inference from the tree's own prose plus §1.
+**Status of the parts.** The single-call-site fact is **MEASURED** (grep, above)
+and is the load-bearing claim. The reflective door's behaviour is **MEASURED**
+(§4, order-controlled). The extension to warm invoke-cache entries specifically
+is **ARGUED** — inference from the tree's own prose plus §1. **I did not build
+and did not instrument any door.**
+
+Note what the grep alone already settles, without any behavioural argument: a
+dispatch that does not pass through line 7433 **cannot** be affected by the
+environment variable, in any mode, ever. Every door listed in
+`force_native_over_real_jdk_bytecode_memoized`'s doc comment as reaching
+`should_force_registered_native_over_bytecode` instead of step 1 is, by
+construction, outside the dial's reach.
 
 ## 6. Why I did not ship a fix
 
