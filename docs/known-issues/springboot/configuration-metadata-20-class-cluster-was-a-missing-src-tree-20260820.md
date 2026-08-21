@@ -77,6 +77,32 @@ the only difference is that CratonVM's stack trace includes the
 `AssertionFailedError.<init>` frames HotSpot elides. It is a fixture/expectation
 mismatch, not a divergence.
 
+## …and on Linux it is not even that (2026-08-20)
+
+Re-run on the Azure host, where the fixture already ships `src/` for both
+modules, all 21 classes (the 20 plus `JsonMarshallerTests`) are clean on **four
+arms** — HotSpot, and CratonVM under ZGC, G1 and Generational:
+
+```
+hs   pass=21  notpass=0
+zgc  pass=21  notpass=0
+g1   pass=21  notpass=0
+gen  pass=21  notpass=0
+```
+
+Per-class test counts are **identical between HotSpot and all three collectors
+on all 21 classes**, so none of these greens is a suite that quietly ran fewer
+tests.
+
+`ChangelogWriterTests` passes on Linux on every arm, so its Windows failure is
+**host-specific, not VM-specific** — an expectation mismatch in generated
+Asciidoc text on a CRLF host, failing HotSpot and CratonVM alike. It is not a
+CratonVM defect on either platform.
+
+One benign count difference between hosts:
+`ConfigurationMetadataAnnotationProcessorTests` runs **66** tests on Linux and
+**65** on Windows — on *both* VMs, so it is an OS-gated test, not a divergence.
+
 ## Carry-over
 
 The other five source-less modules have the same latent gap — `core/spring-boot`
