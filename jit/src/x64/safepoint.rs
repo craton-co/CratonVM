@@ -980,6 +980,21 @@ impl Compiler {
     /// alloc helpers this is 0 (they take primitive arguments). For
     /// `invoke*` the caller pops `this + args` before this call and
     /// passes `0` here because those entries are consumed.
+    /// `CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY=1` — count a safepoint as
+    /// mapped even when its map is known to have dropped a live oop, i.e. the
+    /// pre-fix accounting behind `fully_oop_covered`.
+    ///
+    /// Kept so the change is measurable in one binary: the fix can only ever
+    /// make coverage claims RARER, and the question it opens is how much
+    /// precise-only suppression it costs on workloads that were relying on it.
+    fn oopmap_presence_only() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY")
+                .is_some()
+        })
+    }
+
     pub(super) fn emit_oop_map_for_safepoint(&mut self) {
         // Defensive: if the compiler is already in a failed state,
         // don't emit bogus maps.
@@ -1027,15 +1042,46 @@ impl Compiler {
         let live_frame_hi = std::mem::take(&mut self.pending_live_frame_hi);
         let native_pc = self.buf.pos() as u32; // Cast: x86-64 immediate encoding
         let mut slots: Vec<i16> = Vec::new();
+        // Whether this safepoint's map is known to be INCOMPLETE — some live
+        // oop could not be recorded.
+        //
+        // MEASURED INERT on every workload run so far (probe and ntru, all
+        // three collectors): this never fires there, and the arms with and
+        // without it are byte-identical. It is fail-closed hardening for drops
+        // that ARE unsound whenever they happen — it is NOT the explanation for
+        // the never-mapped operand-spill slots those runs report. Those are
+        // staged invoke-arguments, which were never in this vocabulary to be
+        // dropped from. See
+        // `docs/known-issues/gc/bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`. Every `continue`/failed-`if let` below is
+        // a silent omission, and until this existed none of them reached
+        // `fully_oop_covered`, which tests only that each safepoint produced AN
+        // entry (`safepoint_pcs ⊆ mapped_safepoint_pcs`). A safepoint whose map
+        // dropped every oop still counted as mapped, and the runtime then spent
+        // that claim to skip the conservative backstop.
+        //
+        // Seeded from the mark vector's own exactness. `stack_oop_marks_exact`
+        // is already trusted to veto a spill elision
+        // (`can_elide_self_call_register_spill`) and the shadow publication; it
+        // was not consulted here. When it is false the padding a few lines above
+        // filled the marks with `false`, i.e. "not an oop" for entries nobody
+        // classified — sound only because a conservative sweep follows, which is
+        // exactly what the coverage claim suppresses.
+        let mut map_incomplete = !self.stack.is_empty() && !self.stack_oop_marks_exact;
         let n = self.stack.len();
         for i in 0..n {
             if !self.stack_oop_marks[i] {
                 continue;
             }
-            if let StackSlot::Frame(off) = self.stack[i] {
-                if let Ok(i16_off) = i16::try_from(off) {
-                    slots.push(i16_off);
-                }
+            match self.stack[i] {
+                StackSlot::Frame(off) => match i16::try_from(off) {
+                    Ok(i16_off) => slots.push(i16_off),
+                    // A frame deeper than i16 from `rbp`. Rare, and silent.
+                    Err(_) => map_incomplete = true,
+                },
+                // An oop operand that is still register/scratch/xmm resident at
+                // the safepoint. There was no `else` arm here: the value is live,
+                // the map does not name it, and nothing recorded that.
+                _ => map_incomplete = true,
             }
         }
         // Stage 2 (precise oop maps) — add the canonical frame slots of local
@@ -1058,14 +1104,44 @@ impl Compiler {
                     let k = mask.trailing_zeros() as usize;
                     mask &= mask - 1; // clear lowest set bit
                     let off = self.local_offset(k);
-                    if let Ok(i16_off) = i16::try_from(off) {
-                        if !slots.contains(&i16_off) {
-                            slots.push(i16_off);
+                    match i16::try_from(off) {
+                        Ok(i16_off) => {
+                            if !slots.contains(&i16_off) {
+                                slots.push(i16_off);
+                            }
                         }
+                        Err(_) => map_incomplete = true,
                     }
                 }
             }
         }
+        // Stage 3 — the STAGED INVOKE-ARGUMENT buffer. These oops were popped
+        // off the simulated operand stack before the call, so neither loop above
+        // can see them; without this they were covered only by the conservative
+        // bound this safepoint publishes, while the method still claimed full
+        // precise coverage. Naming them here makes them precise roots, which
+        // also means a moving collection REWRITES them rather than merely
+        // marking them — the property the claim is actually spent on.
+        //
+        // Taken, not copied, so a staging site that emits no map cannot leak
+        // into a later safepoint (same discipline as `live_frame_hi`).
+        for off in std::mem::take(&mut self.pending_staged_arg_oops) {
+            match i16::try_from(off) {
+                Ok(i16_off) => {
+                    if !slots.contains(&i16_off) {
+                        slots.push(i16_off);
+                    }
+                }
+                Err(_) => map_incomplete = true,
+            }
+        }
+        // A reference staged somewhere no map can name it (native-ABI outgoing
+        // args, direct-call service slots, inlined-callee parameter locals).
+        // Fail closed.
+        if std::mem::take(&mut self.pending_staged_args_unmapped) {
+            map_incomplete = true;
+        }
+
         // Stage A.2 (precise oop maps, B-K fix) — under the precise gate, record
         // an entry for EVERY safepoint, including ones with no live oops (empty
         // `slots`). The default path keeps skipping empties (smaller metadata,
@@ -1073,9 +1149,23 @@ impl Compiler {
         // every safepoint's sp-id resolve to a definitive map, which is the
         // precondition for `fully_oop_covered`: without them, a safepoint with
         // zero live oops would look "un-mapped" and wrongly break coverage.
+        //
+        // A safepoint that LOST an oop above still pushes its entry — the entry
+        // is what makes the sp-id resolve, and the recorded slots are still
+        // worth rewriting — but it is NOT added to `mapped_safepoint_pcs`, so
+        // `fully_oop_covered` goes false for the whole method and the collector
+        // keeps its conservative backstop. This is the same fail-closed
+        // direction this function already takes for a missing paired spill
+        // (`live_frame_hi` = 0 = "unknown, scan conservatively").
+        //
+        // `mapped_safepoint_pcs` feeds `fully_oop_covered` and nothing else, so
+        // withholding a pc cannot affect anything at run time.
+        //
+        // `CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY=1` restores the old
+        // presence-only accounting so the difference is an A/B in one binary.
         let push_map = !slots.is_empty() || self.precise_maps;
         if push_map {
-            if self.precise_maps {
+            if self.precise_maps && (!map_incomplete || Self::oopmap_presence_only()) {
                 // Cast: bytecode/native offset to u32 (non-negative, fits)
                 self.mapped_safepoint_pcs.insert(self.cur_bc_pc as u32);
             }

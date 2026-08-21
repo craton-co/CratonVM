@@ -57,7 +57,7 @@ whole triage.
 The Azure fixture (`/data/cratonvm/apps/spring-boot`) has the sources for all
 seven modules. Copied the two cluster modules down as a tarball (253 `.java`
 files; a tarball, not per-file `scp`, so no CRLF translation) and extracted into
-the local fixture. `apps/` is `.gitignore`d, so this is a local fixture repair
+the local fixture. `../../../apps` is `../../../.gitignore`d, so this is a local fixture repair
 and not a repo change — it has to be redone on any fresh fixture.
 
 ## After the repair

@@ -473,6 +473,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-method-stats", on_key: Some("CRATONVM_DBG_JIT_METHOD_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-scan-prof", on_key: Some("CRATONVM_DBG_JIT_SCAN_PROF"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-rootscan", on_key: Some("CRATONVM_DBG_JIT_ROOTSCAN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-names", on_key: Some("CRATONVM_DBG_JIT_NAMES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-pin", on_key: Some("CRATONVM_DBG_JIT_PIN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-putfield", on_key: Some("CRATONVM_DBG_JIT_PUTFIELD"), off_key: None, off_word: None },
@@ -795,6 +796,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "sp-inline-mic", on_key: Some("CRATONVM_JIT_SP_INLINE_MIC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-inline-pic", on_key: Some("CRATONVM_JIT_SP_INLINE_PIC"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unreg-memo-gc-reset", on_key: Some("CRATONVM_JIT_UNREG_MEMO_GC_RESET"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "frame-bands", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_BANDS"), off_word: None },
+    E { group: Group::JIT, token: "oopmap-coverage-presence-only", on_key: Some("CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "moving-young-bounds-guard", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD"), off_word: None },
     E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
@@ -1086,6 +1090,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "invoke-phases", on_key: Some("CRATONVM_DBG_INVOKE_PHASES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "param-tag-scan", on_key: None, off_key: Some("CRATONVM_JIT_NO_PARAM_TAG_SCAN"), off_word: None },
     E { group: Group::JIT, token: "ldc-const-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_LDC_CONST_CACHE"), off_word: None },
+    E { group: Group::JIT, token: "ir-unresumable-trap-guard", on_key: Some("CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "compiled-ldc-const-cache", on_key: Some("CRATONVM_JIT_COMPILED_LDC_CONST_CACHE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "new-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_NEW_SITE_CACHE"), off_word: None },
     E { group: Group::JIT, token: "site-cache", on_key: Some("CRATONVM_JIT_SITE_CACHE"), off_key: None, off_word: None },
@@ -1202,6 +1207,8 @@ pub const INVENTORY: &[E] = &[
     // surface rather than behind a live `getenv` nobody can enumerate.
     E { group: Group::GC, token: "exact-refproc-survival", on_key: None, off_key: Some("CRATONVM_NO_EXACT_REFPROC_SURVIVAL"), off_word: None },
     E { group: Group::GC, token: "g1-coverage-pin", on_key: Some("CRATONVM_G1_COVERAGE_PIN"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-pin-empty-publication", on_key: Some("CRATONVM_G1_PIN_EMPTY_PUBLICATION"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-precise-only-roots", on_key: Some("CRATONVM_G1_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-evac-retry", on_key: None, off_key: Some("CRATONVM_G1_NO_EVAC_RETRY"), off_word: None },
     E { group: Group::GC, token: "g1-live-region-memo", on_key: None, off_key: Some("CRATONVM_G1_NO_LIVE_REGION_MEMO"), off_word: None },
     E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: Some("0") },
@@ -1274,6 +1281,16 @@ pub const INVENTORY: &[E] = &[
     // serial; `relocate` reads 0/off/false/no as off.
     E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-21 with the per-cycle relocation proof. Default-ON
+    // and therefore a KILL SWITCH, with the same `off_word: Some("0")`
+    // correction as its neighbours: ZGC may compact while a compiled frame
+    // is live whenever the collection PROVED that frame's oops rewritable,
+    // and `=0` restores the older refusal that fired on the mere existence
+    // of a compiled frame. The older refusal is why the default
+    // configuration (ZGC + JIT) never defragmented and eventually threw
+    // OutOfMemoryError on a 97%-free heap. See
+    // `gc/src/zgc.rs::zgc_relocate_under_proven_jit`.
+    E { group: Group::GC, token: "zgc-relocate-proven-jit", on_key: Some("CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-19 with the ZGC read-bounds publish. An OPT-OUT, not an
     // opt-in: ZGC publishing its arena envelope into `JIT_READ_BOUNDS` is the
     // default, and this key is the kill switch that restores helper-only
@@ -2735,6 +2752,10 @@ mod tests {
             // unsetting a key whose unset meaning had just become ON.
             ("zgc-parmark", "CRATONVM_ZGC_PARMARK"),
             ("zgc-relocate", "CRATONVM_ZGC_RELOCATE"),
+            // Joined 2026-08-21, default-ON for the same reason: without a
+            // falsey word its `-token` form would unset the key and leave
+            // the machinery on, which is not a kill switch.
+            ("zgc-relocate-proven-jit", "CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT"),
         ] {
             let e = lookup(Group::GC, token).unwrap_or_else(|| panic!("{token} is undeclared"));
             assert_eq!(e.on_key, Some(key));
