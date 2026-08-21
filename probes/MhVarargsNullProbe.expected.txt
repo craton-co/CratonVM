@@ -2,7 +2,7 @@
 #
 # Temurin 25.0.3+9 (/data/toolchain/jdk-25), captured 2026-08-21.
 #
-# 14 rows failed on CratonVM before the generic-entry rule in
+# 12 rows failed on CratonVM before the generic-entry rule in
 # native-builtins/src/lang_invoke.rs (`MH_GENERIC_SPREAD` /
 # `collect_trailing_varargs`'s `null_collects`) and the varargs collection the
 # MH_KIND_CONSTRUCTOR arm of `mh_dispatch` never did:

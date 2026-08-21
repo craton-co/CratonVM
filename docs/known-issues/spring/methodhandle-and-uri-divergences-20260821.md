@@ -1,8 +1,11 @@
-# Six measured `MethodHandle` / `java.net.URI` divergences left open on 2026-08-21
+# Nine measured `MethodHandle` / `java.net.URI` divergences left open on 2026-08-21
 
 ## Status
-**OPEN, all six MEASURED against HotSpot 25.0.3+9, none currently failing a
-suite class.** Found while fixing the two 2026-08-21 Spring FAILs (the retired
+**OPEN, all nine MEASURED against HotSpot 25.0.3+9, none currently failing a
+suite class.** Four groups: the inexact `invoke` door (C03/C07/C09), two
+places CratonVM is more forgiving than HotSpot about argument shape (B06, I06),
+`asType`'s impurity (I13/I14), and two hierarchical `URI.resolve` behaviours
+(R13/R15). Found while fixing the two 2026-08-21 Spring FAILs (the retired
 `two-new-fails-20260821-fullsuite-rerun` write-up) — each is a row of a probe
 that ships with the fix, so re-checking any of them is one command, not a
 re-derivation. Left open deliberately; the reason is given per row.

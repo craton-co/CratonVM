@@ -201,8 +201,8 @@ remaining MethodHandle corners). Driver: `/data/tnf-spring-ab.sh` over
 
 ## What is still open
 
-Six measured rows across the two probes still diverge and are recorded, with
-their mechanism and why each was left, in
+Nine measured rows across the three probes still diverge, in four groups, and
+each is recorded with its mechanism and why it was left in
 `docs/known-issues/spring/methodhandle-and-uri-divergences-20260821.md`. In
 short: the inexact `invoke` door cannot see its call-site descriptor
 (C03/C07/C09); CratonVM stays more forgiving than HotSpot about an
