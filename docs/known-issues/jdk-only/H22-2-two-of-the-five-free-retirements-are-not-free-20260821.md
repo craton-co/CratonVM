@@ -260,3 +260,68 @@ price; **they have the same scope question open** and nobody has answered it.
 ```markdown
 - [H22-2](H22-2-two-of-the-five-free-retirements-are-not-free-20260821.md) — `OPEN` · **MEASURED, 8 differential arms + 1 exact-invocation census.** `H14-3`'s two largest free retirements are not free, and a 517-assertion probe against HotSpot 25.0.3+9 says so where 104 vectors said nothing. **`register_string_builder_natives` is FATAL**: armed on the 3 classes it actually registers, the VM exits `rc=1` on the first `append(char[])` with `ArrayStoreException: can not copy byte[] into char[]` — JDK 25's compact-strings `AbstractStringBuilder` cannot run against CratonVM's two-field `char[]`/`int` builder, which `native_override.rs:5129` already says out loud. Each half is free ALONE (`StringBuilder`+`StringBuffer` = 0, `AbstractStringBuilder` = 0), so this is also the first measured counter-example to `H14-3` §6's untested "their sum is not the cost of arming several". **`register_throwable_subclass_natives` costs 61 of 61 stack traces**: armed, every `getStackTrace()[0]` becomes `<init>` or `fillInStackTrace`, because the retired path routes capture through `Throwable.fillInStackTrace(I)` from *inside* the constructor frames and `capture_throwable_trace` skips none of them — one missing frame skip standing between the plan and 906 registrations. Everything else in that arm is byte-identical, and it FIXES `TypeNotPresentException.getMessage`. §4 is the method finding: `H14-3` armed 2 of 3 and 26 of 62 classes, because a shadow CSV lists what the corpus observed and `AbstractStringBuilder` is observed 0 times (`H11-1`, with positive control).
 ```
+
+---
+
+## INDEPENDENT CHECK (lane H0, 2026-08-21) — the conclusion holds; the failure MODE is worse than reported
+
+This record's structural finding — **each half is free alone, together they
+break** — is **CONFIRMED**, isolated to the exact pair. But the mode I measure is
+not an exception. It is **silent total data loss**.
+
+Probe: `new StringBuilder()`, `append("x")`, print, `append(new char[]{'a','b','c'})`,
+print. Oracle HotSpot 25.0.3+9 gives `x` then `xabc`.
+
+| armed prefixes | `append(String)` | `append(char[])` | rc |
+|---|---|---|---:|
+| *(unarmed control)* | `x` | `xabc` | 0 |
+| `java/lang/StringBuilder` alone | `x` | `xabc` | 0 |
+| `java/lang/AbstractStringBuilder` alone | `x` | `xabc` | 0 |
+| **both together** | **`` (empty)** | **`` (empty)** | **0** |
+| all three incl. `StringBuffer` | **`` (empty)** | **`` (empty)** | **0** |
+
+**Every append is discarded and `toString()` returns empty, with no exception
+and exit code 0.**
+
+### Why this is worse than the `rc=1` this record reports
+
+An `ArrayStoreException` is loud: it stops the program at the defect. **A
+`StringBuilder` that silently accepts every append and returns the empty string
+is the single worst shape a defect can have in `java.lang`** — every log line,
+every generated message, every `String.join`, every `toString()` in the process
+becomes empty, and **nothing throws**. A test that asserts "no exception" passes.
+A test that prints a result prints nothing and may still be scored on its exit
+code.
+
+This does not contradict the record: both are real, and the difference is almost
+certainly which append overload the probe drives — this record's hits the
+`byte[]`/`char[]` compact-string copy, mine hits a path that no-ops. **Two
+probes, two modes, one cause.** It does mean the row should not be summarised as
+"it crashes", because the shape a reader plans against changes the priority.
+
+### Ruled out: this is NOT a regression from `H18`
+
+The obvious suspect was `H18-1`, which landed changes in
+`vm/src/runtime/interpreter/typecheck.rs` between the two binaries and could
+plausibly have converted a failing array-store type check into a passing one —
+turning a crash into silence.
+
+**Tested and DISPROVED.** Identical arming, identical probe:
+
+```
+cratonvm-r5.exe  (pre-H18)   append(String) ok:      append(char[]) ok:
+cratonvm-r6.exe  (post-H18)  append(String) ok:      append(char[]) ok:
+```
+
+Byte-identical. The silence predates `H18` and belongs to the arming, not to any
+recent change. Recorded because the hypothesis was cheap, plausible, and would
+have been a serious accusation to leave standing untested.
+
+### What this adds to the plan
+
+`H14-3` priced `StringBuilder`/`StringBuffer` at **zero vectors** and this record
+explains why: the corpus never checks the *content* of a built string under the
+dial. **A zero-cost cell measured over a corpus that does not assert the value
+is not evidence that the value is right** — which is this directory's oldest
+standing lesson (*a green gate is evidence about the question it asked*) landing
+on the newest instrument.
