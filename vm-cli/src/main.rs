@@ -4473,6 +4473,12 @@ fn run() -> Result<()> {
                 // RUNNING-and-silent one (JIT-compiled code or a long native
                 // call). See `SharedVm::dump_thread_summary_after_dumps`.
                 shared_for_watchdog.dump_thread_summary_after_dumps();
+                // A stall whose reactor threads are parked in `select` — i.e.
+                // working — is not explained by any thread dump: the question
+                // is what the selector had to hand them, and `interest_ops` vs
+                // `ready_ops` per registered key answers it at the moment of
+                // the stall. Costs nothing until this deadline fires.
+                cratonvm_native_io::nio_selector::dump_selector_state_to_stderr();
                 eprintln!(
                     "=== T19.H1 watchdog: {total_acks} thread(s) dumped; \
                      aborting process ==="
