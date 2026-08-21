@@ -475,6 +475,13 @@ echo "== RUN pid=$$ tree=$HERE rev=$(git -C "$HERE" rev-parse --short HEAD 2>/de
 . "$HERE/harness-guard.sh" || { echo "ERROR: cannot source $HERE/harness-guard.sh"; exit 3; }
 harness_load_uncounted "$HERE/harness-uncounted.txt"
 
+# The ENVIRONMENT-fault classifier. The `sig` grep in run_pass() can only find an
+# assertion signature, and a VM that died before it reached the vector has none —
+# a bad --java-home, a rejected command line and a missing main class all printed
+# a bare `cratonvm rc=1`, indistinguishable from a real failure. See
+# harness-vmfault.sh; its --selftest carries the negative controls.
+. "$HERE/harness-vmfault.sh" || { echo "ERROR: cannot source $HERE/harness-vmfault.sh"; exit 3; }
+
 # Copy every non-source file under $1 into $2, preserving relative paths.
 copy_tree() {
   [ -d "$1" ] || return 0
@@ -700,8 +707,20 @@ run_pass() {
     state=PASS; why=""
     if [ "$cvrc" -ne 0 ]; then
       state=FAIL; why="cratonvm rc=$cvrc"
+      # ENVIRONMENT faults FIRST. A VM that never reached the vector has no
+      # assertion signature for the alternation below to find, so every one of
+      # them used to print the bare `cratonvm rc=$cvrc` above — the same line a
+      # genuine assertion failure prints. The vector is still red; the `why` now
+      # says the harness is broken instead of implying the VM answered wrongly.
+      if envwhy=$(vm_fault_class "$cvrc" "$cvout"); then
+        why="$envwhy"
+        # Accumulated for ONE explanation at the bottom. A broken --java-home
+        # fails all 105 vectors, and the fix printed 105 times is noise.
+        ENV_FAULT_N=$((ENV_FAULT_N+1)); ENV_FAULT_LAST="$envwhy"
+      else
       sig=$(printf '%s\n' "$cvout" | grep -aiE 'AssertionError|NoSuchMethod|linkage error|panic|SEGV|fatal' | grep -avE '^\s*at ' | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | head -c 90)
       [ -n "$sig" ] && why="rc=$cvrc: $sig"
+      fi
     elif printf '%s' "$cvout" | grep -qaiE 'SIGSEGV|rust panic|fatal runtime error|stack overflow'; then
       state=FAIL; why="VM crash"
     # Anchored on a word boundary: a bare `^PASS $c` would let `PASS RJdkPhaser`
@@ -774,6 +793,10 @@ run_pass() {
 
 total_pass=0; total_fail=0; total_failed=""; ran=0; skipped=""
 total_hbad=0; total_hfailed=""
+# ENVIRONMENT faults: vectors whose VM never started. Counted here only so the
+# summary can explain them ONCE; they are already red via $fail and this must
+# never add a second point for the same vector.
+ENV_FAULT_N=0; ENV_FAULT_LAST=""
 
 # Created once per invocation, not once per pass: with RELEASES= set, run_pass
 # runs several times and every pass's reports belong to the one summary at the
@@ -882,6 +905,19 @@ if ! harness_guard_nondiscriminating "$HERE/src" "$LISTED_CLASSES"; then
   printf '%s\n' "$HARNESS_GUARD_MSGS"
   total_hbad=$((total_hbad+HARNESS_G5_BAD))
   total_hfailed="$total_hfailed$HARNESS_G5_CLASSES"
+fi
+
+# ---- the environment's own verdict ----------------------------------------
+#
+# Printed BEFORE the harness verdict and the totals, because when this fires the
+# numbers below it describe a run that never happened. NOT added to $total_fail:
+# every vector it names is already counted red by $fail, and a second point
+# would be the double-count the G2/G3 note above exists to avoid.
+if [ "$ENV_FAULT_N" -gt 0 ]; then
+  echo "  ENVIRONMENT: $ENV_FAULT_N vector(s) had no VM to answer them — the run below is not a"
+  echo "  measurement of CratonVM. Last seen:"
+  echo "    $ENV_FAULT_LAST"
+  vm_fault_hint "$ENV_FAULT_LAST"
 fi
 
 # ---- the instrument's own verdict ----------------------------------------
