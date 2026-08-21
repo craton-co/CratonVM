@@ -147,13 +147,63 @@ So the defect is not that the map loses entries. It is that **the frame is kept
 safe by two mechanisms and `fully_oop_covered` describes only one of them**, while
 being spent to suppress the other.
 
-## The repair
+## The repair — LANDED (`3d430ea69`)
 
-`fully_oop_covered` must additionally require that nothing relies on the
-conservative vocabulary at any safepoint of the method — i.e. no staged
-invoke-argument buffer live across a call, and no blind-spilled callee-saved
-GPR carrying an untagged oop. A method that needs either cannot claim precise
-coverage.
+Two halves, matching the two ways an argument is staged.
+
+**Named.** The staged invoke-argument buffer is now in the precise map.
+`pop_invoke_args` returns each argument's oop mark alongside its slot
+(`pop_stack` discards the mark, which is fine only while the value goes back
+onto the stack model), the two staged-buffer sites record the buffer offset of
+every reference argument, and `emit_oop_map_for_safepoint` merges them. They
+become precise roots, so a moving collection REWRITES them rather than merely
+marking them — the property the coverage claim is actually spent on.
+
+**Withdrawn.** The other three staging sites put arguments where no oop map can
+name them: the native-ABI outgoing-argument area, the direct-call service slots,
+and an inlined callee's parameter locals. Those set
+`pending_staged_args_unmapped`, so the safepoint goes incomplete and the method
+loses `fully_oop_covered` rather than claiming coverage it does not have — and
+only when a reference is actually staged there, so a call with no reference
+arguments keeps its coverage.
+
+Both pendings are TAKEN by the map, like `pending_live_frame_hi`, so a staging
+site that emits no map cannot leak slots into a later safepoint.
+
+### Measured after
+
+`while_covered` — never-mapped oops on frames ASSERTING coverage, which is the
+quantity the bit's soundness is about — is **zero on every arm**:
+
+```text
+                      before                    after
+ntru  G1              never_mapped=2  (wc=2)    never_mapped=0  (wc=0)   PASS
+ntru  generational    never_mapped=4  (wc=4)    never_mapped=0  (wc=0)   PASS
+ntru  default (ZGC)   never_mapped=6  (wc=6)    never_mapped=4  (wc=0)   PASS
+probe generational    sites=4, wc=20            wc=0
+probe G1              0                         0
+```
+
+ntru is the stable measurement — ~5880 frames and ~90 700 verifiable words per
+run, three collectors. The four residual hits on the ZGC arm are on frames that
+correctly report `covered=false`, so they say nothing about the bit.
+
+`wrong_map` on ntru fell from 13 724 to 11 312, which is the same fix seen from
+the other side: ~2 400 words that were named by SOME map of the method are now
+named by the ACTIVE one.
+
+Cost: `precise_only_true` is unchanged — 0 on G1, 0 on ZGC, 1 on generational,
+before and after. The fail-closed half cost no measurable coverage on these
+workloads.
+
+### What this still does not prove
+
+`while_covered=0` holds over the workloads measured; it is not a proof. The
+probe's frame shape varies run to run (17→41 frames, 5→13 unreadable), so its
+counts are not a clean before/after pair — the ntru rows are. And the oracle's
+false-positive mode is unchanged: a primitive whose bits land on a live object
+header still reads as an unmapped oop, which is the likeliest reading of the
+four residual ZGC hits.
 
 The fail-closed drop accounting in `30370b165` stays: those drops are genuine
 unsoundness whenever they fire, it is the correct direction, and it is measured
