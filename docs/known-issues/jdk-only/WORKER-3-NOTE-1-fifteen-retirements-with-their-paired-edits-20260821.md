@@ -30,6 +30,10 @@ release build of this branch and a clean release build of the base commit
 | `SUITE=all` | 103 / 105 | **106 / 107** | 104 / 105 |
 | `SUITE=core` | 64 / 65 | **67 / 67** | 65 / 65 |
 
+These three are the A/B that attributes this lane's delta, both arms
+taken before H0's tip moved. **The state that actually lands is in
+§1.0: 107/107, 107/107, 67/67, zero failures in every arm.**
+
 **The denominators moved because this branch adds two vectors** (§4), 65 → 67
 and 105 → 107. Nothing was removed from any list.
 
@@ -43,6 +47,47 @@ itself or blamed its own diff for the failure.
 The one remaining failure, `RJdkFunctionCombinators` on `SUITE=all`, is H0's —
 `H24-3` diagnosed it to `register_comparator_natives` in
 `native-collections/src/lib.rs` — and it fails identically on the control.
+
+### 1.0 Re-verified on the MERGED state, after H0's tip moved
+
+`claude/jdk-only-mode-handoff-09b48c` advanced by four commits while this lane
+was working, and one of them (`ecd4f56e1`) closed `RJdkFunctionCombinators` —
+the last standing `SUITE=all` failure — by guarding the `java/util/Comparator`
+family on a real image. H0's tip was merged into this branch (`b74c73269`,
+clean auto-merge; the only file both sides touched is `run.sh`, and the two
+edits are in different blocks), and everything was rebuilt and re-run.
+
+**MEASURED on the merged state, `HEAD b74c73269`, clean tree:**
+
+| arm | **merged branch** | H0's tip alone (its own figure) |
+|---|---|---|
+| `CRATONVM_ARGS=--jdk-only` | **107 / 107, 0 failed** | 105 / 105 |
+| `SUITE=all` | **107 / 107, 0 failed** | 105 / 105 |
+| `SUITE=core` | **67 / 67, 0 failed** | 65 / 65 |
+
+**Every scheduled vector passes in every arm**, which is the bar the brief
+raised on 2026-08-21 (*"there is no failing set now: any red vector you produce
+is yours"*). The +2 in each denominator is this lane's two vectors.
+
+The census on the merged state, over the original 105-vector schedule: **1403
+native-won / 471 bytecode-won**, `synthetic-native-registered` **1610** — the
+1622 → 1610 fall is H0's Comparator guard, not this lane's, and this lane's
+native-won figure is unchanged from its own control at 1403.
+
+The registry diff was re-run on the merged binary and is byte-identical to the
+pre-merge one: −15 registrations, −6 triples, **0 triples appeared, 0 slot
+owners moved file**.
+
+**The A/B in §1 and §1.2 was deliberately NOT re-taken on the merged base.**
+Attributing this lane's delta needs H0's fix in NEITHER arm; folding it into
+both would add a −12 synthetic-registration movement to a comparison that
+claims −9 shadowed. Two questions, two runs, and the numbers are labelled with
+which is which.
+
+**One caveat on every census figure in this record: they are LINUX figures.**
+The brief publishes 1387 native-won / 481 bytecode-won from Windows; this host's
+control measures 1403 / 472 at the same commit. The platform difference is real
+and predates this branch — do not diff a figure here against a figure there.
 
 ### 1.1 The registry, diffed at TRIPLE granularity
 
@@ -346,7 +391,7 @@ contributed no shadows; the census is over the 105 real vectors.
 
 ## INDEX ROWS (for H0 to move into `INDEX.md`)
 
-* `WORKER-3-NOTE-1` — 15 registrations retired with their paired edits (both
+* `WORKER-3-NOTE-1` — 107/107, 107/107, 67/67 on the merged tip. 15 registrations retired with their paired edits (both
   `Thread.stop` copies, two rows no image declares, three near-misses, seven
   shadowed losers), four live wrong answers fixed, two corpus vectors added.
   `deprecated_api_manifest` gains the `ImageStatus` column. **CLOSED for the
