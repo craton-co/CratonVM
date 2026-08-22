@@ -907,7 +907,71 @@ use cratonvm_types::compat::CompatibilityMode;
 /// not COMPILED since `26e4b5db4` — see
 /// `known-issues/stub-ratchet-was-a-compile-error-and-is-three-over-baseline-20260820.md`.
 /// The count had been three over for two days with nothing able to say so.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1625;
+///
+/// # 1625 / 1614 -> 1609 / 1598, 2026-08-21 -- measured by ROW DIFF, not argued
+///
+/// The `claude/jdk-only-mode-handoff-09b48c` merge. **-16 stubs in BOTH
+/// configurations, and -70 total** against a row dump of pristine `be6e52f82`
+/// (`CRATONVM_RATCHET_ROWS=1` on each tree, sorted, `comm`). This is the third
+/// case -- registrations DELETED -- and for once the account is a list rather
+/// than a subtraction:
+///
+/// ```text
+/// GONE (24)
+///   12  java/util/Comparator.{naturalOrder,reverseOrder,reversed,comparing,
+///         comparingInt,comparingLong,comparingDouble,thenComparing x2,
+///         thenComparingInt,thenComparingLong,thenComparingDouble}
+///                                             native-collections/src/lib.rs
+///    9  java/util/function.{Predicate.and,or,negate,not; Consumer.andThen;
+///         Function.andThen,compose; BinaryOperator.maxBy,minBy}
+///                                    native-builtins/src/phases_late/streams.rs
+///    3  java/lang/invoke/MethodHandleProxies.{asInterfaceInstance,
+///         isWrapperInstance,wrapperInstanceTarget}
+///                                        native-builtins/src/lang_invoke.rs
+/// NEW (8)
+///    8  sun/nio/fs/WindowsFileAttributes.{isDirectory,isRegularFile,isOther,
+///         isSymbolicLink,size,creationTime,lastAccessTime,lastModifiedTime}
+///                                  native-builtins/src/phases_late/nio_file.rs
+/// ```
+///
+/// 24 gone, 8 new, net -16. The twelve are the `java/util/Comparator` family
+/// guarded behind `registry.drops_real_layout_synthetic()` so a REAL image runs
+/// the JDK's own `Comparators$NaturalOrderComparator` instead of a stub -- the
+/// closure of the last standing `SUITE=all` failure.
+///
+/// **CORRECTION.** The merge commit that landed this said the delta was NOT the
+/// Comparator guard, "which is inert in this registry -- 9 Comparator rows are
+/// still present". That is WRONG, and the way it was wrong is worth keeping:
+/// the check was `grep 'java/util/Comparator'` over the row dump, which matches
+/// DESCRIPTORS as well as classes. Seven of those nine survivors are other
+/// classes that merely take a `Comparator` argument
+/// (`cratonvm/internal/ArrayListSubList.sort(Ljava/util/Comparator;)V`,
+/// `java/util/stream/Collectors.{minBy,maxBy}`); only
+/// `java/util/Comparator$Native.{compare,writeReplace}` is the class itself,
+/// and those two are registered unconditionally by design. **Grep the row's
+/// CLASS field, not the line.** The guard fired exactly as intended.
+///
+/// **The +8 are the half that deserves scrutiny**, and they are case (a) by the
+/// dichotomy below: new `SyntheticStub` rows on `sun/nio/fs/WindowsFileAttributes`,
+/// a REAL JDK class rather than a VM-minted stand-in, so the
+/// `VM_MINTED_STAND_IN_RECEIVERS` exemption recorded above does NOT cover them.
+/// They are recorded here as owed work, not absolved: under `--jdk-only` these
+/// eight are dropped and the JDK's own bytecode must satisfy them.
+///
+/// **The totals were re-measured, not carried.** The previous
+/// `MEASURED_TOTAL_REGISTRATIONS_*` were themselves stale: pristine `be6e52f82`
+/// measures **12919** total in the no-management resolve against a frozen
+/// 12885, so dev's own second column had drifted +34 with nothing able to say
+/// so. Both columns below are from the runs quoted in this block.
+///
+/// Measured post-merge on the merged tree (WORKER-5 included, which moved the
+/// totals a further -15 and the stub counts NOT AT ALL):
+///
+/// ```text
+/// management     1609 SyntheticStub out of 13202 total
+/// no-management  1598 SyntheticStub out of 12834 total
+/// ```
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1609;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -922,7 +986,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1625;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1614;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1598;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -952,13 +1016,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1614;
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
 /// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13253;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13202;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12885;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12834;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
