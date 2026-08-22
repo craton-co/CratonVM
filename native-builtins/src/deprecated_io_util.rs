@@ -803,28 +803,32 @@ fn register_date_getters_setters(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // toLocaleString()Ljava/lang/String;
-    r.register(
-        date,
-        "toLocaleString",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let ms = get_date_millis(ctx, this);
-            let (year, month, day, hour, min, sec, _) = from_epoch_millis(ms);
-            let formatted = format!(
-                "{:02}/{:02}/{:04} {:02}:{:02}:{:02}",
-                month + 1,
-                day,
-                year,
-                hour,
-                min,
-                sec
-            );
-            let s = ctx.create_string(&formatted);
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    // `toLocaleString()Ljava/lang/String;` WAS REGISTERED HERE AND IS RETIRED
+    // (2026-08-21, WORKER 4). It is a section 1.4 shadow that answered the wrong
+    // string, and the JDK's own body answers the right one on this VM.
+    //
+    // MEASURED, `regression-suite/probes/W4Deprecated.java`, Linux/JDK 25.0.4,
+    // `new Date(946684800000L)`:
+    //
+    //     HotSpot                                        Jan 1, 2000, 12:00:00 AM
+    //     CratonVM, this native                          01/01/2000 00:00:00      <- WRONG
+    //     CratonVM, DateFormat.getDateTimeInstance(...)  Jan 1, 2000, 12:00:00 AM <- the JDK body
+    //
+    // `Date.toLocaleString()`'s body IS that third line — `DateFormat
+    // .getDateTimeInstance(DEFAULT, DEFAULT).format(this)` — so the probe's
+    // third row is not an approximation of the JDK path, it is the JDK path,
+    // run on this VM, agreeing with the oracle exactly. Retiring the native is
+    // a fix and not a trade.
+    //
+    // Trap 4 checked, not assumed: `--dump-native-registry` unioned over 105
+    // corpus vectors shows ONE registration of this triple, this one,
+    // `owns_slot=True`, `invocations=0`. The deletion removes a row and
+    // promotes nothing.
+    //
+    // The unit test that asserted the wrong string went with it — see
+    // `test_date_to_locale_string`'s replacement in the test module. It froze
+    // `"01/01/1970 00:00:00"` as expected output, which is how a divergence
+    // survives a green suite for as long as this one did.
 
     // toGMTString()Ljava/lang/String;
     r.register(date, "toGMTString", "()Ljava/lang/String;", |ctx, args| {
@@ -1104,41 +1108,43 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
 // T8.2.7 — Number.byteValue() / shortValue()
 // ---------------------------------------------------------------------------
 
-fn register_number_defaults(r: &mut NativeMethodRegistry) {
-    let num = "java/lang/Number";
-
-    // byteValue()B — returns (byte) intValue(). Real JDK's `Number`
-    // default is exactly `(byte) intValue()`, dispatched virtually — it
-    // must NOT assume the value lives in field 0, because that's only
-    // true for the built-in boxed wrappers (Integer/Long/Float/Double).
-    // `BigDecimal` (no field-0 primitive at all — arbitrary-precision
-    // fields instead) silently returned 0 for every value under the old
-    // field-read shortcut, which broke JSON-B/Yasson's untyped numeric
-    // binding (every JSON number decodes to a `BigDecimal`) — see
-    // JsonbHttpMessageConverterTests.readUntyped(). Delegating to the
-    // virtual `intValue()` handles BigDecimal, BigInteger, and any other
-    // Number subclass correctly, while still being correct for the boxed
-    // wrappers since their own `intValue()` natives already do the right
-    // thing.
-    r.register(num, "byteValue", "()B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let int_val = match ctx.invoke_virtual(this, "intValue", "()I", &[])? {
-            Some(Value::Int(v)) => v,
-            _ => 0,
-        };
-        Ok(Some(Value::Int((int_val as i8) as i32)))
-    });
-
-    // shortValue()S — returns (short) intValue(); see byteValue() above.
-    r.register(num, "shortValue", "()S", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let int_val = match ctx.invoke_virtual(this, "intValue", "()I", &[])? {
-            Some(Value::Int(v)) => v,
-            _ => 0,
-        };
-        Ok(Some(Value::Int((int_val as i16) as i32)))
-    });
-}
+/// RETIRED 2026-08-21 (WORKER 4). This function registered
+/// `java.lang.Number.byteValue()B` and `shortValue()S`, and both were section
+/// 1.4 shadows of a real `java.base` body that is one line long:
+///
+/// ```java
+/// public byte  byteValue()  { return (byte)  intValue(); }
+/// public short shortValue() { return (short) intValue(); }
+/// ```
+///
+/// The natives were a faithful transcription of exactly that — `invoke_virtual`
+/// on `intValue()`, then the narrowing cast — which is what makes them a
+/// re-implementation rather than a bridge. Nothing here crosses a VM boundary.
+///
+/// **The evidence for retiring rather than keeping.** MEASURED,
+/// `regression-suite/probes/W4Deprecated.java`, 116 cases, Linux/JDK 25.0.4:
+/// `byteValue()`/`shortValue()` over 15 truncating and sign-flipping inputs,
+/// through a USER `Number` subclass that declares only the four abstract
+/// primitives (the shape a `java.lang.Number` row exists to serve, via the
+/// superclass walk), through `Integer`/`Long`/`Double`/`Float`, through
+/// `BigInteger`/`BigDecimal` — the two the comment below specifically called
+/// out — and through a `Number`-typed reference. **Zero diffs against the
+/// oracle in both modes, before and after.**
+///
+/// `--dump-native-registry` unioned over 105 corpus vectors: ONE registration
+/// each, `owns_slot=True`, `invocations=0`. `dupX = 0`, so the deletion removes
+/// two rows and promotes nothing.
+///
+/// The `BigDecimal` regression the old comment records — *"silently returned 0
+/// for every value under the old field-read shortcut, which broke JSON-B /
+/// Yasson's untyped numeric binding"* — was caused by a native READING FIELD 0,
+/// and was fixed by making the native call `intValue()` virtually. The JDK's
+/// own body has always called `intValue()` virtually. The second fix for that
+/// defect is to stop standing in front of the body that never had it.
+///
+/// (The class is `java.lang.Number`, which is WORKER 3's subject; the file is
+/// WORKER 4's. Recorded because the split is not obvious from either side.)
+fn register_number_defaults(_r: &mut NativeMethodRegistry) {}
 
 // ---------------------------------------------------------------------------
 // T8.2.8 — Properties.save(...)
@@ -2162,30 +2168,15 @@ mod tests {
         assert_eq!(month.unwrap(), Some(Value::Int(11)));
     }
 
-    #[test]
-    fn test_date_to_locale_string() {
-        let reg = setup();
-        let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
-        // Epoch 0 = 1970-01-01 00:00:00
-        set_date_millis(&mut ctx, date_obj, 0);
-
-        let result = call_native(
-            &reg,
-            &mut ctx,
-            "java/util/Date",
-            "toLocaleString",
-            "()Ljava/lang/String;",
-            &[Value::Object(Some(date_obj))],
-        );
-        let val = result.unwrap().unwrap();
-        if let Value::Object(Some(s)) = val {
-            let text = ctx.read_string(s).unwrap();
-            assert_eq!(text, "01/01/1970 00:00:00");
-        } else {
-            panic!("Expected string object");
-        }
-    }
+    // `test_date_to_locale_string` was REMOVED 2026-08-21 (WORKER 4) with the
+    // registration it pinned. It asserted
+    //
+    //     assert_eq!(text, "01/01/1970 00:00:00");
+    //
+    // which is not what `Date.toLocaleString()` returns on any JDK — HotSpot
+    // 25.0.4 answers `Jan 1, 1970, 12:00:00 AM` — so the test's function was to
+    // hold a divergence in place. `[a test that freezes VM output locks in the
+    // divergence]`. See the retirement note beside the old registration.
 
     #[test]
     fn test_date_to_gmt_string() {
@@ -2289,50 +2280,15 @@ mod tests {
 
     // --- T8.2.7 Number.byteValue / shortValue ---
 
-    #[test]
-    fn test_number_byte_value() {
-        // byteValue()/shortValue() now delegate to the virtual `intValue()`
-        // (matching real JDK's `Number` default and correctly handling
-        // subclasses like BigDecimal that don't store their value as a raw
-        // field-0 primitive) — script the mock's `invoke_virtual` to stand
-        // in for that dispatch.
-        let reg = setup();
-        let mut ctx = MockNativeContext::new();
-        let num = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Number", 4).unwrap();
-        ctx.set_field(num, 0, Value::Int(300));
-        ctx.set_invoke_virtual_result(Ok(Some(Value::Int(300))));
-
-        let result = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Number",
-            "byteValue",
-            "()B",
-            &[Value::Object(Some(num))],
-        );
-        // 300 as byte = 44 (300 & 0xFF = 44, then as i8 = 44)
-        assert_eq!(result.unwrap(), Some(Value::Int(44)));
-    }
-
-    #[test]
-    fn test_number_short_value() {
-        let reg = setup();
-        let mut ctx = MockNativeContext::new();
-        let num = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Number", 4).unwrap();
-        ctx.set_field(num, 0, Value::Int(70000));
-        ctx.set_invoke_virtual_result(Ok(Some(Value::Int(70000))));
-
-        let result = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Number",
-            "shortValue",
-            "()S",
-            &[Value::Object(Some(num))],
-        );
-        // 70000 as i16 = 4464
-        assert_eq!(result.unwrap(), Some(Value::Int(70000i32 as i16 as i32)));
-    }
+    // `test_number_byte_value` and `test_number_short_value` were REMOVED
+    // 2026-08-21 (WORKER 4) with the two registrations they pinned. Both drove
+    // a `MockNativeContext` whose `invoke_virtual` was scripted to return the
+    // value the test then asserted the narrowing of — so they tested the cast,
+    // which is a Rust `as`, and could not have failed while the registration
+    // existed. `regression-suite/probes/W4Deprecated.java` asks the same
+    // question of a real VM against a real oracle, over 116 cases including
+    // the `BigDecimal`/`BigInteger` subclasses the retired comment was about.
+    // See `register_number_defaults` for the retirement note.
 
     // --- T8.2.8 Properties.save ---
 

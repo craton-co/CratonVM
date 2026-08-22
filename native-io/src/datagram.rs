@@ -287,6 +287,29 @@ fn parse_inet_address(ctx: &mut dyn NativeContext, addr: ObjectRef) -> Option<Ip
 // Native handlers
 // ---------------------------------------------------------------------------
 
+/// The `MembershipKey` private slot map, relative to
+/// [`crate::concrete_receiver::concrete_base`].
+///
+/// Absolute indices until 2026-08-21: the key was minted AS the ABSTRACT
+/// `java.nio.channels.MembershipKey`, which declares no instance fields, so
+/// slots 0..3 were nobody's. They are now written above the concrete class's
+/// own layout — `sun.nio.ch.MembershipKeyImpl` declares seven and each of its
+/// two concrete subclasses three more — because the mint moved to that class
+/// (see [`dgram_join_group`]).
+const MK_FIELD_GROUP: usize = 0;
+const MK_FIELD_INTERFACE: usize = 1;
+const MK_FIELD_FD: usize = 2;
+const MK_FIELD_VALID: usize = 3;
+/// How many private slots [`dgram_join_group`] appends above the real layout.
+const MK_PRIVATE_SLOTS: usize = 4;
+
+/// The concrete classes HotSpot 25 builds for a multicast membership, IPv4 and
+/// IPv6. Both extend the (also abstract) `sun.nio.ch.MembershipKeyImpl`; which
+/// one the JDK picks is decided by the group address's family, so this crate
+/// picks the same way rather than always naming one.
+const MK_IMPL_V4: &str = "sun/nio/ch/MembershipKeyImpl$Type4";
+const MK_IMPL_V6: &str = "sun/nio/ch/MembershipKeyImpl$Type6";
+
 /// `joinGroup0(InetAddress group, NetworkInterface ifc) -> MembershipKey`.
 fn dgram_join_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(this) = arg_obj(args, 0) else {
@@ -320,15 +343,39 @@ fn dgram_join_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Err(io_error("join: address-family mismatch")),
     }
     record_join(fd, group, interface_ip);
-    // Build a MembershipKey: 4-field synthetic object {group, ifc, fd, valid}.
-    let mk_cid = ctx
-        .ensure_class_initialized("java/nio/channels/MembershipKey")
-        .unwrap_or_else(|_| ClassId::new(0));
-    let mk = ctx.alloc_object(mk_cid, 4);
-    ctx.set_field(mk, 0, Value::Object(Some(group_obj)));
-    ctx.set_field(mk, 1, Value::Object(arg_obj(args, 2)));
-    ctx.set_field(mk, 2, Value::Int(fd as i32));
-    ctx.set_field(mk, 3, Value::Int(1)); // valid
+    // Build a MembershipKey: {group, ifc, fd, valid}, appended above the
+    // concrete class's own layout.
+    //
+    // **The defect this closes.** `ensure_class_initialized(
+    // "java/nio/channels/MembershipKey")` resolves to the real, ABSTRACT JDK
+    // class, and `alloc_object` then minted an object whose runtime class is
+    // abstract -- a receiver `new` cannot legally produce (JVMS 6.5). Same
+    // one-line shape `H21-1` fixed for `Pipe`. `java.nio.channels.MembershipKey`
+    // declares no instance fields, which is why slots 0..3 were free and why
+    // moving to a class that DOES declare fields needs the appended base.
+    //
+    // **Which concrete class**: the JDK's own `MembershipRegistry` builds
+    // `MembershipKeyImpl.Type4` for an IPv4 group and `Type6` otherwise, so
+    // this picks by the same discriminator it already computed above.
+    let mk_impl = match group {
+        IpAddr::V4(_) => MK_IMPL_V4,
+        IpAddr::V6(_) => MK_IMPL_V6,
+    };
+    let minted = crate::concrete_receiver::alloc_concrete(
+        ctx,
+        &[mk_impl],
+        "java/nio/channels/MembershipKey",
+        MK_PRIVATE_SLOTS,
+    );
+    let (mk, base) = (minted.obj, minted.base);
+    ctx.set_field(mk, base + MK_FIELD_GROUP, Value::Object(Some(group_obj)));
+    ctx.set_field(
+        mk,
+        base + MK_FIELD_INTERFACE,
+        Value::Object(arg_obj(args, 2)),
+    );
+    ctx.set_field(mk, base + MK_FIELD_FD, Value::Int(fd as i32));
+    ctx.set_field(mk, base + MK_FIELD_VALID, Value::Int(1));
     Ok(Some(Value::Object(Some(mk))))
 }
 
@@ -337,18 +384,21 @@ fn dgram_drop_membership(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let Some(mk) = arg_obj(args, 0) else {
         return Ok(None);
     };
-    let fd = match ctx.get_field(mk, 2) {
+    // Resolved from the RECEIVER, with the width guard that collapses to 0 for
+    // any key this crate did not allocate -- see `concrete_base`.
+    let base = crate::concrete_receiver::concrete_base(ctx, mk, MK_PRIVATE_SLOTS);
+    let fd = match ctx.get_field(mk, base + MK_FIELD_FD) {
         Value::Int(v) if v >= 0 => v as FdId,
         _ => return Ok(None),
     };
-    let group_obj = match ctx.get_field(mk, 0) {
+    let group_obj = match ctx.get_field(mk, base + MK_FIELD_GROUP) {
         Value::Object(Some(o)) => o,
         _ => return Ok(None),
     };
     let Some(group) = parse_inet_address(ctx, group_obj) else {
         return Ok(None);
     };
-    let interface_ip: IpAddr = match ctx.get_field(mk, 1) {
+    let interface_ip: IpAddr = match ctx.get_field(mk, base + MK_FIELD_INTERFACE) {
         Value::Object(Some(o)) => parse_inet_address(ctx, o).unwrap_or(match group {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -364,8 +414,8 @@ fn dgram_drop_membership(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => None,
     };
     record_leave(fd, group);
-    if ctx.object_num_fields(mk) >= 4 {
-        ctx.set_field(mk, 3, Value::Int(0)); // invalidate
+    if ctx.object_num_fields(mk) >= base + MK_PRIVATE_SLOTS {
+        ctx.set_field(mk, base + MK_FIELD_VALID, Value::Int(0)); // invalidate
     }
     Ok(None)
 }
@@ -375,8 +425,9 @@ fn dgram_membership_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let Some(mk) = arg_obj(args, 0) else {
         return Ok(Some(Value::Int(0)));
     };
-    if ctx.object_num_fields(mk) >= 4 {
-        return Ok(Some(ctx.get_field(mk, 3)));
+    let base = crate::concrete_receiver::concrete_base(ctx, mk, MK_PRIVATE_SLOTS);
+    if ctx.object_num_fields(mk) >= base + MK_PRIVATE_SLOTS {
+        return Ok(Some(ctx.get_field(mk, base + MK_FIELD_VALID)));
     }
     Ok(Some(Value::Int(0)))
 }
@@ -418,6 +469,9 @@ fn dgram_unblock(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Where this registrar's own rows start; the mirrors at the foot of the
+    // function must not be able to see any other crate's.
+    let __rows_before = r.dump_registrations().len();
 
     // Multicast
     r.register(
@@ -450,6 +504,36 @@ pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
         "(Ljava/net/InetAddress;)Ljava/nio/channels/MembershipKey;",
         dgram_unblock,
     );
+
+    // The registration half of the two fabricated-receiver fixes above.
+    //
+    // `join` is an INSTANCE method whose receiver is now
+    // `sun.nio.ch.DatagramChannelImpl` (`lib.rs::native_dc_open`), and the four
+    // `MembershipKey` rows now answer for a `MembershipKeyImpl.Type4`/`Type6`.
+    // Dispatch keys on the receiver's runtime class (`H11-1`), and the
+    // superclass walk does not run for a class that declares the method with
+    // `Code` -- which all of these do. Without these mirrors the natives above
+    // would simply stop being reached.
+    //
+    // `MembershipKeyImpl` itself is in the list because it is where the two
+    // concrete subclasses inherit `isValid`/`drop`/`block`/`unblock` FROM: a
+    // `Type4` receiver declares none of them, so step 1 misses and the walk
+    // goes to its superclass -- which must find a registration there, not the
+    // JDK's own body.
+    crate::concrete_receiver::mirror_class_registrations(
+        r,
+        __rows_before,
+        "java/nio/channels/DatagramChannel",
+        "sun/nio/ch/DatagramChannelImpl",
+    );
+    for impl_name in ["sun/nio/ch/MembershipKeyImpl", MK_IMPL_V4, MK_IMPL_V6] {
+        crate::concrete_receiver::mirror_class_registrations(
+            r,
+            __rows_before,
+            "java/nio/channels/MembershipKey",
+            impl_name,
+        );
+    }
     r.set_category(__prev_cat);
 }
 

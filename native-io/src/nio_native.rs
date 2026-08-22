@@ -1400,6 +1400,13 @@ fn udp_remove(id: i32) {
 /// the synthetic field layout. Tolerates classes that don't appear in the
 /// bootstrap classloader — falls back to `ClassId::new(0)` with the
 /// explicit field count.
+/// Retained for the `t16_dc_*` family, which is `synthetic-jdk`-gated, so this
+/// has no caller in the default build. Do NOT reach for it in new code: it
+/// resolves whatever name it is given, which for every abstract public API
+/// class in `java.nio.channels` mints a receiver `new` cannot legally produce
+/// (JVMS 6.5). `crate::concrete_receiver::alloc_concrete` is the replacement
+/// and refuses a class that is abstract or an interface.
+#[allow(dead_code)]
 fn alloc_t16(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -1418,15 +1425,7 @@ fn obj_or_none(args: &[Value], idx: usize) -> Option<cratonvm_types::ObjectRef> 
     }
 }
 
-fn t16_afc_uses_real_handle(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
-    ctx.object_num_fields(obj) >= 3 && matches!(ctx.get_field(obj, 0), Value::Int(_))
-}
-
 // ---- AsynchronousFileChannel ----
-
-fn t16_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    crate::native_afc_open(ctx, args)
-}
 
 #[cfg(any())]
 #[allow(dead_code)]
@@ -1456,128 +1455,9 @@ fn t16_afc_open_legacy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(ch))))
 }
 
-fn t16_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    match obj_or_none(args, 0) {
-        Some(o) if t16_afc_uses_real_handle(ctx, o) => crate::native_afc_is_open(ctx, args),
-        Some(o) if ctx.object_num_fields(o) >= 2 => Ok(Some(ctx.get_field(o, 1))),
-        _ => Ok(Some(Value::Int(1))),
-    }
-}
-
-fn t16_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    match obj_or_none(args, 0) {
-        Some(o) if t16_afc_uses_real_handle(ctx, o) => crate::native_afc_size(ctx, args),
-        Some(o) if ctx.object_num_fields(o) >= 1 => {
-            let path = match ctx.get_field(o, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Long(0))),
-            };
-            if path.is_empty() {
-                return Ok(Some(Value::Long(0)));
-            }
-            // AUDIT-NOTE 2026-05-24 (HIGH security pass): metadata-only.
-            // This native services `AsynchronousFileChannel.size()` and
-            // reads no file contents — it only returns a `len()` for a
-            // path that the guest *already* opened. If the open itself
-            // was sandbox-rejected, the path slot on the AFC object
-            // stays empty (we returned 0 above). Re-validating here
-            // would either be redundant (already enforced at open time)
-            // or — under a future `setPathConfineToCwd(false)` runtime
-            // toggle on a long-lived AFC — incorrectly reject a path
-            // that was legitimate at open time. We deliberately do not
-            // call `validate_path` here.
-            let sz = std::fs::metadata(&path)
-                .map(|m| m.len() as i64)
-                .unwrap_or(0);
-            Ok(Some(Value::Long(sz)))
-        }
-        _ => Ok(Some(Value::Long(0))),
-    }
-}
-
-fn t16_afc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(o) = obj_or_none(args, 0) {
-        if t16_afc_uses_real_handle(ctx, o) {
-            return crate::native_afc_close(ctx, args);
-        }
-        if ctx.object_num_fields(o) >= 2 {
-            ctx.set_field(o, 1, Value::Int(0));
-        }
-    }
-    Ok(None)
-}
-
 // ---- AsynchronousSocketChannel ----
 
-fn t16_asc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let ch = alloc_t16(ctx, "java/nio/channels/AsynchronousSocketChannel", 4);
-    ctx.set_field(ch, 0, Value::Int(0)); // not connected
-    ctx.set_field(ch, 1, Value::Int(1)); // open
-    ctx.set_field(ch, 2, Value::Int(-1)); // fd unset
-    ctx.set_field(ch, 3, Value::Object(None)); // remote addr
-    Ok(Some(Value::Object(Some(ch))))
-}
-
-fn t16_asc_open_group(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    t16_asc_open(ctx, _args)
-}
-
-fn t16_asc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Null-tolerant: if no `this` given (test pattern), report open.
-    match obj_or_none(args, 0) {
-        Some(o) if ctx.object_num_fields(o) >= 2 => Ok(Some(ctx.get_field(o, 1))),
-        _ => Ok(Some(Value::Int(1))),
-    }
-}
-
-fn t16_asc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(o) = obj_or_none(args, 0) {
-        if ctx.object_num_fields(o) >= 2 {
-            ctx.set_field(o, 1, Value::Int(0));
-        }
-    }
-    Ok(None)
-}
-
 // ---- AsynchronousChannelGroup ----
-
-fn t16_acg_with_fixed(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let g = alloc_t16(ctx, "java/nio/channels/AsynchronousChannelGroup", 1);
-    ctx.set_field(g, 0, Value::Int(1)); // state = running
-    Ok(Some(Value::Object(Some(g))))
-}
-
-fn t16_acg_with_thread_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    t16_acg_with_fixed(ctx, args)
-}
-
-fn t16_acg_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Null-tolerant: default to "not shutdown" when no self argument is passed.
-    match obj_or_none(args, 0) {
-        Some(o) if ctx.object_num_fields(o) >= 1 => {
-            let state = ctx.get_field(o, 0).as_int().unwrap_or(1);
-            Ok(Some(Value::Int(if state == 0 { 1 } else { 0 })))
-        }
-        _ => Ok(Some(Value::Int(0))),
-    }
-}
-
-fn t16_acg_is_terminated(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    t16_acg_is_shutdown(ctx, args)
-}
-
-fn t16_acg_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(o) = obj_or_none(args, 0) {
-        if ctx.object_num_fields(o) >= 1 {
-            ctx.set_field(o, 0, Value::Int(0));
-        }
-    }
-    Ok(None)
-}
-
-fn t16_acg_await_termination(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(1)))
-}
 
 // ---- DatagramChannel (SYNTHETIC, synthetic-jdk only) ----
 //
@@ -1765,59 +1645,72 @@ fn t16_lr_get_sequence_number(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // AsynchronousFileChannel
-    let afc = "java/nio/channels/AsynchronousFileChannel";
-    r.register(
-        afc,
-        "open",
-        "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/nio/channels/AsynchronousFileChannel;",
-        t16_afc_open,
-    );
-    r.register(afc, "isOpen", "()Z", t16_afc_is_open);
-    r.register(afc, "size", "()J", t16_afc_size);
-    r.register(afc, "close", "()V", t16_afc_close);
-
-    // AsynchronousSocketChannel
-    let asc = "java/nio/channels/AsynchronousSocketChannel";
-    r.register(
-        asc,
-        "open",
-        "()Ljava/nio/channels/AsynchronousSocketChannel;",
-        t16_asc_open,
-    );
-    r.register(
-        asc,
-        "open",
-        "(Ljava/nio/channels/AsynchronousChannelGroup;)Ljava/nio/channels/AsynchronousSocketChannel;",
-        t16_asc_open_group,
-    );
-    r.register(asc, "isOpen", "()Z", t16_asc_is_open);
-    r.register(asc, "close", "()V", t16_asc_close);
-
-    // AsynchronousChannelGroup
-    let acg = "java/nio/channels/AsynchronousChannelGroup";
-    r.register(
-        acg,
-        "withFixedThreadPool",
-        "(ILjava/util/concurrent/ThreadFactory;)Ljava/nio/channels/AsynchronousChannelGroup;",
-        t16_acg_with_fixed,
-    );
-    r.register(
-        acg,
-        "withThreadPool",
-        "(Ljava/util/concurrent/ExecutorService;)Ljava/nio/channels/AsynchronousChannelGroup;",
-        t16_acg_with_thread_pool,
-    );
-    r.register(acg, "isShutdown", "()Z", t16_acg_is_shutdown);
-    r.register(acg, "isTerminated", "()Z", t16_acg_is_terminated);
-    r.register(acg, "shutdown", "()V", t16_acg_shutdown);
-    r.register(acg, "shutdownNow", "()V", t16_acg_shutdown);
-    r.register(
-        acg,
-        "awaitTermination",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        t16_acg_await_termination,
-    );
+    // THE `AsynchronousFileChannel` / `AsynchronousSocketChannel` /
+    // `AsynchronousChannelGroup` OVERRIDES WERE RETIRED 2026-08-21 (WORKER 4).
+    //
+    // Fifteen registrations. They were the WINNERS -- this registrar runs last,
+    // and re-registration updates the slot in place -- and what they were
+    // winning against was the real implementation of the same three families in
+    // `async_socket.rs` and `lib.rs`. `lib.rs`'s own integration comment has
+    // said so since the modules landed: *"WP3.2 -- AIO socket channels +
+    // AsynchronousChannelGroup. Supersedes the synthetic `t16_asc_*` /
+    // `t16_acg_*` stubs registered in `register_t16_channel_overrides`."* It
+    // did not supersede them; it lost to them.
+    //
+    // MEASURED (`--dump-native-registry`, `--jdk-only`, r1 build, `W4Abstract`):
+    //
+    //     AsynchronousSocketChannel.open()          owns_slot=True  inv=1
+    //       [native-io/src/nio_native.rs:1782]   <- this file
+    //       [native-io/src/async_socket.rs:3548] owns_slot=False   <- the owner
+    //     AsynchronousFileChannel.open(Path,…)      owns_slot=True  inv=1
+    //       [native-io/src/nio_native.rs:1770]   <- this file
+    //       [native-io/src/lib.rs:21667]         owns_slot=False
+    //
+    // and the same shape for `isOpen`, `size` and `close` on all three classes.
+    //
+    // **Two independent defects were behind that, and they are why this is a
+    // retirement rather than a re-order.**
+    //
+    // 1. **Two slot maps on one class.** `t16_asc_open` wrote
+    //    `{0: connected, 1: open, 2: fd, 3: remote}`; `async_socket.rs`'s
+    //    `aio_asc_open` -- which owns `connect`, `read`, `write`,
+    //    `getRemoteAddress` and every option accessor on the same object --
+    //    reads `{0: open, 1: connected, 2: reg_id, 3: remote}`. Slots 0 and 1
+    //    mean the OPPOSITE thing and slot 2 holds a different KIND of integer.
+    //    That is the `java.lang.Process` shape, and `net_channels.rs` carried a
+    //    third copy of the same map. W7-49 measured the two-way version of this
+    //    and could not repair it from one side; all three sides are in this
+    //    lane's scope, so they move together.
+    //
+    // 2. **A fabricated ABSTRACT receiver.** `t16_asc_open` and
+    //    `t16_acg_with_fixed` called `alloc_t16(ctx, "java/nio/channels/
+    //    AsynchronousSocketChannel", …)` -- a name that resolves to the real,
+    //    ABSTRACT JDK class. MEASURED by `probes/W4Abstract.java`:
+    //    `AsynchronousSocketChannel.open().getClass()` answered
+    //    `java.nio.channels.AsynchronousSocketChannel`, `isAbstract == true`,
+    //    against `sun.nio.ch.UnixAsynchronousSocketChannelImpl` on the oracle.
+    //    That is a receiver `new` cannot legally produce (JVMS 6.5). The
+    //    `async_socket.rs` factories were fixed in the same commit series and
+    //    mint the concrete class; while these fifteen rows owned the slots,
+    //    that fix was inert -- which is exactly the `[a green arm is evidence
+    //    about the question it asked]` failure, caught here only because the
+    //    probe asked the class-identity question directly.
+    //
+    // **Trap 4 was checked, not assumed** (`WORKER-4` brief: retiring the
+    // winner PROMOTES the loser). For every one of the fifteen triples the
+    // promoted row is `native-io`'s own real implementation -- `async_socket.rs`
+    // for the two socket families, `lib.rs::register_async_file_channel` for
+    // the file channel -- and never `net_channels.rs`, whose rows are
+    // `owns_slot=False` behind BOTH. Re-verify with
+    // `--dump-native-registry` before and after any further change here.
+    //
+    // `t16_afc_open` was a one-line delegation to `crate::native_afc_open`
+    // already, and `t16_afc_{is_open,size,close}` each opened with
+    // `t16_afc_uses_real_handle(..) => crate::native_afc_*`. Since every
+    // `AsynchronousFileChannel` this VM builds comes from `alloc_afc_channel`,
+    // that predicate was true for all of them and the legacy arms below it were
+    // unreachable. Deleting the four rows promotes the very functions they were
+    // delegating to.
 
     // DatagramChannel (SYNTHETIC, synthetic-jdk only).
     //

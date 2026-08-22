@@ -143,6 +143,28 @@ const CONNECT_REPOLL_MS: i32 = 50;
 
 const SI_ID: usize = 0;
 const SI_OPEN_FLAG: usize = 4;
+/// How many private slots the legacy selector map occupies. Only the two
+/// indices above are used; the width is what `concrete_base`'s guard tests.
+const SI_PRIVATE_SLOTS: usize = SI_OPEN_FLAG + 1;
+
+/// The concrete `Selector` HotSpot 25 builds for the default provider, per
+/// platform. MEASURED (`probes/W4Abstract.java`, oracle column, Linux):
+/// `Selector.open().getClass()` is `sun.nio.ch.EPollSelectorImpl`.
+///
+/// `sun.nio.ch.SelectorImpl` -- what `selector_open_native` used to name -- is
+/// ABSTRACT, so every selector this VM handed out was a receiver `new` cannot
+/// legally produce (JVMS 6.5). The list is ordered and
+/// `concrete_receiver::alloc_concrete` takes the first entry that is present
+/// AND instantiable, so the abstract parent stays as the last-resort entry and
+/// a platform not named here degrades to exactly today's behaviour.
+pub(crate) const SELECTOR_IMPLS: &[&str] = &[
+    "sun/nio/ch/EPollSelectorImpl",
+    "sun/nio/ch/WEPollSelectorImpl",
+    "sun/nio/ch/KQueueSelectorImpl",
+    "sun/nio/ch/WindowsSelectorImpl",
+    "sun/nio/ch/DevPollSelectorImpl",
+    "sun/nio/ch/PollSelectorImpl",
+];
 
 const SK_SELECTOR: usize = 0;
 const SK_CHANNEL: usize = 1;
@@ -2282,10 +2304,18 @@ fn selector_id_from_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
         return id;
     }
     // Legacy fallback for any synthetic-layout selector object.
-    if ctx.object_num_fields(obj) <= SI_ID {
+    //
+    // The base is resolved from the RECEIVER, not assumed to be 0: since
+    // 2026-08-21 `selector_open_native` mints the CONCRETE per-platform
+    // selector (`SELECTOR_IMPLS`), whose declared fields occupy the low slots.
+    // `concrete_base`'s width guard collapses to 0 for any selector this crate
+    // did not allocate, which is what keeps this fallback answering exactly
+    // what it answered before for a foreign or stub-mode object.
+    let base = crate::concrete_receiver::concrete_base(ctx, obj, SI_PRIVATE_SLOTS);
+    if ctx.object_num_fields(obj) <= base + SI_ID {
         return 0;
     }
-    ctx.get_field(obj, SI_ID).as_int().unwrap_or(0)
+    ctx.get_field(obj, base + SI_ID).as_int().unwrap_or(0)
 }
 
 fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
@@ -2295,11 +2325,13 @@ fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
             return open;
         }
     }
-    // Legacy fallback (synthetic-layout selector object).
-    if ctx.object_num_fields(obj) <= SI_OPEN_FLAG {
+    // Legacy fallback (synthetic-layout selector object). Same base rule as
+    // `selector_id_from_obj`.
+    let base = crate::concrete_receiver::concrete_base(ctx, obj, SI_PRIVATE_SLOTS);
+    if ctx.object_num_fields(obj) <= base + SI_OPEN_FLAG {
         return false;
     }
-    ctx.get_field(obj, SI_OPEN_FLAG).as_int().unwrap_or(0) != 0
+    ctx.get_field(obj, base + SI_OPEN_FLAG).as_int().unwrap_or(0) != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -2308,13 +2340,31 @@ fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
 
 /// `Selector.open()` — static factory returning a fresh SelectorImpl.
 fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = ctx
-        .new_object("sun/nio/ch/SelectorImpl")?
-        .and_then(|v| match v {
-            Value::Object(o) => o,
-            _ => None,
-        })
-        .ok_or_else(|| ioex("Selector.open: could not allocate SelectorImpl"))?;
+    // Minted AS the CONCRETE per-platform selector, not as the ABSTRACT
+    // `sun.nio.ch.SelectorImpl` this line used to name.
+    //
+    // **The defect.** MEASURED, `probes/W4Abstract.java`, both modes:
+    // `Selector.open().getClass()` answered `sun.nio.ch.SelectorImpl` with
+    // `Modifier.isAbstract == true`, against `sun.nio.ch.EPollSelectorImpl` on
+    // the oracle. A receiver `new` cannot legally produce (JVMS 6.5) -- the
+    // same one-line shape `H21-1` fixed for `Pipe`.
+    //
+    // **`new_object` is gone with it, and that is a second fix.** The doc
+    // comment on `g_selector_provider` records the consequence of the old call
+    // in detail: `new_object` runs no constructor, so
+    // `AbstractSelector.provider()`'s real `final` bytecode returned the never-
+    // assigned `provider` field and `Selector.open().provider()` answered NULL
+    // in both modes. `alloc_concrete` does not run one either -- the difference
+    // is that the registration half below now puts `provider()` on the concrete
+    // class too, so that bytecode is not reached.
+    let minted = crate::concrete_receiver::alloc_concrete(
+        ctx,
+        SELECTOR_IMPLS,
+        "sun/nio/ch/SelectorImpl",
+        SI_PRIVATE_SLOTS,
+    );
+    let obj = minted.obj;
+    let si_base = minted.base;
     let id = selector_open();
     // Bind the (real-JDK-layout) selector object to its native id by GC-stable
     // identity hash — its int slots are reference-typed and would coerce to
@@ -2326,11 +2376,11 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
         .or_default()
         .push(SelectorObjId { object: obj, id });
     let n = ctx.object_num_fields(obj);
-    if n > SI_ID {
-        ctx.set_field(obj, SI_ID, Value::Int(id));
+    if n > si_base + SI_ID {
+        ctx.set_field(obj, si_base + SI_ID, Value::Int(id));
     }
-    if n > SI_OPEN_FLAG {
-        ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(1));
+    if n > si_base + SI_OPEN_FLAG {
+        ctx.set_field(obj, si_base + SI_OPEN_FLAG, Value::Int(1));
     }
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -2489,8 +2539,9 @@ fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if remove_bucket {
         ids.remove(&hash);
     }
-    if ctx.object_num_fields(obj) > SI_OPEN_FLAG {
-        ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(0));
+    let base = crate::concrete_receiver::concrete_base(ctx, obj, SI_PRIVATE_SLOTS);
+    if ctx.object_num_fields(obj) > base + SI_OPEN_FLAG {
+        ctx.set_field(obj, base + SI_OPEN_FLAG, Value::Int(0));
     }
     Ok(None)
 }
@@ -4133,6 +4184,9 @@ fn windows_reset_wakeup_socket0_native(
 pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Where this registrar's rows start, so the mirror at its foot cannot see
+    // another crate's. `concrete_receiver::mirror_class_registrations`.
+    let __rows_before = r.dump_registrations().len();
     let sel = "sun/nio/ch/SelectorImpl";
     r.register(
         "java/nio/channels/Selector",
@@ -4524,6 +4578,19 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         windows_reset_wakeup_socket0_native,
         NativeKind::Bridge,
     );
+
+    // The registration half of `selector_open_native`'s fabricated-receiver
+    // fix. Dispatch keys on the receiver's runtime class (`H11-1`), and each
+    // concrete selector -- or the `SelectorImpl`/`AbstractSelector` chain above
+    // it -- declares `select`/`selectNow`/`wakeup`/`close`/`isOpen`/`keys`/
+    // `selectedKeys`/`provider` with `Code`. Without this the whole family
+    // would go quiet the moment the mint moved, and quietly: real
+    // `EPollSelectorImpl` bytecode against a selector whose `<init>` never ran
+    // is a null-field NPE, not a missing-method error.
+    for target in SELECTOR_IMPLS {
+        crate::concrete_receiver::mirror_class_registrations(r, __rows_before, sel, target);
+    }
+
     r.set_category(__prev_cat);
 }
 
