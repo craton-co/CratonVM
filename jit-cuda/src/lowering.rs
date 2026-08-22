@@ -322,6 +322,22 @@ pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
         name: "failure_flag".to_string(),
         kind: PtxParamKind::U64Ptr,
     });
+    // The index of the first element this launch is responsible for.
+    //
+    // A whole-array launch passes 0 and nothing changes. A CHUNKED launch
+    // passes the chunk's base, so one kernel can be launched several times
+    // over disjoint slices of the same iteration space while each thread
+    // still computes its GLOBAL index. That is what lets the writeback of
+    // one chunk overlap with the kernel of the next; without it every
+    // launch would start its index space at zero, because CUDA has no
+    // launch offset of its own.
+    //
+    // Costs one `ld.param` and one `add.s32` in the prologue, per thread,
+    // whether or not chunking is in use.
+    out.push(PtxParam {
+        name: "tid_base".to_string(),
+        kind: PtxParamKind::S32,
+    });
     out
 }
 
@@ -445,8 +461,9 @@ mod tests {
             allow_div_by_zero: false,
         };
         let params = build_param_list(&sig);
-        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag) = 7
-        assert_eq!(params.len(), 7);
+        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag,
+        //  tid_base) = 8
+        assert_eq!(params.len(), 8);
         assert_eq!(params[0].name, "p0_ptr");
         assert_eq!(params[1].name, "p0_len");
         assert_eq!(params[2].name, "p1_ptr");
@@ -454,6 +471,7 @@ mod tests {
         assert_eq!(params[4].name, "ret_ptr");
         assert_eq!(params[5].name, "ret_len");
         assert_eq!(params[6].name, "failure_flag");
+        assert_eq!(params[7].name, "tid_base");
     }
 
     #[test]
@@ -469,10 +487,11 @@ mod tests {
             allow_div_by_zero: false,
         };
         let params = build_param_list(&sig);
-        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag) = 6
-        assert_eq!(params.len(), 6);
+        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag, tid_base) = 7
+        assert_eq!(params.len(), 7);
         assert_eq!(params[4].name, "ret_ptr");
         assert_eq!(params[5].name, "failure_flag");
+        assert_eq!(params[6].name, "tid_base");
     }
 
     fn lower_i32_remainder_body(allow_div_by_zero: bool) -> String {
@@ -1376,18 +1395,22 @@ mod tests {
         let text = m.render();
         assert!(text.contains(".visible .entry NonCanonicalLoops__start5Loop_"));
         // The tid+K fold: an `add.s32` with immediate 5 feeding a fresh
-        // register, right after `emit_tid`'s `mov.b32` reinterpret and
-        // before anything else touches the induction register.
-        assert!(
-            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 5;"),
-            "expected the tid+K fold immediately after tid computation:\n{text}"
-        );
-        // The loop guard must use the folded register (%r1), not the
-        // raw tid (%r0).
+        // register. Register numbers are not asserted — the `tid_base`
+        // add for chunked launches sits between the reinterpret and this
+        // fold and shifts them — so find the fold and then check the guard
+        // uses ITS destination.
+        let folded = text
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with("add.s32") && l.ends_with(", 5;"))
+            .and_then(|l| l.split_whitespace().nth(1).map(|r| r.trim_end_matches(',')))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("expected the tid+K fold:\n{text}"));
+        // The loop guard must use the folded register, not the raw tid.
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains("%r1,")
+                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
@@ -1669,19 +1692,22 @@ mod tests {
         let text = m.render();
         assert!(text.contains(".visible .entry EligibleOffsetLoop__offsetLoop_"));
         // The tid+K fold: an `add.s32` with immediate 4 feeding a fresh
-        // register, right after `emit_tid`'s `mov.b32` reinterpret —
-        // deterministic because both params are arrays (`bind_param_locals`
-        // only touches the U64 pool before `emit_tid` runs), so the tid
-        // register is always %r0 and the folded register is always %r1.
-        assert!(
-            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 4;"),
-            "expected the tid+K fold immediately after tid computation:\n{text}"
-        );
+        // register. It no longer sits immediately after `emit_tid`'s
+        // `mov.b32` reinterpret — the `tid_base` add that makes chunked
+        // launches possible comes between — so this matches the fold
+        // itself rather than its adjacency to the reinterpret.
+        let folded = text
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with("add.s32") && l.ends_with(", 4;"))
+            .and_then(|l| l.split_whitespace().nth(1).map(|r| r.trim_end_matches(',')))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("expected the tid+K fold:\n{text}"));
         // The loop guard must compare the folded register, not raw tid.
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains("%r1,")
+                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
@@ -1726,7 +1752,10 @@ mod tests {
         // constant-pool `Integer` entry rather than merely refusing to
         // reject the loop.
         assert!(
-            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 40000;"),
+            text.lines().any(|l| {
+                let l = l.trim_start();
+                l.starts_with("add.s32") && l.ends_with(", 40000;")
+            }),
             "expected the tid+K fold with the ldc-resolved start value:\n{text}"
         );
     }

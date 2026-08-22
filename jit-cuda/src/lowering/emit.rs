@@ -325,7 +325,21 @@ impl<'a> Emitter<'a> {
         .unwrap();
         // Reinterpret as s32 for index arithmetic.
         writeln!(self.body, "    mov.b32 {}, {};", tid_s32.name, tid_u32.name).unwrap();
-        self.tid_reg = Some(tid_s32);
+        // Add the launch's base index. Zero for a whole-array launch; the
+        // chunk's first element for a chunked one, which is how several
+        // launches can cover disjoint slices of one iteration space while
+        // every thread still knows its global index. See the `tid_base`
+        // parameter in `lowering::ptx_params`.
+        let base = self.regs.fresh_reg(RegKind::S32);
+        let tid_final = self.regs.fresh_reg(RegKind::S32);
+        writeln!(self.body, "    ld.param.s32 {}, [tid_base];", base.name).unwrap();
+        writeln!(
+            self.body,
+            "    add.s32 {}, {}, {};",
+            tid_final.name, tid_s32.name, base.name
+        )
+        .unwrap();
+        self.tid_reg = Some(tid_final);
     }
 
     /// Fold a counted loop's compile-time-constant start value `K`

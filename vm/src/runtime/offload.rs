@@ -2986,6 +2986,16 @@ pub fn dispatch_method_from_native_on_stream(
     writebacks.push(MarshalWriteback::FailureFlag {
         buf: failure_flag_buf,
     });
+    // `tid_base` — the index of the first element this launch covers.
+    //
+    // Every lowered kernel takes it (see `lowering::ptx_params`), and a
+    // whole-array launch is base 0. A CHUNKED launch, which is what lets
+    // one chunk's writeback overlap with the next chunk's kernel, passes
+    // that chunk's first index instead. CUDA has no launch offset of its
+    // own, so this parameter is the only way one kernel can cover disjoint
+    // slices of an iteration space while every thread still computes its
+    // global index.
+    kernel_args = kernel_args.push_i32(0);
 
     // 8. Phase 7 #1 — dispatch on the stream. The launch grid's
     //    element count comes from `max_array_len` (0 for a scalar-only
