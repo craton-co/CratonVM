@@ -7922,7 +7922,7 @@ pub fn dump_wait_object_state(shared: &SharedVm, obj: ObjectRef) {
         .class_manager
         .read()
         .class_store
-        .get_class(cid)
+        .get(cid)
         .map(|c| c.name.to_string())
         .unwrap_or_else(|| format!("<class_id {cid:?}>"));
     let field = |f: &str| -> Option<cratonvm_types::Value> {
