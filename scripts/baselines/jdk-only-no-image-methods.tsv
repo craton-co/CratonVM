@@ -1,6 +1,6 @@
 # jdk-only method-granular multi-image sweep — H25-1 N1
 # regenerate: scripts/jdk-only-image-method-index.py per image, then scripts/jdk-only-no-image-methods.py --tsv
-# census: reg.json (10378 registrations, strict mode)
+# census: cratonvm-r11.exe --jdk-only --dump-native-registry (10378 registrations, strict mode)
 # images: jdk17-linux=17.0.20.1 jdk17-mac-x64=17.0.20.1 jdk17-windows=17.0.20 jdk21-linux=21.0.12 jdk21-mac-x64=21.0.12 jdk21-windows=21.0.12 jdk25-linux=25.0.4 jdk25-mac-x64=25.0.4 jdk25-windows=25.0.4
 # canary java/lang/StringUTF16.isBigEndian()Z: cross-version
 # verdicts: cross-version=386 dead-everywhere=305 live=8812 no-image-class=875
@@ -222,7 +222,7 @@ cross-version	-	java/util/ArrayList$SubList	getLast	()Ljava/lang/Object;	yes	nat
 cross-version	-	java/util/ArrayList$SubList	removeFirst	()Ljava/lang/Object;	yes	native-collections/src/lib.rs:7775	jdk21-linux,jdk21-mac-x64,jdk21-windows,jdk25-linux,jdk25-mac-x64,jdk25-windows
 cross-version	-	java/util/ArrayList$SubList	removeLast	()Ljava/lang/Object;	yes	native-collections/src/lib.rs:7778	jdk21-linux,jdk21-mac-x64,jdk21-windows,jdk25-linux,jdk25-mac-x64,jdk25-windows
 cross-version	-	java/util/ArrayList$SubList	reversed	()Ljava/util/List;	yes	native-collections/src/lib.rs:7787	jdk21-linux,jdk21-mac-x64,jdk21-windows,jdk25-linux,jdk25-mac-x64,jdk25-windows
-cross-version	-	java/util/LinkedHashMap	reversed	()Ljava/util/SequencedMap;	yes	native-collections/src/lib.rs:38957	jdk21-linux,jdk21-mac-x64,jdk21-windows,jdk25-linux,jdk25-mac-x64,jdk25-windows
+cross-version	-	java/util/LinkedHashMap	reversed	()Ljava/util/SequencedMap;	yes	native-collections/src/lib.rs:38993	jdk21-linux,jdk21-mac-x64,jdk21-windows,jdk25-linux,jdk25-mac-x64,jdk25-windows
 cross-version	-	java/util/concurrent/ForkJoinPool	invokeAllUninterruptibly	(Ljava/util/Collection;)Ljava/util/List;	yes	native-builtins/src/phases_early.rs:10083	jdk25-linux,jdk25-mac-x64,jdk25-windows
 cross-version	-	java/util/concurrent/ForkJoinPool	lazySubmit	(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;	yes	native-builtins/src/phases_early.rs:10119	jdk21-linux,jdk21-mac-x64,jdk21-windows,jdk25-linux,jdk25-mac-x64,jdk25-windows
 cross-version	-	java/util/concurrent/ForkJoinTask	quietlyJoin	(JLjava/util/concurrent/TimeUnit;)Z	no	native-builtins/src/phases_late/concurrent.rs:7590	jdk21-linux,jdk21-mac-x64,jdk21-windows,jdk25-linux,jdk25-mac-x64,jdk25-windows
@@ -554,11 +554,11 @@ dead-everywhere	truly-gone	java/util/Locale	TRADITIONAL_CHINESE	Ljava/util/Local
 dead-everywhere	truly-gone	java/util/Locale	UK	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1580	-
 dead-everywhere	truly-gone	java/util/Locale	US	Ljava/util/Locale;	yes	native-builtins/src/lib.rs:19391	-
 dead-everywhere	truly-gone	java/util/TimeZone	getOffsetsByWall	(J[I)I	yes	native-builtins/src/lib.rs:20901	-
-dead-everywhere	truly-gone	java/util/TreeMap	iterator	()Ljava/util/Iterator;	yes	native-collections/src/lib.rs:49971	-
-dead-everywhere	near-miss	java/util/TreeMap$KeySet	<init>	(Ljava/util/Collection;)V	yes	native-collections/src/lib.rs:50142	-
-dead-everywhere	near-miss	java/util/TreeMap$KeySet	<init>	(Ljava/util/Comparator;)V	yes	native-collections/src/lib.rs:50136	-
-dead-everywhere	truly-gone	java/util/TreeMap$KeySet	readObject	(Ljava/io/ObjectInputStream;)V	yes	native-collections/src/lib.rs:50159	-
-dead-everywhere	truly-gone	java/util/TreeMap$KeySet	writeObject	(Ljava/io/ObjectOutputStream;)V	yes	native-collections/src/lib.rs:50153	-
+dead-everywhere	truly-gone	java/util/TreeMap	iterator	()Ljava/util/Iterator;	yes	native-collections/src/lib.rs:50007	-
+dead-everywhere	near-miss	java/util/TreeMap$KeySet	<init>	(Ljava/util/Collection;)V	yes	native-collections/src/lib.rs:50178	-
+dead-everywhere	near-miss	java/util/TreeMap$KeySet	<init>	(Ljava/util/Comparator;)V	yes	native-collections/src/lib.rs:50172	-
+dead-everywhere	truly-gone	java/util/TreeMap$KeySet	readObject	(Ljava/io/ObjectInputStream;)V	yes	native-collections/src/lib.rs:50195	-
+dead-everywhere	truly-gone	java/util/TreeMap$KeySet	writeObject	(Ljava/io/ObjectOutputStream;)V	yes	native-collections/src/lib.rs:50189	-
 dead-everywhere	near-miss	java/util/concurrent/CopyOnWriteArraySet	<init>	(I)V	yes	native-collections/src/lib.rs:16478	-
 dead-everywhere	near-miss	java/util/concurrent/CopyOnWriteArraySet	<init>	(IF)V	yes	native-collections/src/lib.rs:16479	-
 dead-everywhere	truly-gone	java/util/jar/Attributes$Name	MAIN_CLASS	Ljava/util/jar/Attributes$Name;	no	native-builtins/src/lib.rs:8730	-

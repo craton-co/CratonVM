@@ -1,9 +1,17 @@
 # WORKER-5 NOTE 1 — the method-granular multi-image sweep: 64 of `H25-1`'s 342 are ALIVE on an older image, and 110 more rows are dead on 17/21 but alive on 25
 
-**Status: MEASURED.** Lane WORKER-5, 2026-08-21, at `22cb4338d`. Nine JDK
-images, one strict-mode registry census from `C:/craton/cratonvm-r10.exe`
-(42,391,040 bytes). No source change to the VM; two new scripts and one
-committed data file.
+**Status: MEASURED.** Lane WORKER-5, 2026-08-21. Nine JDK images, one
+strict-mode registry census from `C:/craton/cratonvm-r11.exe`. No source change
+to the VM; two new scripts and one committed data file.
+
+> **Re-verified after merging H0's `dab993033`** (which brought `ecd4f56e1`, the
+> `java/util/Comparator` guard, into `native-collections/src/lib.rs`). The whole
+> sweep was re-run against an `r11` census: **10,378 registrations, 999 / 342 /
+> 9,037, and verdicts 8812 / 386 / 305 / 875 — identical**, canary still
+> `cross-version`. The committed TSV differs from the `r10` one **only in
+> `registered_by` line numbers**, which `ecd4f56e1` shifted by adding 36 lines;
+> stripping the line numbers makes the two byte-identical, 692 rows each. The
+> committed file is the `r11` one, so its line numbers point at the merged tree.
 
 `H25-1` N1 asked for this and called it a **precondition, not a follow-up**:
 until it ran, *no row in the 342 could be deleted by anyone.* It has run.
@@ -36,8 +44,9 @@ were already there from the class-granular sweep.
 | 21 | 21.0.12 | 21.0.12 | 21.0.12 |
 | 25 | 25.0.4 | 25.0.4 | 25.0.4 |
 
-Census: `cratonvm-r10.exe --jdk-only --dump-native-registry --explain-jdk-only`,
-schema 5, **10,378 registrations**, `image_adjudication: true`.
+Census: `--jdk-only --dump-native-registry --explain-jdk-only`, schema 5,
+**10,378 registrations**, `image_adjudication: true`. Taken on `cratonvm-r10.exe`
+and re-taken identically on `cratonvm-r11.exe` after the merge (see the banner).
 
 **The census reproduces `H25-1` exactly** on a newer binary — 999
 `no-image-class` / **342** method-dead / 9,037 other, **314** of the 342 owning
@@ -201,10 +210,12 @@ committed so nobody has to re-run a nine-image sweep to quote one.
 * **The `--synthetic-jdk` mode is out of scope.** Some of these stubs may be
   load-bearing there, where a fabricated carrier CAN declare a method no real
   image does. Any gate built on this must be strict-mode-only.
-* **The census is from `r10`, not from a binary built at `22cb4338d`.** The
-  registration set is a property of the VM source, and the reproduction in §1 of
-  `H25-1`'s exact partition is the evidence that it is the same population; but
-  a registrar added after r10 was built is not in this sweep.
+* **The census is from a prebuilt binary, not from one built at this tree's
+  HEAD.** The registration set is a property of the VM source; the reproduction
+  in §1 of `H25-1`'s exact partition, and the identical re-take on `r11` after
+  the merge, are the evidence that it is the same population. But a registrar
+  added after `r11` was built (2026-08-21 18:42) is not in this sweep, and
+  nothing here was measured on a binary compiled from the merged tree itself.
 * **`H25-1` §2.1's hole is untouched.** The mechanism that drops the five
   `java/lang/Compiler` registrations from the strict dump is still not traced to
   a line. This record adds a reason to want it: N2 wants a method-granular gate
