@@ -56,6 +56,23 @@ readable rather than a claim:
 `CRATONVM_VECTOR_INTRINSICS_STATS=1` prints it; the totals line prints itself
 whenever either counter moved.
 
+## End to end: still no token, and now the arithmetic says so
+
+`LlamaApp … -p "hi" -n 1`, the parent record's own repro, on the fixed binary:
+**66 minutes at 97% of one core, no token, killed.** HotSpot does it in 8.2 s
+wall, 2.51 s of it generating.
+
+That is not a contradiction of the 3.8x and it does not need another run to
+interpret. A Llama-3.2-1B forward pass is on the order of 1.2e9 lane
+multiply-adds; at the measured 20.8 µs per lane that is **~7 hours per token**,
+against ~40 hours before this change. The run was killed because the answer was
+already computable, not because it was ambiguous.
+
+So the kernel is 3.8x faster and the application's observable behaviour is
+unchanged. Both statements are worth keeping in the same place: a speedup that
+does not cross a usefulness threshold is still a speedup, and reporting it
+without the threshold would be the more misleading of the two.
+
 ## What is left, and why 3.8x and not 3800x
 
 A `--nojit --stack-sample-ms 5` profile of the same kernel, 342 samples,
