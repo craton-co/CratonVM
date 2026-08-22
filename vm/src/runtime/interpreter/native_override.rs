@@ -8149,14 +8149,13 @@ mod enforcement_dial_door_tests {
         // EMPTY IS THE GOAL. A row is a known hole that has been written down,
         // not an approval — and it must be edited to add one, which is the
         // difference between this and a comment saying "be careful here".
+        // The `dispatch_virtual.rs` row is GONE, on this test's own instruction.
+        // It read "Fixed on the handoff branch by 089329af7; drop this row when
+        // that reaches dev" — `089329af7` is now an ancestor of dev, the file
+        // consults the dial, and the self-retiring half of this gate began
+        // failing on exactly that. An exemption that outlives the hole it
+        // excused is a standing approval nobody revisits.
         const FORCE_SITES_EXEMPT: &[(&str, &str)] = &[
-            (
-                "dispatch_virtual.rs",
-                "vtable force path; memoizes into a per-entry force_native_cache \
-                 OnceLock, so the dial needs the memo to be dial-aware (the \
-                 2026-08-04 per-call-site drift hazard). Fixed on the handoff \
-                 branch by 089329af7; drop this row when that reaches dev.",
-            ),
             (
                 "jit_bridge.rs",
                 "JIT direct-bind force path. A compiled site that binds a native \
