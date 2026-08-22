@@ -13814,9 +13814,13 @@ fn native_dis_read_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// The 2-byte length prefix counts **bytes**, not characters. The
 /// return value is a newly allocated Java String containing the
 /// decoded code units. On a malformed stream this native throws
-/// `UTFDataFormatException` (surfaced as `IOException` for now, as
-/// the dedicated exception class is not yet in our throwable
-/// registry — the message identifies the byte offset of the fault).
+/// `java.io.UTFDataFormatException`, built out of the image by
+/// [`utf_data_format_error`], with a message identifying the byte offset of the
+/// fault. It said `IOException` *"for now, as the dedicated exception class is
+/// not yet in our throwable registry"* until 2026-08-22, and that premise was
+/// never checked: nothing has to be in the `RuntimeError` enum to be thrown —
+/// `new_object` + `<init>` raises the real class, which is how the channel
+/// refusals in this file have always worked.
 fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -13837,11 +13841,10 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let bytes = dis_read_exact(ctx, this, len)?;
-    let s = decode_modified_utf8(&bytes).map_err(|e| {
-        cratonvm_types::error::RuntimeError::IOException {
-            message: format!("readUTF: {e}"),
-        }
-    })?;
+    let s = match decode_modified_utf8(&bytes) {
+        Ok(s) => s,
+        Err(e) => return Err(utf_data_format_error(ctx, &e)),
+    };
     let result = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(result))))
 }
@@ -13865,6 +13868,54 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// silently mis-framed rather than rejected. Exporting the codec is what lets
 /// that second implementation converge onto this one instead of growing a third
 /// spelling. See W7-8-fabricated-success-io-sweep.md.
+/// What a malformed modified-UTF-8 stream owes its reader:
+/// `java.io.UTFDataFormatException`, not a bare `java.io.IOException`.
+///
+/// MEASURED, `regression-suite/probes/W4Data.java`, Linux/JDK 25.0.4, both
+/// modes, feeding `readUTF` a 1-byte payload whose only byte is a continuation
+/// byte (`00 01 80`):
+///
+/// ```text
+///   HotSpot    java.io.UTFDataFormatException
+///   CratonVM   java.io.IOException
+/// ```
+///
+/// `DataInput.readUTF`'s javadoc names `UTFDataFormatException` explicitly and
+/// separately from `IOException`, and the distinction is the whole point of the
+/// two types: one says the DATA is corrupt, the other says the CHANNEL failed.
+/// A caller that retries on `IOException` and gives up on
+/// `UTFDataFormatException` -- which is the sensible way round -- retries
+/// forever against a corrupt record.
+///
+/// `UTFDataFormatException extends IOException`, so tightening this cannot
+/// break a handler that already compiled. This is the same repair, and the same
+/// argument, as `afc_closed_channel_error` above; the comment on `readUTF` used
+/// to say the dedicated class was *"not yet in our throwable registry"*, and it
+/// does not need to be — `new_object` + `<init>` builds the real one out of the
+/// image, exactly as the channel refusals do.
+fn utf_data_format_error(ctx: &mut dyn NativeContext, detail: &str) -> MethodCallFailed {
+    let message = format!("readUTF: {detail}");
+    match ctx.new_object("java/io/UTFDataFormatException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let msg = ctx.create_string(&message);
+            let built = ctx.invoke(
+                "java/io/UTFDataFormatException",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(exc)), Value::Object(Some(msg))],
+            );
+            if built.is_ok() {
+                return MethodCallFailed::ExceptionThrown(exc);
+            }
+            RuntimeError::IOException { message }.into()
+        }
+        // Only reached when the class cannot be built at all (a mock context, or
+        // an image without it). The supertype keeps the failure LOUD rather than
+        // letting a malformed record decode to something.
+        _ => RuntimeError::IOException { message }.into(),
+    }
+}
+
 pub fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
@@ -16489,11 +16540,14 @@ fn native_raf_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let len = u16::from_be_bytes(len_buf) as usize;
     let mut payload = vec![0u8; len];
     raf_read_exact(ctx, fd, &mut payload)?;
-    let s = decode_modified_utf8(&payload).map_err(|e| {
-        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IOException {
-            message: format!("readUTF: {e}"),
-        }))
-    })?;
+    // `RandomAccessFile.readUTF` owes the same `UTFDataFormatException` as
+    // `DataInputStream.readUTF` -- both implement `DataInput`, whose javadoc
+    // names it -- so both go through the one helper rather than each spelling
+    // its own refusal.
+    let s = match decode_modified_utf8(&payload) {
+        Ok(s) => s,
+        Err(e) => return Err(utf_data_format_error(ctx, &e)),
+    };
     let obj = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(obj))))
 }

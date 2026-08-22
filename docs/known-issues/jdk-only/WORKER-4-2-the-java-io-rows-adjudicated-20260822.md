@@ -12,7 +12,8 @@ using the classes `run.sh` had already compiled — not over one boot and not fr
 a source grep. Probes, all diffed against the oracle in both modes:
 `W4Deprecated.java` (116 cases), `W4File.java` (90), `W4Abstract.java` (63
 receivers), `W4Print.java` (55), `W4Scanner.java` (29), `W4BaseStream.java` (26),
-`W4StreamCarrier.java` (15 carriers) — 394 checks in all.
+`W4StreamCarrier.java` (15 carriers), `W4Data.java` (68) — 462 checks in all,
+over the four largest classes in the census plus the base classes under them.
 
 **Acceptance: `107/107 · 107/107 · 65/65 → 67/67`**, on the branch tip merged in,
 `TIMEOUT=600`. No vector changed colour across any of the three retirement
@@ -497,7 +498,66 @@ and append), `FileWriter` and `RandomAccessFile` over the results.
 
 ---
 
-## 7. What this record does NOT claim
+## 7. `DataInputStream` / `DataOutputStream` — 68 cases, one wrong exception TYPE
+
+The third-largest group (15 + 14 owned §1.4 shadow rows) and the one where a
+divergence is least likely to be seen by eye, because the values are bytes.
+`regression-suite/probes/W4Data.java` dumps every write as hex and every read as
+its exact value, so byte order, sign extension, the modified-UTF-8 encoding and
+the EOF contract are checked rather than assumed.
+
+**67 of 68 already agreed**, including the three places this format is easy to
+get wrong:
+
+* **Modified UTF-8 is not UTF-8.** `writeUTF` was checked on `""`, ASCII, a
+  Latin-1 character, a CJK character, a supplementary character (a surrogate
+  PAIR of two three-byte sequences — SIX bytes, not four) and a mixed string,
+  each round-tripped back through `readUTF`. The hex matched HotSpot's byte for
+  byte.
+* **The EOF contract is per method.** `read()` and `read(byte[],int,int)` answer
+  `-1`; `readInt`/`readLong`/`readByte`/`readUnsignedByte`/`readBoolean`/
+  `readFully` throw `EOFException`. All eight checked separately.
+* **Sign extension and truncation.** `readShort` vs `readUnsignedShort` vs
+  `readChar` over the same bytes; `readByte` vs `readUnsignedByte` over `0x80`;
+  `writeShort` truncating a value that does not fit; `writeByte(-1)`;
+  `write(0x1ff)`.
+
+### 7.1 The one: a corrupt record reported as an I/O failure
+
+```text
+readUTF over 00 01 80   (a payload whose only byte is a continuation byte)
+  HotSpot    java.io.UTFDataFormatException
+  CratonVM   java.io.IOException
+```
+
+`DataInput.readUTF`'s javadoc names `UTFDataFormatException` explicitly and
+separately from `IOException`, and the separation is the point of the two types:
+one says the DATA is corrupt, the other says the CHANNEL failed. A caller that
+retries on `IOException` and gives up on `UTFDataFormatException` — the sensible
+way round — retries forever against a corrupt record. `[subcls≠cls]`: the
+supertype is not good enough for an exception class.
+
+**The comment above the native explained why it was the supertype, and the
+explanation was wrong.** It read: *"surfaced as `IOException` for now, as the
+dedicated exception class is not yet in our throwable registry"*. Nothing has to
+be in the `RuntimeError` enum to be thrown. `ctx.new_object(class)` +
+`<init>` + `MethodCallFailed::ExceptionThrown` raises the real class out of the
+image, and **this same file already does exactly that** — `afc_closed_channel_error`
+and `afc_non_writable_error`, twenty lines apart, for
+`ClosedChannelException` and `NonWritableChannelException`, with the identical
+"the supertype is visible but `catch` does not match it" argument written out.
+
+The premise was never checked against the file it was written in. `[a premise in
+a comment is not a compile-time link]` — and this is the variant where the
+premise blocks a fix rather than licensing a bug.
+
+Both `readUTF` implementations in the crate now go through one helper:
+`DataInputStream`'s and `RandomAccessFile`'s. Both implement `DataInput`, whose
+javadoc names the exception, so neither gets to spell its own refusal.
+
+---
+
+## 8. What this record does NOT claim
 
 * **It does not adjudicate the remaining rows one by one.** §6 puts the three
   biggest groups — `java/io/File` (54), `PrintStream` (30), `PrintWriter` (7) —
@@ -516,21 +576,22 @@ and append), `FileWriter` and `RandomAccessFile` over the results.
 
 ---
 
-## 8. NOMINATIONS
+## 9. NOMINATIONS
 
 **N1 — CLOSED BY THIS RECORD.** It read: *"`URL.openStream()` /
 `getResourceAsStream()` mint a bare `InputStream`-typed receiver, and 25 §1.4
 shadows exist to serve it."* MEASURED false — they mint a concrete
 `ByteArrayInputStream` — and eleven of the shadows are retired. §4.
 
-**N3 — the adjudication table should be a script.** The `invcensus` +
-`ioadjudicate` pair used here is ~80 lines: run every scheduled vector with its
-own `--dump-native-registry`, then union `invocations` per triple and join
-against `real_declaring_method`. It answers "which registrations does this file
-actually own, and which of them does anything reach" for ANY prefix, which is
-the first question every adjudication lane has had to re-derive by hand.
-`scripts/nio-concrete-receiver-audit.py` landed from this lane; this one did
-not, only because its output is a table rather than a pass/fail.
+**N3 — CLOSED.** The adjudication pair is now
+`scripts/native-registration-census.sh` (one strict-mode boot per scheduled
+vector, each with its own `--dump-native-registry`) and
+`scripts/native-registration-adjudication.py` (union the invocations, join
+against `real_declaring_method`, report per triple: traffic, how many vectors,
+how many OTHER files register it, and whether the real method has bytecode).
+Neither is `java.io`-specific — pass any class prefix. Between them they answer
+the question every adjudication lane has re-derived by hand: *which
+registrations does this file actually own, and does anything reach them.*
 
 **N4 — `java/io/UnixFileSystem` has 12 shadow rows and is a class no Windows
 image declares.** `phases_late/nio_file.rs`. A platform-specific class in a
@@ -570,7 +631,7 @@ implementation could run instead is unmeasured.
 
 ---
 
-## 9. Index rows (for H0 to move into `INDEX.md`)
+## 10. Index rows (for H0 to move into `INDEX.md`)
 
 * `WORKER-4-2` — the `java.io` rows counted three ways (194 registrations / 99
   unreached / `H14-2`'s 99 by a different instrument, not known to be the same
@@ -588,4 +649,6 @@ implementation could run instead is unmeasured.
   biggest classes put to the oracle behaviourally for the first time --
   `PrintStream`/`PrintWriter` 55 cases ZERO diffs, `File` 90 cases and one
   (`mkdirs()` answered `true` for a directory that already existed, in both
-  copies of the native).
+  copies of the native); and `DataInputStream`/`DataOutputStream` 68 cases and
+  one (`readUTF` reported a corrupt record as a bare `IOException`, blocked by a
+  comment whose premise was false about the file it was written in).
