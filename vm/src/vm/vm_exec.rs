@@ -2784,7 +2784,7 @@ pub(crate) fn is_signature_polymorphic_method_name(method_name: &str) -> bool {
     )
 }
 
-fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
+pub(crate) fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
     class_name == "java/lang/invoke/MethodHandle"
         || class_name.starts_with("java/lang/invoke/MethodHandle")
         || (class_name.starts_with("java/lang/invoke/") && class_name.contains("MethodHandle"))
@@ -18483,6 +18483,18 @@ pub fn invoke_or_native(
         cratonvm_native_api::registry::lookup_census::INVOKE_GENERAL,
     );
     dbg_dispatch_tally("invoke_or_native", class_name, method_name, descriptor);
+    // Publish the CALL-SITE descriptor for `MethodHandle.invoke`, whose
+    // collect-or-passthrough answer for a trailing `null` depends on the type
+    // the caller WROTE and on nothing observable at dispatch. See
+    // `cratonvm_native_api::poly_call_site`.
+    //
+    // Narrowed to a MethodHandle receiver so nothing else can leave a
+    // descriptor armed, and never CLEARED here — the signature-polymorphic
+    // block in `invoke_on_class_shared_inner` owns the clearing, and this door
+    // may run before it.
+    if method_name == "invoke" && is_method_handle_signature_polymorphic_receiver(class_name) {
+        cratonvm_native_api::poly_call_site::arm(descriptor);
+    }
     // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
     // get(Class) dispatch entering the general resolver, with its dispatch
     // class and receiver identity, so the failing call's route is visible.
@@ -26861,6 +26873,21 @@ fn invoke_on_class_shared_inner(
                         // confirm it does not flip that assertion off zero,
                         // which is a measurement this lane could not make.
                         //
+                        // Publish the CALL-SITE descriptor for the one native
+                        // that cannot decide without it —
+                        // `MethodHandle.invoke`, whose collect-or-passthrough
+                        // answer for a trailing `null` depends on the type the
+                        // caller WROTE. See
+                        // `cratonvm_native_api::poly_call_site`. Armed for
+                        // `invoke` and CLEARED for every other
+                        // signature-polymorphic name, so nothing here can leave
+                        // a stale descriptor for a later dispatch to read as
+                        // its own.
+                        if method_name == "invoke" {
+                            cratonvm_native_api::poly_call_site::arm(descriptor);
+                        } else {
+                            cratonvm_native_api::poly_call_site::clear();
+                        }
                         // Try all possible registered descriptors for signature-polymorphic methods.
                         // These methods are registered with generic Object[] params but varying return types.
                         let poly_descs = SIGNATURE_POLYMORPHIC_NATIVE_DESCRIPTORS;

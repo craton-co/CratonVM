@@ -177,5 +177,72 @@ public class OpaqueUriProbe {
         p("R15 hier.resolve(abs-with-dots)",
                 URI.create("https://h/a/b").resolve("https://x/p/../q").toString());
         p("R16 hier.resolve(rel)", URI.create("https://h/a/b").resolve("c").toString());
+
+        // `URI.resolve` is RFC 2396, not RFC 3986, and its empty-reference and
+        // scheme-carrying-reference arms are where that shows. Every row is
+        // measured, not derived.
+        String[][] rr = {
+            {"https://h/a/b?q=1", ""},
+            {"https://h/a/b?q=1", "#f"},
+            {"https://h/a/b?q=1", "?q=2"},
+            {"https://h/a/b?q=1", "?q=2#f"},
+            {"https://h/a/b?q=1", "."},
+            {"https://h/a/b?q=1", ".."},
+            {"https://h/a/b?q=1", "/x"},
+            {"https://h/a/b?q=1", "c"},
+            {"https://h/a/b?q=1", "//other/p"},
+            {"https://h/a/b?q=1", "//other/p/../q"},
+            {"https://h/a/b?q=1", "https://x/p/../q"},
+            {"https://h/a/b?q=1", "https://x/p/../q?z=1#w"},
+            {"https://h/a/b?q=1", "mailto:c@d?x=1"},
+            {"https://h/a/", ""},
+            {"https://h/a", ""},
+            {"https://h/", ""},
+            {"https://h", ""},
+            {"https://h/a/b#g", "#g"},
+            {"https://h/a/b#g", ""},
+            {"https://h/a/b", "c/../d"},
+            {"https://h/a/b", "./e"},
+            {"/base/path?q=1", ""},
+            {"/base/path?q=1", "x"},
+            {"mailto:a@b", "#f"},
+            {"https://h/a/b?q=1", "/p/../q"},
+            {"https://h/a/b?q=1", "/p/./q"},
+            {"https://h/a/b", "../../x"},
+            {"https://h/a/b", "?"},
+            {"https://h/a/b", "#"},
+            {"file:/a/b", ""},
+            {"https://h/a/b", "//other"},
+            {"https://h/a/b?q=1", "//other?z=2"},
+            {"https://h/a/b", "c#f"},
+            {"https://h/a/b", "//other/p?z=2#w"},
+        };
+        String[] nn = {
+            "https://h/a/../../x", "/a/../../x", "https://h/a/b/../c", "a/../../b",
+            "https://h/a/./b", "https://h/a/b/..", "https://h/a/b/.", "/../x",
+            "https://h/../x", "a/b/../../../c", "https://h/a//b", "./a/b",
+        };
+        int k = 0;
+        for (String u : nn) {
+            k++;
+            try {
+                p(String.format("N%02d %s .normalize", k, u), URI.create(u).normalize().toString());
+            }
+            catch (Exception ex) {
+                p(String.format("N%02d %s .normalize", k, u), "THREW " + ex);
+            }
+        }
+        int i = 0;
+        for (String[] pair : rr) {
+            i++;
+            String label = String.format("S%02d %s resolve %s", i, pair[0],
+                    pair[1].isEmpty() ? "<empty>" : pair[1]);
+            try {
+                p(label, URI.create(pair[0]).resolve(pair[1]).toString());
+            }
+            catch (Exception ex) {
+                p(label, "THREW " + ex.getClass().getName() + ": " + ex.getMessage());
+            }
+        }
     }
 }

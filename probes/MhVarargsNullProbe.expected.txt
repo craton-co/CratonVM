@@ -1,42 +1,4 @@
-# HotSpot oracle for probes/MhVarargsNullProbe.java
-#
-# Temurin 25.0.3+9 (/data/toolchain/jdk-25), captured 2026-08-21.
-#
-# 12 rows failed on CratonVM before the generic-entry rule in
-# native-builtins/src/lang_invoke.rs (`MH_GENERIC_SPREAD` /
-# `collect_trailing_varargs`'s `null_collects`) and the varargs collection the
-# MH_KIND_CONSTRUCTOR arm of `mh_dispatch` never did:
-#   B01 B07 B08 B10 B11 B16 B17 B18 D01 D02 D04 E07, plus the E-row
-#   instrumentation that `asFixedArity`'s in-place marking had corrupted.
-# Row B01 is Spring's `#varargsFunctionHandle(null)`
-# (VariableAndFunctionTests.functionViaMethodHandleForStaticMethodThatAccepts
-# OnlyVarargs), the reported failure.
-#
-# FOUR rows still diverge on CratonVM, deliberately, and are recorded in
-# docs/known-issues/spring/ :
-#
-#   B06  vf.iwa(new String[0])
-#        HotSpot collects UNCONDITIONALLY on the generic entry, so an
-#        already-packed array becomes the single ELEMENT of a new one and the
-#        cast throws. CratonVM keeps its packed-call passthrough: the `null`
-#        half of the rule turns a working program into a wrong one, the packed
-#        half would turn a working program into a CCE.
-#
-#   C03  vf.invoke((Object)null)
-#   C07  mx.invoke(a,(Object)null)
-#   C09  ov.invoke((Object)null)
-#        The inexact `invoke` door. HotSpot decides from the CALL SITE's static
-#        parameter type, which CratonVM's signature-polymorphic shim is not
-#        handed — `vm_exec`'s poly-dispatch block has it in `descriptor` but
-#        there is no channel from there into a native. Note C02
-#        (`invoke((String[])null)`) is the row that would break if this door
-#        simply started collecting, so the two cannot both be right without
-#        that channel.
-#
-# The counterparts that must NOT collect are the controls: C01/C02/C06/C08/C10
-# (the exact door names the array type) and D03 (`asFixedArity()` un-marks the
-# handle).
-#
+# HotSpot openjdk version "25.0.4" 2026-07-21 LTS oracle for MhVarargsNullProbe.java
 A01 vf.isVarargsCollector = true
 A02 mx.isVarargsCollector = true
 A03 fx.isVarargsCollector = false
@@ -88,3 +50,27 @@ F01 Method.invoke(null-array) = null
 F02 Method.invoke(new String[]{null}) = [null]
 F03 plain java varargsFunction((String[])null) = null
 F04 plain java varargsFunction(null-as-element) = [null]
+G01 vf.invoke(new String[0]) [exact array type] = []
+G02 vf.invoke((Object) new String[0]) = THREW java.lang.ClassCastException: Cannot cast [Ljava.lang.String; to java.lang.String
+G03 ov.invoke((String[]) null) [Object[] param, String[] site] = null
+G04 ov.invoke(new String[] {"a"}) [subtype array] = [a]
+G05 mx.invoke("a", (Object) new String[] {"b"}) = THREW java.lang.ClassCastException: Cannot cast [Ljava.lang.String; to java.lang.String
+G06 mx.invoke("a", new String[] {"b"}) [exact array type] = a|[b]
+G07 vf.invoke((Object) "a") = [a]
+G08 iv.invoke((Object) null) = THREW java.lang.NullPointerException: Cannot invoke "java.lang.Number.intValue()" because the return value of "sun.invoke.util.ValueConversions.primitiveConversion(sun.invoke.util.Wrapper, Object, boolean)" is null
+G09 iv.invoke((int[]) null) = null
+G10 inst.invoke(recv,(Object) null) = i:[null]
+G11 inst.invoke(recv,(String[]) null) = i:null
+G12 inst.invoke(recv,new String[] {a}) = i:[a]
+G13 inst.invoke(recv,a,b) = i:[a, b]
+H01 fa.isVarargsCollector = false
+H02 fa.iwa(x,y) = THREW java.lang.invoke.WrongMethodTypeException: cannot convert MethodHandle(String[])String to (Object,Object)Object
+H03 fa.iwa(x) = THREW java.lang.ClassCastException: Cannot cast java.lang.String to [Ljava.lang.String;
+H04 fa.iwa(new String[]{x}) = [x]
+H05 fa.iwa() = THREW java.lang.invoke.WrongMethodTypeException: cannot convert MethodHandle(String[])String to ()Object
+H06 fa.invoke(x,y) = THREW java.lang.invoke.WrongMethodTypeException: cannot convert MethodHandle(String[])String to (String,String)String
+H07 fa.invokeExact(new String[]{x}) = [x]
+H08 mfa.iwa(a,b,c) = THREW java.lang.invoke.WrongMethodTypeException: cannot convert MethodHandle(String,String[])String to (Object,Object,Object)Object
+H09 mfa.iwa(a,new String[]{b}) = a|[b]
+H10 fx.iwa(a,b) [plain String[] param, 2 flat args] = THREW java.lang.invoke.WrongMethodTypeException: cannot convert MethodHandle(String[])String to (Object,Object)Object
+H11 fx.iwa(new String[]{a,b}) = fixed:[a, b]
