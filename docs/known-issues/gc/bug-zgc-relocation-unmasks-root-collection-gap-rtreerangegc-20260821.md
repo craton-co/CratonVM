@@ -54,11 +54,9 @@ on it. Those two are consequences of the rc=1, not separate defects.
 > vector.** Both of us called it a flake first, from different binaries.
 >
 > The practical rule is unchanged: judge before/after on the isolated
-> `--Xmx 64m` arm, three runs, not on one corpus cell. Anything below that reasons from
-> "it always fails" is weaker than it reads — in particular, a single green
-> corpus run does NOT show the gap closed. Use the isolated `--Xmx 64m` repro,
-> three runs, for any before/after judgement; that is the arm the binary table
-> below was measured on.
+> `--Xmx 64m` arm, three runs, not on one corpus cell — a single green corpus
+> run does NOT show the gap closed. That is the arm the binary table below was
+> measured on.
 >
 > The `--jdk-only` PASS is a separate matter and is NOT the flake: it reproduces
 > 2/2 deliberately, and the mechanism is in the mode section further down.
