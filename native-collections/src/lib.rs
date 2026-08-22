@@ -51684,12 +51684,8 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
-    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+    let (data_opt, size, comparator, mut result, [to_elem, _]) =
+        ts_begin_range_result(ctx, this, [to_elem, Value::Object(None)])?;
     if let Some(data) = data_opt {
         // Family-1 stale-ObjectRef fix: `tree_compare`/`native_ts_add` can
         // run a user Comparator/lambda and trigger a moving GC. See
@@ -51733,12 +51729,8 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
-    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+    let (data_opt, size, comparator, mut result, [from_elem, _]) =
+        ts_begin_range_result(ctx, this, [from_elem, Value::Object(None)])?;
     if let Some(data) = data_opt {
         // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
         let data_pin = ctx.pin_native_root(data);
@@ -51771,6 +51763,84 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         ctx.unpin_native_roots(data_pin);
     }
     Ok(Some(Value::Object(Some(result))))
+}
+
+/// The prologue all six `TreeSet` range-view natives share: read the source's
+/// side-table state, allocate the result set and its element array, publish
+/// them - and hand every one of those back at its POST-allocation address.
+///
+/// # Why this is a function and not six copies of six lines
+///
+/// The six copies read `ts_state` - the source's backing array and its
+/// comparator - and the caller's bound elements BEFORE two allocations
+/// (`try_alloc_declared_width`, then `alloc_ref_array`), and read `result` and
+/// `buf` back after them, all as bare Rust locals. Each native then opened its
+/// scan loop by pinning those same locals, which pins nothing if a relocation
+/// already happened: a from-space address, pinned, stays a from-space address.
+///
+/// MEASURED, `RTreeRangeGc` under `--jdk-only`, 2 runs in 20:
+///
+/// ```text
+/// ClassCastException: class java.lang.Object cannot be cast to
+///                     class java.lang.Comparable   at RTreeRangeGc.java:210
+/// ```
+///
+/// and `CRATONVM_DBG_CCE_BT` named the site exactly - `native_ts_sub_set` ->
+/// `tree_compare` -> `compare_via_compare_to`, with `a=java/lang/Object(cid=0)`
+/// and `b=RTreeRangeGc$K`. The BOUND was fine; `a` is an ELEMENT read out of a
+/// backing array that had moved, and `java.lang.Object` with `class_id=0` is
+/// the free-list face of a block that was reclaimed while still referenced.
+///
+/// This is `WORKER-1-NOTE-1`'s undiagnosed half: it measured `RTreeRangeGc` at
+/// 9 pass / 3 fail under `--jdk-only` and deterministic in compatible mode, and
+/// recorded that those had to be two different defects. They were.
+///
+/// `bounds` is a fixed pair so a single-bound caller pays no allocation for it;
+/// pass `Value::Object(None)` for the absent one and ignore it on the way out.
+fn ts_begin_range_result(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    bounds: [Value; 2],
+) -> Result<(Option<ObjectRef>, i32, Value, ObjectRef, [Value; 2]), MethodCallFailed> {
+    // `this_pin` goes up first, so one `unpin_native_roots(this_pin)` unwinds
+    // every handle this function pushes - including on the failure path.
+    let this_pin = ctx.pin_native_root(this);
+    let lo_pin = pin_value(ctx, bounds[0]);
+    let hi_pin = pin_value(ctx, bounds[1]);
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data_pin = data_opt.map(|d| ctx.pin_native_root(d));
+    let cmp_pin = pin_value(ctx, comparator);
+
+    let result = match try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let result_pin = ctx.pin_native_root(result);
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    let buf_pin = ctx.pin_native_root(buf);
+
+    let result = ctx.read_native_pin(result_pin, result);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    let comparator = read_pinned_elem(ctx, cmp_pin, comparator);
+    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+
+    let result = ctx.read_native_pin(result_pin, result);
+    let data_opt = match (data_opt, data_pin) {
+        (Some(d), Some(p)) => Some(ctx.read_native_pin(p, d)),
+        _ => None,
+    };
+    let comparator = read_pinned_elem(ctx, cmp_pin, comparator);
+    let bounds = [
+        read_pinned_elem(ctx, lo_pin, bounds[0]),
+        read_pinned_elem(ctx, hi_pin, bounds[1]),
+    ];
+    ctx.unpin_native_roots(this_pin);
+    Ok((data_opt, size, comparator, result, bounds))
 }
 
 /// The `TreeSet` twin of [`tm_refuse_reversed_bounds`].
@@ -51822,12 +51892,8 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_elem = args.get(2).copied().unwrap_or(Value::Object(None));
     let (this, from_elem, to_elem) = ts_refuse_reversed_bounds(ctx, this, from_elem, to_elem)?;
-    let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
-    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+    let (data_opt, size, comparator, mut result, [from_elem, to_elem]) =
+        ts_begin_range_result(ctx, this, [from_elem, to_elem])?;
     if let Some(data) = data_opt {
         // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
         let data_pin = ctx.pin_native_root(data);
@@ -51896,12 +51962,8 @@ fn native_ts_tail_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
-    let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
-    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+    let (data_opt, size, comparator, mut result, [from_elem, _]) =
+        ts_begin_range_result(ctx, this, [from_elem, Value::Object(None)])?;
     if let Some(data) = data_opt {
         // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
         let data_pin = ctx.pin_native_root(data);
@@ -51944,12 +52006,8 @@ fn native_ts_head_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
-    let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
-    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+    let (data_opt, size, comparator, mut result, [to_elem, _]) =
+        ts_begin_range_result(ctx, this, [to_elem, Value::Object(None)])?;
     if let Some(data) = data_opt {
         // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
         let data_pin = ctx.pin_native_root(data);
@@ -52000,12 +52058,8 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // `subSet(e, false, e, false)` is a legal empty range, `subSet(hi, .., lo, ..)`
     // is not. Same split as `native_tm_sub_map_inclusive`.
     let (this, from_elem, to_elem) = ts_refuse_reversed_bounds(ctx, this, from_elem, to_elem)?;
-    let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
-    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
+    let (data_opt, size, comparator, mut result, [from_elem, to_elem]) =
+        ts_begin_range_result(ctx, this, [from_elem, to_elem])?;
     if let Some(data) = data_opt {
         // Family-1 stale-ObjectRef fix: same hazard as `native_ts_head_set`.
         let data_pin = ctx.pin_native_root(data);

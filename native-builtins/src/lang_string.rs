@@ -2344,6 +2344,42 @@ fn invoke_to_string_units_opt(
     ctx: &mut dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
 ) -> Result<Option<Vec<u16>>, cratonvm_types::error::MethodCallFailed> {
+    // MUST exclude arrays, for the reason the wrapper fast path below says in
+    // its own words -- and this is the site that was missing it.
+    //
+    // A reference array has no class of its own in the class store, so it
+    // carries its COMPONENT's class id: `class_id_of_object(new String[2])`
+    // answers `java/lang/String`, and the name test below matched. This native
+    // then read slot 0 as `String.value`, i.e. it decoded the array's FIRST
+    // ELEMENT POINTER as the `(tag, payload)` pair of a `Value` cell.
+    //
+    // MEASURED (`probes/AppendArrayProbe`, no GC involved -- the guard fires at
+    // `collections_now=0`):
+    //
+    // ```text
+    //   sb.append(new String[]{"y","n"})
+    //   CratonVM   ""            + `gc::guard: corrupt Value cell` + an NPE
+    //                              downstream on the String it minted with a
+    //                              null `value`
+    //   HotSpot    "[Ljava.lang.String;@<hash>"
+    // ```
+    //
+    // That is the whole of the producer
+    // `corrupt-value-cell-is-fatal-on-three-of-four-collectors` was looking for.
+    // Its own reasoning was that the reference must already be stale on entry
+    // because the String fast path has no allocation between entry and the
+    // read; the reference was never stale, and the read was never of a String.
+    // The Spring Boot witness reaches it through
+    // `ItemMetadata.newProperty(.., new String[]{"y","n"}, ..)` and AssertJ's
+    // `createDescription`, which is a `sb.append(Object)` over that array.
+    //
+    // `read_string`'s structural decode is gated with it: it reads the same two
+    // slots, so it has the same hazard and none of the class test's excuse.
+    //
+    // An array falls through to the `invoke_virtual("toString")` at the bottom,
+    // which is `Object.toString()` -- the identity rendering HotSpot gives.
+    let is_array = ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array;
+
     // Fast path: if it's already a String object, read its code units.
     //
     // The class test comes FIRST and `read_string` stays as the fallback: on a
@@ -2353,11 +2389,13 @@ fn invoke_to_string_units_opt(
     let this_class = ctx
         .class_name_of_id(ctx.class_id_of_object(obj))
         .unwrap_or_default();
-    if this_class == "java/lang/String" {
-        return Ok(Some(read_string_chars(&*ctx, obj)));
-    }
-    if let Some(s) = ctx.read_string(obj) {
-        return Ok(Some(s.encode_utf16().collect()));
+    if !is_array {
+        if this_class == "java/lang/String" {
+            return Ok(Some(read_string_chars(&*ctx, obj)));
+        }
+        if let Some(s) = ctx.read_string(obj) {
+            return Ok(Some(s.encode_utf16().collect()));
+        }
     }
 
     // Fast path for wrapper types: if the object has exactly 1 field and its
@@ -2652,7 +2690,14 @@ fn charsequence_fast_units(
 ) -> Result<Option<Vec<u16>>, MethodCallFailed> {
     let cid = ctx.class_id_of_object(cs);
     let name = ctx.class_name_of_id(cid).unwrap_or_default();
-    if name == "java/lang/String" {
+    // The array exclusion `invoke_to_string_units_opt` carries, for the same
+    // reason: a reference array answers its COMPONENT's class id, so
+    // `String[]` passes a `name == "java/lang/String"` test and this would read
+    // its first element pointer as `String.value`. Nothing routes an array here
+    // today -- an array is not a `CharSequence` -- but this is the second of
+    // the two doors that read String slots off a class-name test, and the first
+    // one was reached.
+    if name == "java/lang/String" && ctx.heap_kind_of(cs) != cratonvm_types::ObjectKind::Array {
         return Ok(Some(read_string_chars(&*ctx, cs)));
     }
     if name == "java/lang/StringBuilder" || name == "java/lang/StringBuffer" {
@@ -3707,7 +3752,8 @@ pub(crate) fn native_sb_insert_charsequence(
     let name = ctx
         .class_name_of_id(ctx.class_id_of_object(cs))
         .unwrap_or_default();
-    if name == "java/lang/String" {
+    // Third door, same array exclusion -- see `charsequence_fast_units`.
+    if name == "java/lang/String" && ctx.heap_kind_of(cs) != cratonvm_types::ObjectKind::Array {
         return native_sb_insert_string(ctx, args);
     }
 
