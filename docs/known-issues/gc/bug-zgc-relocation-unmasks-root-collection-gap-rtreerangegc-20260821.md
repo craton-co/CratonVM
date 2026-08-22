@@ -108,6 +108,25 @@ form: `b2e13e441 fix(collections): TreeMap/TreeSet snapshot walks dereferenced
 relocated ObjectRefs` is the same shape — a snapshot walk holding an address
 across a relocation.
 
+### The obvious candidate is DISPROVED (2026-08-22)
+
+WORKER-4 landed `420d5117a fix(collections): TreeMap.root is a real red-black
+tree of real TreeMap$Entry` and `83d3c296e fix(collections): TreeSet.m is a real
+backing TreeMap` — changes to exactly the substitution layer the mode arm
+localises this gap to. Predicted that they might close it, then measured:
+
+```text
+r13 (before WORKER-4)  --Xmx 64m   rc=1  3/3
+r14 (after  WORKER-4)  --Xmx 64m   rc=1  3/3
+```
+
+**Unchanged.** So the unrooted reference is NOT the map's root/entry structure,
+which is now real on both counts. That leaves the range-VIEW machinery
+(`checkMap` walks `subMap`/`headMap`/`tailMap` and `navigableKeySet`) as the
+remaining suspect, and it is the same object the prior fix in this area named:
+a snapshot walk holding an address across a relocation. Whoever picks this up
+starts there, and does not re-try the backing store.
+
 ## Why this was landed rather than held
 
 The merge introduces no defect; it inherits dev's newly-honest collector. Dev's
