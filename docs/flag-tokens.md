@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-468 tokens.
+469 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -214,6 +214,7 @@ export inherited from a parent shell.
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
 | `gocbf` | `CRATONVM_DBG_GOCBF` |
+| `gpu-dump-ptx` | `CRATONVM_GPU_DUMP_PTX` |
 | `gpu-trace-bytes` | `CRATONVM_GPU_TRACE_BYTES` |
 | `gse` | `CRATONVM_DBG_GSE` |
 | `h2parserread` | `CRATONVM_DBG_H2PARSERREAD` |
@@ -897,7 +898,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-18 tokens.
+19 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -919,6 +920,7 @@ export inherited from a parent shell.
 | `stress-thread-states` | `CRATONVM_STRESS_THREAD_STATES` |
 | `striped-counters` | `CRATONVM_STRIPED_COUNTERS_OFF` |
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
+| `wait-spurious-ms` | `CRATONVM_WAIT_SPURIOUS_MS` |
 
 ## `CRATONVM_SECURITY`
 
