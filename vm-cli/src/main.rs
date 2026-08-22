@@ -5198,6 +5198,11 @@ fn run() -> Result<()> {
     // deletion exercise those two records describe but never measured.
     cratonvm_vm::vm::dump_check_override_census();
     cratonvm_vm::vm::dump_canonical_census();
+    // The enforcement dial's per-door census (`H17-3` N1). Silent unless
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW` is armed or `CRATONVM_DBG_DIAL_DOORS`
+    // is set; `reached - yielded` per door is the price the dial is not
+    // charging.
+    cratonvm_vm::vm::dump_dial_door_census();
 
     // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown
     // (env-gated inside `dump_now` callers; `enabled()` re-checked here).

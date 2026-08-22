@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-466 tokens.
+467 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -69,6 +69,7 @@ export inherited from a parent shell.
 | `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
 | `layout-alias` | `CRATONVM_DBG_LAYOUT_ALIAS` |
 | `check-override` | `CRATONVM_DBG_CHECK_OVERRIDE` |
+| `dial-doors` | `CRATONVM_DBG_DIAL_DOORS` |
 | `direct-memory` | `CRATONVM_DBG_DM` |
 | `dupx-trace` | `CRATONVM_DBG_DUPX_TRACE` |
 | `read0-latency` | `CRATONVM_DBG_READ0LAT` |

@@ -5752,6 +5752,7 @@ fn admit_forced_native_id(
         .kind_of_id(id)
         .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
     match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::DispatchDoor::ForceIntercept,
         crate::vm::dispatch_policy(shared),
         class_name,
         method_name,
@@ -7496,6 +7497,7 @@ pub(super) fn resolve_step1_native(
         crate::vm::record_native_shadow_ran_over_bytecode(class_name, method_name, descriptor);
     }
     match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::DispatchDoor::Step1,
         policy,
         class_name,
         method_name,
@@ -7559,7 +7561,50 @@ fn step1_dispatch_has_code(
     descriptor: &str,
     dispatch_class_override: Option<crate::classloading::ClassId>,
 ) -> bool {
-    let cm = shared.classes.class_manager.read();
+    // `reentrant: false` -- step 1 runs before method resolution and holds no
+    // class-manager guard, so the plain `read()` this function has always taken
+    // stays exactly what it was. See [`dispatch_has_code`] for why the other
+    // callers cannot use it.
+    dispatch_has_code(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+        dispatch_class_override,
+        false,
+    )
+}
+
+/// [`step1_dispatch_has_code`]'s body, with the lock acquisition made a
+/// parameter.
+///
+/// # Why `reentrant` is not a style choice
+///
+/// `class_manager` is an [`OrderedPlRwLock`](cratonvm_types::lock_order::OrderedPlRwLock),
+/// and `parking_lot`'s plain `read()` is **not reentrant**: a thread that
+/// already holds a read guard and takes another one deadlocks against a queued
+/// writer. Under lock-order enforcement that is a panic, which is loud and
+/// findable; enforcement is compiled out of a release build, where the same
+/// code is a silent hang instead.
+///
+/// [`jdk_only_dial_yields_to_bytecode`] is called from doors that DO hold the
+/// guard -- `invoke_or_native`'s superclass walk holds it across the whole walk
+/// -- so it passes `true` and gets `read_recursive()`, which is documented as
+/// existing for exactly this case. Re-entering a lock the thread already holds
+/// adds no edge to the wait-for graph.
+fn dispatch_has_code(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    dispatch_class_override: Option<crate::classloading::ClassId>,
+    reentrant: bool,
+) -> bool {
+    let cm = if reentrant {
+        shared.classes.class_manager.read_recursive()
+    } else {
+        shared.classes.class_manager.read()
+    };
     // Same start class the call site's own superclass walk uses: the
     // loader-precise override when the caller resolved one, else the flat
     // name lookup.
@@ -7592,6 +7637,105 @@ fn step1_dispatch_has_code(
         .get(declaring_id)
         .and_then(|declaring| declaring.methods.get(index as usize))
         .is_some_and(|method| method.code().is_some())
+}
+
+/// The enforcement dial (`CRATONVM_ENFORCE_NATIVE_SHADOW`), asked at a
+/// dispatch door **other than** step 1.
+///
+/// # What was wrong
+///
+/// `env_cache::jdk_only_enforce_shadow_for` had exactly one live call site
+/// tree-wide -- `resolve_step1_native`, a few hundred lines above -- which
+/// `H17-2` §5 established by grep over the whole repository rather than by
+/// inference from behaviour. So "arming a class" armed only the subset of that
+/// class's dispatches that reached step 1 **cold**. A dispatch served by a warm
+/// invoke-cache entry, or by `invoke_or_native`'s registry-first probe, or by
+/// that probe's superclass walk, ran the native regardless of the dial.
+///
+/// That is not a small discrepancy in a measurement. Four records
+/// (`H0-3`, `H0-4`, `H14-3`, `H15`) priced retirements with this instrument,
+/// and a retirement removes the *registration*, so under a retirement **every**
+/// door misses. The dial priced a hybrid no retirement can reach: `H16-3`
+/// photographed a real `Node[]` holding one real node and two fabrications.
+/// The asymmetry that survives is the one to quote: **an armed FAILURE is real;
+/// an armed ZERO is unreliable.**
+///
+/// # What this answers
+///
+/// The same three-way question step 1 asks, in the same order, with the
+/// cheapest test first so that the doors this is called from -- one of which is
+/// the hottest native path in the VM -- pay a `Copy` field read and an enum
+/// compare on a default `--real-jdk` run and nothing else:
+///
+/// 1. `Bridge` only. `Intrinsic` is §1.4's reviewed exception and is taken
+///    regardless; `SyntheticStub` is refused by §1.3 before any of this.
+/// 2. `--jdk-only` only. The dial has never had meaning in `Compatible` mode
+///    and must not acquire one here.
+/// 3. The dial must cover THIS receiver class. `jdk_only_enforce_shadow()`
+///    alone answers "is anything armed", which under a prefix list is true for
+///    every class in the VM -- asking it here would enforce one subsystem's
+///    dial across the whole process, which is the 32/17 -> 3/46 collapse the
+///    scoping exists to avoid.
+/// 4. And only then the hierarchy walk, which is the expensive part.
+///
+/// # The conservatism is deliberate and is NOT a full retirement
+///
+/// A yield needs concrete bytecode to yield *to*. A real retirement of a
+/// registration whose method has no `Code` produces an `AbstractMethodError` or
+/// a `MissingNative`; this dial produces the native, exactly as step 1 always
+/// has. So an armed run still under-prices a retirement of a triple with no
+/// bytecode behind it, and it must be read that way. What it no longer does is
+/// under-price by an unknown factor that depends on which door the call
+/// happened to arrive through.
+///
+/// # Per-call-site drift, the hazard this file has already paid for once
+///
+/// A `java/lang/String` force-native arm was deleted on 2026-08-04 because "a
+/// method's behaviour started depending on how many times its call site had
+/// run", and `forced_native_string_arm_stays_deleted` in this module is the
+/// gate that keeps it deleted. Consulting a dial at a **memoized** door
+/// recreates that defect unless the memo is dial-aware.
+///
+/// It is handled here by asking on every dispatch rather than at publication:
+/// `revalidate_cached_native` calls this on every warm hit, not once at fill
+/// time, and answers `None` (the eviction signal every caller already
+/// implements) when the dial yields; `populate_invoke_cache` calls it before
+/// deciding what to cache, so an armed class's bridge is never published to a
+/// call site in the first place. Cold and warm therefore give the same answer
+/// for the same triple, which is the property whose absence was the 2026-08-04
+/// bug.
+#[inline]
+pub(crate) fn jdk_only_dial_yields_to_bytecode(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    kind: cratonvm_native_api::NativeKind,
+) -> bool {
+    if kind != cratonvm_native_api::NativeKind::Bridge {
+        return false;
+    }
+    if !crate::vm::dispatch_policy(shared).is_jdk_only() {
+        return false;
+    }
+    if !crate::runtime::env_cache::jdk_only_enforce_shadow_for(class_name) {
+        return false;
+    }
+    dial_yields_to_bytecode_slow(shared, class_name, method_name, descriptor)
+}
+
+/// [`jdk_only_dial_yields_to_bytecode`]'s tail, out of line so the three
+/// early-outs above can inline into the hot doors without dragging a
+/// hierarchy walk in with them.
+#[cold]
+#[inline(never)]
+fn dial_yields_to_bytecode_slow(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    dispatch_has_code(shared, class_name, method_name, descriptor, None, true)
 }
 
 /// Resolve the complete identity stored by a warmed native invoke target.
@@ -7679,6 +7823,7 @@ pub(super) fn revalidate_cached_native(
 
     let (class_name, method_name, descriptor) = registry.triple_of(id)?;
     match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::DispatchDoor::CacheRevalidate,
         policy,
         class_name,
         method_name,
@@ -7690,7 +7835,19 @@ pub(super) fn revalidate_cached_native(
         // Concrete bytecode precedence was decided before publication. If
         // redefinition can change that fact, the RedefineGate is checked and
         // evicts this target before we get here.
-        false,
+        //
+        // ...with ONE exception, and it is the whole of `H17-3` §6: the
+        // enforcement dial is process-static configuration that was not
+        // consulted at publication either, because until now nothing but step 1
+        // consulted it anywhere. A warmed entry published before the dial was
+        // read would otherwise pin the bridge for the life of the process,
+        // which is precisely how an armed run came to price a hybrid. Asking
+        // here -- on every warm hit, not once at fill time -- is what makes the
+        // warm and cold answers agree for the same triple. `None` from the
+        // resolver is the eviction signal every caller of this function already
+        // implements, so the site re-resolves through step 1, which asks the
+        // same question and reaches the same bytecode.
+        jdk_only_dial_yields_to_bytecode(shared, class_name, method_name, descriptor, kind),
     ) {
         Some(decision) => {
             let callback = decision.native_callback()?;
@@ -7698,6 +7855,147 @@ pub(super) fn revalidate_cached_native(
             Some(callback)
         }
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod enforcement_dial_door_tests {
+    /// The dial must be consulted at every door that can run a `Bridge` in
+    /// front of concrete bytecode -- not just at step 1.
+    ///
+    /// # Why this is a source scan and not a behavioural test
+    ///
+    /// `H17-2` §5 established the defect BY GREP, not by inference: on
+    /// 2026-08-21 `jdk_only_enforce_shadow_for` had exactly one live call site
+    /// in the whole repository, inside `resolve_step1_native`. A dispatch that
+    /// does not pass through that line cannot be affected by the environment
+    /// variable, in any mode, ever -- so the regression this guards against is
+    /// structural, and the instrument that found it was structural. A
+    /// behavioural test would need a VM with a real class library, a
+    /// process-global env var read through a memoised slot, and a Java-visible
+    /// witness -- four of the six this directory has reached for are already
+    /// measured blind. This needs none of them and cannot go blind.
+    ///
+    /// # What the doors cost, MEASURED
+    ///
+    /// Instrumented build, `DialWitness direct`, armed for `java/util/HashMap`,
+    /// one case per process (`H0-8` rule 1):
+    ///
+    /// ```text
+    ///   [DIAL_DOOR_CENSUS] armed=true reached=947 yielded=57 leaked=890
+    ///   [DIAL_DOOR] step1             reached=15   yielded=15   leaked=0
+    ///   [DIAL_DOOR] invoke_or_native  reached=115  yielded=0    leaked=115
+    ///   [DIAL_DOOR] force_intercept   reached=28   yielded=28   leaked=0
+    ///   [DIAL_DOOR] cache_revalidate  reached=774  yielded=0    leaked=774
+    ///   [DIAL_DOOR] cache_populate    reached=1    yielded=0    leaked=1
+    ///   [DIAL_DOOR] jit_fast_native   reached=3    yielded=3    leaked=0
+    ///   [DIAL_DOOR] stackless_force   reached=11   yielded=11   leaked=0
+    /// ```
+    ///
+    /// **94% of armed `Bridge` dispatches never asked the dial**, and on a hot
+    /// workload (`DialWitness jit`, 60 000 iterations) it was 299 431 of
+    /// 299 469 -- so a suite, which is a hot workload, was very nearly unarmed.
+    /// The three doors with a non-zero `leaked` column are the three pinned
+    /// here. `force_intercept`, `stackless_force`, `jit_fast_native` and
+    /// `elidable_ctor` pass `bytecode_available: true` unconditionally under
+    /// `--jdk-only` and were already stricter than the dial, which is why they
+    /// are absent.
+    #[test]
+    fn every_leaking_door_asks_the_enforcement_dial() {
+        // (source, what it is, anchor proving the scan reads the right text,
+        // how many QUALIFIED dial consultations must be there)
+        //
+        // The needle is the QUALIFIED path, so neither the definition (in this
+        // file, unqualified) nor a doc-comment mention (inside backticks, no
+        // `(`) can inflate the count.
+        let doors: &[(&str, &str, &str, usize)] = &[
+            (
+                include_str!("../../vm/vm_exec.rs"),
+                "vm/src/vm/vm_exec.rs :: invoke_or_native -- the registry-first probe, its \
+                 array-type alias retry, and both arms of its superclass walk",
+                "fn invoke_or_native",
+                4,
+            ),
+            (
+                include_str!("dispatch_static.rs"),
+                "vm/src/runtime/interpreter/dispatch_static.rs :: populate_invoke_cache",
+                "fn populate_invoke_cache",
+                1,
+            ),
+        ];
+        for (src, what, anchor, want) in doors {
+            // Establish the corpus is real before concluding anything from a
+            // count: a file that stopped containing the door at all would make
+            // this pass, or fail, for the wrong reason.
+            assert!(
+                src.contains(anchor),
+                "{what}: the anchor `{anchor}` is gone, so this scan is looking at the wrong \
+                 text and whatever it counts means nothing"
+            );
+            let calls = src
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && t.contains("::jdk_only_dial_yields_to_bytecode(")
+                })
+                .count();
+            assert!(
+                calls >= *want,
+                "{what} consults the enforcement dial at {calls} site(s), expected at least \
+                 {want}. `CRATONVM_ENFORCE_NATIVE_SHADOW` is meant to simulate a retirement, \
+                 and a retirement removes the REGISTRATION -- so every door misses, not just \
+                 the cold step-1 one. A door that stops asking silently returns the dial to \
+                 the state H17-2 measured: armed failures real, armed zeros unreliable, and \
+                 every armed cell in docs/known-issues/jdk-only/ pricing a hybrid that no \
+                 retirement can reach."
+            );
+        }
+    }
+
+    /// The warm invoke-cache door -- this file's own, and the one that carried
+    /// 82% of the leak.
+    ///
+    /// Scoped to `revalidate_cached_native`'s body rather than counted over the
+    /// file, because the needle is unqualified here and this module's own
+    /// source would otherwise satisfy the search it performs.
+    #[test]
+    fn the_warm_invoke_cache_door_asks_the_enforcement_dial() {
+        let src = include_str!("native_override.rs");
+        let start = src
+            .find("pub(super) fn revalidate_cached_native(")
+            .expect("`revalidate_cached_native` is gone, so this scan reads the wrong text");
+        let rest = &src[start..];
+        // The next `#[cfg(test)]` is this very module; everything between is
+        // the function and the plain items that follow it.
+        let end = rest.find("\n#[cfg(test)]").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("jdk_only_dial_yields_to_bytecode("),
+            "`revalidate_cached_native` no longer asks the enforcement dial. It is the door a \
+             warmed native target is redeemed through, and it carried 774 of the 890 leaked \
+             armed dispatches in the measurement quoted above -- 299 292 of 299 431 on a hot \
+             one. A warmed entry published before the dial was consulted pins the bridge for \
+             the life of the process, which is exactly how an armed run came to price a \
+             hybrid."
+        );
+    }
+
+    /// The scans above can fail.
+    ///
+    /// A guard that cannot fail reads exactly like one that works; this file
+    /// already carries a note about three such guards found in one evening. If
+    /// the helper is renamed, every count above silently drops to zero and the
+    /// assertions become a report about a string that appears nowhere -- so pin
+    /// the spelling against its definition site.
+    #[test]
+    fn the_door_scans_are_looking_for_a_name_that_exists() {
+        let src = include_str!("native_override.rs");
+        assert!(
+            src.contains("pub(crate) fn jdk_only_dial_yields_to_bytecode("),
+            "`jdk_only_dial_yields_to_bytecode` was renamed or removed, so the two door scans \
+             above now search for a string that appears nowhere and would pass on a tree with \
+             no dial wiring at all"
+        );
     }
 }
 

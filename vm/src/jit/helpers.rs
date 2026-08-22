@@ -9958,6 +9958,7 @@ fn jdk_only_admit_jit_fast_native(
         .map(|kind| (callback, kind));
     let bytecode_available = jit_fast_native_has_bytecode(vm, class_name, method_name, descriptor);
     match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::DispatchDoor::JitFastNative,
         crate::vm::dispatch_policy(vm),
         class_name,
         method_name,
