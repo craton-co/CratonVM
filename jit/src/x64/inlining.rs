@@ -791,13 +791,25 @@ impl Compiler {
                 }
 
                 // iadd
+                //
+                // THE INT SLOTS IN THIS FRAME ARE SIGN-EXTENDED 64-BIT VALUES,
+                // and every consumer relies on it: `i2l` is a no-op here, an
+                // `iastore` writes the low word, and `lmul`/`if_icmp*` read the
+                // full register. A 64-bit `ADD RAX, RCX` keeps that invariant
+                // only while the 32-bit result does not overflow — on
+                // overflow it produces the true 65-bit sum instead of the
+                // wrapped `int` Java specifies, and the difference is 2^32,
+                // which is exactly what a later `i2l` would have thrown away.
+                // So compute in 32 bits and re-establish the invariant, the way
+                // `ineg`, `ishl`, `ishr` and `iushr` below already do.
                 0x60 => {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    // ADD RAX, RCX
-                    self.rex_w();
+                    // ADD EAX, ECX ; MOVSXD RAX, EAX
                     self.buf.emit(&[0x01, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -813,14 +825,15 @@ impl Compiler {
                     cpc += 1;
                 }
 
-                // isub
+                // isub — 32-bit then sign-extend, for the reason `iadd` gives.
                 0x64 => {
                     let top = self.pop_stack();
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, top);
-                    // SUB RAX, RCX
-                    self.rex_w();
+                    // SUB EAX, ECX ; MOVSXD RAX, EAX
                     self.buf.emit(&[0x29, 0xC8]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -836,14 +849,40 @@ impl Compiler {
                     cpc += 1;
                 }
 
-                // imul
+                // imul — 32-bit then sign-extend. Same invariant as `iadd`,
+                // and this is the one that actually bites: a 32-bit product
+                // overflows for ordinary inputs, where a sum rarely does.
+                //
+                // MEASURED. BouncyCastle's HAETAE reduces with
+                //
+                //     private static int montgomeryReduce(long a) {
+                //         int t = (int) a * QINV;             // QINV = 0x380F0401
+                //         long tt = a - ((long) t * Q);
+                //         return (int) (tt >> 32);
+                //     }
+                //
+                // where the `int` multiply is DELIBERATELY allowed to overflow —
+                // that truncation is the algorithm. Inlined into
+                // `HAETAEEngine.ntt`, the 64-bit `IMUL RAX, RCX` left the full
+                // product in the slot, the `(long) t` that follows was a no-op
+                // on an already-64-bit value, and `t * Q` was therefore computed
+                // from a number ~2^32 times too large. Every value the transform
+                // produced after that was unreduced garbage
+                // (`-827016358` where the answer is `-27922`).
+                //
+                // That is the whole of the HAETAE defect: `pqc` KAT vector 5
+                // verifying false and vector 6 never terminating, both of which
+                // read as "a JIT bug somewhere in `ntt`" for weeks. `ntt` itself
+                // is compiled correctly; what was wrong was the copy of
+                // `montgomeryReduce` spliced into it.
                 0x68 => {
                     self.pop_to_rax();
                     let slot2 = self.pop_stack();
                     self.load_slot_to_reg(RCX, slot2);
-                    // IMUL RAX, RCX
-                    self.rex_w();
+                    // IMUL EAX, ECX ; MOVSXD RAX, EAX
                     self.buf.emit(&[0x0F, 0xAF, 0xC1]);
+                    self.rex_w();
+                    self.buf.emit(&[0x63, 0xC0]);
                     self.push_from_rax();
                     cpc += 1;
                 }
