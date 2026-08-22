@@ -186,8 +186,24 @@ explicitly **not** shown to cause this stall.
    dump sound. The line now names which handle it used, so a silent fallback
    cannot pass as a sound reading, and prints an explicit `RELOCATED` line when
    the entry pointer and the live one disagree — which measures the staleness
-   instead of merely suspecting it. **Re-take the `result`/`waiters` reading on
-   this binary before citing it.**
+   instead of merely suspecting it.
+
+   **Re-taken, and the original reading holds.** First stall on the GC-safe
+   binary:
+
+   ```
+   [WAIT-OBJECT] handle=registry-remapped obj=0x20061300748
+   [WAIT-OBJECT] class=io/netty/channel/DefaultChannelPromise
+                 result=Some(Object(Some(...)))  waiters=Some(Int(1))
+   ```
+
+   `handle=registry-remapped` confirms the resolver engaged rather than
+   silently falling back. **No `RELOCATED` line** — the entry pointer and the
+   live pointer were identical, so in this instance the promise never moved and
+   the earlier stale-local dumps were in fact reading the right memory. The
+   caveat was worth raising (it was unfalsifiable as written), but the specific
+   failure it warned about did not materialise. `result != null`,
+   `waiters == 1`, no orphan — now on a handle that cannot lie.
 1. A plain missing fence is now UNLIKELY and should not be assumed: the thin
    path CASes `Acquire` on lock (`try_thin_lock`) and `Release` on unlock
    (`try_thin_unlock`), and the inflated path goes through a
