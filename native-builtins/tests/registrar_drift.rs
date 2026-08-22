@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1_233;
+const BASELINE_TOTAL_DRIFT: usize = 1221;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1_369;
+const BASELINE_TOTAL_PAIRS: usize = 1356;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -732,7 +732,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/io/BufferedInputStream", "read", "()I"),
             ("java/io/BufferedInputStream", "read", "([BII)I"),
             ("java/io/BufferedInputStream", "reset", "()V"),
-            ("java/io/BufferedInputStream", "skip", "(J)J"),
             ("java/io/ByteArrayInputStream", "<init>", "([B)V"),
             ("java/io/ByteArrayInputStream", "<init>", "([BII)V"),
             ("java/io/ByteArrayInputStream", "available", "()I"),
@@ -873,13 +872,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/util/HashMap", "forEach", "(Ljava/util/function/BiConsumer;)V"),
             ("java/util/HashMap", "getOrDefault", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
             ("java/util/HashMap", "putIfAbsent", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
-            ("java/util/List", "of", "()Ljava/util/List;"),
-            ("java/util/List", "of", "(Ljava/lang/Object;)Ljava/util/List;"),
-            ("java/util/List", "of", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/List;"),
-            ("java/util/List", "of", "([Ljava/lang/Object;)Ljava/util/List;"),
-            ("java/util/Map", "of", "()Ljava/util/Map;"),
-            ("java/util/Map", "of", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;"),
-            ("java/util/Map", "ofEntries", "([Ljava/util/Map$Entry;)Ljava/util/Map;"),
             ("java/util/Optional", "empty", "()Ljava/util/Optional;"),
             ("java/util/Optional", "get", "()Ljava/lang/Object;"),
             ("java/util/Optional", "ifPresent", "(Ljava/util/function/Consumer;)V"),
@@ -898,8 +890,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/util/Properties", "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;"),
             ("java/util/Properties", "size", "()I"),
             ("java/util/Properties", "stringPropertyNames", "()Ljava/util/Set;"),
-            ("java/util/Set", "of", "()Ljava/util/Set;"),
-            ("java/util/Set", "of", "([Ljava/lang/Object;)Ljava/util/Set;"),
             ("java/util/StringJoiner", "<init>", "(Ljava/lang/CharSequence;)V"),
             ("java/util/StringJoiner", "<init>", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)V"),
             ("java/util/StringJoiner", "add", "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;"),
@@ -1544,12 +1534,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
         ],
     ),
     (
-        "register_p65_stream_map_multi",
-        &[
-            ("java/util/Map", "ofEntries", "([Ljava/util/Map$Entry;)Ljava/util/Map;"),
-        ],
-    ),
-    (
         "register_p67_misc",
         &[
             ("java/lang/StackWalker", "forEach", "(Ljava/util/function/Consumer;)V"),
@@ -1677,13 +1661,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/net/ServerSocket", "getLocalPort", "()I"),
             ("java/net/ServerSocket", "getLocalSocketAddress", "()Ljava/net/SocketAddress;"),
             ("java/net/ServerSocket", "isBound", "()Z"),
-        ],
-    ),
-    (
-        "register_pe2_string_marshaling",
-        &[
-            ("java/lang/foreign/MemorySegment", "getUtf8String", "(J)Ljava/lang/String;"),
-            ("java/lang/foreign/MemorySegment", "reinterpret", "(J)Ljava/lang/foreign/MemorySegment;"),
         ],
     ),
     (
