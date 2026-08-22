@@ -3073,15 +3073,34 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         });
     };
 
-    // The channel was connected via the Future-form `connect`, which stores the
-    // Slot 2 is either an fd_table fd (channel produced by the Future-form
+    // `F_REG_ID` is either an fd_table fd (channel produced by the Future-form
     // `connect` — the client path this native was originally written for) or,
     // for a channel handed to `AsynchronousServerSocketChannel.accept`'s
     // `CompletionHandler`, an `aio_registry` id >= `AIO_REG_BASE`. Only the
     // former used to be accepted, so EVERY server-side read failed with
     // "read: not connected" and no NIO2 server could serve a byte
     // (`TomcatServletWebServerFactoryTests.sslWithHttp11Nio2Protocol`).
-    let slot2 = match ctx.get_field(this, 2) {
+    //
+    // READ IT THROUGH `aio_get`, NOT AS A RAW SLOT. This was the one place in
+    // this file that indexed a private slot directly, and on a REAL JDK channel
+    // object it does not address `F_REG_ID` at all: `aio_base` exists precisely
+    // because a concrete receiver carries the JDK's own fields first and this
+    // module's private slots after them, so raw index 2 lands on an unrelated
+    // real field. A synthetic 3-field carrier has `base == 0`, which is why this
+    // worked everywhere it was tested and failed on the one path that gets a
+    // concrete channel.
+    //
+    // MEASURED: `CRATONVM_DBG_AIO=1` on
+    // `TestWsWebSocketContainerSessionExpirySession` shows the Future-form
+    // read/write resolving `fd=9` and succeeding, and the handler-form read on
+    // the SAME channel logging `this_fields=52` — a real
+    // `AsynchronousSocketChannel` implementation object, not a 3-field carrier —
+    // then failing `read: bad fd for tcp clone`. Tomcat's `WsFrameClient`
+    // treats that failure as a dropped connection and closes the session
+    // immediately after `onOpen`, which is the whole 19-class WebSocket cluster:
+    // sessions are unregistered as fast as they are registered, so
+    // `getOpenSessions()` never returns more than the caller.
+    let slot2 = match aio_get(ctx, this, F_REG_ID) {
         Value::Int(v) if v >= 0 => v,
         _ => {
             post_immediate(ctx, ReadOutcome::Error("read: not connected".to_string()));
@@ -3830,6 +3849,51 @@ mod tests {
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::{confine_test_lock, MockNativeContext};
+
+    /// No private slot in this module may be indexed RAW — every access goes
+    /// through `aio_get`/`aio_set`/`aio_has`, which add `aio_base`.
+    ///
+    /// This is a source guard rather than a behavioural one because the defect
+    /// it catches is invisible on the receiver shape the unit tests build. A
+    /// synthetic 3-field carrier has `base == 0`, so `ctx.get_field(this, 2)`
+    /// and `aio_get(ctx, this, F_REG_ID)` are the SAME slot and every test
+    /// passes either way. They diverge only on a concrete receiver — a real JDK
+    /// `AsynchronousSocketChannel` implementation object, which carries the
+    /// JDK's own fields first and this module's private slots after them.
+    ///
+    /// That is not hypothetical. `aio_asc_read` indexed slot 2 directly, and on
+    /// a concrete channel (`CRATONVM_DBG_AIO=1` reports `this_fields=52`) it
+    /// read an unrelated real field and failed `read: bad fd for tcp clone`.
+    /// Tomcat's `WsFrameClient` reads that as a dropped connection and closes
+    /// the session immediately after `onOpen` — the 19-class WebSocket cluster,
+    /// from one missing `aio_base`.
+    #[test]
+    fn every_private_slot_access_goes_through_the_base_aware_accessor() {
+        let src = include_str!("async_socket.rs");
+        // Split so this test's OWN lines do not contain the pattern it hunts —
+        // a self-matching guard reports itself and nothing else.
+        let getter = concat!("ctx.get_", "field(this, ");
+        let setter = concat!("ctx.set_", "field(this, ");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                // Skip comments, which quote the bad form deliberately.
+                !t.starts_with("//")
+                    && (t.contains(getter) || t.contains(setter))
+                    && !t.contains("F_")
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "private slot(s) indexed without `aio_base` — on a CONCRETE receiver \
+             these do not address the slot they name, they address whatever real \
+             JDK field happens to sit at that index. Use `aio_get`/`aio_set`. \
+             Offenders: {offenders:?}"
+        );
+    }
 
     /// AUDIT 2026-07-26 (native-io-audit): the handler form of
     /// `AsynchronousSocketChannel.write` reported a bare `IntCount` and never
