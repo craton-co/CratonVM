@@ -5038,16 +5038,19 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         //
         // It is invisible on Windows because `os_process_cmdline` finds no
         // command line for most pids there, so the field stays null and the
-        // vector's law skips the row — a platform-shaped blind spot, not a
+        // vector's law skips the row -- a platform-shaped blind spot, not a
         // platform-shaped defect.
         //
-        // (Edited by WORKER 3, whose subject is the java.lang rows: the class
-        // is `java.lang.ProcessHandle$Info` but the file is WORKER 4's. Four
-        // lines, no behaviour change beyond the component type.)
-        let arr = match ctx.class_id_by_name("java/lang/String") {
-            Some(cid) => ctx.new_ref_array(cid, arguments.len()),
-            None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len()),
-        };
+        // MERGE NOTE 2026-08-22. WORKER 3 and WORKER 4 found and fixed this
+        // independently, in the same hour, from the same red vector; the
+        // comment above is WORKER 3's and the call below is WORKER 4's. The
+        // difference is scope: `crate::new_string_array` also carries the
+        // `File.list()` site, which already had the correct four-line idiom,
+        // and `watch.rs::pollEventNames0`, whose registered descriptor is
+        // `(I)[Ljava/lang/String;` and which had the wrong one. Three sites,
+        // one implementation -- which is the whole reason to prefer a helper
+        // over the inline `match` this replaces.
+        let arr = crate::new_string_array(ctx, arguments.len());
         let arr_pin = ctx.pin_native_root(arr);
         for (i, a) in arguments.iter().enumerate() {
             let s = ctx.create_string(a);

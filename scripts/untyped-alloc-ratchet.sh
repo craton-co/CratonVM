@@ -61,6 +61,21 @@
 #     because braces inside Rust string literals are not braces. A top-level
 #     `mod` ends at the next COLUMN-0 `}`, which no string literal can fake.
 #
+#     CORRECTED 2026-08-22: the `mod` pattern was `^(pub )?mod NAME {`, which
+#     does not match `pub(crate) mod new13_tests {` — a real shape, at
+#     phases_late/ssl_security.rs:8671. FOUR more sites were counted as
+#     production because of it (objects 33 -> 29, excluded 197 -> 201). Found by
+#     reading the new per-function reach map and noticing a TEST NAME in it.
+#
+# (c) The per-function REACH MAP, added 2026-08-22 for a measured reason.
+#     `arrays` grew by one and `reach` did not move at all, because WORKER 2's
+#     new (deliberate) `degrade_bucket_table_to_untyped` site (+1) exactly
+#     cancelled a REMOVED caller of `alloc_ref_array` (157 -> 156). ONE
+#     AGGREGATE NUMBER HID A REGRESSION AND AN IMPROVEMENT AT THE SAME TIME.
+#     The baseline now carries one `fn=contribution` line per enclosing
+#     function, and every run prints the entries that moved — even when the
+#     total did not.
+#
 # (b) `reach` — ONE LEVEL OF CALL GRAPH, which is what v6's LIMIT 7 asked for.
 #     v6 counted direct spellings only, so routing a caller of a helper away
 #     from an untyped allocation removed a real fabrication and moved the number
@@ -102,6 +117,8 @@
 #       every `HashMap.table` and the gate still reported 29 -> 29, green.
 #   v6  counted direct spellings only (LIMIT 7) and counted `#[cfg(test)] mod`
 #       blocks of production files as production sites — 54.9% of its number.
+#   v7a the first `mod` pattern missed `pub(crate) mod`, and a single `reach`
+#       total hid an offsetting pair. Both found by this gate's own output.
 #
 # Every one printed a confident number. **A gate that measures a FRACTION reads
 # as good news.** Hence: the zero-guard, the per-function breakdown, the unit
@@ -185,7 +202,11 @@ scan() {
       # to EOF instead of to line 11577.
       if (pend) {
         if (c1 == "#") next
-        if ($0 ~ /^(pub )?mod [A-Za-z0-9_]+ \{$/) { intest = 1; pend = 0; next }
+        # `pub(crate) mod new13_tests {` is a REAL shape in this tree
+        # (phases_late/ssl_security.rs:8671) and `^(pub )?mod` did not match it,
+        # so that whole test module counted as production. Accept any
+        # visibility, and tolerate trailing space before the brace.
+        if ($0 ~ /^(pub([ 	]*\([^)]*\))?[ 	]+)?mod[ 	]+[A-Za-z0-9_]+[ 	]*\{[ 	]*$/) { intest = 1; pend = 0; next }
         pend = 0
       }
       if (c1 == "#") { if ($0 == "#[cfg(test)]") { pend = 1; next } }
@@ -260,7 +281,13 @@ if [ -n "$NAMES" ]; then
   # shellcheck disable=SC2086
   DEFS=$(git grep -hoE "fn[[:space:]]+($NAMES)[[:space:]]*\(" -- $CRATES $EXCL 2>/dev/null \
             | sed -E 's/^fn[[:space:]]+//; s/[[:space:]]*\($//' | sort | uniq -c)
-  REACH=$(printf 'ENCL\n%s\nCALLS\n%s\nDEFS\n%s\n' "$ENCL" "$CALLS" "$DEFS" | awk -v base="$DIRECT" '
+  # Emits the TOTAL on line 1 and one sorted `fn=contribution` per line after.
+  # The per-function map is what makes an OFFSET visible: on 2026-08-22 `arrays`
+  # grew by one while `reach` did not move at all, because a new deliberate site
+  # (+1) exactly cancelled a REMOVED caller of `alloc_ref_array` (157 -> 156).
+  # One aggregate number hid a real regression and a real improvement at once,
+  # which is the failure mode this whole file is about.
+  REACHMAP=$(printf 'ENCL\n%s\nCALLS\n%s\nDEFS\n%s\n' "$ENCL" "$CALLS" "$DEFS" | awk -v base="$DIRECT" '
     /^ENCL$/  { s = "e"; next }
     /^CALLS$/ { s = "c"; next }
     /^DEFS$/  { s = "d"; next }
@@ -270,9 +297,16 @@ if [ -n "$NAMES" ]; then
     s == "d" { defs[$2] = $1; next }
     END {
       r = base
-      for (f in encl) { c = calls[f] - defs[f]; r += encl[f] * (c > 1 ? c : 1) }
+      n = 0
+      for (f in encl) { c = calls[f] - defs[f]; v[f] = encl[f] * (c > 1 ? c : 1); r += v[f]; k[n++] = f }
       print r
+      for (i = 1; i < n; i++) { t = k[i]; j = i - 1
+        while (j >= 0 && k[j] > t) { k[j+1] = k[j]; j-- }
+        k[j+1] = t }
+      for (i = 0; i < n; i++) printf "%s=%d\n", k[i], v[k[i]]
     }')
+  REACH=$(printf '%s\n' "$REACHMAP" | head -1)
+  REACHFN=$(printf '%s\n' "$REACHMAP" | tail -n +2)
   AMBIG=$(printf '%s\n' "$DEFS" | awk '$1 > 1' | grep -c .)
 fi
 
@@ -291,6 +325,12 @@ if [ "${1:-}" = "--update" ]; then
     echo "reach=$REACH"
     echo "widths=$WIDTHS"
     echo "byfn=$BYFN"
+    # One line per enclosing function, so a `git diff` of this file names WHICH
+    # function moved. The total above can stay still while two entries here move
+    # in opposite directions — measured 2026-08-22.
+    echo "reachfn_begin"
+    printf '%s\n' "$REACHFN"
+    echo "reachfn_end"
   } > "$BASELINE"
   echo "baseline written: objects=$OBJ arrays=$ARR sites=$SITES reach=$REACH"
   echo "                  test_sites=$TESTS (excluded) widths=[$WIDTHS]"
@@ -383,6 +423,7 @@ B_ARR=$(sed -n 's/^arrays=//p' "$BASELINE");  B_ARR=${B_ARR:-0}
 B_REACH=$(sed -n 's/^reach=//p' "$BASELINE"); B_REACH=${B_REACH:-0}
 B_WIDTHS=$(sed -n 's/^widths=//p' "$BASELINE")
 B_BYFN=$(sed -n 's/^byfn=//p' "$BASELINE")
+B_REACHFN=$(sed -n '/^reachfn_begin$/,/^reachfn_end$/p' "$BASELINE" | sed '1d;$d')
 bad=0
 
 echo "UNTYPED-ALLOC RATCHET (v7)"
@@ -418,6 +459,23 @@ for triple in "object:$OBJ:$B_OBJ" "array:$ARR:$B_ARR" "reach:$REACH:$B_REACH"; 
     echo "  IMPROVED: $k down $((was - now)) — re-baseline so the gain holds."
   fi
 done
+
+# Per-function reach movement, reported ALWAYS — including when the total did
+# not move. Two entries moving in opposite directions is not a hypothetical:
+# see the comment on REACHMAP above.
+if [ -n "${REACHFN:-}" ] && [ -n "$B_REACHFN" ]; then
+  MOVED=$(printf 'B\n%s\nN\n%s\n' "$B_REACHFN" "$REACHFN" | awk '
+    /^B$/ { s = "b"; next }
+    /^N$/ { s = "n"; next }
+    NF == 0 { next }
+    { split($0, a, "="); if (s == "b") b[a[1]] = a[2]; else n[a[1]] = a[2]; seen[a[1]] = 1 }
+    END { for (f in seen) if (b[f] + 0 != n[f] + 0)
+            printf "    %-44s %4d -> %-4d\n", f, b[f], n[f] }' | sort)
+  if [ -n "$MOVED" ]; then
+    echo "  reach MOVED per function (a still TOTAL can hide an offsetting pair):"
+    printf '%s\n' "$MOVED"
+  fi
+fi
 
 for w in $WIDTHS; do
   case " $B_WIDTHS " in *" $w "*) ;;

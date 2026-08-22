@@ -108,6 +108,11 @@ pub mod outbound_policy;
 // WP3.5 — DirectByteBuffer real allocation + Bits accounting + power-of-two pool.
 pub mod direct_buffer;
 // WP3.7 — Pipe.open() backed by libc::pipe / CreatePipe.
+/// Minting a receiver of the class the real JDK would construct, instead of
+/// the ABSTRACT public API class this crate's factories used to name — and
+/// keeping the registration in step with the mint. `H21-1` N3.
+pub mod concrete_receiver;
+
 pub mod pipe;
 // WP3.7 — DatagramChannel send/receive/multicast.
 pub mod datagram;
@@ -1187,6 +1192,13 @@ fn native_file_mkdirs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let path = read_file_path(ctx, this).unwrap_or_default();
     let path = validated_path(&path)?;
+    // `exists()` FIRST -- see the note on the twin registration in
+    // `native-builtins/src/phases_late/nio_file.rs`, which owns the slot.
+    // `create_dir_all` succeeds on a directory that is already there, and
+    // `mkdirs()` is contracted to answer "did THIS call create it".
+    if std::path::Path::new(&path).exists() {
+        return Ok(Some(Value::Int(0)));
+    }
     Ok(Some(Value::Int(if fs::create_dir_all(&path).is_ok() {
         1
     } else {
@@ -1291,22 +1303,51 @@ fn native_file_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         );
     }
     // Create a String[] array. The component class MUST be `java/lang/String`
-    // — `java.io.File.list()` is declared to return `String[]`, and callers
-    // (e.g. Jetty's module discovery) may `checkcast [Ljava/lang/String;` or
-    // store the result into a `String[]`-typed field. A `ClassId(0)` (Object)
-    // component would make that fail. Fall back to `ClassId(0)` only if the
-    // String class is somehow not loadable.
-    let string_cid = ctx
-        .ensure_class_initialized("java/lang/String")
-        .ok()
-        .or_else(|| ctx.class_id_by_name("java/lang/String"))
-        .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(string_cid, entries.len());
+    // — `java.io.File.list()` is declared to return `String[]`; see
+    // `new_string_array` for the whole rule and for what an `Object[]` costs.
+    let arr = new_string_array(ctx, entries.len());
     for (i, name) in entries.iter().enumerate() {
         let s = ctx.create_string(name);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+/// Allocate a `java.lang.String[]` — a REFERENCE array whose component type is
+/// `String`, not `Object`.
+///
+/// # Why the component type is not a detail
+///
+/// `ctx.new_array(ArrayElementType::Reference, n)` builds an `Object[]`. Every
+/// value this crate then stores in it is a `String`, every assertion about the
+/// CONTENTS passes, and the array is still the wrong type: a caller that
+/// `checkcast [Ljava/lang/String;` — or simply stores it into a `String[]`
+/// field, or reads it back through a `String[]`-typed accessor — gets an
+/// `Object[]` and fails.
+///
+/// **MEASURED, and it is why this helper exists rather than the four-line
+/// idiom being copied a third time.** `RJdkOptionalShape` on Linux/JDK 25.0.4:
+///
+/// ```text
+/// AssertionError: process.info.arguments: get() on a PRESENT Optional must
+/// return a [Ljava.lang.String;, got [Ljava.lang.Object;
+/// ```
+///
+/// `ProcessHandleImpl$Info.arguments` is declared `String[]`, and
+/// `process.rs::…info0` filled it with an `Object[]`. The corpus asks nothing
+/// about array component types (`WORKER-4` trap 5 says so in as many words), so
+/// this stood until a vector was written that asked.
+///
+/// The `ClassId(0)` fallback is `Object[]` — the pre-existing answer — and is
+/// reached only if `java.lang.String` is not loadable, at which point the array
+/// is the least of it.
+pub(crate) fn new_string_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
+    let string_cid = ctx
+        .ensure_class_initialized("java/lang/String")
+        .ok()
+        .or_else(|| ctx.class_id_by_name("java/lang/String"))
+        .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
+    ctx.new_ref_array(string_cid, len)
 }
 
 fn native_file_can_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5227,22 +5268,94 @@ fn native_scanner_init_readable(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(None)
 }
 
-fn native_scanner_init_inputstream(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(None),
-    };
-    // Read all bytes from the InputStream by calling read() repeatedly
-    let stream = match args.get(1) {
-        Some(Value::Object(Some(s))) => *s,
-        _ => {
-            scan_set_source(ctx, this, "");
-            return Ok(None);
-        }
-    };
+/// `Scanner(InputStream)`.
+///
+/// # The duck test below is a FAST PATH, not the answer
+///
+/// Until 2026-08-22 this body was three duck-typed branches over the source's
+/// SLOTS and nothing else: `(Object, Int, …, Int)` in 0/1/3 meant "a
+/// `ByteArrayInputStream`, read its `buf` directly"; `Int` in slot 0 or slot 1
+/// meant "a synthetic `FileInputStream`, drain that fd". **Every other
+/// `InputStream` in the language matched no branch, left `bytes` empty, and
+/// produced a scanner over the empty string** — a silent wrong answer, not an
+/// error.
+///
+/// MEASURED, `regression-suite/probes/W4Scanner.java`, Linux/JDK 25.0.4, both
+/// modes, source `"alpha beta 42 gamma"`:
+///
+/// ```text
+///                                          HotSpot                   CratonVM
+///   new Scanner(byteArrayInputStream)       [alpha, beta, 42, gamma]  [same]
+///   new Scanner(new FileInputStream(f))     [alpha, beta, 42, gamma]  []
+///   new Scanner(Files.newInputStream(f))    [alpha, beta, 42, gamma]  []
+///   new Scanner(new BufferedInputStream(…)) [alpha, beta, 42, gamma]  []
+///   new Scanner(new DataInputStream(…))     [alpha, beta, 42, gamma]  []
+///   new Scanner(new PushbackInputStream(…)) [alpha, beta, 42, gamma]  []
+///   new Scanner(new SequenceInputStream(…)) [alpha, beta, 42, gamma]  []
+///   new Scanner(anonymous InputStream)      [alpha, beta, 42, gamma]  []
+/// ```
+///
+/// `new Scanner(new FileInputStream(f))` reading nothing is the headline: it is
+/// the first example in most tutorials, and a real `FileInputStream`'s slot 0
+/// is its `FileDescriptor` OBJECT, which matches none of the three shapes.
+///
+/// # Why a duck test was the wrong instrument, twice
+///
+/// A slot layout cannot identify a class. This exact test has already produced
+/// a wrong answer once inside this file: `Scanner(Readable)` used to be pointed
+/// at this body, and a `StringReader`'s `{str, length, next, mark}` layout
+/// MATCHES the byte-array shape, so it read array elements out of a `String`
+/// and — again — produced an empty scanner. `[a slot COUNT cannot identify a
+/// layout]`.
+///
+/// # The remedy: ask the stream, do not inspect it
+///
+/// The general case now DRAINS the source through its own virtual
+/// `read([BII)I`, in 4 KiB chunks, which is the same thing
+/// `native_scanner_init_readable` does for a `Reader` and the same thing the
+/// JDK's own `Scanner` does. Any `InputStream` — JDK, application, or
+/// synthetic — answers it, because `read(byte[],int,int)` is the one method
+/// every `InputStream` has to provide.
+///
+/// The two special-cases are kept AHEAD of it, and both earn their place:
+///
+///   * the `ByteArrayInputStream` layout, because copying its `buf` avoids a
+///     bytecode round trip per 4 KiB for the commonest source;
+///   * the raw-`Int` fd slots, because the `System.in` carrier that
+///     `lang_system::native_system_init_phase1` installs is NOT a stream with
+///     a working `read` — it is a `FileInputStream`-shaped object whose fd
+///     lives in a slot — so draining it virtually would read nothing.
+///
+/// Neither can now cause the silent-empty outcome, because the fallback is a
+/// drain rather than an empty `Vec`.
+/// The one class this VM allocates as a "stream whose fd lives in a slot".
+///
+/// `native_fis_init_string` (files opened by name) and
+/// `lang_system::native_system_init_phase1` (`System.in`) both mint a
+/// `java.io.FileInputStream`-shaped object and put the fd id in a slot rather
+/// than behind a working `read`. Those two are the ONLY receivers for which
+/// reading a slot as a file descriptor is correct, so the branches that do it
+/// are gated on this name.
+const SYNTHETIC_FD_CARRIER: &str = "java/io/FileInputStream";
+
+/// Read everything `stream` will give, as bytes. The shared source of every
+/// `Scanner(InputStream, …)` constructor.
+///
+/// Extracted from `native_scanner_init_inputstream` 2026-08-22 because it now
+/// has four callers, and because the charset overloads were reaching NONE of
+/// this logic: `Scanner(InputStream, Charset)` and
+/// `Scanner(InputStream, String)` had no registration at all, so the real JDK
+/// constructor ran, set the real `Scanner`'s fields, and this VM's
+/// `hasNext`/`next` natives then read their OWN unset state — an empty scanner,
+/// silently, again.
+fn scanner_source_bytes(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<u8> {
+    // The receiver's class, bound once: EVERY branch below is gated on it since
+    // 2026-08-22, and the two fd branches needed it even more than the
+    // byte-array one did. See `SYNTHETIC_FD_CARRIER`.
+    let src_class = ctx
+        .class_name_of_id(ctx.class_id_of_object(stream))
+        .unwrap_or_default();
+    let is_fd_carrier = src_class == SYNTHETIC_FD_CARRIER;
     // Try to read bytes: check if this is a ByteArrayInputStream (has BAIS layout)
     // or a fd-based stream (FileInputStream layout)
     let mut bytes = Vec::new();
@@ -5256,9 +5369,41 @@ fn native_scanner_init_inputstream(
         None
     };
 
-    if let (Value::Object(Some(data_arr)), Value::Int(_pos), Some(Value::Int(_count))) =
-        (&field0, &field1, &field3_opt)
+    // THE FAST PATHS ARE GATED ON THE RECEIVER'S CLASS SINCE 2026-08-22, not on
+    // the shape of its slots, and that is the second half of this repair.
+    //
+    // Adding the general drain below was not enough on its own. MEASURED, with
+    // the drain in place but the shape test still selecting:
+    //
+    //     new Scanner(new FileInputStream(f))       FIXED   (falls to the drain)
+    //     new Scanner(Files.newInputStream(f))      FIXED
+    //     new Scanner(new DataInputStream(…))       FIXED
+    //     new Scanner(new PushbackInputStream(…))   FIXED
+    //     new Scanner(new SequenceInputStream(…))   FIXED
+    //     new Scanner(new BufferedInputStream(…))   STILL EMPTY
+    //
+    // Because a `BufferedInputStream` MATCHES the byte-array shape test: it
+    // carries a `byte[] buf` and two `int`s, which is the whole of what the
+    // test could see. It then read `buf[pos..count]` out of a buffer that a
+    // freshly constructed stream has not filled yet, and got zero bytes -- the
+    // same silent-empty answer, now reached through the branch that was
+    // supposed to be the reliable one.
+    //
+    // `input_stream_has_bais_layout` asks the question the shape test was
+    // standing in for: is the receiver's class `java.io.ByteArrayInputStream`,
+    // or a subclass of it. `[a slot COUNT cannot identify a layout]`, for the
+    // third time in this one function -- `Scanner(Readable)` and
+    // `BufferedInputStream` are the other two.
+    if input_stream_has_bais_layout(ctx, stream)
+        && matches!(
+            (&field0, &field1, &field3_opt),
+            (Value::Object(Some(_)), Value::Int(_), Some(Value::Int(_)))
+        )
     {
+        let data_arr = match field0 {
+            Value::Object(Some(a)) => a,
+            _ => unreachable!("guarded by the matches! above"),
+        };
         // ByteArrayInputStream layout: read directly
         let pos = match field1 {
             Value::Int(v) => v as usize,
@@ -5269,23 +5414,43 @@ fn native_scanner_init_inputstream(
             _ => 0,
         };
         for i in pos..count {
-            match ctx.get_array_element(*data_arr, i) {
+            match ctx.get_array_element(data_arr, i) {
                 Value::Int(b) => bytes.push(b as u8),
                 _ => bytes.push(0),
             }
         }
-    } else if let Value::Int(fd) = field0 {
+    } else if is_fd_carrier && matches!(field0, Value::Int(_)) {
         // fd-based stream (synthetic FileInputStream layout where slot 0 is
         // already an int — written by `native_fis_init_string` for files
         // opened by name).
-        let fd = fd as FdId;
+        //
+        // `is_fd_carrier` ADDED 2026-08-22, and it is the sharpest of the three
+        // shape-test repairs in this function. Without it the test was "slot 0
+        // holds an int", which is true of a great many streams that have
+        // nothing to do with a file descriptor — including
+        // `java.io.BufferedInputStream` and any application subclass of
+        // `InputStream` whose first field is an `int`.
+        //
+        // MEASURED (`W4Scanner`, with the drain instrumented): neither reached
+        // the general drain at all, because this branch took them first, and
+        // then read from whatever fd their int happened to be. An anonymous
+        // `InputStream` subclass with a `private int i = 0` cursor made
+        // `new Scanner(stream)` **read from file descriptor 0 — this process's
+        // STDIN** — and report the empty result as the stream's contents.
+        //
+        //     new Scanner(new BufferedInputStream(bais))   HotSpot [alpha, …]  CratonVM []
+        //     new Scanner(anonymous InputStream)           HotSpot [alpha, …]  CratonVM []
+        let fd = match field0 {
+            Value::Int(v) => v,
+            _ => 0,
+        } as FdId;
         loop {
             match ctx.fd_table().read_byte(fd) {
                 Ok(b) if b >= 0 => bytes.push(b as u8),
                 _ => break,
             }
         }
-    } else if let Value::Int(encoded) = field1 {
+    } else if is_fd_carrier && matches!(field1, Value::Int(encoded) if encoded > 0) {
         // S110 — System.in encoding. The `native_system_init_phase1` path
         // in `native-builtins/src/lang_system.rs` cannot store the stdin
         // fd id (= 0) in slot 0 because the real-JDK FileInputStream
@@ -5293,19 +5458,255 @@ fn native_scanner_init_inputstream(
         // `Value::Int(0)` to `Value::Object(None)`. Instead it writes
         // `Int(fd + 1)` to slot 1; we decode here. `encoded > 0` filters
         // out the zero / negative residue from coerced reference slots.
-        if encoded > 0 {
-            let fd = (encoded - 1) as FdId;
+        //
+        // The `encoded > 0` test moved INTO the pattern guard 2026-08-22. It
+        // used to be an `if` inside the arm, so an `Int(0)` in slot 1 — which
+        // is any ordinary stream with an int field there — selected this branch
+        // and then did nothing, and the general drain below could never be
+        // reached for it.
+        let encoded = match field1 {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        let fd = (encoded - 1) as FdId;
+        loop {
+            match ctx.fd_table().read_byte(fd) {
+                Ok(b) if b >= 0 => bytes.push(b as u8),
+                _ => break,
+            }
+        }
+    } else {
+        // THE GENERAL CASE — every `InputStream` that is not one of the two
+        // shapes above. Drain it through its own `read(byte[], int, int)`,
+        // which is the one method the abstract class obliges every subclass to
+        // make work. See this function's doc comment for the eight source
+        // shapes this repairs and for why the shape test alone was never
+        // enough.
+        //
+        // GC: `invoke_virtual` runs arbitrary bytecode, which allocates and can
+        // relocate both the stream and the buffer, so both are pinned and
+        // re-read on every iteration — the same shape as
+        // `native_scanner_init_readable`'s `Reader` loop above.
+        const CHUNK: usize = 4096;
+        // `CRATONVM_SCANNER_DEBUG=1` prints what each source answered. Kept
+        // because the shape tests above are exactly the kind of thing that
+        // fails SILENTLY: the answer is an empty scanner either way, so
+        // "which branch took it, and what did it read" is not derivable from
+        // the output. It found the fd-carrier bug above in one run.
+        let debug = std::env::var_os("CRATONVM_SCANNER_DEBUG").is_some();
+        let stream_pin = ctx.pin_native_root(stream);
+        let buf0 = ctx.new_array(ArrayElementType::Byte, CHUNK);
+        let buf_pin = ctx.pin_native_root(buf0);
+        let mut bulk_calls = 0usize;
+        loop {
+            let src = ctx.read_native_pin(stream_pin, stream);
+            let buf = ctx.read_native_pin(buf_pin, buf0);
+            let outcome = ctx.invoke_virtual(
+                src,
+                "read",
+                "([BII)I",
+                &[
+                    Value::Object(Some(buf)),
+                    Value::Int(0),
+                    Value::Int(CHUNK as i32),
+                ],
+            );
+            if debug {
+                eprintln!(
+                    "native-io: scanner bulk read on {src_class} -> {}",
+                    match &outcome {
+                        Ok(Some(v)) => format!("Ok({v:?})"),
+                        Ok(None) => "Ok(None)".to_string(),
+                        Err(_) => "Err".to_string(),
+                    }
+                );
+            }
+            bulk_calls += 1;
+            let n = match outcome {
+                Ok(Some(Value::Int(n))) => n,
+                // A source that answers something other than an int cannot be
+                // drained this way. `Err` is deliberately NOT propagated:
+                // `Scanner`'s constructor does not declare `IOException`, and
+                // turning a read fault into a constructor throw would be a
+                // different divergence from the one being fixed.
+                _ => -1,
+            };
+            if n <= 0 {
+                break;
+            }
+            let buf = ctx.read_native_pin(buf_pin, buf0);
+            let want = (n as usize).min(CHUNK);
+            let start = bytes.len();
+            bytes.resize(start + want, 0);
+            let copied = ctx.read_byte_array_into(buf, 0, &mut bytes[start..]);
+            bytes.truncate(start + copied);
+            if copied == 0 {
+                break;
+            }
+        }
+
+        // SECOND DOOR: `read()I`, one byte at a time.
+        //
+        // Reached only when the bulk overload produced NOTHING on its first
+        // call, which is not the same as "the stream was empty" -- an empty
+        // stream answers `-1` after this native has already established that
+        // the overload works. `java.io.InputStream` declares `read()` abstract,
+        // so every concrete stream in the language provides it; the bulk
+        // overload is the OPTIMISATION and this is the guarantee.
+        //
+        // It is slow by construction (one bytecode round trip per byte) and
+        // that is acceptable here precisely because it is unreachable for any
+        // source whose bulk overload answered -- see `native_is_read_all_bytes`
+        // for what a one-byte-per-call loop costs on a 769 KB manifest, and why
+        // it must not be the primary path.
+        if bytes.is_empty() && bulk_calls > 0 {
+            if debug {
+                eprintln!("native-io: scanner falling back to read()I on {src_class}");
+            }
             loop {
-                match ctx.fd_table().read_byte(fd) {
-                    Ok(b) if b >= 0 => bytes.push(b as u8),
+                let src = ctx.read_native_pin(stream_pin, stream);
+                match ctx.invoke_virtual(src, "read", "()I", &[]) {
+                    Ok(Some(Value::Int(b))) if b >= 0 => bytes.push(b as u8),
                     _ => break,
                 }
             }
         }
+        ctx.unpin_native_roots(stream_pin);
     }
-    let text = String::from_utf8_lossy(&bytes);
+    bytes
+}
+
+/// Hand `bytes`, decoded as `charset_name`, to `this` as its source.
+///
+/// `this` is pinned by the caller ACROSS `scanner_source_bytes`, which runs
+/// arbitrary bytecode through `invoke_virtual` and can therefore move it.
+fn scanner_set_decoded(
+    ctx: &mut dyn NativeContext,
+    this_pin: usize,
+    this: ObjectRef,
+    bytes: &[u8],
+    charset_name: Option<&str>,
+) -> MethodCallResult {
+    let text = match charset_name {
+        // The charset overloads decode through the same table `String(byte[],
+        // Charset)` and `ByteArrayOutputStream.toString(Charset)` use, so an
+        // ISO-8859-1 source is not silently read as UTF-8 -- measured with
+        // `café naïve`, which is two tokens in Latin-1 and two REPLACEMENT
+        // CHARACTERs if the argument is ignored.
+        Some(name) => {
+            let units = cratonvm_native_api::charset::decode_bytes_lossy(name, bytes);
+            String::from_utf16_lossy(&units)
+        }
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    };
+    let this = ctx.read_native_pin(this_pin, this);
     scan_set_source(ctx, this, &text);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
+}
+
+/// `Scanner(InputStream)` — the default-charset overload.
+fn native_scanner_init_inputstream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            scan_set_source(ctx, this, "");
+            return Ok(None);
+        }
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let bytes = scanner_source_bytes(ctx, stream);
+    scanner_set_decoded(ctx, this_pin, this, &bytes, None)
+}
+
+/// `Scanner(InputStream, Charset)` and `Scanner(InputStream, String)`.
+///
+/// **Neither had a registration until 2026-08-22**, and the failure was silent:
+/// the real JDK constructor ran and initialised the real `Scanner`'s fields,
+/// while this VM's `hasNext`/`next` natives read the synthetic state that
+/// nothing had written. MEASURED, `regression-suite/probes/W4Scanner.java`:
+///
+/// ```text
+///                                                    HotSpot            CratonVM
+///   new Scanner(bais, StandardCharsets.UTF_8)        [alpha, beta, …]   []
+///   new Scanner(bais, "UTF-8")                       [alpha, beta, …]   []
+///   new Scanner(latin1Bytes, ISO_8859_1)             [café, naïve]      []
+/// ```
+///
+/// Both descriptors share this body: `baos_charset_name_of` already accepts
+/// either a `Charset` object or a plain name `String`.
+fn native_scanner_init_inputstream_charset(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            scan_set_source(ctx, this, "");
+            return Ok(None);
+        }
+    };
+    let charset_name =
+        baos_charset_name_of(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
+    let this_pin = ctx.pin_native_root(this);
+    let bytes = scanner_source_bytes(ctx, stream);
+    scanner_set_decoded(ctx, this_pin, this, &bytes, Some(&charset_name))
+}
+
+/// `Scanner(ReadableByteChannel)` and `Scanner(ReadableByteChannel, String)`.
+///
+/// Same silent-empty shape as the charset overloads — no registration, so the
+/// real constructor initialised state this VM's accessors do not read.
+/// MEASURED: `new Scanner(Channels.newChannel(bais))` gave `[]` against
+/// HotSpot's `[alpha, beta, 42, gamma]`.
+///
+/// The channel is adapted with `java.nio.channels.Channels.newInputStream`,
+/// which is the JDK's own adapter and exactly what the real constructor uses,
+/// rather than by draining `read(ByteBuffer)` here: that keeps this body to the
+/// one thing it is for, and any `ReadableByteChannel` — including one an
+/// application wrote — is adapted by code that already understands it.
+fn native_scanner_init_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let channel = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => {
+            scan_set_source(ctx, this, "");
+            return Ok(None);
+        }
+    };
+    let charset_name = args
+        .get(2)
+        .filter(|v| matches!(v, Value::Object(Some(_))))
+        .map(|v| baos_charset_name_of(ctx, *v));
+    let this_pin = ctx.pin_native_root(this);
+    let adapted = ctx.invoke(
+        "java/nio/channels/Channels",
+        "newInputStream",
+        "(Ljava/nio/channels/ReadableByteChannel;)Ljava/io/InputStream;",
+        &[Value::Object(Some(channel))],
+    );
+    let bytes = match adapted {
+        Ok(Some(Value::Object(Some(stream)))) => scanner_source_bytes(ctx, stream),
+        // No adapter available: an EMPTY scanner is what this produced before
+        // the registration existed, so this is not a new outcome — but it is
+        // now the narrow fallback rather than the whole behaviour.
+        _ => Vec::new(),
+    };
+    scanner_set_decoded(ctx, this_pin, this, &bytes, charset_name.as_deref())
 }
 
 fn native_scanner_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7426,45 +7827,71 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     registry.register(baos, "flush", "()V", native_baos_flush);
 
     // --- java.io.InputStream (base class fallback) ---
+    //
+    // ELEVEN ROWS RETIRED FROM THIS BLOCK AND THE `OutputStream` ONE BELOW,
+    // 2026-08-22 (WORKER 4). What is left is the two rows that are NOT section
+    // 1.4 shadows, because the method they answer is ABSTRACT in `java.base` and
+    // has no bytecode to shadow: `InputStream.read()I` and
+    // `OutputStream.write(I)V`.
+    //
+    // # What was here, and why it is not any more
+    //
+    // `read([B)I`, `read([BII)I`, `available()I`, `close()V`, `skip(J)J`,
+    // `readAllBytes()[B`, `readNBytes(I)[B` and `readNBytes([BII)I` on
+    // `java/io/InputStream`; `write([BII)V`, `flush()V` and `close()V` on
+    // `java/io/OutputStream`. Every one of them stood in front of a real
+    // `java.base` body, and the bodies here were transcriptions of those bodies
+    // -- `native_bais_read_bytes`, for a receiver that is not one of ours, ran
+    // `invoke_virtual(this, "read", "()I")` in a loop, which is
+    // `InputStream.read(byte[],int,int)`'s JDK default written out in Rust.
+    //
+    // # The population they existed for no longer exists
+    //
+    // The comment that used to sit on `native_bais_read_bytes` named it:
+    // *"synthetic streams (URL.openStream, getResourceAsStream) that materialise
+    // as bare InputStream-typed receivers but actually have the
+    // ByteArrayInputStream layout in slots 0..3"*. A BARE `java.io.InputStream`
+    // receiver is a JVMS 6.5 defect in its own right -- the class is abstract --
+    // and `regression-suite/probes/W4StreamCarrier.java` (added for this) asks
+    // whether any survives. MEASURED, 15 carriers, BOTH modes:
+    //
+    //     abstractOrInterface = 0
+    //     URL.openStream()                  -> java.io.ByteArrayInputStream
+    //     URLConnection.getInputStream()    -> java.io.ByteArrayInputStream
+    //     Class.getResourceAsStream()       -> java.io.ByteArrayInputStream
+    //     ClassLoader.getResourceAsStream() -> java.io.ByteArrayInputStream
+    //
+    // Every one of them is a CONCRETE `ByteArrayInputStream`, which has its own
+    // exact-class registrations twenty lines above and reaches them first. The
+    // fallback was serving a shape the VM stopped producing.
+    //
+    // # And the shape it DOES still serve is measured identical without it
+    //
+    // `regression-suite/probes/W4BaseStream.java` drives the other population --
+    // an application subclass that declares only the abstract primitive and
+    // inherits the rest, which reaches these rows through the superclass walk
+    // (`H11-1`, `H11-3` N3). MEASURED, 26 cases, ZERO diffs against HotSpot
+    // 25.0.4+7 in both modes, and `--dump-native-registry` on the same run shows
+    // thirteen of the fourteen rows taking `invocations: 0` while
+    // `read([BII)I` takes 1 -- the positive control that makes the zeros
+    // informative rather than merely absent (`[zero@consumer]`).
+    //
+    // # Trap 4, per row rather than assumed
+    //
+    // `--dump-native-registry` unioned over 105 per-vector strict-mode boots:
+    // `dupX = 0` for all eleven. The deletions remove eleven rows and promote
+    // nobody. Two rows in these families were DELIBERATELY LEFT, and both have
+    // a rival underneath:
+    //
+    //   * `java/io/OutputStream.write([B)V` -- `native-builtins/src/lib.rs`
+    //     owns it, `invocations = 10`. Not this crate's to retire.
+    //   * `java/io/InputStream.transferTo` -- `phases_late/zip_streams.rs`
+    //     registers the same triple, so retiring this copy PROMOTES that one.
+    //     See the note on its registration below.
+    //
+    // `java/io/FilterOutputStream.close()V` also stays: `dupX = 1`, and the
+    // comment on it records the kafka gzip truncation it was added for.
     registry.register("java/io/InputStream", "read", "()I", native_bais_read);
-    registry.register(
-        "java/io/InputStream",
-        "read",
-        "([B)I",
-        native_bais_read_byte_array,
-    );
-    registry.register(
-        "java/io/InputStream",
-        "read",
-        "([BII)I",
-        native_bais_read_bytes,
-    );
-    registry.register(
-        "java/io/InputStream",
-        "available",
-        "()I",
-        native_bais_available,
-    );
-    registry.register("java/io/InputStream", "close", "()V", native_bais_close);
-    registry.register("java/io/InputStream", "skip", "(J)J", native_is_skip);
-    registry.register(
-        "java/io/InputStream",
-        "readAllBytes",
-        "()[B",
-        native_is_read_all_bytes,
-    );
-    registry.register(
-        "java/io/InputStream",
-        "readNBytes",
-        "(I)[B",
-        native_is_read_n_bytes,
-    );
-    registry.register(
-        "java/io/InputStream",
-        "readNBytes",
-        "([BII)I",
-        native_is_read_n_bytes_buf,
-    );
     // `SyntheticStub`, stated. `java.io.InputStream.transferTo` is ordinary
     // bytecode in `java.base` — a read/write loop — so contract §1.5 cannot call
     // this a bridge, and `phases_late/zip_streams.rs` registers the same triple
@@ -7480,15 +7907,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // --- java.io.OutputStream (base class fallback) ---
+    // `write([BII)V`, `flush()V` and `close()V` retired here -- see the note on
+    // the `InputStream` block above, which covers both families. `write(I)V`
+    // stays because `java.io.OutputStream.write(int)` is ABSTRACT: there is no
+    // bytecode behind it, so it is a stand-in and not a shadow.
     registry.register("java/io/OutputStream", "write", "(I)V", native_baos_write);
-    registry.register(
-        "java/io/OutputStream",
-        "write",
-        "([BII)V",
-        native_baos_write_bytes,
-    );
-    registry.register("java/io/OutputStream", "flush", "()V", native_baos_flush);
-    registry.register("java/io/OutputStream", "close", "()V", native_baos_close);
     // FilterOutputStream.close() MUST flush and then close the wrapped stream
     // (`out`, slot 0). Without this, a `DataOutputStream`/`BufferedOutputStream`
     // wrapping e.g. a `GZIPOutputStream` resolved its inherited `close()` to the
@@ -7587,38 +8010,15 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
 // any concrete InputStream subtype registered in the native registry.
 // ===========================================================================
 
-/// InputStream.skip(long n) → skip n bytes via repeated read()
-fn native_is_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Long(0))),
-    };
-    let n = match args.get(1) {
-        Some(Value::Long(v)) => *v,
-        Some(Value::Int(v)) => *v as i64,
-        _ => 0,
-    };
-    let mut skipped: i64 = 0;
-    // Each delegated read is GC-capable; `this` is reused by the next loop
-    // iteration, so a raw native local would become stale after a collection.
-    let this_pin = ctx.pin_native_root(this);
-    for _ in 0..n {
-        let this = ctx.read_native_pin(this_pin, this);
-        let b = match ctx.invoke_virtual(this, "read", "()I", &[]) {
-            Ok(result) => result,
-            Err(error) => {
-                ctx.unpin_native_roots(this_pin);
-                return Err(error);
-            }
-        };
-        match b {
-            Some(Value::Int(-1)) | None => break,
-            _ => skipped += 1,
-        }
-    }
-    ctx.unpin_native_roots(this_pin);
-    Ok(Some(Value::Long(skipped)))
-}
+// `native_is_skip`, `native_is_read_n_bytes` and `native_is_read_n_bytes_buf`
+// were DELETED 2026-08-22 (WORKER 4) with the `java/io/InputStream` rows that
+// were their only call sites -- see the retirement note on that registration
+// block. Each was a Rust transcription of the corresponding `java.base` default
+// body; `git log -S native_is_read_n_bytes` has them.
+//
+// `native_is_read_all_bytes` SURVIVES and is deliberately not deleted with
+// them: `process.rs` registers it on its own class, so it has a live call site
+// that does not go through the base-class fallback.
 
 /// InputStream.readAllBytes() → byte[] (Java 9+)
 ///
@@ -7691,113 +8091,6 @@ pub(crate) fn native_is_read_all_bytes(
     let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
     ctx.write_byte_array_from(arr, 0, &bytes);
     Ok(Some(Value::Object(Some(arr))))
-}
-
-/// InputStream.readNBytes(int n) → byte[] (Java 11+) — reads exactly n bytes (or EOF)
-///
-/// Same one-byte-per-`invoke_virtual` slowness as `native_is_read_all_bytes`
-/// (see its doc comment) — rewritten to the same bulk-`read([BII)I` pattern.
-fn native_is_read_n_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => {
-            let arr = ctx.new_array(ArrayElementType::Byte, 0);
-            return Ok(Some(Value::Object(Some(arr))));
-        }
-    };
-    let n = match args.get(1) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
-        _ => 0,
-    };
-
-    let this_pin = ctx.pin_native_root(this);
-    const CHUNK: usize = 16 * 1024;
-    let chunk_len = n.min(CHUNK).max(1);
-    let chunk_buf = ctx.new_array(ArrayElementType::Byte, chunk_len);
-    let chunk_pin = ctx.pin_native_root(chunk_buf);
-    let mut bytes: Vec<u8> = Vec::with_capacity(n);
-    let mut scratch = vec![0u8; chunk_len];
-    while bytes.len() < n {
-        let want = (n - bytes.len()).min(chunk_len);
-        let this_cur = ctx.read_native_pin(this_pin, this);
-        let chunk_cur = ctx.read_native_pin(chunk_pin, chunk_buf);
-        let read = match ctx.invoke_virtual(
-            this_cur,
-            "read",
-            "([BII)I",
-            &[
-                Value::Object(Some(chunk_cur)),
-                Value::Int(0),
-                Value::Int(want as i32),
-            ],
-        ) {
-            Ok(Some(Value::Int(r))) if r > 0 => r as usize,
-            Ok(_) => break,
-            Err(e) => {
-                ctx.unpin_native_roots(this_pin);
-                return Err(e);
-            }
-        };
-        let chunk_cur = ctx.read_native_pin(chunk_pin, chunk_buf);
-        let copied = ctx.read_byte_array_into(chunk_cur, 0, &mut scratch[..read]);
-        bytes.extend_from_slice(&scratch[..copied]);
-    }
-    ctx.unpin_native_roots(this_pin);
-    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
-    ctx.write_byte_array_from(arr, 0, &bytes);
-    Ok(Some(Value::Object(Some(arr))))
-}
-
-/// InputStream.readNBytes(byte[] buf, int off, int len) → int (Java 11+)
-///
-/// Same one-byte-per-`invoke_virtual` slowness as `native_is_read_all_bytes`
-/// — rewritten to bulk-read directly into the caller's own `buf` (no extra
-/// copy needed since the destination is already a real array).
-fn native_is_read_n_bytes_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let buf = match args.get(1) {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
-        _ => 0,
-    };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
-        _ => 0,
-    };
-
-    let this_pin = ctx.pin_native_root(this);
-    let buf_pin = ctx.pin_native_root(buf);
-    let mut count = 0usize;
-    while count < len {
-        let this_cur = ctx.read_native_pin(this_pin, this);
-        let buf_cur = ctx.read_native_pin(buf_pin, buf);
-        let read = match ctx.invoke_virtual(
-            this_cur,
-            "read",
-            "([BII)I",
-            &[
-                Value::Object(Some(buf_cur)),
-                Value::Int((off + count) as i32),
-                Value::Int((len - count) as i32),
-            ],
-        ) {
-            Ok(Some(Value::Int(r))) if r > 0 => r as usize,
-            Ok(_) => break,
-            Err(e) => {
-                ctx.unpin_native_roots(this_pin);
-                return Err(e);
-            }
-        };
-        count += read;
-    }
-    ctx.unpin_native_roots(this_pin);
-    Ok(Some(Value::Int(count as i32)))
 }
 
 /// InputStream.transferTo(OutputStream out) -> long (Java 9+)
@@ -7923,6 +8216,38 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         "<init>",
         "(Ljava/io/InputStream;)V",
         native_scanner_init_inputstream,
+    );
+    // The charset overloads. See `native_scanner_init_inputstream_charset` for
+    // what their absence did — it was silent, which is why it lasted.
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/io/InputStream;Ljava/lang/String;)V",
+        native_scanner_init_inputstream_charset,
+    );
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V",
+        native_scanner_init_inputstream_charset,
+    );
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/nio/channels/ReadableByteChannel;)V",
+        native_scanner_init_channel,
+    );
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/nio/channels/ReadableByteChannel;Ljava/lang/String;)V",
+        native_scanner_init_channel,
+    );
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/nio/channels/ReadableByteChannel;Ljava/nio/charset/Charset;)V",
+        native_scanner_init_channel,
     );
     registry.register(c, "<init>", "(Ljava/io/File;)V", native_scanner_init_file);
     registry.register(
@@ -8114,21 +8439,34 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     //    for two different reasons — receiver-keying at step 1, the
     //    interface-default gate at step 6.
     //
-    // 5. WHY THE LINES ARE STILL HERE. `vm/src/vm/tests.rs`'s
-    //    `auto_closeable_close_p70` does
-    //    `call_native(.., "java/lang/AutoCloseable", "close", "()V", ..)`, and
-    //    that helper `panic!`s when the triple is not registered. Deleting the
-    //    row turns a unit test red for a reason unrelated to any behaviour it
-    //    means to protect. `vm/` is out of bounds for this lane, so the
-    //    deletion is a two-file commit somebody else has to make. See
-    //    `docs/known-issues/jdk-only/H11-3-*.md` N1.
-    registry.register("java/io/Closeable", "close", "()V", native_scanner_close);
-    registry.register(
-        "java/lang/AutoCloseable",
-        "close",
-        "()V",
-        native_scanner_close,
-    );
+    // 5. RETIRED 2026-08-21 (WORKER 4). The two registrations that stood here
+    //    --
+    //
+    //        registry.register("java/io/Closeable",       "close", "()V", native_scanner_close);
+    //        registry.register("java/lang/AutoCloseable", "close", "()V", native_scanner_close);
+    //
+    //    -- are gone. The only thing that had been keeping them was
+    //    `vm/src/vm/tests.rs`'s `auto_closeable_close_p70`, which calls the
+    //    triple DIRECTLY through a helper that `panic!`s on an unregistered
+    //    one; `H11-3` N1 wrote the deletion out verbatim and could not make it,
+    //    because `vm/` was out of that lane's bounds. It is a two-file commit
+    //    and this is the other file.
+    //
+    //    Trap 4 checked, not assumed (`WORKER-4` brief: retiring the winner
+    //    PROMOTES the loser). MEASURED, `--dump-native-registry`, `--jdk-only`:
+    //
+    //        java/io/Closeable.close()V        owns_slot=True inv=0  [native-io/src/lib.rs:8050]
+    //        java/lang/AutoCloseable.close()V  owns_slot=True inv=0  [native-io/src/lib.rs:8051]
+    //
+    //    ONE row each, from this file. `dupX = 0`, so the deletion removes two
+    //    registry rows and hands nothing to anybody -- unlike `pipe.rs`'s six
+    //    abstract rows, where `net_channels.rs` is waiting underneath with an
+    //    incompatible body (`H11-2` §4).
+    //
+    //    Items 1-4b above are the evidence that nothing reached them, and they
+    //    stay because they are the argument. `java/util/Scanner.close()V` is
+    //    still registered ~80 lines up, with this same callback, and that is
+    //    the row every real Scanner has always used.
     registry.set_category(__prev_cat);
 }
 
@@ -13556,9 +13894,13 @@ fn native_dis_read_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// The 2-byte length prefix counts **bytes**, not characters. The
 /// return value is a newly allocated Java String containing the
 /// decoded code units. On a malformed stream this native throws
-/// `UTFDataFormatException` (surfaced as `IOException` for now, as
-/// the dedicated exception class is not yet in our throwable
-/// registry — the message identifies the byte offset of the fault).
+/// `java.io.UTFDataFormatException`, built out of the image by
+/// [`utf_data_format_error`], with a message identifying the byte offset of the
+/// fault. It said `IOException` *"for now, as the dedicated exception class is
+/// not yet in our throwable registry"* until 2026-08-22, and that premise was
+/// never checked: nothing has to be in the `RuntimeError` enum to be thrown —
+/// `new_object` + `<init>` raises the real class, which is how the channel
+/// refusals in this file have always worked.
 fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -13579,11 +13921,10 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let bytes = dis_read_exact(ctx, this, len)?;
-    let s = decode_modified_utf8(&bytes).map_err(|e| {
-        cratonvm_types::error::RuntimeError::IOException {
-            message: format!("readUTF: {e}"),
-        }
-    })?;
+    let s = match decode_modified_utf8(&bytes) {
+        Ok(s) => s,
+        Err(e) => return Err(utf_data_format_error(ctx, &e)),
+    };
     let result = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(result))))
 }
@@ -13607,6 +13948,54 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// silently mis-framed rather than rejected. Exporting the codec is what lets
 /// that second implementation converge onto this one instead of growing a third
 /// spelling. See W7-8-fabricated-success-io-sweep.md.
+/// What a malformed modified-UTF-8 stream owes its reader:
+/// `java.io.UTFDataFormatException`, not a bare `java.io.IOException`.
+///
+/// MEASURED, `regression-suite/probes/W4Data.java`, Linux/JDK 25.0.4, both
+/// modes, feeding `readUTF` a 1-byte payload whose only byte is a continuation
+/// byte (`00 01 80`):
+///
+/// ```text
+///   HotSpot    java.io.UTFDataFormatException
+///   CratonVM   java.io.IOException
+/// ```
+///
+/// `DataInput.readUTF`'s javadoc names `UTFDataFormatException` explicitly and
+/// separately from `IOException`, and the distinction is the whole point of the
+/// two types: one says the DATA is corrupt, the other says the CHANNEL failed.
+/// A caller that retries on `IOException` and gives up on
+/// `UTFDataFormatException` -- which is the sensible way round -- retries
+/// forever against a corrupt record.
+///
+/// `UTFDataFormatException extends IOException`, so tightening this cannot
+/// break a handler that already compiled. This is the same repair, and the same
+/// argument, as `afc_closed_channel_error` above; the comment on `readUTF` used
+/// to say the dedicated class was *"not yet in our throwable registry"*, and it
+/// does not need to be — `new_object` + `<init>` builds the real one out of the
+/// image, exactly as the channel refusals do.
+fn utf_data_format_error(ctx: &mut dyn NativeContext, detail: &str) -> MethodCallFailed {
+    let message = format!("readUTF: {detail}");
+    match ctx.new_object("java/io/UTFDataFormatException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let msg = ctx.create_string(&message);
+            let built = ctx.invoke(
+                "java/io/UTFDataFormatException",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(exc)), Value::Object(Some(msg))],
+            );
+            if built.is_ok() {
+                return MethodCallFailed::ExceptionThrown(exc);
+            }
+            RuntimeError::IOException { message }.into()
+        }
+        // Only reached when the class cannot be built at all (a mock context, or
+        // an image without it). The supertype keeps the failure LOUD rather than
+        // letting a malformed record decode to something.
+        _ => RuntimeError::IOException { message }.into(),
+    }
+}
+
 pub fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
@@ -16231,11 +16620,14 @@ fn native_raf_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let len = u16::from_be_bytes(len_buf) as usize;
     let mut payload = vec![0u8; len];
     raf_read_exact(ctx, fd, &mut payload)?;
-    let s = decode_modified_utf8(&payload).map_err(|e| {
-        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IOException {
-            message: format!("readUTF: {e}"),
-        }))
-    })?;
+    // `RandomAccessFile.readUTF` owes the same `UTFDataFormatException` as
+    // `DataInputStream.readUTF` -- both implement `DataInput`, whose javadoc
+    // names it -- so both go through the one helper rather than each spelling
+    // its own refusal.
+    let s = match decode_modified_utf8(&payload) {
+        Ok(s) => s,
+        Err(e) => return Err(utf_data_format_error(ctx, &e)),
+    };
     let obj = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -20595,6 +20987,74 @@ const AFC_FIELD_PATH: usize = 1;
 const AFC_FIELD_OPEN: usize = 2;
 const AFC_NUM_FIELDS: usize = 3;
 
+/// The concrete `AsynchronousFileChannel` HotSpot 25 builds, per platform.
+/// MEASURED (`probes/W4Abstract.java`, oracle column, Linux):
+/// `AsynchronousFileChannel.open(f, READ).getClass()` is
+/// `sun.nio.ch.SimpleAsynchronousFileChannelImpl`; on Windows it is
+/// `sun.nio.ch.WindowsAsynchronousFileChannelImpl`.
+///
+/// `pub` because `native-builtins/src/phases_late/net_channels.rs` owns the one
+/// `force(Z)V` registration in the tree and has to put it on these classes too
+/// -- see [`afc_channel_is_open`].
+pub const AFC_IMPLS: &[&str] = &[
+    "sun/nio/ch/SimpleAsynchronousFileChannelImpl",
+    "sun/nio/ch/WindowsAsynchronousFileChannelImpl",
+];
+/// Their abstract parent -- a MIRROR target only, never a mint target.
+pub const AFC_ABSTRACT_IMPL: &str = "sun/nio/ch/AsynchronousFileChannelImpl";
+
+/// Where this family's private slot map starts on `o`.
+///
+/// See `alloc_afc_channel` for the defect; the same two-halves rule as
+/// `async_socket.rs::aio_base`. The width guard inside `concrete_base`
+/// collapses the base to 0 for any receiver this crate did not allocate, so a
+/// real `Impl` built by JDK bytecode reads the slots it read before.
+fn afc_base(ctx: &mut dyn NativeContext, o: ObjectRef) -> usize {
+    crate::concrete_receiver::concrete_base(ctx, o, AFC_NUM_FIELDS)
+}
+
+fn afc_get(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize) -> Value {
+    let base = afc_base(ctx, o);
+    ctx.get_field(o, base + idx)
+}
+
+fn afc_set(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize, v: Value) {
+    let base = afc_base(ctx, o);
+    ctx.set_field(o, base + idx, v);
+}
+
+/// Whether `o` carries this family's whole private map.
+fn afc_is_ours(ctx: &mut dyn NativeContext, o: ObjectRef) -> bool {
+    let base = afc_base(ctx, o);
+    ctx.object_num_fields(o) >= base + AFC_NUM_FIELDS
+}
+
+/// Whether `channel`'s open flag is set.
+///
+/// # Why this is `pub`
+///
+/// `net_channels.rs` owns `AsynchronousFileChannel.force(Z)V` -- the only
+/// registration of that triple in the tree -- and its body used to read this
+/// crate's slots BY INDEX. Its own comment states the rule it was breaking:
+/// *"the registration which decides the layout is the one that ALLOCATES."*
+/// That crate cannot know the layout, and since 2026-08-21 there is no fixed
+/// answer to know: the private map is appended above whatever the concrete
+/// `sun.nio.ch.*Impl` declares. So the allocator publishes readers instead.
+#[must_use]
+pub fn afc_channel_is_open(ctx: &mut dyn NativeContext, channel: ObjectRef) -> bool {
+    matches!(afc_get(ctx, channel, AFC_FIELD_OPEN), Value::Int(1))
+}
+
+/// `channel`'s handle id in this crate's `afc_files()` table, or `None` when the
+/// receiver is not one of ours. Companion of [`afc_channel_is_open`].
+#[must_use]
+pub fn afc_channel_handle_id(ctx: &mut dyn NativeContext, channel: ObjectRef) -> Option<u32> {
+    match afc_get(ctx, channel, AFC_FIELD_FD) {
+        Value::Int(v) if v > 0 => Some(v as u32),
+        _ => None,
+    }
+}
+
 /// Opt-in `AsynchronousFileChannel` tracing (`CRATONVM_DBG_AIO=1`), added
 /// 2026-08-16 for the hibernate `WrongCredentialsTest` investigation.
 ///
@@ -21228,6 +21688,70 @@ const WK_NUM_FIELDS: usize = 5;
 /// WatchEvent layout: 2 fields
 /// [0] = kind (Int — 1=CREATE, 2=DELETE, 4=MODIFY)
 /// [1] = context (Object — Path of the affected file)
+/// The concrete `WatchService` HotSpot 25 builds for the default file system,
+/// per platform. Ordered because only one of them is in any given image; the
+/// first that resolves AND is instantiable wins (see `concrete_receiver`).
+const WS_IMPLS: &[&str] = &[
+    "sun/nio/fs/LinuxWatchService",
+    "sun/nio/fs/WindowsWatchService",
+    "sun/nio/fs/PollingWatchService",
+    "sun/nio/fs/BsdWatchService",
+];
+/// The `WatchKey` each of those services hands back. Same order, and the
+/// pairing is not enforced in code because only one platform's classes are
+/// present in any one image.
+const WK_IMPLS: &[&str] = &[
+    "sun/nio/fs/LinuxWatchService$LinuxWatchKey",
+    "sun/nio/fs/WindowsWatchService$WindowsWatchKey",
+    "sun/nio/fs/PollingWatchService$PollingWatchKey",
+];
+/// `WatchEvent` has ONE implementation on every platform.
+const WE_IMPLS: &[&str] = &["sun/nio/fs/AbstractWatchKey$Event"];
+
+/// Where the watch family's private slot map starts on `o`.
+///
+/// Until 2026-08-21 all three of these objects were minted AS the abstract /
+/// interface public API type (`java.nio.file.WatchService` is an INTERFACE,
+/// `WatchKey` is an INTERFACE, `WatchEvent` is an INTERFACE), which declares no
+/// instance fields — so the private map at 0.. was nobody's and the base was
+/// implicitly 0. They are now minted as the concrete `sun.nio.fs.*` classes the
+/// JDK itself builds, which declare fields, so the map moves above them.
+/// `probes/W4Abstract.java` is the assertion that found this; JVMS §6.5 is why
+/// it is a defect with no oracle run required.
+fn watch_base(ctx: &mut dyn NativeContext, o: ObjectRef, slots: usize) -> usize {
+    crate::concrete_receiver::concrete_base(ctx, o, slots)
+}
+
+fn ws_get(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize) -> Value {
+    let base = watch_base(ctx, o, WS_NUM_FIELDS);
+    ctx.get_field(o, base + idx)
+}
+
+fn ws_set(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize, v: Value) {
+    let base = watch_base(ctx, o, WS_NUM_FIELDS);
+    ctx.set_field(o, base + idx, v);
+}
+
+fn wk_get(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize) -> Value {
+    let base = watch_base(ctx, o, WK_NUM_FIELDS);
+    ctx.get_field(o, base + idx)
+}
+
+fn wk_set(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize, v: Value) {
+    let base = watch_base(ctx, o, WK_NUM_FIELDS);
+    ctx.set_field(o, base + idx, v);
+}
+
+fn we_set(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize, v: Value) {
+    let base = watch_base(ctx, o, WE_NUM_FIELDS);
+    ctx.set_field(o, base + idx, v);
+}
+
+fn we_get(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize) -> Value {
+    let base = watch_base(ctx, o, WE_NUM_FIELDS);
+    ctx.get_field(o, base + idx)
+}
+
 const WE_FIELD_KIND: usize = 0;
 const WE_FIELD_CONTEXT: usize = 1;
 const WE_NUM_FIELDS: usize = 2;
@@ -21632,6 +22156,8 @@ fn register_phase92_io_completeness(registry: &mut NativeMethodRegistry) {
 fn register_async_file_channel(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Where this registrar's rows start; see `mirror_class_registrations`.
+    let __afc_rows_before = r.dump_registrations().len();
     let afc = "java/nio/channels/AsynchronousFileChannel";
 
     // open(Path, OpenOption...) → AsynchronousFileChannel
@@ -21788,6 +22314,15 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
         native_completed_future_get,
     );
+
+    // The registration half of `alloc_afc_channel`'s fabricated-receiver fix.
+    // Dispatch keys on the receiver's runtime class (`H11-1`) and every one of
+    // these classes declares the family with `Code`, so the mint and the
+    // registration have to move together.
+    for target in AFC_IMPLS.iter().chain([AFC_ABSTRACT_IMPL].iter()) {
+        crate::concrete_receiver::mirror_class_registrations(r, __afc_rows_before, afc, target);
+    }
+
     r.set_category(__prev_cat);
 }
 
@@ -21797,7 +22332,7 @@ fn native_afc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // `@throws ClosedChannelException If this channel is closed` --
     // AsynchronousFileChannel.tryLock(long,long,boolean). Was a bare
     // IOException here; see `afc_closed_channel_error`.
-    if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+    if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
         return Err(afc_closed_channel_error(ctx));
     }
 
@@ -21880,8 +22415,8 @@ fn native_afc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // a premise about the registrations, not a property of the class, so it is
     // checked rather than assumed. The predicate is `t16_afc_uses_real_handle`'s:
     // our channels are >= 3 slots with an Int handle id in slot 0.
-    if ctx.object_num_fields(this) < AFC_NUM_FIELDS
-        || !matches!(ctx.get_field(this, AFC_FIELD_FD), Value::Int(_))
+    if !afc_is_ours(ctx, this)
+        || !matches!(afc_get(ctx, this, AFC_FIELD_FD), Value::Int(_))
     {
         return Err(RuntimeError::IOException {
             message: "AsynchronousFileChannel.lock: receiver was not opened by this VM's \
@@ -21916,7 +22451,7 @@ fn native_afc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // it builds any future at all. Without this, `lock()` on a read-only
     // channel would report an exclusive lock it does not hold.
     if !shared {
-        let writable = match ctx.get_field(this, AFC_FIELD_FD) {
+        let writable = match afc_get(ctx, this, AFC_FIELD_FD) {
             Value::Int(v) if v > 0 => afc_file_writable(v as u32),
             _ => false,
         };
@@ -21926,7 +22461,7 @@ fn native_afc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             // handle from `afc_files()`, so `afc_file_writable` answers false
             // for a closed channel too and the order of these two refusals
             // decides which type the caller sees.
-            if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+            if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
                 return Err(afc_closed_channel_error(ctx));
             }
             return Err(afc_non_writable_error(ctx));
@@ -21962,11 +22497,11 @@ fn native_afc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // `@throws ClosedChannelException If this channel is closed` --
     // AsynchronousFileChannel.truncate(long). The JDK reaches it through
     // AsynchronousFileChannelImpl.begin(); see `afc_closed_channel_error`.
-    if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+    if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
         return Err(afc_closed_channel_error(ctx));
     }
 
-    let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+    let handle_id = match afc_get(ctx, this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
@@ -22077,8 +22612,19 @@ fn native_file_lock_impl_release(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Ok(Some(Value::Int(1)))
     );
     if is_valid {
+        // "Is this one of OURS" -- and since 2026-08-21 an
+        // `AsynchronousFileChannel` this crate mints carries a CONCRETE class
+        // name (`AFC_IMPLS`), not the abstract one. A name test that still
+        // listed only the abstract spelling would send every async-file lock
+        // down the `FileChannelImpl.release` arm, which has no entry for it.
         let channel_class = ctx.class_name_of_id(ctx.class_id_of_object(channel));
-        if channel_class.as_deref() != Some("java/nio/channels/AsynchronousFileChannel") {
+        let is_async_file_channel = matches!(
+            channel_class.as_deref(),
+            Some("java/nio/channels/AsynchronousFileChannel")
+        ) || channel_class
+            .as_deref()
+            .is_some_and(|n| AFC_IMPLS.contains(&n) || n == AFC_ABSTRACT_IMPL);
+        if !is_async_file_channel {
             // Real FileChannelImpl (the only other producer of a real
             // FileLockImpl in this codebase) -- replicate the bytecode's
             // FileChannelImpl.release(this) call exactly.
@@ -22124,15 +22670,23 @@ fn alloc_afc_channel(
         message: format!("AsynchronousFileChannel.open: {e}"),
     })?;
 
-    let afc = try_alloc_synthetic(
+    // FIXED 2026-08-21: the mint names the CONCRETE class (`AFC_IMPLS`), and
+    // the private map is appended above whatever that class declares
+    // (`afc_base`). The doc comment above says this class's 16 registrations
+    // "cannot move onto the Impl" -- and that stays true, which is why they are
+    // MIRRORED rather than moved: `register_async_file_channel`'s foot copies
+    // every row onto the concrete classes, so both spellings answer.
+    let afc = crate::concrete_receiver::alloc_concrete(
         ctx,
+        AFC_IMPLS,
         "java/nio/channels/AsynchronousFileChannel",
         AFC_NUM_FIELDS,
-    )?;
-    ctx.set_field(afc, AFC_FIELD_FD, Value::Int(handle_id as i32));
+    )
+    .obj;
+    afc_set(ctx, afc, AFC_FIELD_FD, Value::Int(handle_id as i32));
     let path_s = ctx.create_string(path_str);
-    ctx.set_field(afc, AFC_FIELD_PATH, Value::Object(Some(path_s)));
-    ctx.set_field(afc, AFC_FIELD_OPEN, Value::Int(1));
+    afc_set(ctx, afc, AFC_FIELD_PATH, Value::Object(Some(path_s)));
+    afc_set(ctx, afc, AFC_FIELD_OPEN, Value::Int(1));
     Ok(Some(Value::Object(Some(afc))))
 }
 
@@ -22183,14 +22737,14 @@ fn afc_read_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, 
     let bb = obj_arg92(args, 1)?;
     let position = afc_position_arg(args, 2)?;
 
-    if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+    if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
         return Err(RuntimeError::IOException {
             message: "AsynchronousFileChannel is closed".into(),
         }
         .into());
     }
 
-    let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+    let handle_id = match afc_get(ctx, this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
         // Future<Integer>.get() real bytecode does checkcast Integer on
         // this return value -- a bare Value::Int here (as opposed to
@@ -22320,14 +22874,14 @@ fn afc_write_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value,
     let bb = obj_arg92(args, 1)?;
     let position = afc_position_arg(args, 2)?;
 
-    if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+    if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
         return Err(RuntimeError::IOException {
             message: "AsynchronousFileChannel is closed".into(),
         }
         .into());
     }
 
-    let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+    let handle_id = match afc_get(ctx, this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
         // See the matching arm in afc_read_boxed: must be a boxed
         // Integer inside a real completed Future, not a bare Value::Int.
@@ -22529,11 +23083,11 @@ pub(crate) fn native_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // `catch (ClosedChannelException)` does not match, with a message about an
     // internal handle id. HotSpot raises ClosedChannelException from
     // AsynchronousFileChannelImpl.begin(), which `size()` runs first.
-    if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+    if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
         return Err(afc_closed_channel_error(ctx));
     }
 
-    let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+    let handle_id = match afc_get(ctx, this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
         _ => return Ok(Some(Value::Long(0))),
     };
@@ -22545,21 +23099,21 @@ pub(crate) fn native_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 pub(crate) fn native_afc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    if matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
-        let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+    if matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
+        let handle_id = match afc_get(ctx, this, AFC_FIELD_FD) {
             Value::Int(v) if v > 0 => v as u32,
             _ => 0,
         };
         afc_trace!("close  id={handle_id}");
         afc_remove_file(handle_id);
-        ctx.set_field(this, AFC_FIELD_OPEN, Value::Int(0));
+        afc_set(ctx, this, AFC_FIELD_OPEN, Value::Int(0));
     }
     Ok(None)
 }
 
 pub(crate) fn native_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let open = matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1));
+    let open = matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1));
     Ok(Some(Value::Int(if open { 1 } else { 0 })))
 }
 
@@ -22815,6 +23369,9 @@ fn drain_into_queues(state: &mut WatchServiceState) {
 fn register_watch_service(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Where this registrar's rows start, so the mirrors at its foot cannot see
+    // another crate's. See `concrete_receiver::mirror_class_registrations`.
+    let __rows_before = r.dump_registrations().len();
     let ws = "java/nio/file/WatchService";
 
     // FileSystems.getDefault().newWatchService() → WatchService
@@ -22920,6 +23477,41 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
     r.register("java/nio/file/WatchEvent", "count", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+
+    // The registration half of the three fabricated-receiver fixes in this
+    // family (`native_ws_new`, `native_ws_register`, `native_ws_poll_inner`).
+    //
+    // Dispatch keys on the receiver's runtime class (`H11-1`), so once the
+    // three mints name the concrete `sun.nio.fs.*` classes, the interface rows
+    // above stop being reachable for them. Both halves have to move together
+    // or the family simply goes quiet -- and quietly, because an interface row
+    // that nothing reaches looks exactly like an interface row that nothing
+    // needs.
+    //
+    // `AbstractWatchService` and `AbstractWatchKey` are in the lists because
+    // they are where the concrete classes inherit `poll`/`take`/`close` and
+    // `pollEvents`/`reset`/`watchable` FROM -- all `final`, all with `Code`.
+    // A registration on the concrete class wins at step 1; these are the belt
+    // to that pair of braces, and cost nothing when the concrete row answers.
+    for target in WS_IMPLS.iter().chain(["sun/nio/fs/AbstractWatchService"].iter()) {
+        crate::concrete_receiver::mirror_class_registrations(r, __rows_before, ws, target);
+    }
+    for target in WK_IMPLS.iter().chain(["sun/nio/fs/AbstractWatchKey"].iter()) {
+        crate::concrete_receiver::mirror_class_registrations(
+            r,
+            __rows_before,
+            "java/nio/file/WatchKey",
+            target,
+        );
+    }
+    for target in WE_IMPLS {
+        crate::concrete_receiver::mirror_class_registrations(
+            r,
+            __rows_before,
+            "java/nio/file/WatchEvent",
+            target,
+        );
+    }
 
     // NO `StandardWatchEventKinds` CONSTANTS ARE REGISTERED HERE, and none can
     // usefully be (E40-1 §2, answering E36-1 N5).
@@ -23110,7 +23702,7 @@ fn ws_require_open(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    if matches!(ctx.get_field(this, WS_FIELD_OPEN), Value::Int(1)) {
+    if matches!(ws_get(ctx, this, WS_FIELD_OPEN), Value::Int(1)) {
         Ok(())
     } else {
         Err(closed_watch_service_exception(ctx))
@@ -23123,11 +23715,21 @@ fn ws_require_open(
 /// an IOException — the Java side treats WatchService setup as a
 /// checked operation so throwing here is spec-compliant.
 fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let ws = try_alloc_synthetic(ctx, "java/nio/file/WatchService", WS_NUM_FIELDS)?;
+    // `java.nio.file.WatchService` is an INTERFACE. Minting an instance of it
+    // is an `InstantiationError` for `new` by JVMS 6.5, and this line did it in
+    // both modes until 2026-08-21 -- MEASURED by `probes/W4Abstract.java`
+    // against `sun.nio.fs.LinuxWatchService` on the oracle. See `WS_IMPLS`.
+    let ws = crate::concrete_receiver::alloc_concrete(
+        ctx,
+        WS_IMPLS,
+        "java/nio/file/WatchService",
+        WS_NUM_FIELDS,
+    )
+    .obj;
     let regs = ctx.new_array(ArrayElementType::Reference, 64);
-    ctx.set_field(ws, WS_FIELD_REGS, Value::Object(Some(regs)));
-    ctx.set_field(ws, WS_FIELD_COUNT, Value::Int(0));
-    ctx.set_field(ws, WS_FIELD_OPEN, Value::Int(1));
+    ws_set(ctx, ws, WS_FIELD_REGS, Value::Object(Some(regs)));
+    ws_set(ctx, ws, WS_FIELD_COUNT, Value::Int(0));
+    ws_set(ctx, ws, WS_FIELD_OPEN, Value::Int(1));
 
     let (tx, rx) = mpsc::channel::<NotifyResult>();
     let watcher = notify::RecommendedWatcher::new(
@@ -23266,25 +23868,25 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // other never fired. Spring Boot's `FileWatcher` keys its
     // registration map on the WatchKey, so the duplicate key's callbacks
     // simply never ran (`shouldNotFailIfDirectoryIsRegisteredMultipleTimes`).
-    let count = match ctx.get_field(watcher, WS_FIELD_COUNT) {
+    let count = match ws_get(ctx, watcher, WS_FIELD_COUNT) {
         Value::Int(n) => n.max(0) as usize,
         _ => 0,
     };
-    if let Value::Object(Some(regs)) = ctx.get_field(watcher, WS_FIELD_REGS) {
+    if let Value::Object(Some(regs)) = ws_get(ctx, watcher, WS_FIELD_REGS) {
         for i in 0..count.min(ctx.array_length(regs)) {
             let Value::Object(Some(existing)) = ctx.get_array_element(regs, i) else {
                 continue;
             };
-            let same_path = match ctx.get_field(existing, WK_FIELD_PATH) {
+            let same_path = match wk_get(ctx, existing, WK_FIELD_PATH) {
                 Value::Object(Some(s)) => {
                     ctx.read_string(s).as_deref() == Some(canonical_str.as_str())
                 }
                 _ => false,
             };
             if same_path {
-                ctx.set_field(existing, WK_FIELD_EVENTS, Value::Int(event_mask));
-                ctx.set_field(existing, WK_FIELD_VALID, Value::Int(1));
-                ctx.set_field(existing, WK_FIELD_WATCHABLE, Value::Object(Some(path_obj)));
+                wk_set(ctx, existing, WK_FIELD_EVENTS, Value::Int(event_mask));
+                wk_set(ctx, existing, WK_FIELD_VALID, Value::Int(1));
+                wk_set(ctx, existing, WK_FIELD_WATCHABLE, Value::Object(Some(path_obj)));
                 return Ok(Some(Value::Object(Some(existing))));
             }
         }
@@ -23301,26 +23903,30 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // key into freed memory (the Family-1 stale-ObjectRef defect).
     let path_obj_pin = ctx.pin_native_root(path_obj);
     let watcher_pin = ctx.pin_native_root(watcher);
-    let wk = try_alloc_synthetic(ctx, "java/nio/file/WatchKey", WK_NUM_FIELDS)?;
+    // Same defect, same shape: `java.nio.file.WatchKey` is an INTERFACE.
+    let wk = crate::concrete_receiver::alloc_concrete(
+        ctx,
+        WK_IMPLS,
+        "java/nio/file/WatchKey",
+        WK_NUM_FIELDS,
+    )
+    .obj;
     let wk_pin = ctx.pin_native_root(wk);
     let path_s = ctx.create_string(&canonical_str);
     let wk = ctx.read_native_pin(wk_pin, wk);
-    ctx.set_field(wk, WK_FIELD_PATH, Value::Object(Some(path_s)));
-    ctx.set_field(wk, WK_FIELD_EVENTS, Value::Int(event_mask));
-    ctx.set_field(wk, WK_FIELD_VALID, Value::Int(1));
-    ctx.set_field(wk, WK_FIELD_PENDING, Value::Object(None));
-    ctx.set_field(
-        wk,
-        WK_FIELD_WATCHABLE,
-        Value::Object(Some(ctx.read_native_pin(path_obj_pin, path_obj))),
-    );
+    wk_set(ctx, wk, WK_FIELD_PATH, Value::Object(Some(path_s)));
+    wk_set(ctx, wk, WK_FIELD_EVENTS, Value::Int(event_mask));
+    wk_set(ctx, wk, WK_FIELD_VALID, Value::Int(1));
+    wk_set(ctx, wk, WK_FIELD_PENDING, Value::Object(None));
+    let path_obj_now = ctx.read_native_pin(path_obj_pin, path_obj);
+    wk_set(ctx, wk, WK_FIELD_WATCHABLE, Value::Object(Some(path_obj_now)));
 
     // Attach to the service's Java-side registration array.
     let watcher = ctx.read_native_pin(watcher_pin, watcher);
-    if let Value::Object(Some(regs)) = ctx.get_field(watcher, WS_FIELD_REGS) {
+    if let Value::Object(Some(regs)) = ws_get(ctx, watcher, WS_FIELD_REGS) {
         if count < ctx.array_length(regs) {
             ctx.set_array_element(regs, count, Value::Object(Some(wk)));
-            ctx.set_field(watcher, WS_FIELD_COUNT, Value::Int((count + 1) as i32));
+            ws_set(ctx, watcher, WS_FIELD_COUNT, Value::Int((count + 1) as i32));
         }
     }
     let wk = ctx.read_native_pin(wk_pin, wk);
@@ -23338,11 +23944,11 @@ fn detect_events(
     service: ObjectRef,
     wk: ObjectRef,
 ) -> Vec<(i32, String)> {
-    let path_str = match ctx.get_field(wk, WK_FIELD_PATH) {
+    let path_str = match wk_get(ctx, wk, WK_FIELD_PATH) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Vec::new(),
     };
-    let event_mask = match ctx.get_field(wk, WK_FIELD_EVENTS) {
+    let event_mask = match wk_get(ctx, wk, WK_FIELD_EVENTS) {
         Value::Int(n) => n,
         _ => 0,
     };
@@ -23374,11 +23980,11 @@ fn ws_signalled_key(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
-    let count = match ctx.get_field(this, WS_FIELD_COUNT) {
+    let count = match ws_get(ctx, this, WS_FIELD_COUNT) {
         Value::Int(n) => n.max(0) as usize,
         _ => 0,
     };
-    let regs = match ctx.get_field(this, WS_FIELD_REGS) {
+    let regs = match ws_get(ctx, this, WS_FIELD_REGS) {
         Value::Object(Some(a)) => a,
         _ => return Ok(None),
     };
@@ -23395,7 +24001,7 @@ fn ws_signalled_key(
         let Value::Object(Some(wk)) = ctx.get_array_element(regs_now, i) else {
             continue;
         };
-        if !matches!(ctx.get_field(wk, WK_FIELD_VALID), Value::Int(1)) {
+        if !matches!(wk_get(ctx, wk, WK_FIELD_VALID), Value::Int(1)) {
             continue;
         }
         let this_now = ctx.read_native_pin(this_pin, this);
@@ -23408,23 +24014,31 @@ fn ws_signalled_key(
         let pending = ctx.new_array(ArrayElementType::Reference, events.len());
         let pending_pin = ctx.pin_native_root(pending);
         for (j, (kind, name)) in events.iter().enumerate() {
-            let we = try_alloc_synthetic(ctx, "java/nio/file/WatchEvent", WE_NUM_FIELDS)?;
+            // Same defect: `java.nio.file.WatchEvent` is an INTERFACE, and
+            // the JDK's one implementation is `AbstractWatchKey.Event`.
+            let we = crate::concrete_receiver::alloc_concrete(
+                ctx,
+                WE_IMPLS,
+                "java/nio/file/WatchEvent",
+                WE_NUM_FIELDS,
+            )
+            .obj;
             let we_pin = ctx.pin_native_root(we);
-            let watchable = match ctx.get_field(ctx.read_native_pin(wk_pin, wk), WK_FIELD_WATCHABLE)
-            {
+            let wk_now_for_watchable = ctx.read_native_pin(wk_pin, wk);
+            let watchable = match wk_get(ctx, wk_now_for_watchable, WK_FIELD_WATCHABLE) {
                 Value::Object(Some(p)) => Some(p),
                 _ => None,
             };
             let context = watch_context_path(ctx, watchable, name)?;
             let we_now = ctx.read_native_pin(we_pin, we);
-            ctx.set_field(we_now, WE_FIELD_KIND, Value::Int(*kind));
-            ctx.set_field(we_now, WE_FIELD_CONTEXT, context);
+            we_set(ctx, we_now, WE_FIELD_KIND, Value::Int(*kind));
+            we_set(ctx, we_now, WE_FIELD_CONTEXT, context);
             let pending_now = ctx.read_native_pin(pending_pin, pending);
             ctx.set_array_element(pending_now, j, Value::Object(Some(we_now)));
         }
         let wk_now = ctx.read_native_pin(wk_pin, wk);
         let pending_now = ctx.read_native_pin(pending_pin, pending);
-        ctx.set_field(wk_now, WK_FIELD_PENDING, Value::Object(Some(pending_now)));
+        wk_set(ctx, wk_now, WK_FIELD_PENDING, Value::Object(Some(pending_now)));
         signalled = Some(wk_now);
         break;
     }
@@ -23586,17 +24200,17 @@ fn native_ws_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // class layout declares zero fields). Writing slot 2 on such a receiver is
     // an out-of-bounds field write the heap guard drops with a warning; skip
     // it instead of relying on the guard.
-    if ctx.object_num_fields(this) > WS_FIELD_OPEN {
-        ctx.set_field(this, WS_FIELD_OPEN, Value::Int(0));
+    if ctx.object_num_fields(this) > watch_base(ctx, this, WS_NUM_FIELDS) + WS_FIELD_OPEN {
+        ws_set(ctx, this, WS_FIELD_OPEN, Value::Int(0));
         // Closing a service cancels every key it created (JDK contract).
-        let count = match ctx.get_field(this, WS_FIELD_COUNT) {
+        let count = match ws_get(ctx, this, WS_FIELD_COUNT) {
             Value::Int(n) => n.max(0) as usize,
             _ => 0,
         };
-        if let Value::Object(Some(regs)) = ctx.get_field(this, WS_FIELD_REGS) {
+        if let Value::Object(Some(regs)) = ws_get(ctx, this, WS_FIELD_REGS) {
             for i in 0..count.min(ctx.array_length(regs)) {
                 if let Value::Object(Some(wk)) = ctx.get_array_element(regs, i) {
-                    ctx.set_field(wk, WK_FIELD_VALID, Value::Int(0));
+                    wk_set(ctx, wk, WK_FIELD_VALID, Value::Int(0));
                 }
             }
         }
@@ -23612,13 +24226,13 @@ fn native_ws_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_wk_poll_events(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let pending = match ctx.get_field(this, WK_FIELD_PENDING) {
+    let pending = match wk_get(ctx, this, WK_FIELD_PENDING) {
         Value::Object(Some(a)) => Some(a),
         _ => None,
     };
     // "Retrieves and removes all pending events for this watch key" — the
     // events must not be handed out twice.
-    ctx.set_field(this, WK_FIELD_PENDING, Value::Object(None));
+    wk_set(ctx, this, WK_FIELD_PENDING, Value::Object(None));
 
     let this_pin = ctx.pin_native_root(this);
     let pending_pin = pending.map(|p| (ctx.pin_native_root(p), p));
@@ -23664,12 +24278,12 @@ fn native_wk_poll_events(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn native_wk_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let valid = matches!(ctx.get_field(this, WK_FIELD_VALID), Value::Int(1));
+    let valid = matches!(wk_get(ctx, this, WK_FIELD_VALID), Value::Int(1));
     if valid {
         // Re-arm: drop whatever `pollEvents()` did not consume. The previous
         // body installed a fresh 64-element array here, which `pollEvents()`
         // then reported as 64 pending (null) events.
-        ctx.set_field(this, WK_FIELD_PENDING, Value::Object(None));
+        wk_set(ctx, this, WK_FIELD_PENDING, Value::Object(None));
     }
     Ok(Some(Value::Int(if valid { 1 } else { 0 })))
 }
@@ -23678,12 +24292,12 @@ fn native_wk_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// `Path` handed to `Path.register`.
 fn native_wk_watchable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    if let Value::Object(Some(p)) = ctx.get_field(this, WK_FIELD_WATCHABLE) {
+    if let Value::Object(Some(p)) = wk_get(ctx, this, WK_FIELD_WATCHABLE) {
         return Ok(Some(Value::Object(Some(p))));
     }
     // No stored watchable (a key from an older layout): rebuild a synthetic
     // Path from the canonical path string.
-    let name = match ctx.get_field(this, WK_FIELD_PATH) {
+    let name = match wk_get(ctx, this, WK_FIELD_PATH) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
@@ -23698,19 +24312,19 @@ fn native_wk_watchable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_wk_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    ctx.set_field(this, WK_FIELD_VALID, Value::Int(0));
+    wk_set(ctx, this, WK_FIELD_VALID, Value::Int(0));
     Ok(None)
 }
 
 fn native_wk_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let valid = matches!(ctx.get_field(this, WK_FIELD_VALID), Value::Int(1));
+    let valid = matches!(wk_get(ctx, this, WK_FIELD_VALID), Value::Int(1));
     Ok(Some(Value::Int(if valid { 1 } else { 0 })))
 }
 
 fn native_we_kind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let bit = match ctx.get_field(this, WE_FIELD_KIND) {
+    let bit = match we_get(ctx, this, WE_FIELD_KIND) {
         Value::Int(k) => k,
         _ => 0,
     };
@@ -23722,7 +24336,7 @@ fn native_we_kind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 fn native_we_context(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    Ok(Some(ctx.get_field(this, WE_FIELD_CONTEXT)))
+    Ok(Some(we_get(ctx, this, WE_FIELD_CONTEXT)))
 }
 
 // ---------------------------------------------------------------------------
@@ -23732,6 +24346,11 @@ fn native_we_context(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Where this registrar's own rows start, so the mirror at the foot of the
+    // function can only ever see rows written below this line. See
+    // `mirror_class_registrations` for why filtering on the class name alone
+    // would be wrong.
+    let __rows_before = r.dump_registrations().len();
     let dc = "java/nio/channels/DatagramChannel";
 
     // open() → DatagramChannel
@@ -24050,6 +24669,29 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "bind",
         "(Ljava/net/SocketAddress;)V",
         native_dc_socket_bind,
+    );
+
+    // Every row above that names the abstract public class, again on the
+    // CONCRETE class `native_dc_open` now mints.
+    //
+    // This is the registration half of the fabricated-receiver fix and it is
+    // not optional. Native dispatch keys on the receiver's runtime class
+    // (`H11-1`, measured twice), and the one fallback walk runs only when the
+    // receiver's own class declares neither the method nor a registration —
+    // which a real `sun.nio.ch.DatagramChannelImpl` does NOT satisfy, because
+    // it declares `read`/`write`/`send`/`receive`/`close`/`bind`/… with `Code`.
+    // Moving the receiver without moving the registration would therefore not
+    // fall back to the rows above; it would run the JDK's own bytecode against
+    // a channel whose `<init>` this VM never ran.
+    //
+    // The `sun/nio/ch/DatagramSocketAdaptor` and `SelectorProvider` rows above
+    // are deliberately NOT mirrored: they are registered on their own classes,
+    // and the filter is on `dc`.
+    crate::concrete_receiver::mirror_class_registrations(
+        r,
+        __rows_before,
+        dc,
+        "sun/nio/ch/DatagramChannelImpl",
     );
 
     r.set_category(__prev_cat);
@@ -24585,7 +25227,41 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
             message: format!("DatagramChannel.open: {e}"),
         })?;
 
-    let dc = try_alloc_synthetic(ctx, "java/nio/channels/DatagramChannel", DC_NUM_FIELDS)?;
+    // Minted AS `sun.nio.ch.DatagramChannelImpl`, the class HotSpot 25 hands
+    // back here, and NOT as the abstract `java.nio.channels.DatagramChannel`
+    // this line used to name.
+    //
+    // **The defect.** `try_alloc_synthetic` resolves that name against the real
+    // image, gets the real ABSTRACT JDK class, and `alloc_object` then mints an
+    // object whose runtime class is abstract — a receiver `new` cannot legally
+    // produce (JVMS §6.5). MEASURED by `probes/W4Abstract.java`:
+    // `DatagramChannel.open().getClass()` answered
+    // `java.nio.channels.DatagramChannel`, `Modifier.isAbstract == true`, in
+    // BOTH modes, against `sun.nio.ch.DatagramChannelImpl` on the oracle. Same
+    // one-line shape `H21-1` fixed for `Pipe` and `socket_channel.rs` for the
+    // two stream channels.
+    //
+    // **Why no slot map has to move.** This family keeps NOTHING in the
+    // object's fields: `dc_fds`, `dc_connected_channels`,
+    // `dc_nonblocking_channels` and `dc_socket_cache` above are all
+    // identity-hash keyed side tables, and their doc comments say why. So the
+    // real `DatagramChannelImpl`'s much larger layout is inert here, exactly as
+    // `socket_channel.rs::alloc_channel_as_impl` records for `SocketChannel`.
+    // Contrast `datagram.rs::dgram_join_group`, which DOES index slots and
+    // therefore needed the appended-slot base.
+    //
+    // **The registration half is in `register_datagram_channel`**, which
+    // mirrors every row it writes onto the `Impl` spelling. Without that the
+    // real `DatagramChannelImpl` bytecode would take over on the new receiver —
+    // dispatch keys on the receiver's class (`H11-1`) and the superclass walk
+    // does not run for a class that declares the method with `Code`.
+    let dc = crate::concrete_receiver::alloc_concrete(
+        ctx,
+        &["sun/nio/ch/DatagramChannelImpl"],
+        "java/nio/channels/DatagramChannel",
+        DC_NUM_FIELDS,
+    )
+    .obj;
     // "A newly-created channel is always in blocking mode"
     // (`java.nio.channels.SelectableChannel`). Assert it rather than assume
     // it: the side tables are keyed by identity hash, and a fresh object may
