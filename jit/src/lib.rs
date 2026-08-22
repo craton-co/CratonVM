@@ -8547,6 +8547,30 @@ pub enum JitIntrinsic {
     /// `Math/StrictMath.unsignedMultiplyHigh(JJ)J` — high 64 bits of the
     /// UNSIGNED 128-bit product, emitted as a one-operand `MUL r64`.
     MathUnsignedMultiplyHigh = 15,
+    /// `Math/StrictMath.min(FF)F` / `max(FF)F` / `min(DD)D` / `max(DD)D`.
+    ///
+    /// The `int` and `long` forms have been intrinsics since Round-8; these
+    /// four had not, so every `Math.min(float,float)` from compiled code ran
+    /// the JDK's Java body — which is not a one-liner. It tests for NaN,
+    /// then tests both arguments against zero, then calls
+    /// `Float.floatToRawIntBits` and reads a `static final long`, before
+    /// finally doing the comparison.
+    ///
+    /// Measured on the four-sphere ray tracer (three `Math.min(float,float)`
+    /// per pixel, 307,200 pixels): replacing the calls with plain ternaries
+    /// in the Java source cut that kernel's CratonVM CPU time from 145 ms to
+    /// 77 ms. Roughly **47% of the kernel was inside `Math.min`**, about
+    /// 74 ns per call. The same probe with `Math.sqrt` removed showed no
+    /// change, confirming the cost was these calls and not FP work.
+    ///
+    /// Lowered inline — see the `MATH_MIN_FLOAT_INTRINSIC` arm in
+    /// `x64/bytecode_walk.rs` for the SSE sequence and, more importantly,
+    /// for why `MINSS` alone is NOT `Math.min`: it implements neither the
+    /// NaN rule nor the signed-zero rule.
+    MathMinFloat = 16,
+    MathMaxFloat = 17,
+    MathMinDouble = 18,
+    MathMaxDouble = 19,
 
     // ===== INTRINSIC REGION BEGIN: INT_BITS =====
     // java.lang.Integer bit-manipulation intrinsics (Phase 1a). Variant
@@ -8868,6 +8892,10 @@ mod math_intrinsic_aliases {
     pub const MATH_MULTIPLY_HIGH_INTRINSIC: usize = JitIntrinsic::MathMultiplyHigh.as_entry();
     pub const MATH_UNSIGNED_MULTIPLY_HIGH_INTRINSIC: usize =
         JitIntrinsic::MathUnsignedMultiplyHigh.as_entry();
+    pub const MATH_MIN_FLOAT_INTRINSIC: usize = JitIntrinsic::MathMinFloat.as_entry();
+    pub const MATH_MAX_FLOAT_INTRINSIC: usize = JitIntrinsic::MathMaxFloat.as_entry();
+    pub const MATH_MIN_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathMinDouble.as_entry();
+    pub const MATH_MAX_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathMaxDouble.as_entry();
 }
 pub use math_intrinsic_aliases::*;
 
@@ -9847,6 +9875,15 @@ pub fn try_resolve_intrinsic(
             ("max", "(II)I") => Some((JitIntrinsic::MathMaxInt, 2, b'I')),
             ("min", "(JJ)J") => Some((JitIntrinsic::MathMinLong, 2, b'J')),
             ("max", "(JJ)J") => Some((JitIntrinsic::MathMaxLong, 2, b'J')),
+            // The float/double twins of the two lines above. These four were
+            // missing for a long time, so a `Math.min(float,float)` in a hot
+            // loop paid a full Java-method dispatch into a JDK body that
+            // itself calls `Float.floatToRawIntBits` — measured at ~74 ns a
+            // call, 47% of a ray-tracer kernel. See `JitIntrinsic::MathMinFloat`.
+            ("min", "(FF)F") => Some((JitIntrinsic::MathMinFloat, 2, b'F')),
+            ("max", "(FF)F") => Some((JitIntrinsic::MathMaxFloat, 2, b'F')),
+            ("min", "(DD)D") => Some((JitIntrinsic::MathMinDouble, 2, b'D')),
+            ("max", "(DD)D") => Some((JitIntrinsic::MathMaxDouble, 2, b'D')),
             // High 64 bits of the 128-bit product — one `IMUL`/`MUL r64`.
             // Hottest leaf in SunEC P-256 Montgomery field arithmetic.
             ("multiplyHigh", "(JJ)J") => Some((JitIntrinsic::MathMultiplyHigh, 2, b'J')),

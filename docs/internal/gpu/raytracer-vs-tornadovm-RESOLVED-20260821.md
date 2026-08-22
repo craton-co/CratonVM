@@ -170,33 +170,55 @@ stated above is measured — the instruction counts come from
 ## 7. Performance result — the original headline does not hold
 
 The record's "~1.3-1.4x faster than TornadoVM in steady state" was
-measured at one resolution, and 640x480 happens to sit just below the
-crossover. Best-of-20 wall time, full per-call round trip:
+measured at one resolution. It is not a steady-state figure: it is the
+value the ratio happens to take at 640x480, on a curve that falls
+monotonically with problem size.
 
-| n (pixels) | HotSpot CPU | CratonVM CPU | CratonVM `--gpu` | TornadoVM PTX | Craton/Tornado |
-|---:|---:|---:|---:|---:|---:|
-| 19,200 | 0.617 ms | 9.78 ms | **0.080 ms** | 0.270 ms | **3.37x** |
-| 76,800 | 2.130 ms | 26.21 ms | **0.163 ms** | 0.397 ms | **2.43x** |
-| 307,200 | 8.250 ms | 90.60 ms | **0.444 ms** | 0.614 ms | **1.38x** |
-| 1,228,800 | 31.76 ms | 349.09 ms | 1.395 ms | **1.359 ms** | 0.97x |
-| 2,764,800 | 70.86 ms | 782.11 ms | 2.958 ms | **2.744 ms** | 0.93x |
+`bench-gpu/run-raytracer-interleaved.sh` measures the two GPU arms
+**paired** — alternating which runs first within each round, six rounds,
+best-of-30 each — because this box carries a variable background CPU load
+and both arms spend real host time marshalling and launching. Two
+unpaired sweeps forty minutes apart disagreed about which arm was faster
+at 1920x1440, which is what motivated pairing.
 
-Fitting the top two rows separates fixed cost from per-pixel cost:
+| n (pixels) | CratonVM `--gpu` | TornadoVM PTX | CratonVM ahead by | rounds won |
+|---:|---:|---:|---:|---:|
+| 307,200 | **0.418 ms** | 0.675 ms | **38.2%** | 6/6 |
+| 1,228,800 | **1.311 ms** | 1.496 ms | **12.4%** | 6/6 |
+| 2,764,800 | **2.711 ms** | 2.821 ms | 3.9% | 4/6 |
+
+CratonVM is ahead everywhere measured, but **the margin collapses
+monotonically with n**, and by 1920x1440 it is inside round-to-round
+noise — two of six rounds go the other way. Fitting the two ends
+separates why:
 
 | | fixed per call | per pixel |
 |---|---:|---:|
-| CratonVM `--gpu` | **0.144 ms** | 1.018 ns |
-| TornadoVM PTX | 0.250 ms | **0.902 ns** |
+| CratonVM `--gpu` | **0.191 ms** | 0.911 ns |
+| TornadoVM PTX | 0.436 ms | **0.863 ns** |
 
-So the honest statement is: **CratonVM's per-launch overhead is ~1.7x
-lower and its per-pixel kernel cost is ~13% higher**, and the two cross
-at roughly n = 970,000. A single-resolution measurement cannot tell those
-apart, which is why the original 1.3-1.4x claim was not wrong so much as
-undecomposed.
+**CratonVM's per-launch overhead is ~2.3x lower; its per-pixel kernel
+cost is ~6% higher.** Extrapolated, the two cross somewhere above five
+million pixels. A single-resolution measurement cannot tell those two
+facts apart, which is why the original 1.3-1.4x claim was not so much
+wrong as undecomposed — and why quoting any one ratio as "the speedup"
+for this pair is the wrong shape of claim to make.
 
-CratonVM's CPU path is a separate matter: 11x slower than HotSpot on this
-kernel at every size, flat across the sweep. That is not this record's
-subject and is left open (§9).
+For the same reason the CPU columns are omitted from the table above:
+they are not paired, and the HotSpot control drifted between 8.2 ms and
+14 ms at 640x480 across this session depending on what else the box was
+doing. The GPU arms barely move under that load (they are GPU-bound),
+which is exactly why they can be compared to each other and not to
+numbers from another day. The interleaved script prints the control
+alongside each round and flags it, rather than silently averaging a
+loaded round in.
+
+CratonVM's CPU path is a separate matter: roughly 11x slower than HotSpot
+on this kernel, and flat in that ratio across the whole sweep — 9.8 ms vs
+0.62 ms at 19,200 pixels, 782 ms vs 71 ms at 2,764,800. A constant ratio
+across a 144x range in n says this is per-iteration work, not a fixed
+cost or a scaling cliff. Not this record's subject; left open in §9 with
+the one concrete lead found.
 
 ## 8. The join-state blowup found while looking at the kernel
 
@@ -224,14 +246,85 @@ pointers).
 | registers used | 61 | **26** |
 | `ptxas -O3` compile | 182 ms | **81 ms** |
 
-**Wall-clock on this kernel: unchanged.** That is the honest and slightly
-disappointing result — halving the instruction count moved the 1920x1440
-number from 2.958 ms to within noise of itself, which says this kernel is
-not instruction-bound at these sizes. What the change does buy is the
-first-call latency (`ptxas` compile is part of CratonVM's fixed cost, the
-metric it already wins on), register headroom, and a real improvement for
-any kernel that *is* instruction-bound. It is kept on those grounds, not
-on this benchmark's.
+**Wall-clock effect: real but far smaller than the instruction counts
+suggest.** A three-run spot check right after the change said "unchanged",
+which was simply too noisy a measurement to see it. The per-pixel fit
+across sessions is the better instrument, using TornadoVM as the
+cross-session control since it did not change:
+
+| | per pixel, before | after | change |
+|---|---:|---:|---:|
+| CratonVM `--gpu` | 1.018 ns | 0.911 ns | **-10.5%** |
+| TornadoVM PTX (control) | 0.902 ns | 0.863 ns | -4.3% |
+
+The control moved 4.3% between the two measurement sessions, so roughly
+**6 points of CratonVM's 10.5% are attributable to the change** and the
+rest is session drift. That is a modest return on halving the executed
+instruction count, and it says this kernel is closer to memory-bound than
+compute-bound at these sizes: it writes 11 MB per frame at 1920x1440 and
+copies it back over PCIe.
+
+Six percent is still worth having, and it is not the main reason to keep
+the change. `ptxas` compile time more than halved, and that is part of the
+fixed per-call cost — the metric this path already wins on by 2.3x. Add
+the register headroom, and any kernel that *is* compute-bound.
+
+## 8b. `Math.min(float,float)` was 47% of the CPU kernel
+
+§7's CPU column is the same computation running interpreted/JIT-compiled,
+so it prices the same kernel on the other path. It was ~11x HotSpot at
+every size — a constant ratio across a 144x range in `n`, which says
+per-iteration work rather than a fixed cost or a scaling cliff.
+
+Rather than guess, three source variants were run against each other on
+the same VM in the same session (an unpaired reading here is worthless —
+the HotSpot control moved between 8.2 ms and 14 ms across this session):
+
+| 640x480 variant | CratonVM CPU |
+|---|---:|
+| as written | 145 ms |
+| `Math.min(a,b)` replaced by `a <= b ? a : b` | **77 ms** |
+| `Math.sqrt` replaced by a cheap stand-in | 147 ms (no change) |
+
+**Roughly 47% of the kernel was inside `Math.min(float,float)`** — three
+calls per pixel, about 74 ns each. `Math.sqrt` cost nothing measurable,
+being already intrinsified.
+
+The cause is the twin-check pattern: `Math.min`/`Math.max` had JIT
+intrinsics for `(II)I` and `(JJ)J` but not for `(FF)F` and `(DD)D`, so
+the float forms ran the JDK's Java body — which is not a one-liner. It
+tests for NaN, tests both arguments against zero, then calls
+`Float.floatToRawIntBits` and reads a `static final long` before finally
+comparing.
+
+The four missing intrinsics now lower inline. The interesting part is
+that **`MINSS` is not `Math.min`**: per the SDM it returns its second
+operand whenever both operands are zero or either is NaN, and Java
+requires the opposite in both cases (`-0.0` is strictly smaller than
+`+0.0`; a NaN argument is returned *with its payload*, which
+`floatToRawIntBits` can observe). The lowering pairs `MINSS(a,b)` with
+`MINSS(b,a)` and ORs them — which is the identity for ordered unequal
+inputs and yields `-0.0` iff either input was `-0.0` — then patches the
+two NaN cases with never-taken branches. `max` is the mirror image
+(`MAXSS`, AND).
+
+Result on the same quiet box, HotSpot control at its 8.2 ms baseline in
+both runs:
+
+| n (pixels) | CratonVM CPU before | after | speedup | vs HotSpot |
+|---:|---:|---:|---:|---:|
+| 19,200 | 9.78 ms | 7.05 ms | 1.39x | |
+| 76,800 | 26.21 ms | 15.29 ms | 1.71x | |
+| 307,200 | 90.60 ms | 47.04 ms | 1.93x | |
+| 1,228,800 | 349.09 ms | 168.95 ms | 2.07x | |
+| 2,764,800 | 782.11 ms | 371.16 ms | **2.11x** | 11.0x -> **5.3x** |
+
+Every frame stayed bit-identical to HotSpot. So did `MathMinMaxFp`, a
+fixture that checks all four methods against both NaN payloads, all four
+signed-zero combinations and the infinities — asserting on raw bits,
+because `-0.0 == 0.0` is true and `NaN == NaN` is false, so `==` would
+notice neither bug. It agrees bit-for-bit three ways: HotSpot, the
+CratonVM JIT, and the CratonVM interpreter under `--nojit`.
 
 ## 9. Residuals
 
@@ -265,22 +358,23 @@ on this benchmark's.
   the Java loop. Doing it properly means recording the bound's parameter
   index in `KernelSignature` and having the dispatch site size the grid
   from `max(largest_array_len, that_scalar)`. Worth doing; not done here.
-* **The CratonVM CPU path is ~11x HotSpot on this kernel**, flat across
-  the sweep (§7). Unprofiled. One concrete lead: `Math.min`/`Math.max`
-  are JIT intrinsics for `(II)I` and `(JJ)J` only — the `(FF)F` and
-  `(DD)D` forms fall through to the JDK's Java implementation, which for
-  floats contains a nested `Float.floatToRawIntBits` call and a
-  `getstatic`. This kernel calls `Math.min(float,float)` three times per
-  pixel. Not measured, so not claimed.
+* **The CratonVM CPU path is still ~5.3x HotSpot on this kernel** after
+  the `Math.min` work in §8b took it from ~11x. Where the remaining 5.3x
+  goes is unprofiled.
 * TornadoVM's own GPU-vs-Java divergence (§6) is reported, not diagnosed.
 
 ## 10. Reproduction
 
 ```sh
-# One command, all four paths, five resolutions, with a FrameDiff verdict
-# per row against the HotSpot reference frame.
+# Correctness + a resolution sweep: all four paths, five resolutions, with
+# a FrameDiff verdict per row against the HotSpot reference frame.
 PYTHON3_DIR=<dir containing python3.exe> \
   bench-gpu/run-raytracer-comparison.sh results.md
+
+# Timing only, and the one to trust for the GPU-vs-GPU comparison:
+# paired, order-alternating rounds with a per-round HotSpot control.
+PYTHON3_DIR=<dir containing python3.exe> \
+  bench-gpu/run-raytracer-interleaved.sh 1920 1440 6
 ```
 
 The script exists because three separate footguns turn this measurement
