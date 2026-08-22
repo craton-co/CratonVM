@@ -18,10 +18,32 @@ collections_now=2 last_publish_pc=17 holder=<not found in frames>
 in_blocked_region=false frames=2 top_frame=RTreeRangeGc.checkMap pc=44
 ```
 
-Deterministic: 3/3 with the merged binary, 0/3 without. `stdout` is empty, so
-the vector publishes no check count and the cross-VM diff compares two empty
-strings — which is why harness guards **G2 and G3 also fire** on it. Those two
-are consequences of the rc=1, not separate defects.
+`stdout` is empty, so the vector publishes no check count and the cross-VM diff
+compares two empty strings — which is why harness guards **G2 and G3 also fire**
+on it. Those two are consequences of the rc=1, not separate defects.
+
+> **CORRECTION (2026-08-22): "deterministic" is true of the ISOLATED repro and
+> NOT of the suite.** This paragraph originally read "Deterministic: 3/3 with the
+> merged binary, 0/3 without." The isolated claim still holds — 3/3 on r12, r13
+> and r14, 0/3 on r5/r10/r11 — but a single `r14` corpus run reddened it in
+> `SUITE=all` and **passed it in `SUITE=core`**, same binary, same flags,
+> minutes apart:
+>
+> ```text
+> r14   --jdk-only   106 / 107   RLangPackages                  (RTreeRangeGc PASSED)
+> r14   SUITE=all    105 / 107   RLangPackages  RTreeRangeGc
+> r14   SUITE=core    66 /  67   RLangPackages                  (RTreeRangeGc PASSED)
+> ```
+>
+> So under the corpus it is **intermittent**, and this host is one where load
+> flips PASS/FAIL rather than only timings. Anything below that reasons from
+> "it always fails" is weaker than it reads — in particular, a single green
+> corpus run does NOT show the gap closed. Use the isolated `--Xmx 64m` repro,
+> three runs, for any before/after judgement; that is the arm the binary table
+> below was measured on.
+>
+> The `--jdk-only` PASS is a separate matter and is NOT the flake: it reproduces
+> 2/2 deliberately, and the mechanism is in the mode section further down.
 
 ## The gap is NOT new, and it is not the merge's
 
