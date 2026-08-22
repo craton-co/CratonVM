@@ -255,23 +255,57 @@ pub fn factory_methods_and_owners() -> impl Iterator<Item = (&'static str, &'sta
 /// succeed and the `Err` arm is the not-loadable fallback. **Do not read this
 /// function as infallible-and-fine.** See
 /// docs/known-issues/jdk-only/F33-1-a-factory-and-its-owner-must-share-one-kind-20260813.md
-fn alloc_singleton(ctx: &mut dyn NativeContext, owner_class: &str) -> ObjectRef {
-    // Resolve (or synthesise) the class id, then allocate.  The
-    // synthetic class has 1 field slot reserved so downstream
-    // callers that happen to poke at field 0 don't go out of
-    // bounds.
-    match ctx.ensure_class_initialized(owner_class) {
-        Ok(cid) => {
+/// # …and the `Err` arm is REACHED, in compatible mode, today
+///
+/// MEASURED 2026-08-21, `JarAccessProbe` on the real-JDK path, no flags:
+///
+/// ```text
+///   HotSpot   javaUtilJarAccess() -> java.util.jar.JavaUtilJarAccessImpl
+///   CratonVM  javaUtilJarAccess() -> cratonvm.synthetic.AnonymousObject$1
+/// ```
+///
+/// `cratonvm/internal/ss/JavaUtilJarAccess$1` is a name CratonVM invents; no
+/// image declares it, so `ensure_class_initialized` cannot resolve it and every
+/// call took the `ClassId(0)` arm — which the allocator renders as
+/// `cratonvm/synthetic/AnonymousObject$N`, a class with an EMPTY method table.
+/// All five natives `register_java_util_jar_access` puts on the stand-in were
+/// therefore INERT: they were registered on a class the factory never handed
+/// out. Same for the other two invented owners (`JavaIORandomAccessFileAccess$1`,
+/// `JavaNetHttpCookieAccess$1`).
+///
+/// What it cost: `URLClassLoader.definePackage` calls
+/// `javaUtilJarAccess().getTrustedAttributes(man, name)` for every package it
+/// defines from a JAR, so every Tomcat webapp class load out of a JAR threw
+/// `NoSuchMethodError: java.util.jar.Attributes
+/// cratonvm.synthetic.AnonymousObject$1.getTrustedAttributes(...)` — an HTTP
+/// 500 out of `JspServlet.service`, and the whole residual left in
+/// `known-issues/tomcat/ecj-operandstack-*` once the JIT half was fixed.
+///
+/// The fix is to mint the stand-in under ITS OWN NAME, which is what
+/// `alloc_named_synthetic_singleton` already does for `java/nio/Buffer$2` two
+/// functions below — the registry is keyed by receiver class name, so a
+/// correctly-named receiver is exactly what makes those five registrations
+/// reachable. `try_ensure_synthetic_class` refuses under `--jdk-only`, so the
+/// strict-mode disposition the paragraph above describes is unchanged: a
+/// refusal, not a wrong-class object.
+fn alloc_singleton(
+    ctx: &mut dyn NativeContext,
+    owner_class: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Resolve the real class when the image has it. The synthetic fallback
+    // reserves 1 field slot so downstream callers that happen to poke at
+    // field 0 don't go out of bounds.
+    //
+    // `ClassId(0)` is checked explicitly, not just the `Err`: it is the
+    // untyped-allocation id, so an `Ok(ClassId(0))` would land on exactly the
+    // `AnonymousObject$N` receiver this function exists to stop handing out.
+    if let Ok(cid) = ctx.ensure_class_initialized(owner_class) {
+        if cid != cratonvm_types::ClassId::new(0) {
             let real_fields = ctx.class_num_total_fields(cid);
-            ctx.alloc_object(cid, real_fields.max(1))
-        }
-        Err(_) => {
-            // Class did not exist. `ClassId(0)` is NOT a placeholder that keeps
-            // dispatch working — it is a receiver of the wrong class, handed to
-            // a caller that will invokeinterface on it. See the doc comment.
-            ctx.alloc_object(cratonvm_types::ClassId::new(0), 1)
+            return Ok(ctx.alloc_object(cid, real_fields.max(1)));
         }
     }
+    alloc_named_synthetic_singleton(ctx, owner_class)
 }
 
 fn alloc_owner_instance(ctx: &mut dyn NativeContext, owner_class: &str) -> Option<ObjectRef> {
@@ -442,7 +476,7 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
     macro_rules! gen_factory {
         ($name:ident, $owner:literal) => {
             fn $name(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-                let obj = alloc_singleton(ctx, $owner);
+                let obj = alloc_singleton(ctx, $owner)?;
                 Ok(Some(Value::Object(Some(obj))))
             }
         };
@@ -515,7 +549,7 @@ fn jla_get_reflection_factory(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     // Returning a synthetic 1-field object gives the caller a
     // non-null that routes through invokevirtual dispatch into
     // lang_class.
-    let obj = alloc_singleton(ctx, "jdk/internal/reflect/ReflectionFactory");
+    let obj = alloc_singleton(ctx, "jdk/internal/reflect/ReflectionFactory")?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -2412,7 +2446,7 @@ fn register_java_net_uri_access(registry: &mut NativeMethodRegistry) {
 fn jnio_get_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Return a synthetic BufferPool whose `getCount` / `getMemoryUsed`
     // natives are already registered in phases_late.
-    let pool = alloc_singleton(ctx, "java/lang/management/BufferPoolMXBean");
+    let pool = alloc_singleton(ctx, "java/lang/management/BufferPoolMXBean")?;
     Ok(Some(Value::Object(Some(pool))))
 }
 

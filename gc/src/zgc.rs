@@ -1915,7 +1915,25 @@ impl ZObjectStartBits {
 /// helper-only is a safe, merely slower, state.
 impl Drop for ZgcRealHeap {
     fn drop(&mut self) {
-        crate::gen_heap::clear_jit_read_bounds();
+        // OWNER-CHECKED, both of them. These tables are PROCESS-GLOBAL and this
+        // heap may not be their publisher, so a short-lived heap -- a sizing
+        // probe, an init-time heap replaced once `-Xmx` is parsed, or the next
+        // unit test over in another thread -- must not wipe the bounds a
+        // different, still-live heap published.
+        //
+        // `GenerationalHeap::drop` reached that conclusion for
+        // `JIT_REGION_BOUNDS` after measuring the consequence: an empty table
+        // makes the frame-band verifier answer "nothing unpublished" for every
+        // frame, VACUOUSLY, and 3 of 3 collections on a default-collector run
+        // reported coverage incomplete because the table was empty for the
+        // whole run. This `Drop` cleared the read table unconditionally, which
+        // is the same defect one collector over; it is owner-checked now, and
+        // the movable table is owner-checked from the start.
+        //
+        // The discriminator is this heap's own arena base, which is what both
+        // publishes wrote into slot 0.
+        crate::gen_heap::clear_jit_read_bounds_owned_by(self.arena_base);
+        crate::gen_heap::clear_movable_bounds_owned_by(self.arena_base);
     }
 }
 
@@ -2604,6 +2622,17 @@ pub struct ZgcRealHeap {
     /// is permanently JIT-busy trades heap layout for the correctness of not
     /// sliding objects out from under registers the collector cannot rewrite.
     relocation_skipped_jit: AtomicUsize,
+    /// Cycles that relocated **while a compiled frame was live**, on the
+    /// strength of the collection's per-cycle coverage proof rather than on JIT
+    /// quiet.
+    ///
+    /// The companion to [`Self::relocation_skipped_jit`], and the number that
+    /// says whether the proof is doing anything: a run with `skipped_jit` high
+    /// and this zero is one where the proof never passes -- which on a
+    /// many-threaded workload is the expected answer, because the proof marks
+    /// CROSS_THREAD_JIT_PEER incomplete whenever a peer is in compiled code.
+    /// Without this counter the two are indistinguishable at the summary line.
+    relocation_on_proven_jit: AtomicUsize,
     /// Lifetime count of TLAB cells a [`Self::retire_all_tlabs`] could not
     /// lock, and so could not close.
     ///
@@ -3376,6 +3405,24 @@ impl ZgcRealHeap {
         if zgc_jit_read_bounds_enabled() {
             crate::gen_heap::publish_jit_read_bounds(0, arena_base, arena_end);
         }
+        // Publish the MOVABLE envelope — a third table, and deliberately not
+        // `JIT_REGION_BOUNDS` (see `MovableBoundsTable`: filling that one would
+        // re-enable an inline reference STORE fast path this collector must not
+        // have). Without it the frame-band verifier's residency test answers
+        // `false` for every address under ZGC, so the verifier inspects every
+        // slot, classifies none, and reports "nothing unpublished" having
+        // verified nothing — which is why `relocate_stw` could not consult the
+        // coverage verdict at all.
+        //
+        // The WHOLE arena, not the low region the slide actually compacts. A
+        // superset is the safe direction here: an address wrongly called
+        // movable costs one declined compaction, an address wrongly called
+        // immovable is a frame reported clean that was never inspected. The
+        // envelope is also the one thing about this arena that provably never
+        // changes — it is captured once above and there is no `Arena::grow`
+        // call in this file — so it cannot go stale between the root scan and
+        // the pause, which a cursor-tight bound could.
+        crate::gen_heap::publish_movable_bounds(0, arena_base, arena_end);
         let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(
                 cratonvm_types::FIRST_LAYOUT_DOMAIN,
@@ -3410,6 +3457,7 @@ impl ZgcRealHeap {
             corpse_reports: AtomicUsize::new(0),
             corpse_cycle: AtomicU64::new(0),
             relocation_skipped_jit: AtomicUsize::new(0),
+            relocation_on_proven_jit: AtomicUsize::new(0),
             tlab_retire_skipped_total: AtomicUsize::new(0),
 
             unwalkable_reports: AtomicUsize::new(0),
@@ -4172,6 +4220,12 @@ impl ZgcRealHeap {
     /// run that never defragments.
     pub fn relocation_skipped_jit(&self) -> usize {
         self.relocation_skipped_jit.load(Ordering::Relaxed)
+    }
+
+    /// Cycles that compacted with a compiled frame live, on the per-cycle
+    /// coverage proof. See the field doc for why a zero here is informative.
+    pub fn relocation_on_proven_jit(&self) -> usize {
+        self.relocation_on_proven_jit.load(Ordering::Relaxed)
     }
 
 
@@ -5574,6 +5628,30 @@ impl ZgcRealHeap {
     }
 }
 
+/// May a ZGC cycle compact while a compiled frame is live, on the strength of
+/// the collection's per-cycle coverage proof?
+///
+/// Default ON. `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` (or `off`/`false`/
+/// `no`) restores the older refusal -- compact only when no compiled frame is
+/// live at all -- which is the bisect for anything that appears with this on.
+/// A kill switch and not an opt-in: default-off here would leave the default
+/// configuration (this collector, JIT on) with no defragmentation, which is the
+/// defect rather than a conservative posture.
+///
+/// Read per CYCLE rather than latched in a `OnceLock`. It is consulted once per
+/// collection, so the cost is nothing, and a latch would make the switch
+/// untestable -- the first test to touch it would decide the answer for every
+/// later test in the binary.
+fn zgc_relocate_under_proven_jit() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
 impl ZgcRealHeap {
     /// Compact the low end of the arena at a stop-the-world, after the mark.
     /// Phase 4 of the ZGC maturity plan.
@@ -5694,58 +5772,76 @@ impl ZgcRealHeap {
         // person argues with a measurement rather than re-deriving the fear.
         // Correctness settles it regardless: a slide under a live compiled
         // frame corrupts the heap, and fragmentation only wastes it.
-        // ---- A PER-CYCLE REFUSAL WAS TRIED HERE AND WITHDRAWN (2026-08-21) --
+        // ---- THE REFUSAL IS PER-CYCLE, NOT PER-JIT-FRAME (2026-08-21) ------
         //
-        // The blunt form below costs real work, and the cost is measured: on
-        // `org.h2.test.store.TestKillProcessWhileWriting` at `--Xmx 1g` the
-        // DEFAULT configuration (this collector, JIT on) throws
+        // Everything above is right that a slide under a compiled frame whose
+        // oops the collector cannot rewrite corrupts the heap. It is wrong that
+        // "a compiled frame exists" is how to ask.
+        //
+        // `gen_heap::collect_garbage_inner` asked it that way and stopped on
+        // 2026-07-26 (`arch-2026-07-26/moving-young-precise-roots`), in a
+        // comment that describes this defect one collector over: *"Because
+        // `gc_quiescence::is_active()` is true whenever ANY thread holds a live
+        // JIT frame -- i.e. in every steady-state workload once the
+        // 500-invocation JIT threshold trips -- that term made the young
+        // generation stop being a copying collector the moment the JIT
+        // engaged."* On THIS collector compaction is also the only
+        // defragmentation there is, so the same term additionally means the
+        // default configuration never defragments: measured as
         // `OutOfMemoryError: Java heap space (ByteBuffer.allocate 1048576)` with
-        // 97 % of the heap free, because `is_active()` is true from the moment
-        // the JIT threshold trips and so this function declines on every cycle
-        // -- and compaction is the only defragmentation there is here. The same
-        // class passes with `--nojit`, on the generational collector, and on
-        // HotSpot. See
-        // `internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`.
+        // 97 % of the heap free on `org.h2.test.store.TestKillProcessWhileWriting`.
         //
-        // The obvious repair is the one `gen_heap::collect_garbage_inner` made
-        // on 2026-07-26: refuse on the collection's PER-CYCLE COVERAGE PROOF
-        // instead of on the existence of a compiled frame. It was implemented,
-        // and it makes the class pass. It is NOT sound on this collector, and
-        // the reason is left here so nobody re-derives it:
+        // What replaces it is the collection's PER-CYCLE COVERAGE PROOF. Two
+        // things had to be true before this could be consulted here, and a
+        // first attempt on 2026-08-21 was landed and reverted because neither
+        // was:
         //
-        //   * `memory::roots::collect_roots` computes that proof inside a `&&`
-        //     chain whose second term is
-        //     `heap.is_generational() || g1_precise_only_roots`. Rust
-        //     short-circuits, so on a ZGC cycle
-        //     `refresh_moving_young_coverage_for_collection()` is NEVER CALLED,
-        //     and the published verdict stays at the value
-        //     `begin_moving_young_coverage_cycle` reset it to -- `false`,
-        //     meaning "complete". Reading it here reads a proof nobody ran.
-        //   * Running it anyway would not help: the band scan's residency test
-        //     reads `JIT_REGION_BOUNDS`, which "ZGC never fills"
-        //     (`conservative_roots::moving_young_unpublished_frame_oop_present`),
-        //     so the verifier fails closed for this collector by design.
+        //   1. **The proof has to be RUN for this collector.**
+        //      `memory::roots::collect_roots` computed it inside a `&&` chain
+        //      whose second term was `heap.is_generational() || ...`, so on a
+        //      ZGC cycle `refresh_moving_young_coverage_for_collection()` was
+        //      never called and the verdict stayed at the `false` -- meaning
+        //      *complete* -- that `begin_moving_young_coverage_cycle` had reset
+        //      it to. The proof and the conservative-scan SUPPRESSION are now
+        //      two expressions there; only the suppression is collector-gated.
+        //   2. **The verifier has to be able to classify an address.** Its
+        //      residency test read `JIT_REGION_BOUNDS`, which is
+        //      generational-only, so under ZGC it answered `false` for every
+        //      address and `moving_young_unpublished_frame_oop_present` failed
+        //      closed on `YOUNG_BOUNDS_UNPUBLISHED`. It now asks
+        //      `gen_heap::addr_is_movable`, and this collector publishes its
+        //      arena envelope into `MOVABLE_BOUNDS` at construction -- a third
+        //      table, because filling `JIT_REGION_BOUNDS` would re-enable an
+        //      inline reference STORE fast path this collector must not have.
         //
-        // `known-issues/gc/bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`
-        // calls ZGC's verdict "a vacuous coverage proof" in as many words. So
-        // this collector has no proof to consult, and until it has one the
-        // honest answer is the blunt refusal: fragmentation wastes a heap, a
-        // slide behind an unrewritable frame corrupts one.
+        // Every conservative term of the generational decision is kept, and one
+        // is added: the proof must have been ATTEMPTED.
+        // `refresh_moving_young_coverage_for_collection` returns `true` without
+        // proving anything when moving-young is off, so asking only "is
+        // coverage incomplete?" would read a vacuous `false` as a proof -- the
+        // exact mistake the first attempt made, now guarded from both sides
+        // (`moving_young_enabled()` here, and the verifier's own fail-closed
+        // gate on `movable_bounds_are_live()`).
         //
-        // What would lift it, in the order a session should try:
-        //   1. make `collect_roots` run the proof for ZGC as well -- compute the
-        //      verdict without taking the conservative-scan suppression -- AND
-        //   2. give ZGC a young-bounds publication the band verifier can read,
-        //      so the verifier stops failing closed; OR
-        //   3. stage (b) of `feature-designs/zgc-jit-load-barrier.md`, after
-        //      which relocation under compiled code needs no proof at all.
-        // Only 1+2 together, or 3, make the verdict mean anything here.
-        if crate::gc_quiescence::is_active()
-            || crate::gc_quiescence::unregistered_jit_frame_on_stack()
-        {
+        // The proof stays conservative in a way worth knowing before reading a
+        // `relocation_skipped_jit` count: it marks CROSS_THREAD_JIT_PEER
+        // incomplete whenever any thread OTHER than the collection initiator is
+        // in compiled code, so a many-threaded workload still compacts rarely.
+        // That is a real limit of the proof, not of this gate.
+        let compiled_frames_live = crate::gc_quiescence::is_active()
+            || crate::gc_quiescence::unregistered_jit_frame_on_stack();
+        let frames_are_rewritable = zgc_relocate_under_proven_jit()
+            && crate::gc_quiescence::moving_young_enabled()
+            && !crate::gc_quiescence::moving_young_coverage_incomplete()
+            && !crate::gc_quiescence::force_non_moving_jit_roots()
+            && !crate::gc_quiescence::unregistered_jit_frame_on_stack();
+        if compiled_frames_live && !frames_are_rewritable {
             self.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
             let reclaimed = self.arena.lock().retract_cursor_into_free_tail();
             return (0, reclaimed, cratonvm_types::PointerMap::default());
+        }
+        if compiled_frames_live {
+            self.relocation_on_proven_jit.fetch_add(1, Ordering::Relaxed);
         }
         // A RETAINED TLAB CHUNK WAS THE OBVIOUS SUSPECT HERE, AND IT IS RULED
         // OUT. `retire_all_tlabs` skips a cell it cannot `try_lock`, and on a
@@ -18097,35 +18193,41 @@ pub(crate) mod tests {
         );
     }
 
-    /// **No object may be relocated while a compiled frame is live — including
-    /// when this collection's coverage verdict says the frame is fine.**
+    /// **No object may be relocated behind a compiled frame whose oops this
+    /// collection did not prove rewritable — and every other cycle may move.**
     ///
     /// A JIT frame can hold an object pointer in a register or a spill slot.
-    /// The collector cannot find those and cannot rewrite them, so an object a
-    /// compiled frame is using must not move. `gen_heap` diverts to its
-    /// non-moving sweep for exactly this reason and G1 reads the same flag;
-    /// ZGC read it zero times and slid anyway.
+    /// The collector cannot find those and cannot rewrite them, so an object
+    /// such a frame is using must not move.
     ///
-    /// The second half is the 2026-08-21 addition, and it pins a WITHDRAWAL
-    /// rather than a feature. Refusing on the per-cycle coverage proof instead
-    /// — the repair `gen_heap` made on 2026-07-26 — was implemented, made
-    /// `TestKillProcessWhileWriting` pass, and is unsound here: on a ZGC cycle
-    /// `roots.rs` short-circuits before running the proof, so the verdict this
-    /// test sets is exactly the vacuous `false` the collector would have read.
-    /// A future session will have the same idea; this half is what tells it the
-    /// idea was tried. See `relocate_stw`'s own comment for the two things that
-    /// have to change first.
+    /// The question is WHICH frames those are. `gen_heap` stopped answering it
+    /// with "any frame at all" on 2026-07-26; this collector did so on
+    /// 2026-08-21, and the four states below are what the answer has to mean:
     ///
-    /// Asserted three ways in ONE test, because only the set is meaningful: a
-    /// heap that never relocates would satisfy the refusal trivially, and a
-    /// fixture too dense for the selector would satisfy it by accident. The
-    /// third part proves the same fixture DOES relocate once the guard is
-    /// dropped, so the first two are measuring the guard and not the fixture.
+    ///   1. frame live, coverage INCOMPLETE  -> nothing moves (the safety half)
+    ///   2. frame live, coverage COMPLETE    -> the SAME fixture moves (the fix)
+    ///   3. the kill switch                  -> restores (1) even under a proof
+    ///   4. no frame at all                  -> moves (the fixture is not inert)
     ///
-    /// The exact edit that trips it: remove the `is_active()` early return
-    /// from `relocate_stw`.
+    /// Without 2 and 4 a heap that never relocates would satisfy 1 trivially;
+    /// without 1 the proof is not doing any work.
+    ///
+    /// **This test cannot see the two preconditions that make the verdict
+    /// meaningful**, and a first attempt at this change was landed and reverted
+    /// because both were false. A unit test on a bare `ZgcRealHeap` sets the
+    /// verdict itself, so state 2 passes whether or not anything ever computes
+    /// one in a real VM. The siblings that pin those are
+    /// `roots.rs`'s `the_coverage_proof_runs_for_every_collector` (the proof is
+    /// not short-circuited away for non-generational heaps) and
+    /// `a_heap_that_publishes_no_movable_bounds_cannot_prove_coverage` below
+    /// (the verifier fails closed when it cannot classify an address). Read the
+    /// three together; this one alone is necessary and not sufficient.
+    ///
+    /// The exact edits that trip it: delete the coverage terms from
+    /// `relocate_stw`'s refusal (fails 1), or restore the bare `is_active()`
+    /// early return (fails 2).
     #[test]
-    fn a_live_compiled_frame_forbids_relocation_whatever_the_coverage_verdict_says() {
+    fn a_compiled_frame_forbids_relocation_only_when_its_coverage_is_unproven() {
         const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
         const FIELDS: usize = 500;
 
@@ -18155,7 +18257,7 @@ pub(crate) mod tests {
                 .count()
         };
 
-        // --- 1. frame live, coverage says INCOMPLETE: nothing may move -----
+        // --- 1. frame live, coverage INCOMPLETE: nothing may move ----------
         let (heap, mut roots, pre) = build();
         // SAFETY: these unit tests run the heap single-threaded.
         let stw = unsafe { StopTheWorldToken::new() };
@@ -18186,36 +18288,55 @@ pub(crate) mod tests {
             "nothing moved, but the JIT refusal never fired -- the fixture is passing for some other reason (check page occupancy against max_live_occupancy)"
         );
 
-        // --- 2. frame live, coverage says COMPLETE: still nothing may move -
+        // --- 2. frame live, coverage PROVEN: the SAME fixture must move ----
         //
-        // The withdrawal, pinned. `begin_moving_young_coverage_cycle` leaves
-        // the verdict at "complete", which is EXACTLY the state a real ZGC
-        // cycle is in -- `roots.rs` short-circuits before running the proof for
-        // this collector, so the verdict is vacuous rather than earned. A
-        // refusal that consults it would relocate here.
-        let (heap_vacuous, mut roots_vacuous, pre_vacuous) = build();
+        // A compiled frame is still live; what changed is that the collection
+        // proved every one of its oops is published on a rewritable channel
+        // this slide's pointer map reaches.
+        let (heap_proven, mut roots_proven, pre_proven) = build();
         crate::gc_quiescence::begin_moving_young_coverage_cycle();
         assert!(
             crate::gc_quiescence::is_active()
                 && !crate::gc_quiescence::moving_young_coverage_incomplete(),
-            "this half needs a live frame AND a verdict of complete, or it tests something else"
+            "this half needs a live frame AND a complete proof, or it tests something else"
         );
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_ZGC_RELOCATE", Some("1"))],
             || {
-                heap_vacuous.collect_garbage(&stw, &mut roots_vacuous, &NoMonitors);
+                heap_proven.collect_garbage(&stw, &mut roots_proven, &NoMonitors);
+            },
+        );
+        assert!(
+            moved_count(&roots_proven, &pre_proven) > 0,
+            "a compiled frame was live and its coverage was PROVEN complete, and the collector still refused to compact -- which is the defect behind the H2 TestKillProcessWhileWriting OutOfMemoryError at 97% free"
+        );
+        assert!(
+            heap_proven.relocation_on_proven_jit.load(Ordering::Relaxed) > 0,
+            "objects moved, but not through the proven-JIT arm -- the fixture stopped arming quiescence and this half no longer tests the proof"
+        );
+
+        // --- 3. the kill switch restores the blunt refusal ------------------
+        let (heap_blunt, mut roots_blunt, pre_blunt) = build();
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        cratonvm_types::flags::with_thread_overrides(
+            &[
+                ("CRATONVM_ZGC_RELOCATE", Some("1")),
+                ("CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT", Some("0")),
+            ],
+            || {
+                heap_blunt.collect_garbage(&stw, &mut roots_blunt, &NoMonitors);
             },
         );
         assert_eq!(
-            moved_count(&roots_vacuous, &pre_vacuous),
+            moved_count(&roots_blunt, &pre_blunt),
             0,
-            "objects moved behind a live compiled frame on the strength of the coverage verdict. On a ZGC cycle that verdict is never computed (roots.rs short-circuits on is_generational), so it is a vacuous false, not a proof -- see relocate_stw"
+            "CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0 must restore the older behaviour exactly, or it is not a bisect"
         );
 
         let _ = guard_depth;
         crate::gc_quiescence::leave();
 
-        // --- 3. guard released: the SAME fixture must move ------------------
+        // --- 4. guard released: the SAME fixture must move ------------------
         let (heap2, mut roots2, pre2) = build();
         assert!(
             !crate::gc_quiescence::is_active(),
@@ -18236,6 +18357,77 @@ pub(crate) mod tests {
             0,
             "the refusal fired with no compiled frame live"
         );
+    }
+
+    /// **A heap that publishes no movable bounds cannot prove coverage.**
+    ///
+    /// The verifier classifies a frame word as relocatable with
+    /// `gen_heap::addr_is_movable`. Where no collector has published a range,
+    /// that answers `false` for every address in the process, so the scan
+    /// inspects every slot, classifies none, and returns "nothing unpublished"
+    /// having verified nothing — and a refusal built on the verdict then
+    /// relocates on a proof nobody ran. That is exactly how the first version
+    /// of `relocate_stw`'s per-cycle refusal was unsound, and
+    /// `movable_bounds_are_live` is the gate that makes it fail closed instead.
+    ///
+    /// Asserted here rather than only in `conservative_roots` because this is
+    /// the collector that depends on it: ZGC fills `MOVABLE_BOUNDS` at
+    /// construction precisely so its verdict is earned.
+    #[test]
+    fn a_heap_that_publishes_no_movable_bounds_cannot_prove_coverage() {
+        // An empty table matches nothing. Pure function of the table, so no
+        // other test can perturb this half.
+        assert!(
+            !crate::gen_heap::addr_in_movable_bounds(0),
+            "address 0 must never be inside a published range"
+        );
+
+        // Constructing a ZGC heap must publish its envelope. Read slot 0 back
+        // IMMEDIATELY and keep the value: these tables are process-global and
+        // the gc unit tests run in parallel threads, so a peer test's heap can
+        // take the slot at any point after this. Asserting against the live
+        // table later is how this test failed on its first run -- which is
+        // exactly the hazard `ZgcRealHeap::drop` is now owner-checked for, so
+        // the flake was the finding.
+        let heap = ZgcRealHeap::with_capacity(4 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(1), 2);
+        let published_base =
+            crate::gen_heap::MOVABLE_BOUNDS.words[0].load(Ordering::Acquire);
+        let published_end =
+            crate::gen_heap::MOVABLE_BOUNDS.words[1].load(Ordering::Acquire);
+        assert!(
+            crate::gen_heap::movable_bounds_published(),
+            "ZgcRealHeap::with_capacity must publish its arena envelope, or the              frame-band verifier is vacuous on this collector and every coverage              verdict it produces is unearned"
+        );
+
+        // The envelope this heap published must cover an object it allocated.
+        // Guarded on still owning the slot: if a peer test replaced it between
+        // the two reads, the strong claim is about the peer's heap and skipping
+        // it is honest. `heap.conservative_addr_span()` is this heap's own
+        // envelope, so the comparison does not consult the shared table twice.
+        if let Some((base, end)) = heap.conservative_addr_span() {
+            if published_base == base && published_end == end {
+                assert!(
+                    crate::gen_heap::addr_is_movable(obj.as_ptr() as usize),
+                    "an object this heap just allocated is not inside the movable                      bounds it published -- the verifier would classify it as                      immovable and skip it"
+                );
+            }
+            assert!(
+                obj.as_ptr() as usize >= base && (obj.as_ptr() as usize) < end,
+                "the envelope this heap publishes does not contain its own                  allocations, so publishing it cannot help any verifier"
+            );
+        }
+
+        // Teardown is OWNER-CHECKED: dropping a heap that no longer owns slot 0
+        // must leave the current publisher's bounds alone.
+        crate::gen_heap::publish_movable_bounds(0, 0xdead_0000, 0xdead_1000);
+        drop(heap);
+        assert_eq!(
+            crate::gen_heap::MOVABLE_BOUNDS.words[0].load(Ordering::Acquire),
+            0xdead_0000,
+            "a dropped heap wiped movable bounds it did not publish -- which is              how a short-lived heap makes a LIVE heap's verifier vacuous"
+        );
+        crate::gen_heap::clear_movable_bounds();
     }
 
     /// **A `Reference` the collector moved must be findable at its NEW
