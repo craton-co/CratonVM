@@ -1,9 +1,13 @@
 # WORKER-5 NOTE 6 — the three residual instrument defects the brief listed, and the one that turned out to be 6.9× rather than 5%
 
-**Status: FIXED, MEASURED.** Lane WORKER-5, 2026-08-21, at `22cb4338d`. Two
-harness fixes (`regression-suite/harness-census.sh` + three hunks in `run.sh`)
-and one VM fix (`cratonvm_types::flags::resolve_capped_usize`, built and
-verified on Linux).
+**Status: FIXED, MEASURED.** Lane WORKER-5, 2026-08-21/22. Two harness fixes
+(`regression-suite/harness-census.sh` + three hunks in `run.sh`) and two VM
+fixes (`cratonvm_types::flags::resolve_capped_usize`, and the `cratonvm_jit`
+drop counter of §4a), both built and verified on Linux.
+
+> **§4a, added 2026-08-22, closes the gap §3 and §5 left open.** All three of
+> the report's bounded collections now report `truncated` + `dropped`, so a
+> strict run's saturation verdict can say **totals** instead of `UNKNOWN`.
 
 §4 of the WORKER-5 brief lists this week's measurement failures. Three of them
 were still open. They are all in the arithmetic and all in the same direction:
@@ -175,13 +179,60 @@ The last line is a **premise pin**, like `harness-vmfault.sh`'s: if a future VM
 starts rendering that sink `false`, the check goes red and the UNKNOWN branch
 can be retired deliberately rather than left as folklore.
 
+## 4a. CLOSED 2026-08-22 — `jit_compile` has a counter, and the verdict is no longer UNKNOWN by construction
+
+The gap §3 left open is closed, as `H1-1` §5.1 specified. `cratonvm_jit`'s
+compile-time sink now carries `JDK_ONLY_VIOLATIONS_DROPPED` and exposes
+`jdk_only_jit_sink_{dropped,len,saturated}`.
+
+Two things had to change together, and the second is the interesting one:
+
+* the violation is now built **before** the capacity test. The old order
+  returned at the cap without ever asking whether the triple was already
+  recorded, so the sink could not distinguish "full of other rows" from "full,
+  and this row is one of them" — and therefore **could not count a distinct
+  drop even if someone had added the counter**. `helpers.rs` was fixed the same
+  way two days earlier;
+* the cap now reads `CRATONVM_NATIVE_SHADOW_SINK_CAP` through the shared
+  `resolve_capped_usize` (§1), so the knob the report ADVISES moves all three of
+  its bounded collections rather than two of them.
+
+MEASURED on a Linux build of `ab038275f`:
+
+| `CRATONVM_NATIVE_SHADOW_SINK_CAP` | the three `cap`s | warnings |
+|---|---|---:|
+| unset | 4096 · 4096 · 256 | 0 |
+| `9000` | 9000 · 9000 · 9000 | 0 |
+| `200000` | 65536 · 65536 · 65536 | 3 |
+
+and the report's third object is now
+`"jit_compile": {"recorded": 0, "cap": 256, "truncated": false, "dropped": 0}`
+— all three `truncated` lines `false`, none `null`. `census_saturation` over
+that report returns **rc=0** and
+
+```text
+  saturation: none — every bounded collection reported `truncated: false`, so the
+    counts above are totals, not floors.
+```
+
+**A strict run can now say "totals" and mean it.** The `UNKNOWN` branch stays in
+`harness-census.sh`: every report written by an older binary still carries the
+`null`, and the selftest's premise pin still holds for those.
+
+`vm-cli` also warns on this sink like the other two, and NOTE-6 N3 is closed
+with it — the saturation advice is clamped to 65,536, so the VM can no longer
+print a value it would then adjust.
+
 ## 5. What this does NOT establish
 
-* **`jit_compile` still has no counter.** This record makes the harness stop
-  lying about it; it does not measure whether that sink ever overflows. Until
-  `cratonvm_jit` gains a `dropped` counter, `UNKNOWN` is the honest answer and
-  the census cannot be called complete. That is a real remaining gap, not a
-  formality.
+* **No Windows binary contains any of §1 or §4a.** Both were built and verified
+  on Linux only. The suite arms in `WORKER-5-NOTE-7` ran against prebuilt
+  Windows binaries that predate them, so nothing here has been exercised by a
+  105-vector sweep.
+* **`jit_compile` is now measured, not exonerated.** `dropped: 0` on a
+  two-thousand-put `HashMap` workload says that run did not overflow it; it says
+  nothing about a real application, which is exactly the workload `G60-1` N3
+  asked for and no one has run against the third sink.
 * **The 70 "never native" triples were not audited individually.** The number
   is a set difference over the census; no row was traced to a registrar.
 * **Both buckets are still per-suite.** A triple that is bytecode-won here could
@@ -203,14 +254,11 @@ can be retired deliberately rather than left as folklore.
   of `(triple, kind, outcome)` rows, ~5% inflated, and — far more importantly —
   85% of the triples in it ALSO ran the native. Any record reading it as "the
   contract working" is off by ~6.9×.
-* **N2 — give `jit_compile`'s sink a `dropped` counter** in `cratonvm_jit`, and
-  the `UNKNOWN` branch retires itself. Until then no strict run can honestly
-  claim its counts are totals.
-* **N3 — `vm-cli`'s saturation advice should be clamped at the source too**
-  (§1). It currently computes `(recorded + dropped) * 2` with no ceiling, so it
-  can still print a number larger than 65,536 — which now clamps loudly instead
-  of failing silently, but advising a value the VM will adjust is still worse
-  than advising the right one.
+* ~~**N2 — give `jit_compile`'s sink a `dropped` counter.**~~ **DONE
+  2026-08-22, §4a.** The `UNKNOWN` branch stays for reports written by older
+  binaries.
+* ~~**N3 — `vm-cli`'s saturation advice should be clamped at the source.**~~
+  **DONE 2026-08-22, §4a.** `.min(65_536)`.
 * **N4 — the shared-knob pattern deserves a second look.** One knob feeding two
   sinks was already a small trap; `resolve_capped_usize` removes the drift but
   the two sinks still cannot be raised independently.

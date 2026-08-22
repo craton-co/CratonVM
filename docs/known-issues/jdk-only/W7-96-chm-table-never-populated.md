@@ -1,5 +1,9 @@
 # W7-96 — `ConcurrentHashMap.table` is never populated: what that blocks, what it does not, and the mirror that closes the carrier half
 
+Status (2026-08-22, WORKER 2): **§4 is BUILT and RUN**, both §7 nominations are
+IMPLEMENTED, and the §8.1 authority move is **REFUSED with a 23-reader audit** —
+see §9, which supersedes the status line below and corrects §3.1.
+
 Status: **the feasibility question is ANSWERED — YES, `table` can be maintained**,
 and the carrier half is implemented in `native-collections/src/lib.rs`. The
 retirement half is **NOT** unblocked and this record is the correction to the one
@@ -403,3 +407,161 @@ like a real-bytecode CAS bug for the first hour.
    a future authority move will need `counterCells` for contended size counting.
 6. **The change is unbuilt.** It must compile and the `--jdk-only` corpus must be
    verdict-neutral apart from `RJdkEnumerations` before any of §4 is believed.
+
+---
+
+# §9 — RE-MEASURED AND ACTED ON, 2026-08-22 (WORKER 2)
+
+This record was written 2026-08-12 against a binary that no longer exists, and
+its §4 was **written but not built**. Everything below is measured on
+`/data/vm-com2w-nom`, built from the branch tip on
+`azureuser@20.80.105.49`, `--jdk-only`, one case per process, against
+HotSpot 25.0.3+9. Arms with all of it: **107/107, 107/107, 67/67, rc=0**;
+the collection LAW diff against HotSpot is **IDENTICAL, 63 of 63**.
+
+## §9.1 §4 IS BUILT, AND §1's TABLE HAS MOVED
+
+§4's carrier change landed and works. §1's table is re-measured:
+
+| field | | empty | 6 entries | 200 entries |
+|---|---|---|---|---|
+| `table`, **written only** | HotSpot | `null` | `len=16 used=6` | `len=512 used=198` |
+| | CratonVM | `null` ✓ | **`null`** | **`null`** |
+| `table`, **after a bulk read** | HotSpot | `null` | `len=16 used=6` | `len=512 used=198` |
+| | CratonVM | `null` ✓ | **`len=16 used=6`** ✓ | **`len=512 used=198`** ✓ |
+| `baseCount` / `sizeCtl` after a bulk read | both | 0/0 vs 0/**16** | 6/12 ✓ | 200/384 ✓ |
+| `keys()` / `elements()` | both | `$KeyIterator` / `$ValueIterator` ✓ | ✓ | ✓ |
+| `keySet().iterator()` | HotSpot | `$KeyIterator` | | |
+| | CratonVM | **`Arrays$ArrayItr`** | | |
+
+So §1's "CratonVM `null` everywhere" is now true only of a map that has been
+WRITTEN AND NEVER BULK-READ. Two rows are new:
+
+* **`sizeCtl` is 16 on an empty CratonVM CHM where HotSpot has 0.** Not in §1's
+  original table; harmless (it is the pending table size, which is what HotSpot
+  parks there for a capacity-constructed map) but not identical.
+* **A read does not survive the next write.** `keySet()` publishes the mirror,
+  then one `put`, then reflect: HotSpot 7 entries, CratonVM **6**. That is §3.2's
+  *"a mirror is not an authority"* as a measurement rather than an argument, and
+  it is the sharpest statement of what the authority move has to fix.
+
+## §9.2 §7 NOMINATION 1 — IMPLEMENTED, and §3.1's conclusion needs correcting
+
+REPRODUCED first on the pre-fix binary, ten days after §3.1, three runs
+identical — six `put`s of distinct keys into a fresh CHM:
+
+```text
+  dial OFF     putFresh=6/6  size=6  getHits=6/6  keySetIter=6  table=used6
+  dial ARMED   putFresh=6/6  size=1  getHits=1/6  keySetIter=1  table=used1
+  HotSpot      putFresh=6/6  size=6  getHits=6/6  keySetIter=6  table=used6
+```
+
+The dial now wins over all three force paths. **Placed at the TOP of each rather
+than on the one cluster §7 names** — every cluster below has the same problem,
+and a per-cluster condition would have to be repeated correctly in three files.
+`EnforceShadowScope::Off::covers()` is `false`, so an unarmed run does not change
+by one dispatch; the arms and the LAW diff confirm that.
+
+**AND §3.1's conclusion is half right.** It says the load-bearing measurement
+under the 47 held retirements *"cannot currently be taken"* because the gate
+defeats the dial. With the gate fixed, the armed map is still MIXED-ROUTE:
+
+```text
+  dial ARMED, after the fix   putFresh=6/6  size=1  getHits=6/6  keySetIter=1
+```
+
+`get` finds all six in the native store while `size()`/`keySet()` read the real
+`table` and answer 1. **The gate was ONE of the doors, not the door.**
+`WORKER-1`'s brief names the rest: `jdk_only_enforce_shadow_for` has exactly one
+live call site, inside `resolve_step1_native`, so arming a class arms only its
+cold step-1 dispatches — the warm invoke-cache, the force interceptor and
+reflective `Method.invoke` are outside it by construction.
+
+**The instrument is one door better, not fixed, and this record must not be read
+as having unblocked the 47.** What changed is that arming the dial no longer
+DESTROYS DATA while reporting success: the next lane gets an honest wrong answer
+instead of a silent one.
+
+## §9.3 §7 NOMINATION 2 — IMPLEMENTED
+
+Eleven sites ended in `None => Ok(Some(Value::Object(None)))`, which on `put`
+means "no previous mapping" — a fresh insert. `chm_segment_for_mut` MATERIALISES
+the segments instead, which is better than throwing: a segment-less CHM is an
+UNINITIALISED object, not a corrupt one, and the JDK's own CHM allocates its
+table lazily on first `put` for the same reason.
+
+Routed to the EIGHT inserting sites only. `remove`, `replace`,
+`computeIfPresent` and every reader are correct no-ops on an empty map, and
+materialising on a read path would allocate where it must not.
+
+MEASURED armed, after: `getHits` 1/6 → **6/6**, `keySet` `[]` → `[k1..k5]`.
+
+## §9.4 THE AUTHORITY MOVE — REFUSED, with the audit §3.2 never ran
+
+§8.1 keeps the authority move as the headline residual and prices it as *"one
+flat table vs the 4/16-way striping"*. **That price is too low.** The striping is
+not 16 Java monitors; `native-collections/src/lib.rs:3425`-3500 carries a
+lock-free-read layer — per-segment `parking_lot::RwLock`s, resize epochs,
+mutation epochs and an active-mutation counter, with readers validating against a
+snapshot. A flat table has to reproduce all of it with per-bin locking PLUS
+forwarding-node semantics, so a reader mid-resize does not miss entries. That is
+CHM's own design and it is the part §8.1 does not count.
+
+Against that cost, here is the exposure — **23 readers of a CHM written and never
+bulk-read**, one case per process, against HotSpot:
+
+```text
+  MISMATCH  reflective read of `table`         HS len=16 used=6   CV null
+  MISMATCH  a SUBCLASS reading CHM.table       HS len=16          CV null
+  agree     size, isEmpty, get, containsKey, containsValue
+  agree     forEach, keySet, values, entrySet, toString
+  agree     new HashMap<>(m), new TreeMap<>(m), Map.copyOf, unmodifiableMap
+  agree     entrySet().stream(), equals, hashCode
+  agree     serialization round trip
+  agree     reduceValues, searchKeys, mappingCount, keySet(V), elements()
+```
+
+**21 of 23 agree, and both mismatches are the same act — a direct reflective read
+of the field.** Every functional reader agrees, including the five CHM-specific
+bulk operations (`reduceValues`, `searchKeys`, `mappingCount`, `keySet(V)`,
+`elements()`) that walk the table on HotSpot.
+
+So the trade is: re-engineer the lock-free-read layer of the VM's most
+concurrency-critical collection, to correct a field that 21 of 23 readers do not
+consult, on a corpus whose arms are almost entirely single-threaded — i.e. the
+one class of bug this change could introduce is the one the gate cannot see.
+**Refused, and the refusal is the same standard `WORKER-2-NOTE-1` §9 applied to
+`HashMap`'s Integer-keyed side store: bound the exposure, then decline.**
+
+### What it would take, for whoever does take it
+
+1. `table` becomes the store: `map_carrier_class_for_receiver` answers
+   `ConcurrentHashMap$Node` for a CHM, and `map_buckets_slot` already resolves
+   `table` by name, so the `HashMap` bucket machinery can back it.
+2. Locking moves from 16 segment monitors to the bin head (`synchronized (f)`,
+   CHM's own rule), with the empty-bin insert guarded on the map. This is FINER
+   striping than today, not coarser — the one place §8.1's pricing is pessimistic.
+3. Resize needs forwarding nodes, or the epoch validation at `:3425`-3500
+   re-derived for a single array.
+4. `baseCount` is a `long`; `set_map_size` writes an `Int`, so `map_size_slot`
+   needs a long-aware arm.
+5. 31 functions reach the store (`chm_segment_for` / `chm_all_segments`), and 21
+   `is_chm_receiver` guards currently route CHM AWAY from `map_state` — §4.4
+   audited them in the other direction and that audit has to be re-run inverted.
+6. It must be ONE change. A half-migration is two stores that disagree, which is
+   the defect this record exists to describe.
+
+**Only then do CHM's and `Properties`' six iterator-class cells become
+closable** (`WORKER-2-NOTE-1` §9a.4): a real `$KeyIterator` needs a `remove()`
+that writes through, and today it would mutate the mirror.
+
+## §9.5 Residual status after this pass
+
+| §8 item | state |
+|---|---|
+| 1. authority move | **refused with the audit above**; specified in §9.4 |
+| 2. `AbstractMap.keySet` type-punned `Object[]` | still open — MEASURED again, `CHM_FIELD_SEGMENTS = 0` still aliases it; 6 references, so contained, but it dies with the authority move |
+| 3. `keySet().iterator()` is `Arrays$ArrayItr` | still open, and now known to be BLOCKED on §9.4 rather than merely undone |
+| 4. `instanceof` spelling divergence | explained: §9.2 confirms mixed-route dispatch under an armed dial |
+| 5. `counterCells`/`nextTable`/`transferIndex` null | still matches HotSpot at every measured size |
+| 6. "the change is unbuilt" | **closed** — built, run, 107/107 ×2 and 67/67 |
