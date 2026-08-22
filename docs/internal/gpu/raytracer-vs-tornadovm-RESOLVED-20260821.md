@@ -210,6 +210,25 @@ same box, host control at its idle baseline in every round:
 | 1,228,800 | **0.787 ms** | 1.407 ms | **44.1%** | 6/6 |
 | 2,764,800 | **1.663 ms** | 2.637 ms | **36.9%** | 6/6 |
 
+**And then the serial dispatch was overlapped.** Splitting the launch into
+chunks so a chunk's writeback runs under the next chunk's kernel (§8d)
+moved the two large sizes again. 640x480 is below the chunking threshold
+and is unchanged.
+
+| n (pixels) | CratonVM `--gpu` | TornadoVM PTX | CratonVM ahead | rounds won |
+|---:|---:|---:|---:|---:|
+| 307,200 | **0.277 ms** | 0.576 ms | 52.0% | 6/6 |
+| 1,228,800 | **0.746 ms** | 1.408 ms | **47.0%** | 6/6 |
+| 2,764,800 | **1.206 ms** | 2.767 ms | **56.4%** | 6/6 |
+
+The shape of the answer has now inverted twice. It started as a margin
+that collapsed with problem size (38/12/4%), became one that shrank
+slowly from a much higher base (52/44/37%), and is now one that GROWS
+with size. Three different qualitative conclusions from the same
+benchmark and the same two VMs, separated only by defects in ours. That
+is the real lesson of this record, and it is why the tables are all kept
+rather than replaced.
+
 | | fixed per call | per pixel |
 |---|---:|---:|
 | CratonVM `--gpu` | **0.104 ms** | **0.564 ns** |
@@ -408,6 +427,105 @@ win did not show up in wall-clock: the instructions that mattered were
 1/32-rate ones, and counting instructions weighted them the same as the
 rest.
 
+## 8d. Overlapping the writeback with the kernel
+
+With the sqrt fix in, the per-pixel cost split 58% transfer / 42%
+compute, and the dispatch ran them strictly in series: upload, launch,
+synchronize, download. The two can run at once.
+
+Measured first, before any VM change, against this exact kernel's PTX
+(11 MB out, RTX 2060):
+
+| | ms | |
+|---|---:|---|
+| kernel alone | 0.56 | |
+| D2H, page-locked, async | 0.86 | 12.9 GB/s |
+| D2H, pageable, async | 1.28 | 8.6 GB/s — overlaps too, just slower |
+| D2H, pageable, sync | 0.86 | what the VM did; full bandwidth, zero overlap |
+| serial (kernel then copy) | 1.43 | |
+| **concurrent, page-locked** | **0.87** | ~`max(kernel, copy)` — near-perfect overlap |
+| host memcpy, staging -> heap | 0.42 | 26.5 GB/s |
+
+So the overlap is real and nearly free, but only into page-locked
+memory, and the Java heap arena is pageable. `cuMemHostRegister` on the
+array itself was measured and rejected: registering 11 MB costs 0.08 ms
+but UNregistering costs 0.69 ms, most of the win, and caching a
+registration would have to survive a moving collector.
+
+A prototype with the real kernel — hand-adding a `tid_base` parameter to
+the dumped PTX, 4 streams x 16 chunks, page-locked staging, output
+checked byte-identical to the serial path — reached **0.969 ms against
+1.616 ms serial, 1.67x**. That is what justified doing it in the VM.
+
+**CUDA has no launch offset**, which is the whole reason this needs a
+kernel-ABI change: a kernel's threads always index from zero, so one
+kernel cannot cover a slice of an iteration space unless it is told
+where the slice starts. Hence the trailing `.param .s32 tid_base` on
+every lowered kernel, added to the thread index in the prologue. A
+whole-array launch passes 0 and nothing changes.
+
+In the VM, swept on a quiet host with `CRATONVM_GPU_CHUNKS=1` as a
+same-binary kill switch:
+
+```text
+  streams \ chunks    1(off)      4       8      16      32
+       2              1.645    1.304   1.127   1.316   1.645
+       4              1.718    1.283   1.186   1.293   1.683
+       8              1.643    1.293   1.092   1.291   1.666
+```
+
+Eight chunks is the floor in every row; 32 is no better than not
+chunking, because per-launch cost grows linearly while the overlap it
+buys does not. **1.643 -> 1.092 ms, 1.51x.** The VM lands below the
+prototype's 1.67x because the bridge does per-launch `last_write` event
+bookkeeping for every device-pointer argument that the raw prototype did
+not.
+
+Two costs had to be found by measurement rather than guessed. Allocating
+the page-locked staging slab per dispatch made the chunked path **2.8x
+SLOWER** than the serial one it replaced — `cuMemAllocHost` of a
+frame-sized slab swamps the overlap it enables. Creating the per-chunk
+events per dispatch cost another 5%. Both are pooled now, handed out only
+when the cache holds the sole reference, so a submission still waiting on
+one never has it reused underneath it.
+
+### The semantic this required, and why it is safe
+
+A chunk lands in the Java array as its own copy completes, which is
+BEFORE the bounds-failure flag has been read. `finalize_submission`
+otherwise drains that flag first, precisely so a failed kernel leaves the
+heap untouched.
+
+That is allowed for an array the kernel writes and **never reads**, and
+only such an array:
+
+* a committed chunk holds values whose threads succeeded — the flag is
+  set by the failing thread, not by its neighbours, so a committed chunk
+  never contains garbage;
+* on deopt the interpreter re-runs the whole method from iteration 0,
+  rewrites every element it would have written, and throws at the same
+  index, so the early-committed elements are a subset of what plain Java
+  writes before the throw, holding the same values;
+* the argument collapses the moment the kernel READS the array, because
+  then the partial commit is the re-run's own input.
+
+`reads_param_mask` (the mirror of `writes_param_mask`) makes that
+distinction available, and `writes & !reads` is the eligible set. It
+defaults to "everything is read" where it cannot be computed, which
+refuses chunking.
+
+`BoundsDeoptChunked` verifies it end to end: a bounds failure on a
+2^21-element write-only output, large enough that chunking is genuinely
+active. The existing `BoundsDeopt2` does NOT reach this path — its output
+is shorter than the loop bound, so the planner refuses it, which is
+itself worth knowing before trusting that gate to cover this. CratonVM
+and HotSpot agree exactly, `mismatched=0` across every element:
+
+```text
+thrown=ArrayIndexOutOfBoundsException nonzero=1048575 mismatched=0
+out0=0 outMid=3145725 outAfter=0 outLast=0
+```
+
 ## 9. Residuals
 
 **Closed by this work:**
@@ -444,14 +562,11 @@ rest.
   the `Math.min` work in §8b took it from ~11x. Where the remaining 5.3x
   goes is unprofiled.
 * TornadoVM's own GPU-vs-Java divergence (§6) is reported, not diagnosed.
-* **The GPU per-pixel cost is now 58% transfer, 42% compute** (a 0.327 ns
-  floor against 0.564 ns total). The dispatch sequence is strictly serial
-  — upload, launch, synchronize, download — so a chunked stream pipeline
-  overlapping the writeback of chunk N with the kernel on chunk N+1 could
-  hide the smaller half behind the larger: worth up to ~40%. The
-  stream/event infrastructure already exists; what does not is a story for
-  a mid-stream bounds-failure deopt, which is why this is filed rather
-  than attempted.
+* **The chunked stream overlap is DONE** (§8d) — 1.51x on the GPU-side
+  work, and it took the margin over TornadoVM at 2.76M pixels from 36.9%
+  to 56.4%. What remains on the transfer side is the bridge's per-launch
+  `last_write` event bookkeeping, which is why the VM lands at 1.51x
+  where a raw prototype of the same shape reached 1.67x.
 * **18% of the kernel SASS is branch-reconvergence machinery** — 67 `BRA`
   plus 32 `BSSY`/`BSYNC`/`BMOV` triples — from the short-circuit `&&`s and
   from ternaries whose arms contain a call. The kernel is written

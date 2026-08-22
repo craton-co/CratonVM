@@ -120,12 +120,78 @@ pub(crate) fn alloc_segment_carrier(
     ctx: &mut dyn NativeContext,
     slots: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if ctx.class_id_by_name(CRATON_SEGMENT_CLASS).is_none()
-        && ctx.try_ensure_synthetic_class(CRATON_SEGMENT_CLASS, 0).is_err()
-    {
+    let Some(class_id) = craton_segment_class_id(ctx) else {
         return try_alloc_concurrent_synthetic(ctx, PE_SEGMENT_INTERFACE, slots);
+    };
+    // `max` with the declared count is `try_alloc_concurrent_synthetic`'s rule,
+    // kept rather than assumed away: it is what stops an under-request from
+    // producing an object whose header disagrees with its slot count, which the
+    // GC's bounds guard then rejects every field access on. For THIS class the
+    // declared count is 0, so it is the identity — but a class-manager read
+    // lock is ~20 ns against a ~7 µs allocation, and a rule that holds by
+    // construction is still worth asking for rather than assuming.
+    let n = slots.max(ctx.class_num_total_fields(class_id));
+    Ok(ctx
+        .try_alloc_object_gc_safe(class_id, n)
+        .unwrap_or_else(|| ctx.alloc_object(class_id, n)))
+}
+
+/// [`CRATON_SEGMENT_CLASS`]'s `ClassId`, resolved once per VM.
+///
+/// # Why this is not simply a `try_alloc_concurrent_synthetic` call
+///
+/// It was, and that cost 15-40% on every segment CratonVM mints. MEASURED with
+/// `probes/SegmentAllocBench.java`, arms interleaved so both see the same host,
+/// one binary from the merge base and one with the class change:
+///
+/// ```text
+///        ofArray_ns   arena_ns   asSlice_ns
+/// base      7637        6482        6873
+/// v5        9849        7075        8321
+/// base      7420        6087        7109
+/// v5       10679        8693        7756
+/// ```
+///
+/// The shared allocator resolves its class by NAME on every call:
+/// `ensure_class_initialized`, which is a loader-faithful resolution and not a
+/// map hit; then `class_name_of_id`, which clones the name into a fresh
+/// `String` to compare it; then `layout_alias::classify`. That is affordable
+/// for a native reached once per `new URI(..)`. It is not affordable for one
+/// `AbstractVector.defaultReinterpret` reaches on every `reinterpretAsInts()`.
+///
+/// The cost of skipping it is one instrument: `report_layout_alias` no longer
+/// sees these allocations. It was reporting `Undeclared` for every one of them
+/// — this class declares no fields on purpose (see below) — so what is lost is
+/// a constant, not a signal.
+///
+/// # Why the key carries `vm_identity`
+///
+/// The cache is process-global and a `ClassId` is only meaningful within one
+/// VM, so the identity is stored beside it and a mismatch re-resolves. That is
+/// not defensive padding: `native-io`'s direct-memory `Bits` and this file's
+/// `NATIVE_ACCESS_POLICY` are process-global for the same reason, and a second
+/// VM in the same process inheriting the first one's `ClassId` would allocate
+/// every segment against whatever class happened to hold that id.
+///
+/// `None` means the fabrication was REFUSED — see [`alloc_segment_carrier`].
+fn craton_segment_class_id(ctx: &mut dyn NativeContext) -> Option<cratonvm_types::ClassId> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // `vm_identity << 32 | class_id`, or 0 for "not resolved yet". `Relaxed` is
+    // sufficient because the value is self-validating: a reader either sees a
+    // packed pair whose identity half is its own VM's, or re-resolves. A torn
+    // read is impossible — it is one 64-bit atomic.
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    let vm = ctx.vm_identity() as u64 & 0xFFFF_FFFF;
+    let packed = CACHED.load(Ordering::Relaxed);
+    if packed != 0 && (packed >> 32) == vm {
+        return Some(cratonvm_types::ClassId::new((packed & 0xFFFF_FFFF) as u32));
     }
-    try_alloc_concurrent_synthetic(ctx, CRATON_SEGMENT_CLASS, slots)
+    let class_id = match ctx.class_id_by_name(CRATON_SEGMENT_CLASS) {
+        Some(id) => id,
+        None => ctx.try_ensure_synthetic_class(CRATON_SEGMENT_CLASS, 0).ok()?,
+    };
+    CACHED.store((vm << 32) | u64::from(class_id.as_u32()), Ordering::Relaxed);
+    Some(class_id)
 }
 
 /// Maximum number of bytes for a single memory copy/fill operation.

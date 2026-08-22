@@ -16,10 +16,20 @@ Superseded documents:
 * `bug-gpullama3-unsafe-getshort-model-load-livelock.md`, whose diagnosis was
   wrong in every particular — see §6.
 
-One residual is **not** fixed and has been re-homed rather than dropped:
-`FileChannel.read` into a heap buffer is ~9x HotSpot. It is measured, its
-stated cause in the open record is **refuted**, and it now lives at
-`docs/known-issues/perf/filechannel-heap-read-glue-depth-20260822.md`. See §5.
+**The application now runs its real inference loop and still produces no
+output**, for a reason the open record could not see because it never got
+past the first `matmul`: CratonVM's Vector API runs the JDK's generic Java
+fallback, at ~500,000-850,000x HotSpot on this kernel. That is measured, it
+is a throughput matter and not a correctness one (every value matches the
+oracle bit for bit), and it is `docs/known-issues/perf/
+vector-api-over-memorysegment-is-a-java-fallback-20260822.md`. See §5.2.
+
+Two residuals are **not** fixed and have been re-homed rather than dropped:
+
+* the Vector API throughput above, and
+* `FileChannel.read` into a heap buffer at ~8.7x HotSpot, whose stated cause
+  in the open record is **refuted** — `docs/known-issues/perf/
+  filechannel-heap-read-glue-depth-20260822.md`. See §5.1.
 
 ---
 
@@ -249,7 +259,9 @@ temporary-buffer cache no matter what the VM is doing. See §5.
 
 ---
 
-## 5. The residual, re-homed — and its stated cause refuted
+## 5. The two residuals, re-homed
+
+### 5.1 `FileChannel.read` into a heap buffer, and its stated cause refuted
 
 The open record's other minor gap: `FileChannel.read` into a heap buffer is
 far slower than HotSpot, attributed to `sun.nio.ch.Util`'s per-thread
@@ -286,6 +298,75 @@ defect, so retiring this record must not retire it. It is now
 the profile, the refuted hypothesis, and the shape of the fix that was
 considered and not taken.
 
+
+### 5.2 The Vector API is a Java fallback, and it is why there is still no token
+
+This one the open record could not have written: it never got past the first
+`matmul`, so the kernel behind it had never run. With the cast fixed it runs,
+and the application's own headline claim — "it still does not produce output"
+— is still true, for an entirely different reason.
+
+`probes/Fp16VectorDotBench.java` prices `FP16FloatTensor.vectorDot` directly,
+so the cost can be stated in nanoseconds rather than in "still running":
+
+| VM | ns per lane |
+|---|---|
+| HotSpot | 0.268 |
+| CratonVM | 115 561 – 139 180 (four runs, JIT on) |
+
+and end to end, the same command the Repro section gives with `-n 1`:
+
+| VM | result |
+|---|---|
+| HotSpot | 8.2 s wall, 2.51 s generating the token |
+| CratonVM | 56 min at 97% of one core, no token, killed |
+
+The two agree rather than contradicting: ~1.2e9 lane multiply-adds per
+forward pass at ~116 µs each is tens of hours per token. **The application is
+not stuck.** RSS is flat under continuous CPU and a profile puts it in the
+kernel — which is the reading error §1.2 records this record's family making
+once already, now with the answer in hand rather than guessed.
+
+A 3500-sample `--nojit` profile puts 93.7% of the kernel in the Vector API's
+own generic Java fallback: `bOpTemplate`, `uOpTemplate`, `lanewiseTemplate`,
+`lambda$binaryOperations$13`, `vectorFactory`, `VectorSupport.maybeRebox`,
+`VectorPayload.<init>` — a lambda per operation and a fresh vector object per
+result, which is exactly what C2 exists to erase. `native-builtins/src/
+vector_api.rs` implements a large Vector API surface already, but it
+registers on `jdk/incubator/vector/FloatVector` and friends while a real-JDK
+receiver is a concrete `Float256Vector`, so none of it is reached here.
+
+**Correctness is not in question, and the probe says so out loud.** Every
+value matches Temurin 25.0.3+9 exactly — `FfmVectorSegmentProbe` checks all
+eight FP16 lanes and their sum, and `Fp16VectorDotBench` prints one `dot()`
+call's raw float bits as a `warm=` column, identical on both VMs. A
+throughput page that skipped that would leave a reader unsure whether the
+slow answer was also a wrong one.
+
+One lever inside it was implemented and then **reverted**, and the reversal is
+the more useful record. `java.math` frames under `Math.fma` are 26.1% of that
+profile — the JDK's `Math.fma` fallback builds two `BigDecimal`s and does a
+`BigInteger` Knuth division per call, and `FloatVector.fma` calls it per lane.
+Registering `fma` on `java/lang/Math` (CratonVM already has it on
+`StrictMath`) changed the kernel by nothing distinguishable from noise,
+because:
+
+* with the JIT on — the mode that matters — `Math.fma` is already ~3 ns per
+  call, the same as `a * b + c`; the 26.1% is an artefact of the `--nojit` the
+  sampler requires, and
+* in the interpreter the registration does not win anyway: `Math.fma` has real
+  bytecode and is not on `force_native_over_real_jdk_bytecode`'s list.
+
+An inert registration is exactly what this tree keeps having to un-ship, so it
+was not shipped. `probes/MathFmaProbe.java` was kept, because it is a
+correctness vector and it found something: 35 of 39 rows match HotSpot bit for
+bit, and the four that do not are all `0 × Infinity`, where CratonVM answers
+the canonical NaN and the oracle answers the x86 indefinite one — the known
+`Value::Double` NaN-payload limitation, which predates this work.
+
+Full measurement: `docs/known-issues/perf/
+vector-api-over-memorysegment-is-a-java-fallback-20260822.md`.
+
 ---
 
 ## 6. What the original record got wrong
@@ -299,8 +380,9 @@ Kept deliberately, because the errors are instructive rather than careless.
 | "Suspect area: `Unsafe.getShort`" | `Unsafe.getShort` is not on the hot path at all |
 | "`FloatTensor` FP16 reader spins" | the cost was in `Vocabulary`'s constructor and `GGUF.readArray` |
 | suspicion drawn from a HotSpot startup warning | the warning names a deprecated API, not a hot method |
-| "the temporary direct-buffer cache does not work" | it does; `direct_delta=0` over 5000 reads (§5) |
+| "the temporary direct-buffer cache does not work" | it does; `direct_delta=0` over 5000 reads (§5.1) |
 | "option 1 (a real superclass) is the honest one" | it aliases three field names onto the wrong slots (§2.3) |
+| "it throws on the first `matmul`" (the only reason for no output) | it no longer throws, and still produces none: the kernel is ~500,000x (§5.2) |
 
 Every one of the first five followed from reasoning about which code *looked*
 suspicious. A single `--stack-sample-ms` run with `--nojit` — 797 samples,
@@ -335,6 +417,43 @@ consumer actually depends on.
     RForeignLayoutCollections PASS
     RForeignLayoutJdkInterfaces PASS
     RJdkForeign PASS
+
+Three more probes came out of the work and are in the tree:
+`Fp16VectorDotBench` and `SegmentAllocBench` price §5.2's two costs, and
+`MathFmaProbe` is the `Math.fma` correctness vector §5.2 describes.
+
+`SegmentAllocBench` earned its place as an A/B **control** rather than a
+benchmark. The first version of the class change resolved
+`CRATON_SEGMENT_CLASS` by NAME on every allocation, through the shared
+`try_alloc_concurrent_synthetic` — and that is a loader-faithful resolution
+plus a `String` clone of the class name, not a map hit. It cost 15-40% on
+every segment CratonVM mints, measured with the arms interleaved and one
+binary built from the merge base:
+
+```text
+       ofArray_ns   arena_ns   asSlice_ns
+base      7637        6482        6873
+before    9849        7075        8321
+base      7420        6087        7109
+before   10679        8693        7756
+```
+
+Resolving the `ClassId` once per VM and allocating against it removed that and
+then some — after, `arena` is 4380-4706 against the base's 5036-5690 and
+`asSlice` 4866-4959 against 5555-6007, with `ofArray` on par. It is worth
+noting how narrowly this was caught: it is invisible to every correctness
+vector, and the workload that would have shown it is the one that cannot
+finish. The control exists because `AbstractVector.defaultReinterpret` mints a
+segment per `reinterpretAsInts()`, so a per-allocation regression here is
+multiplied by every lane group in the kernel.
+
+Core regression suite on the fixed binary: **66 of 67 vectors pass**. The one
+failure, `RTreeRangeGc`, is pre-existing and already filed as
+`bug-zgc-relocation-unmasks-root-collection-gap-rtreerangegc-20260821.md`.
+That is established rather than assumed: the same vector run 3x on this binary
+and 3x on one built from the merge base fails on both, with identical guard
+text — 3 of 3 here against 2 of 3 there, which is the flake's own rate rather
+than a change in it.
 
 ## 8. Repro
 

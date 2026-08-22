@@ -35,12 +35,28 @@ on it. Those two are consequences of the rc=1, not separate defects.
 > r14   SUITE=core    66 /  67   RLangPackages                  (RTreeRangeGc PASSED)
 > ```
 >
-> So under the corpus it is **intermittent**, and this host is one where load
-> flips PASS/FAIL rather than only timings. Anything below that reasons from
-> "it always fails" is weaker than it reads — in particular, a single green
-> corpus run does NOT show the gap closed. Use the isolated `--Xmx 64m` repro,
-> three runs, for any before/after judgement; that is the arm the binary table
-> below was measured on.
+> **RE-CORRECTED 2026-08-22, later: one outlier in eight, not “intermittent”.**
+> Four corpus runs on this host, two compatible arms each:
+>
+> ```text
+> r13  all FAIL   core FAIL
+> r14  all FAIL   core PASS   <- the single outlier, and the one this note was written from
+> r15  all FAIL   core FAIL
+> r16  all FAIL   core FAIL
+> ```
+>
+> Seven of eight compatible observations FAIL and every strict one PASSES, so
+> the honest reading is **deterministic and mode-dependent, with a rare
+> flake** — not “intermittent”, which is what one outlier looked like at the
+> time. `WORKER-5` reached the same conclusion from 12 ABBA-interleaved runs
+> on their own binary (strict PASS x6, compatible FAIL x6) and their framing
+> is the one to keep: **“flaky” is a property of a BINARY AND A HOST, not of a
+> vector.** Both of us called it a flake first, from different binaries.
+>
+> The practical rule is unchanged: judge before/after on the isolated
+> `--Xmx 64m` arm, three runs, not on one corpus cell — a single green corpus
+> run does NOT show the gap closed. That is the arm the binary table below was
+> measured on.
 >
 > The `--jdk-only` PASS is a separate matter and is NOT the flake: it reproduces
 > 2/2 deliberately, and the mechanism is in the mode section further down.
