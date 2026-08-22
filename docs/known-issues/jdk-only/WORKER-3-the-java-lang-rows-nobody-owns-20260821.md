@@ -39,12 +39,31 @@ will move them.
 
 ```text
   CRATONVM_ARGS=--jdk-only   105 / 105
-  SUITE=all                  104 / 105   RJdkFunctionCombinators (H0 is on it)
+  SUITE=all                  105 / 105   ALL GREEN as of 2026-08-21
   SUITE=core                  65 /  65
 
   CENSUS  native-shadows-bytecode 1387  ·  bytecode-won 481
-          synthetic-native-registered 1622  ·  compatibility_classes 0
+          synthetic-native-registered 1610  ·  compatibility_classes 0
 ```
+
+**UPDATE, 2026-08-21: the corpus is GREEN IN EVERY ARM for the first time.** The
+fifth and last long-standing `SUITE=all` failure, `RJdkFunctionCombinators`,
+closed when H0 guarded the `java/util/Comparator` family on a real image
+(`ecd4f56e1`). `synthetic-native-registered` fell **1622 → 1610**, the twelve
+registrations no longer made — which is the narrowest available confirmation
+that the guard took effect rather than landing inert.
+
+**This raises the bar for you rather than lowering it.** Until today "verdict
+neutral" meant *do not grow the failing set*. There is no failing set now:
+**any red vector you produce is yours**, and a green arm is no longer weak
+evidence that nothing broke — it is the only evidence, and it is still evidence
+about the question it asked (trap 5). The corpus still does not check array
+component types, the CONTENT of a built string, or the class identity of a
+returned object.
+
+**And do not read the green as progress against the contract.** The defect
+population is unchanged at **1387 shadows**; §1 below still stands. All five
+closures were COMPATIBLE-mode defects that strict mode already fixed.
 
 Four of five long-standing `SUITE=all` failures closed this week. The **defect
 population is 1402 shadows over 149 registrars**, 1402/1402 attributed (`H14-1`).
@@ -58,11 +77,22 @@ a gate that reads 100%. That gap is the project.
 
 1. **The JDK path recipe in older briefs is poison.** `JDK="$(dirname "$(dirname
    "$(command -v javap)")")"` yields the MSYS POSIX spelling; `run.sh` exports
-   `MSYS_NO_PATHCONV=1`, so it reaches `cratonvm.exe` unconverted and the VM dies
-   in argument parsing. The harness then prints a bare `cratonvm rc=1`,
-   **indistinguishable from a real assertion failure.** MEASURED A/B: POSIX form
-   0 passed / 5 failed, Windows form 5 passed / 0 failed. **Use
-   `cygpath -m "$(dirname "$(dirname "$(command -v javap)")")"`.**
+   `MSYS_NO_PATHCONV=1`, so it reaches `cratonvm.exe` unconverted. **Use
+   `cygpath -m "$(dirname "$(dirname "$(command -v javap)")")"`.** MEASURED A/B,
+   same binary, only the spelling changed: POSIX 0 passed / 5 failed, Windows
+   5 passed / 0 failed.
+
+   **CORRECTION 2026-08-21: it is NOT "the VM dies in argument parsing"** — both
+   `H24-2` and H0 said that and both were wrong. The VM accepts the POSIX
+   spelling on the command line; it dies **validating the JDK image**:
+   `Provide a valid JDK installation (must contain 'jmods/' or 'lib/modules')`.
+   Nobody could see that because the harness printed a bare `cratonvm rc=1`.
+
+   **That half is now FIXED.** `run.sh`'s signature extraction falls through to
+   clap's `^error: `/`^Usage: ` lines and then to the VM's own first line, tagged
+   `unclassified:`, with `no output` when the VM printed nothing. A launch or
+   config failure no longer renders identically to an assertion failure. The fix
+   diagnosed this very bug the first time it ran.
 2. **The enforcement dial reaches ONE dispatch door.**
    `jdk_only_enforce_shadow_for` has exactly one live call site, inside
    `resolve_step1_native`. Arming a class arms only its **cold, step-1**
@@ -86,9 +116,21 @@ a gate that reads 100%. That gap is the project.
    going GREEN is the fix, not a violation.** Four have closed that way.
 7. **`RMapGcStress` is a TIMEOUT**, `rc=124`: it needs 233 s against a 120 s
    budget. Not an objection to your change. **Use `TIMEOUT=600`.**
-8. **Never run two `regression-suite/run.sh` at once.** `.guard-tmp` is a fixed
-   shared path; concurrent sweeps starved the oracle and moved a cell from
-   83/104 to 102/104.
+8. **~~Never run two `regression-suite/run.sh` at once.~~ FIXED 2026-08-21 —
+   you may now sweep concurrently.** `.guard-tmp` was a FIXED shared path and its
+   `rm -rf` deleted a running sweep's oracle files underneath it. It is now
+   PID-scoped (`$HERE/.guard-tmp.$$`) with a `trap` cleanup, and two concurrent
+   two-vector sweeps were MEASURED green with no harness errors and no leftover
+   directories.
+
+   **Keep the SIGNATURE, because it will recur elsewhere.** It corrupted a
+   measurement twice and both times looked like a VM defect first: `H14-3` §5
+   moved a cell from **83/104 to 102/104**, and H0 got **3 passed, 204 failed**
+   — every vector red AND a `harness:` entry for each, `204 = 102 vectors x 2`.
+   **Total redness that INCLUDES the harness guard is an ENVIRONMENT failure, not
+   a defect.** No source change can fail `RJitGc`, `RCrypto` and `RShutdownHooks`
+   in one run. If you ever see that shape, check what else is running before you
+   revert anything.
 9. **Never patch source with heredoc-python (`python - <<'PY'`).** It bakes
    literal control characters in; the file still parses and is silently wrong.
    Write a `.py` to a scratch dir and run it. Verify with `cat -A`.
