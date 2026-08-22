@@ -44178,13 +44178,26 @@ struct TmArrayState {
     data: Option<ObjectRef>,
     size: i32,
     comparator: Value,
-
+    /// The `modCount` this map's real `root` mirror was last built at, or `-1`
+    /// when it has never been built. See [`tm_publish_real_root`].
+    ///
+    /// This is what makes the mirror affordable. `WORKER-2-NOTE-1` section 5b
+    /// declined `root` because the only available triggers are the bulk-read
+    /// natives and `native_tm_entry_set` ALREADY allocates N entries, so a
+    /// mirror rebuilt on every read would roughly double the allocation cost of
+    /// every `TreeMap` iteration in the VM. Gating on `modCount` -- which this
+    /// lane fixed one commit earlier, and which is pinned at 0 without that fix
+    /// -- turns "per iteration" into "per mutation": an unchanged map is a
+    /// single `i32` compare.
+    root_published_at: i32,
+}
 impl Default for TmArrayState {
     fn default() -> Self {
         TmArrayState {
             data: None,
             size: 0,
             comparator: Value::Object(None),
+            root_published_at: -1,
         }
     }
 }
@@ -48067,7 +48080,236 @@ fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(entry))))
 }
 
+/// `java.util.TreeMap$Entry`, the real node class. `javap -p` (JDK 25):
+/// `K key; V value; Entry left; Entry right; Entry parent; boolean color`.
+const TM_ENTRY_CLASS: &str = "java/util/TreeMap$Entry";
+/// `TreeMap.RED` / `.BLACK`. The JDK spells them `false` / `true`.
+const TM_RED: i32 = 0;
+const TM_BLACK: i32 = 1;
+
+/// The shape `TreeMap.buildFromSorted` would give `n` sorted entries, as plain
+/// indices: `(left, right, parent, color, root)` with `-1` for absent.
+///
+/// Computed as integers BEFORE anything is allocated, which is what keeps the
+/// mirror GC-safe: the only heap work afterwards is one field-writing pass with
+/// every node reachable from a pinned array.
+fn tm_build_tree_shape(n: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, i32) {
+    let mut left = vec![-1i32; n];
+    let mut right = vec![-1i32; n];
+    let mut parent = vec![-1i32; n];
+    let mut color = vec![TM_BLACK; n];
+    if n == 0 {
+        return (left, right, parent, color, -1);
+    }
+    // `TreeMap.computeRedLevel(int size)`, JDK 21+: the level whose nodes are
+    // RED is the deepest complete one, so the tree is a valid red-black tree
+    // (every root-to-leaf path has the same BLACK count).
+    let red_level = 31 - ((n as u32) + 1).leading_zeros() as i32;
+    // Explicit stack rather than recursion: `n` is unbounded from Java, and a
+    // native is not the place to inherit the JVM's stack depth. Each frame
+    // carries which SIDE of its parent it is, rather than trying to infer that
+    // from the indices afterwards -- the inference is exactly the kind of
+    // almost-right arithmetic that produces a tree which walks correctly in
+    // order and is silently unbalanced.
+    // (lo, hi, level, parent, is_left)
+    let mut stack: Vec<(i64, i64, i32, i32, bool)> = vec![(0, n as i64 - 1, 0, -1, false)];
+    let mut root = -1i32;
+    while let Some((lo, hi, level, par, is_left)) = stack.pop() {
+        if hi < lo {
+            continue;
+        }
+        // `>>> 1` on the SUM, matching `buildFromSorted`'s own midpoint, so the
+        // shape is the one java.base would have produced for these entries.
+        let mid = (((lo + hi) as u64) >> 1) as usize;
+        parent[mid] = par;
+        if level == red_level {
+            color[mid] = TM_RED;
+        }
+        if par < 0 {
+            root = mid as i32;
+        } else if is_left {
+            left[par as usize] = mid as i32;
+        } else {
+            right[par as usize] = mid as i32;
+        }
+        stack.push((lo, mid as i64 - 1, level + 1, mid as i32, true));
+        stack.push((mid as i64 + 1, hi, level + 1, mid as i32, false));
+    }
+    (left, right, parent, color, root)
+}
+
+/// Populate the receiver's real `java.util.TreeMap.root` with a real
+/// `TreeMap$Entry` red-black tree over its current contents.
+///
+/// # What this closes
+///
+/// `WORKER-2` section 5 row 3 asks for `TreeMap`'s own diagnosis, and the
+/// answer (`WORKER-2-NOTE-1` section 5) is that `TreeMap` has no `this$0`
+/// problem at all -- its whole structure lives in the address-keyed
+/// `tm_array_table`, so the real JDK fields are populated only where something
+/// took the trouble. `size` and `comparator` were mirrored, `modCount` was
+/// fixed one commit back, and `root` was the last one left:
+///
+/// ```text
+///   TreeMap, 20 puts + 1 remove   HotSpot 25.0.3+9        before
+///     root                        a java.util.TreeMap$Entry tree   null
+/// ```
+///
+/// # Why it is safe to build
+///
+/// `buildFromSorted` is a pure function of a sorted sequence and
+/// `computeRedLevel` gives a genuinely valid colouring, so the result is a
+/// real red-black tree rather than a shape that merely looks like one. This VM
+/// already proves the class is buildable here: `TreeMap.clone()` returns a map
+/// whose `root` IS populated on CratonVM too, because clone runs java.base's
+/// own `buildFromSorted` bytecode.
+///
+/// The authoritative store does not move. `tm_array_table` stays the single
+/// source of truth and this mirror is rebuilt from it; nothing reads back
+/// through `root`. That direction matters: a mirror that were also an input
+/// would be the two-producers-one-slot trap this file has already paid for
+/// twice (`WORKER-2-NOTE-1` sections 4a and 9a.1).
+///
+/// # Why it is affordable
+///
+/// Gated on `modCount`, so an unchanged map costs one `i32` compare. See
+/// [`TmArrayState::root_published_at`].
+fn tm_publish_real_root(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    // A stand-in would be exactly the class-fabrication `--jdk-only` exists to
+    // stop, and its fields would not be the ones real bytecode reads.
+    if ctx.would_fabricate_synthetic_stub(TM_ENTRY_CLASS)
+        || ctx.is_class_synthetic_stub(TM_ENTRY_CLASS)
+    {
+        return;
+    }
+    let root_slot = match ctx.resolve_field_index("java/util/TreeMap", "root") {
+        Some(s) if s < ctx.object_num_fields(this) => s,
+        // No `root` field to mirror into: the synthetic-JDK shape, where the
+        // caller keeps exactly the behaviour it had.
+        _ => return,
+    };
+    let mod_now = match ctx.resolve_field_index("java/util/TreeMap", "modCount") {
+        Some(s) if s < ctx.object_num_fields(this) => match ctx.get_field(this, s) {
+            Value::Int(m) => m,
+            _ => return,
+        },
+        _ => return,
+    };
+    {
+        let tbl = tm_array_table().lock().unwrap();
+        if let Some(st) = tbl.get(&tm_obj_key(ctx, this)) {
+            if st.root_published_at == mod_now {
+                return;
+            }
+        }
+    }
+    let pairs = tm_collect_pairs(ctx, this);
+    let n = pairs.len();
+    if n == 0 {
+        ctx.set_field(this, root_slot, Value::Object(None));
+        tm_array_table()
+            .lock()
+            .unwrap()
+            .entry(tm_obj_key(ctx, this))
+            .or_default()
+            .root_published_at = mod_now;
+        return;
+    }
+    let (left, right, parent, color, root_idx) = tm_build_tree_shape(n);
+    let (kf, vf, lf, rf, pf, cf) = match (
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "key"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "value"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "left"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "right"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "parent"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "color"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
+        _ => return,
+    };
+    let cid = match ctx.ensure_class_initialized(TM_ENTRY_CLASS) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if ctx.class_name_arc_of_id(cid).as_deref() != Some(TM_ENTRY_CLASS) {
+        return;
+    }
+    let width = ctx.class_num_total_fields(cid);
+    // GC-SAFETY: every allocation below can move the heap, so the nodes live in
+    // a pinned `Object[]` from the moment they exist rather than in a Rust Vec
+    // the collector cannot rewrite. `this` and the key/value snapshot are
+    // pinned for the same reason.
+    let this_pin = ctx.pin_native_root(this);
+    let keys: Vec<Value> = pairs.iter().map(|(k, _)| *k).collect();
+    let vals: Vec<Value> = pairs.iter().map(|(_, v)| *v).collect();
+    let (_, key_pins) = pin_value_slice(ctx, &keys);
+    let (_, val_pins) = pin_value_slice(ctx, &vals);
+    let nodes = alloc_ref_array(ctx, n);
+    let nodes_pin = ctx.pin_native_root(nodes);
+    for i in 0..n {
+        let e = ctx.alloc_object(cid, width);
+        let nodes = ctx.read_native_pin(nodes_pin, nodes);
+        ctx.set_array_element(nodes, i, Value::Object(Some(e)));
+    }
+    for i in 0..n {
+        let nodes = ctx.read_native_pin(nodes_pin, nodes);
+        let e = match ctx.get_array_element(nodes, i) {
+            Value::Object(Some(e)) => e,
+            _ => continue,
+        };
+        let k = read_pinned_elem(ctx, key_pins[i], keys[i]);
+        let v = read_pinned_elem(ctx, val_pins[i], vals[i]);
+        ctx.set_field(e, kf, k);
+        ctx.set_field(e, vf, v);
+        ctx.set_field(e, cf, Value::Int(color[i]));
+    }
+    let link = |ctx: &mut dyn NativeContext, i: usize, slot: usize, target: i32| {
+        let nodes = ctx.read_native_pin(nodes_pin, nodes);
+        let e = match ctx.get_array_element(nodes, i) {
+            Value::Object(Some(e)) => e,
+            _ => return,
+        };
+        let t = if target < 0 {
+            Value::Object(None)
+        } else {
+            ctx.get_array_element(nodes, target as usize)
+        };
+        ctx.set_field(e, slot, t);
+    };
+    for i in 0..n {
+        link(ctx, i, lf, left[i]);
+        link(ctx, i, rf, right[i]);
+        link(ctx, i, pf, parent[i]);
+    }
+    let nodes = ctx.read_native_pin(nodes_pin, nodes);
+    let root_val = if root_idx < 0 {
+        Value::Object(None)
+    } else {
+        ctx.get_array_element(nodes, root_idx as usize)
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, root_slot, root_val);
+    ctx.unpin_native_roots(this_pin);
+    tm_array_table()
+        .lock()
+        .unwrap()
+        .entry(tm_obj_key(ctx, this))
+        .or_default()
+        .root_published_at = mod_now;
+}
+
+/// Refresh the real-JDK mirrors a bulk read makes observable. Called from the
+/// `TreeMap` bulk-read natives, which are the only points where this VM knows
+/// something is about to look at the map as an object rather than through an
+/// accessor.
+fn tm_refresh_real_mirrors(ctx: &mut dyn NativeContext, args: &[Value]) {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        tm_publish_real_root(ctx, this);
+    }
+}
+
 fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    tm_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -48237,6 +48479,7 @@ impl PinnedPairs {
 }
 
 fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    tm_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -48252,6 +48495,7 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    tm_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -48582,6 +48826,7 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    tm_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
