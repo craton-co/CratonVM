@@ -78,6 +78,28 @@ The registry diff was re-run on the merged binary and is byte-identical to the
 pre-merge one: −15 registrations, −6 triples, **0 triples appeared, 0 slot
 owners moved file**.
 
+**And then the branch moved again, so this was done twice.** While the above was
+building, WORKER 2 pushed seven commits to
+`origin/claude/jdk-only-mode-handoff-09b48c` — `native-collections/src/lib.rs`
+(+582: `TreeMap`'s pinned `modCount`, the view carriers' `this$0`, `Hashtable`'s
+real node type and bucket sizes, CHM's real table on bulk reads) and its own
+record. Disjoint from every file this lane touched, and merged clean.
+
+**MEASURED on `d828a329d`, this lane's work ON TOP of WORKER 2's:**
+
+| arm | result |
+|---|---|
+| `CRATONVM_ARGS=--jdk-only` | **107 / 107, 0 failed** |
+| `SUITE=all` | **107 / 107, 0 failed** |
+| `SUITE=core` | **67 / 67, 0 failed** |
+
+Census over the original 105 vectors: **1403 / 471**, `synthetic-native-registered`
+**1610** — identical to the previous merged state. Registry diff identical:
+−15 / −6 / 0 appeared / **0 slot owners moved file**.
+
+*Two fixes that each pass alone are not a tested combination* — which is why the
+whole verification was repeated rather than reasoned about, both times.
+
 **The A/B in §1 and §1.2 was deliberately NOT re-taken on the merged base.**
 Attributing this lane's delta needs H0's fix in NEITHER arm; folding it into
 both would add a −12 synthetic-registration movement to a comparison that
