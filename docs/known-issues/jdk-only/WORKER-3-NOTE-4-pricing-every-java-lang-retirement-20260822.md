@@ -157,39 +157,109 @@ Every link of the chain works when driven directly under retirement —
 `StringLatin1.newString` → `abc7`, `isLatin1()` → true. Only the whole call does
 not.
 
-### 4.5 The part that is still open
+### 4.5 Resolved — `StringBuilder.toString()` has THREE doors, and they disagree
 
-`sb_read_chars` already carries a layout-aware fallback (`sb_value_units`, which
-reads either layout). It is not enough, and the residual is sharper than the
-original bug — MEASURED, one `toString()` call per builder, result stored:
+The first-call/second-call split in §4.4 is not a latch. Instrumented at the
+producer (`native_sb_to_string` and `sb_state`, which is where the truncating
+`count` comes from), with both builder classes retired:
 
-| builder | `builder.length()` | first `toString()` | second `toString()` |
+```text
+[w3sb] sb_state fields=6 buf_is_char=false count_slot=Some(3) count=8 …
+LATIN1   s.length()=0              <- FIRST toString(): no to_string line at all
+[w3sb] sb_state … count=8
+[w3sb] to_string count=8 chars_len=8
+LATIN1   secondCall.length()=8     <- SECOND toString(): served by the intrinsic
+```
+
+**The first call never reaches `native_sb_to_string`.** The second does. Same
+receiver, same method, two consecutive calls, two different implementations —
+and the two disagree about the answer.
+
+Closing the second door as well identifies it. `CRATONVM_DISABLE_INTRINSICS=1`
+(the interpreter intrinsic table, `native-builtins/src/intrinsics/mod.rs:80`,
+which binds `StringBuilder.toString`/`length`/`append` **directly to the same
+Rust bodies without consulting the registry**) drops the instrumented call count
+from 12 to 4 and makes the answer consistent:
+
+| doors closed | LATIN1 1st | LATIN1 2nd | UTF-16 |
 |---|---:|---:|---:|
-| LATIN1 `"abcdefgh"` | 8 | **0** | **8** |
-| UTF-16 `"é中文abcd"` | 7 | 7 | 7 |
+| none (control) | 8 | 8 | 7 |
+| registrations only | **0** | 8 | 7 |
+| registrations + intrinsics | **0** | **0** | **0** |
 
-**The first call on a LATIN1 builder returns a genuinely empty String**
-(`isEmpty()`, `hashCode()==0`, `getBytes().length==0`); the second call on the
-same builder is correct, and UTF-16 is unaffected either way. First-call-only and
-coder-dependent — the shape of a latch, not of a slot misread, which is why
-three rounds of static reading produced three mechanisms the code disproves.
+With both doors shut the answer is empty *consistently*, which is the honest
+reading: **real JDK `AbstractStringBuilder` bytecode does not produce a usable
+string on this VM**, and the natives and intrinsics were both masking it. The
+"first call only" and "UTF-16 is fine" effects were two doors interleaving, not
+two bugs.
 
-Under instrumentation now; **not diagnosed, and this note does not guess.**
+A third door remains open: `sb_state` is still entered 4 times with **both**
+the registrations and the intrinsic table disabled, so `length()` reaches a
+native body by a route neither switch controls.
 
-## 5. What this changes for the brief
+**This is trap 2 generalized, and it is the most important thing in this note.**
+The brief says an armed zero is unreliable because the dial reaches one dispatch
+door. The measurement says the doors are not merely several — they are
+*independent registrars of the same method*, at least three of them, only one of
+which the census counts and only one of which any "retirement" reaches.
 
-* **`java.lang` core, 168 rows** — priced end to end. **34 rows are free**
-  (`exceptions` 30, `threadgroup` 3, `enum` 1); the remaining ~134 are
-  load-bearing, and `Class`/`Thread`/`System`/`Object`/`Runtime` are catastrophic
-  at 5–67 passed. This block cannot be closed by retirement. The verb for most of
-  it is the one `H14-2` §5 already found for `register_exception_extras_natives`:
-  these are registrations on inherited methods, and the population needs
-  re-tagging, not deletion.
-* **`java/lang/invoke`, 56 rows** — refused, source-level, 25 vectors.
-* **`StringBuilder`, 57 rows** — the brief's "do not retire" is CONFIRMED and
-  now has a price (12 vectors) and a mechanism (a `char[]`-backed object model
-  bridged by one native at the `String` boundary). The apparent 107/107 for
-  `StringBuilder` alone is an inheritance artifact and must not be banked.
+## 5. REFUSED — the 30-row exception retirement, with evidence
+
+§2 prices `exceptions` at 107/107 and −30 census, and `H14-2` §5 predicts it
+(21 of 22 registered on a class that does not declare the method). It is still
+refused, because the arm retired a **class** and the source holds something else.
+
+MEASURED, `--dump-native-registry`, the 21 `java/lang/*Exception|*Error` classes:
+
+| | |
+|---|---:|
+| registrations on those classes | **651** |
+| registrars they span | **3** (`lang_misc.rs` 576, `lib.rs` 74, `reflect_annotations.rs` 1) |
+| already `owns_slot: false` — losers a deletion would PROMOTE | **66** |
+
+The gate suppressed all 651 at once, which no single source edit does. Deleting
+the `lib.rs` extras loop promotes 66 already-condemned bodies into service —
+`H22` nearly shipped exactly that mistake at a scale of 16, and this is 66.
+
+**Work-order for whoever takes it**, in this order and not another:
+
+1. Extend the gate from classes to `class#method#descriptor` triples.
+2. Price the `lib.rs` extras loop **alone** (74 rows), not the 21 classes.
+3. `--dump-native-registry` before/after, diffing `owns_slot` — the pass
+   condition is *zero* rows flipping `false → true`, not a green suite.
+4. Only then delete, and re-run all three arms.
+
+## 6. Reproducing the instrument
+
+Not landed: `CRATONVM_`-prefixed flags are a guarded surface with five
+generated/checked artifacts (`types/tests/flag-surface.txt`,
+`flag_declaration_guard.rs`, `flag_docs_generated.rs`, `flag_surface.rs`,
+`flag_env_mutation_guard.rs`), and doing that properly is its own pass. The
+patch is four lines at one choke point, `native-api/src/registry.rs`, at the top
+of `NativeMethodRegistry::register`:
+
+```rust
+if !w3_retired_classes().is_empty() && w3_retired_classes().iter().any(|c| c == class_name) {
+    return;
+}
+```
+
+with a memoised reader (an unset var costs one atomic load and an `is_empty`,
+consulted ~10,000 times a boot):
+
+```rust
+fn w3_retired_classes() -> &'static [String] {
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| match std::env::var("W3_RETIRE") {
+        Ok(v) => v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Err(_) => Vec::new(),
+    }).as_slice()
+}
+```
+
+Landing it is worth a pass of its own: WORKER 2's collection prefixes, WORKER 4's
+`java.io` block and `H0-4`'s six priced registrars are all sitting on the same
+unanswerable question this makes cheap.
 
 ## Index rows for `INDEX.md` (H0 to place)
 
@@ -199,3 +269,9 @@ Under instrumentation now; **not diagnosed, and this note does not guess.**
   wrong: appends land, `count`/`coder`/payload are correct, `toString()` alone fails
 * `WORKER-3-NOTE-4` §4.3 — retiring a class can PROMOTE its superclass's
   natives: `sb_only` scores −7 census while changing nothing
+* `WORKER-3-NOTE-4` §4.5 — `StringBuilder.toString()` has at least THREE
+  independent doors (registry, interpreter intrinsic table, and one neither
+  switch reaches) and they return different answers for the same call
+* `WORKER-3-NOTE-4` §5 — the 30-row exception retirement is REFUSED: the arm
+  retired a class, the source spans 3 registrars and 651 rows, and deleting any
+  of them promotes 66 `owns_slot: false` losers
