@@ -8151,13 +8151,6 @@ mod enforcement_dial_door_tests {
         // difference between this and a comment saying "be careful here".
         const FORCE_SITES_EXEMPT: &[(&str, &str)] = &[
             (
-                "dispatch_virtual.rs",
-                "vtable force path; memoizes into a per-entry force_native_cache \
-                 OnceLock, so the dial needs the memo to be dial-aware (the \
-                 2026-08-04 per-call-site drift hazard). Fixed on the handoff \
-                 branch by 089329af7; drop this row when that reaches dev.",
-            ),
-            (
                 "jit_bridge.rs",
                 "JIT direct-bind force path. A compiled site that binds a native \
                  directly has no interpreter door to report through, so this needs \
