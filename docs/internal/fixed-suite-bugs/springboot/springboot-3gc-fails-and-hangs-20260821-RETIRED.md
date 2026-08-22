@@ -189,7 +189,8 @@ a known event, not a new one.
 ## 3. The nine HANGs — the harness, and one real throughput residual
 
 **None of the nine is a hang.** Given a budget that fits, all nine pass
-serially under ZGC with test counts identical to HotSpot:
+serially under ZGC with test counts identical to HotSpot — and eight of them
+were since confirmed on Generational and G1 too (see below):
 
 | class | HotSpot | CratonVM (ZGC, serial) | ratio |
 |---|---|---|---|
@@ -268,6 +269,86 @@ native-collections floor, and it is split out to
 `docs/known-issues/perf/springboot-configurationpropertysources-native-collections-floor-20260821.md`
 rather than left implied by a ratio on this page.
 
+## The closing run: both arms, the sweep's own conditions
+
+Twelve classes, `PARALLEL=3`, base timeout 300 s — the shard's own settings —
+on the fixed binary, on a **quiet** host (load 1.7 at start), using the tracked
+driver so what is measured is what shipped:
+
+| arm | result |
+|---|---|
+| **A** — budget table deliberately absent | **PASS 11, HANG 1** |
+| **B** — budget table present | **PASS 12, HANG 0, FAIL 0** |
+
+Arm A's single HANG is `ConfigurationPropertySourcesTests`, and the driver
+labels it for what it is: `budget 300s (base default -- no validated budget for
+this class)`. Every other class — including all three reported FAIL rows —
+passes at parallel-3 with 300 s **when the host is idle**. Arm B's per-class
+walls, against the budgets they were given:
+
+```
+BatchJdbcAutoConfigurationTests             PASS    46s  cap  300s
+ZipContentTests                             PASS    53s  cap  300s
+RabbitAutoConfigurationTests                PASS    87s  cap  900s
+CacheAutoConfigurationTests                 PASS   108s  cap  600s
+FlywayAutoConfigurationTests                PASS    87s  cap  600s
+JacksonAutoConfigurationTests               PASS   125s  cap  900s
+JettyServletWebServerFactoryTests           PASS   131s  cap  900s
+PulsarAutoConfigurationTests                PASS    69s  cap  900s
+TomcatServletWebServerFactoryTests          PASS   131s  cap  900s
+KafkaAutoConfigurationIntegrationTests      PASS    18s  cap  600s
+WebMvcAutoConfigurationTests                PASS   137s  cap 7200s
+ConfigurationPropertySourcesTests           PASS   600s  cap 5400s
+```
+
+No NEAR-CAP rows. So the reported table needed **two** things to appear: the
+missing budget table *and* a busy host.
+
+### The host was the other half, and it is measurable
+
+The same eight classes, run serially on this box while other tenants had it at
+load 20–35, against the same classes on an idle box:
+
+| class | idle | under load 20–35 |
+|---|---|---|
+| `CacheAutoConfigurationTests` | 95.6 s | 207 s |
+| `FlywayAutoConfigurationTests` | 72.2 s | 263 s |
+| `JacksonAutoConfigurationTests` | 106.6 s | 325 s |
+| `JettyServletWebServerFactoryTests` | 119.2 s | 264 s |
+| `TomcatServletWebServerFactoryTests` | 192.8 s | 256 s |
+| `WebMvcAutoConfigurationTests` | 161.1 s | 282 s |
+
+Every one of them crosses 300 s under load and none of them does idle. That is
+the whole HANG column, and it is why the driver now prints `/proc/loadavg` at
+the top of every shard log. This box was seen at **load 178 on 8 cores** during
+this work.
+
+## Generational and G1 confirm ZGC
+
+Eight of the nine HANG classes re-run serially on the other two collectors
+(`ConfigurationPropertySourcesTests` excluded — it is the known throughput
+outlier, collector-independent, and costs an hour per arm):
+
+**G1: 8/8 PASS.** **Generational: 7/8 PASS**, with counts identical to HotSpot
+on every one.
+
+The eighth is worth its own note, because it is the `+ Kafka on Generational
+only` in the reported table. `KafkaAutoConfigurationIntegrationTests` failed
+**2/3** on the Generational arm — but that arm ran at load 20–35 and took
+282 s, and the two failures are both
+
+```
+KafkaAutoConfigurationIntegrationTests.java:93
+  assertThat(listener.latch.await(30, TimeUnit.SECONDS)).isTrue();
+```
+
+— a **30-second wall-clock deadline inside the test**, on an embedded broker,
+on a box running 4× oversubscribed. Re-run on the same collector once the host
+was quiet: **3/3 PASS, three times running, 25 s each**. G1 passed it in 20 s.
+It is a host artefact against a test's own timing assumption, not a collector
+defect — and it is the reason a class can look collector-specific when the only
+thing that differs is which arm happened to run while the box was busy.
+
 ## What this page is evidence for
 
 * A FAIL/HANG table from a parallel shard is a statement about the shard, not
@@ -279,3 +360,7 @@ rather than left implied by a ratio on this page.
 * A harness that re-implements a launch will re-implement it *minus* whatever
   was learned since. The budget table existed, was validated, and was invisible
   to the driver that needed it.
+* **Record the host load beside every wall time.** Half of this table needed a
+  busy box to appear at all, and one row (`Kafka` on Generational) is a test's
+  own 30-second deadline losing to 4× oversubscription. Neither is visible in a
+  results.tsv that carries only pass/fail.
