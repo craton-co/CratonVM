@@ -5165,9 +5165,13 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
 /// not per registrar. See the block above `register_collections_natives`.
 fn register_map_view_carrier_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     for c in MAP_VIEW_CARRIERS {
         let c = *c;
+        // PER CARRIER, not per registrar — `H4-1` §2. This list spans four
+        // ownership clusters; one `set_category` outside the loop made moving
+        // any of them a partial retag of the other three. See
+        // [`CarrierFamily`].
+        r.set_category(carrier_family_kind(carrier_family_of(c)));
         r.register(c, "size", "()I", native_al_size);
         r.register(c, "isEmpty", "()Z", native_al_is_empty);
         r.register(c, "contains", "(Ljava/lang/Object;)Z", native_al_contains);
@@ -16966,9 +16970,10 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
 /// and `deprecated_util.rs` already names it).
 fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     for c in SET_VIEW_CARRIERS {
         let c = *c;
+        // PER CARRIER — see [`CarrierFamily`] and the note above.
+        r.set_category(carrier_family_kind(carrier_family_of(c)));
         r.register(c, "size", "()I", native_hs_size);
         r.register(c, "isEmpty", "()Z", native_hs_is_empty);
         r.register(c, "add", "(Ljava/lang/Object;)Z", native_hs_add);
@@ -18180,6 +18185,92 @@ const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
 /// (ints), and this VM's five fields would land an `Int` cursor in a reference
 /// slot. So the native state goes PAST the declared fields —
 /// [`key_itr_base`] — and the object is allocated `declared + 5` wide.
+/// Which OWNERSHIP CLUSTER a view carrier belongs to — the unit `H4-1` §2 says
+/// the retag has to move in, and the thing this file had a comment about and no
+/// code for.
+///
+/// # The problem, in `H4-1`'s words
+///
+/// > *"`register_map_view_carrier_natives` — `MAP_VIEW_CARRIERS` holds
+/// > `HashMap$Values`, `LinkedHashMap$LinkedValues`, **`TreeMap$Values`**,
+/// > **`TreeMap$EntrySet`**, **`Hashtable$ValueCollection`**,
+/// > `ConcurrentHashMap$ValuesView`: four families. … So the split has to be
+/// > per carrier family, keyed on whether the producing registrar moved — not
+/// > per registrar."*
+///
+/// Both carrier registrars opened with ONE
+/// `r.set_category(NativeKind::Bridge)` over the whole list, so moving either
+/// of them was all-or-nothing across four ownership clusters. Retagging the
+/// registrar as a unit is a partial retag of three families; refusing a
+/// carrier whose PRODUCER is still `Bridge` runs the real JDK body over a
+/// carrier this crate minted.
+///
+/// # What this changes, and what it deliberately does not
+///
+/// Every carrier now declares its family and takes its category from
+/// [`carrier_family_kind`], which is asked once per carrier rather than once
+/// per registrar. **Today every family answers `Bridge`, so this is a
+/// no-behaviour-change refactor** — and that is the point: the structure is in
+/// place so that moving `register_hashmap_natives` moves ITS carriers and only
+/// its carriers, by construction rather than by a reviewer noticing.
+///
+/// `H4-1` §2 calls that shape *"strictly safer than §5's, because dispatch
+/// keys on class: any class left `Bridge` behaves exactly as today"*.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum CarrierFamily {
+    /// `java/util/HashMap` and `java/util/LinkedHashMap` — one cluster, because
+    /// `LinkedHashMap` extends `HashMap` and shares its `table`.
+    HashMapCluster,
+    /// `java/util/Hashtable`. `Properties` rides with it in the registry even
+    /// though its storage differs, because `is_hashtable_receiver` accepts both.
+    HashtableCluster,
+    /// `java/util/TreeMap` — the one whose `H4-1` §2 example is sharpest,
+    /// because a `TreeMap$Values` carrier is minted by `register_tree_map_natives`.
+    TreeMapCluster,
+    /// `java/util/concurrent/ConcurrentHashMap`.
+    ChmCluster,
+}
+
+/// The `NativeKind` a carrier of `family` must be registered under: the kind
+/// its PRODUCING registrar currently carries.
+///
+/// All four are `Bridge` today, which is exactly the state that makes this
+/// refactor inert. When a cluster moves, change its arm here and its carriers
+/// follow — the one edit, in the one place, that `H4-1` §2 asks for.
+///
+/// **Before moving [`CarrierFamily::HashMapCluster`], read
+/// [`register_set_view_carrier_natives`]'s cluster note.** The
+/// [`MAP_KEY_ITR_CARRIERS`] rows cannot be refused while a `Hashtable$KeySet`
+/// still mints a `HashMap$KeyIterator`; that edge is closed separately by
+/// [`key_itr_carrier_for`], and until it is, this arm and the Hashtable one
+/// have to move together.
+fn carrier_family_kind(family: CarrierFamily) -> cratonvm_native_api::NativeKind {
+    match family {
+        CarrierFamily::HashMapCluster => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::HashtableCluster => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::TreeMapCluster => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::ChmCluster => cratonvm_native_api::NativeKind::Bridge,
+    }
+}
+
+/// The owning cluster of a [`MAP_VIEW_CARRIERS`] / [`SET_VIEW_CARRIERS`] name.
+///
+/// Exhaustive over both lists by construction: an unlisted name answers
+/// `HashMapCluster`, which is the conservative default only because every
+/// carrier that reaches here IS in one of the two lists — the registrars are
+/// the only callers and they iterate those lists.
+fn carrier_family_of(name: &str) -> CarrierFamily {
+    match name {
+        "java/util/Hashtable$ValueCollection"
+        | "java/util/Hashtable$KeySet"
+        | "java/util/Hashtable$EntrySet" => CarrierFamily::HashtableCluster,
+        "java/util/TreeMap$Values" | "java/util/TreeMap$EntrySet" => CarrierFamily::TreeMapCluster,
+        "java/util/concurrent/ConcurrentHashMap$ValuesView"
+        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => CarrierFamily::ChmCluster,
+        _ => CarrierFamily::HashMapCluster,
+    }
+}
+
 const MAP_KEY_ITR_CARRIERS: &[&str] = &[
     "java/util/HashMap$KeyIterator",
     "java/util/HashMap$EntryIterator",
