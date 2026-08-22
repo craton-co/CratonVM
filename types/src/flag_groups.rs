@@ -298,6 +298,15 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "census-exact-invocations", on_key: Some("CRATONVM_CENSUS_EXACT_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce", on_key: Some("CRATONVM_DBG_CCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce-bt", on_key: Some("CRATONVM_DBG_CCE_BT"), off_key: None, off_word: None },
+    // Declared 2026-08-22 with the fix it was written for. When a VM-side field
+    // read decodes a `Value` cell with an out-of-range discriminant, name the
+    // RECEIVER and the Java frames that reached it. The collector's own guard
+    // reports the CELL and can report nothing else -- it runs in the collector
+    // crate and cannot see a frame -- which is why the producer behind
+    // `corrupt-value-cell-is-fatal-on-three-of-four-collectors` stayed open for
+    // two days. Costs one relaxed load per `NativeContext::get_field` while
+    // armed and nothing at all while it is not.
+    E { group: Group::DBG, token: "corrupt-cell", on_key: Some("CRATONVM_DBG_CORRUPT_CELL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccecache", on_key: Some("CRATONVM_DBG_CCECACHE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccsprobe", on_key: Some("CRATONVM_DBG_CCSPROBE"), off_key: None, off_word: None },
     // The per-occurrence, backtrace-carrying arm of the descriptor-coercion
@@ -628,6 +637,17 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-seed-collision", on_key: Some("CRATONVM_DBG_OSR_SEED_COLLISION"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-slots", on_key: Some("CRATONVM_DBG_OSR_SLOTS"), off_key: None, off_word: None },
+    // Declared 2026-08-22. `view-kind` reports a map-view carrier whose CLASS
+    // and whose head element disagree about what it holds, and every `vc_route`
+    // rebuild; `view-resync` reports a TreeMap range view's rebuild -- pairs
+    // seen, kept, bounds and the comparison verdict histogram. The pair
+    // separated three defects that all present as one red vector: an entrySet
+    // that came back holding values, a view that came back EMPTY, and a stale
+    // element inside the scan. An empty view that saw no pairs and one whose
+    // every comparison landed out of range are different defects and nothing
+    // else can tell them apart.
+    E { group: Group::DBG, token: "view-kind", on_key: Some("CRATONVM_DBG_VIEWKIND"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "view-resync", on_key: Some("CRATONVM_DBG_VIEWRESYNC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-bt", on_key: Some("CRATONVM_DBG_OVERLAY_BT"), off_key: None, off_word: None },
