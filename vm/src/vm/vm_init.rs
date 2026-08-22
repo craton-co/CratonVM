@@ -6130,10 +6130,25 @@ impl SharedVm {
         // `Bridge` dispatches never asked it, and
         // `refusals.interpreter_shadow_unenforced` read `0` for all 890,
         // because that one call site is also the only recorder of the
-        // native-won half. The per-door columns are what make that visible
-        // instead of silent: `reached` minus `yielded`, summed, is the number
-        // of dispatches the arming did not reach, and on a fixed binary it is
-        // zero.
+        // native-won half.
+        //
+        // **`declined_no_bytecode` is NOT a leak count, and an earlier draft of
+        // this object called it one.** `reached` minus `yielded` is the dial
+        // being ASKED and answering no, and after the three cheap guards the
+        // only remaining reason to answer no is `dispatch_has_code == false` --
+        // there is no concrete bytecode to yield TO, so the native runs exactly
+        // as step 1 has always let it. Armed for `java/util/HashMap` it is 0,
+        // which is why the wrong name survived its first checks; armed for
+        // `all` it is 494 of 19 931. A widening scope cannot widen a leak.
+        //
+        // The question the wrong name implied -- does some door serve a
+        // `Bridge` WITHOUT asking? -- this counter cannot answer, because a
+        // door that never calls `note_dial_door` is invisible to it. It is
+        // answered statically instead, by the three source-witness tests in
+        // `native_override.rs` (`the_unrouted_invoke_or_native_doors_ask_the_
+        // enforcement_dial`, `the_warm_invoke_cache_door_asks_the_enforcement_
+        // dial`, and the scan that pins the helper's spelling so the other two
+        // cannot silently degrade to searching for nothing).
         out.push_str("  },\n  \"enforcement_dial\": {\n");
         out.push_str(&format!(
             "    \"scope\": {},\n",
@@ -6145,7 +6160,7 @@ impl SharedVm {
         out.push_str(&format!("    \"reached\": {reached},\n"));
         out.push_str(&format!("    \"yielded\": {yielded},\n"));
         out.push_str(&format!(
-            "    \"leaked\": {},\n",
+            "    \"declined_no_bytecode\": {},\n",
             reached.saturating_sub(yielded)
         ));
         out.push_str("    \"doors\": [");
@@ -8882,6 +8897,19 @@ impl Vm {
                 if let Some(s) = weak.upgrade() {
                     crate::vm::vm_init::dump_wait_object_state(&s, obj);
                 }
+            });
+        }
+        // And the GC-SAFE handle for that dump. `Monitor::wait` holds the
+        // awaited `ObjectRef` as a plain local for the whole wait, which a
+        // moving collector invalidates; `jmx_waiting_monitor` is a scanned root
+        // that `update_thread_objs_after_gc` (gc.rs step 21) forwards, so it is
+        // the address still valid at dump time. Without this the dump silently
+        // reports pre-relocation field values.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_object_resolve(move |tid| {
+                let s = weak.upgrade()?;
+                s.threads.thread_registry.peek_jmx_waiting_monitor(tid)
             });
         }
 

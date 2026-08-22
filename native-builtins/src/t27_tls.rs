@@ -3004,12 +3004,30 @@ fn mark_trust_check_done(id: i32) {
 /// handshake loop), so the raw pointer never outlives the native call frame
 /// that created it.
 pub(crate) struct ActiveNativeContextGuard {
-    _private: (),
+    /// What was published when this guard was created; restored on drop.
+    ///
+    /// SAVE/RESTORE, not clear-to-`None`, since 2026-08-22. Clearing is correct
+    /// for exactly one publisher and silently wrong for two: an inner
+    /// `set_active_native_context` would take the window away from the OUTER
+    /// frame when it returned, and every later `with_active_native_context`
+    /// there would degrade to `None` — which for
+    /// `JavaKeyManagerResolver::resolve` means "no client certificate", a
+    /// silent wrong answer rather than a crash.
+    ///
+    /// Nothing nested until `do_check_trusted` started publishing (see that
+    /// call site). Making the guard re-entrant is what allows a second
+    /// publisher to exist at all, and it costs one word.
+    ///
+    /// Restoring is sound for the same reason publishing is: the outer pointer
+    /// came from a frame that is still live — this guard is nested inside it —
+    /// so it cannot have expired while this guard was alive.
+    prev: Option<*mut (dyn NativeContext + 'static)>,
 }
 
 impl Drop for ActiveNativeContextGuard {
     fn drop(&mut self) {
-        ACTIVE_TLS_NATIVE_CTX.with(|c| c.set(None));
+        let prev = self.prev;
+        ACTIVE_TLS_NATIVE_CTX.with(|c| c.set(prev));
     }
 }
 
@@ -3027,8 +3045,8 @@ pub(crate) fn set_active_native_context(ctx: &mut dyn NativeContext) -> ActiveNa
     // before the real `ctx` borrow this pointer came from could expire —
     // see the guard's doc and `with_active_native_context`'s SAFETY note.
     let ptr: *mut (dyn NativeContext + 'static) = unsafe { std::mem::transmute(ptr) };
-    ACTIVE_TLS_NATIVE_CTX.with(|c| c.set(Some(ptr)));
-    ActiveNativeContextGuard { _private: () }
+    let prev = ACTIVE_TLS_NATIVE_CTX.with(|c| c.replace(Some(ptr)));
+    ActiveNativeContextGuard { prev }
 }
 
 /// Reborrow the `ctx` published by `set_active_native_context`, if any is
@@ -8223,6 +8241,63 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+
+    /// A nested `set_active_native_context` must RESTORE the outer window, not
+    /// clear it.
+    ///
+    /// There are two publishers now — `http_url_connection::perform` on the
+    /// client path and `x509_manager::do_check_trusted` on the server path —
+    /// and on a client connection that validates a chain they nest. With the
+    /// old clear-to-`None` drop, the inner guard's return would leave the outer
+    /// frame with no window, and every later `with_active_native_context` there
+    /// would answer `None`. For `JavaKeyManagerResolver::resolve` that is not a
+    /// crash, it is "no client certificate" — a silent wrong answer, on the one
+    /// path whose whole job is to produce one.
+    ///
+    /// Asserted through `with_active_native_context`, the real reader, rather
+    /// than by inspecting the thread-local: that is what every consumer
+    /// actually calls.
+    #[test]
+    fn a_nested_active_native_context_restores_the_outer_one() {
+        use crate::test_utils::MockNativeContext;
+        let mut outer = MockNativeContext::new();
+        let mut inner = MockNativeContext::new();
+
+        assert!(
+            super::with_active_native_context(|_| ()).is_none(),
+            "no window should be published before the first guard"
+        );
+        let outer_guard = super::set_active_native_context(&mut outer);
+        let outer_ptr = ACTIVE_TLS_NATIVE_CTX.with(|c| c.get());
+        assert!(outer_ptr.is_some(), "the outer guard must publish a window");
+        {
+            let _inner_guard = super::set_active_native_context(&mut inner);
+            let inner_ptr = ACTIVE_TLS_NATIVE_CTX.with(|c| c.get());
+            assert!(inner_ptr.is_some());
+            assert!(
+                !std::ptr::addr_eq(inner_ptr.unwrap(), outer_ptr.unwrap()),
+                "the inner guard must publish ITS context while it is alive"
+            );
+        }
+        assert!(
+            super::with_active_native_context(|_| ()).is_some(),
+            "the inner guard cleared the window instead of restoring it — the \
+             enclosing frame is now running with no published context, and every \
+             `with_active_native_context` in it silently answers None"
+        );
+        assert!(
+            std::ptr::addr_eq(
+                ACTIVE_TLS_NATIVE_CTX.with(|c| c.get()).unwrap(),
+                outer_ptr.unwrap()
+            ),
+            "the restored window must be the OUTER context, not some other one"
+        );
+        drop(outer_guard);
+        assert!(
+            super::with_active_native_context(|_| ()).is_none(),
+            "the outermost guard must still clear the window on the way out"
+        );
+    }
 
     /// A server session cache is per `SSLContext` **and per client-auth
     /// policy** — a connection asking for a client certificate must not be
