@@ -2548,6 +2548,32 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     method_descriptor: &str,
 ) -> bool {
     hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
+    // W7-96 §7 NOMINATION 1 — THE RETIREMENT DIAL HAS TO WIN HERE.
+    //
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW` is the instrument the whole Phase 2
+    // migration is supposed to be measured with: arm it for a class and that
+    // class's registered natives are supposed to step aside so the real JDK
+    // bytecode runs and can be judged. This function never consulted it, so
+    // arming the dial measured THIS GATE rather than the VM.
+    //
+    // W7-96 §3.1 measured the consequence, 3 of 3 runs identical. Armed for
+    // `java/util/concurrent/ConcurrentHashMap`, six `put`s of distinct keys
+    // into a fresh map gave `size() == 1` and `get()` hits 1 of 6 — five
+    // entries silently gone, with `put` reporting a fresh insert for every one.
+    // Not a real-bytecode CAS bug: `<init>` is absent from the collection
+    // cluster below while `put` is in it, so the dial retired the constructor
+    // and kept the mutators, leaving a map with no segments whose
+    // `chm_segment_for -> None` arm answers "no previous mapping" having stored
+    // nothing. The record spent an hour reading that as a VM defect.
+    //
+    // Placed at the TOP rather than on the one cluster the record names,
+    // because every rule below has the same problem and a per-cluster guard
+    // would have to be repeated correctly in three files. `EnforceShadowScope`
+    // is `Off` unless the env var is set, and `Off::covers()` is `false`, so an
+    // ordinary run does not change by one dispatch.
+    if crate::runtime::env_cache::enforce_shadow_scope().covers(class_name) {
+        return false;
+    }
     // `Map.values()` (native_map_values in native-collections/src/lib.rs)
     // returns a plain `java/util/ArrayList` that stashes its source map in a
     // spare trailing capacity slot so a later `Map.put`/`remove` on the
@@ -2730,12 +2756,48 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // CratonVM-minted one carries a SNAPSHOT past those slots instead
     // (`key_itr_base`), so the real bodies would report every collection
     // exhausted.
+    // `setValue` on a LIVE entrySet element. It carries its source map in a
+    // trailing undeclared slot and the JDK body writes only the field, so
+    // `entrySet()...setValue(v)` would stop updating the map. Scoped to the one
+    // method: `getKey`/`getValue`/`equals`/`hashCode`/`toString` read the
+    // declared slots, which a live entry fills correctly, and their real
+    // bytecode is the better answer.
+    if matches!(
+        class_name,
+        "java/util/HashMap$Node"
+            | "java/util/LinkedHashMap$Entry"
+            | "java/util/TreeMap$Entry"
+            | "java/util/concurrent/ConcurrentHashMap$MapEntry"
+            | "java/util/Hashtable$Entry"
+    ) && method_name == "setValue"
+    {
+        return true;
+    }
     if matches!(
         class_name,
         "java/util/HashMap$KeyIterator"
             | "java/util/HashMap$EntryIterator"
             | "java/util/LinkedHashMap$LinkedKeyIterator"
             | "java/util/LinkedHashMap$LinkedEntryIterator"
+            // `TreeMap$KeyIterator` joined 2026-08-22 -- it is what HotSpot
+            // answers for BOTH `TreeSet.iterator()` and
+            // `TreeMap.keySet().iterator()`, where this VM was handing back the
+            // `Arrays$ArrayItr` refusal landing. Its snapshot lives at
+            // `key_itr_base`, past `PrivateEntryIterator`'s own fields, so the
+            // real bodies would walk a `next` chain nothing populated and
+            // report every set exhausted. Single-producer class, so this row
+            // cannot capture anyone else's objects -- unlike the
+            // `Hashtable$Enumerator` attempt that reddened `RJdkEnumerations`.
+            // The values-side twins, 2026-08-22. `values()` is a `Collection`,
+            // not a `Set`, so it is ArrayList-shaped and its iterator came back
+            // as a plain `ArrayList$Itr` where HotSpot names a per-family
+            // class. Their three snapshot fields live past the class's own
+            // declared ones (`al_itr_alt_base`), so without these rows the real
+            // bodies walk fields nothing populated. Each is single-producer.
+            | "java/util/HashMap$ValueIterator"
+            | "java/util/LinkedHashMap$LinkedValueIterator"
+            | "java/util/TreeMap$ValueIterator"
+            | "java/util/TreeMap$EntryIterator"
     ) && matches!(method_name, "hasNext" | "next" | "remove")
     {
         return true;

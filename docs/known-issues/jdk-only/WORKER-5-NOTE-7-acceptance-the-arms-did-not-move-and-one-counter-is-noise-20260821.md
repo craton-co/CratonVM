@@ -90,10 +90,15 @@ flake landing on opposite sides of two full sweeps, not a change in behaviour.
   `RTreeRangeGc` is a TreeMap vector. **ARGUED, not measured** — nothing here
   bisects it, and r12's exact provenance is unknown. `native-collections` is
   WORKER 2's surface.
-* **`RLangPackages` publishes no check count** and is not in
-  `regression-suite/harness-uncounted.txt`, so the harness flags `[G3]` on every
-  run. That is a registration gap in a new vector, independent of whether the
-  vector passes.
+* **`RLangPackages` trips `[G3]`** (no check count, not in
+  `regression-suite/harness-uncounted.txt`).
+  **CORRECTED 2026-08-22 — see `WORKER-5-NOTE-8` §3.** This record originally
+  called that "a registration gap ... independent of whether the vector passes".
+  That is wrong: the vector DOES publish a count (HotSpot prints
+  `PASS RLangPackages (27 checks)`); it never reaches that line on CratonVM
+  because it dies on its FIRST check. `[G3]` is a consequence of the failure,
+  and `harness-uncounted.txt` would be the wrong fix — it would silence a flag
+  that is correctly firing. The real defect is `getDefinedPackage`, NOTE-8.
 
 ### 1a.4 What the classifier did on a real failure
 

@@ -7,7 +7,7 @@ objects=29
 arrays=130
 sites=159
 test_sites=201
-reach=616
+reach=617
 widths=1 2 3 4 5 6 7 8 12
 byfn=alloc_object=228 new_ref_array=148 define_class=6 try_new_ref_array=4 class_is=1 alloc_object_of=1
 reachfn_begin
@@ -20,7 +20,7 @@ alloc_mbean_server_with_domain=9
 alloc_obj=10
 alloc_path=12
 alloc_proxy_list=3
-alloc_ref_array=156
+alloc_ref_array=157
 alloc_ref_array_or_oom=2
 alloc_response=3
 alloc_singleton=3
