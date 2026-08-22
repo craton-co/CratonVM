@@ -12720,11 +12720,28 @@ pub(crate) fn native_string_formatted(
 // little-endian: `probes/StringUtf16ClassShapeProbe` reads them back as
 // `HI_BYTE_SHIFT=0` / `LO_BYTE_SHIFT=8`, identical to HotSpot.
 //
-// So this stays registered for images that DO declare the method (JDK 17/21),
-// where it must give the same answer `UnsafeConstants` gives, which it does. A
-// census row reading `has_code: false` here means "absent from this image", not
-// "an unimplemented native something is waiting on" — the distinction cost a
+// So this stays registered for images that DO declare the method, where it must
+// give the same answer `UnsafeConstants` gives, which it does. A census row
+// reading `has_code: false` here means "absent from this image", not "an
+// unimplemented native something is waiting on" — the distinction cost a
 // paragraph of doubt in the record that filed the UTF-16 hash defect.
+//
+// **"(JDK 17/21)" used to be an assumption in this sentence. It is now a
+// measurement.** MEASURED 2026-08-21 over the nine supported images —
+// `javap -p --system <image> java.lang.StringUTF16`:
+//
+// ```text
+//   jdk17-linux  jdk17-windows  jdk17-mac-x64    private static native boolean isBigEndian();
+//   jdk21-linux  jdk21-windows  jdk21-mac-x64    private static native boolean isBigEndian();
+//   jdk25-linux  jdk25-windows  jdk25-mac-x64    ABSENT
+// ```
+//
+// Six of nine declare it. Re-derivable with
+// `scripts/jdk-only-no-image-methods.py`, which reports this row as `PARTIAL`
+// and exists because this comment was the standing witness that a
+// single-image census cannot adjudicate the population it belongs to.
+// See `docs/known-issues/jdk-only/WORKER-3-NOTE-2-*.md`: 62 of the 355 rows a
+// JDK-25-only adjudication calls "declared nowhere" are this same shape.
 //
 // Arity is guaranteed by the verifier (`()Z`); we ignore any extra args
 // defensively and return the constant unconditionally.
