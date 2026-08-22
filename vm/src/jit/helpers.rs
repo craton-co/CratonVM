@@ -16062,20 +16062,85 @@ unsafe fn try_lambda_site_direct_call(
             crate::runtime::interpreter::lambda_site_bump_direct();
             return Some(rc);
         }
-        // A deopt. The body did not complete, so its signals describe an
-        // attempt that is being abandoned and are dropped with it, and the
-        // reconstructed frame is consumed here rather than left for a later
-        // call to mis-claim. This site leaves the direct arm for good; the
-        // generic path below re-runs the body, and every later call goes
-        // through the interpreter's one-shot, which can resume such a frame
-        // precisely because it knows the impl's own identity.
-        drop(stashed);
+        // A deopt. Its signals describe an attempt that is being abandoned and
+        // are dropped with it, and this site leaves the direct arm for good so
+        // every later call goes through the interpreter's one-shot.
+        //
+        // But "the body did not complete" is NOT "the body did nothing". A
+        // deopt sentinel means the compiled body ran up to `rframe.bci` and
+        // stopped there; returning `None` here hands the call to the generic
+        // path below, which re-enters the impl FROM ENTRY and therefore
+        // re-executes every side effect already committed before the trap. That
+        // is the hibernate-reactive `reactiveRemove`-fires-twice defect: one
+        // `ArrayLoop.next()` dispatch, two deletes, `--nojit` clean,
+        // `CRATONVM_JIT_LAMBDA_SITE=0` clean. See
+        // `docs/known-issues/hibernate/hib-reactive-3gc-run-regressions-20260820.md`
+        // section 8.
+        //
+        // The reconstructed frame is what makes resuming from the trap point
+        // possible, so spend it instead of dropping it — through the same
+        // `resume_deopted_body` the interpreter's one-shot door uses, keyed on
+        // this site's OWN impl identity (`site.cached_impl()`), which is exactly
+        // the identity `try_resume_trapped_callee` could not supply.
         site.disable_direct();
         crate::runtime::interpreter::lambda_site_bump_deopted();
+        if let Some(rframe) = stashed {
+            let frames_depth_on_entry = thread.frames.len();
+            match crate::runtime::interpreter::resume_deopted_body(
+                vm,
+                thread,
+                &code,
+                site.cached_impl(),
+                &rframe,
+                frames_depth_on_entry,
+                "lambda-site-direct",
+            ) {
+                Ok(Some(value)) => {
+                    crate::runtime::interpreter::lambda_site_bump_resumed();
+                    return Some(jit_abi_bits_of(value));
+                }
+                Ok(None) => {
+                    // No resume was possible; the owning method has been
+                    // de-speculated instead. Falling through re-runs the body,
+                    // side effects and all — counted so the residual is visible
+                    // rather than silent.
+                    crate::runtime::interpreter::lambda_site_bump_unresumable();
+                }
+                Err(crate::error::MethodCallFailed::ExceptionThrown(exc)) => {
+                    // Same contract as the MIC hit path: leave it in
+                    // `jit_pending_exception` for the compiled caller's own
+                    // post-invoke check, and return the null/zero sentinel.
+                    set_jit_pending_exception(thread, exc);
+                    crate::runtime::interpreter::lambda_site_bump_resumed();
+                    return Some(0);
+                }
+                Err(_) => {
+                    crate::runtime::interpreter::lambda_site_bump_unresumable();
+                }
+            }
+        }
         return None;
     }
     crate::runtime::interpreter::lambda_site_bump_direct();
     Some(rc)
+}
+
+/// Encode a resumed frame's return `Value` into the raw JIT-ABI register bit
+/// pattern a compiled caller expects.
+///
+/// The inverse of `execute_jit_call_oneshot`'s argument decode, and the same
+/// table: `void` and `null` are both the zero word, a float/double travels as
+/// its bit pattern, and a reference as its raw address.
+fn jit_abi_bits_of(value: Option<Value>) -> i64 {
+    match value {
+        Some(Value::Int(x)) => x as i64, // Cast: JIT ABI -- i64 register convention
+        Some(Value::Long(x)) => x,
+        Some(Value::Float(x)) => x.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+        Some(Value::Double(x)) => x.to_bits() as i64, // Cast: JIT ABI -- double bits to i64
+        Some(Value::Object(Some(obj))) => obj.as_ptr() as i64, // Cast: JIT ABI -- pointer to i64
+        Some(Value::Object(None)) | None => 0,
+        Some(_) => 0,
+    }
 }
 
 /// Put a drained [`DrainedJitSignals`] back exactly as it was found.

@@ -117,16 +117,54 @@ fn map_size(reg: &NativeMethodRegistry, ctx: &mut MockCtx, class: &str, map: Obj
     }
 }
 
-/// `native_map_init` allocates the bucket table; the `set_field` that publishes
-/// it must target the map's post-move address.
+/// The `set_field` that publishes the bucket table must target the map's
+/// post-move address.
+///
+/// **Retargeted 2026-08-22, and the coverage is stronger for it.** This test
+/// used to assert the table was non-null straight after `<init>`. `29028bb9e`
+/// made a JAVA-constructed `HashMap` allocate its table LAZILY, which is what
+/// HotSpot does — `new HashMap<>()` leaves `table == null` until the first put,
+/// with the pending capacity parked in `threshold` — so the old assertion was
+/// asserting a divergence. The nine INTERNAL callers of `native_map_init` stay
+/// eager (`map_init_eager`), so this is a change to the Java-constructor path
+/// only.
+///
+/// **What this no longer covers, stated rather than quietly dropped.** MEASURED
+/// after the retarget: one put under relocation gives `size() == 1` and a
+/// readable value, but EVERY object field of the map is still `Object(None)`.
+/// The entries live in the native side table; the Java `table` field is a
+/// materialised VIEW that nothing on the `<init>`-then-`put` path builds any
+/// more. So there is no `set_field` at this point to catch publishing through a
+/// stale receiver, and the assertion that used to catch it has no site here.
+///
+/// The relocation-safety of the lazy path IS still asserted below, through the
+/// natives — which is how every other test in this file states it. What is
+/// owed is a test at whatever materialises `table` for a real-layout reader
+/// (`H23`'s work), because that is where the field publish moved to. Filed here
+/// rather than left as a silently weaker test.
 #[test]
-fn hashmap_init_publishes_buckets_after_relocation() {
+fn hashmap_lazy_table_publishes_buckets_after_relocation() {
     let reg = build_registry();
     let mut ctx = MockCtx::new();
     let map = construct_under_relocation(&reg, &mut ctx, HM, 6);
     assert!(
-        matches!(ctx.get_field(map, 0), Value::Object(Some(_))),
-        "HashMap.<init> published its bucket array through a stale receiver"
+        !matches!(ctx.get_field(map, 0), Value::Object(Some(_))),
+        "HashMap.<init> allocated a bucket table eagerly; HotSpot leaves \
+         table == null until the first put (29028bb9e)"
+    );
+    // One put, under relocation, re-reading the receiver through its caller pin.
+    // A native that kept a pre-move copy of `this` writes its entry nowhere, so
+    // the size and the read-back below are what catch it.
+    let map = fill_map_under_relocation(&reg, &mut ctx, HM, map, 1);
+    assert_eq!(
+        map_size(&reg, &mut ctx, HM, map),
+        1,
+        "the first put into a LAZY table was lost across a relocation"
+    );
+    assert_eq!(
+        get_int(&reg, &mut ctx, HM, map, 0),
+        Some(0),
+        "the entry stored into the lazily-materialised table is not readable back"
     );
 }
 

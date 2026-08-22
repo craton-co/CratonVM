@@ -5653,7 +5653,7 @@ impl SharedVm {
     ///     "jit_fastpath": { "recorded": 3, "cap": 4096,
     ///                       "truncated": false, "dropped": 0 },
     ///     "jit_compile":  { "recorded": 0, "cap": 256,
-    ///                       "truncated": null, "dropped": null }
+    ///                       "truncated": false, "dropped": 0 }
     ///   }
     /// }
     /// ```
@@ -5695,9 +5695,18 @@ impl SharedVm {
     /// 3. **`jit_fastpath` / `jit_compile`** — the other two bounded
     ///    collections feeding `violations[]` had *no* saturation signal at all,
     ///    so `truncated: false` at the top level answered for one source of
-    ///    three. `jit_compile`'s two fields are `null`, not `false`: that sink
-    ///    lives in `cratonvm_jit` and has no counter yet, and an unmeasured
-    ///    thing must not render as a clean one.
+    ///    three. `jit_compile`'s two fields rendered `null`, not `false`,
+    ///    because that sink lived in `cratonvm_jit` with no counter and an
+    ///    unmeasured thing must not render as a clean one.
+    ///
+    ///    **CLOSED 2026-08-22 (H1-1 §5.1).** `cratonvm_jit` now carries
+    ///    `JDK_ONLY_VIOLATIONS_DROPPED` and its cap honours the same
+    ///    `CRATONVM_NATIVE_SHADOW_SINK_CAP` as the other two, so all three
+    ///    collections answer both questions and none of them renders `null`.
+    ///    `run.sh`'s saturation verdict is no longer `UNKNOWN` by construction
+    ///    — a strict run can say "totals" and mean it. Reports written by an
+    ///    OLDER binary still carry the `null`, which is why
+    ///    `regression-suite/harness-census.sh` keeps its third verdict.
     ///
     /// `saturated: true` used to condemn a COUNTER as well as a list —
     /// `refusals.interpreter_shadow_unenforced` stopped advancing once the sink
@@ -6082,13 +6091,12 @@ impl SharedVm {
             crate::jit::helpers::jdk_only_jit_helper_sink_dropped()
         ));
         out.push_str("    },\n");
-        // `cratonvm_jit`'s compile-time sink is capped too and has NO drop
-        // counter, because the fix for it is a one-line change in
-        // `jit/src/lib.rs :: record_jdk_only_direct_native_refusal` and this
-        // lane does not own that file. `null` rather than `false`: an absent
-        // measurement must not render as a clean one — the same rule the
-        // `partial` class buckets above obey. See the H1-1 record's
-        // OUT-OF-FILE EDITS REQUIRED section for the exact patch.
+        // `cratonvm_jit`'s compile-time sink used to render `null` here,
+        // because it had no drop counter and an unmeasured thing must not
+        // render as a clean one. **It has one since 2026-08-22** (H1-1 §5.1),
+        // so all three bounded collections now answer the same two questions
+        // and `run.sh`'s saturation verdict is no longer UNKNOWN by
+        // construction. Its cap honours the same knob as the other two.
         out.push_str("    \"jit_compile\": {\n");
         out.push_str(&format!(
             "      \"recorded\": {},\n",
@@ -6096,10 +6104,16 @@ impl SharedVm {
         ));
         out.push_str(&format!(
             "      \"cap\": {},\n",
-            cratonvm_jit::JDK_ONLY_VIOLATION_CAP
+            cratonvm_jit::jdk_only_violation_cap()
         ));
-        out.push_str("      \"truncated\": null,\n");
-        out.push_str("      \"dropped\": null\n");
+        out.push_str(&format!(
+            "      \"truncated\": {},\n",
+            cratonvm_jit::jdk_only_jit_sink_saturated()
+        ));
+        out.push_str(&format!(
+            "      \"dropped\": {}\n",
+            cratonvm_jit::jdk_only_jit_sink_dropped()
+        ));
         out.push_str("    }\n");
         // A SIBLING object again, and for the sharpest version of
         // `observation_sink`'s reason. `CRATONVM_ENFORCE_NATIVE_SHADOW` does

@@ -1472,6 +1472,20 @@ impl LambdaJitSite {
         &self.cached.class_name
     }
 
+    /// The impl body's `CachedBytecodeMethod`.
+    ///
+    /// The direct compiled arm needs it for one thing: to RESUME a
+    /// reconstructed frame when that body deoptimizes.
+    /// [`jit_bridge::resume_deopted_body`](super::resume_deopted_body) keys
+    /// every resume attempt on the trapped method's own identity, and until
+    /// this accessor existed the arm could not name the impl — so it dropped
+    /// the frame and let its caller re-run the body from entry, which
+    /// double-executed whatever the body had already committed. See
+    /// [`LambdaJitSite::direct_disabled`].
+    pub(crate) fn cached_impl(&self) -> &Arc<CachedBytecodeMethod> {
+        &self.cached
+    }
+
     /// May the direct compiled arm still serve this site? See
     /// [`LambdaJitSite::direct_disabled`].
     pub(crate) fn direct_enabled(&self) -> bool {
@@ -1788,6 +1802,21 @@ pub(crate) mod lambda_site_prof {
     pub(crate) static SITE_DEOPTED: AtomicU64 = AtomicU64::new(0);
     /// Refused because the argument shape did not match the site's.
     pub(crate) static SITE_ARITY: AtomicU64 = AtomicU64::new(0);
+    /// Deopted bodies whose reconstructed frame was RESUMED and run to
+    /// completion by the direct arm, so the body's already-committed side
+    /// effects were not repeated.
+    ///
+    /// NOT gated on the census switch, unlike its neighbours: this counts a
+    /// correctness event, and its sibling below counts a correctness RESIDUAL.
+    /// A number that only exists when a debug variable was set cannot be used
+    /// to answer "did any call re-execute" after the fact.
+    pub(crate) static SITE_RESUMED: AtomicU64 = AtomicU64::new(0);
+    /// Deopted bodies the direct arm could NOT resume, so the generic path
+    /// re-ran them from entry. Every one of these re-executes whatever the
+    /// compiled body committed before it trapped. Expected to be 0; a non-zero
+    /// value is the remaining exposure of the defect
+    /// `resume_deopted_body` was wired in for.
+    pub(crate) static SITE_UNRESUMABLE: AtomicU64 = AtomicU64::new(0);
     /// Inline-cache thunks installed. Counts SITES, not calls — every dispatch
     /// after one of these lands never reaches Rust at all, which is precisely
     /// why the per-call counters go quiet when the feature is working and this
@@ -1828,12 +1857,15 @@ pub(crate) mod lambda_site_prof {
     pub(crate) fn line() -> String {
         format!(
             "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} \
+             site_resumed={} site_unresumable={} \
              site_arity={} site_adapters={} site_cap_adapters={}",
             SITE_CALLS.load(Ordering::Relaxed),
             SITE_DIRECT.load(Ordering::Relaxed),
             SITE_NO_CODE.load(Ordering::Relaxed),
             SITE_REFUSED.load(Ordering::Relaxed),
             SITE_DEOPTED.load(Ordering::Relaxed),
+            SITE_RESUMED.load(Ordering::Relaxed),
+            SITE_UNRESUMABLE.load(Ordering::Relaxed),
             SITE_ARITY.load(Ordering::Relaxed),
             SITE_ADAPTERS.load(Ordering::Relaxed),
             // Beside the total, never instead of it: a run full of
@@ -1893,6 +1925,31 @@ pub(crate) fn lambda_site_bump_refused() {
 #[inline]
 pub(crate) fn lambda_site_bump_deopted() {
     lambda_site_prof::bump(&lambda_site_prof::SITE_DEOPTED);
+}
+/// A deopted body whose reconstructed frame the direct arm RESUMED. Ungated —
+/// see [`lambda_site_prof::SITE_RESUMED`].
+#[inline]
+pub(crate) fn lambda_site_bump_resumed() {
+    lambda_site_prof::SITE_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+/// A deopted body the direct arm could NOT resume, so the generic path re-ran
+/// it from entry. Ungated — see [`lambda_site_prof::SITE_UNRESUMABLE`].
+#[inline]
+pub(crate) fn lambda_site_bump_unresumable() {
+    lambda_site_prof::SITE_UNRESUMABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(resumed, unresumable)` — the direct arm's deopt outcome split.
+///
+/// `unresumable` is the number of SAM calls whose compiled body trapped and was
+/// then re-executed from entry by the generic path, side effects and all. It is
+/// the metric a regression test asserts is zero.
+pub fn lambda_site_deopt_outcomes() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        lambda_site_prof::SITE_RESUMED.load(Ordering::Relaxed),
+        lambda_site_prof::SITE_UNRESUMABLE.load(Ordering::Relaxed),
+    )
 }
 /// NOT gated on the census switch. An installed thunk is a lasting change to a
 /// call site, not a per-call event, so one relaxed increment per SITE is free

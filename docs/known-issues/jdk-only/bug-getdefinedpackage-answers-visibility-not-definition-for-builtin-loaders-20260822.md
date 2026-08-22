@@ -48,6 +48,37 @@ instance of the platform split that lane already recorded for the census
 (1387/481 on Windows against 1403/472 on Linux at one commit). **Treat a
 single-platform green on a loader-identity vector as unproven.**
 
+## Independently confirmed, and WIDER than this record measured
+
+`WORKER-5-NOTE-8` reached the same defect the same day, from the other
+direction, on a binary that lane built itself from the integrated tree
+(`cratonvm-w5.exe` at `4903bcf62`) because no prebuilt binary matched. Their
+table is broader than the single `java.lang` assertion `RLangPackages` trips on,
+and the extra rows matter:
+
+| probe | HotSpot | CratonVM |
+|---|---|---|
+| `app.getDefinedPackage("java.lang")` | `null` | **`package java.lang`** |
+| `app.getDefinedPackage("java.util")` | `null` | **`package java.util`** |
+| `app.getDefinedPackage("java.io")` | `null` | **`package java.io`** |
+| `app.getDefinedPackage("no.such.package")` | `null` | `null` |
+| **`platform`**`.getDefinedPackage("java.lang")` | `null` | **`package java.lang`** |
+| `Package.getPackage("java.lang")` — SHOULD walk | `package java.lang` | `package java.lang` |
+
+Three things this record could not have concluded from one assertion:
+
+* it is **not `java.lang`-specific** — every boot-defined package answers;
+* the **platform** loader is wrong too, not just the application loader, which
+  is what makes "built-in loaders take the global probe" the right diagnosis
+  rather than an application-loader special case;
+* the two NEGATIVE rows bound it. `no.such.package` answers `null`, so the
+  probe is not simply returning non-null for everything, and `getPackage` — the
+  method that IS supposed to walk the delegation chain — is correct. The defect
+  is precisely that `getDefinedPackage` behaves like `getPackage`.
+
+Their phrasing of the mechanism is the one to quote: **CratonVM implements
+`getDefinedPackage` as "any package I can see".**
+
 ## Root cause: a premise written down as a deliberate choice
 
 `native-builtins/src/classloader.rs`, the doc comment on
