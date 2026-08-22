@@ -373,6 +373,327 @@ pub fn dump_check_override_census() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The enforcement dial's per-door census  (`H17-3` N1)
+// ---------------------------------------------------------------------------
+
+/// Which dispatch door is asking [`resolve_native_dispatch_wave1`].
+///
+/// # Why a dispatch door has a name at all
+///
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` -- the dial that makes contract §1.4
+/// *enforced* rather than *counted* -- had exactly **one** live call site
+/// tree-wide (`resolve_step1_native`), which `H17-2` §5 established by grep and
+/// not by inference. Arming a class therefore armed only that class's cold,
+/// step-1 dispatches; every dispatch served by a warm invoke-cache entry, by
+/// the force-native interceptor or by a reflective `Method.invoke` ran the
+/// native regardless. Four records priced retirements with that instrument, so
+/// **an armed FAILURE was real and an armed ZERO was unreliable**.
+///
+/// Naming the doors is the precondition for fixing that: a door that cannot be
+/// named cannot be counted, and `H17-3` §6's first instruction is to count
+/// before editing. The variants below are the complete set of
+/// `resolve_native_dispatch_wave1` call sites as of 2026-08-21 -- `rg -n
+/// 'resolve_native_dispatch_wave1\($'` is the check that this list is still
+/// complete, and a new door that reuses an existing variant is worse than a
+/// new variant, because it silently merges two populations.
+///
+/// This tag is **measurement only**. No dispatch decision reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DispatchDoor {
+    /// `resolve_step1_native` -- `try_stackless_invoke` step 1, the cold
+    /// name-keyed lookup. The one door the dial has always reached.
+    Step1,
+    /// `invoke_or_native` -- the VM's hottest native path; the "always check
+    /// the native registry first" probe.
+    InvokeOrNative,
+    /// `admit_forced_native{,_id}` -- the force-native interceptor, reached
+    /// from seven call sites and from the per-call-site `NativeCallSite` memo.
+    ForceIntercept,
+    /// `revalidate_cached_native` -- a warmed invoke-cache entry being
+    /// redeemed. Returning `None` here is the eviction signal.
+    CacheRevalidate,
+    /// `populate_invoke_cache` -- deciding what a cold call site caches.
+    CachePopulate,
+    /// `jdk_only_admit_jit_fast_native` -- JIT by-name native fast path,
+    /// cache-fill time.
+    JitFastNative,
+    /// `invoke_on_class_shared_inner`, the `should_force_registered_native_
+    /// over_bytecode` arm.
+    ClassSharedForce,
+    /// `invoke_on_class_shared_inner`, the `is_native` arm.
+    ClassSharedNative,
+    /// `try_stackless_invoke`'s own force-native arm (`invoke.rs`).
+    StacklessForce,
+    /// `resolve_native_for_dispatch` -- `execute`'s no-`Code` rescue chain.
+    /// §7 step 3b: there is no bytecode here to shadow.
+    NoCodeRescue,
+    /// `elidable_ctor_native_would_run` -- the JIT's allocation-elision probe.
+    ElidableCtor,
+    /// `invoke_or_native`'s array-alias retry on the ORIGINAL class name.
+    InvokeOrNativeAlias,
+    /// `invoke_or_native`'s superclass walk, the arm where the parent has BOTH
+    /// bytecode and a registered native.
+    InvokeOrNativeParentShadow,
+    /// `invoke_or_native`'s superclass walk, the arm where the parent has only
+    /// a registered native.
+    InvokeOrNativeParent,
+}
+
+impl DispatchDoor {
+    /// Every door, in census-print order.
+    pub const ALL: [DispatchDoor; 14] = [
+        DispatchDoor::Step1,
+        DispatchDoor::InvokeOrNative,
+        DispatchDoor::InvokeOrNativeAlias,
+        DispatchDoor::InvokeOrNativeParentShadow,
+        DispatchDoor::InvokeOrNativeParent,
+        DispatchDoor::ForceIntercept,
+        DispatchDoor::CacheRevalidate,
+        DispatchDoor::CachePopulate,
+        DispatchDoor::JitFastNative,
+        DispatchDoor::ClassSharedForce,
+        DispatchDoor::ClassSharedNative,
+        DispatchDoor::StacklessForce,
+        DispatchDoor::NoCodeRescue,
+        DispatchDoor::ElidableCtor,
+    ];
+
+    /// Stable census key. Also the name in `[DIAL_DOOR]` rows.
+    pub fn name(self) -> &'static str {
+        match self {
+            DispatchDoor::Step1 => "step1",
+            DispatchDoor::InvokeOrNative => "invoke_or_native",
+            DispatchDoor::InvokeOrNativeAlias => "invoke_or_native.alias",
+            DispatchDoor::InvokeOrNativeParentShadow => "invoke_or_native.parent_shadow",
+            DispatchDoor::InvokeOrNativeParent => "invoke_or_native.parent",
+            DispatchDoor::ForceIntercept => "force_intercept",
+            DispatchDoor::CacheRevalidate => "cache_revalidate",
+            DispatchDoor::CachePopulate => "cache_populate",
+            DispatchDoor::JitFastNative => "jit_fast_native",
+            DispatchDoor::ClassSharedForce => "class_shared_force",
+            DispatchDoor::ClassSharedNative => "class_shared_native",
+            DispatchDoor::StacklessForce => "stackless_force",
+            DispatchDoor::NoCodeRescue => "no_code_rescue",
+            DispatchDoor::ElidableCtor => "elidable_ctor",
+        }
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        match self {
+            DispatchDoor::Step1 => 0,
+            DispatchDoor::InvokeOrNative => 1,
+            DispatchDoor::InvokeOrNativeAlias => 2,
+            DispatchDoor::InvokeOrNativeParentShadow => 3,
+            DispatchDoor::InvokeOrNativeParent => 4,
+            DispatchDoor::ForceIntercept => 5,
+            DispatchDoor::CacheRevalidate => 6,
+            DispatchDoor::CachePopulate => 7,
+            DispatchDoor::JitFastNative => 8,
+            DispatchDoor::ClassSharedForce => 9,
+            DispatchDoor::ClassSharedNative => 10,
+            DispatchDoor::StacklessForce => 11,
+            DispatchDoor::NoCodeRescue => 12,
+            DispatchDoor::ElidableCtor => 13,
+        }
+    }
+}
+
+/// Armed-class `Bridge` dispatches that ARRIVED at each door.
+static DIAL_DOOR_REACHED: [std::sync::atomic::AtomicU64; 14] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Of those, the ones the door sent to bytecode (`bytecode_available` true).
+static DIAL_DOOR_YIELDED: [std::sync::atomic::AtomicU64; 14] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Per-triple detail, `CRATONVM_DBG_DIAL_DOORS=1` only: which (door, triple)
+/// pairs the dial armed and what each one decided. A `Mutex<BTreeMap>` is far
+/// too expensive for the hot path, which is why the totals above are separate
+/// and always available on an armed run.
+#[allow(clippy::type_complexity)]
+fn dial_door_detail(
+) -> &'static parking_lot::Mutex<std::collections::BTreeMap<(&'static str, String, String, String), (u64, u64)>>
+{
+    static C: std::sync::OnceLock<
+        parking_lot::Mutex<
+            std::collections::BTreeMap<(&'static str, String, String, String), (u64, u64)>,
+        >,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// `CRATONVM_DBG_DIAL_DOORS` -- add the per-triple rows to the door census.
+pub fn dial_door_detail_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_DIAL_DOORS")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Note one armed-class `Bridge` arrival at `door`, and whether the door sent
+/// it to bytecode.
+///
+/// Ordered cheapest-test-first: a `--real-jdk` run stops on the `Copy` policy
+/// read, an unarmed `--jdk-only` run stops on the enum compare or the memoised
+/// dial bool, and only a run that has actually armed this class pays for the
+/// counter. That is the same budget `resolve_step1_native` has always paid to
+/// ask the dial at all.
+///
+/// Called from [`resolve_native_dispatch_wave1`] for every routed door, and
+/// directly from the three `invoke_or_native` doors that are not routed through
+/// it at all (an unrouted `find` is invisible to a resolver-side census, which
+/// is exactly the kind of hole this census exists to make countable).
+#[inline]
+pub(crate) fn note_dial_door(
+    door: DispatchDoor,
+    policy: cratonvm_types::compat::ExecutionPolicy,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    kind: cratonvm_native_api::NativeKind,
+    yielded: bool,
+) {
+    if policy.is_jdk_only()
+        && kind == cratonvm_native_api::NativeKind::Bridge
+        && crate::runtime::env_cache::jdk_only_enforce_shadow_for(class_name)
+    {
+        record_dial_door_armed(door, class_name, method_name, descriptor, yielded);
+    }
+}
+
+/// Record one armed-class `Bridge` arrival at `door`.
+///
+/// Called from [`resolve_native_dispatch_wave1`] under `is_jdk_only()` only, and
+/// it returns on the first line for every class the dial does not cover -- so
+/// an unarmed `--jdk-only` run pays one memoised bool read and one enum
+/// compare, and a `--real-jdk` run never reaches it at all. That is the same
+/// budget `resolve_step1_native` has always paid to ask the dial.
+#[cold]
+#[inline(never)]
+fn record_dial_door_armed(
+    door: DispatchDoor,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    yielded: bool,
+) {
+    DIAL_DOOR_REACHED[door.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if yielded {
+        DIAL_DOOR_YIELDED[door.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if dial_door_detail_on() {
+        let mut d = dial_door_detail().lock();
+        let e = d
+            .entry((
+                door.name(),
+                class_name.to_string(),
+                method_name.to_string(),
+                descriptor.to_string(),
+            ))
+            .or_insert((0, 0));
+        e.0 += 1;
+        if yielded {
+            e.1 += 1;
+        }
+    }
+}
+
+/// The per-door census as `(door, reached, yielded)`, for the report writer.
+///
+/// Doors with nothing to say are still returned: a door missing from the list
+/// would be ambiguous between "no armed dispatch arrived here" and "this binary
+/// does not know about that door", and telling those apart is the whole point
+/// of a census whose predecessor was a deduplicated presence set with no
+/// counts.
+pub fn dial_door_counts() -> Vec<(&'static str, u64, u64)> {
+    DispatchDoor::ALL
+        .iter()
+        .map(|d| {
+            (
+                d.name(),
+                DIAL_DOOR_REACHED[d.index()].load(std::sync::atomic::Ordering::Relaxed),
+                DIAL_DOOR_YIELDED[d.index()].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+/// Dump the per-door census. No-op unless the dial is armed or
+/// `CRATONVM_DBG_DIAL_DOORS` is set, so a normal run prints nothing.
+///
+/// Read the two columns as a leak report: `reached` is armed-class `Bridge`
+/// dispatches that arrived at the door, `yielded` is the ones it handed to
+/// bytecode. **`reached - yielded` is the price the dial is not charging.**
+pub fn dump_dial_door_census() {
+    let armed = !crate::runtime::env_cache::enforce_shadow_scope().is_off();
+    if !armed && !dial_door_detail_on() {
+        return;
+    }
+    let mut total_r = 0u64;
+    let mut total_y = 0u64;
+    for d in DispatchDoor::ALL {
+        total_r += DIAL_DOOR_REACHED[d.index()].load(std::sync::atomic::Ordering::Relaxed);
+        total_y += DIAL_DOOR_YIELDED[d.index()].load(std::sync::atomic::Ordering::Relaxed);
+    }
+    eprintln!(
+        "[DIAL_DOOR_CENSUS] armed={armed} reached={total_r} yielded={total_y} leaked={}",
+        total_r.saturating_sub(total_y)
+    );
+    for d in DispatchDoor::ALL {
+        let r = DIAL_DOOR_REACHED[d.index()].load(std::sync::atomic::Ordering::Relaxed);
+        let y = DIAL_DOOR_YIELDED[d.index()].load(std::sync::atomic::Ordering::Relaxed);
+        if r == 0 && y == 0 {
+            continue;
+        }
+        eprintln!(
+            "[DIAL_DOOR] {}\treached={}\tyielded={}\tleaked={}",
+            d.name(),
+            r,
+            y,
+            r.saturating_sub(y)
+        );
+    }
+    if dial_door_detail_on() {
+        let d = dial_door_detail().lock();
+        eprintln!("[DIAL_DOOR_DETAIL] rows={}", d.len());
+        for ((door, cls, m, desc), (r, y)) in d.iter() {
+            eprintln!("[DIAL_TRIPLE] {door}\t{cls}\t{m}\t{desc}\treached={r}\tyielded={y}");
+        }
+    }
+}
+
 static JDK_ONLY_NATIVE_SHADOW_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -473,12 +794,20 @@ const JDK_ONLY_NATIVE_SHADOW_CAP_MAX: usize = 65_536;
 /// The contract §2 point about process globals is untouched by either: the
 /// global existed before this constant did and is unaffected by its value.
 ///
-/// Read once, at the first observation. `CRATONVM_NATIVE_SHADOW_SINK_CAP=0`, a
-/// non-numeric value, or anything above
-/// [`JDK_ONLY_NATIVE_SHADOW_CAP_MAX`] leaves the default in place — a
-/// diagnostic must never be the thing that fails, and a cap of zero would
-/// silently report an empty population as a complete one, which is the exact
-/// failure this whole area exists to remove.
+/// Read once, at the first observation. `CRATONVM_NATIVE_SHADOW_SINK_CAP=0`, an
+/// empty or a non-numeric value leaves the default in place — a diagnostic must
+/// never be the thing that fails, and a cap of zero would silently report an
+/// empty population as a complete one, which is the exact failure this whole
+/// area exists to remove.
+///
+/// **CORRECTION, 2026-08-21 (WORKER-5).** A value ABOVE
+/// [`JDK_ONLY_NATIVE_SHADOW_CAP_MAX`] used to fall back to the default too, so
+/// `…=200000` produced 4096 — smaller than the ceiling it was trying to exceed
+/// — and printed nothing. That is self-inflicted: `vm-cli`'s own saturation
+/// advice prints `(recorded + dropped) * 2`, which exceeds 65,536 for any
+/// workload with more than ~32,768 shadows. Such a value is now CLAMPED to the
+/// ceiling, and every rejected or adjusted value prints one `[cratonvm]` line.
+/// See [`cratonvm_types::flags::resolve_capped_usize`].
 ///
 /// **The filter is deliberately NOT resized with it.**
 /// [`JDK_ONLY_NATIVE_SHADOW_FILTER_SLOTS`] stays 512, so above that the filter
@@ -496,11 +825,12 @@ pub fn jdk_only_native_shadow_cap() -> usize {
         // than the latched snapshot every other knob is served from ---
         // `types/tests/flag_declaration_guard.rs` documents that split, and it is
         // the reason an undeclared read site is a defect rather than untidiness.
-        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_SHADOW_SINK_CAP")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| *n > 0 && *n <= JDK_ONLY_NATIVE_SHADOW_CAP_MAX)
-            .unwrap_or(JDK_ONLY_NATIVE_SHADOW_CAP)
+        cratonvm_types::flags::resolve_capped_usize(
+            "CRATONVM_NATIVE_SHADOW_SINK_CAP",
+            "interpreter observation sink",
+            JDK_ONLY_NATIVE_SHADOW_CAP,
+            JDK_ONLY_NATIVE_SHADOW_CAP_MAX,
+        )
     })
 }
 
@@ -1019,6 +1349,10 @@ pub fn resolve_dispatch<'a>(
 /// adapter never has a `&Method`, so it can never return `Bytecode`.
 #[inline]
 pub fn resolve_native_dispatch_wave1(
+    // Measurement only: which dispatch door is asking. Nothing in this
+    // function's decision reads it -- see [`DispatchDoor`] for why every
+    // door nevertheless has to be able to say its own name.
+    door: DispatchDoor,
     policy: cratonvm_types::compat::ExecutionPolicy,
     class_name: &str,
     method_name: &str,
@@ -1043,6 +1377,17 @@ pub fn resolve_native_dispatch_wave1(
     // future `MissingNative` is ever raised from here, its `module` must stay
     // `None` unless the CALLER (which usually does hold a class) passes it in.
     let (callback, kind) = native?;
+
+    // `H17-3` N1's per-door counter.
+    note_dial_door(
+        door,
+        policy,
+        class_name,
+        method_name,
+        descriptor,
+        kind,
+        bytecode_available,
+    );
 
     if !compat_native_wins {
         // The site preferred bytecode on its own. A registration exists for a
@@ -18734,13 +19079,26 @@ pub fn invoke_or_native(
         // the slot id (`resolve_id` + `callback_of` + `kind_of_id`), so the
         // census increment is one relaxed add on the id already in hand.
         match resolve_native_dispatch_wave1(
+            DispatchDoor::InvokeOrNative,
             dispatch_policy(shared),
             effective_class,
             method_name,
             descriptor,
             Some((callback, native_kind)),
             !has_real,
-            has_real,
+            // `has_real` is this site's own bytecode fact and covers only the
+            // `SyntheticStub`-on-an-allow-listed-class case, so for a `Bridge`
+            // it is always `false` -- which is why arming a class never changed
+            // anything that arrived HERE (`H17-3` §6). The dial supplies the
+            // missing term, and only for a class it has been armed for.
+            has_real
+                || crate::runtime::interpreter::jdk_only_dial_yields_to_bytecode(
+                    shared,
+                    effective_class,
+                    method_name,
+                    descriptor,
+                    native_kind,
+                ),
         ) {
             Some(DispatchDecision::Reject(violation)) => {
                 return Err(MethodCallFailed::InternalError(VmError::JdkOnly(violation)));
@@ -18781,15 +19139,45 @@ pub fn invoke_or_native(
     // Also try the original class name in case the caller registered a
     // specific override for the array type.
     if effective_class != class_name {
-        if let Some(callback) =
+        // `find` -> `find_with_kind`: the same 128-bit triple hash and the same
+        // callback, plus the `NativeKind` without which no policy question can
+        // be asked here at all. This retry is one of three dispatch sites in
+        // this function that never went through §7 routing, so the dial is the
+        // only policy it consults -- routing them properly is a larger change
+        // and is nominated, not smuggled in here.
+        if let Some((callback, native_kind)) =
             shared
                 .natives
                 .native_methods
-                .find(class_name, method_name, descriptor)
+                .find_with_kind(class_name, method_name, descriptor)
         {
-            census_general_native_dispatch(shared, callback, class_name, method_name, descriptor);
-            return safe_native_call(shared, thread, callback, args)
-                .map(|v| coerce_native_return(v, descriptor));
+            let dial = crate::runtime::interpreter::jdk_only_dial_yields_to_bytecode(
+                shared,
+                class_name,
+                method_name,
+                descriptor,
+                native_kind,
+            );
+            note_dial_door(
+                DispatchDoor::InvokeOrNativeAlias,
+                dispatch_policy(shared),
+                class_name,
+                method_name,
+                descriptor,
+                native_kind,
+                dial,
+            );
+            if !dial {
+                census_general_native_dispatch(
+                    shared,
+                    callback,
+                    class_name,
+                    method_name,
+                    descriptor,
+                );
+                return safe_native_call(shared, thread, callback, args)
+                    .map(|v| coerce_native_return(v, descriptor));
+            }
         }
     }
     // Walk the superclass chain: the constant pool may reference a subclass
@@ -18828,11 +19216,85 @@ pub fn invoke_or_native(
                         // native wins. See `populate_virtual_invoke_cache` for
                         // the full LinkedHashMap-overlay rationale.
                         if parent.find_method(method_name, descriptor).is_some() {
-                            if let Some(callback) = shared.natives.native_methods.find(
+                            if let Some((callback, native_kind)) =
+                                shared.natives.native_methods.find_with_kind(
+                                    &parent.name,
+                                    method_name,
+                                    descriptor,
+                                )
+                            {
+                                // The `cm` read guard is HELD across this whole
+                                // walk, which is why the dial's bytecode probe
+                                // takes the class manager with
+                                // `read_recursive()`. A plain `read()` here
+                                // deadlocks against a queued writer, and in a
+                                // release build -- where lock-order enforcement
+                                // is compiled out -- it does so silently.
+                                let dial =
+                                    crate::runtime::interpreter::jdk_only_dial_yields_to_bytecode(
+                                        shared,
+                                        &parent.name,
+                                        method_name,
+                                        descriptor,
+                                        native_kind,
+                                    );
+                                note_dial_door(
+                                    DispatchDoor::InvokeOrNativeParentShadow,
+                                    dispatch_policy(shared),
+                                    &parent.name,
+                                    method_name,
+                                    descriptor,
+                                    native_kind,
+                                    dial,
+                                );
+                                if !dial {
+                                    census_general_native_dispatch(
+                                        shared,
+                                        callback,
+                                        &parent.name,
+                                        method_name,
+                                        descriptor,
+                                    );
+                                    drop(cm);
+                                    return safe_native_call(shared, thread, callback, args)
+                                        .map(|v| coerce_native_return(v, descriptor));
+                                }
+                            }
+                            break;
+                        }
+                        if let Some((callback, native_kind)) =
+                            shared.natives.native_methods.find_with_kind(
                                 &parent.name,
                                 method_name,
                                 descriptor,
-                            ) {
+                            )
+                        {
+                            if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
+                                eprintln!(
+                                    "[invoke_or_native] hierarchy walk hit on parent={}",
+                                    parent.name
+                                );
+                            }
+                            // Same `read_recursive()` reason as the arm above:
+                            // `cm` is held.
+                            let dial =
+                                crate::runtime::interpreter::jdk_only_dial_yields_to_bytecode(
+                                    shared,
+                                    &parent.name,
+                                    method_name,
+                                    descriptor,
+                                    native_kind,
+                                );
+                            note_dial_door(
+                                DispatchDoor::InvokeOrNativeParent,
+                                dispatch_policy(shared),
+                                &parent.name,
+                                method_name,
+                                descriptor,
+                                native_kind,
+                                dial,
+                            );
+                            if !dial {
                                 census_general_native_dispatch(
                                     shared,
                                     callback,
@@ -18844,29 +19306,6 @@ pub fn invoke_or_native(
                                 return safe_native_call(shared, thread, callback, args)
                                     .map(|v| coerce_native_return(v, descriptor));
                             }
-                            break;
-                        }
-                        if let Some(callback) = shared.natives.native_methods.find(
-                            &parent.name,
-                            method_name,
-                            descriptor,
-                        ) {
-                            if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
-                                eprintln!(
-                                    "[invoke_or_native] hierarchy walk hit on parent={}",
-                                    parent.name
-                                );
-                            }
-                            census_general_native_dispatch(
-                                shared,
-                                callback,
-                                &parent.name,
-                                method_name,
-                                descriptor,
-                            );
-                            drop(cm);
-                            return safe_native_call(shared, thread, callback, args)
-                                .map(|v| coerce_native_return(v, descriptor));
                         }
                     }
                     cid = parent_id;
@@ -27364,6 +27803,7 @@ fn invoke_on_class_shared_inner(
                 descriptor,
             ) {
                 match resolve_native_dispatch_wave1(
+                    DispatchDoor::ClassSharedForce,
                     dispatch_policy(shared),
                     &class_name_for_force,
                     method_name,
@@ -27498,6 +27938,7 @@ fn invoke_on_class_shared_inner(
             descriptor,
         ) {
             Some((callback, native_kind)) => match resolve_native_dispatch_wave1(
+                DispatchDoor::ClassSharedNative,
                 policy,
                 &class_name,
                 method_name,

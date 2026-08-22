@@ -86,25 +86,30 @@ fn native_thread_stop0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(None)
 }
 
-/// `Thread.stop()V` — public deprecated wrapper that creates ThreadDeath.
-fn native_thread_stop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if !ALLOW_THREAD_STOP.load(Ordering::Relaxed) {
-        return Err(RuntimeError::UnsupportedOperationException {
-            message: "Thread.stop() is not supported".to_string(),
-        }
-        .into());
-    }
-    let this = obj_arg(args, 0)?;
-    // Family-1 fix (cce0079): the ThreadDeath alloc can move `this` — pin
-    // and refresh before the identity read. GC-stable key as in stop0.
-    let this_pin = ctx.pin_native_root(this);
-    let thread_death = try_alloc_concurrent_synthetic(ctx, "java/lang/ThreadDeath", 0)?;
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    let thread_key = ctx.identity_hash_code(this) as u64;
-    store_stop_throwable(ctx, thread_key, thread_death);
-    Ok(None)
-}
+// `Thread.stop()V` — RETIRED, 2026-08-21 (WORKER 3, `H25-3` R1 / N1).
+//
+// The native threw `UnsupportedOperationException("Thread.stop() is not
+// supported")` unless `ALLOW_THREAD_STOP` was set, and nothing outside this
+// file's own tests can set it. MEASURED across nine images — JDK 17.0.20,
+// 21.0.12 and 25.0.4 x linux/windows/macos — every one of them declares
+// `public final void stop()` WITH a `Code` attribute:
+//
+// ```text
+//   javap -c --system <image> java.lang.Thread     (JDK 21, JDK 25)
+//     0: new  #.. // class java/lang/UnsupportedOperationException
+//     7: athrow
+// ```
+//
+// so on the two modern images the real bytecode throws the very exception the
+// native threw, and on JDK 17 it does the real deprecated work by way of
+// `stop0` (still registered below). Retiring it is behaviour-preserving on
+// 21/25 and a fidelity IMPROVEMENT — the JDK's own `UnsupportedOperationException`
+// carries no message, and ours invented one.
+//
+// The retirement had to be paired: `native-builtins/src/lib.rs` held a SECOND
+// registration of the same triple whose body called `ctx.thread_interrupt` and
+// returned normally. Deleting only this one would have promoted that. Both went
+// in the same commit; see the note at the `lib.rs` site.
 
 // ---------------------------------------------------------------------------
 // T8.1.2 — Thread.suspend() / resume()
@@ -163,18 +168,26 @@ fn native_thread_resume0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 // ---------------------------------------------------------------------------
-// T8.1.3 — Thread.destroy()
+// T8.1.3 — `Thread.destroy()V`: RETIRED, 2026-08-21 (WORKER 3).
+//
+// The body raised `NoSuchMethodError(java/lang/Thread.destroy()V)` — which is
+// exactly what an unregistered call to a method no image declares raises
+// anyway, so the registration bought nothing and cost a row.
+//
+// MEASURED, `javap -p --system <image> java.lang.Thread` over all nine
+// supported images (JDK 17.0.20 / 21.0.12 / 25.0.4 x linux/windows/macos):
+// **no image declares `destroy` at all**. It was removed in JDK 11, not
+// deprecated. This is the one verb `H14-1` had no name for and `H25-1` sized
+// at 342 registrations without being able to act on any of them — a triple no
+// supported image declares anywhere on the receiver's hierarchy — and it is
+// the first row retired on that evidence.
+//
+// The multi-image part is load-bearing and is why `H25-1` refused: four of the
+// six `java/lang` rows that looked identical to this one on a JDK 25 census
+// (`stop0`, `suspend0`, `resume0`, `countStackFrames`) ARE declared by JDK 17
+// or JDK 21 and must stay. `scripts/jdk-only-no-image-methods.py` is the sweep
+// that separates them.
 // ---------------------------------------------------------------------------
-
-fn native_thread_destroy(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Err(MethodCallFailed::InternalError(VmError::Linkage(
-        LinkageError::NoSuchMethodError {
-            class_name: "java/lang/Thread".to_string(),
-            method_name: "destroy".to_string(),
-            method_descriptor: "()V".to_string(),
-        },
-    )))
-}
 
 // ---------------------------------------------------------------------------
 // T8.1.4 — Thread.countStackFrames()
@@ -287,20 +300,17 @@ fn native_run_finalization(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
 }
 
 // ---------------------------------------------------------------------------
-// T8.1.7 — System.runFinalizersOnExit(boolean)
+// T8.1.7 — `System.runFinalizersOnExit(Z)V`: RETIRED, 2026-08-21 (WORKER 3).
+//
+// MEASURED, `javap -p --system <image> java.lang.System` over all nine
+// supported images: none declares it. It was removed in JDK 11. Same verb as
+// `Thread.destroy` above.
+//
+// The flag it wrote, `RUN_FINALIZERS_ON_EXIT`, went with it: `grep -rn` found
+// exactly one writer (this native) and no reader outside this file's own test.
+// A write-only flag set by an unreachable native is two absences agreeing with
+// each other, and neither is evidence the feature exists.
 // ---------------------------------------------------------------------------
-
-/// Global flag: if true, finalizers run on VM exit.
-pub(crate) static RUN_FINALIZERS_ON_EXIT: AtomicBool = AtomicBool::new(false);
-
-fn native_run_finalizers_on_exit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let flag = match args.first() {
-        Some(Value::Int(i)) => *i != 0,
-        _ => false,
-    };
-    RUN_FINALIZERS_ON_EXIT.store(flag, Ordering::Release);
-    Ok(None)
-}
 
 // ---------------------------------------------------------------------------
 // T8.1.9 — ClassLoader.defineClass(byte[], int, int)
@@ -365,23 +375,39 @@ pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let thread = "java/lang/Thread";
 
-    // T8.1.1 — Thread.stop
+    // T8.1.1 — Thread.stop0.
+    //
+    // KEPT, and its DUPLICATE in `native-builtins/src/lib.rs` was deleted
+    // rather than this one: all three JDK 17 images declare
+    // `private native void stop0(java.lang.Object)`, so this is a
+    // cross-version registration, not a dead stub. JDK 21 and JDK 25 declare
+    // no `stop0` at all, which is why a JDK-25-only census reports it as
+    // reaching nothing.
     r.register(
         thread,
         "stop0",
         "(Ljava/lang/Object;)V",
         native_thread_stop0,
     );
-    r.register(thread, "stop", "()V", native_thread_stop);
+    // T8.1.1 — `Thread.stop()V` is NOT registered: see the retirement note above.
 
-    // T8.1.2 — Thread.suspend / resume
+    // T8.1.2 — Thread.suspend / resume.
+    //
+    // KEPT even though JDK 21 and JDK 25 declare neither: MEASURED,
+    // `javap -p --system <image> java.lang.Thread` finds
+    // `private native void suspend0()` and `resume0()` on all three JDK 17
+    // images. This is the `StringUTF16.isBigEndian` shape — a registration that
+    // is correct precisely because a supported image other than the one on this
+    // host declares the method — and it is why a single-image census may not
+    // retire anything in this population.
     r.register(thread, "suspend0", "()V", native_thread_suspend0);
     r.register(thread, "resume0", "()V", native_thread_resume0);
 
-    // T8.1.3 — Thread.destroy
-    r.register(thread, "destroy", "()V", native_thread_destroy);
+    // T8.1.3 — `Thread.destroy()V` is NOT registered: no supported image
+    // declares it. See the retirement note above.
 
-    // T8.1.4 — Thread.countStackFrames
+    // T8.1.4 — Thread.countStackFrames. KEPT: declared by JDK 17 AND JDK 21
+    // (removed in 25), so the same cross-version argument applies.
     r.register(
         thread,
         "countStackFrames",
@@ -403,13 +429,8 @@ pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
         native_run_finalization,
     );
 
-    // T8.1.7 — System.runFinalizersOnExit
-    r.register(
-        "java/lang/System",
-        "runFinalizersOnExit",
-        "(Z)V",
-        native_run_finalizers_on_exit,
-    );
+    // T8.1.7 — `System.runFinalizersOnExit(Z)V` is NOT registered: no supported
+    // image declares it. See the retirement note above.
 
     // T8.1.8 — SecurityManager is already registered in security_manager.rs.
     // No action needed here; see security_manager::register_security_manager_natives.
@@ -483,27 +504,18 @@ mod tests {
 
     // ----- T8.1.1 Thread.stop -----
 
+    /// `Thread.stop()V` must stay UNREGISTERED, and this is the assertion that
+    /// keeps it that way. Re-adding it would silently take the method back off
+    /// the real bytecode of every supported image — and, if the `lib.rs` copy
+    /// ever came back with it, would restore the "interrupt and return
+    /// normally" body this retirement removed.
     #[test]
-    fn test_thread_stop_throws_when_disallowed() {
-        let _g = GLOBAL_FLAG_LOCK.lock().unwrap();
-        ALLOW_THREAD_STOP.store(false, Ordering::SeqCst);
+    fn t8_1_1_thread_stop_is_retired_not_registered() {
         let reg = make_registry();
-        let mut ctx = MockNativeContext::new();
-        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5).unwrap();
-
-        let res = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Thread",
-            "stop",
-            "()V",
-            &[Value::Object(Some(thr))],
-        );
-        assert!(res.is_err());
-        let msg = format!("{}", res.unwrap_err());
         assert!(
-            msg.contains("UnsupportedOperationException") || msg.contains("not supported"),
-            "Expected UnsupportedOperationException, got: {msg}"
+            reg.find("java/lang/Thread", "stop", "()V").is_none(),
+            "java/lang/Thread.stop()V is served by real bytecode on every \
+             supported image; it must not be registered here"
         );
     }
 
@@ -555,30 +567,6 @@ mod tests {
         ALLOW_THREAD_STOP.store(false, Ordering::SeqCst);
     }
 
-    #[test]
-    fn test_thread_stop_creates_thread_death_when_allowed() {
-        let _g = GLOBAL_FLAG_LOCK.lock().unwrap();
-        ALLOW_THREAD_STOP.store(true, Ordering::SeqCst);
-        let reg = make_registry();
-        let mut ctx = MockNativeContext::new();
-        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5).unwrap();
-        // GC-stable keying: the natives key by identity hash now.
-        let tid = ctx.identity_hash_code(thr) as u64;
-
-        let res = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Thread",
-            "stop",
-            "()V",
-            &[Value::Object(Some(thr))],
-        );
-        assert!(res.is_ok());
-        let taken = take_stop_throwable(tid);
-        assert!(taken.is_some(), "Expected ThreadDeath stored");
-
-        ALLOW_THREAD_STOP.store(false, Ordering::SeqCst);
-    }
 
     // ----- T8.1.2 Thread.suspend / resume -----
 
@@ -627,25 +615,16 @@ mod tests {
 
     // ----- T8.1.3 Thread.destroy -----
 
+    /// `Thread.destroy()V` must stay UNREGISTERED. No supported image declares
+    /// it (MEASURED over nine), and an unregistered call to a method no image
+    /// declares already raises `NoSuchMethodError` — which is all the retired
+    /// native did.
     #[test]
-    fn test_thread_destroy_throws_no_such_method() {
+    fn t8_1_3_thread_destroy_is_retired_not_registered() {
         let reg = make_registry();
-        let mut ctx = MockNativeContext::new();
-        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5).unwrap();
-
-        let res = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/Thread",
-            "destroy",
-            "()V",
-            &[Value::Object(Some(thr))],
-        );
-        assert!(res.is_err());
-        let msg = format!("{}", res.unwrap_err());
         assert!(
-            msg.contains("no such method") || msg.contains("NoSuchMethod"),
-            "Expected NoSuchMethodError, got: {msg}"
+            reg.find("java/lang/Thread", "destroy", "()V").is_none(),
+            "no supported JDK image declares java/lang/Thread.destroy()V"
         );
     }
 
@@ -770,36 +749,16 @@ mod tests {
 
     // ----- T8.1.7 runFinalizersOnExit -----
 
+    /// `System.runFinalizersOnExit(Z)V` must stay UNREGISTERED: no supported
+    /// image declares it, and the flag it set had no reader.
     #[test]
-    fn test_run_finalizers_on_exit_stores_flag() {
-        RUN_FINALIZERS_ON_EXIT.store(false, Ordering::Relaxed);
-
+    fn t8_1_7_run_finalizers_on_exit_is_retired_not_registered() {
         let reg = make_registry();
-        let mut ctx = MockNativeContext::new();
-
-        // Set to true
-        let res = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/System",
-            "runFinalizersOnExit",
-            "(Z)V",
-            &[Value::Int(1)],
+        assert!(
+            reg.find("java/lang/System", "runFinalizersOnExit", "(Z)V")
+                .is_none(),
+            "no supported JDK image declares java/lang/System.runFinalizersOnExit(Z)V"
         );
-        assert!(res.is_ok());
-        assert!(RUN_FINALIZERS_ON_EXIT.load(Ordering::Relaxed));
-
-        // Set to false
-        let res = call_native(
-            &reg,
-            &mut ctx,
-            "java/lang/System",
-            "runFinalizersOnExit",
-            "(Z)V",
-            &[Value::Int(0)],
-        );
-        assert!(res.is_ok());
-        assert!(!RUN_FINALIZERS_ON_EXIT.load(Ordering::Relaxed));
     }
 
     // ----- T8.1.8 SecurityManager — already in security_manager.rs -----
@@ -926,12 +885,14 @@ mod tests {
     #[test]
     fn test_registration_count() {
         let reg = make_registry();
-        // 2 (stop) + 2 (suspend/resume) + 1 (destroy) + 1 (countStackFrames)
-        // + 2 (runFinalization) + 1 (runFinalizersOnExit)
-        // + 1 (defineClass 3-arg) + 5 (Compiler) = 15
+        // 1 (stop0) + 2 (suspend0/resume0) + 1 (countStackFrames)
+        // + 2 (runFinalization) + 1 (defineClass 3-arg) + 5 (Compiler) = 12.
+        // `stop`, `destroy` and `runFinalizersOnExit` were retired 2026-08-21;
+        // the three assertions above pin their ABSENCE, so this bound only has
+        // to stop the registrar losing anything else.
         assert!(
-            reg.len() >= 15,
-            "Expected at least 15 registered natives, got {}",
+            reg.len() >= 12,
+            "Expected at least 12 registered natives, got {}",
             reg.len()
         );
     }

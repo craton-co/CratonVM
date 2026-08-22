@@ -902,6 +902,7 @@ fn resolve_native_for_dispatch(
         .kind_of_id(id)
         .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
     match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::DispatchDoor::NoCodeRescue,
         crate::vm::dispatch_policy(shared),
         class_name,
         method_name,

@@ -45,7 +45,7 @@ a host artefact.
 (The last row is a *cross-binary* comparison — a different commit as well as a
 different fix — so it is evidence only that the two defects are distinct in
 rate, not a clean A/B. See the caution in
-`docs/internal/fixed-suite-bugs/springboot/springboot-3gc-fails-and-hangs-20260821-RETIRED.md`
+`fixed-suite-bugs/springboot/springboot-3gc-fails-and-hangs-20260821-RETIRED.md`
 about cross-binary arms.)
 
 ## Why it is plausibly the same family

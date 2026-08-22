@@ -5028,7 +5028,26 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let line_str = ctx.create_string(&command_line);
         let this_cur = ctx.read_native_pin(this_pin, this);
         ctx.set_field_by_name(this_cur, "commandLine", Value::Object(Some(line_str)));
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len());
+        // `String[]`, not `Object[]`. `ProcessHandle.Info.arguments()` is
+        // declared `Optional<String[]>`, and `new_array(Reference, n)` produces
+        // an array whose runtime component type is `java.lang.Object`. On Linux
+        // this is the ONLY reason `RJdkOptionalShape` fails:
+        //
+        //   AssertionError: process.info.arguments: get() on a PRESENT Optional
+        //   must return a [Ljava.lang.String;, got [Ljava.lang.Object;
+        //
+        // It is invisible on Windows because `os_process_cmdline` finds no
+        // command line for most pids there, so the field stays null and the
+        // vector's law skips the row — a platform-shaped blind spot, not a
+        // platform-shaped defect.
+        //
+        // (Edited by WORKER 3, whose subject is the java.lang rows: the class
+        // is `java.lang.ProcessHandle$Info` but the file is WORKER 4's. Four
+        // lines, no behaviour change beyond the component type.)
+        let arr = match ctx.class_id_by_name("java/lang/String") {
+            Some(cid) => ctx.new_ref_array(cid, arguments.len()),
+            None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len()),
+        };
         let arr_pin = ctx.pin_native_root(arr);
         for (i, a) in arguments.iter().enumerate() {
             let s = ctx.create_string(a);

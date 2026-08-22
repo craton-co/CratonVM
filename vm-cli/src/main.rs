@@ -2302,7 +2302,15 @@ fn active_jdk_mode_line() -> String {
     match ACTIVE_JDK_MODE.get() {
         Some((mode, Some(home))) => format!("jdk mode: {mode} (java.home={home})"),
         Some((mode, None)) => format!("jdk mode: {mode}"),
-        None => "jdk mode: <not yet resolved — failure occurred during argument parsing>".into(),
+        // NOT "during argument parsing". This arm is reached whenever the
+        // OnceLock is unset, and the class library is selected LATE: a
+        // `--java-home` that clap accepted but that carries no `jmods/` or
+        // `lib/modules` lands here too, and that is the common case (a POSIX
+        // path spelling on Windows reaches it with rc=1). Naming a phase this
+        // function cannot observe sent two separate triage records after the
+        // argument parser for a fault that was never in it.
+        None => "jdk mode: <not yet resolved — the failure occurred before the class library was selected>"
+            .into(),
     }
 }
 
@@ -5198,6 +5206,11 @@ fn run() -> Result<()> {
     // deletion exercise those two records describe but never measured.
     cratonvm_vm::vm::dump_check_override_census();
     cratonvm_vm::vm::dump_canonical_census();
+    // The enforcement dial's per-door census (`H17-3` N1). Silent unless
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW` is armed or `CRATONVM_DBG_DIAL_DOORS`
+    // is set; `reached - yielded` per door is the price the dial is not
+    // charging.
+    cratonvm_vm::vm::dump_dial_door_census();
 
     // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown
     // (env-gated inside `dump_now` callers; `enabled()` re-checked here).

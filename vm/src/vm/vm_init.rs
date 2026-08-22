@@ -6101,6 +6101,50 @@ impl SharedVm {
         out.push_str("      \"truncated\": null,\n");
         out.push_str("      \"dropped\": null\n");
         out.push_str("    }\n");
+        // A SIBLING object again, and for the sharpest version of
+        // `observation_sink`'s reason. `CRATONVM_ENFORCE_NATIVE_SHADOW` does
+        // not add rows to this report -- it REMOVES them, because an enforced
+        // shadow does not dispatch and so never produces a
+        // `bridge-ran-over-bytecode` row. An armed report and an unarmed one
+        // were therefore indistinguishable in every field, and the armed
+        // one's emptier `violations[]` reads as the better result. It is not;
+        // it is a different question.
+        //
+        // `doors` is the other half. Until 2026-08-21 the dial had exactly
+        // one live call site (`resolve_step1_native`), so `scope` alone would
+        // still have overstated what an armed run measured: 890 of 947 armed
+        // `Bridge` dispatches never asked it, and
+        // `refusals.interpreter_shadow_unenforced` read `0` for all 890,
+        // because that one call site is also the only recorder of the
+        // native-won half. The per-door columns are what make that visible
+        // instead of silent: `reached` minus `yielded`, summed, is the number
+        // of dispatches the arming did not reach, and on a fixed binary it is
+        // zero.
+        out.push_str("  },\n  \"enforcement_dial\": {\n");
+        out.push_str(&format!(
+            "    \"scope\": {},\n",
+            json_escape(&crate::runtime::env_cache::enforce_shadow_scope().report_spelling())
+        ));
+        let doors = crate::vm::dial_door_counts();
+        let reached: u64 = doors.iter().map(|(_, r, _)| *r).sum();
+        let yielded: u64 = doors.iter().map(|(_, _, y)| *y).sum();
+        out.push_str(&format!("    \"reached\": {reached},\n"));
+        out.push_str(&format!("    \"yielded\": {yielded},\n"));
+        out.push_str(&format!(
+            "    \"leaked\": {},\n",
+            reached.saturating_sub(yielded)
+        ));
+        out.push_str("    \"doors\": [");
+        for (i, (door, r, y)) in doors.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "\n      {{\"door\": {}, \"reached\": {r}, \"yielded\": {y}}}",
+                json_escape(door)
+            ));
+        }
+        out.push_str("\n    ]\n");
         out.push_str("  }\n}\n");
 
         use std::io::Write;

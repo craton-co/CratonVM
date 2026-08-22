@@ -4,7 +4,7 @@ import java.util.concurrent.*;
 /** Collection CONTRACTS — fail-fast, view aliasing, equals/hashCode, entry
  *  mutation. native-collections implements most of these, and the vectors
  *  exercise values far more than contracts. Deterministic, ASCII. */
-public class Sweep5 {
+public class Sweep5CollectionContracts {
     static void t(String l, Call c) {
         try { System.out.println("C " + l + " = " + c.run()); }
         catch (Throwable x) { System.out.println("C " + l + " = THREW " + x.getClass().getName()); }

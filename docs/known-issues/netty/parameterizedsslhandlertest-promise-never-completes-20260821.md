@@ -79,12 +79,41 @@ Either is a happens-before failure across `monitorenter`/`monitorexit`.
 |---|---:|---:|
 | baseline (`c21d766ad`) | 40 | 3 |
 | baseline (spurious binary, switch OFF) | 40 | 2 |
-| `CRATONVM_JIT_DENY=DefaultPromise` | 10 | 0 |
+| `CRATONVM_JIT_DENY=DefaultPromise` (orphan binary) | 10 | 0 |
+| `CRATONVM_JIT_DENY=DefaultPromise` (fields binary, engagement proven) | 6 | **1** |
 
-~5–7.5%. The JIT-deny arm is **not** conclusive at 10 runs (≈0.6 expected) — it
-needs ~50 to separate 6% from 0%, and is the obvious next A/B now that the
-mechanism is known, since a compiled `monitorenter`/`monitorexit` missing a
-fence is the leading candidate for the stale read.
+~5–7.5%.
+
+**The JIT is REFUTED.** The first deny arm (0/10) proved nothing — 10 runs at a
+6% rate expects 0.6 — so it was re-run toward 50 with the lever's engagement
+proven first (below). It stalled at **run 4**, which settles it without needing
+50: 50 runs were only ever required to demonstrate *absence*; one stall
+demonstrates *presence*. The stalled run carries the identical signature, with
+`DefaultPromise` force-interpreted:
+
+```
+[WAIT-OBJECT] class=io/netty/util/concurrent/DefaultPromise
+              result=Some(Object(Some(...)))  waiters=Some(Int(1))
+orphan hits: 0
+```
+
+So the stale read is **not** in `DefaultPromise`'s compiled code, and a compiled
+`monitorenter`/`monitorexit` missing a fence is no longer the candidate. **The
+defect is tier-independent — it is in the VM's monitor implementation itself**
+(the interpreter path included), or in the `Object.wait`/`notifyAll`
+bookkeeping around it.
+
+Engagement was proven before trusting either arm: with the lever set,
+`still-interpreted` rises 20 → 32 and the hot-but-stuck list names the denied
+methods outright —
+
+```
+42036 invocations  compile-failed  DefaultPromise.isDone0(Ljava/lang/Object;)Z
+29492 invocations  compile-failed  DefaultPromise.isDone()Z
+```
+
+`isDone`/`isDone0` are precisely the volatile `result` read at BCI 20, i.e. the
+arm did test candidate (1) directly.
 
 ## Instruments added (all default-OFF or watchdog-only)
 
@@ -115,10 +144,19 @@ explicitly **not** shown to cause this stall.
 
 ## Next
 
-1. Decide which read goes stale — instrument `monitorenter`/`monitorexit`
-   fencing, or A/B `CRATONVM_JIT_DENY=DefaultPromise` to ~50 runs.
-2. Fix the ordering; re-measure the rate over ≥40 runs.
-3. Fix the selector-registry leak independently.
+1. The JIT is out, so audit the **interpreter's** `monitorenter`/`monitorexit`
+   and `Monitor::enter`/`exit` for the missing fence: the release on exit must
+   publish the waiter's `waiters++`, and the acquire on enter must make the
+   completer observe it. `MonitorState` is behind a `parking_lot::Mutex`, which
+   orders access to `owner`/`entry_count` — but the *Java* fields the two
+   `synchronized` blocks exchange (`result`, `waiters`) are ordinary heap slots
+   written outside that mutex, so nothing in the current implementation
+   obviously publishes them.
+2. Cheapest confirmation: log `waiters` as the completer reads it, next to the
+   value the waiter wrote. A 0-vs-1 disagreement names the failing edge
+   directly and needs one stall, not a rate.
+3. Fix the ordering; re-measure the rate over ≥40 runs.
+4. Fix the selector-registry leak independently.
 
 ## Repro
 

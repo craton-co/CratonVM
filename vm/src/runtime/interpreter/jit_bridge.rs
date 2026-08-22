@@ -3288,6 +3288,7 @@ fn elidable_ctor_native_would_run(shared: &SharedVm, class_name: &str) -> bool {
         .native_methods
         .find_with_kind(class_name, "<init>", "()V");
     crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::DispatchDoor::ElidableCtor,
         crate::vm::dispatch_policy(shared),
         class_name,
         "<init>",
