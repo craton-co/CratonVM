@@ -12,9 +12,24 @@
 > vectors measurement closed. Read §B.1 before trusting any "this body is dead"
 > conclusion, and §B.2 before reasoning about native-versus-bytecode dispatch.
 >
-> **The headline count below is corrected as of 2026-08-17, and it will rot
-> again** — the directory has gone 105 → 155 → 227 → 280 files in a fortnight.
+> **The headline count below is corrected as of 2026-08-22, and it will rot
+> again** — the directory has gone 105 → 155 → 227 → 280 → **412** files.
 > Recount before quoting.
+>
+> **2026-08-22 recount, `HEAD = 081dd2fe8`.** 412 files. Applying this README's
+> own exclusion rule mechanically (28 matches) plus the five `WORKER-n-the-*`
+> handoff briefs added 2026-08-21 leaves **379** as the upper bound. The rule
+> needed no amendment this time — the five parallel lanes named their records
+> `WORKER-n-NOTE-k-*`, which are records and are counted as such. The +132 in
+> five days is five lanes writing at once, not 132 new defects: a large share
+> are notes ON existing records, corrections, and acceptance evidence.
+>
+> **The 253 → 379 jump is not a measure of progress in either direction.**
+> Records were also RETIRED in that window (WORKER-4 alone retired eleven
+> `java/io` shadows and three `deprecated` natives, with their records moved),
+> and the growth is dominated by the instrument and acceptance notes those
+> retirements required. Do not read the count as a defect population; that is
+> the mistake this section already records three times.
 
 **Status:** OPEN. **280 `.md` files** in this directory on **2026-08-17**, at
 `HEAD = 9ae371468`, taken with `ls docs/known-issues/jdk-only/*.md | wc -l`.

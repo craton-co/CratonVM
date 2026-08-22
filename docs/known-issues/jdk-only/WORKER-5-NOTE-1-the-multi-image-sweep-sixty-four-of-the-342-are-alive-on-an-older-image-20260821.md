@@ -4,10 +4,19 @@
 strict-mode registry census from `C:/craton/cratonvm-r11.exe`. No source change
 to the VM; two new scripts and one committed data file.
 
+> **CORRECTED 2026-08-22 — 42 rows this record first called retirable are
+> NOT.** WORKER 3 implemented the same sweep independently (`409f5f630`) and
+> disagreed. The cause is in §2.5, the finding is that **an index built from the
+> method table alone cannot see a registration whose name is a FIELD**, and the
+> committed TSV has been regenerated with a fifth verdict. The first version of
+> this record, and its TSV, would have nominated those 42 for deletion.
+>
 > **Re-verified after merging H0's `dab993033`** (which brought `ecd4f56e1`, the
 > `java/util/Comparator` guard, into `native-collections/src/lib.rs`). The whole
 > sweep was re-run against an `r11` census: **10,378 registrations, 999 / 342 /
-> 9,037, and verdicts 8812 / 386 / 305 / 875 — identical**, canary still
+> 9,037, and verdicts 8812 / 386 / 305 / 875 — identical** (those are the
+> pre-correction verdicts; §2.5 then split 42 of the 305 out as
+> `field-shaped`), canary still
 > `cross-version`. The committed TSV differs from the `r10` one **only in
 > `registered_by` line numbers**, which `ecd4f56e1` shifted by adding 36 lines;
 > stripping the line numbers makes the two byte-identical, 692 rows each. The
@@ -62,10 +71,14 @@ IMAGES, not the binary.
                      ONE image (jdk25-win)      NINE images
   live                       —                      8812
   cross-version              —                       386   <- DO NOT DELETE
-  dead-everywhere            —                       305   <- retirable
+  field-shaped               —                        42   <- DO NOT DELETE (§2.5)
+  dead-everywhere            —                       263   <- retirable
   no-image-class            999                       875
   "declared nowhere"        342                        —
 ```
+
+`dead-everywhere` read **305** before §2.5's correction; 42 of those were
+`field-shaped`.
 
 Cross-tabbed, which is the table that answers `H25-1`:
 
@@ -82,12 +95,19 @@ Cross-tabbed, which is the table that answers `H25-1`:
 
 ### 2.1 The answer to N1
 
-> **Of `H25-1`'s 342: 278 are dead on all nine images. 64 are SAVED by an older
-> image.**
+> **Of `H25-1`'s 342: 236 are dead as a method on all nine images, 64 are SAVED
+> by an older image, and 42 are not methods at all.**
 
-**18.7% of the population would have been deleted wrongly.** None of the 342 is
-`live` and none is `no-image-class`, so the split is exactly two ways and the
-342 needs no other verb.
+| of the 342 | rows | may it be retired? |
+|---|---:|---|
+| `dead-everywhere` / truly-gone | 162 | yes |
+| `dead-everywhere` / near-miss | 74 | yes as a *method*, but see `H25-1` N3a |
+| `cross-version` | **64** | **NO** — an older image declares it |
+| `field-shaped` | **42** | **NO** — the name is a FIELD (§2.5) |
+
+**31% of the population `H25-1` flagged must not be deleted** — 64 because of the
+images, 42 because of the member kind. None of the 342 is `live` or
+`no-image-class`.
 
 Four of the six ★ rows `H25-1` §1.4 called "removed from the JDK, not
 deprecated" are among the 64:
@@ -129,11 +149,13 @@ meant to run a 17 or 21 image, those registrations do nothing there, and nothing
 reports it. That is `H25-1` N3a's near-miss argument in the version dimension
 instead of the descriptor one.
 
-### 2.3 The `dead-everywhere` 305, which is the actual work list
+### 2.3 The `dead-everywhere` 263, which is the actual work list
 
-225 **truly-gone** (no image declares that method NAME on the hierarchy) and 80
+183 **truly-gone** (no image declares that method NAME on the hierarchy) and 80
 **near-miss** (some image declares the name, no overload matches the
-descriptor). 280 of the 305 own their slot.
+descriptor). Before §2.5's correction this read 305 = 225 + 80; the 42
+`field-shaped` rows all came out of the truly-gone half, which is exactly where
+they would: a field name is not a method name anywhere.
 
 By owning file: `shared_secrets_bridge.rs` 26, `native-io/lib.rs` 22,
 `unsafe_natives.rs` 19, `lib.rs` 18, `locale_bootstrap.rs` 18,
@@ -155,9 +177,54 @@ is a platform class: `java/io/UnixFileSystem` (34),
 `no_image_receiver.rs` already documents, and it corroborates the class-granular
 table rather than contradicting it.
 
+### 2.5 CORRECTION — two implementations, and the disagreement was the finding
+
+WORKER 3 built the same sweep independently and at the same path
+(`409f5f630`, `scripts/jdk-only-no-image-methods.py`). It asks
+`javap -p -s --system` per class where this one builds an in-process index per
+image. Their numbers did not match mine, and **theirs had a category mine could
+not produce: a registration whose name is a FIELD.**
+
+That is not a taxonomy quibble. This sweep indexed the **method table** and
+skipped the field table, so a registration naming a field found nothing on the
+hierarchy and came out `dead-everywhere` — **into a committed TSV whose whole
+purpose is to tell W3 and W4 what is safe to delete.** 42 rows.
+
+The index now records field names, and `field-shaped` is a fifth verdict that
+says DO NOT DELETE. Reconciled over the same population — the rows a JDK-25-only
+adjudication calls "declared nowhere":
+
+| this lane (index) | rows | WORKER 3 (javap) | rows |
+|---|---:|---|---:|
+| `dead-everywhere` / truly-gone | 162 | `DEAD_EVERYWHERE` | 192 |
+| `dead-everywhere` / near-miss | 74 | `NEAR_MISS` | 63 |
+| `cross-version` | 64 | `PARTIAL` | 62 |
+| `field-shaped` | 42 | `LIVE (field-shaped)` | 38 |
+| **population** | **342** | | **355** |
+
+The two **agree on the load-bearing categories**: ~62–64 rows saved by an older
+image, ~38–42 that are fields, and ~250 of 350 not declared with that
+descriptor anywhere. The residual gaps are two:
+
+* **The populations differ, 342 vs 355.** Different censuses; not reconciled
+  here, and worth 13 rows on its own.
+* **The truly-gone / near-miss boundary sits differently** (162+74 vs 192+63).
+  This sweep asks whether the NAME appears anywhere on the *hierarchy*; a name
+  inherited from a supertype makes a row a near-miss here and can leave it
+  truly-gone there. Neither is wrong; they answer slightly different questions
+  and **a lane quoting one must not mix it with the other.**
+
+**Both scripts are kept.** The javap one is authoritative about member kinds
+for free and needs no index; the index one is fast enough to run over all
+10,378 registrations, and carries the coverage refusals, the canary and the
+committed TSV. Deleting either without re-running the other removes the only
+cross-check this measurement has — and the cross-check is what caught the 42.
+
 ## 3. The instrument, and the canary that proves it
 
-Two scripts, both with a `--selftest` that fails.
+Two scripts, both with a `--selftest` that fails. The sweep is
+`scripts/jdk-only-image-method-sweep.py` (renamed at merge time, because
+WORKER 3's landed first at `jdk-only-no-image-methods.py`).
 
 **`scripts/jdk-only-image-method-index.py`** builds one method index per image.
 It reads `lib/modules` through `jimage` — MEASURED: a JDK 25 `jimage` lists a
@@ -168,7 +235,7 @@ Its selftest exercises the two constant-pool shapes a naive loop gets wrong
 walk, three malformed inputs, and all three archive layouts. **0 unparsed class
 files across all nine images**, 26,559–28,059 classes each.
 
-**`scripts/jdk-only-no-image-methods.py`** is the method-granular sibling of
+**`scripts/jdk-only-image-method-sweep.py`** is the method-granular sibling of
 `jdk-only-no-image-receivers.py`. It resolves each triple against the class, its
 superclass chain and its transitive interfaces, per image, and it **REFUSES** a
 narrow image set the way the sibling does — fewer than two indexes, a missing
@@ -226,8 +293,10 @@ committed so nobody has to re-run a nine-image sweep to quote one.
 * **N1 — the block on the 342 is LIFTED, with a list.** W3 and W4 may act on
   `scripts/baselines/jdk-only-no-image-methods.tsv`. Rows marked
   `dead-everywhere` are retirable subject to the duplicate-registration check;
-  rows marked `cross-version` **must not be touched**, and the `declared_by`
-  column names the images that keep them alive.
+  rows marked `cross-version` **or `field-shaped` must not be touched**, and the
+  `declared_by` column names the images that keep a cross-version row alive.
+  **Anyone who pulled the pre-2026-08-22 TSV must re-pull it** — it marked 42
+  `field-shaped` rows as `dead-everywhere`.
 * **N2 — expect a census delta of ZERO and write it down first.** `H25-1` §3:
   these rows are never dispatched, so retiring them clears nothing from the
   1402. **A zero is the PASS.**
@@ -248,9 +317,12 @@ committed so nobody has to re-run a nine-image sweep to quote one.
 
 ### INDEX ROWS (for H0 to move into `INDEX.md`)
 
-* `WORKER-5-NOTE-1` — the method-granular nine-image sweep. **64 of `H25-1`'s
-  342 are declared by JDK 17 or 21 and must not be deleted; 278 are dead
-  everywhere.** 308 further rows are declared on 25 and absent from 17/21, 110
-  of them on 25 alone. Instruments: `scripts/jdk-only-image-method-index.py`,
-  `scripts/jdk-only-no-image-methods.py`,
+* `WORKER-5-NOTE-1` — the method-granular nine-image sweep. **Of `H25-1`'s 342:
+  64 are declared by JDK 17 or 21, 42 name a FIELD, and neither may be deleted;
+  236 are dead as a method.** 308 further rows are declared on 25 and absent
+  from 17/21, 110 of them on 25 alone. §2.5 reconciles this against WORKER 3's
+  independent javap sweep — **the disagreement between the two is what caught
+  the 42**, which this record's first TSV had marked retirable. Instruments:
+  `scripts/jdk-only-image-method-index.py`,
+  `scripts/jdk-only-image-method-sweep.py`,
   `scripts/baselines/jdk-only-no-image-methods.tsv`. MEASURED.
