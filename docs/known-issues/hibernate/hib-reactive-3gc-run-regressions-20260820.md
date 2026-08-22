@@ -5,7 +5,13 @@ field corruption). A SECOND, more consequential family — a persistence-context
 correctness cascade — is characterized with a concrete mechanism and evidence
 trail but **not fixed**: root-causing it further needs step-through debugging
 of `CompletableFuture`/Vert.x continuation completion timing that this session
-could not do from log archaeology alone.
+could not do from log archaeology alone. **UPDATE 2026-08-21 (section 6):**
+the mechanism is now narrowed to a specific, reproducible symptom —
+`reactiveRemove(entity)` is invoked TWICE for one `ArrayLoop` array slot that
+is dispatched only ONCE — confirmed by identity-hash-correlated tracing
+across three independent runs on the idle Azure host. This is likely a
+CratonVM lambda/method-reference dispatch defect, not a Hibernate bug; the
+exact composition layer responsible is still open.
 
 **Baseline:** the previous known-good state is
 [residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md)
@@ -577,3 +583,173 @@ the 9 have `found=0`. This script is gitignored (only `class-overrides.tsv`
 is force-tracked), so no fix is committed here — flagging it so the next
 `results.tsv` isn't read at face value. The one-line fix is to grep only
 `"$tmp"`, not `"$tmp" "$RAW"`.
+
+---
+
+## 6. 2026-08-21 — `EntityEntryContext`/`EntityEntryImpl`/`SessionImpl.contains()` instrumented directly; the mechanism narrows to `reactiveRemove` firing twice for one `ArrayLoop` slot
+
+Following section 4.5's own instruction (instrument `PersistenceContext`'s
+entry map itself, in real Hibernate ORM 7.4.5 core — not vendored locally,
+sources jar fetched to `/tmp/hibernate-core-7.4.5.Final-sources.jar`,
+patched classes compiled into a directory placed ahead of the real jar on
+the classpath so no jar rebuild is needed). Binary: `cratonvm-pcprobe`
+(same idle Azure host, `dev` tip at merge time + this branch, no code
+changes). All instrumentation is the low-overhead raw-`int[]`
+`TraceBuf`/`PcTrace` shape section 4.1 established as required — string
+tracing was not retried.
+
+### 6.1 Two theories eliminated before finding the real one
+
+* **A large heap does not help.** `FilterWithPaginationTest` still fails
+  with `-Xmx4000m` (vs. the default 1500m) — a compacting/generational
+  moving-GC-vs-`IdentityHashMap` theory (object relocation invalidating a
+  cached identity hash mid-lookup) predicted a large-enough heap would
+  suppress the collection cycle and the bug. It didn't, on the first test
+  of the theory.
+* **`System.identityHashCode()`/`IdentityHashMap` are stable under real GC
+  pressure on CratonVM.** A standalone probe
+  (`IdentityHashStabilityProbe.java`, 2000 objects, all put into an
+  `IdentityHashMap` immediately after allocation, then 1.6 GB of garbage
+  forced through a 512 MB heap, then every hash and every map lookup
+  re-checked): **0 hash mismatches, 0 map misses.** This directly refutes
+  the "compaction corrupts identity hashing" theory rather than just
+  failing to trigger it — the primitive itself is correct under load. (Not
+  committed; a throwaway probe, not added to `probes/` since it produced a
+  clean negative on a mechanism already ruled out by 6.1's first bullet.)
+
+### 6.2 `EntityEntryContext`'s own `IdentityHashMap` (`nonEnhancedEntityXref`) is never wrong
+
+`FamousPerson` is not bytecode-enhanced (no `$$_hibernate_*` synthetic
+methods in the compiled class), so `EntityEntryContext.getEntityEntry`
+resolves it entirely through `nonEnhancedEntityXref`, a plain
+`IdentityHashMap<Object,ManagedEntity>` (`EntityEntryContext.java`,
+`getAssociatedManagedEntity`'s final `return nonEnhancedEntityXref != null
+? nonEnhancedEntityXref.get( entity ) : null`). Instrumented every
+`get`/`put`/`remove` on this map with entity identity hash + map size.
+Across a full, reproducing `FilterWithPaginationTest` run: **zero**
+"put-then-miss-with-no-remove-in-between" sequences and **zero**
+"remove-then-later-hit" sequences, for any of the 408 distinct entities
+traced. The map is entirely self-consistent throughout the run — this
+mechanism, the doc's own section 4.5 leading candidate, is refuted.
+
+### 6.3 The real signal: `EntityEntry.status` flips to `DELETED` between two legitimate `contains()` checks on the same object
+
+Instrumented `EntityEntryImpl.getStatus()`/`setStatus()` (both delegate to
+a single bit-packed `compressedState int` — a compact-layout field, exactly
+the kind of representation this project's own history flags as a hazard
+area — but the packing itself is not implicated here, see below) and
+`SessionImpl.contains(Object)` directly. One clean, complete history for
+the object that ends up throwing (`objectIdHash=28305`,
+`entryIdHash=28306`, one representative run):
+
+```
+setStatus(old=4) -> CHANGED to 0      (SAVING -> MANAGED, from @BeforeEach persist)
+getStatus() = 0   x3                  (both of the two calls below read this)
+contains() check #1: entry found, status=0, not deleted -> proceeds     <- SUCCEEDS
+contains() check #2: entry found, status=0, not deleted -> proceeds     <- SUCCEEDS (again!)
+setStatus(old=0) -> CHANGED to 2      (MANAGED -> DELETED, from check #1 or #2's own async completion)
+contains() check #3: entry found, status=2, DELETED -> throws           <- FAILS
+```
+
+The status transitions are real, driven by genuine `setStatus()` calls —
+not phantom/corrupted reads. The question is not "why did status change
+unexpectedly" but **"why was `fetchAndDelete`'s delete pipeline entered
+twice for the same object, when the array it was drawn from only lists it
+once."**
+
+### 6.4 The list has no duplicate; `ArrayLoop` dispatches the slot exactly once; `reactiveRemove` still fires twice
+
+Cross-referencing three independent reproducing runs, each traced at every
+layer between `getResultList()` and `fetchAndDelete`:
+
+1. **`BaseReactiveTest.deleteEntities`'s own `list`** (instrumented with an
+   `IdentityHashMap`-based per-element duplicate check, reusing the
+   already-proven-correct primitive from 6.1): always **exactly 5**
+   elements, and the entity that goes on to fail appears **exactly once**
+   in the list (`dup=false`), at index 2 in all three runs.
+2. **`CompletionStages.ArrayLoop.next()`** (instrumented directly — entry,
+   dispatched index, exhaustion): for the loop instance driving this
+   deletion, indices 0, 1, 2 are each dispatched **exactly once**, in
+   order, one `next()` call per index, no reentrant/overlapping calls
+   visible on the single thread. This directly reproduces and confirms
+   section 4.2's own finding — that finding was correct, but answers a
+   different question than the one that matters here.
+3. **`ReactiveSessionImpl.reactiveRemove(Object)`** (instrumented at its
+   own entry, the direct target of `applyToAll(delegate::reactiveRemove,
+   entity)`): called **twice** for the same object identity hash, from the
+   same session identity hash, ~800 μs apart, with **no second `ArrayLoop`
+   dispatch event in between** — the single `consumer.apply(2)` call from
+   item 2 above is the only dispatch on record, yet its terminal action
+   (`reactiveRemove`) runs twice.
+
+So the duplication is not in the list, not in the loop's index bookkeeping,
+and not in `DefaultReactiveDeleteEventListener`'s own logic — it is
+**between one `ArrayLoop.next()` dispatch and the `reactiveRemove` call
+that dispatch is supposed to produce exactly once**, i.e. inside the
+`consumer.apply(index).thenCompose(CompletionStages::alwaysContinue)`
+composition chain itself (`CompletionStages.java`, the `IntPredicate`
+overload of `loop`) or in how CratonVM invokes the `delegate::reactiveRemove`
+method reference underneath that chain.
+
+### 6.5 What this is not, and what it most likely is
+
+Five distinct mechanisms have now been checked directly and eliminated for
+this specific symptom: JDK `CompletableFuture`/`isDone()` timing (section
+2's theory), duplicate `ArrayLoop` index dispatch (section 3's theory,
+re-confirmed absent here too), concurrent `deleteEntities()` calls (section
+4.3), moving-GC/identity-hash instability (6.1), and a stale
+`EntityEntryContext` map (6.2). What remains — a chained lambda/method-reference
+composition executing its terminal side-effecting call twice for one
+outer invocation — is a shape this project's own history has seen before
+in the SAM/lambda-dispatch area (`residual-seven-after-the-afc-fix-20260817.md`
+sections 2.2-§7: `RwLock` + `HashMap` lookups on a process-global
+`lambda_proxies`/native-registry map, asked "up to twice" per invocation in
+at least two other places already found in that investigation). Whether
+this is the same structural pattern recurring at a different call shape, or
+a distinct defect, is not established here.
+
+### 6.6 `--nojit` clears it: this is the JIT, not the interpreter
+
+Ran the exact repro (`FilterWithPaginationTest` in isolation, idle Azure
+host, `cratonvm-pcprobe`) with `--jit off`: **3/3 clean PASS**, 17-18s each.
+Immediately re-ran with `--jit on` as a control on the same binary: **FAIL**,
+same signature as every other run this session. This is a direct,
+same-binary, same-host A/B — the project's own standing convention
+("`--nojit` decides a suspected dispatch bug") gives a clean answer:
+**the JIT is implicated directly.** The interpreter's own dispatch of this
+composition chain is correct; something in the compiled path for the
+`consumer.apply(index).thenCompose(CompletionStages::alwaysContinue)` chain
+(or the `delegate::reactiveRemove` method reference underneath it) causes
+the terminal call to fire twice once JIT-compiled.
+
+### 6.7 What the next session should do
+
+1. **Start from `vm/src/runtime/interpreter/invoke.rs` and `jit/helpers.rs`'s
+   lambda/SAM dispatch paths** — `interpreter::lambda::try_lambda_dispatch`,
+   `try_invoke_cached_lambda_impl`, and the JIT-side cached-native-dispatch
+   helpers (`try_jit_site_cached_native_dispatch`,
+   `jit_invoke_virtual_mic`) already named in
+   `residual-seven-after-the-afc-fix-20260817.md` sections 2.2-§7 for this
+   same workload family. Section 6.6's finding gives those a NEW,
+   correctness (not performance) angle: does a JIT-compiled call site for a
+   method reference / functional-interface `apply()` ever re-enter or
+   replay the callee under a specific tier-transition or deopt condition?
+2. **This is now a MINIMAL, reproducible, same-binary A/B** — not a probe
+   that needs to be built from scratch. `FilterWithPaginationTest` in
+   isolation on the idle Azure host, `--jit on` vs `--jit off`, is the
+   instrument. Any candidate fix must flip this same A/B from FAIL to PASS
+   under `--jit on`, repeated ≥10x per this project's own repeat-before-filing
+   discipline (this session repeated the FAIL 5x and the `--nojit` PASS 3x,
+   consistent every time).
+3. **`CRATONVM_C2_SUPERSEDE=0` does NOT clear it** — tried on the `--jit on`
+   repro, 3/3 still FAIL (same signature, `sum_class_ms` 20-29s). So this is
+   not a C1-to-C2 tier-transition/supersede-window issue; whatever compiles
+   this call site reproduces the defect on its own, without a tier
+   transition in play. Cross this candidate off before re-trying it.
+4. All instrumentation in this section lived in the gitignored
+   `apps/hibernate-reactive` vendor checkout and the `/tmp` sources-jar
+   overlay — not committed, matching this doc's established convention.
+   The one exception is `IdentityHashStabilityProbe.java`, also not
+   committed (see 6.1) since it produced a clean negative on an already-
+   eliminated theory; recreate it if the identity-hash angle needs
+   revisiting for a different mechanism.
