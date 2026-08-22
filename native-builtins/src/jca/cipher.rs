@@ -180,7 +180,7 @@ struct CipherState {
     chacha_counter: u32,
     /// This `Cipher` is a thin wrapper over a THIRD-PARTY provider's own
     /// `CipherSpi`; every method below forwards to it and none of the state
-    /// above is used. See `try_delegate_cipher_to_provider`.
+    /// above is used. See `try_delegate_cipher_to_named_provider`.
     ///
     /// The SPI object itself is NOT here — it lives in the `Cipher`'s own
     /// `spi` field on the Java heap, so the collector roots and remaps it like
@@ -762,6 +762,32 @@ fn cipher_init_record_with_counter(
             .map(|s| s.algorithm.clone())
             .unwrap_or_default()
     });
+    // An EMPTY transformation is not a transformation, and the write below is
+    // `entry(tkey).or_default()` — which happily invents a state with no
+    // algorithm in it and a live `mode`, so `init` reports success and the
+    // first `doFinal` lands in the AES arm with nothing to dispatch on. That is
+    // exactly what the relocated-`algo` defect in `cipher_alloc` produced
+    // (`CipherStreamTest2`: `Unexpected exception Serpent/CBC/PKCS5Padding`,
+    // `RC6/CTR/NoPadding`, and whichever other name the collector happened to
+    // land on). `cipher_alloc` no longer creates such a state, and this refuses
+    // to initialise one if any path ever does again: `Cipher.init` DECLARES
+    // `InvalidKeyException`, but this is not a key problem, and the JDK's own
+    // answer for an unusable `Cipher` is the unchecked `IllegalStateException`
+    // (the same one `cipher_do_final_impl` raises for a missing state).
+    //
+    // Every `javax.crypto.Cipher` in this VM is minted by `cipher_alloc`, which
+    // writes the transformation into the side-table before returning, so a
+    // reachable caller cannot trip this.
+    if algo.is_empty() {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "Cipher.init on a Cipher with no recorded transformation: the \
+                      side-table entry is missing or empty, so no algorithm can be \
+                      dispatched. Refusing to initialise it rather than computing a \
+                      substitute at doFinal time."
+                .into(),
+        }
+        .into());
+    }
     // P0: `.unwrap_or_default()` here recorded an EMPTY modulus/exponent as
     // this cipher's key state — a `Cipher.init` that reported success while
     // installing no key at all. `cipher_do_final_impl` does catch the empty
@@ -1891,12 +1917,29 @@ fn cipher_iv_parameters(
 /// field 5 is `initialized:Z`, a primitive boolean, and storing an Object there
 /// breaks the `expected object reference` invariant on read-back.
 ///
-/// Call only after [`check_transformation_supported`] has admitted `algo`: this
-/// function allocates unconditionally, so reaching it with an unserviceable
-/// name is how a fabricated `Cipher` gets built.
-fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+/// Call only after [`check_transformation_supported`] has admitted the name:
+/// this function allocates unconditionally, so reaching it with an
+/// unserviceable name is how a fabricated `Cipher` gets built.
+///
+/// The transformation arrives as a **Rust string, not the caller's `String`
+/// `ObjectRef`**, and that is the whole point. This used to take the argument
+/// reference and `read_string` it HERE — one line *after*
+/// `try_alloc_concurrent_synthetic`, which allocates and can therefore relocate
+/// it under the compacting collector. The read then landed on the vacated
+/// address and `unwrap_or_default()` turned that miss into an EMPTY
+/// transformation, which is how a `Cipher` came to carry `algorithm: ""` in the
+/// side-table and `transformation = ""` in its own field. Nothing downstream
+/// recovers from that: `cipher_do_final_impl` classifies "" as family `None`
+/// and its guard fires, naming the admission table for a defect the admission
+/// table had no part in (`CipherStreamTest2`, `RC6/CTR/NoPadding`).
+///
+/// Every caller already holds the string it read from the argument before it
+/// allocated anything, so taking `&str` removes the hazard rather than pinning
+/// around it. `obj` still has to be pinned across `create_string` below, for
+/// the same reason.
+fn cipher_alloc(ctx: &mut dyn NativeContext, algo_str: &str) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6)?;
-    let algo_str = ctx.read_string(algo).unwrap_or_default();
+    let pin = ctx.pin_native_root(obj);
     // Compute key outside the closure — `obj_key` borrows `ctx` and the
     // table write-guard must not depend on the ctx borrow.
     let key = obj_key(ctx, obj);
@@ -1904,7 +1947,7 @@ fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> Result<ObjectRe
         t.insert(
             key,
             CipherState {
-                algorithm: algo_str.clone(),
+                algorithm: algo_str.to_string(),
                 ..Default::default()
             },
         );
@@ -1914,9 +1957,30 @@ fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> Result<ObjectRe
     // Cipher this VM handed out printed `Cipher.null, … algorithm from: (no
     // provider)`. The transformation is known here; the provider is filled in by
     // the caller, which is the only layer that knows whether one was NAMED.
-    let t_str = ctx.create_string(&algo_str);
+    let t_str = ctx.create_string(algo_str);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.unpin_native_roots(pin);
     ctx.set_field_by_name(obj, "transformation", Value::Object(Some(t_str)));
     Ok(obj)
+}
+
+/// [`crate::jca::provider_chain::record_requested_provider`], answering with the
+/// engine object's POST-call reference.
+///
+/// That helper builds a `Provider` — real bytecode, real allocation — so a
+/// caller that goes on to hand the `Cipher` back to Java must not keep the
+/// pre-call `ObjectRef`. It pins internally for its own use and drops the
+/// forwarded value on the floor; this returns it.
+fn record_provider_and_reread(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    provider: &str,
+) -> ObjectRef {
+    let pin = ctx.pin_native_root(obj);
+    crate::jca::provider_chain::record_requested_provider(ctx, obj, provider);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.unpin_native_roots(pin);
+    obj
 }
 
 // ---------------------------------------------------------------------------
@@ -1983,7 +2047,6 @@ const SPI_INIT_PLAIN: &str = "(ILjava/security/Key;Ljava/security/SecureRandom;)
 fn cipher_get_instance_with_provider(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-    algo: ObjectRef,
     algo_str: &str,
 ) -> MethodCallResult {
     let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
@@ -1995,35 +2058,41 @@ fn cipher_get_instance_with_provider(
             crate::jca::provider_chain::third_party_service_class(Some(provider), "Cipher", &service)
                 .is_some()
         }) {
-            let obj = cipher_alloc(ctx, algo)?;
+            let mut obj = cipher_alloc(ctx, algo_str)?;
             // An `Err` here is the named provider refusing its own service's
             // mode or padding, which is exactly what HotSpot surfaces from
             // `Transform.setModePadding`. It must not be swallowed in favour of
             // this engine's answer — see `try_delegate_cipher_to_named_provider`.
-            if try_delegate_cipher_to_named_provider(ctx, provider, algo_str, obj)? {
-                crate::jca::provider_chain::record_requested_provider(ctx, obj, provider);
+            if try_delegate_cipher_to_named_provider(ctx, provider, algo_str, &mut obj)? {
+                let obj = record_provider_and_reread(ctx, obj, provider);
                 return Ok(Some(Value::Object(Some(obj))));
             }
         }
     }
     match check_transformation_supported(ctx, algo_str, GetInstanceForm::WithProvider) {
         Ok(_) => {
-            let obj = cipher_alloc(ctx, algo)?;
+            let mut obj = cipher_alloc(ctx, algo_str)?;
             if let Some(provider) = requested_provider.as_deref() {
-                crate::jca::provider_chain::record_requested_provider(ctx, obj, provider);
+                obj = record_provider_and_reread(ctx, obj, provider);
             }
             Ok(Some(Value::Object(Some(obj))))
         }
         Err(refusal) => {
-            let provider_arg = match args.get(1) {
-                Some(Value::Object(Some(p))) => Some(*p),
-                _ => None,
+            // The provider comes from the NAME resolved at the top of this
+            // function, not from an `args[1]` re-read here: `cipher_alloc`
+            // allocates, so every `ObjectRef` in `args` is potentially stale
+            // from this point on. `requested_provider` is a `String` and is not.
+            let mut obj = cipher_alloc(ctx, algo_str)?;
+            let delegated = match requested_provider.as_deref() {
+                Some(provider) => {
+                    try_delegate_cipher_to_named_provider(ctx, provider, algo_str, &mut obj)?
+                }
+                None => false,
             };
-            let obj = cipher_alloc(ctx, algo)?;
-            match try_delegate_cipher_to_provider(ctx, provider_arg, algo_str, obj)? {
+            match delegated {
                 true => {
                     if let Some(provider) = requested_provider.as_deref() {
-                        crate::jca::provider_chain::record_requested_provider(ctx, obj, provider);
+                        obj = record_provider_and_reread(ctx, obj, provider);
                     }
                     Ok(Some(Value::Object(Some(obj))))
                 }
@@ -2093,45 +2162,6 @@ fn cipher_delegate_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<O
     }
 }
 
-/// Try to service `algo` from the explicitly-named `provider`'s own
-/// implementation, and on success turn `cipher_obj` into a wrapper over it.
-///
-/// Returns `Ok(true)` when the provider owned the service and its SPI was
-/// instantiated. `Ok(false)` means "not this provider's" — the caller must
-/// surface its original refusal, unchanged.
-///
-/// `build_jca_impl` is the same instantiation path `sun.security.jca.GetInstance`
-/// interception already uses for every engine that routes through it (which is
-/// why `MessageDigest`/`Signature` from a third-party provider have always
-/// worked, and `Cipher` has not); it runs the provider's genuine bytecode,
-/// including the `EngineCreator` factory that BC-FIPS needs.
-fn try_delegate_cipher_to_provider(
-    ctx: &mut dyn NativeContext,
-    provider_arg: Option<ObjectRef>,
-    algo: &str,
-    cipher_obj: ObjectRef,
-) -> Result<bool, MethodCallFailed> {
-    let Some(provider_arg) = provider_arg else {
-        // No provider named. Anonymous `getInstance` must NOT go hunting: the
-        // caller asked for "whatever the chain gives me", and silently
-        // preferring a third-party implementation over this VM's would change
-        // the answer for every existing caller.
-        return Ok(false);
-    };
-    let is_string = ctx
-        .class_name_of_id(ctx.class_id_of_object(provider_arg))
-        .is_some_and(|n| n == "java/lang/String");
-    let provider = if is_string {
-        ctx.read_string(provider_arg).unwrap_or_default()
-    } else {
-        crate::jca::provider_chain::provider_name_of(ctx, provider_arg)
-    };
-    if provider.is_empty() || provider == "<unknown>" {
-        return Ok(false);
-    }
-    try_delegate_cipher_to_named_provider(ctx, &provider, algo, cipher_obj)
-}
-
 /// The provider name this crate's own `Cipher` engine answers as.
 ///
 /// Every `getProvider()` on a natively-served `Cipher` reports this, so it is
@@ -2194,13 +2224,21 @@ fn cipher_refusal_is_declared(ctx: &mut dyn NativeContext, refusal: &MethodCallF
 }
 
 /// Ask ONE named provider to serve `algo`, and on success turn `cipher_obj`
-/// into a wrapper over its SPI. See [`try_delegate_cipher_to_provider`].
+/// into a wrapper over its SPI.
+/// `cipher_obj` is taken by `&mut` and REWRITTEN before this returns. Every
+/// step below runs the provider's own bytecode — `build_jca_impl`
+/// instantiates its SPI class, `engineSetMode`/`engineSetPadding` are ordinary
+/// virtual calls — so the `Cipher` can relocate underneath this frame, and
+/// both the `spi` field write at the end and the caller's eventual return value
+/// would otherwise use its vacated address. The `spi` root was already pinned
+/// here; the `Cipher` itself was the one that was not.
 fn try_delegate_cipher_to_named_provider(
     ctx: &mut dyn NativeContext,
     provider: &str,
     algo: &str,
-    cipher_obj: ObjectRef,
+    cipher_obj: &mut ObjectRef,
 ) -> Result<bool, MethodCallFailed> {
+    let cipher_pin = ctx.pin_native_root(*cipher_obj);
     // Every service name this transformation may be registered under, most
     // specific first — see `cipher_transform_candidates`. `owned` records that
     // the provider claimed at least one of them, which is what separates "not
@@ -2260,6 +2298,8 @@ fn try_delegate_cipher_to_named_provider(
         installed = Some(spi);
         break;
     }
+    *cipher_obj = ctx.read_native_pin(cipher_pin, *cipher_obj);
+    ctx.unpin_native_roots(cipher_pin);
     if installed.is_none() {
         if !owned {
             return Ok(false);
@@ -2299,8 +2339,8 @@ fn try_delegate_cipher_to_named_provider(
     }
     let spi = installed.expect("installed is Some on this path");
     // The SPI lives in the Java-visible `spi` field so the collector owns it.
-    ctx.set_field_by_name(cipher_obj, "spi", Value::Object(Some(spi)));
-    let key = obj_key(ctx, cipher_obj);
+    ctx.set_field_by_name(*cipher_obj, "spi", Value::Object(Some(spi)));
+    let key = obj_key(ctx, *cipher_obj);
     with_table_write(|t| {
         if let Some(state) = t.get_mut(&key) {
             state.delegated = true;
@@ -2329,16 +2369,16 @@ fn try_delegate_cipher_to_named_provider(
 fn try_delegate_cipher_to_chain(
     ctx: &mut dyn NativeContext,
     algo: &str,
-    cipher_obj: ObjectRef,
+    cipher_obj: &mut ObjectRef,
 ) -> Result<bool, MethodCallFailed> {
-    let pin = ctx.pin_native_root(cipher_obj);
+    let pin = ctx.pin_native_root(*cipher_obj);
     for provider in crate::jca::provider_chain::chain_provider_names() {
-        let obj = ctx.read_native_pin(pin, cipher_obj);
+        let mut obj = ctx.read_native_pin(pin, *cipher_obj);
         // A provider that owns the name but whose class will not instantiate is
         // reported by `try_delegate_cipher_to_named_provider` as `Err`. That is
         // one provider's problem, not the chain's — a real `ProviderList` walk
         // moves on to the next candidate — so keep looking.
-        if let Ok(true) = try_delegate_cipher_to_named_provider(ctx, &provider, algo, obj) {
+        if let Ok(true) = try_delegate_cipher_to_named_provider(ctx, &provider, algo, &mut obj) {
             // Record WHICH provider answered. `Cipher.getProvider()` reports
             // this engine's own identity unless told otherwise, so a chain walk
             // that found a third-party SPI produced a working cipher that named
@@ -2346,12 +2386,14 @@ fn try_delegate_cipher_to_chain(
             // fails on `decrypt.getProvider().getName()`, expecting `BC` and
             // getting `SunJCE`. The named-provider overloads have always
             // recorded it; the anonymous chain walk did not.
-            let obj = ctx.read_native_pin(pin, cipher_obj);
-            crate::jca::provider_chain::record_requested_provider(ctx, obj, &provider);
+            let obj = ctx.read_native_pin(pin, obj);
+            let obj = record_provider_and_reread(ctx, obj, &provider);
+            *cipher_obj = ctx.read_native_pin(pin, obj);
             ctx.unpin_native_roots(pin);
             return Ok(true);
         }
     }
+    *cipher_obj = ctx.read_native_pin(pin, *cipher_obj);
     ctx.unpin_native_roots(pin);
     Ok(false)
 }
@@ -3775,10 +3817,21 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     let family = cipher_family(&cipher_name);
     match family {
         Some(CipherFamily::Aes | CipherFamily::AesFixed(_) | CipherFamily::AesKeyWrap) => {}
-        // Not reachable through `Cipher.getInstance`, which now refuses every
-        // name outside the table — so reaching it means the admission table and
-        // this dispatch have drifted apart, not that a user asked for something
-        // odd. Say so, rather than computing AES and calling it success.
+        // Not reachable through `Cipher.getInstance`, which refuses every name
+        // outside the table. Say so, rather than computing AES and calling it
+        // success.
+        //
+        // The wording used to add "so reaching it means the admission table and
+        // this dispatch have drifted apart", and that diagnosis was WRONG and
+        // cost a day. The name that reached here was not an odd one the table
+        // let through — it was EMPTY, because `cipher_alloc` read the
+        // transformation out of the caller's `String` argument one line AFTER
+        // allocating the `Cipher`, and the allocation could relocate or reclaim
+        // that argument (`unwrap_or_default()` then made the miss silent). The
+        // admission table was never consulted for "" and never admitted it.
+        // `cipher_init_record_with_counter` now refuses an empty transformation
+        // at `init`, so a residual instance of that family cannot reach here at
+        // all; if one does, suspect a root that is not pinned, not the table.
         other => {
             return Err(RuntimeError::IllegalStateException {
                 message: format!(
@@ -4521,23 +4574,26 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                         &candidates,
                         CIPHER_NATIVE_PROVIDER,
                     ) {
-                        let obj = cipher_alloc(ctx, algo)?;
-                        if try_delegate_cipher_to_named_provider(ctx, &provider, &algo_str, obj)? {
-                            crate::jca::provider_chain::record_requested_provider(
-                                ctx, obj, &provider,
-                            );
+                        let mut obj = cipher_alloc(ctx, &algo_str)?;
+                        if try_delegate_cipher_to_named_provider(
+                            ctx,
+                            &provider,
+                            &algo_str,
+                            &mut obj,
+                        )? {
+                            let obj = record_provider_and_reread(ctx, obj, &provider);
                             return Ok(Some(Value::Object(Some(obj))));
                         }
                     }
-                    let obj = cipher_alloc(ctx, algo)?;
+                    let obj = cipher_alloc(ctx, &algo_str)?;
                     Ok(Some(Value::Object(Some(obj))))
                 }
                 Err(refusal) => {
                     // Not a name this engine computes. Ask the installed
                     // providers, in chain order, before refusing — see
                     // `try_delegate_cipher_to_chain`.
-                    let obj = cipher_alloc(ctx, algo)?;
-                    match try_delegate_cipher_to_chain(ctx, &algo_str, obj)? {
+                    let mut obj = cipher_alloc(ctx, &algo_str)?;
+                    match try_delegate_cipher_to_chain(ctx, &algo_str, &mut obj)? {
                         true => Ok(Some(Value::Object(Some(obj)))),
                         false => Err(refusal),
                     }
@@ -4569,7 +4625,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 &algo_str,
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
-            cipher_get_instance_with_provider(ctx, args, algo, &algo_str)
+            cipher_get_instance_with_provider(ctx, args, &algo_str)
         },
     );
     r.register(
@@ -4587,7 +4643,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 &algo_str,
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
-            cipher_get_instance_with_provider(ctx, args, algo, &algo_str)
+            cipher_get_instance_with_provider(ctx, args, &algo_str)
         },
     );
 
