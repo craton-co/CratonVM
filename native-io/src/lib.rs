@@ -1192,6 +1192,13 @@ fn native_file_mkdirs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let path = read_file_path(ctx, this).unwrap_or_default();
     let path = validated_path(&path)?;
+    // `exists()` FIRST -- see the note on the twin registration in
+    // `native-builtins/src/phases_late/nio_file.rs`, which owns the slot.
+    // `create_dir_all` succeeds on a directory that is already there, and
+    // `mkdirs()` is contracted to answer "did THIS call create it".
+    if std::path::Path::new(&path).exists() {
+        return Ok(Some(Value::Int(0)));
+    }
     Ok(Some(Value::Int(if fs::create_dir_all(&path).is_ok() {
         1
     } else {

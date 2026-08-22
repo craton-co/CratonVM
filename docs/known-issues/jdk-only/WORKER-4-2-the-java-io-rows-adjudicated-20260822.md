@@ -10,8 +10,9 @@ three arms green.** Lane WORKER 4, 2026-08-22. Companion to
 `--dump-native-registry` runs** — one strict-mode boot per scheduled vector,
 using the classes `run.sh` had already compiled — not over one boot and not from
 a source grep. Probes, all diffed against the oracle in both modes:
-`W4Deprecated.java` (116 cases), `W4BaseStream.java` (26), `W4StreamCarrier.java`
-(15 carriers), `W4Scanner.java` (29), `W4Abstract.java` (63 receivers).
+`W4Deprecated.java` (116 cases), `W4File.java` (90), `W4Abstract.java` (63
+receivers), `W4Print.java` (55), `W4Scanner.java` (29), `W4BaseStream.java` (26),
+`W4StreamCarrier.java` (15 carriers) — 394 checks in all.
 
 **Acceptance: `107/107 · 107/107 · 65/65 → 67/67`**, on the branch tip merged in,
 `TIMEOUT=600`. No vector changed colour across any of the three retirement
@@ -425,13 +426,86 @@ what the receiver IS.**
 
 ---
 
-## 6. What this record does NOT claim
+## 6. The two biggest classes, put to the oracle: `File` 90 cases, `PrintStream` 55, one defect between them
 
-* **It does not adjudicate the other 169 rows.** `java/io/File` (54),
-  `PrintStream` (30) and `PrintWriter` (7) are the three biggest groups and
-  none is in this lane's ownership (`phases_late/nio_file.rs`,
-  `logging_shims.rs`). The table is per-row and reproducible; the verdicts are
-  not written.
+§1.1 says `java/io/File` (54 owned §1.4 shadow rows) and
+`java/io/PrintStream` + `PrintWriter` (37) are the largest groups in the
+`java.io` census. Neither had ever been diffed against HotSpot for anything but
+"does not throw" — and §5 had just shown what that misses.
+
+`regression-suite/probes/W4File.java` (90 cases) and `W4Print.java` (55), both
+added here, both against the oracle in both modes.
+
+### 6.1 `PrintStream` / `PrintWriter` — 55 cases, ZERO diffs
+
+Every `print`/`println` overload including the null-`String` and null-`Object`
+forms, `char[]`, `-0.0`, `NaN`, `+Infinity`, `Long.MIN_VALUE`; `write(int)`,
+`write(byte[],int,int)`, all four `append` forms including `append(null)` and
+the chained builder shape; `printf`/`format` with `%n`, `%%`, hex, width,
+left-justify, grouping under an explicit `Locale`, and a deliberately mistyped
+conversion; non-ASCII through the stream's charset including a surrogate pair;
+the `checkError` contract on a stream whose sink throws (and that the flag
+LATCHES); and autoflush on and off.
+
+Every case is checked on the BYTES the stream emitted, not on the call
+returning — the corpus asks nothing about the content of a built string
+(`WORKER-4` trap 5), and a print stream is nothing but content.
+
+**37 §1.4 shadow rows, and not one of them answers differently from HotSpot.**
+That is a real result and it should be recorded as loudly as a defect would be:
+the largest remaining `java.io` group after `File` is a group of correct
+stand-ins. It does not make them contract-compliant — they still shadow real
+`java.base` bytecode — but it does mean retiring them is a pure §1.4 exercise
+with no behaviour to preserve, which is the cheapest kind to schedule.
+
+### 6.2 `java.io.File` — 90 cases, ONE defect
+
+`mkdirs()` returned `true` for a directory that already existed.
+
+```text
+new File(dir, "x/y/z").mkdirs()   first call    HotSpot true   CratonVM true
+new File(dir, "x/y/z").mkdirs()   second call   HotSpot FALSE  CratonVM TRUE
+```
+
+`std::fs::create_dir_all` answers `Ok(())` for a path that is already a
+directory, so `is_ok()` reports "I created it" for a call that did nothing. The
+JDK's body opens `if (exists()) return false;`: the return value is *did THIS
+call create the directory*, not *does it exist now*, and callers branch on it —
+an installer treating `true` as "first run", a cache treating it as "I own this
+directory".
+
+The sibling `mkdir()` was already right, because `create_dir` fails on an
+existing path. That is why the single-level case matched the oracle and only the
+recursive one did not, and it is why a probe that tests `mkdir` and assumes
+`mkdirs` follows would have passed.
+
+**Both copies fixed.** `--dump-native-registry` shows two registrations of
+`java/io/File.mkdirs()Z` — `phases_late/nio_file.rs` (`owns_slot=True`) and
+`native-io/src/lib.rs` (`owns_slot=False`) — with the identical bug. Fixing only
+the winner leaves the defect armed behind it, and trap 4 is that retiring a
+winner promotes the loser.
+
+The other 89 cases agree exactly: path decomposition including empty, relative,
+trailing-slash, doubled-separator and dot-segment forms; the two-argument
+constructors; existence, kind, length and permission queries on a file, a
+directory and a missing path; all five listing overloads including the filtered
+ones and the `null` a non-directory must return; `equals`/`hashCode`/`compareTo`;
+`toURI`/`toPath`/`getCanonicalFile` round trips; `createNewFile`, `renameTo`,
+`setLastModified`, `setReadOnly`, `setWritable`, `delete` and the second call to
+each; the disk-space queries; `createTempFile`; and `FileOutputStream` (truncate
+and append), `FileWriter` and `RandomAccessFile` over the results.
+
+---
+
+## 7. What this record does NOT claim
+
+* **It does not adjudicate the remaining rows one by one.** §6 puts the three
+  biggest groups — `java/io/File` (54), `PrintStream` (30), `PrintWriter` (7) —
+  to the oracle BEHAVIOURALLY, which is a different question from §1.4
+  compliance: 145 cases, one defect, and the other 144 answers identical to
+  HotSpot. That licenses retiring them as a pure contract exercise with no
+  behaviour to preserve; it does not do the retiring, and it says nothing about
+  the ~112 rows outside those three classes.
 * **It does not intersect its 99 with `H14-2`'s 99.** §1.
 * **The synthetic-jdk configuration was not built.** §2's verdict for
   `io_streams.rs` rests on a source read of the `#[cfg]` chain plus the measured
@@ -442,7 +516,7 @@ what the receiver IS.**
 
 ---
 
-## 7. NOMINATIONS
+## 8. NOMINATIONS
 
 **N1 — CLOSED BY THIS RECORD.** It read: *"`URL.openStream()` /
 `getResourceAsStream()` mint a bare `InputStream`-typed receiver, and 25 §1.4
@@ -496,7 +570,7 @@ implementation could run instead is unmeasured.
 
 ---
 
-## 8. Index rows (for H0 to move into `INDEX.md`)
+## 9. Index rows (for H0 to move into `INDEX.md`)
 
 * `WORKER-4-2` — the `java.io` rows counted three ways (194 registrations / 99
   unreached / `H14-2`'s 99 by a different instrument, not known to be the same
@@ -510,4 +584,8 @@ implementation could run instead is unmeasured.
   `java.util.Scanner` read NOTHING from nine of eleven source shapes --
   including `new Scanner(new FileInputStream(f))` -- answering an empty scanner
   rather than an error, from three separate defects of which the sharpest read
-  this process's STDIN for any stream with an `int` in slot 0.
+  this process's STDIN for any stream with an `int` in slot 0; and the two
+  biggest classes put to the oracle behaviourally for the first time --
+  `PrintStream`/`PrintWriter` 55 cases ZERO diffs, `File` 90 cases and one
+  (`mkdirs()` answered `true` for a directory that already existed, in both
+  copies of the native).

@@ -15487,9 +15487,36 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let ok = std::fs::create_dir(&path).is_ok();
         Ok(Some(Value::Int(if ok { 1 } else { 0 })))
     });
+// `File.mkdirs()` RETURNS FALSE WHEN THE DIRECTORY ALREADY EXISTS.
+//
+// `std::fs::create_dir_all` answers `Ok(())` for a path that is already a
+// directory, so `is_ok()` alone reports "I created it" for a directory this
+// call did nothing to. The JDK's own body opens with `if (exists()) return
+// false;` -- the return value is "did THIS call create the directory", not
+// "does the directory exist now", and callers branch on it (an installer that
+// treats `true` as "first run", a cache that treats it as "I own this dir").
+//
+// MEASURED, `regression-suite/probes/W4File.java`, Linux/JDK 25.0.4, both
+// modes:
+//
+//     new File(dir, "x/y/z").mkdirs()   first call    HotSpot true   CratonVM true
+//     new File(dir, "x/y/z").mkdirs()   second call   HotSpot FALSE  CratonVM TRUE
+//
+// The sibling `mkdir()` was already right -- `create_dir` fails on an existing
+// path -- which is why the single-level case matched the oracle and only the
+// recursive one did not.
+//
+// BOTH COPIES of this native are fixed, deliberately. `--dump-native-registry`
+// shows two registrations of `java/io/File.mkdirs()Z`: this one, `owns_slot=
+// True`, and `native-io/src/lib.rs`'s, `owns_slot=False`. Fixing only the
+// winner leaves the identical defect armed behind it, and trap 4 is that
+// retiring a winner PROMOTES the loser.
     r.register(file, "mkdirs", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
+        if std::path::Path::new(&path).exists() {
+            return Ok(Some(Value::Int(0)));
+        }
         let ok = std::fs::create_dir_all(&path).is_ok();
         Ok(Some(Value::Int(if ok { 1 } else { 0 })))
     });
