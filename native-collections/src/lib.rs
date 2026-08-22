@@ -52983,6 +52983,63 @@ fn chm_collect_all_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value
 }
 
 /// Initialize a CHM with segments.
+/// [`chm_segment_for`] for a MUTATOR: builds the segment array on demand
+/// rather than answering `None`.
+///
+/// # W7-96 §7 NOMINATION 2 — a dropped store reported as a successful insert
+///
+/// Every mutator used to end in
+///
+/// ```text
+///     None => Ok(Some(Value::Object(None))),
+/// ```
+///
+/// and on `put` that value means *"there was no previous mapping"* — i.e. a
+/// FRESH INSERT. So a `ConcurrentHashMap` whose segments are absent answered
+/// "stored, and it is new" to every `put` while storing nothing, and `size()`
+/// stayed 0. W7-96 §3.1 measured six puts landing one entry, 3 of 3 runs
+/// identical, and spent an hour reading it as a real-bytecode CAS bug.
+///
+/// A receiver reaches that state whenever `<init>` did not run this crate's
+/// constructor: `readObject` (which already worked around it by calling
+/// `chm_init_segments` itself), `Unsafe.allocateInstance`, and — the case that
+/// made it matter — the retirement dial retiring `<init>` while the force gate
+/// kept `put`.
+///
+/// Materialising is better than throwing. A segment-less CHM is not a
+/// corrupt object, it is an UNINITIALISED one, and the JDK's own
+/// `ConcurrentHashMap` allocates its table lazily on first `put` for exactly
+/// the same reason. This makes the VM correct rather than merely loud, and it
+/// removes the workaround `native_chm_read_object` had to carry.
+///
+/// READERS are deliberately NOT routed here: on a map with no segments there is
+/// genuinely nothing to find, so `get`/`containsKey` answering absent is right,
+/// and materialising on a read would allocate on a path that must not.
+fn chm_segment_for_mut(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    hash: i32,
+) -> Option<ObjectRef> {
+    if let Some(seg) = chm_segment_for(&*ctx, this, hash) {
+        return Some(seg);
+    }
+    if matches!(ctx.get_field(this, CHM_FIELD_SEGMENTS), Value::Object(Some(_))) {
+        // A segments array exists but this bucket is empty -- that is a real
+        // absence, not an uninitialised receiver, so leave it alone.
+        return None;
+    }
+    let this_pin = ctx.pin_native_root(this);
+    chm_init_segments(
+        ctx,
+        this,
+        CHM_DEFAULT_SEGMENTS,
+        CHM_DEFAULT_SEGMENT_CAP,
+    );
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    chm_segment_for(&*ctx, this, hash)
+}
+
 fn chm_init_segments(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -53868,7 +53925,7 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
             let hash = chm_key_hash(ctx, &key)?;
             let this = ctx.read_native_pin(this_pin0, this);
-            if let Some(seg) = chm_segment_for(ctx, this, hash) {
+            if let Some(seg) = chm_segment_for_mut(ctx, this, hash) {
                 let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
                 let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
                 let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
@@ -54347,7 +54404,7 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         let key = read_pinned_elem(ctx, key_pin, key);
         let hash = chm_key_hash(ctx, &key)?;
         let this = ctx.read_native_pin(this_pin, this);
-        match chm_segment_for(ctx, this, hash) {
+        match chm_segment_for_mut(ctx, this, hash) {
             Some(seg) => {
                 let _resize_flag = ChmResizeLockGuard::enter();
                 let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
@@ -54412,7 +54469,7 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let key = read_pinned_elem(ctx, key_pin, key);
         let hash = chm_key_hash(ctx, &key)?;
         let this = ctx.read_native_pin(this_pin, this);
-        match chm_segment_for(ctx, this, hash) {
+        match chm_segment_for_mut(ctx, this, hash) {
             Some(seg) => {
                 let _resize_flag = ChmResizeLockGuard::enter();
                 // GC-pausable contended wait — re-read the pinned locals
@@ -54430,7 +54487,7 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
     #[allow(unreachable_code)]
     let hash = chm_key_hash(ctx, &key)?;
-    match chm_segment_for(ctx, this, hash) {
+    match chm_segment_for_mut(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
@@ -54636,7 +54693,7 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let key = read_pinned_elem(ctx, key_pin, key);
     let hash = chm_key_hash(ctx, &key)?;
     let this = ctx.read_native_pin(roots_base, this);
-    let result = match chm_segment_for(ctx, this, hash) {
+    let result = match chm_segment_for_mut(ctx, this, hash) {
         Some(seg) => {
             // JDK-exact lock-free fast path: `computeIfAbsent` on a PRESENT
             // key returns the existing value WITHOUT locking. Real CHM locks
@@ -54681,7 +54738,7 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let key = read_pinned_elem(ctx, key_pin, key);
     let hash = chm_key_hash(ctx, &key)?;
     let this = ctx.read_native_pin(roots_base, this);
-    let result = match chm_segment_for(ctx, this, hash) {
+    let result = match chm_segment_for_mut(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
             // GC-pausable contended wait — re-read the pinned locals AFTER
@@ -54774,7 +54831,7 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let key = read_pinned_elem(ctx, key_pin, key);
     let hash = chm_key_hash(ctx, &key)?;
     let this = ctx.read_native_pin(roots_base, this);
-    let result = match chm_segment_for(ctx, this, hash) {
+    let result = match chm_segment_for_mut(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
             // GC-pausable contended wait — re-read the pinned locals AFTER
@@ -54873,7 +54930,7 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);
             let hash = chm_key_hash(ctx, &key)?;
             let this = ctx.read_native_pin(this_pin, this);
-            if let Some(seg) = chm_segment_for(ctx, this, hash) {
+            if let Some(seg) = chm_segment_for_mut(ctx, this, hash) {
                 let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
                 let key = read_pinned_elem(ctx, flat_pins[i * 2], flat[i * 2]);
                 let value = read_pinned_elem(ctx, flat_pins[i * 2 + 1], flat[i * 2 + 1]);

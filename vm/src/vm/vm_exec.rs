@@ -24814,7 +24814,14 @@ fn invoke_on_class_shared_inner(
                         // normally, unblocking Spring's
                         // `GenericConversionService.addConverter()` →
                         // `getConvertibleTypes().iterator()` boot path.
-                        || (matches!(
+                        // W7-96 §7 NOMINATION 1 — the third mirror. See the
+                        // note on `force_native_over_real_jdk_bytecode`; this
+                        // cluster is local to this path, so the dial must be
+                        // read here as well. `Off::covers()` is `false`, so an
+                        // unarmed run does not change by one dispatch.
+                        || (!crate::runtime::env_cache::enforce_shadow_scope()
+                                .covers(class_name)
+                            && matches!(
                                 class_name,
                                 "java/util/HashMap"
                                 | "java/util/LinkedHashMap"
