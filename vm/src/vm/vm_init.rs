@@ -7898,6 +7898,47 @@ pub fn dump_wait_site_thread_local(shared: &SharedVm) {
     }
 }
 
+/// Print the state of the object a thread is parked on in `Object.wait()`.
+///
+/// The netty `ParameterizedSslHandlerTest` stall bottoms out in
+/// `DefaultPromise.await`/`awaitUninterruptibly` at the `Object.wait()` BCI, a
+/// 30 s-spurious-wakeup A/B showed the awaited promise is ALREADY complete, and
+/// the orphan check came back clean — so the waiter is on the right monitor and
+/// a notifier would resolve the same one. The remaining question is netty's own
+/// bookkeeping, which lives in two fields of the promise:
+///
+/// * `result`  — non-null once the promise completes (set OUTSIDE the monitor).
+/// * `waiters` — a PLAIN int the waiter increments inside the monitor
+///   immediately before `wait()`; `checkNotifyWaiters()` skips `notifyAll()`
+///   entirely when it reads 0.
+///
+/// `result != null` with `waiters >= 1` here means the completer either never
+/// ran `checkNotifyWaiters` or read a stale `waiters` — i.e. the monitor is not
+/// establishing happens-before between the two `synchronized` blocks.
+pub fn dump_wait_object_state(shared: &SharedVm, obj: ObjectRef) {
+    let cid = shared.mem.heap.class_id_of(obj);
+    let name = shared
+        .classes
+        .class_manager
+        .read()
+        .class_store
+        .get_class(cid)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| format!("<class_id {cid:?}>"));
+    let field = |f: &str| -> Option<cratonvm_types::Value> {
+        let cm = shared.classes.class_manager.read();
+        let idx = super::vm_exec::resolve_field_index_in_hierarchy(cid, f, &cm.class_store)?;
+        drop(cm);
+        Some(shared.mem.heap.get_field(obj, idx))
+    };
+    eprintln!(
+        "[WAIT-OBJECT] obj={:p} class={name} result={:?} waiters={:?}",
+        obj.as_ptr(),
+        field("result"),
+        field("waiters"),
+    );
+}
+
 impl SharedVm {
     /// Placeholder split-impl — see the inherent impl above. The split is
     /// purely so the thread-local helpers above can sit between two impl
@@ -8673,6 +8714,17 @@ impl Vm {
             crate::threading::monitor::install_wait_site_dump(move |_tid| {
                 if let Some(s) = weak.upgrade() {
                     crate::vm::vm_init::dump_wait_site_thread_local(&s);
+                }
+            });
+        }
+        // Companion to the frame dump above: the STATE of the object the thread
+        // is parked on. See `dump_wait_object_state` for why those two fields
+        // are the ones that decide the netty promise stall.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_object_dump(move |obj| {
+                if let Some(s) = weak.upgrade() {
+                    crate::vm::vm_init::dump_wait_object_state(&s, obj);
                 }
             });
         }

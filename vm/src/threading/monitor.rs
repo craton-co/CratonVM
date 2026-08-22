@@ -242,6 +242,25 @@ where
     let _ = WAIT_SITE_DUMP.set(Arc::new(f));
 }
 
+/// Callback installed by the VM to print the state of the object a thread is
+/// parked on in `Object.wait()`. Separate from [`WAIT_SITE_DUMP`] because it
+/// needs heap + class metadata, which `monitor.rs` has no handle on.
+type WaitObjectDumpFn = Arc<dyn Fn(ObjectRef) + Send + Sync>;
+static WAIT_OBJECT_DUMP: std::sync::OnceLock<WaitObjectDumpFn> = std::sync::OnceLock::new();
+
+pub fn install_wait_object_dump<F>(f: F)
+where
+    F: Fn(ObjectRef) + Send + Sync + 'static,
+{
+    let _ = WAIT_OBJECT_DUMP.set(Arc::new(f));
+}
+
+fn emit_wait_object_state(obj: ObjectRef) {
+    if let Some(f) = WAIT_OBJECT_DUMP.get() {
+        f(obj);
+    }
+}
+
 fn emit_wait_site_frames(thread_id: ThreadId) {
     if let Some(f) = WAIT_SITE_DUMP.get() {
         f(thread_id);
@@ -1123,6 +1142,29 @@ impl Monitor {
                             && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire)
                         {
                             emit_wait_site_frames(thread_id);
+                            // WAITED-ON OBJECT STATE (diagnostic). The orphan check
+                            // below came back CLEAN on a reproduced stall, so the
+                            // waiter IS parked on the monitor its object points at
+                            // and a notifier would resolve the same one. What is
+                            // left to distinguish is netty's own bookkeeping:
+                            //
+                            //   result != null && waiters >= 1
+                            //       the promise completed AND this waiter had
+                            //       registered — so `checkNotifyWaiters` either
+                            //       never ran or read a stale `waiters`, i.e. the
+                            //       monitor is not establishing happens-before.
+                            //   result != null && waiters == 0
+                            //       the increment is not visible here at all.
+                            //   result == null
+                            //       the promise never completed — the 30 s A/B
+                            //       result would then need re-examining.
+                            //
+                            // Only the VM can read those fields, hence the
+                            // callback; `emit_wait_site_frames` uses the same
+                            // pattern for exactly this reason.
+                            if let Some(obj) = waited_on {
+                                emit_wait_object_state(obj);
+                            }
                             frames_dumped = true;
                         }
                         // ORPHAN CHECK (diagnostic). The 30 s-spurious-wakeup A/B
