@@ -867,6 +867,26 @@ fix is committed here; the fix is to drop `docker\.sock` from the pattern
 from inside the harness's own containers setup, not a raw log line that
 also appears on success).
 
+**FIXED 2026-08-22.** Applied directly to both Azure copies of the script
+(`/data/cratonvm/apps/hibernate-reactive-suite-runner/` and
+`/data/cvm-hibreactive-idle-20260820/apps/hibernate-reactive-suite-runner/`
+— the two found with this bug; the older Windows-box copy carries only
+section 5's original `"$tmp" "$RAW"` scope bug, in a differently-shaped
+`sig`-generation block, not touched here): dropped the `docker\.sock`
+alternative, and — since the surrounding code was already being edited —
+also fixed section 5's still-live `"$tmp" "$RAW"` scope issue in this same
+block (it checked both; now only `"$tmp"`, this class's own output).
+Verified both corrections against real data rather than by inspection
+alone: the new pattern no longer matches this section's own saved
+`raw.log`s that previously false-positived (re-checked directly, `grep`
+against the old pattern still matches, against the new pattern no longer
+does), and a synthetic genuine `ConnectException: Connection refused` log
+still matches the new pattern, so real no-DB detection is unaffected.
+`bash -n` passes on both files. Still gitignored, so this is a local fix on
+the two hosts/worktrees touched, not a commit — the next session working
+from a *different* worktree's copy of this script should apply the same
+change (or copy the fixed file) if it hits this again.
+
 ### 7.5 Updated status
 
 Of the 9 classes now checked with `--jit on` vs `--jit off` (`FilterWithPaginationTest`
