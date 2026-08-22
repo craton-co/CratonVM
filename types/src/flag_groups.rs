@@ -772,6 +772,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "ute", on_key: Some("CRATONVM_DBG_UTE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "validate-new", on_key: Some("CRATONVM_DBG_VALIDATE_NEW"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "vdisp", on_key: Some("CRATONVM_DBG_VDISP"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "vector-intrinsics-stats", on_key: Some("CRATONVM_VECTOR_INTRINSICS_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "verify-error", on_key: Some("CRATONVM_DBG_VERIFY_ERROR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "verify-inline-frame-record", on_key: Some("CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "verify-oop-maps", on_key: Some("CRATONVM_DBG_VERIFY_OOP_MAPS"), off_key: None, off_word: None },
@@ -1143,7 +1144,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "stack-bang", on_key: Some("CRATONVM_JIT_STACK_BANG"), off_key: Some("CRATONVM_JIT_NO_STACK_BANG"), off_word: None },
     // Interpreter-side like `trivial-getter`: the lock-free static-field read
     // path in `vm::vm_object`, default-ON with an opt-out-only spelling.
+    E { group: Group::JIT, token: "static-bytecode-callee", on_key: Some("CRATONVM_JIT_STATIC_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "statics-index", on_key: None, off_key: Some("CRATONVM_NO_STATICS_INDEX"), off_word: None },
+    E { group: Group::JIT, token: "vector-intrinsics", on_key: Some("CRATONVM_VECTOR_INTRINSICS"), off_key: None, off_word: Some("0") },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0") },
@@ -1237,6 +1240,8 @@ pub const INVENTORY: &[E] = &[
     // `cuda_bridge::critical` — millisecond budgets, trimmed `u64`, latched in
     // an `AtomicU64` on first read. Value tokens:
     // `CRATONVM_GC=gpu-critical-wait-ms=250`.
+    E { group: Group::GC, token: "gpu-chunk-streams", on_key: Some("CRATONVM_GPU_CHUNK_STREAMS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "gpu-chunks", on_key: Some("CRATONVM_GPU_CHUNKS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "gpu-critical-lease-ms", on_key: Some("CRATONVM_GPU_CRITICAL_LEASE_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "gpu-critical-wait-ms", on_key: Some("CRATONVM_GPU_CRITICAL_WAIT_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None },

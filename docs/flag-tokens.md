@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-470 tokens.
+471 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -513,6 +513,7 @@ export inherited from a parent shell.
 | `ute` | `CRATONVM_DBG_UTE` |
 | `validate-new` | `CRATONVM_DBG_VALIDATE_NEW` |
 | `vdisp` | `CRATONVM_DBG_VDISP` |
+| `vector-intrinsics-stats` | `CRATONVM_VECTOR_INTRINSICS_STATS` |
 | `verify-error` | `CRATONVM_DBG_VERIFY_ERROR` |
 | `verify-inline-frame-record` | `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD` |
 | `verify-oop-maps` | `CRATONVM_DBG_VERIFY_OOP_MAPS` |
@@ -536,7 +537,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-212 tokens.
+214 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -722,7 +723,9 @@ export inherited from a parent shell.
 | `sp-tailcall` | `CRATONVM_JIT_SP_TAILCALL` |
 | `spec-bce` | `CRATONVM_JIT_NO_SPEC_BCE` |
 | `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
+| `static-bytecode-callee` | `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` |
 | `statics-index` | `CRATONVM_NO_STATICS_INDEX` |
+| `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
@@ -755,7 +758,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-66 tokens.
+68 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -783,6 +786,8 @@ export inherited from a parent shell.
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
 | `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |
+| `gpu-chunk-streams` | `CRATONVM_GPU_CHUNK_STREAMS` |
+| `gpu-chunks` | `CRATONVM_GPU_CHUNKS` |
 | `gpu-critical-lease-ms` | `CRATONVM_GPU_CRITICAL_LEASE_MS` |
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |

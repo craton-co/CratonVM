@@ -1,10 +1,17 @@
 # WORKER-5 NOTE 8 — `getDefinedPackage` answers for packages the loader did not DEFINE, and it is why `RLangPackages` fails on a binary built from the integrated tree
 
-**Status: OPEN, MEASURED.** Lane WORKER-5, 2026-08-22, on
-`C:/craton/cratonvm-w5.exe` — a Windows `cargo build --release -p cratonvm-cli`
-of the integrated tree at `4903bcf62`, built by this lane precisely because no
-prebuilt binary matched the tree. Oracle: HotSpot 25.0.3+9. Not this lane's
-surface to fix.
+**Status: FIXED, MEASURED.** Lane WORKER-5, 2026-08-22. Found on
+`C:/craton/cratonvm-w5.exe` and fixed on `C:/craton/cratonvm-w5b.exe` — two
+Windows `cargo build --release -p cratonvm-cli` builds of the integrated tree,
+made by this lane precisely because no prebuilt binary matched the tree. Oracle:
+HotSpot 25.0.3+9.
+
+> **§7 is the fix.** One caller, one branch: `getDefinedPackage` was probing the
+> VM-global classpath for every BUILT-IN loader, so the application loader found
+> the boot image's `java/lang/*.class` and fabricated a `Package`. The
+> application and platform loaders are now probed against their OWN class-path
+> segment. `RLangPackages` goes from failing its first check to
+> **`PASS RLangPackages (27 checks)`**, the same count HotSpot publishes.
 
 ---
 
@@ -95,13 +102,12 @@ cratonvm --java-home "$JDK" --jdk-only -cp /tmp/dpp DefinedPackageProbe
 
 ## 5. What this does NOT establish
 
-* **No cause is named.** This is a black-box oracle diff; nothing here reads the
-  Rust side or points at a registrar. Locating the implementation is the owning
-  lane's first step, not a conclusion of this record.
-* **The strong control is missing.** Proving `getDefinedPackage` returns non-null
-  for a package the app loader really DOES define needs a class in a *named*
-  package on the classpath. The probe says so rather than implying its weak
-  control covered it.
+* ~~**No cause is named.**~~ Named and fixed in §7. What §1–§6 record is the
+  black-box diff as it stood before the Rust side was read.
+* ~~**The strong control is missing.**~~ Measured with the fix — see §7.3.
+  The single-file probe still cannot carry it (a `.java` file has one package),
+  so the probe now points at §7.3 rather than implying its weak control
+  sufficed.
 * **`getPackages()` was not measured**, only `getPackage`/`getDefinedPackage`.
   A loader-set defect would likely show there too.
 * **Only two loaders were asked**, application and platform. The boot loader is
@@ -110,16 +116,158 @@ cratonvm --java-home "$JDK" --jdk-only -cp /tmp/dpp DefinedPackageProbe
   `WORKER-5-NOTE-7` §1a.2 (12 ABBA-interleaved runs, both outcomes under both
   harnesses); it is not evidence about this defect.
 
+## 7. THE FIX
+
+### 7.1 The cause, in one branch
+
+`native-builtins/src/classloader.rs :: package_class_files_visible_to_loader`
+resolved a loader's view in four steps, and step 1 was:
+
+```rust
+// 1. built-in loaders (bootstrap/platform/application) — they ARE the global
+//    classpath, so the global probe is the right one;
+if is_builtin {
+    return !ctx.find_all_resource_urls(class_glob).is_empty();
+}
+```
+
+`find_all_resource_urls` concatenates **bootstrap + extension + application**.
+So the application loader saw the boot image and claimed `java.lang`.
+
+The irony is exact: this function was WRITTEN to fix the same loader-identity
+error for `URLClassLoader` (the Spring `BeanDefinitionLoader` bug its own doc
+comment cites) — and the branch that skipped the built-ins left the error in
+place for the two loaders every application actually uses.
+
+### 7.2 What changed
+
+`ClassManager` already keeps the three class paths separate, and
+`next_resource_url_from` already numbers them **0 bootstrap, 1 extension, 2
+application**. That numbering is reused rather than a second one invented:
+
+* `ClassManager::find_resource_urls_in_segment(name, segment)` — new, three
+  lines of match;
+* `NativeContext::find_resource_urls_in_segment` — new, **defaulting to the
+  unsegmented probe** so any implementation that has not overridden it behaves
+  exactly as before rather than silently reporting "nothing is visible";
+* `builtin_loader_segment()` — maps `ClassLoaders$AppClassLoader` → 2 and
+  `ClassLoaders$PlatformClassLoader` → 1 (plus the legacy `sun/misc/Launcher$`
+  spellings). Everything else returns `None`, which selects the historical
+  global probe.
+
+**The `loader == None` arm is deliberately untouched.** That arm IS the boot
+loader, and answering `true` for `java.lang` there is correct — narrowing it
+would have been a second bug in the opposite direction.
+
+**Blast radius: one caller.** `package_class_files_visible_to_loader` is called
+from exactly one place, `i2_classloader_get_defined_package`, so nothing but
+`getDefinedPackage` can move.
+
+### 7.3 MEASURED, including the control that was missing
+
+The probe now matches the oracle on every row:
+
+| | HotSpot | before | after |
+|---|---|---|---|
+| `app.getDefinedPackage("java.lang")` | `null` | `java.lang` | **`null`** |
+| `app.getDefinedPackage("java.util")` | `null` | `java.util` | **`null`** |
+| `app.getDefinedPackage("java.io")` | `null` | `java.io` | **`null`** |
+| `platform.getDefinedPackage("java.lang")` | `null` | `java.lang` | **`null`** |
+| `app.getDefinedPackage("no.such.package")` | `null` | `null` | `null` |
+| `Package.getPackage("java.lang")` — must WALK | non-null | non-null | **non-null** |
+
+`getPackage` still resolving is the check that says the fix narrowed
+`getDefinedPackage` specifically rather than breaking package lookup.
+
+**§5 said the strong control was missing. It is not any more.** A class in a
+genuinely app-classpath-defined named package, which is the regression that
+would matter (blinding the app loader would re-open the Spring
+`BeanDefinitionLoader` bug):
+
+```text
+                                          HotSpot          before        after
+app.getDefinedPackage("com.example.app")  com.example.app  com.example.app  com.example.app
+app.getDefinedPackage("java.lang")        null             java.lang        null
+app.getDefinedPackage("com.example.nope") null             null             null
+```
+
+**The fixed VM matches HotSpot on all three, and the pre-fix binary differs on
+exactly one.** The fix narrows the probe without blinding it.
+
+And the vector itself:
+
+```text
+before:  AssertionError at check 1 of 27
+after:   PASS RLangPackages (27 checks)      <- the count HotSpot publishes
+```
+
+### 7.4 The residual this fix KNOWINGLY carries
+
+This VM does not model the JDK's platform **module** set, only an "extension"
+class-path segment which is empty on a normal run. So a genuinely
+platform-defined package — `java.sql` is the obvious one — now answers `null`
+where HotSpot answers non-null.
+
+That is a real divergence and it is **new**, traded deliberately:
+
+* it moves in the direction `getDefinedPackage`'s contract prefers — a missing
+  `Package` rather than a fabricated one;
+* no corpus vector asks the question, and `RLangPackages` asserts only that the
+  platform loader must NOT claim `java.lang`;
+* the alternative is modelling the platform module set, which is a much larger
+  job than this defect warrants.
+
+It is written into `builtin_loader_segment`'s doc comment so the next reader
+meets it at the code, not only here.
+
+## 8. The arms after the fix — and `RTreeRangeGc` is NOT a flake on this binary
+
+```text
+  SUITE=all CRATONVM_ARGS=--jdk-only   107 / 107   0 failed
+  SUITE=all                            106 / 107   RTreeRangeGc
+  SUITE=core                            66 /  67   RTreeRangeGc
+```
+
+`RLangPackages` is gone from all three. **The strict arm is green for the first
+time on a binary built from this tree**, and its census reads
+`saturation: none — every bounded collection reported truncated: false`.
+
+### 8.1 A CORRECTION to `WORKER-5-NOTE-7` §1a.2
+
+That record called `RTreeRangeGc` **a flake**, from 12 ABBA-interleaved runs on
+`cratonvm-r12.exe` that gave both outcomes. On `cratonvm-w5b.exe` it is not
+flaky at all. Twelve runs, six rounds, the two modes interleaved so neither
+order nor drift can explain it:
+
+```text
+round 1..6:   strict = PASS ×6        compatible = FAIL ×6
+```
+
+**Deterministic, and mode-dependent** — which is trap 6's shape exactly: *"these
+failures are COMPATIBLE-mode defects … a vector going GREEN is the fix"*. It
+passes under `--jdk-only` and fails only without the flag.
+
+That makes it far more actionable than a flake: a deterministic
+mode-conditioned failure is diagnosable. It is also a reminder that **"flaky"
+is a property of a binary and a host, not of a vector** — r12 and w5b are many
+commits apart, and the earlier runs were taken under a load these were not.
+
+Not this lane's surface (the failure is `gc::guard` + `[G2] nothing survives
+extract()` in the substitution layer), and `ba370cc23` records another lane
+already narrowing it there.
+
 ## 6. NOMINATIONS
 
-* **N1 — owner needed for `getDefinedPackage`.** It must consult only the
-  packages THIS loader defined. The `no.such.package` row says the lookup is
-  already package-set-aware, so the fix is likely a scope, not a new mechanism.
-* **N2 — `RLangPackages` is a REAL failing vector on the integrated tree**, and
-  the `107/107 · 107/107 · 67/67` recorded elsewhere is not reproducible on a
-  binary built from that tree by this lane. Whoever measured green should say
-  which binary and which commit; one of the two measurements is about a
-  different artefact.
+* ~~**N1 — owner needed for `getDefinedPackage`.**~~ **DONE — §7.** It was a
+  scope, exactly as the `no.such.package` row predicted.
+* **N2 — `RLangPackages` was a REAL failing vector on the integrated tree**, and
+  the `107/107 · 107/107 · 67/67` recorded elsewhere was not reproducible on a
+  binary built from that tree. It passes now, but the question stands: whoever
+  measured green should say which binary and which commit, because one of the
+  two measurements was about a different artefact and that can recur.
+* **N3b — the platform module set (§7.4).** `java.sql` and its siblings now
+  answer `null` on the platform loader. Whoever owns the module model should
+  decide whether that is worth closing.
 * **N3 — do NOT add `RLangPackages` to `harness-uncounted.txt`** (§3). The `[G3]`
   flag is correct; silencing it would hide the failure that causes it.
 

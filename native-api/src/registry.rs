@@ -1446,6 +1446,20 @@ pub trait NativeClassAccess {
         None
     }
 
+    /// [`Self::find_all_resource_urls`] restricted to ONE class-path segment:
+    /// 0 bootstrap, 1 extension, 2 application — the numbering
+    /// [`Self::next_resource_url`] already uses.
+    ///
+    /// Exists for `ClassLoader.getDefinedPackage`, which does NOT delegate: the
+    /// application loader must answer `null` for `java.lang`, which lives on
+    /// segment 0. The default falls back to the unsegmented probe so that an
+    /// implementation which has not overridden it behaves exactly as before
+    /// rather than silently reporting "nothing is visible".
+    fn find_resource_urls_in_segment(&self, name: &str, segment: u8) -> Vec<String> {
+        let _ = segment;
+        self.find_all_resource_urls(name)
+    }
+
     /// `true` when [`Self::next_resource_url`] can serve `name` — i.e. the
     /// name matches at most one entry per classpath entry, so "the first URL
     /// this entry serves" cannot be dropping others. Default `false`.

@@ -1,5 +1,13 @@
 # `RTreeRangeGc` reddens on the default collector — the gap is old, the *coverage* is new
 
+> **2026-08-22 — this vector carries TWO defects, and this record describes one.**
+> The generational column of the table below is a **different** defect from the
+> default column's: on generational the first failure is `subMap(k, k)`
+> returning an **empty view** (`0 entries, expected 200`) on its FIRST walk,
+> not a stale address decoding as another object. Different operation, different
+> symptom. Fixing either will not green the vector.
+> See `jdk-only/WORKER-1-NOTE-2-…-20260822.md` §4c.
+
 ## What is failing
 
 `regression-suite` vector `RTreeRangeGc`, which the harness runs with
@@ -35,12 +43,28 @@ on it. Those two are consequences of the rc=1, not separate defects.
 > r14   SUITE=core    66 /  67   RLangPackages                  (RTreeRangeGc PASSED)
 > ```
 >
-> So under the corpus it is **intermittent**, and this host is one where load
-> flips PASS/FAIL rather than only timings. Anything below that reasons from
-> "it always fails" is weaker than it reads — in particular, a single green
-> corpus run does NOT show the gap closed. Use the isolated `--Xmx 64m` repro,
-> three runs, for any before/after judgement; that is the arm the binary table
-> below was measured on.
+> **RE-CORRECTED 2026-08-22, later: one outlier in eight, not “intermittent”.**
+> Four corpus runs on this host, two compatible arms each:
+>
+> ```text
+> r13  all FAIL   core FAIL
+> r14  all FAIL   core PASS   <- the single outlier, and the one this note was written from
+> r15  all FAIL   core FAIL
+> r16  all FAIL   core FAIL
+> ```
+>
+> Seven of eight compatible observations FAIL and every strict one PASSES, so
+> the honest reading is **deterministic and mode-dependent, with a rare
+> flake** — not “intermittent”, which is what one outlier looked like at the
+> time. `WORKER-5` reached the same conclusion from 12 ABBA-interleaved runs
+> on their own binary (strict PASS x6, compatible FAIL x6) and their framing
+> is the one to keep: **“flaky” is a property of a BINARY AND A HOST, not of a
+> vector.** Both of us called it a flake first, from different binaries.
+>
+> The practical rule is unchanged: judge before/after on the isolated
+> `--Xmx 64m` arm, three runs, not on one corpus cell — a single green corpus
+> run does NOT show the gap closed. That is the arm the binary table below was
+> measured on.
 >
 > The `--jdk-only` PASS is a separate matter and is NOT the flake: it reproduces
 > 2/2 deliberately, and the mechanism is in the mode section further down.
@@ -116,6 +140,16 @@ interpreter frame root set." That was too broad, and the mode arm says so:
 --Xmx 64m --jdk-only      rc=0  2/2   PASS RTreeRangeGc (14014 checks)
 ```
 
+> **REFUTED 2026-08-22 — strict mode is not clean, it is LESS SENSITIVE.**
+> The two-row arm below was measured at one heap size. Squeeze it and
+> `--jdk-only` goes red: **`--Xmx 48m` FAIL 2/2, `--Xmx 32m` FAIL 2/2**, and
+> `--Xmx 64m` itself flaked to FAIL on one of two runs. So the `pass` is a
+> threshold, not immunity, and **every inference in the rest of this section
+> rests on it**. The unrooted reference cannot be attributed to the substituted
+> collection natives on this evidence, because the gap survives their removal.
+> Measured on a pristine `origin/dev` build at `bf85389bb`; see
+> `jdk-only/WORKER-1-NOTE-2-rtreerangegc-range-views-and-a-repro-that-disagrees-20260822.md`.
+
 **Strict mode is CLEAN.** `--jdk-only` drops the substituted collection natives
 and runs the JDK's own `TreeMap`/`TreeSet` bytecode, and the gap goes with them.
 So the unrooted reference is held by CratonVM's own collection substitution
@@ -124,6 +158,35 @@ why the corpus's `--jdk-only` arm stayed green at 106/107 while `SUITE=all` and
 `SUITE=core` went red. That also makes this the SIXTH Compatible-mode defect
 this week that strict mode does not have, and an argument for the mode rather
 than a cost of it.
+
+> **THE INFERENCE IS CONTESTED, 2026-08-22 (WORKER round, `4730f4acc`).** The
+> MEASUREMENT above stands — the vector is compatible-FAIL / strict-PASS, and
+> that reproduces. What is challenged is the sentence after "therefore".
+>
+> That lane built a 3-walk range-view repro and its arms disagree with the
+> vector's on **two of eight**: it **FAILS under `--jdk-only`**, where the
+> vector passes, and **PASSES on generational**, where the vector fails. If a
+> range-view relocation gap reproduces with the substituted collection natives
+> out of the picture, then either "the substitution layer holds the unrooted
+> reference" is too narrow, or **there are two defects** and the mode arm is
+> separating them rather than locating one.
+>
+> They explicitly decline to call their repro a diagnosis of this vector, which
+> is the right call and the reason to trust the rest: *"a probe reporting its own
+> reach as the defect"* is the error this directory keeps recording. Treat the
+> `--jdk-only` PASS as an observation about the VECTOR, not as a proven
+> localisation, until the two are shown to be the same defect.
+>
+> **They also closed this record's own loose end.** Pristine `origin/dev` was
+> built and is **red 3/3 on the isolated `--Xmx 64m` repro**, with every control
+> in this record reproducing on it. The "dev is already red" claim below is no
+> longer an inference from a table.
+>
+> **And the range views are confirmed, with a control** — one view kind per
+> process, two runs each: `headMap(k)`, `tailMap(k)` and `headMap(k,false)` fail
+> at walk 18, `subMap(k,k)` at walk 3, and **the map itself is clean over 64
+> walks**. So the earlier "start at the range-VIEW machinery" pointer is right,
+> and whole-map iteration is not implicated.
 
 `RTreeRangeGc.checkMap` walks TreeMap/TreeSet range views. This area has prior
 form: `b2e13e441 fix(collections): TreeMap/TreeSet snapshot walks dereferenced
