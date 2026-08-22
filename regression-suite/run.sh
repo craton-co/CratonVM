@@ -666,7 +666,34 @@ resolve_release() {
 run_pass() {
   pass=0; fail=0; failed=""
   hbad=0; hfailed=""
-  GUARDTMP="$HERE/.guard-tmp"; rm -rf "$GUARDTMP"; mkdir -p "$GUARDTMP"
+  # PID-SCOPED since 2026-08-21. This was `$HERE/.guard-tmp`, a FIXED path, and
+  # the `rm -rf` below is the hazard: a second `run.sh` starting while a first is
+  # mid-sweep deletes the first's oracle files underneath it. Both runs then diff
+  # against nothing.
+  #
+  # It has now corrupted a measurement twice, and both times it was mistaken for
+  # a VM defect first:
+  #   * `H14-3` §5 — two concurrent sweeps starved the HotSpot oracle and moved
+  #     `register_uri_natives` from 83/104 to **102/104**. Three arms discarded.
+  #   * 2026-08-21, H0 — an orphaned background arms script overlapped a second
+  #     `SUITE=all` and produced **3 passed, 204 failed**: every vector red AND a
+  #     `harness:` entry for each. `204 = 102 vectors x 2`.
+  #
+  # THE SIGNATURE IS WORTH KNOWING: total redness that INCLUDES the harness guard
+  # is an ENVIRONMENT failure, not a defect. No source change can fail `RJitGc`,
+  # `RCrypto` and `RShutdownHooks` in the same run.
+  #
+  # `run.sh`'s own comment at the report-directory block already said a new
+  # scratch path "must not add a second FIXED shared path … this directory is
+  # PID-scoped so it cannot repeat that". The newer directory obeyed it; the
+  # original never did. This closes that gap rather than adding a lock, because
+  # concurrent sweeps are USEFUL — several workers can measure at once — and a
+  # lock would serialise them for a reason that no longer exists.
+  GUARDTMP="$HERE/.guard-tmp.$$"; rm -rf "$GUARDTMP"; mkdir -p "$GUARDTMP"
+  # Leak-proof: the explicit `rm -rf` at the end of run_pass only runs on the
+  # normal path, so an interrupted or timed-out sweep used to leave the directory
+  # behind. With a PID suffix that would accumulate one per run.
+  trap 'rm -rf "$GUARDTMP"' EXIT INT TERM
   label=""; [ -n "$REL" ] && label=" (--release $REL)"
   echo "== compiling regression-suite$label =="
   compile_modules || { echo "ERROR: javac failed on module $JDKONLY_MODULE"; return 3; }
