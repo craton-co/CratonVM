@@ -607,12 +607,18 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
                     CompletionKind::AcceptedChannel(new_id) => {
                         // Wrap the registry entry into a synthetic
                         // AsynchronousSocketChannel Java object.
-                        let ch =
-                            alloc_obj(ctx, "java/nio/channels/AsynchronousSocketChannel", N_FIELDS);
-                        ctx.set_field(ch, F_OPEN, Value::Int(1));
-                        ctx.set_field(ch, F_CONNECTED, Value::Int(1));
-                        ctx.set_field(ch, F_REG_ID, Value::Int(new_id));
-                        ctx.set_field(ch, F_REMOTE, Value::Object(None));
+                        // Concrete, per `ASC_IMPLS`; see `aio_base`.
+                        let minted = crate::concrete_receiver::alloc_concrete(
+                            ctx,
+                            ASC_IMPLS,
+                            "java/nio/channels/AsynchronousSocketChannel",
+                            N_FIELDS,
+                        );
+                        let ch = minted.obj;
+                        aio_set(ctx, ch, F_OPEN, Value::Int(1));
+                        aio_set(ctx, ch, F_CONNECTED, Value::Int(1));
+                        aio_set(ctx, ch, F_REG_ID, Value::Int(new_id));
+                        aio_set(ctx, ch, F_REMOTE, Value::Object(None));
                         Value::Object(Some(ch))
                     }
                 };
@@ -1892,8 +1898,13 @@ fn flush_pending_field_resets(ctx: &mut dyn NativeContext) {
         // Resolve through the root: this is the target's CURRENT address, not
         // the one the worker captured before it blocked.
         if let Some(target) = ctx.resolve_global_root(r.target_gref) {
-            if ctx.object_num_fields(target) > r.field {
-                ctx.set_field(target, r.field, r.value);
+            // `r.field` is a LOGICAL index into this module's private map, not
+            // an absolute slot: the worker that parked it cannot know the
+            // receiver's class, and since 2026-08-21 the map is appended above
+            // whatever the concrete `sun.nio.ch.*Impl` declares. Resolve the
+            // base here, where `ctx` is available.
+            if aio_has(ctx, target, r.field) {
+                aio_set(ctx, target, r.field, r.value);
             }
         }
         if r.release_root {
@@ -1987,11 +1998,113 @@ const F_REG_ID: usize = 2;
 const F_REMOTE: usize = 3;
 const N_FIELDS: usize = 4;
 
-fn read_aio_id(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    if ctx.object_num_fields(this) <= F_REG_ID {
+/// The concrete `AsynchronousSocketChannel` HotSpot 25 builds, per platform.
+/// Ordered; only one is present in any one image.
+///
+/// `pub` because `native-builtins/src/phases_late/net_channels.rs` owns the one
+/// `connect(Ljava/net/SocketAddress;)Ljava/util/concurrent/Future;` registration
+/// in the tree and has to put it on these classes too.
+pub const ASC_IMPLS: &[&str] = &[
+    "sun/nio/ch/UnixAsynchronousSocketChannelImpl",
+    "sun/nio/ch/WindowsAsynchronousSocketChannelImpl",
+];
+/// Its abstract parent, which declares most of the family with `Code`. It is
+/// a MIRROR target, never a mint target -- it is abstract, which is the whole
+/// defect.
+pub const ASC_ABSTRACT_IMPL: &str = "sun/nio/ch/AsynchronousSocketChannelImpl";
+
+/// The concrete `AsynchronousServerSocketChannel`, per platform.
+const ASSC_IMPLS: &[&str] = &[
+    "sun/nio/ch/UnixAsynchronousServerSocketChannelImpl",
+    "sun/nio/ch/WindowsAsynchronousServerSocketChannelImpl",
+];
+const ASSC_ABSTRACT_IMPL: &str = "sun/nio/ch/AsynchronousServerSocketChannelImpl";
+
+/// The concrete `AsynchronousChannelGroup`: the platform's completion port.
+/// `AsynchronousChannelGroup.withFixedThreadPool` on Linux answers a
+/// `sun.nio.ch.EPollPort` (MEASURED, `probes/W4Abstract.java` oracle column).
+const ACG_IMPLS: &[&str] = &[
+    "sun/nio/ch/EPollPort",
+    "sun/nio/ch/Iocp",
+    "sun/nio/ch/KQueuePort",
+    "sun/nio/ch/SolarisEventPort",
+];
+/// Its two abstract parents, mirror targets for the same reason as
+/// [`ASC_ABSTRACT_IMPL`]: `shutdown`/`isShutdown`/`awaitTermination` are
+/// declared there, with `Code`.
+const ACG_ABSTRACT_IMPLS: &[&str] = &[
+    "sun/nio/ch/Port",
+    "sun/nio/ch/AsynchronousChannelGroupImpl",
+];
+
+/// Where this module's private slot map (`F_OPEN`..`F_REMOTE`) starts on `o`.
+///
+/// **This is the repair `aio_assc_open`'s doc comment asked for and could not
+/// make.** Until 2026-08-21 the four constants were ABSOLUTE indices, and the
+/// three factories minted objects whose class NAME was the abstract public API
+/// class -- so `F_OPEN` wrote an `Int` into the slot the real
+/// `java.nio.channels.AsynchronousServerSocketChannel` layout calls `provider`
+/// (a reference the collector scans as an oop) and the other three sat past the
+/// end of everything the class declared. Both halves are fixed together, which
+/// is what that comment said the repair required:
+///
+///   * the mints now name the CONCRETE `sun.nio.ch.*Impl` class (JVMS 6.5 -- a
+///     receiver `new` cannot produce is a defect with no oracle run required,
+///     `H21-1` N3), and
+///   * the private map is APPENDED above whatever that class declares, through
+///     this one function, called the same way by every allocator and every
+///     accessor so the two can never disagree.
+///
+/// The width guard inside `concrete_base` collapses the base to 0 for any
+/// receiver this module did not allocate, so the shared `aio_asc_is_open` still
+/// answers correctly for a foreign or stub-mode object -- which is the other
+/// thing that comment said a one-sided renumber would break.
+fn aio_base(ctx: &mut dyn NativeContext, o: ObjectRef) -> usize {
+    crate::concrete_receiver::concrete_base(ctx, o, N_FIELDS)
+}
+
+/// Read private slot `idx` of an async channel.
+fn aio_get(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize) -> Value {
+    let base = aio_base(ctx, o);
+    ctx.get_field(o, base + idx)
+}
+
+/// Write private slot `idx` of an async channel.
+fn aio_set(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize, v: Value) {
+    let base = aio_base(ctx, o);
+    ctx.set_field(o, base + idx, v);
+}
+
+/// Whether `o` is wide enough to carry private slot `idx`.
+fn aio_has(ctx: &mut dyn NativeContext, o: ObjectRef, idx: usize) -> bool {
+    let base = aio_base(ctx, o);
+    ctx.object_num_fields(o) > base + idx
+}
+
+/// Record a completed blocking connect on a channel THIS module allocated.
+///
+/// Exported because `native-builtins/src/phases_late/net_channels.rs` owns the
+/// one surviving `connect(Ljava/net/SocketAddress;)Ljava/util/concurrent/Future;`
+/// registration on this class and used to write slots 0/2/3 by index under a
+/// map whose slots 0 and 1 mean the OPPOSITE of this one's -- the
+/// two-layouts-on-one-class condition W7-49 measured and could not repair from
+/// one side. One writer, one map: that crate now calls this.
+pub fn async_socket_note_connected(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    fd_id: i32,
+    remote: Value,
+) {
+    aio_set(ctx, this, F_CONNECTED, Value::Int(1));
+    aio_set(ctx, this, F_REG_ID, Value::Int(fd_id));
+    aio_set(ctx, this, F_REMOTE, remote);
+}
+
+fn read_aio_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    if !aio_has(ctx, this, F_REG_ID) {
         return None;
     }
-    match ctx.get_field(this, F_REG_ID) {
+    match aio_get(ctx, this, F_REG_ID) {
         Value::Int(v) if v != 0 && v != -1 => Some(v),
         _ => None,
     }
@@ -2019,8 +2132,33 @@ fn group_next_id() -> i32 {
     NEXT.fetch_add(1, Ordering::SeqCst)
 }
 
+/// The `AsynchronousChannelGroup`'s one private slot: its `group_registry` id,
+/// appended above the concrete port class's own layout. Same rule as
+/// [`aio_base`], with a width of one.
+fn acg_group_base(ctx: &mut dyn NativeContext, o: ObjectRef) -> usize {
+    crate::concrete_receiver::concrete_base(ctx, o, 1)
+}
+
+fn acg_has_id(ctx: &mut dyn NativeContext, o: ObjectRef) -> bool {
+    let base = acg_group_base(ctx, o);
+    ctx.object_num_fields(o) >= base + 1
+}
+
+fn acg_read_id(ctx: &mut dyn NativeContext, o: ObjectRef) -> Value {
+    let base = acg_group_base(ctx, o);
+    ctx.get_field(o, base)
+}
+
 fn aio_acg_with_fixed(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let group = alloc_obj(ctx, "java/nio/channels/AsynchronousChannelGroup", 1);
+    // `java.nio.channels.AsynchronousChannelGroup` is ABSTRACT; the group the
+    // JDK hands back is the platform completion port (`ACG_IMPLS`).
+    let minted = crate::concrete_receiver::alloc_concrete(
+        ctx,
+        ACG_IMPLS,
+        "java/nio/channels/AsynchronousChannelGroup",
+        1,
+    );
+    let (group, acg_base) = (minted.obj, minted.base);
     let id = group_next_id();
     group_registry().write().insert(
         id,
@@ -2029,7 +2167,7 @@ fn aio_acg_with_fixed(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
             pending_ops: Arc::new(AtomicUsize::new(0)),
         },
     );
-    ctx.set_field(group, 0, Value::Int(id));
+    ctx.set_field(group, acg_base, Value::Int(id));
     Ok(Some(Value::Object(Some(group))))
 }
 
@@ -2039,7 +2177,7 @@ fn aio_acg_with_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn aio_acg_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let id = match obj_or_none(args, 0) {
-        Some(o) if ctx.object_num_fields(o) >= 1 => match ctx.get_field(o, 0) {
+        Some(o) if acg_has_id(ctx, o) => match acg_read_id(ctx, o) {
             Value::Int(v) => v,
             _ => return Ok(Some(Value::Int(0))),
         },
@@ -2055,7 +2193,7 @@ fn aio_acg_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn aio_acg_is_terminated(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let id = match obj_or_none(args, 0) {
-        Some(o) if ctx.object_num_fields(o) >= 1 => match ctx.get_field(o, 0) {
+        Some(o) if acg_has_id(ctx, o) => match acg_read_id(ctx, o) {
             Value::Int(v) => v,
             _ => return Ok(Some(Value::Int(0))),
         },
@@ -2071,7 +2209,7 @@ fn aio_acg_is_terminated(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn aio_acg_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let id = match obj_or_none(args, 0) {
-        Some(o) if ctx.object_num_fields(o) >= 1 => match ctx.get_field(o, 0) {
+        Some(o) if acg_has_id(ctx, o) => match acg_read_id(ctx, o) {
             Value::Int(v) => v,
             _ => return Ok(None),
         },
@@ -2096,11 +2234,18 @@ fn aio_acg_await_termination(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 fn aio_asc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Force pool to start (lazily).
     let _ = job_sender();
-    let ch = alloc_obj(ctx, "java/nio/channels/AsynchronousSocketChannel", N_FIELDS);
-    ctx.set_field(ch, F_OPEN, Value::Int(1));
-    ctx.set_field(ch, F_CONNECTED, Value::Int(0));
-    ctx.set_field(ch, F_REG_ID, Value::Int(-1));
-    ctx.set_field(ch, F_REMOTE, Value::Object(None));
+    // Concrete, per `ASC_IMPLS`; see `aio_base` for the two halves of the fix.
+    let ch = crate::concrete_receiver::alloc_concrete(
+        ctx,
+        ASC_IMPLS,
+        "java/nio/channels/AsynchronousSocketChannel",
+        N_FIELDS,
+    )
+    .obj;
+    aio_set(ctx, ch, F_OPEN, Value::Int(1));
+    aio_set(ctx, ch, F_CONNECTED, Value::Int(0));
+    aio_set(ctx, ch, F_REG_ID, Value::Int(-1));
+    aio_set(ctx, ch, F_REMOTE, Value::Object(None));
     Ok(Some(Value::Object(Some(ch))))
 }
 
@@ -2113,7 +2258,7 @@ fn aio_asc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     flush_pending_array_writes_inner(ctx);
     flush_pending_field_resets(ctx);
     match obj_or_none(args, 0) {
-        Some(o) if ctx.object_num_fields(o) > F_OPEN => Ok(Some(ctx.get_field(o, F_OPEN))),
+        Some(o) if aio_has(ctx, o, F_OPEN) => Ok(Some(aio_get(ctx, o, F_OPEN))),
         _ => Ok(Some(Value::Int(0))),
     }
 }
@@ -2121,8 +2266,8 @@ fn aio_asc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn aio_asc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
         if dbg_aio_enabled() {
-            let raw_id = if ctx.object_num_fields(this) > F_REG_ID {
-                match ctx.get_field(this, F_REG_ID) {
+            let raw_id = if aio_has(ctx, this, F_REG_ID) {
+                match aio_get(ctx, this, F_REG_ID) {
                     Value::Int(v) => v,
                     _ => i32::MIN,
                 }
@@ -2131,11 +2276,11 @@ fn aio_asc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             };
             dbg_aio!("CLOSE entered, raw F_REG_ID field={raw_id}");
         }
-        if ctx.object_num_fields(this) > F_OPEN {
-            ctx.set_field(this, F_OPEN, Value::Int(0));
+        if aio_has(ctx, this, F_OPEN) {
+            aio_set(ctx, this, F_OPEN, Value::Int(0));
         }
-        if ctx.object_num_fields(this) > F_CONNECTED {
-            ctx.set_field(this, F_CONNECTED, Value::Int(0));
+        if aio_has(ctx, this, F_CONNECTED) {
+            aio_set(ctx, this, F_CONNECTED, Value::Int(0));
         }
         if let Some(id) = read_aio_id(ctx, this) {
             dbg_aio!(
@@ -2148,7 +2293,7 @@ fn aio_asc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 aio_shutdown_stream(id);
                 aio_remove(id);
             }
-            ctx.set_field(this, F_REG_ID, Value::Int(-1));
+            aio_set(ctx, this, F_REG_ID, Value::Int(-1));
         }
     }
     Ok(None)
@@ -2212,12 +2357,12 @@ fn aio_asc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // Reserve an id up front in `Pending` state so close() can find it.
     let id = aio_register(AioHandle::Pending);
     let this = if ctx.object_num_fields(this) >= N_FIELDS {
-        ctx.set_field(this, F_REG_ID, Value::Int(id));
+        aio_set(ctx, this, F_REG_ID, Value::Int(id));
         let host_str = ctx.create_string(&addr);
         // `create_string` allocates: re-read the channel through its root
         // before writing the second field.
         let this = ctx.resolve_global_root(channel_gref).unwrap_or(this);
-        ctx.set_field(this, F_REMOTE, Value::Object(Some(host_str)));
+        aio_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
         this
     } else {
         this
@@ -2248,8 +2393,8 @@ fn aio_asc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // Mark connected synchronously since the JDK Java code expects to
     // be able to call read/write after connect returns (the handler tells
     // it whether the connect succeeded).
-    if ctx.object_num_fields(this) > F_CONNECTED {
-        ctx.set_field(this, F_CONNECTED, Value::Int(1));
+    if aio_has(ctx, this, F_CONNECTED) {
+        aio_set(ctx, this, F_CONNECTED, Value::Int(1));
     }
     Ok(Some(Value::Object(None)))
 }
@@ -2580,7 +2725,7 @@ fn aio_asc_read_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         });
         Ok(Some(Value::Object(Some(future))))
     };
-    let fd = match ctx.get_field(this, F_REG_ID) {
+    let fd = match aio_get(ctx, this, F_REG_ID) {
         Value::Int(v) if v >= 0 => v,
         _ => return post(FutureOutcome::Error("read: not connected".to_string())),
     };
@@ -2829,7 +2974,7 @@ fn aio_asc_write_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         });
         Ok(Some(Value::Object(Some(future))))
     };
-    let fd = match ctx.get_field(this, F_REG_ID) {
+    let fd = match aio_get(ctx, this, F_REG_ID) {
         Value::Int(v) if v >= 0 => v,
         _ => return post(FutureOutcome::Error("write: not connected".to_string())),
     };
@@ -3111,15 +3256,19 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// onto the `Impl` strands every receiver this function returns.
 fn aio_assc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let _ = job_sender();
-    let ch = alloc_obj(
+    // Concrete, per `ASSC_IMPLS`. This is the site the doc comment above calls
+    // "THIS IS A FABRICATION SITE" -- it is one no longer.
+    let ch = crate::concrete_receiver::alloc_concrete(
         ctx,
+        ASSC_IMPLS,
         "java/nio/channels/AsynchronousServerSocketChannel",
         N_FIELDS,
-    );
-    ctx.set_field(ch, F_OPEN, Value::Int(1));
-    ctx.set_field(ch, F_CONNECTED, Value::Int(0));
-    ctx.set_field(ch, F_REG_ID, Value::Int(-1));
-    ctx.set_field(ch, F_REMOTE, Value::Object(None));
+    )
+    .obj;
+    aio_set(ctx, ch, F_OPEN, Value::Int(1));
+    aio_set(ctx, ch, F_CONNECTED, Value::Int(0));
+    aio_set(ctx, ch, F_REG_ID, Value::Int(-1));
+    aio_set(ctx, ch, F_REMOTE, Value::Object(None));
     Ok(Some(Value::Object(Some(ch))))
 }
 
@@ -3238,8 +3387,8 @@ fn aio_assc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Arc::new(Mutex::new(listener)),
         local_addr,
     ));
-    if ctx.object_num_fields(this) > F_REG_ID {
-        ctx.set_field(this, F_REG_ID, Value::Int(id));
+    if aio_has(ctx, this, F_REG_ID) {
+        aio_set(ctx, this, F_REG_ID, Value::Int(id));
     }
     Ok(Some(Value::Object(Some(this))))
 }
@@ -3342,6 +3491,54 @@ fn aio_assc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Object(None)))
 }
 
+/// `AsynchronousServerSocketChannel.accept()` — the no-handler, `Future`-
+/// returning overload. **A LOUD REFUSAL, deliberately, and it replaces a
+/// louder-but-wrong one.**
+///
+/// # Why there is a native here at all
+///
+/// Until 2026-08-21 `aio_assc_open` minted an instance of the ABSTRACT
+/// `java.nio.channels.AsynchronousServerSocketChannel`, on which this overload
+/// is declared with no `Code`, so the call raised `AbstractMethodError` — a
+/// refusal, by accident of the fabricated receiver. The receiver is now the
+/// concrete `sun.nio.ch.UnixAsynchronousServerSocketChannelImpl` (JVMS 6.5 —
+/// see `ASSC_IMPLS`), whose real `accept()` bytecode runs
+/// `AsynchronousServerSocketChannelImpl.accept()` -> `implAccept()` and reads
+/// the `localAddress` field that `aio_assc_bind` never wrote. MEASURED:
+/// `RJdkAsyncChannel.acceptFutureMustNotHang` came back with
+/// `NotYetBoundException` on a channel that had been bound — a WRONG answer
+/// about the channel's state, where the old one was at least a true "not
+/// implemented".
+///
+/// # Why a refusal rather than an implementation
+///
+/// The `Future` form has to complete LATER, from the accept worker, and this
+/// module's completion path (`push_handler_completion` + `drain_completions`)
+/// applies on the calling thread. A real `CompletableFuture` handed back here
+/// would be completed only by a `drain` that a caller blocked in
+/// `future.get(timeout)` never reaches — the hang that
+/// `acceptFutureMustNotHang` exists to forbid, and the worst of the three
+/// available answers. `accept(Object, CompletionHandler)` is the form this
+/// module implements for real, and it is the one an idiomatic NIO2 server uses.
+///
+/// `UnsupportedOperationException` rather than `AbstractMethodError` because it
+/// is TRUE: the method exists and this VM does not implement it. Both are
+/// caught by any caller written to tolerate a partial NIO2, and the vector
+/// accepts either.
+///
+/// NOMINATION: implementing this properly needs a completion path that can run
+/// off the calling thread — the same thing `AsynchronousChannelGroup`'s own
+/// dispatcher would need. Until then this refusal is the honest answer.
+fn aio_assc_accept_future(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let _ = ctx;
+    Err(RuntimeError::UnsupportedOperationException {
+        message: "AsynchronousServerSocketChannel.accept() (the Future form) is not implemented \
+                  by CratonVM; use accept(Object, CompletionHandler)"
+            .to_string(),
+    }
+    .into())
+}
+
 fn aio_assc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     aio_asc_close(ctx, args)
 }
@@ -3392,6 +3589,9 @@ fn iocp_drain(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult 
 pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Where this registrar's rows start; the mirrors at its foot must not be
+    // able to see another crate's. `mirror_class_registrations` says why.
+    let __rows_before = r.dump_registrations().len();
     let asc = "java/nio/channels/AsynchronousSocketChannel";
     let assc = "java/nio/channels/AsynchronousServerSocketChannel";
     let acg = "java/nio/channels/AsynchronousChannelGroup";
@@ -3532,6 +3732,15 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)V",
         aio_assc_accept,
     );
+    // The `Future`-returning overload. See `aio_assc_accept_future` for why it
+    // is a refusal, and why a refusal had to be registered rather than left to
+    // the JDK's own body once the receiver became concrete.
+    r.register(
+        assc,
+        "accept",
+        "()Ljava/util/concurrent/Future;",
+        aio_assc_accept_future,
+    );
     r.register(
         assc,
         "getLocalAddress",
@@ -3590,6 +3799,24 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         r.register(cls, "drain", "()V", iocp_drain);
         r.register(cls, "poll", "()V", iocp_drain);
     }
+
+    // The registration half of the three fabricated-receiver fixes above.
+    //
+    // Dispatch keys on the receiver's runtime class (`H11-1`), and each of
+    // these concrete classes -- and the abstract `sun.nio.ch.*Impl` it inherits
+    // from -- declares this family with `Code`. Without the mirror, moving the
+    // mint would hand every call to the JDK's own bodies, running against a
+    // channel whose `<init>` this VM never ran.
+    for target in ASC_IMPLS.iter().chain([ASC_ABSTRACT_IMPL].iter()) {
+        crate::concrete_receiver::mirror_class_registrations(r, __rows_before, asc, target);
+    }
+    for target in ASSC_IMPLS.iter().chain([ASSC_ABSTRACT_IMPL].iter()) {
+        crate::concrete_receiver::mirror_class_registrations(r, __rows_before, assc, target);
+    }
+    for target in ACG_IMPLS.iter().chain(ACG_ABSTRACT_IMPLS.iter()) {
+        crate::concrete_receiver::mirror_class_registrations(r, __rows_before, acg, target);
+    }
+
     r.set_category(__prev_cat);
 }
 

@@ -5028,30 +5028,29 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let line_str = ctx.create_string(&command_line);
         let this_cur = ctx.read_native_pin(this_pin, this);
         ctx.set_field_by_name(this_cur, "commandLine", Value::Object(Some(line_str)));
-        // `ProcessHandle.Info.arguments()` is declared `Optional<String[]>`, so
-        // the array's COMPONENT TYPE is observable: a caller that does
-        // `String[] a = info.arguments().get()` gets a `ClassCastException` from
-        // a `[Ljava.lang.Object;`, and one that only reads `.length` never
-        // notices. This allocated the untyped shape, which is the same species
-        // as the `HashMap` table `H23` typed and the `Hashtable` table
-        // `WORKER-2-NOTE-1` §2 typed: an `alloc`-style call that hard-codes the
-        // `Object` sentinel because nothing on the path asked for a component.
+        // `String[]`, not `Object[]`. `ProcessHandle.Info.arguments()` is
+        // declared `Optional<String[]>`, and `new_array(Reference, n)` produces
+        // an array whose runtime component type is `java.lang.Object`. On Linux
+        // this is the ONLY reason `RJdkOptionalShape` fails:
         //
-        // MEASURED, `--jdk-only`: this is the ONLY assertion `RJdkOptionalShape`
-        // was failing, in all three arms and on a PRISTINE build of the branch
-        // tip — five of its six families already passed. The vector reports it
-        // as *"an int presence flag in the value slot is what this looks like"*
-        // because a wrong-typed payload and a flag are indistinguishable to its
-        // type law; the `Optional` LAYOUT the vector is named for is fine, and
-        // the nine `http2.rs` sites its javadoc blames were already repaired.
+        //   AssertionError: process.info.arguments: get() on a PRESENT Optional
+        //   must return a [Ljava.lang.String;, got [Ljava.lang.Object;
         //
-        // Falls back to the untyped array when `java/lang/String` cannot be
-        // resolved, which keeps a stripped image reporting arguments rather
-        // than failing.
-        let arr = match ctx.ensure_class_initialized("java/lang/String") {
-            Ok(cid) => ctx.new_ref_array(cid, arguments.len()),
-            Err(_) => ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len()),
-        };
+        // It is invisible on Windows because `os_process_cmdline` finds no
+        // command line for most pids there, so the field stays null and the
+        // vector's law skips the row -- a platform-shaped blind spot, not a
+        // platform-shaped defect.
+        //
+        // MERGE NOTE 2026-08-22. WORKER 3 and WORKER 4 found and fixed this
+        // independently, in the same hour, from the same red vector; the
+        // comment above is WORKER 3's and the call below is WORKER 4's. The
+        // difference is scope: `crate::new_string_array` also carries the
+        // `File.list()` site, which already had the correct four-line idiom,
+        // and `watch.rs::pollEventNames0`, whose registered descriptor is
+        // `(I)[Ljava/lang/String;` and which had the wrong one. Three sites,
+        // one implementation -- which is the whole reason to prefer a helper
+        // over the inline `match` this replaces.
+        let arr = crate::new_string_array(ctx, arguments.len());
         let arr_pin = ctx.pin_native_root(arr);
         for (i, a) in arguments.iter().enumerate() {
             let s = ctx.create_string(a);

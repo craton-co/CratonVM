@@ -14047,48 +14047,33 @@ pub fn register_essential_natives_with_shims(
         },
     );
 
-    // T1.5.1 — `Thread.stop0(Object)` async-exception delivery.
+    // T1.5.1 — `Thread.stop0(Object)` / `Thread.stop()`: REGISTERED NOWHERE
+    // IN THIS FILE, and that is a deletion, not an omission.
     //
-    // `args[0]` is the target `Thread` object (the receiver of the
-    // instance method); `args[1]` is the `Throwable` to deliver. We
-    // post it into the target thread's registry slot; the target
-    // raises it at its next safepoint via
-    // `interpreter::check_pending_async_exception`.
+    // Both triples used to be registered here AND in
+    // `deprecated_lang.rs::register_deprecated_lang_natives`, which runs later
+    // and therefore owned both slots. MEASURED from
+    // `--dump-native-registry --explain-jdk-only --jdk-only`:
     //
-    // The deprecated-for-removal no-arg `Thread.stop()` is a thin
-    // wrapper that would allocate a `ThreadDeath` and delegate; we
-    // fall back to setting the interrupt flag, which is the
-    // spec-permitted safe alternative when `stop()` is invoked
-    // without its argument.
-    registry.register(
-        "java/lang/Thread",
-        "stop0",
-        "(Ljava/lang/Object;)V",
-        |ctx, args| {
-            let target = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let throwable = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let _ = ctx.thread_post_async_exception(target, throwable);
-            Ok(None)
-        },
-    );
-    registry.register("java/lang/Thread", "stop", "()V", |ctx, args| {
-        let target = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(None),
-        };
-        // Deprecated-for-removal no-arg form: fall back to
-        // setting the interrupt flag per the safe-default
-        // spec note. Real-world callers should use
-        // `stop0(Throwable)` or `interrupt()` directly.
-        ctx.thread_interrupt(target);
-        Ok(None)
-    });
+    // ```text
+    //   stop  ()V                  lib.rs  owns_slot=false   deprecated_lang.rs  owns_slot=true
+    //   stop0 (Ljava/lang/Object;)V lib.rs  owns_slot=false   deprecated_lang.rs  owns_slot=true
+    // ```
+    //
+    // So neither body here has ever run. That made them a LANDMINE rather than
+    // dead weight: a census-driven retirement of the `deprecated_lang.rs`
+    // registration — which is what the row counts recommend, and what
+    // `docs/known-issues/jdk-only/H25-3-*.md` R1 was written to refuse —
+    // would have PROMOTED the `stop()` closure that was here, turning a method
+    // that correctly throws `UnsupportedOperationException` into one that
+    // silently interrupts the target thread and returns normally. The census
+    // would have fallen by one and the change would have scored as a win.
+    //
+    // `stop()` is now served by the real bytecode of every supported image
+    // (JDK 21/25 throw `UnsupportedOperationException`; JDK 17 does the real
+    // deprecated work through `stop0`). `stop0` keeps its single
+    // `deprecated_lang.rs` registration, because JDK 17 declares it — see the
+    // note there.
 
     // T1.6.7 — `Thread.holdsLock(Object)` real implementation.
     // Was a constant `return false` stub. Now consults the per-thread
@@ -25903,40 +25888,70 @@ fn dbg_vdisp_cached() -> bool {
 /// `None`. Size-dependent immutable-collection stamps are handled separately by
 /// [`immutable_collection_kind`] because their concrete class varies with the
 /// element count.
-fn jdk_concrete_getclass_alias(stamp: &str) -> Option<&'static str> {
+fn jdk_concrete_getclass_alias(stamp: &str) -> Option<&'static [&'static str]> {
     Some(match stamp {
         // java.util.stream — synthetic streams are stamped with the *interface*.
         // (`IntStream.of(..)` already produces a real `IntPipeline$Head`, so its
         // objects are not stamped with the interface and never reach here.)
-        "java/util/stream/Stream" => "java/util/stream/ReferencePipeline$Head",
-        "java/util/stream/IntStream" => "java/util/stream/IntPipeline$Head",
-        "java/util/stream/LongStream" => "java/util/stream/LongPipeline$Head",
-        "java/util/stream/DoubleStream" => "java/util/stream/DoublePipeline$Head",
+        "java/util/stream/Stream" => &["java/util/stream/ReferencePipeline$Head"],
+        "java/util/stream/IntStream" => &["java/util/stream/IntPipeline$Head"],
+        "java/util/stream/LongStream" => &["java/util/stream/LongPipeline$Head"],
+        "java/util/stream/DoubleStream" => &["java/util/stream/DoublePipeline$Head"],
         // java.net — abstract URLConnection subclasses.
-        "java/net/JarURLConnection" => "sun/net/www/protocol/jar/JarURLConnection",
-        "java/net/HttpURLConnection" => "sun/net/www/protocol/http/HttpURLConnection",
+        "java/net/JarURLConnection" => &["sun/net/www/protocol/jar/JarURLConnection"],
+        "java/net/HttpURLConnection" => &["sun/net/www/protocol/http/HttpURLConnection"],
         // java.nio.file — abstract/interface stamps; the concrete impl is
         // platform specific. Resolution is best-effort: an unavailable class
         // simply falls back to the stamped mirror (see caller).
+        //
+        // TWO OF THESE NAMED AN ABSTRACT CLASS until 2026-08-21 (WORKER 4).
+        // `sun.nio.fs.UnixFileSystem` and `sun.nio.fs.UnixFileSystemProvider`
+        // are the abstract PARENTS of the per-platform classes, so on Linux
+        // `FileSystems.getDefault().getClass()` answered
+        // `sun.nio.fs.UnixFileSystem` with `Modifier.isAbstract == true`, where
+        // HotSpot 25.0.4 answers `sun.nio.fs.LinuxFileSystem`. MEASURED,
+        // `probes/W4Abstract.java`, both modes. An alias that names a class
+        // `new` cannot produce (JVMS 6.5) is the same defect the mint sites had
+        // — it is just being told rather than built.
+        //
+        // The lists are ordered concrete-first and the resolver takes the first
+        // entry that is present AND instantiable, so the abstract parents are
+        // kept as LAST-RESORT entries: on a platform whose concrete class is not
+        // in this list the answer degrades to today's, never to nothing. The
+        // `instantiable` filter is what makes keeping them safe.
         "java/nio/file/FileSystem" => {
             if cfg!(windows) {
-                "sun/nio/fs/WindowsFileSystem"
+                &["sun/nio/fs/WindowsFileSystem"]
             } else {
-                "sun/nio/fs/UnixFileSystem"
+                &[
+                    "sun/nio/fs/LinuxFileSystem",
+                    "sun/nio/fs/MacOSXFileSystem",
+                    "sun/nio/fs/BsdFileSystem",
+                    "sun/nio/fs/AixFileSystem",
+                    "sun/nio/fs/SolarisFileSystem",
+                    "sun/nio/fs/UnixFileSystem",
+                ]
             }
         }
         "java/nio/file/spi/FileSystemProvider" => {
             if cfg!(windows) {
-                "sun/nio/fs/WindowsFileSystemProvider"
+                &["sun/nio/fs/WindowsFileSystemProvider"]
             } else {
-                "sun/nio/fs/UnixFileSystemProvider"
+                &[
+                    "sun/nio/fs/LinuxFileSystemProvider",
+                    "sun/nio/fs/MacOSXFileSystemProvider",
+                    "sun/nio/fs/BsdFileSystemProvider",
+                    "sun/nio/fs/AixFileSystemProvider",
+                    "sun/nio/fs/SolarisFileSystemProvider",
+                    "sun/nio/fs/UnixFileSystemProvider",
+                ]
             }
         }
         "java/nio/file/Path" => {
             if cfg!(windows) {
-                "sun/nio/fs/WindowsPath"
+                &["sun/nio/fs/WindowsPath"]
             } else {
-                "sun/nio/fs/UnixPath"
+                &["sun/nio/fs/UnixPath"]
             }
         }
         _ => return None,
@@ -26091,9 +26106,14 @@ pub(crate) fn getclass_display_class_id(
                 Some(name) => {
                     if let Some(kind) = collection_display_kind(&name) {
                         kind
-                    } else if let Some(alias) = jdk_concrete_getclass_alias(&name) {
-                        match getclass_resolve_name(ctx, alias) {
-                            Some(cid) => GetClassDisplay::Fixed(cid),
+                    } else if let Some(aliases) = jdk_concrete_getclass_alias(&name) {
+                        // The first candidate the image has AND that `new`
+                        // could legally produce. Trusting the NAME is what put
+                        // an ABSTRACT class in two of these rows; see the
+                        // table's own comment and
+                        // `cratonvm_native_api::instantiable`.
+                        match cratonvm_native_api::instantiable::first_instantiable(ctx, aliases) {
+                            Some((_, cid)) => GetClassDisplay::Fixed(cid),
                             None => GetClassDisplay::Stamp,
                         }
                     } else {
