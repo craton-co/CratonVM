@@ -212,12 +212,29 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         "(C)Ljava/lang/Appendable;",
         native_sb_append_char,
     );
-    registry.register(
-        class,
-        "appendCodePoint",
-        &format!("(I)L{class};"),
-        native_sb_append_codepoint,
-    );
+    // `appendCodePoint(I)` is registered ONCE, below, next to the code-point
+    // family it belongs with. A second registration used to stand here, 113
+    // lines earlier in this same function, pointing at
+    // `native_sb_append_codepoint`; `register()` is last-write-wins, so it
+    // never owned the slot. MEASURED from
+    // `--dump-native-registry --explain-jdk-only --jdk-only`:
+    //
+    // ```text
+    //   appendCodePoint (I)L<class>;   lang_string.rs:215  owns_slot=false
+    //   appendCodePoint (I)L<class>;   lang_string.rs:328  owns_slot=true
+    // ```
+    //
+    // for each of the three classes this registrar is called for — six
+    // registrations, three slots. Deleting the loser is inert by construction:
+    // the winner's body IS `native_sb_append_codepoint` (see
+    // `native_sb_append_code_point`, which is a one-line delegation to it), so
+    // the surviving registration runs exactly the code the deleted one named.
+    //
+    // The tree previously recorded a decision to keep the duplicate "because
+    // removing it would move a census count for no behavioural gain". That
+    // sentence was written before the census became the effort's success
+    // metric, and it is now an argument for the deletion rather than against
+    // it — `H25-3` N4.
     // JDK 21+ `repeat(int codePoint, int count)` — intercept so it operates on
     // the synthetic char[] layout instead of running real bytecode that hits
     // `ensureCapacityNewCoder` → `Arrays.copyOf([B)` over a char[] (ArrayStore).
@@ -303,6 +320,26 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         "(Ljava/lang/CharSequence;)Ljava/lang/Appendable;",
         native_sb_append_charsequence,
     );
+    // DO NOT RETIRE for `class == "java/lang/AbstractStringBuilder"`.
+    //
+    // MEASURED, `javap -p --system <image> java.lang.AbstractStringBuilder` on
+    // all nine supported images:
+    //
+    // ```text
+    //   abstract class java.lang.AbstractStringBuilder implements Appendable, CharSequence {
+    //     public abstract java.lang.String toString();
+    // ```
+    //
+    // `public abstract`, no `Code`, not `ACC_NATIVE`. This registration is the
+    // ONLY implementation that exists for that receiver, so the standard
+    // retirement argument — "real JDK bytecode is behind it, deleting the
+    // native leaves something to run" — is FALSE here. It is the third known
+    // instance of `H14-1` 4's two-row "do not touch" bucket, after
+    // `java/nio/file/Path.toString()` and `Path.equals(Object)`, and one data
+    // point behind `H25-2`'s finding that the same shape is 1,405 registrations
+    // over 193 classes registry-wide, not 2. `H25-3` R5; marked here per
+    // `H25-2` N3, because a comment at the registrar is the difference between
+    // a future lane retiring this row and not.
     registry.register(
         class,
         "toString",
@@ -531,12 +568,30 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         &format!("(Ljava/lang/CharSequence;I)L{class};"),
         native_sb_repeat_charsequence,
     );
-    registry.register(
-        class,
-        "repeat",
-        &format!("(Ljava/lang/String;I)L{class};"),
-        native_sb_repeat_charsequence,
-    );
+    // `repeat(Ljava/lang/String;I)` is NOT registered, and its absence is the
+    // result of a measurement rather than an oversight.
+    //
+    // MEASURED, `javap -p -s --system <image> java.lang.AbstractStringBuilder`
+    // over the nine supported images (JDK 17.0.20 / 21.0.12 / 25.0.4 x
+    // linux/windows/macos):
+    //
+    // ```text
+    //   JDK 17            no `repeat` of any descriptor
+    //   JDK 21, JDK 25    repeat(CI)      repeat(II)      repeat(Ljava/lang/CharSequence;I)
+    // ```
+    //
+    // There has never been a `repeat(String,int)` overload. `String` implements
+    // `CharSequence`, so `sb.repeat("x", 3)` compiles to an invocation of the
+    // `CharSequence` descriptor and hits the registration above; the `String`
+    // spelling could not be named by any call site javac emits. Three
+    // registrations (one per class this registrar is called for), each with
+    // `owns_slot: true` and `invocations: 0`, that have never once executed.
+    //
+    // This is `H25-1` 2.2's NEAR_MISS species — an interception somebody
+    // intended that silently never fires because the descriptor matches no
+    // overload the image declares — and it is invisible to the census by
+    // construction, so retiring it predicts a census delta of ZERO. That is a
+    // PASS, not a failure.
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,6 +1394,125 @@ pub(crate) fn format_double(v: f64) -> String {
 // ---------------------------------------------------------------------------
 
 /// Helper: read field 0 (char[] buffer) and field 1 (int count) from StringBuilder.
+/// Resolve one of `AbstractStringBuilder`'s instance fields for THIS receiver
+/// from the class model, rather than from an index this file guessed.
+///
+/// The index heuristic these helpers used is right for exactly one of the three
+/// layouts this VM meets, and `sb_set_count` already half-knew it — it mirrors
+/// the count into the field NAMED `count` precisely because slot 2 is not it on
+/// a modern image. `sb_state` never got the same treatment, so the writer and
+/// the reader disagreed on every real-JDK-layout builder:
+///
+/// ```text
+///   MEASURED — javap -p --system <image> java.lang.AbstractStringBuilder
+///     JDK 17.0.20          value@0  coder@1  count@2
+///     JDK 21.0.12          value@0  coder@1  maybeLatin1@2  count@3
+///     JDK 25.0.4           value@0  coder@1  maybeLatin1@2  count@3
+///   CratonVM synthetic     value(char[])@0   count@1
+/// ```
+///
+/// so on a JDK 21 or 25 image the reader returned `maybeLatin1` — a boolean —
+/// as the builder's length. MEASURED with the enforcement dial armed on
+/// `java/lang/StringBuilder,java/lang/AbstractStringBuilder`: real bytecode
+/// appended `"ab"` and left `count = 2` (read back through reflection), while
+/// `sb.length()` answered `0` and `toString()` answered `""`. That is half of
+/// the "every append silently discarded, `toString()` empty, `rc=0`" behaviour
+/// `H22` measured on this registrar and could not explain.
+///
+/// A slot COUNT cannot decide this, which is why the lookup is by name:
+/// JDK 17's `StringBuffer` also has four slots — `value, coder, count,
+/// toStringCache` — and its `count` is at 2, not 3.
+///
+/// Returns `None` when the class model cannot answer — the unit-test
+/// `MockNativeContext` has no hierarchy for `java/lang/StringBuilder`, and a
+/// receiver allocated with the 2-slot synthetic layout under a class whose
+/// model describes the 4-slot real one must not be indexed past its end. Every
+/// caller then falls back to the historical index heuristic, so behaviour under
+/// the mock and under the synthetic layout is unchanged.
+fn sb_field_slot(
+    ctx: &dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    name: &str,
+) -> Option<usize> {
+    // The 2-slot synthetic layout is unambiguous — `value@0, count@1`, nothing
+    // else to confuse — and it is the hot one. Answer it without touching the
+    // class model at all: `resolve_field_index_by_class_id` takes a read lock
+    // on the class manager and walks the hierarchy, and `sb_state` sits on the
+    // `append` path.
+    let fields = ctx.object_num_fields(this);
+    if fields <= 2 {
+        return None;
+    }
+    let slot = ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(this), name)?;
+    if slot < fields {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+/// The builder's UTF-16 content, whatever layout its `value` slot holds.
+///
+/// `sb_state` recognises only a `char[]` payload, and yields `None` for a
+/// receiver whose `value` is the real compact `byte[]`. Every caller that
+/// treats that `None` as "empty" then reports a real builder as empty. This is
+/// the builder-side twin of `decode_string_chars`, which has handled all three
+/// String layouts since JDK 9 compact strings landed.
+///
+/// Returns `None` only when there is no readable payload at all — a caller that
+/// cannot proceed must REFUSE (`native_sb_char_at` throws) rather than fabricate
+/// a value, because "" and 0 are answers a caller cannot tell from the truth.
+pub(crate) fn sb_value_units(
+    ctx: &dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+) -> Option<Vec<u16>> {
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(arr)) if ctx.object_is_array(arr) => arr,
+        _ => return None,
+    };
+    let raw_len = ctx.array_length(arr);
+    let elem = ctx.heap_element_type_of(arr);
+    if elem == cratonvm_types::ArrayElementType::Char {
+        let mut out = vec![0u16; raw_len];
+        let written = ctx.read_char_array_into(arr, 0, &mut out[..]);
+        out.truncate(written);
+        return Some(out);
+    }
+    if !matches!(
+        elem,
+        cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean
+    ) {
+        return None;
+    }
+    // Real compact layout. `coder` is 1 for UTF-16 and 0 for LATIN-1; read it
+    // by name, because its slot moved between the images above just as
+    // `count`'s did.
+    let coder_slot = sb_field_slot(ctx, this, "coder").unwrap_or(1);
+    let is_utf16 = matches!(ctx.get_field(this, coder_slot), Value::Int(1));
+    let mut out = Vec::with_capacity(if is_utf16 { raw_len / 2 } else { raw_len });
+    if is_utf16 {
+        for c in 0..raw_len / 2 {
+            let lo = match ctx.get_array_element(arr, c * 2) {
+                Value::Int(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            let hi = match ctx.get_array_element(arr, c * 2 + 1) {
+                Value::Int(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            out.push((hi << 8) | lo);
+        }
+    } else {
+        for i in 0..raw_len {
+            out.push(match ctx.get_array_element(arr, i) {
+                Value::Int(v) => (v & 0xff) as u16,
+                _ => 0,
+            });
+        }
+    }
+    Some(out)
+}
+
 pub(crate) fn sb_state(
     ctx: &dyn NativeContext,
     this: cratonvm_types::ObjectRef,
@@ -1352,16 +1526,20 @@ pub(crate) fn sb_state(
         }
         _ => None,
     };
-    let count = if ctx.object_num_fields(this) >= 3 {
-        match ctx.get_field(this, 2) {
+    let count = match sb_field_slot(ctx, this, "count") {
+        Some(slot) => match ctx.get_field(this, slot) {
             Value::Int(v) => v,
             _ => 0,
-        }
-    } else {
-        match ctx.get_field(this, 1) {
+        },
+        // No class model (the mock) — the historical heuristic, unchanged.
+        None if ctx.object_num_fields(this) >= 3 => match ctx.get_field(this, 2) {
             Value::Int(v) => v,
             _ => 0,
-        }
+        },
+        None => match ctx.get_field(this, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        },
     };
     (buf, count)
 }
@@ -1390,38 +1568,13 @@ pub(crate) fn sb_state(
 /// `java.desktop`/`java.beans` clinit) never observed the length increase
 /// and spun forever, hammering the OOB guard on every iteration.
 ///
-/// `object_num_fields` reports the object's *actual* allocated slot count
-/// (matching the `class_num_total_fields` idiom used elsewhere to avoid
-/// hard-coding a layout — see the `Timestamp` nanos-field fix), so branch
-/// on it instead of assuming either shape.
-/// Helper: write the StringBuilder count in the layout-appropriate slot.
-///
-/// CratonVM's own synthetic StringBuilder/StringBuffer layout is 2 slots:
-/// `value: char[]` @0, `count: int` @1 (see `instance_fields(2)` in
-/// `classloading/src/class_manager.rs`) — this is the layout every object
-/// actually gets allocated with unless real `AbstractStringBuilder`
-/// bytecode itself constructs one (e.g. during Byte Buddy
-/// retransformation), which uses the real JDK 9+ 3-slot layout `value:
-/// byte[]` @0, `coder: byte` @1, `count: int` @2 instead.
-///
-/// A prior version of this helper unconditionally wrote slot 1 = 0 (as a
-/// LATIN1 `coder` placeholder) and mirrored `count` into slot 2, on the
-/// assumption every StringBuilder has the 3-slot real layout. Every
-/// StringBuilder actually allocated through CratonVM's own 2-slot
-/// synthetic path (i.e. essentially all of them) instead had its *real*
-/// count slot (slot 1) stomped to 0 on every append/insert/setLength call,
-/// and the slot-2 mirror silently dropped by the `gen_heap` OOB-write
-/// guard (num_slots=2 < index 2) — so `StringBuilder.length()` always
-/// read back 0 immediately after the write that was supposed to grow it.
-/// Java code with a growth loop keyed on `sb.length()` (e.g.
-/// `while (sb.length() < n) sb.append(c);`, seen during real
-/// `java.desktop`/`java.beans` clinit) never observed the length increase
-/// and spun forever, hammering the OOB guard on every iteration.
-///
-/// `object_num_fields` reports the object's *actual* allocated slot count
-/// (matching the `class_num_total_fields` idiom used elsewhere to avoid
-/// hard-coding a layout — see the `Timestamp` nanos-field fix), so branch
-/// on it instead of assuming either shape.
+/// `object_num_fields` was the answer that fix reached for, and it is not
+/// enough on its own — a slot COUNT cannot separate JDK 17's `StringBuffer`
+/// (`value, coder, count, toStringCache`, count at 2) from JDK 25's
+/// (`value, coder, maybeLatin1, count, toStringCache`, count at 3). Both the
+/// writer here and the reader in `sb_state` now resolve the slot by NAME
+/// through `sb_field_slot`, and fall back to the slot-count heuristic only
+/// where there is no class model to ask.
 ///
 /// # The by-name mirror (2026-07-26)
 ///
@@ -1459,6 +1612,24 @@ pub(crate) fn sb_state(
 /// to resolve names against), and the extra by-name write is a no-op when no
 /// such field exists.
 fn sb_set_count(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, count: i32) {
+    // Ask the class model where `count` is, exactly as `sb_state` now does —
+    // the two must not disagree, and for two years they did. See
+    // `sb_field_slot` for the three layouts and the measurement.
+    if let Some(slot) = sb_field_slot(ctx, this, "count") {
+        // The payload these natives maintain is a `char[]`, and
+        // `native_sb_get_coder` reports LATIN1 for it, so keep the real
+        // `coder` field agreeing with that answer. Resolve it by name too:
+        // the previous unconditional `set_field(this, 1, 0)` was a `coder`
+        // write on the JDK 17 layout and a `count` write on the 2-slot
+        // synthetic one, and the unconditional `set_field(this, 2, count)`
+        // wrote an int over `maybeLatin1` on every JDK 21+ image.
+        if let Some(coder) = sb_field_slot(ctx, this, "coder") {
+            ctx.set_field(this, coder, Value::Int(0));
+        }
+        ctx.set_field(this, slot, Value::Int(count));
+        return;
+    }
+    // No class model (the mock) — the historical heuristic, unchanged.
     if ctx.object_num_fields(this) >= 3 {
         // Real JDK 9+ layout: value@0, coder@1, count@2.
         ctx.set_field(this, 1, Value::Int(0));
@@ -1483,11 +1654,19 @@ pub(crate) fn sb_ensure_capacity(
 ) -> (cratonvm_types::ObjectRef, cratonvm_types::ObjectRef) {
     use cratonvm_types::ArrayElementType;
 
-    let (buf, count) = sb_state(ctx, this);
+    let (buf, raw_count) = sb_state(ctx, this);
     let old_cap = buf.map_or(0, |b| ctx.array_length(b));
-    let count = (count.max(0) as usize).min(old_cap);
+    // Clamp to the CHAR[] capacity only when there is one. For a receiver whose
+    // payload is a compact `byte[]` there is no char[] to clamp against and
+    // `old_cap` is 0, so the old clamp reported every such builder as empty and
+    // the grow below had nothing to preserve.
+    let count = if buf.is_some() {
+        (raw_count.max(0) as usize).min(old_cap)
+    } else {
+        raw_count.max(0) as usize
+    };
 
-    if count + additional <= old_cap {
+    if buf.is_some() && count + additional <= old_cap {
         return (this, buf.unwrap());
     }
 
@@ -1513,6 +1692,27 @@ pub(crate) fn sb_ensure_capacity(
             && scope.heap_element_type_of(old_buf) == cratonvm_types::ArrayElementType::Char
         {
             let _ = scope.bulk_array_copy(old_buf, 0, new_buf, 0, count);
+        } else {
+            // A receiver whose `value` is the real compact `byte[]` — a builder
+            // real `AbstractStringBuilder` bytecode constructed (Mockito's
+            // inline mock maker and Byte Buddy retransformation both produce
+            // them), or one built while the `--jdk-only` enforcement dial was
+            // armed on `java/lang/AbstractStringBuilder`.
+            //
+            // The `char[]` guard above is a copy CONDITION, so this arm used to
+            // fall straight through to the `set_field` below and install an
+            // empty `char[]` over the payload: every character already in the
+            // builder was DISCARDED, silently, with no exception and `rc=0`.
+            // Widen it instead — `sb_value_units` reads either layout — so the
+            // conversion this function was already performing stops losing the
+            // content it converts.
+            let existing = sb_value_units(&*scope, this).unwrap_or_default();
+            let keep = existing.len().min(count).min(new_cap);
+            if !scope.write_char_array_from(new_buf, 0, &existing[..keep]) {
+                for (i, &ch) in existing[..keep].iter().enumerate() {
+                    scope.set_array_element(new_buf, i, Value::Int(ch as i32));
+                }
+            }
         }
     }
 
@@ -2682,20 +2882,38 @@ pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => return Ok(Some(Value::Object(None))),
     };
     let (buf, count) = sb_state(ctx, this);
-    let buf = match buf {
-        Some(b) => b,
-        None => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
-    };
-    let count = count as usize;
+    let count = count.max(0) as usize;
     // Read chars and build Rust string
-    let mut chars = Vec::with_capacity(count);
-    for i in 0..count {
-        let ch = match ctx.get_array_element(buf, i) {
-            Value::Int(v) => v as u16,
-            _ => 0,
-        };
-        chars.push(ch);
-    }
+    let chars: Vec<u16> = match buf {
+        Some(buf) => {
+            let count = count.min(ctx.array_length(buf));
+            let mut chars = Vec::with_capacity(count);
+            for i in 0..count {
+                let ch = match ctx.get_array_element(buf, i) {
+                    Value::Int(v) => v as u16,
+                    _ => 0,
+                };
+                chars.push(ch);
+            }
+            chars
+        }
+        // NOT `""`. A receiver whose `value` is the real compact `byte[]` has a
+        // payload this function can read perfectly well — it is the same
+        // decode `decode_string_chars` has always done for `String` — and
+        // answering "" for it is a FABRICATION, not a refusal: the caller
+        // cannot tell an empty builder from one whose content this native
+        // declined to look at. That answer is the visible half of the "every
+        // append silently discarded, `toString()` empty, `rc=0`" behaviour
+        // `H22` measured on this registrar.
+        //
+        // A receiver with no readable payload at all still yields "", which is
+        // what a freshly-allocated builder legitimately holds.
+        None => {
+            let mut units = sb_value_units(ctx, this).unwrap_or_default();
+            units.truncate(count.min(units.len()));
+            units
+        }
+    };
     // `StringBuilder.toString()` must return a *fresh* String distinct from
     // any equal literal — the JVM spec only pools literals and `intern()`.
     // Routing it through the interned pool made `==` wrongly report identity
@@ -3215,8 +3433,42 @@ pub(crate) fn sb_read_chars(ctx: &dyn NativeContext, this: cratonvm_types::Objec
                 _ => 0,
             });
         }
+        return chars;
     }
-    chars
+    // `sb_state` yields `None` for a builder whose `value` is the real compact
+    // `byte[]`, and returning an empty vector here was NOT a refusal — it was a
+    // wrong answer with a plausible shape.
+    //
+    // The caller that matters is `native_string_init_abstract_string_builder`,
+    // i.e. `String(AbstractStringBuilder, Void)`. MEASURED, `javap -p -c
+    // --system <jdk-25> java.lang.StringBuilder`, that IS `toString()`:
+    //
+    // ```text
+    //    1: invokevirtual  Method length:()I
+    //    4: ifne  10
+    //    7: ldc   String ""            // the empty-builder fast path
+    //   16: invokespecial Method java/lang/String."<init>":(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V
+    // ```
+    //
+    // so any builder that real `AbstractStringBuilder` bytecode constructed —
+    // which the doc comment on that constructor already names ("Byte Buddy can
+    // execute that real bytecode while retransformation is in progress") —
+    // stringified to "". No exception, `rc=0`, and `length()` answering the
+    // right number the whole time.
+    //
+    // MEASURED reproduction with the `--jdk-only` enforcement dial armed on
+    // `java/lang/StringBuilder,java/lang/AbstractStringBuilder`:
+    // `value = byte[16]`, `coder = 0`, `count = 2`, `sb.length() == 2`, and
+    // `sb.toString().length() == 0` with a `byte[0]` behind it. That is the
+    // "every append silently discarded, `toString()` empty, `rc=0`" behaviour
+    // `H22` measured on `register_string_builder_natives`, and this is where it
+    // was produced.
+    //
+    // `sb_value_units` reads either layout, so the answer is now the builder's
+    // actual content in both.
+    let mut units = sb_value_units(ctx, this).unwrap_or_default();
+    units.truncate(count.min(units.len()));
+    units
 }
 
 /// Helper: write a Vec<u16> back into a StringBuilder, replacing all content.
@@ -12468,11 +12720,28 @@ pub(crate) fn native_string_formatted(
 // little-endian: `probes/StringUtf16ClassShapeProbe` reads them back as
 // `HI_BYTE_SHIFT=0` / `LO_BYTE_SHIFT=8`, identical to HotSpot.
 //
-// So this stays registered for images that DO declare the method (JDK 17/21),
-// where it must give the same answer `UnsafeConstants` gives, which it does. A
-// census row reading `has_code: false` here means "absent from this image", not
-// "an unimplemented native something is waiting on" — the distinction cost a
+// So this stays registered for images that DO declare the method, where it must
+// give the same answer `UnsafeConstants` gives, which it does. A census row
+// reading `has_code: false` here means "absent from this image", not "an
+// unimplemented native something is waiting on" — the distinction cost a
 // paragraph of doubt in the record that filed the UTF-16 hash defect.
+//
+// **"(JDK 17/21)" used to be an assumption in this sentence. It is now a
+// measurement.** MEASURED 2026-08-21 over the nine supported images —
+// `javap -p --system <image> java.lang.StringUTF16`:
+//
+// ```text
+//   jdk17-linux  jdk17-windows  jdk17-mac-x64    private static native boolean isBigEndian();
+//   jdk21-linux  jdk21-windows  jdk21-mac-x64    private static native boolean isBigEndian();
+//   jdk25-linux  jdk25-windows  jdk25-mac-x64    ABSENT
+// ```
+//
+// Six of nine declare it. Re-derivable with
+// `scripts/jdk-only-no-image-methods.py`, which reports this row as `PARTIAL`
+// and exists because this comment was the standing witness that a
+// single-image census cannot adjudicate the population it belongs to.
+// See `docs/known-issues/jdk-only/WORKER-3-NOTE-2-*.md`: 62 of the 355 rows a
+// JDK-25-only adjudication calls "declared nowhere" are this same shape.
 //
 // Arity is guaranteed by the verifier (`()Z`); we ignore any extra args
 // defensively and return the constant unconditionally.

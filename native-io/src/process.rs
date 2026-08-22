@@ -5028,10 +5028,28 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let line_str = ctx.create_string(&command_line);
         let this_cur = ctx.read_native_pin(this_pin, this);
         ctx.set_field_by_name(this_cur, "commandLine", Value::Object(Some(line_str)));
-        // `String[]`, not `Object[]`: the field is declared
-        // `private String[] arguments` and `Info.arguments()` hands it straight
-        // to `Optional.ofNullable`, so the caller sees the component type. See
-        // `crate::new_string_array` for the measurement that found this.
+        // `String[]`, not `Object[]`. `ProcessHandle.Info.arguments()` is
+        // declared `Optional<String[]>`, and `new_array(Reference, n)` produces
+        // an array whose runtime component type is `java.lang.Object`. On Linux
+        // this is the ONLY reason `RJdkOptionalShape` fails:
+        //
+        //   AssertionError: process.info.arguments: get() on a PRESENT Optional
+        //   must return a [Ljava.lang.String;, got [Ljava.lang.Object;
+        //
+        // It is invisible on Windows because `os_process_cmdline` finds no
+        // command line for most pids there, so the field stays null and the
+        // vector's law skips the row -- a platform-shaped blind spot, not a
+        // platform-shaped defect.
+        //
+        // MERGE NOTE 2026-08-22. WORKER 3 and WORKER 4 found and fixed this
+        // independently, in the same hour, from the same red vector; the
+        // comment above is WORKER 3's and the call below is WORKER 4's. The
+        // difference is scope: `crate::new_string_array` also carries the
+        // `File.list()` site, which already had the correct four-line idiom,
+        // and `watch.rs::pollEventNames0`, whose registered descriptor is
+        // `(I)[Ljava/lang/String;` and which had the wrong one. Three sites,
+        // one implementation -- which is the whole reason to prefer a helper
+        // over the inline `match` this replaces.
         let arr = crate::new_string_array(ctx, arguments.len());
         let arr_pin = ctx.pin_native_root(arr);
         for (i, a) in arguments.iter().enumerate() {
