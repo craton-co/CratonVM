@@ -244,6 +244,28 @@ never immune, only less sensitive, and 48m/32m were the arms that proved it.
 `SUITE=all`: **107 passed, 0 failed**, where this page's own tables show 105/107
 and 106/107.
 
+## 8b. The probe that would have found all four in one command
+
+`regression-suite/probes/TreeVectorShape` arrived on `dev` while this was being
+fixed, and it is the right shape: same fixture as the vector, but the PHASE LIST
+is an argument, so "which view" separates from "how many collections have
+happened". Every earlier probe here -- this lane's included -- walked ONE view
+repeatedly and could not tell those apart. Both this lane's first bisect and
+`WORKER-1-NOTE-2`'s were confounded by exactly that.
+
+One `dev` binary and one fixed binary, this host:
+
+```text
+                                    dev            fixed
+generational, phases 1,2,5          4 pass / 0     4 pass / 0
+generational, all 11 phases         0 / 3 FAIL     3 pass / 0
+default,      all 11 phases         0 / 3 FAIL     3 pass / 0
+```
+
+Worth keeping. It is three seconds where the vector is 14,014 checks, and its
+phase ordinal moves when a fix lands rather than a pass/fail a flake can supply
+for free.
+
 ## 9. Gate
 
 `RJdkViews.entrySetStaysEntries` — the empty-then-populated entrySet, a range

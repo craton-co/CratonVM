@@ -164,12 +164,79 @@ Same symptom, which is consistent with one defect and proves little on its own.
 
 ### Verdict
 
-**Partially settled.** On `--jdk-only` they agree once pressure is equalised,
-which is evidence for one defect and refutes the parent's premise either way.
-On generational they still differ, and nothing I could construct closes that —
-so "same defect" is **not established**, and anyone fixing the range-view site
-should expect the vector to stay red on generational afterwards and not read
-that as the fix having failed.
+**SETTLED — they are TWO defects** (§4c). The default collector's is
+`headMap(k,false)` handing back a stale address that decodes as another object;
+generational's is `subMap(k,k)` handing back an EMPTY view on its first walk.
+Different operation, different symptom, different collector, both needing
+`--Xmx 64m` and neither needing the JIT.
+
+The `--jdk-only` threshold result in §4b is unaffected and still refutes the
+parent record's "strict mode is CLEAN" and the localisation built on it.
+
+**Operationally**: fixing one will not green the vector. Whoever takes the
+empty-view defect has the cheaper target — `1,2,5` on generational, three
+phases, deterministic, no relocation reasoning required.
+
+## 4c. THE GENERATIONAL TRIGGER, FOUND — and it is a SECOND defect
+
+A vector-SHAPED probe finds it immediately: same fixture, but the phase list is
+an ARGUMENT, so "which phase" separates from "how many collections have
+happened". Every earlier probe here walked one view repeatedly and could not.
+
+```text
+generational, --Xmx 64m, phases 1,2,5 = build map, size, ONE subMap walk
+   FAILAT phase=5   "subMap: 0 entries, expected 200"      2/2
+```
+
+**An EMPTY view, on the FIRST `subMap` walk.** Not a corrupted one. That is a
+different symptom from the default collector's, and a different phase:
+
+| | default (ZGC) | generational |
+|---|---|---|
+| first failing phase | **6** — `headMap(k, false)` | **5** — `subMap(k, k)` |
+| symptom | `ClassCastException: V → Map$Entry` | **`0 entries, expected 200`** |
+| shape | stale address decoded as another object | **empty range view** |
+| needs `--Xmx 64m` | yes | yes |
+| `--nojit` | still fails | still fails |
+| HotSpot | pass | pass |
+
+**So the answer to N1 is: TWO DEFECTS.** Different operation, different symptom,
+different collector. The `--jdk-only` threshold result in §4b stands and still
+refutes the parent's localisation — but the arm disagreement that motivated the
+question is now explained, and it is not one gap seen twice.
+
+### The generational one is operation-specific, and the controls say so
+
+```text
+generational, --Xmx 64m, one phase each after the build:
+   headMap  tailMap  subMap  headMap(k,f)  tailMap(k,t)  subMap(k,t,k,f)  subSet
+     ok       ok     FAIL        ok            ok              ok           ok
+   1,2,3,3,3,3,3,3  (headMap x6)   ok      <- position control
+   1,2,5,5,5,5,5,5  (subMap  x6)   FAIL at the FIRST subMap
+   set-only 11..16                 ok      <- the set is not involved
+   map+set built, no walks          ok      <- holding both is not enough
+```
+
+`headMap` six times never fails; `subMap` fails on its first walk. **It is the
+operation, not the position** — the opposite conclusion to the one the default
+collector's bisect invited, and the reason both needed the control.
+
+Note the two-bound `subMap(k,true,k,false)` overload passes where the two-arg
+`subMap(k,k)` fails, so it is not "two bounds" as such.
+
+### Why every earlier probe missed it — my assertion, not the VM's behaviour
+
+`TreeRepeat` counted the elements it walked and **never asserted the count**. An
+empty view yields zero elements, the loop body never runs, nothing is checked,
+and it printed `ok`. That is how `sub` survived **1024 walks** on generational
+in §4b: 1024 repetitions of a check that could not fail.
+
+`RTreeRangeGc` has the assertion (`check(seen == hi - lo, …)`) and its own
+comment says exactly why: *"a range view that hands back FEWER entries than it
+should — the empty-view failure this vector exists to catch"*. I trimmed it out
+when I shrank the probe, and then read the resulting green as evidence about the
+VM. `a-narrow-probe-reports-its-own-reach-not-the-defect`, caused by my own
+edit rather than by the probe's scope.
 
 ## 5. Reproduce
 
@@ -183,6 +250,35 @@ failing walk ordinal is stable, so a fix is judged on whether the ordinal moves
 rather than on a pass/fail that a 25% flake can supply for free.
 
 ## RESOLVED 2026-08-22 -- SAME defect family, and N1 is answered by an A/B
+
+### First, §4c: BOTH symptoms existed, both are fixed, and the collector split does not hold on a second host
+
+§4c is right that the vector carries more than one defect and right that an
+EMPTY view is a different symptom from a stale address -- that empty view is
+the `tm_sync_native_state` defect below, and its signature is exactly the
+`"N entries, expected M"` §4c names. It is fixed.
+
+What does NOT reproduce here is the split BY COLLECTOR. `TreeVectorShape`, this
+lane's Azure host, one `dev` binary and one fixed binary:
+
+```text
+                                    dev            fixed
+generational, phases 1,2,5          4 pass / 0     4 pass / 0
+generational, all 11 phases         0 / 3 FAIL     3 pass / 0
+                                    phase=8, ClassCastException V -> Map$Entry
+default,      all 11 phases         0 / 3 FAIL     3 pass / 0
+                                    phase=6, ClassCastException V -> Map$Entry
+```
+
+On this host generational fails with the SAME `V -> Map$Entry` cast as the
+default collector, two phases later, and the `1,2,5` cell that fails 2/2 there
+passes 4/4 here on a `dev` binary. So "different collector, different symptom"
+is a property of a BINARY AND A HOST -- the framing this record and
+`WORKER-1-NOTE-1` both already converged on -- rather than of the vector. §4c's
+operational conclusion holds regardless and was correct: fixing one would not
+have greened it. It took four.
+
+
 
 `TreeRepeat` is red 6/6 on a `dev` binary and green 6/6 on
 `fix/gc-known-issues-20260822`, on BOTH the arms this note flagged as
