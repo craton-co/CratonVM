@@ -8,6 +8,12 @@
 # and NO BUILD. It is the only instrument in the tree that costs less than the
 # work it prices.
 #
+# **That premise became true on 2026-08-21 and was false before it** -- the dial
+# reached one of fourteen dispatch doors, so "the native stops winning" applied
+# to a class's cold step-1 dispatches and nothing else. Caveat 4 below has the
+# measurement and the direction of the error. A cell from an older binary is not
+# a conservative version of a current cell; it is a different measurement.
+#
 # `H0-4` swept six collection prefixes by hand on 2026-08-20 and found a 23x
 # spread where every previous argument had treated "the collection cluster" as
 # one body. That sweep exists because somebody remembered to type it. This
@@ -41,12 +47,45 @@
 #     `LinkedHashMap` run also touches. Two rows overlapping is not a
 #     contradiction in the table; it is the class hierarchy.
 #
-#  A fourth, from `H7-1` N2: `CRATONVM_ENFORCE_NATIVE_SHADOW` is read at exactly
-#  ONE dispatch site (`env_cache`'s `jdk_only_enforce_shadow_for`, consumed in
-#  `native_override.rs`'s `resolve_step1_native`). Every other dispatch edge
-#  computes `bytecode_available` without it. So each cell is the blast radius of
-#  the dial AT ONE SITE, and a real retirement acts at all of them. The number
-#  is a floor.
+#  4. **Every cell taken before 2026-08-21 is void, and NOT in the direction
+#     its own caveat claimed.** `CRATONVM_ENFORCE_NATIVE_SHADOW` used to be read
+#     at exactly ONE dispatch site (`resolve_step1_native`); every other door
+#     computed `bytecode_available` without it. MEASURED: 890 of 947 armed
+#     `Bridge` dispatches never asked the dial, 299 431 of 299 469 on a hot
+#     workload. That is fixed -- all fourteen doors consult it now, and three
+#     source-witness tests in `native_override.rs` keep them consulting it.
+#
+#     The caveat this replaces said "the number is a floor", i.e. that a real
+#     retirement would hurt at least as much. **That was backwards.**
+#     `java/util/HashMap` scored **81/104 half-armed and 86/104 fully armed**:
+#     the old cells overstated the damage. Half-armed is not a partial
+#     retirement, it is a state no configuration can otherwise reach -- bytecode
+#     built the table and a native then wrote into it -- and the witness was a
+#     `HashMap` reporting `size()==4` over four occupied buckets while iterating
+#     one key. Uniform-native works and uniform-bytecode works; the MIXTURE is
+#     corrupt.
+#
+#     One conservatism does survive, and this one really is a floor: a yield
+#     needs concrete bytecode to yield TO, so a triple whose shadowed method has
+#     no `Code` still runs its native. The report's
+#     `enforcement_dial.declined_no_bytecode` counts exactly those (0 armed for
+#     `java/util/HashMap`; 494 of 19 931 armed for `all`).
+#
+#  5. **Four of the six witnesses this directory reaches for are BLIND**, so
+#     do not spot-check a cell with one at random -- MEASURED, `H17-2` §2:
+#
+#       bucket head class    NO  -- the native mints a real `HashMap$Node`
+#       `modCount`           NO  -- the native maintains it
+#       key `hashCode()`     NO  -- the native calls it once per put, as bytecode does
+#       `equals()` count     NO  -- zero in every configuration
+#       `table` ARRAY class  YES -- but ONE BIT PER MAP (did that map's FIRST
+#                                  insert run bytecode), never a count. Reading
+#                                  it as a count is the shared error of
+#                                  `H16-3`, `H0-8` and `H17-1`.
+#       `--jdk-only-report`  presence only, never a count
+#
+#     `regression-suite/probes/DialWitness.java` is the surviving witness plus a
+#     consistency check, one case per process.
 #
 # ---------------------------------------------------------------------------
 # WHY THE SIGNAL IS THE FAILING SET AND NOT THE PASS COUNT
@@ -370,8 +409,22 @@ cat <<'CAVEATS'
       shadows the other's run touches.
     * A green cell means "these vectors raise no objection", not "this family
       is retirable". The corpus has no AWT vector at all (G79-1).
-    * The dial is read at ONE dispatch site (H7-1 N2). A real retirement acts
-      at all of them, so every cell is a FLOOR.
+    * Cells taken BEFORE 2026-08-21 are void, and not in the direction the
+      old caveat here claimed. The dial then reached 1 of 14 dispatch doors
+      (890 of 947 armed Bridge dispatches never asked it); it reaches all 14
+      now. Half-armed measured MORE damage, not less -- HashMap 81/104 then,
+      86/104 once every door consulted the dial -- because half-armed is a
+      corrupt hybrid, not a partial retirement. Do not treat an old cell as a
+      conservative version of a current one.
+    * One conservatism survives and this one IS a floor: a yield needs
+      concrete bytecode to yield to, so a triple whose shadowed method has no
+      Code still runs its native. --jdk-only-report's
+      enforcement_dial.declined_no_bytecode counts exactly those.
+    * Four of six witnesses are BLIND (H17-2 2): bucket head class, modCount,
+      key hashCode() counts, equals() counts. Only the `table` array class
+      discriminates, and it is ONE BIT PER MAP, never a count. Spot-check a
+      cell with regression-suite/probes/DialWitness.java, not with a witness
+      picked at random.
 CAVEATS
 echo
 
