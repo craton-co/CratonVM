@@ -1,5 +1,13 @@
 # `RTreeRangeGc` reddens on the default collector — the gap is old, the *coverage* is new
 
+> **2026-08-22 — this vector carries TWO defects, and this record describes one.**
+> The generational column of the table below is a **different** defect from the
+> default column's: on generational the first failure is `subMap(k, k)`
+> returning an **empty view** (`0 entries, expected 200`) on its FIRST walk,
+> not a stale address decoding as another object. Different operation, different
+> symptom. Fixing either will not green the vector.
+> See `jdk-only/WORKER-1-NOTE-2-…-20260822.md` §4c.
+
 ## What is failing
 
 `regression-suite` vector `RTreeRangeGc`, which the harness runs with
@@ -131,6 +139,16 @@ interpreter frame root set." That was too broad, and the mode arm says so:
 --Xmx 64m                 rc=1  2/2   (no PASS line)
 --Xmx 64m --jdk-only      rc=0  2/2   PASS RTreeRangeGc (14014 checks)
 ```
+
+> **REFUTED 2026-08-22 — strict mode is not clean, it is LESS SENSITIVE.**
+> The two-row arm below was measured at one heap size. Squeeze it and
+> `--jdk-only` goes red: **`--Xmx 48m` FAIL 2/2, `--Xmx 32m` FAIL 2/2**, and
+> `--Xmx 64m` itself flaked to FAIL on one of two runs. So the `pass` is a
+> threshold, not immunity, and **every inference in the rest of this section
+> rests on it**. The unrooted reference cannot be attributed to the substituted
+> collection natives on this evidence, because the gap survives their removal.
+> Measured on a pristine `origin/dev` build at `bf85389bb`; see
+> `jdk-only/WORKER-1-NOTE-2-rtreerangegc-range-views-and-a-repro-that-disagrees-20260822.md`.
 
 **Strict mode is CLEAN.** `--jdk-only` drops the substituted collection natives
 and runs the JDK's own `TreeMap`/`TreeSet` bytecode, and the gap goes with them.
