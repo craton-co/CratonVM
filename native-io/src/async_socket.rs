@@ -3094,6 +3094,21 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// (a private one per class), give `aio_asc_is_open` a per-class sibling, and
 /// settle the `native-builtins` survivor in the same step — a build, and one
 /// change spanning both crates.
+///
+/// **THIS IS A FABRICATION SITE, and it is the one `H5-1` N7 could not find.**
+/// The `alloc_obj` below mints an object whose class NAME is the abstract
+/// `java.nio.channels.AsynchronousServerSocketChannel`. `H5-1` §3.2 listed 13
+/// such sites and marked this class "abstract; no fabrication site found —
+/// candidate, unproven", i.e. possibly movable down to a `sun.nio.ch.*Impl`.
+/// It is not movable. The census missed it only because the call is split over
+/// four lines and the grep matched `alloc_obj(ctx, "…"` on one — `[window≠absence]`.
+///
+/// MEASURED 2026-08-20 (H11), `fe59bf9d9`, `--jdk-only`:
+/// `AsynchronousServerSocketChannel.open().getClass().getName()` answers
+/// `java.nio.channels.AsynchronousServerSocketChannel`, where HotSpot 25.0.3+9
+/// answers `sun.nio.ch.WindowsAsynchronousServerSocketChannelImpl`. Since
+/// dispatch keys on the receiver's class, moving this class's 12 registrations
+/// onto the `Impl` strands every receiver this function returns.
 fn aio_assc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let _ = job_sender();
     let ch = alloc_obj(

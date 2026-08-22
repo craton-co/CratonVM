@@ -159,6 +159,40 @@ fn dbg_jit_rootscan() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some())
 }
 
+/// `CRATONVM_GC_PRECISE_ONLY_ROOTS=1` — opt back in to the precise-only root
+/// branch, i.e. let a pause skip the conservative JIT frame scan when the
+/// coverage proof passes. **Default OFF since 2026-08-21.**
+///
+/// Why it is off by default is a measurement, not a judgement. The branch fires
+/// on **~0.1 % of collections**: 2 of 14 420 on `PolynomialTest` under
+/// `CRATONVM_GC_STRESS`, 31 of 46 135 and 84 of 70 144 on longer runs of the
+/// same shape, and 0 of 10 on an unstressed run. Whatever it saves is bounded
+/// by that, because the other 99.9 % of collections already run the scan.
+/// Against that: the proof it spends is a PRESENCE test, and the runtime oracle
+/// the contract names as the sufficient proof cannot observe the cycles that
+/// use it (see `coverage_gate_active`). A 0.1 %-engagement optimisation is not
+/// worth an unobtainable soundness argument, so the default is now the safe
+/// side and the flag is how anyone who wants the old behaviour measures it.
+///
+/// The branch it enables trades the conservative scan away on the strength of
+/// `CompiledMethod::fully_oop_covered`, which is a PRESENCE test — every
+/// GC-capable safepoint recorded *an* oop map — and not a completeness one.
+/// The written contract for that bit names the runtime
+/// `CRATONVM_DBG_VERIFY_OOP_MAPS` oracle as the sufficient proof that must gate
+/// the suppression. It does not gate it, and it structurally cannot: the oracle
+/// runs inside `scan_one_frame_precise`, which runs inside
+/// `scan_active_jit_frames`, which is exactly what this branch skips. On the
+/// cycles the bit is spent, the oracle is not looking.
+///
+/// This switch exists so the difference costs one binary to measure, not two.
+/// See `docs/known-issues/gc/bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`.
+fn dbg_precise_only_roots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_PRECISE_ONLY_ROOTS").is_some()
+    })
+}
+
 /// `CRATONVM_G1_PRECISE_ONLY_ROOTS=1` вЂ” let G1 take the precise-only root
 /// branch again, i.e. skip the conservative JIT scan on a pause whose oop-map
 /// coverage proof passed.
@@ -956,9 +990,55 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         && !moving_young_osr_fallback
         && crate::jit::conservative_roots::refresh_moving_young_coverage_for_collection()
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
-    let moving_young_precise_only =
-        coverage_proven && (shared.mem.heap.is_generational() || g1_precise_only_roots);
-    if !moving_young_precise_only {
+    // The SUPPRESSION is additionally opt-in as of 2026-08-21
+    // (`CRATONVM_GC_PRECISE_ONLY_ROOTS=1`), and only the suppression — the proof
+    // above still runs on every collector, which is the whole point of the
+    // split.
+    //
+    // What it spends is `CompiledMethod::fully_oop_covered`, a PRESENCE test:
+    // every GC-capable safepoint recorded *an* oop map. The contract written
+    // above its assignment in `jit/src/x64/driver.rs` says as much — that bit is
+    // the NECESSARY codegen precondition, and the runtime
+    // `CRATONVM_DBG_VERIFY_OOP_MAPS` oracle is "the SUFFICIENT proof that must
+    // gate the actual backstop suppression".
+    //
+    // That gate did not exist and could not have: the oracle runs inside
+    // `scan_one_frame_precise` <- `scan_active_jit_frames`, which is the very
+    // call this suppression skips. On every cycle that SPENT the bit, the
+    // instrument meant to check it was not running — so no `while_covered=0`
+    // reading has ever described a suppressed cycle.
+    //
+    // Measured before switching the default: the branch fires on ~0.1 % of
+    // collections under `CRATONVM_GC_STRESS` (2 of 14 420, 31 of 46 135, 84 of
+    // 70 144). The other 99.9 % already run the scan, so that bounds what it
+    // saves — and verifying it costs the same frame walk as the scan it skips.
+    let moving_young_precise_only = dbg_precise_only_roots()
+        && coverage_proven
+        && (shared.mem.heap.is_generational() || g1_precise_only_roots);
+    // Verify first, then suppress. When the proof holds, the roots gathered to
+    // establish it are dropped and the cycle proceeds precise-only exactly as
+    // before; when it is refuted they are KEPT, which is simply the
+    // conservative scan the suppression was trying to avoid.
+    let mut moving_young_precise_only = moving_young_precise_only;
+    let mut jit_scan_done = false;
+    if moving_young_precise_only && crate::jit::conservative_roots::coverage_gate_active() {
+        crate::memory::native_roots::rootprof::note_scan_caller(0); // gc-roots
+        if crate::jit::conservative_roots::verify_active_coverage_into(
+            &shared.mem.heap,
+            &mut roots,
+        ) {
+            moving_young_precise_only = false;
+            jit_scan_done = true;
+        } else {
+            roots.truncate(jit_scan_start);
+        }
+    }
+    // A refutation recorded by any earlier cycle stands: the offending compiled
+    // method is still in the code cache.
+    if crate::jit::conservative_roots::coverage_oracle_refuted() {
+        moving_young_precise_only = false;
+    }
+    if !moving_young_precise_only && !jit_scan_done {
         crate::memory::native_roots::rootprof::note_scan_caller(0); // gc-roots
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut roots);
     }
@@ -993,9 +1073,21 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     if dbg_jit_rootscan() {
         let frames = crate::jit::conservative_roots::active_compiled_frames();
         let labels: Vec<&str> = frames.iter().map(|(_, l, _, _)| l.as_str()).collect();
+        // `osr_reason=` is a CUMULATIVE snapshot (bad_shadow_layout,
+        // debug_disabled, bad_map_coverage, missing_exact_rbp), not a
+        // per-cycle value — this line already runs at a cost only a debug
+        // build accepts, and OSR fallback is checked per JIT-entry-chain
+        // frame, not per collection, so there is no single-cycle count to
+        // report. Read the growth between two lines, or the tail line before
+        // exit. See `conservative_roots::osr_fallback_reason` for what each
+        // bucket means.
+        let (osr_bad_shadow, osr_debug_disabled, osr_bad_map, osr_missing_rbp) =
+            crate::jit::conservative_roots::osr_fallback_reason::snapshot();
         eprintln!(
             "[jitroots] precise_only={precise_only} proven={proven} moving_young={moving_young} \
-             osr_fb={osr_fb} incomplete={incomplete} reason={reason} chain={chain} \
+             osr_fb={osr_fb} osr_reason=(shadow={osr_bad_shadow} debug={osr_debug_disabled} \
+             map_coverage={osr_bad_map} exact_rbp={osr_missing_rbp}) \
+             incomplete={incomplete} reason={reason} chain={chain} \
              any_jit={any_jit} \
              scan_added={added} is_g1={is_g1} ybounds={ybounds} frames={labels:?}",
             precise_only = moving_young_precise_only,

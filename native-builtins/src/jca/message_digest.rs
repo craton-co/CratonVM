@@ -306,6 +306,43 @@ fn md_get_instance_with_provider(
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
+    // Provider EXISTENCE is not provider OWNERSHIP. `check_named_provider_arg`
+    // above admits any name `find()` knows; it does not ask whether that
+    // provider implements the algorithm. `MessageDigest` was the last engine
+    // still stopping there — `KeyFactory` (`key_factory.rs`), `Signature`
+    // (`signature.rs`), `Cipher` (`cipher.rs`), `SecureRandom` and `Mac` all
+    // run this gate — so it answered a digest for a provider that does not
+    // implement it:
+    //
+    // ```text
+    // MessageDigest.getInstance("SHA-256", "H13Prov")   // a probe provider
+    //   HotSpot 25.0.3+9 -> NoSuchAlgorithmException:
+    //                       no such algorithm: SHA-256 for provider H13Prov
+    //   CratonVM         -> a working SHA-256
+    // ```
+    //
+    // MEASURED, `docs/known-issues/jdk-only/H13-2-*.md` §3. This is the
+    // wrong-ACCEPT half of `E25-R11` §1.5's species, which was closed on `Mac`
+    // and left open here — the shape `W4-3` documents at length: not a wrong
+    // digest, but a digest where the oracle refuses, which surfaces only as an
+    // interop bug against everyone running a real JDK.
+    //
+    // Safe for the JDK providers, and that is MEASURED rather than assumed: the
+    // gate reads the same service table `Provider.getService` does, and SUN's
+    // 15 `MessageDigest` services (`SHA-256`, `SHA-1`, `SHA-512`, `MD5`,
+    // `SHA3-256`, `SHA-384`, …) resolve there byte-for-byte as they do on
+    // HotSpot. It also resolves `Alg.Alias.MessageDigest.<oid>` itself, which is
+    // why it runs on the CALLER's spelling, before `canonical_if_unrecognised`
+    // — the ordering `key_factory.rs` uses and whose inversion is the defect
+    // recorded above `kf_get_instance`.
+    crate::jca::provider_chain::check_provider_ownership(
+        ctx,
+        args,
+        1,
+        "MessageDigest",
+        &algo,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
     let requested_provider = crate::jca::provider_chain::provider_arg_name(ctx, args, 1);
     // An `Alg.Alias.MessageDigest.<oid>` spelling — `1.3.14.3.2.26` for SHA-1,
     // `2.16.840.1.101.3.4.2.1` for SHA-256 — resolves to the primary name the

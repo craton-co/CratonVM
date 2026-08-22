@@ -2,16 +2,17 @@
 
 ## Status
 
-**STILL OPEN 2026-08-21, and the refusal is now lifted.** The mechanism below
-is settled. The two things that made the obvious fix unsound have both been
-built — the coverage proof is computed for this collector, and the frame-band
-verifier can classify an address under it — so `relocate_stw` consults the
-verdict and **ZGC compacts under live compiled frames for the first time: 21
-cycles, 203 007 objects, on the very run that used to compact zero times.**
-
-The class still fails. Twenty-one compactions are not enough, because a THIRD
-obligation blocks 89 % of collections, and the instrument added along the way
-names it: `osr-shadow-coverage-unproven`. See §"Where it stands now".
+**STILL OPEN 2026-08-22, two of the three obligations now lifted.** ZGC
+compacts under live compiled frames for the first time (21 cycles, 203 007
+objects, on a run that used to compact zero times), and the disjunct that
+blocked 89% of collections — `osr-shadow-coverage-unproven` — is traced to a
+one-line gap (the optimizing tier never computed `fully_oop_covered`) and
+fixed, verified via unit tests, a runtime oracle differential, and a
+corruption canary. Two of the five classes this defect touches no longer
+crash at all. `TestKillProcessWhileWriting` and `TestMVStoreTool` still fail:
+a third, separate obligation (`CROSS_THREAD_JIT_PEER`) still blocks most
+cycles on this heavily multi-threaded workload. See §"Follow-up 2026-08-22"
+and §"Still open".
 
 ## Symptom
 
@@ -356,14 +357,99 @@ exception-object construction goes wrong specifically when the housekeeping
 lambda's own OOM handling runs repeatedly — worth its own page, not filed here
 because the differential proves it isn't this defect.
 
+## Follow-up 2026-08-22: which disjunct, found and fixed
+
+Instrumented `moving_young_osr_method_needs_fallback` with four per-disjunct
+counters (`conservative_roots::osr_fallback_reason`) and wired a cumulative
+snapshot into the `[jitroots]` line. On `TestKillProcessWhileWriting`, every
+single OSR-fallback firing read `osr_reason=(shadow=0 debug=0 map_coverage=N
+exact_rbp=0)` — the blocker is **exclusively** imprecise map coverage, never
+the shadow-stack layout and never a missing exact RBP.
+
+Tracing `fully_oop_covered` (the field that feeds `map_coverage`) found the
+mechanism: `x64/driver.rs` (the fast tier) computes it from a real bytecode-PC
+subset check; `ir_lower.rs` (the **optimizing** tier — the one that actually
+compiles H2's hot OSR loops, per `plan_inline`'s type-guarded virtual
+inlining) never computed it at all. It stayed at the `CompiledMethod` struct
+default of `false` for every method this tier ever compiled, unconditionally,
+OSR or not. `moving_young_osr_method_needs_fallback` reads `false` as
+"imprecise" and refuses — so every optimizing-tier OSR artifact failed this
+check by construction, regardless of how good its actual maps were.
+
+**The fix is one line**, and it needed no new tracking: each `OopMapEntry`
+this backend emits already carries its own `moving_young_coverage_complete`
+verdict — the exact per-safepoint flag `gc_quiescence`'s per-cycle proof
+already trusts for non-OSR collections, computed at emission time from
+`coverable && (published || slots.is_empty())`. `cm.oop_maps` is the complete
+set this compilation ever pushed, so the aggregate is a straight `AND`:
+
+```rust
+cm.fully_oop_covered = cm.oop_maps.iter().all(|m| m.moving_young_coverage_complete);
+```
+
+Landed in `ir_lower.rs`, right after `cm.oop_maps = oop_maps;`.
+
+### Verified three ways
+
+1. **Unit tests.** `cargo test --release -p cratonvm-jit`: 2091+ tests, 0
+   failed — the fix touches no existing invariant the suite already checks.
+2. **The runtime oracle, differentially.** `CRATONVM_DBG_VERIFY_OOP_MAPS`
+   counts `never_mapped (while_covered=N)` — an in-band live oop that was
+   never mapped **despite its frame claiming full coverage**, which is
+   exactly the shape a wrong `fully_oop_covered=true` would produce. Ran
+   `TestKillProcessWhileWriting` twice, same binary, same host, one variable:
+   with the fix, `while_covered=1192`; with `ir_lower.rs`'s one line reverted
+   (binary rebuilt, class rerun), `while_covered=1410`. **The count did not
+   go up with the fix — if anything it went down.** This settles that the
+   fix does not introduce a new false-coverage claim: the audit finding is
+   pre-existing, and almost certainly lives in the fast tier's own
+   bytecode-PC subset check (`x64/driver.rs`), which this page's earlier
+   fast-tier analysis already flagged as collision-prone once more than one
+   bytecode stream shares the PC namespace — untouched by this fix, and now
+   confirmed present with or without it. **Filed separately, not fixed
+   here**: it is a distinct, pre-existing correctness gap this fix's own
+   verification oracle surfaced, not something this fix caused.
+3. **Corruption canary.** 6× `TestMultiThread`, ABBA-style, clean directory
+   per rep, on the fixed binary: zero `SIGSEGV`/`ClassCastException`/panics/
+   assertion failures across all six (all six hit the host's own 300 s cap
+   under heavy contention, not a class-level failure).
+
+### Measured effect on the five affected classes
+
+`TestOpenClose` and `TestMVStoreCachePerformance` — the two that used to
+crash via a fast, clean `MVStoreException`/`OutOfMemoryError` within a few
+minutes — no longer hit that crash at all on a solo, uncontended rerun;
+`TestOpenClose` instead surfaces the unrelated pre-existing `java/lang/Object`
+exception documented above, confirmed via the same kill-switch differential
+methodology to be unaffected by either this fix or the ZGC one.
+`TestKillProcessWhileWriting` and `TestMVStoreTool` still eventually fail via
+the same clean OOM shape, later than before (`failure_seq` roughly doubled) —
+consistent with the coverage proof now succeeding some of the time rather
+than never, but not always: H2's MVStore workload keeps enough peer threads
+in compiled code that `CROSS_THREAD_JIT_PEER` (a different, still-conservative
+obligation — see `roots.rs`'s own comment on the cross-thread coverage
+handshake `arch-2026-07-26/moving-young-precise-roots.md` specifies and
+nobody has built) still blocks the majority of cycles.
+
 ## Still open
 
-* **The defect itself.** The class fails on `dev` — `osr-shadow-coverage-unproven`
-  blocks 89% of collections; the coverage-proof and `MOVABLE_BOUNDS`
-  infrastructure is landed and sound (tests, kill-switch bisect, and a clean
-  corruption canary all confirm it), but it is not sufficient alone. Next step
-  is JIT-side: measure which of `moving_young_osr_shadow_fallback_needed`'s two
-  disjuncts fires for H2's OSR-compiled MVStore loops.
+* **The residual itself.** `TestKillProcessWhileWriting` and `TestMVStoreTool`
+  still fail on `dev` — the `osr-shadow-coverage-unproven` disjunct that
+  blocked them is fixed (see above), but `CROSS_THREAD_JIT_PEER` — a
+  many-threaded workload having a peer thread in compiled code at the
+  collection's safepoint — is a separate, still-unbuilt obligation. Next step
+  is the cross-thread coverage handshake `roots.rs` already names.
+* **A pre-existing, unrelated correctness gap the OSR fix's own verification
+  surfaced.** `CRATONVM_DBG_VERIFY_OOP_MAPS`'s `never_mapped (while_covered=N)`
+  counter is nonzero on `dev` **with or without** the OSR fix (1192 vs 1410 on
+  the same class, same host) — some frame is claiming `fully_oop_covered=true`
+  while an in-band live oop goes unmapped, on the fast tier's own bytecode-PC
+  subset check (`x64/driver.rs`'s `safepoint_pcs.is_subset(&mapped_safepoint_pcs)`),
+  independent of everything this page fixes. Only 23 distinct
+  `code+offset` sites produce the 1410 baseline occurrences, so this is a
+  small number of specific compiled methods, not a systemic failure. Not
+  investigated further here — it needs its own page and its own
+  differential, the way this one got one.
 * **The two small objects in the large-object region.** The fragmentation
   report placed an 80-byte `String` and a 24-byte `Object` above `high_cursor`,
   where `ZGC_LARGE_OBJECT_MIN`'s design says only large objects should live —

@@ -574,6 +574,47 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
     })
 }
 
+/// Per-disjunct breakdown of why [`moving_young_osr_method_needs_fallback`]
+/// returned true, so the single `osr-shadow-coverage-unproven` reason code the
+/// collector sees can be split apart without a debugger. Filed 2026-08-21:
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s own
+/// measurement found this reason blocking 234/263 collections and could not
+/// say which of the (then three) disjuncts was responsible, only that "H2's
+/// MVStore loops are OSR-compiled constantly." Attribution is by the same
+/// short-circuit priority the boolean uses, so exactly one counter increments
+/// per call that returns true: a frame with a genuinely broken shadow layout
+/// is not ALSO double-counted under the map-coverage bucket just because it
+/// would have failed that check too.
+pub mod osr_fallback_reason {
+    use std::sync::atomic::AtomicUsize;
+
+    /// `!shadow_layout_ok` — the shadow-stack prologue slots were never
+    /// allocated for this compilation at all. A codegen gap: this method was
+    /// compiled by a path that does not emit shadow-stack bookkeeping.
+    pub static BAD_SHADOW_LAYOUT: AtomicUsize = AtomicUsize::new(0);
+    /// `debug_shadow_disabled` — `CRATONVM_SHADOW_NOPUSH` / `_NORELOAD` forced
+    /// it. Not a production path; present so a debug run does not silently
+    /// fall through to a different bucket and misattribute.
+    pub static DEBUG_DISABLED: AtomicUsize = AtomicUsize::new(0);
+    /// Shadow layout is fine, precise maps exist, but this safepoint's map is
+    /// not `fully_oop_covered`.
+    pub static BAD_MAP_COVERAGE: AtomicUsize = AtomicUsize::new(0);
+    /// Shadow layout is fine, the map is fully covered, but the chain entry
+    /// carries no exact RBP for this frame — the map cannot be located
+    /// without one, even though it would answer the question if it could.
+    pub static MISSING_EXACT_RBP: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn snapshot() -> (usize, usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            BAD_SHADOW_LAYOUT.load(Relaxed),
+            DEBUG_DISABLED.load(Relaxed),
+            BAD_MAP_COVERAGE.load(Relaxed),
+            MISSING_EXACT_RBP.load(Relaxed),
+        )
+    }
+}
+
 fn moving_young_osr_method_needs_fallback(
     cm: &cratonvm_jit::CompiledMethod,
     exact_rbp: usize,
@@ -586,7 +627,24 @@ fn moving_young_osr_method_needs_fallback(
         && cm.shadow_savetop_slot_off != 0
         && cm.shadow_off_in_thread != 0;
     let precise_map_ok = !cm.has_precise_oop_maps() || (cm.fully_oop_covered && exact_rbp != 0);
-    !shadow_layout_ok || debug_shadow_disabled || !precise_map_ok
+    use std::sync::atomic::Ordering::Relaxed;
+    if !shadow_layout_ok {
+        osr_fallback_reason::BAD_SHADOW_LAYOUT.fetch_add(1, Relaxed);
+        return true;
+    }
+    if debug_shadow_disabled {
+        osr_fallback_reason::DEBUG_DISABLED.fetch_add(1, Relaxed);
+        return true;
+    }
+    if !precise_map_ok {
+        if cm.has_precise_oop_maps() && !cm.fully_oop_covered {
+            osr_fallback_reason::BAD_MAP_COVERAGE.fetch_add(1, Relaxed);
+        } else {
+            osr_fallback_reason::MISSING_EXACT_RBP.fetch_add(1, Relaxed);
+        }
+        return true;
+    }
+    false
 }
 
 /// spring-bug-10 experiment (`CRATONVM_SHADOW_PIN`): when set, the shadow-stack
@@ -4445,6 +4503,127 @@ fn coverage_pin_enabled() -> bool {
     *E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_PRECISE_COVERAGE_PIN").is_some())
 }
 
+/// Set once the completeness oracle has REFUTED some frame's
+/// `fully_oop_covered` claim: an in-band live object address named by no map of
+/// a frame that asserted full coverage.
+///
+/// Latched for the life of the process, not per-cycle, and the reason is not
+/// caution — it is that the refutation is a statement about COMPILED CODE, not
+/// about a moment. The method that produced the unnamed slot is still in the
+/// code cache and will run again; a later cycle that happens not to re-observe
+/// it has learned nothing new. Clearing this per cycle would make the gate a
+/// coin toss on whether the offending frame was on the stack when the oracle
+/// last looked.
+///
+/// Production-global / `cfg(test)`-thread-local, the same split
+/// `gc_quiescence` uses for its own cycle flags and for the same reason: the
+/// latch is one-way by design, so a test that sets it in a shared process
+/// would permanently change what every later test in that process observes.
+#[cfg(not(test))]
+static COVERAGE_ORACLE_REFUTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static COVERAGE_ORACLE_REFUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(not(test))]
+fn coverage_oracle_refuted_get() -> bool {
+    COVERAGE_ORACLE_REFUTED.load(Ordering::Acquire)
+}
+
+#[cfg(not(test))]
+fn coverage_oracle_refuted_swap() -> bool {
+    COVERAGE_ORACLE_REFUTED.swap(true, Ordering::AcqRel)
+}
+
+#[cfg(test)]
+fn coverage_oracle_refuted_get() -> bool {
+    COVERAGE_ORACLE_REFUTED.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn coverage_oracle_refuted_swap() -> bool {
+    COVERAGE_ORACLE_REFUTED.with(|c| c.replace(true))
+}
+
+/// Clear the latch. Test-only; the production latch is deliberately one-way.
+#[cfg(test)]
+pub fn reset_coverage_oracle_refuted_for_test() {
+    COVERAGE_ORACLE_REFUTED.with(|c| c.set(false));
+}
+
+/// Whether the completeness oracle has ever refuted a coverage claim in this
+/// process. Read by the root scan before it spends the bit.
+pub fn coverage_oracle_refuted() -> bool {
+    coverage_oracle_refuted_get()
+}
+
+/// Record a refutation and mark THIS cycle incomplete, so the collector that is
+/// mid-decision diverts as well as every later one.
+fn note_coverage_oracle_refutation() {
+    let first = !coverage_oracle_refuted_swap();
+    cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+        cratonvm_gc::gc_quiescence::incomplete_reason::COVERAGE_ORACLE_REFUTED,
+    );
+    if first {
+        eprintln!(
+            "[VERIFY-OOP-MAPS] REFUTED: a frame asserting fully_oop_covered holds an \
+             in-band oop no map names. Conservative JIT backstop is now forced ON for \
+             the rest of this process."
+        );
+    }
+}
+
+/// Run the completeness oracle over this thread's live compiled frames and
+/// report whether it refutes any frame's coverage claim.
+///
+/// This exists because of a structural hole, not a missing feature. The oracle
+/// runs inside `scan_one_frame_precise`, which runs inside
+/// `scan_active_jit_frames` — and `collect_roots` calls that only when it has
+/// DECIDED NOT to suppress. So on every cycle where the coverage bit is
+/// actually spent, the instrument designated to check it is not running. Every
+/// `while_covered=0` reading ever taken was taken on cycles that did not use
+/// the bit.
+///
+/// `roots` is scanned into and then truncated back by the caller when the proof
+/// holds: the walk cannot be done without producing roots, and producing them
+/// is how we know the walk really covered the same frames the backstop would.
+pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) -> bool {
+    let before = oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed);
+    scan_active_jit_frames(heap, roots);
+    if oracle_force_refute() {
+        note_coverage_oracle_refutation();
+        return true;
+    }
+    oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed) > before
+}
+
+/// Whether the pre-suppression verification should run: only when the oracle is
+/// enabled (it is the thing doing the verifying) or when the forced-refutation
+/// switch is on. Default-off, so the default path pays one cached bool.
+pub fn coverage_gate_active() -> bool {
+    verify_oop_maps_enabled() || oracle_force_refute()
+}
+
+/// `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE=1` — treat the first covered frame the
+/// oracle inspects as refuted, without a real unmapped oop.
+///
+/// The gate below is only reachable when a compiled method actually strands an
+/// oop, which is exactly the thing every fix on this page has been closing —
+/// `while_covered` is 0 on every workload measured. A gate whose wiring has
+/// never been executed is indistinguishable from a gate that does not work, so
+/// this forces the branch instead of waiting for a defect to supply it.
+/// Test-only; it makes the VM refuse a suppression it could legitimately take.
+fn oracle_force_refute() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE").is_some()
+    })
+}
+
 /// Count of precise frames observed NOT `fully_oop_covered` during GC scans
 /// while `CRATONVM_PRECISE_COVERAGE_PIN` is on. Diagnostic only.
 static UNCOVERED_PRECISE_FRAMES: AtomicUsize = AtomicUsize::new(0);
@@ -4739,6 +4918,10 @@ fn verify_precise_covers_conservative(
                         if frame_cm.fully_oop_covered {
                             audit::NEVER_MAPPED_WHILE_COVERED.fetch_add(1, AOrd::Relaxed);
                             audit::note_site(frame_cm.entry_ptr() as usize, off, class);
+                            // The bit has been caught claiming coverage it does
+                            // not have. Latch it: `collect_roots` consults this
+                            // before skipping the conservative backstop.
+                            note_coverage_oracle_refutation();
                         }
                         if STEP3_LOG_COUNT.fetch_add(1, AOrd::Relaxed) < STEP3_LOG_CAP {
                             eprintln!(
@@ -5129,6 +5312,76 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod coverage_oracle_gate_tests {
+    use super::*;
+
+    /// The latch starts clear, a refutation sets it, and it does not clear
+    /// itself. One-way is the point: the refutation is about compiled code
+    /// that is still in the cache, not about the moment it was observed.
+    #[test]
+    fn a_refutation_latches_and_does_not_clear() {
+        reset_coverage_oracle_refuted_for_test();
+        assert!(!coverage_oracle_refuted(), "latch must start clear");
+        note_coverage_oracle_refutation();
+        assert!(coverage_oracle_refuted(), "a refutation must latch");
+        // A later cycle that observes nothing must not un-refute.
+        assert!(
+            coverage_oracle_refuted(),
+            "the latch must survive a cycle that saw nothing"
+        );
+        reset_coverage_oracle_refuted_for_test();
+    }
+
+    /// A refutation marks the CURRENT cycle incomplete too, not just later
+    /// ones — the collector asking the question is mid-decision.
+    #[test]
+    fn a_refutation_marks_this_cycle_incomplete() {
+        reset_coverage_oracle_refuted_for_test();
+        cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
+        assert!(!cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete());
+        note_coverage_oracle_refutation();
+        assert!(
+            cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete(),
+            "the cycle being decided must go incomplete"
+        );
+        assert_eq!(
+            cratonvm_gc::gc_quiescence::moving_young_incomplete_reason(),
+            cratonvm_gc::gc_quiescence::incomplete_reason::COVERAGE_ORACLE_REFUTED,
+        );
+        reset_coverage_oracle_refuted_for_test();
+        cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
+    }
+
+    /// The gate is inert unless something is actually doing the verifying.
+    /// Default-off is what keeps this free on the production path, so a
+    /// regression that turns it on by accident must fail here.
+    #[test]
+    fn the_gate_is_inert_by_default() {
+        assert!(
+            !coverage_gate_active(),
+            "neither CRATONVM_DBG_VERIFY_OOP_MAPS nor the force switch is set \
+             in the test environment, so the gate must not run"
+        );
+    }
+
+    /// The kill switch and the force switch read the keys they are documented
+    /// under. A gate whose flag is misspelled reports itself off forever.
+    #[test]
+    fn the_switches_read_their_documented_keys() {
+        let surface = include_str!("../../../types/tests/flag-surface.txt");
+        for key in [
+            "CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE",
+            "CRATONVM_GC_PRECISE_ONLY_ROOTS",
+        ] {
+            assert!(
+                surface.lines().any(|l| l.trim() == key),
+                "{key} must be declared in the flag surface"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -8111,12 +8111,16 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
 
 pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     // Mixed block:
-    //   * MethodHandleProxies.asInterfaceInstance is still a SIMPLIFIED stub —
-    //     it returns the MH itself as the "proxy". `isWrapperInstance` and
-    //     `wrapperInstanceTarget` are now answered CONSISTENTLY with that
+    //   * MethodHandleProxies.asInterfaceInstance is a SIMPLIFIED stub — it
+    //     returns the MH itself as the "proxy" — and `isWrapperInstance` /
+    //     `wrapperInstanceTarget` are answered CONSISTENTLY with that
     //     (is-a-MethodHandle / the handle itself) instead of the old blanket
     //     0/null, which contradicted what `asInterfaceInstance` had just
     //     returned. `wrapperInstanceType` is not registered — see below.
+    //     SINCE 2026-08-21 (H19) all three are registered ONLY when this
+    //     registry is NOT being populated for a real JDK image: against a real
+    //     image the simplification is a `ClassCastException` at every call
+    //     site and the JDK's own bytecode is measured correct. See the guard.
     //   * LambdaMetafactory.metafactory / altMetafactory are now a faithful
     //     bridge to the VM's real lambda-proxy machinery (the same one the
     //     `invokedynamic` opcode uses): they register a proxy class via
@@ -8131,15 +8135,73 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // MethodHandleProxies
     let mhp = "java/lang/invoke/MethodHandleProxies";
-    r.register(
-        mhp,
-        "asInterfaceInstance",
-        "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;)Ljava/lang/Object;",
-        |_ctx, args| {
-            // Return the method handle as the proxy (simplified)
-            Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
-        },
-    );
+    // NOT REGISTERED WHEN A REAL JDK IMAGE IS LOADED (H19, 2026-08-21).
+    //
+    // The three registrations below are the `asInterfaceInstance`
+    // simplification and the two queries that were made consistent with it.
+    // They are correct only in the synthetic-JDK image, where
+    // `MethodHandleProxies` has no bytecode at all. Against a real image they
+    // are the entire defect: `asInterfaceInstance` reads `args[1]` and IGNORES
+    // `args[0]` (the interface), so every call site got the `MethodHandle`
+    // itself and threw
+    // `ClassCastException: java.lang.invoke.MethodHandle cannot be cast to
+    // <the requested interface>`.
+    //
+    // The historical reason for the simplification is GONE. The real
+    // `MethodHandleProxies` spins a proxy whose `<init>` does
+    // `target.asType(<MT>)` off an `ldc` of a `CONSTANT_MethodType`, which the
+    // interpreter used to refuse; `vm/src/runtime/interpreter/constants.rs`
+    // decodes both tags today and does so mode-independently.
+    //
+    // MEASURED 2026-08-21 (`C:/craton/cratonvm-r5.exe`, oracle HotSpot
+    // 25.0.3+9), the same program in three arms — the `--jdk-only` arm is the
+    // experiment, because these rows are already dropped there as
+    // `SyntheticStub`:
+    //
+    //   asInterfaceInstance(Greeter.class, mh).getClass()
+    //     HotSpot     jdk.MHProxy1.…$Greeter/0x…       greet("bob") = "hi bob"
+    //     --jdk-only  jdk.MHProxy1.…$Greeter           greet("bob") = "hi bob"
+    //     Compatible  ClassCastException
+    //   isWrapperInstance(<raw MethodHandle>)
+    //     HotSpot false | --jdk-only false | Compatible TRUE
+    //   wrapperInstanceTarget(<raw MethodHandle>)
+    //     HotSpot IllegalArgumentException | --jdk-only IllegalArgumentException
+    //     Compatible returns the handle
+    //   two asInterfaceInstance calls yield distinct instances
+    //     HotSpot true | --jdk-only true | Compatible FALSE
+    //
+    // WHY A GUARD AND NOT A DELETION. `docs/known-issues/jdk-only/H15-3` §1.4
+    // proposed deleting these three outright. Deletion is not available to this
+    // lane and would be red in CI: `vm/src/vm/tests.rs`'s
+    // `method_handle_proxies_p68` calls `isWrapperInstance` through
+    // `call_native`, which PANICS (`"{class}.{method}{descriptor} not
+    // registered"`) on an absent registration, and
+    // `cargo test -p cratonvm-vm --lib --features synthetic-jdk` is a blocking
+    // job. That registry is built by `NativeMethodRegistry::new()` and never
+    // calls `set_drop_real_layout_synthetic`, so the guard below leaves it —
+    // and the synthetic-JDK image, which has no `MethodHandleProxies` bytecode
+    // to fall back to — untouched.
+    //
+    // `drops_real_layout_synthetic()` is the predicate the registry documents
+    // for exactly this question, and a `#[cfg(feature = "synthetic-jdk")]`
+    // guard is explicitly NOT equivalent (`native-api/src/registry.rs`): the
+    // Cargo feature decides what is compiled, the launcher flag decides which
+    // class library loads. Both real-JDK arms of `vm_init` set the flag before
+    // any `register_*` pass, so this drops in `--real-jdk`/Compatible AND in
+    // `--jdk-only` — a no-op for the latter, which already dropped them.
+    //
+    // docs/known-issues/jdk-only/H19-1-three-stand-ins-retired-against-a-real-image-20260821.md §1
+    if !r.drops_real_layout_synthetic() {
+        r.register(
+            mhp,
+            "asInterfaceInstance",
+            "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;)Ljava/lang/Object;",
+            |_ctx, args| {
+                // Return the method handle as the proxy (simplified)
+                Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+            },
+        );
+    }
     // The three queries below used to be blanket `false` / `null` / `null`,
     // which directly contradicted what `asInterfaceInstance` had just handed
     // the caller: under this simplification a "wrapper instance" IS the
@@ -8160,27 +8222,33 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             Ok(None)
         }
     }
-    r.register(
-        mhp,
-        "isWrapperInstance",
-        "(Ljava/lang/Object;)Z",
-        |ctx, args| {
-            let present = mhp_wrapper_handle(ctx, args)?.is_some();
-            Ok(Some(Value::Int(if present { 1 } else { 0 })))
-        },
-    );
-    r.register(
-        mhp,
-        "wrapperInstanceTarget",
-        "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| match mhp_wrapper_handle(ctx, args)? {
-            // Real JDK throws IllegalArgumentException for a non-wrapper; we
-            // keep the historical null there so an existing caller that never
-            // checked `isWrapperInstance` first does not start throwing.
-            Some(mh) => Ok(Some(Value::Object(Some(mh)))),
-            None => Ok(Some(Value::Object(None))),
-        },
-    );
+    // Same guard, same reasoning, and it has to be the same guard: these two
+    // are only coherent BESIDE the `asInterfaceInstance` simplification above.
+    // Dropping that one alone would leave `isWrapperInstance` answering `true`
+    // for a raw handle that the real `asInterfaceInstance` never produced.
+    if !r.drops_real_layout_synthetic() {
+        r.register(
+            mhp,
+            "isWrapperInstance",
+            "(Ljava/lang/Object;)Z",
+            |ctx, args| {
+                let present = mhp_wrapper_handle(ctx, args)?.is_some();
+                Ok(Some(Value::Int(if present { 1 } else { 0 })))
+            },
+        );
+        r.register(
+            mhp,
+            "wrapperInstanceTarget",
+            "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
+            |ctx, args| match mhp_wrapper_handle(ctx, args)? {
+                // Real JDK throws IllegalArgumentException for a non-wrapper; we
+                // keep the historical null there so an existing caller that never
+                // checked `isWrapperInstance` first does not start throwing.
+                Some(mh) => Ok(Some(Value::Object(Some(mh)))),
+                None => Ok(Some(Value::Object(None))),
+            },
+        );
+    }
     // `wrapperInstanceType` is deliberately NOT registered. The registration
     // deleted here keyed on `(Ljava/lang/Object;)Ljava/lang/Class;`, but the
     // real `MethodHandleProxies.wrapperInstanceType(Object)` returns a

@@ -71,6 +71,61 @@ A count that goes *down* passes and prints a re-freeze instruction. It is not
 auto-lowered: the ratchet is slack-free by design, and silently absorbing an
 improvement would re-admit exactly that many new unadjudicated rows.
 
+## THE TWO-COLUMN RULE (added 2026-08-20, H3-1 / `G89-1` N3)
+
+Every count above is a count of `Bridge` rows, and **a `Bridge` count alone
+cannot say why it moved.** There are two ways it falls and they want opposite
+responses:
+
+* a registration was **deleted** — real bytecode now runs, which is the work;
+* an existing registration **changed kind** (`Bridge` -> `SyntheticStub`, or the
+  dangerous direction, `SyntheticStub` -> `Bridge`) — nothing was added or
+  removed, and this file's own header records that the second case makes both
+  numbers FALL and prints "IMPROVED — lock it in".
+
+`native-builtins/tests/stub_ratchet.rs` fixed the identical blind spot in its
+sibling on 2026-08-19 by printing a SECOND column — the total registration count
+— because **a relabel keeps its row and moves only its kind; an addition or a
+deletion moves the row count.** This gate now prints the same second column and
+uses it to CLASSIFY every delta:
+
+    registry rows: 11636 (baseline 11636, delta +0)   by kind {...}
+    rows UNCHANGED and kinds moved -> a RELABEL. ...
+
+It also prints, on every run:
+
+* a **per-file breakdown** of the ratchet population (`registered_by`, keyed by
+  file — the same granularity and the same reason as `synthetic_by_file()`).
+  A green ratchet whose *composition* shifted underneath it is the case a
+  single number is structurally unable to show;
+* with `CRATONVM_RATCHET_ROWS=1`, the ratchet population **by name**, so two
+  commits can be diffed by row identity rather than by a scalar
+  (`CRATONVM_RATCHET_ROWS=all` dumps every registration with its kind, which is
+  what a suspected relabel needs). Off by default: this is not gate output.
+
+The row column is **recorded, not asserted** — a new `Bridge` legitimately
+raises the total, so a ratchet there would fire on correct work. It is read out
+of the baseline's `observed` block, which `--update-baseline` has always
+written.
+
+## THE MODE HALF OF THE KEY (added 2026-08-20, H3-1)
+
+The baseline key was `<jdk-feature>/<os>` and the entry separately recorded a
+`mode`, which `gate` refused to score against a census of the other mode. Two
+modes therefore shared ONE slot: `--update-baseline` on a `--jdk-only` census
+would have OVERWRITTEN the compatible baseline, after which every compatible run
+refused. So the strict registry — which ships, and which two of the five
+ratchets make claims about (`bridge.shadows_bytecode_anywhere` is §1.4, and
+`superseded.stub_lost_to_admitted` says "admitted under `--jdk-only`" in its own
+name) — **could not be given a baseline at all**, and was measured by nothing.
+
+The key is now `<jdk-feature>/<os>` for `compatible` (unchanged, so the
+committed `25/linux` entry still scores) and `<jdk-feature>/<os>/<mode>`
+otherwise. `regression-suite/bridge-ratchet.sh` takes the second census.
+
+*"A gate whose stated population is wider than its measured one always reads as
+success. Nothing catches it but running the wider thing."*
+
 ## Usage
 
     # take the census (see regression-suite/bridge-ratchet.sh, which does this)
@@ -217,6 +272,67 @@ _OBJECT = "java/lang/Object"
 
 def _inherits_from_object(img):
     return img.get("inherited_from") == _OBJECT
+
+
+def _adjudicated(img):
+    """True when the image discharges this `Bridge`'s §1.5 claim.
+
+    THE ONE definition, read as a predicate, of the arithmetic `adjudicate`
+    does as `rows - acc_native - inherited_acc_native`: an own `ACC_NATIVE`
+    declaration, or an inherited one that is not `java.lang.Object`'s.
+
+    It is stated once and used by the per-file view and the row dump, and
+    `selftest` asserts that `len(unadjudicated_rows(doc))` equals
+    `bridge.without_acc_native` on every census it builds. Two views of one
+    population that are allowed to drift are how a breakdown comes to name a
+    different set from the number above it.
+    """
+    if not img.get("image_has_class"):
+        return False
+    if img.get("declared"):
+        return bool(img.get("acc_native"))
+    return bool(img.get("inherited_acc_native")) and not _inherits_from_object(img)
+
+
+def _reg_file(row):
+    """The SOURCE FILE that made a registration, from `registered_by`.
+
+    `registered_by` carries `file:line`, and the line is the `register*` call
+    site rather than the enclosing `fn register_…`; recovering the function
+    needs per-crate source parsing. File granularity is enough to answer "which
+    subsystem moved", which is what a red ratchet actually asks — the same
+    choice, for the same reason, as `synthetic_by_file()` in
+    `native-builtins/tests/stub_ratchet.rs`.
+    """
+    at = row.get("registered_by") or "<unknown>"
+    at = str(at).replace("\\", "/")
+    head, sep, tail = at.rpartition(":")
+    return head if sep and tail.isdigit() else at
+
+
+def unadjudicated_rows(doc):
+    """Every `Bridge` row in the RATCHET population, as sortable tuples.
+
+    `(class, name, descriptor, file)`. Everything is coerced to `str`: a census
+    with a null `class` would otherwise make `sort()` raise, and a crash in the
+    row dump would take down a run whose gate result is fine.
+    """
+    out = []
+    for row in doc.get("natives") or []:
+        if row.get("kind") != "bridge":
+            continue
+        if _adjudicated(_img(row)):
+            continue
+        out.append((str(row.get("class")), str(row.get("name")),
+                    str(row.get("descriptor")), _reg_file(row)))
+    out.sort()
+    return out
+
+
+def unadjudicated_by_file(doc):
+    """`[(file, rows)]` over the ratchet population, biggest first."""
+    per = Counter(f for _, _, _, f in unadjudicated_rows(doc))
+    return sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))
 
 
 def adjudicate(doc):
@@ -409,6 +525,103 @@ def render_block(block):
     return "\n".join(lines)
 
 
+def render_by_file(doc, limit=12):
+    """The ratchet population, grouped by the file that registered it.
+
+    Printed on EVERY run, pass or fail. The bare counts above say *that* the
+    population moved; they never said *where*, and the difference is the whole
+    cost of acting on a red ratchet — `G83-1` recorded the sibling gate sitting
+    31 over its baseline with nobody able to name the 31 without writing a
+    one-off script first.
+    """
+    per_file = unadjudicated_by_file(doc)
+    total = sum(n for _, n in per_file)
+    lines = [
+        f"  Bridge rows with no ACC_NATIVE target, by registering file "
+        f"({len(per_file)} files, {total} rows):"
+    ]
+    for path, n in per_file[:limit]:
+        lines.append(f"    {n:>6}  {path}")
+    if len(per_file) > limit:
+        rest = sum(n for _, n in per_file[limit:])
+        lines.append(f"    {rest:>6}  ... and {len(per_file) - limit} more files")
+    lines.append(
+        "    (CRATONVM_RATCHET_ROWS=1 dumps this population by name; =all dumps "
+        "every registration with its kind)"
+    )
+    return "\n".join(lines)
+
+
+def dump_rows(doc, want):
+    """The `CRATONVM_RATCHET_ROWS` row dump — off unless the variable is set.
+
+    A scalar cannot be diffed. Two commits' dumps can: sort, `comm -23`, and the
+    added and removed rows are named rather than counted. `=1` is the ratchet
+    population; `=all` is every registration WITH ITS KIND, which is the view a
+    suspected relabel needs (a row that moved `SyntheticStub` -> `Bridge` is
+    absent from both `=1` dumps' difference in one direction only).
+
+    Deliberately not gate output: on the live registry `=1` is thousands of
+    lines.
+    """
+    if not want:
+        return
+    if want == "all":
+        rows = sorted(
+            (str(r.get("kind")), str(r.get("class")), str(r.get("name")),
+             str(r.get("descriptor")), _reg_file(r),
+             "own" if r.get("owns_slot", True) else "superseded")
+            for r in (doc.get("natives") or [])
+        )
+        for kind, cls, name, desc, path, slot in rows:
+            print(f"@@ROW\t{kind}\t{cls}\t{name}\t{desc}\t{path}\t{slot}")
+        print(f"@@ROWS {len(rows)} (every registration, with its kind)")
+        return
+    rows = unadjudicated_rows(doc)
+    for cls, name, desc, path in rows:
+        print(f"@@BRIDGEROW\t{cls}\t{name}\t{desc}\t{path}")
+    print(f"@@BRIDGEROWS {len(rows)} (Bridge rows with no ACC_NATIVE target)")
+
+
+def _classify_row_delta(d_rows, deltas):
+    """What the SECOND column says about a movement in the first.
+
+    Total and exhaustive on purpose: every combination of `d_rows` and the
+    per-kind deltas returns a sentence, because the one case a reader will hit
+    at the worst moment is the one nobody wrote a branch for.
+    """
+    moved = any(v for v in deltas.values())
+    if d_rows > 0:
+        return (
+            f"rows UP by {d_rows} -> registrations were ADDED. A rise in the "
+            "counts above is the regression this gate exists for: fix the "
+            "registration (register_with_kind -> SyntheticStub/Intrinsic, or "
+            "delete it so the real bytecode runs). Do NOT re-freeze without "
+            "naming which rows arrived — CRATONVM_RATCHET_ROWS=1."
+        )
+    if d_rows < 0:
+        return (
+            f"rows DOWN by {-d_rows} -> registrations were DELETED. A fall in "
+            "the counts above is a genuine removal, not a relabel, and is the "
+            "one case where re-freezing records work rather than absorbing it."
+        )
+    if moved:
+        return (
+            "rows UNCHANGED and kinds moved -> a RELABEL. Nothing was "
+            "registered or deleted; existing rows changed kind. A FALL in the "
+            "Bridge counts above is then the gate becoming more honest rather "
+            "than work being done — and the opposite direction, a "
+            "SyntheticStub that became a Bridge, is a fake admitted into "
+            "--jdk-only and is invisible to every count above it."
+        )
+    return (
+        "rows and kinds both unchanged -> any movement above came from the "
+        "IMAGE, not the registry: a different JDK build answers "
+        "image_declaring_method differently. Check --jdk-version against the "
+        "baseline's before treating it as a code change."
+    )
+
+
 def load_baseline(path):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -417,8 +630,20 @@ def load_baseline(path):
         return {"schema": BLOCK_SCHEMA, "slack": SLACK, "min_total_rows": MIN_TOTAL_ROWS, "jdk": {}}
 
 
-def baseline_key(jdk_feature, os_name):
-    return f"{jdk_feature}/{os_name}"
+def baseline_key(jdk_feature, os_name, mode="compatible"):
+    """`<feature>/<os>` for `compatible`, `<feature>/<os>/<mode>` otherwise.
+
+    The asymmetry is deliberate and is BACKWARD COMPATIBILITY, not taste: every
+    committed baseline was frozen in `compatible` under the two-part key, and
+    re-keying them would refuse every existing entry on the next run. What the
+    third part buys is that a second mode can now HAVE a baseline — see the
+    module docstring: before this, the two modes shared one slot, so a
+    `--jdk-only` census could only either be refused or silently overwrite the
+    compatible one.
+    """
+    if mode in (None, "", "compatible"):
+        return f"{jdk_feature}/{os_name}"
+    return f"{jdk_feature}/{os_name}/{mode}"
 
 
 def gate(block, baseline, jdk_feature, os_name):
@@ -428,7 +653,7 @@ def gate(block, baseline, jdk_feature, os_name):
     0: a gate that cannot answer must not report the answer it would like.
     """
     out = []
-    key = baseline_key(jdk_feature, os_name)
+    key = baseline_key(jdk_feature, os_name, block.get("mode"))
 
     if block["census_schema_version"] != REQUIRED_CENSUS_SCHEMA:
         return 2, [
@@ -461,6 +686,9 @@ def gate(block, baseline, jdk_feature, os_name):
             "another platform's numbers would answer a question nobody asked.",
             f"  Take one:  --census <file> --jdk-feature {jdk_feature} --os {os_name} "
             '--update-baseline --note "<why>"',
+            f"  (this census is mode {block.get('mode')!r}; the key carries the mode "
+            "for every mode but `compatible`, so the two cannot overwrite each "
+            "other's slot)",
         ]
     if entry.get("mode") != block["mode"]:
         return 2, [
@@ -524,6 +752,45 @@ def gate(block, baseline, jdk_feature, os_name):
             )
         else:
             out.append(f"ok  {human}: {observed} (baseline {frozen}, slack {slack})")
+
+    # THE SECOND COLUMN — recorded, never asserted.
+    #
+    # A ratchet on the total would fire on correct work: a new genuine `Bridge`
+    # over an `ACC_NATIVE` target raises the row count and is exactly what this
+    # gate is supposed to welcome. What the column IS for is classifying the
+    # deltas above, which a single number is structurally unable to do — see the
+    # module docstring's "two-column rule", and `G89-1` §3a, where it
+    # adjudicated a +226 as pure relabelling without anyone having to remember
+    # what the change did.
+    #
+    # Read out of the baseline's `observed` block, which `--update-baseline` has
+    # written since this file was created — so this needs no re-freeze to start
+    # working on the committed `25/linux` entry.
+    frozen_obs = entry.get("observed") or {}
+    frozen_total = frozen_obs.get("total_rows")
+    frozen_kinds = frozen_obs.get("registrations") or {}
+    kinds = block.get("registrations") or {}
+    out.append("")
+    if frozen_total is None:
+        out.append(
+            f"    registry rows: {block['total_rows']}   by kind {dict(kinds)}"
+        )
+        out.append(
+            "    the baseline for this key records no row column, so a movement "
+            "above cannot be classified as a relabel or as an addition. "
+            "Re-freeze to gain it."
+        )
+    else:
+        d_rows = block["total_rows"] - frozen_total
+        deltas = {
+            k: kinds.get(k, 0) - frozen_kinds.get(k, 0)
+            for k in ("bridge", "intrinsic", "synthetic-stub")
+        }
+        out.append(
+            f"    registry rows: {block['total_rows']} "
+            f"(baseline {frozen_total}, delta {d_rows:+d})   by kind {deltas}"
+        )
+        out.append(f"    {_classify_row_delta(d_rows, deltas)}")
 
     if not failed:
         out.append(
@@ -672,9 +939,34 @@ def selftest():
     check("a census from another OS is refused, not scored", 2,
           _synthetic_census(), os_name="windows")
 
+    # THE MODE HALF OF THE KEY (H3-1, 2026-08-20). Before it, `mode` lived only
+    # inside the entry and the key was `<feature>/<os>`, so the two modes shared
+    # one slot: `--update-baseline` on a strict census OVERWROTE the compatible
+    # baseline and every later compatible run refused. The strict registry —
+    # which ships, and which `bridge.shadows_bytecode_anywhere` (§1.4) and
+    # `superseded.stub_lost_to_admitted` ("admitted under --jdk-only") make
+    # claims about — could therefore not be given a baseline at all.
     strict = _synthetic_census()
     strict["mode"] = "jdk-only"
-    check("mode mismatch is refused", 2, strict)
+    check("a strict census with no strict baseline is refused", 2, strict)
+
+    strict_baseline = _selftest_baseline()
+    strict_baseline["jdk"]["25/linux/jdk-only"] = dict(
+        strict_baseline["jdk"]["25/linux"], mode="jdk-only")
+    check("a strict census scores against the STRICT baseline", 0, strict,
+          baseline=strict_baseline)
+
+    # …and the compatible entry is untouched by the strict one existing, which
+    # is the whole point of the third key part.
+    check("the compatible census still scores against the two-part key", 0,
+          _synthetic_census(), baseline=strict_baseline)
+
+    # The `entry["mode"]` guard still earns its place: an entry frozen from the
+    # wrong mode under the legacy two-part key is refused, not scored.
+    wrong_mode = _selftest_baseline()
+    wrong_mode["jdk"]["25/linux"]["mode"] = "jdk-only"
+    check("a baseline entry recording the wrong mode is refused", 2,
+          _synthetic_census(), baseline=wrong_mode)
 
     # 7. An improvement passes and says to re-freeze.
     better = _synthetic_census()
@@ -693,6 +985,71 @@ def selftest():
                 + b["class_present_method_undeclared"] + b["class_absent"])
     checks.append((identity, "the seven image buckets are disjoint and sum to the total",
                    True, identity, []))
+
+    # 8a. THE PER-FILE VIEW AND THE ROW DUMP NAME THE SAME POPULATION THE
+    #     NUMBER COUNTS. `_adjudicated` is a predicate and `without_acc_native`
+    #     is arithmetic; nothing but this makes them the same statement, and a
+    #     breakdown that names a different set from the number above it is worse
+    #     than no breakdown. Checked on the shapes that discriminate: an
+    #     inherited ACC_NATIVE (adjudicated), the same inherited through
+    #     java.lang.Object (NOT adjudicated), and an absent class.
+    same = True
+    for label, extra in (
+        ("clean", ()),
+        ("inherited-native", (_row("bridge", "p/INH", _INH_NATIVE),)),
+        ("object-inherited", (_row("bridge", "p/OBJINH",
+                                   _verdict(inherited_from="java/lang/Object",
+                                            inh_native=True)),)),
+        ("absent", (_row("bridge", "p/GONE2", _ABSENT),)),
+    ):
+        d = _synthetic_census(extra=extra)
+        n_rows = len(unadjudicated_rows(d))
+        n_count = adjudicate(d)["bridge"]["without_acc_native"]
+        n_file = sum(n for _, n in unadjudicated_by_file(d))
+        if not (n_rows == n_count == n_file):
+            same = False
+            checks.append((False,
+                           f"row view / per-file view / count agree ({label})",
+                           n_count, f"rows={n_rows} by_file={n_file}", []))
+    if same:
+        checks.append((True, "the row dump, the per-file view and the count are "
+                             "one population (4 shapes)", True, True, []))
+
+    # 8b. Both dumps run without raising on a census with null fields — a crash
+    #     in a diagnostic must not take down a run whose gate result is fine.
+    holey = _synthetic_census()
+    holey["natives"].append({"kind": "bridge", "image_declaring_method": _ABSENT})
+    dump_ok = True
+    try:
+        import io as _io
+        import contextlib as _ctx
+        for want in ("1", "all"):
+            with _ctx.redirect_stdout(_io.StringIO()):
+                dump_rows(holey, want)
+    except Exception as exc:  # pragma: no cover - that is what is being checked
+        dump_ok = False
+        checks.append((False, "the row dump survives a census with null fields",
+                       True, repr(exc), []))
+    if dump_ok:
+        checks.append((True, "the row dump survives a census with null fields",
+                       True, True, []))
+
+    # 8c. THE SECOND COLUMN classifies every combination, including the one
+    #     nobody writes a branch for. A missing case here would print an empty
+    #     line under a fired ratchet, at the exact moment somebody needs it.
+    classify_ok = all(
+        isinstance(_classify_row_delta(d, k), str) and _classify_row_delta(d, k)
+        for d, k in (
+            (0, {"bridge": 0, "intrinsic": 0, "synthetic-stub": 0}),
+            (0, {"bridge": -7, "intrinsic": 0, "synthetic-stub": 7}),
+            (-7, {"bridge": 0, "intrinsic": 0, "synthetic-stub": -7}),
+            (-7, {"bridge": 3, "intrinsic": 0, "synthetic-stub": -10}),
+            (12, {"bridge": 12, "intrinsic": 0, "synthetic-stub": 0}),
+        )
+    )
+    checks.append((classify_ok,
+                   "the row-delta classifier answers every combination",
+                   True, classify_ok, []))
 
     # 9. THE ITEM-1 REGRESSION, shown failing both ways round.
     #
@@ -835,6 +1192,12 @@ def main(argv=None):
     print(f"== bridge-ratchet: {args.census} ==")
     print(render_block(block))
     print()
+    # Both on EVERY run, pass or fail: the composition of a green population is
+    # the thing a scalar cannot show, and a failing run that does not name its
+    # rows costs whoever hits it the script `G83-1` had to go and write.
+    print(render_by_file(doc))
+    print()
+    dump_rows(doc, os.environ.get("CRATONVM_RATCHET_ROWS", ""))
 
     if args.jdk_feature is None:
         print("ERROR: --jdk-feature is required. The image adjudication is a statement "
@@ -860,7 +1223,7 @@ def main(argv=None):
         baseline.setdefault("schema", BLOCK_SCHEMA)
         baseline.setdefault("slack", SLACK)
         baseline.setdefault("min_total_rows", MIN_TOTAL_ROWS)
-        key = baseline_key(args.jdk_feature, args.os_name)
+        key = baseline_key(args.jdk_feature, args.os_name, block["mode"])
         entry = {
             "mode": block["mode"],
             "os": args.os_name,
