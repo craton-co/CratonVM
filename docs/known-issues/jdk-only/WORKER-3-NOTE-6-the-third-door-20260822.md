@@ -97,22 +97,50 @@ stands unchanged.
 
 ## 5. Verification
 
-| arm | result |
-|---|---|
-| `CRATONVM_ARGS=--jdk-only` | **107 / 107** |
-| `SUITE=all` | 106 / 107 — `RTreeRangeGc` |
-| `SUITE=core` | 66 / 67 — `RTreeRangeGc`, 3 runs |
-| **pristine `8104bfd2f`, `SUITE=core`** | **66 / 67 — `RTreeRangeGc`, 2 runs** |
+Verified twice: on the base this work was cut from (`8104bfd2f`) and again on
+the MERGED state (`e15560b32`), because the base branch moved 23 files under it
+mid-task. The second pass is the one that matters — it found a failure the first
+could not have seen.
 
-`RTreeRangeGc` is **not** this change. It is the open GC issue recorded in
-`bug-zgc-relocation-unmasks-root-collection-gap-rtreerangegc-20260821.md`, the
-failure text matches that record's signature (`cratonvm::gc::guard`), and a
-pristine rebuild of the same commit fails it identically. That doc calls it
-intermittent under the corpus; on this host today it is reliably red in
-`SUITE=core` and green under `--jdk-only`, which is worth a line in that record.
+**On `8104bfd2f`:** `--jdk-only` 107/107; `SUITE=all` 106/107; `SUITE=core`
+66/67 across 3 runs, the only failure being `RTreeRangeGc`.
 
-Census, `--jdk-only`, counted by TRIPLE: **1443 native-won**. Unchanged by this
-fix, as predicted — a `kind=intrinsic` row cannot be counted (`NOTE-5`).
+**On the merged `e15560b32`:** the probe still answers `8 8`, and
+
+| arm | mine | CONTROL — their tip, this fix reverted |
+|---|---|---|
+| `--jdk-only` run 1 | 106/107 `RJdkJmx` | 105/107 `RTreeRangeGc` `RJdkJmx` |
+| `--jdk-only` run 2 | 105/107 `RTreeRangeGc` `RJdkJmx` | 106/107 `RJdkJmx` |
+| `SUITE=all` | 106/107 `RTreeRangeGc` | — |
+| `SUITE=core` | 66/67 `RTreeRangeGc` | — |
+
+**Identical failure populations.** Neither failure is this change.
+
+* `RTreeRangeGc` — the open GC issue in
+  `bug-zgc-relocation-unmasks-root-collection-gap-rtreerangegc-20260821.md`;
+  matching `cratonvm::gc::guard` signature, and a **pristine rebuild of
+  `8104bfd2f` fails it identically** (2 runs). That record calls it intermittent
+  under the corpus; today it was reliably red in `SUITE=core` (5 runs across two
+  binaries) and intermittent under `--jdk-only`, which is worth a line there.
+* **`RJdkJmx` is a REGRESSION ON THE BASE BRANCH, not here.** It fails **2 of 2**
+  on `9a7104199` with this fix reverted, and does not appear in this lane's
+  pre-merge 107/107. Symptom:
+  `CK RJdkJmx objectName=cratonvm.test:name=alpha,type=Counter` — a cross-VM
+  diff on an `ObjectName` rendering. **Flagged for H0; it is not a `java.lang`
+  row and this lane is not taking it.**
+
+Census, `--jdk-only`, counted by TRIPLE: **1443 native-won**, unchanged by this
+fix as predicted — a `kind=intrinsic` row cannot be counted at all (`NOTE-5`).
+
+### A note on the control that nearly did not happen
+
+The first control build died `rc=143` (SIGTERM — this host runs ~470 sessions
+and broad `pkill`s land on other people's cargo). Because the build script only
+copies its binary on `rc=0`, the previous binary was still in place, and a
+`cp` of it produced a "control" that was **the fixed binary under another
+name**. Caught by checking the build log's `rc` and the binary's mtime rather
+than its existence. Any A/B on this host should assert both before believing a
+result.
 
 ## Index rows for `INDEX.md` (H0 to place)
 
@@ -127,3 +155,7 @@ fix, as predicted — a `kind=intrinsic` row cannot be counted (`NOTE-5`).
 * `WORKER-3-NOTE-6` §3 — FIXED: the third copy of the builder read was
   fabricating `""` for a `byte[]`-backed builder; the two siblings were fixed
   and this one, the live one, was missed
+
+* `WORKER-3-NOTE-6` §5 — `RJdkJmx` is a REGRESSION ON THE BASE BRANCH: it fails
+  2 of 2 on `9a7104199` with this lane's fix reverted, on an `ObjectName`
+  rendering diff. H0 to route it; it is not a `java.lang` row.
