@@ -1,5 +1,20 @@
 # H0-8 — the "third mechanism" was four order artifacts of one yield, and my own probe was the confound
 
+> **CORRECTION 2026-08-22 — the counting claim in this record is
+> withdrawn (`H17-2` N4).** The `table` array class is not a yield
+> counter. It reports **one bit per map** — whether that map's FIRST
+> insert ran bytecode — so it cannot distinguish "this method never
+> yielded" from "this method yielded later, after the native had already
+> allocated the table". Every observation here stands; every statement of
+> the FORM "the dial yields once per X" does not.
+>
+> The mechanism is now settled and it was never a yield budget: the dial
+> had one live call site of fourteen dispatch doors, so an armed class
+> yielded only on the dispatches that reached step 1 cold. Fixed
+> 2026-08-21 — all fourteen doors consult it, and an armed class now
+> yields on every covered dispatch that has bytecode to yield to. See
+> `WORKER-1-the-dial-now-reaches-every-door-20260821.md`.
+
 **Status: MEASURED.** Lane H0 (orchestrator), 2026-08-21, on
 `C:/craton/cratonvm-r8.exe` at `025780ff7`. Oracle HotSpot 25.0.3+9. No source
 change.

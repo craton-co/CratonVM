@@ -607,6 +607,82 @@ by **running** the instrument rather than reading it. A reviewer of the header
 diff would have signed it off.
 ---
 
+## 13. Two corrections against this record, both found by looking harder at its own claims
+
+### 13a. "All fourteen doors" was an enumeration, not a proof — and it was short by two
+
+This record says the dial reaches every dispatch door and that the census shows
+no leak. The census cannot show a leak it cannot see, and §11 already says so:
+*a door that never calls `note_dial_door` is invisible to it*. That was written
+as a caveat. It was live.
+
+MEASURED on `origin/dev` at `d702ecca5`, by grep rather than by counter:
+
+```text
+vm/src/runtime/interpreter/dispatch_virtual.rs   dial=0  census=0   forces natives
+vm/src/runtime/interpreter/jit_bridge.rs         dial=0  census=0   forces natives
+```
+
+Both call `force_native_over_real_jdk_bytecode` and neither has ever asked the
+dial. `dispatch_virtual.rs` additionally memoizes the decision into a per-entry
+`force_native_cache` `OnceLock` — the 2026-08-04 drift hazard, in the one place
+this lane did not look. **Lane WORKER 2 reached the same two files from the
+other end** (`089329af7`, handoff branch): an armed `ConcurrentHashMap` taking
+six `put`s of distinct keys and reporting `size=1`, calling five dropped stores
+fresh inserts.
+
+The armed report for that same shape on `dev` reads `reached=734 yielded=734
+declined_no_bytecode=0` across five doors — **perfectly clean, and blind**.
+
+**The fix this lane owes is not another door, it is the gate that finds doors.**
+`every_force_native_file_asks_the_dial_or_is_exempt` (in `native_override.rs`)
+scans every file under `vm/src` that calls the force helper and requires it to
+either consult the dial or carry a written exemption. Counting cannot find a
+missing counter; only a source scan can. The two files above are its initial
+exemption rows, each with the reason and, for `dispatch_virtual.rs`, the commit
+that retires the row. The list is asserted non-rotting: a row naming a file that
+no longer forces anything fails the test, because a stale exemption reads as
+coverage.
+
+### 13b. `RTreeRangeGc` is not "a flake", and I called it one on one observation
+
+§9 recorded it as *"a flake, and the proof is same-binary"* — the fixed binary
+passed it in a `--jdk-only` arm and failed it in a `SUITE=all` arm nine minutes
+later. The observation is real. The inference was wrong, and 18 single-vector
+runs say why:
+
+```text
+--jdk-only            9 pass / 3 fail      a ~25% FLAKE
+compatible (default)  0 pass / 6 fail      DETERMINISTIC
+```
+
+**The two arms run different modes.** What looked like one vector flipping was a
+flake and a deterministic compatible-mode defect, with the arm boundary sitting
+exactly between them. **A single same-binary flip is not evidence of flakiness
+when the two observations differ in a mode flag** — and every "flake" attribution
+in this record that rests on that one flip should be read against `WORKER-1-NOTE-1`.
+
+What survives: the unarmed comparisons in §9 and §10 are unaffected, because
+control and fix were compared *within* the same arm each time, and the vector
+behaves the same way for both binaries.
+
+### 13c. The `25-linux` blast-radius baseline is deliberately still not taken
+
+The weekly job has been measuring a table and scoring nothing since it was
+added, and the obvious close is to take the baseline it asks for. **Not yet, and
+for a measured reason.** The sweep arms each prefix with `--jdk-only`, which is
+the 25%-flake half; the baseline is keyed on the failing SET; so control and arm
+would disagree about `RTreeRangeGc` roughly three runs in eight by chance alone,
+and the job would report `REGRESSION`/`REPAIRED` on a vector nobody touched.
+
+The workflow's own header cites `G89-1` — a ratchet red in blocking CI for five
+days that "adjudicated nothing" — as its reason for being non-blocking. A gate
+that cries wolf three weeks in eight fails identically. **A flaky vector must be
+quarantined before a baseline exists, never after**, and the harness has no
+quarantine mechanism today (`harness-uncounted.txt` is about check counts). That
+is `WORKER-1-NOTE-1` N1 and it belongs to whoever owns `regression-suite/`.
+---
+
 ## NOMINATIONS
 
 * **N1 — the native-won recorder has the same one-door defect the dial had.**
