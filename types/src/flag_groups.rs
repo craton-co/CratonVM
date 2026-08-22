@@ -695,6 +695,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "sc-write", on_key: Some("CRATONVM_DBG_SC_WRITE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "scalar-deopt", on_key: Some("CRATONVM_DBG_SCALAR_DEOPT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "scalar-new", on_key: Some("CRATONVM_DBG_SCALAR_NEW"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "scanner-debug", on_key: Some("CRATONVM_SCANNER_DEBUG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "seed-all-old", on_key: Some("CRATONVM_DBG_SEED_ALL_OLD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "seedhunt", on_key: Some("CRATONVM_DBG_SEEDHUNT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sel", on_key: Some("CRATONVM_DBG_SEL"), off_key: None, off_word: None },

@@ -93,6 +93,16 @@ a gate that reads 100%. That gap is the project.
    `unclassified:`, with `no output` when the VM printed nothing. A launch or
    config failure no longer renders identically to an assertion failure. The fix
    diagnosed this very bug the first time it ran.
+> **CORRECTION 2026-08-22 — the one-call-site premise below is FIXED.**
+> `jdk_only_enforce_shadow_for` now has a call site at every one of the
+> fourteen dispatch doors, and the leak that premise describes is gone
+> (MEASURED before the fix: 890 of 947 armed `Bridge` dispatches never
+> asked the dial). **The direction stated here is also wrong**: armed
+> cells taken with the one-door dial were not a floor — `java/util/HashMap`
+> scored 81/104 half-armed and 86/104 fully armed, because half-armed is a
+> corrupt hybrid, not a partial retirement. See
+> `WORKER-1-the-dial-now-reaches-every-door-20260821.md`.
+
 2. **The enforcement dial reaches ONE dispatch door.**
    `jdk_only_enforce_shadow_for` has exactly one live call site, inside
    `resolve_step1_native`. Arming a class arms only its **cold, step-1**
