@@ -10514,6 +10514,10 @@ impl Compiler {
                                         },
                                         self.helpers.service_callee_deopt,
                                         info as usize,
+                                        // This backend stages its outgoing
+                                        // arguments into one descending block,
+                                        // so element 0 already names it.
+                                        arg_offsets[0],
                                     ),
                                 );
                             }
