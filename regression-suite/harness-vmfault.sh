@@ -214,7 +214,7 @@ if [ "${1:-}" = "--selftest" ]; then
   _pos "bad --java-home" 1 \
 "[cratonvm] main-vm run() returned Err: --java-home path does not exist or is not a directory: /c/Program Files/Microsoft/jdk-25.0.3.9-hotspot
 Provide a valid JDK installation (must contain \`jmods/\` or \`lib/modules\`).
-[cratonvm] jdk mode: <not yet resolved — failure occurred during argument parsing>" \
+[cratonvm] jdk mode: <not yet resolved — the failure occurred before the class library was selected>" \
     "REJECTED THE JDK IMAGE"
 
   _pos "unknown flag" 2 \
@@ -239,7 +239,7 @@ For more information, try '--help'." \
   # The non-image startup failure: same banner, no image complaint.
   _pos "startup failure that is not the image" 1 \
 "[cratonvm] main-vm run() returned Err: could not open the class path entry /nope
-[cratonvm] jdk mode: <not yet resolved — failure occurred during argument parsing>" \
+[cratonvm] jdk mode: <not yet resolved — the failure occurred before the class library was selected>" \
     "BEFORE RESOLVING ITS JDK MODE"
 
   _pos "timeout"    124 "" "TIMED OUT"
@@ -313,7 +313,7 @@ Usage: cratonvm" \
   # is the right time to notice the two paths have merged.
   _sig=$(printf '%s\n' \
 "[cratonvm] main-vm run() returned Err: --java-home path does not exist or is not a directory: /c/x
-[cratonvm] jdk mode: <not yet resolved — failure occurred during argument parsing>" \
+[cratonvm] jdk mode: <not yet resolved — the failure occurred before the class library was selected>" \
     | grep -aiE 'AssertionError|NoSuchMethod|linkage error|panic|SEGV|fatal' | grep -avE '^\s*at ')
   if [ -z "$_sig" ]; then
     _ok "run.sh's existing sig grep is still blind to the trap-1 output (the premise)"

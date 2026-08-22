@@ -574,6 +574,47 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
     })
 }
 
+/// Per-disjunct breakdown of why [`moving_young_osr_method_needs_fallback`]
+/// returned true, so the single `osr-shadow-coverage-unproven` reason code the
+/// collector sees can be split apart without a debugger. Filed 2026-08-21:
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s own
+/// measurement found this reason blocking 234/263 collections and could not
+/// say which of the (then three) disjuncts was responsible, only that "H2's
+/// MVStore loops are OSR-compiled constantly." Attribution is by the same
+/// short-circuit priority the boolean uses, so exactly one counter increments
+/// per call that returns true: a frame with a genuinely broken shadow layout
+/// is not ALSO double-counted under the map-coverage bucket just because it
+/// would have failed that check too.
+pub mod osr_fallback_reason {
+    use std::sync::atomic::AtomicUsize;
+
+    /// `!shadow_layout_ok` — the shadow-stack prologue slots were never
+    /// allocated for this compilation at all. A codegen gap: this method was
+    /// compiled by a path that does not emit shadow-stack bookkeeping.
+    pub static BAD_SHADOW_LAYOUT: AtomicUsize = AtomicUsize::new(0);
+    /// `debug_shadow_disabled` — `CRATONVM_SHADOW_NOPUSH` / `_NORELOAD` forced
+    /// it. Not a production path; present so a debug run does not silently
+    /// fall through to a different bucket and misattribute.
+    pub static DEBUG_DISABLED: AtomicUsize = AtomicUsize::new(0);
+    /// Shadow layout is fine, precise maps exist, but this safepoint's map is
+    /// not `fully_oop_covered`.
+    pub static BAD_MAP_COVERAGE: AtomicUsize = AtomicUsize::new(0);
+    /// Shadow layout is fine, the map is fully covered, but the chain entry
+    /// carries no exact RBP for this frame — the map cannot be located
+    /// without one, even though it would answer the question if it could.
+    pub static MISSING_EXACT_RBP: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn snapshot() -> (usize, usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            BAD_SHADOW_LAYOUT.load(Relaxed),
+            DEBUG_DISABLED.load(Relaxed),
+            BAD_MAP_COVERAGE.load(Relaxed),
+            MISSING_EXACT_RBP.load(Relaxed),
+        )
+    }
+}
+
 fn moving_young_osr_method_needs_fallback(
     cm: &cratonvm_jit::CompiledMethod,
     exact_rbp: usize,
@@ -586,7 +627,24 @@ fn moving_young_osr_method_needs_fallback(
         && cm.shadow_savetop_slot_off != 0
         && cm.shadow_off_in_thread != 0;
     let precise_map_ok = !cm.has_precise_oop_maps() || (cm.fully_oop_covered && exact_rbp != 0);
-    !shadow_layout_ok || debug_shadow_disabled || !precise_map_ok
+    use std::sync::atomic::Ordering::Relaxed;
+    if !shadow_layout_ok {
+        osr_fallback_reason::BAD_SHADOW_LAYOUT.fetch_add(1, Relaxed);
+        return true;
+    }
+    if debug_shadow_disabled {
+        osr_fallback_reason::DEBUG_DISABLED.fetch_add(1, Relaxed);
+        return true;
+    }
+    if !precise_map_ok {
+        if cm.has_precise_oop_maps() && !cm.fully_oop_covered {
+            osr_fallback_reason::BAD_MAP_COVERAGE.fetch_add(1, Relaxed);
+        } else {
+            osr_fallback_reason::MISSING_EXACT_RBP.fetch_add(1, Relaxed);
+        }
+        return true;
+    }
+    false
 }
 
 /// spring-bug-10 experiment (`CRATONVM_SHADOW_PIN`): when set, the shadow-stack
@@ -2622,6 +2680,37 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     if !moving_young_enabled() || band_verify_disabled() {
         return false;
     }
+    // The band scan's residency test asks "could a moving cycle relocate the
+    // object at this address?", and until 2026-08-21 it asked that as
+    // `gen_heap::addr_in_published_young_regions`, which reads
+    // `JIT_REGION_BOUNDS`. That table has one writer and it is
+    // generational-only — G1 deliberately keeps it empty, ZGC never filled it.
+    // Where it is empty the test answers `false` for EVERY address, so the scan
+    // below inspects every verifiable slot, classifies none of them as young,
+    // and returns "nothing unpublished" without having verified anything.
+    //
+    // That vacuous pass is not a theoretical hazard: it is how `PolynomialTest`
+    // got `incomplete=false` under `-XX:+UseG1GC`, which let `roots.rs`
+    // suppress the conservative scan, which left G1's pin set empty, which let
+    // the pause evacuate a region a live compiled frame still referenced.
+    //
+    // It now asks `gen_heap::addr_is_movable`, the union of that young table
+    // with `MOVABLE_BOUNDS` — a third table a collector fills to say what its
+    // relocating phase may move, precisely because filling `JIT_REGION_BOUNDS`
+    // to fix this verifier would silently re-enable an inline reference STORE
+    // fast path G1 and ZGC must not have. ZGC publishes its arena envelope
+    // there; generational still answers through the young table, so its
+    // behaviour is unchanged.
+    //
+    // Fail closed, exactly as the module block above says this verifier does
+    // for an unbounded band or an unresolvable shadow window: an uninspectable
+    // frame reports "not verified", never "verified clean". The gate is on the
+    // UNION being live, so a collector that publishes neither table still gets
+    // the refusal it had before rather than a quiet pass.
+    if bounds_guard_enabled() && !cratonvm_gc::gen_heap::movable_bounds_are_live() {
+        *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::YOUNG_BOUNDS_UNPUBLISHED;
+        return true;
+    }
     let scanner_sp = current_stack_pointer();
     let mut unverified = false;
     let mut unpublished = false;
@@ -2755,7 +2844,7 @@ fn report_unpublished_band_words(
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
         if band_slot_is_verifiable(off, &cm.frame_layout, live_hi)
-            && cratonvm_gc::gen_heap::addr_in_published_young_regions(w)
+            && cratonvm_gc::gen_heap::addr_is_movable(w)
             && !published.contains(&w)
         {
             hits += 1;
@@ -2777,6 +2866,19 @@ fn report_unpublished_band_words(
 /// word. A MEASUREMENT INSTRUMENT: it is how "does the codegen model actually
 /// cover this workload?" is asked, and it is unsafe to run with if the answer
 /// is no. Not a supported configuration.
+/// `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD=1` — let the frame-band verifier run
+/// against an unpublished young-bounds table, i.e. let it pass vacuously.
+///
+/// The pre-fix behaviour, kept as an A/B arm. Unsafe on any collector that does
+/// not publish `JIT_REGION_BOUNDS`, which is every collector except the
+/// generational one.
+fn bounds_guard_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD").is_none()
+    })
+}
+
 fn band_verify_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY").is_some())
@@ -2822,7 +2924,7 @@ fn band_has_unpublished_young_word(
         &cm.frame_layout,
         live_hi,
         published,
-        cratonvm_gc::gen_heap::addr_in_published_young_regions,
+        cratonvm_gc::gen_heap::addr_is_movable,
     )
 }
 
@@ -4401,6 +4503,127 @@ fn coverage_pin_enabled() -> bool {
     *E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_PRECISE_COVERAGE_PIN").is_some())
 }
 
+/// Set once the completeness oracle has REFUTED some frame's
+/// `fully_oop_covered` claim: an in-band live object address named by no map of
+/// a frame that asserted full coverage.
+///
+/// Latched for the life of the process, not per-cycle, and the reason is not
+/// caution — it is that the refutation is a statement about COMPILED CODE, not
+/// about a moment. The method that produced the unnamed slot is still in the
+/// code cache and will run again; a later cycle that happens not to re-observe
+/// it has learned nothing new. Clearing this per cycle would make the gate a
+/// coin toss on whether the offending frame was on the stack when the oracle
+/// last looked.
+///
+/// Production-global / `cfg(test)`-thread-local, the same split
+/// `gc_quiescence` uses for its own cycle flags and for the same reason: the
+/// latch is one-way by design, so a test that sets it in a shared process
+/// would permanently change what every later test in that process observes.
+#[cfg(not(test))]
+static COVERAGE_ORACLE_REFUTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static COVERAGE_ORACLE_REFUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(not(test))]
+fn coverage_oracle_refuted_get() -> bool {
+    COVERAGE_ORACLE_REFUTED.load(Ordering::Acquire)
+}
+
+#[cfg(not(test))]
+fn coverage_oracle_refuted_swap() -> bool {
+    COVERAGE_ORACLE_REFUTED.swap(true, Ordering::AcqRel)
+}
+
+#[cfg(test)]
+fn coverage_oracle_refuted_get() -> bool {
+    COVERAGE_ORACLE_REFUTED.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn coverage_oracle_refuted_swap() -> bool {
+    COVERAGE_ORACLE_REFUTED.with(|c| c.replace(true))
+}
+
+/// Clear the latch. Test-only; the production latch is deliberately one-way.
+#[cfg(test)]
+pub fn reset_coverage_oracle_refuted_for_test() {
+    COVERAGE_ORACLE_REFUTED.with(|c| c.set(false));
+}
+
+/// Whether the completeness oracle has ever refuted a coverage claim in this
+/// process. Read by the root scan before it spends the bit.
+pub fn coverage_oracle_refuted() -> bool {
+    coverage_oracle_refuted_get()
+}
+
+/// Record a refutation and mark THIS cycle incomplete, so the collector that is
+/// mid-decision diverts as well as every later one.
+fn note_coverage_oracle_refutation() {
+    let first = !coverage_oracle_refuted_swap();
+    cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+        cratonvm_gc::gc_quiescence::incomplete_reason::COVERAGE_ORACLE_REFUTED,
+    );
+    if first {
+        eprintln!(
+            "[VERIFY-OOP-MAPS] REFUTED: a frame asserting fully_oop_covered holds an \
+             in-band oop no map names. Conservative JIT backstop is now forced ON for \
+             the rest of this process."
+        );
+    }
+}
+
+/// Run the completeness oracle over this thread's live compiled frames and
+/// report whether it refutes any frame's coverage claim.
+///
+/// This exists because of a structural hole, not a missing feature. The oracle
+/// runs inside `scan_one_frame_precise`, which runs inside
+/// `scan_active_jit_frames` — and `collect_roots` calls that only when it has
+/// DECIDED NOT to suppress. So on every cycle where the coverage bit is
+/// actually spent, the instrument designated to check it is not running. Every
+/// `while_covered=0` reading ever taken was taken on cycles that did not use
+/// the bit.
+///
+/// `roots` is scanned into and then truncated back by the caller when the proof
+/// holds: the walk cannot be done without producing roots, and producing them
+/// is how we know the walk really covered the same frames the backstop would.
+pub fn verify_active_coverage_into(heap: &VmHeap, roots: &mut Vec<ObjectRef>) -> bool {
+    let before = oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed);
+    scan_active_jit_frames(heap, roots);
+    if oracle_force_refute() {
+        note_coverage_oracle_refutation();
+        return true;
+    }
+    oop_map_audit::NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed) > before
+}
+
+/// Whether the pre-suppression verification should run: only when the oracle is
+/// enabled (it is the thing doing the verifying) or when the forced-refutation
+/// switch is on. Default-off, so the default path pays one cached bool.
+pub fn coverage_gate_active() -> bool {
+    verify_oop_maps_enabled() || oracle_force_refute()
+}
+
+/// `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE=1` — treat the first covered frame the
+/// oracle inspects as refuted, without a real unmapped oop.
+///
+/// The gate below is only reachable when a compiled method actually strands an
+/// oop, which is exactly the thing every fix on this page has been closing —
+/// `while_covered` is 0 on every workload measured. A gate whose wiring has
+/// never been executed is indistinguishable from a gate that does not work, so
+/// this forces the branch instead of waiting for a defect to supply it.
+/// Test-only; it makes the VM refuse a suppression it could legitimately take.
+fn oracle_force_refute() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE").is_some()
+    })
+}
+
 /// Count of precise frames observed NOT `fully_oop_covered` during GC scans
 /// while `CRATONVM_PRECISE_COVERAGE_PIN` is on. Diagnostic only.
 static UNCOVERED_PRECISE_FRAMES: AtomicUsize = AtomicUsize::new(0);
@@ -4425,56 +4648,329 @@ pub fn uncovered_precise_frame_count() -> usize {
 /// maps and therefore show here as "unmapped" — expected, not a gap. The signal
 /// is sharpest for leaf-ish compiled frames (the register/spill-resident root
 /// class, e.g. the bintrees-`main`-reads-`args` and `codePointAt` families).
+/// Counters for [`verify_precise_covers_conservative`], reported at exit.
+pub mod oop_map_audit {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Frames whose band was walked and whose maps were readable.
+    pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// Verifiable in-band words examined.
+    pub static WORDS: AtomicU64 = AtomicU64::new(0);
+    /// In-band object addresses named by NO oop map of the owning frame.
+    /// **This is the number that says whether the codegen's coverage bit is
+    /// sound**: a live reference in a slot the frame's maps never mention.
+    pub static NEVER_MAPPED: AtomicU64 = AtomicU64::new(0);
+    /// In-band object addresses named by SOME map of the owning frame but not
+    /// by the one its safepoint id selects. Not a codegen coverage gap — a
+    /// map-selection gap, which strands the oop just as effectively.
+    pub static WRONG_MAP: AtomicU64 = AtomicU64::new(0);
+    /// Object addresses BELOW the innermost compiled frame — interpreter,
+    /// native and Rust frames the compiled method called into. Not the oop
+    /// map's responsibility; counted so it can be subtracted rather than
+    /// mistaken for a gap, which is what the previous oracle did.
+    pub static BELOW_JIT: AtomicU64 = AtomicU64::new(0);
+    /// Frames whose safepoint id or maps could not be read, so their band was
+    /// scanned against an EMPTY active set and their words are not counted.
+    pub static UNREADABLE_FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// `never_mapped` hits on a frame whose `fully_oop_covered` is `true` —
+    /// i.e. the codegen bit asserting complete coverage was wrong.
+    pub static NEVER_MAPPED_WHILE_COVERED: AtomicU64 = AtomicU64::new(0);
+
+    /// Distinct `(method entry_ptr, slot offset)` pairs reported as
+    /// never-mapped, with the storage class of the slot.
+    ///
+    /// The raw counter double-counts in two ways, both of which made the first
+    /// run unreadable: the audit runs once per CHAIN ENTRY and every entry
+    /// re-walks the same parent frames, and a workload takes many collections
+    /// at the same stack shape. What the question needs is "which METHOD has
+    /// which unmapped SLOT", which is what this records.
+    pub static SITES: std::sync::Mutex<
+        Option<std::collections::BTreeMap<(usize, i32), &'static str>>,
+    > = std::sync::Mutex::new(None);
+
+    pub fn note_site(entry_ptr: usize, off: i32, class: &'static str) {
+        if let Ok(mut g) = SITES.lock() {
+            g.get_or_insert_with(Default::default).insert((entry_ptr, off), class);
+        }
+    }
+
+    pub fn dump() {
+        if FRAMES.load(Ordering::Relaxed) == 0 && WORDS.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        if let Ok(g) = SITES.lock() {
+            if let Some(map) = g.as_ref() {
+                let mut by_class: std::collections::BTreeMap<&'static str, usize> =
+                    Default::default();
+                for class in map.values() {
+                    *by_class.entry(class).or_default() += 1;
+                }
+                eprintln!(
+                    "[cratonvm] oop-map audit: DISTINCT never-mapped sites={} by_class={:?}",
+                    map.len(),
+                    by_class
+                );
+                for ((ptr, off), class) in map.iter().take(24) {
+                    eprintln!("[cratonvm] oop-map audit:   code={ptr:#x} rbp-{off:#x} {class}");
+                }
+            }
+        }
+        eprintln!(
+            "[cratonvm] oop-map audit: frames={} unreadable_frames={} words={} \
+             never_mapped={} (while_covered={}) wrong_map={} below_jit={}",
+            FRAMES.load(Ordering::Relaxed),
+            UNREADABLE_FRAMES.load(Ordering::Relaxed),
+            WORDS.load(Ordering::Relaxed),
+            NEVER_MAPPED.load(Ordering::Relaxed),
+            NEVER_MAPPED_WHILE_COVERED.load(Ordering::Relaxed),
+            WRONG_MAP.load(Ordering::Relaxed),
+            BELOW_JIT.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// Which storage class of the compiled frame the slot at `[rbp - off]` is in.
+///
+/// This is what turns a never-mapped hit from a number into a verdict. The
+/// abstract model behind `moving_young_coverage_complete` describes Java locals
+/// and the operand stack; the module block on
+/// `refresh_moving_young_coverage_for_current_thread` names the three storage
+/// classes it does NOT describe — scalar-replacement field slots, LICM hoist
+/// slots, and the full-GPR safepoint spill area. A hit in one of those is the
+/// PREDICTED defect. A hit in a Java local is either a genuine miss of what the
+/// model does claim, or this oracle's known false positive (a primitive whose
+/// bits land on a live object header).
+fn classify_frame_slot(off: i32, layout: &cratonvm_jit::FrameLayout) -> &'static str {
+    let within = |lo: i32, hi: i32| hi > lo && off >= lo && off < hi;
+    if within(layout.scalar_lo, layout.scalar_hi) {
+        "scalar-replacement-field"
+    } else if within(layout.ref_hoist_lo, layout.ref_hoist_hi) {
+        "licm-ref-hoist"
+    } else if within(layout.arith_lo, layout.arith_hi) {
+        "licm-arith-hoist"
+    } else if within(layout.reg_spill_lo, layout.reg_spill_hi) {
+        "gpr-safepoint-spill"
+    } else if layout.java_locals_hi > 0 && off <= layout.java_locals_hi {
+        "java-local"
+    } else if within(layout.spill_lo, layout.spill_hi) {
+        "operand-spill"
+    } else if layout.locals_hi > 0 && off <= layout.locals_hi {
+        "reserved-locals-tail"
+    } else {
+        "other"
+    }
+}
+
+/// The oop-map slot offsets the ACTIVE safepoint selects for the frame at
+/// `rbp` — the exact set `scan_active_oop_map_at_rbp` would publish.
+///
+/// `None` means the id or its map could not be read, which is a different
+/// finding from "the map is empty" and is counted separately.
+fn active_map_slots(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<Vec<i16>> {
+    let sp_id_slot_off = cm.sp_id_slot_off;
+    if sp_id_slot_off <= 0 || rbp < sp_id_slot_off as usize {
+        return None;
+    }
+    let id_addr = rbp - sp_id_slot_off as usize;
+    if id_addr & 0x7 != 0 {
+        return None;
+    }
+    // SAFETY: the safepoint id lives in the validated frame's reserved local
+    // slot, exactly as `scan_active_oop_map_at_rbp` reads it.
+    let safepoint_id = unsafe { (id_addr as *const usize).read() } as u32;
+    let map = cm.find_oop_map_for_safepoint_id(safepoint_id)?;
+    Some(map.frame_slot_offsets.clone())
+}
+
+/// `CRATONVM_DBG_VERIFY_OOP_MAPS` — does the precise oop map actually cover
+/// every live reference in the compiled frames it claims?
+///
+/// # What the previous version measured, and why it was an upper bound
+///
+/// It built its `mapped` set from ONE method's maps at ONE frame base
+/// (`info.exact_rbp`) and then scanned the WHOLE band `[scanner_sp,
+/// frame_base)`. That band spans every compiled frame in the chain plus the
+/// interpreter, native and Rust frames the compiled code called into, so:
+///
+///   * a nested JIT callee's slots, correctly named by the CALLEE's own map at
+///     the CALLEE's own rbp, counted as unmapped;
+///   * every interpreter/native word counted as unmapped, though no oop map has
+///     ever claimed to describe those — they are published by their own root
+///     mechanisms;
+///   * register images and dead spill slots counted as unmapped, which the band
+///     verifier next door already documents as a false verdict "on every
+///     collection".
+///
+/// It reported 64 hits on the `PolynomialTest` failure and its own header
+/// admitted the ambiguity ("NB band may include nested-JIT-callee slots"), so
+/// the number could not be used to say whether the codegen bit was sound.
+///
+/// # What this measures
+///
+/// The RBP chain is walked exactly as `scan_compiled_frame_bands` walks it, and
+/// each frame is checked against ITS OWN method's maps at ITS OWN rbp, over its
+/// own band only, skipping the slots `band_slot_is_verifiable` excludes. Every
+/// in-band object address is then classified:
+///
+///   * `never_mapped` — named by no map of the owning frame. A live reference
+///     the collector would neither publish nor rewrite. This is the number that
+///     answers whether the coverage bit is sound, and `never_mapped_while_covered`
+///     is the subset where the frame's `fully_oop_covered` asserted otherwise.
+///   * `wrong_map` — named by some map of the frame but not the one its
+///     safepoint id selects. Not a codegen coverage gap; a selection gap.
+///   * `below_jit` — below the innermost frame. The interpreter/native region,
+///     reported so it can be subtracted rather than counted as a gap.
+///
+/// Still conservative in ONE direction, deliberately: a primitive `i64` whose
+/// bits land on a live object header is counted. So a non-zero `never_mapped`
+/// is a lead, and a ZERO is the strong result — it says no verifiable in-band
+/// word went unnamed.
 fn verify_precise_covers_conservative(
     info: PreciseFrameInfo,
     cm: &cratonvm_jit::CompiledMethod,
     heap: &VmHeap,
 ) {
-    // Oop-map offsets are emitted relative to the compiled frame's RBP, not
-    // the Rust caller's approximate stack pointer captured by the guard.  OSR
-    // used to be the sole consumer of `exact_rbp`; ordinary compiled entries
-    // need the identical addressing contract for precise marking and moving-GC
-    // root registration.
-    let slot_base = if info.exact_rbp != 0 {
-        info.exact_rbp
-    } else {
-        info.frame_base
-    };
-    let mut mapped: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for map in &cm.oop_maps {
-        for &off in &map.frame_slot_offsets {
-            mapped.insert((slot_base as isize + off as isize) as usize);
-        }
-    }
+    use oop_map_audit as audit;
+    use std::sync::atomic::Ordering as AOrd;
+
     let scanner_sp = current_stack_pointer();
-    let lo = scanner_sp.min(info.frame_base);
-    let hi = scanner_sp.max(info.frame_base);
-    let mut addr = (lo + 7) & !7usize; // align up to 8
-    while addr + 8 <= hi {
-        // SAFETY: `[scanner_sp, frame_base)` is the calling thread's own live
-        // stack band — the same region `scan_one_frame` reads — and `addr` is
-        // 8-byte aligned and bounded by `hi`.
-        let qword = unsafe { (addr as *const usize).read() };
-        if heap.is_object_address(qword).is_some() && !mapped.contains(&addr) {
-            if STEP3_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEP3_LOG_CAP {
-                let delta = (addr as isize) - (info.frame_base as isize);
-                eprintln!(
-                    "[VERIFY-OOP-MAPS] unmapped in-band oop: code@{:p} frame_base={:#x} slot_base={:#x} \
-                     slot=[rbp{}{:#x}] addr={:#x} val={:#x} maps={} covered={} \
-                     (NB band may include nested-JIT-callee slots)",
-                    info.entry_ptr,
-                    info.frame_base,
-                    slot_base,
-                    if delta >= 0 { "+" } else { "-" },
-                    delta.unsigned_abs(),
-                    addr,
-                    qword,
-                    cm.oop_maps.len(),
-                    cm.fully_oop_covered,
-                );
-            }
+    let entry_sp = info.frame_base;
+    let mut rbp = info.exact_rbp;
+    if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
+        audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+        return;
+    }
+    let Some(innermost) =
+        innermost_frame_method(rbp, info.exact_cm_id, entry_sp, scanner_sp, info.compiled_method)
+    else {
+        // Nothing describes the frame at `exact_rbp`; every offset would be
+        // read against the wrong method. Same fail-closed stance as the band
+        // verifier.
+        audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+        return;
+    };
+    // SAFETY: as in `scan_compiled_frame_bands` — a chain entry's method is
+    // Arc-owned while any of its frames is live, and a resolved callee is kept
+    // alive by the live frame whose return address resolved it.
+    let mut frame_cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost };
+    let _ = cm;
+
+    let mut lowest_band_lo = usize::MAX;
+    let mut frames = 0usize;
+    while frames < 4096 {
+        frames += 1;
+        let frame_size = frame_cm.osr_frame_size;
+        if frame_size <= 0 {
+            audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+            break;
         }
-        addr += 8;
+        let frame_size = frame_size as usize;
+        const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+        if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+            audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+            break;
+        }
+        let band_lo = rbp - frame_size;
+        lowest_band_lo = lowest_band_lo.min(band_lo);
+
+        let active: std::collections::HashSet<i16> = match active_map_slots(rbp, frame_cm) {
+            Some(v) => v.into_iter().collect(),
+            None => {
+                audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+                std::collections::HashSet::new()
+            }
+        };
+        let any: std::collections::HashSet<i16> = frame_cm
+            .oop_maps
+            .iter()
+            .flat_map(|m| m.frame_slot_offsets.iter().copied())
+            .collect();
+
+        audit::FRAMES.fetch_add(1, AOrd::Relaxed);
+        let live_hi = moving_young_frame_live_hi(rbp, frame_cm);
+        let mut off = 8i32;
+        while (off as usize) <= frame_size {
+            if !band_slot_is_verifiable(off, &frame_cm.frame_layout, live_hi) {
+                off += 8;
+                continue;
+            }
+            let addr = rbp - off as usize;
+            if addr & 0x7 == 0 {
+                audit::WORDS.fetch_add(1, AOrd::Relaxed);
+                // SAFETY: `addr` is an 8-aligned address inside this thread's
+                // own live compiled frame band, the same region
+                // `scan_one_frame` reads.
+                let qword = unsafe { (addr as *const usize).read() };
+                if heap.is_object_address(qword).is_some() {
+                    let off16 = i16::try_from(off).unwrap_or(i16::MAX);
+                    if active.contains(&off16) {
+                        // covered by the map the collector will actually scan
+                    } else if any.contains(&off16) {
+                        audit::WRONG_MAP.fetch_add(1, AOrd::Relaxed);
+                    } else {
+                        audit::NEVER_MAPPED.fetch_add(1, AOrd::Relaxed);
+                        let class = classify_frame_slot(off, &frame_cm.frame_layout);
+                        // Only a frame that ASSERTS full coverage is evidence about
+                        // the codegen bit. A map-less frame (`maps=0 covered=false`)
+                        // is already reported by the NO_PRECISE_MAP obligation and
+                        // says nothing here -- the first run's probe arm was almost
+                        // entirely those.
+                        if frame_cm.fully_oop_covered {
+                            audit::NEVER_MAPPED_WHILE_COVERED.fetch_add(1, AOrd::Relaxed);
+                            audit::note_site(frame_cm.entry_ptr() as usize, off, class);
+                            // The bit has been caught claiming coverage it does
+                            // not have. Latch it: `collect_roots` consults this
+                            // before skipping the conservative backstop.
+                            note_coverage_oracle_refutation();
+                        }
+                        if STEP3_LOG_COUNT.fetch_add(1, AOrd::Relaxed) < STEP3_LOG_CAP {
+                            eprintln!(
+                                "[VERIFY-OOP-MAPS] NEVER-MAPPED in-band oop: code@{:p} \
+                                 rbp={rbp:#x} slot=[rbp-{off:#x}] class={class} \
+                                 addr={addr:#x} \
+                                 val={qword:#x} frame_size={frame_size} maps={} covered={}",
+                                frame_cm.entry_ptr(),
+                                frame_cm.oop_maps.len(),
+                                frame_cm.fully_oop_covered,
+                            );
+                        }
+                    }
+                }
+            }
+            off += 8;
+        }
+
+        // `[rbp]` / `[rbp + 8]` are the saved caller RBP and return PC; a
+        // non-JIT parent ends the walk.
+        let parent_rbp = unsafe { (rbp as *const usize).read() };
+        let ret_addr = unsafe { ((rbp + 8) as *const usize).read() };
+        let Some(parent_cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+            break;
+        };
+        if parent_rbp <= rbp
+            || parent_rbp & 0x7 != 0
+            || parent_rbp >= entry_sp
+            || parent_rbp < scanner_sp
+        {
+            audit::UNREADABLE_FRAMES.fetch_add(1, AOrd::Relaxed);
+            break;
+        }
+        frame_cm = unsafe { &*(parent_cm_ptr as *const cratonvm_jit::CompiledMethod) };
+        rbp = parent_rbp;
+    }
+
+    // Everything below the innermost compiled band is interpreter / native /
+    // Rust. Counted, never blamed on an oop map.
+    if lowest_band_lo != usize::MAX && lowest_band_lo > scanner_sp {
+        let mut a = (scanner_sp + 7) & !7usize;
+        while a + 8 <= lowest_band_lo {
+            // SAFETY: 8-aligned address in this thread's own live stack band.
+            let qword = unsafe { (a as *const usize).read() };
+            if heap.is_object_address(qword).is_some() {
+                audit::BELOW_JIT.fetch_add(1, AOrd::Relaxed);
+            }
+            a += 8;
+        }
     }
 }
 
@@ -4591,7 +5087,16 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // their own mechanisms. Prefer the bounded JIT frame bands recovered from
     // the live RBP chain; retain the historical sweep as a fail-safe whenever
     // a frame record or its size metadata is not trustworthy.
-    if !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
+    // `CRATONVM_JIT_NO_FRAME_BANDS=1` restores the historical whole-band sweep
+    // so the coverage difference between the two is an A/B inside ONE binary.
+    // The bands cover each compiled frame's own `[rbp - frame_size, rbp)` and
+    // nothing else; the whole-band sweep also covers `[scanner_sp, rbp_inner)`,
+    // i.e. the interpreter / native / Rust frames the compiled method called
+    // INTO. The narrowing rests on "their roots are published by their own
+    // mechanisms", which does not hold for an object that has been allocated
+    // and not yet stored anywhere tracked — see
+    // `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`.
+    if !frame_bands_enabled() || !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
         scan_one_frame(scanner_sp, info.frame_base, heap, out);
     }
     let _ = info.entry_ptr; // reserved for future PC-precise lookup
@@ -4605,6 +5110,15 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
 /// is historical: normal compiled entries populate it too. Nested direct JIT
 /// calls use the normal saved-RBP chain, so this excludes intervening
 /// interpreter/Rust frames without excluding JIT spill space.
+/// `CRATONVM_JIT_NO_FRAME_BANDS` kill switch for the bounded-band scan, so the
+/// whole-band sweep it replaced can be reinstated in the same binary.
+fn frame_bands_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_FRAME_BANDS").is_none()
+    })
+}
+
 fn scan_compiled_frame_bands(
     info: PreciseFrameInfo,
     scanner_sp: usize,
@@ -4798,6 +5312,76 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod coverage_oracle_gate_tests {
+    use super::*;
+
+    /// The latch starts clear, a refutation sets it, and it does not clear
+    /// itself. One-way is the point: the refutation is about compiled code
+    /// that is still in the cache, not about the moment it was observed.
+    #[test]
+    fn a_refutation_latches_and_does_not_clear() {
+        reset_coverage_oracle_refuted_for_test();
+        assert!(!coverage_oracle_refuted(), "latch must start clear");
+        note_coverage_oracle_refutation();
+        assert!(coverage_oracle_refuted(), "a refutation must latch");
+        // A later cycle that observes nothing must not un-refute.
+        assert!(
+            coverage_oracle_refuted(),
+            "the latch must survive a cycle that saw nothing"
+        );
+        reset_coverage_oracle_refuted_for_test();
+    }
+
+    /// A refutation marks the CURRENT cycle incomplete too, not just later
+    /// ones — the collector asking the question is mid-decision.
+    #[test]
+    fn a_refutation_marks_this_cycle_incomplete() {
+        reset_coverage_oracle_refuted_for_test();
+        cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
+        assert!(!cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete());
+        note_coverage_oracle_refutation();
+        assert!(
+            cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete(),
+            "the cycle being decided must go incomplete"
+        );
+        assert_eq!(
+            cratonvm_gc::gc_quiescence::moving_young_incomplete_reason(),
+            cratonvm_gc::gc_quiescence::incomplete_reason::COVERAGE_ORACLE_REFUTED,
+        );
+        reset_coverage_oracle_refuted_for_test();
+        cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
+    }
+
+    /// The gate is inert unless something is actually doing the verifying.
+    /// Default-off is what keeps this free on the production path, so a
+    /// regression that turns it on by accident must fail here.
+    #[test]
+    fn the_gate_is_inert_by_default() {
+        assert!(
+            !coverage_gate_active(),
+            "neither CRATONVM_DBG_VERIFY_OOP_MAPS nor the force switch is set \
+             in the test environment, so the gate must not run"
+        );
+    }
+
+    /// The kill switch and the force switch read the keys they are documented
+    /// under. A gate whose flag is misspelled reports itself off forever.
+    #[test]
+    fn the_switches_read_their_documented_keys() {
+        let surface = include_str!("../../../types/tests/flag-surface.txt");
+        for key in [
+            "CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE",
+            "CRATONVM_GC_PRECISE_ONLY_ROOTS",
+        ] {
+            assert!(
+                surface.lines().any(|l| l.trim() == key),
+                "{key} must be declared in the flag surface"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -487,19 +487,47 @@ impl rustls::client::ClientSessionStore for TracingClientSessionStore {
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — the server twin of
 /// `ctx_client_session_store_table`, same single `or_insert_with` site.
 fn ctx_server_session_store_table(
-) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
     static T: OnceLock<
-        cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
+        cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
     > = OnceLock::new();
     T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
+/// One session cache per `SSLContext` **and per client-auth policy**.
+///
+/// The `bool` half of that key is load-bearing, and the bug it fixes is
+/// `TestClientCert`'s entire failing set. A resumed TLS 1.2 session replays the
+/// original handshake's outcome: the server sends no `CertificateRequest`, so
+/// the client is never asked for a certificate. A connection that IS requesting
+/// client auth must therefore not be allowed to resume a session established
+/// WITHOUT it — the resumption silently cancels the request.
+///
+/// That is precisely what defeated `wants_deferred_client_auth` (see its doc).
+/// The deferred mechanism exists to answer Tomcat's post-handshake
+/// `setNeedClientAuth(true)` by offering client auth on the NEXT connection,
+/// because rustls has no renegotiation. MEASURED on `dev@151f7831a`: it did
+/// offer it — `engine_begin request=true` on the second engine — and then the
+/// client resumed the first connection's no-client-auth session, so
+/// `JavaKeyManagerResolver::resolve` was called **zero** times across the whole
+/// class against **16** `has_certs` calls. The resolver was fully configured
+/// and simply never consulted.
+///
+/// Sessions established WITH client auth still resume among themselves, so the
+/// cost is one full handshake per policy transition, not per connection.
+///
+/// Real JSSE reaches the same outcome by a different route: its session object
+/// carries the peer certificates, and it declines to resume into a connection
+/// whose client-auth requirement that session cannot satisfy. rustls's
+/// `StoresServerSessions` is an opaque blob store with no such visibility,
+/// which is why the partition lives in the KEY rather than in a predicate.
 fn ctx_server_session_store(
     key: u64,
+    client_auth_requested: bool,
 ) -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
     ctx_server_session_store_table()
         .lock()
-        .entry(key)
+        .entry((key, client_auth_requested))
         .or_insert_with(|| {
             let inner: Arc<dyn rustls::server::StoresServerSessions + Send + Sync> =
                 rustls::server::ServerSessionMemoryCache::new(256);
@@ -2515,13 +2543,23 @@ impl rustls::client::danger::ServerCertVerifier for PassthroughServerCertVerifie
                 mark_trust_check_done(engine_id);
                 Ok(rustls::client::danger::ServerCertVerified::assertion())
             }
-            Some(Ok(TrustOutcome::Rejected(detail))) => {
+            Some(Ok(TrustOutcome::Rejected(detail, alert))) => {
                 mark_trust_check_done(engine_id);
                 if crate::nbflags().dbg_tls_auth_ok {
-                    eprintln!("[dbg-tls-auth] (in-handshake) TrustManager rejected: {detail}");
+                    eprintln!(
+                        "[dbg-tls-auth] (in-handshake) TrustManager rejected: {detail} \
+                         -> alert {:?}",
+                        alert.alert_description()
+                    );
                 }
+                // NOT `ApplicationVerificationFailure`, which rustls maps to
+                // `access_denied` — a POLICY refusal, not a certificate one.
+                // That is what this path sent for every rejection, and it cost
+                // `SslErrorTest` 12 of its 72 tests where HotSpot passes all
+                // 72. `crate::tls_cert_alert` transcribes JSSE's own
+                // `CertificateMessage.getCertificateAlert`.
                 Err(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::ApplicationVerificationFailure,
+                    alert.certificate_error(detail),
                 ))
             }
             // A Java `Error` (not `Exception`) came out of the manager. JSSE lets
@@ -8186,6 +8224,43 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
 
+    /// A server session cache is per `SSLContext` **and per client-auth
+    /// policy** — a connection asking for a client certificate must not be
+    /// able to resume one that did not.
+    ///
+    /// Resuming across that boundary replays a handshake that sent no
+    /// `CertificateRequest`, so the client is never asked and the request is
+    /// silently cancelled. That is what defeated `wants_deferred_client_auth`
+    /// and produced `TestClientCert`'s whole failing set: the second engine
+    /// really did offer client auth (`engine_begin request=true`, measured)
+    /// and `JavaKeyManagerResolver::resolve` was still called zero times.
+    ///
+    /// Asserted on `Arc::ptr_eq`, which is the property that matters — two
+    /// distinct caches, not merely two lookups. The same-policy case is
+    /// asserted too, because a partition that never shares would silently
+    /// disable resumption altogether and still pass a difference-only check.
+    #[test]
+    fn a_server_session_cache_is_partitioned_by_client_auth_policy() {
+        let key = 0x5eed_0000_0000_0001u64;
+        let without = super::ctx_server_session_store(key, false);
+        let with = super::ctx_server_session_store(key, true);
+        assert!(
+            !Arc::ptr_eq(&without, &with),
+            "a client-auth connection shares the no-client-auth session cache, so it \
+             can resume a session that carries no client certificate — the resumption \
+             then cancels the CertificateRequest and the peer is never asked"
+        );
+        assert!(
+            Arc::ptr_eq(&without, &super::ctx_server_session_store(key, false)),
+            "same context, same policy must share ONE cache — otherwise this \
+             partition has disabled server-side resumption instead of scoping it"
+        );
+        assert!(
+            Arc::ptr_eq(&with, &super::ctx_server_session_store(key, true)),
+            "same context, same policy must share ONE cache (client-auth side)"
+        );
+    }
+
     /// The exact PKCS#8 key CratonVM lifts out of Spring Boot's
     /// `spring-boot-ldap` test keystore
     /// (`.../ldap/autoconfigure/embedded/test.jks`, alias `mykey`, 335 bytes),
@@ -13620,11 +13695,15 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         state.client_auth_requested |= state.need_client_auth || state.want_client_auth;
         // Share this SSLContext's server-side session store across its engines,
         // for the same reason as the client's — a server that forgets every
-        // session cannot honour a resumption attempt.
+        // session cannot honour a resumption attempt — but PARTITIONED by
+        // whether this engine is asking for a client certificate. Resuming
+        // across that boundary replays a handshake that asked for none, which
+        // silently cancels the request. See `ctx_server_session_store`.
         let config = match state.trust_managers_ctx_key {
             Some(k) => {
                 let mut cloned = (*config).clone();
-                cloned.session_storage = ctx_server_session_store(k);
+                cloned.session_storage =
+                    ctx_server_session_store(k, state.client_auth_requested);
                 Arc::new(cloned)
             }
             None => config,
@@ -14492,8 +14571,14 @@ enum TrustCheckMode {
 enum TrustOutcome {
     Accepted,
     /// Rejected, with the reason already recorded via
-    /// `set_last_trust_rejection_detail`.
-    Rejected(String),
+    /// `set_last_trust_rejection_detail`, and the alert JSSE would raise for
+    /// the manager's exception.
+    ///
+    /// The alert is computed where the exception is still in hand, NOT at the
+    /// point of use: `reject_peer_with_fatal_alert` runs on the unwinding path
+    /// and may not call Java, and the verifier-time arm is inside rustls's own
+    /// state machine. See `crate::tls_cert_alert`.
+    Rejected(String, crate::tls_cert_alert::JsseCertAlert),
 }
 
 fn engine_run_trust_check(
@@ -14513,7 +14598,7 @@ fn engine_run_trust_check(
         // Kept as a belt-and-braces arm rather than an `unreachable!` so a
         // future edit that changes that cannot turn into a panic in a TLS
         // handshake.
-        TrustOutcome::Rejected(detail) => Err(crate::phases_early::throw_jca_exc(
+        TrustOutcome::Rejected(detail, _alert) => Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLHandshakeException",
             &format!("TrustManager rejected the peer certificate chain: {detail}"),
@@ -14626,6 +14711,9 @@ fn engine_consult_trust_managers(
     }
     let mut rejected = false;
     let mut rejection: Option<String> = None;
+    // JSSE's default when nothing overrides it — see `crate::tls_cert_alert`.
+    // Only meaningful when `rejected`, and set on the same branch that sets it.
+    let mut rejection_alert = crate::tls_cert_alert::JsseCertAlert::CertificateUnknown;
     // See `IN_TRUST_CHECK`. Cleared on every exit path below — the early
     // `return Err(e)` for a propagating `Error` clears it too.
     IN_TRUST_CHECK.with(|c| c.set(true));
@@ -14710,6 +14798,19 @@ fn engine_consult_trust_managers(
                 }
                 other => format!("{other:?}"),
             });
+            // Which alert this becomes is decided HERE, while the exception is
+            // still an object and Java can still be called. Both consumers run
+            // somewhere that cannot do either: `reject_peer_with_fatal_alert`
+            // is on the unwinding path, and the verifier-time arm is inside
+            // rustls's state machine.
+            rejection_alert = match &e {
+                cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) => {
+                    crate::tls_cert_alert::jsse_cert_alert_for(ctx, *exc)
+                }
+                // Not an exception at all (an internal error): JSSE has no
+                // opinion, and `certificate_unknown` is its default.
+                _ => crate::tls_cert_alert::JsseCertAlert::CertificateUnknown,
+            };
             rejected = true;
             break;
         }
@@ -14724,9 +14825,9 @@ fn engine_consult_trust_managers(
         if mode == TrustCheckMode::InVerifier {
             // No `reject_peer_with_fatal_alert` and no throw: rustls is about to
             // do the equivalent, correctly, from inside its own state machine.
-            return Ok(TrustOutcome::Rejected(detail));
+            return Ok(TrustOutcome::Rejected(detail, rejection_alert));
         }
-        reject_peer_with_fatal_alert(pending.engine_id);
+        reject_peer_with_fatal_alert(pending.engine_id, rejection_alert);
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLHandshakeException",
@@ -14760,10 +14861,13 @@ fn engine_consult_trust_managers(
 ///
 /// Takes no `NativeContext` and calls no Java: it must be safe to run on the
 /// rejection path, which is already unwinding.
-fn reject_peer_with_fatal_alert(engine_id: i32) {
+fn reject_peer_with_fatal_alert(
+    engine_id: i32,
+    alert: crate::tls_cert_alert::JsseCertAlert,
+) {
     with_engine(engine_id, |s| {
         if let Some(c) = s.conn.as_mut() {
-            c.queue_fatal_alert(rustls::AlertDescription::CertificateUnknown);
+            c.queue_fatal_alert(alert.alert_description());
         }
     });
 }
@@ -14988,7 +15092,19 @@ fn engine_check_endpoint_identity(
             set_last_trust_rejection_detail(&detail);
             // Same reasoning as the TrustManager rejection above: the peer has
             // to be told, or it sees an unexplained close.
-            reject_peer_with_fatal_alert(pending.engine_id);
+            // `certificate_unknown`, which is what this line sent before the
+            // alert became a parameter: JSSE reaches an identity failure as a
+            // `CertificateException` out of `checkServerTrusted` with no
+            // `CertPathValidatorException` cause, so `getCertificateAlert`
+            // leaves its default in place. Named rather than implied, because
+            // the VERIFIER-time twin of this check (in
+            // `PassthroughServerCertVerifier`) answers `NotValidForNameContext`
+            // and therefore `bad_certificate` — the two disagree, JSSE agrees
+            // with this one, and nothing has measured the difference yet.
+            reject_peer_with_fatal_alert(
+                pending.engine_id,
+                crate::tls_cert_alert::JsseCertAlert::CertificateUnknown,
+            );
             Err(crate::phases_early::throw_jca_exc(
                 ctx,
                 "javax/net/ssl/SSLHandshakeException",
@@ -15552,10 +15668,84 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
     Ok(ses)
 }
 
+/// `getPeerHost()` as `String.valueOf` would render it — including the literal
+/// `null` HotSpot prints for an engine built by the no-arg `createSSLEngine()`.
+fn engine_peer_host_text(ctx: &mut dyn NativeContext, engine: ObjectRef) -> String {
+    match ctx.invoke_virtual(engine, "getPeerHost", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_else(|| "null".into()),
+        _ => "null".to_string(),
+    }
+}
+
+/// `getPeerPort()`. A CratonVM engine that never had a host recorded reads the
+/// field, which `createSSLEngine()` seeds to -1 — the value
+/// `javax.net.ssl.SSLEngine`'s own field initialiser uses, and the one HotSpot
+/// prints.
+fn engine_peer_port_text(ctx: &mut dyn NativeContext, engine: ObjectRef) -> String {
+    match ctx.invoke_virtual(engine, "getPeerPort", "()I", &[]) {
+        Ok(Some(v)) => v.as_int().unwrap_or(-1).to_string(),
+        _ => "-1".to_string(),
+    }
+}
+
+/// The session, rendered by its own `toString()`.
+///
+/// Deliberately a virtual call and not a local format: the `Session(...)` shape
+/// is JSSE's `SSLSessionImpl.toString()` and belongs in one place. A session
+/// this engine cannot produce renders as `null`, which is what string
+/// concatenation of a null reference does.
+fn engine_session_text(ctx: &mut dyn NativeContext, engine: ObjectRef) -> String {
+    let session = match ctx.invoke_virtual(engine, "getSession", "()Ljavax/net/ssl/SSLSession;", &[])
+    {
+        Ok(Some(Value::Object(Some(sess)))) => sess,
+        _ => return "null".to_string(),
+    };
+    match ctx.invoke_virtual(session, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_else(|| "null".into()),
+        _ => "null".to_string(),
+    }
+}
+
 fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls_impl = "sun/security/ssl/SSLEngineImpl";
+
+    // toString() — NOT one of the methods this file used to register, so the
+    // real JDK body ran, and JDK 25's is
+    //
+    //     "SSLEngine[hostname=" + getPeerHost() + ", port=" + getPeerPort()
+    //             + ", " + conContext.conSession + "]"
+    //
+    // `conContext` is a `TransportContext` that only SunJSSE's own constructor
+    // chain creates, and CratonVM never runs it. So `String.valueOf(engine)` —
+    // any log line, assertion message or `IllegalStateException("… " + engine)`
+    // that mentions an engine — threw
+    // `NullPointerException: Cannot read field "conSession" because
+    // "this.conContext" is null`, from inside the failure path rather than
+    // from the code under test. Measured against HotSpot 25 with
+    // `probes/SslContextSpiProbe.java`.
+    //
+    // Rebuilt from the engine's OWN accessors. `getPeerHost`/`getPeerPort` have
+    // no native here, so they run the JDK's field reads — and those fields are
+    // real: `set_engine_peer_host` writes `peerHost`/`peerPort` as well as the
+    // side table, and `createSSLEngine()`'s no-arg form seeds `peerPort = -1`
+    // exactly as `javax.net.ssl.SSLEngine`'s own field initialiser does. The
+    // session half goes through `getSession().toString()` rather than being
+    // formatted here, so the `Session(...)` shape lives in ONE place (the
+    // `javax/net/ssl/SSLSession` registration in `register_ssl_session_real`)
+    // and `String.valueOf(session)` is right on its own too.
+    r.register(cls_impl, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let text = format!(
+            "SSLEngine[hostname={}, port={}, {}]",
+            engine_peer_host_text(ctx, this),
+            engine_peer_port_text(ctx, this),
+            engine_session_text(ctx, this),
+        );
+        let s = ctx.create_string(&text);
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     // Constructor — allocates an engine_id slot in the side-table.
     r.register(cls_impl, "<init>", "()V", |ctx, args| {
@@ -19146,6 +19336,37 @@ fn fire_session_binding(
 
 fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     let cls = "javax/net/ssl/SSLSession";
+
+    // toString() — JSSE's `SSLSessionImpl.toString()` is
+    // `"Session(" + creationTime + "|" + getCipherSuite() + ")"`, and it is the
+    // tail of `SSLEngineImpl.toString()` / `SSLSocketImpl.toString()` as well as
+    // an answer in its own right. CratonVM's session objects carry the bare
+    // `javax/net/ssl/SSLSession` INTERFACE as their class, so with no
+    // registration here a virtual `toString()` resolves to `Object.toString()`
+    // and prints an identity hash — which is not wrong so much as useless, and
+    // it is the half of `SSLEngine.toString()` a reader actually wants.
+    //
+    // Both fields come from this file's own accessors, so a session that cannot
+    // answer one still renders rather than throwing: JSSE's own creationTime is
+    // a `long` and its cipher suite is never null (it is
+    // `SSL_NULL_WITH_NULL_NULL` before a handshake), so 0 and the JSSE null
+    // suite are the values that make the string mean what it means.
+    r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let created = match ctx.invoke_virtual(this, "getCreationTime", "()J", &[]) {
+            Ok(Some(v)) => v.as_long().unwrap_or(0),
+            _ => 0,
+        };
+        let suite = match ctx.invoke_virtual(this, "getCipherSuite", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx
+                .read_string(s)
+                .unwrap_or_else(|| crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into()),
+            _ => crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string(),
+        };
+        let text = format!("Session({created}|{suite})");
+        let s = ctx.create_string(&text);
+        Ok(Some(Value::Object(Some(s))))
+    });
 
     // getPeerCertificates() — the client certificate chain, for mTLS. Tomcat's
     // SSLAuthenticator / coyote SSLSupport reads this to authenticate the

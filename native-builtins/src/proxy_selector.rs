@@ -854,13 +854,6 @@ mod tests {
 
     /// `read_settings` reads process-global environment variables, so the
     /// tests that mutate them must not run concurrently with each other.
-    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
     /// Save/clear/restore the proxy env vars around a closure so a failing
     /// assertion cannot leak state into the next test.
     fn with_proxy_env<R>(pairs: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
@@ -874,23 +867,20 @@ mod tests {
             "no_proxy",
             "NO_PROXY",
         ];
-        let _guard = env_test_lock();
-        let saved: Vec<(&str, Option<String>)> =
-            KEYS.iter().map(|k| (*k, cratonvm_types::flags::runtime_var(k).ok())).collect();
-        for key in KEYS {
-            std::env::remove_var(key);
-        }
+        // Clear all eight, then apply the caller's pairs, in ONE thread-scoped
+        // override. This used to be up to sixteen `environ` mutations per call
+        // (eight removes, the sets, then eight restores) under a lock held
+        // against fellow env tests only — a process-wide data race with every
+        // other test running in parallel. Nothing is written to `environ` now,
+        // so there is nothing to restore and nothing to race.
+        let mut edits: Vec<(&str, Option<&str>)> = KEYS.iter().map(|k| (*k, None)).collect();
         for (key, value) in pairs {
-            std::env::set_var(key, value);
-        }
-        let out = f();
-        for (key, value) in saved {
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
+            match edits.iter_mut().find(|(k, _)| k == key) {
+                Some(slot) => slot.1 = Some(value),
+                None => edits.push((key, Some(value))),
             }
         }
-        out
+        cratonvm_types::flags::with_thread_overrides(&edits, f)
     }
 
     /// PERF-fix guard. `read_settings` runs once per `ProxySelector.select`,

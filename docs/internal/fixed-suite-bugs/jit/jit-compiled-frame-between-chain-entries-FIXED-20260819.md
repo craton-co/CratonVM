@@ -132,7 +132,7 @@ depth=4000000 self-tail-recursion  ->  CratonVM JIT: RETURNED
 The single-pass backend lowers a direct self-tail-call to `JMP body_entry`, so
 the activations are never pushed. Separate mechanism, separate blast radius
 (`StackOverflowError` depth accounting, every caller-sensitive API), tracked in
-`docs/known-issues/jit/jit-eliminates-self-tail-call-frames-20260819.md` and
+`../../fixed-suite-bugs/jit/jit-eliminates-self-tail-call-frames-FIXED-20260820.md` and
 still OPEN.
 
 ## Diagnostic

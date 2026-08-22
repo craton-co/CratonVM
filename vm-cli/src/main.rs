@@ -121,6 +121,15 @@ fn maybe_dump_shutdown_reports() {
     // its cost somewhere the compiler statistics do not reach.
     cratonvm_vm::jit::conservative_roots::scan_prof::dump();
 
+    // The oop-map audit's tally, self-gated the same way
+    // (`CRATONVM_DBG_VERIFY_OOP_MAPS`). It answers the one question the
+    // moving-young design rests on and that nothing else reports: does the
+    // precise map name every live reference in the frames it claims to
+    // describe? `never_mapped` is that answer; `below_jit` is the interpreter
+    // and native region the map never claimed, split out so it cannot be
+    // mistaken for a gap the way the previous oracle's single number was.
+    cratonvm_vm::jit::conservative_roots::oop_map_audit::dump();
+
     // How many native-registry probes one invoke cost, self-gated on
     // `CRATONVM_DBG_NATIVE_LOOKUPS=1`. This is the number
     // `performance/vm-per-call-dispatch-cost-RETIRED-20260817.md` §2 asks for
@@ -158,13 +167,39 @@ fn maybe_dump_shutdown_reports() {
         // `[compact-inline] MISS` census under CRATONVM_DBG_COMPACT_INLINE:
         // MISS names the SITES that cannot inline, this names the ACCESSES that
         // paid the helper's `is_object_address` walk. See
-        // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+        // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
         eprintln!(
-            "[cratonvm] getfield helper calls: {} | CALL sites emitted by arm: {}",
+            "[cratonvm] getfield helper calls: {} (of which trusted-ref: {}) | CALL sites emitted by arm: {}",
             cratonvm_vm::jit::helpers::jit_getfield_helper_calls()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "<not counted>".to_string()),
+            cratonvm_vm::jit::helpers::jit_getfield_trusted_ref_calls(),
             cratonvm_jit::metrics::getfield_arm_emits()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // The `validate_code_ptr` memo's engagement, on the same switch and for
+        // the same reason as every counter above it. The memo replaced a global
+        // `Mutex` taken on EVERY compiled call; a run where `hits` is 0 has the
+        // lock back and would still time within noise of one where it is not.
+        {
+            let (hits, misses) = cratonvm_jit::code_ptr_memo_stats();
+            eprintln!(
+                "[cratonvm] code-ptr memo: hits={hits} misses={misses} enabled={} \
+                 region_epoch={}",
+                cratonvm_jit::code_ptr_memo_enabled(),
+                cratonvm_jit::code_ptr_regions_epoch()
+            );
+        }
+        // JIT-side only: these are the sites `helpers.rs` tags by hand. The
+        // whole-VM per-caller census that used to print beneath this was
+        // retired once it had answered — it cost 3.4x on ZGC, which is how
+        // the getfield page's first round of numbers came out wrong.
+        eprintln!(
+            "[cratonvm] membership walks by JIT site: {}",
+            cratonvm_vm::jit::helpers::membership_walks_by_site()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
                 .collect::<Vec<_>>()
@@ -177,6 +212,18 @@ fn maybe_dump_shutdown_reports() {
         eprintln!(
             "[cratonvm] inline call arms: {}",
             cratonvm_jit::metrics::inline_call_arm_emits()
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // Compiled local exception handlers. `sites-emitted` counts STUBS, not
+        // catches; `entered` is the only number that says a `catch` block ran
+        // in compiled code, and `propagated` is its correct-but-not-a-win
+        // sibling. Zeros printed, for the same reason as the line above.
+        eprintln!(
+            "[cratonvm] local handlers: {}",
+            cratonvm_jit::metrics::local_handler_counts()
                 .iter()
                 .map(|(n, c)| format!("{n}={c}"))
                 .collect::<Vec<_>>()
@@ -2255,7 +2302,15 @@ fn active_jdk_mode_line() -> String {
     match ACTIVE_JDK_MODE.get() {
         Some((mode, Some(home))) => format!("jdk mode: {mode} (java.home={home})"),
         Some((mode, None)) => format!("jdk mode: {mode}"),
-        None => "jdk mode: <not yet resolved — failure occurred during argument parsing>".into(),
+        // NOT "during argument parsing". This arm is reached whenever the
+        // OnceLock is unset, and the class library is selected LATE: a
+        // `--java-home` that clap accepted but that carries no `jmods/` or
+        // `lib/modules` lands here too, and that is the common case (a POSIX
+        // path spelling on Windows reaches it with rc=1). Naming a phase this
+        // function cannot observe sent two separate triage records after the
+        // argument parser for a fault that was never in it.
+        None => "jdk mode: <not yet resolved — the failure occurred before the class library was selected>"
+            .into(),
     }
 }
 
@@ -4489,6 +4544,12 @@ fn run() -> Result<()> {
                 // RUNNING-and-silent one (JIT-compiled code or a long native
                 // call). See `SharedVm::dump_thread_summary_after_dumps`.
                 shared_for_watchdog.dump_thread_summary_after_dumps();
+                // A stall whose reactor threads are parked in `select` — i.e.
+                // working — is not explained by any thread dump: the question
+                // is what the selector had to hand them, and `interest_ops` vs
+                // `ready_ops` per registered key answers it at the moment of
+                // the stall. Costs nothing until this deadline fires.
+                cratonvm_native_io::nio_selector::dump_selector_state_to_stderr();
                 eprintln!(
                     "=== T19.H1 watchdog: {total_acks} thread(s) dumped; \
                      aborting process ==="
@@ -5087,6 +5148,19 @@ fn run() -> Result<()> {
             "[cratonvm]   of which VarHandle instance-field reads served directly: {}",
             cratonvm_vm::jit::helpers::varhandle_field_read_hit_count()
         );
+        // The same read, reached WITHOUT the funnel — a thin direct call baked
+        // into compiled code by `VARHANDLE_READ_DIRECT_FNS`. The pair is the
+        // engagement evidence for that bind: `served` counts calls that never
+        // entered `jit_invoke_dispatch` at all, `declined` counts the ones that
+        // did. A non-zero bind count in the "thin direct-helper binds" line with
+        // `served=0` here is the specific failure this exists to name — the site
+        // compiled and every execution refused.
+        {
+            let (served, declined) = cratonvm_vm::jit::helpers::varhandle_read_direct_counts();
+            eprintln!(
+                "[cratonvm] VarHandle read thin direct calls: served={served} declined={declined}",
+            );
+        }
         // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of
         // the two above: it is the one by-name fast path that decides per
         // dispatch rather than at cache-fill time. Reported separately because
@@ -5155,6 +5229,11 @@ fn run() -> Result<()> {
     // deletion exercise those two records describe but never measured.
     cratonvm_vm::vm::dump_check_override_census();
     cratonvm_vm::vm::dump_canonical_census();
+    // The enforcement dial's per-door census (`H17-3` N1). Silent unless
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW` is armed or `CRATONVM_DBG_DIAL_DOORS`
+    // is set; `reached - yielded` per door is the price the dial is not
+    // charging.
+    cratonvm_vm::vm::dump_dial_door_census();
 
     // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown
     // (env-gated inside `dump_now` callers; `enabled()` re-checked here).

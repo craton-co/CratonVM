@@ -415,6 +415,35 @@ struct Compiler {
     /// Empty when the method has no handlers. Consulted only by
     /// [`Compiler::pc_is_protected`]; see `PROTECTED_RANGES_REQUEST`.
     protected_ranges: Vec<(u32, u32)>,
+    /// This method's exception table as `(start_pc, end_pc, handler_pc, catch
+    /// type name)`, non-empty exactly when compiled local handlers are ARMED
+    /// for this compile (see the arming conditions in `driver.rs`). An empty
+    /// name is a catch-all.
+    ///
+    /// Non-empty is what makes handler bodies live code: the walk seeds each
+    /// `handler_pc` as a reachability root and as a branch target whose
+    /// incoming operand stack is the JVMS `[exception]` — depth one, marked as
+    /// a reference. Empty ⇒ byte-identical codegen to before the feature.
+    pub(super) local_handler_table: Vec<(usize, usize, usize, &'static str)>,
+    /// The compiling method's declaring class id — the loader context a catch
+    /// type name resolves through at runtime. Meaningful only alongside a
+    /// non-empty [`Self::local_handler_table`].
+    pub(super) local_handler_class_id: u32,
+    /// One [`crate::JitLocalHandlerSite`] per throwing bci that got a local
+    /// dispatch, in emission order. Moved onto the published `CompiledMethod`,
+    /// which is what keeps the addresses baked into the stubs valid.
+    pub(super) local_handler_sites: Vec<Box<crate::JitLocalHandlerSite>>,
+    /// `throw bci -> index into `local_handler_sites``, so two fallible
+    /// operations at the same bci share one site and one cache.
+    local_handler_site_by_bci: FxHashMap<usize, usize>,
+    /// Pending local-handler stubs: `(rel32 patch offset of the guard's branch,
+    /// site index, throw bci, whether the propagate edge is a reason-9 deopt
+    /// rather than the shared sentinel exit)`.
+    ///
+    /// Emitted by `emit_local_handler_stubs` after the body walk, because a
+    /// stub jumps FORWARD to handler blocks whose native offsets only exist
+    /// once the walk has passed them.
+    local_handler_stubs: Vec<(usize, usize, usize, bool)>,
     /// `LoopXform::bci_of` when this compile is emitting REWRITTEN bytecode
     /// (see `plan_bytecode_loop_xform`), `None` on every ordinary compile.
     ///
@@ -714,10 +743,16 @@ struct Compiler {
     loop_unroll_hints: FxHashMap<usize, usize>,
     /// Resolved ldc/ldc_w constants: (bytecode_pc, i64 value).
     ldc_info: Vec<(usize, i64)>,
-    /// String ldc sites: (bytecode_pc, stable UTF-8 pointer, byte length).
-    /// The bytes are owned by the compiled method; code materializes the Java
-    /// object through `helpers.ldc_string` instead of baking an ObjectRef.
-    ldc_string_info: Vec<(usize, *const u8, usize)>,
+    /// String-`ldc` sites: `(bytecode_pc, referencing class id, CP index)`.
+    /// Served by `helpers.ldc_string_cp`, the exact twin of the class row
+    /// below — and CP-indexed for one more reason than the mirror is: JVMS
+    /// §5.4.3 resolves a constant-pool entry ONCE and records the result, and
+    /// that record is keyed `(class, cp index)`. The predecessor shape baked
+    /// the literal's UTF-8 bytes, which is a key the record cannot be read
+    /// with, so every execution re-derived the answer through the string
+    /// pool's lock and a hash of the whole literal (18.4 ns against HotSpot's
+    /// 0.2 — `probes/LdcConstCostProbe.java`).
+    ldc_string_info: Vec<(usize, u32, u16)>,
     /// Class-`ldc` sites: `(bytecode_pc, referencing class id, CP index)`.
     /// Served by `helpers.ldc_class_cp`, which resolves the target and
     /// returns its mirror — the mirror is a heap object, so it can neither be
@@ -875,6 +910,33 @@ struct Compiler {
     /// oop bits safely for non-moving GC, but moving-young must treat those
     /// safepoints as incomplete and fall back.
     stack_oop_marks_exact: bool,
+    /// Frame offsets of the STAGED INVOKE-ARGUMENT buffer slots that hold
+    /// references, for the safepoint map about to be emitted.
+    ///
+    /// Invoke arguments are popped off `self.stack` and written into a buffer
+    /// in the spill reserve BEFORE the call, so by the time
+    /// `emit_oop_map_for_safepoint` runs there is nothing left on the simulated
+    /// stack to name them — `emit_pre_safepoint_spill` says as much where it
+    /// publishes the conservative bound ("includes the staged invoke-argument
+    /// buffer ... live for the duration of the call"). They were covered by that
+    /// bound and by nothing else, which is why a frame could assert
+    /// `fully_oop_covered` while live argument oops sat unnamed in the
+    /// operand-spill region.
+    ///
+    /// Consumed (taken) by the next `emit_oop_map_for_safepoint`, exactly like
+    /// `pending_live_frame_hi`, so a staging site that emits no map cannot leak
+    /// its slots into a later safepoint's map.
+    pending_staged_arg_oops: Vec<i32>,
+    /// A reference argument was staged somewhere this compiler cannot name in
+    /// an oop map — the native-ABI outgoing-argument area
+    /// (`emit_stack_arg_setup`), the direct-call service slots, or an inlined
+    /// callee's parameter locals.
+    ///
+    /// Those areas are covered by the conservative scan and by nothing else, so
+    /// a method that stages a reference into one of them must not claim precise
+    /// coverage. Fail-closed: it makes the safepoint incomplete rather than
+    /// silently narrowing what the map describes.
+    pending_staged_args_unmapped: bool,
     /// T1.1.a — collected oop maps, indexed by native PC offset of the
     /// instruction *after* the safepoint call. Transferred to
     /// `CompiledMethod::oop_maps` at finalize time.
@@ -936,6 +998,17 @@ struct Compiler {
     /// Debug-only: number of exception ranges modelled by the liveness /
     /// interference analyses for this method (CRATONVM_DBG_EXCFRAME).
     exception_ranges_dbg_len: usize,
+    /// Where the inline mini-emitter's walk last stood, so a rollback can name
+    /// itself.
+    ///
+    /// `outer-splice-rolled-back=N` is a count with no subject: it says a
+    /// planned splice was thrown away at emission, but not what construct did
+    /// it, and all ~50 of `try_emit_inline_body`'s bails look identical from
+    /// outside. A single-pass walk bails where it stands, so the (callee pc,
+    /// opcode) it last reached IS the answer. Updated once per callee
+    /// instruction and reported by `try_emit_inline_site` under
+    /// `CRATONVM_DBG_JITC`.
+    pub(super) inline_walk_at: (usize, u8),
     /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
     /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
     /// snapshot: the abstract stack has no per-entry width source, so when this is
@@ -2381,6 +2454,11 @@ impl Compiler {
             precise_exception_frames,
             inline_scope_stack: Vec::new(),
             protected_ranges,
+            local_handler_table: Vec::new(),
+            local_handler_class_id: 0,
+            local_handler_sites: Vec::new(),
+            local_handler_site_by_bci: FxHashMap::default(),
+            local_handler_stubs: Vec::new(),
             // Installed after construction by `compile_with_param_slots`, and
             // only when it decided to compile rewritten bytecode.
             bci_provenance: None,
@@ -2463,6 +2541,8 @@ impl Compiler {
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
             stack_oop_marks_exact: true,
+            pending_staged_arg_oops: Vec::new(),
+            pending_staged_args_unmapped: false,
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
@@ -2471,6 +2551,7 @@ impl Compiler {
             local_liveness_words: 0,
             local_liveness_covered: Vec::new(),
             exception_ranges_dbg_len: 0,
+            inline_walk_at: (usize::MAX, 0),
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,

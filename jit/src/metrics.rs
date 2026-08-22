@@ -2788,6 +2788,52 @@ pub fn note_inline_call_arm(arm: usize) {
     }
 }
 
+/// Compiled-local-handler census, index-parallel with `LOCAL_HANDLER_COUNTS`.
+///
+/// Four numbers, because most single readings of "the feature is on" are wrong
+/// on their own. `sites-emitted` is a COMPILE-time count and says only that
+/// stubs exist. `entered` is the win — a `catch` that ran in compiled code.
+/// `propagated` is the miss edge, which is correct behaviour rather than a
+/// failure. `methods-armed` separates "no method qualified" from "methods
+/// qualified and nothing ever threw".
+pub const LOCAL_HANDLER_NAMES: [&str; 4] =
+    ["methods-armed", "sites-emitted", "entered", "propagated"];
+
+static LOCAL_HANDLER_COUNTS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Index into [`LOCAL_HANDLER_NAMES`]: a method compiled with local handlers
+/// armed.
+pub const LOCAL_HANDLER_METHOD_ARMED: usize = 0;
+/// Index: one local-handler dispatch stub emitted.
+pub const LOCAL_HANDLER_SITE_EMITTED: usize = 1;
+/// Index: a `catch` block entered without leaving compiled code.
+pub const LOCAL_HANDLER_ENTERED: usize = 2;
+/// Index: a throwable this frame does not catch, sent down the old route.
+pub const LOCAL_HANDLER_PROPAGATED: usize = 3;
+
+/// Bump one [`LOCAL_HANDLER_NAMES`] counter.
+#[inline]
+pub fn note_local_handler(index: usize) {
+    if let Some(slot) = LOCAL_HANDLER_COUNTS.get(index) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(name, count)` for the compiled-local-handler census, INCLUDING zeros —
+/// see [`LOCAL_HANDLER_NAMES`] for why each zero is a different answer.
+pub fn local_handler_counts() -> Vec<(&'static str, u64)> {
+    LOCAL_HANDLER_NAMES
+        .iter()
+        .zip(LOCAL_HANDLER_COUNTS.iter())
+        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
+        .collect()
+}
+
 /// Names for [`GETFIELD_ARM_EMITS`], index-parallel.
 pub const GETFIELD_ARM_NAMES: [&str; 6] = [
     "sp-inlined-callee",

@@ -985,6 +985,7 @@ pub(super) fn populate_invoke_cache(
                 Some(kind),
             );
             match crate::vm::resolve_native_dispatch_wave1(
+                crate::vm::DispatchDoor::CachePopulate,
                 crate::vm::dispatch_policy(shared),
                 &class_name,
                 &method_name,
@@ -995,7 +996,21 @@ pub(super) fn populate_invoke_cache(
                 // route has declined. §7 step 3's input is therefore unknown
                 // here, and `false` keeps `JdkOnly` from changing what gets
                 // cached on a fact it has not established.
-                false,
+                //
+                // The dial is the exception: it establishes the fact itself,
+                // with the same hierarchy walk step 1 uses. Declining to cache
+                // an armed class's bridge is what keeps this call site from
+                // pinning it -- the resolution below then caches the bytecode
+                // target, so the armed answer is the same on the first
+                // execution and the millionth. See
+                // `jdk_only_dial_yields_to_bytecode`.
+                crate::runtime::interpreter::jdk_only_dial_yields_to_bytecode(
+                    shared,
+                    &class_name,
+                    &method_name,
+                    &descriptor,
+                    kind,
+                ),
             ) {
                 // Deliberately NOT an error path: populating a call-site cache
                 // is not a dispatch. Under `JdkOnly` a refused stub simply does

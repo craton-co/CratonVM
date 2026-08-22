@@ -192,6 +192,18 @@ pub fn signal_stack_dump_to_waiters() {
 /// hot contended-enter path stays byte-for-byte unchanged in normal runs
 /// (plain `entry_condvar.wait`); the poll variant runs only under the flag.
 /// Read once and cached so the per-enter check is a single relaxed load.
+/// `CRATONVM_WAIT_SPURIOUS_MS=<n>` — see the call site in `Monitor::wait`.
+/// Diagnostic only; `None` (unset) leaves the wait loop unchanged.
+fn wait_spurious_ms() -> Option<u64> {
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_WAIT_SPURIOUS_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    })
+}
+
 pub fn mon_enter_dump_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_MONENTER").is_ok())
@@ -228,6 +240,25 @@ where
     F: Fn(ThreadId) + Send + Sync + 'static,
 {
     let _ = WAIT_SITE_DUMP.set(Arc::new(f));
+}
+
+/// Callback installed by the VM to print the state of the object a thread is
+/// parked on in `Object.wait()`. Separate from [`WAIT_SITE_DUMP`] because it
+/// needs heap + class metadata, which `monitor.rs` has no handle on.
+type WaitObjectDumpFn = Arc<dyn Fn(ObjectRef) + Send + Sync>;
+static WAIT_OBJECT_DUMP: std::sync::OnceLock<WaitObjectDumpFn> = std::sync::OnceLock::new();
+
+pub fn install_wait_object_dump<F>(f: F)
+where
+    F: Fn(ObjectRef) + Send + Sync + 'static,
+{
+    let _ = WAIT_OBJECT_DUMP.set(Arc::new(f));
+}
+
+fn emit_wait_object_state(obj: ObjectRef) {
+    if let Some(f) = WAIT_OBJECT_DUMP.get() {
+        f(obj);
+    }
 }
 
 fn emit_wait_site_frames(thread_id: ThreadId) {
@@ -970,6 +1001,12 @@ impl Monitor {
         thread_id: ThreadId,
         timeout_ms: Option<u64>,
         interrupted: Option<&std::sync::atomic::AtomicBool>,
+        // DIAGNOSTIC ONLY (netty promise stall): the object this monitor was
+        // reached through, so the poll loop can re-read its mark word and prove
+        // whether the waiter has been ORPHANED — parked on a monitor the object
+        // no longer points at, so any later `notifyAll()` inflates a different
+        // one and never reaches here. Carries no semantics.
+        waited_on: Option<ObjectRef>,
     ) -> Result<bool, MonitorError> {
         let mut state = self.state.lock();
         if state.owner != Some(thread_id) {
@@ -1004,6 +1041,7 @@ impl Monitor {
         let poll_interval = std::time::Duration::from_millis(5);
         let mut was_interrupted = false;
         let mut frames_dumped = false;
+        let mut orphan_reported = false;
         match timeout_ms {
             Some(ms) if ms > 0 => {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
@@ -1061,8 +1099,31 @@ impl Monitor {
                 // Untimed wait. Loop with periodic interrupt checks until
                 // notify() wakes us or the interrupt flag is set.
                 if let Some(flag) = interrupted {
+                    // DIAGNOSTIC A/B (netty ParameterizedSslHandlerTest promise
+                    // stall, 2026-08-21). `CRATONVM_WAIT_SPURIOUS_MS=<n>` makes
+                    // this untimed wait return to Java after `n` ms even with no
+                    // notify. A spurious wakeup is explicitly permitted by
+                    // JLS 17.2.1, and every correct caller re-checks its
+                    // condition in a `while` loop — netty's
+                    // `DefaultPromise.awaitUninterruptibly` does exactly that.
+                    //
+                    // It exists to PARTITION the stall, on ONE binary, without a
+                    // cross-binary comparison: if the stall disappears under it,
+                    // the promise had already completed and the notification was
+                    // lost, so the defect is in this monitor. If the stall
+                    // survives, the promise was never completed and the defect is
+                    // upstream, in whatever should have run the task.
+                    //
+                    // Default OFF: unset leaves the loop byte-for-byte as it was.
+                    let spurious_after = wait_spurious_ms();
+                    let started = std::time::Instant::now();
                     loop {
                         let result = self.wait_condvar.wait_for(&mut state, poll_interval);
+                        if let Some(ms) = spurious_after {
+                            if started.elapsed() >= std::time::Duration::from_millis(ms) {
+                                break;
+                            }
+                        }
                         if flag.load(std::sync::atomic::Ordering::Acquire) {
                             was_interrupted = true;
                             // LOST-WAKEUP FIX (see the timed branch above): if a
@@ -1081,7 +1142,60 @@ impl Monitor {
                             && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire)
                         {
                             emit_wait_site_frames(thread_id);
+                            // WAITED-ON OBJECT STATE (diagnostic). The orphan check
+                            // below came back CLEAN on a reproduced stall, so the
+                            // waiter IS parked on the monitor its object points at
+                            // and a notifier would resolve the same one. What is
+                            // left to distinguish is netty's own bookkeeping:
+                            //
+                            //   result != null && waiters >= 1
+                            //       the promise completed AND this waiter had
+                            //       registered — so `checkNotifyWaiters` either
+                            //       never ran or read a stale `waiters`, i.e. the
+                            //       monitor is not establishing happens-before.
+                            //   result != null && waiters == 0
+                            //       the increment is not visible here at all.
+                            //   result == null
+                            //       the promise never completed — the 30 s A/B
+                            //       result would then need re-examining.
+                            //
+                            // Only the VM can read those fields, hence the
+                            // callback; `emit_wait_site_frames` uses the same
+                            // pattern for exactly this reason.
+                            if let Some(obj) = waited_on {
+                                emit_wait_object_state(obj);
+                            }
                             frames_dumped = true;
+                        }
+                        // ORPHAN CHECK (diagnostic). The 30 s-spurious-wakeup A/B
+                        // proved the awaited promise is ALREADY complete while
+                        // this thread stays parked, i.e. a `notifyAll()` never
+                        // reached it. The one way that happens with a correct
+                        // condvar is that the notifier resolved a DIFFERENT
+                        // monitor: `notify_all` re-reads the object's mark word,
+                        // so if that word stops pointing at `self` the notify
+                        // lands on a freshly inflated monitor and this waiter is
+                        // orphaned for good. Re-read it on the existing 5 ms poll
+                        // and say so once.
+                        if !orphan_reported {
+                            if let Some(obj) = waited_on {
+                                let cur = header_of(obj).mark_word.load(Ordering::Acquire);
+                                let still_ours = monitor_ptr_from_mark(cur)
+                                    .is_some_and(|p| std::ptr::eq(p, self as *const Monitor));
+                                if !still_ours {
+                                    orphan_reported = true;
+                                    eprintln!(
+                                        "[MONITOR-ORPHAN] thread {thread_id:?} is parked in \
+                                         Object.wait() on a monitor the object no longer points \
+                                         at — obj={:p} mark_state={} monitor={:p}. Any later \
+                                         notify()/notifyAll() inflates a DIFFERENT monitor and \
+                                         cannot reach this waiter.",
+                                        obj.as_ptr(),
+                                        ObjectHeader::mark_state(cur),
+                                        self as *const Monitor,
+                                    );
+                                }
+                            }
                         }
                         // If the condvar was signalled (not timed out), break
                         // to allow the caller to re-check its condition.
@@ -1933,7 +2047,7 @@ impl MonitorTable {
     ) -> Result<bool, MethodCallFailed> {
         let monitor = self.ensure_inflated(obj_ref, thread_id)?;
         monitor
-            .wait(thread_id, timeout_ms, interrupted)
+            .wait(thread_id, timeout_ms, interrupted, Some(obj_ref))
             .map_err(|MonitorError::NotOwner| {
                 MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::IllegalMonitorStateException {
