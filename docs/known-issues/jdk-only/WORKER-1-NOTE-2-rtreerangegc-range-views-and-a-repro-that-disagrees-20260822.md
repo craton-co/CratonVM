@@ -106,6 +106,71 @@ are not yet shown to be the same thing. Reasoning from "I found a 3-walk repro
 of it" would be the error this directory keeps recording — a probe reporting its
 own reach as the defect.
 
+## 4b. N1 RUN — one half settled, and it refutes the parent's premise
+
+### The `--jdk-only` disagreement is a THRESHOLD, and that is the finding
+
+The parent record's localisation turns on *"Strict mode is CLEAN … so the
+unrooted reference is held by CratonVM's own collection substitution."* That
+arm was measured at one heap size. Squeezing it:
+
+```text
+RTreeRangeGc  --jdk-only  --Xmx 64m    pass FAIL      <- flaked on one of two
+RTreeRangeGc  --jdk-only  --Xmx 48m    FAIL FAIL
+RTreeRangeGc  --jdk-only  --Xmx 32m    FAIL FAIL
+   (control)  default     --Xmx 64m    FAIL FAIL
+```
+
+**`--jdk-only` is not clean; it is less sensitive.** So the vector and this
+note's repro agree on that arm once the pressure is equalised — one of the two
+disagreements resolves in the direction of ONE defect — and, more importantly,
+**the parent's evidence for blaming the collection substitution is gone.** The
+gap survives removing those natives.
+
+### The generational disagreement is NOT settled, and my probes are why
+
+`TreeRepeat sub` passes on generational at 8, 64, 256 and **1024** walks — 340×
+the pressure that fails at walk 3 on the default collector. That is immunity,
+not a threshold. So I went looking for the site that does fail there, and did
+not find one:
+
+```text
+generational, 64 walks each, 2/2:
+   headMap tailMap subMap headMap(k,false) whole-map   all ok
+   headSet tailSet subSet keySet toString              all ok
+   map subMap + set subSet held together ("both")      ok
+```
+
+Yet the full vector fails on generational. **Every construction I could build
+passes there and the vector does not**, so the vector's generational trigger is
+something none of these reproduce — most likely its distinct shape: eleven
+views walked ONCE each with a 400-entry map and a 400-entry set both live,
+rather than one view walked repeatedly.
+
+**That is a statement about my probes' reach, not about the defect.** It is
+exactly the failure mode this directory records as `a-narrow-probe-reports-its-
+own-reach-not-the-defect`, and naming it is the honest stopping point.
+
+### N1 as filed — the weak half
+
+Both repros die on the identical cast:
+
+```text
+cannot be cast to class java.util.Map$Entry     (vector)
+cannot be cast to class java.util.Map$Entry     (TreeRepeat sub)
+```
+
+Same symptom, which is consistent with one defect and proves little on its own.
+
+### Verdict
+
+**Partially settled.** On `--jdk-only` they agree once pressure is equalised,
+which is evidence for one defect and refutes the parent's premise either way.
+On generational they still differ, and nothing I could construct closes that —
+so "same defect" is **not established**, and anyone fixing the range-view site
+should expect the vector to stay red on generational afterwards and not read
+that as the fix having failed.
+
 ## 5. Reproduce
 
 ```bash
@@ -159,12 +224,38 @@ So the parent record's *"strict mode is CLEAN, therefore it is the collection
 substitution"* was indeed too narrow, in precisely the way this note suspected:
 strict mode was clean **for the vector**, not for the machinery.
 
-**N2 -- why `subMap` is ~6x more sensitive, not 2x.** Not separately measured,
-and now moot as a defect signal, but the candidate is on the page: the two-bound
-entry points alone route through `tm_refuse_reversed_bounds`, which dispatches a
-FULL user comparator before the view is built at all. That is an extra
-allocating interpreted call per `subMap` on top of the second bound key, so the
-extra factor is a comparator dispatch and not a `new`.
+**N2 -- why the two-bound entry points are ~6x more sensitive, not 2x:
+ANSWERED for `subSet`, and it was a
+fourth defect.** For the TreeSet half it is not the allocation rate at all.
+Both two-bound `TreeSet` natives read
+the element ONCE at the top of the scan loop, compared it against the low bound
+-- a full interpreted `compareTo`, which allocates -- and then compared THE SAME
+Rust local against the high bound. The re-read three statements further down,
+before `native_ts_add`, has said exactly this since 2026-07-31; the second
+comparison never got it. The four single-bound natives compare once per element
+and have nothing to go stale between. `TreeMap`s own two-bound rebuild refreshes
+the element before EACH comparison and never had this, so the `subMap` half of
+the 6x is still only the extra dispatch -- unmeasured, and now moot.
+
+It survived the first three fixes as a ~3% residual under `--jdk-only` and was
+found by instrumenting the vector rather than a probe: at the moment
+`native_ts_sub_set` threw, the source set audited **400 / 400 intact** and an
+immediate retry of the same `subSet` answered **200**. Nothing was wrong with
+the set. MEASURED, interleaved on one host, 120 runs each, `--Xmx 64m
+--jdk-only`: **117 pass / 3 fail before, 120 pass / 0 fail after.**
+
+**Section 4b's two findings, both confirmed here:**
+
+* **"`--jdk-only` is not clean; it is less sensitive"** -- right, and the
+  mechanism is now named: strict mode reaches the `TreeSet` half of the defects
+  and not the `TreeMap` half, so its rate is lower at any given heap size and
+  rises as the heap tightens. The fixed binary is 12/12 at each of
+  `--Xmx 64m`, `48m` and `32m`, in BOTH modes -- 72 runs, 0 failures.
+* **"Every construction I could build passes on generational and the vector
+  does not"** -- also right, and not a limit of those probes. The vector's
+  generational failure was the `TreeMap` entrySet-kind defect, which
+  `TreeRepeat` cannot reach because it never asks a view for its `entrySet()`
+  twice. The fixed binary is 12/12 on generational.
 
 **N3 -- the vector's `--jdk-only` PASS.** Withdrawn as load-bearing: it was
 2/2, `WORKER-1-NOTE-1` measured 9 pass / 3 fail over twelve, and this lane
@@ -183,11 +274,12 @@ tells a future regression here apart from a general iteration defect.
 
 ## NOMINATIONS
 
-* **N1 — settle same-or-different before fixing either.** Run the full vector
-  and `TreeRepeat sub` under `CRATONVM_DBG_COERCION=1` and compare the guard's
-  `holder` / `last_publish_pc`. If the two disagree there as they do on the
-  arms, they are two defects and the record's `--jdk-only`-clean conclusion
-  stands for its own.
+* **N1 — RUN 2026-08-22, §4b.** Partially settled: `--jdk-only` is a threshold
+  (vector FAILs 2/2 at 48m and 32m), which refutes the parent's "strict mode is
+  clean" and the localisation built on it. Generational remains unexplained and
+  no constructed probe fails there. What is left of N1 is the generational
+  trigger, and it needs a probe shaped like the VECTOR — many views once each,
+  map and set both live — not another repeated-walk one.
 * **N2 — why is `subMap` 6× more sensitive, not 2×?** Two bound keys explain 2×.
   The remaining factor is the thing to read: it is the difference between the
   one-bound and two-bound paths, and it is where a snapshot is most likely held

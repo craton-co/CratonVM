@@ -1,6 +1,6 @@
-# `RTreeRangeGc` was THREE collection-native defects, and none of them was a root-collection gap
+# `RTreeRangeGc` was FOUR collection-native defects, and none of them was a root-collection gap
 
-**Status: FIXED 2026-08-22.** All three land on `fix/gc-known-issues-20260822`.
+**Status: FIXED 2026-08-22.** All four land on `fix/gc-known-issues-20260822`.
 `RTreeRangeGc` passes 25/25 on the default collector and 25/25 under
 `--jdk-only` on one binary, and `SUITE=all` is **107 passed, 0 failed**.
 
@@ -177,9 +177,16 @@ pointer that was already wrong.
   is a property of a BINARY AND A HOST, not of a vector.** This lane's own
   strict arm bears that out from the other side -- 2 fails in 20 where theirs
   saw 0 in 6, same vector, different binary and load.
-* **`--jdk-only` is CLEAN (2/2).** It is not; `WORKER-1-NOTE-1` measured 9
-  pass / 3 fail over twelve runs the next day and was right. Two runs cannot
-  see a 25% flake, and this page drew a mode conclusion from them.
+* **`--jdk-only` is CLEAN (2/2).** It is not, and it was refuted twice before
+  this fix landed. `WORKER-1-NOTE-1` measured 9 pass / 3 fail over twelve runs
+  the next day; `WORKER-1-NOTE-2` §4b then showed the `pass` is a THRESHOLD and
+  not immunity -- `--Xmx 48m` FAIL 2/2, `--Xmx 32m` FAIL 2/2, and `--Xmx 64m`
+  itself flaking. Both were right, and §4b's consequence was the important one:
+  *"the parent's evidence for blaming the collection substitution is gone."*
+  Two runs cannot see a 25% flake, and this page drew a MODE conclusion from
+  them. The mechanism behind the threshold is now plain -- strict mode reaches
+  the `TreeSet` half of these defects and not the `TreeMap` half, so its rate is
+  lower at any heap size and rises as the heap tightens.
 * **"The affected path is the young/relocating one the other two collectors
   share and G1 does not take here."** G1 passes because G1 did not relocate
   these objects on this workload, not because it takes a different path.
@@ -187,21 +194,57 @@ pointer that was already wrong.
   machinery."** The conclusion was right; the reasoning — a 3/3 vs 3/3 A/B over
   a defect that is at best 25% in one of its two modes — could not support it.
 
-## 7. Measured, after
+## 7. Defect 4 — and it is why `subSet` was always the sensitive one
 
-`cratonvm-tsrange-20260822`, one binary, `--Xmx 64m`, 25 runs per arm:
+Three fixes in, the vector still failed **~3 runs in 100** under `--jdk-only`,
+same `java.lang.Object cannot be cast to Comparable`, raised from
+`native_ts_sub_set`'s `cmp_hi` line. An instrumented copy of the vector settled
+it in one hit: at the moment it threw, the source set audited **400 / 400
+intact** and an immediate retry of the same `subSet` answered **200**. Nothing
+was wrong with the set; one Rust local was one collection out of date.
+
+Both two-bound `TreeSet` natives read the element ONCE at the top of the loop,
+compared it against the LOW bound — a full interpreted `compareTo`, which
+allocates — and then compared THE SAME local against the high bound. The re-read
+three statements below, before `native_ts_add`, has said exactly this since
+2026-07-31; the second comparison never got it. The four single-bound natives
+compare once and were always fine.
+
+That is `WORKER-1-NOTE-2`'s N2 answered: `subSet` is ~6x more sensitive than
+`headSet`/`tailSet` not because it allocates a second bound key, but because it
+is the only path with a second comparison for a stale element to reach.
+
+## 8. Measured, after
+
+Interleaved on one host, 120 runs each, `--Xmx 64m --jdk-only`, for the last
+fix alone:
+
+```text
+before   117 pass /  3 fail
+after    120 pass /  0 fail
+```
+
+`cratonvm-tselem-20260822`, one binary, 12 runs per cell:
+
+| arm | `--Xmx 64m` | `--Xmx 48m` | `--Xmx 32m` |
+| --- | --- | --- | --- |
+| default (ZGC) | 12 / 12 | 12 / 12 | 12 / 12 |
+| `--jdk-only` | 12 / 12 | 12 / 12 | 12 / 12 |
+
+The tighter heaps are there because `WORKER-1-NOTE-2` §4b showed strict mode was
+never immune, only less sensitive, and 48m/32m were the arms that proved it.
 
 | arm | before | after |
 | --- | --- | --- |
-| default (ZGC) | 0 / 12 | **25 / 25** |
-| `--jdk-only` | 2 fails in 20 | **25 / 25** |
+| default (ZGC) | 0 / 12 | 25 / 25, then 12 / 12 at three heap sizes |
+| `--jdk-only` | 3-4 fails per 100 | 120 / 120, then 12 / 12 at three heap sizes |
 | `-XX:+UseG1GC` | 12 / 12 | 12 / 12 |
-| generational | 0 / N since 2026-08-20 | **12 / 12** |
+| generational | 0 / N since 2026-08-20 | 12 / 12 |
 
 `SUITE=all`: **107 passed, 0 failed**, where this page's own tables show 105/107
 and 106/107.
 
-## 8. Gate
+## 9. Gate
 
 `RJdkViews.entrySetStaysEntries` — the empty-then-populated entrySet, a range
 view's entrySet asserted element by element, and the `equals`/`hashCode` half.
@@ -213,7 +256,7 @@ diff for the wrong reason. It FAILS on the pre-fix binary and PASSES on HotSpot,
 The vector itself needed nothing: `RTreeRangeGc` was already registered, already
 publishes its check count, and caught all three.
 
-## 9. Left open
+## 10. Left open
 
 * **`regression-suite/known-flaky.txt` quarantines `RTreeRangeGc` at 3/12.**
   That row is now stale — 50 runs, two arms, zero failures. The row is removed
