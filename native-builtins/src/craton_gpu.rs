@@ -255,6 +255,19 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "(J)Ljava/lang/String;",
         builtin_future_get_error_message,
     );
+    // `GpuFuture.get()` reads a failed submission's reason through
+    // `futureGetError`, not `futureGetErrorMessage`. Registering only
+    // the latter meant the DIAGNOSTIC path for every GPU failure was
+    // itself a failure: a kernel that could not be compiled, marshalled
+    // or launched surfaced as `UnsatisfiedLinkError:
+    // Native.futureGetError` from inside `get()`, hiding the message
+    // the Rust side had already produced. Same body, both names.
+    registry.register(
+        KLASS,
+        "futureGetError",
+        "(J)Ljava/lang/String;",
+        builtin_future_get_error_message,
+    );
 
     registry.register(KLASS, "arrayWrapInt", "([I)J", builtin_array_wrap_int);
     registry.register(KLASS, "arrayWrapLong", "([J)J", builtin_array_wrap_long);
@@ -413,6 +426,25 @@ pub fn array_snapshot(handle: u64) -> Option<(cratonvm_types::ArrayElementType, 
         s.arrays
             .get(&handle)
             .map(|e| (e.element_type, e.element_count, e.bytes.clone()))
+    })
+}
+
+/// Element type and length for an `arrayWrap*`/`arrayAllocate*`
+/// handle, without copying the payload. Returns `None` if the handle
+/// is unknown or has been released.
+///
+/// This is what the dispatch path wants on every submit: it needs the
+/// shape to build the `(ptr, len)` kernel-argument pair, and it needs
+/// the bytes only when the device cache misses. Reading the two apart
+/// is the difference between a resident weight tensor costing one
+/// upload for the life of the process and costing a full `memcpy` of
+/// itself per kernel launch.
+#[cfg(feature = "gpu-offload")]
+pub fn array_shape(handle: u64) -> Option<(cratonvm_types::ArrayElementType, usize)> {
+    state::with(|s| {
+        s.arrays
+            .get(&handle)
+            .map(|e| (e.element_type, e.element_count))
     })
 }
 

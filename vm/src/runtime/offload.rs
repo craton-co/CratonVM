@@ -398,6 +398,10 @@ impl OffloadCache {
         // u64::MAX. `writes & !reads` is what the chunked writeback may
         // stream out before the failure flag is known.
         sig.reads_param_mask = ptx_module.reads_param_mask;
+        // Where the counted loop's trip count comes from, so the launch
+        // grid is sized to the loop rather than to the largest array
+        // argument. See `WorkBound`.
+        sig.work_bound = ptx_module.work_bound;
         let ptx_text = ptx_module.render();
         dump_ptx_if_requested(class_name, &method.name, &ptx_text);
         let ctx = self.ctx.as_ref().expect("ctx presence checked above");
@@ -2491,6 +2495,12 @@ fn enqueue_completion(
 
 #[cfg(feature = "gpu-offload")]
 fn record_failed_submission(stream: Option<std::sync::Arc<Stream>>, message: String) -> u64 {
+    // Every explicit-dispatch failure ends here, and until this line
+    // existed none of them said anything: the reason was stored on the
+    // submission and only ever surfaced if the Java side successfully
+    // called back for it. `--print-gpu-decisions` turns this on along
+    // with the analyzer verdicts.
+    tracing::warn!("gpu offload: submission failed — {message}");
     let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let sub = std::sync::Arc::new(StreamSubmission {
         handle,
@@ -2592,13 +2602,22 @@ pub fn dispatch_method_from_native_on_stream(
     // knows whether the compiled PTX declares a trailing `ret_ptr`
     // param (any non-void, non-array return) that needs a matching
     // accumulator buffer pushed ahead of `failure_flag`.
-    let (class_id, method_index, is_static, this_field_names, writes_param_mask, return_kind): (
+    let (
+        class_id,
+        method_index,
+        is_static,
+        this_field_names,
+        writes_param_mask,
+        return_kind,
+        work_bound,
+    ): (
         crate::classloading::ClassId,
         u16,
         bool,
         Vec<String>,
         u64,
         ParamKind,
+        jit_cuda::emitter::WorkBound,
     ) = {
         // Phase 9 #1 fix — load the class on demand. The class name
         // arrives as a string from `Native.submitMethod`; the user has
@@ -2710,6 +2729,7 @@ pub fn dispatch_method_from_native_on_stream(
                     names,
                     compiled.signature.writes_param_mask,
                     compiled.signature.return_kind,
+                    compiled.signature.work_bound,
                 )
             }
             LookupOutcome::Skip => {
@@ -2819,6 +2839,11 @@ pub fn dispatch_method_from_native_on_stream(
     let mut kernel_args = KernelArgs::new();
     let mut writebacks: Vec<MarshalWriteback> = Vec::new();
     let mut max_array_len: usize = 0;
+    // Per-declared-parameter array lengths, so `work_bound` can name
+    // the one that is the loop trip count. Only the static path
+    // populates this (the `pthis_*` prelude has no declared index),
+    // which is also the only path `WorkBound::ParamLen` is derived on.
+    let mut param_lens: Vec<Option<usize>> = Vec::new();
     let mut h2d_bytes: usize = 0;
     // Param-index counter for the writes-mask lookup. The non-static
     // `pthis_*` arms come first and consume slots ahead of the
@@ -2995,6 +3020,7 @@ pub fn dispatch_method_from_native_on_stream(
                             if arr_len > max_array_len {
                                 max_array_len = arr_len;
                             }
+                            record_param_len(&mut param_lens, i, arr_len);
                             if let Some(wb) = wb_opt {
                                 writebacks.push(wb);
                             }
@@ -3014,16 +3040,15 @@ pub fn dispatch_method_from_native_on_stream(
                 // the DeviceBuffer in the resident state so this
                 // path skips the H→D copy when the bytes haven't
                 // changed since the previous kernel.
-                if let Some((etype, len, host_bytes, arr_handle)) =
-                    try_gpu_array_snapshot(shared, *obj_ref)
-                {
-                    match marshal_resident_array_arg(ctx, etype, len, host_bytes, arr_handle) {
+                if let Some((etype, len, arr_handle)) = try_gpu_array_shape(shared, *obj_ref) {
+                    match marshal_resident_array_arg(ctx, etype, len, arr_handle) {
                         Ok((args_after, wb)) => {
                             kernel_args = args_after(kernel_args);
                             if let Some(l) = wb.array_len() {
                                 if l > max_array_len {
                                     max_array_len = l;
                                 }
+                                record_param_len(&mut param_lens, i, l);
                             }
                             writebacks.push(wb);
                         }
@@ -3209,7 +3234,27 @@ pub fn dispatch_method_from_native_on_stream(
             h2d_trace::total(),
         );
     }
-    let runtime_work: u32 = u32::try_from(max_array_len).unwrap_or(u32::MAX);
+    // Size the grid to the loop, not to the biggest array. For an
+    // element-wise kernel these are the same number. For a kernel whose
+    // inputs are larger than its iteration space — a matrix-vector
+    // product is the canonical one — they differ by the matrix's inner
+    // dimension, and the largest-array rule launches that many times too
+    // many threads. Each extra thread does nothing but reach the guard
+    // and exit, but the driver still creates it.
+    //
+    // `Unknown` (anything that is not a single counted loop) and a
+    // parameter whose length we never recorded both fall back to the
+    // old rule, which is over-provisioning and therefore always safe.
+    let work_items: usize = match work_bound {
+        jit_cuda::emitter::WorkBound::ParamLen(idx) => param_lens
+            .get(idx as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(max_array_len),
+        jit_cuda::emitter::WorkBound::Literal(v) if v > 0 => v as usize,
+        _ => max_array_len,
+    };
+    let runtime_work: u32 = u32::try_from(work_items).unwrap_or(u32::MAX);
     // The thread-local SafepointToken's role is over (marshal is
     // done). The cross-thread GcCriticalGuard (moved into
     // `FinalizeState` below) takes over.
@@ -4820,19 +4865,29 @@ impl MarshalWriteback {
 }
 
 /// Phase 6 #3: detect a `craton.gpu.GpuArray` Java object and read
-/// its (element_type, length, host bytes, native handle) tuple from
-/// the resident-array store. Returns `None` for any non-GpuArray
-/// object so callers can fall through to other arg shapes.
+/// its (element_type, length, native handle) tuple from the
+/// resident-array store. Returns `None` for any non-GpuArray object so
+/// callers can fall through to other arg shapes.
+///
+/// **Shape only, deliberately.** This used to return the host bytes
+/// too, which meant every submit copied the whole array out of the
+/// resident store — including the overwhelmingly common case where the
+/// buffer was already on the device and the copy was thrown away
+/// unread. For a weight tensor that is resident for the life of the
+/// process (a language model's, say) that is the entire point of
+/// residency undone: gigabytes of `memcpy` per kernel launch. The bytes
+/// are now fetched by `marshal_resident_array_arg` on the cache-miss
+/// path only.
 ///
 /// The GpuArray Java layout (P3-2):
 ///   field 0: `long handle`
 ///   field 1: `Class<?> elementType`  (unused here; type comes from
 ///                                     the resident-store record)
 #[cfg(feature = "gpu-offload")]
-fn try_gpu_array_snapshot(
+fn try_gpu_array_shape(
     shared: &crate::vm::SharedVm,
     obj_ref: cratonvm_types::ObjectRef,
-) -> Option<(cratonvm_types::ArrayElementType, usize, Vec<u8>, u64)> {
+) -> Option<(cratonvm_types::ArrayElementType, usize, u64)> {
     let cid = shared.mem.heap.class_id_of(obj_ref);
     let cm = shared.classes.class_manager.read();
     let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
@@ -4845,8 +4900,20 @@ fn try_gpu_array_snapshot(
         cratonvm_types::Value::Long(h) => h as u64,
         _ => return None,
     };
-    let (etype, len, bytes) = cratonvm_native_builtins::craton_gpu::array_snapshot(handle)?;
-    Some((etype, len, bytes, handle))
+    let (etype, len) = cratonvm_native_builtins::craton_gpu::array_shape(handle)?;
+    Some((etype, len, handle))
+}
+
+/// Remember one declared parameter's array length, growing the vector
+/// as needed. Indexed by the analyzer's declared-parameter index — the
+/// same index `writes_param_mask` is bit-indexed by, and the one
+/// `WorkBound::ParamLen` names.
+#[cfg(feature = "gpu-offload")]
+fn record_param_len(param_lens: &mut Vec<Option<usize>>, index: usize, len: usize) {
+    if param_lens.len() <= index {
+        param_lens.resize(index + 1, None);
+    }
+    param_lens[index] = Some(len);
 }
 
 /// Marshal a resident GpuArray as a kernel arg. The shape of the
@@ -4854,12 +4921,14 @@ fn try_gpu_array_snapshot(
 /// source bytes are the resident-store snapshot rather than a JVM
 /// array — and the writeback target is the resident store (so a
 /// subsequent `GpuArray.toHost()` reads the post-kernel content).
+///
+/// The host bytes are read from the resident store only when the
+/// device cache misses; a hit never touches them.
 #[cfg(feature = "gpu-offload")]
 fn marshal_resident_array_arg(
     ctx: &cuda_bridge::DeviceContext,
     element_type: cratonvm_types::ArrayElementType,
     len: usize,
-    host_bytes: Vec<u8>,
     arr_handle: u64,
 ) -> Result<
     (
@@ -4881,7 +4950,13 @@ fn marshal_resident_array_arg(
             let arc = if let Some(arc) = $cache_get(arr_handle) {
                 arc
             } else {
-                // (b) Miss — upload and install.
+                // (b) Miss — read the host bytes (the only path that
+                // needs them at all), upload and install.
+                let host_bytes = cratonvm_native_builtins::craton_gpu::array_snapshot(arr_handle)
+                    .map(|(_, _, bytes)| bytes)
+                    .ok_or_else(|| {
+                        format!("GpuArray handle {arr_handle} released before its first upload")
+                    })?;
                 let host: &[$ty] = bytemuck::cast_slice(&host_bytes);
                 let buf = gpu_marshal::upload(ctx, host)
                     .map_err(|e| format!("upload {} (GpuArray, len={len}): {e}", $tag))?;

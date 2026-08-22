@@ -24,6 +24,32 @@ pub enum LoweringError {
     Internal(String),
 }
 
+/// How many work items the kernel's counted loop actually runs.
+///
+/// The launch grid used to be sized from the *largest array argument*,
+/// which is right for an element-wise kernel (where the biggest array
+/// is the iteration space) and badly wrong for anything whose inputs
+/// are larger than its output. `out[i] = sum_j w[i*n + j] * x[j]`
+/// iterates `out.length` times over a `w` that is `n` times bigger, so
+/// a 2048-row matrix-vector product launched 4.2 million threads to do
+/// 2048 threads' work — every extra one reaching the guard and exiting,
+/// but only after the driver had created it.
+///
+/// Recording where the bound came from lets the host size the grid to
+/// the loop instead. `Unknown` keeps the old largest-array behaviour,
+/// which is what every shape that is not a single counted loop gets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkBound {
+    /// Not a single counted loop, or the bound is not attributable to
+    /// one parameter: fall back to the largest array argument.
+    #[default]
+    Unknown,
+    /// The loop runs `p<N>.length` times.
+    ParamLen(u32),
+    /// The loop runs a compile-time-constant number of times.
+    Literal(i32),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PtxModule {
     pub sm_major: u32,
@@ -44,6 +70,10 @@ pub struct PtxModule {
     /// `writes_param_mask`; see `KernelSignature::reads_param_mask` for
     /// why the chunked writeback needs it.
     pub reads_param_mask: u64,
+    /// The counted loop's trip count, when it is attributable — see
+    /// [`WorkBound`]. Read by the marshaller in `vm::runtime::offload`
+    /// to size the launch grid.
+    pub work_bound: WorkBound,
 }
 
 impl PtxModule {
@@ -145,6 +175,13 @@ pub enum RegKind {
     F64,
     /// Predicate register.
     Pred,
+    /// Raw 16-bit. Not a JVM value type — a `short` on the operand
+    /// stack is sign-extended into an `S32` register, same as the JVM
+    /// does. This exists purely as the operand type PTX demands for
+    /// `cvt.f32.f16`, which is the one instruction that reads half
+    /// precision. Nothing is ever stored in a `B16` across a
+    /// control-flow edge.
+    B16,
 }
 
 impl RegKind {
@@ -157,6 +194,7 @@ impl RegKind {
             RegKind::F32 => "f32",
             RegKind::F64 => "f64",
             RegKind::Pred => "pred",
+            RegKind::B16 => "b16",
         }
     }
 
@@ -169,6 +207,7 @@ impl RegKind {
             RegKind::F32 => "f",
             RegKind::F64 => "fd",
             RegKind::Pred => "p",
+            RegKind::B16 => "rs",
         }
     }
 }
@@ -185,6 +224,7 @@ mod tests {
             kernels: vec![],
             writes_param_mask: 0,
             reads_param_mask: 0,
+            work_bound: crate::emitter::WorkBound::Unknown,
         };
         let s = m.render();
         assert!(s.contains(".version 7.5"));
