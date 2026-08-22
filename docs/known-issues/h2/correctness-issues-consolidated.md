@@ -81,7 +81,7 @@ The rest of the 28 either passed outright (several recovering fully since
 the original rerun — `TestLIRSMemoryConsumption`, `TestDiskFull`,
 `TestPerfectHash`, `TestValueMemory`, `TestPgServer`, `TestStringCache`), hit
 a wall-clock cap while still visibly computing (throughput, not correctness —
-see `hangs-true-vs-perfcliff-20260821.md`'s retirement writeup), or are
+see `hangs-true-vs-perfcliff-RESOLVED-20260821.md`), or are
 already excluded by the census's own §3 (HotSpot fails them too). None
 surfaced a new correctness signature beyond `TestRandomMapOps` above.
 
@@ -91,7 +91,7 @@ result.
 ## Related
 - `nonpassed-40-census-20260818.md` — the source census, §2b (correctness)
   and §3 (not-CratonVM, HotSpot fails too).
-- `hangs-true-vs-perfcliff-20260821.md` — retired; see
-  `docs/internal/fixed-suite-bugs/h2-suite-bugs/` for the final version.
+- `hangs-true-vs-perfcliff-RESOLVED-20260821.md` — the resolved triage: of
+  the ten classes that still capped, zero are deadlocked or blocked.
 - `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` — the root
   cause behind three of this doc's four "new" FAILs.

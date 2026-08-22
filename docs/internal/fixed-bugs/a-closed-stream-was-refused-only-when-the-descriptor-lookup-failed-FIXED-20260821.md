@@ -171,8 +171,9 @@ improvement** — both were re-run ABBA, five rounds:
 
 * `TestTempTables` passes on BOTH arms every time, at 229–292 s on base against
   a **300 s cap**. The sweep's HANG was the cap. It is named in
-  `known-issues/h2/hangs-true-vs-perfcliff-20260821.md` as a perf cliff that
-  clears at a 5× cap, i.e. exactly the class whose wall sits on the boundary —
+  `fixed-suite-bugs/h2-suite-bugs/hangs-true-vs-perfcliff-RESOLVED-20260821.md`
+  as a perf cliff that clears at a 5× cap, i.e. exactly the class whose wall
+  sits on the boundary —
   the coin-toss shape a one-run-per-arm sweep cannot resolve.
 * `TestConcurrentConnectionUsage` failed once in nine on base and never in ten
   on fix. One in nine is a flake; that split is nowhere near a result, and

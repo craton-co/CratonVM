@@ -928,11 +928,36 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // `CRATONVM_G1_PRECISE_ONLY_ROOTS=1` restores the old behaviour so the
     // difference is an A/B inside one binary.
     let g1_precise_only_roots = dbg_g1_precise_only_roots();
-    let moving_young_precise_only = moving_young
-        && (shared.mem.heap.is_generational() || g1_precise_only_roots)
+    // TWO decisions, and they were one `&&` chain until 2026-08-21.
+    //
+    // `coverage_proven` is the per-cycle PROOF: did every live compiled frame
+    // publish its oops on a channel this collection can rewrite? It is a fact
+    // about the frames, not about the collector, and the collector-side gates
+    // that consult it (`gen_heap::collect_garbage_inner`, and `zgc`'s
+    // relocation refusal) need it computed on THEIR cycles to mean anything.
+    //
+    // `moving_young_precise_only` is the SUPPRESSION: may this collection skip
+    // the conservative JIT-frame scan? That one stays generational-only. G1
+    // needs the scan for its pin set and ZGC needs it as the backstop for
+    // everything the precise map does not name; the restriction is what
+    // `bug-g1-evacuates-live-jit-reference-20260819.md` asked for.
+    //
+    // The two were computed by one short-circuiting chain, so on a G1 or ZGC
+    // cycle `refresh_moving_young_coverage_for_collection()` was NEVER CALLED
+    // and the published verdict stayed at the `false` — meaning *complete* —
+    // that `begin_moving_young_coverage_cycle` reset it to. Anything reading it
+    // was reading a proof nobody ran. Splitting them costs one verifier pass
+    // per collection on the two collectors that were skipping it, and buys a
+    // verdict that is earned rather than vacuous.
+    //
+    // Order matters: `refresh_...` must stay AHEAD of the collector test so it
+    // is not short-circuited away again.
+    let coverage_proven = moving_young
         && !moving_young_osr_fallback
         && crate::jit::conservative_roots::refresh_moving_young_coverage_for_collection()
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
+    let moving_young_precise_only =
+        coverage_proven && (shared.mem.heap.is_generational() || g1_precise_only_roots);
     if !moving_young_precise_only {
         crate::memory::native_roots::rootprof::note_scan_caller(0); // gc-roots
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut roots);
@@ -969,12 +994,24 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         let frames = crate::jit::conservative_roots::active_compiled_frames();
         let labels: Vec<&str> = frames.iter().map(|(_, l, _, _)| l.as_str()).collect();
         eprintln!(
-            "[jitroots] precise_only={precise_only} moving_young={moving_young} \
-             osr_fb={osr_fb} incomplete={incomplete} chain={chain} any_jit={any_jit} \
+            "[jitroots] precise_only={precise_only} proven={proven} moving_young={moving_young} \
+             osr_fb={osr_fb} incomplete={incomplete} reason={reason} chain={chain} \
+             any_jit={any_jit} \
              scan_added={added} is_g1={is_g1} ybounds={ybounds} frames={labels:?}",
             precise_only = moving_young_precise_only,
+            proven = coverage_proven,
             osr_fb = moving_young_osr_fallback,
             incomplete = cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete(),
+            // WHICH obligation blocked it, not just that one did. `incomplete`
+            // alone cannot separate "this workload has a compiled frame the JIT
+            // never described" from "a peer thread happened to be in compiled
+            // code at this safepoint", and those want completely different
+            // work: the first is a codegen gap, the second is the cross-thread
+            // coverage handshake `arch-2026-07-26/moving-young-precise-roots.md`
+            // specifies and nobody has built.
+            reason = cratonvm_gc::gc_quiescence::incomplete_reason::label(
+                cratonvm_gc::gc_quiescence::moving_young_incomplete_reason(),
+            ),
             chain = crate::jit::conservative_roots::current_thread_jit_depth(),
             any_jit = crate::jit::conservative_roots::any_thread_in_jit(),
             added = roots.len() - jit_scan_start,
@@ -1508,5 +1545,64 @@ mod tests {
             assert!(cratonvm_gc::gc_quiescence::is_active());
         }
         assert_eq!(cratonvm_gc::gc_quiescence::depth(), depth_before);
+    }
+    /// **The coverage proof must be computed for EVERY collector, not only the
+    /// one that consumes the suppression.**
+    ///
+    /// This is a source witness, and it is a source witness on purpose. The
+    /// defect it guards is not a wrong value — it is a call that never happens:
+    /// `refresh_moving_young_coverage_for_collection()` sat behind
+    /// `heap.is_generational()` in a short-circuiting `&&` chain, so on a G1 or
+    /// ZGC cycle nothing ran and `moving_young_coverage_incomplete()` kept the
+    /// `false` that `begin_moving_young_coverage_cycle` had reset it to. A
+    /// collector-side gate reading that verdict is reading a proof nobody ran,
+    /// which is exactly how `zgc::relocate_stw`'s first per-cycle refusal was
+    /// unsound. No runtime assertion in this crate can see a call that did not
+    /// happen; the ORDER of the terms is the invariant, so the order is what is
+    /// asserted.
+    #[test]
+    fn the_coverage_proof_runs_for_every_collector() {
+        let src = include_str!("roots.rs");
+
+        // Establish the corpus before concluding anything from it: a file that
+        // stopped containing the decision would make this pass for the wrong
+        // reason.
+        assert!(
+            src.contains("let coverage_proven = moving_young"),
+            "roots.rs no longer computes `coverage_proven`, so this scan is \
+             reading the wrong text and its verdict means nothing"
+        );
+
+        let proof = src
+            .find("let coverage_proven = moving_young")
+            .expect("anchor checked above");
+        let suppression = src
+            .find("let moving_young_precise_only =")
+            .expect("roots.rs no longer computes `moving_young_precise_only`");
+        assert!(
+            proof < suppression,
+            "the proof must be computed BEFORE, and independently of, the \
+             suppression decision"
+        );
+
+        // The proof expression must not mention the collector at all. If a
+        // collector test creeps back into it, `&&` short-circuits and the
+        // refresh stops running for whatever the test excludes.
+        let proof_expr = &src[proof..suppression];
+        assert!(
+            proof_expr.contains("refresh_moving_young_coverage_for_collection()"),
+            "`coverage_proven` no longer calls the refresh, so nothing computes \
+             the verdict any collector-side gate reads"
+        );
+        for forbidden in ["is_generational", "is_g1", "g1_precise_only_roots"] {
+            assert!(
+                !proof_expr.contains(forbidden),
+                "`coverage_proven` mentions `{forbidden}`. In a short-circuiting \
+                 `&&` chain that stops the refresh from running for the excluded \
+                 collectors, and their verdict silently becomes a vacuous \
+                 `false` meaning `complete` -- the defect this split exists to \
+                 remove. Gate the SUPPRESSION on the collector, never the proof."
+            );
+        }
     }
 }

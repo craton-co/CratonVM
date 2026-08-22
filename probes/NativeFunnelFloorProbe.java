@@ -41,6 +41,28 @@ public final class NativeFunnelFloorProbe {
     static int plain(int i) { return i & 0xFFFF; }
 
     /**
+     * The STATIC twin of {@link Guarded#apply}: identical body, identical
+     * never-taken {@code try}/{@code catch}, but reached by {@code invokestatic}
+     * so the caller's compile can bind it directly — if it is allowed to.
+     *
+     * This rung exists because the two doors were banned for the same reason
+     * and lifted at different times. The MIC (virtual/interface) door's ban is
+     * gone, measured on this probe at 125.98 -> 14.35 ns/op, and
+     * {@code CRATONVM_JIT_MIC_EXC_TABLE_PUBLISH=0} restores it. The
+     * statically-bound door's ban is still ON by default, "pending its own
+     * measurement" (see {@code jit::direct_call_exc_table_publish_enabled}),
+     * and {@code CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=1} lifts it.
+     *
+     * Paired against {@code plain} — same call kind, same arity, same
+     * arithmetic, no exception table — so the pair isolates the table and
+     * nothing else.
+     */
+    static int guardedStatic(int i) {
+        try { return i & 0xFFFF; }
+        catch (RuntimeException e) { return -1; }
+    }
+
+    /**
      * Three Java-callee shapes, so the DISPATCH helper's own cost is measurable
      * from Java the way the native funnel's is.
      *
@@ -78,6 +100,22 @@ public final class NativeFunnelFloorProbe {
     static long h_currentThread(int n){ Object o=null; for (int i=0;i<n;i++) { o = Thread.currentThread(); } osink=o; return 1; }
     static long i_iface(int n)        { long a=0; for (int i=0;i<n;i++) { a += DIRECT.apply(i); } return a; }
     static long j_ifaceGuarded(int n) { long a=0; for (int i=0;i<n;i++) { a += GUARDED.apply(i); } return a; }
+    static long k_plainGuarded(int n)  { long a=0; for (int i=0;i<n;i++) { a += guardedStatic(i); } return a; }
+
+    /**
+     * The same static exception-table callee reached through ONE extra
+     * non-loop frame.
+     *
+     * `k_plainGuarded`'s loop is OSR-compiled, and an OSR body emits its
+     * invokes itself rather than going through `callee_compiler` — so the
+     * `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` gate is never consulted from it
+     * (`direct callee binds: 0 bound, 0 left` in both arms). `hop` tiers up as
+     * an ORDINARY callee instead, so its own call to `guardedStatic` does reach
+     * that gate. The pair separates "the gate does not work" from "the gate is
+     * not reachable from an OSR body", which the numbers alone cannot.
+     */
+    static int hop(int i) { return guardedStatic(i); }
+    static long l_guardedViaHop(int n) { long a=0; for (int i=0;i<n;i++) { a += hop(i); } return a; }
 
     interface Arm { long run(int n); }
 
@@ -105,6 +143,8 @@ public final class NativeFunnelFloorProbe {
         time("Thread.currentThread",        NativeFunnelFloorProbe::h_currentThread, n, reps);
         time("JAVA iface call (1 impl)",     NativeFunnelFloorProbe::i_iface, n, reps);
         time("JAVA iface call, try/catch",   NativeFunnelFloorProbe::j_ifaceGuarded, n, reps);
+        time("JAVA static call, try/catch",  NativeFunnelFloorProbe::k_plainGuarded, n, reps);
+        time("JAVA static try/catch via hop", NativeFunnelFloorProbe::l_guardedViaHop, n, reps);
 
         // Not decoration: a fast path that broke the digest contract would
         // still print the numbers above. This is the SHA-256 of the 8 bytes
