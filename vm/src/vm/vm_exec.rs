@@ -8792,6 +8792,18 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         false
     }
 
+    fn synthetic_implements_declared(&self, class_id: ClassId, target_class_name: &str) -> bool {
+        // Via the `pub use typecheck::*` re-export in `interpreter.rs`, exactly
+        // as `aastore_element_assignable` below reaches its predicate: one
+        // implementation, three doors (the `checkcast`/`instanceof` opcodes, the
+        // JIT's `jit_checkcast`/`jit_instanceof` helpers, and reflection).
+        crate::runtime::interpreter::synthetic_implements_public(
+            self.shared,
+            class_id,
+            target_class_name,
+        )
+    }
+
     fn superclass_of(&self, class_id: ClassId) -> Option<ClassId> {
         self.shared
             .classes
@@ -9946,6 +9958,14 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .class_manager
             .read()
             .find_all_resource_urls(name)
+    }
+
+    fn find_resource_urls_in_segment(&self, name: &str, segment: u8) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .find_resource_urls_in_segment(name, segment as usize)
     }
 
     fn next_resource_url(

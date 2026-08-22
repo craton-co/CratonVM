@@ -3925,6 +3925,19 @@ pub(crate) fn native_class_is_instance(
             return Ok(Some(Value::Int(1)));
         }
     }
+    // LAST, after every hierarchy answer: the relationships the VM DECLARES for
+    // the concrete stand-in classes it mints itself. This is the same table the
+    // `instanceof` bytecode consults, reached through the same door the
+    // reflective array store uses — see
+    // `NativeContext::synthetic_implements_declared` for why reflection asking a
+    // narrower question than the opcode is a defect and not a conservatism.
+    //
+    // Measured on `probes/FfmVectorSegmentProbe.java`: an FFM segment that a
+    // `checkcast jdk/internal/foreign/AbstractMemorySegmentImpl` had just
+    // admitted answered `isInstance` FALSE for the same class.
+    if ctx.synthetic_implements_declared(target_class_id, &this_name_for_assignability) {
+        return Ok(Some(Value::Int(1)));
+    }
     Ok(Some(Value::Int(0)))
 }
 
@@ -4290,9 +4303,18 @@ pub(crate) fn native_class_is_assignable_from(
                 return Ok(Some(Value::Int(0)));
             }
         };
+        // The last disjunct is the DECLARED relationships of the concrete
+        // stand-in classes the VM mints itself — the same table the `checkcast`
+        // and `instanceof` opcodes consult. See
+        // `NativeContext::synthetic_implements_declared`, and the matching
+        // arm at the tail of `native_class_is_instance`: the two reflective
+        // questions have to agree with each other as well as with the bytecode,
+        // and a `Class.isAssignableFrom` that refuses what `Class.isInstance`
+        // admits is the shape `Class.cast` fails on.
         let result = other_class_id == this_class_id
             || ctx.is_subclass(other_class_id, this_class_id)
-            || loader_aware_reflect_assignable(ctx, other_class_id, this_class_id, &this_name);
+            || loader_aware_reflect_assignable(ctx, other_class_id, this_class_id, &this_name)
+            || ctx.synthetic_implements_declared(other_class_id, &this_name);
         Ok(Some(Value::Int(if result { 1 } else { 0 })))
     })();
     // Restore depth on every exit path (success or error).
