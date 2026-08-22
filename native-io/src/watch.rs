@@ -848,70 +848,65 @@ fn take_stashed_names(ws_id: i32, key: i32) -> Vec<String> {
 /// actively wrong: a class name that exists nowhere, and a doc comment that
 /// presented this family as backing "the real JDK 25 pipeline". See
 /// `WORKER-4-2` N5.
-pub fn register_watch_service_real(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    // RETAGGED 2026-08-19 (P0 "wholesale Bridge over-tagging"), and this is the
-    // one retag this session that satisfies ALL THREE verifications in
-    // G85-1 §3b rather than two of them.
+pub fn register_watch_service_real(_r: &mut NativeMethodRegistry) {
+    // RETIRED 2026-08-22 (WORKER 4). This registered 54 triples -- nine `*0`
+    // methods across six `sun/nio/fs/*WatchService` classes -- and every one of
+    // them was unreachable.
     //
-    // 1. THE TAG MOVES. Censused: 27 `Bridge` registrations here, ZERO of them
-    //    targeting an `ACC_NATIVE` method — mistagged by the same standard
-    //    every other retag used. Under `--jdk-only` all 27 are now dropped.
-    // 2. THE CONTRACTS HOLD. `RJdkWatchService` (13 checks, scheduled) covers
-    //    construction, registration, key lifecycle, the closed-state
-    //    transitions and both argument refusals.
-    // 3. THE SURFACE IS EXERCISED — and this one needed its own measurement.
-    //    The doc comment above says these registrations exist so a caller
-    //    "still gets real OS-level notifications", so the risk was that real
-    //    bytecode would satisfy every contract and silently deliver nothing.
-    //    A vector cannot assert that without depending on filesystem latency,
-    //    so it was measured separately: create a directory, register, create a
-    //    file, poll. HotSpot EVENT / CratonVM EVENT, with these natives
-    //    refused. The real `WatchService` works here on its own.
+    // # The names do not exist
     //
-    // That third check is the one 0-invocation retags cannot make, and it is
-    // why `Vector` elsewhere in this tree is recorded as unproven rather than
-    // safe.
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    // `sun/nio/fs/UnixWatchService` was here until 2026-08-22 and names no class
-    // in any JDK image; `LinuxWatchService` is the Linux one. See the
-    // measurement in this function's doc comment.
-    let classes = [
-        "sun/nio/fs/AbstractWatchService",
-        "sun/nio/fs/LinuxWatchService",
-        "sun/nio/fs/BsdWatchService",
-        "sun/nio/fs/MacOSXWatchService",
-        "sun/nio/fs/WindowsWatchService",
-        "sun/nio/fs/PollingWatchService",
-    ];
-
-    for cls in classes {
-        // `init0` is the bootstrap point for our native ws_id; the JDK
-        // class-file declares this as a native helper called from the
-        // Java-level `<init>`.  We register both the conventional
-        // `init0` and the no-arg `<init>` form so either dispatch path
-        // lands here.
-        r.register(cls, "init0", "()V", ws_init_native);
-        r.register(
-            cls,
-            "register0",
-            "(Ljava/lang/String;I)I",
-            ws_register0_native,
-        );
-        r.register(cls, "take0", "()I", ws_take0_native);
-        r.register(cls, "poll0", "(J)I", ws_poll0_native);
-        r.register(cls, "cancel0", "(I)V", ws_cancel0_native);
-        r.register(cls, "close0", "()V", ws_close0_native);
-        r.register(cls, "reset0", "(I)Z", ws_reset0_native);
-        r.register(cls, "pollEventKinds0", "(I)[I", ws_poll_event_kinds0_native);
-        r.register(
-            cls,
-            "pollEventNames0",
-            "(I)[Ljava/lang/String;",
-            ws_poll_event_names0_native,
-        );
-    }
-    r.set_category(__prev_cat);
+    // MEASURED, `javap --module java.base`, Temurin 25.0.4+7. The real natives
+    // on `sun.nio.fs.LinuxWatchService` are
+    //
+    //     eventSize  eventOffsets  inotifyInit  inotifyAddWatch  inotifyRmWatch
+    //     configureBlocking  socketpair  poll(int,int)
+    //
+    // -- not `init0` / `register0` / `take0` / `poll0(J)` / `cancel0` /
+    // `close0` / `reset0` / `pollEventKinds0` / `pollEventNames0`, which is
+    // what this registered. The set was a CratonVM-defined API wearing
+    // `sun.nio.fs` names, and one of the class names (`sun/nio/fs/
+    // UnixWatchService`, corrected earlier the same day) named nothing on any
+    // platform.
+    //
+    // # And nothing reached them, in ANY configuration
+    //
+    // `WORKER-4-2` N5 measured `invocations: 0` and REFUSED to delete on the
+    // grounds that clearing it needed a `--features synthetic-jdk` build that
+    // lane had not made. That build is made. `regression-suite/probes/
+    // W4Watch.java` drives the whole lifecycle -- open, register, poll-empty,
+    // create a file, poll-with-timeout until the event arrives, read the
+    // events, reset, cancel, close, and the three closed-service refusals --
+    // with `--dump-native-registry` on each of three configurations:
+    //
+    //     --jdk-only              0 rows registered (SyntheticStub, refused at the door)
+    //     --real-jdk             54 rows,  0 INVOKED
+    //     --features synthetic-jdk   54 rows,  0 INVOKED
+    //
+    // and the probe PASSES on all three. The public `java.nio.file.WatchService`
+    // surface in `lib.rs` -- `native_ws_new`, `native_ws_register`,
+    // `native_ws_poll`, `native_ws_take` and friends -- is what actually serves
+    // it, and it does not call into this module at all.
+    //
+    // `[2cfgs]`: this is the case where checking the second feature config
+    // CLOSED a refusal rather than opening one.
+    //
+    // # The ENGINE below is deliberately kept
+    //
+    // `open_watch_service`, `register_dir`, `poll_with_timeout`,
+    // `take_blocking`, `poll_events`, `reset_key`, `cancel_key` and
+    // `close_watch_service` are a real inotify-backed implementation with its
+    // own tests. What was wrong was the DOOR, not the room: the engine was
+    // wired to method names no JDK declares.
+    //
+    // Deleting it would destroy the option that is actually worth taking --
+    // re-pointing it at the real names (`inotifyInit`, `inotifyAddWatch`,
+    // `socketpair`, `poll(int,int)`) so the JDK's own `LinuxWatchService`
+    // bytecode drives it, which is what a bridge is FOR. That is a measured
+    // piece of work, not a deletion, and this note is here so whoever takes it
+    // starts from the engine rather than from scratch.
+    //
+    // Until then the module is unreferenced. That is visible and honest;
+    // 54 registry rows claiming to cover `sun.nio.fs` were neither.
 }
 
 // ---------------------------------------------------------------------------
