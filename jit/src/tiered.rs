@@ -1292,6 +1292,7 @@ pub fn dump_method_stats_to_stderr() {
         "[cratonvm] JIT method stats: {} distinct methods tracked, {} ever invoked, {} total invocations \
          | still-interpreted={} c1={} full-profile={} c2={} \
          | compiles: c1={} c2={} osr={} deopts={} c2_bailouts={} total_compile_time_ms={} \
+         | code_buffer_bails={} (discarded_compile_ms={}) \
          | c1_threshold={} hot_but_stuck_in_interpreter={} (of which ineligible-by-policy={}, compile-failures={})",
         snap.distinct_methods,
         snap.methods_ever_invoked,
@@ -1306,6 +1307,8 @@ pub fn dump_method_stats_to_stderr() {
         stats.deoptimizations.load(Ordering::Relaxed),
         stats.c2_bailouts.load(Ordering::Relaxed),
         stats.total_compile_time_ms.load(Ordering::Relaxed),
+        crate::code_buffer_bail_cost().0,
+        crate::code_buffer_bail_cost().1,
         c1_threshold,
         hot_but_stuck.len(),
         ineligible_by_policy,

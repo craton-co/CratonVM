@@ -14788,6 +14788,38 @@ pub fn jit_skip_seal_census() -> Vec<(&'static str, u64)> {
 /// exemption exists to prevent.
 pub const CODE_BUFFER_TOO_SMALL_SITE: &str = "code-buffer-estimate-too-small";
 
+/// Compiles thrown away because the buffer estimate was short, and the
+/// wall-clock nanoseconds those attempts cost.
+///
+/// The retry is deferred to the NEXT compile request, so every shortfall is a
+/// full lowering done twice. Whether that matters is an arithmetic question and
+/// it had never been answered: `bug-two-pqc-classes-exceed-900s-20260821.md`
+/// listed "14 wasted compiles of ~120 KB methods" as a lead and said, correctly,
+/// "worth sizing before assuming it matters". These two counters size it. They
+/// are printed beside `total_compile_time_ms`, which is the denominator that
+/// makes the number mean something.
+static CODE_BUFFER_BAIL_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CODE_BUFFER_BAIL_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record one discarded compile and what it cost.
+pub fn note_code_buffer_bail_cost(elapsed: std::time::Duration) {
+    CODE_BUFFER_BAIL_NANOS.fetch_add(
+        elapsed.as_nanos().min(u64::MAX as u128) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    CODE_BUFFER_BAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(discarded compiles, milliseconds they cost)`.
+pub fn code_buffer_bail_cost() -> (u64, u64) {
+    (
+        CODE_BUFFER_BAIL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        CODE_BUFFER_BAIL_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+    )
+}
+
 /// Per-method code-buffer shortfalls measured by a previous compile attempt.
 ///
 /// Keyed by the same `"<class>.<method>:<descriptor>"` string the backend
