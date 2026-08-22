@@ -6801,6 +6801,86 @@ pub(super) fn surefire_lazy_launcher_discover_native(
     Some(cb)
 }
 
+/// Will a native registered for this triple ACTUALLY run?
+///
+/// `native_methods.find(..).is_some()` is used all over the VM as a stand-in for
+/// "this call is native-shadowed", and for most triples the two are the same
+/// thing. They are NEVER the same thing for a `SyntheticStub` on a
+/// [`real_protected_stub_class`] whose real body is loaded: that native loses
+/// the arbitration at every dispatch site
+/// ([`synthetic_stub_should_yield_to_real_bytecode`]), so the bytecode is what
+/// executes and the "shadow" does not exist.
+///
+/// # What the difference costs
+///
+/// Each consumer of the raw probe pays a different penalty for the wrong
+/// answer, and they compound:
+///
+/// * the JIT's four compile gates refuse to compile the method at all, so it
+///   never reaches a tier and the megamorphic inline cache has nothing to
+///   publish (`hit_entry=0`, `pub_published=0` for 506 000 consecutive calls);
+/// * `jit_invoke_targets_native_shadow` then seals every CALLER of it out of
+///   the JIT for the same reason;
+/// * with no compiled callee to enter, every call from compiled code takes the
+///   `invoke_or_native` -> `invoke_on_class_shared_inner` tail, which resolves
+///   the callee from a class NAME on every single call.
+///
+/// MEASURED 2026-08-22 on `perf/webclient-reactive-20260821`, 200k-iteration
+/// loops, HotSpot 25 control in brackets:
+///
+/// | call | CratonVM | HotSpot |
+/// |---|---:|---:|
+/// | `Instant.getNano()` - native registered, always yielded | 1627 ns | 2.3 ns |
+/// | `Instant.compareTo()` - same class, no native | 39 ns | 2.9 ns |
+/// | `ReentrantLock.lock()` + `unlock()` | 1760 ns | 11.9 ns |
+/// | `AtomicBoolean.compareAndSet()` | 4325 ns | 5.5 ns |
+/// | `LinkedBlockingDeque.peek()` | 1820 ns | 11.3 ns |
+/// | `StringJoiner.length()` | 2924 ns | 5.2 ns |
+/// | `Duration.getSeconds()` - control, no native | 24 ns | 2.3 ns |
+///
+/// Two methods of the SAME class, 40x apart, is the whole defect: `getNano` has
+/// a registered native and `compareTo` does not. `java.time.Instant.now()`
+/// alone runs 1 240 308 times in one `WebClientIntegrationTests` run - 475x the
+/// next hottest method in that run.
+///
+/// # Why relaxing the gates is sound
+///
+/// The gates exist because "a compiled direct call bypasses the interpreter's
+/// native-vs-bytecode decision". That is exactly the premise this predicate
+/// checks: when the arbitration says the bytecode wins, compiling the bytecode
+/// IS the interpreter's decision, not a bypass of it.
+///
+/// The relaxation is also one-way-safe. Every term
+/// [`synthetic_stub_yields_with_cm`] reads is monotone in the direction that
+/// matters - a class becomes loaded, a `Code` attribute becomes decoded - so a
+/// `yield = true` verdict cannot revert while the process runs. The one thing
+/// that could revert it, a JVMTI redefine, already quiesces and invalidates
+/// compiled code through `any_class_redefined` /
+/// `JitCache::invalidate_matching`.
+///
+/// Returning `true` reproduces the previous behaviour exactly for every triple
+/// outside the twelve-class allow-list, and the two cheap terms in
+/// [`synthetic_stub_kind_should_yield_to_real_bytecode`] short-circuit before
+/// anything touches the class manager, so that is also the cost.
+pub(crate) fn registered_native_will_run(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    shared
+        .natives
+        .native_methods
+        .find(class_name, method_name, descriptor)
+        .is_some()
+        && !synthetic_stub_should_yield_to_real_bytecode(
+            shared,
+            class_name,
+            method_name,
+            descriptor,
+        )
+}
+
 /// Synthetic stubs are fallback implementations for fake or incomplete JDK
 /// classes. When the real class bytecode is loaded and explicitly protected,
 /// dispatch must prefer that bytecode over the approximate stub.
