@@ -34,15 +34,25 @@ me one cycle of believing I had reddened a vector that was already red. The
 control settled it in one run, and the control is cheap — build the unmodified
 tip once and keep the binary.
 
-**It is not harness contention, and that was tested rather than assumed.**
-`H0`'s `d4ca67040` PID-scopes `regression-suite/.guard-tmp`, which is exactly
-the fixed shared path trap 8 warns about, so the obvious hypothesis was that a
-concurrent sweep had starved my oracle. Merged, rebuilt, re-run: **still
-`RJdkOptionalShape`, in all three arms.** The failure is CratonVM throwing
-`AssertionError` inside the vector, not an oracle diff. Two discriminators were
-also checked — the second `run.sh` visible in `ps` during a sweep is that run's
-own CHILD (`ppid` matches), not a foreign session, and `.guard-tmp` is per
-worktree rather than per host.
+**It is not harness contention and it is not a launch failure. Both were tested
+rather than assumed, against H0's own two instruments.**
+
+* `d4ca67040` PID-scopes `regression-suite/.guard-tmp` — exactly the fixed
+  shared path trap 8 warns about — so the first hypothesis was a concurrent
+  sweep starving my oracle. Merged, rebuilt, re-run: **unchanged, all three
+  arms.** Two further discriminators: the second `run.sh` visible in `ps`
+  during a sweep is that run's own CHILD (`ppid` matches), not a foreign
+  session, and `.guard-tmp` is per worktree rather than per host.
+* `dab993033` makes a launch/config failure NAME ITSELF instead of rendering
+  as an assertion failure — H0 wrote it after discovering that trap 1's
+  *"the VM dies in argument parsing"* was wrong twice over and that the real
+  death was JDK-image validation behind a bare `cratonvm rc=1`. That is the
+  best available instrument for "is this really an assertion?". Merged and
+  re-run: **the vector still classifies as a genuine `AssertionError` thrown by
+  CratonVM inside the test**, not as `unclassified:` and not as `no output`.
+
+Three independent reasons to believe the failure, and one of them is the tool
+built specifically to catch the alternative.
 
 **ARGUED, not measured, and left for H0:** `ff262645d` records the corpus as
 `105/105, 105/105, 65/65`, all five standing failures closed. That measurement
@@ -90,11 +100,14 @@ MEASURED on the final binary, which is the merge of this lane's three commits
 with `H0`'s `d4ca67040`, `TIMEOUT=600`:
 
 ```text
-                     pristine 22cb4338d     final
-  --jdk-only         104 / 105              104 / 105
-  SUITE=all          103 / 105              104 / 105     <- H0's comparator fix
-  SUITE=core          64 /  65               64 /  65
+                     pristine 22cb4338d     final     final + dab993033
+  --jdk-only         104 / 105              104 / 105  104 / 105
+  SUITE=all          103 / 105              104 / 105  104 / 105   <- H0's comparator fix
+  SUITE=core          64 /  65               64 /  65   64 /  65
 ```
+
+The third column is the same binary re-run after merging H0's improved
+signature extraction — the harness changed, the verdicts did not.
 
 Every arm is at or above the baseline and the ONLY failure in any of them is
 `RJdkOptionalShape` (§0). `RChmKeySetView` — the vector this lane REDDENED
