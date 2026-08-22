@@ -3000,7 +3000,15 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
                          narrow the workload, that is what censors the census.",
                         cratonvm_vm::vm::jdk_only_native_shadow_cap(),
                         recorded as u64 + dropped,
-                        (recorded as u64 + dropped).saturating_mul(2).max(8192),
+                        // CLAMPED to the sinks' own ceiling (WORKER-5 NOTE-6
+                        // N3). Unclamped this advised `(recorded+dropped)*2`,
+                        // which exceeds 65,536 for any workload with more than
+                        // ~32,768 shadows — so the VM could print a value it
+                        // then adjusts. Since 2026-08-22 an over-ceiling value
+                        // clamps LOUDLY rather than silently reverting to the
+                        // default, but advising a number the run will change is
+                        // still worse than advising the right one.
+                        (recorded as u64 + dropped).saturating_mul(2).max(8192).min(65_536),
                     );
                 }
                 // The JIT fast-path sink is a SECOND bounded collection feeding
@@ -3016,6 +3024,21 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
                          numbers. Same remedy: raise CRATONVM_NATIVE_SHADOW_SINK_CAP.",
                         cratonvm_vm::jit::helpers::jdk_only_jit_helper_violation_cap(),
                         cratonvm_vm::jit::helpers::jdk_only_jit_helper_sink_dropped(),
+                    );
+                }
+                // The THIRD bounded collection. It had no counter at all until
+                // 2026-08-22, so it could not warn here and rendered `null` in
+                // the file — which `run.sh` read as "nothing truncated", on
+                // every strict run there has ever been. All three now answer
+                // the same two questions.
+                if cratonvm_jit::jdk_only_jit_sink_saturated() {
+                    eprintln!(
+                        "[cratonvm] warning: the JDK-only JIT COMPILE-TIME violation sink \
+                         SATURATED at {} rows and dropped {} refusal(s) it could not name — \
+                         observation_sink.jit_compile in the report carries the same two \
+                         numbers. Same remedy: raise CRATONVM_NATIVE_SHADOW_SINK_CAP.",
+                        cratonvm_jit::jdk_only_violation_cap(),
+                        cratonvm_jit::jdk_only_jit_sink_dropped(),
                     );
                 }
             }
