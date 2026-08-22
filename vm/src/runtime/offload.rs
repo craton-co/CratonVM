@@ -160,6 +160,16 @@ pub struct OffloadCache {
     /// different Java-visible handle spaces reached through different
     /// `Native.*` entry points, so nothing ever confuses the two).
     next_stream_handle: std::sync::atomic::AtomicU64,
+    /// Compute capability of `ctx`'s device, as `(major, minor)`.
+    ///
+    /// This is the `sm_XX` every kernel on this cache is lowered for.
+    /// It used to be hardcoded to `(7, 0)`, so an sm_75 RTX 2060 (or
+    /// anything newer) was handed PTX that declared `.target sm_70` and
+    /// the driver JIT could not use any instruction introduced after
+    /// Volta. Probed once at construction; `(7, 0)` remains the floor
+    /// when the probe fails or reports something older, because the
+    /// lowering emits Volta-era PTX unconditionally.
+    sm: (u32, u32),
 }
 
 impl OffloadCache {
@@ -187,6 +197,29 @@ impl OffloadCache {
         } else {
             None
         };
+        // Ask the device it will actually launch on for its compute
+        // capability, so kernels are lowered for the real `sm_XX`
+        // instead of the Volta floor. Clamped up only: the lowering
+        // emits sm_70-era PTX, so a device older than that (or a
+        // failed probe) keeps the floor and the driver rejects the
+        // module later if it truly cannot run it.
+        let sm = if ctx.is_some() {
+            match cuda_bridge::probe_device(config.gpu_device_ordinal) {
+                Ok(caps) if (caps.compute_major, caps.compute_minor) >= (7, 0) => {
+                    tracing::info!(
+                        "gpu offload: device {} is {} (sm_{}{}), lowering for it",
+                        caps.ordinal,
+                        caps.name,
+                        caps.compute_major,
+                        caps.compute_minor
+                    );
+                    (caps.compute_major, caps.compute_minor)
+                }
+                _ => (7, 0),
+            }
+        } else {
+            (7, 0)
+        };
         Self {
             ctx,
             kernels: RwLock::new(FxHashMap::default()),
@@ -194,6 +227,7 @@ impl OffloadCache {
             print_decisions: config.print_gpu_decisions,
             streams: RwLock::new(FxHashMap::default()),
             next_stream_handle: std::sync::atomic::AtomicU64::new(1),
+            sm,
         }
     }
 
@@ -300,16 +334,17 @@ impl OffloadCache {
             }
         };
 
-        // Lower to PTX. We target sm_70 by default; the eventual
-        // production wiring should consult `cuda_bridge::probe` and
-        // pass the device's actual compute capability.
+        // Lower to PTX for the compute capability `self.sm` probed at
+        // construction. This used to be a hardcoded `(7, 0)`, which
+        // declared `.target sm_70` on every device and left the driver
+        // JIT unable to use anything introduced after Volta.
         let ptx_module: PtxModule = match jit_cuda::lowering::lower_method_with_pool(
             class_name,
             method,
             constant_pool,
             &sig,
-            7,
-            0,
+            self.sm.0,
+            self.sm.1,
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -336,6 +371,7 @@ impl OffloadCache {
         // (read-only input — same bytes as already on the device).
         sig.writes_param_mask = ptx_module.writes_param_mask;
         let ptx_text = ptx_module.render();
+        dump_ptx_if_requested(class_name, &method.name, &ptx_text);
         let ctx = self.ctx.as_ref().expect("ctx presence checked above");
         let module = match DeviceModule::from_ptx(ctx, &ptx_text, &[kernel_name.as_str()]) {
             Ok(m) => m,
@@ -357,6 +393,47 @@ impl OffloadCache {
         });
         self.kernels.write().insert(key, Arc::clone(&kernel));
         LookupOutcome::Hit(kernel)
+    }
+}
+
+/// Write the PTX just lowered for `class.method` to
+/// `$CRATONVM_GPU_DUMP_PTX/<class>.<method>.ptx`, when that variable
+/// names a directory.
+///
+/// Diagnostic only, and off unless asked for. It exists because the
+/// question "is this kernel bit-exact with the CPU?" is answered by
+/// reading the emitted instructions' rounding modifiers, and there was
+/// previously no way to see them short of rebuilding the VM with a
+/// `println!`. The 2026-08-21 ray-tracer divergence — unrounded
+/// `mul.f32`/`add.f32` being contracted into one `FFMA` by ptxas — was
+/// exactly that kind of question.
+///
+/// A failure to write is reported once at `warn` and otherwise ignored:
+/// a diagnostic knob must never take down a run.
+fn dump_ptx_if_requested(class_name: &str, method_name: &str, ptx_text: &str) {
+    let Ok(dir) = std::env::var("CRATONVM_GPU_DUMP_PTX") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    // Method names carry JVM-legal characters that are not filename-legal
+    // (`<init>`, `<clinit>`); map anything outside a conservative set.
+    let safe: String = format!("{class_name}.{method_name}")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = std::path::Path::new(&dir).join(format!("{safe}.ptx"));
+    if let Err(e) = std::fs::write(&path, ptx_text) {
+        tracing::warn!("gpu offload: CRATONVM_GPU_DUMP_PTX write to {path:?} failed: {e}");
+    } else {
+        tracing::info!("gpu offload: wrote PTX for {class_name}.{method_name} to {path:?}");
     }
 }
 

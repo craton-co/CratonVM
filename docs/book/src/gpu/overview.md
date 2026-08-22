@@ -115,7 +115,10 @@ The full launch path — interpreter hook → offload analyzer/cache →
 bytecode→PTX lowering → CUDA bridge → `cuLaunchKernel` — is implemented and
 has been validated end-to-end on real NVIDIA hardware (RTX 2060, sm_75),
 with kernel output checksums matching HotSpot bit-for-bit across every kernel
-measured. See [GPU offload benchmarks](benchmarks.md) for the numbers.
+measured. See [GPU offload benchmarks](benchmarks.md) for the numbers, and
+[Float bit-exactness](../../../gpu/README.md#float-bit-exactness) for what
+keeps a float kernel bit-exact: chiefly the explicit `.rn` rounding modifiers
+that stop ptxas contracting `a*b + c` into a single-rounding FMA.
 
 That validation pass found and fixed two bugs: offload-eligible call sites
 were being promoted into the interpreter's invoke cache, which silently ended

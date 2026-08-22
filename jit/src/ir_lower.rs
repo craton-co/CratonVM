@@ -3678,6 +3678,11 @@ fn reloc_emit_enabled() -> bool {
             self.patch_rel32_to_here(p);
         }
         let arg_offsets: Vec<i32> = (0..num_args).map(|i| self.slot_of(inputs[2 + i])).collect();
+        // `arg_offsets` are each argument's own register-allocated home slot,
+        // which the stub loads into the ABI registers one at a time. They are
+        // NOT a contiguous block, so the callee-deopt service -- which reads
+        // `num_args` consecutive slots to rebuild the callee's incoming
+        // locals -- must be pointed at the staging block written above instead.
         done_patches.extend(crate::runtime_lowering::emit_hashed_vtable_stub(
             &mut self.buf,
             pic,
@@ -3686,6 +3691,7 @@ fn reloc_emit_enabled() -> bool {
             self.frame_record,
             self.service_callee_deopt,
             info_ptr,
+            self.args_stage_top_off,
         ));
 
         // ── Slow path: the resolving + cache-populating helper ────────────
@@ -10202,6 +10208,30 @@ pub(crate) fn lower_inner_with_scopes(
     // "this word is a register image" is the property the reader is testing.
     cm.sp_id_slot_off = sp_id_slot_off;
     cm.oop_maps = oop_maps;
+    // Stage A.2 (precise oop maps, B-K fix) parity with the x64 fast-tier
+    // driver (`x64/driver.rs`'s `cm.fully_oop_covered = compiler.precise_maps
+    // && ... && compiler.safepoint_pcs.is_subset(&compiler.mapped_safepoint_pcs)`).
+    // This backend never computed the field at all -- it stayed at the
+    // `CompiledMethod` default of `false` for every method this tier compiled,
+    // OSR or not, which blanket-failed `moving_young_osr_method_needs_fallback`'s
+    // precise-map check on every OSR artifact this backend ever produced.
+    // Measured 2026-08-22 on `TestKillProcessWhileWriting`: this is the
+    // disjunct that actually fires (`osr_reason=(... map_coverage=N ...)`),
+    // not the shadow layout and not a missing exact RBP -- both of which this
+    // backend gets right already.
+    //
+    // Unlike the fast tier, this backend needs no PC-based subset check: each
+    // `OopMapEntry` above already carries its own `moving_young_coverage_complete`
+    // (the shadow-push `coverable && (published || slots.is_empty())` verdict,
+    // computed per safepoint at the point it is emitted), and `cm.oop_maps` is
+    // the complete set this compilation ever pushed to -- so the aggregate is a
+    // straight AND over data already relied on elsewhere: it is the exact
+    // per-entry flag `gc_quiescence`'s per-cycle proof already consults for
+    // every non-OSR moving-young collection. An empty `oop_maps` makes this
+    // vacuously true, which is safe: `has_precise_oop_maps()` (`!oop_maps.is_empty()`)
+    // is what actually gates the fast tier's OR-branch on "no maps at all," so a
+    // vacuous true here never overrides that check.
+    cm.fully_oop_covered = cm.oop_maps.iter().all(|m| m.moving_young_coverage_complete);
     cm.osr_frame_size = frame_size;
     // OSR and the save area, stated where the artifact is published.
     //

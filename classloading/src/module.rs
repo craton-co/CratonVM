@@ -1049,12 +1049,68 @@ impl ModuleRegistry {
 
     /// Return all provider implementation classes for a given service interface.
     ///
-    /// Walks every registered module's `provides` declarations looking for
+    /// Walks every DECLARED module's `provides` declarations looking for
     /// entries whose service matches `service_class` (binary class name,
-    /// e.g. `"com/example/MyService"`).
+    /// e.g. `"com/example/MyService"`), and skips every module whose only
+    /// source is the application CLASS path.
+    ///
+    /// # Why the filter is here and not at the consumer
+    ///
+    /// A modular jar reached through `-cp` is an unnamed-module citizen, and a
+    /// real JVM ignores its `module-info` outright — every `provides` clause
+    /// included. This is the same rule [`Self::is_class_path_only`] states and
+    /// that `populate_boot_layer_modules` already applies through
+    /// `NativeContext::module_is_class_path_only`; the two doors onto the
+    /// module source were fixed a day apart and only the boot-layer one got the
+    /// module-shaped predicate.
+    ///
+    /// The other door is `service_loader.rs`'s provider-collection arm, whose
+    /// guard is `loader_view_is_exhaustive` — a property of the **LOADER**,
+    /// where the rule is about the **MODULE**. The system application loader
+    /// carries no recorded URL list, so that guard is false and the arm fires.
+    /// It cannot be repaired at the consumer either: this function returns
+    /// provider NAMES with the owning module discarded, so by the time
+    /// `service_loader.rs` sees the strings the module they came from is gone.
+    /// Hence the filter lives at the source, where the module is still in hand,
+    /// and all three ServiceLoader-shaped consumers inherit it.
+    ///
+    /// # Why this is not a second, additive method
+    ///
+    /// There is no legitimate consumer of the unfiltered walk — the JDK rule
+    /// admits no exception — and a correct twin sitting beside a wrong original
+    /// is the shape where one of ten call sites gets the fix. One function,
+    /// correct.
+    ///
+    /// # Platform and `--module-path` modules are unaffected — MEASURED
+    ///
+    /// This is the load-bearing safety property, because the platform leans on
+    /// the module source far harder than the app does. MEASURED 2026-08-21 on
+    /// `cratonvm-r8.exe` with `CRATONVM_DIAG_SERVICELOADER=1`: `descriptors=0
+    /// providers=8` for `java.security.Provider`, `descriptors=0 providers=9`
+    /// for `java.util.spi.ToolProvider`, `descriptors=0 providers=1` for
+    /// `CharsetProvider`. Every one of those arrives through a `provides`
+    /// clause and through nothing else, so a filter that caught them would
+    /// silently delete the whole JCA provider set and
+    /// `ToolProvider.getSystemJavaCompiler()`.
+    ///
+    /// It does not catch them. `automatic` is stamped in exactly two places
+    /// (grep-exhaustive over the workspace) and both answer `false` for a
+    /// platform module: `ClassManager::new`'s eager scan hardcodes `automatic =
+    /// true` for the application class path ONLY (bootstrap and extension get
+    /// `false`), and the lazy path computes `!already_explicit &&
+    /// !is_platform_module_name(&desc.name)`, which is `false` for every
+    /// `java.*` / `jdk.*` name. Genuine `--module-path` modules are the
+    /// `already_explicit` half: `vm_init` re-registers them with
+    /// `automatic = false`.
+    ///
+    /// docs/known-issues/jdk-only/H24-1-the-module-source-door-and-the-two-modules-a-boot-layer-probe-could-not-see-20260821.md
     pub fn service_providers(&self, service_class: &str) -> Vec<String> {
         let mut providers = Vec::new();
         for desc in self.modules.values() {
+            // The rule is about the MODULE, not the loader that asked.
+            if desc.automatic {
+                continue;
+            }
             for p in &desc.provides {
                 if p.service == service_class {
                     providers.extend(p.with.iter().cloned());
@@ -2334,6 +2390,46 @@ mod tests {
         assert_eq!(other, vec!["com/other/OtherImpl"]);
 
         assert!(reg.service_providers("nonexistent/SPI").is_empty());
+    }
+
+    /// A modular jar reached through `-cp` is an unnamed-module citizen and a
+    /// real JVM ignores its `module-info` outright, `provides` included. Before
+    /// 2026-08-21 `service_providers` walked every descriptor with no filter,
+    /// so `regression-suite/src/RServiceLoaderDoubleSource.java` measured
+    /// `descriptors=0 providers=2` where HotSpot 25.0.3+9 answers 0.
+    ///
+    /// The negative control is the half that matters and it is in this same
+    /// test on purpose: a filter that also caught DECLARED modules would delete
+    /// the platform's entire JCA provider set, which arrives through `provides`
+    /// clauses and through nothing else. Asserting only the exclusion would
+    /// pass on a function that returns an empty vector unconditionally.
+    #[test]
+    fn service_providers_skips_class_path_only_modules() {
+        let mut declared = sample_desc("declared.mod");
+        declared.provides.push(ModuleProvidesEntry {
+            service: "com/example/SPI".to_string(),
+            with: vec!["com/example/DeclaredImpl".to_string()],
+        });
+
+        let mut cp_only = sample_desc("cponly.mod");
+        cp_only.automatic = true;
+        cp_only.provides.push(ModuleProvidesEntry {
+            service: "com/example/SPI".to_string(),
+            with: vec!["com/example/ClassPathImpl".to_string()],
+        });
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(declared, vec![]);
+        reg.register(cp_only, vec![]);
+
+        // Excluded: the `-cp` module's provider must not reach ServiceLoader.
+        // Included: the declared module's provider must still arrive.
+        assert_eq!(
+            reg.service_providers("com/example/SPI"),
+            vec!["com/example/DeclaredImpl"],
+        );
+        assert!(reg.is_class_path_only("cponly.mod"));
+        assert!(!reg.is_class_path_only("declared.mod"));
     }
 
     // -----------------------------------------------------------------------

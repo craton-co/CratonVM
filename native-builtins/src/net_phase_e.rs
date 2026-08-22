@@ -8087,13 +8087,20 @@ pub(crate) struct GcBlockingSocket<S> {
 }
 
 impl<S> GcBlockingSocket<S> {
-    fn new(inner: S) -> Self {
+    /// `pub(crate)` since 2026-08-22: `x509_manager::ocsp_http_post` needs the
+    /// same treatment. Its OCSP fetch runs from inside certificate validation,
+    /// i.e. from inside the very handshake this wrapper exists for, and it was
+    /// doing raw blocking `connect`/`write`/`read` with no region at all — the
+    /// precise shape `gc_blocked_syscall`'s doc describes, and the last
+    /// handshake-reachable path still doing it. DEFENSIVE: no test is known to
+    /// fail on it today (see that call site for what was and was not measured).
+    pub(crate) fn new(inner: S) -> Self {
         Self { inner }
     }
 
     /// The underlying socket, for the non-blocking calls (`set_read_timeout`
     /// and friends) that must NOT open a region.
-    fn get_ref(&self) -> &S {
+    pub(crate) fn get_ref(&self) -> &S {
         &self.inner
     }
 }
@@ -10454,6 +10461,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(conn, "method", Value::Object(Some(m)));
             ctx.set_field_by_name(conn, "doInput", Value::Int(1));
             ctx.set_field_by_name(conn, "connected", Value::Int(0));
+            // `URLConnection`'s field initialiser is `useCaches =
+            // defaultUseCaches`, i.e. true. The constructor that would run it
+            // never runs on this ALLOCATED carrier, so the field arrives
+            // zeroed. Nothing in `perform` consults it, but `getUseCaches()`
+            // reports it — see `register_https_delegate_forwarders`, which
+            // routes the https carrier's delegate-forwarding override back to
+            // that inherited one-`getfield` body — and a fresh connection that
+            // answers `false` is reporting a value the caller never chose.
+            ctx.set_field_by_name(conn, "useCaches", Value::Int(1));
             Ok(Some(Value::Object(Some(conn))))
         },
     );

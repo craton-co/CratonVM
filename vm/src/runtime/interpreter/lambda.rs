@@ -293,26 +293,83 @@ pub(crate) fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_
     if let Some(desc) = array_descriptor_of(shared, obj_ref) {
         return desc;
     }
-    if raw_name != "cratonvm/internal/UnmodifiableMap" {
+    // The stamp table used to be inlined here FOR MAPS ONLY, so every other
+    // internal stamp fell through and printed its private name — the exact
+    // thing this function exists to prevent, applied to one of the eleven
+    // stamps that need it. MEASURED 2026-08-21, Compatible mode,
+    // `cratonvm-r5.exe`:
+    //
+    //   (AbstractCollection) List.of(1,2,3)
+    //     -> class cratonvm.internal.UnmodifiableList cannot be cast to
+    //        class java.util.AbstractCollection
+    //
+    // against HotSpot's `java.util.ImmutableCollections$ListN`. The `LambdaSafe`
+    // breakage described above — it compares the exception prefix against
+    // `argument.getClass().getName()` — was therefore still live for every
+    // List, Set and Collection receiver.
+    //
+    // `unmod_stamp_display_name` is now the one table, and it is the SAME
+    // function the `instanceof`/`checkcast` DECISION reads, so the message and
+    // the verdict cannot drift apart again. It returns `None` for every
+    // non-stamp class (the overwhelmingly common case) without touching a
+    // field. H18-1.
+    let Some(family) = unmod_stamp_display_name(shared, obj_ref, raw_name) else {
         return raw_name.to_string();
-    }
-    if !matches!(shared.mem.heap.get_field(obj_ref, 1), Value::Int(1)) {
-        return "java/util/Collections$UnmodifiableMap".to_string();
+    };
+    // A MESSAGE wants the size-discriminated form; a SUBTYPE answer does not
+    // (`Map1` and `MapN` are supertype-identical — see
+    // `unmod_stamp_display_name`). So the refinement lives here, at the only
+    // caller that can observe it, and not in the shared table. This is the
+    // pre-existing map behaviour, generalised to List and Set rather than
+    // replaced: the size still comes from the backing collection's own `size`
+    // FIELD, never from `invoke_virtual("size")`, so this stays safepoint-free
+    // and the receiver cannot move under it.
+    let refined = match family {
+        "java/util/ImmutableCollections$MapN" if unmod_backing_size(shared, obj_ref) == Some(1) => {
+            "java/util/ImmutableCollections$Map1"
+        }
+        "java/util/ImmutableCollections$ListN"
+            if matches!(unmod_backing_size(shared, obj_ref), Some(1..=2)) =>
+        {
+            "java/util/ImmutableCollections$List12"
+        }
+        "java/util/ImmutableCollections$SetN"
+            if matches!(unmod_backing_size(shared, obj_ref), Some(1..=2)) =>
+        {
+            "java/util/ImmutableCollections$Set12"
+        }
+        other => other,
+    };
+    refined.to_string()
+}
+
+/// The element count of an unmodifiable wrapper's backing collection, read from
+/// its `size` FIELD.
+///
+/// Deliberately not `invoke_virtual(this, "size", "()I")`, which is how
+/// `native-builtins` reaches the same number for `getClass()`: that runs Java
+/// code, and this is called while building a `ClassCastException` from a
+/// receiver the interpreter holds as a bare local. A field read cannot
+/// safepoint.
+///
+/// `None` when the backing is absent or is an array/foreign layout with no
+/// `size` field — the caller then keeps the `…N` form, which is what HotSpot
+/// reports for everything but the one- and two-element cases anyway.
+fn unmod_backing_size(shared: &SharedVm, obj_ref: ObjectRef) -> Option<i32> {
+    if shared.mem.heap.num_fields(obj_ref) == 0 {
+        return None;
     }
     let backing = match shared.mem.heap.get_field(obj_ref, 0) {
         Value::Object(Some(backing)) => backing,
-        _ => return "java/util/ImmutableCollections$MapN".to_string(),
+        _ => return None,
     };
-    let size = {
-        let class_id = shared.mem.heap.class_id_of(backing);
-        let cm = shared.classes.class_manager.read();
-        find_field_recursive(class_id, "size", &cm.class_store)
-            .map(|(field_index, _, _)| shared.mem.heap.get_field(backing, field_index))
-    };
-    if matches!(size, Some(Value::Int(1))) {
-        "java/util/ImmutableCollections$Map1".to_string()
-    } else {
-        "java/util/ImmutableCollections$MapN".to_string()
+    let class_id = shared.mem.heap.class_id_of(backing);
+    let cm = shared.classes.class_manager.read();
+    let raw = find_field_recursive(class_id, "size", &cm.class_store)
+        .map(|(field_index, _, _)| shared.mem.heap.get_field(backing, field_index));
+    match raw {
+        Some(Value::Int(n)) => Some(n),
+        _ => None,
     }
 }
 

@@ -574,6 +574,47 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
     })
 }
 
+/// Per-disjunct breakdown of why [`moving_young_osr_method_needs_fallback`]
+/// returned true, so the single `osr-shadow-coverage-unproven` reason code the
+/// collector sees can be split apart without a debugger. Filed 2026-08-21:
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s own
+/// measurement found this reason blocking 234/263 collections and could not
+/// say which of the (then three) disjuncts was responsible, only that "H2's
+/// MVStore loops are OSR-compiled constantly." Attribution is by the same
+/// short-circuit priority the boolean uses, so exactly one counter increments
+/// per call that returns true: a frame with a genuinely broken shadow layout
+/// is not ALSO double-counted under the map-coverage bucket just because it
+/// would have failed that check too.
+pub mod osr_fallback_reason {
+    use std::sync::atomic::AtomicUsize;
+
+    /// `!shadow_layout_ok` — the shadow-stack prologue slots were never
+    /// allocated for this compilation at all. A codegen gap: this method was
+    /// compiled by a path that does not emit shadow-stack bookkeeping.
+    pub static BAD_SHADOW_LAYOUT: AtomicUsize = AtomicUsize::new(0);
+    /// `debug_shadow_disabled` — `CRATONVM_SHADOW_NOPUSH` / `_NORELOAD` forced
+    /// it. Not a production path; present so a debug run does not silently
+    /// fall through to a different bucket and misattribute.
+    pub static DEBUG_DISABLED: AtomicUsize = AtomicUsize::new(0);
+    /// Shadow layout is fine, precise maps exist, but this safepoint's map is
+    /// not `fully_oop_covered`.
+    pub static BAD_MAP_COVERAGE: AtomicUsize = AtomicUsize::new(0);
+    /// Shadow layout is fine, the map is fully covered, but the chain entry
+    /// carries no exact RBP for this frame — the map cannot be located
+    /// without one, even though it would answer the question if it could.
+    pub static MISSING_EXACT_RBP: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn snapshot() -> (usize, usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            BAD_SHADOW_LAYOUT.load(Relaxed),
+            DEBUG_DISABLED.load(Relaxed),
+            BAD_MAP_COVERAGE.load(Relaxed),
+            MISSING_EXACT_RBP.load(Relaxed),
+        )
+    }
+}
+
 fn moving_young_osr_method_needs_fallback(
     cm: &cratonvm_jit::CompiledMethod,
     exact_rbp: usize,
@@ -586,7 +627,24 @@ fn moving_young_osr_method_needs_fallback(
         && cm.shadow_savetop_slot_off != 0
         && cm.shadow_off_in_thread != 0;
     let precise_map_ok = !cm.has_precise_oop_maps() || (cm.fully_oop_covered && exact_rbp != 0);
-    !shadow_layout_ok || debug_shadow_disabled || !precise_map_ok
+    use std::sync::atomic::Ordering::Relaxed;
+    if !shadow_layout_ok {
+        osr_fallback_reason::BAD_SHADOW_LAYOUT.fetch_add(1, Relaxed);
+        return true;
+    }
+    if debug_shadow_disabled {
+        osr_fallback_reason::DEBUG_DISABLED.fetch_add(1, Relaxed);
+        return true;
+    }
+    if !precise_map_ok {
+        if cm.has_precise_oop_maps() && !cm.fully_oop_covered {
+            osr_fallback_reason::BAD_MAP_COVERAGE.fetch_add(1, Relaxed);
+        } else {
+            osr_fallback_reason::MISSING_EXACT_RBP.fetch_add(1, Relaxed);
+        }
+        return true;
+    }
+    false
 }
 
 /// spring-bug-10 experiment (`CRATONVM_SHADOW_PIN`): when set, the shadow-stack
@@ -2622,10 +2680,11 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     if !moving_young_enabled() || band_verify_disabled() {
         return false;
     }
-    // The band scan's residency test is
+    // The band scan's residency test asks "could a moving cycle relocate the
+    // object at this address?", and until 2026-08-21 it asked that as
     // `gen_heap::addr_in_published_young_regions`, which reads
     // `JIT_REGION_BOUNDS`. That table has one writer and it is
-    // generational-only — G1 deliberately keeps it empty, ZGC never fills it.
+    // generational-only — G1 deliberately keeps it empty, ZGC never filled it.
     // Where it is empty the test answers `false` for EVERY address, so the scan
     // below inspects every verifiable slot, classifies none of them as young,
     // and returns "nothing unpublished" without having verified anything.
@@ -2635,10 +2694,20 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     // suppress the conservative scan, which left G1's pin set empty, which let
     // the pause evacuate a region a live compiled frame still referenced.
     //
+    // It now asks `gen_heap::addr_is_movable`, the union of that young table
+    // with `MOVABLE_BOUNDS` — a third table a collector fills to say what its
+    // relocating phase may move, precisely because filling `JIT_REGION_BOUNDS`
+    // to fix this verifier would silently re-enable an inline reference STORE
+    // fast path G1 and ZGC must not have. ZGC publishes its arena envelope
+    // there; generational still answers through the young table, so its
+    // behaviour is unchanged.
+    //
     // Fail closed, exactly as the module block above says this verifier does
     // for an unbounded band or an unresolvable shadow window: an uninspectable
-    // frame reports "not verified", never "verified clean".
-    if bounds_guard_enabled() && !cratonvm_gc::gen_heap::published_young_regions_are_live() {
+    // frame reports "not verified", never "verified clean". The gate is on the
+    // UNION being live, so a collector that publishes neither table still gets
+    // the refusal it had before rather than a quiet pass.
+    if bounds_guard_enabled() && !cratonvm_gc::gen_heap::movable_bounds_are_live() {
         *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::YOUNG_BOUNDS_UNPUBLISHED;
         return true;
     }
@@ -2775,7 +2844,7 @@ fn report_unpublished_band_words(
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
         if band_slot_is_verifiable(off, &cm.frame_layout, live_hi)
-            && cratonvm_gc::gen_heap::addr_in_published_young_regions(w)
+            && cratonvm_gc::gen_heap::addr_is_movable(w)
             && !published.contains(&w)
         {
             hits += 1;
@@ -2855,7 +2924,7 @@ fn band_has_unpublished_young_word(
         &cm.frame_layout,
         live_hi,
         published,
-        cratonvm_gc::gen_heap::addr_in_published_young_regions,
+        cratonvm_gc::gen_heap::addr_is_movable,
     )
 }
 

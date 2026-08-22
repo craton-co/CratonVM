@@ -14,3 +14,10 @@ build-modules/
 # Transient directory run.sh uses to probe whether javac can target a given
 # --release. Created and removed inside release_supported().
 .release-probe.*
+
+# Per-vector --jdk-only-report JSON, written when CRATONVM_ARGS names
+# --jdk-only. PID-scoped (never a fixed shared name, unlike .guard-tmp) and
+# removed by run.sh once the census summary has been printed. Ignored anyway,
+# because a killed run leaves it behind and this checkout has an auto-commit
+# sweep that would otherwise land a few hundred JSON files in a commit.
+.jdk-only-reports.*

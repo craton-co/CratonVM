@@ -9740,8 +9740,31 @@ static JDK_ONLY_HELPER_VIOLATIONS: std::sync::OnceLock<
     parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>>,
 > = std::sync::OnceLock::new();
 
-/// Maximum number of distinct structured violations these helpers retain.
-pub const JDK_ONLY_HELPER_VIOLATION_CAP: usize = 256;
+/// Maximum number of distinct structured violations these helpers retain, by
+/// default.
+///
+/// Read through [`jdk_only_jit_helper_violation_cap`], never directly — an
+/// operator can raise it, and a site reading this constant would report the
+/// default while the sink obeyed something else. Same shape, same default and
+/// the same override knob as the interpreter's sink
+/// (`crate::vm::JDK_ONLY_NATIVE_SHADOW_CAP`), deliberately: both feed one
+/// `--jdk-only-report`, and two caps a reader has to remember separately is how
+/// one of them ends up quoted for the other.
+pub const JDK_ONLY_HELPER_VIOLATION_CAP: usize = 4096;
+
+/// Ceiling on the operator override. Mirrors the interpreter sink's, for the
+/// same reason: a mistyped value must not turn a diagnostic into a memory leak.
+const JDK_ONLY_HELPER_VIOLATION_CAP_MAX: usize = 65_536;
+
+/// Distinct violations this sink had no room for.
+///
+/// The number that turns `violations[]` from a floor into a total for the JIT
+/// fast-path source, exactly as `JDK_ONLY_NATIVE_SHADOW_DROPPED` does for the
+/// interpreter's. Before 2026-08-20 this sink had **no** saturation signal at
+/// all — not even a boolean — so a truncated JIT list was indistinguishable
+/// from a complete one in the report and in every record quoting it.
+static JDK_ONLY_HELPER_VIOLATIONS_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Times a JIT by-name native fast path was refused because `JdkOnly` is in
 /// force. Includes both outright `Reject`s and §7-step-3 yields to bytecode.
@@ -9769,6 +9792,71 @@ pub fn jdk_only_jit_fastpath_refusals() -> u64 {
     JDK_ONLY_FASTPATH_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The cap this process is actually using for the helper sink.
+///
+/// Reads the SAME declared knob as the interpreter's sink,
+/// `CRATONVM_NATIVE_SHADOW_SINK_CAP` (`flag_groups::INVENTORY`,
+/// `CRATONVM_DBG=native-shadow-sink-cap`). One knob for both on purpose: a
+/// census run raises "the observation sink" once and gets both of the report's
+/// bounded collections, instead of raising one and quietly reading a truncated
+/// other. Reusing the declared name is also what keeps this read out of
+/// `types/tests/flag_declaration_guard.rs` — an undeclared `getenv` is served
+/// from a different source than the latched snapshot every other knob uses, and
+/// is a defect in this tree rather than untidiness.
+///
+/// A value of `0`, a non-numeric value, or anything above
+/// [`JDK_ONLY_HELPER_VIOLATION_CAP_MAX`] leaves the default in place: a
+/// diagnostic must never be the thing that fails, and a cap of zero would
+/// report an empty population as a complete one.
+pub fn jdk_only_jit_helper_violation_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_SHADOW_SINK_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0 && *n <= JDK_ONLY_HELPER_VIOLATION_CAP_MAX)
+            .unwrap_or(JDK_ONLY_HELPER_VIOLATION_CAP)
+    })
+}
+
+/// How many distinct violations this sink is holding right now.
+pub fn jdk_only_jit_helper_sink_len() -> usize {
+    jdk_only_helper_violations().lock().len()
+}
+
+/// How many violations this sink had no room for.
+///
+/// **An EVENT count, and deliberately not dressed up as a distinct-row count.**
+/// This sink dedups with `Vec::contains` over the rows it RETAINED; a row it
+/// dropped was never pushed, so a second refusal naming the same triple is not
+/// recognised as a repeat and is counted again. The number is therefore an
+/// upper bound on the distinct rows missing from `violations[]`, and a
+/// perfectly good answer to the only question that has to be answered without
+/// a rebuild — *is this list the population, or is it short?*
+///
+/// Making it exact costs a second dedup structure that would itself need a cap,
+/// i.e. the same problem one level down. Raising
+/// `CRATONVM_NATIVE_SHADOW_SINK_CAP` until this reads zero is the way to get an
+/// exact list, and it needs no code change at all.
+///
+/// The interpreter's counterpart, `crate::vm::jdk_only_native_shadow_sink_dropped`,
+/// gets closer to distinct-row counting because that sink has a 512-slot
+/// filter that survives the drop. Neither is exact; both are honest about which
+/// way they err, and both err upward.
+pub fn jdk_only_jit_helper_sink_dropped() -> u64 {
+    JDK_ONLY_HELPER_VIOLATIONS_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Was at least one violation dropped for want of room?
+///
+/// **Not `len() == cap`.** A run whose last distinct violation exactly fills the
+/// sink dropped nothing and must not be reported truncated — the same
+/// distinction `crate::vm::jdk_only_native_shadow_sink_saturated` documents, and
+/// the reason this is derived from the drop counter rather than from the length.
+pub fn jdk_only_jit_helper_sink_saturated() -> bool {
+    jdk_only_jit_helper_sink_dropped() > 0
+}
+
 /// Record one refused fast-path admission, with its structured violation when
 /// the resolver produced one.
 ///
@@ -9786,8 +9874,18 @@ fn record_jdk_only_fastpath_refusal(
     JDK_ONLY_FASTPATH_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(violation) = violation {
         let mut recorded = jdk_only_helper_violations().lock();
-        if recorded.len() < JDK_ONLY_HELPER_VIOLATION_CAP && !recorded.contains(&violation) {
-            recorded.push(violation);
+        // The dedup test comes FIRST now. It used to be `len() < CAP && !contains`,
+        // which cannot tell "this is a repeat" from "there was no room" — so a
+        // saturated sink dropped rows with nothing anywhere recording that it
+        // had, and the JIT half of `--jdk-only-report`'s `violations[]` was a
+        // floor that looked exactly like a population.
+        if !recorded.contains(&violation) {
+            if recorded.len() < jdk_only_jit_helper_violation_cap() {
+                recorded.push(violation);
+            } else {
+                JDK_ONLY_HELPER_VIOLATIONS_DROPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
     None
@@ -12855,21 +12953,77 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
 //
 // Each is a VM-side reimplementation of a registered native, baked straight
 // into the emitted `CALL` — no dispatch helper, and so no policy check, on the
-// path. None of them carries an internal JDK-only check, deliberately: under
-// `JdkOnly` they are unreachable, gated twice and both gates upstream of any
-// code that could execute.
+// path.
 //
-//  1. `build_helpers` does not register their addresses at all under
-//     `JdkOnly`, so the `*_DIRECT_FN` cells stay `0` — the established
-//     "not wired, use the generic dispatch helper" sentinel.
-//  2. `jit::direct_native_helper` refuses to bind a non-zero address once
-//     `set_jit_execution_policy` has latched strict, and records a
-//     `NativeShadowsBytecode` violation when it does.
+// # H12-1: the two gates this comment used to claim were BOTH false
 //
-// Adding a third, per-invocation check inside these bodies would put a policy
-// read on the hottest boxing/collection paths in the VM to defend against a
-// state that cannot occur. If either gate above is ever removed, this comment
-// is the reason these bodies look unguarded.
+// What stood here until 2026-08-20 said these bodies need no internal JDK-only
+// check because "under `JdkOnly` they are unreachable, gated twice and both
+// gates upstream of any code that could execute", naming:
+//
+//   1. `build_helpers` does not register their addresses under `JdkOnly`, so
+//      the `*_DIRECT_FN` cells stay `0`; and
+//   2. `jit::direct_native_helper` refuses to bind a non-zero address.
+//
+// **Gate 1 has not existed since 2026-08-06.** `jit/src/lib.rs`'s own module
+// comment states the opposite in as many words: *"the `*_DIRECT_FN` helper
+// addresses are registered **unconditionally** (2026-08-06) … and the bind
+// decision is threaded per compilation as an argument instead"*. The paragraph
+// above was not updated when its own premise was deleted. `jit/src/lib.rs`'s
+// JDK-ONLY-NOTE item 3 still lists withholding them as an OPEN ask, which is
+// the same fact from the other side.
+//
+// **Gate 2 exists and works — at ONE of the three compile doors.**
+// `direct_native_helper` is called only from `try_compile_inner`, i.e.
+// `CompileDoor::MethodEntry` (both its single-pass and IR ladders). The other
+// two doors in `jit::compile_gate`'s three-door table reach
+// `x64::compile_with_param_slots` directly and carry their own hand-copied
+// direct-call ladders, neither of which asks any policy question:
+//
+//   * `CompileDoor::Osr` — `vm/src/runtime/interpreter/jit_bridge.rs`, which
+//     binds `jit_hashmap_get_direct`, `jit_hashmap_put_direct`,
+//     `jit_thread_current_thread_direct`, `jit_preconditions_check_index_direct`
+//     and `jit_reachability_fence_direct`;
+//   * `CompileDoor::EagerFirstCall` — `vm/src/runtime/interpreter.rs`, which
+//     binds `jit_integer_value_of_direct` and `jit_integer_int_value_direct`.
+//
+// Both take the helper's address as `crate::jit::helpers::NAME as *const () as
+// usize` rather than reading the `*_DIRECT_FN` cell, and both say in a comment
+// that they do so *because* `build_helpers` publishes those cells too late for
+// the first compile. So gate 1 would not have covered them even when it
+// existed, and gate 2 never saw them.
+//
+// MEASURED, `--jdk-only`, binary at fe59bf9d9, `CRATONVM_INTRINSIC_STATS=1`, a
+// loop inside a once-invoked method:
+//
+//     compiled Thread.currentThread direct calls: 298000
+//       (sites bound per compile door: single-pass 0/7, IR 0/0, OSR 1)
+//
+// The MethodEntry door examined seven `invokestatic` sites and refused all
+// seven; the OSR door bound one and compiled code then called it 298 000
+// times. `java/lang/Thread.currentThread()Ljava/lang/Thread;` is `bridge` in
+// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, and so are `HashMap.get`,
+// `HashMap.put`, `Preconditions.checkIndex` and `Reference.reachabilityFence`.
+// A `--real-jdk` run of the same probe reports the identical `OSR 1`: the OSR
+// door does not know which mode it is in.
+//
+// # Why the check is per-invocation and here, rather than at the binds
+//
+// A bind-time check has to be written once per door, and the record of this
+// file is that a fourth door — or a fifth ladder in an existing one — arrives
+// before anyone revisits the gate. `compile_gate`'s own module doc calls that
+// out: three doors, and each grew its hand-copied subset of the admission
+// checks "reactively after its own bug". A check in the callee is the one
+// shape that cannot be forgotten by a door that has not been written yet.
+//
+// It costs one relaxed policy read per call, on the compatible arm, ahead of
+// work that already includes an object-address probe and a class comparison.
+// That cost is NOT measured — see the H12-1 record's verification plan, which
+// names the A/B that must run before this is called free.
+//
+// This does not replace gate 2. `direct_native_helper` is still the right
+// place to refuse, because a refusal there costs nothing at run time; this is
+// the backstop for the doors that never ask it.
 //
 // JDK-ONLY-WAVE2 §4, layering half CLOSED 2026-08-06/08-10. The ask was that
 // the compile-time recognition in `jit::try_compile` consult the shared
@@ -12878,8 +13032,339 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
 // because it cannot see `NativeKind`. Both halves landed:
 // `direct_native_helper` takes an `intrinsic_resolver` the VM answers out of
 // the registry's kind, and the policy is threaded per compilation rather than
-// read from the latch. The gates above are those, not a mirror.
+// read from the latch. Gate 2 is that; gate 1 is gone.
 // ---------------------------------------------------------------------------
+
+/// Times a thin direct-call helper declined to serve its own fast path because
+/// the calling VM is in `JdkOnly` and the helper shadows a `Bridge`
+/// registration.
+///
+/// # Reading a zero
+///
+/// A zero here is ambiguous on its own and must be read beside a bind counter,
+/// for exactly the reason [`JIT_FUNNEL_BYPASS_HITS`]' doc gives about inert
+/// fast paths. The two readings are:
+///
+/// | this | `thread_current_thread_bound_sites().2` (OSR binds) | meaning |
+/// |---|---|---|
+/// | 0 | 0 | no compiled site bound a guarded helper — the run says nothing |
+/// | 0 | >0 | a compatible-mode run, or a strict run where the bound sites never executed |
+/// | >0 | >0 | the backstop fired: a door bound in strict mode and this refused at the call |
+///
+/// The third row is the expected shape of a `--jdk-only` run whose hot loop is
+/// OSR-compiled, until the OSR and eager doors are taught to ask
+/// `jit::direct_native_helper` at bind time (H12-1 §OUT-OF-FILE O1/O2). When
+/// they are, this drops to the first row and the counter becomes the evidence
+/// that it did.
+pub static JIT_DIRECT_HELPER_JDK_ONLY_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of thin direct-call helper invocations refused under `JdkOnly`.
+pub fn jit_direct_helper_jdk_only_refusals() -> u64 {
+    JIT_DIRECT_HELPER_JDK_ONLY_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a thin direct-call helper that shadows a `Bridge` registration must
+/// decline its fast path for `vm` and route to the generic dispatch helper.
+///
+/// The callee-side half of the JDK-only direct-helper gate — see the module
+/// block above for why it exists on this side at all, and for the measurement
+/// that showed the compile-time half covering only one of three doors.
+///
+/// Applies **only** to helpers whose registered triple is `Bridge`.
+/// `jit_integer_value_of_direct` and `jit_integer_int_value_direct` are
+/// deliberately NOT guarded: `java/lang/Integer.valueOf(I)` and
+/// `java/lang/Integer.intValue()` are both `intrinsic` in
+/// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, which is §1.4's
+/// reviewed exception — the one kind `direct_native_helper` also admits under
+/// `JdkOnly`. Guarding them here would be stricter than the contract and would
+/// cost the eager-first-call door its only two binds.
+#[inline]
+fn jit_direct_helper_refused(vm: &SharedVm) -> bool {
+    if crate::vm::dispatch_policy(vm).is_jdk_only() {
+        JIT_DIRECT_HELPER_JDK_ONLY_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+// ===========================================================================
+// H20-1 — the bind-time half: one enumerated address source for every compile
+// door, and a `match` the compiler will not let anyone leave incomplete.
+//
+// # Why the enforcement is here and not on `JitDirectCall`
+//
+// `H12-1` N1 asked for `CompileAdmission`'s trick to be applied to
+// `JitDirectCall`: make it un-constructible outside a constructor that takes a
+// policy witness. The analogy is right about the *problem* and wrong about the
+// *place*, for a reason that is a property of the backend rather than of taste.
+//
+// `CompileAdmission` works because it is consumed at a choke point DOWNSTREAM
+// of every door (`x64::compile_with_param_slots`) and the refusal is safe
+// there: the caller's fallback — "do not compile, keep interpreting" — is
+// universal and every door already handles it.
+//
+// A direct-bind refusal has no such downstream point. `x64/driver.rs`'s
+// `reserve_stack_floor` walk states the backend's rule in its own words: *"a
+// raw self-call site is an `invokestatic` pc with neither an invoke-info entry
+// nor a direct-call plan"*. Every ladder — this crate's two and
+// `try_compile_inner`'s two — pushes its row and then `continue`s PAST the
+// `invoke_info` construction for that pc (`jit_bridge.rs`'s pushes are at
+// 1243/1371/1435, all after the ladder). So a row deleted after the door
+// leaves the pc with no metadata at all, and the `0xb8` arm compiles
+// `Thread.currentThread()` as a call to the enclosing method. Filtering
+// downstream would replace an open door with a wild jump.
+//
+// `try_compile_inner` already has the only safe shape, and it is the model:
+//
+//     let entry = direct_native_helper(..);      // 0 == refused
+//     if entry != 0 { direct_calls.push(..); continue; }
+//     // falls through to the code that builds `invoke_info` for this pc
+//
+// So the token has to ride on the ENTRY ADDRESS, obtained at the bind site,
+// before the `continue`. That is what [`admit_direct_native_entry`] is:
+// `Option<usize>`, `None` meaning "fall through", which is byte-for-byte the
+// `entry == 0` sentinel the MethodEntry ladder has always used.
+//
+// # What is compiler-enforced, and what is not
+//
+// Enforced by this file:
+//   * a tenth thin helper cannot be added without stating its registered kind
+//     — [`DirectNativeShadow`] is matched exhaustively in three places;
+//   * a door cannot ask for an address without naming which VM it is compiling
+//     for, because that is the only parameter.
+//
+// Enforced by `jit::compile_gate`:
+//   * a fourth `CompileDoor` cannot be added without answering
+//     `builds_direct_calls`;
+//   * a door that never declares a `DirectCallPolicy` has its rows counted by
+//     `undeclared_direct_bind_rows`.
+//
+// NOT enforced, and named so it is not mistaken for enforced: the raw items
+// below are still `pub`, so a ladder can still take
+// `helpers::jit_hashmap_get_direct as *const () as usize` and skip this
+// function — which is what both direct doors do today. Making them
+// `pub(in crate::jit)` is what closes it, and it is a compile error in
+// `vm/src/runtime/interpreter/jit_bridge.rs` and
+// `vm/src/runtime/interpreter.rs` until those two ladders are converted. Lane
+// H20 owns neither and was forbidden to build; H20-1 §6 O1/O2 specify the
+// change. `direct_bind_source_witness` below is the stand-in that makes a NEW
+// raw address-take a red test rather than a thing a reviewer has to notice.
+// ===========================================================================
+
+/// A thin direct-call helper that stands in front of a **registered native**,
+/// enumerated so the policy question can be asked once per helper instead of
+/// once per door.
+///
+/// Membership rule, and it is narrower than "everything in `direct_calls`":
+/// a variant belongs here iff the emitted `CALL` reaches a VM-side body that
+/// re-implements a row in the native registry. That excludes
+/// `Math.sqrt` (lowered to `SQRTSD`, shadows nothing), the `String`/`CRC32`
+/// call-site intrinsics and the `JitIntrinsic` sentinels, and the
+/// `AtomicInteger` family (resolved by `try_resolve_atomic_intrinsic`, which
+/// carries its own admission). Those owe no policy question and listing them
+/// here would invite a "fix" that is not one — `H12-2` §1's last bullet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectNativeShadow {
+    /// `java/lang/Thread.currentThread()Ljava/lang/Thread;`
+    ThreadCurrentThread,
+    /// `jdk/internal/util/Preconditions.checkIndex(IILjava/util/function/BiFunction;)I`
+    PreconditionsCheckIndex,
+    /// `java/lang/ref/Reference.reachabilityFence(Ljava/lang/Object;)V`
+    ReachabilityFence,
+    /// `java/lang/Integer.valueOf(I)Ljava/lang/Integer;`
+    IntegerValueOf,
+    /// `java/lang/Integer.intValue()I`
+    IntegerIntValue,
+    /// `java/util/HashMap.get(Ljava/lang/Object;)Ljava/lang/Object;`
+    HashMapGet,
+    /// `java/util/HashMap.put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;`
+    HashMapPut,
+    /// `java/util/concurrent/ConcurrentHashMap.get(Ljava/lang/Object;)Ljava/lang/Object;`
+    ConcurrentHashMapGet,
+    /// `java/lang/StringLatin1.toLowerCase(...)` — bound by the MethodEntry
+    /// single-pass ladder only; listed so the enumeration is the whole
+    /// population rather than the part two doors happen to bind.
+    StringLatin1ToLowerCase,
+}
+
+impl DirectNativeShadow {
+    /// Every shadow, for the tests and the source witness.
+    pub const ALL: [DirectNativeShadow; 9] = [
+        DirectNativeShadow::ThreadCurrentThread,
+        DirectNativeShadow::PreconditionsCheckIndex,
+        DirectNativeShadow::ReachabilityFence,
+        DirectNativeShadow::IntegerValueOf,
+        DirectNativeShadow::IntegerIntValue,
+        DirectNativeShadow::HashMapGet,
+        DirectNativeShadow::HashMapPut,
+        DirectNativeShadow::ConcurrentHashMapGet,
+        DirectNativeShadow::StringLatin1ToLowerCase,
+    ];
+
+    /// The registered triple whose native this helper re-implements.
+    ///
+    /// For `ConcurrentHashMapGet` this is the **implementing** class, not the
+    /// `java/util/concurrent/ConcurrentMap` interface the call site names —
+    /// H7-1's finding, and the reason `direct_native_helper_for_impl` exists.
+    /// A policy question asked about the interface row is a question about a
+    /// registration that does not run.
+    pub const fn triple(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            DirectNativeShadow::ThreadCurrentThread => (
+                "java/lang/Thread",
+                "currentThread",
+                "()Ljava/lang/Thread;",
+            ),
+            DirectNativeShadow::PreconditionsCheckIndex => (
+                "jdk/internal/util/Preconditions",
+                "checkIndex",
+                "(IILjava/util/function/BiFunction;)I",
+            ),
+            DirectNativeShadow::ReachabilityFence => (
+                "java/lang/ref/Reference",
+                "reachabilityFence",
+                "(Ljava/lang/Object;)V",
+            ),
+            DirectNativeShadow::IntegerValueOf => (
+                "java/lang/Integer",
+                "valueOf",
+                "(I)Ljava/lang/Integer;",
+            ),
+            DirectNativeShadow::IntegerIntValue => ("java/lang/Integer", "intValue", "()I"),
+            DirectNativeShadow::HashMapGet => (
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            DirectNativeShadow::HashMapPut => (
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            DirectNativeShadow::ConcurrentHashMapGet => (
+                "java/util/concurrent/ConcurrentHashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            DirectNativeShadow::StringLatin1ToLowerCase => (
+                "java/lang/StringLatin1",
+                "toLowerCase",
+                "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+            ),
+        }
+    }
+
+    /// The Rust item name, so a refusal and the source witness can both name
+    /// the same symbol the ladders name.
+    pub const fn helper_symbol(self) -> &'static str {
+        match self {
+            DirectNativeShadow::ThreadCurrentThread => "jit_thread_current_thread_direct",
+            DirectNativeShadow::PreconditionsCheckIndex => {
+                "jit_preconditions_check_index_direct"
+            }
+            DirectNativeShadow::ReachabilityFence => "jit_reachability_fence_direct",
+            DirectNativeShadow::IntegerValueOf => "jit_integer_value_of_direct",
+            DirectNativeShadow::IntegerIntValue => "jit_integer_int_value_direct",
+            DirectNativeShadow::HashMapGet => "jit_hashmap_get_direct",
+            DirectNativeShadow::HashMapPut => "jit_hashmap_put_direct",
+            DirectNativeShadow::ConcurrentHashMapGet => "jit_concurrent_hashmap_get_direct",
+            DirectNativeShadow::StringLatin1ToLowerCase => "jit_string_latin1_to_lower_direct",
+        }
+    }
+
+    /// The helper's entry address.
+    ///
+    /// Taken as `NAME as *const () as usize` rather than read out of the
+    /// `*_DIRECT_FN` cell, for the reason both direct doors already state: a
+    /// door can run before `build_helpers` has published those cells, so a cell
+    /// read yields `0` on the first compile in a process and the bind is
+    /// silently skipped. Process-invariant either way — the cells hold exactly
+    /// these addresses (`build_helpers`, registered unconditionally since
+    /// 2026-08-06).
+    ///
+    /// Private on purpose. The address is only ever handed out by
+    /// [`admit_direct_native_entry`], which is the whole point of this type.
+    fn entry_addr(self) -> usize {
+        match self {
+            DirectNativeShadow::ThreadCurrentThread => {
+                jit_thread_current_thread_direct as *const () as usize
+            }
+            DirectNativeShadow::PreconditionsCheckIndex => {
+                jit_preconditions_check_index_direct as *const () as usize
+            }
+            DirectNativeShadow::ReachabilityFence => {
+                jit_reachability_fence_direct as *const () as usize
+            }
+            DirectNativeShadow::IntegerValueOf => {
+                jit_integer_value_of_direct as *const () as usize
+            }
+            DirectNativeShadow::IntegerIntValue => {
+                jit_integer_int_value_direct as *const () as usize
+            }
+            DirectNativeShadow::HashMapGet => jit_hashmap_get_direct as *const () as usize,
+            DirectNativeShadow::HashMapPut => jit_hashmap_put_direct as *const () as usize,
+            DirectNativeShadow::ConcurrentHashMapGet => {
+                jit_concurrent_hashmap_get_direct as *const () as usize
+            }
+            DirectNativeShadow::StringLatin1ToLowerCase => {
+                jit_string_latin1_to_lower_direct as *const () as usize
+            }
+        }
+    }
+}
+
+/// Is this triple a reviewed `NativeKind::Intrinsic` in `vm`'s registry?
+///
+/// The canonical copy of the closure `jit_bridge.rs` writes out three times
+/// (4656, 4856, 6226) to hand to `jit::direct_native_helper`. Hoisted here so
+/// the compile-time answer and the callee-side answer come from one predicate:
+/// `a-serviceability-predicate-must-mirror-the-dispatch-it-guards`.
+///
+/// Fail-closed: `false` for `Bridge`, for `SyntheticStub`, and for anything
+/// unregistered.
+pub fn is_reviewed_intrinsic_native(
+    vm: &SharedVm,
+    class: &str,
+    method: &str,
+    descriptor: &str,
+) -> bool {
+    let registry = &vm.natives.native_methods;
+    registry
+        .resolve_id(class, method, descriptor)
+        .and_then(|id| registry.kind_of_id(id))
+        .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
+}
+
+/// The one sanctioned way for a compile door to obtain a thin direct-call
+/// helper's entry address.
+///
+/// `Some(addr)` — bind it. `None` — **fall through**, do not `continue`: the
+/// site must still get its `invoke_info` or the backend reads the pc as a raw
+/// self-call. See the module block above for the backend's own statement of
+/// that rule; it is the reason this returns an `Option` at the bind site
+/// instead of the plan being filtered later.
+///
+/// The policy is derived from `vm` rather than passed in, so a door cannot
+/// supply the wrong one; the registry kind is asked about the triple whose
+/// native actually runs. Under `JdkOnly` a refusal is recorded through
+/// `cratonvm_jit::record_jdk_only_direct_native_refusal`, i.e. into the same
+/// counter and the same `--jdk-only-report` violation list the MethodEntry
+/// door's refusals land in.
+///
+/// Compile-time only — never called from emitted code. One registry lookup on
+/// the strict arm, per recognised site, per compilation.
+pub fn admit_direct_native_entry(vm: &SharedVm, shadow: DirectNativeShadow) -> Option<usize> {
+    let (class, method, descriptor) = shadow.triple();
+    let policy = cratonvm_jit::compile_gate::DirectCallPolicy::from_jdk_only(
+        crate::vm::dispatch_policy(vm).is_jdk_only(),
+    );
+    if !policy.admits_shadow_bind(is_reviewed_intrinsic_native(vm, class, method, descriptor)) {
+        cratonvm_jit::record_jdk_only_direct_native_refusal(class, method, descriptor);
+        return None;
+    }
+    Some(shadow.entry_addr())
+}
 
 /// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites
 /// (registered into `cratonvm_jit::INTEGER_VALUE_OF_DIRECT_FN` by
@@ -13410,9 +13895,17 @@ pub unsafe extern "C" fn jit_preconditions_check_index_direct(
     formatter: i64,
 ) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
+    // H12-1. `jdk/internal/util/Preconditions.checkIndex(IILjava/util/function/BiFunction;)I`
+    // is `bridge`, and the OSR door binds this helper with no policy question.
+    // Declining takes the same generic dispatcher the throwing case already
+    // uses, so the refusal costs a route, not a contract.
+    //
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM,
+    // and the fall-through below already passes it to `jit_invoke_dispatch`.
+    let vm = &*(vm_ptr as *const SharedVm);
     let i = index as i32;
     let n = length as i32;
-    if i >= 0 && n >= 0 && i < n {
+    if i >= 0 && n >= 0 && i < n && !jit_direct_helper_refused(vm) {
         return i as i64;
     }
     // Throwing case (and any shape this fast path declines to judge): the
@@ -13522,22 +14015,41 @@ pub unsafe extern "C" fn jit_thread_current_thread_direct(vm_ptr: i64) -> i64 {
     // the fast arm below cannot allocate or enter the GC barrier, and the
     // cold arm's `jit_invoke_dispatch` performs its own.
     crate::jit::conservative_roots::note_jit_boundary();
-    if let Some((thread, _guard)) = jit_thread_mut() {
-        if let Some(obj) = thread.java_thread_obj {
-            // Mirror `safe_native_call`'s object-return handoff root, exactly
-            // as `call_integer_native_raw` does. The mirror is already rooted
-            // per-thread, so this is the diagnostic/contract half rather than
-            // a liveness requirement — but a returned object that is NOT in
-            // `native_pending_return` is a shape every other object-returning
-            // JIT edge here avoids, and nothing is gained by being the
-            // exception.
-            thread.native_pending_return = Some(obj);
-            JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return obj.as_ptr() as i64;
+    // H12-1. `java/lang/Thread.currentThread()Ljava/lang/Thread;` is `bridge`,
+    // and this is the helper the OSR door was MEASURED binding under
+    // `--jdk-only` (298 000 calls, `OSR 1`, single-pass `0/7`). Declining here
+    // takes the cold arm below — `jit_invoke_dispatch` with the synthetic
+    // call-site info — which this function's doc already describes as
+    // "byte-for-byte the route the site took before this helper existed", and
+    // which is policy-checked.
+    //
+    // Checked up front rather than beside the `java_thread_obj` read: in strict
+    // mode this helper must never serve, so every call IS a refusal, and the
+    // only calls the counter over-reports relative to "fast arm suppressed" are
+    // the ones with no thread mirror yet — at most one per thread.
+    //
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM,
+    // and the cold arm below already passes it to `jit_invoke_dispatch`.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if !jit_direct_helper_refused(vm) {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            if let Some(obj) = thread.java_thread_obj {
+                // Mirror `safe_native_call`'s object-return handoff root,
+                // exactly as `call_integer_native_raw` does. The mirror is
+                // already rooted per-thread, so this is the diagnostic/contract
+                // half rather than a liveness requirement — but a returned
+                // object that is NOT in `native_pending_return` is a shape
+                // every other object-returning JIT edge here avoids, and
+                // nothing is gained by being the exception.
+                thread.native_pending_return = Some(obj);
+                JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return obj.as_ptr() as i64;
+            }
         }
     }
-    // No mirror yet (or no JIT thread context): the ordinary route, which is
-    // what this site did on every call before the fast arm existed.
+    // No mirror yet, no JIT thread context, or `JdkOnly` declined the fast arm:
+    // the ordinary route, which is what this site did on every call before the
+    // fast arm existed.
     jit_invoke_dispatch(
         vm_ptr,
         &THREAD_CURRENT_THREAD_INFO as *const JitInvokeInfo as i64,
@@ -13653,7 +14165,10 @@ const DIRECT_CALL_HELPER_NATIVES: [(&str, &str, &str); 10] = [
         "toLowerCase",
         "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
     ),
-    // `jit_concurrent_hashmap_get_direct` — calls `native_chm_get` directly.
+    // `jit_concurrent_hashmap_get_direct` — reaches `native_chm_get` through
+    // `safe_native_call_prevalidated_objects` (H7-1), which restores the funnel
+    // but still carries no `NativeMethodId`, so `record_invocation` never fires
+    // and this row's count stays a floor.
     (
         "java/util/concurrent/ConcurrentMap",
         "get",
@@ -13819,6 +14334,53 @@ unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64)
 /// Guarded direct path for `ConcurrentMap.get(Object)` when the runtime
 /// receiver is exactly ConcurrentHashMap. All other receivers retain the
 /// canonical interface dispatcher.
+///
+/// # H7-1: one entry, one wrapper, one fallback
+///
+/// Two things in this body used to differ from its own sibling
+/// [`jit_hashmap_get_direct`], for no stated reason, and both differences were
+/// invisible to every arm because nothing runs a map lookup cold and warm and
+/// diffs the two answers (`docs/known-issues/jdk-only/H7-1-*`):
+///
+/// 1. **An unrecognised key address answered `null` instead of falling back.**
+///    The old `else { return 0 }` below turned "this argument is not an object
+///    I can find in the heap" into the Java-visible answer `null`. Interpreted,
+///    the identical call goes through the full dispatcher — so the same source
+///    line could answer differently once its caller tiered up. The sibling
+///    already took the other branch (`None => break 'fast`) and says why:
+///    the arena-membership probe "is the only check between a stale/fabricated
+///    key argument and that dereference". It is now `break 'fast` here too, so
+///    the two helpers give one answer to one question. This is also the shape
+///    `chm-get-misses-stored-key-in-process-RETIRED-20260804.md` records:
+///    reporting ABSENT for a pair that was never compared.
+/// 2. **`native_chm_get` was called with no funnel at all.** The comment that
+///    stood here argued the wrapper was "second, redundant" because the native
+///    pins its own receiver and key. Pinning is a *service of the funnel* —
+///    `pin_native_root` writes into the ring `safe_native_call_impl` sets a
+///    watermark on and truncates — and the funnel also supplies the
+///    `NativeRunning` transition (which is what makes the STW census WAIT for a
+///    native holding raw `ObjectRef`s in Rust locals), the argument-forwarding
+///    barrier, the JNI pending-exception drain and `catch_unwind`.
+///    `native_chm_get` is not a leaf by any of `set_leaf`'s four criteria: it
+///    reaches `chm_key_hash`, which dispatches the key's real `hashCode()`.
+///    Its sibling `native_chm_contains_key` carries a comment about exactly
+///    this hazard being caught live by `RMapGcStress`. So the call now goes
+///    through `safe_native_call_prevalidated_objects`, which is what the
+///    sibling helper already used for its own non-leaf fallback
+///    (`native_hashmap_get_exact`) three hundred lines below.
+///
+/// **Cost of (2), stated rather than measured** — no binary carrying this has
+/// been built. It adds one native funnel entry per compiled `ConcurrentMap.get`
+/// that reaches the native. The in-tree figure for the funnel-plus-by-name
+/// round trip is ~400 ns/call
+/// (`native-call-funnel-per-call-floor-item2-20260805.md`); this restores only
+/// the funnel half, since the callback is still resolved at compile time. The
+/// native it fronts is itself measured at 6920 cycles/call on the path that
+/// misses its string-node cache (see `native_chm_get`'s own comment in
+/// `native-collections/src/lib.rs`), so the wrapper is a small addition to a
+/// large number — and the wrapper-free variant only ever appeared on the JIT
+/// side, meaning every interpreted `ConcurrentHashMap.get` in this VM has
+/// always paid it.
 pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
     vm_ptr: i64,
     receiver: i64,
@@ -13827,49 +14389,81 @@ pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
-    if receiver != 0
-        && (receiver as u64 & 0x7) == 0
-        && (receiver as u64) < (1u64 << 48)
-        && jit_concurrent_hashmap_receiver_is_exact(vm, receiver)
-    {
-        if let (Some(recv), Some((thread, _guard))) = (
-            vm.mem.heap.is_object_address(receiver as usize),
-            jit_thread_mut(),
-        ) {
-            let key = if key == 0 {
-                Value::Object(None)
-            } else if let Some(key) = vm.mem.heap.is_object_address(key as usize) {
-                Value::Object(Some(key))
-            } else {
-                return 0;
-            };
-            let values = [Value::Object(Some(recv)), key];
-            // `native_chm_get` pins its receiver/key before every operation
-            // that can invoke Java or collect. Calling it directly avoids the
-            // second, redundant safe-native wrapper/root snapshot on a hot
-            // read-only lookup while retaining its canonical error contract.
-            let result = {
-                let mut ctx = crate::vm::NativeContextImpl {
-                    shared: vm,
-                    thread: &mut *thread,
-                };
-                cratonvm_native_collections::native_chm_get(&mut ctx, &values)
-            };
-            match result {
-                Ok(Some(Value::Object(Some(object)))) => {
-                    thread.native_pending_return = Some(object);
-                    return object.as_ptr() as i64;
-                }
-                Ok(Some(Value::Object(None))) | Ok(None) => return 0,
-                Ok(_) => {}
-                Err(error) => {
-                    return handle_jit_dispatch_error(
-                        vm,
-                        thread,
-                        error,
-                        &CONCURRENT_HASHMAP_GET_DIRECT_INFO,
-                    )
-                }
+    'fast: {
+        // H12-1. Both rows this ladder touches —
+        // `java/util/concurrent/ConcurrentMap.get` at the call site and
+        // `java/util/concurrent/ConcurrentHashMap.get`, whose `native_chm_get`
+        // actually runs — are `bridge`. No compile door binds this helper
+        // today (the OSR ladder does not recognise `ConcurrentMap`, and
+        // `direct_native_helper_for_impl` refuses it at MethodEntry), so this
+        // is the one guard here that is a backstop rather than a live fix.
+        // It is written anyway, because H7-1 §4a's point is that the pair is
+        // right by a coincidence of tagging that a retag is meant to change.
+        //
+        // After the receiver screens, for the counter reason spelled out in
+        // `jit_hashmap_get_direct`.
+        if receiver == 0
+            || (receiver as u64 & 0x7) != 0
+            || (receiver as u64) >= (1u64 << 48)
+            || !jit_concurrent_hashmap_receiver_is_exact(vm, receiver)
+        {
+            break 'fast;
+        }
+        if jit_direct_helper_refused(vm) {
+            break 'fast;
+        }
+        let Some(recv) = vm.mem.heap.is_object_address(receiver as usize) else {
+            break 'fast;
+        };
+        let key_val = if key == 0 {
+            // An explicit `null` key ARGUMENT, which `native_chm_get` answers
+            // with `chm_reject_null_key`'s NPE. Do not confuse it with the
+            // unrecognised-address case below — that one is not an argument
+            // value at all, it is a failed validation.
+            Value::Object(None)
+        } else if (key as u64 & 0x7) != 0 || (key as u64) >= (1u64 << 48) {
+            break 'fast;
+        } else {
+            match vm.mem.heap.is_object_address(key as usize) {
+                Some(object) => Value::Object(Some(object)),
+                // See item 1 in this function's doc comment. Was `return 0`.
+                None => break 'fast,
+            }
+        };
+        let Some((thread, _guard)) = jit_thread_mut() else {
+            break 'fast;
+        };
+        let values = [Value::Object(Some(recv)), key_val];
+        // Item 2 in this function's doc comment: the SAME funnel the
+        // interpreter uses for the SAME callback, so the two tiers cannot
+        // disagree about pinning, transitions or exception draining. Every
+        // `Value::Object` in `values` was validated against this VM's heap
+        // immediately above, which is exactly the precondition the
+        // `_prevalidated_objects` variant is documented against.
+        let result = crate::vm::safe_native_call_prevalidated_objects(
+            vm,
+            thread,
+            cratonvm_native_collections::native_chm_get,
+            &values,
+        );
+        match result {
+            Ok(Some(Value::Object(Some(object)))) => {
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+            Ok(Some(Value::Object(None))) | Ok(None) => return 0,
+            // A non-object `Value` out of an object-typed map is
+            // out-of-contract. `get` is a read, so re-running it through the
+            // dispatcher is idempotent and costs only a second lookup — the
+            // reason the PUT sibling may NOT do the same thing.
+            Ok(_) => break 'fast,
+            Err(error) => {
+                return handle_jit_dispatch_error(
+                    vm,
+                    thread,
+                    error,
+                    &CONCURRENT_HASHMAP_GET_DIRECT_INFO,
+                )
             }
         }
     }
@@ -13909,6 +14503,19 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
             break 'fast;
         }
         if !jit_hashmap_receiver_is_exact(vm, receiver) {
+            break 'fast;
+        }
+        // H12-1. `java/util/HashMap.get` is `bridge`, so under `JdkOnly` the
+        // real `java.util.HashMap` bytecode is authoritative and this helper
+        // must not answer. `break 'fast` is the route every non-exact receiver
+        // already takes, and `jit_invoke_dispatch` below is policy-checked.
+        //
+        // Placed AFTER the receiver screens on purpose, so
+        // `JIT_DIRECT_HELPER_JDK_ONLY_REFUSALS` counts calls the fast path
+        // would otherwise have SERVED. In front of them it would also count
+        // every call that was going to `break 'fast` anyway, and a counter that
+        // inflates is a counter nobody can read a ratio out of.
+        if jit_direct_helper_refused(vm) {
             break 'fast;
         }
         let key_val = if key == 0 {
@@ -14090,9 +14697,47 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
 }
 
 /// PUT sibling of [`jit_hashmap_get_direct`] — see its doc for the contract.
-/// The overlay insert writes only the Rust-side table (GC-scanned as roots),
-/// so the wrapper-free path holds; any non-overlay case (materialization,
-/// resize, non-Integer key) falls back to full dispatch.
+///
+/// # H7-1: one implementation, and no arm that mutates and then re-dispatches
+///
+/// This used to call `cratonvm_native_collections::jit_overlay_hashmap_put`
+/// — a `pub` re-export of `try_hm_int_fast_put` — as its own private first
+/// stage, and hand every other outcome back to `jit_invoke_dispatch`. Two
+/// consequences, the second of which is a wrong answer:
+///
+/// * It was a **second entry into the map's write path** that the registry has
+///   never heard of, which is the population `H4-1` §1c and `H0-3` are about.
+///   `native_hashmap_put_exact`'s FIRST statement is that same
+///   `try_hm_int_fast_put`, so calling the native loses no fast path — it
+///   loses the private door.
+/// * `Some(Ok(Some(<non-object Value>)))` fell to `break 'fast`, i.e. to
+///   `jit_invoke_dispatch`, **after the overlay insert had already happened**.
+///   The generic path then re-executed the put and returned the value this
+///   call had just written as if it were the previous mapping.
+///   `HashMap.put`'s return value is the previous mapping, so that is a
+///   silently wrong answer, and it is reachable: the overlay's stored `Value`
+///   comes from whoever wrote it, and `H4-1` §1a counts 42 direct Rust
+///   `native_map_put_pub` call sites that are not obliged to store an object.
+///   The GET sibling may re-dispatch on this arm because a read is idempotent;
+///   a write is not, and the two were written as if they were the same shape.
+///
+/// The exact-`java/util/HashMap` receiver guard above is what makes
+/// `native_hashmap_put_exact` the right callee rather than the registered
+/// `native_map_put`: for that receiver `native_map_put_evict`'s
+/// `is_bare_java_lang_object` / `is_unmod_wrapper` / `ht_reject_null_*` /
+/// CHM / LHM / TreeMap ladder is all no-ops, and its `CF_EXACT_HASHMAP` arm is
+/// `native_hashmap_put_exact`'s body line for line. That is the same identity
+/// `hashmap_native_callback` already relies on for the site-cache door, and
+/// the same shape [`jit_hashmap_get_direct`]'s own fallback arm already uses.
+///
+/// **Cost, stated rather than measured** — no binary carrying this has been
+/// built. The overlay-servable put now pays one
+/// `safe_native_call_prevalidated_objects` funnel entry it did not pay before.
+/// It buys the funnel's pin ring, `NativeRunning` transition and exception
+/// drain for a call that can reach `map_hash_key` (arbitrary Java `hashCode()`)
+/// on any non-overlay outcome — which the old code reached only via the
+/// dispatcher, so nothing is lost there. Falsified by an A/B on one binary
+/// showing a map-put-dominated workload regressing beyond noise.
 ///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_hashmap_put_direct(
@@ -14115,6 +14760,15 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
             break 'fast;
         }
         if !jit_hashmap_receiver_is_exact(vm, receiver) {
+            break 'fast;
+        }
+        // H12-1. `java/util/HashMap.put` is `bridge`; see the sibling comment
+        // in `jit_hashmap_get_direct`, including why this sits after the
+        // receiver screens. This one matters more than the read: the OSR door
+        // binds it, and a put is a MUTATION, so a strict-mode execution of this
+        // body writes through CratonVM's native into a map the interpreter
+        // reads with real bytecode.
+        if jit_direct_helper_refused(vm) {
             break 'fast;
         }
         let mut vals = [Value::Object(None); 2];
@@ -14142,26 +14796,44 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
         let Some((thread, _guard)) = jit_thread_mut() else {
             break 'fast;
         };
-        let probe = {
-            let mut ctx = crate::vm::NativeContextImpl {
-                shared: vm,
-                thread: &mut *thread,
-            };
-            cratonvm_native_collections::jit_overlay_hashmap_put(
-                &mut ctx, recv_obj, vals[0], vals[1],
-            )
-        };
-        match probe {
-            Some(Ok(Some(Value::Object(Some(object))))) => {
+        // H7-1: the ONE implementation, through the same funnel the
+        // interpreter uses for the same receiver. `native_hashmap_put_exact`
+        // opens with `try_hm_int_fast_put`, so the overlay fast path is
+        // unchanged; what is gone is the JIT's private entry into it and the
+        // arm that inserted and then re-dispatched. Every `Value::Object` in
+        // `vals` was validated against this VM's heap above, which is the
+        // `_prevalidated_objects` precondition.
+        let values = [Value::Object(Some(recv_obj)), vals[0], vals[1]];
+        match crate::vm::safe_native_call_prevalidated_objects(
+            vm,
+            thread,
+            cratonvm_native_collections::native_hashmap_put_exact,
+            &values,
+        ) {
+            Ok(Some(Value::Object(Some(object)))) => {
                 thread.native_pending_return = Some(object);
                 return object.as_ptr() as i64;
             }
-            Some(Ok(Some(Value::Object(None)))) | Some(Ok(None)) => return 0,
-            Some(Ok(Some(_))) => break 'fast,
-            Some(Err(error)) => {
+            Ok(Some(Value::Object(None))) | Ok(None) => return 0,
+            // Out-of-contract: an object-typed map answered with a non-object
+            // `Value`. The put has ALREADY been applied by the call above, so
+            // re-dispatching would apply it twice and return the value this
+            // call wrote instead of the previous mapping — the defect this
+            // rewrite exists to remove. There is no `L`-shaped encoding of a
+            // primitive `Value`, so answer `null`: it is the one reply that
+            // does not mutate a second time, and it is what the same match
+            // already answers for `Value::Object(None)`.
+            Ok(Some(_)) => {
+                debug_assert!(
+                    false,
+                    "java/util/HashMap.put returned a non-object Value; a non-Java writer \
+                     stored a primitive under this key (H4-1 §1a)"
+                );
+                return 0;
+            }
+            Err(error) => {
                 return handle_jit_dispatch_error(vm, thread, error, &HASHMAP_PUT_DIRECT_INFO)
             }
-            None => break 'fast,
         }
     }
     let args = [receiver, key, value];
@@ -19724,15 +20396,29 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     // Every helper in this block is a **VM-side reimplementation of a
     // registered native** that the JIT bakes straight into the emitted `CALL`.
     // Under `JdkOnly` that is `NativeShadowsBytecode` by construction (§1 rule
-    // 4: concrete bytecode wins), so they are not registered at all. Belt and
-    // braces: `jit::direct_native_helper` already refuses to *bind* a non-zero
-    // address once the policy is latched, and leaving the address at `0` makes
-    // that refusal unreachable rather than merely correct — one fewer way for
-    // a compile path to reach a baked native. `0` is the established "not
-    // wired, use the generic dispatch helper" sentinel every one of these
-    // recognition sites already handles, so the fallback is the ordinary
-    // policy-checked `jit_invoke_dispatch` route, not a stub and not a wild
-    // jump.
+    // 4: concrete bytecode wins).
+    //
+    // H20-1 — WHAT THIS PARAGRAPH USED TO SAY, AND WHY IT WAS DELETED.
+    //
+    // Until 2026-08-21 it continued: "…so they are not registered at all. Belt
+    // and braces: `jit::direct_native_helper` already refuses to *bind* a
+    // non-zero address once the policy is latched, and leaving the address at
+    // `0` makes that refusal unreachable rather than merely correct."
+    //
+    // Fifteen lines below, the registration block says "Registered
+    // UNCONDITIONALLY as of 2026-08-06 (JDK-ONLY-WAVE2 §2)". Both sentences
+    // have been in this function, contradicting each other, since that commit.
+    // `H12-1` found and rewrote the OTHER copy of the same stale claim (the
+    // thin-helper module block ~7 000 lines up); this one it did not see. Two
+    // copies of one deleted premise is the shape of
+    // `a-premise-in-a-comment-is-not-a-compile-time-link`: the commit that
+    // removed the fact could not be made to visit either sentence that
+    // depended on it.
+    //
+    // The refusal that IS real is `jit::direct_native_helper`, at ONE of the
+    // three compile doors, plus the callee-side backstop `H12-1` landed in the
+    // helper bodies. `admit_direct_native_entry` above is the bind-time source
+    // the other two doors must switch to; O1/O2 in the H20-1 record.
     //
     // Deliberately NOT skipped under `JdkOnly`:
     //  * `set_indy_string_concat_fn` — a `StringConcatFactory` *bootstrap*
@@ -21030,6 +21716,150 @@ mod g12_compiled_aastore_asks_the_shared_predicate {
              25.0.3 (MEASURED, RArrayStoreInterfaces s12) in both tiers; the \
              compiled tier reads this predicate and nothing else"
         );
+    }
+}
+
+// ===========================================================================
+// H20-1 — the source witness for the enforcement this lane could not land.
+//
+// Making the nine raw helper items `pub(in crate::jit)` is what would make a
+// door that skips `admit_direct_native_entry` a compile error. That change is a
+// compile error in `vm/src/runtime/interpreter/jit_bridge.rs` and
+// `vm/src/runtime/interpreter.rs` until both ladders are converted, and lane
+// H20 owned neither file and was forbidden to build. Until O1/O2 land, this is
+// the guard: a ladder that takes a raw address is a RED TEST, not something a
+// reviewer has to notice.
+//
+// A frozen count, not a ban, precisely because the nine existing takes are
+// legitimate-for-now. `a-premise-in-a-comment-is-not-a-compile-time-link` is
+// the defect class this whole lane is about, and a comment saying "do not add
+// another one" would be another instance of it.
+// ===========================================================================
+#[cfg(test)]
+mod direct_bind_source_witness {
+    use super::DirectNativeShadow;
+
+    /// Working-tree path of a file under the `vm` crate.
+    ///
+    /// `CARGO_MANIFEST_DIR` is `<repo>/vm`, so these read the SOURCE, not a
+    /// build artifact — `source-witness-tests-read-the-working-tree`. An edit
+    /// that has not been rebuilt still fails this test, which is the point.
+    fn vm_src(rel: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+    }
+
+    /// Count code (non-comment) occurrences of `crate::jit::helpers::<sym>` for
+    /// any enumerated shadow.
+    ///
+    /// Comment lines are excluded by their trimmed prefix rather than by a
+    /// parser: both doors reference these symbols in prose right beside the
+    /// code, and a count that included prose would move whenever someone
+    /// improved a comment. CR is trimmed too, so a CRLF checkout does not
+    /// change the answer — `windows-crlf-breaks-source-witness-tests`.
+    fn raw_address_takes(rel: &str) -> Vec<(usize, String)> {
+        let path = vm_src(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let mut hits = Vec::new();
+        for (i, raw) in text.lines().enumerate() {
+            let line = raw.trim_end_matches('\r').trim_start();
+            if line.starts_with("//") {
+                continue;
+            }
+            for shadow in DirectNativeShadow::ALL {
+                let needle = format!("crate::jit::helpers::{}", shadow.helper_symbol());
+                if line.contains(&needle) {
+                    hits.push((i + 1, shadow.helper_symbol().to_string()));
+                }
+            }
+        }
+        hits
+    }
+
+    /// The OSR door takes seven raw addresses and the eager first-call door two.
+    ///
+    /// MEASURED from the working tree at H20's commit; five of the OSR seven
+    /// are `bridge` rows (`H12-2` 1). If this number goes UP, a new ladder
+    /// bound a helper without asking `admit_direct_native_entry` — the exact
+    /// event `H12-1` says keeps happening and nothing catches. If it goes DOWN,
+    /// O1/O2 are landing and the baseline should be lowered in the same commit;
+    /// at zero, delete this module and make the nine items
+    /// `pub(in crate::jit)`, which is strictly better than any test.
+    #[test]
+    fn the_two_direct_doors_take_exactly_the_addresses_h12_measured() {
+        let osr = raw_address_takes("src/runtime/interpreter/jit_bridge.rs");
+        let eager = raw_address_takes("src/runtime/interpreter.rs");
+        assert_eq!(
+            osr.len(),
+            7,
+            "OSR ladder raw address-takes changed; found {osr:?}. \
+             Up = a new unguarded bind (H12-1). Down = O1 landing; lower this \
+             number in the same commit."
+        );
+        assert_eq!(
+            eager.len(),
+            2,
+            "eager first-call ladder raw address-takes changed; found {eager:?}. \
+             Both of its binds are `intrinsic` today, so it is incidentally \
+             correct and structurally unguarded (H12-1 2c)."
+        );
+    }
+
+    /// Every enumerated shadow has a distinct symbol, triple and address.
+    ///
+    /// A duplicated address would mean two variants naming one helper, which
+    /// would make a refusal for one silently refuse the other;
+    /// `duplicate-native-registrations-verify-which-wins` is the adjacent trap.
+    #[test]
+    fn the_enumeration_is_injective() {
+        let mut symbols: Vec<&str> = DirectNativeShadow::ALL
+            .iter()
+            .map(|s| s.helper_symbol())
+            .collect();
+        symbols.sort_unstable();
+        symbols.dedup();
+        assert_eq!(symbols.len(), DirectNativeShadow::ALL.len());
+
+        let mut triples: Vec<(&str, &str, &str)> =
+            DirectNativeShadow::ALL.iter().map(|s| s.triple()).collect();
+        triples.sort_unstable();
+        triples.dedup();
+        assert_eq!(triples.len(), DirectNativeShadow::ALL.len());
+
+        let mut addrs: Vec<usize> = DirectNativeShadow::ALL
+            .iter()
+            .map(|s| s.entry_addr())
+            .collect();
+        assert!(
+            addrs.iter().all(|&a| a != 0),
+            "a shadow's address is never 0; 0 is the ladders' \"not wired\" sentinel"
+        );
+        addrs.sort_unstable();
+        addrs.dedup();
+        assert_eq!(
+            addrs.len(),
+            DirectNativeShadow::ALL.len(),
+            "two variants resolve to one helper address"
+        );
+    }
+
+    /// The enumerated symbol names are the names the ladders actually write.
+    ///
+    /// `helper_symbol` is a string, so it can drift from the item it names.
+    /// This pins it to the working tree: every symbol must be declared here.
+    #[test]
+    fn every_enumerated_symbol_is_a_real_item_in_this_file() {
+        let path = vm_src("src/jit/helpers.rs");
+        let text = std::fs::read_to_string(&path).expect("read helpers.rs");
+        for shadow in DirectNativeShadow::ALL {
+            let decl = format!("extern \"C\" fn {}(", shadow.helper_symbol());
+            assert!(
+                text.contains(&decl),
+                "{:?} names `{}`, which is not declared in this file",
+                shadow,
+                shadow.helper_symbol()
+            );
+        }
     }
 }
 

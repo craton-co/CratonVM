@@ -638,6 +638,61 @@ fn alloc_obj(ctx: &mut dyn NativeContext, class_name: &str, nfields: usize) -> O
     }
 }
 
+/// Allocate a channel AS the concrete `sun.nio.ch.*Impl` the JDK itself would
+/// construct, falling back to the abstract public class this crate used to
+/// name.
+///
+/// **The defect this closes.** `sc_open` / `ssc_open` / the two accept paths
+/// used to call `alloc_obj(ctx, "java/nio/channels/SocketChannel", …)`, and
+/// `ensure_class_initialized` on that name resolves to the REAL, ABSTRACT JDK
+/// class — so `ctx.alloc_object` then minted an instance whose runtime class is
+/// abstract. `new` on an abstract class is an `InstantiationError` by JVMS
+/// §6.5; no bytecode in any image can produce such a receiver. MEASURED
+/// (`H21-1` §2): `SocketChannel.open().getClass()` answered
+/// `java.nio.channels.SocketChannel` with `Modifier.isAbstract == true` on
+/// CratonVM in BOTH modes, against `sun.nio.ch.SocketChannelImpl` on HotSpot
+/// 25.0.3+9. That, and not "the registrations are on the wrong class", is the
+/// root the P1 *NIO, files, networking* remedy was aiming at — see `H11-2` §0,
+/// which counts 237 registrations that CANNOT move while the receiver is
+/// fabricated under the abstract name.
+///
+/// **Why this is behaviour-preserving for the two channel families.** Two
+/// facts, both read from this file rather than assumed:
+///
+/// 1. Every `SocketChannel` / `ServerSocketChannel` native here is ALREADY
+///    registered on the `Impl` spelling — `register_socket_channel_real` does
+///    `for c in [sc, scimpl]` and `for c in [ssc, sscimpl]`, so the two names
+///    carry an identical triple set. Dispatch keys on the receiver's runtime
+///    class (`H11-1`), so moving the receiver to `scimpl` finds the same
+///    callbacks at step 1 and strands nothing.
+/// 2. No native in this file reads or writes a channel's object slots. The
+///    per-channel state lives in the identity-keyed `chan_fields` side table
+///    (`cf_set` / `cf_get`), which is exactly why the real `Impl`'s much larger
+///    and differently-ordered layout is inert here. Contrast
+///    `datagram.rs::dgram_join_group`, which DOES write slots 0..3 by index and
+///    therefore cannot take this change without moving its state first.
+///
+/// **Why the fallback is kept rather than switched outright.** The abstract
+/// name has a fabricated-layout entry in `classloading`'s stand-in table
+/// (`class_manager.rs`, `"java/nio/channels/SocketChannel" => instance_fields(5)`)
+/// and the `Impl` name does not, so on an image where the `sun.nio.ch` class is
+/// absent the unconditional form would silently degrade to `ClassId::new(0)`.
+/// Preferring the `Impl` and falling back leaves that boot byte-identical to
+/// today. `[refuse=transient?]` in reverse: do not remove a path whose absence
+/// you have not measured.
+fn alloc_channel_as_impl(
+    ctx: &mut dyn NativeContext,
+    impl_name: &str,
+    abstract_name: &str,
+    nfields: usize,
+) -> ObjectRef {
+    if let Ok(cid) = ctx.ensure_class_initialized(impl_name) {
+        let real = ctx.class_num_total_fields(cid);
+        return ctx.alloc_object(cid, real.max(nfields));
+    }
+    alloc_obj(ctx, abstract_name, nfields)
+}
+
 /// Seed the `AbstractInterruptibleChannel` / `AbstractSelectableChannel` monitor
 /// fields the real JDK `close()`/`register()` bytecode does `synchronized(...)`
 /// on. CratonVM creates channels without running those constructors, leaving the
@@ -1395,7 +1450,12 @@ fn sc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
 
 /// Shared body of `SocketChannel.open()` / `open(ProtocolFamily)`.
 fn sc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCallResult {
-    let ch = alloc_obj(ctx, "java/nio/channels/SocketChannel", SC_OBJECT_SLOTS);
+    let ch = alloc_channel_as_impl(
+        ctx,
+        "sun/nio/ch/SocketChannelImpl",
+        "java/nio/channels/SocketChannel",
+        SC_OBJECT_SLOTS,
+    );
     let ch = init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
@@ -1454,11 +1514,26 @@ fn sc_open_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 
 /// The classes CratonVM's own NIO factories allocate their objects AS.
-/// `sc_open` / `ssc_open` / the accept path allocate the ABSTRACT
-/// `java/nio/channels/{Socket,ServerSocket}Channel` directly, and
-/// `nio_selector::selector_open_native` allocates `sun/nio/ch/SelectorImpl`;
-/// the remaining `sun.nio.ch.*Impl` spellings are the ones our natives are
-/// additionally registered under, for callers that resolve against them.
+///
+/// CORRECTED 2026-08-21 (H21). This comment used to say `sc_open` / `ssc_open`
+/// / the accept path "allocate the ABSTRACT
+/// `java/nio/channels/{Socket,ServerSocket}Channel` directly". They no longer
+/// do: `alloc_channel_as_impl` prefers `sun/nio/ch/{Socket,ServerSocket}
+/// ChannelImpl`, which is what HotSpot 25.0.3+9 constructs, and falls back to
+/// the abstract name only where the `sun.nio.ch` class is absent from the
+/// image. **Both spellings must stay in this list**: the abstract half is still
+/// reachable — `native-builtins/src/servlet.rs` and
+/// `phases_late/net_channels.rs` mint `java/nio/channels/SocketChannel`
+/// receivers of their own, and the fallback above can still produce one — so
+/// removing it would make `is_foreign_channel` answer "foreign" for a channel
+/// this VM built.
+///
+/// `nio_selector::selector_open_native` still allocates the ABSTRACT
+/// `sun/nio/ch/SelectorImpl` (MEASURED: `Selector.open().getClass()` is
+/// `sun.nio.ch.SelectorImpl`, `isAbstract == true`, against
+/// `sun.nio.ch.WEPollSelectorImpl` on HotSpot). That one is NOT fixed here
+/// because the concrete class is OS- and JDK-version-dependent and this crate
+/// is cross-platform; `H21-2` N2 states the remedy.
 const CRATONVM_NIO_CLASSES: &[&str] = &[
     "java/nio/channels/SocketChannel",
     "sun/nio/ch/SocketChannelImpl",
@@ -1475,8 +1550,15 @@ const CRATONVM_NIO_CLASSES: &[&str] = &[
 /// Is this receiver a channel/selector that somebody ELSE implemented?
 ///
 /// The natives in this crate are registered on the ABSTRACT JDK classes
-/// (`java/nio/channels/SocketChannel`, `Selector`, ...) because that is the
-/// class CratonVM's own factories allocate. But the interpreter resolves a
+/// (`java/nio/channels/SocketChannel`, `Selector`, ...) AND on their
+/// `sun.nio.ch.*Impl` twins. Until 2026-08-21 the abstract half was also the
+/// class CratonVM's own factories allocated; `alloc_channel_as_impl` now mints
+/// the `Impl`, so a channel this VM built and a channel a real provider built
+/// can carry the SAME class name. That does not weaken this guard, because
+/// `CRATONVM_NIO_CLASSES` already listed both spellings and this predicate was
+/// already unable to tell the two apart — but it does mean the predicate is a
+/// CLASS test and not an ownership test, and `H21-2` §5 records it as the one
+/// residual the receiver change does not improve. But the interpreter resolves a
 /// native by walking the receiver's SUPERCLASS chain (`invoke_or_native` in
 /// vm/src/vm/vm_exec.rs, and its mirror in
 /// vm/src/runtime/interpreter/dispatch_virtual.rs), so a registration on
@@ -4331,7 +4413,12 @@ fn ssc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
 
 /// Shared body of `ServerSocketChannel.open()` / `open(ProtocolFamily)`.
 fn ssc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCallResult {
-    let ch = alloc_obj(ctx, "java/nio/channels/ServerSocketChannel", SC_OBJECT_SLOTS);
+    let ch = alloc_channel_as_impl(
+        ctx,
+        "sun/nio/ch/ServerSocketChannelImpl",
+        "java/nio/channels/ServerSocketChannel",
+        SC_OBJECT_SLOTS,
+    );
     let ch = init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
@@ -4763,7 +4850,12 @@ fn ssc_accept_impl(
     let new_id = tcp_register(TcpHandle::Stream(Arc::new(stream)));
     tcp_blocking_state().write().insert(new_id, blocking);
 
-    let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", SC_OBJECT_SLOTS);
+    let child = alloc_channel_as_impl(
+        ctx,
+        "sun/nio/ch/SocketChannelImpl",
+        "java/nio/channels/SocketChannel",
+        SC_OBJECT_SLOTS,
+    );
     let child = init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(
@@ -4902,7 +4994,12 @@ fn ssc_accept_unix(
     // `getLocalAddress()`/`getRemoteAddress()` on an accepted UDS channel.
     let path = cf_get_str(ctx, this, F_UDS_PATH).unwrap_or_default();
 
-    let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", SC_OBJECT_SLOTS);
+    let child = alloc_channel_as_impl(
+        ctx,
+        "sun/nio/ch/SocketChannelImpl",
+        "java/nio/channels/SocketChannel",
+        SC_OBJECT_SLOTS,
+    );
     let child = init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(

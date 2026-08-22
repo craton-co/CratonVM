@@ -9,8 +9,10 @@ runtime oracle named in the contract now gates the suppression when it is on,
 and it can now *see* the cycles it gates — which it could not before, for a
 structural reason nobody had noticed.
 
-Two earlier rounds closed the codegen half (`30370b165`, `3d430ea69`); this
-round closes the consumer half.
+Two earlier rounds closed the codegen half (`30370b165`, `3d430ea69`), and a
+third (`53876976a`) split the per-cycle PROOF from the SUPPRESSION so the proof
+is computed on every collector rather than short-circuited away on two of them.
+This round closes the last piece: the suppression itself.
 
 ## What the bit is spent on
 
@@ -121,9 +123,66 @@ binary:
 | 1 MB (longer) | 70 144 | 84 | 0.120 % |
 
 **The other 99.9 % of collections already run the conservative scan**, so
-whatever the branch saves is bounded by that share. This is the number that
+whatever the branch saves is bounded by that share.
+
+**Re-measured after merging 220 dev commits**, because two of them change the
+premise directly: `f4d697453` makes the optimizing tier compute
+`fully_oop_covered` at all (so more methods can carry it), and `53876976a`
+splits the per-cycle proof from the suppression so the proof runs on every
+collector. Either could have raised engagement enough to change the trade.
+
+| tree | collections | `precise_only=true` | share |
+|---|---:|---:|---:|
+| `ee4cdf528` (pre-merge), 16 MB stress | 14 420 | 2 | 0.014 % |
+| merged with `2b034da6d`, 16 MB stress | **70 066** | **6** | **0.009 %** |
+| merged, same stress, default (opt-in off) | 3 539 | **0** | 0 % |
+
+Lower, not higher, on an order of magnitude more collections. The default flip
+is better supported after the merge than before it. This is the number that
 decides the trade, and it is an engagement count — it needed no quiet host,
 which is fortunate, because the host spent this session between load 5 and 168.
+
+## Follow-up 2026-08-21: the verdict is now COMPUTED on every collector
+
+This record's §"What this does NOT establish" notes that true generational
+"reports `incomplete=true` for other obligations on every collection, so it
+never takes the suppression", and that "the two collectors where the proof *did*
+pass are G1 and ZGC". The second half had a simpler explanation than it looked:
+**the proof was never run on a G1 or ZGC cycle at all.**
+`memory::roots::collect_roots` computed it inside a short-circuiting `&&` chain
+whose second term was `heap.is_generational() || g1_precise_only_roots`, so
+`refresh_moving_young_coverage_for_collection()` was skipped and the published
+verdict stayed at the `false` — meaning *complete* — that
+`begin_moving_young_coverage_cycle` had reset it to. It did not pass; nobody
+asked.
+
+Two changes, both landed:
+
+* The proof and the conservative-scan SUPPRESSION are now separate expressions.
+  The proof mentions no collector and runs on every cycle; the suppression stays
+  generational-only, which is what
+  `bug-g1-evacuates-live-jit-reference-20260819.md` asked for.
+* `moving_young_unpublished_frame_oop_present`'s residency test asks
+  `gen_heap::addr_is_movable` — the union of the generational young table with a
+  new `MOVABLE_BOUNDS` table a collector fills to say what its relocating phase
+  may move. `JIT_REGION_BOUNDS` was deliberately NOT filled: its second,
+  load-bearing job is the inline-reference-store write-barrier gate that G1 and
+  ZGC answer by leaving it empty.
+
+Measured on one H2 class, `TestKillProcessWhileWriting`, per collection:
+
+| collector | before | after |
+|---|---|---|
+| G1 | `incomplete=false` 722 499 / `true` 1 169 | `false` **0** / `true` 886 790, all `young-bounds-unpublished-verifier-vacuous` |
+| ZGC | verdict never computed | proof ran on 263 cycles, passed 21 |
+
+G1's answer is now correct rather than clean: it publishes neither table, so the
+verifier honestly reports that it cannot classify. Its behaviour is unchanged —
+`refuse_evacuation` is gated on `CRATONVM_G1_COVERAGE_PIN`, default off — but
+`record_g1_pause_coverage` stops measuring a vacuous verdict.
+
+ZGC acts on it: `relocate_stw` now compacts when the proof holds. See
+`known-issues/h2/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`.
 
 ## The repair
 
