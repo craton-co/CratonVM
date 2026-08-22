@@ -9743,9 +9743,43 @@ fn map_keys_equal(
 
 /// Get the bucket index for a given hash and capacity.
 fn map_bucket_index(hash: i32, capacity: i32) -> usize {
-    // Use bitwise AND for power-of-two capacity (like JDK HashMap)
-    ((hash as u32) & ((capacity as u32).wrapping_sub(1))) as usize
+    // ONE rule, with a fast path — not two rules.
+    //
+    // The general form is the JDK `Hashtable`'s: `(hash & 0x7FFFFFFF) % len`.
+    // For a power-of-two length that is ARITHMETICALLY IDENTICAL to
+    // `hash & (len - 1)`, because `len - 1` has no bit 31 set, so masking the
+    // sign bit first cannot change any bit the AND keeps. The branch below is
+    // therefore a division-elimination optimisation and nothing else: no map
+    // changes bucket for it, and the existing `map_bucket_index_power_of_two`
+    // test still pins the power-of-two answers.
+    //
+    // Why the general arm has to exist: `java.util.Hashtable` sizes its table
+    // 11, 23, 47, 95, … — `(oldCapacity << 1) + 1`, never a power of two — and
+    // MEASURED against HotSpot 25.0.3+9 this VM had it at 16 and 64. Making
+    // the RULE follow the table's actual length, rather than teaching every
+    // one of the 34 call sites which family its receiver belongs to, keeps the
+    // reader and the writer of a bucket index in agreement by construction:
+    // a table allocated at a non-power-of-two length is indexed modulo that
+    // length everywhere, including the `alloc_bucket_table` low-memory
+    // fallback that silently substitutes a different size.
+    let cap = capacity as u32;
+    if cap != 0 && cap.is_power_of_two() {
+        return ((hash as u32) & (cap - 1)) as usize;
+    }
+    if cap == 0 {
+        return 0;
+    }
+    (((hash as u32) & 0x7FFF_FFFF) % cap) as usize
 }
+
+/// `java.util.Hashtable`'s default table length, and the one number in this
+/// file that is deliberately not [`MAP_DEFAULT_CAPACITY`].
+///
+/// `new Hashtable()` is `this(11, 0.75f)` in JDK 25, and 11 * 0.75 = 8.25
+/// truncates to the threshold 8 that [`ensure_hashtable_load_factor`] already
+/// writes — so the two constants were already consistent with each other and
+/// only the array length was wrong.
+const HASHTABLE_DEFAULT_CAPACITY: usize = 11;
 
 /// The real JDK class a `java.util.HashMap.table` is an array of.
 ///
@@ -10378,8 +10412,26 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
     // from HotSpot for the identical set of keys (found via a json-smart
     // parse -> serialize -> re-parse round trip, where one map came from the
     // interpreter and the other from JIT-compiled code).
+    // `java.util.Hashtable.rehash()` is `(oldCapacity << 1) + 1`, not a
+    // doubling: 11 -> 23 -> 47 -> 95. Deriving the rule from the receiver keeps
+    // it in one place; `map_bucket_index` needs no matching change, because it
+    // takes the table's actual length as its modulus.
+    //
+    // The `doubled` split-rehash below tests `new_cap == old_cap * 2`, which is
+    // false for every 2n+1 step, so a Hashtable automatically takes the legacy
+    // per-bucket re-insert path — and that path's head-prepend is exactly what
+    // `Hashtable.rehash` itself does (`e.next = newMap[index]; newMap[index] =
+    // e;`), so the within-bucket order matches too.
+    let ht_layout = uses_native_hashtable_layout(ctx, this);
     let new_cap = if old_buckets0.is_none() {
-        std::cmp::max(old_cap, MAP_DEFAULT_CAPACITY as i32)
+        let floor = if ht_layout {
+            HASHTABLE_DEFAULT_CAPACITY as i32
+        } else {
+            MAP_DEFAULT_CAPACITY as i32
+        };
+        std::cmp::max(old_cap, floor)
+    } else if ht_layout {
+        std::cmp::min(old_cap.saturating_mul(2).saturating_add(1), MAP_MAX_CAPACITY)
     } else {
         std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY)
     };
@@ -10853,7 +10905,7 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut keys = Vec::new();
     if let Some(b) = buckets {
-        for i in 0..(cap as usize) {
+        for i in map_bucket_scan_order(ctx, this, cap as usize) {
             let mut node_val = ctx.get_array_element(b, i);
             while let Value::Object(Some(node)) = node_val {
                 let key = get_node_key(ctx, node);
@@ -10863,6 +10915,44 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
         }
     }
     keys
+}
+
+/// The bucket indices of `this`'s table, in the order the receiver's family
+/// ENUMERATES them.
+///
+/// `HashMap` walks its table upwards, 0..len. `java.util.Hashtable` walks it
+/// DOWNWARDS: `Hashtable$Enumerator`'s constructor sets `index = table.length`
+/// and `hasMoreElements` decrements, so bucket `len-1` is enumerated first.
+/// That is not an implementation detail — it is the observable order of
+/// `Hashtable.toString()`, `keySet()`, `values()`, `entrySet()` and
+/// `keys()`/`elements()` alike, because every one of them is that enumerator.
+///
+/// MEASURED, `--jdk-only`, four keys `a b c d` in a default `Hashtable`
+/// (table length 11, so `a`->9 `b`->10 `c`->0 `d`->1):
+///
+/// ```text
+///                    HotSpot 25.0.3+9      CratonVM before      after
+///   toString()       {b=2, a=1, d=4, c=3}  {c=3, d=4, a=1, b=2}  matches
+///   keySet()         [b, a, d, c]          [c, d, a, b]          matches
+///   values()         [2, 1, 4, 3]          [3, 4, 1, 2]          matches
+///   entrySet() iter  b,a,d,c               c,d,a,b               matches
+///   keys()           b,a,d,c               b,a,d,c               unchanged
+/// ```
+///
+/// The last row is the point: `native_ht_keys` was ALREADY descending and
+/// right, so this VM had two enumeration orders for one `Hashtable` and they
+/// disagreed with each other. Only the three bulk collectors were wrong.
+///
+/// This divergence was INVISIBLE until the table length matched HotSpot's.
+/// With a 16-bucket table the keys land on different indices entirely, so the
+/// orders differed for a reason that swamped this one; fixing the capacity is
+/// what made the ordering rule measurable.
+fn map_bucket_scan_order(ctx: &dyn NativeContext, this: ObjectRef, cap: usize) -> Vec<usize> {
+    if uses_native_hashtable_layout(ctx, this) {
+        (0..cap).rev().collect()
+    } else {
+        (0..cap).collect()
+    }
 }
 
 /// Collect all values from a HashMap into a Vec.
@@ -10897,7 +10987,7 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut values = Vec::new();
     if let Some(b) = buckets {
-        for i in 0..(cap as usize) {
+        for i in map_bucket_scan_order(ctx, this, cap as usize) {
             let mut node_val = ctx.get_array_element(b, i);
             while let Value::Object(Some(node)) = node_val {
                 let value = get_node_value(ctx, node);
@@ -10948,7 +11038,7 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut entries = Vec::new();
     if let Some(b) = buckets {
-        for i in 0..(cap as usize) {
+        for i in map_bucket_scan_order(ctx, this, cap as usize) {
             let mut node_val = ctx.get_array_element(b, i);
             while let Value::Object(Some(node)) = node_val {
                 let key = get_node_key(ctx, node);
@@ -11234,7 +11324,7 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let this = ctx.read_native_pin(this_pin, this);
         let component = map_carrier_class_for_receiver(ctx, this);
         let this = ctx.read_native_pin(this_pin, this);
-        let buckets = ctx.new_ref_array(component, MAP_DEFAULT_CAPACITY);
+        let buckets = ctx.new_ref_array(component, HASHTABLE_DEFAULT_CAPACITY);
         let buckets_pin = ctx.pin_native_root(buckets);
         let this = ctx.read_native_pin(this_pin, this);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
@@ -11493,6 +11583,34 @@ fn native_hashtable_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
     }
     native_map_init(ctx, &[Value::Object(Some(this))])?;
+    // `Hashtable(int initialCapacity)` is `new Entry[initialCapacity]` — the
+    // requested length VERBATIM, with 0 rounded up to 1. It is not rounded to a
+    // power of two (that is `HashMap`'s `tableSizeFor`) and not inflated by the
+    // load factor. `native_map_init` has just allocated the 11-bucket default,
+    // so re-size it here rather than threading a capacity through that native's
+    // whole legacy-layout arm.
+    //
+    // Rehashing is `map_resize`'s job and it only GROWS, so a smaller-than-11
+    // request is honoured by allocating directly; the map is empty at this
+    // point, so there is nothing to rehash either way.
+    let requested = std::cmp::min(std::cmp::max(capacity, 1), MAP_MAX_CAPACITY) as usize;
+    if requested != HASHTABLE_DEFAULT_CAPACITY {
+        let this_pin = ctx.pin_native_root(this);
+        let component = map_carrier_class_for_receiver(ctx, this);
+        let this = ctx.read_native_pin(this_pin, this);
+        let buckets = ctx.new_ref_array(component, requested);
+        let buckets_pin = ctx.pin_native_root(buckets);
+        let this = ctx.read_native_pin(this_pin, this);
+        let buckets = ctx.read_native_pin(buckets_pin, buckets);
+        ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        if let Some(slot) = ctx.resolve_field_index("java/util/Hashtable", "threshold") {
+            if slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, slot, Value::Int(((requested as i32) * 3) / 4));
+            }
+        }
+    }
     ensure_hashtable_load_factor(ctx, this, "java/util/Hashtable");
     Ok(None)
 }
@@ -13931,6 +14049,9 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let backing_map = ctx.read_native_pin(backing_pin, backing_map);
     hs_set_backing_map(ctx, set, backing_map);
     let this = ctx.read_native_pin(this_pin, this);
+    let set = ctx.read_native_pin(set_pin, set);
+    store_set_view_backref(ctx, set, this);
+    let this = ctx.read_native_pin(this_pin, this);
     let entries = map_collect_entries(ctx, this);
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // per-entry alloc_synthetic/map_alloc_node allocations move `this`,
@@ -14995,6 +15116,12 @@ fn make_view_set_of(
     let backing_pin = ctx.pin_native_root(backing);
     let set = ctx.read_native_pin(set_pin, set);
     hs_set_backing_map(ctx, set, backing);
+    // The declared enclosing-instance field, next to the undeclared backing
+    // slot above. `source` was re-read from its pin two lines up and nothing
+    // has allocated since.
+    let source = ctx.read_native_pin(source_pin, source);
+    let set = ctx.read_native_pin(set_pin, set);
+    store_set_view_backref(ctx, set, source);
     let sentinel = Value::Int(1);
     for (i, elem) in elems.iter().enumerate() {
         let backing = ctx.read_native_pin(backing_pin, backing);
@@ -15192,6 +15319,58 @@ fn set_view_carrier_for(ctx: &dyn NativeContext, source: ObjectRef, kind: i32) -
 /// makes: these are package-private JDK classes, and a stripped image or a
 /// synthetic-JDK build that has not bootstrapped them must not turn
 /// `map.keySet()` — which cannot fail — into a `NoClassDefFoundError`.
+/// Store the source map in a [`SET_VIEW_CARRIERS`] object's OWN declared
+/// enclosing-instance field, the way the JDK's own `keySet()`/`entrySet()`
+/// accessors do.
+///
+/// The `values()` twin is [`store_view_carrier_backref`], and this is the half
+/// that was missing. MEASURED before this change, `--jdk-only`, one case per
+/// process, against HotSpot 25.0.3+9:
+///
+/// ```text
+///   HM.keySet    this$0 = NULL              HotSpot: java.util.HashMap
+///   HM.entrySet  this$0 = NULL              HotSpot: java.util.HashMap
+///   HM.values    this$0 = java.util.HashMap HotSpot: java.util.HashMap   (already right)
+/// ```
+///
+/// and the same two-of-three split for `LinkedHashMap`. So the defect is not
+/// "view carriers have a null `this$0`" — it is that the SET carriers do, and
+/// the `values` carrier does not, because only the `values` mint path calls
+/// [`store_view_carrier_backref`].
+///
+/// # Why this is the containment `H4-1` §2 names
+///
+/// A view carrier is minted with its real JDK class and its list/backing state
+/// at *undeclared* slots; the declared `this$0` is what real JDK bytecode for
+/// `HashMap$KeySet.size()` dereferences. Today those bodies never run — every
+/// carrier class is in `force_native_over_real_jdk_bytecode` — so a null
+/// `this$0` is contained by the registrar rows, and `H4-1` §2's point is that
+/// **arming removes that containment**: refuse the carrier's registrations
+/// while the producer is still a bridge and the real body NPEs on the null.
+///
+/// Populating the field removes the coupling in the other direction: the
+/// carrier becomes correct whether or not its rows are refused, so the per
+/// carrier-family split `H4-1` §2 requires is no longer a *correctness*
+/// precondition for arming this half of the family.
+///
+/// Both names are tried for the reason [`values_view_class_source`] gives:
+/// `ConcurrentHashMap`'s views inherit `map` from `CollectionView` and declare
+/// no `this$0`. The write is skipped when the resolved slot is not below the
+/// undeclared slot [`hs_map_slot`] hands the backing map, so it can never
+/// collide with the backing-map store.
+fn store_set_view_backref(ctx: &mut dyn NativeContext, set: ObjectRef, source: ObjectRef) {
+    let cid = ctx.class_id_of_object(set);
+    let backing_slot = hs_map_slot(&*ctx, set).unwrap_or(HS_FIELD_MAP);
+    for name in ["this$0", "map"] {
+        if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, name) {
+            if slot < backing_slot {
+                ctx.set_field(set, slot, Value::Object(Some(source)));
+                return;
+            }
+        }
+    }
+}
+
 fn alloc_set_view_carrier(
     ctx: &mut dyn NativeContext,
     carrier: &str,
@@ -40050,6 +40229,15 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         alloc_view_backing(ctx, this_at_call, VIEW_KIND_ENTRYSET, cap)
     })?;
     hs_set_backing_map(ctx, set, backing_map);
+    // `LinkedHashMap` has its OWN entrySet native — it does not reach
+    // `native_map_entry_set` or `make_view_set_of` — so the declared
+    // enclosing-instance field needs storing here as well. MEASURED: with the
+    // other three mint sites fixed, `LinkedHashMap.entrySet()` was the ONE
+    // carrier still reporting `this$0 = NULL` against HotSpot's
+    // `java.util.LinkedHashMap`, while its own `keySet()` and `values()` were
+    // already right. A fourth mint site is exactly the shape `H23`'s
+    // three-of-four table typing had; the lesson is the same one.
+    store_set_view_backref(ctx, set, this);
     for i in 0..pairs.len() {
         let mut entry_obj =
             rooted_across(ctx, &mut [&mut this, &mut set, &mut backing_map], |ctx| {
@@ -52901,6 +53089,10 @@ fn native_chm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Refresh the real `table` mirror: this native already walks every entry,
+    // so the rebuild is a constant factor and not a change of order. See
+    // `chm_refresh_real_table`.
+    chm_refresh_real_table(ctx, this);
     // A null mapped value is what makes this view read-only, per the JDK.
     let view = make_key_set_view(ctx, this, Value::Object(None))?;
     Ok(Some(Value::Object(Some(view))))
@@ -52911,6 +53103,10 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Refresh the real `table` mirror: this native already walks every entry,
+    // so the rebuild is a constant factor and not a change of order. See
+    // `chm_refresh_real_table`.
+    chm_refresh_real_table(ctx, this);
     let vals = chm_collect_all_values(ctx, this);
     // Use the layout-aware ArrayList helpers: in real-JDK mode `elementData`
     // and `size` are NOT at slots 0/1 (`AbstractList.modCount` occupies an
@@ -52963,6 +53159,10 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Refresh the real `table` mirror: this native already walks every entry,
+    // so the rebuild is a constant factor and not a change of order. See
+    // `chm_refresh_real_table`.
+    chm_refresh_real_table(ctx, this);
     let entries = chm_collect_all_entries(ctx, this);
     // cceres5: pin the snapshot + receiver before the first allocation below.
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
@@ -54746,6 +54946,45 @@ fn chm_real_class(ctx: &mut dyn NativeContext, name: &str) -> Option<ClassId> {
 /// returns `None` and the caller keeps today's snapshot carrier verbatim. A
 /// partially-materialised `table` would be a populated-looking lie, which is
 /// the one outcome worse than the null it replaces.
+//
+// ---------------------------------------------------------------------------
+
+/// Refresh [`chm_publish_real_table`]'s mirror for its side effect, discarding
+/// the array.
+///
+/// # Why the O(N) read natives, and not `put`
+///
+/// `H23-2` §7.3 nominated *"`ConcurrentHashMap.table` is null for an ordinary
+/// map"*, and MEASURED on this host it was: a two-entry `new
+/// ConcurrentHashMap<>()` reported `table = null` where HotSpot 25.0.3+9
+/// reports `[Ljava.util.concurrent.ConcurrentHashMap$Node; len=16`, and a
+/// 40-entry one reported null against HotSpot's `len=64`. The mirror was
+/// correct wherever it ran; it ran from exactly ONE caller,
+/// `chm_real_dual_iterator`, i.e. only from `keys()`/`elements()`.
+///
+/// The mirror is a rebuild-from-scratch of the whole segmented store, so it is
+/// O(N). Hanging it on `put` would make every insert O(N) and hanging it on
+/// `size()` would make an O(1) query O(N) — both are worse than the defect.
+/// Every caller added here is a bulk operation that ALREADY walks every entry
+/// (`chm_collect_all_keys` / `_values` / `_entries` do the same walk the mirror
+/// does), so the cost is a constant factor on an already-linear operation and
+/// the asymptotics of no operation change.
+///
+/// What that buys, and what it does not: after any bulk read of a CHM its
+/// `table` is a fresh, correctly-typed `$Node[]` that java.base's own
+/// `Traverser` walks. A map that has been WRITTEN and never bulk-read still
+/// presents `table = null` — the residual, stated rather than hidden, because
+/// closing it needs `table` to be the authority a real `putVal` CASes into
+/// rather than a mirror (`W7-96-chm-table-never-populated.md`), which is a
+/// different change from this one.
+///
+/// The total-fallback contract is inherited unchanged: any surprise leaves
+/// `table` exactly as it was, so a failed refresh can never be worse than not
+/// refreshing.
+fn chm_refresh_real_table(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let _ = chm_publish_real_table(ctx, this);
+}
+
 fn chm_publish_real_table(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     // `this` is pinned for the WHOLE body and every early exit unwinds through
     // the single `unpin_native_roots` below, so the many `return None` arms
@@ -54820,8 +55059,36 @@ fn chm_publish_real_table_pinned(
     // HotSpot's own sizing, so the published table matches it bin-for-bin:
     // start at DEFAULT_CAPACITY and double while the count exceeds the 0.75
     // load factor. Measured against HotSpot: 6 entries -> 16, 200 -> 512.
+    //
+    // ...but DEFAULT_CAPACITY is only the floor for a map built by the no-arg
+    // constructor. `new ConcurrentHashMap<>(16)` ends with
+    // `sizeCtl = tableSizeFor(16 + (16 >>> 1) + 1) = 32`, and HotSpot's first
+    // `put` allocates 32 buckets and keeps them — a 3-entry map built that way
+    // has `table.length == 32`, not 16. [`chm_initial_table`] is where this
+    // implementation already records that, so take it as the floor.
+    //
+    // TWO PRODUCERS, ONE SLOT, and this is where they reconcile. `sizeCtl` is
+    // written by [`chm_record_initial_table`] as the requested TABLE SIZE and
+    // by the tail of this function as the 0.75 THRESHOLD — both faithful to
+    // HotSpot, which reuses the field for both meanings at different points in
+    // a map's life, and indistinguishable to [`chm_initial_table`], which
+    // applies `next_power_of_two` to whatever it finds. That round trip is
+    // exact once the floor below is in place, and not by luck: the threshold
+    // this function writes is `cap - (cap >> 2)`, i.e. `0.75 * cap`, which is
+    // strictly greater than `cap / 2`, so `next_power_of_two` of it is `cap`
+    // for every `cap >= 4`. The mirror therefore reports the SAME virtual table
+    // size to `chm_reorder_by_virtual_bucket` after a refresh as before one,
+    // and repeated refreshes are idempotent.
+    //
+    // MEASURED, and this is why the floor is not cosmetic: without it, a
+    // refresh of the `new ConcurrentHashMap<>(16)` in `RChmKeySetView` wrote
+    // `sizeCtl = 12`, `chm_initial_table` then answered 16 where the
+    // constructor had recorded 32, and `keySet()` came back
+    // `[youralias, thirdalias, myalias]` against HotSpot's
+    // `[thirdalias, myalias, youralias]` — a real regression, caught by that
+    // vector, from a mirror that only ran on `keys()` before.
     let n = entries.len();
-    let mut cap = 16usize;
+    let mut cap = chm_initial_table(ctx, this).max(16);
     while n > cap - (cap >> 2) {
         if cap > (1usize << 29) {
             return None;
