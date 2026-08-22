@@ -18302,6 +18302,9 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // because dispatch falls through to the default Iterator.remove().
     ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
     ctx.set_field(itr, base + MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    // Seed the fail-fast generation LAST: `MAP_KEY_ITR_FIELD_BACKING` above is
+    // how `map_itr_comod_source` finds the collection to watch.
+    map_itr_seed_expected(ctx, itr);
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
@@ -18656,6 +18659,122 @@ fn al_itr_sync_mod_count(ctx: &mut dyn NativeContext, itr: ObjectRef, list: Obje
     if let Some(slot) = al_itr_expected_mod_count_slot(ctx, itr) {
         let seen = al_mod_count(ctx, list).unwrap_or(0);
         ctx.set_field(itr, slot, Value::Int(seen));
+    }
+}
+
+/// Off-switch for the map/set iterator comodification check. Default ON.
+#[inline]
+fn map_itr_failfast_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_MAP_ITERATOR_FAILFAST").is_none()
+    })
+}
+
+/// The iterator's own declared `expectedModCount` slot, or `None`.
+///
+/// Same shape and same failure direction as
+/// [`al_itr_expected_mod_count_slot`]: a carrier that does not declare the
+/// field, or whose declared slot would collide with the undeclared snapshot
+/// block this file writes from `key_itr_base` upward, keeps the old
+/// never-throw behaviour rather than guessing. A missed exception on an
+/// incorrect program is far better than a spurious one on a correct program.
+fn map_itr_expected_mod_slot(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<usize> {
+    let cid = ctx.class_id_of_object(itr);
+    let slot = ctx.resolve_field_index_by_class_id(cid, "expectedModCount")?;
+    let base = key_itr_base(ctx, itr);
+    if slot >= base || slot >= ctx.object_num_fields(itr) {
+        return None;
+    }
+    Some(slot)
+}
+
+/// The collection whose modification generation this iterator is fail-fast
+/// against: for a keySet/entrySet view that is the SOURCE map behind the
+/// view's backing, and for a plain `HashSet` it is the backing map itself.
+fn map_itr_comod_source(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<ObjectRef> {
+    let base = key_itr_base(ctx, itr);
+    if ctx.object_num_fields(itr) <= base + MAP_KEY_ITR_FIELD_BACKING {
+        return None;
+    }
+    let coll = match ctx.get_field(itr, base + MAP_KEY_ITR_FIELD_BACKING) {
+        Value::Object(Some(c)) => c,
+        _ => return None,
+    };
+    let backing = hs_backing_map(ctx, coll)?;
+    Some(view_backing_source(ctx, backing).unwrap_or(backing))
+}
+
+/// `src`'s current modification generation, or `None` when it keeps none.
+fn map_itr_mod_count(ctx: &dyn NativeContext, src: ObjectRef) -> Option<i32> {
+    match ctx.get_field_by_name(src, "modCount") {
+        Value::Int(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// The JDK's `expectedModCount = modCount` line — at mint, and again after a
+/// removal made THROUGH the iterator (which bumps the source and would
+/// otherwise trip the check the iterator just installed).
+fn map_itr_seed_expected(ctx: &mut dyn NativeContext, itr: ObjectRef) {
+    if !map_itr_failfast_enabled() {
+        return;
+    }
+    let Some(slot) = map_itr_expected_mod_slot(&*ctx, itr) else {
+        return;
+    };
+    let Some(src) = map_itr_comod_source(&*ctx, itr) else {
+        return;
+    };
+    if let Some(seen) = map_itr_mod_count(&*ctx, src) {
+        ctx.set_field(itr, slot, Value::Int(seen));
+    }
+}
+
+/// The JDK's `HashMap$HashIterator.nextNode()` comodification test.
+///
+/// These iterators walk a SNAPSHOT taken at `iterator()` time, so a structural
+/// change to the source was previously invisible: the loop quietly finished
+/// over stale contents where HotSpot throws. MEASURED with
+/// `probes/MapModCountProbe`, one process per VM, HotSpot 25.0.3+9:
+///
+/// ```text
+///                  entrySet.put  entrySet.remove  keySet.put      HotSpot
+///   HashMap             NONE          NONE           NONE         CME x3
+///   LinkedHashMap       NONE          NONE           NONE         CME x3
+///   TreeMap             NONE          NONE           NONE         CME x3
+///   Hashtable           CME           CME            CME          CME x3
+/// ```
+///
+/// Only `Hashtable` matched, and only because its views hand out java.base's
+/// OWN cursor (`real_ht_view_enumerator`) instead of a snapshot.
+///
+/// The generation this reads is the one `bump_map_mod_count` maintains; it was
+/// stuck at 0 for `LinkedHashMap` until `539d962f1`, so this check could not
+/// have worked for that family before then.
+fn map_itr_check_comod(
+    ctx: &dyn NativeContext,
+    itr: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if !map_itr_failfast_enabled() {
+        return Ok(());
+    }
+    let Some(slot) = map_itr_expected_mod_slot(ctx, itr) else {
+        return Ok(());
+    };
+    let expected = match ctx.get_field(itr, slot) {
+        Value::Int(v) => v,
+        _ => return Ok(()),
+    };
+    let Some(src) = map_itr_comod_source(ctx, itr) else {
+        return Ok(());
+    };
+    match map_itr_mod_count(ctx, src) {
+        Some(actual) if actual != expected => {
+            Err(cratonvm_types::error::RuntimeError::ConcurrentModificationException.into())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -19078,6 +19197,9 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `HashMap$HashIterator.nextNode()` checks here and `hasNext()` does not,
+    // so a loop that runs to exhaustion still throws on its next `next()`.
+    map_itr_check_comod(&*ctx, this)?;
     let base = key_itr_base(ctx, this);
     let cursor = match ctx.get_field(this, base + MAP_KEY_ITR_FIELD_CURSOR) {
         Value::Int(c) => c,
@@ -19212,6 +19334,9 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     ctx.unpin_native_roots(this_pin);
     let _ = removed?;
     ctx.set_field(this, base + MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    // The removal above bumped the source's generation; adopt it, or the next
+    // `next()` would trip the check this iterator installed on itself.
+    map_itr_seed_expected(ctx, this);
     Ok(None)
 }
 
