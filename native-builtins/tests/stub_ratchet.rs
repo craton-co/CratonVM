@@ -851,7 +851,63 @@ use cratonvm_types::compat::CompatibilityMode;
 /// worktree at that commit. The procedure works for baselines set from now on;
 /// it did not work for this one, and a procedure that cannot run reads exactly
 /// like a procedure nobody bothered to run.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1626;
+/// # 1622 / 1611 -> 1625 / 1614, 2026-08-21 — three methods on a carrier
+/// `--jdk-only` already drops whole, and a third case this gate cannot state
+///
+/// The rise is exactly three rows, and for the first time they were IDENTIFIED
+/// before the constant moved rather than argued about afterwards
+/// (`dump_synthetic_stubs` here, and the same test grafted onto `083998c7b`
+/// where it did not yet exist — `census_rows` is byte-identical across the two,
+/// so the graft measures that commit's registry and nothing else):
+///
+/// ```text
+/// cratonvm/internal/ss/JavaUtilJarAccess$1.entryFor(Ljava/util/jar/JarFile;Ljava/lang/String;)Ljava/util/jar/JarEntry;
+/// cratonvm/internal/ss/JavaUtilJarAccess$1.getTrustedAttributes(Ljava/util/jar/Manifest;Ljava/lang/String;)Ljava/util/jar/Attributes;
+/// cratonvm/internal/ss/JavaUtilJarAccess$1.isInitializing()Z
+/// ```
+///
+/// Three added, ZERO removed, from `392e6990a` (2026-08-19), which completed
+/// `jdk.internal.access.JavaUtilJarAccess`: the carrier had two of its five
+/// methods and the other three were abstract on a synthetic class, so a caller
+/// reaching one got an `AbstractMethodError`.
+///
+/// **The two-column rule does not adjudicate this one, and that is the finding.**
+/// Totals moved 12792 -> 12885 and 13160 -> 13253, i.e. +93 rows against +3
+/// stubs — neither "total unchanged" (a relabel) nor "total up by about the stub
+/// delta" (new fakes). It is 90 new `Bridge` rows and 3 new stubs, and the 3 are
+/// genuinely new registrations, not re-tags.
+///
+/// So by the letter of the message below this is case (a), "a NEW fake was
+/// written — do NOT just raise the baseline". Both of that case's remedies are
+/// unavailable, and not by accident:
+///
+/// * "make the new native a real `Bridge`/`Intrinsic`" would be WRONG here.
+///   `cratonvm/internal/ss/JavaUtilJarAccess$1` is on
+///   `no_image_receiver::VM_MINTED_STAND_IN_RECEIVERS`, and `F33-1` decided
+///   deliberately that a factory and the carrier it hands out share one kind, so
+///   the whole thing — factory and methods together — is refused under
+///   `--jdk-only`. Tagging these three `Bridge` would keep a fake carrier alive
+///   in strict mode, which is the defect that page exists to record.
+/// * "prefer fixing the underlying VM gap so real bytecode runs" has nothing to
+///   run. The receiver's class exists only inside CratonVM and has no bytecode
+///   at all; there is no JDK body behind `entryFor` to yield to.
+///
+/// The alternative to these three stubs is therefore not real bytecode — it is
+/// the `AbstractMethodError` they were added to stop. `--jdk-only` behaviour is
+/// unchanged either way, because the carrier is dropped whole in both.
+///
+/// **The third case, for the next reader:** a stub added to a receiver that
+/// strict mode already refuses IN ITS ENTIRETY costs strict mode nothing. Ask
+/// what mints the receiver (the rule at
+/// `no_image_receiver::VM_MINTED_STAND_IN_RECEIVERS`) before applying the
+/// dichotomy below; if the owner is a listed stand-in, the row count is the only
+/// thing that moved and completing its interface is a fix, not a regression.
+///
+/// Found while merging dev into an unrelated TLS branch, because this file had
+/// not COMPILED since `26e4b5db4` — see
+/// `known-issues/stub-ratchet-was-a-compile-error-and-is-three-over-baseline-20260820.md`.
+/// The count had been three over for two days with nothing able to say so.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1625;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -866,7 +922,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1626;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1615;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1614;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -896,13 +952,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1615;
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
 /// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13225;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13253;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12857;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12885;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;

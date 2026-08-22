@@ -15,11 +15,23 @@ pub use cratonvm_types::compat::{CompatibilityMode, ExecutionPolicy};
 /// Available garbage collector algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcAlgorithm {
-    /// Generational semi-space GC (default, current implementation).
+    /// Generational semi-space GC. **Not the default in a default build** —
+    /// see [`Zgc`](Self::Zgc) and `VmConfig::default`, which selects `Zgc`
+    /// whenever the `zgc` feature is on and `Generational` only when it is
+    /// off. Reachable everywhere via `-XX:+UseGenerationalGC`.
+    ///
+    /// The "(default, current implementation)" this line used to carry stopped
+    /// being true when the `zgc` default landed, and it is load-bearing: a
+    /// reader who believes it attributes a default-build measurement to the
+    /// wrong collector, which is what happened while root-causing
+    /// `docs/known-issues/gc/bug-g1-evacuates-live-jit-reference-20260819.md`
+    /// (three arms recorded as "generational" were ZGC runs).
     Generational,
     /// G1 (Garbage-First) region-based collector.
     G1,
     /// ZGC-real backend: a memory-backed stop-the-world mark-sweep collector.
+    /// **The default in any build with the `zgc` feature**, which includes the
+    /// release build.
     #[cfg(feature = "zgc")]
     Zgc,
 }

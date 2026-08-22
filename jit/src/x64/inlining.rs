@@ -151,7 +151,14 @@ impl Compiler {
         // behind by a bailed splice would attach a caller frame to every later
         // point in the enclosing method.
         self.push_inline_scope(pc, site.callee_num_args);
+        let walk_at_checkpoint = self.inline_walk_at;
+        self.inline_walk_at = (usize::MAX, 0);
         let inline_ok = self.try_emit_inline_body(pc, site);
+        let bailed_at = self.inline_walk_at;
+        // A nested splice runs the same walk, so restore the enclosing walk's
+        // position on the way out: otherwise an inner body that finished
+        // cleanly would overwrite where the OUTER one stands.
+        self.inline_walk_at = walk_at_checkpoint;
         self.pop_inline_scope();
         self.slot_mirror_suppressed = mirror_suppressed_checkpoint;
         self.slot_mirror = None;
@@ -243,6 +250,24 @@ impl Compiler {
                 .truncate(null_check_store_stubs_checkpoint);
             self.deopt_points.truncate(deopt_points_checkpoint);
             crate::metrics::note_inline_call_arm(6);
+            // Name the rollback. The count alone ("outer-splice-rolled-back=1")
+            // says a planned splice was thrown away without saying by what, and
+            // that has stood as an open question on the netty exhaustive-loop
+            // pages since 2026-08-18.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                let (bail_pc, bail_op) = bailed_at;
+                if bail_pc == usize::MAX {
+                    eprintln!(
+                        "[cratonvm-jitc] inline-rollback {}.{}{} at pc={pc}: before the walk started (prologue/args/merge-region reservation) or refused by the deopt-metadata postcondition",
+                        site.class_name, site.method_name, site.descriptor,
+                    );
+                } else {
+                    eprintln!(
+                        "[cratonvm-jitc] inline-rollback {}.{}{} at pc={pc}: callee_pc={bail_pc} op=0x{bail_op:02x}",
+                        site.class_name, site.method_name, site.descriptor,
+                    );
+                }
+            }
             false
         }
     }
@@ -295,6 +320,11 @@ impl Compiler {
         }
 
         let callee_locals_size = callee_max_locals.max(callee_param_slot_span);
+        // The cursor as the CALLER's operand stack sees it *before* any of this
+        // splice's reservations move it. The invoke's result belongs at the
+        // depth the caller's stack reaches once the arguments are popped, which
+        // is at or below this — never above it. See `caller_post_pop_spill`.
+        let caller_spill_pre_reserve = self.next_spill_offset;
         // Allocate callee locals in caller's spill area.
         let Some(callee_local_base) = self.reserve_spill_slots(callee_locals_size) else {
             return false;
@@ -309,12 +339,35 @@ impl Compiler {
             return false;
         }
 
+        // Spill cursor as the CALLER's operand stack sees it with this invoke's
+        // arguments popped — where the return value belongs, and the single
+        // thing this splice must restore before pushing it.
+        //
+        // It cannot be read off `next_spill_offset` after the loop below, and
+        // that is the whole trap: `reserve_spill_slots` above has ALREADY moved
+        // the cursor past the argument slots (it has to — they stay live until
+        // `load_slot_to_reg` marshals each into a callee local), so `pop_stack`'s
+        // reclaim arm (`off == next_spill_offset - 8`) can no longer recognise
+        // any of them as the top slot and never rewinds. Derive it from the
+        // slots themselves: popping the top `n` operands frees every frame slot
+        // from the DEEPEST popped one upward, so the lowest popped `Frame`
+        // offset is exactly the caller's new top. An argument held in a
+        // register (`Scratch`/`Xmm`/`CalleeSaved`) owns no frame slot and
+        // correctly does not move the cursor — hence the `min` over `Frame`
+        // arms only, seeded with the pre-reservation cursor for a callee whose
+        // arguments are all register-resident (and for a no-arg callee, where
+        // the caller's top does not move at all).
+        //
         // Store args into the callee's JVM local slots. Category-2 parameters
         // consume two JVM slots while the JIT operand stack carries one i64
         // value, so the descriptor-derived slot map must mirror the normal
         // prologue layout (`(JJI)J` -> slots 0, 2, 4).
+        let mut caller_post_pop_spill = caller_spill_pre_reserve;
         for i in (0..callee_num_args).rev() {
             let slot = self.pop_stack();
+            if let StackSlot::Frame(off) = slot {
+                caller_post_pop_spill = caller_post_pop_spill.min(off);
+            }
             let local_idx = callee_param_jvm_slots[i];
             let local_off = callee_local_base + (local_idx as i32) * 8; // Cast: x86-64 immediate encoding
             self.load_slot_to_reg(RAX, slot);
@@ -373,6 +426,9 @@ impl Compiler {
 
         while cpc < callee_len {
             let op = callee_code[cpc];
+            // Name the spot for a rollback report (see `inline_walk_at`). A
+            // bail leaves this at the instruction it died on.
+            self.inline_walk_at = (cpc, op);
 
             // Merge-point handling.
             //
@@ -1264,8 +1320,42 @@ impl Compiler {
                         op == 0xb0 || self.stack_oop_marks.last().copied().unwrap_or(false);
                     // Pop callee's return value → push onto caller stack
                     self.pop_to_rax();
-                    // Reclaim callee locals
-                    self.next_spill_offset = save_spill;
+                    // Reclaim the callee's locals AND its merge region, back to
+                    // the depth the CALLER's operand stack reached when this
+                    // invoke's arguments were popped. `save_spill` is the
+                    // callee's operand base, which sits `callee_locals_size +
+                    // MAX_INLINE_MERGE_DEPTH` slots ABOVE that — pushing the
+                    // result from there parks it above its semantic
+                    // operand-stack depth, and every later push in the caller's
+                    // basic block inherits the shift.
+                    //
+                    // The linear walk stays self-consistent, so nothing looks
+                    // wrong — until the first branch target after the splice,
+                    // whose depth is re-established from the bytecode at the
+                    // canonical `base_spill_offset + i*8` (see the revived-merge
+                    // reconstruction in `bytecode_walk.rs`). Writer and reader
+                    // then address different slots and the method computes with
+                    // a stale one.
+                    //
+                    // Measured on ECJ's `OperandStack.pop(OperandCategory)`,
+                    // whose inlined `TypeIds.getCategory(id)` result landed two
+                    // slots deep while the `tableswitch` merge's `if_icmpeq`
+                    // read the true slot 0 — so the compiled body compared the
+                    // raw `TypeBinding.id` against the expected category, and
+                    // every JSP compiled after that method tiered up threw
+                    // `AssertionError: Unexpected operand at stack top`
+                    // (tomcat/ecj-operandstack-*.md). The same defect had been
+                    // fixed once in the direct-call arms of `bytecode_walk.rs`
+                    // (2026-08-06); it came back through this arm when
+                    // `0f55466d0` (2026-08-18) taught the splicer to inline a
+                    // value-producing branch merge, which is what made that
+                    // branchy callee inlinable in the first place.
+                    //
+                    // Safe: the load above already read the value out of the
+                    // callee's slot, and `caller_post_pop_spill` is strictly
+                    // below `callee_local_base`, so the store cannot alias
+                    // anything the callee still owns.
+                    self.next_spill_offset = caller_post_pop_spill;
                     self.push_from_rax();
                     if ret_is_oop {
                         self.mark_top_as_oop();
@@ -1281,7 +1371,21 @@ impl Compiler {
 
                 // return (void)
                 0xb1 => {
-                    self.next_spill_offset = save_spill;
+                    // Same reclaim as the value-returning arm above. A void
+                    // splice pushes nothing, so the caller's NEXT push is the
+                    // one that would inherit the shift.
+                    //
+                    // At the OUTER level `reset_spills()` — which the main walk
+                    // runs at every instruction boundary — already lowers the
+                    // cursor to just past the highest live operand and repairs
+                    // this on its own; no test can tell the two apart there, and
+                    // one asserting otherwise was written and then deleted for
+                    // passing either way. It IS load-bearing for a nested
+                    // splice: the mini-walk in this function has no
+                    // per-instruction reset, so an inner void body would leave
+                    // the enclosing CALLEE's cursor parked in the inner callee's
+                    // abandoned frame region.
+                    self.next_spill_offset = caller_post_pop_spill;
                     // Jump past the rest of the inlined code
                     self.buf.emit_byte(0xE9);
                     let patch_off = self.buf.pos();
@@ -1749,23 +1853,29 @@ impl Compiler {
             }
         }
 
-        // Reclaim callee local spill slots. The `ireturn` handler pushed any
-        // return value AT `save_spill` (it set next_spill=save_spill then
-        // push_from_rax, leaving next_spill=save_spill+8). Resetting next_spill
-        // back to `save_spill` here would FREE that return-value slot, so the
-        // next push (e.g. a sibling call's argument) reused it and clobbered the
-        // value — `leaf(a) + leafBig(a)` miscompiled because `leaf(a)`'s result
-        // was overwritten by `iload a` for leafBig's argument. Keep next_spill
-        // above the live operand-stack top so the return value is preserved.
+        // Reclaim the callee's locals and merge region, leaving the cursor
+        // exactly where the CALLER's operand stack now tops out.
+        //
+        // This must agree instruction-for-instruction with the `xreturn` arms
+        // above, which is why both read `caller_post_pop_spill`: a callee with
+        // several `return`s emits one such arm per return, and the walk falls
+        // out of the loop with whichever one came last — so a cursor recomputed
+        // here from anything else would silently disagree with the code that
+        // was actually emitted.
+        //
+        // The return value occupies ONE slot at `caller_post_pop_spill`; the
+        // cursor must stay ABOVE it. Handing that slot back instead is a real
+        // bug with a name: the next push (a sibling call's argument) reused it,
+        // and `leaf(a) + leafBig(a)` miscompiled because `leaf(a)`'s result was
+        // overwritten by `iload a` for leafBig's argument.
         let next_spill = if self.stack.len() > caller_base_depth {
-            // A return value occupies one slot at `save_spill`.
-            let Some(end) = self.checked_spill_range_end(save_spill, 1) else {
+            let Some(end) = self.checked_spill_range_end(caller_post_pop_spill, 1) else {
                 return false;
             };
             end
         } else {
-            // Void callee: nothing pushed, callee operand stack fully reclaimed.
-            save_spill
+            // Void callee: nothing pushed, callee frame fully reclaimed.
+            caller_post_pop_spill
         };
         self.next_spill_offset = next_spill;
 

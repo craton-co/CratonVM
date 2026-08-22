@@ -73,6 +73,19 @@ The required speed-up is the useful number, and it is not uniform: `TestCancel` 
 
 Two rows in this group are *not* at the cap and still lost: `TestKillProcessWhileWriting` (9.5 s → 147.7 s, 15.6x, finishes as FAIL) and `TestMultiThread` (12.2 s → 231.8 s, 19x — see its own page).
 
+> **`TestKillProcessWhileWriting` is NOT a wall-clock row (2026-08-21).** It
+> fails with `OutOfMemoryError: Java heap space (ByteBuffer.allocate 1048576)`
+> on a heap that is **97 % free**: ZGC's stop-the-world slide, its only
+> defragmentation, declines on every cycle because a compiled frame is live,
+> which in a JIT-warm workload is every cycle. The same class passes under
+> `--nojit`, on the generational collector, and on HotSpot. **Still OPEN** — the
+> obvious repair rests on a coverage proof that is not computed for this
+> collector; see
+> `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` for the
+> measurement and for what has to change first. The lesson is the one §2b
+> already states, applied to §2a: a row that finishes and fails deserves the
+> mechanism to be read before it is filed under the throughput story.
+
 ### 2b. Two are real correctness — we finish in comparable time and get it wrong
 
 > **Revised 2026-08-18, after both new rows were worked.** This section said

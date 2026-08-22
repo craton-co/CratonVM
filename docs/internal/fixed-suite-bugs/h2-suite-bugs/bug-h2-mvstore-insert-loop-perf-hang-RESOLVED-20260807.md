@@ -4,7 +4,7 @@
 **RESOLVED / retired.** Everything this page asked has been answered, and the
 two things on it that were *defects* are fixed. What remains is a constant
 factor that is not this page's own — it is the general interpreter gap already
-tracked on `docs/known-issues/h2/h2-update-path-throughput-20260802.md`, which
+tracked on `performance/h2-update-path-throughput-RETIRED-20260821.md`, which
 now carries the INSERT-side numbers too.
 
 Predecessor: `docs/known-issues/h2/bug-h2-mvstore-insert-loop-perf-hang.md`
@@ -214,7 +214,7 @@ progressing throughout, no deadlock.
 
 The irreducible part — CratonVM costs ~5-10× HotSpot's interpreter and its JIT
 recovers ~1.5× where C2 recovers ~26× — is **not filed here any more**. It is
-the same quantity `h2-update-path-throughput-20260802.md` tracks, which now
+the same quantity `h2-update-path-throughput-RETIRED-20260821.md` tracks, which now
 carries the INSERT-loop table and the flat profile above. Keeping a second page
 for the same constant is what sent three sessions after "a cliff".
 
@@ -256,7 +256,7 @@ Drop `--nojit` and it OOMs — see the regression record above, not this page.
 
 ## Related
 
-* `docs/known-issues/h2/h2-update-path-throughput-20260802.md` — the surviving
+* `performance/h2-update-path-throughput-RETIRED-20260821.md` — the surviving
   page for the constant factor. Its "flat across statement kinds" band is what
   this page's numbers fall inside.
 * `docs/known-issues/vm/jit-young-heap-exhaustion-after-header-16-20260807.md` —

@@ -2652,16 +2652,6 @@ mod bootstrap_property_fallback_tests {
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
-    use std::sync::{Mutex, OnceLock};
-
-    /// `JBOSS_HOME` is an ordinary process variable — undeclared, so
-    /// `flags::runtime_var` gives it live `std::env` semantics and it must be
-    /// stashed/restored in `environ` under this lock.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
-    }
-
     /// Run `f` with the two `jboss.home.dir` inputs set as given.
     ///
     /// `CRATONVM_JBOSS_MP_ROOT` is a **declared** flag, served from the
@@ -2674,21 +2664,16 @@ mod bootstrap_property_fallback_tests {
     /// the wrong reason. It is overridden on the snapshot instead — thread
     /// scope, because every reader here runs on this thread.
     fn with_jboss_env<R>(home: Option<&str>, mp_root: Option<&str>, f: impl FnOnce() -> R) -> R {
-        let _guard = env_lock();
-        let previous = cratonvm_types::flags::runtime_var_os("JBOSS_HOME");
-        match home {
-            Some(v) => std::env::set_var("JBOSS_HOME", v),
-            None => std::env::remove_var("JBOSS_HOME"),
-        }
-        let result = cratonvm_types::flags::with_thread_overrides(
-            &[("CRATONVM_JBOSS_MP_ROOT", mp_root)],
+        // Both names go through one thread-scoped override. `JBOSS_HOME` used
+        // to be stashed into `environ` with `set_var` under a local mutex —
+        // which serialised these tests against each other and against nothing
+        // else, while thousands of tests ran on other threads. `set_var` is a
+        // process-wide data race, so there was no lock that could have made it
+        // safe; the override never touches `environ` at all.
+        cratonvm_types::flags::with_thread_overrides(
+            &[("JBOSS_HOME", home), ("CRATONVM_JBOSS_MP_ROOT", mp_root)],
             f,
-        );
-        match previous {
-            Some(v) => std::env::set_var("JBOSS_HOME", v),
-            None => std::env::remove_var("JBOSS_HOME"),
-        }
-        result
+        )
     }
 
     #[test]
@@ -4190,6 +4175,12 @@ pub mod jmx_openmbean;
 pub mod date_format_fast;
 pub mod t27_tls;
 pub mod t27_tls_cbc;
+// Which TLS alert a client-side `TrustManager` rejection becomes. Shared by the
+// verifier-time path (`PassthroughServerCertVerifier::verify_server_cert`) and
+// the post-handshake one (`reject_peer_with_fatal_alert`), which had already
+// drifted apart once — the newer path answered `access_denied` for every
+// rejection where the older one answered `certificate_unknown`.
+pub mod tls_cert_alert;
 pub mod t3_impl;
 pub mod tls;
 // Deny-by-default guard for the JSSE socket-factory surface: an

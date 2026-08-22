@@ -11803,7 +11803,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
-        let obj = self.shared.mem.heap.load_and_forward(obj);
+        let (obj, obj_validated) = self.shared.mem.heap.load_and_forward_checked(obj);
         // T10.9.E вЂ” descriptor-aware read path. Resolve (and cache) the
         // declared field descriptor for the receiver's class and route
         // the slot decode through `get_field_as`, so a long-typed field
@@ -11811,7 +11811,15 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // the raw storage happens to hold. Missing class metadata or an
         // unknown slot falls back to the legacy raw read via
         // `coerce_field_value_by_descriptor`'s default arm.
-        let class_id = self.shared.mem.heap.class_id_of(obj);
+        // `load_and_forward` hands back its argument unchanged when validation
+        // failed, so the trusted twin is only safe on the validated arm. The
+        // `ClassId::new(0)` fallback is exactly what `class_id_of` returns on a
+        // validation miss, so this is the same value by a shorter route.
+        let class_id = if obj_validated {
+            self.shared.mem.heap.class_id_of_validated(obj)
+        } else {
+            ClassId::new(0)
+        };
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
             Some(desc) => {
                 let decoded = self.shared.mem.heap.get_field_as(obj, index, desc);
@@ -11840,7 +11848,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
-        let obj = self.shared.mem.heap.load_and_forward(obj);
+        let (obj, obj_validated) = self.shared.mem.heap.load_and_forward_checked(obj);
         let value = forward_boundary_value(&self.shared.mem.heap, value);
         // DIAGNOSTIC-ONLY (cce0079 tree-key tail): decisive probe - capture
         // the minor-GC epoch at entry and compare at exit. A delta proves a
@@ -11927,7 +11935,15 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // `Value` variant to the declared field type prevents tag drift
         // from leaking across subsequent reads. Fallback: legacy
         // `set_field` when the descriptor is unresolvable.
-        let class_id = self.shared.mem.heap.class_id_of(obj);
+        // `load_and_forward` hands back its argument unchanged when validation
+        // failed, so the trusted twin is only safe on the validated arm. The
+        // `ClassId::new(0)` fallback is exactly what `class_id_of` returns on a
+        // validation miss, so this is the same value by a shorter route.
+        let class_id = if obj_validated {
+            self.shared.mem.heap.class_id_of_validated(obj)
+        } else {
+            ClassId::new(0)
+        };
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
             Some(desc) => {
                 // Overlay hunter (CRATONVM_DBG_OVERLAY): a native writing a
@@ -11960,8 +11976,16 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
-        let obj = self.shared.mem.heap.load_and_forward(obj);
-        let class_id = self.shared.mem.heap.class_id_of(obj);
+        let (obj, obj_validated) = self.shared.mem.heap.load_and_forward_checked(obj);
+        // `load_and_forward` hands back its argument unchanged when validation
+        // failed, so the trusted twin is only safe on the validated arm. The
+        // `ClassId::new(0)` fallback is exactly what `class_id_of` returns on a
+        // validation miss, so this is the same value by a shorter route.
+        let class_id = if obj_validated {
+            self.shared.mem.heap.class_id_of_validated(obj)
+        } else {
+            ClassId::new(0)
+        };
         let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
         {
@@ -11972,9 +11996,17 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
-        let obj = self.shared.mem.heap.load_and_forward(obj);
+        let (obj, obj_validated) = self.shared.mem.heap.load_and_forward_checked(obj);
         let value = forward_boundary_value(&self.shared.mem.heap, value);
-        let class_id = self.shared.mem.heap.class_id_of(obj);
+        // `load_and_forward` hands back its argument unchanged when validation
+        // failed, so the trusted twin is only safe on the validated arm. The
+        // `ClassId::new(0)` fallback is exactly what `class_id_of` returns on a
+        // validation miss, so this is the same value by a shorter route.
+        let class_id = if obj_validated {
+            self.shared.mem.heap.class_id_of_validated(obj)
+        } else {
+            ClassId::new(0)
+        };
         let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
         {
@@ -12158,8 +12190,12 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             }
             return 0;
         }
-        let obj = self.shared.mem.heap.load_and_forward(obj);
-        let kind = self.shared.mem.heap.kind_of(obj);
+        // The KINDOF-SENTINEL guard above has just validated `obj`, so the
+        // barrier and the kind read below both take their trusted twins:
+        // three membership walks per call become one, with no object left
+        // unvalidated.
+        let obj = self.shared.mem.heap.load_and_forward_validated(obj);
+        let kind = self.shared.mem.heap.kind_of_validated(obj);
         if kind != ObjectKind::Array {
             // Only emit the (noisy) diagnostic when explicitly requested — the
             // `#[track_caller]` location pinpoints the offending native/opcode
@@ -12298,7 +12334,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return false;
         }
-        let et = self.shared.mem.heap.element_type_of(arr);
+        let et = self.shared.mem.heap.element_type_of_validated(arr);
         if !matches!(et, ArrayElementType::Byte | ArrayElementType::Boolean) {
             return false;
         }
@@ -12357,7 +12393,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return 0;
         }
-        let et = self.shared.mem.heap.element_type_of(arr);
+        let et = self.shared.mem.heap.element_type_of_validated(arr);
         if !matches!(et, ArrayElementType::Byte | ArrayElementType::Boolean) {
             return 0;
         }
@@ -12397,7 +12433,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return 0;
         }
-        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+        if self.shared.mem.heap.element_type_of_validated(arr) != ArrayElementType::Int {
             return 0;
         }
         let len = self.shared.mem.heap.array_length(arr);
@@ -12440,7 +12476,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return false;
         }
-        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Int {
+        if self.shared.mem.heap.element_type_of_validated(arr) != ArrayElementType::Int {
             return false;
         }
         let len = self.shared.mem.heap.array_length(arr);
@@ -12481,7 +12517,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return 0;
         }
-        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Char {
+        if self.shared.mem.heap.element_type_of_validated(arr) != ArrayElementType::Char {
             return 0;
         }
         let len = self.shared.mem.heap.array_length(arr);
@@ -12528,7 +12564,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return false;
         }
-        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Char {
+        if self.shared.mem.heap.element_type_of_validated(arr) != ArrayElementType::Char {
             return false;
         }
         let len = self.shared.mem.heap.array_length(arr);
@@ -24631,6 +24667,34 @@ fn invoke_on_class_shared_inner(
                                     | "java/util/LinkedHashMap$LinkedEntryIterator"
                             )
                             && matches!(method_name, "hasNext" | "next" | "remove"))
+                        // The serialization hooks of the immutable-collection
+                        // carriers. `List.of`/`Set.of`/`Map.of`/`copyOf` return
+                        // a CratonVM-minted object whose `getClass()` aliases to
+                        // one of these six real JDK classes, each of which
+                        // declares its own `writeReplace()` - a body over the
+                        // `e0`/`e1`/`elements`/`table` fields the carrier never
+                        // fills, so the `java.util.CollSer` it wrote carried
+                        // this VM's slots and reading it back threw
+                        // `InvalidObjectException: invalid object`.
+                        // `CollSer.readResolve` is here because its `IMM_MAP`
+                        // arm builds a real `MapN` whose `table` no map native
+                        // reads; `Collections$UnmodifiableRandomAccessList` is
+                        // the only `Collections$Unmodifiable*` wrapper that
+                        // declares a `writeReplace`, and its native declines the
+                        // replacement. Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/ImmutableCollections$List12"
+                                    | "java/util/ImmutableCollections$ListN"
+                                    | "java/util/ImmutableCollections$Set12"
+                                    | "java/util/ImmutableCollections$SetN"
+                                    | "java/util/ImmutableCollections$Map1"
+                                    | "java/util/ImmutableCollections$MapN"
+                                    | "java/util/Collections$UnmodifiableRandomAccessList"
+                            )
+                            && method_name == "writeReplace")
+                        || (class_name == "java/util/CollSer" && method_name == "readResolve")
                         // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
                         // getThreadMXBean() — the real-JDK code path delegates
                         // through `getPlatformMXBean(Class)` + PlatformComponent

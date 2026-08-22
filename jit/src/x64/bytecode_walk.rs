@@ -252,7 +252,67 @@ impl Compiler {
         // successor of a reachable instruction is reachable by construction. A
         // `None` result means opaque control flow (`jsr`/`ret`, malformed
         // encodings) — keep the historical behaviour there rather than guess.
-        let reachable = compute_reachable_pcs(code, code_len);
+        // ── Handler blocks become LIVE code when local handlers are armed ──
+        //
+        // The paragraph above is the pre-2026-08-20 world, in which "the
+        // backend has no in-method handler dispatch, so a handler body is dead
+        // code in the emitted image". With `local_handler_table` non-empty it
+        // does have one, so each `handler_pc` is:
+        //
+        //   * a reachability ROOT — the exception edge is a real predecessor
+        //     the bytecode's own branch decoding cannot see, and without it the
+        //     block stays dead, `pc_to_native[handler_pc]` stays `-1`, and
+        //     `patch_branches` would reject the whole method rather than
+        //     silently mis-jump;
+        //   * a branch TARGET whose incoming operand stack is the JVMS
+        //     `[exception]` — depth one, and a reference. Seeded HERE, before
+        //     the walk, so it wins the `or_insert` in
+        //     `record_branch_target_depth` against anything a later branch to
+        //     the same pc records.
+        let local_handler_pcs: Vec<usize> = self
+            .local_handler_table
+            .iter()
+            .map(|(_, _, handler_pc, _)| *handler_pc)
+            .filter(|pc| *pc < code_len)
+            .collect();
+        for &handler_pc in &local_handler_pcs {
+            branch_targets[handler_pc] = true;
+            self.branch_target_stack_depth.entry(handler_pc).or_insert(1);
+            self.branch_target_stack_oop_marks
+                .entry(handler_pc)
+                .or_insert_with(|| vec![true]);
+        }
+        let reachable = compute_reachable_pcs_with_roots(code, code_len, &local_handler_pcs);
+        // Which pcs became live ONLY because of a handler root.
+        //
+        // Those must not be published as OSR entry points. An OSR entry is
+        // taken at a back edge with the interpreter's frame seeded into the
+        // compiled one, and the trampoline seeds LOCALS: a pc inside a `catch`
+        // block can be standing on an operand stack the entry contract has no
+        // way to describe. Before this feature such a pc was dead and got no
+        // entry, so suppressing them keeps the published OSR entry set exactly
+        // what it was — the feature buys handler THROUGHPUT and changes nothing
+        // about which loops can be entered.
+        //
+        // Empty on every compile that arms no local handlers, and computed only
+        // then: the second reachability pass is not worth paying for otherwise.
+        let handler_only_pcs: Vec<bool> = if local_handler_pcs.is_empty() {
+            Vec::new()
+        } else {
+            let normal = compute_reachable_pcs(code, code_len);
+            match (&reachable, &normal) {
+                (Some(all), Some(norm)) => all
+                    .iter()
+                    .zip(norm.iter())
+                    .map(|(a, n)| *a && !*n)
+                    .collect(),
+                // Opaque control flow: neither map is trustworthy, so treat
+                // every pc as handler-only and publish no OSR entries at all.
+                // Strictly more conservative than before, and unreachable in
+                // practice — `jsr`/`ret` never reaches this backend.
+                _ => vec![true; code_len + 1],
+            }
+        };
 
         // Back-edge targets — the only bcis that get an OSR-exit map (see the
         // Step-7 emission site below for why "every pc" was wrong).
@@ -385,6 +445,22 @@ impl Compiler {
             // The predecessor that did a `goto` already canonicalized; now the
             // fall-through path must match.
             if !dead && branch_targets[pc] {
+                // A handler entry reached ALIVE by ordinary control flow would
+                // have to agree with the exception edge about what is on the
+                // stack, and the exception edge always says exactly one value:
+                // the throwable. javac never emits such a block — a handler is
+                // preceded by the `goto`/`return`/`athrow` that ends the
+                // protected code, so the walk arrives dead and takes the
+                // revival above. Refuse rather than canonicalise two
+                // disagreeing pictures onto the same slots: the local-handler
+                // stub would then store the throwable over a live value.
+                if !local_handler_pcs.is_empty()
+                    && local_handler_pcs.contains(&pc)
+                    && self.stack.len() != 1
+                {
+                    self.fail("singlepass-codegen/local-handler-entry-live-fallthrough");
+                    return false;
+                }
                 if let Some(&expected_depth) = self.branch_target_stack_depth.get(&pc) {
                     if expected_depth > 0 && self.stack.len() == expected_depth {
                         self.canonicalize_stack();
@@ -477,7 +553,15 @@ impl Compiler {
                 let inside_synthetic_guard = self
                     .synthetic_guard_span
                     .is_some_and(|(from, to)| pc >= from && pc < to);
-                if inside_aaload_hoisted || inside_arith_hoisted || inside_synthetic_guard {
+                // See `handler_only_pcs`: a pc that is live only because a
+                // `catch` block is now emitted keeps the OSR-entry answer it
+                // had when that block was dead code.
+                let handler_only = handler_only_pcs.get(pc).copied().unwrap_or(false);
+                if inside_aaload_hoisted
+                    || inside_arith_hoisted
+                    || inside_synthetic_guard
+                    || handler_only
+                {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {
                     self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
@@ -1322,19 +1406,16 @@ impl Compiler {
                     if self.ldc_class_info_idx.contains_key(&pc) {
                         return false;
                     }
-                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    if let Some(&idx) = self.ldc_string_info_idx.get(&pc) {
-                        let (_, bytes, len) = self.ldc_string_info[idx];
-                        self.emit_pre_safepoint_spill();
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_imm64(ARG_REGS[1], bytes as i64);
-                        self.emit_mov_imm64(ARG_REGS[2], len as i64);
-                        self.emit_call_absolute(self.helpers.ldc_string);
-                        self.emit_oop_map_for_safepoint();
-                        self.push_from_rax();
-                        self.mark_top_as_oop();
+                    if self.emit_ldc_string(pc) {
                         pc += 2;
                         continue;
+                    }
+                    if self.ldc_string_info_idx.contains_key(&pc) {
+                        // Recognised as a string `ldc` and NOT emittable —
+                        // `ldc_string_cp` unwired, or no context slot. Bail the
+                        // site rather than fall through to `ldc_info`, which
+                        // does not hold this pc and would push a null.
+                        return false;
                     }
                     let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                     match val {
@@ -1356,19 +1437,16 @@ impl Compiler {
                     if self.ldc_class_info_idx.contains_key(&pc) {
                         return false;
                     }
-                    // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    if let Some(&idx) = self.ldc_string_info_idx.get(&pc) {
-                        let (_, bytes, len) = self.ldc_string_info[idx];
-                        self.emit_pre_safepoint_spill();
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_imm64(ARG_REGS[1], bytes as i64);
-                        self.emit_mov_imm64(ARG_REGS[2], len as i64);
-                        self.emit_call_absolute(self.helpers.ldc_string);
-                        self.emit_oop_map_for_safepoint();
-                        self.push_from_rax();
-                        self.mark_top_as_oop();
+                    if self.emit_ldc_string(pc) {
                         pc += 3;
                         continue;
+                    }
+                    if self.ldc_string_info_idx.contains_key(&pc) {
+                        // Recognised as a string `ldc` and NOT emittable —
+                        // `ldc_string_cp` unwired, or no context slot. Bail the
+                        // site rather than fall through to `ldc_info`, which
+                        // does not hold this pc and would push a null.
+                        return false;
                     }
                     let val = self.ldc_info_idx.get(&pc).map(|&i| self.ldc_info[i].1);
                     match val {
@@ -3827,7 +3905,6 @@ impl Compiler {
                 // tableswitch — jump table for dense tables, CMP chain for small
                 0xaa => {
                     self.flush_scratch_registers();
-                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -3888,7 +3965,35 @@ impl Compiler {
                         pc += 4;
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    if def_target <= base_pc || targets.iter().any(|&target| target <= base_pc) {
+                    let any_backward =
+                        def_target <= base_pc || targets.iter().any(|&target| target <= base_pc);
+                    // Canonicalize the operands that OUTLIVE this switch, exactly
+                    // as the `ifeq`/`if_icmp`/`goto` arms do — and before popping
+                    // the key, so the key participates in the relocation and
+                    // cannot be clobbered by another slot's move (the same
+                    // ordering rule those arms state).
+                    //
+                    // Every arm of a switch is a branch target, and a target
+                    // revived from dead code rebuilds the operand stack at the
+                    // canonical `base_spill_offset + i*8` — a layout NOTHING was
+                    // establishing here, so any operand this basic block left at
+                    // a non-canonical offset was read from the wrong slot by
+                    // every arm. That is the second half of ECJ's
+                    // `OperandStack.pop(OperandCategory)` miscompile: the inlined
+                    // `TypeIds.getCategory` result sat above its semantic depth
+                    // (fixed in `x64/inlining.rs`) and this `tableswitch` was the
+                    // one branch shape in the walk that did not repair it, so the
+                    // `if_icmpeq` at the merge compared the raw `TypeBinding.id`
+                    // (tomcat/ecj-operandstack-*.md).
+                    //
+                    // Forward-only, mirroring those arms: a backward target's
+                    // layout was fixed when the walk emitted it, and relocating
+                    // to suit a forward merge would disagree with it.
+                    if !any_backward && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
+                    let key_slot = self.pop_stack();
+                    if any_backward {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
@@ -3987,7 +4092,6 @@ impl Compiler {
                 // lookupswitch — CMP chain for small, binary search for large
                 0xab => {
                     self.flush_scratch_registers();
-                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -4042,7 +4146,18 @@ impl Compiler {
                         pairs.push((key, target));
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    if def_target <= base_pc || pairs.iter().any(|&(_, target)| target <= base_pc) {
+                    let any_backward = def_target <= base_pc
+                        || pairs.iter().any(|&(_, target)| target <= base_pc);
+                    // Same canonicalization the `tableswitch` arm above performs,
+                    // and for the same reason — see the note there. The two
+                    // switch arms are the only branch shapes in this walk that
+                    // were not establishing the canonical layout their own
+                    // targets are revived with.
+                    if !any_backward && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
+                    let key_slot = self.pop_stack();
+                    if any_backward {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
@@ -4198,11 +4313,21 @@ impl Compiler {
                             );
                             self.exc_frame_box_ptr_by_bci.insert(pc, box_ptr);
                         }
-                        // JMP rel32 (E9) - patched to the reason-9 stub.
+                        // JMP rel32 (E9) - patched to the reason-9 stub, or to
+                        // this bci's local-handler stub when this method's own
+                        // exception table can catch here and compiled local
+                        // handlers are armed. A `throw` caught by the very
+                        // method that raised it is the shape javac emits for
+                        // every `try { ... throw ... } catch` and for a
+                        // rethrowing `finally`, and it is as enterable in
+                        // compiled code as a callee's throw: the helper takes
+                        // the throwable `jit_throw_exception` just stashed.
+                        // The stub's own miss edge is this same reason-9 stub,
+                        // so a propagating throw is unchanged.
                         self.buf.emit_byte(0xE9);
                         let patch_offset = self.buf.pos();
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                        self.deopt_stubs.push((patch_offset, pc, 9));
+                        self.record_exception_check_edge(patch_offset, pc, true);
                     } else {
                         self.emit_epilogue();
                     }
@@ -6975,11 +7100,15 @@ impl Compiler {
                             // them. See
                             // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
                             let args_frame_top = self.next_spill_offset;
-                            let mut arg_slots = Vec::with_capacity(n);
-                            for _ in 0..n {
-                                arg_slots.push(self.pop_stack());
+                            let (arg_slots, arg_oops) = self.pop_invoke_args(n);
+                            // A reference staged into an area no oop map can name (the
+                            // native-ABI outgoing-argument area, the direct-call service
+                            // slots, or an inlined callee's parameter locals). The
+                            // conservative scan covers those and the precise map cannot,
+                            // so this method must not claim precise coverage here.
+                            if arg_oops.iter().any(|&o| o) {
+                                self.pending_staged_args_unmapped = true;
                             }
-                            arg_slots.reverse();
                             // Spill cursor as the bytecode's operand stack sees it
                             // now that this invoke's arguments are popped. The
                             // return value belongs HERE, not wherever the
@@ -7232,11 +7361,7 @@ impl Compiler {
                         // Capture spill offset BEFORE popping to prevent
                         // the args buffer from overlapping source Frame slots.
                         let pre_pop_spill = self.next_spill_offset;
-                        let mut arg_slots = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            arg_slots.push(self.pop_stack());
-                        }
-                        arg_slots.reverse();
+                        let (arg_slots, arg_oops) = self.pop_invoke_args(n);
                         // Cursor at the popped-args depth — the reclaim after
                         // the call restores THIS level (not `pre_pop_spill`).
                         // Restoring to pre_pop left the return value parked
@@ -7265,6 +7390,13 @@ impl Compiler {
                                 let buf_offset = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
                                 self.load_slot_to_reg(RAX, *slot);
                                 self.emit_store_local(buf_offset, RAX);
+                                // This argument leaves the simulated operand
+                                // stack here; if it is a reference, the
+                                // safepoint map below is the only thing that
+                                // can still name it.
+                                if arg_oops[i] {
+                                    self.pending_staged_arg_oops.push(buf_offset);
+                                }
                             }
                         }
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
@@ -7379,11 +7511,15 @@ impl Compiler {
                                 crate::deopt::DeoptReason::ReceiverTypeChanged,
                             );
                         }
-                        let mut arg_slots = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            arg_slots.push(self.pop_stack());
+                        let (arg_slots, arg_oops) = self.pop_invoke_args(n);
+                        // A reference staged into an area no oop map can name (the
+                        // native-ABI outgoing-argument area, the direct-call service
+                        // slots, or an inlined callee's parameter locals). The
+                        // conservative scan covers those and the precise map cannot,
+                        // so this method must not claim precise coverage here.
+                        if arg_oops.iter().any(|&o| o) {
+                            self.pending_staged_args_unmapped = true;
                         }
-                        arg_slots.reverse();
 
                         if is_tail_call && self.body_entry_offset > 0 {
                             // Tail-call optimization: load args into parameter locals
@@ -9298,11 +9434,15 @@ impl Compiler {
                             // them. See
                             // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
                             let args_frame_top = self.next_spill_offset;
-                            let mut arg_slots = Vec::with_capacity(n);
-                            for _ in 0..n {
-                                arg_slots.push(self.pop_stack());
+                            let (arg_slots, arg_oops) = self.pop_invoke_args(n);
+                            // A reference staged into an area no oop map can name (the
+                            // native-ABI outgoing-argument area, the direct-call service
+                            // slots, or an inlined callee's parameter locals). The
+                            // conservative scan covers those and the precise map cannot,
+                            // so this method must not claim precise coverage here.
+                            if arg_oops.iter().any(|&o| o) {
+                                self.pending_staged_args_unmapped = true;
                             }
-                            arg_slots.reverse();
                             // Spill cursor as the bytecode's operand stack sees it
                             // now that this invoke's arguments are popped. The
                             // return value belongs HERE, not wherever the
@@ -9475,11 +9615,7 @@ impl Compiler {
                             // Capture spill offset BEFORE popping to prevent
                             // the args buffer from overlapping source Frame slots.
                             let pre_pop_spill = self.next_spill_offset;
-                            let mut arg_slots = Vec::with_capacity(n);
-                            for _ in 0..n {
-                                arg_slots.push(self.pop_stack());
-                            }
-                            arg_slots.reverse();
+                            let (arg_slots, arg_oops) = self.pop_invoke_args(n);
                             // Post-pop cursor — the restore point after the
                             // dispatch (see the invokestatic twin above for
                             // the Bug-4 frame-creep rationale).
@@ -9500,6 +9636,11 @@ impl Compiler {
                                     let buf_offset = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
                                     self.load_slot_to_reg(RAX, *slot);
                                     self.emit_store_local(buf_offset, RAX);
+                                    // See the invokestatic twin: the map below
+                                    // is the only remaining namer of this oop.
+                                    if arg_oops[i] {
+                                        self.pending_staged_arg_oops.push(buf_offset);
+                                    }
                                 }
                             }
 
@@ -11531,6 +11672,10 @@ impl Compiler {
         // Without this, a JIT-dispatched callee that throws would leave the
         // exception stashed in TLS while the JIT kept running with a bogus
         // `0` return value (Jetty `Main.main` "getClasspath on null").
+        // Local-handler dispatch stubs FIRST: each one's "not ours" edge is
+        // recorded as an ordinary entry in one of the two lists below, so both
+        // must still be unemitted when this runs.
+        self.emit_local_handler_stubs();
         self.emit_exception_check_stub();
         self.emit_deopt_stubs();
         true

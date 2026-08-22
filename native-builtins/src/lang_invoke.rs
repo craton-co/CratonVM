@@ -1340,6 +1340,30 @@ fn mh_type_descriptor(ctx: &mut dyn NativeContext, mh: ObjectRef) -> Option<Stri
 /// immediately by its `MethodType`, e.g.
 /// `cannot convert MethodHandle(String)String to (int,int)int`. There is no
 /// space after `MethodHandle`, and both signatures use simple type names.
+/// Can a VARIABLE-ARITY handle of type `old_desc` be `asType`-adapted to
+/// `new_desc` by collecting trailing arguments?
+///
+/// The JDK's rule (`MethodHandle.asVarargsCollector`'s contract, implemented in
+/// `AsVarargsCollector.asTypeUncached`): the trailing array parameter absorbs
+/// `newArity - collectArg` arguments, where `collectArg` is the index of that
+/// array — so any requested arity from `collectArg` upwards is legal, including
+/// `collectArg` itself, which collects zero into an empty array. Element-type
+/// compatibility is left to dispatch, exactly as for the non-collecting path:
+/// this predicate only decides whether the ARITY difference is a refusal, which
+/// is the only thing `method_type_is_convertible_to` was rejecting.
+fn varargs_astype_is_legal(old_desc: &str, new_desc: &str) -> bool {
+    let (Some((old_params, _)), Some((new_params, _))) = (
+        split_descriptor_params(old_desc),
+        split_descriptor_params(new_desc),
+    ) else {
+        return false;
+    };
+    match old_params.last() {
+        Some(last) if last.starts_with('[') => new_params.len() + 1 >= old_params.len(),
+        _ => false,
+    }
+}
+
 fn mh_astype_refusal(
     ctx: &mut dyn NativeContext,
     mh: ObjectRef,
@@ -1354,6 +1378,19 @@ fn mh_astype_refusal(
     };
     let new_desc = methodtype_to_descriptor(ctx, new_type)?;
     if method_type_is_convertible_to(&old_desc, &new_desc)? {
+        return None;
+    }
+    // A VARIABLE-ARITY handle adapts across arity, which is the whole point of
+    // being one: HotSpot's `AsVarargsCollector.asTypeUncached` reacts to a
+    // longer requested type by building `asCollector(arrayType, newArity -
+    // collectArg)` and adapting THAT. `method_type_is_convertible_to` compares
+    // arities and so refuses every one of those, which is what made
+    // `findStatic(C, "m", (String,String[])String).asType((String,String,
+    // String)String)` throw where HotSpot collects (`probes/
+    // VarargsCollectorProbe.java`). Dispatch already performs the collection —
+    // see `collect_trailing_varargs`, whose `ACC_VARARGS` trigger is the same
+    // fact the marking records — so accepting here is all that was missing.
+    if mh_is_varargs_collector(ctx, mh) && varargs_astype_is_legal(&old_desc, &new_desc) {
         return None;
     }
     // Our own aliasing, not a conversion HotSpot refuses.
@@ -1869,6 +1906,55 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(empty))))
         }
     });
+    // `Class.getSimpleName()`'s spelling of a binary class name.
+    //
+    // The last-segment-after-`.`-or-`$` rule this used to apply is right for a
+    // plain class and wrong for every ARRAY class: an array's binary name is
+    // `[Ljava/lang/String;` or `[I`, whose last segment is `String;` and `[I`,
+    // where the JDK prints `String[]` and `int[]`. `MethodType.toString()` is
+    // the message text of every `WrongMethodTypeException` and
+    // `MethodHandle` linkage error, so the difference read as
+    //
+    // ```text
+    //   HotSpot   (String,String[])String
+    //   CratonVM  (String,String;)String
+    // ```
+    //
+    // in a diagnostic whose entire job is to be compared, character for
+    // character, against the type the caller asked for
+    // (`probes/MhCombinatorProbe.java` / `probes/VarargsCollectorProbe.java`).
+    fn class_display_simple_name(raw: &str) -> String {
+        let name = raw.replace('/', ".");
+        let dims = name.bytes().take_while(|b| *b == b'[').count();
+        let base = &name[dims..];
+        let suffix = "[]".repeat(dims);
+        if dims == 0 {
+            let tail = base.rsplit(['.', '$']).next().unwrap_or(base);
+            return tail.to_string();
+        }
+        match base.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+            Some(inner) => {
+                let tail = inner.rsplit(['.', '$']).next().unwrap_or(inner);
+                format!("{tail}{suffix}")
+            }
+            // A primitive element type is a one-letter descriptor, not a name.
+            None => {
+                let elem = match base {
+                    "B" => "byte",
+                    "C" => "char",
+                    "D" => "double",
+                    "F" => "float",
+                    "I" => "int",
+                    "J" => "long",
+                    "S" => "short",
+                    "Z" => "boolean",
+                    other => other,
+                };
+                format!("{elem}{suffix}")
+            }
+        }
+    }
+
     // `MethodType.toString()` is specified as `(P1,P2,…)R` using each type's
     // SIMPLE name — `(Bean)int`, not `MethodType(1 params)`, which is what this
     // returned until 2026-08-04 and which no JDK ever prints.
@@ -1906,11 +1992,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 return Ok("?".to_string());
             };
             match resolve_class_name_robust(ctx, m) {
-                Some(name) => {
-                    let name = name.replace('/', ".");
-                    let tail = name.rsplit(['.', '$']).next().unwrap_or(&name);
-                    Ok(tail.to_string())
-                }
+                Some(name) => Ok(class_display_simple_name(&name)),
                 None => Ok("?".to_string()),
             }
         }
@@ -7846,24 +7928,13 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
         "java/lang/invoke/MethodHandle",
         "asVarargsCollector",
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| {
-            // args[0] is the receiver; hand it straight back, marked.
-            if let Some(Value::Object(Some(this))) = args.first() {
-                mh_set_varargs_collector(ctx, *this, true);
-            }
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        },
+        |ctx, args| mh_with_varargs_marking(ctx, args.first().copied(), true),
     );
     r.register(
         "java/lang/invoke/MethodHandle",
         "asFixedArity",
         "()Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| {
-            if let Some(Value::Object(Some(this))) = args.first() {
-                mh_set_varargs_collector(ctx, *this, false);
-            }
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        },
+        |ctx, args| mh_with_varargs_marking(ctx, args.first().copied(), false),
     );
     // `MethodHandle.isVarargsCollector()` is CONCRETE in the real JDK — the base
     // class returns `false` and `MethodHandleImpl$AsVarargsCollector` overrides
@@ -8494,6 +8565,120 @@ fn mh_set_varargs_collector(ctx: &dyn NativeContext, mh: ObjectRef, on: bool) {
     }
 }
 
+/// `asVarargsCollector(t)` / `asFixedArity()` — a COPY of the receiver carrying
+/// the requested marking, leaving the receiver untouched.
+///
+/// Falls back to marking the receiver in place when [`mh_clone_handle`] cannot
+/// own it, which is the pre-2026-08-21 behaviour for exactly those handles.
+fn mh_with_varargs_marking(
+    ctx: &mut dyn NativeContext,
+    receiver: Option<Value>,
+    on: bool,
+) -> MethodCallResult {
+    let this = match receiver {
+        Some(Value::Object(Some(o))) => o,
+        other => return Ok(Some(other.unwrap_or(Value::Object(None)))),
+    };
+    let handle = match mh_clone_handle(ctx, this) {
+        Some(copy) => copy,
+        None => this,
+    };
+    mh_set_varargs_collector(ctx, handle, on);
+    Ok(Some(Value::Object(Some(handle))))
+}
+
+/// Copy a synthetic `MethodHandle` slot for slot, or `None` when the receiver
+/// is not one of ours.
+///
+/// `asFixedArity()` and `asVarargsCollector()` are PURE on every JDK: each
+/// returns a NEW handle (`MethodHandleImpl$AsVarargsCollector` wrapping the
+/// target, or the wrapped target itself) and leaves the receiver exactly as it
+/// was. CratonVM models a handle as ONE mutable object, so both used to flip
+/// the marking on the RECEIVER and hand it back — which means one library
+/// calling `h.asFixedArity()` silently changed how every OTHER holder of `h`
+/// dispatched it. Spring's `FunctionReference.executeFunctionViaMethodHandle`
+/// re-reads `methodHandle.isVarargsCollector()` on every evaluation of the same
+/// long-lived registered handle, so that is not a hypothetical: measured as
+/// rows I03/I04/I09/I10/I28 of `probes/MhIdentityProbe.java`, where a handle
+/// stopped collecting its arguments after an unrelated `asFixedArity()`.
+///
+/// Width is the ownership test. A handle narrower than the synthetic layout is
+/// a real-JDK one, or `panama.rs`'s compact downcall layout whose slot 0 is a
+/// native address — copying either would be a guess about slots this file does
+/// not own, so the caller keeps the old in-place behaviour for them.
+///
+/// `asType` is deliberately NOT converted: it stamps the new type in place on
+/// every hot MethodHandle path and several shims (`explicitCastArguments`,
+/// `mh_astype_refusal`) are written against that. Its impurity stays a recorded
+/// deviation — `probes/MhIdentityProbe.java` rows I13/I14.
+fn mh_clone_handle(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let n = ctx.object_num_fields(this);
+    if n <= MH_VARARGS {
+        return None;
+    }
+    let cid = ctx.class_id_of_object(this);
+    // `alloc_object` can collect and relocate the receiver; the copy loop below
+    // allocates nothing, so one pin around the allocation is enough.
+    let this_pin = ctx.pin_native_root(this);
+    let copy = ctx.alloc_object(cid, n);
+    let this = ctx.read_native_pin(this_pin, this);
+    for i in 0..n {
+        let v = ctx.get_field(this, i);
+        ctx.set_field(copy, i, v);
+    }
+    ctx.unpin_native_roots(this_pin);
+    Some(copy)
+}
+
+thread_local! {
+    /// Armed for exactly one [`mh_dispatch`] — the one entered from
+    /// `MethodHandle.invokeWithArguments`, the GENERIC door.
+    ///
+    /// # Why the door matters
+    ///
+    /// A `null` sitting in a varargs-collector's trailing array slot is
+    /// ambiguous: it can BE the array, or it can be one element the collector
+    /// must wrap. The JDK decides from the CALL SITE's static type, in
+    /// `MethodHandleImpl$AsVarargsCollector.asType` — the "pass it straight
+    /// through" shortcut is taken only when the caller's trailing parameter
+    /// type is assignable to the collector's array type. So:
+    ///
+    /// ```text
+    ///   mh.invokeExact((String[]) null)   ->  Arrays.toString(null)      null
+    ///   mh.invokeWithArguments(nullArg)   ->  Arrays.toString({null})    [null]
+    /// ```
+    ///
+    /// because `invokeWithArguments` always adapts to `genericMethodType(n)`,
+    /// whose trailing parameter is `Object` and is never assignable to
+    /// `String[]`. CratonVM derives varargs behaviour from the RUNTIME values
+    /// at dispatch (see [`collect_trailing_varargs`]), and a null carries no
+    /// runtime type — so the door it came through is the only signal left.
+    /// Measured on HotSpot 25 in `probes/MhVarargsNullProbe.java`, C01/C02
+    /// against B01; Spring's SpEL `#varargsFunctionHandle(null)`
+    /// (`VariableAndFunctionTests`) is the reported victim.
+    ///
+    /// # Why it is TAKEN rather than scoped
+    ///
+    /// Only the OUTERMOST handle is adapted to the generic type; an adapter's
+    /// inner target is invoked at its own exact type. [`mh_dispatch`] clears
+    /// the flag on entry, so the recursive dispatches an adapter arm makes see
+    /// `false` — which is what HotSpot does for e.g.
+    /// `filterArguments(collector, 0, f).invokeWithArguments(null)`.
+    static MH_GENERIC_SPREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm [`MH_GENERIC_SPREAD`] for the next [`mh_dispatch`] on this thread.
+/// Call it IMMEDIATELY before the dispatch — anything in between that itself
+/// dispatches a handle would consume it.
+fn arm_generic_spread() {
+    MH_GENERIC_SPREAD.with(|f| f.set(true));
+}
+
+/// Read and clear [`MH_GENERIC_SPREAD`].
+fn take_generic_spread() -> bool {
+    MH_GENERIC_SPREAD.with(|f| f.replace(false))
+}
+
 /// Mint one of the `__mh_*_wrapper__` combinator carriers that `MH_BOUND`
 /// points at.
 ///
@@ -9023,6 +9208,66 @@ pub fn gc_update_lambda_callsite_cache_refs(pointer_map: &cratonvm_types::Pointe
 }
 
 /// Allocate a fully-described MethodHandle.
+/// Is the method this handle resolves to declared `ACC_VARARGS` (`T...`)?
+///
+/// Answered from the class file's own access flags, which is the only place the
+/// distinction lives: `void m(String[] a)` and `void m(String... a)` have the
+/// same descriptor and differ solely by this bit.
+///
+/// **Two screens before the method-table walk.** `declared_methods` allocates a
+/// `Vec<MethodMetadata>` with a `String` per entry, and `alloc_method_handle`
+/// runs on every handle creation — including the field-accessor and combinator
+/// kinds that have no method at all. So this returns early unless the handle is
+/// for a real method AND the descriptor's LAST parameter is an array, which
+/// every variable-arity method's is (JLS §8.4.1).
+///
+/// The superclass walk is not optional: `findVirtual(sub, name, type)` resolves
+/// an INHERITED method, and its `ACC_VARARGS` bit lives on the declaring class,
+/// not on the receiver's.
+fn method_is_variable_arity(
+    ctx: &dyn NativeContext,
+    class: &str,
+    name: &str,
+    desc: &str,
+    kind: i32,
+) -> bool {
+    if !(kind == MH_KIND_STATIC
+        || kind == MH_KIND_VIRTUAL
+        || kind == MH_KIND_SPECIAL
+        || kind == MH_KIND_CONSTRUCTOR)
+    {
+        return false;
+    }
+    if class.is_empty() || name.is_empty() {
+        return false;
+    }
+    match split_descriptor_params(desc) {
+        Some((params, _)) if params.last().is_some_and(|p| p.starts_with('[')) => {}
+        _ => return false,
+    }
+    let mut cid = match ctx.class_id_by_name(class) {
+        Some(c) => c,
+        None => return false,
+    };
+    // Bounded: a hierarchy deeper than this is a cycle, and a cycle here would
+    // hang handle creation rather than answer it wrong.
+    for _ in 0..64 {
+        let found = ctx
+            .declared_methods(cid)
+            .into_iter()
+            .find(|m| m.name == name && m.descriptor == desc);
+        if let Some(m) = found {
+            // ACC_VARARGS, JVMS Table 4.6-A.
+            return (m.access_flags & 0x0080) != 0;
+        }
+        cid = match ctx.superclass_of(cid) {
+            Some(s) => s,
+            None => return false,
+        };
+    }
+    false
+}
+
 pub(crate) fn alloc_method_handle(
     ctx: &mut dyn NativeContext,
     class: &str,
@@ -9058,12 +9303,25 @@ pub(crate) fn alloc_method_handle(
     ctx.set_field(mh, MH_DESC, Value::Object(Some(dc)));
     ctx.set_field(mh, MH_KIND, Value::Int(kind));
     ctx.set_field(mh, MH_BOUND, Value::Object(None));
-    // Definitively NOT a varargs collector until `asVarargsCollector` says so.
-    // Written rather than left to the allocator so the read in
-    // `mh_is_varargs_collector` never has to interpret an unwritten slot: a raw
-    // slot can read back as stale padding, and "is this handle a collector"
-    // must not be answered from one.
-    ctx.set_field(mh, MH_VARARGS, Value::Int(0));
+    // The marking. Written unconditionally rather than left to the allocator so
+    // the read in `mh_is_varargs_collector` never has to interpret an unwritten
+    // slot: a raw slot can read back as stale padding, and "is this handle a
+    // collector" must not be answered from one.
+    //
+    // `Lookup.find*`/`unreflect*` on a method declared `T...` hand back a
+    // VARIABLE-ARITY handle — the JDK applies `asVarargsCollector` at the end
+    // of `getDirectMethod`, and it is what makes `mh.asType(longerType)`
+    // collect the trailing arguments instead of failing on the arity. Until
+    // this line, only an explicit `asVarargsCollector()` call set it, so
+    // `MethodHandles.lookup().findStatic(C, "m", (String,String[])String)
+    // .isVarargsCollector()` answered `false` where every JDK answers `true`
+    // (`probes/VarargsCollectorProbe.java`, six rows) and the `asType` that
+    // depends on it threw `WrongMethodTypeException`.
+    ctx.set_field(
+        mh,
+        MH_VARARGS,
+        Value::Int(i32::from(method_is_variable_arity(ctx, class, name, desc, kind))),
+    );
     // Populate the real-JDK MethodHandle.type:MethodType field at its
     // resolved slot (0) so `mh.type()` and JDK-internal reads (LambdaForm,
     // MemberName, Invokers, ObjectStreamClass) see a MethodType, not null.
@@ -9620,6 +9878,76 @@ fn mh_dispatch_fold(
 /// (target, combiner/filter, pos) -- only the DISPATCH-time splicing differs
 /// (replace vs. splice-in-addition; see `MH_KIND_COLLECT_ARGS`'s doc
 /// comment).
+/// The descriptor `MethodHandles.collectArguments(target, pos, filter)` gives
+/// its adapter, per the javadoc:
+///
+/// * a filter that RETURNS A VALUE consumes the target's parameter at `pos` and
+///   supplies it, so the adapter's parameter list is the target's with the one
+///   at `pos` REPLACED by the filter's whole parameter list;
+/// * a `void` filter consumes nothing, so its parameters are INSERTED at `pos`
+///   and the target keeps all of its own.
+///
+/// The return type is always the target's.
+///
+/// # Why the adapter's own type has to be right
+///
+/// `make_collect_args_adapter` used to hand `alloc_method_handle` the TARGET's
+/// descriptor unchanged, so the adapter reported the arity it was built to
+/// remove. Dispatch was unaffected (`mh_dispatch_collect_args` works off the
+/// bound wrapper, not the descriptor), which is why this survived: the handle
+/// invoked correctly and only LIED about its type.
+///
+/// A caller that reads the type back is where it surfaced.
+/// `MethodHandles.explicitCastArguments` refuses on an arity mismatch alone,
+/// and invokebinder's `Binder.invoke(target)` — which walks its transforms
+/// calling each one's `up()` and then explicit-casts the result to the binder's
+/// start type — is built entirely on that read. JRuby's
+/// `InvokeSite.prepareBinder` folds the flat Ruby arguments into the
+/// `IRubyObject[] args` parameter with `SmartBinder.collect(name, pattern,
+/// collectorHandle)`, which lowers to exactly this combinator, so every JRuby
+/// call site failed to link with
+///
+/// ```text
+/// WrongMethodTypeException: cannot explicitly cast
+///   MethodHandle(ThreadContext,IRubyObject,IRubyObject,IRubyObject[])IRubyObject
+///   to (ThreadContext,IRubyObject,IRubyObject,IRubyObject,IRubyObject)IRubyObject
+/// ```
+///
+/// — the target arity, uncollected, against the call site's own. That is both
+/// `JRubyScriptTemplateTests` classes in the Spring Framework suite, and
+/// `probes/MhCombinatorProbe.java`'s `collect-then-explicitCast` row is the
+/// three-line version of it.
+///
+/// `None` when either descriptor cannot be parsed or `pos` is out of range; the
+/// caller then keeps the target's descriptor, which is the previous behaviour
+/// and no worse than it was.
+fn collect_args_adapter_descriptor(
+    target_desc: &str,
+    filter_desc: &str,
+    pos: i32,
+) -> Option<String> {
+    let (tparams, tret) = split_descriptor_params(target_desc)?;
+    let (fparams, fret) = split_descriptor_params(filter_desc)?;
+    let pos = usize::try_from(pos).ok()?;
+    let mut out: Vec<String> = Vec::with_capacity(tparams.len() + fparams.len());
+    if fret == "V" {
+        if pos > tparams.len() {
+            return None;
+        }
+        out.extend_from_slice(&tparams[..pos]);
+        out.extend(fparams);
+        out.extend_from_slice(&tparams[pos..]);
+    } else {
+        if pos >= tparams.len() {
+            return None;
+        }
+        out.extend_from_slice(&tparams[..pos]);
+        out.extend(fparams);
+        out.extend_from_slice(&tparams[pos + 1..]);
+    }
+    Some(format!("({}){}", out.concat(), tret))
+}
+
 fn make_collect_args_adapter(
     ctx: &mut dyn NativeContext,
     target: Option<Value>,
@@ -9649,9 +9977,17 @@ fn make_collect_args_adapter(
     ctx.set_field(wrapper, 0, Value::Object(Some(target)));
     ctx.set_field(wrapper, 1, Value::Object(Some(filter_ref)));
     ctx.set_field(wrapper, 2, Value::Int(pos));
-    let desc = mh_type_descriptor(ctx, target)
+    let target_desc = mh_type_descriptor(ctx, target)
         .or_else(|| mh_read_desc(ctx, target))
         .unwrap_or_default();
+    // The ADAPTER's descriptor, not the target's — see
+    // `collect_args_adapter_descriptor` for what reads it back and why the
+    // difference is not cosmetic. Falls back to the target's when either
+    // descriptor is unreadable, which is what this line used to do always.
+    let desc = mh_type_descriptor(ctx, filter_ref)
+        .or_else(|| mh_read_desc(ctx, filter_ref))
+        .and_then(|fd| collect_args_adapter_descriptor(&target_desc, &fd, pos))
+        .unwrap_or(target_desc);
     let adapter = alloc_method_handle(
         ctx,
         "__adapter__",
@@ -9872,6 +10208,18 @@ pub(crate) fn mh_dispatch(
     mh: cratonvm_types::ObjectRef,
     extra_args: &[Value],
 ) -> MethodCallResult {
+    // Consume the generic-entry flag FIRST, so every recursive dispatch an
+    // adapter arm makes below sees `false` — only the outermost handle is
+    // adapted to `genericMethodType(n)`. See [`MH_GENERIC_SPREAD`].
+    //
+    // Combined with the handle's own collector marking here rather than inside
+    // [`collect_trailing_varargs`], which sees only `class`/`name`/`desc`: the
+    // JDK's rule keys on the HANDLE (`asFixedArity()` on a variable-arity
+    // target yields a handle that does NOT collect, and
+    // `asVarargsCollector()` on a fixed-arity one yields a handle that does),
+    // not on the target's `ACC_VARARGS` flag. `probes/MhVarargsNullProbe.java`
+    // rows D03 and D04 are exactly that pair of controls.
+    let generic_collector = take_generic_spread() && mh_is_varargs_collector(ctx, mh);
     // A real-JDK guard/invoker adapter can ultimately target a foreign
     // downcall. Its downcall state lives above the MethodHandle metadata
     // slots, so dispatch it directly rather than decoding the generic layout.
@@ -9980,7 +10328,8 @@ pub(crate) fn mh_dispatch(
             };
             // Collect trailing varargs (no-op unless the target is ACC_VARARGS and
             // the args were supplied flat — see `collect_trailing_varargs`).
-            let full = collect_trailing_varargs(ctx, &class, &name, &desc, &full);
+            let full =
+                collect_trailing_varargs(ctx, &class, &name, &desc, &full, generic_collector);
             let adapted = adapt_invoke_args(ctx, &full, &desc);
             let result = ctx.invoke(&class, &name, &desc, &adapted);
             box_direct_primitive_return(
@@ -10026,7 +10375,17 @@ pub(crate) fn mh_dispatch(
                                                      // can both allocate; pin `new_obj` and re-read the forwarded
                                                      // reference before it's returned.
             let new_obj_pin = ctx.pin_native_root(new_obj);
-            let adapted = adapt_invoke_args(ctx, extra_args, &desc);
+            // A variable-arity CONSTRUCTOR is a varargs collector exactly like
+            // a variable-arity method — `findConstructor(Holder.class,
+            // methodType(void.class, String[].class)).isVarargsCollector()` is
+            // true on every JDK — but this arm was the one dispatch path that
+            // never collected, so `ctor.invokeWithArguments("a", "b")` reached
+            // `<init>([Ljava/lang/String;)V` with two flat arguments and built
+            // an empty array (`probes/MhVarargsNullProbe.java` B18, measured
+            // `H[]` against HotSpot's `H[a, b]`).
+            let collected =
+                collect_trailing_varargs(ctx, &class, &name, &desc, extra_args, generic_collector);
+            let adapted = adapt_invoke_args(ctx, &collected, &desc);
             let new_obj = ctx.read_native_pin(new_obj_pin, new_obj);
             let mut init_args = Vec::with_capacity(1 + adapted.len());
             init_args.push(Value::Object(Some(new_obj)));
@@ -10783,7 +11142,14 @@ pub(crate) fn mh_dispatch(
                 Value::Object(Some(r)) => {
                     // Bound method handle — receiver was pre-captured
                     let recv_pin = ctx.pin_native_root(r);
-                    let collected = collect_trailing_varargs(ctx, &class, &name, &desc, extra_args);
+                    let collected = collect_trailing_varargs(
+                        ctx,
+                        &class,
+                        &name,
+                        &desc,
+                        extra_args,
+                        generic_collector,
+                    );
                     let adapted = adapt_invoke_args(ctx, &collected, &desc);
                     let (adapted_pin_base, adapted_handles) = pin_mh_args(ctx, &adapted);
                     let adapted: Vec<Value> = adapted
@@ -10811,8 +11177,14 @@ pub(crate) fn mh_dispatch(
                     Some(Value::Object(Some(receiver))) => {
                         let receiver = *receiver;
                         let recv_pin = ctx.pin_native_root(receiver);
-                        let collected =
-                            collect_trailing_varargs(ctx, &class, &name, &desc, &extra_args[1..]);
+                        let collected = collect_trailing_varargs(
+                            ctx,
+                            &class,
+                            &name,
+                            &desc,
+                            &extra_args[1..],
+                            generic_collector,
+                        );
                         let adapted = adapt_invoke_args(ctx, &collected, &desc);
                         let (adapted_pin_base, adapted_handles) = pin_mh_args(ctx, &adapted);
                         let adapted: Vec<Value> = adapted
@@ -11340,12 +11712,31 @@ fn adapt_single_arg(ctx: &mut dyn NativeContext, arg: Value, expected_type: &str
 /// already-packed call (exactly N args with the last an array) is returned
 /// unchanged — so non-varargs dispatch and the direct `invoke` / `invokeExact`
 /// callers (which pass the array explicitly) are byte-for-byte unaffected.
+///
+/// `generic_collector` is the one thing this function cannot derive from the
+/// target: the dispatch came through `MethodHandle.invokeWithArguments` AND
+/// the handle is a varargs collector. See [`MH_GENERIC_SPREAD`] for why that
+/// combination is what decides a `null` in the trailing array slot.
+///
+/// # Known deviation — an ALREADY-PACKED array on the generic entry
+///
+/// HotSpot collects unconditionally on that entry, so
+/// `vf.invokeWithArguments(new Object[] {new String[0]})` throws
+/// `ClassCastException: Cannot cast [Ljava.lang.String; to java.lang.String`
+/// there (it wraps the array as the single ELEMENT of a new one). CratonVM
+/// keeps its packed-call passthrough, which is the more forgiving answer and
+/// which every in-tree caller depends on. Only the `null` half of the rule is
+/// implemented here, because only the `null` half turns a working program into
+/// a wrong one; the packed half turns a working program into a CCE. Measured
+/// as row B06 of `probes/MhVarargsNullProbe.java`, and recorded in
+/// `docs/known-issues/spring/`.
 fn collect_trailing_varargs(
     ctx: &mut dyn NativeContext,
     class: &str,
     name: &str,
     desc: &str,
     params: &[Value],
+    generic_collector: bool,
 ) -> Vec<Value> {
     // Cheap pre-checks BEFORE the allocating `declared_methods` lookup, so the
     // hot path (every static/virtual MethodHandle dispatch -- Groovy/Gradle/
@@ -11367,6 +11758,13 @@ fn collect_trailing_varargs(
     };
     let last = ptypes[array_idx].clone();
     let trailing_types = &ptypes[array_idx + 1..];
+    // Does a `null` in the array slot mean "the array is null" or "one element
+    // that happens to be null"? On the generic entry of a varargs collector it
+    // is always the latter — and only for the SYNTACTICALLY LAST parameter,
+    // which is the only one a Java collector can own (JLS §8.4.1). JRuby's
+    // `(…, IRubyObject[] args, Block)` shape, which this function locates by
+    // searching for the array ANYWHERE, is therefore never affected.
+    let null_collects = generic_collector && array_idx + 1 == p;
     // Already packed: exactly P args and the array-position value is itself
     // an array (or null). Covers a correct `invokeExact`/pre-packed call AND
     // e.g. `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection
@@ -11375,7 +11773,7 @@ fn collect_trailing_varargs(
     if params.len() == p {
         match params.get(array_idx) {
             Some(Value::Object(Some(arr))) if ctx.object_is_array(*arr) => return params.to_vec(),
-            Some(Value::Object(None)) => return params.to_vec(),
+            Some(Value::Object(None)) if !null_collects => return params.to_vec(),
             _ => {}
         }
     }
@@ -11442,7 +11840,7 @@ fn collect_trailing_varargs(
     // supplied values, just with `excess == 0`.
     let array_slot_is_wrapped = match params.get(array_idx) {
         Some(Value::Object(Some(arr))) => ctx.object_is_array(*arr),
-        Some(Value::Object(None)) => true,
+        Some(Value::Object(None)) => !null_collects,
         _ => false,
     };
     let scalar_needs_wrap = params.len() == p && !array_slot_is_wrapped;
@@ -11793,6 +12191,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                         Value::Int(k) => k,
                         _ => MH_KIND_VIRTUAL,
                     };
+                    arm_generic_spread();
                     let result = mh_dispatch(ctx, this, &[]);
                     return if kind == MH_KIND_CONSTRUCTOR {
                         result
@@ -11815,6 +12214,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 Value::Int(k) => k,
                 _ => MH_KIND_VIRTUAL,
             };
+            arm_generic_spread();
             let result = mh_dispatch(ctx, this, &unpacked);
             if kind == MH_KIND_CONSTRUCTOR {
                 result
@@ -11851,6 +12251,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 Value::Int(k) => k,
                 _ => MH_KIND_VIRTUAL,
             };
+            arm_generic_spread();
             let result = mh_dispatch(ctx, this, &unpacked);
             if kind == MH_KIND_CONSTRUCTOR {
                 result
@@ -14274,6 +14675,28 @@ mod tests {
     // from `CollBox.java` / `CollBox2.java`, named in the assertion message so
     // a future reader can re-run the row rather than re-derive it.
     // -----------------------------------------------------------------------
+
+    /// The generic-entry flag is ONE-SHOT, and that is the whole reason an
+    /// adapter's inner target keeps its exact-type semantics.
+    ///
+    /// `invokeWithArguments` arms it; the first [`mh_dispatch`] takes it; every
+    /// recursive dispatch an adapter arm makes below that sees `false`. If
+    /// `take_generic_spread` ever became a peek, a null reaching an inner
+    /// collector through e.g. `filterArguments(collector, 0, f)` would be
+    /// collected where HotSpot passes it straight through.
+    #[test]
+    fn the_generic_spread_flag_is_taken_not_peeked() {
+        // Starts clear on a fresh thread.
+        assert!(!take_generic_spread());
+        arm_generic_spread();
+        assert!(take_generic_spread(), "the outermost dispatch sees it");
+        assert!(!take_generic_spread(), "a nested dispatch must not");
+        // Arming twice is still one dispatch's worth.
+        arm_generic_spread();
+        arm_generic_spread();
+        assert!(take_generic_spread());
+        assert!(!take_generic_spread());
+    }
 
     #[test]
     fn a_wrapper_typed_component_settles_the_element_class() {

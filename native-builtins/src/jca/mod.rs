@@ -55,6 +55,12 @@ pub mod x500;
 // ASN.1 helper used by x500 (DER encode/decode primitives). No registrations
 // of its own — exists as a compile-time module for x500.rs to depend on.
 pub mod asn1;
+// The `javax.net.ssl.SSLContextSpi` boundary: which SPI implementations
+// CratonVM claims as its own, and how the `javax/net/ssl/SSLContext` natives
+// ask. Three registration sets stand on that class (`tls.rs`, `net_phase_e.rs`,
+// `phases_late/ssl_security.rs`) and last-write-wins decides which answers, so
+// the decision lives here rather than in whichever one happens to win.
+pub mod ssl_context_spi;
 
 use cratonvm_native_api::NativeMethodRegistry;
 

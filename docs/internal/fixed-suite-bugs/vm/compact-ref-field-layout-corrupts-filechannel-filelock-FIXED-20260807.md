@@ -126,7 +126,7 @@ explains both.
 **HIGH.** `FileChannel.tryLock()` / `lock()` is how every file-backed database
 opens. On dev tip no persistent H2 database opens at all — the whole
 `org.h2.test.*` file-config suite, and the throughput work in
-`h2-update-path-throughput-20260802.md`, are blocked on it. Anything else that
+`h2-update-path-throughput-RETIRED-20260821.md`, are blocked on it. Anything else that
 takes a file lock is equally dead.
 
 ## Reproducing — twelve lines, no H2
@@ -282,7 +282,7 @@ being ✅ FIXED must not be read as the merge being clean. Filed separately as
 
 ## Related
 
-* `docs/known-issues/h2/h2-update-path-throughput-20260802.md` — blocked on this;
+* `performance/h2-update-path-throughput-RETIRED-20260821.md` — blocked on this;
   no file-backed H2 database opens on dev tip.
 * the retired `bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807`
   write-up — its `MergeLockBudgetProbe` is a second, H2-shaped reproducer

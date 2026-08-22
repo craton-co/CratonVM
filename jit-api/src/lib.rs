@@ -689,6 +689,33 @@ pub mod npe_action {
     /// `sastore` into a null `short[]`.
     pub const ASTORE_SHORT: u8 = 17;
 }
+/// Bit the JIT may set in `jit_getfield`'s `field_index` argument to say
+/// **"this receiver is already proven to be an oop"**.
+///
+/// When set, the helper skips its `is_object_address` heap-membership walk.
+/// Everything else — the pending-NPE contract, the slot bounds check, the
+/// compact/legacy layout split, the read and the reference decode — is
+/// unchanged, so this carries no new colouring or layout exposure. It is
+/// purely "skip one validation".
+///
+/// # Why a flag bit and not a second helper slot
+///
+/// `helpers_abi.rs` pins [`JitRuntimeHelpers`]'s field count, byte size and
+/// golden offsets with const assertions plus an ABI version, precisely so the
+/// offsets the JIT bakes cannot move. A one-bit argument flag needs none of
+/// that. `field_index` is a small non-negative slot index — a class-file field
+/// table is `u16`-sized — so bit 62 cannot collide with a real index.
+///
+/// # Why skipping the walk is sound
+///
+/// The walk is validation against a stale/garbage receiver from a miscompiled
+/// frame. The emitter sets this only where the IR's type lattice types the base
+/// node `IrType::Ref` — the same proof the PRIMITIVE trusted-oop arm already
+/// relies on, and that arm goes further and performs a raw inline load off this
+/// very receiver. `plausible_heap_pointer` still runs either way, so null and
+/// unaligned/out-of-range bits are still refused.
+pub const GETFIELD_RECEIVER_PROVEN_OOP: u64 = 1 << 62;
+
 
 /// Function pointer table for JIT runtime callbacks.
 ///
@@ -1184,6 +1211,43 @@ pub struct JitRuntimeHelpers {
     /// checked `jit_getfield` helper, which is the pre-fix behaviour. Appended
     /// at the END of the struct so all prior golden offsets stay stable.
     pub read_bounds_addr: usize,
+    /// Compiled local exception handlers — address of
+    /// `extern "C" fn(vm_ptr: i64, site_ptr: i64, out_exc: *mut i64) -> i64`
+    /// (`vm/src/jit/helpers.rs::jit_local_handler_lookup`).
+    ///
+    /// Called from a per-throwing-bci stub the instant a fallible site returns
+    /// the `i64::MIN` sentinel. It answers which of THIS method's own
+    /// exception-table entries takes the pending throwable — index into the
+    /// site's compile-time candidate list, or `-1` for "this frame does not
+    /// catch it" — and on a hit stores the throwable into the frame slot the
+    /// handler's operand stack starts at.
+    ///
+    /// `0` = not wired (hand-built test tables, or the feature switched off)
+    /// → the backend arms no local-handler stubs at all and every caught
+    /// exception takes the reason-9 deopt / shared-sentinel route out of
+    /// compiled code, which is the behaviour that predates the feature.
+    /// Appended at the END of the struct so all prior golden offsets stay
+    /// stable.
+    pub local_handler_lookup: usize,
+
+    /// `ldc <String>` — the interned literal named at `cp_idx` in
+    /// `holder_class_id`'s constant pool.
+    ///
+    /// `extern "C" fn(vm_ptr: i64, holder_class_id: i64, cp_idx: i64) -> i64`.
+    /// The CP-indexed twin of [`Self::ldc_class_cp`], and the SUPERSEDER of
+    /// [`Self::ldc_string`], which bakes the literal's UTF-8 bytes instead and
+    /// therefore has no key to answer from: JVMS §5.4.3 resolves a
+    /// constant-pool entry once and records the result, and the record is
+    /// keyed `(class, cp index)`. The bytes form re-derived the answer on every
+    /// execution — the string pool's `RwLock`, a hash of the literal's whole
+    /// content and a `memcmp` — measured at 18.4 ns against HotSpot's 0.2 ns
+    /// (`probes/LdcConstCostProbe.java`).
+    ///
+    /// `0` = not wired (hand-built test tables) → the backend refuses a
+    /// string-`ldc` site and bails the compile, exactly as an unwired
+    /// [`Self::ldc_class_cp`] makes it refuse a class-`ldc` site. Appended at
+    /// the END of the struct so all prior golden offsets stay stable.
+    pub ldc_string_cp: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1364,6 +1428,13 @@ helper_fields! {
     // immediate by the guarded inline getfield READ path. Deliberately a
     // DIFFERENT table from region_bounds_addr above -- see the field doc.
     (read_bounds_addr,               FieldKind::Offset),
+    // Optional: 0 makes the single-pass backend arm no local-handler stubs, so
+    // every caught exception keeps leaving compiled code — the pre-feature
+    // behaviour.
+    (local_handler_lookup,           FieldKind::OptionalPtr),
+    // Optional: 0 makes both backends refuse a string-`ldc` site and bail the
+    // compile, the same way an unwired `ldc_class_cp` does for `ldc <Class>`.
+    (ldc_string_cp,                  FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1389,7 +1460,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 65,
+    JitRuntimeHelpers::NUM_FIELDS == 67,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1784,6 +1855,8 @@ mod tests {
             ldc_class_cp: 0x11B8,
             aastore_type_check: 0x11C0,
             read_bounds_addr: 0x11C8,
+            local_handler_lookup: 0x11D0,
+            ldc_string_cp: 0x11D8,
         }
     }
 
@@ -2021,6 +2094,8 @@ mod tests {
             ldc_class_cp: 0,
             aastore_type_check: 0,
             read_bounds_addr: 0,
+            local_handler_lookup: 0,
+            ldc_string_cp: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2196,8 +2271,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 65.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 65);
+        // And the macro-driven count is the canonical 67.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 67);
     }
 
     #[test]
@@ -2520,6 +2595,16 @@ mod tests {
                 "read_bounds_addr",
                 std::mem::offset_of!(JitRuntimeHelpers, read_bounds_addr),
             ),
+            (
+                65,
+                "local_handler_lookup",
+                std::mem::offset_of!(JitRuntimeHelpers, local_handler_lookup),
+            ),
+            (
+                66,
+                "ldc_string_cp",
+                std::mem::offset_of!(JitRuntimeHelpers, ldc_string_cp),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2574,7 +2659,7 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 43, "required-pointer count drifted");
-        assert_eq!(opt, 12, "optional-pointer count drifted");
+        assert_eq!(opt, 14, "optional-pointer count drifted");
         assert_eq!(off, 10, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
@@ -2780,6 +2865,7 @@ mod tests {
             "set_throw_bci" => h.set_throw_bci = 0,
             "aastore_type_check" => h.aastore_type_check = 0,
             "read_bounds_addr" => h.read_bounds_addr = 0,
+            "local_handler_lookup" => h.local_handler_lookup = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }

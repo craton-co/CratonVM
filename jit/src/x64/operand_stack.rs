@@ -123,6 +123,33 @@ impl Compiler {
             .or_insert(marks);
     }
 
+    /// Pop `n` invoke arguments, returning their slots (in call order) AND
+    /// whether each is a reference.
+    ///
+    /// `pop_stack` discards the oop mark it pops, which is fine everywhere the
+    /// value goes straight back onto the simulated stack — but invoke arguments
+    /// leave the stack model entirely and land in a staging buffer, and the
+    /// safepoint map has to name the reference ones. This is the only way to
+    /// learn which those are, since the marks are gone by the time the buffer
+    /// offsets are known.
+    ///
+    /// The mark is read BEFORE the pop, so it is the mark belonging to the slot
+    /// being popped. A short mark vector reads `false` here and additionally
+    /// makes `pop_stack` clear `stack_oop_marks_exact`, which
+    /// `emit_oop_map_for_safepoint` already treats as an incomplete map — so a
+    /// desync cannot turn into a silently unnamed argument.
+    pub(super) fn pop_invoke_args(&mut self, n: usize) -> (Vec<StackSlot>, Vec<bool>) {
+        let mut slots = Vec::with_capacity(n);
+        let mut oops = Vec::with_capacity(n);
+        for _ in 0..n {
+            oops.push(self.stack_oop_marks.last().copied().unwrap_or(false));
+            slots.push(self.pop_stack());
+        }
+        slots.reverse();
+        oops.reverse();
+        (slots, oops)
+    }
+
     /// Pop a value from the simulated operand stack.
     /// Returns `StackSlot::Frame(0)` and sets `self.failed` on underflow.
     pub(super) fn pop_stack(&mut self) -> StackSlot {
@@ -144,9 +171,45 @@ impl Compiler {
         if self.stack.is_empty() && self.stack_oop_marks.is_empty() {
             self.stack_oop_marks_exact = true;
         }
-        // Reclaim spill space if this was a Frame slot at the top
+        // Reclaim spill space if this was a Frame slot at the top — and only if
+        // no entry still on the stack lives at or above it.
+        //
+        // The bare `off == next_spill_offset - 8` test assumed spill offsets are
+        // handed out in stack order, so the top entry always owns the topmost
+        // slot. `invalidate_callee_saved` breaks that assumption: it reserves ONE
+        // fresh slot at the top of the reserve and repoints EVERY matching
+        // entry at it, including entries buried under the top of the stack. A
+        // pop of a shallower `Frame` entry then rewound the cursor past a slot a
+        // DEEPER entry still owned, and the next `push_stack` handed the same
+        // offset out again — the pushed value overwrote the buried one, and the
+        // buried entry read back whatever the new owner had stored.
+        //
+        // The shape it was measured on is `kotlin.reflect...KotlinTypeFactory
+        // .simpleTypeWithNonTrivialMemberScope`, whose kotlinc-generated body
+        // pops five operands into locals 7..11 (`astore`/`istore`, each one an
+        // invalidation) while four earlier operands still sit on the stack, then
+        // reloads all five to build a lambda and finally calls a constructor
+        // with the four buried ones. The buried `arguments` operand arrived null
+        // — `NullPointerException: Parameter specified as non-null is null:
+        // method ...SimpleTypeImpl.<init>, parameter arguments` — which is
+        // `InvocableHandlerMethodKotlinTests.genericParameter()` in the Spring
+        // Framework suite. It needs at least four colourable locals to appear
+        // (`CRATONVM_JIT_LOCAL_REGS=3` passes, `=4` fails) and disappears under
+        // `--nojit` and `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=0`.
+        //
+        // The added scan is over the simulated stack, which is short, and it can
+        // only ever DELAY a reclaim: a slot nobody references is still freed on
+        // the next pop that tops out at it. Frame usage can rise for a method
+        // that invalidates a lot, which `checked_spill_range_end` already bounds
+        // — an exhausted reserve fails the compile and falls back to the
+        // interpreter rather than emitting a wrong body.
         if let StackSlot::Frame(off) = slot {
-            if off == self.next_spill_offset - 8 {
+            if off == self.next_spill_offset - 8
+                && !self
+                    .stack
+                    .iter()
+                    .any(|s| matches!(s, StackSlot::Frame(o) if *o >= off))
+            {
                 self.next_spill_offset -= 8;
             }
         }

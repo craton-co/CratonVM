@@ -51,6 +51,11 @@ cratonvm-jit = { path = "../jit", version = "0.3.0" }
 # (`CRATONVM_DBG=define-census`) beside the other self-gated tallies.
 cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+# Direct dep so the T19.H1 watchdog can print the selector census
+# (`nio_selector::dump_selector_state_to_stderr`) beside the thread dumps, for a
+# stall whose reactor is alive and selecting. Same pattern as the
+# `cratonvm-jit` / `cratonvm-classloading` hook deps above.
+cratonvm-native-io = { path = "../native-io", version = "0.3.0" }
 # Direct dep so `main()` can expand the ten grouped `CRATONVM_*` variables into
 # the per-knob keys before anything reads one. See `cratonvm_types::flag_groups`.
 cratonvm-types = { path = "../types", version = "0.3.0" }

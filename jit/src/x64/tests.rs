@@ -112,6 +112,91 @@ fn estimate_max_stack_counts_ldc_family_and_dup_pushes() {
     );
 }
 
+/// A spill slot a BURIED operand-stack entry still owns must not be handed out
+/// again by the next push.
+///
+/// `invalidate_callee_saved` reserves ONE fresh slot at the top of the spill
+/// reserve and repoints EVERY entry that reads the register at it — including
+/// entries buried under the top of the stack, and including two entries at the
+/// same shared slot. `pop_stack` then reclaimed on `off == next_spill_offset -
+/// 8` alone, which assumes the top entry owns the topmost slot. Popping the
+/// shallower of two aliases satisfied that test while the deeper alias still
+/// read the slot, so the next `push_stack` was handed it and the pushed value
+/// overwrote the buried operand.
+///
+/// Measured consequence: `kotlin.reflect...KotlinTypeFactory
+/// .simpleTypeWithNonTrivialMemberScope` — five `astore`/`istore` pops into
+/// locals 7..11 (an invalidation each) with four earlier operands still on the
+/// stack — passed a null where its caller had pushed
+/// `Collections.emptyList()`, i.e.
+/// `InvocableHandlerMethodKotlinTests.genericParameter()` in the Spring
+/// Framework suite.
+#[test]
+fn pop_does_not_reclaim_a_slot_a_buried_entry_still_owns() {
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut compiler = Compiler::new(
+        "buried-spill-alias-test".to_string(),
+        ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    // Two entries reading the same callee-saved register, one buried under the
+    // other — the shape `aload N; ...; aload N` leaves behind.
+    compiler.stack_push(StackSlot::CalleeSaved(R12), true);
+    compiler.stack_push(StackSlot::CalleeSaved(R12), true);
+
+    // The store that overwrites R12 materialises both to ONE shared slot.
+    compiler.invalidate_callee_saved(R12);
+    let shared = match compiler.stack[0] {
+        StackSlot::Frame(off) => off,
+        other => panic!("buried entry not materialised: {other:?}"),
+    };
+    assert!(
+        matches!(compiler.stack[1], StackSlot::Frame(off) if off == shared),
+        "both aliases should share one spill slot, got {:?}",
+        compiler.stack[1]
+    );
+
+    // Pop the shallower alias. The buried one still reads `shared`.
+    let popped = compiler.pop_stack();
+    assert!(
+        matches!(popped, StackSlot::Frame(off) if off == shared),
+        "expected the shared slot on top, got {popped:?}"
+    );
+
+    let pushed = compiler.push_stack().expect("push after pop");
+    assert!(
+        !matches!(pushed, StackSlot::Frame(off) if off == shared),
+        "push reused spill slot {shared}, which the buried entry {:?} still reads",
+        compiler.stack[0]
+    );
+}
+
 #[test]
 fn push_stack_refuses_to_cross_spill_limit() {
     let alloc_result = crate::regalloc::RegAllocResult {
@@ -433,6 +518,9 @@ fn test_helpers() -> JitRuntimeHelpers {
         self_call_stack_guard: 0,
         region_bounds_addr: 0,
         read_bounds_addr: 0,
+        // Compiled local handlers are never armed in a backend unit test: the
+        // feature is flag-gated and the tables here are hand-built.
+        local_handler_lookup: 0,
         native_stack_floor_fn: 0,
         ldc_string: sentinel,
         // Unwired (0) — CRATONVM_JIT_SAFEPOINT_POLLS is off by default,
@@ -461,6 +549,11 @@ fn test_helpers() -> JitRuntimeHelpers {
         // `required` in `jit-api`, so 0 would fail `validate()` rather than
         // select a different lowering.
         aastore_type_check: sentinel,
+        // Unwired (0), for the same reason `ldc_class_cp` is: these tests
+        // build no string-`ldc` site, and 0 makes the backend refuse one
+        // rather than emit a null CALL. `ldc_string` above stays sentinel-wired
+        // because its slot is `required` in `jit-api`; nothing calls it.
+        ldc_string_cp: 0,
     }
 }
 
@@ -12025,6 +12118,238 @@ fn a_call_inside_a_spliced_body_reaches_the_dispatch_helper() {
         vec![5, 10],
         "arg[0] must be at the lowest address — a reversed buffer swaps these",
     );
+}
+
+/// Build a reference-returning `InlineSite` for `static Object id(Object o)`
+/// — `aload_0; areturn`.
+///
+/// `make_inline_site` hard-codes an all-`I` descriptor, and the shape these
+/// tests need is a REFERENCE result: only a reference is named in an oop map,
+/// which is the observable that says which frame slot the splice parked it in.
+fn identity_ref_inline_site() -> crate::InlineSite {
+    let mut site = make_inline_site(&[0x2a, 0xb0], 1, 1, true, b'L');
+    site.descriptor = "(Ljava/lang/Object;)Ljava/lang/Object;".to_string();
+    site
+}
+
+/// Compile [`DIRECT_CALL_RESULT_LIVE_AT_SAFEPOINT`] with the pc-1 call either
+/// SPLICED or dispatched, and return the oop-map frame slots recorded at the
+/// pc-4 safepoint — i.e. where the pc-1 call parked its reference result.
+fn spliced_result_slots_at_pc4(splice_pc1: bool) -> Vec<i16> {
+    // LEAK(intentional): compiled code stores raw pointers to these, so they
+    // must outlive it; the test process owns them for its (short) lifetime.
+    let sink = Box::leak(Box::new(JitInvokeInfo {
+        class_name: "T",
+        method_name: "sink",
+        descriptor: "()V",
+        num_jit_args: 0,
+        return_type: b'V',
+        invoke_kind: 3,
+        declaring_class_id: 0,
+    }));
+    let callee = Box::leak(Box::new(JitInvokeInfo {
+        class_name: "T",
+        method_name: "id",
+        descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;",
+        num_jit_args: 1,
+        return_type: b'L',
+        invoke_kind: 3,
+        declaring_class_id: 0,
+    }));
+    let invoke_info: Vec<(usize, *const JitInvokeInfo)> = vec![
+        (1usize, callee as *const JitInvokeInfo),
+        (4usize, sink as *const JitInvokeInfo),
+    ];
+    let mut inline_sites = HashMap::new();
+    if splice_pc1 {
+        inline_sites.insert(1usize, identity_ref_inline_site());
+    }
+    let compiled = compile(
+        &DIRECT_CALL_RESULT_LIVE_AT_SAFEPOINT,
+        DIRECT_CALL_RESULT_LIVE_AT_SAFEPOINT.len(),
+        1,
+        1,
+        true,
+        Vec::new(), // multianewarray_info
+        Vec::new(), // field_info
+        Vec::new(), // typecheck_info
+        Vec::new(), // static_field_info
+        Vec::new(), // new_info
+        Vec::new(), // anewarray_info
+        invoke_info,
+        Vec::new(), // direct_calls
+        Vec::new(), // mic_slots
+        Vec::new(), // pic_slots
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        inline_sites,
+        None, // string_layout
+    )
+    .expect("a reference-returning leaf callee must compile spliced and unspliced");
+    let mut slots = compiled
+        .oop_maps
+        .iter()
+        .find(|m| m.bytecode_pc == 4)
+        .map(|m| m.frame_slot_offsets.clone())
+        .unwrap_or_default();
+    slots.sort_unstable();
+    slots
+}
+
+/// A spliced callee's result must land at the operand-stack depth the CALLER's
+/// bytecode gives it — not at the top of the callee's own frame region.
+///
+/// `try_emit_inline_body` carves the callee's locals AND a
+/// `MAX_INLINE_MERGE_DEPTH` merge region out of the caller's spill area, and
+/// does it BEFORE the arguments are popped (it has to — an argument slot stays
+/// live until it is marshalled into a callee local). The cursor at the end of
+/// the splice therefore sits `callee_locals + MAX_INLINE_MERGE_DEPTH` slots
+/// above where the caller's operand stack actually tops out, and the `xreturn`
+/// arms used to push the result from THERE.
+///
+/// Inside the caller's basic block that is invisible: the linear walk writes
+/// and reads the same shifted slots and computes the right answer. It becomes
+/// wrong code at the first merge point that re-establishes depth from the
+/// bytecode — writer and reader then address different slots. That is the
+/// `AssertionError: Unexpected operand at stack top` every JSP compile threw
+/// once ECJ's `OperandStack.pop(OperandCategory)` tiered up
+/// (tomcat/ecj-operandstack-*.md); the same defect had been fixed once in the
+/// direct-call arms of `bytecode_walk.rs` on 2026-08-06 and came back through
+/// the splicer when `0f55466d0` (2026-08-18) taught it to inline a
+/// value-producing branch merge.
+///
+/// The oop map is the observable, exactly as in
+/// [`direct_call_result_slot_is_independent_of_service_arg_reservation`]: the
+/// slot a live reference is reported in IS the slot the result was pushed to.
+/// Negative control (fix reverted, test kept) reports the spliced arm five
+/// slots higher — one callee local plus the four-slot merge region.
+#[test]
+fn a_spliced_callees_result_lands_at_the_callers_operand_depth() {
+    let dispatched = spliced_result_slots_at_pc4(false);
+    let spliced = spliced_result_slots_at_pc4(true);
+    assert!(
+        !dispatched.is_empty(),
+        "the pc-1 reference result must be a mapped live oop at the pc-4 safepoint"
+    );
+    assert_eq!(
+        spliced, dispatched,
+        "the splice's callee-locals and merge-region reservations moved the \
+         return value off its operand-stack depth: the linear walk and every \
+         merge point after this call now disagree about which slot holds it"
+    );
+}
+
+/// ECJ's `OperandStack.pop(OperandCategory)` reduced to its skeleton, EXECUTED.
+///
+/// A value produced by an inlined call, held on the operand stack across a
+/// `tableswitch`, and compared against a constant pushed at a switch arm — the
+/// exact shape whose compiled body compared the raw `TypeBinding.id` against
+/// the expected category instead of `TypeIds.getCategory(id)`.
+///
+/// This one is satisfied by EITHER half of the fix (the splice pushing at the
+/// caller's depth, or the switch arms canonicalising the operands that outlive
+/// them), and that is deliberate: it asserts the end-to-end behaviour the
+/// tomcat page is about, while the two tests above pin the splice half on its
+/// own. `tableswitch`/`lookupswitch` were the only branch shapes in this walk
+/// that did not establish the canonical layout their own arms are revived with,
+/// which is why the shift reached the merge here and not through an `ifeq`.
+#[test]
+fn an_inlined_result_held_across_a_tableswitch_reaches_the_merge_intact() {
+    // callee: `static int category(int a) { return a == 1 ? 2 : 1; }`
+    //   0: iload_0
+    //   1: iconst_1
+    //   2: if_icmpne 7
+    //   5: iconst_2
+    //   6: ireturn
+    //   7: iconst_1     <- branch target
+    //   8: ireturn
+    let callee = make_inline_site(
+        &[0x1a, 0x04, 0xa0, 0x00, 0x05, 0x05, 0xac, 0x04, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
+
+    // caller: `static int f(int a, int sel) {
+    //             int cat = category(a);
+    //             int k = switch (sel) { case 0 -> 1; case 1 -> 2; default -> 3; };
+    //             return cat == k ? 1 : 0; }`
+    //
+    //    0: iload_0                          [a]
+    //    1: invokestatic #1                  [cat]        <- the splice
+    //    4: iload_1                          [cat, sel]
+    //    5: tableswitch low=0 high=1         [cat]
+    //         (6,7 padding; 8 default; 12 low; 16 high; 20 case0; 24 case1)
+    //   28: iconst_1                         [cat, 1]     <- case 0
+    //   29: goto 37
+    //   32: iconst_2                         [cat, 2]     <- case 1
+    //   33: goto 37
+    //   36: iconst_3                         [cat, 3]     <- default
+    //   37: if_icmpeq 42                     []
+    //   40: iconst_0
+    //   41: ireturn
+    //   42: iconst_1
+    //   43: ireturn
+    let mut caller: Vec<u8> = vec![
+        0x1a, // 0  iload_0
+        0xb8, 0x00, 0x01, // 1  invokestatic #1
+        0x1b, // 4  iload_1
+        0xaa, // 5  tableswitch
+        0x00, 0x00, // 6,7 padding to the 4-byte boundary
+    ];
+    caller.extend_from_slice(&(36i32 - 5).to_be_bytes()); //  8 default -> 36
+    caller.extend_from_slice(&0i32.to_be_bytes()); // 12 low
+    caller.extend_from_slice(&1i32.to_be_bytes()); // 16 high
+    caller.extend_from_slice(&(28i32 - 5).to_be_bytes()); // 20 case 0 -> 28
+    caller.extend_from_slice(&(32i32 - 5).to_be_bytes()); // 24 case 1 -> 32
+    caller.extend_from_slice(&[
+        0x04, // 28 iconst_1
+        0xa7, 0x00, 0x08, // 29 goto 37
+        0x05, // 32 iconst_2
+        0xa7, 0x00, 0x04, // 33 goto 37
+        0x06, // 36 iconst_3
+        0x9f, 0x00, 0x05, // 37 if_icmpeq 42
+        0x03, // 40 iconst_0
+        0xac, // 41 ireturn
+        0x04, // 42 iconst_1
+        0xac, // 43 ireturn
+    ]);
+    let caller_len = caller.len();
+    assert_eq!(caller_len, 44, "hand-assembled caller length");
+    caller.push(0); // padding, like every other method the JIT sees
+    caller.push(0);
+
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+    let compiled = compile_with_inlines(&caller, caller_len, 2, 2, sites)
+        .expect("a branchy leaf callee held across a tableswitch must compile");
+
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap. The
+    // body is arithmetic and branches only — no helper is reached.
+    unsafe {
+        // a=1 -> cat=2; sel=1 -> k=2; equal.
+        // Under the bug the merge reads canonical slot 0, which still holds the
+        // `a` the caller pushed at pc 0: 1 vs 2 -> 0.
+        assert_eq!(
+            compiled.try_call(&[1, 1]).expect("test JIT call"),
+            1,
+            "the spliced result must be what the tableswitch merge compares"
+        );
+        // a=1 -> cat=2; sel=0 -> k=1; not equal. Under the bug: 1 vs 1 -> 1.
+        assert_eq!(compiled.try_call(&[1, 0]).expect("test JIT call"), 0);
+        // a=0 -> cat=1; sel=0 -> k=1; equal. Under the bug: 0 vs 1 -> 0.
+        assert_eq!(compiled.try_call(&[0, 0]).expect("test JIT call"), 1);
+        // a=3 -> cat=1; sel=9 -> default k=3; not equal.
+        assert_eq!(compiled.try_call(&[3, 9]).expect("test JIT call"), 0);
+        // a=1 -> cat=2; sel=9 -> default k=3; not equal. Under the bug: 1 vs 3
+        // -> 0 (agrees) — kept so the default arm is covered on both callee arms.
+        assert_eq!(compiled.try_call(&[1, 9]).expect("test JIT call"), 0);
+    }
 }
 
 /// A spliced call site with no resolved target must REFUSE the splice.
