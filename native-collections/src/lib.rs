@@ -25520,6 +25520,7 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 // is empty (observed: `m.keySet().stream().count()` returned 0 for a 3-entry
 // TreeMap, which broke Keycloak FeatureOptions.<clinit>).
 fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    ts_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
@@ -48298,6 +48299,106 @@ fn tm_publish_real_root(ctx: &mut dyn NativeContext, this: ObjectRef) {
         .root_published_at = mod_now;
 }
 
+/// Populate a `java.util.TreeSet`'s real `m` field with a real
+/// `java.util.TreeMap` holding the same elements, itself carrying a real
+/// `root` tree.
+///
+/// `WORKER-2-NOTE-1` section 5 measured `TreeSet.m` as null where HotSpot has
+/// the backing map, and declined it on the same has-no-consumer/costs-per-read
+/// grounds as `root`. Both halves of that objection are gone: the cost is now
+/// gated on `modCount` exactly as [`tm_publish_real_root`] is, and the map this
+/// mints is the same real object graph that function already builds — so `m`
+/// costs one extra `TreeMap` per mutation rather than per read.
+///
+/// The minted map is a MIRROR, never an authority. `ts_state`'s side-table
+/// entry for the SET stays the single source of truth; nothing in this file
+/// reads the set's contents back through `m`. Making it readable both ways
+/// would be the two-producers-one-slot trap this lane has already paid for
+/// twice (`WORKER-2-NOTE-1` sections 4a and 9a.1).
+fn ts_publish_real_backing_map(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let m_slot = match ctx.resolve_field_index("java/util/TreeSet", "m") {
+        Some(s) if s < ctx.object_num_fields(this) => s,
+        // The synthetic-JDK shape has no `m` to mirror into; the caller keeps
+        // exactly the behaviour it had.
+        _ => return,
+    };
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return,
+    };
+    // Reuse the map already published for this set when the element count has
+    // not moved. `TreeSet` has no `modCount` of its own — it is `m`'s — so the
+    // size is the cheap structural proxy here, and the map's own
+    // `tm_publish_real_root` re-gates on the real `modCount` underneath.
+    if let Value::Object(Some(existing)) = ctx.get_field(this, m_slot) {
+        if matches!(tm_state(ctx, existing), (_, n, _) if n == size) {
+            tm_publish_real_root(ctx, existing);
+            return;
+        }
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let data_pin = ctx.pin_native_root(data);
+    let cmp_pin = pin_value(ctx, comparator);
+    let map = match try_alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS) {
+        Ok(m) => m,
+        Err(_) => {
+            ctx.unpin_native_roots(this_pin);
+            return;
+        }
+    };
+    let map_pin = ctx.pin_native_root(map);
+    // `PRESENT` is the JDK's own sentinel value for every `TreeSet` mapping.
+    // A missing one is not a reason to refuse the mirror — the VALUES of a set's
+    // backing map are not observable through any `Set` operation — so fall back
+    // to null rather than dropping `m` on the floor.
+    let present = ctx
+        .ensure_class_initialized("java/util/TreeSet")
+        .ok()
+        .and_then(|cid| {
+            ctx.static_field_index_by_name(cid, "PRESENT")
+                .map(|idx| ctx.get_static_field(cid, idx))
+        })
+        .unwrap_or(Value::Object(None));
+    let present_pin = pin_value(ctx, present);
+    let n = size.max(0) as usize;
+    let buf = alloc_ref_array(ctx, (n * 2).max(TM_DEFAULT_CAPACITY * 2));
+    let buf_pin = ctx.pin_native_root(buf);
+    for i in 0..n {
+        let data = ctx.read_native_pin(data_pin, data);
+        let k = ctx.get_array_element(data, i);
+        let buf = ctx.read_native_pin(buf_pin, buf);
+        ctx.set_array_element(buf, i * 2, k);
+        let p = read_pinned_elem(ctx, present_pin, present);
+        ctx.set_array_element(buf, i * 2 + 1, p);
+    }
+    let map = ctx.read_native_pin(map_pin, map);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    tm_set_force_array(ctx, map);
+    tm_set_slot(ctx, map, TM_FIELD_DATA, Value::Object(Some(buf)));
+    // Hoisted: `tm_set_slot` takes `ctx` mutably, so the pinned re-read cannot
+    // be an argument expression to it.
+    let cmp_now = read_pinned_elem(ctx, cmp_pin, comparator);
+    tm_set_slot(ctx, map, TM_FIELD_COMPARATOR, cmp_now);
+    // Written LAST: `tm_set_slot` bumps the map's real `modCount` off a size
+    // change, and `tm_publish_real_root` gates on that value — so the size has
+    // to be in place before the root is asked for.
+    tm_set_slot(ctx, map, TM_FIELD_SIZE, Value::Int(size));
+    let map = ctx.read_native_pin(map_pin, map);
+    tm_publish_real_root(ctx, map);
+    let map = ctx.read_native_pin(map_pin, map);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, m_slot, Value::Object(Some(map)));
+    ctx.unpin_native_roots(this_pin);
+}
+
+/// Refresh the real-JDK mirrors a `TreeSet` bulk read makes observable.
+fn ts_refresh_real_mirrors(ctx: &mut dyn NativeContext, args: &[Value]) {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        ts_publish_real_backing_map(ctx, this);
+    }
+}
+
 /// Refresh the real-JDK mirrors a bulk read makes observable. Called from the
 /// `TreeMap` bulk-read natives, which are the only points where this VM knows
 /// something is about to look at the map as an object rather than through an
@@ -49780,6 +49881,7 @@ fn native_ts_lower(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    ts_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
