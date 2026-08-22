@@ -106,9 +106,21 @@ a gate that reads 100%. That gap is the project.
    going GREEN is the fix, not a violation.** Four have closed that way.
 7. **`RMapGcStress` is a TIMEOUT**, `rc=124`: it needs 233 s against a 120 s
    budget. Not an objection to your change. **Use `TIMEOUT=600`.**
-8. **Never run two `regression-suite/run.sh` at once.** `.guard-tmp` is a fixed
-   shared path; concurrent sweeps starved the oracle and moved a cell from
-   83/104 to 102/104.
+8. **~~Never run two `regression-suite/run.sh` at once.~~ FIXED 2026-08-21 —
+   you may now sweep concurrently.** `.guard-tmp` was a FIXED shared path and its
+   `rm -rf` deleted a running sweep's oracle files underneath it. It is now
+   PID-scoped (`$HERE/.guard-tmp.$$`) with a `trap` cleanup, and two concurrent
+   two-vector sweeps were MEASURED green with no harness errors and no leftover
+   directories.
+
+   **Keep the SIGNATURE, because it will recur elsewhere.** It corrupted a
+   measurement twice and both times looked like a VM defect first: `H14-3` §5
+   moved a cell from **83/104 to 102/104**, and H0 got **3 passed, 204 failed**
+   — every vector red AND a `harness:` entry for each, `204 = 102 vectors x 2`.
+   **Total redness that INCLUDES the harness guard is an ENVIRONMENT failure, not
+   a defect.** No source change can fail `RJitGc`, `RCrypto` and `RShutdownHooks`
+   in one run. If you ever see that shape, check what else is running before you
+   revert anything.
 9. **Never patch source with heredoc-python (`python - <<'PY'`).** It bakes
    literal control characters in; the file still parses and is silently wrong.
    Write a `.py` to a scratch dir and run it. Verify with `cat -A`.
