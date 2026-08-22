@@ -3678,6 +3678,11 @@ fn reloc_emit_enabled() -> bool {
             self.patch_rel32_to_here(p);
         }
         let arg_offsets: Vec<i32> = (0..num_args).map(|i| self.slot_of(inputs[2 + i])).collect();
+        // `arg_offsets` are each argument's own register-allocated home slot,
+        // which the stub loads into the ABI registers one at a time. They are
+        // NOT a contiguous block, so the callee-deopt service -- which reads
+        // `num_args` consecutive slots to rebuild the callee's incoming
+        // locals -- must be pointed at the staging block written above instead.
         done_patches.extend(crate::runtime_lowering::emit_hashed_vtable_stub(
             &mut self.buf,
             pic,
@@ -3686,6 +3691,7 @@ fn reloc_emit_enabled() -> bool {
             self.frame_record,
             self.service_callee_deopt,
             info_ptr,
+            self.args_stage_top_off,
         ));
 
         // ── Slow path: the resolving + cache-populating helper ────────────
