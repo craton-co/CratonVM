@@ -971,7 +971,49 @@ use cratonvm_types::compat::CompatibilityMode;
 /// management     1609 SyntheticStub out of 13202 total
 /// no-management  1598 SyntheticStub out of 12834 total
 /// ```
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1609;
+///
+/// # 1609 / 1598 -> 1627 / 1616, 2026-08-22 -- one ABSTRACT spelling became four
+/// CONCRETE ones, and the count rises because there are four
+///
+/// WORKER-4's abstract-receiver work. Row diff, same method as the block above
+/// (`CRATONVM_RATCHET_ROWS=1` on each tree, sorted, `comm`):
+///
+/// ```text
+/// GONE  (9)   sun/nio/fs/UnixWatchService.{init0,close0,register0,cancel0,
+///               reset0,poll0,take0,pollEventKinds0,pollEventNames0}
+/// NEW  (27)   the SAME nine methods on sun/nio/fs/BsdWatchService,
+///               sun/nio/fs/LinuxWatchService and sun/nio/fs/MacOSXWatchService
+///             all in native-io/src/watch.rs
+/// net +18, and the same +18 in BOTH configurations
+/// ```
+///
+/// **This is case (b), and a sharper form of it than the dichotomy below
+/// states.** `sun/nio/fs/UnixWatchService` is ABSTRACT: no receiver can legally
+/// be one (JVMS 6.5), so a registration there was answering for a class that
+/// cannot exist and the concrete per-platform impl never reached its own row.
+/// The registrations did not multiply -- the SPELLING did, from one illegal
+/// receiver to the three legal ones that inherit from it. `WindowsWatchService`
+/// is covered too (`watch.rs:884`) and is not in the diff because it already
+/// carried its own rows.
+///
+/// **The count going UP is therefore the fix landing, not a regression**, and
+/// this is the second shape in this file that the two-column rule cannot
+/// adjudicate on its own. Totals moved 12834 -> 13260 (+426), far more than the
+/// +18, because the concrete classes take the whole mirrored family and not
+/// just the stub rows.
+///
+/// **Do not "fix" this by re-registering on the abstract class to get the
+/// number down.** That is the defect. A per-platform stub count of 3N where the
+/// abstract count was N is the correct shape for anything the JDK spells per
+/// platform.
+///
+/// Measured post-merge:
+///
+/// ```text
+/// management     1627 SyntheticStub out of 13628 total
+/// no-management  1616 SyntheticStub out of 13260 total
+/// ```
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1627;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -986,7 +1028,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1609;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1598;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1616;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1016,13 +1058,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1598;
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
 /// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13202;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13628;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12834;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13260;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
