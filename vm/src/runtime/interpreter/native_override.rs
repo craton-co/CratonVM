@@ -2730,12 +2730,48 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // CratonVM-minted one carries a SNAPSHOT past those slots instead
     // (`key_itr_base`), so the real bodies would report every collection
     // exhausted.
+    // `setValue` on a LIVE entrySet element. It carries its source map in a
+    // trailing undeclared slot and the JDK body writes only the field, so
+    // `entrySet()...setValue(v)` would stop updating the map. Scoped to the one
+    // method: `getKey`/`getValue`/`equals`/`hashCode`/`toString` read the
+    // declared slots, which a live entry fills correctly, and their real
+    // bytecode is the better answer.
+    if matches!(
+        class_name,
+        "java/util/HashMap$Node"
+            | "java/util/LinkedHashMap$Entry"
+            | "java/util/TreeMap$Entry"
+            | "java/util/concurrent/ConcurrentHashMap$MapEntry"
+            | "java/util/Hashtable$Entry"
+    ) && method_name == "setValue"
+    {
+        return true;
+    }
     if matches!(
         class_name,
         "java/util/HashMap$KeyIterator"
             | "java/util/HashMap$EntryIterator"
             | "java/util/LinkedHashMap$LinkedKeyIterator"
             | "java/util/LinkedHashMap$LinkedEntryIterator"
+            // `TreeMap$KeyIterator` joined 2026-08-22 -- it is what HotSpot
+            // answers for BOTH `TreeSet.iterator()` and
+            // `TreeMap.keySet().iterator()`, where this VM was handing back the
+            // `Arrays$ArrayItr` refusal landing. Its snapshot lives at
+            // `key_itr_base`, past `PrivateEntryIterator`'s own fields, so the
+            // real bodies would walk a `next` chain nothing populated and
+            // report every set exhausted. Single-producer class, so this row
+            // cannot capture anyone else's objects -- unlike the
+            // `Hashtable$Enumerator` attempt that reddened `RJdkEnumerations`.
+            // The values-side twins, 2026-08-22. `values()` is a `Collection`,
+            // not a `Set`, so it is ArrayList-shaped and its iterator came back
+            // as a plain `ArrayList$Itr` where HotSpot names a per-family
+            // class. Their three snapshot fields live past the class's own
+            // declared ones (`al_itr_alt_base`), so without these rows the real
+            // bodies walk fields nothing populated. Each is single-producer.
+            | "java/util/HashMap$ValueIterator"
+            | "java/util/LinkedHashMap$LinkedValueIterator"
+            | "java/util/TreeMap$ValueIterator"
+            | "java/util/TreeMap$EntryIterator"
     ) && matches!(method_name, "hasNext" | "next" | "remove")
     {
         return true;

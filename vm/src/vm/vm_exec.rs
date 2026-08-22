@@ -24632,12 +24632,29 @@ fn invoke_on_class_shared_inner(
                         // the `next`/`current`/`index` fields the JDK's own
                         // `HashIterator` bodies walk. Companion entry in
                         // native_override::force_native_over_real_jdk_bytecode.
+                        // See the companion note in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap$Node"
+                                    | "java/util/LinkedHashMap$Entry"
+                                    | "java/util/TreeMap$Entry"
+                                    | "java/util/concurrent/ConcurrentHashMap$MapEntry"
+                                    | "java/util/Hashtable$Entry"
+                            )
+                            && method_name == "setValue")
                         || (matches!(
                                 class_name,
                                 "java/util/HashMap$KeyIterator"
                                     | "java/util/HashMap$EntryIterator"
                                     | "java/util/LinkedHashMap$LinkedKeyIterator"
                                     | "java/util/LinkedHashMap$LinkedEntryIterator"
+                                    // See the companion note in
+                                    // native_override::force_native_over_real_jdk_bytecode.
+                                    | "java/util/HashMap$ValueIterator"
+                                    | "java/util/LinkedHashMap$LinkedValueIterator"
+                                    | "java/util/TreeMap$ValueIterator"
+                                    | "java/util/TreeMap$EntryIterator"
                             )
                             && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
