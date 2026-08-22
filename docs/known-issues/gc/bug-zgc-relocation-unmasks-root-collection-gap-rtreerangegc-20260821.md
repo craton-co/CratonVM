@@ -132,6 +132,16 @@ interpreter frame root set." That was too broad, and the mode arm says so:
 --Xmx 64m --jdk-only      rc=0  2/2   PASS RTreeRangeGc (14014 checks)
 ```
 
+> **REFUTED 2026-08-22 — strict mode is not clean, it is LESS SENSITIVE.**
+> The two-row arm below was measured at one heap size. Squeeze it and
+> `--jdk-only` goes red: **`--Xmx 48m` FAIL 2/2, `--Xmx 32m` FAIL 2/2**, and
+> `--Xmx 64m` itself flaked to FAIL on one of two runs. So the `pass` is a
+> threshold, not immunity, and **every inference in the rest of this section
+> rests on it**. The unrooted reference cannot be attributed to the substituted
+> collection natives on this evidence, because the gap survives their removal.
+> Measured on a pristine `origin/dev` build at `bf85389bb`; see
+> `jdk-only/WORKER-1-NOTE-2-rtreerangegc-range-views-and-a-repro-that-disagrees-20260822.md`.
+
 **Strict mode is CLEAN.** `--jdk-only` drops the substituted collection natives
 and runs the JDK's own `TreeMap`/`TreeSet` bytecode, and the gap goes with them.
 So the unrooted reference is held by CratonVM's own collection substitution
