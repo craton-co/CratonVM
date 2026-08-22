@@ -1,9 +1,10 @@
-# GPULlama3.java on CratonVM: model load fixed, a Vector API failure still open
+# GPULlama3.java on CratonVM: model load fixed, an FFM class-identity defect still open
 
 ## Status
 **PARTIALLY FIXED** (2026-08-22). The reported model-load livelock is fixed
 and was not a livelock. A second, separate defect on the inference path
-remains **OPEN**.
+remains **OPEN** — it is an FFM/Panama class-identity defect, not a GPU or
+Vector API one, and not the GC defect its error message suggests.
 
 Supersedes `bug-gpullama3-unsafe-getshort-model-load-livelock.md`, whose
 diagnosis was wrong in every particular — see "What the original record got
@@ -64,50 +65,73 @@ The generalisable lesson: *CPU-burning with flat RSS* is equally consistent
 with a spin loop and with an O(n²) algorithm over resident data. The cheap
 discriminator is a stack sample, not a memory counter.
 
-## Still open: the first `matmul` throws
+## Still open: every synthetic MemorySegment carries the INTERFACE as its class
 
-With loading fixed, the run reaches inference in ~70 s and dies:
+With loading fixed, the run reaches inference in ~70 s and dies on the
+first `matmul`:
 
 ```
-gc::guard ERROR: in_published_snapshot=false published_roots=121
-  last_publish_at_collection=0  collections_now=1  site="checkcast"
-  holder=frame#17 jdk/incubator/vector/AbstractVector.defaultReinterpret
-                  pc=35 local[4] kind=0 live=true
-  top_frame=jdk/incubator/vector/IntVector.intoMemorySegment0 pc=26
+java.lang.ClassCastException: class java.lang.foreign.MemorySegment
+  cannot be cast to class jdk.internal.foreign.AbstractMemorySegmentImpl
 
 at FloatTensor.matmul(FloatTensor.java:99)
-at Parallel.parallelFor(Parallel.java:10)          <-- multi-threaded
-at FP16FloatTensor.vectorDot(FP16FloatTensor.java:70)
+at Parallel.parallelFor(Parallel.java:10)
+at FP16FloatTensor.vectorDot(FP16FloatTensor.java:70)   <-- ShortVector.fromMemorySegment
 at jdk/incubator/vector/... (Vector API)
 ```
 
-**This is NOT yet diagnosed, and specifically it is NOT yet established to
-be a GC defect.** The guard's own wording invites that reading, and it has
-been wrong before: on 2026-08-17 the identical `in_published_snapshot=false`
-signature turned out to be a JIT `multianewarray` bug allocating with
-`ClassId(0)`, with no GC involvement, because the guard fires whenever an
-address *decodes wrongly*, not only when it was genuinely reclaimed.
+**Root cause.** `native-builtins/src/panama.rs` allocates every synthetic
+`MemorySegment` with the class name `java/lang/foreign/MemorySegment` —
+the **interface** — and a private 6-slot layout
+(`[ptr, size, arena, ro, alive, offset]`). 21 call sites do this. Any JDK
+code that casts a segment to its abstract base therefore throws, and the
+JDK does that routinely: the Vector API's `fromMemorySegment0` /
+`intoMemorySegment0` both open with
+`(AbstractMemorySegmentImpl) segment`.
 
-Controls run so far:
+So this is not specific to the Vector API or to this app. It is every FFM
+consumer that touches the JDK's own segment internals. The same shape is
+already worked around once, for a different consumer: see the "Wave 2 D —
+DirectByteBuffer / Cleaner checkcast guard" note in `native-builtins`,
+which shims `Buffer.session()` to dodge the identical
+`checkcast AbstractMemorySegmentImpl`.
+
+**It is NOT a GC defect, and NOT a JIT defect.** The failure surfaces
+under a `gc::guard` "root COLLECTION gap" error, which reads like one and
+is a red herring — the guard fires whenever an address fails to decode as
+its expected class, not only when the object was reclaimed. Four controls,
+all reproducing the identical single failure:
 
 | control | result |
 |---|---|
-| `--Xmx 8g` on the quadratic path | no change (that path was never GC-bound) |
-| `--Xmx 8g` / `--XX:UseGc G1` on the crash | **not yet run to completion** |
-| failure-set diff across runs | **not yet done** |
+| baseline | exit 1, 64 s, 1 guard hit |
+| `--Xmx 8g` | exit 1, 60 s, 1 guard hit — collector never got the chance |
+| `--XX:UseGc G1` | exit 1, 71 s, 1 guard hit — a different root protocol |
+| `--nojit` | exit 1, 126 s, 1 guard hit — no compiled frames at all |
 
-Before writing this up as a root-collection gap, run the big-heap and
-second-collector arms and diff the failure sets. If either arm reproduces,
-stop reading the guard and look at what constructed the object — here, the
-Vector API's `reinterpret`/`asVectorRaw` type punning is a strong candidate
-for producing an object whose header does not decode as its static type.
+and under `--nojit` the guard prints `collections_now=0`: **not one
+collection had run** when the "reclaimed" address was reported. That is
+conclusive. (The 2026-08-17 `multianewarray`/`ClassId(0)` bug produced the
+same signature for the same reason; the discipline of running the
+big-heap and second-collector arms before believing this guard is what
+separated them both times.)
 
-The one suggestive detail on the GC side: `Parallel.parallelFor` means
-worker threads, and `conservative_roots.rs` documents a known
-**multi-thread-in-JIT under a peer STW** gap — a worker whose published root
-snapshot is stale when a peer collector marks it. `last_publish_at_collection=0`
-against `collections_now=1` is consistent with that. Consistent is not
-confirmed.
+**Fix options**, none of them one-line, which is why this is filed rather
+than fixed here:
+
+1. Give the synthetic segments a concrete class that is assignable to
+   `AbstractMemorySegmentImpl` while keeping CratonVM's 6-slot layout.
+   Requires auditing which inherited JDK methods then become reachable on
+   these objects — they would read CratonVM's slots under the JDK's field
+   meanings, which is the trap that makes this more than a rename.
+2. Special-case assignability so the synthetic segment class satisfies
+   `checkcast`/`instanceof` against `AbstractMemorySegmentImpl`. Narrower,
+   but it makes the type system lie in one more place.
+3. Shim the Vector API's segment entry points the way `Buffer.session()`
+   is shimmed. Cheapest, and whack-a-mole: the FFM surface is large.
+
+Option 1 is the honest one. It should be scoped as Panama work, not as a
+GPULlama3 fix.
 
 ## Other gaps this app surfaced (both open, both minor)
 
