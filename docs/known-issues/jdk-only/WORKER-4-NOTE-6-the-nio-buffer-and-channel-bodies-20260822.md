@@ -1,6 +1,6 @@
-# WORKER-4-NOTE-6 — the NIO buffer and channel bodies: 87 cases, ZERO diffs, and 27 of 95 shadows actually reached
+# WORKER-4-NOTE-6 — the NIO buffer and channel bodies: 170 cases, ZERO diffs, and 47 of 100 shadows actually reached
 
-**Status: MEASURED. No source change — a probe and a coverage number.**
+**Status: MEASURED. No source change — two probes and a coverage number.**
 2026-08-22, Linux (Azure host 2), Temurin 25.0.4+7, on the handoff tip
 `8104bfd2f` built unmodified.
 
@@ -84,12 +84,81 @@ preserve, which is the cheapest kind to schedule. Before this, nobody knew
 which of the 95 were in that position, and "we do not know" is what stops a
 retirement.
 
-## 6. Nomination
+## 6. `W4Direct` — the gap this note nominated, closed in the same session
 
-**N1 — a `W4Direct` probe for the 18 unreached `DirectByteBuffer` shadows.**
-Put bytes THROUGH a direct buffer rather than at it: relative and absolute
-accessors at every width, `slice`/`duplicate`/`asReadOnlyBuffer` of a direct
-buffer, `order()` on the views, a direct buffer handed to `FileChannel.read` /
-`write` / `transferTo`, and `Buffer.address` visibility via a channel round
-trip. That is where address arithmetic errors live and where this probe
-deliberately stopped.
+§4 named `java/nio/DirectByteBuffer` as the sharpest of the eight unreached
+columns: `W4Nio` allocates a direct buffer and checks its SHAPE — `isDirect`,
+`hasArray`, the `array()` refusal — and does almost nothing THROUGH it, and
+direct buffers are where the address arithmetic lives.
+
+`regression-suite/probes/W4Direct.java` (added here) puts bytes through it.
+**83 cases, ZERO diffs against the oracle in both modes**, and the control says
+it landed where it was aimed:
+
+```text
+  java/nio/DirectByteBuffer rows FIRED : 19    (W4Nio reached NONE)
+    get 47 · session 15 · getInt 5 · isDirect 3 · get([B) 2 · isReadOnly 2
+    put 2 · getChar 1 · getDouble 1 · getFloat 1 …
+```
+
+Its shape is deliberate in two ways:
+
+* **Every case runs against a HEAP buffer too**, through one shared `exercise`
+  routine. A difference between the two backings therefore shows up as a diff
+  between two lines of the SAME run, rather than needing a second oracle
+  comparison to notice — which is the failure mode a direct-vs-heap divergence
+  actually has.
+* **It ends at a real `FileChannel`.** A direct buffer handed to a channel has
+  its address passed to the OS, so a wrong offset surfaces as wrong BYTES ON
+  DISK rather than as an exception. It writes a direct buffer, reads it back,
+  writes a SLICED direct buffer (the offset case), and reads into a buffer with
+  a non-zero position — then checks the file contents, not the return code.
+
+## 7. Combined coverage, and what is still not covered
+
+Union of the two probes' registry dumps:
+
+| | |
+|---|---:|
+| buffer/channel §1.4 shadows | **100** |
+| reached by `W4Nio` + `W4Direct` | **47** |
+| still unreached | **53** |
+
+`DirectByteBuffer` is now at zero unreached. What is left:
+
+| class | unreached shadows |
+|---|---:|
+| `java/nio/ByteBuffer` | 15 |
+| `java/nio/Buffer$2` | 10 |
+| `java/nio/CharBuffer` | 6 |
+| `java/nio/Buffer` | 5 |
+| `java/nio/IntBuffer` | 5 |
+| `java/nio/LongBuffer` | 5 |
+| `java/nio/ByteBufferAsCharBufferB` | 4 |
+| `java/nio/HeapByteBuffer` | 1 |
+
+**170 cases and zero diffs still buys "47 of 100 agree", not "the family is
+clean."** The honest way to read the pair is: every question anyone has thought
+to ask of these bodies is answered correctly, and slightly under half the rows
+have been asked anything at all.
+
+The residue is mostly the TYPED VIEW classes (`Buffer$2`, `CharBuffer`,
+`IntBuffer`, `LongBuffer`, `ByteBufferAsCharBufferB` — 30 of the 53), which both
+probes touch only at the edges: `asIntBuffer`/`asCharBuffer`/`asLongBuffer` get
+one write and one read each. A third probe driving the view classes at every
+width, with both backings and both byte orders, would take the covered fraction
+past two thirds; that is the next one worth writing and this note does not
+write it.
+
+## 8. Nomination
+
+**N1 — CLOSED by §6, in the same session it was raised.** `W4Direct` reaches 19
+`DirectByteBuffer` rows and finds no divergence.
+
+**N2 — the typed VIEW classes are 30 of the 53 rows still unreached.** §7. A
+probe driving `asIntBuffer` / `asCharBuffer` / `asLongBuffer` / `asShortBuffer`
+/ `asFloatBuffer` / `asDoubleBuffer` at every width, over BOTH backings and BOTH
+byte orders, with write-through checked back through the parent's bytes. The
+view classes are the ones whose names encode the backing and the order
+(`ByteBufferAsCharBufferB`), which is exactly the kind of family where one arm
+drifts.
