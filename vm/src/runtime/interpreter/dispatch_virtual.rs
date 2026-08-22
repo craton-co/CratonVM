@@ -3446,8 +3446,16 @@ pub(super) fn populate_virtual_invoke_cache(
         // receiver checks at the other call sites and poisoning this inline
         // cache with `VirtualNative` for a genuinely real ThreadPoolExecutor.
         // That arm is gone, so this site no longer forces anything for it.)
+        // W7-96 §7 NOMINATION 1. The shared function above now returns `false`
+        // for a class the retirement dial covers, but this mirror ORs in a
+        // cluster of its own -- so the dial has to be consulted here too or
+        // arming it still measures the gate. `Off::covers()` is `false`, so an
+        // unarmed run is unchanged.
+        let dial_retires =
+            crate::runtime::env_cache::enforce_shadow_scope().covers(declaring_name);
         let force = force_native_over_real_jdk_bytecode(declaring_name, &method_name, &descriptor)
-            || (matches!(
+            || (!dial_retires
+                && matches!(
                 declaring_name,
                 "java/util/HashMap"
                     | "java/util/LinkedHashMap"

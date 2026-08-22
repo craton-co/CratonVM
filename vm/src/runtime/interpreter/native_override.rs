@@ -2548,6 +2548,32 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     method_descriptor: &str,
 ) -> bool {
     hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
+    // W7-96 §7 NOMINATION 1 — THE RETIREMENT DIAL HAS TO WIN HERE.
+    //
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW` is the instrument the whole Phase 2
+    // migration is supposed to be measured with: arm it for a class and that
+    // class's registered natives are supposed to step aside so the real JDK
+    // bytecode runs and can be judged. This function never consulted it, so
+    // arming the dial measured THIS GATE rather than the VM.
+    //
+    // W7-96 §3.1 measured the consequence, 3 of 3 runs identical. Armed for
+    // `java/util/concurrent/ConcurrentHashMap`, six `put`s of distinct keys
+    // into a fresh map gave `size() == 1` and `get()` hits 1 of 6 — five
+    // entries silently gone, with `put` reporting a fresh insert for every one.
+    // Not a real-bytecode CAS bug: `<init>` is absent from the collection
+    // cluster below while `put` is in it, so the dial retired the constructor
+    // and kept the mutators, leaving a map with no segments whose
+    // `chm_segment_for -> None` arm answers "no previous mapping" having stored
+    // nothing. The record spent an hour reading that as a VM defect.
+    //
+    // Placed at the TOP rather than on the one cluster the record names,
+    // because every rule below has the same problem and a per-cluster guard
+    // would have to be repeated correctly in three files. `EnforceShadowScope`
+    // is `Off` unless the env var is set, and `Off::covers()` is `false`, so an
+    // ordinary run does not change by one dispatch.
+    if crate::runtime::env_cache::enforce_shadow_scope().covers(class_name) {
+        return false;
+    }
     // `Map.values()` (native_map_values in native-collections/src/lib.rs)
     // returns a plain `java/util/ArrayList` that stashes its source map in a
     // spare trailing capacity slot so a later `Map.put`/`remove` on the
