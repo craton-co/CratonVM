@@ -7746,6 +7746,19 @@ pub(crate) fn loader_owns_complete_resource_view(
 ///    visible, matching HotSpot;
 /// 4. anything else (a custom loader we have no URL view of) — global probe,
 ///    i.e. unchanged from before this function existed.
+/// Is this one of the three loaders that ARE the process classpath
+/// (bootstrap / platform / application)?
+///
+/// For those, the VM-global resource view is not an approximation of the
+/// loader's own view — it is the same view, so a global probe is the right
+/// answer rather than a fallback.
+pub(crate) fn loader_is_builtin(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(loader))
+        .is_some_and(|n| {
+            n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$")
+        })
+}
+
 pub(crate) fn package_class_files_visible_to_loader(
     ctx: &mut dyn NativeContext,
     loader: Option<ObjectRef>,
@@ -7754,12 +7767,7 @@ pub(crate) fn package_class_files_visible_to_loader(
     let Some(loader) = loader else {
         return !ctx.find_all_resource_urls(class_glob).is_empty();
     };
-    let is_builtin = ctx
-        .class_name_of_id(ctx.class_id_of_object(loader))
-        .is_some_and(|n| {
-            n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$")
-        });
-    if is_builtin {
+    if loader_is_builtin(ctx, loader) {
         return !ctx.find_all_resource_urls(class_glob).is_empty();
     }
     if !loader_local_resource_urls(ctx, loader, class_glob).is_empty() {
