@@ -19,6 +19,14 @@
 #       CI step that exports the variable silently runs the DEFAULT policy, and
 #       its green result says nothing about the policy it claimed to test.
 #
+#       When CRATONVM_ARGS names --jdk-only, every vector is ALSO given
+#       --jdk-only-report writing to a PID-scoped directory, and the run ends
+#       with a union census of what strict mode actually did (native-won versus
+#       bytecode-won shadows, synthetic-native registrations, unenforced
+#       shadows, compatibility classes, and how many reports SATURATED their
+#       bounded sinks). Reported, never counted: it cannot change a verdict.
+#       Suppressed if you pass your own --jdk-only-report.
+#
 #   JDK_ONLY=1
 #       Also run the RJdk* JDK-only corpus (src/RJdk*.java, the named module
 #       under modules/, and the class-path service resources under resources/).
@@ -161,12 +169,39 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # fail, the exact defect this file's guards exist to catch) or fail every run
 # for all eight lanes. The design constraints for landing one are in
 # docs/known-issues/jdk-only/W8-E9-1-three-broken-oracles-and-the-suite-denominator.md.
+# RJitMapTierDiff landed 2026-08-20 (lane H10) as H7-1 N1. It is in CORE and
+# NOT in JDKONLY_CLASSES, for the same reason RJdkViews is: the thing it
+# discriminates on only exists in --real-jdk. jit/src/lib.rs's four collection
+# direct-helper triples are all `bridge` in
+# scripts/baselines/jdk-only-kind-map-25-linux.tsv, so under --jdk-only
+# direct_native_helper refuses every one of them at BIND time and strict mode
+# has no second tier for these calls at all. CORE membership gets it BOTH arms
+# anyway — SUITE_SET is "$CORE_CLASSES${JDK_ONLY:+ $JDKONLY_CLASSES}", so the
+# strict run schedules it too and it PINS that refusal (every `moved=` must
+# still read -1) — while a second registration in JDKONLY_CLASSES would only
+# run the identical command twice.
+#
+# READ THIS BEFORE COMPARING TO A PUBLISHED BASELINE: it is the 105th vector.
+# HANDOFF-20260820.md §1's `--jdk-only 104 / 104`, `SUITE=all 99 / 104` and
+# `SUITE=core 63 / 64` all gain one to their DENOMINATOR. A run that reports
+# 104/105 without naming which vector failed has not been read carefully.
+#
+# It is a two-tier fixture and that is the whole point: every shape is read at
+# the first (interpreted) invocation and at the last, and the iteration at
+# which the answer moved is PUBLISHED on every row, so a wrong answer that only
+# appears after tier-up is arm-visible. Reading each shape once measures
+# whichever tier happened to be right — the defect H4-1 O1 named as "a
+# tier-dependent wrong answer no arm diffs for" and no arm in this suite could
+# see. MEASURED on HotSpot 25.0.3+9 in the scheduled configuration: rc=0,
+# PASS RJitMapTierDiff (75 checks), md5-identical over 3 runs and identical
+# under -Xint. Falsified on purpose before landing (H10-1 §5).
+#
 # The list below is the UNION of both sides of the 2026-08-17 dev merge:
 # this branch had 61 vectors, dev had 44, and RVarHandleAccess is dev's one
 # addition this branch had never scheduled. Dropping either side would
 # silently unschedule working coverage, which is the defect several of the
 # guards further down exist to catch.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RJitArraycopyRefDeopt RJitMultiArrayClass RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession RVarHandleAccess"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RJitArraycopyRefDeopt RJitMultiArrayClass RJitMapTierDiff RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RClassUnloadSweepGen RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3 RJdkBridge1 RSslNullSession RSslLiveSession RVarHandleAccess RStringBuilderContent RLangPackages"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -354,6 +389,47 @@ prune_missing "$JDKONLY_CLASSES"; JDKONLY_CLASSES="$PRUNED"
 case " ${CRATONVM_ARGS:-} " in
   *" --jdk-only "*) JDK_ONLY=1 ;;
 esac
+
+# ---- the strict census, folded into the arm (G84-1 N3) --------------------
+#
+# `--jdk-only-report` counts precisely what three P0 rows in
+# docs/jdk-only-runtime-services.md argue about from source reading:
+# `interpreter_shadow_unenforced`, the `native-shadows-bytecode` population
+# split on its `outcome` field, `synthetic-native-registered`, and
+# `compatibility_classes`. It costs ONE flag on a run that is already happening,
+# and unlike the stub ratchet it needs no frozen baseline to be informative.
+#
+# THREE PROPERTIES THIS MUST NOT BREAK, and how each is kept:
+#
+#  * It must not change a verdict. The launcher writes the report from
+#    `write_jdk_only_dumps`, which returns `()` and has no effect on the exit
+#    code; a write failure is an `eprintln!` warning, not an error. The lines it
+#    prints begin `[cratonvm] ` and `extract()` keeps only `^(PASS|CK) `, so
+#    nothing reaches the cross-VM diff. Nothing here touches HotSpot's command
+#    line — the oracle stays the plain reference run.
+#  * It must not add a second FIXED shared path. `.guard-tmp` is fixed and two
+#    concurrent runs already destroy each other's oracle files; this directory
+#    is PID-scoped so it cannot repeat that. It is created once per invocation
+#    and removed at the end, `rm -rf`, exactly like `.guard-tmp`.
+#  * A missing report must be VISIBLE, not silent. The summary counts the
+#    reports it expected against the ones that exist and prints the shortfall.
+#    A census that is quietly absent is the failure mode this whole area exists
+#    to remove.
+#
+# Skipped when the operator already passed their own `--jdk-only-report`: two
+# copies of the flag would have the second silently win and write somewhere the
+# summary below cannot see.
+STRICT_REPORT=""
+case " ${CRATONVM_ARGS:-} " in
+  *" --jdk-only-report "*) : ;;
+  *" --jdk-only "*)        STRICT_REPORT=1 ;;
+esac
+# PID-scoped, never a fixed shared name. See the note above.
+REPORTDIR="$HERE/.jdk-only-reports.$$"
+# How many per-vector reports we expect to find at the end. Incremented at the
+# launch site rather than derived from $CLASSES, so a vector skipped for any
+# reason cannot silently lower the denominator.
+report_expected=0
 # SUITE selects the list; JDK_ONLY=1 stays additive on top of it.
 SUITE_SET=""
 case "${SUITE:-core}" in
@@ -398,6 +474,19 @@ echo "== RUN pid=$$ tree=$HERE rev=$(git -C "$HERE" rev-parse --short HEAD 2>/de
 # run. See W7-60-harness-extract-blindness.md and W7-51-vacuous-sweep-round-2.md.
 . "$HERE/harness-guard.sh" || { echo "ERROR: cannot source $HERE/harness-guard.sh"; exit 3; }
 harness_load_uncounted "$HERE/harness-uncounted.txt"
+
+# The ENVIRONMENT-fault classifier. The `sig` grep in run_pass() can only find an
+# assertion signature, and a VM that died before it reached the vector has none —
+# a bad --java-home, a rejected command line and a missing main class all printed
+# a bare `cratonvm rc=1`, indistinguishable from a real failure. See
+# harness-vmfault.sh; its --selftest carries the negative controls.
+. "$HERE/harness-vmfault.sh" || { echo "ERROR: cannot source $HERE/harness-vmfault.sh"; exit 3; }
+
+# The census arithmetic. `sort -u` over whole JSON lines unions
+# (triple, native_kind, outcome), not triples, so the same method was counted
+# more than once; and the saturation grep asks for `truncated: true`, which
+# cannot match the one sink that renders `null`. See harness-census.sh.
+. "$HERE/harness-census.sh" || { echo "ERROR: cannot source $HERE/harness-census.sh"; exit 3; }
 
 # Copy every non-source file under $1 into $2, preserving relative paths.
 copy_tree() {
@@ -590,7 +679,34 @@ resolve_release() {
 run_pass() {
   pass=0; fail=0; failed=""
   hbad=0; hfailed=""
-  GUARDTMP="$HERE/.guard-tmp"; rm -rf "$GUARDTMP"; mkdir -p "$GUARDTMP"
+  # PID-SCOPED since 2026-08-21. This was `$HERE/.guard-tmp`, a FIXED path, and
+  # the `rm -rf` below is the hazard: a second `run.sh` starting while a first is
+  # mid-sweep deletes the first's oracle files underneath it. Both runs then diff
+  # against nothing.
+  #
+  # It has now corrupted a measurement twice, and both times it was mistaken for
+  # a VM defect first:
+  #   * `H14-3` §5 — two concurrent sweeps starved the HotSpot oracle and moved
+  #     `register_uri_natives` from 83/104 to **102/104**. Three arms discarded.
+  #   * 2026-08-21, H0 — an orphaned background arms script overlapped a second
+  #     `SUITE=all` and produced **3 passed, 204 failed**: every vector red AND a
+  #     `harness:` entry for each. `204 = 102 vectors x 2`.
+  #
+  # THE SIGNATURE IS WORTH KNOWING: total redness that INCLUDES the harness guard
+  # is an ENVIRONMENT failure, not a defect. No source change can fail `RJitGc`,
+  # `RCrypto` and `RShutdownHooks` in the same run.
+  #
+  # `run.sh`'s own comment at the report-directory block already said a new
+  # scratch path "must not add a second FIXED shared path … this directory is
+  # PID-scoped so it cannot repeat that". The newer directory obeyed it; the
+  # original never did. This closes that gap rather than adding a lock, because
+  # concurrent sweeps are USEFUL — several workers can measure at once — and a
+  # lock would serialise them for a reason that no longer exists.
+  GUARDTMP="$HERE/.guard-tmp.$$"; rm -rf "$GUARDTMP"; mkdir -p "$GUARDTMP"
+  # Leak-proof: the explicit `rm -rf` at the end of run_pass only runs on the
+  # normal path, so an interrupted or timed-out sweep used to leave the directory
+  # behind. With a PID suffix that would accumulate one per run.
+  trap 'rm -rf "$GUARDTMP"' EXIT INT TERM
   label=""; [ -n "$REL" ] && label=" (--release $REL)"
   echo "== compiling regression-suite$label =="
   compile_modules || { echo "ERROR: javac failed on module $JDKONLY_MODULE"; return 3; }
@@ -604,9 +720,17 @@ run_pass() {
     extra=$(class_args "$c")
     cvextra=$(class_cv_args "$c")
     cpx=$(class_cp_extra "$c")
+    # An ARRAY, not a string, because $REPORTDIR is derived from the repository
+    # path and may contain spaces — the flag lists above are expanded unquoted
+    # on purpose and a path cannot join them. Empty array expands to nothing.
+    cvreport=()
+    if [ -n "$STRICT_REPORT" ]; then
+      cvreport=(--jdk-only-report "$REPORTDIR/$c${REL:+-r$REL}.json")
+      report_expected=$((report_expected+1))
+    fi
     # $CRATONVM_ARGS, $extra and $cvextra are intentionally unquoted: all three
     # are flag lists, not single paths.
-    cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" ${CRATONVM_ARGS:-} $cvextra $extra -cp "$BUILD$cpx" "$c" 2>&1)
+    cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" ${CRATONVM_ARGS:-} $cvextra $extra "${cvreport[@]}" -cp "$BUILD$cpx" "$c" 2>&1)
     cvrc=$?
     cvkey=$(printf '%s\n' "$cvout" | extract)
     # A failed assertion throws AssertionError → non-zero exit (handled by the rc
@@ -616,8 +740,53 @@ run_pass() {
     state=PASS; why=""
     if [ "$cvrc" -ne 0 ]; then
       state=FAIL; why="cratonvm rc=$cvrc"
+      # ENVIRONMENT faults FIRST. A VM that never reached the vector has no
+      # assertion signature for the alternation below to find, so every one of
+      # them used to print the bare `cratonvm rc=$cvrc` above — the same line a
+      # genuine assertion failure prints. The vector is still red; the `why` now
+      # says the harness is broken instead of implying the VM answered wrongly.
+      if envwhy=$(vm_fault_class "$cvrc" "$cvout"); then
+        why="$envwhy"
+        # Accumulated for ONE explanation at the bottom. A broken --java-home
+        # fails all 105 vectors, and the fix printed 105 times is noise.
+        ENV_FAULT_N=$((ENV_FAULT_N+1)); ENV_FAULT_LAST="$envwhy"
+      else
       sig=$(printf '%s\n' "$cvout" | grep -aiE 'AssertionError|NoSuchMethod|linkage error|panic|SEGV|fatal' | grep -avE '^\s*at ' | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | head -c 90)
+      # ---------------------------------------------------------------------
+      # A LAUNCH/CONFIG FAILURE USED TO RENDER EXACTLY LIKE AN ASSERTION
+      # FAILURE (2026-08-21).
+      #
+      # The pattern list above is a list of things somebody had already seen.
+      # Anything else produced an EMPTY `sig`, so `why` stayed the bare
+      # `cratonvm rc=1` — and a vector that never started looked identical to a
+      # vector that ran and failed an assertion. `H24-2` hit this and came
+      # within one step of reporting three of this week's closures reverted;
+      # `H24-2`'s own A/B is reproducible today (a `JDK` exported in the MSYS
+      # POSIX spelling reddens the vector, the `cygpath -m` spelling passes).
+      #
+      # Rather than append one more regex per failure mode — a list that is
+      # incomplete by construction and was already wrong once — fall through to
+      # the VM's OWN first line of output. Two extra steps, in order:
+      #
+      #   1. clap's argument errors, which are `^error: ` / `^Usage: ` /
+      #      `For more information, try '--help'`;
+      #   2. anything at all that is not tracing, a stack frame, VM chatter or
+      #      blank — tagged `unclassified:` so it is obvious the harness did not
+      #      recognise it and the pattern list may deserve a new entry.
+      #
+      # A vector that dies before printing anything now says `no output` rather
+      # than implying an assertion fired.
+      if [ -z "$sig" ]; then
+        sig=$(printf '%s\n' "$cvout" | sed 's/\x1b\[[0-9;]*m//g' \
+              | grep -aE '^error: |^Usage: |For more information, try' | head -1 | head -c 90)
+      fi
+      if [ -z "$sig" ]; then
+        first=$(printf '%s\n' "$cvout" | sed 's/\x1b\[[0-9;]*m//g' \
+                | grep -avE '^\s*at |WARN|^\[cratonvm\]|^\s*$' | head -1 | head -c 70)
+        if [ -n "$first" ]; then sig="unclassified: $first"; else sig="no output"; fi
+      fi
       [ -n "$sig" ] && why="rc=$cvrc: $sig"
+      fi
     elif printf '%s' "$cvout" | grep -qaiE 'SIGSEGV|rust panic|fatal runtime error|stack overflow'; then
       state=FAIL; why="VM crash"
     # Anchored on a word boundary: a bare `^PASS $c` would let `PASS RJdkPhaser`
@@ -690,6 +859,23 @@ run_pass() {
 
 total_pass=0; total_fail=0; total_failed=""; ran=0; skipped=""
 total_hbad=0; total_hfailed=""
+# ENVIRONMENT faults: vectors whose VM never started. Counted here only so the
+# summary can explain them ONCE; they are already red via $fail and this must
+# never add a second point for the same vector.
+ENV_FAULT_N=0; ENV_FAULT_LAST=""
+
+# Created once per invocation, not once per pass: with RELEASES= set, run_pass
+# runs several times and every pass's reports belong to the one summary at the
+# bottom. Cleaned there. A mkdir failure DISABLES the census rather than failing
+# the run — the report is an instrument bolted onto the verdict, and an
+# instrument must never be the thing that turns a run red.
+if [ -n "$STRICT_REPORT" ]; then
+  rm -rf "$REPORTDIR"
+  if ! mkdir -p "$REPORTDIR" 2>/dev/null; then
+    echo "  NOTE: cannot create $REPORTDIR — the --jdk-only census is SKIPPED for this run"
+    STRICT_REPORT=""
+  fi
+fi
 
 if [ -z "${RELEASES:-}" ]; then
   REL=""
@@ -787,6 +973,19 @@ if ! harness_guard_nondiscriminating "$HERE/src" "$LISTED_CLASSES"; then
   total_hfailed="$total_hfailed$HARNESS_G5_CLASSES"
 fi
 
+# ---- the environment's own verdict ----------------------------------------
+#
+# Printed BEFORE the harness verdict and the totals, because when this fires the
+# numbers below it describe a run that never happened. NOT added to $total_fail:
+# every vector it names is already counted red by $fail, and a second point
+# would be the double-count the G2/G3 note above exists to avoid.
+if [ "$ENV_FAULT_N" -gt 0 ]; then
+  echo "  ENVIRONMENT: $ENV_FAULT_N vector(s) had no VM to answer them — the run below is not a"
+  echo "  measurement of CratonVM. Last seen:"
+  echo "    $ENV_FAULT_LAST"
+  vm_fault_hint "$ENV_FAULT_LAST"
+fi
+
 # ---- the instrument's own verdict ----------------------------------------
 #
 # Counted into the exit status, and reported on its own line. A harness guard
@@ -814,4 +1013,63 @@ fi
 # reader does not have to read this script to interpret the line.
 echo "REGRESSION SUITE: $total_pass passed, $total_fail failed${total_failed:+ ( failed:$total_failed )}"
 echo "  COUNTS: $total_pass of $((total_pass+total_vecfail)) SCHEDULED vectors passed; $total_vecfail scheduled vectors failed; $((total_fail-total_vecfail-total_hbad)) list/coverage errors (never scheduled); $total_hbad harness-blindness flags (per-vector flags, not extra vectors)."
+
+# ---- the --jdk-only census, unioned over the vectors that just ran --------
+#
+# Reported, never counted: not one line below touches $total_fail. This is a
+# MEASUREMENT of the mode the arm ran in, and the three P0 rows it feeds want a
+# trend, not a gate — there is no frozen baseline here and deliberately so
+# (G84-1 N3). A census that could turn a run red would acquire a baseline, and a
+# baseline is exactly what makes the stub ratchet unable to tell a regression
+# from an improvement.
+#
+# Every row of `violations[]` is ONE LINE of compact JSON (types::error's
+# to_json has no serde and no pretty-printer), which is why grep/sort is enough
+# and no jq is required. Rows are byte-identical across vectors for the same
+# fact — `summary` is a pure function of the other fields — so `sort -u` is a
+# real UNION and not an approximation. Counter keys are the pretty-printed ones
+# with a space after the colon; violation rows have none, so the two can never
+# be confused by these patterns.
+if [ -n "$STRICT_REPORT" ]; then
+  echo "---------------------------------------------"
+  jr_found=$(ls "$REPORTDIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  jr_rows=$(grep -h '"kind":"native-shadows-bytecode"' "$REPORTDIR"/*.json 2>/dev/null \
+              | sed 's/^[[:space:]]*//; s/,$//' | sort -u)
+  # The whole-line counts, KEPT because every record written before 2026-08-21
+  # quotes them and a reader has to be able to reconcile the two.
+  jr_native_lines=$(printf '%s\n' "$jr_rows" | grep -c '"outcome":"native-won"')
+  jr_bytecode_lines=$(printf '%s\n' "$jr_rows" | grep -c '"outcome":"bytecode-won"')
+  # The counts by TRIPLE, which is the unit docs/known-issues/jdk-only/ quotes.
+  jr_sum=$(printf '%s\n' "$jr_rows" | census_shadow_summary)
+  jr_native=$(printf '%s' "$jr_sum" | sed -n 's/.* native=\([0-9]*\).*/\1/p')
+  jr_bytecode=$(printf '%s' "$jr_sum" | sed -n 's/.* bytecode=\([0-9]*\).*/\1/p')
+  jr_both=$(printf '%s' "$jr_sum" | sed -n 's/.* both=\([0-9]*\).*/\1/p')
+  jr_bconly=$(printf '%s' "$jr_sum" | sed -n 's/.* bytecode_only=\([0-9]*\).*/\1/p')
+  jr_stubs=$(grep -h '"kind":"synthetic-native-registered"' "$REPORTDIR"/*.json 2>/dev/null \
+               | sed 's/^[[:space:]]*//; s/,$//' | sort -u | grep -c '"kind"')
+  jr_unenf=$(grep -h '"interpreter_shadow_unenforced": ' "$REPORTDIR"/*.json 2>/dev/null \
+               | sed 's/[^0-9]//g' | awk '{s+=$1} END {print s+0}')
+  jr_compat=$(grep -h '"compatibility_classes": ' "$REPORTDIR"/*.json 2>/dev/null \
+                | sed 's/[^0-9]//g' | awk '{s+=$1} END {print s+0}')
+  # Whether every figure above is a total, a FLOOR, or UNKNOWN is
+  # census_saturation's job — see harness-census.sh for why `null` is a third
+  # answer and not a quiet `false`.
+  echo "JDK-ONLY CENSUS ($jr_found of $report_expected per-vector reports written):"
+  echo "  native-shadows-bytecode, UNION over vectors, counted by TRIPLE:"
+  echo "    $jr_native native-won (the defect)   ·   $jr_bytecode bytecode-won"
+  echo "    of the $jr_bytecode bytecode-won triples, $jr_both ALSO ran the native in another"
+  echo "    vector; $jr_bconly were bytecode-won and NEVER native — that is 'the contract"
+  echo "    working', and it is the only one of these numbers that means it."
+  echo "    (whole-line rows, the pre-2026-08-21 figures: $jr_native_lines / $jr_bytecode_lines. A whole-line"
+  echo "     sort -u unions (triple, native_kind, outcome), so a triple that dispatched"
+  echo "     two ways is counted twice. harness-census.sh has the measurement.)"
+  echo "  synthetic-native-registered, UNION: $jr_stubs   ·   interpreter_shadow_unenforced, SUM: $jr_unenf   ·   compatibility_classes, SUM: $jr_compat"
+  census_saturation "$REPORTDIR" || true
+  if [ "$jr_found" -lt "$report_expected" ]; then
+    echo "  NOTE: $((report_expected-jr_found)) vector(s) produced no report (a crash before the exit hook, or a write failure)."
+    echo "    Their shadows are missing from the union above. This does NOT affect any vector's verdict."
+  fi
+  rm -rf "$REPORTDIR"
+fi
+
 [ "$total_fail" -eq 0 ]

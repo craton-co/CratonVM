@@ -23,14 +23,23 @@ fn full_registry() -> NativeMethodRegistry {
 // T8.1 — Deprecated java.lang.*
 // ===========================================================================
 
+/// `stop()V` is RETIRED and `stop0` is KEPT, and the split is measured, not
+/// stylistic: `javap -p --system <image> java.lang.Thread` over the nine
+/// supported images finds `public final void stop()` with a `Code` attribute on
+/// all nine, and `private native void stop0(java.lang.Object)` on the three
+/// JDK 17 images only. A method every image implements needs no native; a
+/// method one supported image declares must keep one.
 #[test]
-fn t8_1_1_thread_stop_registered() {
+fn t8_1_1_thread_stop_retired_stop0_kept() {
     let r = full_registry();
-    assert!(r.find("java/lang/Thread", "stop", "()V").is_some());
+    assert!(
+        r.find("java/lang/Thread", "stop", "()V").is_none(),
+        "Thread.stop()V is served by real bytecode on every supported image"
+    );
     assert!(r
         .find("java/lang/Thread", "stop0", "(Ljava/lang/Object;)V")
         .is_some());
-    eprintln!("[t8] T8.1.1 Thread.stop: registered");
+    eprintln!("[t8] T8.1.1 Thread.stop: retired; stop0 kept for JDK 17");
 }
 
 #[test]
@@ -41,11 +50,12 @@ fn t8_1_2_thread_suspend_resume_registered() {
     eprintln!("[t8] T8.1.2 Thread.suspend/resume: registered");
 }
 
+/// Retired 2026-08-21: no supported image declares it.
 #[test]
-fn t8_1_3_thread_destroy_registered() {
+fn t8_1_3_thread_destroy_retired() {
     let r = full_registry();
-    assert!(r.find("java/lang/Thread", "destroy", "()V").is_some());
-    eprintln!("[t8] T8.1.3 Thread.destroy: registered");
+    assert!(r.find("java/lang/Thread", "destroy", "()V").is_none());
+    eprintln!("[t8] T8.1.3 Thread.destroy: retired (declared by no image)");
 }
 
 #[test]
@@ -80,13 +90,15 @@ fn t8_1_6_run_finalization_registered() {
     eprintln!("[t8] T8.1.6 runFinalization: registered");
 }
 
+/// Retired 2026-08-21: no supported image declares it, and the flag it wrote
+/// had no reader outside its own test.
 #[test]
-fn t8_1_7_run_finalizers_on_exit_registered() {
+fn t8_1_7_run_finalizers_on_exit_retired() {
     let r = full_registry();
     assert!(r
         .find("java/lang/System", "runFinalizersOnExit", "(Z)V")
-        .is_some());
-    eprintln!("[t8] T8.1.7 runFinalizersOnExit: registered");
+        .is_none());
+    eprintln!("[t8] T8.1.7 runFinalizersOnExit: retired (declared by no image)");
 }
 
 #[test]

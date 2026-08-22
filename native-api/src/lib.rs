@@ -12,6 +12,7 @@
 /// W7-49-slot-index-recensus.md §8.
 pub mod appended_slots;
 pub mod capability;
+pub mod poly_call_site;
 pub mod charset;
 /// Class-identity answers a native can act on: the ambiguous-vs-absent
 /// distinction, and the refusal a by-name lookup is allowed to return.

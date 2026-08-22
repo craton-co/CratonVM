@@ -227,6 +227,242 @@ pub(crate) fn proxy_instance_satisfies_target(
     false
 }
 
+/// Does the backing collection in slot 0 of an unmodifiable wrapper reach
+/// `iface_name` in its own hierarchy?
+///
+/// `is_subclass_of_by_name` rather than resolving `iface_name` to a `ClassId`
+/// first: the name form neither loads nor looks up, which keeps this on the
+/// no-safepoint side of [`unmod_stamp_display_name`]'s contract. Slot 0 is
+/// `UNMOD_FIELD_BACKING` in `native-collections`.
+fn unmod_backing_reaches(shared: &SharedVm, obj_ref: cratonvm_types::ObjectRef, iface_name: &str) -> bool {
+    if shared.mem.heap.num_fields(obj_ref) == 0 {
+        return false;
+    }
+    let backing = match shared.mem.heap.get_field(obj_ref, 0) {
+        cratonvm_types::Value::Object(Some(b)) => b,
+        _ => return false,
+    };
+    let backing_cid = shared.mem.heap.class_id_of(backing);
+    shared
+        .classes
+        .class_manager
+        .read()
+        .is_subclass_of_by_name(backing_cid, iface_name)
+}
+
+/// The JDK class that a `cratonvm/internal/Unmodifiable*` stamp stands for,
+/// resolved only as far as its FAMILY.
+///
+/// `Object.getClass()` already reports a JDK class for these receivers —
+/// `native-builtins`' `getclass_display_class_id` is the authority, and this
+/// mirrors its stamp table and its slot reads. The ONE thing it deliberately
+/// does not do is pick between the size-discriminated forms (`Map1`/`MapN`,
+/// `List12`/`ListN`, `Set12`/`SetN`), for two reasons that point the same way:
+///
+/// * **It cannot afford to.** The authority reaches the size through
+///   `invoke_virtual(this, "size", "()I")` — it RUNS JAVA CODE. The caller this
+///   exists for is `op_instanceof`/`op_checkcast`, where the receiver has been
+///   popped from the operand stack and is a bare Rust local; the VM's own
+///   root-collection guard already reports that object as
+///   `in_published_snapshot=false` at `site="checkcast"`. Running Java there
+///   would let the collector move a receiver nothing can see.
+/// * **It does not need to.** MEASURED against the oracle's own class files
+///   (`javap`, HotSpot 25.0.3+9): every size pair is supertype-identical.
+///   `Map1` and `MapN` both extend `ImmutableCollections$AbstractImmutableMap`
+///   and implement `Serializable`, and nothing else; `List12`/`ListN` both
+///   extend `AbstractImmutableList`; `Set12`/`SetN` both extend
+///   `AbstractImmutableSet`. `RandomAccess` sits on `AbstractImmutableList`, so
+///   even that cell is size-independent. The size cannot change a subtype
+///   answer, only a name.
+///
+/// Every read below is a heap field read or a class-manager read: nothing here
+/// allocates, loads a class, or reaches a safepoint.
+///
+/// `None` means "no display alias" — the four iterator/entry stamps
+/// (`UnmodifiableItr`, `UnmodifiableListItr`, `UnmodifiableEntryItr`,
+/// `UnmodifiableMapEntry`) land here, exactly as they do in the authority.
+///
+/// docs/known-issues/jdk-only/H18-1-the-opcode-and-the-message-read-different-classes-20260821.md
+pub(crate) fn unmod_stamp_display_name(
+    shared: &SharedVm,
+    obj_ref: cratonvm_types::ObjectRef,
+    stamp_name: &str,
+) -> Option<&'static str> {
+    // Slot 1 is `UNMOD_FIELD_IMMUTABLE` in `native-collections`: set by the
+    // `List.of`/`Set.of`/`Map.of`/`copyOf` factories and clear for the
+    // `Collections.unmodifiable*` wrappers. It is the ONLY thing that tells the
+    // two families apart — they share a stamp. CONTRACT: this index must match
+    // `getclass_immutable_marker`, which reads the same slot.
+    //
+    // Bounds-checked against the OBJECT's header, not the class's declared
+    // field count, and the difference is not academic: `vm_init.rs` registers
+    // all eleven stamps with `ensure_bootstrap_compat_class(.., name, 1)` while
+    // `alloc_unmod_wrapper` allocates them with `try_alloc_synthetic(.., 2)`.
+    // A class-side `num_total_fields >= 2` guard — the shape
+    // `proxy_instance_satisfies_target` uses a few lines above — would reject
+    // every one of these receivers even though slot 1 is really there.
+    //
+    // Evaluated as a CLOSURE, after the name match rather than before it, so
+    // no field is touched for a receiver this function is going to decline.
+    // `cce_display_class_name` calls this on every failed cast in the VM, so
+    // "declines" includes every `java/lang/*` object in the heap.
+    let immutable = || {
+        shared.mem.heap.num_fields(obj_ref) > 1
+            && matches!(
+                shared.mem.heap.get_field(obj_ref, 1),
+                cratonvm_types::Value::Int(1)
+            )
+    };
+    Some(match stamp_name {
+        "cratonvm/internal/UnmodifiableList" => {
+            if immutable() {
+                "java/util/ImmutableCollections$ListN"
+            } else if unmod_backing_reaches(shared, obj_ref, "java/util/RandomAccess") {
+                "java/util/Collections$UnmodifiableRandomAccessList"
+            } else {
+                "java/util/Collections$UnmodifiableList"
+            }
+        }
+        // `UnmodifiableEntrySet` shares `CollSet`'s display in the authority.
+        // That is a KNOWN divergence, not one introduced here: HotSpot reports
+        // `Collections$UnmodifiableMap$UnmodifiableEntrySet` for an
+        // `unmodifiableMap(...).entrySet()` and this VM reports
+        // `Collections$UnmodifiableSet` (MEASURED, both VMs, 2026-08-21 — see
+        // H18-2). Correcting it belongs at the authority, with the `getClass()`
+        // name; mirroring it here keeps the two doors agreeing, which is the
+        // whole point of this function. Both classes are non-`AbstractSet`
+        // wrappers over `UnmodifiableCollection`, so no subtype cell moves.
+        "cratonvm/internal/UnmodifiableSet" | "cratonvm/internal/UnmodifiableEntrySet" => {
+            if immutable() {
+                "java/util/ImmutableCollections$SetN"
+            } else {
+                "java/util/Collections$UnmodifiableSet"
+            }
+        }
+        "cratonvm/internal/UnmodifiableMap" => {
+            if immutable() {
+                "java/util/ImmutableCollections$MapN"
+            } else {
+                "java/util/Collections$UnmodifiableMap"
+            }
+        }
+        "cratonvm/internal/UnmodifiableSortedSet" => "java/util/Collections$UnmodifiableSortedSet",
+        "cratonvm/internal/UnmodifiableNavigableSet" => {
+            "java/util/Collections$UnmodifiableNavigableSet"
+        }
+        "cratonvm/internal/UnmodifiableCollection" => "java/util/Collections$UnmodifiableCollection",
+        _ => return None,
+    })
+}
+
+/// Does the receiver's DISPLAY class — the one `Object.getClass()` reports —
+/// satisfy `target_class_id`?
+///
+/// `Map.of(...)`, `List.of(...)`, `Set.of(...)`, the `copyOf` family and the
+/// `Collections.unmodifiable*` wrappers are all allocated in Compatible mode as
+/// one of eleven `cratonvm/internal/Unmodifiable*` stamps, and `vm_init.rs`
+/// gives every one of those stamps `java/lang/Object` as its superclass with an
+/// accurate INTERFACE list. That is why `Map.of(…) instanceof Map` is right and
+/// `Map.of(…) instanceof AbstractMap` is wrong: the interfaces are declared and
+/// the superclass chain is not there to walk.
+///
+/// `Class.isInstance` has answered this correctly since the Spring
+/// `GenericConversionService` fix (`native-builtins/src/lang_class.rs`, the
+/// "Consistency with `getClass()`" arm). The opcodes never learned to, so the
+/// reflective door and the bytecode door disagreed about ONE object at ONE
+/// instant — MEASURED on seven of seven receivers, and the `RandomAccess` cell
+/// is not cosmetic: `Collections.binarySearch` on an unmodifiable list ran
+/// **886x** slower than on the ArrayList inside it, in the same VM and the same
+/// run, because `Collections` branches on `list instanceof RandomAccess`.
+///
+/// # Can only ADMIT
+///
+/// It runs after every other predicate has declined, and the display class is
+/// the class HotSpot genuinely reports for this receiver, so admitting exactly
+/// that class's supertypes cannot over-admit. The negative control is
+/// `Collections.unmodifiableList(…) instanceof AbstractCollection`, which stays
+/// FALSE because `Collections$UnmodifiableRandomAccessList` extends
+/// `UnmodifiableCollection`, which extends `Object` — verified against the
+/// oracle's class files, not assumed.
+///
+/// # GC safety
+///
+/// The classification runs no Java (see [`unmod_stamp_display_name`]) and is
+/// complete before anything here can safepoint. The one operation that can —
+/// loading the display class on first use — is wrapped in a `native_pin_roots`
+/// entry and `obj_ref` is refreshed from it afterwards, which is why this takes
+/// `&mut ObjectRef`: `op_checkcast` reads the receiver AGAIN in its failure
+/// path, so a move that the caller did not observe would corrupt the
+/// `ClassCastException` it is about to build.
+///
+/// # Cost on the common path
+///
+/// One class-manager read guard, one `Arc<str>` prefix compare that fails at
+/// byte 1 for every `java/…` receiver, and a return. No allocation — strictly
+/// cheaper than [`synthetic_implements`] beside it, which clones the receiver's
+/// class name into a `String` on every call. It sits LAST in the disjunction,
+/// and reaches it only on a path that has already built a `String` for the
+/// target name and taken this same lock twice.
+///
+/// docs/known-issues/jdk-only/H18-1-the-opcode-and-the-message-read-different-classes-20260821.md
+pub(crate) fn display_class_satisfies_target(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    obj_ref: &mut cratonvm_types::ObjectRef,
+    obj_class_id: ClassId,
+    target_class_id: ClassId,
+) -> bool {
+    // Screen, and drop the guard before anything else: `unmod_backing_reaches`
+    // takes the same read lock and `load_class_concurrent` takes the WRITE
+    // lock, on a `parking_lot::RwLock` that is not reentrant. Binding the
+    // result to a `let` is what makes the temporary guard drop here rather than
+    // at the end of the statement — the trap written out at length on
+    // `resolve_component` in `array_is_assignable_to_impl` below.
+    let stamp_name = {
+        let cm = shared.classes.class_manager.read();
+        match cm.get_class(obj_class_id) {
+            Some(c) if c.name.starts_with("cratonvm/internal/Unmodifiable") => c.name.to_string(),
+            // The overwhelmingly common case: not a stamp, nothing to say.
+            _ => return false,
+        }
+    };
+    let Some(display_name) = unmod_stamp_display_name(shared, *obj_ref, &stamp_name) else {
+        return false;
+    };
+    let already_loaded = shared
+        .classes
+        .class_manager
+        .read()
+        .get_loaded_class_id(display_name);
+    let display_class_id = match already_loaded {
+        Some(cid) => cid,
+        None => {
+            // `Map.of()` is served by a native in Compatible mode, so nothing
+            // necessarily loaded `java.util.ImmutableCollections` before this
+            // point. Declining on "not loaded yet" would make the answer depend
+            // on whether anything had called `getClass()` first, which is a
+            // worse defect than the one being fixed. So load it — pinned,
+            // because loading allocates a class mirror and can safepoint.
+            let pin = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(*obj_ref);
+            let loaded = shared.load_class_concurrent(display_name);
+            *obj_ref = thread.native_pin_roots.get(pin).copied().unwrap_or(*obj_ref);
+            thread.native_pin_roots.truncate(pin);
+            match loaded {
+                Ok(cid) => cid,
+                // The display class is not on this classpath. Answer exactly
+                // what this predicate answered before it existed.
+                Err(_) => return false,
+            }
+        }
+    };
+    if display_class_id == target_class_id {
+        return true;
+    }
+    let cm = shared.classes.class_manager.read();
+    cm.is_subclass_of(display_class_id, target_class_id)
+}
+
 /// Check if a lambda proxy object satisfies a target class. Lambda proxy ClassIds
 /// (>= 0x8000_0000) are not in the class store, so normal `is_subclass_of` always
 /// returns false. Instead, we look up the proxy's `functional_interface` and check

@@ -2027,15 +2027,20 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
 
     // --- MethodHandle (1-field: name=0 for debugging) ---
     let mh = "java/lang/invoke/MethodHandle";
-    r.register(
-        mh,
-        "type",
-        "()Ljava/lang/invoke/MethodType;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
+    // `type()` is NOT registered here. It was, with a body that returned
+    // `ctx.get_field(this, 0)` raw, and it never ran once:
+    // `register_t4_method_handle_invoke` runs after this registrar on every
+    // boot arm (`vm/src/vm/vm_init.rs` :2594 and :3298, and
+    // `native-builtins/src/lib.rs`'s synthetic chain) and registers the same
+    // triple with the C19 body that prefers the real-JDK `type` field and
+    // falls back to the synthetic descriptor.
+    //
+    // MEASURED, `--dump-native-registry --explain-jdk-only --jdk-only`:
+    // `java/lang/invoke/MethodHandle.type()Ljava/lang/invoke/MethodType;`
+    // appears twice, `owns_slot=false` here and `owns_slot=true` there.
+    // Deleting the loser is inert; leaving it in place is a landmine, because a
+    // lane retiring the WINNER on a census row would promote this raw slot-0
+    // read in its place.
     r.register(mh, "toString", "()Ljava/lang/String;", |ctx, _args| {
         let s = ctx.create_string("MethodHandle");
         Ok(Some(Value::Object(Some(s))))
@@ -2117,21 +2122,30 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     });
 
     // --- MethodHandles (static utility) ---
+    //
+    // `lookup()` and `privateLookupIn(Class, Lookup)` are NOT registered here,
+    // and the reason is the header comment thirty lines below this one, which
+    // already stated the rule: *"we do not provide stub overrides here — the
+    // real ones take precedence and a stub would only run if the late phase is
+    // not also invoked"*. These two were violations of it, and they were the
+    // dangerous kind.
+    //
+    // Both stubs allocated a bare `MethodHandles$Lookup` and returned it with
+    // slot 0 — the lookup class — NEVER WRITTEN. That is verbatim defect #1 in
+    // `native-builtins/tests/duplicate_registration_gate.rs`'s header: *"a
+    // placeholder registered late shadowed the real implementation; the
+    // returned Lookup's slot 0 was never written, so lookupClass() answered
+    // null. Broke RJdkHidden AND RJdkStrict."*
+    //
+    // MEASURED, `--dump-native-registry --explain-jdk-only --jdk-only`: both
+    // triples appear twice, `owns_slot=false` here and `owns_slot=true` in
+    // `register_p63_method_handles_lookup`, which runs immediately after this
+    // registrar on every boot arm — `vm/src/vm/vm_init.rs` :2588 and :3295,
+    // and `phases_late.rs::register_phase63_natives` for the synthetic chain.
+    // So the deletion is inert TODAY and removes the promotion hazard for
+    // tomorrow.
     let mhs = "java/lang/invoke/MethodHandles";
-    r.register(
-        mhs,
-        "lookup",
-        "()Ljava/lang/invoke/MethodHandles$Lookup;",
-        |ctx, _args| {
-            let lookup =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
-            Ok(Some(Value::Object(Some(lookup))))
-        },
-    );
-    r.register(mhs, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", |ctx, _args| {
-        let lookup = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
-        Ok(Some(Value::Object(Some(lookup))))
-    });
+    let _ = mhs;
 
     // NOT REGISTERED HERE: `MethodHandles.arrayElementVarHandle`.
     //
@@ -2271,11 +2285,11 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // stub overrides here — the real ones take precedence and a stub would
     // only run if the late phase is not also invoked (which would indicate
     // a broken VM startup).
-    let lk = "java/lang/invoke/MethodHandles$Lookup";
-    r.register(lk, "lookupClass", "()Ljava/lang/Class;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
+    //
+    // `MethodHandles$Lookup.lookupClass()` is NOT registered here either — the
+    // third of the same set, `owns_slot=false` in the dump, overwritten by
+    // `register_p63_method_handles_lookup`. It is the READ side of the null
+    // slot 0 the two deleted stubs above produced, so all three went together.
 
     // Lookup.defineHiddenClass: NOT registered here, deliberately.
     //
@@ -2303,6 +2317,18 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // its side-table meta. `sun.security.provider.SHA3.<clinit>` chains
     // `byteArrayViewVarHandle(...).withInvokeExactBehavior()`, which would
     // otherwise hit AbstractMethodError on our synthetic VarHandle.
+    //
+    // DO NOT RETIRE — these two and `accessModeTypeUncached` below are
+    // `declared, NO Code, not ACC_NATIVE` on all nine supported images
+    // (MEASURED, `javap -p --system <image> java.lang.invoke.VarHandle`;
+    // re-derivable with `scripts/jdk-only-no-image-methods.py`). The standard
+    // retirement argument — "real JDK bytecode is behind it, so deleting the
+    // native leaves something to run" — is FALSE for them: this registration is
+    // the only implementation that exists for the receiver, and the sentence
+    // above about `AbstractMethodError` is what the retirement would restore.
+    // `H14-1` 4 sized that bucket at 2 rows because the corpus dispatched 2;
+    // `H25-2` measured the registry and found 1,405 over 193 classes. These are
+    // three of them, marked per `H25-2` N3.
     r.register(
         vh,
         "withInvokeExactBehavior",
@@ -7994,7 +8020,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 if let Some(refusal) = mh_explicit_cast_refusal(ctx, t, mt) {
                     return Err(refusal);
                 }
-                ctx.set_field_by_name(t, "type", Value::Object(Some(mt)));
+                return mh_with_stamped_type(ctx, Value::Object(Some(t)), mt);
             }
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
         },
@@ -8111,12 +8137,16 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
 
 pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     // Mixed block:
-    //   * MethodHandleProxies.asInterfaceInstance is still a SIMPLIFIED stub —
-    //     it returns the MH itself as the "proxy". `isWrapperInstance` and
-    //     `wrapperInstanceTarget` are now answered CONSISTENTLY with that
+    //   * MethodHandleProxies.asInterfaceInstance is a SIMPLIFIED stub — it
+    //     returns the MH itself as the "proxy" — and `isWrapperInstance` /
+    //     `wrapperInstanceTarget` are answered CONSISTENTLY with that
     //     (is-a-MethodHandle / the handle itself) instead of the old blanket
     //     0/null, which contradicted what `asInterfaceInstance` had just
     //     returned. `wrapperInstanceType` is not registered — see below.
+    //     SINCE 2026-08-21 (H19) all three are registered ONLY when this
+    //     registry is NOT being populated for a real JDK image: against a real
+    //     image the simplification is a `ClassCastException` at every call
+    //     site and the JDK's own bytecode is measured correct. See the guard.
     //   * LambdaMetafactory.metafactory / altMetafactory are now a faithful
     //     bridge to the VM's real lambda-proxy machinery (the same one the
     //     `invokedynamic` opcode uses): they register a proxy class via
@@ -8131,15 +8161,73 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // MethodHandleProxies
     let mhp = "java/lang/invoke/MethodHandleProxies";
-    r.register(
-        mhp,
-        "asInterfaceInstance",
-        "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;)Ljava/lang/Object;",
-        |_ctx, args| {
-            // Return the method handle as the proxy (simplified)
-            Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
-        },
-    );
+    // NOT REGISTERED WHEN A REAL JDK IMAGE IS LOADED (H19, 2026-08-21).
+    //
+    // The three registrations below are the `asInterfaceInstance`
+    // simplification and the two queries that were made consistent with it.
+    // They are correct only in the synthetic-JDK image, where
+    // `MethodHandleProxies` has no bytecode at all. Against a real image they
+    // are the entire defect: `asInterfaceInstance` reads `args[1]` and IGNORES
+    // `args[0]` (the interface), so every call site got the `MethodHandle`
+    // itself and threw
+    // `ClassCastException: java.lang.invoke.MethodHandle cannot be cast to
+    // <the requested interface>`.
+    //
+    // The historical reason for the simplification is GONE. The real
+    // `MethodHandleProxies` spins a proxy whose `<init>` does
+    // `target.asType(<MT>)` off an `ldc` of a `CONSTANT_MethodType`, which the
+    // interpreter used to refuse; `vm/src/runtime/interpreter/constants.rs`
+    // decodes both tags today and does so mode-independently.
+    //
+    // MEASURED 2026-08-21 (`C:/craton/cratonvm-r5.exe`, oracle HotSpot
+    // 25.0.3+9), the same program in three arms — the `--jdk-only` arm is the
+    // experiment, because these rows are already dropped there as
+    // `SyntheticStub`:
+    //
+    //   asInterfaceInstance(Greeter.class, mh).getClass()
+    //     HotSpot     jdk.MHProxy1.…$Greeter/0x…       greet("bob") = "hi bob"
+    //     --jdk-only  jdk.MHProxy1.…$Greeter           greet("bob") = "hi bob"
+    //     Compatible  ClassCastException
+    //   isWrapperInstance(<raw MethodHandle>)
+    //     HotSpot false | --jdk-only false | Compatible TRUE
+    //   wrapperInstanceTarget(<raw MethodHandle>)
+    //     HotSpot IllegalArgumentException | --jdk-only IllegalArgumentException
+    //     Compatible returns the handle
+    //   two asInterfaceInstance calls yield distinct instances
+    //     HotSpot true | --jdk-only true | Compatible FALSE
+    //
+    // WHY A GUARD AND NOT A DELETION. `docs/known-issues/jdk-only/H15-3` §1.4
+    // proposed deleting these three outright. Deletion is not available to this
+    // lane and would be red in CI: `vm/src/vm/tests.rs`'s
+    // `method_handle_proxies_p68` calls `isWrapperInstance` through
+    // `call_native`, which PANICS (`"{class}.{method}{descriptor} not
+    // registered"`) on an absent registration, and
+    // `cargo test -p cratonvm-vm --lib --features synthetic-jdk` is a blocking
+    // job. That registry is built by `NativeMethodRegistry::new()` and never
+    // calls `set_drop_real_layout_synthetic`, so the guard below leaves it —
+    // and the synthetic-JDK image, which has no `MethodHandleProxies` bytecode
+    // to fall back to — untouched.
+    //
+    // `drops_real_layout_synthetic()` is the predicate the registry documents
+    // for exactly this question, and a `#[cfg(feature = "synthetic-jdk")]`
+    // guard is explicitly NOT equivalent (`native-api/src/registry.rs`): the
+    // Cargo feature decides what is compiled, the launcher flag decides which
+    // class library loads. Both real-JDK arms of `vm_init` set the flag before
+    // any `register_*` pass, so this drops in `--real-jdk`/Compatible AND in
+    // `--jdk-only` — a no-op for the latter, which already dropped them.
+    //
+    // docs/known-issues/jdk-only/H19-1-three-stand-ins-retired-against-a-real-image-20260821.md §1
+    if !r.drops_real_layout_synthetic() {
+        r.register(
+            mhp,
+            "asInterfaceInstance",
+            "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;)Ljava/lang/Object;",
+            |_ctx, args| {
+                // Return the method handle as the proxy (simplified)
+                Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+            },
+        );
+    }
     // The three queries below used to be blanket `false` / `null` / `null`,
     // which directly contradicted what `asInterfaceInstance` had just handed
     // the caller: under this simplification a "wrapper instance" IS the
@@ -8160,27 +8248,33 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             Ok(None)
         }
     }
-    r.register(
-        mhp,
-        "isWrapperInstance",
-        "(Ljava/lang/Object;)Z",
-        |ctx, args| {
-            let present = mhp_wrapper_handle(ctx, args)?.is_some();
-            Ok(Some(Value::Int(if present { 1 } else { 0 })))
-        },
-    );
-    r.register(
-        mhp,
-        "wrapperInstanceTarget",
-        "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| match mhp_wrapper_handle(ctx, args)? {
-            // Real JDK throws IllegalArgumentException for a non-wrapper; we
-            // keep the historical null there so an existing caller that never
-            // checked `isWrapperInstance` first does not start throwing.
-            Some(mh) => Ok(Some(Value::Object(Some(mh)))),
-            None => Ok(Some(Value::Object(None))),
-        },
-    );
+    // Same guard, same reasoning, and it has to be the same guard: these two
+    // are only coherent BESIDE the `asInterfaceInstance` simplification above.
+    // Dropping that one alone would leave `isWrapperInstance` answering `true`
+    // for a raw handle that the real `asInterfaceInstance` never produced.
+    if !r.drops_real_layout_synthetic() {
+        r.register(
+            mhp,
+            "isWrapperInstance",
+            "(Ljava/lang/Object;)Z",
+            |ctx, args| {
+                let present = mhp_wrapper_handle(ctx, args)?.is_some();
+                Ok(Some(Value::Int(if present { 1 } else { 0 })))
+            },
+        );
+        r.register(
+            mhp,
+            "wrapperInstanceTarget",
+            "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
+            |ctx, args| match mhp_wrapper_handle(ctx, args)? {
+                // Real JDK throws IllegalArgumentException for a non-wrapper; we
+                // keep the historical null there so an existing caller that never
+                // checked `isWrapperInstance` first does not start throwing.
+                Some(mh) => Ok(Some(Value::Object(Some(mh)))),
+                None => Ok(Some(Value::Object(None))),
+            },
+        );
+    }
     // `wrapperInstanceType` is deliberately NOT registered. The registration
     // deleted here keyed on `(Ljava/lang/Object;)Ljava/lang/Class;`, but the
     // real `MethodHandleProxies.wrapperInstanceType(Object)` returns a
@@ -8519,6 +8613,57 @@ fn mh_with_varargs_marking(
     Ok(Some(Value::Object(Some(handle))))
 }
 
+/// `asType(t)` / `explicitCastArguments(h, t)` — a COPY of the receiver
+/// carrying the requested `type`, leaving the receiver untouched.
+///
+/// Both are PURE on every JDK, and both used to stamp the new type onto the
+/// RECEIVER and hand it back. That is not a cosmetic identity difference: two
+/// `asType` calls off one handle overwrote each other, so the FIRST result
+/// silently acquired the second's type (`probes/MhIdentityProbe.java` rows
+/// I36-I39, where `q.asType(A)` reported `A` until `q.asType(B)` ran and then
+/// reported `B`). It also made the refusal predicate read a type its own
+/// previous call had installed — the deviation `mh_astype_refusal`'s own doc
+/// records.
+///
+/// `newType == type` returns the RECEIVER, because that is the JDK's own first
+/// line (`if (newType == type) return this;`) and because it keeps the common
+/// no-op case allocation-free. Measured as I34/I35.
+///
+/// The copy carries the varargs marking with it, so `findStatic(...).asType(t)`
+/// is still a collector — which is what makes `probes/MhVarargsNullProbe.java`
+/// D01/D02 collect.
+fn mh_with_stamped_type(
+    ctx: &mut dyn NativeContext,
+    receiver: Value,
+    new_type: ObjectRef,
+) -> MethodCallResult {
+    let this = match receiver {
+        Value::Object(Some(o)) => o,
+        other => return Ok(Some(other)),
+    };
+    // The JDK's identity shortcut, on the descriptor rather than the
+    // `MethodType` reference: CratonVM mints a fresh `MethodType` per call, so
+    // a reference comparison would never fire.
+    let same = match (
+        ctx.get_field_by_name(this, "type"),
+        methodtype_to_descriptor(ctx, new_type),
+    ) {
+        (Value::Object(Some(old)), Some(new_desc)) => {
+            methodtype_to_descriptor(ctx, old).as_deref() == Some(new_desc.as_str())
+        }
+        _ => false,
+    };
+    if same {
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    let handle = match mh_clone_handle(ctx, this) {
+        Some(copy) => copy,
+        None => this,
+    };
+    ctx.set_field_by_name(handle, "type", Value::Object(Some(new_type)));
+    Ok(Some(Value::Object(Some(handle))))
+}
+
 /// Copy a synthetic `MethodHandle` slot for slot, or `None` when the receiver
 /// is not one of ours.
 ///
@@ -8596,19 +8741,348 @@ thread_local! {
     /// the flag on entry, so the recursive dispatches an adapter arm makes see
     /// `false` — which is what HotSpot does for e.g.
     /// `filterArguments(collector, 0, f).invokeWithArguments(null)`.
-    static MH_GENERIC_SPREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MH_ENTRY_CALL_SITE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Arm [`MH_GENERIC_SPREAD`] for the next [`mh_dispatch`] on this thread.
+/// Arm [`MH_ENTRY_CALL_SITE`] for the next [`mh_dispatch`] on this thread.
 /// Call it IMMEDIATELY before the dispatch — anything in between that itself
 /// dispatches a handle would consume it.
-fn arm_generic_spread() {
-    MH_GENERIC_SPREAD.with(|f| f.set(true));
+///
+/// `descriptor` is the type the JDK would `asType` to: `genericMethodType(m)`
+/// for `invokeWithArguments`, and the literal call-site descriptor for
+/// `invoke` (see `cratonvm_native_api::poly_call_site`). For a virtual or
+/// special handle it is the RECEIVER-STRIPPED form, because that is the shape
+/// `mh_dispatch` compares it against.
+fn arm_entry_call_site(descriptor: &str) {
+    MH_ENTRY_CALL_SITE.with(|f| *f.borrow_mut() = Some(descriptor.to_string()));
 }
 
-/// Read and clear [`MH_GENERIC_SPREAD`].
-fn take_generic_spread() -> bool {
-    MH_GENERIC_SPREAD.with(|f| f.replace(false))
+/// Read and clear [`MH_ENTRY_CALL_SITE`].
+fn take_entry_call_site() -> Option<String> {
+    MH_ENTRY_CALL_SITE.with(|f| f.borrow_mut().take())
+}
+
+/// `genericMethodType(m)` as a descriptor — what `invokeWithArguments` always
+/// adapts to, and the reason a `null` is COLLECTED on that door: its trailing
+/// parameter is `Object`, which no array type is ever assignable from.
+fn generic_method_type_descriptor(m: usize) -> String {
+    let mut s = String::with_capacity(2 + m * 18 + 18);
+    s.push('(');
+    for _ in 0..m {
+        s.push_str(DESC_OBJECT);
+    }
+    s.push(')');
+    s.push_str(DESC_OBJECT);
+    s
+}
+
+/// Drop a descriptor's FIRST parameter — the receiver, for a virtual or
+/// special handle whose call site names it but whose `MH_DESC` does not.
+fn descriptor_without_first_param(desc: &str) -> Option<String> {
+    let close = desc.find(')')?;
+    // `parse_descriptor_param_and_return`, NOT `parse_descriptor_types`: the
+    // latter unwraps a class type to its NAME (`java/lang/String`), so
+    // rejoining its output produces `(java/lang/String)V` — a string that is
+    // not a descriptor and that every comparison downstream then reads wrong.
+    let (params, _) = crate::lang_class::parse_descriptor_param_and_return(desc);
+    if params.is_empty() {
+        return None;
+    }
+    Some(format!("({}){}", params[1..].concat(), &desc[close + 1..]))
+}
+
+/// Render one JVM type descriptor the way a `ClassCastException` message does:
+/// a class as its dotted binary name, an array as its descriptor with dots.
+///
+/// MEASURED on HotSpot 25 (`probes/MhVarargsNullProbe.java` G02/H03):
+/// `Cannot cast [Ljava.lang.String; to java.lang.String`.
+fn jvm_type_display(desc: &str) -> String {
+    if let Some(inner) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+        return inner.replace('/', ".");
+    }
+    desc.replace('/', ".")
+}
+
+/// May `value` be cast to the reference type `desc`?
+///
+/// FAILS OPEN. Every "no" produced here becomes a `ClassCastException` a
+/// caller did not get before, so the only ones worth producing are the ones
+/// the class hierarchy positively contradicts — an unloaded target, an
+/// interface, a class this context cannot resolve, all answer `true`. Same
+/// rule, and the same reason, as `NativeContext::aastore_element_assignable`'s
+/// "must never produce a FALSE ArrayStoreException".
+fn entry_value_casts_to(ctx: &dyn NativeContext, value: ObjectRef, desc: &str) -> bool {
+    if desc == DESC_OBJECT {
+        return true;
+    }
+    // ARRAY-NESS COMES FROM THE HEAP, NOT FROM THE CLASS NAME. A CratonVM array
+    // object's `class_id_of_object` resolves to its COMPONENT class, so a
+    // `String[]` reports `java/lang/String` here — reading array-ness off that
+    // name inverted every array row at once: `fa.invokeWithArguments(new
+    // String[]{"x"})` threw `Cannot cast java.lang.String to
+    // [Ljava.lang.String;` for an argument that IS a `String[]`, and the
+    // already-packed `String[]` of B06 sailed through the component check it
+    // was supposed to fail.
+    let have_is_array = ctx.object_is_array(value);
+    let want_is_array = desc.starts_with('[');
+    if have_is_array != want_is_array {
+        // An array is only ever castable to another array (or to `Object`,
+        // handled above), and a non-array is never castable to one. The shape
+        // settles both without asking the hierarchy.
+        return false;
+    }
+    if want_is_array {
+        // Covariance: `Object[]` accepts every reference array, and anything
+        // finer needs a component class this context does not expose for an
+        // array object. Fail open.
+        return true;
+    }
+    let want = match desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+        Some(inner) => inner,
+        None => return true,
+    };
+    let have = match ctx.class_name_of_id(ctx.class_id_of_object(value)) {
+        Some(n) => n,
+        None => return true,
+    };
+    if have == want {
+        return true;
+    }
+    match (ctx.class_id_by_name(&have), ctx.class_id_by_name(want)) {
+        (Some(h), Some(w)) => ctx.is_subclass(h, w),
+        _ => true,
+    }
+}
+
+/// Does the CALL SITE name the collector's trailing array type, so that the
+/// JDK's `AsVarargsCollector.asType` takes its passthrough shortcut?
+///
+/// The shortcut's condition is `arity matches AND
+/// arrayType.isAssignableFrom(newType.parameterType(collectArg))`. Measured
+/// rows: G01/G06/G09 (exact type -> passthrough), G03/G04 (`Object[]` param,
+/// `String[]` site -> still passthrough, because the assignability is real),
+/// G02/G05/G07 (`Object` site -> collect).
+fn call_site_names_trailing_array(call_site: Option<&str>, target_desc: &str) -> bool {
+    let cs = match call_site {
+        Some(cs) => cs,
+        None => return false,
+    };
+    let (target_params, _) = crate::lang_class::parse_descriptor_param_and_return(target_desc);
+    let (site_params, _) = crate::lang_class::parse_descriptor_param_and_return(cs);
+    if target_params.len() != site_params.len() || target_params.is_empty() {
+        return false;
+    }
+    let want = &target_params[target_params.len() - 1];
+    let have = &site_params[site_params.len() - 1];
+    if want == have {
+        return true;
+    }
+    if !want.starts_with('[') || !have.starts_with('[') {
+        return false;
+    }
+    // `Object[]` is assignable from every reference array.
+    want[1..].starts_with('L') && &want[1..] == DESC_OBJECT
+}
+
+/// The `WrongMethodTypeException` an entry door raises when the supplied
+/// arity cannot be adapted to the handle at all.
+fn entry_wrong_method_type(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    call_site: &str,
+) -> MethodCallFailed {
+    let old_desc = match ctx.get_field_by_name(mh, "type") {
+        Value::Object(Some(mt)) => methodtype_to_descriptor(ctx, mt),
+        _ => mh_read_desc(ctx, mh),
+    };
+    let old_shown = old_desc
+        .as_deref()
+        .and_then(method_type_display)
+        .unwrap_or_else(|| "(?)?".to_string());
+    let new_shown = method_type_display(call_site).unwrap_or_else(|| call_site.to_string());
+    crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/invoke/WrongMethodTypeException",
+        &format!("cannot convert MethodHandle{old_shown} to {new_shown}"),
+    )
+}
+
+/// The `ClassCastException` an entry door's cast raises.
+fn entry_class_cast(
+    ctx: &mut dyn NativeContext,
+    value: ObjectRef,
+    want: &str,
+) -> MethodCallFailed {
+    let have = entry_value_type_display(ctx, value);
+    crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/lang/ClassCastException",
+        &format!("Cannot cast {have} to {}", jvm_type_display(want)),
+    )
+}
+
+/// The name a `ClassCastException` gives the VALUE's class.
+///
+/// An array object's `class_id_of_object` resolves to its COMPONENT class here
+/// — measured: a `String[]` reported `java.lang.String`, so the message read
+/// `Cannot cast java.lang.String to java.lang.String` — so the array's own name
+/// has to be rebuilt around it. The eight primitive component letters are the
+/// JVMS §4.3.2 descriptor spelling, not an inference; the REFERENCE shape is
+/// the one measured against HotSpot (`probes/MhVarargsNullProbe.java` B06/G02:
+/// `Cannot cast [Ljava.lang.String; to java.lang.String`).
+fn entry_value_type_display(ctx: &dyn NativeContext, value: ObjectRef) -> String {
+    let base = ctx
+        .class_name_of_id(ctx.class_id_of_object(value))
+        .unwrap_or_else(|| "java/lang/Object".to_string());
+    if !ctx.object_is_array(value) || base.starts_with('[') {
+        return base.replace('/', ".");
+    }
+    let component = match base.as_str() {
+        "int" => "I".to_string(),
+        "long" => "J".to_string(),
+        "double" => "D".to_string(),
+        "float" => "F".to_string(),
+        "short" => "S".to_string(),
+        "byte" => "B".to_string(),
+        "char" => "C".to_string(),
+        "boolean" => "Z".to_string(),
+        other => format!("L{other};"),
+    };
+    format!("[{component}").replace('/', ".")
+}
+
+/// One argument of an entry-door adaptation: reference casts are CHECKED,
+/// primitives are left to `adapt_invoke_args`/`build_varargs_array` downstream.
+fn entry_cast_check(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    want: &str,
+) -> Result<(), MethodCallFailed> {
+    if !matches!(want.as_bytes().first(), Some(b'L') | Some(b'[')) {
+        return Ok(());
+    }
+    let obj = match value {
+        // `null` casts to every reference type, which is exactly why the null
+        // rows of this family are about COLLECTION and not about casting.
+        Value::Object(Some(o)) => o,
+        _ => return Ok(()),
+    };
+    if entry_value_casts_to(ctx, obj, want) {
+        Ok(())
+    } else {
+        Err(entry_class_cast(ctx, obj, want))
+    }
+}
+
+/// `asType(callSiteType)` — the step every `MethodHandle.invoke` and
+/// `invokeWithArguments` performs before the invocation itself, applied to
+/// CratonVM's argument list.
+///
+/// # Why this is a second function and not a flag on `collect_trailing_varargs`
+///
+/// That one is a REPAIR: it reshapes an argument list that arrived flat, and it
+/// is deliberately permissive because it also serves adapter chains and
+/// internal Rust callers whose arity it cannot vouch for (JRuby's
+/// `insertArguments`-built call sites are the case it was written for). This
+/// one is a CONTRACT: on a door where the call-site type is known, the JDK
+/// either adapts exactly or throws, and the difference between the two is
+/// visible — a fixed-arity handle handed two arguments is a
+/// `WrongMethodTypeException` on every JDK and was a silently gathered array
+/// here (`probes/MhVarargsNullProbe.java` H02/H10, `MhIdentityProbe` I06).
+///
+/// Applied only to MH_KIND_STATIC and MH_KIND_CONSTRUCTOR, and only when the
+/// static handle has no bound receiver — the kinds where `MH_DESC` is exactly
+/// the parameter list the caller supplies, so the arity comparison means what
+/// it says. Every other kind keeps the permissive path.
+fn mh_entry_adapt(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    call_site: &str,
+    target_desc: &str,
+    is_collector: bool,
+    params: &[Value],
+) -> Result<Vec<Value>, MethodCallFailed> {
+    let (ptypes, _) = crate::lang_class::parse_descriptor_param_and_return(target_desc);
+    let n = ptypes.len();
+    let m = params.len();
+    let trailing_array = n >= 1 && ptypes[n - 1].starts_with('[');
+
+    if is_collector && trailing_array {
+        // "The caller must supply, at a minimum, N-1 arguments, where N is the
+        // arity of the target" — MethodHandle.asVarargsCollector's javadoc.
+        if m + 1 < n {
+            return Err(entry_wrong_method_type(ctx, mh, call_site));
+        }
+        if m == n && call_site_names_trailing_array(Some(call_site), target_desc) {
+            for (i, p) in params.iter().enumerate() {
+                entry_cast_check(ctx, *p, &ptypes[i])?;
+            }
+            return Ok(params.to_vec());
+        }
+        let mut out: Vec<Value> = Vec::with_capacity(n);
+        for i in 0..n - 1 {
+            entry_cast_check(ctx, params[i], &ptypes[i])?;
+            out.push(params[i]);
+        }
+        let component = ptypes[n - 1][1..].to_string();
+        for p in &params[n - 1..] {
+            entry_collect_element_check(ctx, *p, &component)?;
+        }
+        let arr = build_varargs_array(ctx, &component, &params[n - 1..]);
+        out.push(Value::Object(arr));
+        return Ok(out);
+    }
+
+    if m != n {
+        return Err(entry_wrong_method_type(ctx, mh, call_site));
+    }
+    for (i, p) in params.iter().enumerate() {
+        entry_cast_check(ctx, *p, &ptypes[i])?;
+    }
+    Ok(params.to_vec())
+}
+
+/// One element on its way into a collector's array.
+///
+/// A reference component is the ordinary cast check. A PRIMITIVE component
+/// refuses `null`, which the JDK reports through the unboxing call it was
+/// about to make — MEASURED for `int` (`probes/MhVarargsNullProbe.java` G08)
+/// and transcribed:
+///
+/// ```text
+/// Cannot invoke "java.lang.Number.intValue()" because the return value of
+/// "sun.invoke.util.ValueConversions.primitiveConversion(sun.invoke.util.Wrapper, Object, boolean)" is null
+/// ```
+///
+/// Only the six `Number` primitives get that text. `char` and `boolean` unbox
+/// through `Character`/`Boolean` rather than `Number`, their message was not
+/// measured, and inventing one would be a guess — they keep the old coercion.
+fn entry_collect_element_check(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    component: &str,
+) -> Result<(), MethodCallFailed> {
+    let numeric = match component {
+        "I" => "intValue",
+        "J" => "longValue",
+        "F" => "floatValue",
+        "D" => "doubleValue",
+        "S" => "shortValue",
+        "B" => "byteValue",
+        _ => return entry_cast_check(ctx, value, component),
+    };
+    if matches!(value, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(format!(
+                "Cannot invoke \"java.lang.Number.{numeric}()\" because the return value of \
+                 \"sun.invoke.util.ValueConversions.primitiveConversion(sun.invoke.util.Wrapper, \
+                 Object, boolean)\" is null"
+            )),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Mint one of the `__mh_*_wrapper__` combinator carriers that `MH_BOUND`
@@ -10151,7 +10625,7 @@ pub(crate) fn mh_dispatch(
     // `asVarargsCollector()` on a fixed-arity one yields a handle that does),
     // not on the target's `ACC_VARARGS` flag. `probes/MhVarargsNullProbe.java`
     // rows D03 and D04 are exactly that pair of controls.
-    let generic_collector = take_generic_spread() && mh_is_varargs_collector(ctx, mh);
+    let entry_call_site = take_entry_call_site();
     // A real-JDK guard/invoker adapter can ultimately target a foreign
     // downcall. Its downcall state lives above the MethodHandle metadata
     // slots, so dispatch it directly rather than decoding the generic layout.
@@ -10187,6 +10661,15 @@ pub(crate) fn mh_dispatch(
     };
     let name = mh_read_name(ctx, mh).unwrap_or_default();
     let desc = mh_read_desc(ctx, mh).unwrap_or_default();
+    // Two readings of the same fact, for the two paths below. `is_collector`
+    // is the handle's own marking; `generic_collector` is the permissive
+    // path's narrower question — "did the call arrive through a door that
+    // could NOT have named the trailing array type", which is what decides a
+    // `null` there.
+    let is_collector = mh_is_varargs_collector(ctx, mh);
+    let generic_collector = entry_call_site.is_some()
+        && is_collector
+        && !call_site_names_trailing_array(entry_call_site.as_deref(), &desc);
     let kind = match ctx.get_field(mh, MH_KIND) {
         Value::Int(k) => k,
         _ => MH_KIND_VIRTUAL,
@@ -10258,10 +10741,19 @@ pub(crate) fn mh_dispatch(
                 }
                 _ => extra_args.to_vec(),
             };
-            // Collect trailing varargs (no-op unless the target is ACC_VARARGS and
-            // the args were supplied flat — see `collect_trailing_varargs`).
-            let full =
-                collect_trailing_varargs(ctx, &class, &name, &desc, &full, generic_collector);
+            // On a door whose call-site type is known, run the JDK's
+            // `asType(callSiteType)` exactly; otherwise repair the argument
+            // list the permissive way. A BOUND receiver disqualifies the
+            // strict path: `bindTo` prepends a value the call site never
+            // named, so the arity comparison would be off by one — and the JDK
+            // agrees that a bound handle "is never a variable-arity method
+            // handle, even if the original target method handle was".
+            let full = match entry_call_site.as_deref() {
+                Some(cs) if !matches!(bound, Value::Object(Some(_))) => {
+                    mh_entry_adapt(ctx, mh, cs, &desc, is_collector, &full)?
+                }
+                _ => collect_trailing_varargs(ctx, &class, &name, &desc, &full, generic_collector),
+            };
             let adapted = adapt_invoke_args(ctx, &full, &desc);
             let result = ctx.invoke(&class, &name, &desc, &adapted);
             box_direct_primitive_return(
@@ -10315,8 +10807,17 @@ pub(crate) fn mh_dispatch(
             // `<init>([Ljava/lang/String;)V` with two flat arguments and built
             // an empty array (`probes/MhVarargsNullProbe.java` B18, measured
             // `H[]` against HotSpot's `H[a, b]`).
-            let collected =
-                collect_trailing_varargs(ctx, &class, &name, &desc, extra_args, generic_collector);
+            let collected = match entry_call_site.as_deref() {
+                Some(cs) => mh_entry_adapt(ctx, mh, cs, &desc, is_collector, extra_args)?,
+                None => collect_trailing_varargs(
+                    ctx,
+                    &class,
+                    &name,
+                    &desc,
+                    extra_args,
+                    generic_collector,
+                ),
+            };
             let adapted = adapt_invoke_args(ctx, &collected, &desc);
             let new_obj = ctx.read_native_pin(new_obj_pin, new_obj);
             let mut init_args = Vec::with_capacity(1 + adapted.len());
@@ -12043,6 +12544,14 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let extra = &args[1..];
+            // TAKEN FIRST. `adapt_invoke_args` below unboxes wrappers, which can
+            // re-enter the interpreter and reach the signature-polymorphic
+            // dispatch block again — and that block CLEARS the channel for
+            // every name it does not arm.
+            let call_site = cratonvm_native_api::poly_call_site::take();
+            if crate::nbflags().dbg_mh_dispatch {
+                eprintln!("[MH_INVOKE_CALLSITE] {call_site:?}");
+            }
             let desc = mh_read_desc(ctx, this).unwrap_or_default();
             let kind = match ctx.get_field(this, MH_KIND) {
                 Value::Int(k) => k,
@@ -12062,6 +12571,24 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             } else {
                 adapt_invoke_args(ctx, extra, &desc)
             };
+            // The one door where the answer genuinely varies with what the
+            // caller WROTE: `mh.invoke((String[]) null)` passes the null
+            // through and `mh.invoke((Object) null)` collects it into a
+            // one-element array. `vm_exec`'s signature-polymorphic dispatch
+            // publishes the descriptor; a miss simply leaves the permissive
+            // path in charge, which is the pre-2026-08-21 behaviour.
+            //
+            // A virtual or special call site names the receiver and `MH_DESC`
+            // does not, so strip it here rather than teach every comparison
+            // downstream about the difference.
+            if let Some(cs) = call_site {
+                let cs = if needs_receiver && !has_bound {
+                    descriptor_without_first_param(&cs).unwrap_or(cs)
+                } else {
+                    cs
+                };
+                arm_entry_call_site(&cs);
+            }
             let result = mh_dispatch(ctx, this, &adapted);
             // Constructor MH already returns the new object; skip auto_box_return
             // which would incorrectly convert the result to null (desc ends in V).
@@ -12123,7 +12650,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                         Value::Int(k) => k,
                         _ => MH_KIND_VIRTUAL,
                     };
-                    arm_generic_spread();
+                    arm_entry_call_site(&generic_method_type_descriptor(0));
                     let result = mh_dispatch(ctx, this, &[]);
                     return if kind == MH_KIND_CONSTRUCTOR {
                         result
@@ -12146,7 +12673,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 Value::Int(k) => k,
                 _ => MH_KIND_VIRTUAL,
             };
-            arm_generic_spread();
+            arm_entry_call_site(&generic_method_type_descriptor(unpacked.len()));
             let result = mh_dispatch(ctx, this, &unpacked);
             if kind == MH_KIND_CONSTRUCTOR {
                 result
@@ -12183,7 +12710,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 Value::Int(k) => k,
                 _ => MH_KIND_VIRTUAL,
             };
-            arm_generic_spread();
+            arm_entry_call_site(&generic_method_type_descriptor(unpacked.len()));
             let result = mh_dispatch(ctx, this, &unpacked);
             if kind == MH_KIND_CONSTRUCTOR {
                 result
@@ -12475,7 +13002,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 if let Some(refusal) = mh_astype_refusal(ctx, this, mt) {
                     return Err(refusal);
                 }
-                ctx.set_field_by_name(this, "type", Value::Object(Some(mt)));
+                return mh_with_stamped_type(ctx, Value::Object(Some(this)), mt);
             }
             Ok(Some(args[0]))
         },
@@ -12485,6 +13012,11 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // do not subclass BoundMethodHandle still get rebind() called by JDK
     // internals (e.g. Invokers, LambdaForm specialization). Return self so the
     // chain continues without "no Code attribute" internal errors.
+    //
+    // DO NOT RETIRE. Confirmed against all nine supported images: `rebind()` is
+    // `abstract` on `java.lang.invoke.MethodHandle` on every one of them, so
+    // there is no bytecode to fall back to and the comment above describes the
+    // exact failure a retirement would restore. `H25-2` N3.
     r.register(
         mh,
         "rebind",
@@ -14616,18 +15148,100 @@ mod tests {
     /// `take_generic_spread` ever became a peek, a null reaching an inner
     /// collector through e.g. `filterArguments(collector, 0, f)` would be
     /// collected where HotSpot passes it straight through.
+    /// The passthrough shortcut's condition, row for row against
+    /// `probes/MhVarargsNullProbe.java`'s G-block.
+    #[test]
+    fn the_call_site_decides_whether_a_collector_wraps() {
+        let vf = "([Ljava/lang/String;)Ljava/lang/String;";
+        let ov = "([Ljava/lang/Object;)Ljava/lang/String;";
+        let mx = "(Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/String;";
+        let iv = "([I)Ljava/lang/String;";
+        // G01/G06/G09 — the call site names the array type exactly.
+        assert!(call_site_names_trailing_array(Some(vf), vf));
+        assert!(call_site_names_trailing_array(
+            Some("(Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/String;"),
+            mx
+        ));
+        assert!(call_site_names_trailing_array(Some(iv), iv));
+        // G03/G04 — `Object[]` IS assignable from `String[]`, so still a
+        // passthrough. An exact-match-only rule would have collected here.
+        assert!(call_site_names_trailing_array(Some(vf), ov));
+        // G02/G05/G07 — an `Object` call site never names an array.
+        assert!(!call_site_names_trailing_array(
+            Some("(Ljava/lang/Object;)Ljava/lang/String;"),
+            vf
+        ));
+        assert!(!call_site_names_trailing_array(
+            Some("(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/String;"),
+            mx
+        ));
+        // The generic door, whose trailing parameter is always `Object`.
+        assert!(!call_site_names_trailing_array(
+            Some(&generic_method_type_descriptor(1)),
+            vf
+        ));
+        // A differing arity is not a passthrough at all — the collector has to
+        // gather, which is what makes `iwa()` an empty array rather than a
+        // refusal.
+        assert!(!call_site_names_trailing_array(
+            Some(&generic_method_type_descriptor(3)),
+            vf
+        ));
+        // `String[]` does NOT accept an `Object[]` call site (the unsound
+        // direction), and no call site at all is never a passthrough.
+        assert!(!call_site_names_trailing_array(Some(ov), vf));
+        assert!(!call_site_names_trailing_array(None, vf));
+    }
+
+    #[test]
+    fn the_generic_method_type_is_all_objects() {
+        assert_eq!(generic_method_type_descriptor(0), "()Ljava/lang/Object;");
+        assert_eq!(
+            generic_method_type_descriptor(2),
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+        );
+    }
+
+    /// A virtual call site names the receiver and `MH_DESC` does not.
+    #[test]
+    fn the_receiver_is_stripped_from_a_virtual_call_site() {
+        assert_eq!(
+            descriptor_without_first_param("(LFoo;Ljava/lang/String;)V").as_deref(),
+            Some("(Ljava/lang/String;)V")
+        );
+        assert_eq!(
+            descriptor_without_first_param("(LFoo;)Ljava/lang/Object;").as_deref(),
+            Some("()Ljava/lang/Object;")
+        );
+        // Nothing to strip.
+        assert_eq!(descriptor_without_first_param("()V"), None);
+    }
+
+    /// The spelling a `ClassCastException` uses. MEASURED rows B06/G02 and H03
+    /// of `probes/MhVarargsNullProbe.java`.
+    #[test]
+    fn the_cast_message_spells_an_array_as_a_descriptor() {
+        assert_eq!(jvm_type_display("Ljava/lang/String;"), "java.lang.String");
+        assert_eq!(jvm_type_display("[Ljava/lang/String;"), "[Ljava.lang.String;");
+        assert_eq!(jvm_type_display("[I"), "[I");
+    }
+
     #[test]
     fn the_generic_spread_flag_is_taken_not_peeked() {
         // Starts clear on a fresh thread.
-        assert!(!take_generic_spread());
-        arm_generic_spread();
-        assert!(take_generic_spread(), "the outermost dispatch sees it");
-        assert!(!take_generic_spread(), "a nested dispatch must not");
-        // Arming twice is still one dispatch's worth.
-        arm_generic_spread();
-        arm_generic_spread();
-        assert!(take_generic_spread());
-        assert!(!take_generic_spread());
+        assert_eq!(take_entry_call_site(), None);
+        arm_entry_call_site("(Ljava/lang/Object;)Ljava/lang/Object;");
+        assert_eq!(
+            take_entry_call_site().as_deref(),
+            Some("(Ljava/lang/Object;)Ljava/lang/Object;"),
+            "the outermost dispatch sees it"
+        );
+        assert_eq!(take_entry_call_site(), None, "a nested dispatch must not");
+        // Arming twice is still one dispatch's worth, and the last one wins.
+        arm_entry_call_site("()V");
+        arm_entry_call_site("(I)V");
+        assert_eq!(take_entry_call_site().as_deref(), Some("(I)V"));
+        assert_eq!(take_entry_call_site(), None);
     }
 
     #[test]

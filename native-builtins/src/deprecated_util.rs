@@ -1427,6 +1427,65 @@ fn make_hashtable_enumeration(
     Ok(Some(Value::Object(Some(en))))
 }
 
+/// The JDK's own `Collections.emptyEnumeration()` carrier, or `None` when this
+/// image cannot produce one.
+///
+/// This is the carrier HotSpot hands back from `Hashtable.keys()`/`elements()`
+/// on an EMPTY table: `Hashtable.getEnumeration(int)` short-circuits to
+/// `Collections.emptyEnumeration()` when `count == 0` rather than building an
+/// `Enumerator`, and that carrier is deliberately NOT an `Iterator`. It is the
+/// premise [`hashtable_has_entry`] already states in its doc block and the one
+/// this VM had no way to honour: the empty case fell through to
+/// [`make_hashtable_enumeration`], whose primary arm fabricates
+/// `java/util/Enumeration$Impl`.
+///
+/// MEASURED 2026-08-21, `new Hashtable<>().keys()`, one probe, three arms:
+///
+/// | | class | `instanceof Iterator` | `nextElement()` past the end |
+/// |---|---|---|---|
+/// | HotSpot 25.0.3+9 | `Collections$EmptyEnumeration` | false | `NoSuchElementException` |
+/// | CratonVM `--jdk-only` | `Collections$3` | false | `NoSuchElementException` |
+/// | CratonVM Compatible | `Enumeration$Impl` | **true** | **returns** |
+///
+/// Three divergences at one site, not one — and the populated table was already
+/// correct in both arms (`Hashtable$Enumerator`), so the defect is
+/// EMPTY-CONDITIONED and a probe that only fills the table cannot see it.
+///
+/// Same rule as [`real_hashtable_enumerator`] and
+/// `classloader::real_snapshot_enumeration`: prefer a real class the JDK builds
+/// itself over a name no image declares. `None` — never a fabrication — when
+/// the method is absent, which is the synthetic-JDK shape and also what
+/// `MockNativeContext`/the in-tree test registry answer, so both keep the
+/// snapshot carrier they have always had.
+///
+/// docs/known-issues/jdk-only/H19-2-the-empty-container-was-the-only-one-still-fabricating-20260821.md
+fn real_empty_enumeration(
+    ctx: &mut dyn NativeContext,
+) -> Result<Option<ObjectRef>, cratonvm_types::error::MethodCallFailed> {
+    if !ctx.method_exists(
+        "java/util/Collections",
+        "emptyEnumeration",
+        "()Ljava/util/Enumeration;",
+    ) {
+        return Ok(None);
+    }
+    // `?`, not a swallow. `classloader::real_snapshot_enumeration` — the sibling
+    // this mirrors, reached from the very same two call sites on the strict arm
+    // today — propagates, and swallowing an `Err(ExceptionThrown)` here would
+    // DISCARD a live `Throwable` rather than deliver it. A shape that is merely
+    // unexpected (a void or null return) still falls back to the snapshot
+    // carrier, which is the case worth being lenient about.
+    match ctx.invoke(
+        "java/util/Collections",
+        "emptyEnumeration",
+        "()Ljava/util/Enumeration;",
+        &[],
+    )? {
+        Some(Value::Object(Some(e))) => Ok(Some(e)),
+        _ => Ok(None),
+    }
+}
+
 /// `elements()Ljava/util/Enumeration;` — java.base's own `Enumerator` over the
 /// live table when one can be built, else a snapshot of values.
 fn native_hashtable_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1439,6 +1498,17 @@ fn native_hashtable_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         this = refreshed;
     }
     let values = collect_hashtable(ctx, this, false);
+    // An EMPTY snapshot must yield the JDK's own `Collections$EmptyEnumeration`
+    // — see [`real_empty_enumeration`] for the three-arm measurement and for
+    // why `hashtable_has_entry` is the WRONG key here (it also answers false
+    // for a NON-empty `Properties`, which must keep the snapshot arm below).
+    // GC: nothing to lose. This branch runs Java code and can move the heap,
+    // but `values` is empty by construction and `this` is not read again.
+    if values.is_empty() {
+        if let Some(e) = real_empty_enumeration(ctx)? {
+            return Ok(Some(Value::Object(Some(e))));
+        }
+    }
     // FIX: type marker 0 = values/elements snapshot.
     make_hashtable_enumeration(ctx, values, 0)
 }
@@ -1446,10 +1516,16 @@ fn native_hashtable_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// `keys()Ljava/util/Enumeration;` — java.base's own `Enumerator` over the live
 /// table when one can be built, else a snapshot of keys.
 ///
-/// The snapshot arm is unchanged and still reached in two cases: an image with
-/// no real `java.util.Hashtable$Enumerator` (the synthetic-JDK shape), and a
-/// receiver whose slot-0 buckets hold nothing — see [`hashtable_has_entry`] for
-/// why those two are the same question.
+/// The snapshot arm is still reached in two cases: an image with no real
+/// `java.util.Hashtable$Enumerator` (the synthetic-JDK shape), and a receiver
+/// whose slot-0 buckets hold nothing — see [`hashtable_has_entry`] for why
+/// those two are the same question.
+///
+/// Since 2026-08-21 (H19) an EMPTY snapshot is diverted BEFORE that arm to the
+/// JDK's own `Collections.emptyEnumeration()` carrier, which is what a real JVM
+/// returns there; see [`real_empty_enumeration`]. That is the only case where
+/// the snapshot arm was reached with nothing to enumerate, and it is the case
+/// `Compatible` mode got wrong in three ways at once.
 fn native_hashtable_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let mut this = obj_arg(args, 0)?;
     if hashtable_has_entry(ctx, this) {
@@ -1462,6 +1538,14 @@ fn native_hashtable_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         this = refreshed;
     }
     let keys = collect_hashtable(ctx, this, true);
+    // See the twin in `native_hashtable_elements` and
+    // [`real_empty_enumeration`]. Keyed on the SNAPSHOT being empty, not on
+    // `hashtable_has_entry`.
+    if keys.is_empty() {
+        if let Some(e) = real_empty_enumeration(ctx)? {
+            return Ok(Some(Value::Object(Some(e))));
+        }
+    }
     // FIX: type marker 1 = keys snapshot.
     make_hashtable_enumeration(ctx, keys, 1)
 }

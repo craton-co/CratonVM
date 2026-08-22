@@ -2295,7 +2295,18 @@ pub(super) fn op_instanceof(
                             }
                         }
                         let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
-                        if shared
+                        // Bound to a `let` rather than left inline in the `if`
+                        // condition, and that is load-bearing: the
+                        // `class_manager.read()` temporary below is dropped at
+                        // the end of THIS statement, so it is not still held
+                        // when `display_class_satisfies_target` runs. That arm
+                        // can take the class-manager WRITE lock (it loads the
+                        // display class on first use) and `parking_lot::RwLock`
+                        // is not reentrant, so evaluating it inside the same
+                        // expression would self-deadlock. Same trap, and the
+                        // same remedy, as `resolve_component` in
+                        // `typecheck::array_is_assignable_to_impl`.
+                        let assignable = shared
                             .classes
                             .class_manager
                             .read()
@@ -2313,6 +2324,21 @@ pub(super) fn op_instanceof(
                                 shared,
                                 obj_ref,
                                 &target_class_name,
+                            );
+                        // LAST, after every cheap predicate: the receiver's
+                        // `getClass()` display class. `Class.isInstance` has
+                        // consulted it since the Spring `GenericConversionService`
+                        // fix and the opcodes never did, so the two doors
+                        // disagreed about one object at one instant — MEASURED
+                        // on seven of seven immutable/unmodifiable receivers.
+                        // H18-1.
+                        if assignable
+                            || display_class_satisfies_target(
+                                shared,
+                                thread,
+                                &mut obj_ref,
+                                obj_class_id,
+                                target_class_id,
                             )
                         {
                             1
@@ -2485,7 +2511,11 @@ pub(super) fn op_checkcast(
                             }
                         }
                         let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
-                        shared
+                        // Bound to a `let`, not left as the block's trailing
+                        // expression: that drops the `class_manager.read()`
+                        // temporary before the display arm below, which can
+                        // take the WRITE lock. See the twin in `op_instanceof`.
+                        let assignable = shared
                             .classes
                             .class_manager
                             .read()
@@ -2503,6 +2533,19 @@ pub(super) fn op_checkcast(
                                 shared,
                                 obj_ref,
                                 &target_class_name,
+                            );
+                        // `&mut obj_ref` is not decoration: the failure path
+                        // below reads the receiver AGAIN (`class_id_of`, then
+                        // `cce_display_class_name`). The display arm can load a
+                        // class and therefore safepoint, so it pins and hands
+                        // back the possibly-moved reference. H18-1.
+                        assignable
+                            || display_class_satisfies_target(
+                                shared,
+                                thread,
+                                &mut obj_ref,
+                                obj_class_id,
+                                target_class_id,
                             )
                     };
                     if !cast_ok {

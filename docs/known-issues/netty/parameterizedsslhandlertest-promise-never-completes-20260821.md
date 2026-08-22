@@ -25,6 +25,34 @@ Both halves matter:
 * **`waiters == 1`** — the parked thread **did** register itself
   (`incWaiters()`) before calling `wait()`.
 
+> ### ⚠ This dump is UNSOUND under a moving collector — read the caveat
+>
+> `Monitor::wait` captures the awaited `ObjectRef` at entry and holds it as a
+> plain Rust local for the whole wait. **Nothing remaps it.** `monitor_wait`
+> does remap once, from the GC pointer map, but only *before* entering the wait;
+> after that the thread is parked and any G1 evacuation moves the promise out
+> from under that address. `thread_registry`'s `jmx_waiting_monitor` is the same
+> shape — an `ObjectRef` that no GC pass scans or forwards. Over a 420 s stall
+> there are many collections.
+>
+> So the `[WAIT-OBJECT]` line above may be reading the **pre-relocation copy**,
+> and G1 leaves that copy intact in the from-region until it is reused — which
+> is exactly why the fields still parse as a plausible `DefaultPromise`. The
+> same applies to the orphan check below: its `0 hits` is not trustworthy in
+> either direction, because it re-reads the mark word through the same stale
+> address.
+>
+> **The conclusion does not rest on this dump.** It rests on the
+> `CRATONVM_WAIT_SPURIOUS_MS` A/B: waking the parked thread makes the run
+> complete, and when it wakes it re-evaluates `isDone()` *in Java*, through a
+> properly remapped reference. That is sound, and it is what establishes the
+> promise was already complete. Treat the field dump as corroboration that has
+> not earned its place until the handle is made GC-safe.
+>
+> Fixing the instrument means holding the awaited object in something the
+> collector forwards (a pinned native root, or re-reading it from a scanned
+> slot on each 5 ms poll) — worth doing before this dump is cited again.
+
 And it is parked at `DefaultPromise.awaitUninterruptibly` BCI 31, which `javap`
 resolves to `Object.wait()`, in `futex_do_wait`, burning no CPU.
 
@@ -79,12 +107,43 @@ Either is a happens-before failure across `monitorenter`/`monitorexit`.
 |---|---:|---:|
 | baseline (`c21d766ad`) | 40 | 3 |
 | baseline (spurious binary, switch OFF) | 40 | 2 |
-| `CRATONVM_JIT_DENY=DefaultPromise` | 10 | 0 |
+| `CRATONVM_JIT_DENY=DefaultPromise` (orphan binary) | 10 | 0 |
+| `CRATONVM_JIT_DENY=DefaultPromise` (fields binary, engagement proven) | 50 | **4** |
 
-~5–7.5%. The JIT-deny arm is **not** conclusive at 10 runs (≈0.6 expected) — it
-needs ~50 to separate 6% from 0%, and is the obvious next A/B now that the
-mechanism is known, since a compiled `monitorenter`/`monitorexit` missing a
-fence is the leading candidate for the stale read.
+~5–7.5%.
+
+**The JIT is REFUTED.** The first deny arm (0/10) proved nothing — 10 runs at a
+6% rate expects 0.6 — so it was re-run toward 50 with the lever's engagement
+proven first (below). It stalled at **run 4**, which settled it without needing
+50 — 50 runs were only ever required to demonstrate *absence*, and one stall
+demonstrates *presence*. The arm was left to finish anyway and ended
+**4 stalls in 50 (8%)**, statistically indistinguishable from the 6.25%
+baseline (5/80): the lever moves the rate not at all. The stalled run carries the identical signature, with
+`DefaultPromise` force-interpreted:
+
+```
+[WAIT-OBJECT] class=io/netty/util/concurrent/DefaultPromise
+              result=Some(Object(Some(...)))  waiters=Some(Int(1))
+orphan hits: 0
+```
+
+So the stale read is **not** in `DefaultPromise`'s compiled code, and a compiled
+`monitorenter`/`monitorexit` missing a fence is no longer the candidate. **The
+defect is tier-independent — it is in the VM's monitor implementation itself**
+(the interpreter path included), or in the `Object.wait`/`notifyAll`
+bookkeeping around it.
+
+Engagement was proven before trusting either arm: with the lever set,
+`still-interpreted` rises 20 → 32 and the hot-but-stuck list names the denied
+methods outright —
+
+```
+42036 invocations  compile-failed  DefaultPromise.isDone0(Ljava/lang/Object;)Z
+29492 invocations  compile-failed  DefaultPromise.isDone()Z
+```
+
+`isDone`/`isDone0` are precisely the volatile `result` read at BCI 20, i.e. the
+arm did test candidate (1) directly.
 
 ## Instruments added (all default-OFF or watchdog-only)
 
@@ -99,7 +158,7 @@ fence is the leading candidate for the stale read.
   Engagement-proven: with the switch unset a never-notified waiter parks
   forever; with it set the waiter returns.
 * the orphan check, and `dump_wait_object_state` (the `[WAIT-OBJECT]` line
-  above).
+  above) — **both unsound under a moving collector; see the caveat box.**
 
 **Do not read `CRATONVM_WAIT_SPURIOUS_MS` as a fix.** It converts a permanent
 hang into an `n`-second delay by papering over a lost wakeup; at 100 ms it also
@@ -115,10 +174,24 @@ explicitly **not** shown to cause this stall.
 
 ## Next
 
-1. Decide which read goes stale — instrument `monitorenter`/`monitorexit`
-   fencing, or A/B `CRATONVM_JIT_DENY=DefaultPromise` to ~50 runs.
-2. Fix the ordering; re-measure the rate over ≥40 runs.
-3. Fix the selector-registry leak independently.
+0. **Make the wait-site handle GC-safe first**, or every field-level measurement
+   here stays unfalsifiable. `Monitor::wait`'s `obj` and
+   `thread_registry::jmx_waiting_monitor` are both raw `ObjectRef`s that no GC
+   pass forwards. (The JMX one is a defect in its own right: a JMX query naming
+   a waiting thread's monitor reads a stale object under any moving collector.)
+1. A plain missing fence is now UNLIKELY and should not be assumed: the thin
+   path CASes `Acquire` on lock (`try_thin_lock`) and `Release` on unlock
+   (`try_thin_unlock`), and the inflated path goes through a
+   `parking_lot::Mutex` — a release/acquire pair there publishes ordinary heap
+   writes just as well as Java fields, because it is one hardware edge. An
+   earlier revision of this page asserted "nothing publishes them"; that was
+   wrong. Audit instead the **inflation transition** and the
+   thin→inflated handover, where the two orderings meet.
+2. Cheapest confirmation: log `waiters` as the completer reads it, next to the
+   value the waiter wrote — through a GC-safe handle per step 0. A 0-vs-1
+   disagreement names the failing edge directly and needs one stall, not a rate.
+3. Fix the ordering; re-measure the rate over ≥40 runs.
+4. Fix the selector-registry leak independently.
 
 ## Repro
 

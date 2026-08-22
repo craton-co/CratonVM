@@ -1,34 +1,4 @@
-# HotSpot oracle for probes/OpaqueUriProbe.java
-#
-# Temurin 25.0.3+9 (/data/toolchain/jdk-25), captured 2026-08-21.
-#
-# The O-rows are OPAQUE URIs, the H-rows the hierarchical controls. Before the
-# opaque guard in `uri_query_units` (native-builtins/src/net_phase_e.rs),
-# CratonVM answered a non-null `getQuery()`/`getRawQuery()` for every opaque
-# URI carrying a `?` — O01, O04, O09, O11 and the C01/C03 constructor rows —
-# which is what made Spring's `WebClientUtils.getRequestDescription` fall out of
-# its opaque short-circuit and print `GET mailto:`
-# (WebClientUtilsTests.opaqueUriUnchanged, the reported failure).
-#
-# Fixed in the same change: R01 (an opaque base is inert for
-# `URI.resolve`) and H11 (`isOpaque`/`isAbsolute` asked whether a colon
-# appeared ANYWHERE, so the relative reference `/redirect:account?q=1` read as
-# an absolute opaque URI).
-#
-# TWO rows still diverge on CratonVM. Both are HIERARCHICAL `URI.resolve`
-# behaviour, outside the opaque family, and are recorded in
-# docs/known-issues/spring/ :
-#
-#   R13  URI.create("https://h/a/b?q=1").resolve("")
-#        HotSpot applies RFC 3986 5.2(6a) — an empty reference path keeps the
-#        base's DIRECTORY and drops the base query, giving `https://h/a/`.
-#        CratonVM returns the base verbatim.
-#
-#   R15  URI.create("https://h/a/b").resolve("https://x/p/../q")
-#        A reference that carries its own scheme is returned by the JDK as the
-#        argument OBJECT, unnormalized. CratonVM rebuilds it through
-#        `uri_remove_dot_segments` and hands back `https://x/q`.
-#
+# HotSpot openjdk version "25.0.4" 2026-07-21 LTS oracle for OpaqueUriProbe.java
 O01 .toString = mailto:user@example.com?subject=hello
 O01 .isOpaque = true
 O01 .isAbsolute = true
@@ -631,3 +601,49 @@ R13 hier.resolve(empty) = https://h/a/
 R14 hier.resolve(lone-fragment) = https://h/a/b?q=1#f
 R15 hier.resolve(abs-with-dots) = https://x/p/../q
 R16 hier.resolve(rel) = https://h/a/c
+N01 https://h/a/../../x .normalize = https://h/../x
+N02 /a/../../x .normalize = /../x
+N03 https://h/a/b/../c .normalize = https://h/a/c
+N04 a/../../b .normalize = ../b
+N05 https://h/a/./b .normalize = https://h/a/b
+N06 https://h/a/b/.. .normalize = https://h/a/
+N07 https://h/a/b/. .normalize = https://h/a/b/
+N08 /../x .normalize = /../x
+N09 https://h/../x .normalize = https://h/../x
+N10 a/b/../../../c .normalize = ../c
+N11 https://h/a//b .normalize = https://h/a/b
+N12 ./a/b .normalize = a/b
+S01 https://h/a/b?q=1 resolve <empty> = https://h/a/
+S02 https://h/a/b?q=1 resolve #f = https://h/a/b?q=1#f
+S03 https://h/a/b?q=1 resolve ?q=2 = https://h/a/?q=2
+S04 https://h/a/b?q=1 resolve ?q=2#f = https://h/a/?q=2#f
+S05 https://h/a/b?q=1 resolve . = https://h/a/
+S06 https://h/a/b?q=1 resolve .. = https://h/
+S07 https://h/a/b?q=1 resolve /x = https://h/x
+S08 https://h/a/b?q=1 resolve c = https://h/a/c
+S09 https://h/a/b?q=1 resolve //other/p = https://other/p
+S10 https://h/a/b?q=1 resolve //other/p/../q = https://other/p/../q
+S11 https://h/a/b?q=1 resolve https://x/p/../q = https://x/p/../q
+S12 https://h/a/b?q=1 resolve https://x/p/../q?z=1#w = https://x/p/../q?z=1#w
+S13 https://h/a/b?q=1 resolve mailto:c@d?x=1 = mailto:c@d?x=1
+S14 https://h/a/ resolve <empty> = https://h/a/
+S15 https://h/a resolve <empty> = https://h/
+S16 https://h/ resolve <empty> = https://h/
+S17 https://h resolve <empty> = https://h
+S18 https://h/a/b#g resolve #g = https://h/a/b#g
+S19 https://h/a/b#g resolve <empty> = https://h/a/
+S20 https://h/a/b resolve c/../d = https://h/a/d
+S21 https://h/a/b resolve ./e = https://h/a/e
+S22 /base/path?q=1 resolve <empty> = /base/
+S23 /base/path?q=1 resolve x = /base/x
+S24 mailto:a@b resolve #f = #f
+S25 https://h/a/b?q=1 resolve /p/../q = https://h/p/../q
+S26 https://h/a/b?q=1 resolve /p/./q = https://h/p/./q
+S27 https://h/a/b resolve ../../x = https://h/../x
+S28 https://h/a/b resolve ? = https://h/a/?
+S29 https://h/a/b resolve # = https://h/a/b#
+S30 file:/a/b resolve <empty> = file:/a/
+S31 https://h/a/b resolve //other = https://other
+S32 https://h/a/b?q=1 resolve //other?z=2 = https://other?z=2
+S33 https://h/a/b resolve c#f = https://h/a/c#f
+S34 https://h/a/b resolve //other/p?z=2#w = https://other/p?z=2#w
