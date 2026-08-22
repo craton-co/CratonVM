@@ -536,7 +536,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-212 tokens.
+213 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -722,6 +722,7 @@ export inherited from a parent shell.
 | `sp-tailcall` | `CRATONVM_JIT_SP_TAILCALL` |
 | `spec-bce` | `CRATONVM_JIT_NO_SPEC_BCE` |
 | `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
+| `static-bytecode-callee` | `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` |
 | `statics-index` | `CRATONVM_NO_STATICS_INDEX` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
@@ -755,7 +756,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-66 tokens.
+68 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -783,6 +784,8 @@ export inherited from a parent shell.
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
 | `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |
+| `gpu-chunk-streams` | `CRATONVM_GPU_CHUNK_STREAMS` |
+| `gpu-chunks` | `CRATONVM_GPU_CHUNKS` |
 | `gpu-critical-lease-ms` | `CRATONVM_GPU_CRITICAL_LEASE_MS` |
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |

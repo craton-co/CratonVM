@@ -35,12 +35,28 @@ on it. Those two are consequences of the rc=1, not separate defects.
 > r14   SUITE=core    66 /  67   RLangPackages                  (RTreeRangeGc PASSED)
 > ```
 >
-> So under the corpus it is **intermittent**, and this host is one where load
-> flips PASS/FAIL rather than only timings. Anything below that reasons from
-> "it always fails" is weaker than it reads — in particular, a single green
-> corpus run does NOT show the gap closed. Use the isolated `--Xmx 64m` repro,
-> three runs, for any before/after judgement; that is the arm the binary table
-> below was measured on.
+> **RE-CORRECTED 2026-08-22, later: one outlier in eight, not “intermittent”.**
+> Four corpus runs on this host, two compatible arms each:
+>
+> ```text
+> r13  all FAIL   core FAIL
+> r14  all FAIL   core PASS   <- the single outlier, and the one this note was written from
+> r15  all FAIL   core FAIL
+> r16  all FAIL   core FAIL
+> ```
+>
+> Seven of eight compatible observations FAIL and every strict one PASSES, so
+> the honest reading is **deterministic and mode-dependent, with a rare
+> flake** — not “intermittent”, which is what one outlier looked like at the
+> time. `WORKER-5` reached the same conclusion from 12 ABBA-interleaved runs
+> on their own binary (strict PASS x6, compatible FAIL x6) and their framing
+> is the one to keep: **“flaky” is a property of a BINARY AND A HOST, not of a
+> vector.** Both of us called it a flake first, from different binaries.
+>
+> The practical rule is unchanged: judge before/after on the isolated
+> `--Xmx 64m` arm, three runs, not on one corpus cell — a single green corpus
+> run does NOT show the gap closed. That is the arm the binary table below was
+> measured on.
 >
 > The `--jdk-only` PASS is a separate matter and is NOT the flake: it reproduces
 > 2/2 deliberately, and the mechanism is in the mode section further down.
@@ -115,6 +131,16 @@ interpreter frame root set." That was too broad, and the mode arm says so:
 --Xmx 64m                 rc=1  2/2   (no PASS line)
 --Xmx 64m --jdk-only      rc=0  2/2   PASS RTreeRangeGc (14014 checks)
 ```
+
+> **REFUTED 2026-08-22 — strict mode is not clean, it is LESS SENSITIVE.**
+> The two-row arm below was measured at one heap size. Squeeze it and
+> `--jdk-only` goes red: **`--Xmx 48m` FAIL 2/2, `--Xmx 32m` FAIL 2/2**, and
+> `--Xmx 64m` itself flaked to FAIL on one of two runs. So the `pass` is a
+> threshold, not immunity, and **every inference in the rest of this section
+> rests on it**. The unrooted reference cannot be attributed to the substituted
+> collection natives on this evidence, because the gap survives their removal.
+> Measured on a pristine `origin/dev` build at `bf85389bb`; see
+> `jdk-only/WORKER-1-NOTE-2-rtreerangegc-range-views-and-a-repro-that-disagrees-20260822.md`.
 
 **Strict mode is CLEAN.** `--jdk-only` drops the substituted collection natives
 and runs the JDK's own `TreeMap`/`TreeSet` bytecode, and the gap goes with them.
