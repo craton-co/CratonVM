@@ -82,6 +82,40 @@ const SIG_OFF_KEYOBJ: usize = 5;
 const SIG_OFF_SPIOBJ: usize = 6;
 const SIG_PRIVATE_SLOTS: usize = 7;
 
+/// Is `this` one of THIS engine's own `java.security.Signature` synthetics,
+/// i.e. does it carry the private slots above?
+///
+/// It does not when the object is a provider's SPI that `sig_get_instance`
+/// handed back UNWRAPPED — see the `spi_is_signature_subclass` branch there.
+/// Such a receiver is the provider's own class, and `synthetic_base_offset`
+/// counts `java.security.Signature`'s fields, so `base + SIG_OFF_*` indexes
+/// straight into the SUBCLASS's declared fields: a read returns the provider's
+/// data mistaken for ours, and a write destroys it.
+fn sig_slots_are_ours(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(this))
+        .is_some_and(|n| n == "java/security/Signature")
+}
+
+/// Read one private slot, or `Value::Object(None)` when the receiver has none.
+fn sig_slot_get(ctx: &mut dyn NativeContext, this: ObjectRef, off: usize) -> Value {
+    if !sig_slots_are_ours(ctx, this) {
+        return Value::Object(None);
+    }
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    ctx.get_field(this, base + off)
+}
+
+/// Write one private slot; a no-op when the receiver has none. Every caller
+/// also writes the authoritative side table, so skipping the slot loses
+/// nothing.
+fn sig_slot_set(ctx: &mut dyn NativeContext, this: ObjectRef, off: usize, v: Value) {
+    if !sig_slots_are_ours(ctx, this) {
+        return;
+    }
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    ctx.set_field(this, base + off, v);
+}
+
 // ---------------------------------------------------------------------------
 // SigProbe fix: process-wide side tables for Signature algorithm / state /
 // key id.  Real-JDK `Signature` is allocated against the loaded class whose
@@ -204,8 +238,14 @@ fn get_sig_user_spi(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(Str
 
 /// The live application `SignatureSpi` for this `Signature`, if it has one.
 fn sig_user_spi_obj(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
-    let base = synthetic_base_offset(ctx, "java/security/Signature");
-    match ctx.get_field(this, base + SIG_OFF_SPIOBJ) {
+    // An SPI that is ITSELF a `java.security.Signature` subclass is returned to
+    // the caller unwrapped, so the receiver here IS the SPI. There is no
+    // wrapper and no slot to read; forwarding to `this` is what makes every
+    // engine call below reach the provider's own `engine*` bytecode.
+    if !sig_slots_are_ours(ctx, this) {
+        return get_sig_user_spi(ctx, this).map(|_| this);
+    }
+    match sig_slot_get(ctx, this, SIG_OFF_SPIOBJ) {
         Value::Object(Some(o)) => Some(o),
         _ => None,
     }
@@ -444,7 +484,7 @@ fn key_id_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> u64 {
         }
     }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    match ctx.get_field(this, base + SIG_OFF_KEYID) {
+    match sig_slot_get(ctx, this, SIG_OFF_KEYID) {
         Value::Long(id) => id as u64,
         Value::Int(id) => id as u64,
         _ => 0,
@@ -474,14 +514,11 @@ fn extract_key_id_from_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> u64 {
 
 fn append_data(ctx: &mut dyn NativeContext, this: ObjectRef, data: &[u8]) {
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let cur = match ctx.get_field(this, base + SIG_OFF_PENDING) {
+    let cur = match sig_slot_get(ctx, this, SIG_OFF_PENDING) {
         Value::Int(n) => n,
         _ => 0,
     };
-    ctx.set_field(
-        this,
-        base + SIG_OFF_PENDING,
-        Value::Int(cur + data.len() as i32),
+    sig_slot_set(ctx, this, SIG_OFF_PENDING, Value::Int(cur + data.len() as i32),
     );
     let key = sig_key(ctx, this);
     sig_payload_table()
@@ -507,7 +544,7 @@ fn take_data(
     this: ObjectRef,
 ) -> Result<Vec<u8>, cratonvm_types::error::MethodCallFailed> {
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
+    sig_slot_set(ctx, this, SIG_OFF_PENDING, Value::Int(0));
     let key = sig_key(ctx, this);
     let taken = sig_payload_table().lock().remove(&key);
     match taken {
@@ -976,7 +1013,7 @@ fn try_chain_signature_spi(
 /// The key object stashed at `init` time, if any.
 fn sig_key_object(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    match ctx.get_field(this, base + SIG_OFF_KEYOBJ) {
+    match sig_slot_get(ctx, this, SIG_OFF_KEYOBJ) {
         Value::Object(Some(o)) => Some(o),
         _ => None,
     }
@@ -1091,7 +1128,7 @@ fn drive_real_mldsa(
     verify_sig: Option<Vec<u8>>,
 ) -> MethodCallResult {
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let key = match ctx.get_field(this, base + SIG_OFF_KEYOBJ) {
+    let key = match sig_slot_get(ctx, this, SIG_OFF_KEYOBJ) {
         Value::Object(Some(o)) => o,
         _ => {
             return Err(refuse_uninitialized(
@@ -1316,21 +1353,90 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         };
         let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.unpin_native_roots(obj_pin);
+        let owner = requested_provider.unwrap_or_else(|| {
+            crate::jca::provider_chain::find_service_provider("Signature", &alg)
+                .unwrap_or_default()
+        });
+        // THE JDK'S OWN RULE, which this engine did not implement.
+        // `Signature.getInstance` wraps the SPI in a `Signature$Delegate` ONLY
+        // when the SPI is not already a `Signature`:
+        //
+        //     if (instance.impl instanceof Signature sig) { sig.algorithm = ...;
+        //     } else { sig = new Delegate((SignatureSpi) instance.impl, ...); }
+        //     sig.provider = instance.provider; return sig;
+        //
+        // Wrapping unconditionally is not a cosmetic difference: a provider
+        // extends `java.security.Signature` PRECISELY so callers can cast the
+        // result to its own interface. BouncyCastle's stateful PQC signers do
+        // exactly that — `XMSSSignatureSpi` extends `Signature` and implements
+        // `StateAwareSignature`, and every caller opens with
+        //
+        //     (StateAwareSignature) Signature.getInstance(oid, "BCPQC")
+        //
+        // which on this VM was `ClassCastException: class java.security
+        // .Signature cannot be cast to ...StateAwareSignature`, deterministically,
+        // on the first call (`pqc.jcajce.provider.test.XMSSTest.testExhaustion`,
+        // `.testKeyExtraction`; HotSpot returns
+        // `XMSSSignatureSpi$withSha256`). The failing cast also emitted the
+        // reclaim guard's `in_published_snapshot=false site="checkcast"` line,
+        // which `op_checkcast` prints for EVERY failed cast and which reads as
+        // a collector defect — it is not one; there had been no collection at
+        // all when the probe reproduced this.
+        //
+        // The unwrapped object is its own SPI: `sig_user_spi_obj` answers
+        // `this` for it, so `initSign`/`update`/`sign`/`verify` forward to the
+        // provider's own `engine*` methods, and the private slots are skipped
+        // (`sig_slots_are_ours`) because they would land on the subclass's
+        // fields. All of the state this engine keeps for it lives in the
+        // identity-keyed side tables, which do not care whose class it is.
+        if spi_is_signature_subclass(ctx, spi) {
+            let spi_pin = ctx.pin_native_root(spi);
+            let algo_str = ctx.create_string(&alg);
+            let spi = ctx.read_native_pin(spi_pin, spi);
+            ctx.set_field_by_name(spi, "algorithm", Value::Object(Some(algo_str)));
+            ctx.unpin_native_roots(spi_pin);
+            set_sig_algo(ctx, spi, idx);
+            set_sig_state(ctx, spi, STATE_UNINIT);
+            set_sig_keyid(ctx, spi, 0);
+            let key = sig_key(ctx, spi);
+            sig_user_spi_table()
+                .lock()
+                .insert(key, (owner, spi_class));
+            return Ok(Some(Value::Object(Some(spi))));
+        }
         ctx.set_field(obj, base + SIG_OFF_SPIOBJ, Value::Object(Some(spi)));
         let key = sig_key(ctx, obj);
-        sig_user_spi_table().lock().insert(
-            key,
-            (
-                requested_provider.unwrap_or_else(|| {
-                    crate::jca::provider_chain::find_service_provider("Signature", &alg)
-                        .unwrap_or_default()
-                }),
-                spi_class,
-            ),
-        );
+        sig_user_spi_table().lock().insert(key, (owner, spi_class));
         return Ok(Some(Value::Object(Some(obj))));
     }
     Ok(Some(Value::Object(Some(obj))))
+}
+
+/// Is `spi` a `java.security.Signature` subclass rather than a bare
+/// `SignatureSpi`?
+///
+/// The JDK asks `instance.impl instanceof Signature` and this is the same
+/// question. `java.security.Signature` itself does not count: this engine's
+/// own synthetic is that class, and a provider registering it verbatim would
+/// have no `engine*` overrides to forward to.
+fn spi_is_signature_subclass(ctx: &mut dyn NativeContext, spi: ObjectRef) -> bool {
+    let mut cid = ctx.class_id_of_object(spi);
+    if ctx
+        .class_name_of_id(cid)
+        .is_some_and(|n| n == "java/security/Signature")
+    {
+        return false;
+    }
+    while let Some(parent) = ctx.superclass_of(cid) {
+        if ctx
+            .class_name_of_id(parent)
+            .is_some_and(|n| n == "java/security/Signature")
+        {
+            return true;
+        }
+        cid = parent;
+    }
+    false
 }
 
 /// Forward one call to the application's `SignatureSpi`, pinning the receiver
@@ -1502,8 +1608,8 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     set_sig_state(ctx, this, STATE_SIGN);
-    ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_SIGN));
-    ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
+    sig_slot_set(ctx, this, SIG_OFF_STATE, Value::Int(STATE_SIGN));
+    sig_slot_set(ctx, this, SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
         let mut kid = extract_key_id_from_key(ctx, *k);
         let alg = get_sig_algo(ctx, this).unwrap_or(-1);
@@ -1528,10 +1634,10 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             }
         }
         set_sig_keyid(ctx, this, kid);
-        ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
+        sig_slot_set(ctx, this, SIG_OFF_KEYID, Value::Long(kid as i64));
         // Stash the real key object for the SunEC ECDSA drive path (slot is
         // GC-scanned, so the ref survives init→update→sign relocations).
-        ctx.set_field(this, base + SIG_OFF_KEYOBJ, Value::Object(Some(*k)));
+        sig_slot_set(ctx, this, SIG_OFF_KEYOBJ, Value::Object(Some(*k)));
     }
     clear_data(ctx, this);
     Ok(None)
@@ -1557,8 +1663,8 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     set_sig_state(ctx, this, STATE_VERIFY);
-    ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_VERIFY));
-    ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
+    sig_slot_set(ctx, this, SIG_OFF_STATE, Value::Int(STATE_VERIFY));
+    sig_slot_set(ctx, this, SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
         let mut kid = extract_key_id_from_key(ctx, *k);
         let alg = get_sig_algo(ctx, this).unwrap_or(-1);
@@ -1583,10 +1689,10 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             }
         }
         set_sig_keyid(ctx, this, kid);
-        ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
+        sig_slot_set(ctx, this, SIG_OFF_KEYID, Value::Long(kid as i64));
         // Stash the real key object for the SunEC ECDSA drive path (slot is
         // GC-scanned, so the ref survives init→update→sign relocations).
-        ctx.set_field(this, base + SIG_OFF_KEYOBJ, Value::Object(Some(*k)));
+        sig_slot_set(ctx, this, SIG_OFF_KEYOBJ, Value::Object(Some(*k)));
     }
     clear_data(ctx, this);
     Ok(None)
@@ -2109,7 +2215,7 @@ fn sig_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // error path is reserved for the cryptographic operations above.
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     let idx =
-        get_sig_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
+        get_sig_algo(ctx, this).unwrap_or_else(|| match sig_slot_get(ctx, this, SIG_OFF_ALGO) {
             Value::Int(i) => i,
             _ => -1,
         });
@@ -2247,7 +2353,7 @@ fn sig_get_provider_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     let idx =
-        get_sig_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
+        get_sig_algo(ctx, this).unwrap_or_else(|| match sig_slot_get(ctx, this, SIG_OFF_ALGO) {
             Value::Int(i) => i,
             _ => -1,
         });
