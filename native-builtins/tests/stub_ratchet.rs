@@ -765,6 +765,92 @@ use cratonvm_types::compat::CompatibilityMode;
 /// baseline — and it is the test that matters, because it is the one that
 /// rejected 28 further triples the 36-vector screen had passed
 /// (`java/lang/ref/`, `sun/nio/fs/`; see `G90-1` §5).
+///
+/// # H3-1 REBASELINE — SUPERSEDED BY THE `H0 RE-FREEZE` NOTE BELOW
+///
+/// **This block is H3-1's PREDICTION, kept for the reasoning in it. The
+/// prediction was WRONG and the measured outcome is in the next section —
+/// read that one for the current value.** Predicted: old 1622, delta −7,
+/// new 1615. Measured: **+4, not −7**, and the constant below is 1626.
+/// The prediction is left standing rather than deleted because the reason
+/// it was wrong is the useful part: it assumed the only change was its own
+/// seven deletions, and a gate that had not run since 2026-08-14 was
+/// hiding three other movements.** The seven
+/// `java.util.function` default/static-method stubs `G89-1` N1 nominated were
+/// DELETED from `native-builtins/src/phases_late/streams.rs`
+/// (`Predicate.{and,or,negate,not}`, `Consumer.andThen`,
+/// `BinaryOperator.{maxBy,minBy}`), so both this count and
+/// [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`] fall by the same 7 — a genuine
+/// **removal**, not a relabel, which is exactly the case the two-column rule
+/// exists to distinguish.
+///
+/// **The number above is deliberately left at 1622 and is NOT to be taken as
+/// the post-change count.** H3-1 could not build or run; a slack-free ratchet
+/// with a hand-written value that lands too HIGH silently re-admits that many
+/// new stubs, and one written from arithmetic rather than a run is exactly the
+/// species this file's own history records ("a constant derived by arithmetic
+/// from the other configuration sat six above the truth for a week"). Leaving
+/// it high is the safe direction: the assert is `<=`, so the run PASSES and
+/// prints `IMPROVED`-shaped output plus the exact constant to paste.
+///
+/// The one command that recomputes it — run BOTH, paste BOTH:
+///
+/// ```text
+/// cargo test -p cratonvm-native-builtins --features management \
+///     --test stub_ratchet synthetic_stub_count_does_not_regress -- --nocapture
+/// cargo test -p cratonvm-native-builtins \
+///     --test stub_ratchet synthetic_stub_count_does_not_regress -- --nocapture
+/// ```
+///
+/// Each prints `stub-ratchet: const <NAME>: usize = <n>;` — paste that line.
+/// Anything other than −7 in either configuration is a finding to attribute
+/// before re-freezing: use `CRATONVM_RATCHET_ROWS=1` on this commit and on
+/// `26e4b5db4` and diff the sorted `stub-ratchet(row):` lines.
+/// # H0 RE-FREEZE — 2026-08-20, MEASURED, and the delta was NOT the predicted one
+///
+/// H3-1 predicted -7 in both configurations. **Measured: +4 in both**, with the
+/// row column up 65. The whole delta is named, by diffing the `@@STUB` lines at
+/// the freeze commit `083998c7b` against this tree -- 11 added, 7 removed:
+///
+/// **+8, cause (b), the opposite of a regression.** The eight
+/// `sun/nio/fs/WindowsFileAttributes` accessors (`creationTime`,
+/// `lastAccessTime`, `lastModifiedTime`, `isDirectory`, `isOther`,
+/// `isRegularFile`, `isSymbolicLink`, `size`) were RETIRED as shadows by H2-1,
+/// so they stopped claiming to be `Bridge` and now read `SyntheticStub` --
+/// which means `--jdk-only` drops them and real `WindowsFileAttributes`
+/// bytecode runs, reading the Windows FILETIME fields H2-1 taught the VM to
+/// populate. **This wave's headline win arrives at this gate as a RISE.** Do
+/// not read it as one; verified live, not inert: all eight print
+/// `[JDK-ONLY-REFUSED]` under `CRATONVM_DBG_DROPPED_STUBS=1` and `RFileTimes`
+/// still passes 68 checks.
+///
+/// **+3, pre-existing, arrived by merge.**
+/// `cratonvm/internal/ss/JavaUtilJarAccess$1.{entryFor,getTrustedAttributes,isInitializing}`.
+/// Not new fakes: that receiver is a **CratonVM-internal** SharedSecrets
+/// carrier, so there is no real JDK class being shadowed and `SyntheticStub` is
+/// the honest kind. They became COUNTED rather than written, because
+/// `b7e24364f` corrected the accessor spelling (`javaUtilJarAccess`, no `get`
+/// prefix -- the real method never carried one) and a door measured
+/// `method-nowhere`-dead went live. They entered this tree through the
+/// `origin/dev` merge, not through wave H.
+///
+/// **-7, a genuine removal.** H3-1's seven `java.util.function` default/static
+/// stubs, exactly as it claimed.
+///
+/// The other ~61 of the +65 rows are NON-stub registrations from work that
+/// landed on `dev` concurrently. They are visible here only because this gate
+/// could not run: it was red from 2026-08-14 (`G89-1` §4) and then did not
+/// PARSE at all from merge `26e4b5db4` until H3-1 repaired it, so this is the
+/// first adjudication since `083998c7b`.
+///
+/// **An instrument finding, recorded because it will bite the next re-freeze.**
+/// The failure message tells you to "run `dump_synthetic_stubs` here and at the
+/// commit that last set the baseline, and diff the sorted `@@STUB` lines". That
+/// was **impossible**: `dump_synthetic_stubs` did not exist at `083998c7b`. The
+/// diff above was only possible by back-porting the function into a scratch
+/// worktree at that commit. The procedure works for baselines set from now on;
+/// it did not work for this one, and a procedure that cannot run reads exactly
+/// like a procedure nobody bothered to run.
 /// # 1622 / 1611 -> 1625 / 1614, 2026-08-21 — three methods on a carrier
 /// `--jdk-only` already drops whole, and a third case this gate cannot state
 ///
@@ -823,10 +909,19 @@ use cratonvm_types::compat::CompatibilityMode;
 /// The count had been three over for two days with nothing able to say so.
 const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1625;
 
-
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for the history both share.
+///
+/// **H3-1 REBASELINE — SUPERSEDED. Predicted 1604 (old 1611, delta −7);
+/// MEASURED 1615, the same +4 as the management resolve. The prediction
+/// below is kept for its reasoning, not its number.** Originally not measured; see [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`] for
+/// the reason the guess is not written here and for the command that
+/// recomputes it. The seven deleted rows are in
+/// `native-builtins/src/phases_late/streams.rs`, which is in BOTH resolves, so
+/// the delta is the same −7 in both — but measure it, do not derive it: this
+/// constant's own history has a case of one derived from the other sitting six
+/// above the truth for a week.
 const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1614;
 
 /// The TOTAL registration count each baseline above was measured beside.
@@ -843,9 +938,25 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1614;
 /// The 2026-08-19 re-freeze is the first case for its own 78 and the second
 /// (partly) for the 31 it inherited, and neither could be told from the other
 /// by the frozen count alone.
+///
+/// A THIRD case exists and 2026-08-20 is the first instance of it: **total DOWN
+/// by about the stub delta -> registrations were DELETED.** That is the only
+/// direction in which re-freezing records work rather than absorbing it, and it
+/// is what H3-1's seven deletions produce.
+///
+/// **H3-1 REBASELINE — SUPERSEDED. Predicted 13153 (old 13160, delta −7);
+/// MEASURED 13225, i.e. **+65**, because ~61 non-stub registrations landed
+/// on `dev` concurrently and this gate could not see them while it was
+/// unparseable. That is case one of the three classified above — rows up,
+/// stubs flat — and it is NOT a stub regression.** Recomputed by the same two commands as
+/// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
+/// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
 const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13253;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
+///
+/// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
+/// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
 const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 12885;
 
@@ -1187,6 +1298,20 @@ fn synthetic_stub_count_does_not_regress() {
         .collect::<Vec<_>>()
         .join(", ");
 
+    // The re-freeze target, computed once so the failure message below can be
+    // written entirely with INLINE format captures and carry no positional
+    // arguments at all.
+    //
+    // That is not a style preference. Between 2026-08-19 and 2026-08-20 this
+    // `assert!` did not PARSE: merge `26e4b5db4` spliced the tail of the old
+    // message onto the head of the new one and left BOTH argument lists, so the
+    // first string literal ended at `stub-ratchet.md.",` and the very next token
+    // was `{BASELINE_SYNTHETIC_STUBS}. A change added ...`, which is not an
+    // expression. `rustfmt --check` reports `unknown start of token: \` at the
+    // seam. A message with no positional arguments cannot be mis-spliced that
+    // way and cannot drift out of step with its argument count.
+    let refreeze = synthetic + SLACK;
+
     assert!(
         synthetic <= BASELINE_SYNTHETIC_STUBS,
         "STUB-RATCHET in the {MEASURED_CONFIG} configuration: {synthetic} \
@@ -1195,7 +1320,8 @@ fn synthetic_stub_count_does_not_regress() {
          \n\
          FIRST, find out WHICH rows, because this number cannot tell you why it \
          moved. Run `dump_synthetic_stubs` here and at the commit that last set \
-         `{BASELINE_CONST}`, and diff the sorted `@@STUB` lines.\n\
+         `{BASELINE_CONST}`, and diff the sorted `@@STUB` lines. This run already \
+         printed the per-file breakdown; the top eight are: {breakdown}\n\
          \n\
          Then read each added triple, because there are TWO causes and they want \
          opposite responses:\n\
@@ -1210,13 +1336,17 @@ fn synthetic_stub_count_does_not_regress() {
          registration site's own comment before assuming (a). On 2026-08-19, 30 \
          of 33 added rows were (b).\n\
          \n\
-         Re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
-         {synthetic} + SLACK ({}) only with that account written down. See \
-         stub-ratchet.md.\n\
+         CLASSIFY IT WITH THE SECOND COLUMN: total registrations are {total}, and \
+         this baseline was measured beside {MEASURED_TOTAL_REGISTRATIONS}. A total \
+         that did NOT move means existing fakes were relabelled (welcome; \
+         re-freeze with the list). A total UP by roughly the stub delta means new \
+         fakes were registered — the regression this gate exists for. A total \
+         DOWN by roughly the stub delta means registrations were DELETED, which \
+         is the only case where re-freezing records work rather than absorbing \
+         it.\n\
          \n\
-         WHERE THEY ARE (top 8 files): {}",
-        synthetic + SLACK,
-        breakdown,
+         Re-freeze `{BASELINE_CONST}` (NOT the other configuration's constant) to \
+         {refreeze} only with that account written down. See stub-ratchet.md.",
     );
 }
 

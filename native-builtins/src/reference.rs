@@ -16,6 +16,21 @@
 //! * Reference  : field 0 = referent, field 1 = queue
 //! * RQ (queue) : field 0 = head-of-linked-list, field 1 = size
 //!
+//! **Those are the SYNTHETIC shapes, and the real JDK 25 classes have more.**
+//! Confirmed 2026-08-20 with `javap -p` against 25.0.3+9 and the matching
+//! `lib/src.zip` entries:
+//!
+//! ```text
+//!   java/lang/ref/Reference       referent, queue, next, discovered
+//!   java/lang/ref/ReferenceQueue  head, queueLength (LONG), lock
+//! ```
+//!
+//! The two that bit: `Reference.queue` is never null on a real object (the
+//! constructor substitutes `ReferenceQueue.NULL_QUEUE`), and `ReferenceQueue`
+//! has a THIRD field, `lock`, created by a field initialiser — i.e. by the very
+//! constructor these natives replace. Real `enqueue`/`poll`/`remove` bytecode
+//! opens with `synchronized (lock)`. See [`native_rq_init`].
+//!
 //! Integration with the GC reference processor:
 //! * Each `<init>` calls `ctx.discover_reference(ref_type, ref_obj, referent, queue)`
 //!   so the GC knows to process the reference during its weak/soft/phantom
@@ -60,8 +75,8 @@ fn ref_next_slot(ctx: &mut dyn NativeContext, ref_obj: cratonvm_types::ObjectRef
 /// post-acquire receiver.
 ///
 /// **Why this exists (H2 `TestMultiThread`, 2026-08-16).** The real JDK guards
-/// `head`, `queueLength` and `Reference.next` with `ReferenceQueue.lock` — a
-/// `ReentrantLock` taken by `enqueue0`, `poll` and `remove` alike. The natives
+/// `head`, `queueLength` and `Reference.next` with `ReferenceQueue.lock`, taken
+/// by `enqueue0`, `poll` and `remove` alike. The natives
 /// below REPLACE that bytecode, and until now supplied no exclusion of their
 /// own: `native_rq_poll` reads `head`, reads `head.next`, then writes both back,
 /// with nothing stopping a second thread from doing the same read in between.
@@ -79,8 +94,13 @@ fn ref_next_slot(ctx: &mut dyn NativeContext, ref_obj: cratonvm_types::ObjectRef
 ///
 /// The QUEUE object's own monitor, deliberately, rather than a new global lock:
 /// it is per-queue (two unrelated queues never contend), it needs no new static
-/// and no new `Mutex`, and no Java code competes for it — JDK 9+ `ReferenceQueue`
-/// synchronizes on a private `ReentrantLock` field, never on `this`. The JDK's
+/// and no new `Mutex`, and no Java code competes for it. Source-verified
+/// 2026-08-20 against JDK 25 `java.base/java/lang/ref/ReferenceQueue.java`: the
+/// field is `private final Lock lock = new Lock();` over a `private static
+/// class Lock { }` — a plain object monitored with `synchronized (lock)` and
+/// `lock.wait()`/`lock.notifyAll()`, NOT a `java.util.concurrent`
+/// `ReentrantLock` as this comment said until today. What the argument
+/// actually needs is unchanged and still true: it is never `this`. The JDK's
 /// lock therefore nests strictly INSIDE this one on the delegating enqueue path
 /// (`native_ref_enqueue`'s real-layout arm) and never in the other order, so no
 /// cycle is introduced.
@@ -348,6 +368,30 @@ fn native_mockito_latent_key_equals(
 // Reference constructors
 // ---------------------------------------------------------------------------
 
+/// `java.lang.ref.ReferenceQueue.NULL_QUEUE`, or `None` when the class is not
+/// loaded/initialised yet.
+///
+/// Non-GC-capable by construction, exactly like
+/// [`reference_queue_enqueued_sentinel`]: `class_id_by_name` +
+/// `static_field_index_by_name` + `get_static_field`, never
+/// `ensure_class_initialized`. Callers hold live unpinned `ObjectRef`s, and a
+/// `<clinit>` here would relocate them.
+///
+/// Quoted from JDK 25 `java.base/java/lang/ref/ReferenceQueue.java`:
+///
+/// ```text
+///   static final ReferenceQueue<Object> NULL_QUEUE = new Null();
+///   static final ReferenceQueue<Object> ENQUEUED   = new Null();
+/// ```
+fn reference_queue_null_sentinel(ctx: &dyn NativeContext) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_by_name("java/lang/ref/ReferenceQueue")?;
+    let index = ctx.static_field_index_by_name(class_id, "NULL_QUEUE")?;
+    match ctx.get_static_field(class_id, index) {
+        Value::Object(Some(sentinel)) => Some(sentinel),
+        _ => None,
+    }
+}
+
 /// Shared init helper: writes the referent into field 0 and the queue (or
 /// null when absent) into field 1.
 fn ref_init_impl(ctx: &mut dyn NativeContext, args: &[Value], has_queue: bool) {
@@ -368,6 +412,31 @@ fn ref_init_impl(ctx: &mut dyn NativeContext, args: &[Value], has_queue: bool) {
             args.get(2).cloned().unwrap_or(Value::Object(None))
         } else {
             Value::Object(None)
+        };
+        // JDK 25 `Reference(T referent, ReferenceQueue<? super T> queue)`:
+        //
+        // ```text
+        //   this.referent = referent;
+        //   this.queue = (queue == null) ? ReferenceQueue.NULL_QUEUE : queue;
+        // ```
+        //
+        // `queue` is NEVER null on a real `Reference`, and two pieces of real
+        // bytecode depend on that: `enqueue()` is
+        // `clearImpl(); return this.queue.enqueue(this);` — a bare dereference,
+        // NPE on null where HotSpot answers `false` — and `isEnqueued()` is
+        // `this.queue == ReferenceQueue.ENQUEUED`. This native replaces the
+        // constructor, so the sentinel is ours to write; until now it wrote a
+        // raw null and the invariant simply did not hold on any reference this
+        // VM built.
+        //
+        // `None` (class not yet initialised) degrades to the previous
+        // behaviour rather than inventing a value.
+        let queue = match queue {
+            v @ Value::Object(Some(_)) => v,
+            _ => match reference_queue_null_sentinel(&*ctx) {
+                Some(null_queue) => Value::Object(Some(null_queue)),
+                None => Value::Object(None),
+            },
         };
         ctx.set_field_by_name(this, "queue", queue);
         return;
@@ -601,6 +670,18 @@ fn native_ref_enqueue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             let Value::Object(Some(queue)) = queue else {
                 return Ok(Some(Value::Int(0)));
             };
+            // `ref_init_impl` now writes `ReferenceQueue.NULL_QUEUE` where it
+            // used to write a raw null, matching the real constructor. That is
+            // a live object, so the `else` above no longer catches "this
+            // reference has no queue" — answer it here instead. The real
+            // bytecode reaches the same verdict the long way round
+            // (`enqueue0`: `if (queue == NULL_QUEUE || queue == ENQUEUED)
+            // return false;`), but only after taking `ReferenceQueue.lock`,
+            // and short-circuiting keeps this path exactly as cheap and as
+            // side-effect-free as it was.
+            if reference_queue_null_sentinel(&*ctx) == Some(queue) {
+                return Ok(Some(Value::Int(0)));
+            }
             // Under the queue's monitor like every other list mutation here:
             // the JDK's `enqueue` takes its own `ReentrantLock`, which excludes
             // this path against ITSELF but not against `native_rq_poll`, whose
@@ -731,11 +812,14 @@ fn reference_queue_enqueued_sentinel(ctx: &dyn NativeContext) -> Option<ObjectRe
 /// `L` descriptor and the coercion never fires (`vm/src/vm/tests.rs`'s
 /// `s28_is_enqueued_lifecycle` builds exactly that shape and still passes).
 ///
-/// `Object(None)` covers both "never had a queue" and "already polled" —
-/// [`native_rq_poll`] detaches by writing `Object(None)` where the JDK's
-/// `poll0` writes `NULL_QUEUE`. Not enqueued either way; see G49-1 §NOMINATION
-/// for the one remaining shape this cannot answer (the GC's own auto-enqueue,
-/// which stamps a raw `Int(1)` from outside this crate).
+/// `Object(None)` covers both "never had a queue" and "already polled" on the
+/// synthetic two-slot shape. On the real layout both of those now hold
+/// `ReferenceQueue.NULL_QUEUE` instead — [`ref_init_impl`] and
+/// [`native_rq_poll`] were corrected to the JDK's own encoding on 2026-08-20
+/// (H2-1) — which is a live `Object(Some(_))` that is not `ENQUEUED`, so the
+/// arm above answers `false` for it without needing a case of its own. See
+/// G49-1 §NOMINATION for the one remaining shape this cannot answer (the GC's
+/// own auto-enqueue, which stamps a raw `Int(1)` from outside this crate).
 fn native_ref_is_enqueued(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -783,11 +867,69 @@ fn native_ref_refers_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // ReferenceQueue
 // ---------------------------------------------------------------------------
 
+/// `java.lang.ref.ReferenceQueue.<init>()V`.
+///
+/// **The real class has a THIRD field, and it is not optional.** JDK 25
+/// `java.base/java/lang/ref/ReferenceQueue.java`, instance fields in
+/// declaration order (confirmed against the compiled class with
+/// `javap -p java.lang.ref.ReferenceQueue`):
+///
+/// ```text
+///   private volatile Reference<? extends T> head;   // slot 0
+///   private long queueLength = 0;                   // slot 1  (LONG)
+///   private static class Lock { };
+///   private final Lock lock = new Lock();           // slot 2
+/// ```
+///
+/// `lock` is a FIELD INITIALISER, so the real `<init>` is what creates it —
+/// and this native replaces that constructor. Every one of `enqueue`, `poll`,
+/// `remove()` and `remove(long)` opens with `synchronized (lock)`, so a queue
+/// built here and then handed to real bytecode monitors a null. That is the
+/// state-population half of `G90-1` §5 for `java/lang/ref/`: the queue looks
+/// like two slots and is three, and the third one cannot be reconstructed by a
+/// reader — only the constructor can supply it.
+///
+/// `queueLength` is a `long`; it used to be initialised with `Value::Int(0)`
+/// through a raw slot write. The poll/enqueue paths already go to some trouble
+/// to preserve the stored width, and this is where that width is decided.
+///
+/// The synthetic two-slot shape keeps the old raw-slot arm: it declares no such
+/// names, so every `set_field_by_name` above it would be a silent no-op.
 fn native_rq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    let real_layout = ctx
+        .resolve_field_index_by_class_id(ctx.class_id_of_object(this), "queueLength")
+        .is_some();
+    if real_layout {
+        ctx.set_field_by_name(this, "head", Value::Object(None));
+        ctx.set_field_by_name(this, "queueLength", Value::Long(0));
+        // `new Lock()` without running its constructor: `ReferenceQueue$Lock`
+        // declares no fields and its private no-arg constructor has an empty
+        // body, so a raw allocation is the same object — and it avoids invoking
+        // a private constructor across the native boundary.
+        //
+        // `ensure_class_initialized` and `alloc_object` are both GC-capable, so
+        // `this` is pinned across them and re-read afterwards. Nothing
+        // allocates between the allocation and the write, so the fresh `Lock`
+        // needs no pin of its own.
+        let pin = ctx.pin_native_root(this);
+        let lock = match ctx.ensure_class_initialized("java/lang/ref/ReferenceQueue$Lock") {
+            Ok(lock_cid) => {
+                let fields = ctx.class_num_total_fields(lock_cid);
+                Some(ctx.alloc_object(lock_cid, fields))
+            }
+            Err(_) => None,
+        };
+        let this = ctx.read_native_pin(pin, this);
+        if let Some(lock) = lock {
+            ctx.set_field_by_name(this, "lock", Value::Object(Some(lock)));
+        }
+        ctx.unpin_native_roots(pin);
+        return Ok(None);
+    }
     ctx.set_field(this, RQ_FIELD_HEAD, Value::Object(None));
     ctx.set_field(this, RQ_FIELD_SIZE, Value::Int(0));
     Ok(None)
@@ -886,12 +1028,34 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                     let this = ctx.read_native_pin(this_pin, this);
                     ctx.set_field(this, RQ_FIELD_HEAD, next);
                     // Detach the popped reference from the list and clear its
-                    // enqueued state (JDK: poll sets queue = null, so
-                    // isEnqueued() reads false afterwards).
+                    // enqueued state, so `isEnqueued()` reads false afterwards.
                     let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
                     ctx.set_field(ref_obj, next_slot, Value::Object(None));
                     let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
-                    ctx.set_field(ref_obj, REF_FIELD_QUEUE, Value::Object(None));
+                    // JDK 25 `poll0` detaches with `r.queue = NULL_QUEUE`, not
+                    // with null — see `ref_init_impl`'s quote of the
+                    // constructor for why `Reference.queue` is never null on a
+                    // real object. A polled reference handed back to real
+                    // `enqueue()` bytecode (`this.queue.enqueue(this)`) NPEs on
+                    // the null this used to leave behind, where HotSpot returns
+                    // `false`. `isEnqueued()` reads the same either way: the
+                    // sentinel is not `ENQUEUED`.
+                    let real_layout = ctx
+                        .resolve_field_index_by_class_id(
+                            ctx.class_id_of_object(ref_obj),
+                            "referent",
+                        )
+                        .is_some();
+                    let detached = if real_layout {
+                        match reference_queue_null_sentinel(&*ctx) {
+                            Some(null_queue) => Value::Object(Some(null_queue)),
+                            None => Value::Object(None),
+                        }
+                    } else {
+                        Value::Object(None)
+                    };
+                    let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
+                    ctx.set_field(ref_obj, REF_FIELD_QUEUE, detached);
                     let this = ctx.read_native_pin(this_pin, this);
                     // Slot 1 is `size` in the synthetic two-slot shape but
                     // `queueLength` — a `long` — on a real JDK ReferenceQueue,

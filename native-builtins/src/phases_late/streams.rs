@@ -2838,81 +2838,28 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // BinaryOperator.maxBy/minBy — `SyntheticStub`, same family and same
-    // argument as `Function.compose/andThen/identity` and the `Predicate` and
-    // `Consumer` blocks below. Both are `static` methods of
-    // `java.util.function.BinaryOperator` with real bodies in every supported
-    // image (`(a, b) -> comparator.compare(a, b) >= 0 ? a : b`), and both mint a
-    // `BinaryOperator$MaxBy` / `$MinBy` no image declares.
+    // TOMBSTONE — `BinaryOperator.maxBy(Comparator)` and `.minBy(Comparator)`
+    // were registered here as `SyntheticStub`, minting a
+    // `java/util/function/BinaryOperator$MaxBy` / `$MinBy` no image declares.
+    // DELETED 2026-08-20 (H3-1). Two of the seven `java.util.function`
+    // default/static-method stubs `G89-1` N1 nominated.
     //
-    // Found by auditing the family rather than by a probe, and it is worse than
-    // its two measured siblings, not better: **no `apply` is registered on
-    // either minted class anywhere in the workspace** (grep both names — these
-    // two mint sites are the only hits). So the carrier that comes back has no
-    // implementation in ANY mode; the `BinaryOperator.apply` interface bridge a
-    // few lines above re-dispatches `apply` on the receiver, which resolves back
-    // to that same interface native. Under `--jdk-only` the mint is refused
-    // first (`$MaxBy` has no `$$Lambda` infix, so §5's door is shut — see the
-    // `Predicate` block) and the caller gets a `NoClassDefFoundError`.
+    // Why deletion is safe rather than merely tidy, and what it does NOT buy:
     //
-    // Not measured under a probe, so stated as reading, not as a repro: what is
-    // verified here is that the classes are fabricated and that nothing
-    // implements them. Dropping the pair under strict can only improve on a
-    // carrier with no methods, and `Compatible` keeps `SyntheticStub`
-    // registrations, so that mode is byte-for-byte unchanged either way.
+    //   * `javap -p java.util.function.BinaryOperator` on the JDK 25 image:
+    //     both are `public static`, NOT `ACC_NATIVE`, with a real body
+    //     (`(a, b) -> comparator.compare(a, b) >= 0 ? a : b`). So real
+    //     bytecode serves the call the moment nothing shadows it.
+    //   * The carriers they minted had NO `apply` registered anywhere in the
+    //     workspace (the site's own note said so), so the object handed back
+    //     could not be invoked in ANY mode.
+    //   * `SyntheticStub` is not `allowed_in(JdkOnly)`, so `--jdk-only`
+    //     already dropped both. **This deletion moves strict mode by exactly
+    //     zero**; it changes `Compatible` / `--real-jdk` only.
     //
-    // Deliberately NOT added to `NO_IMAGE_JDK_RECEIVERS`: that table re-tags
-    // natives BY RECEIVER, and neither class has a native to re-tag. Adding them
-    // would be inert. The mint sites are the only half that exists.
-    r.register_with_kind(
-        bo,
-        "maxBy",
-        "(Ljava/util/Comparator;)Ljava/util/function/BinaryOperator;",
-        |ctx, args| {
-            let comparator = args[0];
-            // Pin across the proxy alloc below — a moving young GC there would
-            // relocate it (native stale-local family).
-            let comparator_pin = pinned_object_value(ctx, comparator);
-            // Store comparator in a 1-field synthetic
-            let proxy =
-                try_alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MaxBy", 1)?;
-            ctx.set_field(
-                proxy,
-                0,
-                read_pinned_object_value(ctx, comparator_pin, comparator),
-            );
-            if let Some((h, _)) = comparator_pin {
-                ctx.unpin_native_roots(h);
-            }
-            Ok(Some(Value::Object(Some(proxy))))
-        },
-        cratonvm_native_api::NativeKind::SyntheticStub,
-    );
-
-    // BinaryOperator.minBy(Comparator) → BinaryOperator
-    r.register_with_kind(
-        bo,
-        "minBy",
-        "(Ljava/util/Comparator;)Ljava/util/function/BinaryOperator;",
-        |ctx, args| {
-            let comparator = args[0];
-            // Pin across the proxy alloc below — a moving young GC there would
-            // relocate it (native stale-local family).
-            let comparator_pin = pinned_object_value(ctx, comparator);
-            let proxy =
-                try_alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MinBy", 1)?;
-            ctx.set_field(
-                proxy,
-                0,
-                read_pinned_object_value(ctx, comparator_pin, comparator),
-            );
-            if let Some((h, _)) = comparator_pin {
-                ctx.unpin_native_roots(h);
-            }
-            Ok(Some(Value::Object(Some(proxy))))
-        },
-        cratonvm_native_api::NativeKind::SyntheticStub,
-    );
+    // Do NOT re-add a mint here. If a future reader needs these, the answer is
+    // real bytecode, and the failing-vector evidence is
+    // `regression-suite/src/RJdkFunctionCombinators.java` (`notFabricated`).
 
     // ToIntFunction, ToLongFunction, ToDoubleFunction interface dispatch
     r.register(
@@ -3101,141 +3048,40 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Predicate.and/or/negate/not — `SyntheticStub`, not the enclosing
-    // registrar's `Bridge`. This is the `Function.compose/andThen/identity`
-    // treatment (L7 item 4, 2026-08-05; second copy 2026-08-06) applied to the
-    // sibling two thirds of the family that lane did not reach.
+    // TOMBSTONE — `Predicate.and`, `.or`, `.negate` and the static `.not` were
+    // registered here as `SyntheticStub`, minting
+    // `java/util/function/Predicate$$Lambda$And` / `$Or` / `$Negate`, none of
+    // which any image declares. DELETED 2026-08-20 (H3-1). Four of the seven
+    // `java.util.function` stubs `G89-1` N1 nominated.
     //
-    // All four are `default`/`static` methods of `java.util.function.Predicate`
-    // with real bodies in every supported image — `and` is
-    // `(t) -> test(t) && other.test(t)` — so a working real-bytecode fallback
-    // plainly exists, which is exactly what `Bridge` asserts there is not. What
-    // they mint (`Predicate$$Lambda$And` / `$Or` / `$Negate`) is declared by no
-    // image; all three are already in `NO_IMAGE_JDK_RECEIVERS`.
+    // Why deletion, and what it does NOT buy:
     //
-    // # Why the strict symptom was `AbstractMethodError`, not `NoClassDefFoundError`
+    //   * `javap -p java.util.function.Predicate` on the JDK 25 image: all four
+    //     are `default`/`static` with real bodies and NOT `ACC_NATIVE`
+    //     (`and` is `(t) -> test(t) && other.test(t)`). Real bytecode serves
+    //     the call the moment nothing shadows it.
+    //   * MEASURED, not reasoned: `RJdkFunctionCombinators` PASSES under
+    //     `--jdk-only` — where these four are dropped at registration — and
+    //     FAILS in `Compatible` on the same binary, where they mint
+    //     (`G62-1` §1). Deleting the registration puts `Compatible` in the
+    //     state strict mode is already measured green in.
+    //   * `SyntheticStub` is not `allowed_in(JdkOnly)`, so **this moves strict
+    //     mode by exactly zero.** It is a `Compatible`-mode correctness fix and
+    //     a seven-row cut in wave 2's backlog, nothing more.
     //
-    // These four are the measured counter-example to `no_image_receiver.rs`'s
-    // gate-1/gate-2 pairing rule, running in the direction that record warns
-    // about: gate 2 (the `test` natives on the minted classes) was closed
-    // automatically by `register`'s `NO_IMAGE_JDK_RECEIVERS` re-tag, while gate
-    // 1 (this mint site) stayed `Bridge` and kept minting. Strict mode was
-    // therefore handed a well-formed carrier with no implementation.
+    // The `test` natives on the three minted carriers are left registered a few
+    // lines below: nothing mints those classes any more, so they are dead
+    // rather than wrong, and removing them too would make the ratchet delta
+    // something other than the exact -7 the re-freeze is derived from. See
+    // H3-1's NOMINATIONS.
     //
-    // And the mint was NOT refused, because of the name. `fabricate_class`
-    // applies the `--jdk-only` policy refusal only when
-    // `origin.is_compatibility_stub()`, and `fabricated_origin_for_name` routes
-    // anything containing `$$Lambda` to `ClassOrigin::GeneratedLambda` instead —
-    // so the `$$Lambda$` infix in these three names walks past §5's door, where
-    // the otherwise identical `Consumer$AndThen` below is refused outright. That
-    // is why one half of this family reported a missing class and the other half
-    // reported `java/util/function/Predicate.test … has no Code attribute`: the
-    // fabricated class exists, carries no `test`, and dispatch resolves up to
-    // the interface's abstract declaration. Two error shapes, one missing half.
-    //
-    // (`class_manager.rs`'s note on that arm records "none of the three fires on
-    // a strict boot", measured 2026-08-05/06 against boot probes. A strict run
-    // of `Predicate.and` fires it. That measurement is stale, not wrong — no
-    // boot probe called a Predicate combinator.)
-    //
-    // Tagged `SyntheticStub`, strict mode drops all four (recording a
-    // `SyntheticNativeRegistered` violation naming this site), nothing mints the
-    // three classes, and `java.base`'s own default methods run.
-    // `Compatible` / `--real-jdk` keep `SyntheticStub` registrations, so both
-    // are byte-for-byte unchanged.
-    let __pred_prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    // Predicate.and/or/negate — composite predicates via 2-field synthetic
-    let pred = "java/util/function/Predicate";
-    r.register(
-        pred,
-        "and",
-        "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let other = args[1];
-            // Pin across the composite alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let this_pin = ctx.pin_native_root(this);
-            let other_pin = pinned_object_value(ctx, other);
-            let composite =
-                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2)?;
-            let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(
-                composite,
-                1,
-                read_pinned_object_value(ctx, other_pin, other),
-            );
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(composite))))
-        },
-    );
-    r.register(
-        pred,
-        "or",
-        "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let other = args[1];
-            // Pin across the composite alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let this_pin = ctx.pin_native_root(this);
-            let other_pin = pinned_object_value(ctx, other);
-            let composite =
-                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2)?;
-            let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(
-                composite,
-                1,
-                read_pinned_object_value(ctx, other_pin, other),
-            );
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(composite))))
-        },
-    );
-    r.register(
-        pred,
-        "negate",
-        "()Ljava/util/function/Predicate;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Pin across the composite alloc below — a moving young GC there
-            // would relocate `this` (native stale-local family).
-            let this_pin = ctx.pin_native_root(this);
-            let composite =
-                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1)?;
-            let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(composite))))
-        },
-    );
-    // Predicate.not(Predicate) — static
-    r.register(
-        pred,
-        "not",
-        "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
-        |ctx, args| {
-            let target = args[0];
-            // Pin across the composite alloc below — a moving young GC there
-            // would relocate it (native stale-local family).
-            let target_pin = pinned_object_value(ctx, target);
-            let composite =
-                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1)?;
-            ctx.set_field(
-                composite,
-                0,
-                read_pinned_object_value(ctx, target_pin, target),
-            );
-            if let Some((h, _)) = target_pin {
-                ctx.unpin_native_roots(h);
-            }
-            Ok(Some(Value::Object(Some(composite))))
-        },
-    );
-    r.set_category(__pred_prev_cat);
+    // NOT REMOVED HERE, AND IT MUST BE: `force_native_over_real_jdk_bytecode`
+    // (`vm/src/runtime/interpreter/native_override.rs`) still names these four
+    // triples. That arm is now inert — both consulting sites re-check the
+    // registry (`dispatch_virtual.rs`) or only SEAL a method out of the JIT
+    // (`jit_bridge.rs`), so a stale entry costs a branch and a missed tier-up,
+    // never an `UnsatisfiedLinkError` — but it is a lie about the tree. H3-1
+    // "OUT-OF-FILE EDITS REQUIRED" carries the exact deletion.
 
     // --- M3 fix: register test() on synthetic Predicate composition classes ---
 
@@ -3372,63 +3218,122 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
     // one is the copy a `Compatible` run actually dispatches. Both are tagged
     // the same way on purpose — a strict run must not depend on which of two
     // registrars ran last.
+    // NOT REGISTERED AGAINST A REAL JDK IMAGE (H19, 2026-08-21).
+    //
+    // The `SyntheticStub` tag made `--jdk-only` drop `compose`/`andThen` and
+    // run the real default methods; it left `Compatible` / `--real-jdk`
+    // dispatching a stand-in the comment above already says is unnecessary
+    // ("So there IS a working real-bytecode fallback"). Registering these two
+    // only when the registry is NOT being populated for a real image finishes
+    // that 2026-08-05 change in the mode it did not reach.
+    //
+    // MEASURED 2026-08-21 (`C:/craton/cratonvm-r5.exe`, oracle HotSpot
+    // 25.0.3+9), one probe, three arms — TWO divergences per method, not one:
+    //
+    //   f.andThen(g).getClass()  HotSpot Function$$Lambda/0x… | --jdk-only
+    //     Function$$Lambda/0x… | Compatible java.util.function.Function$AndThen
+    //   f.compose(g).getClass()  HotSpot Function$$Lambda/0x… | --jdk-only
+    //     Function$$Lambda/0x… | Compatible java.util.function.Function$Compose
+    //   f.andThen(null)          HotSpot NullPointerException | --jdk-only
+    //     NullPointerException | Compatible RETURNS, does not throw
+    //   f.compose(null)          same shape
+    //
+    // The computed values were right in all three arms (`andThen` 30,
+    // `compose` 21), which is why only a CLASS-NAME screen or a null-contract
+    // check can see this: the stand-in does the arithmetic correctly and lies
+    // about its identity and its argument checking.
+    //
+    // The null half is the part no record predicted. `Objects.requireNonNull`
+    // lives in the default method's bytecode, so a native that replaces the
+    // method silently drops it — and `Predicate.and`/`or`, `Consumer.andThen`
+    // and `BinaryOperator.maxBy` all DO throw here, because H3-1 deleted their
+    // stand-ins on 2026-08-20. That contrast is the measurement: seven rows
+    // went, these two stayed, and the difference is visible from Java.
+    //
+    // WHY A GUARD AND NOT A DELETION (H15-3 §2.4 proposed deletion): four
+    // tests in `vm/src/vm/tests.rs` — `m3_function_and_then_creates_composite`,
+    // `m3_function_and_then_apply_chains_correctly`,
+    // `m3_function_compose_creates_composite`,
+    // `m3_function_compose_apply_chains_correctly` — reach these exact triples
+    // through `call_native`, which PANICS on an absent registration, and two of
+    // them `assert_eq!` the composite's class name against the stand-in. That
+    // file is not this lane's to edit and
+    // `cargo test -p cratonvm-vm --lib --features synthetic-jdk` blocks CI.
+    // Its registry is `NativeMethodRegistry::new()` and never calls
+    // `set_drop_real_layout_synthetic`, so the guard leaves it alone — as it
+    // leaves the synthetic-JDK image, which has no `Function` bytecode to fall
+    // back to. (H15-3 §4 N4 named two of the four; the other two are
+    // `compose`'s and fail the same way.)
+    //
+    // `identity()` is NOT guarded here on purpose: `register_function_identity_
+    // natives` in `native-builtins/src/lib.rs` registers it again, later, and
+    // registration is last-write-wins, so guarding only this copy would change
+    // nothing. It also does not need to be — MEASURED, `Function.identity()`,
+    // `UnaryOperator.identity()` and `BinaryOperator.maxBy`/`minBy` already
+    // return real lambdas in Compatible mode DESPITE being registered, and why
+    // the static factories do not fire while these two default methods do is
+    // unexplained. See the record's NOMINATIONS.
+    //
+    // docs/known-issues/jdk-only/H19-1-three-stand-ins-retired-against-a-real-image-20260821.md §2
     let __func_prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let func = "java/util/function/Function";
-    r.register(
-        func,
-        "compose",
-        "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let before = args[1];
-            // Pin across the composite alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let this_pin = ctx.pin_native_root(this);
-            let before_pin = pinned_object_value(ctx, before);
-            let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
-                ctx,
-                "java/util/function/Function$Compose",
-                2,
-            )?;
-            let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(
-                composite,
-                1,
-                read_pinned_object_value(ctx, before_pin, before),
-            );
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(composite))))
-        },
-    );
-    r.register(
-        func,
-        "andThen",
-        "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let after = args[1];
-            // Pin across the composite alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let this_pin = ctx.pin_native_root(this);
-            let after_pin = pinned_object_value(ctx, after);
-            let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
-                ctx,
-                "java/util/function/Function$AndThen",
-                2,
-            )?;
-            let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(
-                composite,
-                1,
-                read_pinned_object_value(ctx, after_pin, after),
-            );
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(composite))))
-        },
-    );
+    if !r.drops_real_layout_synthetic() {
+        r.register(
+            func,
+            "compose",
+            "(Ljava/util/function/Function;)Ljava/util/function/Function;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let before = args[1];
+                // Pin across the composite alloc below — a moving young GC there
+                // would relocate them (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
+                let before_pin = pinned_object_value(ctx, before);
+                let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
+                    ctx,
+                    "java/util/function/Function$Compose",
+                    2,
+                )?;
+                let this = ctx.read_native_pin(this_pin, this);
+                ctx.set_field(composite, 0, Value::Object(Some(this)));
+                ctx.set_field(
+                    composite,
+                    1,
+                    read_pinned_object_value(ctx, before_pin, before),
+                );
+                ctx.unpin_native_roots(this_pin);
+                Ok(Some(Value::Object(Some(composite))))
+            },
+        );
+        r.register(
+            func,
+            "andThen",
+            "(Ljava/util/function/Function;)Ljava/util/function/Function;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let after = args[1];
+                // Pin across the composite alloc below — a moving young GC there
+                // would relocate them (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
+                let after_pin = pinned_object_value(ctx, after);
+                let composite = crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
+                    ctx,
+                    "java/util/function/Function$AndThen",
+                    2,
+                )?;
+                let this = ctx.read_native_pin(this_pin, this);
+                ctx.set_field(composite, 0, Value::Object(Some(this)));
+                ctx.set_field(
+                    composite,
+                    1,
+                    read_pinned_object_value(ctx, after_pin, after),
+                );
+                ctx.unpin_native_roots(this_pin);
+                Ok(Some(Value::Object(Some(composite))))
+            },
+        );
+    }
     // Function.identity()
     r.register(
         func,
@@ -3445,47 +3350,25 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__func_prev_cat);
 
-    // Consumer.andThen — `SyntheticStub`, the third and last mint site of this
-    // family that L7 item 4 left `Bridge`. `java.util.function.Consumer.andThen`
-    // is a `default` method returning `(T t) -> { accept(t); after.accept(t); }`,
-    // so the real-bytecode fallback exists, and `Consumer$AndThen` is declared
-    // by no image (it is already in `NO_IMAGE_JDK_RECEIVERS`, which is what
-    // re-tagged its `accept` below).
+    // TOMBSTONE — `Consumer.andThen(Consumer)` was registered here as
+    // `SyntheticStub`, minting a `java/util/function/Consumer$AndThen` no image
+    // declares. DELETED 2026-08-20 (H3-1). The seventh and last of the
+    // `java.util.function` stubs `G89-1` N1 nominated.
     //
-    // Unlike its `Predicate` siblings above, this name carries no `$$Lambda`
-    // infix, so `fabricated_origin_for_name` gives it
-    // `ClassOrigin::CompatibilityStub` and §5 refuses the mint outright: the
-    // strict symptom was `NoClassDefFoundError: java/util/function/Consumer$AndThen`
-    // thrown from `andThen` itself. Same missing half as `Predicate`, different
-    // error shape purely because of how the fabricated name reads — see the long
-    // note on the `Predicate` block for why that distinction is the whole of the
-    // difference between the two.
-    let cons = "java/util/function/Consumer";
-    r.register_with_kind(
-        cons,
-        "andThen",
-        "(Ljava/util/function/Consumer;)Ljava/util/function/Consumer;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let after = args[1];
-            // Pin across the composite alloc below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let this_pin = ctx.pin_native_root(this);
-            let after_pin = pinned_object_value(ctx, after);
-            let composite =
-                try_alloc_concurrent_synthetic(ctx, "java/util/function/Consumer$AndThen", 2)?;
-            let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(
-                composite,
-                1,
-                read_pinned_object_value(ctx, after_pin, after),
-            );
-            ctx.unpin_native_roots(this_pin);
-            Ok(Some(Value::Object(Some(composite))))
-        },
-        cratonvm_native_api::NativeKind::SyntheticStub,
-    );
+    //   * `javap -p java.util.function.Consumer` on the JDK 25 image: `andThen`
+    //     is `default`, NOT `ACC_NATIVE`, and returns
+    //     `(T t) -> { accept(t); after.accept(t); }`.
+    //   * Under `--jdk-only` this mint was already refused outright (the name
+    //     carries no `$$Lambda` infix, so `fabricated_origin_for_name` gives it
+    //     `ClassOrigin::CompatibilityStub` and §5 shuts the door), and the
+    //     registration itself was already dropped — `SyntheticStub` is not
+    //     `allowed_in(JdkOnly)`. **Strict mode moves by exactly zero.**
+    //   * `Compatible` is where this changes anything: `RJdkFunctionCombinators`
+    //     fails there and passes strict on the same binary (`G62-1` §1).
+    //
+    // `Consumer$AndThen.accept` is left registered below for the same reason as
+    // the `Predicate` carriers: dead, not wrong, and keeping the ratchet delta
+    // at exactly -7.
 
     // --- M3 fix: register apply/accept on synthetic composition classes ---
 

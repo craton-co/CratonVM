@@ -1544,6 +1544,50 @@ fn engine_delegate_shape(engine_class: &str) -> Option<(&'static str, &'static s
     }
 }
 
+/// The same wrapper for an engine whose `Delegate` constructor takes the
+/// `Provider` as well — `(Spi, String, Provider)`, in THAT order.
+///
+/// This is not a stylistic variant of [`engine_delegate_shape`]; it is a
+/// different constructor arity, and until 2026-08-20 the `_ => None` arm above
+/// was the whole story. Every engine whose `Delegate` needs the provider fell
+/// off it and `build_third_party_engine` returned `Ok(None)`, so a provider
+/// written to the DOCUMENTED JCA contract — a class `extends MessageDigestSpi`,
+/// registered with `put("MessageDigest.X", …)` — was unreachable:
+///
+/// ```text
+/// MessageDigest.getInstance("H13MD", "H13Prov")
+///   HotSpot 25.0.3+9 -> java.security.MessageDigest$Delegate
+///   CratonVM         -> NoSuchAlgorithmException: no such algorithm: H13MD
+///                       for provider H13Prov
+/// ```
+///
+/// (MEASURED, `docs/known-issues/jdk-only/H13-2-*.md` §2.) Only providers of
+/// BouncyCastle's shape — where the registered class extends the ENGINE, e.g.
+/// `BCMessageDigest extends MessageDigest` — ever reached the digest engine,
+/// which is why the gap survived a bc-java-driven fix round: the corpus that
+/// exercised this path had no standard-shaped provider in it.
+///
+/// Verified against JDK 25.0.3+9 with `javap -p -s`, not assumed:
+/// `java.security.MessageDigest$Delegate` has exactly one constructor,
+/// `private (MessageDigestSpi, String, Provider)`, alongside a static factory
+/// `of(MessageDigestSpi, String, Provider)` that only picks between `Delegate`
+/// and `CloneableDelegate`. Constructing `Delegate` directly is the
+/// non-cloneable half of that choice and is correct for any SPI; an SPI that
+/// also implements `Cloneable` gets a `MessageDigest` whose `clone()` throws
+/// `CloneNotSupportedException` where HotSpot would clone — recorded as the
+/// known residual of this fix rather than silently accepted.
+fn engine_delegate_shape_with_provider(
+    engine_class: &str,
+) -> Option<(&'static str, &'static str)> {
+    match engine_class {
+        "java/security/MessageDigest" => Some((
+            "java/security/MessageDigest$Delegate",
+            "(Ljava/security/MessageDigestSpi;Ljava/lang/String;Ljava/security/Provider;)V",
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) fn build_third_party_engine(
     ctx: &mut dyn NativeContext,
     provider: &str,
@@ -1579,22 +1623,62 @@ pub(crate) fn build_third_party_engine(
         // extends `java.security.KeyPairGenerator`. Declining here left
         // `MLDSA44-RSA2048-PKCS15-SHA256` (bc-java's `cert.cmp` suite)
         // unreachable while its sibling `EC` resolved.
-        let Some((delegate_class, delegate_desc)) = engine_delegate_shape(required_super) else {
-            return Ok(None);
-        };
-        let pin = ctx.pin_native_root(engine);
-        let algo_str = ctx.create_string(algo);
-        let spi = ctx.read_native_pin(pin, engine);
-        ctx.unpin_native_roots(pin);
-        match ctx.new_object_initialized(
-            delegate_class,
-            delegate_desc,
-            &[Value::Object(Some(spi)), Value::Object(Some(algo_str))],
-        ) {
-            Ok(Some(Value::Object(Some(o)))) => o,
-            // No Delegate on this JDK, or it would not construct. Leave the
-            // caller on its own path rather than handing back a wrong type.
-            _ => return Ok(None),
+        if let Some((delegate_class, delegate_desc)) = engine_delegate_shape(required_super) {
+            let pin = ctx.pin_native_root(engine);
+            let algo_str = ctx.create_string(algo);
+            let spi = ctx.read_native_pin(pin, engine);
+            ctx.unpin_native_roots(pin);
+            match ctx.new_object_initialized(
+                delegate_class,
+                delegate_desc,
+                &[Value::Object(Some(spi)), Value::Object(Some(algo_str))],
+            ) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                // No Delegate on this JDK, or it would not construct. Leave the
+                // caller on its own path rather than handing back a wrong type.
+                _ => return Ok(None),
+            }
+        } else {
+            // The `(Spi, String, Provider)` arity. Reached only by engines the
+            // two-argument table above does not name, so nothing that works
+            // today changes route: this arm can only turn a present-day
+            // `Ok(None)` — and the caller's `NoSuchAlgorithmException` behind it
+            // — into a working delegate.
+            //
+            // The `Provider` object is built the same way
+            // `build_real_spi_wrapper` builds it, for the same reason: the
+            // engine's `getProvider()` is `final`, so the wrapper's own
+            // `provider` field is the only thing that can answer it. Note this
+            // is a MADE provider object, not the instance the caller passed to
+            // `Security.addProvider` — `getProvider() == myProvider` is `true`
+            // on HotSpot and stays `false` here. That is a separate, older
+            // defect (`H13-2` §4) and is deliberately not papered over.
+            let Some((delegate_class, delegate_desc)) =
+                engine_delegate_shape_with_provider(required_super)
+            else {
+                return Ok(None);
+            };
+            let spi_pin = ctx.pin_native_root(engine);
+            let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
+            let prov_obj = make_provider(ctx, provider, ver, coverage)?;
+            let prov_pin = ctx.pin_native_root(prov_obj);
+            let algo_str = ctx.create_string(algo);
+            let spi = ctx.read_native_pin(spi_pin, engine);
+            let prov_obj = ctx.read_native_pin(prov_pin, prov_obj);
+            ctx.unpin_native_roots(spi_pin);
+            ctx.unpin_native_roots(prov_pin);
+            match ctx.new_object_initialized(
+                delegate_class,
+                delegate_desc,
+                &[
+                    Value::Object(Some(spi)),
+                    Value::Object(Some(algo_str)),
+                    Value::Object(Some(prov_obj)),
+                ],
+            ) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return Ok(None),
+            }
         }
     };
     let pin = ctx.pin_native_root(engine);

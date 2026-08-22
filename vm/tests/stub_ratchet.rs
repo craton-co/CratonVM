@@ -78,6 +78,30 @@
 //! closes the half that needs no census, and says so instead of implying the
 //! move happened.
 //!
+//! # 2026-08-20 (H3-1) — two things about the sibling that a reader here needs
+//!
+//! 1. **`native-builtins/tests/stub_ratchet.rs` did not COMPILE between
+//!    2026-08-19 and 2026-08-20.** Merge `26e4b5db4` spliced two versions of
+//!    `synthetic_stub_count_does_not_regress`'s failure message together and
+//!    left both argument lists, so the file was a parse error, not a red gate.
+//!    That is worse than red in exactly the way `G89-1` §1 describes: a broken
+//!    gate says nothing about the next change, and this one is BLOCKING in CI
+//!    (`ci.yml`, both configurations) and is what the P0 *Residual synthetic
+//!    native set* row cites as its evidence. Repaired in the same change as
+//!    this note; `rustfmt --edition 2021 --check <file>` reproduces the
+//!    original diagnosis (`unknown start of token: \`) and is the cheapest way
+//!    to check a merge of a message-heavy `assert!` before paying for a build.
+//! 2. **All four of that file's frozen constants carry
+//!    `H3-1 REBASELINE REQUIRED` markers** and are deliberately left at their
+//!    pre-change values. Seven `java.util.function` stubs were deleted from
+//!    `native-builtins/src/phases_late/streams.rs`, so both columns are
+//!    expected to fall by 7 in both configurations. The expected values are
+//!    written down as PREDICTIONS beside the command that measures them; none
+//!    of them has been run. Do not copy them into the constants — run the
+//!    command.
+//!
+//! Neither touches this file's own assertions, which freeze no count.
+//!
 //! ```text
 //! cargo test -p cratonvm-vm --test stub_ratchet -- --nocapture
 //! ```
