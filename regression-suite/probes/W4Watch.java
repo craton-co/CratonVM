@@ -32,6 +32,36 @@ public class W4Watch {
         }
     }
 
+    /**
+     * Run `trigger`, then collect every event the service reports over a fixed
+     * window, and answer the DEDUPLICATED, SORTED set of `KIND:context` pairs.
+     *
+     * The window is what makes this deterministic: a `WatchService` may split
+     * one filesystem operation across several keys or coalesce several into
+     * one, and either is legal. Draining until the service goes quiet removes
+     * that freedom from the answer. `reset()` is called on every key, because
+     * a key that is not reset stops reporting.
+     */
+    static List<String> drainKinds(WatchService ws, Runnable trigger) throws Exception {
+        TreeSet<String> seen = new TreeSet<>();
+        trigger.run();
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        int quiet = 0;
+        while (System.nanoTime() < deadline && quiet < 4) {
+            WatchKey k = ws.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (k == null) {
+                if (!seen.isEmpty()) quiet++;
+                continue;
+            }
+            quiet = 0;
+            for (WatchEvent<?> ev : k.pollEvents()) {
+                seen.add(ev.kind().name() + ":" + ev.context());
+            }
+            k.reset();
+        }
+        return new ArrayList<>(seen);
+    }
+
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("w4watch");
 
@@ -53,23 +83,42 @@ public class W4Watch {
             // Nothing has happened yet.
             ck("poll.empty", ws.poll() == null);
 
-            Files.write(dir.resolve("created.txt"), "x".getBytes(StandardCharsets.UTF_8));
-
-            // Give the OS a moment; a WatchService is not synchronous.
-            WatchKey got = null;
-            for (int i = 0; i < 40 && got == null; i++) {
-                got = ws.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS);
-            }
-            ck("poll.gotKey", got != null);
-            if (got != null) {
-                List<String> names = new ArrayList<>();
-                for (WatchEvent<?> ev : got.pollEvents()) {
-                    names.add(ev.kind().name() + ":" + ev.context());
+            // ONE event kind per observation, and the events DRAINED over a
+            // window rather than read off the first key that comes back.
+            //
+            // The obvious shape -- `Files.write` a new file, take the first
+            // key, print its events -- is RACY, and this probe shipped that way
+            // for one round: `Files.write` is a create AND a write, so the OS
+            // may deliver `ENTRY_CREATE` and `ENTRY_MODIFY` on one key or on
+            // two, and taking the first key sees either `[CREATE, MODIFY]` or
+            // `[CREATE]` depending on how the poll interleaved with inotify.
+            // MEASURED: the same binary produced both on consecutive runs. A
+            // flaky probe in the tree is worse than no probe, so:
+            //   * `createFile` for the CREATE observation, which emits one kind;
+            //   * an explicit write to an EXISTING file for MODIFY;
+            //   * each drained until the window closes, then reported as a
+            //     deduplicated SET of kinds.
+            ck("poll.create", drainKinds(ws, () -> {
+                try {
+                    Files.createFile(dir.resolve("created.txt"));
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
                 }
-                Collections.sort(names);
-                ck("poll.events", names);
-                ck("poll.reset", got.reset());
-            }
+            }));
+            ck("poll.modify", drainKinds(ws, () -> {
+                try {
+                    Files.writeString(dir.resolve("created.txt"), "more");
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }));
+            ck("poll.delete", drainKinds(ws, () -> {
+                try {
+                    Files.delete(dir.resolve("created.txt"));
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }));
 
             ck("key.cancelThenInvalid", (Object) (new Object() {
                 boolean go() {
