@@ -51916,6 +51916,26 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             if cmp_lo < 0 {
                 continue;
             }
+            // `e` was read from `data` BEFORE the `from_elem` comparison above,
+            // and that comparison dispatches the element's real `compareTo` -- a
+            // full interpreted call that can move `e`. The re-read three
+            // statements down (before `native_ts_add`) has been here since
+            // 2026-07-31 and says exactly this; the SECOND COMPARISON never got
+            // it, so it fed a from-space address to `tree_compare` and the
+            // element decoded as whatever now occupied its old block.
+            //
+            // MEASURED: `RTreeRangeGc` under `--jdk-only` failed ~3 runs in 100
+            // with `ClassCastException: class java.lang.Object cannot be cast to
+            // class java.lang.Comparable` from THIS line, while the source set
+            // audited 400 / 400 intact immediately afterwards and an immediate
+            // retry of the same `subSet` answered 200. Nothing was wrong with
+            // the set; one Rust local was one collection out of date.
+            //
+            // This is also why `subSet` is ~6x more sensitive than `headSet` /
+            // `tailSet` rather than the 2x its extra bound key would explain
+            // (`WORKER-1-NOTE-2` N2): the single-bound natives compare once per
+            // element and have nothing to go stale between.
+            let e = ctx.get_array_element(data, i);
             let cmp_hi = tree_compare(ctx, &comparator, e, to_elem)?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
@@ -52087,6 +52107,26 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             if below {
                 continue;
             }
+            // `e` was read from `data` BEFORE the `from_elem` comparison above,
+            // and that comparison dispatches the element's real `compareTo` -- a
+            // full interpreted call that can move `e`. The re-read three
+            // statements down (before `native_ts_add`) has been here since
+            // 2026-07-31 and says exactly this; the SECOND COMPARISON never got
+            // it, so it fed a from-space address to `tree_compare` and the
+            // element decoded as whatever now occupied its old block.
+            //
+            // MEASURED: `RTreeRangeGc` under `--jdk-only` failed ~3 runs in 100
+            // with `ClassCastException: class java.lang.Object cannot be cast to
+            // class java.lang.Comparable` from THIS line, while the source set
+            // audited 400 / 400 intact immediately afterwards and an immediate
+            // retry of the same `subSet` answered 200. Nothing was wrong with
+            // the set; one Rust local was one collection out of date.
+            //
+            // This is also why `subSet` is ~6x more sensitive than `headSet` /
+            // `tailSet` rather than the 2x its extra bound key would explain
+            // (`WORKER-1-NOTE-2` N2): the single-bound natives compare once per
+            // element and have nothing to go stale between.
+            let e = ctx.get_array_element(data, i);
             let cmp_hi = tree_compare(ctx, &comparator, e, to_elem)?;
             data = ctx.read_native_pin(data_pin, data);
             result = ctx.read_native_pin(result_pin, result);
