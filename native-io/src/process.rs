@@ -5028,7 +5028,11 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let line_str = ctx.create_string(&command_line);
         let this_cur = ctx.read_native_pin(this_pin, this);
         ctx.set_field_by_name(this_cur, "commandLine", Value::Object(Some(line_str)));
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len());
+        // `String[]`, not `Object[]`: the field is declared
+        // `private String[] arguments` and `Info.arguments()` hands it straight
+        // to `Optional.ofNullable`, so the caller sees the component type. See
+        // `crate::new_string_array` for the measurement that found this.
+        let arr = crate::new_string_array(ctx, arguments.len());
         let arr_pin = ctx.pin_native_root(arr);
         for (i, a) in arguments.iter().enumerate() {
             let s = ctx.create_string(a);

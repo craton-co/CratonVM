@@ -737,7 +737,12 @@ fn ws_poll_event_names0_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let ws_id = ws_id_of(ctx, this);
     let key = int_arg(args, 1);
     let names = take_stashed_names(ws_id, key);
-    let arr = ctx.new_array(ArrayElementType::Reference, names.len());
+    // The registered descriptor is `(I)[Ljava/lang/String;`, so the component
+    // type is part of the contract. `crate::new_string_array` carries the
+    // measurement; this row is `SyntheticStub`-tagged and measured dead, but a
+    // dead row that would answer wrongly if it woke up is not worth keeping as
+    // one.
+    let arr = crate::new_string_array(ctx, names.len());
     for (i, name) in names.iter().enumerate() {
         let s = ctx.create_string(name);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));

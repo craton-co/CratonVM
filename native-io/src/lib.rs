@@ -1296,22 +1296,51 @@ fn native_file_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         );
     }
     // Create a String[] array. The component class MUST be `java/lang/String`
-    // — `java.io.File.list()` is declared to return `String[]`, and callers
-    // (e.g. Jetty's module discovery) may `checkcast [Ljava/lang/String;` or
-    // store the result into a `String[]`-typed field. A `ClassId(0)` (Object)
-    // component would make that fail. Fall back to `ClassId(0)` only if the
-    // String class is somehow not loadable.
-    let string_cid = ctx
-        .ensure_class_initialized("java/lang/String")
-        .ok()
-        .or_else(|| ctx.class_id_by_name("java/lang/String"))
-        .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
-    let arr = ctx.new_ref_array(string_cid, entries.len());
+    // — `java.io.File.list()` is declared to return `String[]`; see
+    // `new_string_array` for the whole rule and for what an `Object[]` costs.
+    let arr = new_string_array(ctx, entries.len());
     for (i, name) in entries.iter().enumerate() {
         let s = ctx.create_string(name);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+/// Allocate a `java.lang.String[]` — a REFERENCE array whose component type is
+/// `String`, not `Object`.
+///
+/// # Why the component type is not a detail
+///
+/// `ctx.new_array(ArrayElementType::Reference, n)` builds an `Object[]`. Every
+/// value this crate then stores in it is a `String`, every assertion about the
+/// CONTENTS passes, and the array is still the wrong type: a caller that
+/// `checkcast [Ljava/lang/String;` — or simply stores it into a `String[]`
+/// field, or reads it back through a `String[]`-typed accessor — gets an
+/// `Object[]` and fails.
+///
+/// **MEASURED, and it is why this helper exists rather than the four-line
+/// idiom being copied a third time.** `RJdkOptionalShape` on Linux/JDK 25.0.4:
+///
+/// ```text
+/// AssertionError: process.info.arguments: get() on a PRESENT Optional must
+/// return a [Ljava.lang.String;, got [Ljava.lang.Object;
+/// ```
+///
+/// `ProcessHandleImpl$Info.arguments` is declared `String[]`, and
+/// `process.rs::…info0` filled it with an `Object[]`. The corpus asks nothing
+/// about array component types (`WORKER-4` trap 5 says so in as many words), so
+/// this stood until a vector was written that asked.
+///
+/// The `ClassId(0)` fallback is `Object[]` — the pre-existing answer — and is
+/// reached only if `java.lang.String` is not loadable, at which point the array
+/// is the least of it.
+pub(crate) fn new_string_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
+    let string_cid = ctx
+        .ensure_class_initialized("java/lang/String")
+        .ok()
+        .or_else(|| ctx.class_id_by_name("java/lang/String"))
+        .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
+    ctx.new_ref_array(string_cid, len)
 }
 
 fn native_file_can_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
