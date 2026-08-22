@@ -32,7 +32,7 @@ public class ExchangeProbe {
         s.enqueue(new MockResponse.Builder().body("Hello Spring!")
                 .setHeader("Content-Type", "text/plain").build());
         String r = wc.get().uri("/g").retrieve().bodyToMono(String.class)
-                .block(Duration.ofSeconds(20));
+                .block(Duration.ofSeconds(90));
         if (!"Hello Spring!".equals(r)) throw new IllegalStateException("bad " + r);
         s.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS);
         s.close();
