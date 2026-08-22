@@ -17838,6 +17838,128 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
 }
 
+/// `java.util.Hashtable$Enumerator`, java.base's OWN cursor, which is both an
+/// `Enumeration` and an `Iterator` over one position.
+const HT_ENUMERATOR: &str = "java/util/Hashtable$Enumerator";
+/// `Hashtable$Enumerator(Hashtable, int type, boolean iterator)`.
+const HT_ENUMERATOR_CTOR: &str = "(Ljava/util/Hashtable;IZ)V";
+/// `Hashtable.KEYS` / `.VALUES` / `.ENTRIES`, the `type` argument above.
+const HT_ENUM_KEYS: i32 = 0;
+const HT_ENUM_ENTRIES: i32 = 2;
+
+/// A real `Hashtable$Enumerator` over the Hashtable behind a `Hashtable$KeySet`
+/// / `Hashtable$EntrySet` view, or `None` when this receiver is not one of
+/// those (or the image cannot build the class).
+///
+/// # Why this exists
+///
+/// `H4-1` section 3 predicts that refusing the four `MAP_KEY_ITR_CARRIERS`
+/// while `Hashtable$KeySet` is still `Bridge` makes the Hashtable carrier mint
+/// a `HashMap$KeyIterator` whose natives are gone — a silently EMPTY iteration.
+/// That reasoning is right and it UNDERSTATES the problem. MEASURED, unarmed,
+/// `--jdk-only`, two-entry map:
+///
+/// ```text
+///                             HotSpot 25.0.3+9       CratonVM before
+///   ht.keySet().iterator()    Hashtable$Enumerator   HashMap$KeyIterator
+///   ht.entrySet().iterator()  Hashtable$Enumerator   HashMap$EntryIterator
+///   ht.keys()                 Hashtable$Enumerator   Hashtable$Enumerator  <- already right
+/// ```
+///
+/// The wrong class is handed out TODAY, and this map's own `keys()` was already
+/// correct — so one `Hashtable` answered two different iterator classes
+/// depending on which door you came through, the same two-answers-one-object
+/// shape as the enumeration ORDER bug three commits back.
+///
+/// # Why a REAL cursor and not a snapshot under the real name
+///
+/// The first attempt registered the snapshot natives onto
+/// `Hashtable$Enumerator` and named it in both force-native gates. That
+/// **reddened `RJdkEnumerations`**, and the mechanism is this file's own
+/// two-producers-one-slot lesson (`WORKER-2-NOTE-1` section 4a) in a new place:
+/// `Hashtable.keys()` ALREADY produces a real JDK-built `Hashtable$Enumerator`
+/// (`deprecated_util::real_hashtable_enumerator`), so a gate entry keyed on the
+/// CLASS made the snapshot natives intercept that producer's objects too —
+/// objects whose `key_itr_base` slots nothing ever wrote. Two producers, one
+/// class, and a gate that cannot tell them apart.
+///
+/// Using java.base's own cursor for BOTH doors removes the second producer
+/// instead of trying to disambiguate it: one class, one shape, no natives
+/// registered on it, and **no force-native gate entries at all** — so this
+/// stays inside `native-collections`.
+///
+/// It works for the same measured reason `real_hashtable_enumerator` works, and
+/// this lane strengthened that reason: the receiver's `table` is now a real
+/// `[Ljava.util.Hashtable$Entry;` holding real `Hashtable$Entry` nodes, so the
+/// JDK's own `Enumerator` walks the authoritative store with its own bytecode
+/// and its `Entry.key`/`.value`/`.next` accesses land exactly where it expects.
+/// `remove()` and `count` are that same real state, so write-through is the
+/// JDK's own code rather than anything this file has to mirror.
+fn real_ht_view_enumerator(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    source: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let enum_type = match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+    {
+        Some("java/util/Hashtable$KeySet") => HT_ENUM_KEYS,
+        Some("java/util/Hashtable$EntrySet") => HT_ENUM_ENTRIES,
+        _ => return Ok(None),
+    };
+    // Never accept a stand-in: a fabricated `Hashtable$Enumerator` is exactly
+    // the class-fabrication `--jdk-only` exists to stop, and its methods would
+    // be unbound. Ask before a stub can be created and again after init.
+    if ctx.would_fabricate_synthetic_stub(HT_ENUMERATOR)
+        || ctx.is_class_synthetic_stub(HT_ENUMERATOR)
+        || ctx.ensure_class_initialized(HT_ENUMERATOR).is_err()
+        || ctx.is_class_synthetic_stub(HT_ENUMERATOR)
+        || !ctx.method_exists(HT_ENUMERATOR, "<init>", HT_ENUMERATOR_CTOR)
+    {
+        return Ok(None);
+    }
+    // `source` must be the real `Hashtable` the view was minted over, NOT the
+    // view: `VIEW_BACKING_SRC_SLOT` lives on the view's BACKING map, which is
+    // why the caller resolves it and hands it in. Reading it off the view
+    // itself is how the first cut of this route silently never fired.
+    if ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(source))
+        .as_deref()
+        != Some("java/util/Hashtable")
+    {
+        // `Properties` also reaches here (it extends `Hashtable`), and on
+        // JDK 25 HotSpot answers a `ConcurrentHashMap$KeyIterator` for it
+        // because `Properties` is CHM-backed. Handing it a
+        // `Hashtable$Enumerator` would trade one wrong class for another, so
+        // the exact class is required and `Properties` keeps what it had.
+        return Ok(None);
+    }
+    // GC-SAFETY: `new_object_initialized` runs Java (`<clinit>` and the
+    // constructor) and can move the heap, so `source` — a bare Rust local the
+    // collector cannot see — is rooted across it and read back through the pin.
+    let pin = ctx.pin_native_root(source);
+    let built = ctx.new_object_initialized(
+        HT_ENUMERATOR,
+        HT_ENUMERATOR_CTOR,
+        &[
+            Value::Object(Some(ctx.read_native_pin(pin, source))),
+            Value::Int(enum_type),
+            // `iterator = true`: the Iterator face, whose `next()` performs the
+            // modCount check `keySet().iterator()` is required to do. The
+            // Enumeration face stays available on the same object — that is the
+            // whole point of this class — which is why `keys()` and
+            // `keySet().iterator()` can now be the same shape.
+            Value::Int(1),
+        ],
+    );
+    ctx.unpin_native_roots(pin);
+    match built? {
+        Some(Value::Object(Some(e))) => Ok(Some(e)),
+        _ => Ok(None),
+    }
+}
+
 fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
         return r;
@@ -17873,6 +17995,20 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return Ok(Some(Value::Object(None)));
         }
     };
+    // `H4-1` section 3, closed. See [`real_ht_view_enumerator`]: the Hashtable
+    // family gets java.base's OWN cursor rather than a snapshot under a
+    // borrowed class name. Placed here because it needs `backing` — the view
+    // carries no source slot of its own.
+    //
+    // `this_pin` is this frame's pin base, so it has to be released before any
+    // return past it, exactly like the refusal path below.
+    if let Some(src_map) = view_backing_source(&*ctx, backing) {
+        let e = real_ht_view_enumerator(ctx, this, src_map)?;
+        if let Some(e) = e {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(Some(e))));
+        }
+    }
     // Collect once for the count, allocate, then re-collect from the live
     // backing before storing. `alloc_ref_array` can trigger a moving GC; object
     // refs held only in the Rust Vec from the first collection would otherwise
@@ -44042,7 +44178,7 @@ struct TmArrayState {
     data: Option<ObjectRef>,
     size: i32,
     comparator: Value,
-}
+
 impl Default for TmArrayState {
     fn default() -> Self {
         TmArrayState {
