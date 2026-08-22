@@ -2690,6 +2690,103 @@ pub fn with_process_overrides<R>(edits: &[(&str, Option<&str>)], f: impl FnOnce(
     f()
 }
 
+/// Resolve a numeric operator knob that has a default and a hard ceiling,
+/// **saying out loud when the value asked for is not the value in force**.
+///
+/// # Why this exists
+///
+/// `CRATONVM_NATIVE_SHADOW_SINK_CAP` was read as
+///
+/// ```ignore
+/// runtime_var(NAME).ok().and_then(|v| v.trim().parse().ok())
+///     .filter(|n| *n > 0 && *n <= MAX).unwrap_or(DEFAULT)
+/// ```
+///
+/// which has one failure mode that is worse than the others: a value ABOVE the
+/// ceiling falls back to the **default**, so `…=200000` against a ceiling of
+/// 65,536 and a default of 4,096 yields **4,096** — an order of magnitude LESS
+/// than the ceiling the operator was trying to exceed, silently. The operator
+/// then reads `truncated: true` again and concludes the knob does not work.
+///
+/// It is self-inflicted: `vm-cli` advises `CRATONVM_NATIVE_SHADOW_SINK_CAP=`
+/// `(recorded + dropped) * 2`, which exceeds 65,536 for any workload with more
+/// than ~32,768 shadows — so the VM can print advice it then discards.
+///
+/// Two rules, and the asymmetry is the point:
+///
+/// * **too big → CLAMP to `max`.** The ceiling exists so a mistyped value
+///   cannot turn a diagnostic sink into a memory leak; clamping preserves that
+///   exactly while giving the operator the largest value the rule allows, which
+///   is strictly closer to the intent than the default is.
+/// * **zero, negative, empty or non-numeric → the DEFAULT.** There is no
+///   "closer" value to fall back to, and a cap of zero would report an empty
+///   population as a complete one — the exact failure this whole area exists to
+///   remove. A diagnostic must never be the thing that fails.
+///
+/// Either way the run **prints one `[cratonvm]` line naming the value asked
+/// for, the value in force, and why**. `what` names the sink so two callers
+/// sharing one knob produce two distinguishable lines rather than the same
+/// sentence twice.
+///
+/// Returns `default` when the variable is unset — the common case, silent.
+pub fn resolve_capped_usize(name: &str, what: &str, default: usize, max: usize) -> usize {
+    let (value, warning) = capped_var_verdict(runtime_var(name).ok().as_deref(), name, what, default, max);
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
+    value
+}
+
+/// The decision and the sentence, with no I/O — so the PROSE is testable.
+///
+/// Split out after the first version of these messages shipped with 18-space
+/// gaps in them (a patch script's Python `\`+newline joined the lines and kept
+/// the indentation inside the Rust literal). That was found by running a
+/// six-minute LTO build and reading stderr, which is the wrong loop for a
+/// string literal; `the_warnings_read_as_one_sentence` now catches it in
+/// `cargo test -p cratonvm-types`.
+///
+/// Returns `(value in force, Some(warning) when the value asked for is not it)`.
+fn capped_var_verdict(
+    raw: Option<&str>,
+    name: &str,
+    what: &str,
+    default: usize,
+    max: usize,
+) -> (usize, Option<String>) {
+    debug_assert!(default <= max, "a default above the ceiling can never be reached");
+    let Some(raw) = raw else { return (default, None) };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (default, None);
+    }
+    match trimmed.parse::<usize>() {
+        Ok(n) if n == 0 => (
+            default,
+            Some(format!(
+                "[cratonvm] warning: {name}=0 is not a usable {what} cap — a cap of zero \
+                 reports an empty population as a complete one. Using the default {default}."
+            )),
+        ),
+        Ok(n) if n > max => (
+            max,
+            Some(format!(
+                "[cratonvm] warning: {name}={n} exceeds the {what} ceiling of {max}; CLAMPED \
+                 to {max}. (It used to fall back to the default {default}, which is smaller \
+                 than the ceiling and said nothing.)"
+            )),
+        ),
+        Ok(n) => (n, None),
+        Err(_) => (
+            default,
+            Some(format!(
+                "[cratonvm] warning: {name}={trimmed:?} is not a number — the {what} cap \
+                 stays at the default {default}."
+            )),
+        ),
+    }
+}
+
 /// Read an environment value through the runtime configuration boundary.
 ///
 /// Declared CratonVM flags come from the one immutable [`VmFlags`] snapshot.
@@ -3652,6 +3749,130 @@ mod tests {
                 Some("7")
             );
         });
+    }
+
+    /// `resolve_capped_usize`, every branch.
+    ///
+    /// The branch that was the DEFECT is `too_big_is_clamped_not_defaulted`:
+    /// `CRATONVM_NATIVE_SHADOW_SINK_CAP=200000` used to resolve to the DEFAULT
+    /// (4096) rather than the ceiling (65,536), so an operator asking for more
+    /// got an order of magnitude LESS than the rule allows, silently. The other
+    /// four exist so that fixing it cannot quietly change the cases that were
+    /// already right — a `0` cap in particular must never be honoured, because
+    /// it would report an empty population as a complete one.
+    const CAPVAR: &str = "CRATONVM_NATIVE_SHADOW_SINK_CAP";
+
+    fn cap_with(value: Option<&str>) -> usize {
+        with_thread_overrides(&[(CAPVAR, value)], || {
+            resolve_capped_usize(CAPVAR, "test sink", 4096, 65_536)
+        })
+    }
+
+    #[test]
+    fn unset_resolves_to_the_default() {
+        let _lock = process_override_lock();
+        assert_eq!(cap_with(None), 4096);
+    }
+
+    #[test]
+    fn an_in_range_value_is_honoured_exactly() {
+        let _lock = process_override_lock();
+        assert_eq!(cap_with(Some("9000")), 9000);
+        assert_eq!(cap_with(Some("  9000  ")), 9000, "surrounding space is trimmed");
+        assert_eq!(cap_with(Some("65536")), 65_536, "the ceiling itself is in range");
+    }
+
+    #[test]
+    fn too_big_is_clamped_not_defaulted() {
+        let _lock = process_override_lock();
+        // THE BUG. This asserted 4096 for two months by construction.
+        assert_eq!(
+            cap_with(Some("200000")),
+            65_536,
+            "a value above the ceiling must CLAMP to the ceiling; falling back to \
+             the default hands the operator LESS than the rule allows",
+        );
+    }
+
+    #[test]
+    fn zero_and_nonsense_keep_the_default() {
+        let _lock = process_override_lock();
+        assert_eq!(cap_with(Some("0")), 4096, "a cap of zero reports empty as complete");
+        assert_eq!(cap_with(Some("banana")), 4096);
+        assert_eq!(cap_with(Some("-1")), 4096, "usize::from_str rejects a sign");
+        assert_eq!(cap_with(Some("")), 4096);
+        assert_eq!(cap_with(Some("   ")), 4096);
+    }
+
+    /// The warnings must read as ONE SENTENCE.
+    ///
+    /// The first version of them shipped with 18-space gaps —
+    /// `ceiling of 65536;                  CLAMPED to 65536` — because a patch
+    /// script's Python `\`+newline joined the source lines and kept the
+    /// indentation INSIDE the Rust literal. `cat -A` on the patched line passed,
+    /// because the damage was in a string literal and not in a control
+    /// character. It was found by running a six-minute LTO build and reading
+    /// stderr. This is that check, in 0.03 s.
+    #[test]
+    fn the_warnings_read_as_one_sentence() {
+        for raw in ["200000", "0", "banana"] {
+            let (_, w) = capped_var_verdict(
+                Some(raw), "CRATONVM_NATIVE_SHADOW_SINK_CAP", "interpreter observation sink",
+                4096, 65_536,
+            );
+            let w = w.expect("this input must warn");
+            assert!(
+                !w.contains("   "),
+                "the warning for {raw:?} carries a run of 3+ spaces, so a line \
+                 continuation was eaten: {w:?}",
+            );
+            assert!(!w.contains('\n'), "one line, not several: {w:?}");
+            assert!(w.starts_with("[cratonvm] warning: "), "{w:?}");
+            assert!(
+                w.contains("CRATONVM_NATIVE_SHADOW_SINK_CAP"),
+                "a warning that does not name the variable is not actionable: {w:?}",
+            );
+        }
+    }
+
+    /// A value that IS honoured must say nothing at all. A knob that warns on
+    /// its own happy path trains the reader to ignore it.
+    #[test]
+    fn an_honoured_value_is_silent() {
+        for raw in [None, Some("9000"), Some("65536"), Some("  9000  "), Some(""), Some("   ")] {
+            let (_, w) = capped_var_verdict(raw, "X", "sink", 4096, 65_536);
+            assert!(w.is_none(), "{raw:?} must not warn, got {w:?}");
+        }
+    }
+
+    /// The verdict and the printed value never disagree: the number in the
+    /// message is the number returned.
+    #[test]
+    fn the_message_quotes_the_value_actually_in_force() {
+        let (v, w) = capped_var_verdict(Some("200000"), "X", "sink", 4096, 65_536);
+        assert_eq!(v, 65_536);
+        assert!(w.unwrap().contains("CLAMPED to 65536"));
+        let (v, w) = capped_var_verdict(Some("0"), "X", "sink", 4096, 65_536);
+        assert_eq!(v, 4096);
+        assert!(w.unwrap().contains("default 4096"));
+    }
+
+    /// The two sinks share ONE knob, so they must resolve it identically. This
+    /// pins the property the shared helper exists to guarantee: before it, the
+    /// same twelve lines were duplicated in `vm_exec.rs` and `jit/helpers.rs`
+    /// and could drift.
+    #[test]
+    fn both_sinks_resolve_one_knob_the_same_way() {
+        let _lock = process_override_lock();
+        for v in ["200000", "0", "9000", "banana"] {
+            let a = with_thread_overrides(&[(CAPVAR, Some(v))], || {
+                resolve_capped_usize(CAPVAR, "interpreter observation sink", 4096, 65_536)
+            });
+            let b = with_thread_overrides(&[(CAPVAR, Some(v))], || {
+                resolve_capped_usize(CAPVAR, "JIT fast-path violation sink", 4096, 65_536)
+            });
+            assert_eq!(a, b, "the two sinks disagreed about {v}");
+        }
     }
 
     fn process_override_lock() -> std::sync::MutexGuard<'static, ()> {

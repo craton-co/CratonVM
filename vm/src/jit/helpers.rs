@@ -9804,18 +9804,23 @@ pub fn jdk_only_jit_fastpath_refusals() -> u64 {
 /// from a different source than the latched snapshot every other knob uses, and
 /// is a defect in this tree rather than untidiness.
 ///
-/// A value of `0`, a non-numeric value, or anything above
-/// [`JDK_ONLY_HELPER_VIOLATION_CAP_MAX`] leaves the default in place: a
-/// diagnostic must never be the thing that fails, and a cap of zero would
-/// report an empty population as a complete one.
+/// A value of `0`, an empty or a non-numeric value leaves the default in place:
+/// a diagnostic must never be the thing that fails, and a cap of zero would
+/// report an empty population as a complete one. A value ABOVE
+/// [`JDK_ONLY_HELPER_VIOLATION_CAP_MAX`] is CLAMPED to it rather than dropped to
+/// the default, and every adjustment prints one `[cratonvm]` line — see
+/// [`cratonvm_types::flags::resolve_capped_usize`] and the WORKER-5 correction
+/// on `crate::vm::jdk_only_native_shadow_cap`. Sharing that resolver is also
+/// what keeps the two sinks' answers to ONE knob from drifting apart.
 pub fn jdk_only_jit_helper_violation_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_SHADOW_SINK_CAP")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| *n > 0 && *n <= JDK_ONLY_HELPER_VIOLATION_CAP_MAX)
-            .unwrap_or(JDK_ONLY_HELPER_VIOLATION_CAP)
+        cratonvm_types::flags::resolve_capped_usize(
+            "CRATONVM_NATIVE_SHADOW_SINK_CAP",
+            "JIT fast-path violation sink",
+            JDK_ONLY_HELPER_VIOLATION_CAP,
+            JDK_ONLY_HELPER_VIOLATION_CAP_MAX,
+        )
     })
 }
 
