@@ -666,7 +666,7 @@ What survives: the unarmed comparisons in §9 and §10 are unaffected, because
 control and fix were compared *within* the same arm each time, and the vector
 behaves the same way for both binaries.
 
-### 13c. The `25-linux` baseline: refused, then unblocked and taken
+### 13c. The `25-linux` blast-radius baseline is deliberately still not taken
 
 The weekly job has been measuring a table and scoring nothing since it was
 added, and the obvious close is to take the baseline it asks for. **Not yet, and
@@ -678,25 +678,48 @@ and the job would report `REGRESSION`/`REPAIRED` on a vector nobody touched.
 The workflow's own header cites `G89-1` — a ratchet red in blocking CI for five
 days that "adjudicated nothing" — as its reason for being non-blocking. A gate
 that cries wolf three weeks in eight fails identically. **A flaky vector must be
-quarantined before a baseline exists, never after.**
+quarantined before a baseline exists, never after**, and the harness has no
+quarantine mechanism today (`harness-uncounted.txt` is about check counts). That
+is `WORKER-1-NOTE-1` N1 and it belongs to whoever owns `regression-suite/`.
+### 13d. `jit_bridge.rs` was never a hole, and the list that said it was is now empty
 
-**Then the blocker was removed rather than left standing.**
-`regression-suite/known-flaky.txt` is a shared quarantine list; the sweep loads
-it, drops quarantined vectors from every cell, **prints** what it dropped and
-how that vector actually behaved this run, and shouts if a quarantined vector
-fails in every arm — because that is no longer flakiness and the quarantine has
-become a blindfold. A row naming a vector the corpus does not schedule is a hard
-error, so the list can fail. It does not touch `run.sh`'s own counting: every
-published denominator is unchanged, and instruments opt in.
+§13a listed two undialled force files and implied both were holes. One was.
+The other I had inferred from a grep, and reading the bind path says otherwise.
 
-The baseline is now taken (`scripts/baselines/jdk-only-blast-radius-25-linux.txt`,
-`!adjudicating yes`, `!quarantined RTreeRangeGc`), and **the evidence that the
-flake was the whole problem is that two independent sweeps produced identical
-failing SETS for all six prefixes while the pass COUNTS moved** — `HashSet` 105
-then 106, `ConcurrentHashMap` 103 then 104, as `RTreeRangeGc` landed in a
-different arm each time. A confirming run adjudicates all six cells
-`unchanged`. The weekly job scores something for the first time since it was
-added.
+**MEASURED, by reading `jit::direct_native_helper`.** Under `--jdk-only` it
+refuses to bind ANY native whose registry `NativeKind` is not `Intrinsic` —
+§1.4's reviewed exception — and records the refusal. `HashMap.put`,
+`HashMap.get` and `ConcurrentMap.get` are `Bridge`, and are refused today.
+
+The dial's entire domain is **`Bridge` natives under `--jdk-only`**. That is a
+strict *subset* of what the JIT bind path already refuses. So there is no
+configuration in which the dial would yield a native the JIT would otherwise
+have bound: **the hole cannot exist.**
+
+What `jit_bridge.rs` actually does with the force helper is decide whether to
+SEAL a caller out of tier-up. Missing the dial there makes an armed run seal
+call sites it need not — a tier-up cost, in the safe direction, not a
+correctness bug. Wiring it is an optimisation; and the natural place,
+`registered_native_will_run`, also feeds interpreter dispatch, so it is not the
+free edit it looks like. The row is now `permanent: true` with that reasoning,
+and the exemption list carries a third field so a reasoned non-hole cannot be
+counted as outstanding work. **A list that files both under one heading reads
+as twice the remaining problem** — which is the exact failure this lane spent
+its time finding in other people's tables.
+
+**And the hole count is now zero.** `089329af7` reached `dev` while this was
+being written, so `dispatch_virtual.rs` consults the dial and its row went. The
+gate said so by name, unprompted, on the first run after the merge — the second
+time it has done that on a different branch, which is the argument for a source
+scan over a counter in one sentence. The bound is now `holes == 0`, so a new
+unwired force site is a red test on its own rather than something a reader has
+to notice.
+
+Three of the four checks are proven falsifiable by running them: removing an
+exemption goes red naming the file, pointing a row at a file that forces nothing
+goes red, and flipping the surviving row's `permanent` flag to `false` trips the
+zero bound. The assertion text says explicitly not to fix that by flipping the
+flag back, because that is how a to-do becomes a permanent approval.
 ---
 
 ## NOMINATIONS
