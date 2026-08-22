@@ -108,15 +108,17 @@ Either is a happens-before failure across `monitorenter`/`monitorexit`.
 | baseline (`c21d766ad`) | 40 | 3 |
 | baseline (spurious binary, switch OFF) | 40 | 2 |
 | `CRATONVM_JIT_DENY=DefaultPromise` (orphan binary) | 10 | 0 |
-| `CRATONVM_JIT_DENY=DefaultPromise` (fields binary, engagement proven) | 6 | **1** |
+| `CRATONVM_JIT_DENY=DefaultPromise` (fields binary, engagement proven) | 50 | **4** |
 
 ~5–7.5%.
 
 **The JIT is REFUTED.** The first deny arm (0/10) proved nothing — 10 runs at a
 6% rate expects 0.6 — so it was re-run toward 50 with the lever's engagement
-proven first (below). It stalled at **run 4**, which settles it without needing
-50: 50 runs were only ever required to demonstrate *absence*; one stall
-demonstrates *presence*. The stalled run carries the identical signature, with
+proven first (below). It stalled at **run 4**, which settled it without needing
+50 — 50 runs were only ever required to demonstrate *absence*, and one stall
+demonstrates *presence*. The arm was left to finish anyway and ended
+**4 stalls in 50 (8%)**, statistically indistinguishable from the 6.25%
+baseline (5/80): the lever moves the rate not at all. The stalled run carries the identical signature, with
 `DefaultPromise` force-interpreted:
 
 ```
