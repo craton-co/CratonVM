@@ -2655,41 +2655,60 @@ pub fn with_process_overrides<R>(edits: &[(&str, Option<&str>)], f: impl FnOnce(
 ///
 /// Returns `default` when the variable is unset — the common case, silent.
 pub fn resolve_capped_usize(name: &str, what: &str, default: usize, max: usize) -> usize {
+    let (value, warning) = capped_var_verdict(runtime_var(name).ok().as_deref(), name, what, default, max);
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
+    value
+}
+
+/// The decision and the sentence, with no I/O — so the PROSE is testable.
+///
+/// Split out after the first version of these messages shipped with 18-space
+/// gaps in them (a patch script's Python `\`+newline joined the lines and kept
+/// the indentation inside the Rust literal). That was found by running a
+/// six-minute LTO build and reading stderr, which is the wrong loop for a
+/// string literal; `the_warnings_read_as_one_sentence` now catches it in
+/// `cargo test -p cratonvm-types`.
+///
+/// Returns `(value in force, Some(warning) when the value asked for is not it)`.
+fn capped_var_verdict(
+    raw: Option<&str>,
+    name: &str,
+    what: &str,
+    default: usize,
+    max: usize,
+) -> (usize, Option<String>) {
     debug_assert!(default <= max, "a default above the ceiling can never be reached");
-    let raw = match runtime_var(name) {
-        Ok(v) => v,
-        Err(_) => return default,
-    };
+    let Some(raw) = raw else { return (default, None) };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return default;
+        return (default, None);
     }
     match trimmed.parse::<usize>() {
-        Ok(n) if n == 0 => {
-            eprintln!(
-                "[cratonvm] warning: {name}=0 is not a usable {what} cap — a cap of \
-                 zero reports an empty population as a complete one. Using \
-                 the default {default}."
-            );
-            default
-        }
-        Ok(n) if n > max => {
-            eprintln!(
-                "[cratonvm] warning: {name}={n} exceeds the {what} ceiling of {max}; \
-                 CLAMPED to {max}. (It used to fall back to the default \
-                 {default}, which is smaller than the ceiling and said \
-                 nothing.)"
-            );
-            max
-        }
-        Ok(n) => n,
-        Err(_) => {
-            eprintln!(
-                "[cratonvm] warning: {name}={trimmed:?} is not a number — the {what} \
-                 cap stays at the default {default}."
-            );
-            default
-        }
+        Ok(n) if n == 0 => (
+            default,
+            Some(format!(
+                "[cratonvm] warning: {name}=0 is not a usable {what} cap — a cap of zero \
+                 reports an empty population as a complete one. Using the default {default}."
+            )),
+        ),
+        Ok(n) if n > max => (
+            max,
+            Some(format!(
+                "[cratonvm] warning: {name}={n} exceeds the {what} ceiling of {max}; CLAMPED \
+                 to {max}. (It used to fall back to the default {default}, which is smaller \
+                 than the ceiling and said nothing.)"
+            )),
+        ),
+        Ok(n) => (n, None),
+        Err(_) => (
+            default,
+            Some(format!(
+                "[cratonvm] warning: {name}={trimmed:?} is not a number — the {what} cap \
+                 stays at the default {default}."
+            )),
+        ),
     }
 }
 
@@ -3644,6 +3663,59 @@ mod tests {
         assert_eq!(cap_with(Some("-1")), 4096, "usize::from_str rejects a sign");
         assert_eq!(cap_with(Some("")), 4096);
         assert_eq!(cap_with(Some("   ")), 4096);
+    }
+
+    /// The warnings must read as ONE SENTENCE.
+    ///
+    /// The first version of them shipped with 18-space gaps —
+    /// `ceiling of 65536;                  CLAMPED to 65536` — because a patch
+    /// script's Python `\`+newline joined the source lines and kept the
+    /// indentation INSIDE the Rust literal. `cat -A` on the patched line passed,
+    /// because the damage was in a string literal and not in a control
+    /// character. It was found by running a six-minute LTO build and reading
+    /// stderr. This is that check, in 0.03 s.
+    #[test]
+    fn the_warnings_read_as_one_sentence() {
+        for raw in ["200000", "0", "banana"] {
+            let (_, w) = capped_var_verdict(
+                Some(raw), "CRATONVM_NATIVE_SHADOW_SINK_CAP", "interpreter observation sink",
+                4096, 65_536,
+            );
+            let w = w.expect("this input must warn");
+            assert!(
+                !w.contains("   "),
+                "the warning for {raw:?} carries a run of 3+ spaces, so a line \
+                 continuation was eaten: {w:?}",
+            );
+            assert!(!w.contains('\n'), "one line, not several: {w:?}");
+            assert!(w.starts_with("[cratonvm] warning: "), "{w:?}");
+            assert!(
+                w.contains("CRATONVM_NATIVE_SHADOW_SINK_CAP"),
+                "a warning that does not name the variable is not actionable: {w:?}",
+            );
+        }
+    }
+
+    /// A value that IS honoured must say nothing at all. A knob that warns on
+    /// its own happy path trains the reader to ignore it.
+    #[test]
+    fn an_honoured_value_is_silent() {
+        for raw in [None, Some("9000"), Some("65536"), Some("  9000  "), Some(""), Some("   ")] {
+            let (_, w) = capped_var_verdict(raw, "X", "sink", 4096, 65_536);
+            assert!(w.is_none(), "{raw:?} must not warn, got {w:?}");
+        }
+    }
+
+    /// The verdict and the printed value never disagree: the number in the
+    /// message is the number returned.
+    #[test]
+    fn the_message_quotes_the_value_actually_in_force() {
+        let (v, w) = capped_var_verdict(Some("200000"), "X", "sink", 4096, 65_536);
+        assert_eq!(v, 65_536);
+        assert!(w.unwrap().contains("CLAMPED to 65536"));
+        let (v, w) = capped_var_verdict(Some("0"), "X", "sink", 4096, 65_536);
+        assert_eq!(v, 4096);
+        assert!(w.unwrap().contains("default 4096"));
     }
 
     /// The two sinks share ONE knob, so they must resolve it identically. This
