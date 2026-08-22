@@ -44,6 +44,30 @@ public class RStringBuilderContent {
         }
     }
 
+    /**
+     * All four rendering doors over one array: {@code append(Object)},
+     * {@code valueOf(Object)}, string concatenation and {@code toString()} must
+     * agree, and all four must be the identity form {@code <descriptor>@<hex>}.
+     *
+     * <p>The hash is deliberately not compared across doors as text beyond the
+     * prefix — it IS the same object in all four, so they must match each other
+     * exactly, and that equality is the assertion. Only the PREFIX is compared
+     * to a literal, so nothing here depends on the host.
+     */
+    static void arrayIdentity(String what, Object array, String prefix) {
+        String viaToString = array.toString();
+        ck(what + ".toString prefix", viaToString.startsWith(prefix),
+                "expected " + prefix + "<hash>, got [" + viaToString + "]");
+        ck(what + ".toString has a hash", viaToString.length() > prefix.length(),
+                "identity rendering is missing its hash: [" + viaToString + "]");
+        eq(what + " via append(Object)", new StringBuilder().append(array).toString(), viaToString);
+        eq(what + " via String.valueOf(Object)", String.valueOf(array), viaToString);
+        eq(what + " via concat", "" + array, viaToString);
+        // The insert door reads the same slots through `charsequence_fast_units`.
+        eq(what + " via insert(int, Object)",
+                new StringBuilder("<>").insert(1, array).toString(), "<" + viaToString + ">");
+    }
+
     static void eqi(String what, int got, int want) {
         checks++;
         if (got != want) {
@@ -112,6 +136,44 @@ public class RStringBuilderContent {
         eqi("surrogate.codePointCount", sur.codePointCount(0, 2), 1);
         eqi("surrogate.toString.length", sur.toString().length(), 2);
         eqi("surrogate round-trip", sur.toString().codePointAt(0), 0x1F600);
+
+        // ---- an ARRAY is not a String, whatever its component type is ------
+        //
+        // A reference array has no class of its own in CratonVM's class store,
+        // so it carries its COMPONENT's class id: `String[]` answered
+        // `java/lang/String` to every `class_id`-based String test on the
+        // rendering path. Three of the four such doors -- `append(Object)`,
+        // `valueOf(Object)` and the two CharSequence doors -- then read slot 0
+        // as `String.value`, which is the array's FIRST ELEMENT POINTER decoded
+        // as the (tag, payload) pair of a value cell. `append` answered the
+        // EMPTY string and `valueOf` handed the array back AS a String, which
+        // NPEs at the next `.length()` on it.
+        //
+        // Asserted on SHAPE, never on the identity hash: the prefix is the
+        // contract, the digits are not. The three doors are also asserted to
+        // agree with each other and with `Object.toString()`, which is what
+        // makes a single door regressing visible rather than three matching
+        // wrong answers.
+        arrayIdentity("String[]", new String[] { "y", "n" }, "[Ljava.lang.String;@");
+        arrayIdentity("String[0]", new String[0], "[Ljava.lang.String;@");
+        arrayIdentity("String[1]", new String[] { "solo" }, "[Ljava.lang.String;@");
+        arrayIdentity("Boolean[]", new Boolean[] { true, false }, "[Ljava.lang.Boolean;@");
+        arrayIdentity("Object[]", new Object[] { "o" }, "[Ljava.lang.Object;@");
+        arrayIdentity("String[][]", new String[][] { { "a" } }, "[[Ljava.lang.String;@");
+        arrayIdentity("int[]", new int[] { 1, 2 }, "[I@");
+        arrayIdentity("char[]", new char[] { 'a' }, "[C@");
+
+        // NEGATIVE CONTROLS: the String fast paths those four doors exist for
+        // must still be exactly what they were.
+        Object plain = "text";
+        eq("append(Object) over a real String", new StringBuilder().append(plain).toString(), "text");
+        eq("valueOf(Object) over a real String", String.valueOf(plain), "text");
+        // `String.toString()` returns `this`, so `valueOf` is an IDENTITY on a
+        // String -- the property the fast path is there to preserve.
+        ck("valueOf(Object) over a String is the identity", String.valueOf(plain) == plain,
+                "String.valueOf((Object) s) must return s itself");
+        eq("insert(int, CharSequence) over a real String",
+                new StringBuilder("ac").insert(1, (CharSequence) "b").toString(), "abc");
 
         System.out.println("PASS RStringBuilderContent (" + checks + " checks)");
     }

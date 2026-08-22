@@ -2340,6 +2340,50 @@ fn invoke_to_string_opt(
 /// `encode_utf16` their own ASCII text — none of them can produce a
 /// surrogate, so the conversion is exact and the only behavioural difference
 /// is on the two arms that read a Java `String`.
+/// Is `obj` a real `java.lang.String` INSTANCE - not merely something whose
+/// class id says `java/lang/String`?
+///
+/// A reference array has no class of its own in this VM's class store, so it
+/// carries its COMPONENT's class id: `class_id_of_object(new String[2])` answers
+/// `java/lang/String`. Every `class_name == "java/lang/String"` test in the
+/// rendering path therefore matched a `String[]`, and each one then read slot 0
+/// as `String.value` - which is the array's FIRST ELEMENT POINTER, decoded as
+/// the `(tag, payload)` pair of a `Value` cell.
+///
+/// MEASURED (`probes/AppendArrayProbe`), and no GC is involved - the collector's
+/// corrupt-cell guard fires at `collections_now=0`:
+///
+/// ```text
+///   sb.append(new String[]{"y","n"})
+///   String.valueOf((Object) new String[]{"y","n"})
+///   CratonVM   ""  + `gc::guard: corrupt Value cell` + `NullPointerException:
+///                    Cannot read the array length because "this.value" is null`
+///   HotSpot    "[Ljava.lang.String;@<hash>"
+/// ```
+///
+/// This is the producer `corrupt-value-cell-is-fatal-on-three-of-four-collectors`
+/// left open. That record reasoned the reference "is already stale when the
+/// native is entered" because the String fast path has no allocation between
+/// entry and the read. The reference was never stale; the READ was never of a
+/// String. Its Spring Boot witness reaches here through
+/// `ItemMetadata.newProperty(.., new String[]{"y","n"}, ..)` and AssertJ's
+/// `createDescription`, which is a `sb.append(Object)` over that array.
+///
+/// The kind check is the same one the boxed-wrapper fast path in
+/// [`invoke_to_string_units_opt`] has always carried, in its own words: "MUST
+/// exclude arrays: a heap array's num_slots is its LENGTH". Three of the four
+/// String doors did not.
+///
+/// `vm_exec::is_string_object` is the same predicate on the VM side and has
+/// always screened the kind; this is that rule, brought to the natives.
+fn is_plain_string(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> bool {
+    ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array
+        && ctx
+            .class_name_of_id(ctx.class_id_of_object(obj))
+            .as_deref()
+            == Some("java/lang/String")
+}
+
 fn invoke_to_string_units_opt(
     ctx: &mut dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
@@ -2385,12 +2429,11 @@ fn invoke_to_string_units_opt(
     // The class test comes FIRST and `read_string` stays as the fallback: on a
     // class the VM cannot name, `read_string`'s structural decode is still the
     // best answer available, and keeping it means this refactor cannot lose a
-    // route it used to serve.
-    let this_class = ctx
-        .class_name_of_id(ctx.class_id_of_object(obj))
-        .unwrap_or_default();
+    // route it used to serve. `read_string` is gated by the array test too: it
+    // reads the same two slots, so it has the same hazard and none of the class
+    // test's excuse.
     if !is_array {
-        if this_class == "java/lang/String" {
+        if is_plain_string(&*ctx, obj) {
             return Ok(Some(read_string_chars(&*ctx, obj)));
         }
         if let Some(s) = ctx.read_string(obj) {
@@ -2697,7 +2740,7 @@ fn charsequence_fast_units(
     // today -- an array is not a `CharSequence` -- but this is the second of
     // the two doors that read String slots off a class-name test, and the first
     // one was reached.
-    if name == "java/lang/String" && ctx.heap_kind_of(cs) != cratonvm_types::ObjectKind::Array {
+    if is_plain_string(&*ctx, cs) {
         return Ok(Some(read_string_chars(&*ctx, cs)));
     }
     if name == "java/lang/StringBuilder" || name == "java/lang/StringBuffer" {
@@ -3752,8 +3795,8 @@ pub(crate) fn native_sb_insert_charsequence(
     let name = ctx
         .class_name_of_id(ctx.class_id_of_object(cs))
         .unwrap_or_default();
-    // Third door, same array exclusion -- see `charsequence_fast_units`.
-    if name == "java/lang/String" && ctx.heap_kind_of(cs) != cratonvm_types::ObjectKind::Array {
+    // Third door, same array exclusion -- see `is_plain_string`.
+    if is_plain_string(&*ctx, cs) {
         return native_sb_insert_string(ctx, args);
     }
 
@@ -5380,11 +5423,13 @@ pub(crate) fn native_string_value_of_object(
             //
             // The units form was built by `G26` for exactly this reason and
             // this call site never moved to it.
-            if ctx
-                .class_name_of_id(ctx.class_id_of_object(*obj))
-                .as_deref()
-                == Some("java/lang/String")
-            {
+            //
+            // `is_plain_string`, not a bare class-name test: this arm returns
+            // the RECEIVER as the answer, so a `String[]` admitted here is
+            // handed to the caller AS a String and every later `.value` read of
+            // it decodes the array's first element pointer. That is the loudest
+            // of the four doors, because the bad object escapes the native.
+            if is_plain_string(&*ctx, *obj) {
                 return Ok(Some(Value::Object(Some(*obj))));
             }
             match invoke_to_string_units_opt(ctx, *obj)? {
