@@ -19,10 +19,19 @@
 #     JDK="$(dirname "$(dirname "$(command -v javap)")")"
 #
 # yields the MSYS POSIX spelling; `run.sh` exports `MSYS_NO_PATHCONV=1`, so it
-# reaches `cratonvm.exe` unconverted, the VM refuses it during argument parsing,
-# and the harness prints `cratonvm rc=1` for **every vector in the run**.
+# reaches `cratonvm.exe` unconverted and the run dies before any vector does.
 # MEASURED A/B: POSIX form 0 passed / 5 failed, Windows form 5 passed / 0 failed.
 # Use `cygpath -m "$(dirname "$(dirname "$(command -v javap)")")"`.
+#
+# **WHERE it dies was itself wrong until 2026-08-21, and this file must not
+# repeat the error.** `H24-2`, H0 and the first version of THIS file all said
+# "the VM dies in argument parsing". It does not: the VM ACCEPTS the POSIX
+# spelling on the command line and dies **validating the JDK image** —
+# `Provide a valid JDK installation (must contain 'jmods/' or 'lib/modules')`.
+# Nobody could see that because the harness printed a bare `cratonvm rc=1`, and
+# the VM's own banner says `failure occurred during argument parsing`, which is
+# where three readers got it from. The banner is the KEY this file greps for; it
+# is not a description to be quoted.
 #
 # WHAT THE VM ACTUALLY PRINTS — measured 2026-08-21 against cratonvm-r10.exe
 # --------------------------------------------------------------------------
@@ -81,17 +90,27 @@
 vm_fault_class() {
   _vmf_rc="$1"; _vmf_out="$2"
 
-  # 1. The VM died before resolving its JDK mode. This is the trap-1 shape and
-  #    it is checked FIRST because such a run also carries an `Err:` line whose
-  #    text varies, while this banner does not.
+  # 1. The VM exited BEFORE it resolved its JDK mode. This is the trap-1 shape.
+  #    Checked FIRST because such a run also carries an `Err:` line whose text
+  #    varies, while this banner does not.
+  #
+  #    The banner reads `failure occurred during argument parsing`; do NOT quote
+  #    it as the cause. The JDK-image sub-case below is the common one and is
+  #    NOT an argument-parsing failure at all — see the header.
   case "$_vmf_out" in
     *'jdk mode: <not yet resolved'*)
       _vmf_why=$(printf '%s\n' "$_vmf_out" \
         | grep -aE 'main-vm run\(\) returned Err:' | head -1 \
         | sed 's/^\[cratonvm\] main-vm run() returned Err: //; s/\x1b\[[0-9;]*m//g' \
         | cut -c1-90)
-      printf 'rc=%s: HARNESS FAULT — VM COULD NOT PARSE ITS ARGUMENTS: %s [use cygpath -m for --java-home]\n' \
-             "$_vmf_rc" "${_vmf_why:-see the run() Err line}"
+      case "$_vmf_out" in
+        *'Provide a valid JDK installation'*|*'--java-home path does not exist'*)
+          printf 'rc=%s: HARNESS FAULT — VM REJECTED THE JDK IMAGE: %s [on MSYS use cygpath -m]\n' \
+                 "$_vmf_rc" "${_vmf_why:-see the run() Err line}" ;;
+        *)
+          printf 'rc=%s: HARNESS FAULT — VM EXITED BEFORE RESOLVING ITS JDK MODE (launch/config): %s\n' \
+                 "$_vmf_rc" "${_vmf_why:-see the run() Err line}" ;;
+      esac
       return 0 ;;
   esac
 
@@ -142,12 +161,16 @@ vm_fault_class() {
 # of the 105 vectors the same broken environment killed.
 vm_fault_hint() {
   case "$1" in
-    *'COULD NOT PARSE ITS ARGUMENTS'*)
-      echo "  The VM never resolved its JDK mode, so it never ran a vector. On MSYS/Git"
-      echo "  Bash the usual cause is a POSIX --java-home: run.sh exports"
-      echo "  MSYS_NO_PATHCONV=1, so the path reaches cratonvm.exe unconverted. MEASURED"
-      echo "  A/B: POSIX form 0 passed / 5 failed, Windows form 5 passed / 0 failed. Use"
+    *'REJECTED THE JDK IMAGE'*)
+      echo "  The VM never resolved its JDK mode, so it never ran a vector. It did NOT"
+      echo "  fail to parse the command line — it accepted --java-home and then rejected"
+      echo "  the image behind it. On MSYS/Git Bash the usual cause is a POSIX path:"
+      echo "  run.sh exports MSYS_NO_PATHCONV=1, so it reaches cratonvm.exe unconverted."
+      echo "  MEASURED A/B: POSIX 0 passed / 5 failed, Windows 5 passed / 0 failed. Use"
       echo '    JDK=$(cygpath -m "$(dirname "$(dirname "$(command -v javap)")")")' ;;
+    *'BEFORE RESOLVING ITS JDK MODE'*)
+      echo "  The VM exited during startup, before it resolved its JDK mode, so no vector"
+      echo "  ran. The run() Err line above is the VM's own reason." ;;
     *'REJECTED ITS COMMAND LINE'*)
       echo "  A flag in CRATONVM_ARGS or in a per-class argument list is unknown to this"
       echo "  binary, is missing its value, or conflicts with another. Nothing ran." ;;
@@ -192,7 +215,7 @@ if [ "${1:-}" = "--selftest" ]; then
 "[cratonvm] main-vm run() returned Err: --java-home path does not exist or is not a directory: /c/Program Files/Microsoft/jdk-25.0.3.9-hotspot
 Provide a valid JDK installation (must contain \`jmods/\` or \`lib/modules\`).
 [cratonvm] jdk mode: <not yet resolved — failure occurred during argument parsing>" \
-    "COULD NOT PARSE ITS ARGUMENTS"
+    "REJECTED THE JDK IMAGE"
 
   _pos "unknown flag" 2 \
 "error: unexpected argument '--no-such-flag' found
@@ -212,6 +235,12 @@ For more information, try '--help'." \
 "[cratonvm] main-vm run() returned Err: Could not find or load main class NoSuchMain: class file error: class not found: NoSuchMain
 [cratonvm] jdk mode: real-jdk (java.home=C:/Program Files/Microsoft/jdk-25.0.3.9-hotspot)" \
     "MAIN CLASS NOT FOUND"
+
+  # The non-image startup failure: same banner, no image complaint.
+  _pos "startup failure that is not the image" 1 \
+"[cratonvm] main-vm run() returned Err: could not open the class path entry /nope
+[cratonvm] jdk mode: <not yet resolved — failure occurred during argument parsing>" \
+    "BEFORE RESOLVING ITS JDK MODE"
 
   _pos "timeout"    124 "" "TIMED OUT"
   _pos "not +x"     126 "" "COULD NOT BE EXECUTED"
@@ -266,15 +295,16 @@ Usage: cratonvm" \
   # (g) vm_fault_hint covers every class the classifier can emit, and refuses
   #     anything else. A hint table that has silently fallen behind the
   #     classifier is the `H23` shape: green, and inert.
-  for _cls in "COULD NOT PARSE ITS ARGUMENTS" "REJECTED ITS COMMAND LINE" \
-              "MAIN CLASS NOT FOUND" "TIMED OUT" "COULD NOT BE EXECUTED"; do
+  for _cls in "REJECTED THE JDK IMAGE" "BEFORE RESOLVING ITS JDK MODE" \
+              "REJECTED ITS COMMAND LINE" "MAIN CLASS NOT FOUND" "TIMED OUT" \
+              "COULD NOT BE EXECUTED"; do
     if vm_fault_hint "rc=1: HARNESS FAULT — $_cls: x" > /dev/null; then :; else
       _no "vm_fault_hint has no entry for '$_cls'"; fi
   done
   if vm_fault_hint "rc=1: something else" > /dev/null; then
     _no "vm_fault_hint accepted a why it has no entry for"
   else
-    _ok "vm_fault_hint covers all five classes and refuses anything else"
+    _ok "vm_fault_hint covers all six classes and refuses anything else"
   fi
 
   # --- the fault this classifier is FOR, stated as a regression check -------
@@ -291,7 +321,7 @@ Usage: cratonvm" \
     _no "premise broken: the existing sig grep now matches [$_sig] — re-read this file"
   fi
 
-  [ "$_f" -eq 0 ] && { echo "  selftest OK — 7 faults classified, 5 negative controls fall through,
+  [ "$_f" -eq 0 ] && { echo "  selftest OK — 8 faults classified, 5 negative controls fall through,
   the one-line rule holds, the hint table is complete, and the premise holds"; exit 0; }
   exit 3
 fi
