@@ -1966,10 +1966,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // mirror the `java/io/File` disk-space fallback below (`getTotalSpace`
     // etc. — no portable free-space query, so report "plenty available").
     {
+        // Every accessor below reads the store's ONE private slot through
+        // `file_store_base`, not at a literal 0: since 2026-08-21
+        // `p57_alloc_file_store` mints the concrete `sun.nio.fs.*FileStore`
+        // (JVMS 6.5, `FILE_STORE_IMPLS`), whose own declared fields occupy the
+        // low slots. The base collapses to 0 for any receiver this crate did
+        // not allocate, so a foreign or stub-mode store reads what it read
+        // before.
         let fs_store = "java/nio/file/FileStore";
+        let __fs_rows_before = r.dump_registrations().len();
         r.register(fs_store, "name", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let name = match ctx.get_field(this, 0) {
+            let base = file_store_base(ctx, this);
+            let name = match ctx.get_field(this, base) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
@@ -1990,7 +1999,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // was previously reported as writable to every caller that pre-checks.
         r.register(fs_store, "isReadOnly", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let path = match ctx.get_field(this, 0) {
+            let base = file_store_base(ctx, this);
+            let path = match ctx.get_field(this, base) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
@@ -2026,7 +2036,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // `Unix/WindowsFileStore` issues) and keep 4096 only as the fallback.
         r.register(fs_store, "getBlockSize", "()J", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let path = match ctx.get_field(this, 0) {
+            let base = file_store_base(ctx, this);
+            let path = match ctx.get_field(this, base) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
@@ -2106,7 +2117,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         );
         r.register(fs_store, "toString", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let name = match ctx.get_field(this, 0) {
+            let base = file_store_base(ctx, this);
+            let name = match ctx.get_field(this, base) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
@@ -2115,6 +2127,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 ctx.create_string(&format!("{name} ({t})")),
             ))))
         });
+
+        // The registration half. Dispatch keys on the receiver's runtime class
+        // (`H11-1`), and `sun.nio.fs.UnixFileStore` declares `name`, `type`,
+        // `isReadOnly`, `getTotalSpace`, … with `Code` -- so moving the mint
+        // without moving these rows would hand every accessor to the JDK's own
+        // body against a store whose `<init>` never ran.
+        for target in FILE_STORE_IMPLS {
+            cratonvm_native_io::concrete_receiver::mirror_class_registrations(
+                r,
+                __fs_rows_before,
+                fs_store,
+                target,
+            );
+        }
     }
 
     r.register(
@@ -5805,7 +5831,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // 3 fields: slot 0 = materialised Object[] of Paths, slot 1 = the
             // closed flag `close()` sets, slot 2 = the "an Iterator has already
             // been handed out" latch (see the `iterator` registration below).
-            let stream = try_alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 3)?;
+            // Minted AS the concrete `sun.nio.fs.*DirectoryStream`, not as
+            // the INTERFACE `java.nio.file.DirectoryStream` (JVMS 6.5; see
+            // `DIR_STREAM_IMPLS`). The three private slots move above whatever
+            // that class declares, through `dir_stream_base`.
+            let minted = cratonvm_native_io::concrete_receiver::alloc_concrete(
+                ctx,
+                DIR_STREAM_IMPLS,
+                "java/nio/file/DirectoryStream",
+                DIR_STREAM_SLOTS,
+            );
+            let stream = minted.obj;
+            let ds_base = minted.base;
             // Pin across the array/Path allocs below — a moving young GC there
             // would relocate the fresh stream/array (native stale-local family).
             let stream_pin = ctx.pin_native_root(stream);
@@ -5922,9 +5959,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 ctx.read_native_pin(arr_pin, arr)
             };
             let stream = ctx.read_native_pin(stream_pin, stream);
-            ctx.set_field(stream, 0, Value::Object(Some(arr)));
-            ctx.set_field(stream, 1, Value::Int(0));
-            ctx.set_field(stream, 2, Value::Int(0));
+            ctx.set_field(stream, ds_base, Value::Object(Some(arr)));
+            ctx.set_field(stream, ds_base + 1, Value::Int(0));
+            ctx.set_field(stream, ds_base + 2, Value::Int(0));
             // `stream_pin` is the OUTERMOST watermark, so releasing it also
             // releases `arr_pin`, `filter_pin` and `filtered_pin` above it.
             ctx.unpin_native_roots(stream_pin);
@@ -5938,9 +5975,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // for-each, which compiles to invokeinterface DirectoryStream.iterator.
     // Without these natives every such walk throws
     // `AbstractMethodError: DirectoryStream.iterator()V has no Code attribute`.
+    // Every body below reads the stream's private map through
+    // `dir_stream_base`, not at literal 0/1/2: since 2026-08-21 the mint names
+    // the concrete `sun.nio.fs.*DirectoryStream` (JVMS 6.5, `DIR_STREAM_IMPLS`)
+    // and the map sits above that class's own declared fields.
     let ds = "java/nio/file/DirectoryStream";
+    let __ds_rows_before = r.dump_registrations().len();
     r.register(ds, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let ds_base = dir_stream_base(ctx, this);
         // Spec: iterating a closed stream is a `ClosedDirectoryStreamException`,
         // which IS an `IllegalStateException` (that is its declared supertype),
         // so this is the same class of failure real `UnixDirectoryStream`
@@ -5951,7 +5994,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // `directory stream is closed`, lower-case, which is the sort of
         // one-character divergence that fails a differential with every
         // assertion passing.
-        if matches!(ctx.get_field(this, 1), Value::Int(v) if v != 0) {
+        if matches!(ctx.get_field(this, ds_base + 1), Value::Int(v) if v != 0) {
             return Err(RuntimeError::IllegalStateException {
                 message: "Directory stream is closed".to_string(),
             }
@@ -5967,14 +6010,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // matching the JDK (measured: after `close()` the answer is the closed
         // message even when an iterator had already been obtained).
         // G4-1-the-io-and-nio-fabricated-success-sweep-measured-20260816.md
-        if matches!(ctx.get_field(this, 2), Value::Int(v) if v != 0) {
+        if matches!(ctx.get_field(this, ds_base + 2), Value::Int(v) if v != 0) {
             return Err(RuntimeError::IllegalStateException {
                 message: "Iterator already obtained".to_string(),
             }
             .into());
         }
-        ctx.set_field(this, 2, Value::Int(1));
-        let arr = match ctx.get_field(this, 0) {
+        ctx.set_field(this, ds_base + 2, Value::Int(1));
+        let arr = match ctx.get_field(this, ds_base) {
             Value::Object(Some(a)) => a,
             _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
         };
@@ -5991,8 +6034,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // as the spec requires.
     r.register(ds, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Object(None));
-        ctx.set_field(this, 1, Value::Int(1));
+        let ds_base = dir_stream_base(ctx, this);
+        ctx.set_field(this, ds_base, Value::Object(None));
+        ctx.set_field(this, ds_base + 1, Value::Int(1));
         Ok(None)
     });
     // Was `null`, which is not a legal answer for anything: `DirectoryStream`
@@ -6010,7 +6054,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Spliterator;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let arr = match ctx.get_field(this, 0) {
+        let ds_base = dir_stream_base(ctx, this);
+            let arr = match ctx.get_field(this, ds_base) {
                 Value::Object(Some(a)) => a,
                 _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
             };
@@ -6027,6 +6072,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(spl))))
         },
     );
+
+    // The registration half: `iterator`/`close`/`spliterator` on the concrete
+    // classes the receiver now wears. `H11-1` -- dispatch keys on the receiver.
+    for target in DIR_STREAM_IMPLS {
+        cratonvm_native_io::concrete_receiver::mirror_class_registrations(
+            r,
+            __ds_rows_before,
+            ds,
+            target,
+        );
+    }
 
     // createSymbolicLink / createLink / readSymbolicLink.
     //
@@ -11830,10 +11886,13 @@ fn dos_attr_flag(path: &str, flag: u32) -> bool {
 /// Field 0 of the synthetic store holds its mount root.
 pub(crate) fn file_store_space(ctx: &mut dyn NativeContext, args: &[Value], which: u8) -> i64 {
     let path = match args.first() {
-        Some(Value::Object(Some(this))) => match ctx.get_field(*this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        },
+        Some(Value::Object(Some(this))) => {
+            let base = file_store_base(ctx, *this);
+            match ctx.get_field(*this, base) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            }
+        }
         _ => String::new(),
     };
     file_disk_space_bytes(&path).map_or(0, |(total, free, usable)| match which {
@@ -12037,12 +12096,68 @@ pub(crate) fn attribute_view_short_name(class_name: &str) -> Option<&'static str
     })
 }
 
+/// The concrete `FileStore` HotSpot 25 builds for the default file system,
+/// per platform. MEASURED (`regression-suite/probes/W4Abstract.java`, oracle
+/// column, Linux): `Files.getFileStore(f).getClass()` is
+/// `sun.nio.fs.LinuxFileStore`, where this VM answered the ABSTRACT
+/// `java.nio.file.FileStore` -- a receiver `new` cannot legally produce
+/// (JVMS 6.5). Ordered; `alloc_concrete` takes the first entry that is present
+/// AND instantiable, so the abstract `UnixFileStore` parent is safe to keep as
+/// a last-resort entry.
+pub(crate) const FILE_STORE_IMPLS: &[&str] = &[
+    "sun/nio/fs/LinuxFileStore",
+    "sun/nio/fs/MacOSXFileStore",
+    "sun/nio/fs/BsdFileStore",
+    "sun/nio/fs/SolarisFileStore",
+    "sun/nio/fs/WindowsFileStore",
+    "sun/nio/fs/UnixFileStore",
+];
+/// How many private slots a `FileStore` this crate mints carries: slot 0, the
+/// backing path string.
+pub(crate) const FILE_STORE_SLOTS: usize = 1;
+
+/// Where a minted `FileStore`'s private slot starts on `this`.
+pub(crate) fn file_store_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+    cratonvm_native_api::appended_slots::base_for_object(ctx, this, FILE_STORE_SLOTS)
+}
+
+/// The concrete `DirectoryStream` HotSpot 25 builds. MEASURED, same probe:
+/// `Files.newDirectoryStream(dir).getClass()` is
+/// `sun.nio.fs.UnixSecureDirectoryStream` on Linux, where this VM answered the
+/// INTERFACE `java.nio.file.DirectoryStream`.
+pub(crate) const DIR_STREAM_IMPLS: &[&str] = &[
+    "sun/nio/fs/UnixSecureDirectoryStream",
+    "sun/nio/fs/UnixDirectoryStream",
+    "sun/nio/fs/WindowsDirectoryStream",
+];
+/// The private map: slot 0 = the materialised `Object[]` of `Path`s, slot 1 =
+/// the closed flag, slot 2 = the "an Iterator has already been handed out"
+/// latch.
+pub(crate) const DIR_STREAM_SLOTS: usize = 3;
+
+/// Where a minted `DirectoryStream`'s private map starts on `this`.
+pub(crate) fn dir_stream_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+    cratonvm_native_api::appended_slots::base_for_object(ctx, this, DIR_STREAM_SLOTS)
+}
+
 /// Allocate a synthetic `java/nio/file/FileStore` for `path`. Field 0 holds
 /// the store's `name()` — the drive root on Windows (`C:\`), or `/` on
 /// Unix — since real JDK FileStore names are the mount point, not the
 /// queried path itself.
 pub(crate) fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> Result<ObjectRef, MethodCallFailed> {
-    let store = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileStore", 1)?;
+    // Minted AS the concrete per-platform `sun.nio.fs.*FileStore`, not as the
+    // ABSTRACT `java.nio.file.FileStore` (JVMS 6.5; see `FILE_STORE_IMPLS`).
+    // The private slot moves above whatever that class declares, through
+    // `file_store_base`, which every accessor in the `fs_store` registrar also
+    // calls -- so the allocator and the readers cannot disagree.
+    let minted = cratonvm_native_io::concrete_receiver::alloc_concrete(
+        ctx,
+        FILE_STORE_IMPLS,
+        "java/nio/file/FileStore",
+        FILE_STORE_SLOTS,
+    );
+    let store = minted.obj;
+    let store_base = minted.base;
     let name = if cfg!(windows) {
         std::path::Path::new(path)
             .components()
@@ -12057,7 +12172,7 @@ pub(crate) fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> R
     let store_pin = ctx.pin_native_root(store);
     let s = ctx.create_string(&name);
     let store = ctx.read_native_pin(store_pin, store);
-    ctx.set_field(store, 0, Value::Object(Some(s)));
+    ctx.set_field(store, store_base, Value::Object(Some(s)));
     ctx.unpin_native_roots(store_pin);
     Ok(store)
 }
@@ -15372,9 +15487,36 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let ok = std::fs::create_dir(&path).is_ok();
         Ok(Some(Value::Int(if ok { 1 } else { 0 })))
     });
+// `File.mkdirs()` RETURNS FALSE WHEN THE DIRECTORY ALREADY EXISTS.
+//
+// `std::fs::create_dir_all` answers `Ok(())` for a path that is already a
+// directory, so `is_ok()` alone reports "I created it" for a directory this
+// call did nothing to. The JDK's own body opens with `if (exists()) return
+// false;` -- the return value is "did THIS call create the directory", not
+// "does the directory exist now", and callers branch on it (an installer that
+// treats `true` as "first run", a cache that treats it as "I own this dir").
+//
+// MEASURED, `regression-suite/probes/W4File.java`, Linux/JDK 25.0.4, both
+// modes:
+//
+//     new File(dir, "x/y/z").mkdirs()   first call    HotSpot true   CratonVM true
+//     new File(dir, "x/y/z").mkdirs()   second call   HotSpot FALSE  CratonVM TRUE
+//
+// The sibling `mkdir()` was already right -- `create_dir` fails on an existing
+// path -- which is why the single-level case matched the oracle and only the
+// recursive one did not.
+//
+// BOTH COPIES of this native are fixed, deliberately. `--dump-native-registry`
+// shows two registrations of `java/io/File.mkdirs()Z`: this one, `owns_slot=
+// True`, and `native-io/src/lib.rs`'s, `owns_slot=False`. Fixing only the
+// winner leaves the identical defect armed behind it, and trap 4 is that
+// retiring a winner PROMOTES the loser.
     r.register(file, "mkdirs", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
+        if std::path::Path::new(&path).exists() {
+            return Ok(Some(Value::Int(0)));
+        }
         let ok = std::fs::create_dir_all(&path).is_ok();
         Ok(Some(Value::Int(if ok { 1 } else { 0 })))
     });

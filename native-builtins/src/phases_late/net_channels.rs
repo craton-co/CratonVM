@@ -1753,18 +1753,42 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
     // the other crate; `cratonvm_native_io::afc_sync_at` is the half that has
     // to know the handle table. The rule this body got wrong is that the
     // registration which decides the layout is the one that ALLOCATES.
-    r.register(afc, "force", "(Z)V", |ctx, args| {
+    //
+    // REGISTERED ON THE CONCRETE CLASSES TOO, 2026-08-21 (WORKER 4), and that
+    // is not optional. `native-io`'s `alloc_afc_channel` now mints
+    // `sun.nio.ch.SimpleAsynchronousFileChannelImpl` (Linux) /
+    // `…Windows…` instead of an instance of the ABSTRACT
+    // `java.nio.channels.AsynchronousFileChannel` (JVMS 6.5 -- see
+    // `probes/W4Abstract.java`). Dispatch keys on the receiver's runtime class
+    // (`H11-1`), so an abstract-only row stops being reached the moment the
+    // mint moves. MEASURED: with the row on the abstract name only,
+    // `RJdkAsyncChannel` died with
+    //   NullPointerException: Cannot invoke "sun.nio.ch.NativeThreadSet.add()"
+    //   because "this.threads" is null
+    //     at sun/nio/ch/SimpleAsynchronousFileChannelImpl.implForce
+    // — the JDK's own `force` bytecode, running against a channel whose
+    // `<init>` this VM never ran. `scripts/…`-free reproduction: the
+    // cross-crate audit in this lane's record lists every triple in that
+    // position; `force` and `AsynchronousSocketChannel.connect` were the two.
+    //
+    // AND THE SLOT INDICES ARE GONE. This body read `get_field(this, 2)` and
+    // `get_field(this, 0)` under a hard-coded copy of the other crate's map.
+    // Since 2026-08-21 that map is APPENDED above whatever the concrete class
+    // declares, so no constant can be right. `afc_channel_is_open` /
+    // `afc_channel_handle_id` are the allocator's own readers, published for
+    // this call site — which is the rule the comment above states.
+    let force_body = |ctx: &mut dyn cratonvm_native_api::NativeContext,
+                      args: &[Value]|
+     -> cratonvm_types::error::MethodCallResult {
         let this = obj_arg(args, 0)?;
-        // slot 2 = AFC_FIELD_OPEN
-        if !matches!(ctx.get_field(this, 2), Value::Int(1)) {
+        if !cratonvm_native_io::afc_channel_is_open(ctx, this) {
             return Err(cratonvm_native_io::afc_closed_channel_error(ctx));
         }
         // `metaData == true` is "content AND metadata" -> sync_all.
         let metadata = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-        // slot 0 = AFC_FIELD_FD, this channel's own handle id
-        let handle_id = match ctx.get_field(this, 0) {
-            Value::Int(v) if v > 0 => v as u32,
-            _ => return Ok(None),
+        let handle_id = match cratonvm_native_io::afc_channel_handle_id(ctx, this) {
+            Some(id) => id,
+            None => return Ok(None),
         };
         // STW-TAKEOVER guard, same as the `afc_truncate_at` call site in
         // `native_afc_truncate`: `afc_sync_at` parks on a real `Mutex::lock()`
@@ -1782,7 +1806,13 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             message: format!("AsynchronousFileChannel.force: {e}"),
         })?;
         Ok(None)
-    });
+    };
+    for cls in std::iter::once(afc)
+        .chain(cratonvm_native_io::AFC_IMPLS.iter().copied())
+        .chain(std::iter::once(cratonvm_native_io::AFC_ABSTRACT_IMPL))
+    {
+        r.register(cls, "force", "(Z)V", force_body);
+    }
     // `lock()Ljava/util/concurrent/Future;` was registered here and is now
     // registered by `native-io`'s `register_async_file_channel`
     // (`native_afc_lock`), beside the `tryLock(JJZ)` whose real
@@ -1828,10 +1858,17 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
     //
     // Slots 0 and 1 have OPPOSITE meanings and slot 2 holds a different KIND of
     // integer. That is the two-layouts-on-one-class condition — the shape that
-    // made `java.lang.Process` a bug — and it is NOT repaired here: the owner is
-    // also the allocator, so the repair has to move both sides in one step and
-    // belongs to a lane that owns `native-io`. A one-sided renumber only moves
-    // the disagreement.
+    // made `java.lang.Process` a bug.
+    //
+    // REPAIRED 2026-08-21 (WORKER 4), in the one step this comment said it
+    // needed: the surviving `connect` body below no longer indexes slots at
+    // all, it calls `cratonvm_native_io::async_socket::async_socket_note_connected`,
+    // so there is exactly one map and its owner holds it. The two `open`
+    // bodies below still write 0..3 by index and are still DEAD (overwritten
+    // by `native-io`'s registrations, which run later); they are left in place
+    // rather than deleted because retiring a loser is a registry change that
+    // wants its own `--dump-native-registry` before/after, and this lane's
+    // change is behavioural.
     //
     // Neither map is layout-correct either way: real
     // `java.nio.channels.AsynchronousSocketChannel` (JDK 25.0.3.9, `javap -p`)
@@ -1869,11 +1906,20 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ch))))
         },
     );
-    r.register(
-        asc,
-        "connect",
-        "(Ljava/net/SocketAddress;)Ljava/util/concurrent/Future;",
-        |ctx, args| {
+    // ON THE CONCRETE CLASSES TOO, 2026-08-21 (WORKER 4). Same reason as
+    // `force(Z)V` above, and found by the same cross-crate audit:
+    // `native-io`'s `aio_asc_open` now mints
+    // `sun.nio.ch.UnixAsynchronousSocketChannelImpl` rather than an instance
+    // of the ABSTRACT public class (JVMS 6.5 -- `probes/W4Abstract.java`),
+    // dispatch keys on the receiver (`H11-1`), and this is the ONLY
+    // registration of this triple in the tree. An abstract-only row would
+    // therefore stop answering the moment the mint moved, and the JDK's own
+    // `connect` bytecode would run against a channel with no initialised
+    // state -- the exact shape `RJdkAsyncChannel` hit for `force`.
+    //
+    // Typed as `NativeCallback` (a plain `fn` pointer) so the non-capturing
+    // closure coerces once and can be handed to `register` per class.
+    let connect_body: cratonvm_native_api::registry::NativeCallback = |ctx, args| {
             let this = obj_arg(args, 0)?;
             // Extract host:port from the SocketAddress. The argument is a real
             // `InetSocketAddress` (state behind a private `holder`), NOT a flat
@@ -1893,13 +1939,42 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                         format!("connect failed: {io}")
                     })
                 })?;
-            ctx.set_field(this, 0, Value::Int(1)); // connected
-            ctx.set_field(this, 2, Value::Int(fd_id as i32));
-            ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
+            // FIXED 2026-08-21 (WORKER 4). These three lines used to write
+            // slots 0/2/3 BY INDEX, under the map documented above -- a map
+            // that disagrees with the OWNER's on slots 0 and 1 and on what
+            // kind of integer slot 2 holds. The receiver is always an object
+            // `native-io`'s `aio_asc_open` allocated (that crate wins every
+            // other triple on this class), and since 2026-08-21 its private
+            // map is APPENDED above the concrete `sun.nio.ch.*Impl` layout,
+            // so an absolute index here is now wrong twice over.
+            //
+            // One writer, one map: this calls the owner's own setter. The
+            // repair W7-49 said "belongs to a lane that owns native-io" --
+            // that lane also owns this line, so both halves move together, as
+            // that record required.
+            let remote = args.get(1).copied().unwrap_or(Value::Object(None));
+            cratonvm_native_io::async_socket::async_socket_note_connected(
+                ctx,
+                this,
+                fd_id as i32,
+                remote,
+            );
             // DF07: completed Future<Void> via real CompletableFuture (see helper).
             aio_completed_future(ctx, Value::Object(None))
-        },
-    );
+    };
+    for cls in std::iter::once(asc)
+        .chain(cratonvm_native_io::async_socket::ASC_IMPLS.iter().copied())
+        .chain(std::iter::once(
+            cratonvm_native_io::async_socket::ASC_ABSTRACT_IMPL,
+        ))
+    {
+        r.register(
+            cls,
+            "connect",
+            "(Ljava/net/SocketAddress;)Ljava/util/concurrent/Future;",
+            connect_body,
+        );
+    }
     r.register(
         asc,
         "read",

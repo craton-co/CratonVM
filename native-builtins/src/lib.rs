@@ -25879,40 +25879,70 @@ fn dbg_vdisp_cached() -> bool {
 /// `None`. Size-dependent immutable-collection stamps are handled separately by
 /// [`immutable_collection_kind`] because their concrete class varies with the
 /// element count.
-fn jdk_concrete_getclass_alias(stamp: &str) -> Option<&'static str> {
+fn jdk_concrete_getclass_alias(stamp: &str) -> Option<&'static [&'static str]> {
     Some(match stamp {
         // java.util.stream — synthetic streams are stamped with the *interface*.
         // (`IntStream.of(..)` already produces a real `IntPipeline$Head`, so its
         // objects are not stamped with the interface and never reach here.)
-        "java/util/stream/Stream" => "java/util/stream/ReferencePipeline$Head",
-        "java/util/stream/IntStream" => "java/util/stream/IntPipeline$Head",
-        "java/util/stream/LongStream" => "java/util/stream/LongPipeline$Head",
-        "java/util/stream/DoubleStream" => "java/util/stream/DoublePipeline$Head",
+        "java/util/stream/Stream" => &["java/util/stream/ReferencePipeline$Head"],
+        "java/util/stream/IntStream" => &["java/util/stream/IntPipeline$Head"],
+        "java/util/stream/LongStream" => &["java/util/stream/LongPipeline$Head"],
+        "java/util/stream/DoubleStream" => &["java/util/stream/DoublePipeline$Head"],
         // java.net — abstract URLConnection subclasses.
-        "java/net/JarURLConnection" => "sun/net/www/protocol/jar/JarURLConnection",
-        "java/net/HttpURLConnection" => "sun/net/www/protocol/http/HttpURLConnection",
+        "java/net/JarURLConnection" => &["sun/net/www/protocol/jar/JarURLConnection"],
+        "java/net/HttpURLConnection" => &["sun/net/www/protocol/http/HttpURLConnection"],
         // java.nio.file — abstract/interface stamps; the concrete impl is
         // platform specific. Resolution is best-effort: an unavailable class
         // simply falls back to the stamped mirror (see caller).
+        //
+        // TWO OF THESE NAMED AN ABSTRACT CLASS until 2026-08-21 (WORKER 4).
+        // `sun.nio.fs.UnixFileSystem` and `sun.nio.fs.UnixFileSystemProvider`
+        // are the abstract PARENTS of the per-platform classes, so on Linux
+        // `FileSystems.getDefault().getClass()` answered
+        // `sun.nio.fs.UnixFileSystem` with `Modifier.isAbstract == true`, where
+        // HotSpot 25.0.4 answers `sun.nio.fs.LinuxFileSystem`. MEASURED,
+        // `probes/W4Abstract.java`, both modes. An alias that names a class
+        // `new` cannot produce (JVMS 6.5) is the same defect the mint sites had
+        // — it is just being told rather than built.
+        //
+        // The lists are ordered concrete-first and the resolver takes the first
+        // entry that is present AND instantiable, so the abstract parents are
+        // kept as LAST-RESORT entries: on a platform whose concrete class is not
+        // in this list the answer degrades to today's, never to nothing. The
+        // `instantiable` filter is what makes keeping them safe.
         "java/nio/file/FileSystem" => {
             if cfg!(windows) {
-                "sun/nio/fs/WindowsFileSystem"
+                &["sun/nio/fs/WindowsFileSystem"]
             } else {
-                "sun/nio/fs/UnixFileSystem"
+                &[
+                    "sun/nio/fs/LinuxFileSystem",
+                    "sun/nio/fs/MacOSXFileSystem",
+                    "sun/nio/fs/BsdFileSystem",
+                    "sun/nio/fs/AixFileSystem",
+                    "sun/nio/fs/SolarisFileSystem",
+                    "sun/nio/fs/UnixFileSystem",
+                ]
             }
         }
         "java/nio/file/spi/FileSystemProvider" => {
             if cfg!(windows) {
-                "sun/nio/fs/WindowsFileSystemProvider"
+                &["sun/nio/fs/WindowsFileSystemProvider"]
             } else {
-                "sun/nio/fs/UnixFileSystemProvider"
+                &[
+                    "sun/nio/fs/LinuxFileSystemProvider",
+                    "sun/nio/fs/MacOSXFileSystemProvider",
+                    "sun/nio/fs/BsdFileSystemProvider",
+                    "sun/nio/fs/AixFileSystemProvider",
+                    "sun/nio/fs/SolarisFileSystemProvider",
+                    "sun/nio/fs/UnixFileSystemProvider",
+                ]
             }
         }
         "java/nio/file/Path" => {
             if cfg!(windows) {
-                "sun/nio/fs/WindowsPath"
+                &["sun/nio/fs/WindowsPath"]
             } else {
-                "sun/nio/fs/UnixPath"
+                &["sun/nio/fs/UnixPath"]
             }
         }
         _ => return None,
@@ -26067,9 +26097,14 @@ pub(crate) fn getclass_display_class_id(
                 Some(name) => {
                     if let Some(kind) = collection_display_kind(&name) {
                         kind
-                    } else if let Some(alias) = jdk_concrete_getclass_alias(&name) {
-                        match getclass_resolve_name(ctx, alias) {
-                            Some(cid) => GetClassDisplay::Fixed(cid),
+                    } else if let Some(aliases) = jdk_concrete_getclass_alias(&name) {
+                        // The first candidate the image has AND that `new`
+                        // could legally produce. Trusting the NAME is what put
+                        // an ABSTRACT class in two of these rows; see the
+                        // table's own comment and
+                        // `cratonvm_native_api::instantiable`.
+                        match cratonvm_native_api::instantiable::first_instantiable(ctx, aliases) {
+                            Some((_, cid)) => GetClassDisplay::Fixed(cid),
                             None => GetClassDisplay::Stamp,
                         }
                     } else {
