@@ -4287,6 +4287,12 @@ pub mod spring_startup_bootstrap;
 pub mod unsafe_jdk25;
 pub mod unsafe_natives;
 pub mod vector_api;
+// The real-JDK half of the Vector API: `vector_api` is the synthetic
+// implementation and is unreachable when the real `jdk.incubator.vector` is on
+// the module path, because a real receiver is a concrete `Int256Vector`. This
+// one intercepts `jdk.internal.vm.vector.VectorSupport`, which every lane
+// operation funnels through in BOTH modes.
+pub mod vector_support_intrinsics;
 // WP2.3-B — `MethodHandles.Lookup.defineClass` /
 // `defineHiddenClass` / `defineHiddenClassWithClassData` natives.
 // Routes through `NativeContext::define_class_full` with
@@ -7352,6 +7358,10 @@ pub fn register_essential_natives_with_shims(
     // java.base. Keep them in the real-JDK essential path; the broader
     // incubator Vector API shims remain synthetic-only overrides.
     crate::vector_api::register_vector_support_natives(registry);
+    // The `VectorSupport` operations HotSpot intrinsifies. MUST stay in this
+    // registrar, not a `phases_late` one: `register_synthetic_overrides` does
+    // not run in real-JDK mode, which is exactly where these are needed.
+    crate::vector_support_intrinsics::register_vector_support_intrinsics(registry);
     crate::lang_system::register_runtime_natives(registry);
 
     // Synthetic-stream `spliterator()` natives — synthetic stream objects
@@ -9203,15 +9213,6 @@ pub fn register_essential_natives_with_shims(
     // Base64.getEncoder() while running under JBoss Modules; expose the existing
     // Base64 intrinsics in essentials instead of waiting for the full phase table.
     register_base64_natives(registry);
-    registry.register(
-        "java/lang/Integer",
-        "valueOf",
-        "(Ljava/lang/String;)Ljava/lang/Integer;",
-        |ctx, args| match crate::lang_math::native_integer_parse_int(ctx, args)? {
-            Some(Value::Int(v)) => crate::lang_math::native_integer_value_of(ctx, &[Value::Int(v)]),
-            _ => crate::lang_math::native_integer_value_of(ctx, &[Value::Int(0)]),
-        },
-    );
     registry.register("java/util/Arrays", "equals", "([B[B)Z", |ctx, args| {
         let a_ref = match args.first() {
             Some(Value::Object(o)) => *o,
@@ -11377,6 +11378,16 @@ pub fn register_essential_natives_with_shims(
     // `radix_to_string_tests`) so that they are not a landmine if the
     // registration order ever changes, but a fix aimed at the observable
     // behaviour of `Integer.toString(int, int)` has to land in `lang_math.rs`.
+    // The four census-visible rows on the box classes were retired here
+    // (`Integer.valueOf(String)`, `Integer.toOctalString`,
+    // `Integer.toBinaryString`, `Long.toHexString`) -- real JDK 25 bytecode
+    // serves all four. Everything still registered on `Integer`/`Long` is
+    // `NativeKind::Intrinsic` and census-exempt, so those four were the block.
+    //
+    // Do NOT extend this to the classes: `RJdkReflBox` asserts reflective
+    // boxing IDENTITY with `==`, and the intrinsic `valueOf(I)` is what backs
+    // the cache it checks. Retiring `Integer` or `Long` wholesale reddens it.
+    // See `WORKER-3-NOTE-7`.
     registry.register(
         "java/lang/Integer",
         "toHexString",
@@ -11388,34 +11399,6 @@ pub fn register_essential_natives_with_shims(
             };
             Ok(Some(Value::Object(Some(
                 ctx.create_string(&format!("{:x}", val as u32)),
-            ))))
-        },
-    );
-    registry.register(
-        "java/lang/Integer",
-        "toOctalString",
-        "(I)Ljava/lang/String;",
-        |ctx, args| {
-            let val = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            Ok(Some(Value::Object(Some(
-                ctx.create_string(&format!("{:o}", val as u32)),
-            ))))
-        },
-    );
-    registry.register(
-        "java/lang/Integer",
-        "toBinaryString",
-        "(I)Ljava/lang/String;",
-        |ctx, args| {
-            let val = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            Ok(Some(Value::Object(Some(
-                ctx.create_string(&format!("{:b}", val as u32)),
             ))))
         },
     );
@@ -11466,20 +11449,6 @@ pub fn register_essential_natives_with_shims(
             };
             Ok(Some(Value::Object(Some(
                 ctx.create_string(&format_float(v)),
-            ))))
-        },
-    );
-    registry.register(
-        "java/lang/Long",
-        "toHexString",
-        "(J)Ljava/lang/String;",
-        |ctx, args| {
-            let val = match args.first() {
-                Some(Value::Long(v)) => *v,
-                _ => 0,
-            };
-            Ok(Some(Value::Object(Some(
-                ctx.create_string(&format!("{:x}", val as u64)),
             ))))
         },
     );

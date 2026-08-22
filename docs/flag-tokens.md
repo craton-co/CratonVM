@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-470 tokens.
+472 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -390,6 +390,7 @@ export inherited from a parent shell.
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
 | `overlay-nodedup` | `CRATONVM_DBG_OVERLAY_NODEDUP` |
 | `overlay-prune` | `CRATONVM_DBG_OVERLAY_PRUNE` |
+| `tmview` | `CRATONVM_DBG_TMVIEW` |
 | `parklat` | `CRATONVM_DBG_PARKLAT` |
 | `pb` | `CRATONVM_DBG_PB` |
 | `pbe` | `CRATONVM_DBG_PBE` |
@@ -513,6 +514,7 @@ export inherited from a parent shell.
 | `ute` | `CRATONVM_DBG_UTE` |
 | `validate-new` | `CRATONVM_DBG_VALIDATE_NEW` |
 | `vdisp` | `CRATONVM_DBG_VDISP` |
+| `vector-intrinsics-stats` | `CRATONVM_VECTOR_INTRINSICS_STATS` |
 | `verify-error` | `CRATONVM_DBG_VERIFY_ERROR` |
 | `verify-inline-frame-record` | `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD` |
 | `verify-oop-maps` | `CRATONVM_DBG_VERIFY_OOP_MAPS` |
@@ -536,7 +538,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-213 tokens.
+214 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -724,6 +726,7 @@ export inherited from a parent shell.
 | `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
 | `static-bytecode-callee` | `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` |
 | `statics-index` | `CRATONVM_NO_STATICS_INDEX` |
+| `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |

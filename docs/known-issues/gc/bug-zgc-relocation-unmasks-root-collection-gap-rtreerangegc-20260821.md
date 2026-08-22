@@ -1,5 +1,13 @@
 # `RTreeRangeGc` reddens on the default collector — the gap is old, the *coverage* is new
 
+> **2026-08-22 — this vector carries TWO defects, and this record describes one.**
+> The generational column of the table below is a **different** defect from the
+> default column's: on generational the first failure is `subMap(k, k)`
+> returning an **empty view** (`0 entries, expected 200`) on its FIRST walk,
+> not a stale address decoding as another object. Different operation, different
+> symptom. Fixing either will not green the vector.
+> See `jdk-only/WORKER-1-NOTE-2-…-20260822.md` §4c.
+
 ## What is failing
 
 `regression-suite` vector `RTreeRangeGc`, which the harness runs with

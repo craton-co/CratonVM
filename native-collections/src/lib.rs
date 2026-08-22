@@ -40274,6 +40274,37 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
         let mut m = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
         m.entry(key).or_default().insert(name.to_string(), v);
     }
+    // `LinkedHashMap` kept its whole state in the overlay and never advanced
+    // the JDK `modCount`, the way the HashMap family does through
+    // `bump_map_mod_count`. MEASURED with `probes/MapModCountProbe2`, one
+    // process per VM, against HotSpot 25.0.3+9:
+    //
+    // ```text
+    //                  bumpOnPut  bumpOnRemove      HotSpot
+    //   HashMap             YES        YES          YES YES
+    //   LinkedHashMap       NO         NO           YES YES   <-- stuck at 0
+    //   TreeMap             YES        YES          YES YES
+    //   Hashtable           YES        YES          YES YES
+    // ```
+    //
+    // That matters twice over. `modCount` is the JDK's fail-fast iterator
+    // version, and it is also the invalidation generation any cached or lazily
+    // materialised map view has to key on — a map whose generation never moves
+    // cannot be cached safely, and `LinkedHashMap` is the source type in the
+    // workload that fix exists for (see
+    // `docs/known-issues/perf/lazy-map-views-plan-and-blockers-20260822.md`).
+    //
+    // Bump on a SIZE write only, and here rather than at the three call sites,
+    // for the same reason `set_map_size` is the HashMap family's choke point:
+    // insert, removal and `clear` all route their size through this helper, so
+    // a future mutator cannot forget it. A value-replacing `put` returns from
+    // `native_lhm_put_evict` BEFORE the size write, so it does not bump — which
+    // is what HotSpot does too (`put=5 remove=6 replace=6` in the probe's own
+    // row), and is exactly the property a keySet-view cache needs: only a
+    // change to the KEY SET may move the generation.
+    if name == "size" {
+        bump_map_mod_count(&*ctx, this);
+    }
     // Mirror the structural pointers to the REAL JDK heap fields so that
     // real-bytecode paths that bypass our natives — chiefly Java serialization:
     // inherited `HashMap.writeObject` reads `size`/`table`, and
