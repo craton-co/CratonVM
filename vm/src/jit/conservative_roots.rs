@@ -574,6 +574,47 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
     })
 }
 
+/// Per-disjunct breakdown of why [`moving_young_osr_method_needs_fallback`]
+/// returned true, so the single `osr-shadow-coverage-unproven` reason code the
+/// collector sees can be split apart without a debugger. Filed 2026-08-21:
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s own
+/// measurement found this reason blocking 234/263 collections and could not
+/// say which of the (then three) disjuncts was responsible, only that "H2's
+/// MVStore loops are OSR-compiled constantly." Attribution is by the same
+/// short-circuit priority the boolean uses, so exactly one counter increments
+/// per call that returns true: a frame with a genuinely broken shadow layout
+/// is not ALSO double-counted under the map-coverage bucket just because it
+/// would have failed that check too.
+pub mod osr_fallback_reason {
+    use std::sync::atomic::AtomicUsize;
+
+    /// `!shadow_layout_ok` — the shadow-stack prologue slots were never
+    /// allocated for this compilation at all. A codegen gap: this method was
+    /// compiled by a path that does not emit shadow-stack bookkeeping.
+    pub static BAD_SHADOW_LAYOUT: AtomicUsize = AtomicUsize::new(0);
+    /// `debug_shadow_disabled` — `CRATONVM_SHADOW_NOPUSH` / `_NORELOAD` forced
+    /// it. Not a production path; present so a debug run does not silently
+    /// fall through to a different bucket and misattribute.
+    pub static DEBUG_DISABLED: AtomicUsize = AtomicUsize::new(0);
+    /// Shadow layout is fine, precise maps exist, but this safepoint's map is
+    /// not `fully_oop_covered`.
+    pub static BAD_MAP_COVERAGE: AtomicUsize = AtomicUsize::new(0);
+    /// Shadow layout is fine, the map is fully covered, but the chain entry
+    /// carries no exact RBP for this frame — the map cannot be located
+    /// without one, even though it would answer the question if it could.
+    pub static MISSING_EXACT_RBP: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn snapshot() -> (usize, usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            BAD_SHADOW_LAYOUT.load(Relaxed),
+            DEBUG_DISABLED.load(Relaxed),
+            BAD_MAP_COVERAGE.load(Relaxed),
+            MISSING_EXACT_RBP.load(Relaxed),
+        )
+    }
+}
+
 fn moving_young_osr_method_needs_fallback(
     cm: &cratonvm_jit::CompiledMethod,
     exact_rbp: usize,
@@ -586,7 +627,24 @@ fn moving_young_osr_method_needs_fallback(
         && cm.shadow_savetop_slot_off != 0
         && cm.shadow_off_in_thread != 0;
     let precise_map_ok = !cm.has_precise_oop_maps() || (cm.fully_oop_covered && exact_rbp != 0);
-    !shadow_layout_ok || debug_shadow_disabled || !precise_map_ok
+    use std::sync::atomic::Ordering::Relaxed;
+    if !shadow_layout_ok {
+        osr_fallback_reason::BAD_SHADOW_LAYOUT.fetch_add(1, Relaxed);
+        return true;
+    }
+    if debug_shadow_disabled {
+        osr_fallback_reason::DEBUG_DISABLED.fetch_add(1, Relaxed);
+        return true;
+    }
+    if !precise_map_ok {
+        if cm.has_precise_oop_maps() && !cm.fully_oop_covered {
+            osr_fallback_reason::BAD_MAP_COVERAGE.fetch_add(1, Relaxed);
+        } else {
+            osr_fallback_reason::MISSING_EXACT_RBP.fetch_add(1, Relaxed);
+        }
+        return true;
+    }
+    false
 }
 
 /// spring-bug-10 experiment (`CRATONVM_SHADOW_PIN`): when set, the shadow-stack
