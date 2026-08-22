@@ -932,9 +932,31 @@ mod tests {
         );
     }
 
+    /// The Windows arm asserts the SAME thing as the POSIX one above, and the
+    /// reason it no longer asserts case-folding is worth keeping.
+    ///
+    /// It used to expect `upper.corp:1081` — "Windows stores environment keys
+    /// case-insensitively, so the final assignment is the single value visible
+    /// through either spelling". That was true while `with_proxy_env` mutated
+    /// the real `environ`, where `all_proxy` and `ALL_PROXY` ARE one key and the
+    /// second set overwrites the first.
+    ///
+    /// `b6df44b0b` stopped mutating `environ` — correctly, it was a process-wide
+    /// data race — and routed these through `with_thread_overrides`, a map keyed
+    /// by exact string. Two spellings are now two ENTRIES on every platform, so
+    /// the case-folding this test named is a property of `environ` that the
+    /// override path deliberately does not model, and the test had been
+    /// asserting the old path's semantics against the new one ever since.
+    ///
+    /// **What is still covered:** given both spellings present, `read_settings`
+    /// prefers the lowercase one, on every platform. **What is no longer
+    /// reachable through this door:** that Windows collapses the two into one
+    /// before `read_settings` ever sees them. That needs a real-`environ` test
+    /// or an override map that case-folds when `cfg(windows)`, and neither is
+    /// worth a process-wide race to get back.
     #[cfg(windows)]
     #[test]
-    fn env_proxy_lookup_respects_case_insensitive_windows_storage() {
+    fn env_proxy_lookup_prefers_lowercase_when_both_are_set_windows() {
         let settings = with_proxy_env(
             &[
                 ("all_proxy", "socks://lower.corp:1080"),
@@ -944,9 +966,9 @@ mod tests {
         );
         assert_eq!(
             settings.socks,
-            Some(("upper.corp".to_string(), 1081)),
-            "Windows stores environment keys case-insensitively, so the final \
-             assignment is the single value visible through either spelling"
+            Some(("lower.corp".to_string(), 1080)),
+            "lowercase-wins precedence, through the thread-override path that \
+             replaced `environ` mutation — see this test's doc comment"
         );
     }
 

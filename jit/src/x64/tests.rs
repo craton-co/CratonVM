@@ -11443,8 +11443,8 @@ fn compile_with_direct_call(
 }
 
 // -----------------------------------------------------------------------
-// Regression: fixed-suite-bugs/tomcat/
-//             ecj-operandstack-corruption-jsp-compilation-500s-FIXED.md
+// Regression: fixed-suite-bugs/
+//             ecj-operandstack-corruption-jsp-compilation-500s-FIXED-20260821.md
 // -----------------------------------------------------------------------
 //
 // A direct-call site that ALSO carries `invoke_info` reserves a cold-deopt
