@@ -1288,6 +1288,14 @@ pub const INVENTORY: &[E] = &[
     // serial; `relocate` reads 0/off/false/no as off.
     E { group: Group::GC, token: "zgc-parmark", on_key: Some("CRATONVM_ZGC_PARMARK"), off_key: None, off_word: Some("0") },
     E { group: Group::GC, token: "zgc-relocate", on_key: Some("CRATONVM_ZGC_RELOCATE"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-21 with the per-cycle relocation proof. Default-ON,
+    // so a KILL SWITCH, with the same `off_word: Some("0")` correction as
+    // its neighbours: ZGC may compact while a compiled frame is live
+    // whenever the collection PROVED that frame's oops rewritable, and `=0`
+    // restores the older refusal that fired on the mere existence of a
+    // compiled frame -- which is why the default configuration never
+    // defragmented. See `gc/src/zgc.rs::zgc_relocate_under_proven_jit`.
+    E { group: Group::GC, token: "zgc-relocate-proven-jit", on_key: Some("CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-19 with the ZGC read-bounds publish. An OPT-OUT, not an
     // opt-in: ZGC publishing its arena envelope into `JIT_READ_BOUNDS` is the
     // default, and this key is the kill switch that restores helper-only
@@ -2749,6 +2757,10 @@ mod tests {
             // unsetting a key whose unset meaning had just become ON.
             ("zgc-parmark", "CRATONVM_ZGC_PARMARK"),
             ("zgc-relocate", "CRATONVM_ZGC_RELOCATE"),
+            // Joined 2026-08-21, default-ON for the same reason: without a
+            // falsey word its `-token` form would unset the key and leave
+            // the machinery on, which is not a kill switch.
+            ("zgc-relocate-proven-jit", "CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT"),
         ] {
             let e = lookup(Group::GC, token).unwrap_or_else(|| panic!("{token} is undeclared"));
             assert_eq!(e.on_key, Some(key));

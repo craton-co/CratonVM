@@ -4856,6 +4856,41 @@ fn huc_get_request_property(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }))
 }
 
+/// `URLConnection.getRequestProperties()` — the REQUEST headers set on this
+/// carrier so far, grouped like `getHeaderFields()` groups the response ones.
+///
+/// The real JDK reads its `sun.net.www.MessageHeader requests` field. Neither
+/// CratonVM carrier populates that field — the synthetic one keeps its request
+/// headers in `HUC_REQ_HEADERS`, the real one in the identity-keyed `RealReq`
+/// table — so the inherited bytecode hits its own `requests == null` arm and
+/// answers `Collections.emptyMap()` for a connection that has headers.
+/// Silent, and wrong in the direction that reads as "no headers were set".
+fn huc_get_request_properties(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let headers: Vec<(String, String)> = if is_real_carrier(ctx, this) {
+        with_real_req(ctx, this, |r| r.headers.clone())
+    } else if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_REQ_HEADERS) {
+        let len = ctx.array_length(arr);
+        let mut out = Vec::new();
+        for i in 0..len {
+            if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                let line = ctx.read_string(s).unwrap_or_default();
+                if let Some(colon) = line.find(':') {
+                    out.push((
+                        line[..colon].trim().to_string(),
+                        line[colon + 1..].trim().to_string(),
+                    ));
+                }
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    let map = build_header_map(ctx, &headers)?;
+    Ok(Some(Value::Object(Some(map))))
+}
+
 fn huc_set_do_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
@@ -4897,6 +4932,13 @@ fn huc_set_connect_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         if let Ok(mut t) = real_reqs().lock() {
             t.entry(key).or_default().connect_timeout_ms = Some(v);
         }
+        // Mirror onto the real `URLConnection.connectTimeout` field, for the
+        // same reason `setDoOutput` mirrors `doOutput`: the inherited
+        // `getConnectTimeout()` is one `getfield` and answers from THERE. The
+        // side table above is what `perform` reads; the field is what the JDK's
+        // own accessor reads, and a carrier that reports 0 (infinite) for a
+        // timeout the caller just set is a silent lie.
+        ctx.set_field_by_name(this, "connectTimeout", Value::Int(v));
         return Ok(None);
     }
     ctx.set_field(this, HUC_CONNECT_TIMEOUT, Value::Int(v));
@@ -4914,6 +4956,9 @@ fn huc_set_read_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         if let Ok(mut t) = real_reqs().lock() {
             t.entry(key).or_default().read_timeout_ms = Some(v);
         }
+        // See `huc_set_connect_timeout` — the inherited `getReadTimeout()` is
+        // one `getfield` and must not contradict the setter.
+        ctx.set_field_by_name(this, "readTimeout", Value::Int(v));
         return Ok(None);
     }
     ctx.set_field(this, HUC_READ_TIMEOUT, Value::Int(v));
@@ -5169,7 +5214,230 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
         huc_get_instance_follow_redirects,
     );
     r.register(cls, "usingProxy", "()Z", huc_using_proxy);
+    r.register(
+        cls,
+        "getRequestProperties",
+        "()Ljava/util/Map;",
+        huc_get_request_properties,
+    );
     r.set_category(__prev_cat);
+}
+
+/// Run `super_class`'s OWN bytecode body for `name`/`desc` against `this`.
+///
+/// See [`register_https_delegate_forwarders`] for why. Uses
+/// `invoke_special_bytecode_only`, which resolves statically on `super_class`'s
+/// hierarchy and — the part that matters here — skips the native-registry
+/// lookup, so a native registered for the same triple cannot re-enter itself.
+/// Virtual calls the super body makes (`getHeaderField`, `checkConnected`, …)
+/// still dispatch normally and therefore still land on CratonVM's registered
+/// natives, which is what makes the derived getters answer from CratonVM's
+/// state rather than from the JDK's unused fields.
+fn https_forward_to_super(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    super_class: &str,
+    name: &str,
+    desc: &str,
+) -> MethodCallResult {
+    // A null receiver would have thrown at the call site; keep the same
+    // diagnostic rather than passing it through to the interpreter.
+    let _ = obj_arg(args, 0)?;
+    ctx.invoke_special_bytecode_only(super_class, name, desc, args)
+}
+
+macro_rules! https_super_forwarders {
+    ($r:expr, $cls:expr, [ $( ($fname:ident, $sup:expr, $name:expr, $desc:expr) ),+ $(,)? ]) => {
+        $(
+            fn $fname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                https_forward_to_super(ctx, args, $sup, $name, $desc)
+            }
+            $r.register($cls, $name, $desc, $fname);
+        )+
+    };
+}
+
+/// `HttpsURLConnectionImpl`'s delegate-forwarding overrides, re-pointed at the
+/// superclass bodies they exist to bypass.
+///
+/// **The problem.** `URL.openConnection()` on an `https:` URL hands back a
+/// `sun.net.www.protocol.https.HttpsURLConnectionImpl` that CratonVM
+/// ALLOCATES rather than CONSTRUCTS (see `net_phase_e.rs`'s carrier choice —
+/// the concrete class is required so `instanceof HttpsURLConnection` and the
+/// abstract session accessors both work). Its constructor is what creates the
+/// `DelegateHttpsURLConnection` and stores it in `delegate`, so on this carrier
+/// `delegate` is null — and essentially every method the class declares is
+/// `getfield delegate; invokevirtual …`. `TomcatBaseTest.methodUrl` opens a
+/// connection and calls `setUseCaches(false)` on it before anything else, which
+/// is the whole SSL/TLS + OCSP portion of the Tomcat suite failing on
+///
+/// ```text
+/// java.lang.NullPointerException: Cannot invoke
+///   "sun.net.www.protocol.https.DelegateHttpsURLConnection.setUseCaches(boolean)"
+///   because "this.delegate" is null
+/// ```
+///
+/// **Why the plain-`http` carrier does not have this.** That carrier is
+/// `java/net/HttpURLConnection`, which declares none of these — the calls land
+/// on `java.net.URLConnection`'s own bytecode, which reads and writes the
+/// object's OWN fields. That is exactly the behaviour CratonVM wants, because
+/// `perform` reads those same fields. The https carrier differs from it in one
+/// way only: the Impl overrides them to forward to a delegate that does not
+/// exist here.
+///
+/// **So the fix is to make the override transparent**, not to re-implement 20
+/// JDK methods. Each entry below runs the superclass body the Impl overrides —
+/// `java/net/URLConnection` or `java/net/HttpURLConnection`, the two classes
+/// actually in this carrier's chain (`sun.net.www.protocol.http.HttpURLConnection`
+/// is NOT: `HttpsURLConnectionImpl extends javax.net.ssl.HttpsURLConnection
+/// extends java.net.HttpURLConnection`). Writing bodies by hand instead would
+/// be twenty chances to guess a JDK semantic wrong; this way `setAuthenticator`
+/// throws the JDK's own `UnsupportedOperationException`, `getHeaderFieldDate`
+/// applies the JDK's own `GMT`-suffix repair, and `getDefaultUseCaches` reads
+/// the JDK's own static — none of which is written here.
+///
+/// **What is deliberately NOT registered**, and why the NPE is the right answer
+/// for it: `setNewClient`/`setProxiedClient` (both arities). Those are the
+/// JDK's internal plumbing for driving its own `sun.net.www` HTTP client, which
+/// CratonVM's `perform` replaces wholesale. There is no superclass body to run
+/// — they are declared on the Impl alone — and inventing a no-op would claim a
+/// client was reconfigured when nothing happened. `getSSLSession` is also
+/// absent, and that one is not a gap: `net_phase_e`'s registrar owns it (see
+/// `register_https_session_accessors`' G7 note).
+///
+/// `getConnectTimeout`/`getReadTimeout` reach the inherited one-`getfield`
+/// bodies, which is why `huc_set_connect_timeout`/`huc_set_read_timeout` now
+/// mirror their values onto the real fields as well as into `RealReq`.
+fn register_https_delegate_forwarders(r: &mut NativeMethodRegistry, cls: &str) {
+    const UC: &str = "java/net/URLConnection";
+    const HUC: &str = "java/net/HttpURLConnection";
+    https_super_forwarders!(
+        r,
+        cls,
+        [
+            // --- URLConnection state the object owns ---
+            (fwd_set_use_caches, UC, "setUseCaches", "(Z)V"),
+            (fwd_get_use_caches, UC, "getUseCaches", "()Z"),
+            (fwd_get_do_input, UC, "getDoInput", "()Z"),
+            (fwd_get_do_output, UC, "getDoOutput", "()Z"),
+            (
+                fwd_set_allow_user_interaction,
+                UC,
+                "setAllowUserInteraction",
+                "(Z)V"
+            ),
+            (
+                fwd_get_allow_user_interaction,
+                UC,
+                "getAllowUserInteraction",
+                "()Z"
+            ),
+            (fwd_set_if_modified_since, UC, "setIfModifiedSince", "(J)V"),
+            (fwd_get_if_modified_since, UC, "getIfModifiedSince", "()J"),
+            (fwd_get_default_use_caches, UC, "getDefaultUseCaches", "()Z"),
+            (fwd_set_default_use_caches, UC, "setDefaultUseCaches", "(Z)V"),
+            (fwd_get_connect_timeout, UC, "getConnectTimeout", "()I"),
+            (fwd_get_read_timeout, UC, "getReadTimeout", "()I"),
+            (fwd_get_url, UC, "getURL", "()Ljava/net/URL;"),
+            (fwd_to_string, UC, "toString", "()Ljava/lang/String;"),
+            // --- derived from the response headers; each of these calls
+            //     `getHeaderField` virtually, which lands on CratonVM's own
+            //     registered native ---
+            (
+                fwd_get_content_type,
+                UC,
+                "getContentType",
+                "()Ljava/lang/String;"
+            ),
+            (
+                fwd_get_content_encoding,
+                UC,
+                "getContentEncoding",
+                "()Ljava/lang/String;"
+            ),
+            (fwd_get_expiration, UC, "getExpiration", "()J"),
+            (fwd_get_date, UC, "getDate", "()J"),
+            (fwd_get_last_modified, UC, "getLastModified", "()J"),
+            (
+                fwd_get_header_field_int,
+                UC,
+                "getHeaderFieldInt",
+                "(Ljava/lang/String;I)I"
+            ),
+            (
+                fwd_get_header_field_long,
+                UC,
+                "getHeaderFieldLong",
+                "(Ljava/lang/String;J)J"
+            ),
+            (
+                fwd_get_content,
+                UC,
+                "getContent",
+                "()Ljava/lang/Object;"
+            ),
+            (
+                fwd_get_content_typed,
+                UC,
+                "getContent",
+                "([Ljava/lang/Class;)Ljava/lang/Object;"
+            ),
+            // --- HttpURLConnection's own concrete bodies ---
+            (
+                fwd_get_header_field_date,
+                HUC,
+                "getHeaderFieldDate",
+                "(Ljava/lang/String;J)J"
+            ),
+            (
+                fwd_get_permission,
+                HUC,
+                "getPermission",
+                "()Ljava/security/Permission;"
+            ),
+            (
+                fwd_set_authenticator,
+                HUC,
+                "setAuthenticator",
+                "(Ljava/net/Authenticator;)V"
+            ),
+        ]
+    );
+
+    // The four below have NO superclass body to forward to — `isConnected` and
+    // `setConnected` are declared on the Impl alone (the JDK's own hook for the
+    // delegate to report its state back), and `equals`/`hashCode` would reach
+    // `java.lang.Object`, whose identity semantics are what `URLConnection`
+    // leaves in place anyway. Written against the object's own state instead,
+    // which is the same answer the plain-`http` carrier gives.
+    r.register(cls, "isConnected", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let connected = matches!(
+            ctx.get_field_by_name(this, "connected"),
+            Value::Int(v) if v != 0
+        );
+        Ok(Some(Value::Int(i32::from(connected))))
+    });
+    r.register(cls, "setConnected", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        ctx.set_field_by_name(this, "connected", Value::Int(v));
+        Ok(None)
+    });
+    r.register(cls, "hashCode", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(ctx.identity_hash_code(this))))
+    });
+    r.register(cls, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let same = match args.get(1) {
+            Some(Value::Object(Some(other))) => {
+                ctx.identity_hash_code(*other) == ctx.identity_hash_code(this)
+            }
+            _ => false,
+        };
+        Ok(Some(Value::Int(i32::from(same))))
+    });
 }
 
 pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
@@ -5196,6 +5464,10 @@ pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
     // plain `HttpURLConnection` does not declare them.
     register_https_session_accessors(r, "sun/net/www/protocol/https/HttpsURLConnectionImpl");
     register_https_session_accessors(r, "javax/net/ssl/HttpsURLConnection");
+    // The Impl ALONE — `javax/net/ssl/HttpsURLConnection` declares none of
+    // these and reaches the same superclass bodies by ordinary inheritance, so
+    // registering there would insert a hop that changes nothing.
+    register_https_delegate_forwarders(r, "sun/net/www/protocol/https/HttpsURLConnectionImpl");
     r.set_category(__prev_cat);
 }
 
@@ -5270,6 +5542,152 @@ mod http_url_connection_tests {
                  further. See G7-1."
             );
         }
+    }
+
+    /// Every method `sun.net.www.protocol.https.HttpsURLConnectionImpl`
+    /// declares must be answered by CratonVM, or be on the short list of
+    /// methods that are deliberately left to NPE.
+    ///
+    /// The carrier `URL.openConnection()` hands back for an `https:` URL is
+    /// ALLOCATED, not constructed, so its `delegate` field is null — and every
+    /// method the class declares is `getfield delegate; invokevirtual …`. A
+    /// declared method with no CratonVM registration is therefore not "falls
+    /// back to the JDK", it is a guaranteed
+    /// `NullPointerException: … because "this.delegate" is null`, which is how
+    /// the entire SSL/TLS + OCSP portion of the Tomcat suite failed on
+    /// `TomcatBaseTest.methodUrl`'s opening `setUseCaches(false)`.
+    ///
+    /// The list is `javap -p --module java.base
+    /// sun.net.www.protocol.https.HttpsURLConnectionImpl` on Temurin JDK 25,
+    /// minus `<init>` and the static `checkURL`. It is a constant because this
+    /// test cannot read the JDK image; a JDK that adds a forwarder will not
+    /// fail here, it will fail in the suite — which is exactly why the list
+    /// carries the command that regenerates it.
+    #[test]
+    fn every_declared_https_impl_method_is_answered_or_explicitly_refused() {
+        use cratonvm_native_api::NativeMethodRegistry;
+        const CLS: &str = "sun/net/www/protocol/https/HttpsURLConnectionImpl";
+
+        // Declared on the Impl and left UNREGISTERED on purpose.
+        //
+        // `setNewClient`/`setProxiedClient` drive the JDK's own `sun.net.www`
+        // HTTP client, which `perform` replaces wholesale: there is no
+        // superclass body to forward to (the Impl declares them alone) and a
+        // no-op would claim a client was reconfigured when nothing happened.
+        // The NPE is the honest answer — this path is not implemented.
+        const DELIBERATELY_UNREGISTERED: &[(&str, &str)] = &[
+            ("setNewClient", "(Ljava/net/URL;)V"),
+            ("setNewClient", "(Ljava/net/URL;Z)V"),
+            ("setProxiedClient", "(Ljava/net/URL;Ljava/lang/String;I)V"),
+            ("setProxiedClient", "(Ljava/net/URL;Ljava/lang/String;IZ)V"),
+        ];
+
+        // Answered by `net_phase_e`'s registrar, not this file's — see the G7
+        // note on `register_https_session_accessors`.
+        const OWNED_BY_NET_PHASE_E: &[(&str, &str)] =
+            &[("getSSLSession", "()Ljava/util/Optional;")];
+
+        const DECLARED: &[(&str, &str)] = &[
+            ("setNewClient", "(Ljava/net/URL;)V"),
+            ("setNewClient", "(Ljava/net/URL;Z)V"),
+            ("setProxiedClient", "(Ljava/net/URL;Ljava/lang/String;I)V"),
+            ("setProxiedClient", "(Ljava/net/URL;Ljava/lang/String;IZ)V"),
+            ("connect", "()V"),
+            ("isConnected", "()Z"),
+            ("setConnected", "(Z)V"),
+            ("getCipherSuite", "()Ljava/lang/String;"),
+            ("getLocalCertificates", "()[Ljava/security/cert/Certificate;"),
+            ("getServerCertificates", "()[Ljava/security/cert/Certificate;"),
+            ("getPeerPrincipal", "()Ljava/security/Principal;"),
+            ("getLocalPrincipal", "()Ljava/security/Principal;"),
+            ("getOutputStream", "()Ljava/io/OutputStream;"),
+            ("getInputStream", "()Ljava/io/InputStream;"),
+            ("getErrorStream", "()Ljava/io/InputStream;"),
+            ("disconnect", "()V"),
+            ("usingProxy", "()Z"),
+            ("getHeaderFields", "()Ljava/util/Map;"),
+            ("getHeaderField", "(Ljava/lang/String;)Ljava/lang/String;"),
+            ("getHeaderField", "(I)Ljava/lang/String;"),
+            ("getHeaderFieldKey", "(I)Ljava/lang/String;"),
+            ("setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+            ("addRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V"),
+            ("getResponseCode", "()I"),
+            ("getRequestProperty", "(Ljava/lang/String;)Ljava/lang/String;"),
+            ("getRequestProperties", "()Ljava/util/Map;"),
+            ("setInstanceFollowRedirects", "(Z)V"),
+            ("getInstanceFollowRedirects", "()Z"),
+            ("setRequestMethod", "(Ljava/lang/String;)V"),
+            ("getRequestMethod", "()Ljava/lang/String;"),
+            ("getResponseMessage", "()Ljava/lang/String;"),
+            ("getHeaderFieldDate", "(Ljava/lang/String;J)J"),
+            ("getPermission", "()Ljava/security/Permission;"),
+            ("getURL", "()Ljava/net/URL;"),
+            ("getContentLength", "()I"),
+            ("getContentLengthLong", "()J"),
+            ("getContentType", "()Ljava/lang/String;"),
+            ("getContentEncoding", "()Ljava/lang/String;"),
+            ("getExpiration", "()J"),
+            ("getDate", "()J"),
+            ("getLastModified", "()J"),
+            ("getHeaderFieldInt", "(Ljava/lang/String;I)I"),
+            ("getHeaderFieldLong", "(Ljava/lang/String;J)J"),
+            ("getContent", "()Ljava/lang/Object;"),
+            ("getContent", "([Ljava/lang/Class;)Ljava/lang/Object;"),
+            ("toString", "()Ljava/lang/String;"),
+            ("setDoInput", "(Z)V"),
+            ("getDoInput", "()Z"),
+            ("setDoOutput", "(Z)V"),
+            ("getDoOutput", "()Z"),
+            ("setAllowUserInteraction", "(Z)V"),
+            ("getAllowUserInteraction", "()Z"),
+            ("setUseCaches", "(Z)V"),
+            ("getUseCaches", "()Z"),
+            ("setIfModifiedSince", "(J)V"),
+            ("getIfModifiedSince", "()J"),
+            ("getDefaultUseCaches", "()Z"),
+            ("setDefaultUseCaches", "(Z)V"),
+            ("equals", "(Ljava/lang/Object;)Z"),
+            ("hashCode", "()I"),
+            ("setConnectTimeout", "(I)V"),
+            ("getConnectTimeout", "()I"),
+            ("setReadTimeout", "(I)V"),
+            ("getReadTimeout", "()I"),
+            ("setFixedLengthStreamingMode", "(I)V"),
+            ("setFixedLengthStreamingMode", "(J)V"),
+            ("setChunkedStreamingMode", "(I)V"),
+            ("setAuthenticator", "(Ljava/net/Authenticator;)V"),
+            ("getSSLSession", "()Ljava/util/Optional;"),
+        ];
+
+        let mut r = NativeMethodRegistry::new();
+        super::register_http_url_connection_real(&mut r);
+
+        let mut missing: Vec<String> = Vec::new();
+        for &(name, desc) in DECLARED {
+            if DELIBERATELY_UNREGISTERED.contains(&(name, desc))
+                || OWNED_BY_NET_PHASE_E.contains(&(name, desc))
+            {
+                assert!(
+                    r.find(CLS, name, desc).is_none(),
+                    "{CLS}.{name}{desc} is on an exemption list but IS registered \
+                     here — move it out of the list, or out of this registrar."
+                );
+                continue;
+            }
+            if r.find(CLS, name, desc).is_none() {
+                missing.push(format!("{name}{desc}"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} declared method(s) of {CLS} reach the JDK's own \
+             `getfield delegate; invokevirtual …` body on a carrier whose \
+             `delegate` is null, i.e. throw NullPointerException: {missing:?}. \
+             Add them to `register_https_delegate_forwarders` (forwarding to \
+             the superclass body the Impl overrides), or state why the NPE is \
+             the right answer and list them in DELIBERATELY_UNREGISTERED.",
+            missing.len()
+        );
     }
 
     /// rustls's TLS 1.3 spelling is not JSSE's, and `getCipherSuite()` is
