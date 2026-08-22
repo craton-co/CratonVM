@@ -500,16 +500,41 @@ fn classify_counted_loop(
         )));
     }
 
-    // The induction variable is the LHS of the exit comparison. javac
-    // emits exactly two operand-producing `iload`s in the header
-    // (`iload iv; iload bound`), so the second-to-last `iload` is `iv`.
-    if iload_history.len() < 2 {
-        return Err(LoweringError::UnsupportedNode(format!(
-            "loop header at pc={header_pc} does not have the canonical \
-             `iload iv; iload bound; if_icmp*` operand shape"
-        )));
-    }
-    let iv_slot = iload_history[iload_history.len() - 2];
+    // The induction variable is the LHS of the exit comparison. There
+    // are two operand shapes javac emits for `i < <bound>`:
+    //
+    //   iload iv; iload bound;             if_icmpge    (cached length)
+    //   iload iv; aload arr; arraylength;  if_icmpge    (inline .length)
+    //
+    // The first has two `iload`s, so `iv` is the second-to-last. The
+    // second has only one, and it IS `iv`: the bound is produced by
+    // `arraylength`, not by a load.
+    //
+    // Only the cached-length form used to be recognized, which made
+    // `for (int i = 0; i < out.length; i++)` -- the shape most people
+    // write first -- fall silently back to the CPU while the
+    // hoist-into-a-local rewrite offloaded. Nothing about the inline
+    // form is harder to lower: `locate_bound` resolves both to the same
+    // `BoundSource::ParamLen`, and the launch grid is sized from the
+    // largest array argument either way.
+    let bound_is_inline_arraylength = exit_if_pc > 0 && bytes[exit_if_pc - 1] == 0xBE;
+    let iv_slot = if bound_is_inline_arraylength {
+        *iload_history.last().ok_or_else(|| {
+            LoweringError::UnsupportedNode(format!(
+                "loop header at pc={header_pc} ends in `arraylength; if_icmp*` \
+                 but loads no induction variable"
+            ))
+        })?
+    } else {
+        if iload_history.len() < 2 {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "loop header at pc={header_pc} does not have the canonical \
+                 `iload iv; iload bound; if_icmp*` (or `iload iv; aload arr; \
+                 arraylength; if_icmp*`) operand shape"
+            )));
+        }
+        iload_history[iload_history.len() - 2]
+    };
 
     // Find the induction variable's `iinc` in the loop body and read
     // its stride.
