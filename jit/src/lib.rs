@@ -15291,7 +15291,11 @@ pub fn shadow_overflow_status() -> Option<(usize, Option<String>)> {
 
 /// How the direct-entry arms should treat a compiled callee's raw return
 /// register — see `emit_inline_callee_deopt_check`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// `Debug` is derived so the interlock's own test can NAME the mode it is
+/// asserting about; a failure that says `Off must force the ban on` is worth
+/// more than one that says `assertion failed`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpIcDeoptCheck {
     /// Compare against `i64::MIN` at every direct-entry call (the default).
     On,
@@ -15336,22 +15340,72 @@ pub fn sp_ic_deopt_check_mode() -> SpIcDeoptCheck {
 ///    (`direct-call-service-slots`) rather than an unserviced raw edge, so
 ///    "bound" implies "serviced" for every Java callee.
 ///
-/// Default-OFF pending its own measurement: on netty's
-/// `BigEndianHeapByteBufTest` this gate accounts for 16 of 892 refused binds,
-/// against 736 for the native shadow, so it is a much smaller population than
-/// the virtual-site ban and is not worth defaulting on unmeasured.
-/// `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=1` opts in.
+/// **Default-ON since 2026-08-21.** `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=0`
+/// restores the ban.
+///
+/// The measurement it was waiting for was taken and it is two-sided, so read
+/// both halves before changing this again
+/// (`static-exception-table-callee-pays-the-funnel-20260821.md`):
+///
+///  * **per call, 10.2x.** `probes/NativeFunnelFloorProbe.java`, ABBA on one
+///    binary: a static callee with a never-taken `try`/`catch`, reached from an
+///    ordinary frame, goes 107.30 -> 10.57 ns/op with both controls flat. Under
+///    the ban it takes `jit_invoke_dispatch` on every call — 1 187 000 funnel
+///    entries against zero for the same callee without the table.
+///  * **per workload, nothing measurable.** 3-228 such sites per netty class
+///    against 117-1 252 left on the helper, `native-shadow` dominating every
+///    one, and an ABBA on the 228-site class moving nothing against a 39 %
+///    spread.
+///
+/// So the flip is NOT justified by a workload win, and pretending otherwise
+/// would be the kind of claim this tree does not make. What justifies it is
+/// consistency and cost: the virtual/interface sibling
+/// (`mic_publish_exception_table_callees`) had the IDENTICAL ban for the
+/// IDENTICAL stated reason, was measured at 8.7x, and was lifted — leaving the
+/// statically bound door, which is the EASY case, 11x worse than the virtual
+/// one for the same callee (9.2 ns against 107). A default that makes the
+/// simpler path the slower path is not a conservative default, it is a bug that
+/// happens to be quiet.
+///
+/// The stated reason for the ban has expired, and `probes/ExcTableDirectCallOracle.java`
+/// is what says so rather than the argument above: a callee's own handler,
+/// `finally`, wrong-type non-catch, nested catch and rethrow all behave
+/// identically under HotSpot, under the ban and with it lifted — including the
+/// IMPLICIT AIOOBE/NPE/div-by-zero cases, which are the ones that actually
+/// leave through the `i64::MIN` sentinel the ban's reason names.
+///
+/// The population note that used to stand here (16 of 892 refused binds on
+/// `BigEndianHeapByteBufTest`) is still true and is still the reason not to
+/// expect a workload win; the current census puts it at 17 of 732.
 pub fn direct_call_exc_table_publish_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        if sp_ic_deopt_check_mode() != SpIcDeoptCheck::On {
-            return false;
-        }
-        matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH").as_deref(),
-            Ok("1") | Ok("true")
+        direct_call_exc_table_publish_decision(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH")
+                .as_deref()
+                .ok(),
+            sp_ic_deopt_check_mode(),
         )
     })
+}
+
+/// The policy of [`direct_call_exc_table_publish_enabled`] as a pure function
+/// of its two inputs.
+///
+/// Split out so the decision table can be unit-tested without an environment
+/// variable. The public entry point memoises in a `OnceLock` and reads the
+/// process environment, so a test that exercised IT would have to mutate
+/// `environ` — which is a data race in a parallel test binary, not a
+/// visibility question, and is exactly the pattern that was removed from
+/// `native-builtins` on 2026-08-20.
+fn direct_call_exc_table_publish_decision(flag: Option<&str>, check: SpIcDeoptCheck) -> bool {
+    // The interlock is NOT a knob, and the default flipping does not make it
+    // one: publishing while the sentinel check is suppressed is unsound, so a
+    // suppressed check forces the ban back on whatever the flag says.
+    if check != SpIcDeoptCheck::On {
+        return false;
+    }
+    !matches!(flag, Some("0") | Some("false") | Some("off"))
 }
 
 pub fn direct_jit_callee_calls_enabled() -> bool {
@@ -22604,6 +22658,60 @@ mod long_box_direct_bind_tests {
         let (final_v, final_l) = long_box_direct_helper_sites();
         assert_eq!(final_v, before_v + 3);
         assert_eq!(final_l, before_l + 5);
+    }
+}
+
+#[cfg(test)]
+mod direct_exc_table_publish_policy {
+    use super::*;
+
+    /// The default is ON as of 2026-08-21, and `=0` is what restores the ban.
+    ///
+    /// Pinned because the flip is NOT justified by a workload win — it is
+    /// justified by the static door otherwise being 11x worse than the virtual
+    /// door for the same callee — so the next person to read the census could
+    /// reasonably conclude it should go back. If they do, it should be a
+    /// decision that edits this test, not a silent polarity slip.
+    #[test]
+    fn the_default_is_on_and_zero_restores_the_ban() {
+        assert!(
+            direct_call_exc_table_publish_decision(None, SpIcDeoptCheck::On),
+            "unset must mean ON since 2026-08-21",
+        );
+        for off in ["0", "false", "off"] {
+            assert!(
+                !direct_call_exc_table_publish_decision(Some(off), SpIcDeoptCheck::On),
+                "`{off}` must restore the ban",
+            );
+        }
+        for on in ["1", "true", ""] {
+            assert!(
+                direct_call_exc_table_publish_decision(Some(on), SpIcDeoptCheck::On),
+                "`{on}` must not restore the ban",
+            );
+        }
+    }
+
+    /// The interlock outranks the flag, in BOTH directions.
+    ///
+    /// Publishing a direct `CALL` while the `i64::MIN` sentinel check is
+    /// suppressed is the unsound state — the callee's own handler would never
+    /// run — and the MIC sibling's page records a throughput reading that was
+    /// mistaken for a pass because of exactly this
+    /// (`207.04 ns/op` with the interlock holding, `24.12` without it). The
+    /// default flipping must not turn the interlock into a knob.
+    #[test]
+    fn a_suppressed_sentinel_check_forces_the_ban_back_on() {
+        for check in [SpIcDeoptCheck::Off, SpIcDeoptCheck::SkipVoid] {
+            assert!(
+                !direct_call_exc_table_publish_decision(None, check),
+                "{check:?} must force the ban on even with the flag unset",
+            );
+            assert!(
+                !direct_call_exc_table_publish_decision(Some("1"), check),
+                "{check:?} must force the ban on even when the flag asks for it",
+            );
+        }
     }
 }
 

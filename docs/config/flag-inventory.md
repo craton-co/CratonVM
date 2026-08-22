@@ -1133,7 +1133,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_COMPILED_LDC_CONST_CACHE` | JIT | `CRATONVM_JIT=compiled-ldc-const-cache` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_DENY` | JIT | `CRATONVM_JIT=deny` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_DIRECT_CALLEE_CALLS` | JIT | `CRATONVM_JIT=direct-callee-calls` | opt-in | off | behaviour | snapshot | jit |
-| `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` | JIT | `CRATONVM_JIT=direct-exc-table-publish` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` | JIT | `CRATONVM_JIT=direct-exc-table-publish` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_DISABLE_INLINE_NEW` | JIT | `CRATONVM_JIT=inline-new` | opt-out | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY` | JIT | `CRATONVM_JIT=dispatch-cache-direct-entry` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` | JIT | `CRATONVM_JIT=dispatch-cache-virtual-direct-entry` | opt-in | off | behaviour | snapshot | vm |
