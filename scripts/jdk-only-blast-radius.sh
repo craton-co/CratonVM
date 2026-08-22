@@ -310,6 +310,33 @@ run_arm() {
 
 in_set() { case " $2 " in *" $1 "*) return 0 ;; esac; return 1; }
 
+# --- quarantine ------------------------------------------------------------
+#
+# Vectors MEASURED to be non-deterministic, from regression-suite/known-flaky.txt.
+# They are dropped from every cell below and REPORTED separately, never silently.
+# See that file's header for why a rate and a record are required, and
+# `WORKER-1-NOTE-1` for the measurement behind the row that is there today.
+QUARANTINE_FILE="$ROOT/regression-suite/known-flaky.txt"
+QUARANTINED=""
+if [ -f "$QUARANTINE_FILE" ]; then
+    QUARANTINED="$(sed 's/#.*//' "$QUARANTINE_FILE" | awk 'NF {print $1}' | sort -u | tr '\n' ' ')"
+    QUARANTINED="${QUARANTINED% }"
+fi
+
+# One "<arm><TAB><vector><TAB>FAIL|pass|absent" per line, for the report below.
+QLOG=""
+note_quarantine() {   # $1 = arm label, $2 = that arm's failing set, $3 = scheduled
+    for qv in $QUARANTINED; do
+        if in_set "$qv" "$2"; then         QLOG="$QLOG$1	$qv	FAIL
+"
+        elif in_set "$qv" "$3"; then       QLOG="$QLOG$1	$qv	pass
+"
+        else                               QLOG="$QLOG$1	$qv	absent
+"
+        fi
+    done
+}
+
 # --- the control -----------------------------------------------------------
 CONTROL_FAILED=""; CONTROL_PASSED="?"; CONTROL_TOTAL="?"; CONTROL_SCHEDULED=""
 if [ -z "$SKIP_CONTROL" ]; then
@@ -317,6 +344,21 @@ if [ -z "$SKIP_CONTROL" ]; then
     CONTROL_FAILED="$ARM_FAILED"
     CONTROL_PASSED="$ARM_PASSED"; CONTROL_TOTAL="$ARM_TOTAL"
     CONTROL_SCHEDULED="$ARM_SCHEDULED"
+    note_quarantine control "$ARM_FAILED" "$ARM_SCHEDULED"
+fi
+
+# A quarantine row naming a vector this corpus does not schedule is a stale
+# excuse, and a stale excuse reads as coverage. Same rule the exemption list in
+# `native_override.rs` obeys: the list must be able to fail.
+if [ -n "$QUARANTINED" ] && [ -n "$CONTROL_SCHEDULED" ]; then
+    for qv in $QUARANTINED; do
+        if ! in_set "$qv" "$CONTROL_SCHEDULED"; then
+            echo "ERROR: regression-suite/known-flaky.txt quarantines '$qv', which this" >&2
+            echo "       corpus does not schedule. Drop the row — a quarantine entry that" >&2
+            echo "       matches nothing silently grows the list and excuses nothing." >&2
+            exit 3
+        fi
+    done
 fi
 
 # --- the armed sweep -------------------------------------------------------
@@ -329,8 +371,15 @@ for p in $PREFIXES; do
     # family's cost. H0-4 §4 found four of its six cells inflated by one shared
     # row and re-priced the whole table on it.
     net=""
-    for v in $ARM_FAILED; do in_set "$v" "$CONTROL_FAILED" || net="$net $v"; done
+    for v in $ARM_FAILED; do
+        in_set "$v" "$CONTROL_FAILED" && continue
+        # Quarantined: MEASURED flaky, so its presence here is as likely to be
+        # the coin as the prefix. Excluded from the cell, reported below.
+        in_set "$v" "$QUARANTINED" && continue
+        net="$net $v"
+    done
     net="${net# }"
+    note_quarantine "$label" "$ARM_FAILED" "$ARM_SCHEDULED"
     ROWS="$ROWS$p	$ARM_PASSED	$ARM_TOTAL	$net
 "
     if [ -z "$COMMON_INIT" ]; then COMMON="$net"; COMMON_INIT=1
@@ -360,6 +409,7 @@ if [ -n "$UPDATE" ]; then
         echo "!note	${NOTE:-(none)}"
         echo "!control	$CONTROL_PASSED	$CONTROL_TOTAL	$CONTROL_FAILED"
         echo "!corpus	$CONTROL_SCHEDULED"
+        echo "!quarantined	$QUARANTINED"
         printf '%s' "$ROWS"
     } > "$BASELINE"
     echo "baseline written: $BASELINE"
@@ -392,6 +442,35 @@ printf '%s' "$ROWS" | while IFS='	' read -r p pa to net; do
     printf '  %-46s %10s  %s\n' "$p" "$pa / $to" "$n${net:+   $net}"
 done
 echo
+if [ -n "$QUARANTINED" ]; then
+    echo "  QUARANTINED — measured flaky, EXCLUDED from every cell above"
+    printf '%s' "$QLOG" | awk -F'\t' '
+        $3 == "FAIL"   { f[$2]++ }
+        $3 != "absent" { n[$2]++ }
+        $1 == "control" && $3 == "FAIL" { ctl[$2] = "FAIL" }
+        $1 == "control" && $3 == "pass" { ctl[$2] = "pass" }
+        END {
+            for (v in n)
+                printf "    %-28s failed %d of %d arms (control: %s)\n",
+                       v, f[v] + 0, n[v], (v in ctl ? ctl[v] : "?")
+        }' | sort
+    echo "    Rates and records: regression-suite/known-flaky.txt. A cell above is"
+    echo "    NOT scored on these, because a 25% vector moves a set-keyed cell three"
+    echo "    runs in eight by chance and a gate that cries wolf adjudicates nothing."
+    # The blindfold check. A vector that fails EVERYWHERE is not flaky any more.
+    printf '%s' "$QLOG" | awk -F'\t' '
+        $3 == "FAIL"   { f[$2]++ }
+        $3 != "absent" { n[$2]++ }
+        END { for (v in n) if (f[v] == n[v]) print v }' | while read -r qv; do
+        [ -n "$qv" ] || continue
+        echo
+        echo "  !! '$qv' is quarantined but failed in EVERY arm of this run, control"
+        echo "     included. That is not flakiness. The quarantine is now HIDING a"
+        echo "     deterministic failure — re-measure its rate, and if it has stopped"
+        echo "     being flaky, remove the row and let the cells score it again."
+    done
+    echo
+fi
 if [ -n "$COMMON" ]; then
     echo "  COMMON FACTOR — fails under EVERY armed prefix: $COMMON"
     echo "    H0-4 §4 found exactly this and it was ONE defect with four faces, not four"
@@ -449,6 +528,23 @@ fi
 BL_CORPUS="$(sed -n 's/^!corpus	//p' "$BASELINE" | head -1)"
 moved=0
 echo "ADJUDICATION against $BASELINE"
+
+# The quarantine list is an INPUT to every cell, and adjudication cannot see it.
+# Changing it moves cells: quarantining a vector reports REPAIRED under every
+# prefix it appeared under, un-quarantining reports REGRESSION. Both are honest
+# classifications of a real difference and both send a reader hunting for a code
+# change that never happened. So classify this difference too.
+BL_QUAR="$(sed -n 's/^!quarantined	//p' "$BASELINE" | head -1)"
+if [ "$BL_QUAR" != "$QUARANTINED" ]; then
+    echo "  !! THE QUARANTINE LIST CHANGED SINCE THIS BASELINE WAS TAKEN."
+    echo "     baseline: ${BL_QUAR:-(none)}"
+    echo "     now:      ${QUARANTINED:-(none)}"
+    echo "     Cells below WILL move as a result, and that movement is the list"
+    echo "     changing rather than the VM. Re-take the baseline once you have"
+    echo "     satisfied yourself the list is right — regression-suite/known-flaky.txt"
+    echo "     requires a measured rate and a record for every row."
+    echo
+fi
 printf '%s' "$ROWS" | {
   while IFS='	' read -r p pa to net; do
     [ -n "$p" ] || continue

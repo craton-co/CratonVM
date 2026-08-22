@@ -9675,50 +9675,15 @@ pub(super) fn execute_jit_call_oneshot(
     // the helper returned as if the value had been produced normally.
     if result == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
-            dbg_deopt_sink("lambda-oneshot", &rframe, "");
-            if ir_deopt_resume_enabled()
-                && resume_from_ir_deopt(shared, thread, cached, &rframe).is_some()
-            {
-                return run_pushed_frame_to_completion(shared, thread, frames_depth_on_entry)
-                    .map(Some);
-            }
-            if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
-                if real_frame_deopt_resume_and_despeculate(
-                    shared, thread, compiled, cached, &rframe,
-                )
-                .is_some()
-                {
-                    return run_pushed_frame_to_completion(shared, thread, frames_depth_on_entry)
-                        .map(Some);
-                }
-            } else if !rframe.method_key.is_empty()
-                && !deopt_frame_matches_method(
-                    &rframe,
-                    &cached.class_name,
-                    &cached.method_name,
-                    &cached.method_descriptor,
-                )
-            {
-                // The stash belongs to a nested callee, not to `cached`:
-                // de-speculate its real owner so it stops re-trapping.
-                despeculate_stashed_frame_method(shared, &rframe);
-            } else {
-                let despec_reason = compiled
-                    .deopt_points
-                    .iter()
-                    .find(|dp| dp.bci == rframe.bci)
-                    .map(|dp| dp.reason)
-                    .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
-                let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
-                    shared,
-                    &cached.class_name,
-                    &cached.method_name,
-                    &cached.method_descriptor,
-                    despec_reason,
-                    rframe.bci,
-                );
-            }
-            return Ok(None);
+            return resume_deopted_body(
+                shared,
+                thread,
+                compiled,
+                cached,
+                &rframe,
+                frames_depth_on_entry,
+                "lambda-oneshot",
+            );
         }
     }
     if result == i64::MIN && deopt_signaled {
@@ -9739,6 +9704,83 @@ pub(super) fn execute_jit_call_oneshot(
         })),
         _ => None, // void
     }))
+}
+
+/// Resume a compiled body that trapped, and run the resumed frame to
+/// completion here.
+///
+/// **This is the only correct answer for a body that has already committed a
+/// side effect.** A deopt sentinel does NOT mean "nothing happened": it means
+/// the compiled body ran up to `rframe.bci` and stopped. Declining — returning
+/// `Ok(None)` so the caller re-enters the body from entry — therefore
+/// re-executes everything before that bci a second time. `rframe` is the
+/// reconstructed state that makes resuming from the trap point possible, which
+/// is why it must be spent rather than dropped.
+///
+/// Shared by both one-shot doors into a compiled lambda impl: the interpreter's
+/// [`execute_jit_call_oneshot`] and the compiled caller's
+/// `jit::helpers::try_lambda_site_direct_call`. It was inlined in the first of
+/// those and simply absent from the second, which dropped the frame and let its
+/// caller re-run the body — see
+/// `docs/known-issues/hibernate/hib-reactive-3gc-run-regressions-20260820.md`
+/// section 8 for the hibernate-reactive `reactiveRemove`-fires-twice defect
+/// that came out of exactly that asymmetry.
+///
+/// Returns:
+///   * `Ok(Some(v))` — the frame was resumed and ran to completion; `v` is this
+///     call's result.
+///   * `Ok(None)` — no resume was possible; the owning method has been
+///     de-speculated instead. The caller may re-run the body, and by doing so
+///     accepts that any side effect committed before the trap happens twice.
+///   * `Err(_)` — a Java exception escaped the resumed frame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resume_deopted_body(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    compiled: &crate::jit::CompiledMethod,
+    cached: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    frames_depth_on_entry: usize,
+    sink_label: &str,
+) -> Result<Option<Option<Value>>, MethodCallFailed> {
+    dbg_deopt_sink(sink_label, rframe, "");
+    if ir_deopt_resume_enabled() && resume_from_ir_deopt(shared, thread, cached, rframe).is_some() {
+        return run_pushed_frame_to_completion(shared, thread, frames_depth_on_entry).map(Some);
+    }
+    if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
+        if real_frame_deopt_resume_and_despeculate(shared, thread, compiled, cached, rframe)
+            .is_some()
+        {
+            return run_pushed_frame_to_completion(shared, thread, frames_depth_on_entry).map(Some);
+        }
+    } else if !rframe.method_key.is_empty()
+        && !deopt_frame_matches_method(
+            rframe,
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+        )
+    {
+        // The stash belongs to a nested callee, not to `cached`:
+        // de-speculate its real owner so it stops re-trapping.
+        despeculate_stashed_frame_method(shared, rframe);
+    } else {
+        let despec_reason = compiled
+            .deopt_points
+            .iter()
+            .find(|dp| dp.bci == rframe.bci)
+            .map(|dp| dp.reason)
+            .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
+        let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+            shared,
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+            despec_reason,
+            rframe.bci,
+        );
+    }
+    Ok(None)
 }
 
 /// The one-shot arm of `route_jit_signal_exception`: route an exception raised
