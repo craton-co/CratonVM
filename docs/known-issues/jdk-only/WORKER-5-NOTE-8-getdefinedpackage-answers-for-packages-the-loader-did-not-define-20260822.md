@@ -220,6 +220,42 @@ That is a real divergence and it is **new**, traded deliberately:
 It is written into `builtin_loader_segment`'s doc comment so the next reader
 meets it at the code, not only here.
 
+## 8. The arms after the fix — and `RTreeRangeGc` is NOT a flake on this binary
+
+```text
+  SUITE=all CRATONVM_ARGS=--jdk-only   107 / 107   0 failed
+  SUITE=all                            106 / 107   RTreeRangeGc
+  SUITE=core                            66 /  67   RTreeRangeGc
+```
+
+`RLangPackages` is gone from all three. **The strict arm is green for the first
+time on a binary built from this tree**, and its census reads
+`saturation: none — every bounded collection reported truncated: false`.
+
+### 8.1 A CORRECTION to `WORKER-5-NOTE-7` §1a.2
+
+That record called `RTreeRangeGc` **a flake**, from 12 ABBA-interleaved runs on
+`cratonvm-r12.exe` that gave both outcomes. On `cratonvm-w5b.exe` it is not
+flaky at all. Twelve runs, six rounds, the two modes interleaved so neither
+order nor drift can explain it:
+
+```text
+round 1..6:   strict = PASS ×6        compatible = FAIL ×6
+```
+
+**Deterministic, and mode-dependent** — which is trap 6's shape exactly: *"these
+failures are COMPATIBLE-mode defects … a vector going GREEN is the fix"*. It
+passes under `--jdk-only` and fails only without the flag.
+
+That makes it far more actionable than a flake: a deterministic
+mode-conditioned failure is diagnosable. It is also a reminder that **"flaky"
+is a property of a binary and a host, not of a vector** — r12 and w5b are many
+commits apart, and the earlier runs were taken under a load these were not.
+
+Not this lane's surface (the failure is `gc::guard` + `[G2] nothing survives
+extract()` in the substitution layer), and `ba370cc23` records another lane
+already narrowing it there.
+
 ## 6. NOMINATIONS
 
 * ~~**N1 — owner needed for `getDefinedPackage`.**~~ **DONE — §7.** It was a
