@@ -271,6 +271,16 @@ disjoint in effect** — `LinkedHashMap extends HashMap`, `HashSet` is backed by
 `--prefixes 'a+b'` exists so `H0-4` N2 (arm two together and see whether they
 compose) is one command rather than a code change.
 
+> **CORRECTION 2026-08-22 — the one-call-site premise below is FIXED.**
+> `jdk_only_enforce_shadow_for` now has a call site at every one of the
+> fourteen dispatch doors, and the leak that premise describes is gone
+> (MEASURED before the fix: 890 of 947 armed `Bridge` dispatches never
+> asked the dial). **The direction stated here is also wrong**: armed
+> cells taken with the one-door dial were not a floor — `java/util/HashMap`
+> scored 81/104 half-armed and 86/104 fully armed, because half-armed is a
+> corrupt hybrid, not a partial retirement. See
+> `WORKER-1-the-dial-now-reaches-every-door-20260821.md`.
+
 Two more caveats are printed on every run: a green cell means "these 105 vectors
 raise no objection", not "this family is retirable" (`G79-1`: the corpus has no
 AWT vector at all); and per `H7-1` N2 the dial is read at **one** dispatch site,

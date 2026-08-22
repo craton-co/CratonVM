@@ -694,6 +694,50 @@ pub fn intrinsics_disabled() -> bool {
 /// package prefix; that is the handle dispatch actually has.
 ///
 /// No effect outside `--jdk-only`: the caller tests `is_jdk_only()` first.
+///
+/// # THE CONTRACT — what an armed run does and does not entitle you to say
+///
+/// `H16-3` N2 and `H17-2` N5 both asked for this, because four records read the
+/// dial as "simulate a retirement" while it did something narrower, and nobody
+/// had written down which. It is stated here, at the flag, rather than in a
+/// record, because the reader who needs it is the one about to type the
+/// variable.
+///
+/// **What it does.** For every dispatch of a `Bridge` native whose receiver
+/// class the scope covers, under `--jdk-only`, where the shadowed method has a
+/// concrete `Code` attribute: the native declines and the real JDK bytecode
+/// runs. Every dispatch, at every one of the fourteen doors — not the first
+/// one, not the cold ones. Before 2026-08-21 that last clause was false, and
+/// every armed cell published before then is void (see `H17-2`, and caveat 4
+/// of `scripts/jdk-only-blast-radius.sh`).
+///
+/// **What it still is not.** A retirement removes the REGISTRATION. Three
+/// differences survive, and all three are permanent properties of a dial
+/// rather than bugs to be fixed:
+///
+/// 1. **No-bytecode triples still run their native.** A yield needs concrete
+///    bytecode to yield to; a retirement of a triple with no `Code` produces an
+///    `AbstractMethodError`, not a working call. An armed run therefore
+///    UNDER-prices those, and this is the one direction that really is a floor.
+///    `enforcement_dial.declined_no_bytecode` in `--jdk-only-report` counts
+///    exactly them, so the size of the gap is measurable rather than assumed.
+/// 2. **The registration is still there.** 162 triples are registered more than
+///    once and only the `owns_slot: true` one is reachable, so a real retirement
+///    PROMOTES the loser while the dial does not. `H22` nearly put sixteen
+///    already-condemned bodies into service this way. Diff
+///    `--dump-native-registry` across any deletion; an armed run cannot warn you.
+/// 3. **A scope narrower than `all` produces a MIXED heap.** Objects built by a
+///    covered class's bytecode and objects built by an uncovered class's native
+///    coexist and are handed to each other. That is not a smaller version of the
+///    retirement — it is a state no configuration reaches. It is also the entire
+///    reason scoping exists, so this is a cost to be aware of, not avoided.
+///
+/// **The asymmetry, which is the part worth memorising.** An armed FAILURE is
+/// real: something genuinely broke when real bytecode ran. An armed ZERO is
+/// weaker than it looks — it says the corpus asked no question this prefix
+/// answers wrongly, and the corpus does not ask about array component types,
+/// the CONTENT of a built string, or the class identity of a returned object.
+/// `H23`'s table fix was green three arms running and completely inert.
 #[inline]
 pub fn jdk_only_enforce_shadow() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
