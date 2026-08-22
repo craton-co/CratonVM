@@ -19061,11 +19061,33 @@ pub(crate) fn i2_classloader_get_defined_packages(
     // `new_array` can allocate and therefore move; the elements are global
     // roots, so re-resolving is unnecessary, but the array itself must be
     // filled only after it exists.
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, packages.len());
+    //
+    // TYPED, not `new_array(Reference, n)`. That allocator produces an array
+    // whose runtime component type is `java.lang.Object`, and the JDK declares
+    // this method as returning `Package[]` — so a caller doing
+    // `Package[] ps = cl.getDefinedPackages()` receives an array that fails
+    // `getClass().getComponentType() == Package.class`, and any `aastore` into
+    // it or `checkcast` of it is a wrong answer waiting for its first caller.
+    // MEASURED by `regression-suite/src/RJdkLangPackages.java`, which is the
+    // first vector in this corpus to call the method at all:
+    // `expected [class java.lang.Package] got [class java.lang.Object]`.
+    let arr = alloc_package_array(ctx, packages.len());
     for (i, pkg) in packages.into_iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Object(Some(pkg)));
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+/// A `java.lang.Package[]` of `len` elements.
+///
+/// Falls back to the untyped reference allocator only when the class model
+/// cannot name `java/lang/Package` — which on any real boot it can, since every
+/// caller here has just produced `Package` instances.
+fn alloc_package_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
+    match ctx.class_id_by_name("java/lang/Package") {
+        Some(cid) => ctx.new_ref_array(cid, len),
+        None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, len),
+    }
 }
 
 /// `ClassLoader.getPackages() -> Package[]` — unconditionally empty; see the
@@ -19074,7 +19096,11 @@ pub(crate) fn i2_classloader_get_packages_empty(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    // Empty, but a `Package[0]` rather than an `Object[0]`. The whole reason
+    // this override exists is that jboss-modules' `ConcurrentClassLoader
+    // .<clinit>` stores the result into a `Package[]` local; handing it an
+    // array whose component type is `Object` swaps one wrong shape for another.
+    let empty = alloc_package_array(ctx, 0);
     Ok(Some(Value::Object(Some(empty))))
 }
 

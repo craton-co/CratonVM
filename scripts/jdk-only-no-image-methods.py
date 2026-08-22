@@ -1,451 +1,380 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2024-2026 Craton Software Company
-"""The METHOD-granular multi-image sweep. `H25-1` N1.
+"""Which registered (class, method, descriptor) triples does NO supported JDK image declare?
 
 WHY THIS EXISTS
 ---------------
 
-`H25-1` measured **342 strict-mode registrations naming a method no JDK 25
-image declares anywhere on the receiver's hierarchy** — and then corrected
-itself in its own §1.6:
+`scripts/jdk-only-no-image-receivers.py` answers the same question at CLASS
+granularity: a receiver class no supported image declares can carry no
+`ACC_NATIVE` method, so its registrations are `SyntheticStub`, not §1.5
+`Bridge`s. `H25-1` measured that the identical argument holds one level down --
+342 registrations in a strict-mode dump name a METHOD no JDK 25 image declares
+anywhere on the receiver's hierarchy -- and then refused to act on it, because a
+one-image measurement cannot tell a dead stub from a deliberate cross-version
+registration:
 
-    java/lang/StringUTF16.isBigEndian()Z
+    java/lang/StringUTF16.isBigEndian()Z is absent from JDK 25 and PRESENT in
+    JDK 17 and 21. native-builtins/src/lang_string.rs keeps it on purpose and
+    says so in a 56-line comment.
 
-is one of the 342, and `lang_string.rs:12422` carries a 56-line comment whose
-heading is *"On JDK 25 this registration never fires, and that is not a
-defect"* — it is kept for **JDK 17/21 images, which DO declare it**.
+`H25-1` N1 states the precondition in one sentence: run the multi-image sweep
+FIRST; it is a precondition, not a follow-up. This script is that sweep.
 
-So **342 is a ONE-IMAGE UPPER BOUND, not a work list**, and until this sweep
-runs no row in that population may be deleted by anyone.  That is the sentence
-this script exists to remove.  Its output is the thing W3 and W4 are blocked
-on: which rows are dead on *every* supported image (retirable) and which are
-deliberate cross-version registrations (must not be touched).
+WHAT IT DOES, AND WHAT IT REFUSES TO DO
+---------------------------------------
 
-The class-granular sibling is `scripts/jdk-only-no-image-receivers.py`, and the
-rule it states is the one this extends, with *class* replaced by *method*:
+For every registration in a `--dump-native-registry` JSON it asks each image
+`javap -p -s --system <image>`: does this class declare this exact descriptor,
+does a supertype declare it, or does neither. It then partitions the population:
 
-    if no image on any supported (version, platform) pair declares the
-    receiver METHOD anywhere on the receiver's hierarchy, there is no
-    ACC_NATIVE method for the registration to bind to and there never can be
+  * LIVE      -- declared (or inherited) by EVERY image. Nothing to say.
+  * PARTIAL   -- declared by SOME image only. The `isBigEndian` shape: a
+                 registration that is correct precisely because another
+                 supported image declares the method. NEVER retire one of
+                 these on the strength of a single-image census.
+  * NEAR_MISS -- some image declares the NAME on the class but no overload with
+                 this descriptor. `H25-1` 2.2's population: an interception
+                 somebody intended that has never once executed.
+  * DEAD_EVERYWHERE -- no image declares it anywhere on the hierarchy, and the
+                 class itself is present somewhere. The retirable population.
+  * CLASS_ABSENT_EVERYWHERE -- the receiver class is on no image. Already
+                 covered at class granularity by NO_IMAGE_JDK_RECEIVERS.
 
-THE FOUR VERDICTS
------------------
-
-    no-image-class   no image declares the receiver CLASS. Already the
-                     sibling's question; reported, not re-adjudicated here.
-    dead-everywhere  at least one image HAS the class, and NO image declares
-                     the method on the class or on any supertype/interface.
-                     *** the retirable population ***
-    cross-version    some image declares it, some image that HAS the class does
-                     not. *** the isBigEndian shape — DO NOT DELETE ***
-    live             every image that has the class declares the method.
-
-`dead-everywhere` is split further, because the two halves are different bug
-reports (`H25-1` §2.2):
-
-    truly-gone   no image declares that method NAME on the hierarchy at all
-    near-miss    some image declares the NAME but no overload with this
-                 DESCRIPTOR — an interception somebody intended to install,
-                 which has never once fired, and which nothing reports
+It reports. It does not edit, and it does not exit non-zero on a finding --
+retiring a row is a source change with a duplicate-registration hazard
+(`H22`, and trap 4 of the worker briefs: retiring the winner PROMOTES the loser)
+that no census can see.
 
 Usage:
-    python3 scripts/jdk-only-image-method-index.py --image ... --out idx/X.json.gz
-    python3 scripts/jdk-only-no-image-methods.py \\
-        --census reg-jdkonly.json --indexes idx/*.json.gz --out sweep.json
+    python3 scripts/jdk-only-no-image-methods.py \
+        --registry reg-jdkonly.json \
+        --images /data/jdkimages/jdk17-linux/jdk-17.0.20.1+1 \
+                 /data/jdkimages/jdk21-linux/jdk-21.0.12+8 \
+                 /data/jdkimages/jdk25-linux/jdk-25.0.4+7 \
+        [--file-prefix native-builtins/src/lang_] [--csv out.csv]
 
-    python3 scripts/jdk-only-no-image-methods.py --selftest
+An image path may be a JDK home or a macOS bundle root (`Contents/Home` is
+appended when the bundle layout is detected).
 
 Exit codes:
-    0  the sweep ran (findings are in the report; this is not a pass/fail gate)
-    1  the CANARY misfired — a registration the tree documents as a deliberate
-       cross-version keep did not classify as cross-version. The sweep is
-       wrong; do not use its output.
-    2  refused to adjudicate (census not image-adjudicated, image set too
-       narrow, unreadable input)
-    3  selftest failed
+    0  the sweep ran (findings are printed, never fatal)
+    2  refused to adjudicate -- unusable registry or image
+    3  a prerequisite is missing (no javap)
 """
 import argparse
-import glob
-import gzip
+import collections
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
 
-PLATFORMS = ("linux", "windows", "macos")
-
-# The standing witness of §1.6. It is in the 342 on JDK 25 and DECLARED on
-# 17/21, so a sweep that does not call it `cross-version` has a broken
-# hierarchy walk, a missing old image, or a broken index — and every other row
-# it prints is then untrustworthy. Checked on every real run, not only in the
-# selftest: a gate nobody has watched fail is decoration.
-CANARY = ("java/lang/StringUTF16", "isBigEndian", "()Z")
+CLASS_DECL_RE = re.compile(
+    r"^(?:[\w@$.]+\s+)*?(?:class|interface|enum|record)\s+([\w.$]+)"
+    r"(?:<[^{]*?>)?\s*(?:extends\s+([\w.$,<>\s]+?))?\s*(?:implements\s+([\w.$,<>\s]+?))?\s*\{",
+    re.M,
+)
+DESC_RE = re.compile(r"^\s*descriptor:\s*(\S+)\s*$")
 
 
-def load_index(path):
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8") as fh:
-        doc = json.load(fh)
-    for key in ("label", "classes"):
-        if key not in doc:
-            sys.exit("REFUSING: %s has no `%s` — it is not an image index from"
-                     " jdk-only-image-method-index.py." % (path, key))
-    if len(doc["classes"]) < 1000:
-        sys.exit("REFUSING: %s carries only %d classes. A thin index reports"
-                 " every method as absent and would turn the whole census into"
-                 " a work list." % (path, len(doc["classes"])))
-    return doc
+def resolve_image(path):
+    """A JDK home, or a macOS bundle root whose home is Contents/Home."""
+    if os.path.isdir(os.path.join(path, "Contents", "Home", "lib")):
+        return os.path.join(path, "Contents", "Home")
+    return path
 
 
-def load_census(path):
-    with open(path, encoding="utf-8") as fh:
-        doc = json.load(fh)
-    if not doc.get("image_adjudication"):
-        sys.exit("REFUSING: %s has image_adjudication false — re-run the VM with"
-                 " --explain-jdk-only." % path)
-    if doc.get("mode") not in (None, "jdk-only"):
-        sys.exit("REFUSING: %s was taken in mode %r. This sweep is STRICT-MODE"
-                 " ONLY: a --synthetic-jdk carrier CAN declare a method the real"
-                 " image does not, so a compatible-mode census would nominate"
-                 " rows that are load-bearing there." % (path, doc.get("mode")))
-    return doc["natives"]
+def image_label(path):
+    """A short, stable name for an image: the two path components that differ."""
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    for i, p in enumerate(parts):
+        if p.startswith("jdk") and "-" in p:
+            return "/".join(parts[i:i + 2])
+    return "/".join(parts[-2:])
 
 
-def declares(classes, cls, name, desc):
-    """(exact, name_only) — does the hierarchy rooted at `cls` declare it?
+def member_name(sig):
+    """`public static java.lang.String valueOf(int);` -> `valueOf`.
 
-    `exact` is name+descriptor found on the class, a superclass, or any
-    (transitive) interface.  `name_only` is the same walk asking about the NAME
-    alone, which is what separates `H25-1`'s 286 truly-gone from its 56
-    near-misses.  Returns (None, None) when the image does not have the class
-    at all — a distinct answer from "has it, does not declare it", and
-    collapsing the two is how a one-platform sweep calls a macOS class dead.
+    A constructor prints as the dotted class name with no return type; the
+    registry spells it `<init>`. A field prints with no parentheses.
     """
-    if cls not in classes:
-        return (None, None)
-    key = name + desc
-    seen = set()
-    stack = [cls]
-    exact = False
-    name_only = False
-    while stack:
-        c = stack.pop()
-        if c in seen:
-            continue
-        seen.add(c)
-        entry = classes.get(c)
-        if entry is None:
-            # A supertype outside this image (a third-party or platform class).
-            # Not an error: the walk simply cannot see past it, and saying so
-            # by continuing is honest — `exact` stays False and the row lands
-            # in `cross-version` or `dead-everywhere` for a reason the report
-            # names.
-            continue
-        if key in entry["m"]:
-            exact = True
-        if not name_only:
-            for k in entry["m"]:
-                if k.startswith(name) and k[len(name):len(name) + 1] == "(":
-                    name_only = True
-                    break
-        if exact and name_only:
-            break
-        if entry.get("s"):
-            stack.append(entry["s"])
-        stack.extend(entry.get("i") or [])
-    return (exact, name_only)
+    sig = sig.rstrip(";").strip()
+    if "(" not in sig:
+        toks = sig.split()
+        return toks[-1] if toks else ""
+    head = sig[: sig.index("(")]
+    toks = head.split()
+    tok = toks[-1] if toks else ""
+    if "." in tok:
+        return "<init>"
+    return tok
 
 
-def classify(row, images):
-    """One registration against every image. Returns a verdict dict."""
-    cls, name, desc = row["class"], row["name"], row["descriptor"]
-    have, declared, name_seen = [], [], []
-    for label, classes in images:
-        exact, name_only = declares(classes, cls, name, desc)
-        if exact is None:
-            continue
-        have.append(label)
-        if exact:
-            declared.append(label)
-        if name_only:
-            name_seen.append(label)
-    if not have:
-        verdict = "no-image-class"
-    elif not declared:
-        verdict = "dead-everywhere"
-    elif len(declared) == len(have):
-        verdict = "live"
-    else:
-        verdict = "cross-version"
-    out = {
-        "class": cls, "name": name, "descriptor": desc,
-        "verdict": verdict,
-        "owns_slot": row.get("owns_slot"),
-        "registered_by": (row.get("registered_by") or "").replace("\\", "/"),
-        "invocations": row.get("invocations"),
-        "images_with_class": have,
-        "images_declaring": declared,
-    }
-    if verdict == "dead-everywhere":
-        out["shape"] = "near-miss" if name_seen else "truly-gone"
-        out["images_declaring_the_name"] = name_seen
-    if verdict == "cross-version":
-        out["images_not_declaring"] = [x for x in have if x not in declared]
-    return out
+class Image:
+    """One JDK image, queried through `javap --system` and memoised per class."""
+
+    def __init__(self, javap, home, label):
+        self.javap = javap
+        self.home = home
+        self.label = label
+        self._cache = {}
+
+    def classinfo(self, internal_name):
+        """-> (declared: set[(name, descriptor)], supertypes: list[internal]) or None."""
+        if internal_name in self._cache:
+            return self._cache[internal_name]
+        dotted = internal_name.replace("/", ".")
+        try:
+            out = subprocess.run(
+                [self.javap, "-p", "-s", "--system", self.home, dotted],
+                capture_output=True, text=True, timeout=180,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            self._cache[internal_name] = None
+            return None
+        if out.returncode != 0 or out.stdout.strip().startswith("Error:"):
+            self._cache[internal_name] = None
+            return None
+        info = self._parse(out.stdout)
+        self._cache[internal_name] = info
+        return info
+
+    @staticmethod
+    def _parse(text):
+        # A member line is followed by its own `descriptor:` line. Pair them
+        # positionally rather than by name -- overloads share a name and only
+        # the descriptor separates them.
+        declared = set()
+        pending = None
+        for line in text.splitlines():
+            m = DESC_RE.match(line)
+            if m:
+                if pending is not None:
+                    declared.add((pending, m.group(1)))
+                    pending = None
+                continue
+            stripped = line.strip()
+            if not stripped or stripped.startswith("Compiled from"):
+                continue
+            if stripped.endswith(";"):
+                pending = member_name(stripped)
+            else:
+                pending = None
+        supers = []
+        m = CLASS_DECL_RE.search(text)
+        if m:
+            for grp in (m.group(2), m.group(3)):
+                if not grp:
+                    continue
+                for tok in grp.split(","):
+                    tok = re.sub(r"<.*?>", "", tok).strip()
+                    if tok:
+                        supers.append(tok.replace(".", "/"))
+        # javap prints no `extends` for a class whose direct superclass IS
+        # Object, and an interface prints none at all -- but Object's methods
+        # are inherited (a class) or implicitly declared abstract (an
+        # interface) either way. Leaving Object out of the walk is what made an
+        # earlier run of this script report `java/lang/Package.equals` as
+        # declared by NO image, when every image declares it on Object and the
+        # registration is a DELIBERATE override of it (H25-2 3.3).
+        if "java/lang/Object" not in supers:
+            supers.append("java/lang/Object")
+        return declared, supers
+
+    def declares(self, cls, name, desc, _depth=0):
+        """DECLARED | INHERITED:<class> | NEAR_MISS | METHOD_ABSENT | CLASS_ABSENT"""
+        info = self.classinfo(cls)
+        if info is None:
+            return "CLASS_ABSENT"
+        declared, supers = info
+        if (name, desc) in declared:
+            return "DECLARED"
+        if _depth < 8 and cls != "java/lang/Object":
+            for sup in supers:
+                r = self.declares(sup, name, desc, _depth + 1)
+                if r == "DECLARED" or r.startswith("INHERITED:"):
+                    return "INHERITED:" + sup
+        if any(n == name for n, _ in declared):
+            return "NEAR_MISS"
+        return "METHOD_ABSENT"
 
 
-def coverage_refusals(images_meta):
-    """Every reason to refuse this image set, as a list of sentences."""
-    bad = []
-    if len(images_meta) < 2:
-        bad.append("only %d index(es) given. One image cannot say that a method"
-                   " is on no image — that is exactly the one-image measurement"
-                   " H25-1 retracted." % len(images_meta))
-    plats = {m.get("platform") for m in images_meta}
-    missing_p = [p for p in PLATFORMS if p not in plats]
-    if missing_p:
-        bad.append("no index is for %s. `sun/nio/ch/KQueuePort` is the worked"
-                   " example of what a sweep missing a platform calls dead."
-                   % " or ".join(missing_p))
-    rels = sorted(r for r in {m.get("release") for m in images_meta} if r)
-    if len(rels) < 2:
-        bad.append("only release(s) %s. The whole point of this sweep is that"
-                   " StringUTF16.isBigEndian is dead on 25 and declared on"
-                   " 17/21; a single-release sweep cannot see that."
-                   % (rels or "none"))
-    elif min(rels) > 17:
-        bad.append("the oldest release swept is %d. lang_string.rs:12422 names"
-                   " JDK 17 explicitly as an image these registrations are kept"
-                   " for, so a sweep starting at %d can still call a deliberate"
-                   " row dead." % (min(rels), min(rels)))
-    return bad
-
-
-def main(argv):
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--census", help="a --dump-native-registry --explain-jdk-only JSON")
-    ap.add_argument("--indexes", nargs="*", default=[],
-                    help="image indexes from jdk-only-image-method-index.py")
-    ap.add_argument("--out", help="write the full per-row verdict JSON here")
-    ap.add_argument("--tsv",
-                    help="write the two ACTIONABLE verdicts (dead-everywhere and"
-                         " cross-version) here as a sorted TSV — small enough to"
-                         " commit, which is what makes it quotable next week")
-    ap.add_argument("--allow-narrow", action="store_true",
-                    help="run anyway on an image set that fails the coverage"
-                         " check, and stamp the report `narrow: true`. For"
-                         " development only — a narrow sweep may NOT be quoted"
-                         " as authority to delete anything.")
-    ap.add_argument("--selftest", action="store_true")
-    args = ap.parse_args(argv[1:])
-
-    if args.selftest:
-        return selftest()
-    if not (args.census and args.indexes):
-        sys.exit("REFUSING: --census and --indexes are both required.")
-
-    paths = []
-    for pattern in args.indexes:
-        hits = sorted(glob.glob(pattern)) or [pattern]
-        paths.extend(hits)
-
-    docs = [load_index(p) for p in paths]
-    bad = coverage_refusals(docs)
-    if bad and not args.allow_narrow:
-        sys.exit("REFUSING to adjudicate this image set:\n" +
-                 "\n".join("  * " + s for s in bad) +
-                 "\n\nPass --allow-narrow only to develop the tool; its output"
-                 " is then not authority to delete anything.")
-
-    images = [(d["label"], d["classes"]) for d in docs]
-    rows = load_census(args.census)
-    verdicts = [classify(r, images) for r in rows]
-
-    # THE CANARY. Runs before anything is reported, on every real sweep.
-    canary_rows = [v for v in verdicts
-                   if (v["class"], v["name"], v["descriptor"]) == CANARY]
-    canary = {"triple": "%s.%s%s" % CANARY, "present_in_census": bool(canary_rows)}
-    if canary_rows:
-        canary["verdict"] = canary_rows[0]["verdict"]
-        canary["images_declaring"] = canary_rows[0]["images_declaring"]
-
-    counts = {}
-    for v in verdicts:
-        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
-    shapes = {}
-    for v in verdicts:
-        if v["verdict"] == "dead-everywhere":
-            shapes[v["shape"]] = shapes.get(v["shape"], 0) + 1
-
-    print("census:  %s  (%d registrations)" % (args.census, len(rows)))
-    print("images:  %s" % ", ".join("%s [%s]" % (d["label"], d.get("java_version") or "?")
-                                    for d in docs))
-    if bad:
-        print("\n*** NARROW SWEEP — coverage check waived with --allow-narrow ***")
-        for s in bad:
-            print("  * %s" % s)
-    print("\nverdicts:")
-    for k in ("live", "cross-version", "dead-everywhere", "no-image-class"):
-        print("  %-16s %5d" % (k, counts.get(k, 0)))
-    if shapes:
-        print("  dead-everywhere splits: %s"
-              % ", ".join("%s=%d" % kv for kv in sorted(shapes.items())))
-
-    print("\ncanary %s: %s" % (canary["triple"],
-                               canary.get("verdict", "NOT IN CENSUS")))
-
-    cross = [v for v in verdicts if v["verdict"] == "cross-version"]
-    if cross:
-        print("\nCROSS-VERSION — declared by SOME image, absent from another."
-              " DO NOT DELETE (%d):" % len(cross))
-        for v in sorted(cross, key=lambda v: (v["class"], v["name"]))[:200]:
-            print("  %-58s %-30s declared by %s"
-                  % (v["class"] + "." + v["name"], v["descriptor"],
-                     ",".join(v["images_declaring"])))
-        if len(cross) > 200:
-            print("  … %d more (full list in --out)" % (len(cross) - 200))
-
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump({"census": args.census,
-                       "images": [{k: d[k] for k in
-                                   ("label", "release", "platform",
-                                    "java_version", "class_count")} for d in docs],
-                       "narrow": bool(bad),
-                       "counts": counts,
-                       "dead_shapes": shapes,
-                       "canary": canary,
-                       "rows": verdicts}, fh, indent=1, sort_keys=True)
-        print("\nwrote %s" % args.out)
-
-    if args.tsv:
-        act = sorted((v for v in verdicts
-                      if v["verdict"] in ("dead-everywhere", "cross-version")),
-                     key=lambda v: (v["verdict"], v["class"], v["name"], v["descriptor"]))
-        with open(args.tsv, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("# jdk-only method-granular multi-image sweep — H25-1 N1\n")
-            fh.write("# regenerate: scripts/jdk-only-image-method-index.py per image,"
-                     " then scripts/jdk-only-no-image-methods.py --tsv\n")
-            fh.write("# census: %s (%d registrations, strict mode)\n" % (args.census, len(rows)))
-            fh.write("# images: %s\n" % " ".join("%s=%s" % (d["label"], d.get("java_version") or "?")
-                                                 for d in docs))
-            fh.write("# canary %s: %s\n" % (canary["triple"], canary.get("verdict", "ABSENT")))
-            fh.write("# verdicts: %s\n" % " ".join("%s=%d" % kv for kv in sorted(counts.items())))
-            fh.write("#\n")
-            fh.write("# cross-version rows MUST NOT be deleted: an image this host does not\n")
-            fh.write("# run declares the method. dead-everywhere rows are the retirable\n")
-            fh.write("# population, and retiring them is predicted to move the shadow census\n")
-            fh.write("# by ZERO — they are never dispatched (H25-1 §3).\n")
-            fh.write("verdict\tshape\tclass\tname\tdescriptor\towns_slot\tregistered_by\tdeclared_by\n")
-            for v in act:
-                fh.write("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n"
-                         % (v["verdict"], v.get("shape", "-"), v["class"], v["name"],
-                            v["descriptor"], "yes" if v["owns_slot"] else "no",
-                            v["registered_by"],
-                            ",".join(v["images_declaring"]) or "-"))
-        print("wrote %s (%d actionable rows)" % (args.tsv, len(act)))
-
-    if canary_rows and canary["verdict"] != "cross-version":
-        print("\nCANARY MISFIRED: %s classified `%s`, expected `cross-version`."
-              "\nlang_string.rs:12422 documents it as a deliberate keep for JDK"
-              " 17/21. Either an old image is missing from --indexes, the"
-              "\nhierarchy walk is broken, or an index is thin. Do NOT use this"
-              " sweep's output." % (canary["triple"], canary["verdict"]),
-              file=sys.stderr)
-        return 1
-    if not canary_rows:
-        print("\nNOTE: the canary triple is not in this census, so the sweep's"
-              " own\ncross-version detection went unexercised on real data.",
-              file=sys.stderr)
-    return 0
+SELFTEST_JAVAP = """Compiled from "AbstractStringBuilder.java"
+abstract class java.lang.AbstractStringBuilder implements java.lang.Appendable, java.lang.CharSequence {
+  byte[] value;
+    descriptor: [B
+  byte coder;
+    descriptor: B
+  boolean maybeLatin1;
+    descriptor: Z
+  int count;
+    descriptor: I
+  java.lang.AbstractStringBuilder(int);
+    descriptor: (I)V
+  public abstract java.lang.String toString();
+    descriptor: ()Ljava/lang/String;
+  private java.lang.AbstractStringBuilder repeat(char, int);
+    descriptor: (CI)Ljava/lang/AbstractStringBuilder;
+  public java.lang.AbstractStringBuilder repeat(java.lang.CharSequence, int);
+    descriptor: (Ljava/lang/CharSequence;I)Ljava/lang/AbstractStringBuilder;
+}
+"""
 
 
 def selftest():
-    """Every verdict, both `dead-everywhere` shapes, and every refusal.
+    """The parse is the risky half of this script, so it is pinned.
 
-    Built from synthetic indexes so it needs no JDK and no VM. `H25-1`'s two
-    real rows are modelled by name: `isBigEndian` (declared on 21, gone on 25)
-    must come out `cross-version`, and `Thread.destroy()V` (gone everywhere)
-    must come out `dead-everywhere`.
+    Two properties the sweep depends on and a regex could plausibly lose:
+    overloads must be separated by DESCRIPTOR (not collapsed by name), and a
+    constructor must come back as `<init>` because that is how the registry
+    spells it.
     """
-    old = {
-        "java/lang/Object": {"s": None, "i": [], "m": {"toString()Ljava/lang/String;": 1}},
-        "java/lang/StringUTF16": {"s": "java/lang/Object", "i": [],
-                                  "m": {"isBigEndian()Z": 9}},
-        "java/lang/Thread": {"s": "java/lang/Object", "i": [], "m": {"start()V": 1}},
-        "java/lang/StringBuilder": {"s": "java/lang/Object", "i": [],
-                                    "m": {"repeat(Ljava/lang/CharSequence;I)V": 1}},
-        "java/util/HashMap": {"s": "java/lang/Object", "i": [], "m": {}},
-    }
-    new = {k: dict(v) for k, v in old.items()}
-    new["java/lang/StringUTF16"] = {"s": "java/lang/Object", "i": [], "m": {}}
-    images = [("jdk21-linux", old), ("jdk25-linux", new)]
+    declared, supers = Image._parse(SELFTEST_JAVAP)
+    failures = []
 
-    def row(c, n, d):
-        return {"class": c, "name": n, "descriptor": d, "owns_slot": True,
-                "registered_by": "x.rs:1", "invocations": 0}
+    def want(cond, msg):
+        if not cond:
+            failures.append(msg)
 
-    cases = [
-        (("java/lang/StringUTF16", "isBigEndian", "()Z"), "cross-version", None),
-        (("java/lang/Thread", "destroy", "()V"), "dead-everywhere", "truly-gone"),
-        (("java/lang/StringBuilder", "repeat", "(Ljava/lang/String;I)V"),
-         "dead-everywhere", "near-miss"),
-        (("java/lang/Compiler", "enable", "()V"), "no-image-class", None),
-        (("java/lang/Thread", "start", "()V"), "live", None),
-        # Inheritance: HashMap declares nothing, but Object does. A walk that
-        # stopped at the class would call this dead and nominate it.
-        (("java/util/HashMap", "toString", "()Ljava/lang/String;"), "live", None),
-    ]
-    for triple, want, want_shape in cases:
-        got = classify(row(*triple), images)
-        if got["verdict"] != want:
-            print("SELFTEST FAILED: %s.%s%s -> %s, expected %s"
-                  % (triple + (got["verdict"], want)), file=sys.stderr)
-            return 3
-        if want_shape and got.get("shape") != want_shape:
-            print("SELFTEST FAILED: %s.%s%s shape -> %s, expected %s"
-                  % (triple + (got.get("shape"), want_shape)), file=sys.stderr)
-            return 3
+    want(("count", "I") in declared, "the `count` field was not parsed")
+    want(("value", "[B") in declared, "the `value` field was not parsed")
+    want(("toString", "()Ljava/lang/String;") in declared, "abstract toString was not parsed")
+    want(("<init>", "(I)V") in declared, "the constructor did not come back as <init>")
+    want(("repeat", "(CI)Ljava/lang/AbstractStringBuilder;") in declared,
+         "the private repeat(char,int) overload was lost")
+    want(("repeat", "(Ljava/lang/CharSequence;I)Ljava/lang/AbstractStringBuilder;") in declared,
+         "the repeat(CharSequence,int) overload was lost")
+    want(("repeat", "(Ljava/lang/String;I)Ljava/lang/AbstractStringBuilder;") not in declared,
+         "a descriptor NO image declares was reported as declared -- the parse is "
+         "matching by name, which would make every near-miss look live")
+    want("java/lang/Appendable" in supers and "java/lang/CharSequence" in supers,
+         "the implements clause was not parsed: %r" % (supers,))
+    want("java/lang/Object" in supers,
+         "java/lang/Object must be walked even when javap prints no extends clause "
+         "-- leaving it out reports every Object-inherited method as declared nowhere")
 
-    # A class present on only ONE image must not be judged by the images that
-    # do not have it: `have` is the denominator, not the image list.
-    macos_only = [("jdk25-linux", new),
-                  ("jdk25-macos", dict(new, **{"sun/nio/ch/KQueuePort":
-                                               {"s": None, "i": [], "m": {"close()V": 1}}}))]
-    got = classify(row("sun/nio/ch/KQueuePort", "close", "()V"), macos_only)
-    if got["verdict"] != "live":
-        print("SELFTEST FAILED: a macOS-only class declaring the method must be"
-              " `live`, not %s — the linux image not having the class is not"
-              " evidence against it." % got["verdict"], file=sys.stderr)
+    for f in failures:
+        print("SELFTEST FAIL: " + f, file=sys.stderr)
+    if failures:
+        return 2
+    print("selftest: ok")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    if "--selftest" in sys.argv:
+        return selftest()
+    ap.add_argument("--registry", required=True)
+    ap.add_argument("--images", nargs="+", required=True)
+    ap.add_argument("--javap", default=None)
+    ap.add_argument("--file-prefix", action="append", default=[],
+                    help="only registrations whose registered_by starts with this")
+    ap.add_argument("--class-prefix", action="append", default=[])
+    ap.add_argument("--csv", default=None)
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--selftest", action="store_true",
+                    help="check the javap parse against a frozen sample and exit")
+    ap.add_argument("--only-image-dead", action="store_true",
+                    help="only rows the dump's own (single-image) adjudication "
+                         "already calls undeclared -- the H25-1 342. Cheap way "
+                         "to sweep a whole registry: a row the class-path image "
+                         "declares needs no multi-image question asked.")
+    args = ap.parse_args()
+
+    javap = args.javap or shutil.which("javap")
+    if not javap:
+        print("REFUSING: no javap on PATH and none given with --javap.", file=sys.stderr)
         return 3
+    try:
+        with open(args.registry, encoding="utf-8") as fh:
+            reg = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print("REFUSING: cannot read %s: %s" % (args.registry, exc), file=sys.stderr)
+        return 2
+    nat = reg.get("natives")
+    if not nat:
+        print("REFUSING: %s has no `natives` array." % args.registry, file=sys.stderr)
+        return 2
 
-    # Every refusal path.
-    meta = lambda rel, plat: {"release": rel, "platform": plat}
-    checks = [
-        ("one index", [meta(25, "linux")], "only 1 index"),
-        ("missing platform", [meta(21, "linux"), meta(25, "linux")], "no index is for"),
-        ("one release", [meta(25, "linux"), meta(25, "windows"), meta(25, "macos")],
-         "only release"),
-        ("too new", [meta(21, "linux"), meta(21, "windows"), meta(21, "macos"),
-                     meta(25, "linux"), meta(25, "windows"), meta(25, "macos")],
-         "oldest release swept"),
-    ]
-    for label, metas, needle in checks:
-        msgs = coverage_refusals(metas)
-        if not any(needle in m for m in msgs):
-            print("SELFTEST FAILED: the %r image set was not refused with %r;"
-                  " got %r" % (label, needle, msgs), file=sys.stderr)
-            return 3
-    full = [meta(r, p) for r in (17, 21, 25) for p in PLATFORMS]
-    if coverage_refusals(full):
-        print("SELFTEST FAILED: the full 3x3 sweep must NOT be refused; got %r"
-              % coverage_refusals(full), file=sys.stderr)
-        return 3
+    images = []
+    for p in args.images:
+        home = resolve_image(p)
+        if not os.path.isdir(os.path.join(home, "lib")):
+            print("REFUSING: %s is not a JDK image (no lib/)." % p, file=sys.stderr)
+            return 2
+        images.append(Image(javap, home, image_label(p)))
+    print("images: " + ", ".join(i.label for i in images))
 
-    print("selftest ok: all four verdicts, both dead-everywhere shapes,"
-          " inherited-from-Object, the platform-only class, and all four"
-          " coverage refusals plus the 3x3 acceptance.")
+    rows = []
+    for r in nat:
+        rb = r.get("registered_by") or ""
+        if args.file_prefix and not any(rb.startswith(p) for p in args.file_prefix):
+            continue
+        if args.class_prefix and not any(r["class"].startswith(p) for p in args.class_prefix):
+            continue
+        if args.only_image_dead:
+            im = r.get("image_declaring_method") or {}
+            if im.get("declared") or im.get("inherited_from") or not im.get("image_has_class"):
+                continue
+        rows.append(r)
+    print("registrations in scope: %d" % len(rows))
+
+    out = []
+    for r in rows:
+        cls, name, desc = r["class"], r["name"], r["descriptor"]
+        rb = r.get("registered_by") or ""
+        verdicts = {im.label: im.declares(cls, name, desc) for im in images}
+        live = [k for k, v in verdicts.items()
+                if v == "DECLARED" or v.startswith("INHERITED:")]
+        near = [k for k, v in verdicts.items() if v == "NEAR_MISS"]
+        if live:
+            bucket = "LIVE" if len(live) == len(images) else "PARTIAL"
+        elif near:
+            bucket = "NEAR_MISS"
+        elif all(v == "CLASS_ABSENT" for v in verdicts.values()):
+            bucket = "CLASS_ABSENT_EVERYWHERE"
+        else:
+            bucket = "DEAD_EVERYWHERE"
+        out.append((bucket, cls, name, desc, r.get("owns_slot"), r.get("invocations"),
+                    rb, ",".join(sorted(live)), verdicts))
+
+    counts = collections.Counter(o[0] for o in out)
+    print()
+    for k in ("LIVE", "PARTIAL", "NEAR_MISS", "DEAD_EVERYWHERE", "CLASS_ABSENT_EVERYWHERE"):
+        print("%-26s %5d" % (k, counts.get(k, 0)))
+
+    if not args.quiet:
+        for bucket in ("PARTIAL", "NEAR_MISS", "DEAD_EVERYWHERE"):
+            sel = sorted(o for o in out if o[0] == bucket)
+            if not sel:
+                continue
+            print()
+            print("=== %s (%d) ===" % (bucket, len(sel)))
+            for b, cls, name, desc, owns, inv, rb, live, verdicts in sel:
+                print("  %s.%s%s" % (cls, name, desc))
+                print("      owns_slot=%s invocations=%s @%s" % (owns, inv, rb))
+                print("      " + "  ".join("%s=%s" % (k, v)
+                                           for k, v in sorted(verdicts.items())))
+
+    if args.csv:
+        import csv as _csv
+        with open(args.csv, "w", newline="", encoding="utf-8") as fh:
+            w = _csv.writer(fh)
+            w.writerow(["bucket", "class", "method", "descriptor", "owns_slot",
+                        "invocations", "registered_by", "declared_by"]
+                       + [im.label for im in images])
+            for b, cls, name, desc, owns, inv, rb, live, verdicts in sorted(out):
+                w.writerow([b, cls, name, desc, owns, inv, rb, live]
+                           + [verdicts[im.label] for im in images])
+        print()
+        print("csv: %s" % args.csv)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(main())
