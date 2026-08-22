@@ -231,13 +231,15 @@ diffs §6 refuses and no others. The six probes from the earlier records are
 unchanged.
 
 **`RTreeRangeGc` is red in the two COMPATIBLE arms, on the branch tip, without
-this lane's commits.** It has its own note (`WORKER-4-NOTE-2`) because it is a
-`java.util` / GC finding rather than a `java.io` one, and because the
-reproduction is not obvious: the vector PASSES when run plainly and needs the
-`--Xmx 64m` that `harness-guard.sh::class_cv_args` supplies. Interleaved A/B,
-ten runs, one process each: **base 5/5 red, r1 4/5 red** — the same failure at
-the same rate on both sides. The assertion is
-`headMap(k,false): 0 entries, expected 300`.
+this lane's commits.** `WORKER-1-NOTE-1` owns that vector and establishes its
+shape — two defects under one name, a ~25% flake under `--jdk-only` and a
+deterministic failure in compatible mode. `WORKER-4-NOTE-2` is a companion
+carrying the three things this lane needed and that note does not have: the
+standalone reproduction (`--real-jdk --Xmx 64m`, without which a plain run is a
+green gate by `run.sh`'s own account), the assertion itself
+(`headMap(k,false): 0 entries, expected 300`, which the harness line truncates
+away), and an interleaved ten-run A/B clearing this lane — **base 5/5 red,
+r1 4/5 red**, the same failure at the same rate on both sides.
 
 ### 7.1 A trap this lane walked into, stated because the brief's version is narrower than it reads
 

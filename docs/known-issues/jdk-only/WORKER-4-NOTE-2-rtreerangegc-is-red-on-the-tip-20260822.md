@@ -1,99 +1,83 @@
-# WORKER-4-NOTE-2 — `RTreeRangeGc` is RED on the handoff tip: `headMap(k,false)` answers 0 entries where 300 are live
+# WORKER-4-NOTE-2 — `RTreeRangeGc`: the standalone reproduction, the assertion, and an A/B that clears WORKER 4
 
-**MEASURED 2026-08-22, Linux (Azure host 2), Temurin 25.0.4+7.** Filed by
-WORKER 4, whose subject is `java.io` and who has no claim on this surface. It is
-here because this lane hit it while landing, established whose it is, and should
-not be the only party that knows.
+**Status: COMPANION to `WORKER-1-NOTE-1`, which owns this vector.** MEASURED
+2026-08-22, Linux (Azure host 2), Temurin 25.0.4+7.
 
-## The failure
+`WORKER-1-NOTE-1` establishes the shape and this note does not restate it: the
+vector is **two defects wearing one name** — a ~25% flake under `--jdk-only`
+and a DETERMINISTIC failure in compatible mode — and the arm boundary sits
+exactly between them. Read that first.
 
-```text
-SUITE=all (COMPATIBLE mode)   RTreeRangeGc  FAIL
-  AssertionError: RTreeRangeGc: headMap(k,false): 0 entries, expected 300
-```
+This note adds three things it does not have, all of which WORKER 4 needed in
+order to land, and none of which should have to be re-derived.
 
-`--jdk-only` is GREEN. Only the compatible arms (`SUITE=all`, `SUITE=core`)
-fail.
+## 1. It reproduces WITHOUT the harness — but only with the launcher flag
 
-## Reproducing it WITHOUT the harness
-
-The vector passes when run plainly, which is why it is easy to dismiss:
+The vector passes when run plainly, in both modes:
 
 ```text
-cratonvm --jdk-only  … RTreeRangeGc     rc=0, PASS (14014 checks)
-cratonvm --real-jdk  … RTreeRangeGc     rc=0, PASS (14014 checks)
+cratonvm --jdk-only  … -cp build RTreeRangeGc     rc=0, PASS (14014 checks)
+cratonvm --real-jdk  … -cp build RTreeRangeGc     rc=0, PASS (14014 checks)
 ```
 
-**It needs the launcher flag `harness-guard.sh::class_cv_args` gives it**, which
-that file documents in as many words — *"Two members — `RPriorityQueueGc` and
-`RTreeRangeGc` — are INERT without the CratonVM-only launcher flags
-`class_cv_args()` supplies for them. Scheduling either one without that hook
-manufactures a green gate."* For this vector the flag is `--Xmx 64m`:
+**`harness-guard.sh::class_cv_args` gives it `--Xmx 64m`, and that flag is the
+whole reproduction:**
 
 ```bash
 cratonvm --real-jdk --Xmx 64m --java-home "$JAVA_HOME" -cp build RTreeRangeGc
 ```
 
-That is the whole reproduction. **A plain run of this vector is a green gate**,
-and this note exists partly so the next person does not conclude "cannot
-reproduce" from one.
+`run.sh` says so in as many words — *"Two members — `RPriorityQueueGc` and
+`RTreeRangeGc` — are INERT without the CratonVM-only launcher flags
+`class_cv_args()` supplies for them. Scheduling either one without that hook
+manufactures a green gate."* **A plain run of this vector is a green gate**, so
+"cannot reproduce outside the suite" is the wrong conclusion to draw from one,
+and a single-vector `ONLY=` run through `run.sh` (which does supply the flag) is
+not the only way in. Bisecting this needs a one-process command, and that is it.
 
-## Whose it is: an interleaved A/B, ten runs
+## 2. The assertion
 
-`base` is the handoff tip `d235cced9` built with NO WORKER 4 commits; `r1` is
-the same worktree with this lane's `java.io` changes on top. Runs interleaved,
-one process each (`[ABBA]`):
+```text
+AssertionError: RTreeRangeGc: headMap(k,false): 0 entries, expected 300
+```
+
+A `TreeMap` range view answering **0** where 300 entries are live. Not an
+ordering difference and not a tolerance — a view that lost its whole backing,
+at a 64 MB heap. Worth having in the record because the harness line truncates
+to `Exception in thread "main" java/lang/AssertionError:` and shows none of it.
+
+## 3. It is not WORKER 4's, established by an interleaved A/B
+
+`base` is the handoff tip built with NO WORKER 4 commits; `r1` is the same
+worktree with this lane's `java.io` changes on top. Ten runs, interleaved, one
+process each, `--real-jdk --Xmx 64m` (`[ABBA]`):
 
 ```text
 base:1 r1:1 base:1 r1:1 base:1 r1:1 base:1 r1:1 base:1 r1:0
 ```
 
-**base 5/5 red, r1 4/5 red.** The same failure at the same rate on both sides,
-so it is not this lane's, and the single `r1` pass is the flake rather than the
-signal — `[0/12 does not close a 1-in-10 bug]`, read in the other direction.
+**base 5/5 red, r1 4/5 red** — the same failure at the same rate on both sides.
+The single `r1` pass is the flake, not the signal. Whole-suite arms agree:
+`106/107` and `66/67` on both binaries, with this vector as the only failure.
 
-## Why this is worth a note rather than a shrug
+**No attribution is offered here.** An earlier draft of this note guessed at the
+commit range from what had recently landed nearby; that is exactly the inference
+`WORKER-1-NOTE-1` §2 shows going wrong on this vector, and it is removed rather
+than softened.
 
-`headMap(k, false)` returning **0** entries where 300 are live is not a
-tolerance failure or an ordering difference. It is a view that lost its whole
-backing, under memory pressure, in COMPATIBLE mode only.
+## 4. A narrower reading of trap 8, which cost this lane a contaminated run
 
-That is the surface the commits between `11634cd44` and `381a14036` rebuilt:
-*"`TreeMap.root` is a real red-black tree of real `TreeMap$Entry`"* and
-*"`TreeSet.m` is a real backing `TreeMap`"*. A real node graph is a graph the
-COLLECTOR must now trace, and `--Xmx 64m` is precisely the configuration that
-makes it collect. `[refuse2move=vacuous green]` names the neighbouring hazard —
-a collector that declines to move turns GC vectors green — and this is its
-mirror: a collector that DOES move, over a graph that just became real.
+The first appearance of the failure in this lane came with two
+`HARNESS FAULT — MAIN CLASS NOT FOUND` entries beside it — the brief's own
+trap-8 signature, *"total redness that INCLUDES the harness guard is an
+ENVIRONMENT failure, not a defect."* It was, and the environment was this lane:
+a single-vector control was launched through `run.sh` while a full sweep was
+still running **in the same worktree**, and the second run recompiled
+`regression-suite/build` underneath the first.
 
-**Two things a lane picking this up should not have to re-derive:**
-
-1. `--jdk-only` being green proves nothing here. The strict arm refuses a large
-   part of the collection surface, so it is not exercising the same object
-   graph.
-2. Run it at `--Xmx 64m` and interleave against a pristine build. A single run
-   of either binary can come back either way.
-
-## What this lane did NOT do
-
-Diagnose it. `native-collections` is WORKER 2's file and the GC roots are
-somebody else's again; this note carries the reproduction, the A/B and the
-assertion, and stops there.
-
-## A trap this lane walked into while establishing the above
-
-The FIRST time this failure appeared it came with two `HARNESS FAULT — MAIN
-CLASS NOT FOUND` entries beside it, and that shape is the brief's own trap 8:
-*"Total redness that INCLUDES the harness guard is an ENVIRONMENT failure, not a
-defect."* It was — **and the environment was this lane**. A single-vector control
-was launched through `run.sh` while a full sweep was still running in the same
-worktree, and the second run recompiled `regression-suite/build` underneath the
-first.
-
-H0 PID-scoped `.guard-tmp` on 2026-08-21 and the brief now says concurrent
-sweeps are safe. They are safe **across worktrees**. `regression-suite/build` is
-still one directory per worktree, so two `run.sh` in the SAME worktree still
-collide — which is a narrower rule than "you may now sweep concurrently" reads,
-and worth stating that way.
-
-Every number above was re-measured after that, with one sweep at a time.
+H0 PID-scoped `.guard-tmp` on 2026-08-21 and the brief now reads *"FIXED — you
+may now sweep concurrently."* That is true **across worktrees**.
+`regression-suite/build` is still one directory per worktree, so two `run.sh` in
+the SAME worktree still collide — a narrower rule than the sentence reads, and
+the one that bit here. Every number above was re-measured afterwards with one
+sweep at a time.
