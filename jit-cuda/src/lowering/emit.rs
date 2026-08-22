@@ -208,6 +208,20 @@ pub(crate) struct Emitter<'a> {
     /// marshaller can skip the post-launch D→H copy for read-only
     /// array inputs — see `KernelSignature::writes_param_mask`.
     pub writes_param_mask: u64,
+    /// Bit-set of parameter indices the body READS via an `*aload`.
+    ///
+    /// The mirror of `writes_param_mask`, and it exists for the chunked
+    /// writeback. Committing a chunk into the Java array as its event
+    /// fires puts results there BEFORE the bounds-failure flag has been
+    /// read. That is harmless when the CPU re-run recomputes and rewrites
+    /// those same elements, but NOT harmless if the kernel reads an array
+    /// it also writes, because then a partial commit would change the
+    /// re-run's own input. `writes & !reads` is therefore the set of
+    /// arrays a chunked dispatch may safely stream out early.
+    ///
+    /// `arraylength` deliberately does not set a bit: reading a length
+    /// does not depend on element contents.
+    pub reads_param_mask: u64,
     /// AUDIT C31 follow-up (2026-07-11): the class's constant pool, so
     /// `ldc`/`ldc_w`/`ldc2_w` (opcodes 0x12/0x13/0x14) can resolve their
     /// operand to an `Integer`/`Float`/`Long`/`Double` value and push it
@@ -244,6 +258,7 @@ impl<'a> Emitter<'a> {
             hit_back_branch: false,
             ret_value_reg: None,
             writes_param_mask: 0,
+            reads_param_mask: 0,
             cp,
         }
     }
@@ -325,7 +340,21 @@ impl<'a> Emitter<'a> {
         .unwrap();
         // Reinterpret as s32 for index arithmetic.
         writeln!(self.body, "    mov.b32 {}, {};", tid_s32.name, tid_u32.name).unwrap();
-        self.tid_reg = Some(tid_s32);
+        // Add the launch's base index. Zero for a whole-array launch; the
+        // chunk's first element for a chunked one, which is how several
+        // launches can cover disjoint slices of one iteration space while
+        // every thread still knows its global index. See the `tid_base`
+        // parameter in `lowering::ptx_params`.
+        let base = self.regs.fresh_reg(RegKind::S32);
+        let tid_final = self.regs.fresh_reg(RegKind::S32);
+        writeln!(self.body, "    ld.param.s32 {}, [tid_base];", base.name).unwrap();
+        writeln!(
+            self.body,
+            "    add.s32 {}, {}, {};",
+            tid_final.name, tid_s32.name, base.name
+        )
+        .unwrap();
+        self.tid_reg = Some(tid_final);
     }
 
     /// Fold a counted loop's compile-time-constant start value `K`
@@ -3122,6 +3151,20 @@ impl<'a> Emitter<'a> {
         ))
     }
 
+    /// Record that `param_idx` is read element-wise by the body.
+    ///
+    /// Same 64-param saturation rule as `writes_param_mask`: a kernel with
+    /// more than 64 params sets every bit, which reads as "assume every
+    /// array is read" and only ever refuses chunking. Correctness over
+    /// performance, in the safe direction.
+    fn mark_param_read(&mut self, param_idx: usize) {
+        self.reads_param_mask |= if param_idx < 64 {
+            1u64 << param_idx
+        } else {
+            u64::MAX
+        };
+    }
+
     fn array_load(
         &mut self,
         elem_kind: RegKind,
@@ -3131,6 +3174,8 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        // Element read: see `reads_param_mask` (chunked-writeback guard).
+        self.mark_param_read(param_idx);
         self.emit_bounds_check(&index, param_idx);
         let offset = self.regs.fresh_reg(RegKind::U64);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
@@ -3168,6 +3213,8 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        // Element read: see `reads_param_mask` (chunked-writeback guard).
+        self.mark_param_read(param_idx);
         self.emit_bounds_check(&index, param_idx);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
@@ -3204,6 +3251,8 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        // Element read: see `reads_param_mask` (chunked-writeback guard).
+        self.mark_param_read(param_idx);
         self.emit_bounds_check(&index, param_idx);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let offset = self.regs.fresh_reg(RegKind::U64);

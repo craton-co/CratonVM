@@ -681,6 +681,45 @@ that cries wolf three weeks in eight fails identically. **A flaky vector must be
 quarantined before a baseline exists, never after**, and the harness has no
 quarantine mechanism today (`harness-uncounted.txt` is about check counts). That
 is `WORKER-1-NOTE-1` N1 and it belongs to whoever owns `regression-suite/`.
+### 13d. `jit_bridge.rs` was never a hole, and the list that said it was is now empty
+
+§13a listed two undialled force files and implied both were holes. One was.
+The other I had inferred from a grep, and reading the bind path says otherwise.
+
+**MEASURED, by reading `jit::direct_native_helper`.** Under `--jdk-only` it
+refuses to bind ANY native whose registry `NativeKind` is not `Intrinsic` —
+§1.4's reviewed exception — and records the refusal. `HashMap.put`,
+`HashMap.get` and `ConcurrentMap.get` are `Bridge`, and are refused today.
+
+The dial's entire domain is **`Bridge` natives under `--jdk-only`**. That is a
+strict *subset* of what the JIT bind path already refuses. So there is no
+configuration in which the dial would yield a native the JIT would otherwise
+have bound: **the hole cannot exist.**
+
+What `jit_bridge.rs` actually does with the force helper is decide whether to
+SEAL a caller out of tier-up. Missing the dial there makes an armed run seal
+call sites it need not — a tier-up cost, in the safe direction, not a
+correctness bug. Wiring it is an optimisation; and the natural place,
+`registered_native_will_run`, also feeds interpreter dispatch, so it is not the
+free edit it looks like. The row is now `permanent: true` with that reasoning,
+and the exemption list carries a third field so a reasoned non-hole cannot be
+counted as outstanding work. **A list that files both under one heading reads
+as twice the remaining problem** — which is the exact failure this lane spent
+its time finding in other people's tables.
+
+**And the hole count is now zero.** `089329af7` reached `dev` while this was
+being written, so `dispatch_virtual.rs` consults the dial and its row went. The
+gate said so by name, unprompted, on the first run after the merge — the second
+time it has done that on a different branch, which is the argument for a source
+scan over a counter in one sentence. The bound is now `holes == 0`, so a new
+unwired force site is a red test on its own rather than something a reader has
+to notice.
+
+Three of the four checks are proven falsifiable by running them: removing an
+exemption goes red naming the file, pointing a row at a file that forces nothing
+goes red, and flipping the surviving row's `permanent` flag to `false` trips the
+zero bound. The assertion text says explicitly not to fix that by flipping the
+flag back, because that is how a to-do becomes a permanent approval.
 ---
 
 ## NOMINATIONS

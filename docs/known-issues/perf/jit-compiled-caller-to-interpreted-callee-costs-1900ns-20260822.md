@@ -1,10 +1,16 @@
 # A compiled caller calling an INTERPRETED callee costs 1900 ns — 5x more than never compiling the caller at all
 
-**Status: OPEN — root-caused 2026-08-22 on `dev` `37f12ff6e` (Azure Linux host
-2), with a three-line repro. This is not a lambda bug, not a reactive bug and
-not a `java.time` bug: it is the JIT's interpreter-fallback path, and it applies
-to EVERY compiled method that calls a callee the JIT did not compile — which,
-on any real application, is most callees.**
+**Status: PARTLY FIXED 2026-08-22. `invokestatic` — 89% of the JIT's dispatch
+calls — now enters an uncompiled callee through the call site's own cached
+interpreter frame template: 1310 -> 259 ns/op, 5.06x, six interleaved pairs,
+and now BELOW the both-interpreted cost, so compiling the caller is no longer a
+pessimisation. `invokevirtual` / `invokeinterface` / `invokespecial` are still
+on the by-name path and this page stays open for them.**
+
+This is not a lambda bug, not a reactive bug and not a `java.time` bug: it is
+the JIT's interpreter-fallback path, and it applies to EVERY compiled method
+that calls a callee the JIT did not compile — which, on any real application, is
+most callees.
 
 It is the reason the JIT is worth nothing on
 `known-issues/perf/webclient-integration-tests-reactive-exchange-gap-20260822.md`
@@ -112,26 +118,60 @@ while its own no-reactive-types control arm reads 1.3x.
   `ReactorProbe` (118k -> 115k ns/op, inside noise). Sized and rejected; see
   `site_cache.rs`'s own "that number does not generalise" note, now answered.
 
-## The fix, and why it is not in this commit
+## What was fixed: the `invokestatic` half
 
-Give `jit_invoke_dispatch`'s tail the cache the interpreter already has: a
-site-keyed `(Arc<CachedBytecodeMethod>, RedefineGate)` memo, entered with the
-five-line frame template that `lambda.rs::try_invoke_cached_lambda_impl`
-already uses to run an interpreted callee from a Rust helper
-(`refill_pools_from_shared` + `Frame::new_pooled_cached` +
-`execute_prebuilt_frame`). The refusals must mirror `invoke_or_native`'s gate
-cascade exactly — `site_name_is_special_cased`, any registered native,
-`force_native_over_real_jdk_bytecode`, abstract / `synchronized` / no-`Code`,
-lambda-proxy and array receivers, `any_class_redefined()` — and the loader
-question must be answered per site by the `globally_named` term
-`virtual_dispatch_target_cached` already computes, not by a process-wide flag.
+`jit::helpers::try_jit_static_bytecode_callee` gives the dispatch tail the cache
+the interpreter always had — a site-keyed
+`(Arc<CachedBytecodeMethod>, RedefineGate)` memo, entered with the same frame
+template `lambda.rs::try_invoke_cached_lambda_impl` uses to run an interpreted
+callee from a Rust helper. Its refusals are in its doc comment; the two that
+carry the safety argument are:
 
-Deliberately not attempted in this pass: this is the hottest and most
-correctness-sensitive path in the VM, and the code around it records three
-separate expensive loader-identity defects found on it
-(BUG-JIT-INVOKESPECIAL-LOADER-20260726, the `AotIntegrationTests` static-owner
-hang, the S111r12 virtual rescue). It wants its own change with the full suite
-matrix behind it, not a tail-end addition to a measurement pass.
+* **no native anywhere has this `(name, descriptor)`**
+  (`might_have_method_descriptor`), which removes the native-override,
+  `SyntheticStub`-yield and redefine-shadow questions rather than reproducing
+  them; and
+* **`jit_static_owner_override` declines**, which keeps the entire
+  loader-identity surface — BUG-JIT-INVOKESPECIAL-LOADER-20260726, the
+  `AotIntegrationTests` static-owner hang — on the untouched path.
+
+`invokestatic` was taken first because it is where the volume is
+(`kind_static=2_986_402` of `disp_calls=3_356_461`) and because it has no
+receiver, hence no virtual retarget, no interface rules and no receiver guard.
+
+Measured, six interleaved pairs, `CRATONVM_JIT_DENY=XferProbe.callee`:
+**1310 -> 259 ns/op**, `sink` byte-identical to the baseline and to HotSpot.
+
+`CRATONVM_DBG=mic-prof` proves it fires rather than merely existing — the two
+new census slots read `out_static_bc=1048575 out_static_bc_refused=0` against
+`out_tail=1048575` on `XferProbe`, i.e. it serves 100% of that probe's tail.
+
+**One correctness hole was found by the tree's own guard and is worth recording
+because the same shape will catch the next memo added here.** The new memo
+resolves its owner through `get_loaded_class_id(info.class_name)` — a class
+NAME — so a second loader defining that name makes the template describe the
+wrong class's method, and that event publishes no compiled code, redefines
+nothing and supersedes no tier. It therefore had to join
+`flush_class_identity_dispatch_memos`, not just the generation flush.
+`a_jit_generation_change_clears_every_site_keyed_memo` failed until the memo was
+given its population line, which is exactly what that assertion exists for.
+
+## Still open: the virtual / interface / special half
+
+`out_static_bc=98_201` of `out_tail=342_867` on `probes/ReactorProbe.java` — the
+fix serves 29% of that workload's tail calls, and the remaining 71% are kinds
+0/1/2. Their correctness surface is the one this pass deliberately did not open:
+a receiver-class guard to re-test per hit, the interface/abstract retarget, and
+the `globally_named` loader term that `virtual_dispatch_target_cached` already
+computes but that nothing yet feeds to a bytecode-callee memo. The MIC is where
+the volume for those is: `mic_calls=9_437_184` with `hit_entry=879_584` and
+`hit_noentry=1_954_260`, i.e. 1.95 M dispatches that found the receiver and had
+no compiled callee to enter.
+
+Because that half is still by-name, neither `ReactorProbe` nor the WebClient
+exchange moves measurably yet (both inside noise across interleaved rounds) —
+the improved population is ~3% of dispatch calls there. The isolated 5x is real;
+do not quote it as a suite number.
 
 ## Reproducing
 

@@ -2018,13 +2018,20 @@ pub(crate) fn lambda_site_bump_arity() {
 /// Build (or re-derive) the `CachedBytecodeMethod` for a lambda implementation
 /// method, with the redefinition gate that decides when it goes stale.
 ///
-/// Extracted so the two consumers agree by construction: the interpreted
-/// dispatch cache below, and the compiled call site's own direct-call target
-/// (`build_lambda_jit_site`). Both must refuse the same shapes — a native
-/// shadow, a `synchronized` or abstract body, a class that cannot be resolved
-/// — and a second, hand-copied version of these checks is exactly how one of
-/// them would come to admit a body the other refuses.
-fn build_lambda_impl_cached(
+/// Extracted so the consumers agree by construction: the interpreted dispatch
+/// cache below, the compiled call site's own direct-call target
+/// (`build_lambda_jit_site`), and — since 2026-08-22 —
+/// `jit::helpers::try_jit_static_bytecode_callee`, which needs exactly this
+/// question answered for an ordinary `invokestatic` callee the JIT did not
+/// compile. All must refuse the same shapes — a native shadow, a
+/// `synchronized` or abstract body, a class that cannot be resolved — and a
+/// second, hand-copied version of these checks is exactly how one of them would
+/// come to admit a body another refuses.
+///
+/// Nothing here is lambda-specific: it takes a class id and a (name,
+/// descriptor) and returns the interpreter frame template for whatever
+/// `find_method_recursive` lands on, or `None`.
+pub(crate) fn build_lambda_impl_cached(
     shared: &SharedVm,
     receiver_class_id: ClassId,
     method_name: &str,
