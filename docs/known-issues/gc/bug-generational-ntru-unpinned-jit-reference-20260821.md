@@ -108,6 +108,64 @@ rate collapses near the introduction point, six passes buys less than that
 arithmetic suggests. Whatever commit the search names should be confirmed by
 re-running it and its parent directly, rather than trusting the walk.
 
+## The second bisect completed, and its answer did not survive confirmation
+
+The repetition-aware run named `e40c176d8` — a **merge** — and marked both its
+parents GOOD, which would have made this a two-clean-branches-interact defect.
+Confirmation, 15 reps per arm, all three interleaved:
+
+```text
+merge  e40c176d8   SIG=0  PASS=15
+p1     0fbb1df8a   SIG=0  PASS=15
+p2     927350e53   SIG=0  PASS=15
+```
+
+**45 runs, zero reproductions.** The commit the bisect called BAD does not
+reproduce at all. So this search is void too, and `e40c176d8` is not the answer
+any more than `819ad679a` was.
+
+Note what the BAD verdict rested on: the probe saw the signature **once**, on
+run 5 of 6. That was a real observation, not a bug in the probe — and it is not
+reproducible fifteen runs later.
+
+## What the evidence actually supports now
+
+Collecting every measurement of this failure, in the order taken:
+
+| commit | result | when |
+|---|---|---|
+| `cae49a85c` | SIG 3/3 | during a saturating 53-class gate |
+| `cae49a85c` | SIG 0/2 | bisect #1 endpoint, quiet box |
+| `cae49a85c` | **SIG 7/10** | **interleaved against `684f37e14`** |
+| `684f37e14` | **SIG 0/10** | **same interleave** |
+| `e40c176d8` | SIG 1/5 | bisect #2 |
+| `e40c176d8` | SIG 0/15 | confirmation, interleaved |
+| `0fbb1df8a`, `927350e53` | SIG 0/15 each | same interleave |
+
+The rate tracks **when the runs happened** at least as strongly as **which
+commit** was built. That is the property that makes an ordinary bisect
+unusable here: an absolute per-commit verdict is measuring the box as much as
+the code.
+
+The one measurement that controls for it is the interleaved endpoint pair —
+7/10 against 0/10, same machine, alternating runs. That remains the only
+evidence that any commit difference exists at all, and it is a single
+comparison. **It is being re-run; until it reproduces, treat "there is a
+regression in this window" as unconfirmed.**
+
+## What a workable method looks like
+
+If the interleaved result does reproduce, a bisect is still possible but each
+step must be an **interleaved A/B against a fixed reference build**, not an
+absolute verdict: run candidate and reference alternately in the same window and
+compare their rates. That costs roughly twice as much per step and needs enough
+reps to separate two rates rather than to observe one event — but it is the only
+form that survives an environment-sensitive failure.
+
+Absolute-verdict bisects have now been attempted twice, at 2 and 6 repetitions,
+and both produced confident answers that confirmation destroyed. A third at
+higher repetition would most likely do the same.
+
 ## What the failing run shows
 
 The collector is repeatedly *declining* to move, which is the safe direction,

@@ -1,5 +1,20 @@
 # H17-1 — the armed dial yields once per armed CLASS, not once per process; and two of the three witnesses used to measure it are now blind
 
+> **CORRECTION 2026-08-22 — the counting claim in this record is
+> withdrawn (`H17-2` N4).** The `table` array class is not a yield
+> counter. It reports **one bit per map** — whether that map's FIRST
+> insert ran bytecode — so it cannot distinguish "this method never
+> yielded" from "this method yielded later, after the native had already
+> allocated the table". Every observation here stands; every statement of
+> the FORM "the dial yields once per X" does not.
+>
+> The mechanism is now settled and it was never a yield budget: the dial
+> had one live call site of fourteen dispatch doors, so an armed class
+> yielded only on the dispatches that reached step 1 cold. Fixed
+> 2026-08-21 — all fourteen doors consult it, and an armed class now
+> yields on every covered dispatch that has bytecode to yield to. See
+> `WORKER-1-the-dial-now-reaches-every-door-20260821.md`.
+
 **Status: MEASURED, and it corrects `H16-3` and `H0-8` on a point both stated as
 settled.** Lane H17, 2026-08-21, on the prebuilt `C:/craton/cratonvm-r8.exe`
 (2026-08-21 05:19, clean build at `025780ff7`). Oracle HotSpot 25.0.3+9.
