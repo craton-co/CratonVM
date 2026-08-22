@@ -954,10 +954,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-13 tokens.
+14 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `map-iterator-failfast` | `CRATONVM_NO_MAP_ITERATOR_FAILFAST` |
 | `eager-streams` | `CRATONVM_EAGER_STREAMS` |
 | `foreign-attach` | `CRATONVM_FOREIGN_ATTACH` |
 | `jboss-boot-log-file` | `CRATONVM_JBOSS_BOOT_LOG_FILE` |

@@ -1537,6 +1537,7 @@ pub const INVENTORY: &[E] = &[
     // selects is which verifier sees which chain, and at what strength floor.
     E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "map-iterator-failfast", on_key: None, off_key: Some("CRATONVM_NO_MAP_ITERATOR_FAILFAST"), off_word: None },
     E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "jboss-boot-log-file", on_key: Some("CRATONVM_JBOSS_BOOT_LOG_FILE"), off_key: None, off_word: None },
