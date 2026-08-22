@@ -1,7 +1,8 @@
 # WORKER-4-2 — the `java.io` rows adjudicated: 194 shadows, one file that is not in the build, and a file named `deprecated_io_util` that owns no `java.io` row
 
-**Status: MEASURED, with FOURTEEN retirements landed and two refusals
-recorded, all three arms green.** Lane WORKER 4, 2026-08-22. Companion to
+**Status: MEASURED, with FOURTEEN retirements, a `java.util.Scanner` that
+read nothing from nine of eleven source shapes, and two refusals recorded; all
+three arms green.** Lane WORKER 4, 2026-08-22. Companion to
 `WORKER-4-1`, which closed the fabricated-receiver half of this brief.
 
 **Provenance.** Linux (Azure host 2), Temurin **25.0.4+7**, worktree
@@ -10,7 +11,7 @@ recorded, all three arms green.** Lane WORKER 4, 2026-08-22. Companion to
 using the classes `run.sh` had already compiled — not over one boot and not from
 a source grep. Probes, all diffed against the oracle in both modes:
 `W4Deprecated.java` (116 cases), `W4BaseStream.java` (26), `W4StreamCarrier.java`
-(15 carriers), `W4Abstract.java` (63 receivers).
+(15 carriers), `W4Scanner.java` (29), `W4Abstract.java` (63 receivers).
 
 **Acceptance: `107/107 · 107/107 · 65/65 → 67/67`**, on the branch tip merged in,
 `TIMEOUT=600`. No vector changed colour across any of the three retirement
@@ -326,7 +327,105 @@ the one an adjudication should be scored against.
 
 ---
 
-## 5. What this record does NOT claim
+## 5. `java.util.Scanner` worked for two sources out of eleven, and the other nine answered EMPTY
+
+The largest defect this lane found, and it was not on any P-row list. It was
+reached from the opposite direction to everything else in this record: not from
+a census, but from asking why `System.in` could not be given the shape HotSpot
+gives it (`WORKER-4-1` N4). The blocker was a comment saying the `Scanner`
+native reads the stream's slot 0 as a file descriptor. That turned out to be
+true of far more streams than intended.
+
+MEASURED, `regression-suite/probes/W4Scanner.java`, Linux/JDK 25.0.4+7, both
+modes, source `"alpha beta 42 gamma"`:
+
+```text
+                                            HotSpot                   CratonVM
+new Scanner("…")                            [alpha, beta, 42, gamma]  [same]
+new Scanner(new ByteArrayInputStream(…))    [alpha, beta, 42, gamma]  [same]
+new Scanner(new FileInputStream(f))         [alpha, beta, 42, gamma]  []
+new Scanner(Files.newInputStream(f))        [alpha, beta, 42, gamma]  []
+new Scanner(new BufferedInputStream(…))     [alpha, beta, 42, gamma]  []
+new Scanner(new DataInputStream(…))         [alpha, beta, 42, gamma]  []
+new Scanner(new PushbackInputStream(…))     [alpha, beta, 42, gamma]  []
+new Scanner(new SequenceInputStream(…))     [alpha, beta, 42, gamma]  []
+new Scanner(anonymous InputStream)          [alpha, beta, 42, gamma]  []
+new Scanner(in, StandardCharsets.UTF_8)     [alpha, beta, 42, gamma]  []
+new Scanner(in, "UTF-8")                    [alpha, beta, 42, gamma]  []
+new Scanner(Channels.newChannel(in))        [alpha, beta, 42, gamma]  []
+new Scanner(latin1Bytes, ISO_8859_1)        [café, naïve]             []
+```
+
+**`new Scanner(new FileInputStream(f))` is the first example in most tutorials.**
+None of these threw; every one produced a scanner over the empty string, so a
+caller sees "the file was empty" rather than "this VM cannot read it".
+
+### 5.1 Three defects, found one at a time, each hiding the next
+
+**(a) There was no general path.** The native had three branches keyed on the
+source's SLOTS and no fallback: a source matching none left the byte buffer
+empty. Fixed by draining the source through its own virtual
+`read(byte[],int,int)` — the one method `java.io.InputStream` obliges every
+subclass to provide, and what the JDK's own `Scanner` does — with a `read()I`
+second door for a source whose bulk overload answers nothing.
+
+That fixed five of the nine. **It did not fix `BufferedInputStream` or the
+anonymous subclass**, and the reason is (c).
+
+**(b) Five constructor overloads had no registration at all.**
+`Scanner(InputStream, Charset)`, `Scanner(InputStream, String)` and the three
+`ReadableByteChannel` forms. With no native, the real JDK constructor ran and
+initialised the real `Scanner`'s fields — while this VM's `hasNext`/`next`
+natives read the SYNTHETIC state that nothing had written.
+
+**That is a partially-native class failing open, and it is silent by
+construction.** Half the class is native and half is not; the halves keep
+different state; and a missing registration means the two halves simply do not
+meet. Nothing warns. It is the same species as `[nat hidden]` — native-backed
+state is invisible to real JDK bytecode — arriving through the constructor.
+
+**(c) The fd branch fired on any stream with an int in slot 0, and read that
+file descriptor.** The sharp one. The test was *"slot 0 holds an int"*, which is
+true of `java.io.BufferedInputStream` and of any application subclass of
+`InputStream` whose first field is an `int`. An anonymous subclass with a
+`private int i = 0` cursor made `new Scanner(stream)` **read from file
+descriptor 0 — this process's stdin** — and report the empty result as the
+stream's contents.
+
+Adding (a) could not fix those two because they never reached it: this branch
+took them first. What settled it was instrumenting the drain
+(`CRATONVM_SCANNER_DEBUG=1`, kept and documented at the site): the log shows
+the drain firing for `FileInputStream` / `DataInputStream` /
+`PushbackInputStream` / `SequenceInputStream` and **never being entered** for
+the other two. A shape test that silently mis-selects is invisible in the
+output, because both answers are an empty scanner.
+
+All three branch tests are now gated on the receiver's CLASS.
+
+### 5.2 The same wrong instrument, three times, in one function
+
+`[a slot COUNT cannot identify a layout]`. This function's own comment already
+recorded one instance before this lane arrived:
+
+> `Scanner(Readable)` used to be pointed at this same body, and a
+> `StringReader`'s `{str, length, next, mark}` layout MATCHED the byte-array
+> shape test — field 0 an object, field 1 an int, field 3 an int — so it took
+> the byte-array branch, reading array elements out of a `String`, and produced
+> an empty scanner instead of an error.
+
+That was fixed by giving `Readable` its own body. It was not fixed by removing
+the shape test, and the shape test then mis-selected twice more. **A duck test
+that has produced a wrong answer once will produce another; the fix is to ask
+what the receiver IS.**
+
+### 5.3 Result
+
+29 cases, **0 diffs against the oracle in both modes**, Latin-1 included.
+`107/107 · 107/107 · 67/67` with the other four probes unchanged.
+
+---
+
+## 6. What this record does NOT claim
 
 * **It does not adjudicate the other 169 rows.** `java/io/File` (54),
   `PrintStream` (30) and `PrintWriter` (7) are the three biggest groups and
@@ -343,7 +442,7 @@ the one an adjudication should be scored against.
 
 ---
 
-## 6. NOMINATIONS
+## 7. NOMINATIONS
 
 **N1 — CLOSED BY THIS RECORD.** It read: *"`URL.openStream()` /
 `getResourceAsStream()` mint a bare `InputStream`-typed receiver, and 25 §1.4
@@ -397,7 +496,7 @@ implementation could run instead is unmeasured.
 
 ---
 
-## 7. Index rows (for H0 to move into `INDEX.md`)
+## 8. Index rows (for H0 to move into `INDEX.md`)
 
 * `WORKER-4-2` — the `java.io` rows counted three ways (194 registrations / 99
   unreached / `H14-2`'s 99 by a different instrument, not known to be the same
@@ -406,5 +505,9 @@ implementation could run instead is unmeasured.
   triples it registers and none of them is `java.io`; FOURTEEN retirements
   (three deprecated + eleven base-class) with three probes behind them and two
   refusals with the same; the bare-`InputStream` receiver those eleven existed
-  for was measured out of existence; and retiring fourteen dead rows moved the
-  dispatch-level census by ONE, which is a property of the instrument.
+  for was measured out of existence; retiring fourteen dead rows moved the
+  dispatch-level census by ONE, which is a property of the instrument; and
+  `java.util.Scanner` read NOTHING from nine of eleven source shapes --
+  including `new Scanner(new FileInputStream(f))` -- answering an empty scanner
+  rather than an error, from three separate defects of which the sharpest read
+  this process's STDIN for any stream with an `int` in slot 0.

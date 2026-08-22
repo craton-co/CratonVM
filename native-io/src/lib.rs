@@ -5181,22 +5181,94 @@ fn native_scanner_init_readable(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(None)
 }
 
-fn native_scanner_init_inputstream(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(None),
-    };
-    // Read all bytes from the InputStream by calling read() repeatedly
-    let stream = match args.get(1) {
-        Some(Value::Object(Some(s))) => *s,
-        _ => {
-            scan_set_source(ctx, this, "");
-            return Ok(None);
-        }
-    };
+/// `Scanner(InputStream)`.
+///
+/// # The duck test below is a FAST PATH, not the answer
+///
+/// Until 2026-08-22 this body was three duck-typed branches over the source's
+/// SLOTS and nothing else: `(Object, Int, …, Int)` in 0/1/3 meant "a
+/// `ByteArrayInputStream`, read its `buf` directly"; `Int` in slot 0 or slot 1
+/// meant "a synthetic `FileInputStream`, drain that fd". **Every other
+/// `InputStream` in the language matched no branch, left `bytes` empty, and
+/// produced a scanner over the empty string** — a silent wrong answer, not an
+/// error.
+///
+/// MEASURED, `regression-suite/probes/W4Scanner.java`, Linux/JDK 25.0.4, both
+/// modes, source `"alpha beta 42 gamma"`:
+///
+/// ```text
+///                                          HotSpot                   CratonVM
+///   new Scanner(byteArrayInputStream)       [alpha, beta, 42, gamma]  [same]
+///   new Scanner(new FileInputStream(f))     [alpha, beta, 42, gamma]  []
+///   new Scanner(Files.newInputStream(f))    [alpha, beta, 42, gamma]  []
+///   new Scanner(new BufferedInputStream(…)) [alpha, beta, 42, gamma]  []
+///   new Scanner(new DataInputStream(…))     [alpha, beta, 42, gamma]  []
+///   new Scanner(new PushbackInputStream(…)) [alpha, beta, 42, gamma]  []
+///   new Scanner(new SequenceInputStream(…)) [alpha, beta, 42, gamma]  []
+///   new Scanner(anonymous InputStream)      [alpha, beta, 42, gamma]  []
+/// ```
+///
+/// `new Scanner(new FileInputStream(f))` reading nothing is the headline: it is
+/// the first example in most tutorials, and a real `FileInputStream`'s slot 0
+/// is its `FileDescriptor` OBJECT, which matches none of the three shapes.
+///
+/// # Why a duck test was the wrong instrument, twice
+///
+/// A slot layout cannot identify a class. This exact test has already produced
+/// a wrong answer once inside this file: `Scanner(Readable)` used to be pointed
+/// at this body, and a `StringReader`'s `{str, length, next, mark}` layout
+/// MATCHES the byte-array shape, so it read array elements out of a `String`
+/// and — again — produced an empty scanner. `[a slot COUNT cannot identify a
+/// layout]`.
+///
+/// # The remedy: ask the stream, do not inspect it
+///
+/// The general case now DRAINS the source through its own virtual
+/// `read([BII)I`, in 4 KiB chunks, which is the same thing
+/// `native_scanner_init_readable` does for a `Reader` and the same thing the
+/// JDK's own `Scanner` does. Any `InputStream` — JDK, application, or
+/// synthetic — answers it, because `read(byte[],int,int)` is the one method
+/// every `InputStream` has to provide.
+///
+/// The two special-cases are kept AHEAD of it, and both earn their place:
+///
+///   * the `ByteArrayInputStream` layout, because copying its `buf` avoids a
+///     bytecode round trip per 4 KiB for the commonest source;
+///   * the raw-`Int` fd slots, because the `System.in` carrier that
+///     `lang_system::native_system_init_phase1` installs is NOT a stream with
+///     a working `read` — it is a `FileInputStream`-shaped object whose fd
+///     lives in a slot — so draining it virtually would read nothing.
+///
+/// Neither can now cause the silent-empty outcome, because the fallback is a
+/// drain rather than an empty `Vec`.
+/// The one class this VM allocates as a "stream whose fd lives in a slot".
+///
+/// `native_fis_init_string` (files opened by name) and
+/// `lang_system::native_system_init_phase1` (`System.in`) both mint a
+/// `java.io.FileInputStream`-shaped object and put the fd id in a slot rather
+/// than behind a working `read`. Those two are the ONLY receivers for which
+/// reading a slot as a file descriptor is correct, so the branches that do it
+/// are gated on this name.
+const SYNTHETIC_FD_CARRIER: &str = "java/io/FileInputStream";
+
+/// Read everything `stream` will give, as bytes. The shared source of every
+/// `Scanner(InputStream, …)` constructor.
+///
+/// Extracted from `native_scanner_init_inputstream` 2026-08-22 because it now
+/// has four callers, and because the charset overloads were reaching NONE of
+/// this logic: `Scanner(InputStream, Charset)` and
+/// `Scanner(InputStream, String)` had no registration at all, so the real JDK
+/// constructor ran, set the real `Scanner`'s fields, and this VM's
+/// `hasNext`/`next` natives then read their OWN unset state — an empty scanner,
+/// silently, again.
+fn scanner_source_bytes(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<u8> {
+    // The receiver's class, bound once: EVERY branch below is gated on it since
+    // 2026-08-22, and the two fd branches needed it even more than the
+    // byte-array one did. See `SYNTHETIC_FD_CARRIER`.
+    let src_class = ctx
+        .class_name_of_id(ctx.class_id_of_object(stream))
+        .unwrap_or_default();
+    let is_fd_carrier = src_class == SYNTHETIC_FD_CARRIER;
     // Try to read bytes: check if this is a ByteArrayInputStream (has BAIS layout)
     // or a fd-based stream (FileInputStream layout)
     let mut bytes = Vec::new();
@@ -5210,9 +5282,41 @@ fn native_scanner_init_inputstream(
         None
     };
 
-    if let (Value::Object(Some(data_arr)), Value::Int(_pos), Some(Value::Int(_count))) =
-        (&field0, &field1, &field3_opt)
+    // THE FAST PATHS ARE GATED ON THE RECEIVER'S CLASS SINCE 2026-08-22, not on
+    // the shape of its slots, and that is the second half of this repair.
+    //
+    // Adding the general drain below was not enough on its own. MEASURED, with
+    // the drain in place but the shape test still selecting:
+    //
+    //     new Scanner(new FileInputStream(f))       FIXED   (falls to the drain)
+    //     new Scanner(Files.newInputStream(f))      FIXED
+    //     new Scanner(new DataInputStream(…))       FIXED
+    //     new Scanner(new PushbackInputStream(…))   FIXED
+    //     new Scanner(new SequenceInputStream(…))   FIXED
+    //     new Scanner(new BufferedInputStream(…))   STILL EMPTY
+    //
+    // Because a `BufferedInputStream` MATCHES the byte-array shape test: it
+    // carries a `byte[] buf` and two `int`s, which is the whole of what the
+    // test could see. It then read `buf[pos..count]` out of a buffer that a
+    // freshly constructed stream has not filled yet, and got zero bytes -- the
+    // same silent-empty answer, now reached through the branch that was
+    // supposed to be the reliable one.
+    //
+    // `input_stream_has_bais_layout` asks the question the shape test was
+    // standing in for: is the receiver's class `java.io.ByteArrayInputStream`,
+    // or a subclass of it. `[a slot COUNT cannot identify a layout]`, for the
+    // third time in this one function -- `Scanner(Readable)` and
+    // `BufferedInputStream` are the other two.
+    if input_stream_has_bais_layout(ctx, stream)
+        && matches!(
+            (&field0, &field1, &field3_opt),
+            (Value::Object(Some(_)), Value::Int(_), Some(Value::Int(_)))
+        )
     {
+        let data_arr = match field0 {
+            Value::Object(Some(a)) => a,
+            _ => unreachable!("guarded by the matches! above"),
+        };
         // ByteArrayInputStream layout: read directly
         let pos = match field1 {
             Value::Int(v) => v as usize,
@@ -5223,23 +5327,43 @@ fn native_scanner_init_inputstream(
             _ => 0,
         };
         for i in pos..count {
-            match ctx.get_array_element(*data_arr, i) {
+            match ctx.get_array_element(data_arr, i) {
                 Value::Int(b) => bytes.push(b as u8),
                 _ => bytes.push(0),
             }
         }
-    } else if let Value::Int(fd) = field0 {
+    } else if is_fd_carrier && matches!(field0, Value::Int(_)) {
         // fd-based stream (synthetic FileInputStream layout where slot 0 is
         // already an int — written by `native_fis_init_string` for files
         // opened by name).
-        let fd = fd as FdId;
+        //
+        // `is_fd_carrier` ADDED 2026-08-22, and it is the sharpest of the three
+        // shape-test repairs in this function. Without it the test was "slot 0
+        // holds an int", which is true of a great many streams that have
+        // nothing to do with a file descriptor — including
+        // `java.io.BufferedInputStream` and any application subclass of
+        // `InputStream` whose first field is an `int`.
+        //
+        // MEASURED (`W4Scanner`, with the drain instrumented): neither reached
+        // the general drain at all, because this branch took them first, and
+        // then read from whatever fd their int happened to be. An anonymous
+        // `InputStream` subclass with a `private int i = 0` cursor made
+        // `new Scanner(stream)` **read from file descriptor 0 — this process's
+        // STDIN** — and report the empty result as the stream's contents.
+        //
+        //     new Scanner(new BufferedInputStream(bais))   HotSpot [alpha, …]  CratonVM []
+        //     new Scanner(anonymous InputStream)           HotSpot [alpha, …]  CratonVM []
+        let fd = match field0 {
+            Value::Int(v) => v,
+            _ => 0,
+        } as FdId;
         loop {
             match ctx.fd_table().read_byte(fd) {
                 Ok(b) if b >= 0 => bytes.push(b as u8),
                 _ => break,
             }
         }
-    } else if let Value::Int(encoded) = field1 {
+    } else if is_fd_carrier && matches!(field1, Value::Int(encoded) if encoded > 0) {
         // S110 — System.in encoding. The `native_system_init_phase1` path
         // in `native-builtins/src/lang_system.rs` cannot store the stdin
         // fd id (= 0) in slot 0 because the real-JDK FileInputStream
@@ -5247,19 +5371,255 @@ fn native_scanner_init_inputstream(
         // `Value::Int(0)` to `Value::Object(None)`. Instead it writes
         // `Int(fd + 1)` to slot 1; we decode here. `encoded > 0` filters
         // out the zero / negative residue from coerced reference slots.
-        if encoded > 0 {
-            let fd = (encoded - 1) as FdId;
+        //
+        // The `encoded > 0` test moved INTO the pattern guard 2026-08-22. It
+        // used to be an `if` inside the arm, so an `Int(0)` in slot 1 — which
+        // is any ordinary stream with an int field there — selected this branch
+        // and then did nothing, and the general drain below could never be
+        // reached for it.
+        let encoded = match field1 {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        let fd = (encoded - 1) as FdId;
+        loop {
+            match ctx.fd_table().read_byte(fd) {
+                Ok(b) if b >= 0 => bytes.push(b as u8),
+                _ => break,
+            }
+        }
+    } else {
+        // THE GENERAL CASE — every `InputStream` that is not one of the two
+        // shapes above. Drain it through its own `read(byte[], int, int)`,
+        // which is the one method the abstract class obliges every subclass to
+        // make work. See this function's doc comment for the eight source
+        // shapes this repairs and for why the shape test alone was never
+        // enough.
+        //
+        // GC: `invoke_virtual` runs arbitrary bytecode, which allocates and can
+        // relocate both the stream and the buffer, so both are pinned and
+        // re-read on every iteration — the same shape as
+        // `native_scanner_init_readable`'s `Reader` loop above.
+        const CHUNK: usize = 4096;
+        // `CRATONVM_SCANNER_DEBUG=1` prints what each source answered. Kept
+        // because the shape tests above are exactly the kind of thing that
+        // fails SILENTLY: the answer is an empty scanner either way, so
+        // "which branch took it, and what did it read" is not derivable from
+        // the output. It found the fd-carrier bug above in one run.
+        let debug = std::env::var_os("CRATONVM_SCANNER_DEBUG").is_some();
+        let stream_pin = ctx.pin_native_root(stream);
+        let buf0 = ctx.new_array(ArrayElementType::Byte, CHUNK);
+        let buf_pin = ctx.pin_native_root(buf0);
+        let mut bulk_calls = 0usize;
+        loop {
+            let src = ctx.read_native_pin(stream_pin, stream);
+            let buf = ctx.read_native_pin(buf_pin, buf0);
+            let outcome = ctx.invoke_virtual(
+                src,
+                "read",
+                "([BII)I",
+                &[
+                    Value::Object(Some(buf)),
+                    Value::Int(0),
+                    Value::Int(CHUNK as i32),
+                ],
+            );
+            if debug {
+                eprintln!(
+                    "native-io: scanner bulk read on {src_class} -> {}",
+                    match &outcome {
+                        Ok(Some(v)) => format!("Ok({v:?})"),
+                        Ok(None) => "Ok(None)".to_string(),
+                        Err(_) => "Err".to_string(),
+                    }
+                );
+            }
+            bulk_calls += 1;
+            let n = match outcome {
+                Ok(Some(Value::Int(n))) => n,
+                // A source that answers something other than an int cannot be
+                // drained this way. `Err` is deliberately NOT propagated:
+                // `Scanner`'s constructor does not declare `IOException`, and
+                // turning a read fault into a constructor throw would be a
+                // different divergence from the one being fixed.
+                _ => -1,
+            };
+            if n <= 0 {
+                break;
+            }
+            let buf = ctx.read_native_pin(buf_pin, buf0);
+            let want = (n as usize).min(CHUNK);
+            let start = bytes.len();
+            bytes.resize(start + want, 0);
+            let copied = ctx.read_byte_array_into(buf, 0, &mut bytes[start..]);
+            bytes.truncate(start + copied);
+            if copied == 0 {
+                break;
+            }
+        }
+
+        // SECOND DOOR: `read()I`, one byte at a time.
+        //
+        // Reached only when the bulk overload produced NOTHING on its first
+        // call, which is not the same as "the stream was empty" -- an empty
+        // stream answers `-1` after this native has already established that
+        // the overload works. `java.io.InputStream` declares `read()` abstract,
+        // so every concrete stream in the language provides it; the bulk
+        // overload is the OPTIMISATION and this is the guarantee.
+        //
+        // It is slow by construction (one bytecode round trip per byte) and
+        // that is acceptable here precisely because it is unreachable for any
+        // source whose bulk overload answered -- see `native_is_read_all_bytes`
+        // for what a one-byte-per-call loop costs on a 769 KB manifest, and why
+        // it must not be the primary path.
+        if bytes.is_empty() && bulk_calls > 0 {
+            if debug {
+                eprintln!("native-io: scanner falling back to read()I on {src_class}");
+            }
             loop {
-                match ctx.fd_table().read_byte(fd) {
-                    Ok(b) if b >= 0 => bytes.push(b as u8),
+                let src = ctx.read_native_pin(stream_pin, stream);
+                match ctx.invoke_virtual(src, "read", "()I", &[]) {
+                    Ok(Some(Value::Int(b))) if b >= 0 => bytes.push(b as u8),
                     _ => break,
                 }
             }
         }
+        ctx.unpin_native_roots(stream_pin);
     }
-    let text = String::from_utf8_lossy(&bytes);
+    bytes
+}
+
+/// Hand `bytes`, decoded as `charset_name`, to `this` as its source.
+///
+/// `this` is pinned by the caller ACROSS `scanner_source_bytes`, which runs
+/// arbitrary bytecode through `invoke_virtual` and can therefore move it.
+fn scanner_set_decoded(
+    ctx: &mut dyn NativeContext,
+    this_pin: usize,
+    this: ObjectRef,
+    bytes: &[u8],
+    charset_name: Option<&str>,
+) -> MethodCallResult {
+    let text = match charset_name {
+        // The charset overloads decode through the same table `String(byte[],
+        // Charset)` and `ByteArrayOutputStream.toString(Charset)` use, so an
+        // ISO-8859-1 source is not silently read as UTF-8 -- measured with
+        // `café naïve`, which is two tokens in Latin-1 and two REPLACEMENT
+        // CHARACTERs if the argument is ignored.
+        Some(name) => {
+            let units = cratonvm_native_api::charset::decode_bytes_lossy(name, bytes);
+            String::from_utf16_lossy(&units)
+        }
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    };
+    let this = ctx.read_native_pin(this_pin, this);
     scan_set_source(ctx, this, &text);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
+}
+
+/// `Scanner(InputStream)` — the default-charset overload.
+fn native_scanner_init_inputstream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            scan_set_source(ctx, this, "");
+            return Ok(None);
+        }
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let bytes = scanner_source_bytes(ctx, stream);
+    scanner_set_decoded(ctx, this_pin, this, &bytes, None)
+}
+
+/// `Scanner(InputStream, Charset)` and `Scanner(InputStream, String)`.
+///
+/// **Neither had a registration until 2026-08-22**, and the failure was silent:
+/// the real JDK constructor ran and initialised the real `Scanner`'s fields,
+/// while this VM's `hasNext`/`next` natives read the synthetic state that
+/// nothing had written. MEASURED, `regression-suite/probes/W4Scanner.java`:
+///
+/// ```text
+///                                                    HotSpot            CratonVM
+///   new Scanner(bais, StandardCharsets.UTF_8)        [alpha, beta, …]   []
+///   new Scanner(bais, "UTF-8")                       [alpha, beta, …]   []
+///   new Scanner(latin1Bytes, ISO_8859_1)             [café, naïve]      []
+/// ```
+///
+/// Both descriptors share this body: `baos_charset_name_of` already accepts
+/// either a `Charset` object or a plain name `String`.
+fn native_scanner_init_inputstream_charset(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            scan_set_source(ctx, this, "");
+            return Ok(None);
+        }
+    };
+    let charset_name =
+        baos_charset_name_of(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
+    let this_pin = ctx.pin_native_root(this);
+    let bytes = scanner_source_bytes(ctx, stream);
+    scanner_set_decoded(ctx, this_pin, this, &bytes, Some(&charset_name))
+}
+
+/// `Scanner(ReadableByteChannel)` and `Scanner(ReadableByteChannel, String)`.
+///
+/// Same silent-empty shape as the charset overloads — no registration, so the
+/// real constructor initialised state this VM's accessors do not read.
+/// MEASURED: `new Scanner(Channels.newChannel(bais))` gave `[]` against
+/// HotSpot's `[alpha, beta, 42, gamma]`.
+///
+/// The channel is adapted with `java.nio.channels.Channels.newInputStream`,
+/// which is the JDK's own adapter and exactly what the real constructor uses,
+/// rather than by draining `read(ByteBuffer)` here: that keeps this body to the
+/// one thing it is for, and any `ReadableByteChannel` — including one an
+/// application wrote — is adapted by code that already understands it.
+fn native_scanner_init_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let channel = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => {
+            scan_set_source(ctx, this, "");
+            return Ok(None);
+        }
+    };
+    let charset_name = args
+        .get(2)
+        .filter(|v| matches!(v, Value::Object(Some(_))))
+        .map(|v| baos_charset_name_of(ctx, *v));
+    let this_pin = ctx.pin_native_root(this);
+    let adapted = ctx.invoke(
+        "java/nio/channels/Channels",
+        "newInputStream",
+        "(Ljava/nio/channels/ReadableByteChannel;)Ljava/io/InputStream;",
+        &[Value::Object(Some(channel))],
+    );
+    let bytes = match adapted {
+        Ok(Some(Value::Object(Some(stream)))) => scanner_source_bytes(ctx, stream),
+        // No adapter available: an EMPTY scanner is what this produced before
+        // the registration existed, so this is not a new outcome — but it is
+        // now the narrow fallback rather than the whole behaviour.
+        _ => Vec::new(),
+    };
+    scanner_set_decoded(ctx, this_pin, this, &bytes, charset_name.as_deref())
 }
 
 fn native_scanner_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7769,6 +8129,38 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         "<init>",
         "(Ljava/io/InputStream;)V",
         native_scanner_init_inputstream,
+    );
+    // The charset overloads. See `native_scanner_init_inputstream_charset` for
+    // what their absence did — it was silent, which is why it lasted.
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/io/InputStream;Ljava/lang/String;)V",
+        native_scanner_init_inputstream_charset,
+    );
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V",
+        native_scanner_init_inputstream_charset,
+    );
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/nio/channels/ReadableByteChannel;)V",
+        native_scanner_init_channel,
+    );
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/nio/channels/ReadableByteChannel;Ljava/lang/String;)V",
+        native_scanner_init_channel,
+    );
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/nio/channels/ReadableByteChannel;Ljava/nio/charset/Charset;)V",
+        native_scanner_init_channel,
     );
     registry.register(c, "<init>", "(Ljava/io/File;)V", native_scanner_init_file);
     registry.register(
