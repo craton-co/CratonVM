@@ -166,6 +166,17 @@ pointer that was already wrong.
 ## 6. What it got wrong
 
 * **The verdict**, for the reason in §1.
+* **"Intermittent under the corpus."** The page's own re-correction, landed on
+  `dev` hours before this fix and folded in here, already withdrew that: four
+  corpus runs, two compatible arms each, gave `r13 FAIL/FAIL`, `r14 FAIL/PASS`,
+  `r15 FAIL/FAIL`, `r16 FAIL/FAIL` -- seven of eight compatible observations
+  FAIL and every strict one PASSED. It called that "deterministic and
+  mode-dependent, with a rare flake", which matches the 12/12 compatible
+  failure measured here exactly. `WORKER-5` reached the same reading from 12
+  ABBA-interleaved runs, and their framing is the one worth keeping: **"flaky"
+  is a property of a BINARY AND A HOST, not of a vector.** This lane's own
+  strict arm bears that out from the other side -- 2 fails in 20 where theirs
+  saw 0 in 6, same vector, different binary and load.
 * **`--jdk-only` is CLEAN (2/2).** It is not; `WORKER-1-NOTE-1` measured 9
   pass / 3 fail over twelve runs the next day and was right. Two runs cannot
   see a 25% flake, and this page drew a mode conclusion from them.

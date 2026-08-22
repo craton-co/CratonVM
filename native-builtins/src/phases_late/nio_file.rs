@@ -5654,7 +5654,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
             let path_obj = obj_arg(args, 1)?;
             let options = args.get(3).copied().unwrap_or(Value::Object(None));
-            p59_files_read_attributes(ctx, &[Value::Object(Some(path_obj)), options])
+            let attrs =
+                p59_files_read_attributes(ctx, &[Value::Object(Some(path_obj)), options]);
+            // Same narrowing as the `Files` entry point above; this is the one
+            // `Files.readAttributes` routes through on a real provider.
+            let requested = args.get(2).copied();
+            narrow_to_basic_view(ctx, requested.as_ref(), attrs)
         },
     );
 
@@ -17252,7 +17257,11 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
             }
             let path = args.first().copied().unwrap_or(Value::Object(None));
             let options = args.get(2).copied().unwrap_or(Value::Object(None));
-            p59_files_read_attributes(ctx, &[path, options])
+            let attrs = p59_files_read_attributes(ctx, &[path, options]);
+            // A request for `BasicFileAttributes` gets the BASIC view, not the
+            // full platform object — see `narrow_to_basic_view`.
+            let requested = args.get(1).copied();
+            narrow_to_basic_view(ctx, requested.as_ref(), attrs)
         },
     );
     r.register(
@@ -17453,6 +17462,90 @@ pub(crate) fn basic_file_attributes_alloc(ctx: &mut dyn NativeContext) -> Result
     // Only reached by a synthetic-JDK configuration, where the interface is
     // modelled as a concrete helper with a five-field layout.
     Ok(try_alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5)?)
+}
+
+/// Narrow a platform attributes object to the BASIC view, when — and only
+/// when — the caller asked for `BasicFileAttributes` by name.
+///
+/// # What the caller can tell, and could not before
+///
+/// `basic_file_attributes_alloc` hands back a real
+/// `sun.nio.fs.UnixFileAttributes`, which implements `PosixFileAttributes`.
+/// HotSpot hands back `UnixFileAttributes$UnixAsBasicFileAttributes`, a wrapper
+/// that implements ONLY `BasicFileAttributes`. MEASURED,
+/// `regression-suite/probes/W4Files.java`, Linux/JDK 25.0.4, both modes:
+///
+/// ```text
+///   Files.readAttributes(f, BasicFileAttributes.class) instanceof PosixFileAttributes
+///     HotSpot    false
+///     CratonVM   true
+///
+///   ((PosixFileAttributes) basic).permissions()
+///     HotSpot    unreachable — the cast fails
+///     CratonVM   reachable:true
+/// ```
+///
+/// So an application could reach POSIX permissions off a view the JDK does not
+/// let it reach them from, and — the direction that actually bites — a
+/// `basic instanceof PosixFileAttributes` branch guarding a POSIX-only code
+/// path silently took the POSIX branch on a request that asked for basic.
+/// `WORKER-4-1` N3 recorded the class-name difference and left it as cosmetic;
+/// it is not, and `W4Files` is the difference between the two claims.
+///
+/// # Why the JDK's own factory, and why only here
+///
+/// `UnixAsBasicFileAttributes.wrap(UnixFileAttributes)` is package-private but
+/// it is the JDK's own constructor for exactly this narrowing, and its
+/// delegating bodies call `attrs.isDirectory()` and friends — the accessors
+/// this bridge already registers on `UnixFileAttributes`. Building the wrapper
+/// by hand would be a second implementation of a class that already exists in
+/// the image.
+///
+/// **Only the two Class-taking entry points wrap.** Every INTERNAL consumer —
+/// `FileTreeWalker`, the Dos view, `getLastModifiedTime` — reads the carrier
+/// through the accessor helpers and wants the full object; wrapping there would
+/// hide fields those helpers need for nothing.
+///
+/// A failure to wrap returns the object unchanged, which is the pre-2026-08-22
+/// answer: this narrowing must not become a new way for `readAttributes` to
+/// fail.
+pub(crate) fn narrow_to_basic_view(
+    ctx: &mut dyn NativeContext,
+    requested: Option<&Value>,
+    result: MethodCallResult,
+) -> MethodCallResult {
+    let Some(Value::Object(Some(class))) = requested else {
+        return result;
+    };
+    let asked = crate::lang_class::mirror_class_name(ctx, *class).unwrap_or_default();
+    // Exactly `BasicFileAttributes`. A request for `PosixFileAttributes` or
+    // `DosFileAttributes` must keep the full object, and an unnameable Class
+    // argument states no request at all.
+    if asked != "java/nio/file/attribute/BasicFileAttributes" {
+        return result;
+    }
+    let attrs = match result {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        other => return other,
+    };
+    // Only the Unix carrier has this wrapper; the Windows one has no
+    // equivalent nested type, and a synthetic-mode carrier is not a
+    // `UnixFileAttributes` at all.
+    let carrier = ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(attrs))
+        .unwrap_or_default();
+    if &*carrier != "sun/nio/fs/UnixFileAttributes" {
+        return Ok(Some(Value::Object(Some(attrs))));
+    }
+    match ctx.invoke(
+        "sun/nio/fs/UnixFileAttributes$UnixAsBasicFileAttributes",
+        "wrap",
+        "(Lsun/nio/fs/UnixFileAttributes;)Lsun/nio/fs/UnixFileAttributes$UnixAsBasicFileAttributes;",
+        &[Value::Object(Some(attrs))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(Some(attrs)))),
+    }
 }
 
 pub(crate) fn basic_file_attributes_is_windows(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {

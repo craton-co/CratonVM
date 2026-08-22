@@ -2362,7 +2362,8 @@ fn invoke_to_string_opt(
 /// ```
 ///
 /// This is the producer `corrupt-value-cell-is-fatal-on-three-of-four-collectors`
-/// left open. That record reasoned the reference "is already stale when the
+/// left open (retired as
+/// `corrupt-value-cell-producer-was-a-string-array-FIXED-20260822`). That record reasoned the reference "is already stale when the
 /// native is entered" because the String fast path has no allocation between
 /// entry and the read. The reference was never stale; the READ was never of a
 /// String. Its Spring Boot witness reaches here through

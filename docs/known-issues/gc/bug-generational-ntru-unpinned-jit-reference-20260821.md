@@ -147,11 +147,35 @@ commit** was built. That is the property that makes an ordinary bisect
 unusable here: an absolute per-commit verdict is measuring the box as much as
 the code.
 
-The one measurement that controls for it is the interleaved endpoint pair —
-7/10 against 0/10, same machine, alternating runs. That remains the only
-evidence that any commit difference exists at all, and it is a single
-comparison. **It is being re-run; until it reproduces, treat "there is a
-regression in this window" as unconfirmed.**
+The one measurement that controls for it is the interleaved endpoint pair, and
+**it reproduced exactly**:
+
+```text
+run 1   bad cae49a85c  SIG=7 PASS=3      good 684f37e14  SIG=0 PASS=10
+run 2   bad cae49a85c  SIG=7 PASS=3      good 684f37e14  SIG=0 PASS=10
+```
+
+Twenty runs at the good end with zero failures against twenty at the bad end
+with fourteen. **The regression is confirmed.** An interleaved A/B is a reliable
+instrument here even though an absolute verdict is not — the alternation cancels
+whatever the environment is contributing.
+
+### The rate is not uniform across the window, and that matters
+
+`e40c176d8` showed the signature once in six runs, then zero in fifteen. If good
+commits never fail (`684f37e14` is 0/20), a single signature there cannot be
+noise — it means `e40c176d8` is already bad, but at a **much lower rate** than
+`cae49a85c`'s 70%. One in twenty-one is consistent with roughly 5%.
+
+So the rate appears to *rise* across the window rather than switch on. That has a
+sharp consequence: **"the first bad commit" may not be a well-formed question
+here.** Either several commits each widen the race, or one introduces it and
+later ones amplify it. A binary search assumes a step function and there may not
+be one.
+
+It also prices the search honestly. Detecting a 5% rate with confidence needs on
+the order of 60 reps per step, not 6 or 15 — and near the introduction point
+that is exactly the rate a bisect would face.
 
 ## What a workable method looks like
 
@@ -163,8 +187,16 @@ reps to separate two rates rather than to observe one event — but it is the on
 form that survives an environment-sensitive failure.
 
 Absolute-verdict bisects have now been attempted twice, at 2 and 6 repetitions,
-and both produced confident answers that confirmation destroyed. A third at
-higher repetition would most likely do the same.
+and both produced confident answers that confirmation destroyed. A third of that
+KIND would do the same — but an interleaved A/B bisect is a different instrument,
+and the endpoint pair reproducing twice is evidence it works.
+
+The cost is the open question, not the validity: with the rate falling toward
+~5% near the introduction point, each step needs enough reps to separate 5% from
+0%, and that is ~60 runs per arm per step rather than 6. Before paying that,
+the thing to try is removing the variance instead of measuring around it — see
+whether any knob (heap size, collection frequency, CPU contention) drives the
+rate toward 100%, which would make every later question cheaper.
 
 ## What the failing run shows
 

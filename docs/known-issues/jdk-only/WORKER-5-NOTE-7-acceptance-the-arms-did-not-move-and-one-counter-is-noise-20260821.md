@@ -76,8 +76,14 @@ CTL FAIL · NEW FAIL · NEW PASS · CTL FAIL
 ```
 
 **Both harnesses produce both outcomes.** Three further solo runs gave PASS,
-PASS, FAIL. `RTreeRangeGc` is flaky on r12; the one-cell difference is that
+PASS, FAIL. `RTreeRangeGc` is flaky **on r12**; the one-cell difference is that
 flake landing on opposite sides of two full sweeps, not a change in behaviour.
+
+> **SUPERSEDED for a newer binary — `WORKER-5-NOTE-8` §8.1.** On
+> `cratonvm-w5b.exe`, built from the integrated tree, this vector is NOT flaky:
+> 6/6 PASS in strict and 6/6 FAIL in compatible, interleaved. It is a
+> deterministic COMPATIBLE-mode defect there. "Flaky" was a property of r12 and
+> that host's load, not of the vector.
 
 ### 1a.3 Two findings for other lanes, neither actionable here
 

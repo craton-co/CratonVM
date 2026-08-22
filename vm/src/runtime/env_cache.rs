@@ -1211,6 +1211,45 @@ pub fn jit_lambda_capture_adapter() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` — let a compiled caller's
+/// `invokestatic` to a callee the JIT did NOT compile enter that callee through
+/// a per-site cached interpreter frame template, instead of re-resolving it
+/// from its class NAME on every call.
+///
+/// # What it is worth
+///
+/// MEASURED 2026-08-22, `probes/XferProbe.java` — a hot loop calling a one-line
+/// `static int callee(int x) { return x + 1; }`:
+///
+/// | configuration | ns/op |
+/// |---|---:|
+/// | compiled caller -> compiled callee | 22-33 |
+/// | both interpreted (`--nojit`) | 236-385 |
+/// | compiled caller -> INTERPRETED callee | 1242-1902 |
+///
+/// Compiling the caller and not the callee was **5x slower than compiling
+/// neither**. On a real application most callees are never compiled, so that
+/// loss is paid continuously and cancels the JIT's wins — which is exactly the
+/// "JIT 24.6 ms/op vs `--nojit` 25.8 ms/op" wash recorded for
+/// `WebClientIntegrationTests`. `invokestatic` is where it concentrates:
+/// `CRATONVM_DBG=mic-prof` on `probes/ReactorProbe.java` reports
+/// `kind_static=2_986_402` of `disp_calls=3_356_461` — **89%**.
+///
+/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
+///
+/// Default ON. `CRATONVM_JIT_STATIC_BYTECODE_CALLEE=0` restores the by-name
+/// path, which is the A/B a same-binary bisection needs.
+#[inline]
+pub fn jit_static_bytecode_callee() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_STATIC_BYTECODE_CALLEE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).
