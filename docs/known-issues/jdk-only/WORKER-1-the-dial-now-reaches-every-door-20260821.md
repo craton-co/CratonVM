@@ -666,7 +666,7 @@ What survives: the unarmed comparisons in §9 and §10 are unaffected, because
 control and fix were compared *within* the same arm each time, and the vector
 behaves the same way for both binaries.
 
-### 13c. The `25-linux` blast-radius baseline is deliberately still not taken
+### 13c. The `25-linux` baseline: refused, then unblocked and taken
 
 The weekly job has been measuring a table and scoring nothing since it was
 added, and the obvious close is to take the baseline it asks for. **Not yet, and
@@ -678,9 +678,25 @@ and the job would report `REGRESSION`/`REPAIRED` on a vector nobody touched.
 The workflow's own header cites `G89-1` — a ratchet red in blocking CI for five
 days that "adjudicated nothing" — as its reason for being non-blocking. A gate
 that cries wolf three weeks in eight fails identically. **A flaky vector must be
-quarantined before a baseline exists, never after**, and the harness has no
-quarantine mechanism today (`harness-uncounted.txt` is about check counts). That
-is `WORKER-1-NOTE-1` N1 and it belongs to whoever owns `regression-suite/`.
+quarantined before a baseline exists, never after.**
+
+**Then the blocker was removed rather than left standing.**
+`regression-suite/known-flaky.txt` is a shared quarantine list; the sweep loads
+it, drops quarantined vectors from every cell, **prints** what it dropped and
+how that vector actually behaved this run, and shouts if a quarantined vector
+fails in every arm — because that is no longer flakiness and the quarantine has
+become a blindfold. A row naming a vector the corpus does not schedule is a hard
+error, so the list can fail. It does not touch `run.sh`'s own counting: every
+published denominator is unchanged, and instruments opt in.
+
+The baseline is now taken (`scripts/baselines/jdk-only-blast-radius-25-linux.txt`,
+`!adjudicating yes`, `!quarantined RTreeRangeGc`), and **the evidence that the
+flake was the whole problem is that two independent sweeps produced identical
+failing SETS for all six prefixes while the pass COUNTS moved** — `HashSet` 105
+then 106, `ConcurrentHashMap` 103 then 104, as `RTreeRangeGc` landed in a
+different arm each time. A confirming run adjudicates all six cells
+`unchanged`. The weekly job scores something for the first time since it was
+added.
 ---
 
 ## NOMINATIONS
