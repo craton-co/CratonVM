@@ -29,7 +29,7 @@ rule it states is the one this extends, with *class* replaced by *method*:
     receiver METHOD anywhere on the receiver's hierarchy, there is no
     ACC_NATIVE method for the registration to bind to and there never can be
 
-THE FOUR VERDICTS
+THE FIVE VERDICTS
 -----------------
 
     no-image-class   no image declares the receiver CLASS. Already the
@@ -39,7 +39,27 @@ THE FOUR VERDICTS
                      *** the retirable population ***
     cross-version    some image declares it, some image that HAS the class does
                      not. *** the isBigEndian shape — DO NOT DELETE ***
+    field-shaped     no image declares it as a METHOD, but the NAME is on the
+                     hierarchy as a FIELD. *** DO NOT DELETE ***
     live             every image that has the class declares the method.
+
+`field-shaped` exists because this sweep was WRONG without it. It indexes the
+method table, so a registration naming a field read as `dead-everywhere` and
+went into the committed work list — **42 rows nominated for a retirement that
+must not happen**. It was caught by comparing against WORKER 3's independent
+`jdk-only-no-image-methods.py`, which shells out to `javap` and therefore sees
+fields for free; that one reported 38 rows of the same shape. Two
+implementations of one measurement, and the disagreement was the finding.
+
+THERE ARE TWO SWEEPS IN THIS TREE, ON PURPOSE
+---------------------------------------------
+
+`scripts/jdk-only-no-image-methods.py` (WORKER 3) asks `javap -p -s --system`
+per class. This one builds one in-process index per image and answers every
+query from it, which is what makes the coverage refusals, the canary and a
+committed TSV cheap enough to run over all 10,378 registrations. They agree on
+the load-bearing categories — `WORKER-5-NOTE-1` §2.5 has the reconciliation —
+and neither should be deleted without re-running the other.
 
 `dead-everywhere` is split further, because the two halves are different bug
 reports (`H25-1` §2.2):
@@ -51,10 +71,10 @@ reports (`H25-1` §2.2):
 
 Usage:
     python3 scripts/jdk-only-image-method-index.py --image ... --out idx/X.json.gz
-    python3 scripts/jdk-only-no-image-methods.py \\
-        --census reg-jdkonly.json --indexes idx/*.json.gz --out sweep.json
+    python3 scripts/jdk-only-image-method-sweep.py \\
+        --census reg-jdkonly.json --indexes idx/*.json.gz --out sweep.json --tsv s.tsv
 
-    python3 scripts/jdk-only-no-image-methods.py --selftest
+    python3 scripts/jdk-only-image-method-sweep.py --selftest
 
 Exit codes:
     0  the sweep ran (findings are in the report; this is not a pass/fail gate)
@@ -111,7 +131,7 @@ def load_census(path):
 
 
 def declares(classes, cls, name, desc):
-    """(exact, name_only) — does the hierarchy rooted at `cls` declare it?
+    """(exact, name_only, field) — does the hierarchy rooted at `cls` declare it?
 
     `exact` is name+descriptor found on the class, a superclass, or any
     (transitive) interface.  `name_only` is the same walk asking about the NAME
@@ -121,12 +141,13 @@ def declares(classes, cls, name, desc):
     collapsing the two is how a one-platform sweep calls a macOS class dead.
     """
     if cls not in classes:
-        return (None, None)
+        return (None, None, None)
     key = name + desc
     seen = set()
     stack = [cls]
     exact = False
     name_only = False
+    field = False
     while stack:
         c = stack.pop()
         if c in seen:
@@ -147,20 +168,26 @@ def declares(classes, cls, name, desc):
                 if k.startswith(name) and k[len(name):len(name) + 1] == "(":
                     name_only = True
                     break
-        if exact and name_only:
+        # A registration whose name is a FIELD here is NOT a dead method.
+        # WORKER 3's javap-based sweep found 38 such rows and this index, built
+        # from the method table alone, called every one of them dead. An index
+        # that cannot see fields must not be allowed to nominate them.
+        if not field and name in entry.get("f", ()):
+            field = True
+        if exact and name_only and field:
             break
         if entry.get("s"):
             stack.append(entry["s"])
         stack.extend(entry.get("i") or [])
-    return (exact, name_only)
+    return (exact, name_only, field)
 
 
 def classify(row, images):
     """One registration against every image. Returns a verdict dict."""
     cls, name, desc = row["class"], row["name"], row["descriptor"]
-    have, declared, name_seen = [], [], []
+    have, declared, name_seen, field_seen = [], [], [], []
     for label, classes in images:
-        exact, name_only = declares(classes, cls, name, desc)
+        exact, name_only, field = declares(classes, cls, name, desc)
         if exact is None:
             continue
         have.append(label)
@@ -168,8 +195,14 @@ def classify(row, images):
             declared.append(label)
         if name_only:
             name_seen.append(label)
+        if field:
+            field_seen.append(label)
     if not have:
         verdict = "no-image-class"
+    elif not declared and field_seen:
+        # The name IS on the hierarchy — as a FIELD. Not a dead method, and not
+        # this sweep's business to nominate.
+        verdict = "field-shaped"
     elif not declared:
         verdict = "dead-everywhere"
     elif len(declared) == len(have):
@@ -190,6 +223,8 @@ def classify(row, images):
         out["images_declaring_the_name"] = name_seen
     if verdict == "cross-version":
         out["images_not_declaring"] = [x for x in have if x not in declared]
+    if verdict == "field-shaped":
+        out["images_declaring_the_field"] = field_seen
     return out
 
 
@@ -284,7 +319,8 @@ def main(argv):
         for s in bad:
             print("  * %s" % s)
     print("\nverdicts:")
-    for k in ("live", "cross-version", "dead-everywhere", "no-image-class"):
+    for k in ("live", "cross-version", "field-shaped", "dead-everywhere",
+              "no-image-class"):
         print("  %-16s %5d" % (k, counts.get(k, 0)))
     if shapes:
         print("  dead-everywhere splits: %s"
@@ -319,12 +355,13 @@ def main(argv):
 
     if args.tsv:
         act = sorted((v for v in verdicts
-                      if v["verdict"] in ("dead-everywhere", "cross-version")),
+                      if v["verdict"] in ("dead-everywhere", "cross-version",
+                                          "field-shaped")),
                      key=lambda v: (v["verdict"], v["class"], v["name"], v["descriptor"]))
         with open(args.tsv, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("# jdk-only method-granular multi-image sweep — H25-1 N1\n")
             fh.write("# regenerate: scripts/jdk-only-image-method-index.py per image,"
-                     " then scripts/jdk-only-no-image-methods.py --tsv\n")
+                     " then scripts/jdk-only-image-method-sweep.py --tsv\n")
             fh.write("# census: %s (%d registrations, strict mode)\n" % (args.census, len(rows)))
             fh.write("# images: %s\n" % " ".join("%s=%s" % (d["label"], d.get("java_version") or "?")
                                                  for d in docs))
@@ -332,9 +369,14 @@ def main(argv):
             fh.write("# verdicts: %s\n" % " ".join("%s=%d" % kv for kv in sorted(counts.items())))
             fh.write("#\n")
             fh.write("# cross-version rows MUST NOT be deleted: an image this host does not\n")
-            fh.write("# run declares the method. dead-everywhere rows are the retirable\n")
-            fh.write("# population, and retiring them is predicted to move the shadow census\n")
-            fh.write("# by ZERO — they are never dispatched (H25-1 §3).\n")
+            fh.write("# run declares the method.\n")
+            fh.write("# field-shaped rows MUST NOT be deleted either: the name IS on the\n")
+            fh.write("# hierarchy, as a FIELD. An index built from the method table alone calls\n")
+            fh.write("# them dead and is wrong; WORKER 3's independent javap sweep found the\n")
+            fh.write("# same shape (38 rows there, 42 here).\n")
+            fh.write("# dead-everywhere rows are the retirable population, and retiring them is\n")
+            fh.write("# predicted to move the shadow census by ZERO — they are never\n")
+            fh.write("# dispatched (H25-1 §3).\n")
             fh.write("verdict\tshape\tclass\tname\tdescriptor\towns_slot\tregistered_by\tdeclared_by\n")
             for v in act:
                 fh.write("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n"
@@ -374,7 +416,8 @@ def selftest():
         "java/lang/Thread": {"s": "java/lang/Object", "i": [], "m": {"start()V": 1}},
         "java/lang/StringBuilder": {"s": "java/lang/Object", "i": [],
                                     "m": {"repeat(Ljava/lang/CharSequence;I)V": 1}},
-        "java/util/HashMap": {"s": "java/lang/Object", "i": [], "m": {}},
+        "java/util/HashMap": {"s": "java/lang/Object", "i": [], "m": {},
+                              "f": {"table": 0}},
     }
     new = {k: dict(v) for k, v in old.items()}
     new["java/lang/StringUTF16"] = {"s": "java/lang/Object", "i": [], "m": {}}
@@ -394,6 +437,10 @@ def selftest():
         # Inheritance: HashMap declares nothing, but Object does. A walk that
         # stopped at the class would call this dead and nominate it.
         (("java/util/HashMap", "toString", "()Ljava/lang/String;"), "live", None),
+        # THE NAME IS A FIELD, not a method. An index built from the method
+        # table alone calls this `dead-everywhere` and nominates it for
+        # retirement; WORKER 3's javap sweep found 38 rows of this shape.
+        (("java/util/HashMap", "table", "()V"), "field-shaped", None),
     ]
     for triple, want, want_shape in cases:
         got = classify(row(*triple), images)
@@ -441,9 +488,9 @@ def selftest():
               % coverage_refusals(full), file=sys.stderr)
         return 3
 
-    print("selftest ok: all four verdicts, both dead-everywhere shapes,"
-          " inherited-from-Object, the platform-only class, and all four"
-          " coverage refusals plus the 3x3 acceptance.")
+    print("selftest ok: all five verdicts (including field-shaped), both"
+          " dead-everywhere shapes, inherited-from-Object, the platform-only"
+          " class, and all four coverage refusals plus the 3x3 acceptance.")
     return 0
 
 

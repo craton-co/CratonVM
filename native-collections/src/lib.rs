@@ -5165,9 +5165,13 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
 /// not per registrar. See the block above `register_collections_natives`.
 fn register_map_view_carrier_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     for c in MAP_VIEW_CARRIERS {
         let c = *c;
+        // PER CARRIER, not per registrar — `H4-1` §2. This list spans four
+        // ownership clusters; one `set_category` outside the loop made moving
+        // any of them a partial retag of the other three. See
+        // [`CarrierFamily`].
+        r.set_category(carrier_family_kind(carrier_family_of(c)));
         r.register(c, "size", "()I", native_al_size);
         r.register(c, "isEmpty", "()Z", native_al_is_empty);
         r.register(c, "contains", "(Ljava/lang/Object;)Z", native_al_contains);
@@ -6792,6 +6796,19 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // it builds is the marker-carrying one `propagate_list_removal` understands.
     if let Some(r) = vc_route(ctx, args, native_al_iterator) {
         return r;
+    }
+    // The `Hashtable` family's THIRD door. `keySet()` and `entrySet()` are
+    // set-shaped and route through `native_hs_iterator`; `values()` is
+    // ArrayList-shaped and arrives here, so without this the same map answered
+    // `Hashtable$Enumerator` for two of its views and `ArrayList$Itr` for the
+    // third. See [`real_ht_view_enumerator`] — java.base's own cursor, no
+    // natives registered on it and no force-native gate entry.
+    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+        if let Some(src_map) = values_view_source(&*ctx, recv) {
+            if let Some(e) = real_ht_view_enumerator(ctx, recv, src_map)? {
+                return Ok(Some(Value::Object(Some(e))));
+            }
+        }
     }
     let input = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -16979,9 +16996,10 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
 /// and `deprecated_util.rs` already names it).
 fn register_set_view_carrier_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     for c in SET_VIEW_CARRIERS {
         let c = *c;
+        // PER CARRIER — see [`CarrierFamily`] and the note above.
+        r.set_category(carrier_family_kind(carrier_family_of(c)));
         r.register(c, "size", "()I", native_hs_size);
         r.register(c, "isEmpty", "()Z", native_hs_is_empty);
         r.register(c, "add", "(Ljava/lang/Object;)Z", native_hs_add);
@@ -17855,6 +17873,135 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
 }
 
+/// `java.util.Hashtable$Enumerator`, java.base's OWN cursor, which is both an
+/// `Enumeration` and an `Iterator` over one position.
+const HT_ENUMERATOR: &str = "java/util/Hashtable$Enumerator";
+/// `Hashtable$Enumerator(Hashtable, int type, boolean iterator)`.
+const HT_ENUMERATOR_CTOR: &str = "(Ljava/util/Hashtable;IZ)V";
+/// `Hashtable.KEYS` / `.VALUES` / `.ENTRIES`, the `type` argument above.
+const HT_ENUM_KEYS: i32 = 0;
+const HT_ENUM_VALUES: i32 = 1;
+const HT_ENUM_ENTRIES: i32 = 2;
+
+/// A real `Hashtable$Enumerator` over the Hashtable behind a `Hashtable$KeySet`
+/// / `Hashtable$EntrySet` view, or `None` when this receiver is not one of
+/// those (or the image cannot build the class).
+///
+/// # Why this exists
+///
+/// `H4-1` section 3 predicts that refusing the four `MAP_KEY_ITR_CARRIERS`
+/// while `Hashtable$KeySet` is still `Bridge` makes the Hashtable carrier mint
+/// a `HashMap$KeyIterator` whose natives are gone — a silently EMPTY iteration.
+/// That reasoning is right and it UNDERSTATES the problem. MEASURED, unarmed,
+/// `--jdk-only`, two-entry map:
+///
+/// ```text
+///                             HotSpot 25.0.3+9       CratonVM before
+///   ht.keySet().iterator()    Hashtable$Enumerator   HashMap$KeyIterator
+///   ht.entrySet().iterator()  Hashtable$Enumerator   HashMap$EntryIterator
+///   ht.keys()                 Hashtable$Enumerator   Hashtable$Enumerator  <- already right
+/// ```
+///
+/// The wrong class is handed out TODAY, and this map's own `keys()` was already
+/// correct — so one `Hashtable` answered two different iterator classes
+/// depending on which door you came through, the same two-answers-one-object
+/// shape as the enumeration ORDER bug three commits back.
+///
+/// # Why a REAL cursor and not a snapshot under the real name
+///
+/// The first attempt registered the snapshot natives onto
+/// `Hashtable$Enumerator` and named it in both force-native gates. That
+/// **reddened `RJdkEnumerations`**, and the mechanism is this file's own
+/// two-producers-one-slot lesson (`WORKER-2-NOTE-1` section 4a) in a new place:
+/// `Hashtable.keys()` ALREADY produces a real JDK-built `Hashtable$Enumerator`
+/// (`deprecated_util::real_hashtable_enumerator`), so a gate entry keyed on the
+/// CLASS made the snapshot natives intercept that producer's objects too —
+/// objects whose `key_itr_base` slots nothing ever wrote. Two producers, one
+/// class, and a gate that cannot tell them apart.
+///
+/// Using java.base's own cursor for BOTH doors removes the second producer
+/// instead of trying to disambiguate it: one class, one shape, no natives
+/// registered on it, and **no force-native gate entries at all** — so this
+/// stays inside `native-collections`.
+///
+/// It works for the same measured reason `real_hashtable_enumerator` works, and
+/// this lane strengthened that reason: the receiver's `table` is now a real
+/// `[Ljava.util.Hashtable$Entry;` holding real `Hashtable$Entry` nodes, so the
+/// JDK's own `Enumerator` walks the authoritative store with its own bytecode
+/// and its `Entry.key`/`.value`/`.next` accesses land exactly where it expects.
+/// `remove()` and `count` are that same real state, so write-through is the
+/// JDK's own code rather than anything this file has to mirror.
+fn real_ht_view_enumerator(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    source: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let enum_type = match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+    {
+        Some("java/util/Hashtable$KeySet") => HT_ENUM_KEYS,
+        Some("java/util/Hashtable$EntrySet") => HT_ENUM_ENTRIES,
+        // HotSpot answers ONE class for all three of a Hashtable's views.
+        // MEASURED: `ht.values().iterator()` is a `Hashtable$Enumerator` there
+        // and was a `java.util.ArrayList$Itr` here, because the values carrier
+        // is ArrayList-SHAPED and reaches `native_al_iterator` rather than
+        // `native_hs_iterator`. Same cursor, different door.
+        Some("java/util/Hashtable$ValueCollection") => HT_ENUM_VALUES,
+        _ => return Ok(None),
+    };
+    // Never accept a stand-in: a fabricated `Hashtable$Enumerator` is exactly
+    // the class-fabrication `--jdk-only` exists to stop, and its methods would
+    // be unbound. Ask before a stub can be created and again after init.
+    if ctx.would_fabricate_synthetic_stub(HT_ENUMERATOR)
+        || ctx.is_class_synthetic_stub(HT_ENUMERATOR)
+        || ctx.ensure_class_initialized(HT_ENUMERATOR).is_err()
+        || ctx.is_class_synthetic_stub(HT_ENUMERATOR)
+        || !ctx.method_exists(HT_ENUMERATOR, "<init>", HT_ENUMERATOR_CTOR)
+    {
+        return Ok(None);
+    }
+    // `source` must be the real `Hashtable` the view was minted over, NOT the
+    // view: `VIEW_BACKING_SRC_SLOT` lives on the view's BACKING map, which is
+    // why the caller resolves it and hands it in. Reading it off the view
+    // itself is how the first cut of this route silently never fired.
+    if ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(source))
+        .as_deref()
+        != Some("java/util/Hashtable")
+    {
+        // `Properties` also reaches here (it extends `Hashtable`), and on
+        // JDK 25 HotSpot answers a `ConcurrentHashMap$KeyIterator` for it
+        // because `Properties` is CHM-backed. Handing it a
+        // `Hashtable$Enumerator` would trade one wrong class for another, so
+        // the exact class is required and `Properties` keeps what it had.
+        return Ok(None);
+    }
+    // GC-SAFETY: `new_object_initialized` runs Java (`<clinit>` and the
+    // constructor) and can move the heap, so `source` — a bare Rust local the
+    // collector cannot see — is rooted across it and read back through the pin.
+    let pin = ctx.pin_native_root(source);
+    let built = ctx.new_object_initialized(
+        HT_ENUMERATOR,
+        HT_ENUMERATOR_CTOR,
+        &[
+            Value::Object(Some(ctx.read_native_pin(pin, source))),
+            Value::Int(enum_type),
+            // `iterator = true`: the Iterator face, whose `next()` performs the
+            // modCount check `keySet().iterator()` is required to do. The
+            // Enumeration face stays available on the same object — that is the
+            // whole point of this class — which is why `keys()` and
+            // `keySet().iterator()` can now be the same shape.
+            Value::Int(1),
+        ],
+    );
+    ctx.unpin_native_roots(pin);
+    match built? {
+        Some(Value::Object(Some(e))) => Ok(Some(e)),
+        _ => Ok(None),
+    }
+}
+
 fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
         return r;
@@ -17890,6 +18037,20 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return Ok(Some(Value::Object(None)));
         }
     };
+    // `H4-1` section 3, closed. See [`real_ht_view_enumerator`]: the Hashtable
+    // family gets java.base's OWN cursor rather than a snapshot under a
+    // borrowed class name. Placed here because it needs `backing` — the view
+    // carries no source slot of its own.
+    //
+    // `this_pin` is this frame's pin base, so it has to be released before any
+    // return past it, exactly like the refusal path below.
+    if let Some(src_map) = view_backing_source(&*ctx, backing) {
+        let e = real_ht_view_enumerator(ctx, this, src_map)?;
+        if let Some(e) = e {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(Some(e))));
+        }
+    }
     // Collect once for the count, allocate, then re-collect from the live
     // backing before storing. `alloc_ref_array` can trigger a moving GC; object
     // refs held only in the Rust Vec from the first collection would otherwise
@@ -18202,6 +18363,92 @@ const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
 /// (ints), and this VM's five fields would land an `Int` cursor in a reference
 /// slot. So the native state goes PAST the declared fields —
 /// [`key_itr_base`] — and the object is allocated `declared + 5` wide.
+/// Which OWNERSHIP CLUSTER a view carrier belongs to — the unit `H4-1` §2 says
+/// the retag has to move in, and the thing this file had a comment about and no
+/// code for.
+///
+/// # The problem, in `H4-1`'s words
+///
+/// > *"`register_map_view_carrier_natives` — `MAP_VIEW_CARRIERS` holds
+/// > `HashMap$Values`, `LinkedHashMap$LinkedValues`, **`TreeMap$Values`**,
+/// > **`TreeMap$EntrySet`**, **`Hashtable$ValueCollection`**,
+/// > `ConcurrentHashMap$ValuesView`: four families. … So the split has to be
+/// > per carrier family, keyed on whether the producing registrar moved — not
+/// > per registrar."*
+///
+/// Both carrier registrars opened with ONE
+/// `r.set_category(NativeKind::Bridge)` over the whole list, so moving either
+/// of them was all-or-nothing across four ownership clusters. Retagging the
+/// registrar as a unit is a partial retag of three families; refusing a
+/// carrier whose PRODUCER is still `Bridge` runs the real JDK body over a
+/// carrier this crate minted.
+///
+/// # What this changes, and what it deliberately does not
+///
+/// Every carrier now declares its family and takes its category from
+/// [`carrier_family_kind`], which is asked once per carrier rather than once
+/// per registrar. **Today every family answers `Bridge`, so this is a
+/// no-behaviour-change refactor** — and that is the point: the structure is in
+/// place so that moving `register_hashmap_natives` moves ITS carriers and only
+/// its carriers, by construction rather than by a reviewer noticing.
+///
+/// `H4-1` §2 calls that shape *"strictly safer than §5's, because dispatch
+/// keys on class: any class left `Bridge` behaves exactly as today"*.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum CarrierFamily {
+    /// `java/util/HashMap` and `java/util/LinkedHashMap` — one cluster, because
+    /// `LinkedHashMap` extends `HashMap` and shares its `table`.
+    HashMapCluster,
+    /// `java/util/Hashtable`. `Properties` rides with it in the registry even
+    /// though its storage differs, because `is_hashtable_receiver` accepts both.
+    HashtableCluster,
+    /// `java/util/TreeMap` — the one whose `H4-1` §2 example is sharpest,
+    /// because a `TreeMap$Values` carrier is minted by `register_tree_map_natives`.
+    TreeMapCluster,
+    /// `java/util/concurrent/ConcurrentHashMap`.
+    ChmCluster,
+}
+
+/// The `NativeKind` a carrier of `family` must be registered under: the kind
+/// its PRODUCING registrar currently carries.
+///
+/// All four are `Bridge` today, which is exactly the state that makes this
+/// refactor inert. When a cluster moves, change its arm here and its carriers
+/// follow — the one edit, in the one place, that `H4-1` §2 asks for.
+///
+/// **Before moving [`CarrierFamily::HashMapCluster`], read
+/// [`register_set_view_carrier_natives`]'s cluster note.** The
+/// [`MAP_KEY_ITR_CARRIERS`] rows cannot be refused while a `Hashtable$KeySet`
+/// still mints a `HashMap$KeyIterator`; that edge is closed separately by
+/// [`key_itr_carrier_for`], and until it is, this arm and the Hashtable one
+/// have to move together.
+fn carrier_family_kind(family: CarrierFamily) -> cratonvm_native_api::NativeKind {
+    match family {
+        CarrierFamily::HashMapCluster => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::HashtableCluster => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::TreeMapCluster => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::ChmCluster => cratonvm_native_api::NativeKind::Bridge,
+    }
+}
+
+/// The owning cluster of a [`MAP_VIEW_CARRIERS`] / [`SET_VIEW_CARRIERS`] name.
+///
+/// Exhaustive over both lists by construction: an unlisted name answers
+/// `HashMapCluster`, which is the conservative default only because every
+/// carrier that reaches here IS in one of the two lists — the registrars are
+/// the only callers and they iterate those lists.
+fn carrier_family_of(name: &str) -> CarrierFamily {
+    match name {
+        "java/util/Hashtable$ValueCollection"
+        | "java/util/Hashtable$KeySet"
+        | "java/util/Hashtable$EntrySet" => CarrierFamily::HashtableCluster,
+        "java/util/TreeMap$Values" | "java/util/TreeMap$EntrySet" => CarrierFamily::TreeMapCluster,
+        "java/util/concurrent/ConcurrentHashMap$ValuesView"
+        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => CarrierFamily::ChmCluster,
+        _ => CarrierFamily::HashMapCluster,
+    }
+}
+
 const MAP_KEY_ITR_CARRIERS: &[&str] = &[
     "java/util/HashMap$KeyIterator",
     "java/util/HashMap$EntryIterator",
@@ -25638,6 +25885,7 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 // is empty (observed: `m.keySet().stream().count()` returned 0 for a 3-entry
 // TreeMap, which broke Keycloak FeatureOptions.<clinit>).
 fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    ts_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
@@ -44551,6 +44799,18 @@ struct TmArrayState {
     data: Option<ObjectRef>,
     size: i32,
     comparator: Value,
+    /// The `modCount` this map's real `root` mirror was last built at, or `-1`
+    /// when it has never been built. See [`tm_publish_real_root`].
+    ///
+    /// This is what makes the mirror affordable. `WORKER-2-NOTE-1` section 5b
+    /// declined `root` because the only available triggers are the bulk-read
+    /// natives and `native_tm_entry_set` ALREADY allocates N entries, so a
+    /// mirror rebuilt on every read would roughly double the allocation cost of
+    /// every `TreeMap` iteration in the VM. Gating on `modCount` -- which this
+    /// lane fixed one commit earlier, and which is pinned at 0 without that fix
+    /// -- turns "per iteration" into "per mutation": an unchanged map is a
+    /// single `i32` compare.
+    root_published_at: i32,
 }
 impl Default for TmArrayState {
     fn default() -> Self {
@@ -44558,6 +44818,7 @@ impl Default for TmArrayState {
             data: None,
             size: 0,
             comparator: Value::Object(None),
+            root_published_at: -1,
         }
     }
 }
@@ -48440,7 +48701,336 @@ fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(entry))))
 }
 
+/// `java.util.TreeMap$Entry`, the real node class. `javap -p` (JDK 25):
+/// `K key; V value; Entry left; Entry right; Entry parent; boolean color`.
+const TM_ENTRY_CLASS: &str = "java/util/TreeMap$Entry";
+/// `TreeMap.RED` / `.BLACK`. The JDK spells them `false` / `true`.
+const TM_RED: i32 = 0;
+const TM_BLACK: i32 = 1;
+
+/// The shape `TreeMap.buildFromSorted` would give `n` sorted entries, as plain
+/// indices: `(left, right, parent, color, root)` with `-1` for absent.
+///
+/// Computed as integers BEFORE anything is allocated, which is what keeps the
+/// mirror GC-safe: the only heap work afterwards is one field-writing pass with
+/// every node reachable from a pinned array.
+fn tm_build_tree_shape(n: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, i32) {
+    let mut left = vec![-1i32; n];
+    let mut right = vec![-1i32; n];
+    let mut parent = vec![-1i32; n];
+    let mut color = vec![TM_BLACK; n];
+    if n == 0 {
+        return (left, right, parent, color, -1);
+    }
+    // `TreeMap.computeRedLevel(int size)`, JDK 21+: the level whose nodes are
+    // RED is the deepest complete one, so the tree is a valid red-black tree
+    // (every root-to-leaf path has the same BLACK count).
+    let red_level = 31 - ((n as u32) + 1).leading_zeros() as i32;
+    // Explicit stack rather than recursion: `n` is unbounded from Java, and a
+    // native is not the place to inherit the JVM's stack depth. Each frame
+    // carries which SIDE of its parent it is, rather than trying to infer that
+    // from the indices afterwards -- the inference is exactly the kind of
+    // almost-right arithmetic that produces a tree which walks correctly in
+    // order and is silently unbalanced.
+    // (lo, hi, level, parent, is_left)
+    let mut stack: Vec<(i64, i64, i32, i32, bool)> = vec![(0, n as i64 - 1, 0, -1, false)];
+    let mut root = -1i32;
+    while let Some((lo, hi, level, par, is_left)) = stack.pop() {
+        if hi < lo {
+            continue;
+        }
+        // `>>> 1` on the SUM, matching `buildFromSorted`'s own midpoint, so the
+        // shape is the one java.base would have produced for these entries.
+        let mid = (((lo + hi) as u64) >> 1) as usize;
+        parent[mid] = par;
+        if level == red_level {
+            color[mid] = TM_RED;
+        }
+        if par < 0 {
+            root = mid as i32;
+        } else if is_left {
+            left[par as usize] = mid as i32;
+        } else {
+            right[par as usize] = mid as i32;
+        }
+        stack.push((lo, mid as i64 - 1, level + 1, mid as i32, true));
+        stack.push((mid as i64 + 1, hi, level + 1, mid as i32, false));
+    }
+    (left, right, parent, color, root)
+}
+
+/// Populate the receiver's real `java.util.TreeMap.root` with a real
+/// `TreeMap$Entry` red-black tree over its current contents.
+///
+/// # What this closes
+///
+/// `WORKER-2` section 5 row 3 asks for `TreeMap`'s own diagnosis, and the
+/// answer (`WORKER-2-NOTE-1` section 5) is that `TreeMap` has no `this$0`
+/// problem at all -- its whole structure lives in the address-keyed
+/// `tm_array_table`, so the real JDK fields are populated only where something
+/// took the trouble. `size` and `comparator` were mirrored, `modCount` was
+/// fixed one commit back, and `root` was the last one left:
+///
+/// ```text
+///   TreeMap, 20 puts + 1 remove   HotSpot 25.0.3+9        before
+///     root                        a java.util.TreeMap$Entry tree   null
+/// ```
+///
+/// # Why it is safe to build
+///
+/// `buildFromSorted` is a pure function of a sorted sequence and
+/// `computeRedLevel` gives a genuinely valid colouring, so the result is a
+/// real red-black tree rather than a shape that merely looks like one. This VM
+/// already proves the class is buildable here: `TreeMap.clone()` returns a map
+/// whose `root` IS populated on CratonVM too, because clone runs java.base's
+/// own `buildFromSorted` bytecode.
+///
+/// The authoritative store does not move. `tm_array_table` stays the single
+/// source of truth and this mirror is rebuilt from it; nothing reads back
+/// through `root`. That direction matters: a mirror that were also an input
+/// would be the two-producers-one-slot trap this file has already paid for
+/// twice (`WORKER-2-NOTE-1` sections 4a and 9a.1).
+///
+/// # Why it is affordable
+///
+/// Gated on `modCount`, so an unchanged map costs one `i32` compare. See
+/// [`TmArrayState::root_published_at`].
+fn tm_publish_real_root(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    // A stand-in would be exactly the class-fabrication `--jdk-only` exists to
+    // stop, and its fields would not be the ones real bytecode reads.
+    if ctx.would_fabricate_synthetic_stub(TM_ENTRY_CLASS)
+        || ctx.is_class_synthetic_stub(TM_ENTRY_CLASS)
+    {
+        return;
+    }
+    let root_slot = match ctx.resolve_field_index("java/util/TreeMap", "root") {
+        Some(s) if s < ctx.object_num_fields(this) => s,
+        // No `root` field to mirror into: the synthetic-JDK shape, where the
+        // caller keeps exactly the behaviour it had.
+        _ => return,
+    };
+    let mod_now = match ctx.resolve_field_index("java/util/TreeMap", "modCount") {
+        Some(s) if s < ctx.object_num_fields(this) => match ctx.get_field(this, s) {
+            Value::Int(m) => m,
+            _ => return,
+        },
+        _ => return,
+    };
+    {
+        let tbl = tm_array_table().lock().unwrap();
+        if let Some(st) = tbl.get(&tm_obj_key(ctx, this)) {
+            if st.root_published_at == mod_now {
+                return;
+            }
+        }
+    }
+    let pairs = tm_collect_pairs(ctx, this);
+    let n = pairs.len();
+    if n == 0 {
+        ctx.set_field(this, root_slot, Value::Object(None));
+        tm_array_table()
+            .lock()
+            .unwrap()
+            .entry(tm_obj_key(ctx, this))
+            .or_default()
+            .root_published_at = mod_now;
+        return;
+    }
+    let (left, right, parent, color, root_idx) = tm_build_tree_shape(n);
+    let (kf, vf, lf, rf, pf, cf) = match (
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "key"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "value"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "left"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "right"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "parent"),
+        ctx.resolve_field_index(TM_ENTRY_CLASS, "color"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
+        _ => return,
+    };
+    let cid = match ctx.ensure_class_initialized(TM_ENTRY_CLASS) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if ctx.class_name_arc_of_id(cid).as_deref() != Some(TM_ENTRY_CLASS) {
+        return;
+    }
+    let width = ctx.class_num_total_fields(cid);
+    // GC-SAFETY: every allocation below can move the heap, so the nodes live in
+    // a pinned `Object[]` from the moment they exist rather than in a Rust Vec
+    // the collector cannot rewrite. `this` and the key/value snapshot are
+    // pinned for the same reason.
+    let this_pin = ctx.pin_native_root(this);
+    let keys: Vec<Value> = pairs.iter().map(|(k, _)| *k).collect();
+    let vals: Vec<Value> = pairs.iter().map(|(_, v)| *v).collect();
+    let (_, key_pins) = pin_value_slice(ctx, &keys);
+    let (_, val_pins) = pin_value_slice(ctx, &vals);
+    let nodes = alloc_ref_array(ctx, n);
+    let nodes_pin = ctx.pin_native_root(nodes);
+    for i in 0..n {
+        let e = ctx.alloc_object(cid, width);
+        let nodes = ctx.read_native_pin(nodes_pin, nodes);
+        ctx.set_array_element(nodes, i, Value::Object(Some(e)));
+    }
+    for i in 0..n {
+        let nodes = ctx.read_native_pin(nodes_pin, nodes);
+        let e = match ctx.get_array_element(nodes, i) {
+            Value::Object(Some(e)) => e,
+            _ => continue,
+        };
+        let k = read_pinned_elem(ctx, key_pins[i], keys[i]);
+        let v = read_pinned_elem(ctx, val_pins[i], vals[i]);
+        ctx.set_field(e, kf, k);
+        ctx.set_field(e, vf, v);
+        ctx.set_field(e, cf, Value::Int(color[i]));
+    }
+    let link = |ctx: &mut dyn NativeContext, i: usize, slot: usize, target: i32| {
+        let nodes = ctx.read_native_pin(nodes_pin, nodes);
+        let e = match ctx.get_array_element(nodes, i) {
+            Value::Object(Some(e)) => e,
+            _ => return,
+        };
+        let t = if target < 0 {
+            Value::Object(None)
+        } else {
+            ctx.get_array_element(nodes, target as usize)
+        };
+        ctx.set_field(e, slot, t);
+    };
+    for i in 0..n {
+        link(ctx, i, lf, left[i]);
+        link(ctx, i, rf, right[i]);
+        link(ctx, i, pf, parent[i]);
+    }
+    let nodes = ctx.read_native_pin(nodes_pin, nodes);
+    let root_val = if root_idx < 0 {
+        Value::Object(None)
+    } else {
+        ctx.get_array_element(nodes, root_idx as usize)
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, root_slot, root_val);
+    ctx.unpin_native_roots(this_pin);
+    tm_array_table()
+        .lock()
+        .unwrap()
+        .entry(tm_obj_key(ctx, this))
+        .or_default()
+        .root_published_at = mod_now;
+}
+
+/// Populate a `java.util.TreeSet`'s real `m` field with a real
+/// `java.util.TreeMap` holding the same elements, itself carrying a real
+/// `root` tree.
+///
+/// `WORKER-2-NOTE-1` section 5 measured `TreeSet.m` as null where HotSpot has
+/// the backing map, and declined it on the same has-no-consumer/costs-per-read
+/// grounds as `root`. Both halves of that objection are gone: the cost is now
+/// gated on `modCount` exactly as [`tm_publish_real_root`] is, and the map this
+/// mints is the same real object graph that function already builds — so `m`
+/// costs one extra `TreeMap` per mutation rather than per read.
+///
+/// The minted map is a MIRROR, never an authority. `ts_state`'s side-table
+/// entry for the SET stays the single source of truth; nothing in this file
+/// reads the set's contents back through `m`. Making it readable both ways
+/// would be the two-producers-one-slot trap this lane has already paid for
+/// twice (`WORKER-2-NOTE-1` sections 4a and 9a.1).
+fn ts_publish_real_backing_map(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let m_slot = match ctx.resolve_field_index("java/util/TreeSet", "m") {
+        Some(s) if s < ctx.object_num_fields(this) => s,
+        // The synthetic-JDK shape has no `m` to mirror into; the caller keeps
+        // exactly the behaviour it had.
+        _ => return,
+    };
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) => d,
+        None => return,
+    };
+    // Reuse the map already published for this set when the element count has
+    // not moved. `TreeSet` has no `modCount` of its own — it is `m`'s — so the
+    // size is the cheap structural proxy here, and the map's own
+    // `tm_publish_real_root` re-gates on the real `modCount` underneath.
+    if let Value::Object(Some(existing)) = ctx.get_field(this, m_slot) {
+        if matches!(tm_state(ctx, existing), (_, n, _) if n == size) {
+            tm_publish_real_root(ctx, existing);
+            return;
+        }
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let data_pin = ctx.pin_native_root(data);
+    let cmp_pin = pin_value(ctx, comparator);
+    let map = match try_alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS) {
+        Ok(m) => m,
+        Err(_) => {
+            ctx.unpin_native_roots(this_pin);
+            return;
+        }
+    };
+    let map_pin = ctx.pin_native_root(map);
+    // `PRESENT` is the JDK's own sentinel value for every `TreeSet` mapping.
+    // A missing one is not a reason to refuse the mirror — the VALUES of a set's
+    // backing map are not observable through any `Set` operation — so fall back
+    // to null rather than dropping `m` on the floor.
+    let present = ctx
+        .ensure_class_initialized("java/util/TreeSet")
+        .ok()
+        .and_then(|cid| {
+            ctx.static_field_index_by_name(cid, "PRESENT")
+                .map(|idx| ctx.get_static_field(cid, idx))
+        })
+        .unwrap_or(Value::Object(None));
+    let present_pin = pin_value(ctx, present);
+    let n = size.max(0) as usize;
+    let buf = alloc_ref_array(ctx, (n * 2).max(TM_DEFAULT_CAPACITY * 2));
+    let buf_pin = ctx.pin_native_root(buf);
+    for i in 0..n {
+        let data = ctx.read_native_pin(data_pin, data);
+        let k = ctx.get_array_element(data, i);
+        let buf = ctx.read_native_pin(buf_pin, buf);
+        ctx.set_array_element(buf, i * 2, k);
+        let p = read_pinned_elem(ctx, present_pin, present);
+        ctx.set_array_element(buf, i * 2 + 1, p);
+    }
+    let map = ctx.read_native_pin(map_pin, map);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    tm_set_force_array(ctx, map);
+    tm_set_slot(ctx, map, TM_FIELD_DATA, Value::Object(Some(buf)));
+    // Hoisted: `tm_set_slot` takes `ctx` mutably, so the pinned re-read cannot
+    // be an argument expression to it.
+    let cmp_now = read_pinned_elem(ctx, cmp_pin, comparator);
+    tm_set_slot(ctx, map, TM_FIELD_COMPARATOR, cmp_now);
+    // Written LAST: `tm_set_slot` bumps the map's real `modCount` off a size
+    // change, and `tm_publish_real_root` gates on that value — so the size has
+    // to be in place before the root is asked for.
+    tm_set_slot(ctx, map, TM_FIELD_SIZE, Value::Int(size));
+    let map = ctx.read_native_pin(map_pin, map);
+    tm_publish_real_root(ctx, map);
+    let map = ctx.read_native_pin(map_pin, map);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, m_slot, Value::Object(Some(map)));
+    ctx.unpin_native_roots(this_pin);
+}
+
+/// Refresh the real-JDK mirrors a `TreeSet` bulk read makes observable.
+fn ts_refresh_real_mirrors(ctx: &mut dyn NativeContext, args: &[Value]) {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        ts_publish_real_backing_map(ctx, this);
+    }
+}
+
+/// Refresh the real-JDK mirrors a bulk read makes observable. Called from the
+/// `TreeMap` bulk-read natives, which are the only points where this VM knows
+/// something is about to look at the map as an object rather than through an
+/// accessor.
+fn tm_refresh_real_mirrors(ctx: &mut dyn NativeContext, args: &[Value]) {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        tm_publish_real_root(ctx, this);
+    }
+}
+
 fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    tm_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -48610,6 +49200,7 @@ impl PinnedPairs {
 }
 
 fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    tm_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -48625,6 +49216,7 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    tm_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -48955,6 +49547,7 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    tm_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -49908,6 +50501,7 @@ fn native_ts_lower(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    ts_refresh_real_mirrors(ctx, args);
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),

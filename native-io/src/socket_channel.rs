@@ -1528,12 +1528,24 @@ fn sc_open_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// removing it would make `is_foreign_channel` answer "foreign" for a channel
 /// this VM built.
 ///
+/// CORRECTED AGAIN 2026-08-21 (WORKER 4). This comment used to end: *"
 /// `nio_selector::selector_open_native` still allocates the ABSTRACT
-/// `sun/nio/ch/SelectorImpl` (MEASURED: `Selector.open().getClass()` is
-/// `sun.nio.ch.SelectorImpl`, `isAbstract == true`, against
-/// `sun.nio.ch.WEPollSelectorImpl` on HotSpot). That one is NOT fixed here
-/// because the concrete class is OS- and JDK-version-dependent and this crate
-/// is cross-platform; `H21-2` N2 states the remedy.
+/// `sun/nio/ch/SelectorImpl` … That one is NOT fixed here because the concrete
+/// class is OS- and JDK-version-dependent and this crate is cross-platform."*
+/// It is fixed now: `selector_open_native` mints the concrete per-platform
+/// selector, and OS-dependence is handled by an ordered candidate list whose
+/// entries are filtered through the JVMS 6.5 instantiability predicate
+/// (`cratonvm_native_api::instantiable`), not by naming one class.
+///
+/// **That fix has to be reflected HERE, and forgetting it cost a red vector.**
+/// `foreign_nio_receiver` answers "is this receiver one of ours" from this
+/// list; a selector minted as `sun.nio.ch.EPollSelectorImpl` was not in it, so
+/// `g_selector_provider` classified every selector this VM opens as FOREIGN and
+/// delegated to `AbstractSelector.provider()`'s real `final` bytecode — which
+/// returns the `provider` field no constructor ever set. MEASURED:
+/// `RJdkNio` failed with `AssertionError: Selector.provider() must not be null`.
+/// The list is therefore built from `nio_selector::SELECTOR_IMPLS` rather than
+/// copied, so the two cannot drift again.
 const CRATONVM_NIO_CLASSES: &[&str] = &[
     "java/nio/channels/SocketChannel",
     "sun/nio/ch/SocketChannelImpl",
@@ -1587,7 +1599,13 @@ const CRATONVM_NIO_CLASSES: &[&str] = &[
 pub(crate) fn foreign_nio_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);
     match ctx.class_name_arc_of_id(cid) {
-        Some(name) => !CRATONVM_NIO_CLASSES.contains(&&*name),
+        // The per-platform selectors are read from `nio_selector`'s own table,
+        // not copied into `CRATONVM_NIO_CLASSES`: one list, one place to add a
+        // platform. See that constant's doc comment for what a stale copy cost.
+        Some(name) => {
+            !CRATONVM_NIO_CLASSES.contains(&&*name)
+                && !crate::nio_selector::SELECTOR_IMPLS.contains(&&*name)
+        }
         // Unknown class: keep the pre-existing behaviour rather than guess.
         None => false,
     }

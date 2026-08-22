@@ -87,7 +87,7 @@ class BadClass(Exception):
 
 
 def parse_class(buf):
-    """(name, super, [interfaces], {name+desc: access_flags}) or raise BadClass.
+    """(name, super, [ifaces], {name+desc: acc}, {field: acc}) or raise BadClass.
 
     Deliberately a hand parse and not a library.  We need four fields and the
     method table; every class-file library in reach would either be a new
@@ -154,10 +154,15 @@ def parse_class(buf):
             out.append((acc, utf8[ni], utf8[di]))
         return out
 
-    skip_members()                       # fields
+    fields = skip_members()
     methods = skip_members()
+    # Field NAMES are kept, not descriptors: the consumer only asks "is this
+    # registration's name a FIELD here rather than a method?", and WORKER 3's
+    # sweep found 38 rows of that shape. An index built from the method table
+    # alone must call every one of them dead.
     return (class_name(this_i), class_name(super_i), ifaces,
-            {n + d: acc for (acc, n, d) in methods})
+            {n + d: acc for (acc, n, d) in methods},
+            {n: acc for (acc, n, _d) in fields})
 
 
 def find_java_home(root):
@@ -217,7 +222,7 @@ def index_tree(root):
             full = os.path.join(dirpath, fn)
             try:
                 with open(full, "rb") as fh:
-                    name, sup, ifaces, methods = parse_class(fh.read())
+                    name, sup, ifaces, methods, fields = parse_class(fh.read())
             except (BadClass, KeyError, struct.error, OSError):
                 bad += 1
                 continue
@@ -227,7 +232,7 @@ def index_tree(root):
                 # registration in the census targets.
                 continue
             classes[name] = {"s": sup, "i": [x for x in ifaces if x],
-                             "m": methods}
+                             "m": methods, "f": fields}
     return classes, bad
 
 
@@ -328,7 +333,7 @@ def selftest():
             + u2(0)                                      # 0 fields
             + u2(1) + u2(0x0100) + u2(7) + u2(8) + u2(1)  # 1 method, ACC_NATIVE, 1 attr
             + u2(9) + u4(3) + b"\x00\x01\x02")            # the attribute, skipped by length
-    name, sup, ifaces, methods = parse_class(body)
+    name, sup, ifaces, methods, fields = parse_class(body)
     if (name, sup, ifaces) != ("Foo", "java/lang/Object", []):
         print("SELFTEST FAILED: header parsed as %r" % ((name, sup, ifaces),),
               file=sys.stderr)
