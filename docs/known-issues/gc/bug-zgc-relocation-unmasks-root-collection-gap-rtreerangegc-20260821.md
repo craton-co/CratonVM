@@ -82,10 +82,26 @@ marks the thread from did not contain a slot the thread's own frames hold.
 * `site="checkcast"`, `top_frame=RTreeRangeGc.checkMap pc=44`, `frames=2`
 * `holder=<not found in frames>` — the guard could not attribute the address to
   any frame slot it knows about
-* `--nojit` reproduces, so this is **not** JIT root scanning. It is the
-  interpreter frame root set.
+* `--nojit` reproduces, so this is **not** JIT root scanning.
 * `-XX:+UseG1GC` **passes**, so the affected path is the young/relocating one
   the other two collectors share and G1 does not take here.
+
+**CORRECTION (2026-08-22).** This bullet originally continued "It is the
+interpreter frame root set." That was too broad, and the mode arm says so:
+
+```text
+--Xmx 64m                 rc=1  2/2   (no PASS line)
+--Xmx 64m --jdk-only      rc=0  2/2   PASS RTreeRangeGc (14014 checks)
+```
+
+**Strict mode is CLEAN.** `--jdk-only` drops the substituted collection natives
+and runs the JDK's own `TreeMap`/`TreeSet` bytecode, and the gap goes with them.
+So the unrooted reference is held by CratonVM's own collection substitution
+across a relocating collection, not by interpreter frames in general — which is
+why the corpus's `--jdk-only` arm stayed green at 106/107 while `SUITE=all` and
+`SUITE=core` went red. That also makes this the SIXTH Compatible-mode defect
+this week that strict mode does not have, and an argument for the mode rather
+than a cost of it.
 
 `RTreeRangeGc.checkMap` walks TreeMap/TreeSet range views. This area has prior
 form: `b2e13e441 fix(collections): TreeMap/TreeSet snapshot walks dereferenced

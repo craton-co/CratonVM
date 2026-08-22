@@ -2302,7 +2302,15 @@ fn active_jdk_mode_line() -> String {
     match ACTIVE_JDK_MODE.get() {
         Some((mode, Some(home))) => format!("jdk mode: {mode} (java.home={home})"),
         Some((mode, None)) => format!("jdk mode: {mode}"),
-        None => "jdk mode: <not yet resolved — failure occurred during argument parsing>".into(),
+        // NOT "during argument parsing". This arm is reached whenever the
+        // OnceLock is unset, and the class library is selected LATE: a
+        // `--java-home` that clap accepted but that carries no `jmods/` or
+        // `lib/modules` lands here too, and that is the common case (a POSIX
+        // path spelling on Windows reaches it with rc=1). Naming a phase this
+        // function cannot observe sent two separate triage records after the
+        // argument parser for a fault that was never in it.
+        None => "jdk mode: <not yet resolved — the failure occurred before the class library was selected>"
+            .into(),
     }
 }
 

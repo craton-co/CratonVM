@@ -1,8 +1,12 @@
-# untyped-alloc ratchet baseline (v6: objects + arrays, allowlisted)
+# untyped-alloc ratchet baseline (v7: production sites + one-level reach)
 # regenerate: scripts/untyped-alloc-ratchet.sh --update
-# see docs/known-issues/jdk-only/H0-6 and H23-3
-objects=208
-arrays=151
-sites=359
+# see docs/known-issues/jdk-only/H0-6, H23-3 and WORKER-5-3
+# v6 counted 359 sites; 197 of them were inside a #[cfg(test)] mod of a
+# production file. The drop to 162 is a CORRECTION, not a fix.
+objects=33
+arrays=129
+sites=162
+test_sites=197
+reach=629
 widths=1 2 3 4 5 6 7 8 12
-byfn=alloc_object=228 new_ref_array=147 define_class=6 try_new_ref_array=4 class_is=1 alloc_object_of=1 
+byfn=alloc_object=228 new_ref_array=147 define_class=6 try_new_ref_array=4 class_is=1 alloc_object_of=1
