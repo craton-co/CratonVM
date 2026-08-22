@@ -728,6 +728,39 @@ run_pass() {
     if [ "$cvrc" -ne 0 ]; then
       state=FAIL; why="cratonvm rc=$cvrc"
       sig=$(printf '%s\n' "$cvout" | grep -aiE 'AssertionError|NoSuchMethod|linkage error|panic|SEGV|fatal' | grep -avE '^\s*at ' | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | head -c 90)
+      # ---------------------------------------------------------------------
+      # A LAUNCH/CONFIG FAILURE USED TO RENDER EXACTLY LIKE AN ASSERTION
+      # FAILURE (2026-08-21).
+      #
+      # The pattern list above is a list of things somebody had already seen.
+      # Anything else produced an EMPTY `sig`, so `why` stayed the bare
+      # `cratonvm rc=1` — and a vector that never started looked identical to a
+      # vector that ran and failed an assertion. `H24-2` hit this and came
+      # within one step of reporting three of this week's closures reverted;
+      # `H24-2`'s own A/B is reproducible today (a `JDK` exported in the MSYS
+      # POSIX spelling reddens the vector, the `cygpath -m` spelling passes).
+      #
+      # Rather than append one more regex per failure mode — a list that is
+      # incomplete by construction and was already wrong once — fall through to
+      # the VM's OWN first line of output. Two extra steps, in order:
+      #
+      #   1. clap's argument errors, which are `^error: ` / `^Usage: ` /
+      #      `For more information, try '--help'`;
+      #   2. anything at all that is not tracing, a stack frame, VM chatter or
+      #      blank — tagged `unclassified:` so it is obvious the harness did not
+      #      recognise it and the pattern list may deserve a new entry.
+      #
+      # A vector that dies before printing anything now says `no output` rather
+      # than implying an assertion fired.
+      if [ -z "$sig" ]; then
+        sig=$(printf '%s\n' "$cvout" | sed 's/\x1b\[[0-9;]*m//g' \
+              | grep -aE '^error: |^Usage: |For more information, try' | head -1 | head -c 90)
+      fi
+      if [ -z "$sig" ]; then
+        first=$(printf '%s\n' "$cvout" | sed 's/\x1b\[[0-9;]*m//g' \
+                | grep -avE '^\s*at |WARN|^\[cratonvm\]|^\s*$' | head -1 | head -c 70)
+        if [ -n "$first" ]; then sig="unclassified: $first"; else sig="no output"; fi
+      fi
       [ -n "$sig" ] && why="rc=$cvrc: $sig"
     elif printf '%s' "$cvout" | grep -qaiE 'SIGSEGV|rust panic|fatal runtime error|stack overflow'; then
       state=FAIL; why="VM crash"
