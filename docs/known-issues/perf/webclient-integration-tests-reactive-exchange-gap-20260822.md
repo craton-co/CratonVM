@@ -102,6 +102,17 @@ Each was measured on this workload, interleaved, on this branch:
    JIT 24.62 ms/op, `--nojit` 25.75 ms/op. It costs 12.6% and returns about the
    same. (On the whole class the JIT is ~18% ahead, so do not turn it off
    either.)
+
+   **WHY it is a wash was root-caused 2026-08-22 and is a separate page:**
+   `jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`. A
+   compiled caller calling a callee the JIT did NOT compile falls into the
+   fully name-keyed `invoke_or_native` path and costs **1902 ns** against
+   **385 ns** for the same call with the caller left interpreted — so on a
+   partially-compiled call graph the JIT's wins and this loss cancel. That page
+   also explains why reactive code is hit hardest: a method containing an
+   unbridged `invokedynamic` is denied OSR outright and retired with
+   `MakeNotCompilable` after its first compiled execution, so every
+   lambda-creating method becomes exactly that interpreted callee.
 2. **The native-shadow caller seal is not the lever.** 1179 methods are sealed
    before any compile (`clinit=771`, `calls-native-shadowed-method=408`) against
    155 compiled. `CRATONVM_JIT=-native-shadow-caller-seal` measured 28.43 ms/op

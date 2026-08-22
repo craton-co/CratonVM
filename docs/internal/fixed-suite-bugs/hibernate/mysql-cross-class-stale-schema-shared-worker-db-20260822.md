@@ -99,6 +99,32 @@ confirming HotSpot tolerates worker-DB reuse across classes fine in general
 works for Postgres on CratonVM). The divergence is specific to CratonVM +
 MySQL + a reused database.
 
+## Full isolation sweep (2026-08-22 follow-up) — confirms the scale
+
+Re-ran all 52 FAIL-union classes individually, each against its own freshly
+dropped-and-recreated database (no shared history at all):
+
+**46 / 52 (88%) passed clean in isolation** — confirming the stale-schema-leak
+explanation for the large majority of the original FAIL count. These are not
+independent bugs; they are one mechanism appearing 46 times.
+
+The remaining 6 do NOT reduce to that mechanism. Each was individually
+triaged (isolated run + a HotSpot A/B against the identical MySQL setup)
+before being counted as a residual:
+
+| Class | Isolated result | HotSpot same setup | Disposition |
+|---|---|---|---|
+| `jpa.lock.LockTest` | 1 FAIL (`testFindWithPessimisticWriteLockTimeoutException`, exceeded a 5000ms budget by 245ms) | same failure | **Not new** — already documented as a pre-existing cold-start timing-margin non-bug, see [`locktest-pessimistic-write-timeout-is-not-a-vm-bug-20260730.md`](locktest-pessimistic-write-timeout-is-not-a-vm-bug-20260730.md) |
+| `bootstrap.scanning.PackagedEntityManagerTest` | 14/15 FAIL, `Connection to localhost:5432 refused` | (not run — same root cause applies to any JVM) | **Not a CratonVM bug** — this test bootstraps its `EntityManagerFactory` from a packaged `.par`'s own `META-INF/persistence.xml`, which is a Gradle-templated resource (`@jdbc.url@` etc., see `hibernate-core/src/test/bundles/templates/excludehbmpar/META-INF/persistence.xml`) baked in at build time from whichever `-Pdb=...` profile last ran. It was templated for Postgres and never re-rendered for MySQL — the packaged archive under `target/packages/*/` literally still points at port 5432 regardless of any runtime sysprop override. A build-config gap, not a runtime one. |
+| `hql.HqlParserMemoryUsageTest` | 1 FAIL (parser memory 629MB vs 256MB budget) | not run | **Pre-existing, not MySQL-specific** — also failed in the 2026-08-20 Postgres 3-GC run |
+| `sql.exec.SmokeTests` | still times out (>250s) even isolated | not run | **Pre-existing, not MySQL-specific** — also failed in the Postgres run; see `HIB-CV-37-sqlexec-smoketests-sigsegv.md` / `smoketests-concurrent-query-throughput-20260723-RETIRED.md` for this class's history |
+| `ondelete.OnDeleteTest` | 1 FAIL (`testJoinedSubclass`, cascade-delete leaves a child row behind) | **same failure, identical count** | **Not a CratonVM bug** — HotSpot fails the identical assertion the identical way against the identical MySQL container. Likely a `MySQLDialect.supportsCascadeDelete()` vs. actual generated-DDL gap in Hibernate ORM itself, or an environment/storage-engine characteristic — orthogonal to CratonVM. |
+| `batch.BatchTest` | 1 FAIL (`testBatchInsertUpdate`, exceeds a 120s internal JUnit timeout; ms=140786 for the class) | **PASS**, ms=24816 for the class (~5.7x faster) | **New, genuine, MySQL-specific** — see [`batchtest-mysql-jdbc-batching-slow-20260822.md`](batchtest-mysql-jdbc-batching-slow-20260822.md) |
+
+So of the original 50 FAIL, the accounting is: **46 stale-schema artifact + 3
+pre-existing/not-CratonVM (excluded here) + 1 real, new, MySQL-specific
+performance defect** (`BatchTest`, its own doc).
+
 ## Not yet root-caused
 
 `MySQL8DatabaseCleaner`/`MySQL5DatabaseCleaner`

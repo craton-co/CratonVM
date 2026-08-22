@@ -9072,8 +9072,66 @@ static JDK_ONLY_VIOLATIONS: OnceLock<
     parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>>,
 > = OnceLock::new();
 
-/// Maximum number of distinct structured violations the JIT retains.
+/// Default maximum number of distinct structured violations the JIT retains.
+///
+/// Overridable, since 2026-08-22, by the SAME knob the other two sinks read —
+/// see [`jdk_only_violation_cap`]. The constant stays `pub` because records and
+/// `vm_init.rs` quote it, but the value in force is the function's.
 pub const JDK_ONLY_VIOLATION_CAP: usize = 256;
+
+/// Ceiling on the operator override. Mirrors the other two sinks'.
+const JDK_ONLY_VIOLATION_CAP_MAX: usize = 65_536;
+
+/// The cap this process is actually using for the compile-time sink.
+///
+/// Reads `CRATONVM_NATIVE_SHADOW_SINK_CAP` through
+/// [`cratonvm_types::flags::resolve_capped_usize`], which is the same resolver
+/// the interpreter and JIT fast-path sinks use. Before this, the report's
+/// saturation advice named a knob that moved two of the report's three bounded
+/// collections and silently left the third at 256.
+pub fn jdk_only_violation_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        cratonvm_types::flags::resolve_capped_usize(
+            "CRATONVM_NATIVE_SHADOW_SINK_CAP",
+            "JIT compile-time violation sink",
+            JDK_ONLY_VIOLATION_CAP,
+            JDK_ONLY_VIOLATION_CAP_MAX,
+        )
+    })
+}
+
+/// Distinct violations this sink had no room for.
+///
+/// The number that turns `violations[]` from a floor into a total for the JIT
+/// compile-time source. Until 2026-08-22 this sink had NO saturation signal at
+/// all, so `vm_init.rs` rendered its `truncated`/`dropped` as `null` — and
+/// `run.sh`'s `grep '"truncated": true'` could match neither `null` nor
+/// `false`, so every strict run printed "the counts above are totals, not
+/// floors" over an UNMEASURED collection. All 105 reports carried that `null`.
+static JDK_ONLY_VIOLATIONS_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many distinct violations this sink had no room for.
+///
+/// Dedup is `Vec::contains` over RETAINED rows, so a repeat of an already
+/// dropped row counts again. It errs upward, which is the safe direction for a
+/// floor warning.
+pub fn jdk_only_jit_sink_dropped() -> u64 {
+    JDK_ONLY_VIOLATIONS_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many distinct violations this sink is holding.
+pub fn jdk_only_jit_sink_len() -> usize {
+    jdk_only_violations().lock().len()
+}
+
+/// Did this sink drop anything? NOT `len == cap`: a run whose last distinct
+/// violation exactly fills the sink drops nothing, exactly as
+/// `cratonvm_vm::vm::jdk_only_native_shadow_sink_saturated` documents.
+pub fn jdk_only_jit_sink_saturated() -> bool {
+    jdk_only_jit_sink_dropped() > 0
+}
 
 fn jdk_only_violations() -> &'static parking_lot::Mutex<Vec<cratonvm_types::error::JdkOnlyViolation>>
 {
@@ -9103,10 +9161,12 @@ pub fn jdk_only_jit_violations() -> Vec<cratonvm_types::error::JdkOnlyViolation>
 #[inline(never)]
 pub fn record_jdk_only_direct_native_refusal(class: &str, method: &str, descriptor: &str) {
     JDK_ONLY_DIRECT_NATIVE_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut recorded = jdk_only_violations().lock();
-    if recorded.len() >= JDK_ONLY_VIOLATION_CAP {
-        return;
-    }
+    // The violation is built BEFORE the capacity test, deliberately: the old
+    // order returned at the cap without ever asking whether this triple was
+    // already recorded, so the sink could not tell "full of other rows" from
+    // "full, and this row is one of them" — and therefore could not count a
+    // DISTINCT drop. `helpers.rs` was fixed the same way on 2026-08-20.
+    // `#[cold]`, so the two `String`s cost nothing on any reachable path.
     // `NativeShadowsBytecode` is the accurate shape: the thin helper is a
     // VM-side reimplementation of a registered native standing in front of the
     // real JDK's own bytecode for the same method (`HashMap.put`,
@@ -9122,8 +9182,13 @@ pub fn record_jdk_only_direct_native_refusal(class: &str, method: &str, descript
         descriptor: descriptor.to_string(),
         native_kind: "jit-thin-direct-helper",
     };
+    let mut recorded = jdk_only_violations().lock();
     if !recorded.contains(&violation) {
-        recorded.push(violation);
+        if recorded.len() < jdk_only_violation_cap() {
+            recorded.push(violation);
+        } else {
+            JDK_ONLY_VIOLATIONS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

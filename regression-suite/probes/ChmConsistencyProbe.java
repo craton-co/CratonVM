@@ -38,11 +38,24 @@ import java.util.concurrent.ConcurrentHashMap;
  * case order. Run each case in its own process, or randomise and repeat.</blockquote>
  *
  * <p>{@code H17-2} then named the latch: {@code jdk_only_enforce_shadow_for}
- * has exactly ONE live call site, inside {@code resolve_step1_native}, so
- * arming a class arms only its COLD, step-1 dispatches. The first use of a call
- * site is cold and is dialled; later uses hit the warm cache and are not. Case
- * order is therefore a hidden treatment on every case after the first, which is
- * exactly what the retracted discriminators were measuring.
+ * had exactly ONE live call site, inside {@code resolve_step1_native}, so
+ * arming a class armed only its COLD, step-1 dispatches. The first use of a
+ * call site was cold and was dialled; later uses hit the warm cache and were
+ * not. Case order was therefore a hidden treatment on every case after the
+ * first, which is exactly what the retracted discriminators were measuring.
+ *
+ * <p><b>That latch was FIXED on 2026-08-21</b> — all fourteen dispatch doors
+ * consult the dial now, and three source-witness tests in
+ * {@code native_override.rs} keep them consulting it. So on a current binary
+ * this particular confound is gone, and the retraction above should be read as
+ * a record of what the old measurements were, not as a live hazard.
+ *
+ * <p><b>The one-case-per-process rule stands anyway, and that is the point.</b>
+ * The dial was never the only thing latched per process — JIT tier-up, class
+ * initialisation and the invoke cache's own population all are — so a
+ * repeated-measures probe is confounded whether or not any particular latch has
+ * been fixed. A design that is only correct because one named bug is currently
+ * absent is not a correct design.
  *
  * <p><b>What survives the retraction:</b> the primary symptom is real.
  * {@code size()==1} with an empty {@code keySet()} on an armed CHM is an

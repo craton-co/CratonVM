@@ -100,8 +100,30 @@ fn deprecated_api_manifest() -> Vec<DeprecatedApi> {
         DeprecatedApi { class: "java/lang/Character", method: "isJavaLetterOrDigit", descriptor: "(C)Z", images: ImageStatus::Declared, section: "T8.2.5" },
         DeprecatedApi { class: "java/lang/Character", method: "isSpace", descriptor: "(C)Z", images: ImageStatus::Declared, section: "T8.2.5" },
         DeprecatedApi { class: "java/lang/Class", method: "newInstance", descriptor: "()Ljava/lang/Object;", images: ImageStatus::Declared, section: "T8.2.6" },
-        DeprecatedApi { class: "java/lang/Number", method: "byteValue", descriptor: "()B", images: ImageStatus::Declared, section: "T8.2.7" },
-        DeprecatedApi { class: "java/lang/Number", method: "shortValue", descriptor: "()S", images: ImageStatus::Declared, section: "T8.2.7" },
+        // T8.2.7 `java/lang/Number.{byteValue()B, shortValue()S}` were HERE and
+        // are RETIRED (WORKER-4, `b77f068e3`). They are removed from the
+        // manifest rather than re-tagged because NEITHER `ImageStatus` is true
+        // of them, and the reason is the useful part:
+        //
+        //   * `Declared` asserts "this registration is a §1.5 bridge and MUST
+        //     stay". They are not bridges. Both were transcriptions of a
+        //     one-line `java.base` body (`return (byte) intValue();`), so
+        //     nothing crosses a VM boundary and §1.5 cannot call them one. That
+        //     mis-tag is what held them in place.
+        //   * `AbsentFromAllSupportedImages` asserts absence, which is now the
+        //     behaviour we want — but its NAME would be a lie: every supported
+        //     image declares both, with a body that runs.
+        //
+        // A third status is arguably owed here — DECLARED, WITH A REAL BODY,
+        // SERVED BY BYTECODE — and it would be the honest home for every row
+        // this contract retires next. Raised for the lane that owns this file
+        // rather than added in passing.
+        //
+        // Regrowth is still guarded: a re-registration lands in the stub
+        // ratchet, and behaviour is covered by `probes/W4Deprecated.java`
+        // (116 cases, 0 diffs against the oracle in both modes, driven through
+        // a user `Number` subclass, the boxed types, `BigInteger`/`BigDecimal`
+        // and a `Number`-typed reference).
         DeprecatedApi { class: "java/io/StringBufferInputStream", method: "read", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.10" },
         DeprecatedApi { class: "java/io/LineNumberInputStream", method: "getLineNumber", descriptor: "()I", images: ImageStatus::Declared, section: "T8.2.11" },
         DeprecatedApi { class: "java/net/URLDecoder", method: "decode", descriptor: "(Ljava/lang/String;)Ljava/lang/String;", images: ImageStatus::Declared, section: "T8.2.13" },
@@ -340,10 +362,21 @@ mod tests {
         let sections: std::collections::HashSet<&str> =
             manifest.iter().map(|a| a.section).collect();
 
-        // Verify every T8 sub-section is represented
+        // Verify every T8 sub-section that still has natives is represented.
+        //
+        // **T8.2.7 was here and is deliberately gone (2026-08-22).** Its only
+        // two rows were `java/lang/Number.{byteValue,shortValue}`, both retired
+        // with the manifest note above, so the section is now served ENTIRELY by
+        // real JDK bytecode — the first T8 sub-section to reach that state.
+        // Requiring a section to be "covered" means requiring a native to exist
+        // for it, so leaving `T8.2.7` in this list would make the last
+        // retirement in any section permanently impossible. That is the same
+        // shape as the `Declared => MUST stay` mis-tag that held those two rows
+        // in place; a coverage list over a shrinking population has to be
+        // allowed to shrink.
         for expected in &[
             "T8.1.1", "T8.1.2", "T8.1.3", "T8.1.4", "T8.1.6", "T8.1.7", "T8.1.8", "T8.1.9",
-            "T8.1.10", "T8.2.1", "T8.2.2", "T8.2.3", "T8.2.4", "T8.2.5", "T8.2.6", "T8.2.7",
+            "T8.1.10", "T8.2.1", "T8.2.2", "T8.2.3", "T8.2.4", "T8.2.5", "T8.2.6",
             "T8.2.10", "T8.2.11", "T8.2.13", "T8.2.14", "T8.3.1", "T8.3.2", "T8.4.1", "T8.4.2",
             "T8.4.3", "T8.4.4",
         ] {

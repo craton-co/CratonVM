@@ -872,3 +872,88 @@ HotSpot 25.0.3+9, on binaries built from the source described.
 their falsifiers are on each fix. Two were falsified and both are recorded
 rather than quietly repaired — `RChmKeySetView` (§4a) and `RJdkEnumerations`
 (§9a.1), each an arm catching a fix that reasoning had passed.
+
+---
+
+## 13. THE SECOND PASS CLOSED ALL FOUR DECLINES — 2026-08-22
+
+Everything §5b and §9a refused is implemented. Arms **107/107, 107/107, 67/67,
+rc=0**; the iterator/entry LAW diff against HotSpot is **IDENTICAL, 63 of 63**.
+
+| declined row | where | now |
+|---|---|---|
+| empty `HashMap` table | §9a.3 | **CLOSED** — all five shapes match |
+| `TreeMap.root` | §5b | **CLOSED** — real red-black tree |
+| `TreeSet.m` | §5b | **CLOSED** — real backing `TreeMap` |
+| `entrySet()` element class | §5b | **CLOSED** — five families, not one |
+| values-side iterators | §9a.4 | **CLOSED** for `HashMap`/`LinkedHashMap`/`TreeMap`/`Hashtable` |
+
+### 13.1 Every decline was overturned by a DIFFERENT kind of error
+
+Worth separating, because "I was too cautious" is not one lesson:
+
+* **§5b (`root`, `TreeSet.m`) priced a cost that a BUG was creating.** The
+  mirror looked unaffordable because `modCount` was pinned at 0, so no mirror
+  could be cached. Fixing `modCount` made the same mirror cost one `i32`
+  compare. **Re-price every decline after every fix.**
+* **§9a.3 (empty table) counted the work correctly and mis-read it.** Nine
+  internal callers is right; nine DECISIONS is wrong. All nine keep today's
+  behaviour through an eager entry point, and only Java-facing constructors go
+  lazy. **"N call sites" is a measure of typing, not of risk — look at what
+  each one needs before pricing them all the same.**
+* **§9a.1 (iterator carriers) named a real boundary and the wrong fix.** It
+  refused on OWNERSHIP, because the fix appeared to need two force-native gate
+  entries. Building it proved the plan wrong for an unrelated reason, and the
+  redesign needed no gate entry at all. **A blocked plan is not a blocked
+  goal.**
+
+### 13.2 The rule three families cost to learn
+
+    Hashtable$Enumerator              reddened RJdkEnumerations
+    ConcurrentHashMap$ValueIterator   reddened RJdkEnumerations + RJdkJmx
+    TreeMap$KeyIterator               reddened RJdkJmx
+
+**A snapshot carrier may only take a real class name that NOTHING ELSE mints.**
+A registration and a force-native gate both key on the CLASS, and neither can
+tell two producers apart — so the moment java.base also builds that class, this
+file's bodies run over a real cursor's fields and the failure is silent
+(an empty iteration, a no-op `remove`, a null introspection result).
+
+`HashMap$KeyIterator`, `HashMap$EntryIterator` and the `LinkedHashMap` pair pass
+the test. Of the three that do not, only `Hashtable` could be closed — by
+deleting OUR producer and handing out java.base's own cursor, which works only
+because §2 made that table real. CHM and `TreeMap.keySet()` cannot: their real
+cursors mutate through a MIRROR that is not this VM's store. Both wait on
+`W7-96`.
+
+### 13.3 The instrument that made this possible
+
+Two changes were GREEN on a class-identity probe and broken in the arms: a
+`TreeSet` whose `iterator().remove()` was a silent no-op, and a values view that
+drained EMPTY. Both were caught by a LAW probe that diffs, against HotSpot, the
+drain contents and order, the effect of `remove()`, `IllegalStateException`
+before `next()`, `NoSuchElementException` past the end, the entry class, and
+`setValue` write-through — for every view of eight containers.
+
+**A carrier's CLASS being right says nothing about its BEHAVIOUR**, and §1's
+table plus §9's audit could not see the difference. `WORKER-2` trap 5 says a
+green arm answers the question it asked; so does a green probe.
+
+### 13.4 One latent defect found by the lazy path
+
+`lhm_resize` allocated with `alloc_ref_array` — the untyped sentinel — so any
+`LinkedHashMap` that OUTGREW its initial table silently reverted to
+`[Ljava.lang.Object;`. `lhm_init_with_cap` had always allocated the typed array
+up front, so that function only ran on GROWTH and nothing probed a grown one.
+Making the constructor lazy routed the FIRST insert through it and exposed it.
+Same species as `H23`'s `HashMap` table and §2's `Hashtable` table — the third
+in this file.
+
+### 13.5 What is still open, and it is now ONE thing
+
+`ConcurrentHashMap`'s three iterator classes, `Properties`' three (CHM-backed on
+JDK 25), `TreeMap.keySet()`/`TreeSet`'s one, and CHM's write-then-reflect
+`table`. Every one needs `table` to BE the authority a real
+`putVal`/`replaceNode` CASes into rather than a mirror:
+`W7-96-chm-table-never-populated.md`. Semantics are correct in all of them
+today; only the class names and one nullness differ.

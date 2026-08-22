@@ -24814,7 +24814,14 @@ fn invoke_on_class_shared_inner(
                         // normally, unblocking Spring's
                         // `GenericConversionService.addConverter()` →
                         // `getConvertibleTypes().iterator()` boot path.
-                        || (matches!(
+                        // W7-96 §7 NOMINATION 1 — the third mirror. See the
+                        // note on `force_native_over_real_jdk_bytecode`; this
+                        // cluster is local to this path, so the dial must be
+                        // read here as well. `Off::covers()` is `false`, so an
+                        // unarmed run does not change by one dispatch.
+                        || (!crate::runtime::env_cache::enforce_shadow_scope()
+                                .covers(class_name)
+                            && matches!(
                                 class_name,
                                 "java/util/HashMap"
                                 | "java/util/LinkedHashMap"
@@ -25110,12 +25117,29 @@ fn invoke_on_class_shared_inner(
                         // the `next`/`current`/`index` fields the JDK's own
                         // `HashIterator` bodies walk. Companion entry in
                         // native_override::force_native_over_real_jdk_bytecode.
+                        // See the companion note in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap$Node"
+                                    | "java/util/LinkedHashMap$Entry"
+                                    | "java/util/TreeMap$Entry"
+                                    | "java/util/concurrent/ConcurrentHashMap$MapEntry"
+                                    | "java/util/Hashtable$Entry"
+                            )
+                            && method_name == "setValue")
                         || (matches!(
                                 class_name,
                                 "java/util/HashMap$KeyIterator"
                                     | "java/util/HashMap$EntryIterator"
                                     | "java/util/LinkedHashMap$LinkedKeyIterator"
                                     | "java/util/LinkedHashMap$LinkedEntryIterator"
+                                    // See the companion note in
+                                    // native_override::force_native_over_real_jdk_bytecode.
+                                    | "java/util/HashMap$ValueIterator"
+                                    | "java/util/LinkedHashMap$LinkedValueIterator"
+                                    | "java/util/TreeMap$ValueIterator"
+                                    | "java/util/TreeMap$EntryIterator"
                             )
                             && matches!(method_name, "hasNext" | "next" | "remove"))
                         // The serialization hooks of the immutable-collection
