@@ -4287,6 +4287,12 @@ pub mod spring_startup_bootstrap;
 pub mod unsafe_jdk25;
 pub mod unsafe_natives;
 pub mod vector_api;
+// The real-JDK half of the Vector API: `vector_api` is the synthetic
+// implementation and is unreachable when the real `jdk.incubator.vector` is on
+// the module path, because a real receiver is a concrete `Int256Vector`. This
+// one intercepts `jdk.internal.vm.vector.VectorSupport`, which every lane
+// operation funnels through in BOTH modes.
+pub mod vector_support_intrinsics;
 // WP2.3-B — `MethodHandles.Lookup.defineClass` /
 // `defineHiddenClass` / `defineHiddenClassWithClassData` natives.
 // Routes through `NativeContext::define_class_full` with
@@ -7352,6 +7358,10 @@ pub fn register_essential_natives_with_shims(
     // java.base. Keep them in the real-JDK essential path; the broader
     // incubator Vector API shims remain synthetic-only overrides.
     crate::vector_api::register_vector_support_natives(registry);
+    // The `VectorSupport` operations HotSpot intrinsifies. MUST stay in this
+    // registrar, not a `phases_late` one: `register_synthetic_overrides` does
+    // not run in real-JDK mode, which is exactly where these are needed.
+    crate::vector_support_intrinsics::register_vector_support_intrinsics(registry);
     crate::lang_system::register_runtime_natives(registry);
 
     // Synthetic-stream `spliterator()` natives — synthetic stream objects
