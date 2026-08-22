@@ -11,10 +11,15 @@
 //! It is file-disjoint from the existing `register_watch_service` (which
 //! targets the public Java-level `java/nio/file/WatchService`) — the public
 //! API natives there back the synthetic-jdk fallback layout. The natives
-//! registered here back the real JDK 25 `sun.nio.fs.UnixWatchService` /
-//! `WindowsWatchService` / `PollingWatchService` / `AbstractWatchService`
-//! pipeline, where the JDK Java code orchestrates queueing/registration and
-//! we provide only the OS-level notification helpers.
+//! registered here were WRITTEN AS IF they back the real JDK 25
+//! `sun.nio.fs.*WatchService` pipeline. **They do not, and 2026-08-22 measured
+//! it:** the `*0` method names below appear on no class in any JDK image (the
+//! real `LinuxWatchService` natives are `inotifyInit` / `inotifyAddWatch` /
+//! `socketpair` / `poll(int,int)` and friends), so every triple here is a
+//! CratonVM-defined API wearing a `sun.nio.fs` name. Measured `invocations: 0`
+//! in `--real-jdk` and absent from the `--jdk-only` registry entirely, with the
+//! real `WatchService` delivering events on this VM regardless. See
+//! `register_watch_service_real`'s doc comment for the full measurement.
 //!
 //! ## Backing strategy
 //!
@@ -54,15 +59,15 @@
 //!   * `sun/nio/fs/AbstractWatchService.<init>()` → no-op (Java side
 //!     allocates state; we register a callable native to cover any path
 //!     where the class file declares `<init>` as `native`).
-//!   * `sun/nio/fs/UnixWatchService.poll0(long)`  → blocking poll with
+//!   * `<WatchService impl>.poll0(long)`  → blocking poll with
 //!     timeout in ns; returns a key id or 0.
-//!   * `sun/nio/fs/UnixWatchService.take0()` → blocking take; returns a
+//!   * `<WatchService impl>.take0()` → blocking take; returns a
 //!     key id (never 0 unless the service was closed).
-//!   * `sun/nio/fs/UnixWatchService.register0(String dir, int kinds)`
+//!   * `<WatchService impl>.register0(String dir, int kinds)`
 //!     → returns a key id (≥ 1).
-//!   * `sun/nio/fs/UnixWatchService.cancel0(int keyId)`
-//!   * `sun/nio/fs/UnixWatchService.close0()`
-//!   * `sun/nio/fs/UnixWatchService.pollEvents0(int keyId)` →
+//!   * `<WatchService impl>.cancel0(int keyId)`
+//!   * `<WatchService impl>.close0()`
+//!   * `<WatchService impl>.pollEvents0(int keyId)` →
 //!     `int[]` packed as `[kind, name_id, kind, name_id, ...]` plus a
 //!     companion `String[]` retrieval native `pollEventNames0(int keyId)`
 //!     since returning a Java `List<WatchEvent>` from a native is
@@ -795,12 +800,54 @@ fn take_stashed_names(ws_id: i32, key: i32) -> Vec<String> {
 ///
 ///   * `sun/nio/fs/AbstractWatchService` — base class, covers any direct
 ///     `<init>` dispatch.
-///   * `sun/nio/fs/UnixWatchService` — Linux/macOS/BSD platform impl.
+///   * `sun/nio/fs/LinuxWatchService` — the Linux inotify impl.
+///   * `sun/nio/fs/BsdWatchService` / `sun/nio/fs/MacOSXWatchService` /
+///     `sun/nio/fs/PollingWatchService` — the other Unix impls.
 ///   * `sun/nio/fs/WindowsWatchService` — Windows IOCP-backed impl.
-///   * `sun/nio/fs/PollingWatchService` — pure-Java fallback. We also
-///     register on it so a Java-side caller that explicitly builds one
-///     (e.g. via `FileSystems.getFileSystem(URI)` for a custom FS) still
-///     gets real OS-level notifications.
+///
+/// # CORRECTION 2026-08-22 (WORKER 4): the list named a class that does not
+/// # exist, and the METHOD names do not exist either
+///
+/// The fourth entry used to be `sun/nio/fs/UnixWatchService`, described as the
+/// "Linux/macOS/BSD platform impl". **There is no such class in any JDK image.**
+/// MEASURED, `javap --module java.base`, Temurin 25.0.4+7 on Linux:
+///
+/// ```text
+///   sun.nio.fs.AbstractWatchService   PRESENT
+///   sun.nio.fs.LinuxWatchService      PRESENT
+///   sun.nio.fs.UnixWatchService       absent      <- the name this list used
+///   sun.nio.fs.PollingWatchService    absent      (present on macOS/AIX images)
+///   sun.nio.fs.WindowsWatchService    absent      (present on Windows images)
+/// ```
+///
+/// **And the method names below are CratonVM's own, not the JDK's.** The real
+/// natives on `sun.nio.fs.LinuxWatchService` are
+///
+/// ```text
+///   eventSize()  eventOffsets()  inotifyInit()  inotifyAddWatch(int,long,int)
+///   inotifyRmWatch(int,int)  configureBlocking(int,boolean)
+///   socketpair(int[])  poll(int,int)
+/// ```
+///
+/// — not `init0` / `register0` / `take0` / `poll0(J)` / `cancel0` / `close0` /
+/// `reset0` / `pollEventKinds0` / `pollEventNames0`. So every triple registered
+/// below names a method that no class in the image declares, on top of one
+/// class name that names nothing at all.
+///
+/// **That is why they are inert, and the inertness is measured, not inferred.**
+/// `--dump-native-registry` over the corpus: every row here is
+/// `invocations: 0` in `--real-jdk`, and the whole family is absent from the
+/// `--jdk-only` registry because `SyntheticStub` is refused at the door. The
+/// retag note below already measured the third thing that matters — that the
+/// real `WatchService` delivers events on this VM with these natives refused.
+///
+/// **Kept rather than deleted, deliberately.** They cost nothing at runtime and
+/// the list is the honest record of an API CratonVM defined; deleting it is a
+/// separate change that needs a `--features synthetic-jdk` build to clear,
+/// which this lane did not make. What is fixed here is the part that was
+/// actively wrong: a class name that exists nowhere, and a doc comment that
+/// presented this family as backing "the real JDK 25 pipeline". See
+/// `WORKER-4-2` N5.
 pub fn register_watch_service_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     // RETAGGED 2026-08-19 (P0 "wholesale Bridge over-tagging"), and this is the
@@ -826,9 +873,14 @@ pub fn register_watch_service_real(r: &mut NativeMethodRegistry) {
     // why `Vector` elsewhere in this tree is recorded as unproven rather than
     // safe.
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    // `sun/nio/fs/UnixWatchService` was here until 2026-08-22 and names no class
+    // in any JDK image; `LinuxWatchService` is the Linux one. See the
+    // measurement in this function's doc comment.
     let classes = [
         "sun/nio/fs/AbstractWatchService",
-        "sun/nio/fs/UnixWatchService",
+        "sun/nio/fs/LinuxWatchService",
+        "sun/nio/fs/BsdWatchService",
+        "sun/nio/fs/MacOSXWatchService",
         "sun/nio/fs/WindowsWatchService",
         "sun/nio/fs/PollingWatchService",
     ];

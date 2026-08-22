@@ -501,14 +501,29 @@ which is how a census over-counts what it thinks it covers.
 
 ---
 
-**N6 — the `java/io/{Input,Output}Stream` base-class rows are a hand-written
-copy of `java.base`, kept alive by a fabricated receiver.** §8.2. The retirement
-is blocked by the "bare `InputStream`-typed receiver with a
-`ByteArrayInputStream` layout" population that `URL.openStream()` /
-`getResourceAsStream()` produce. Make THOSE mint a real
-`java.io.ByteArrayInputStream` — the thirteenth instance of this record's own
-species — and fourteen §1.4 shadows become retireable with no behaviour change.
-That is the shape of the next lane in this file.
+**N6 — CLOSED, by `WORKER-4-2` §4.** It read: *"the
+`java/io/{Input,Output}Stream` base-class rows are a hand-written copy of
+`java.base`, kept alive by a fabricated receiver … make `URL.openStream()` /
+`getResourceAsStream()` mint a real `java.io.ByteArrayInputStream` and fourteen
+§1.4 shadows become retireable."*
+
+**The premise was already false and nothing had measured it.**
+`regression-suite/probes/W4StreamCarrier.java` asks all fifteen carriers, in
+both modes: `URL.openStream()`, `URLConnection.getInputStream()`,
+`Class.getResourceAsStream()` and `ClassLoader.getResourceAsStream()` **already
+return a concrete `java.io.ByteArrayInputStream`**, and `abstractOrInterface`
+is 0 of 15. The bare-`InputStream` receiver the rows were written for had
+stopped being produced; nothing connected the two, so the natives stayed.
+
+Eleven of the rows are retired in `WORKER-4-2` §4.3, verified on a build
+(`107/107 · 107/107 · 67/67`, four probes green). Three were deliberately left
+and each has a stated reason there.
+
+**The transferable half is the inverse of this record's own finding.** A
+fabricated receiver justifies natives; when somebody fixes the fabrication, the
+natives it justified do not go with it, because no instrument links a
+registration to the mint that made it necessary. `[a consumer without a producer
+reads as a feature]`.
 
 **N7 — the `java.io` shadow surface, counted.** MEASURED, registration level,
 unioned over all 105 vectors' registry dumps:
@@ -535,4 +550,5 @@ command from the `invcensus` / `ioadjudicate` pair this lane used.
   reaches 105/105 / 105/105 / 65/65 on Linux; the `getClass()` alias table is a
   SECOND mechanism for the same defect; a mint move needs THREE halves, not two;
   the shadow census was being suppressed by the fabrication in two ways at once;
-  `H11-3` N3's superclass-walk hazard is measured NOT LIVE, with a witness.
+  `H11-3` N3's superclass-walk hazard is measured NOT LIVE, with a witness, and
+  eleven of the rows it was about are retired in the companion record.

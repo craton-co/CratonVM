@@ -7380,45 +7380,71 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     registry.register(baos, "flush", "()V", native_baos_flush);
 
     // --- java.io.InputStream (base class fallback) ---
+    //
+    // ELEVEN ROWS RETIRED FROM THIS BLOCK AND THE `OutputStream` ONE BELOW,
+    // 2026-08-22 (WORKER 4). What is left is the two rows that are NOT section
+    // 1.4 shadows, because the method they answer is ABSTRACT in `java.base` and
+    // has no bytecode to shadow: `InputStream.read()I` and
+    // `OutputStream.write(I)V`.
+    //
+    // # What was here, and why it is not any more
+    //
+    // `read([B)I`, `read([BII)I`, `available()I`, `close()V`, `skip(J)J`,
+    // `readAllBytes()[B`, `readNBytes(I)[B` and `readNBytes([BII)I` on
+    // `java/io/InputStream`; `write([BII)V`, `flush()V` and `close()V` on
+    // `java/io/OutputStream`. Every one of them stood in front of a real
+    // `java.base` body, and the bodies here were transcriptions of those bodies
+    // -- `native_bais_read_bytes`, for a receiver that is not one of ours, ran
+    // `invoke_virtual(this, "read", "()I")` in a loop, which is
+    // `InputStream.read(byte[],int,int)`'s JDK default written out in Rust.
+    //
+    // # The population they existed for no longer exists
+    //
+    // The comment that used to sit on `native_bais_read_bytes` named it:
+    // *"synthetic streams (URL.openStream, getResourceAsStream) that materialise
+    // as bare InputStream-typed receivers but actually have the
+    // ByteArrayInputStream layout in slots 0..3"*. A BARE `java.io.InputStream`
+    // receiver is a JVMS 6.5 defect in its own right -- the class is abstract --
+    // and `regression-suite/probes/W4StreamCarrier.java` (added for this) asks
+    // whether any survives. MEASURED, 15 carriers, BOTH modes:
+    //
+    //     abstractOrInterface = 0
+    //     URL.openStream()                  -> java.io.ByteArrayInputStream
+    //     URLConnection.getInputStream()    -> java.io.ByteArrayInputStream
+    //     Class.getResourceAsStream()       -> java.io.ByteArrayInputStream
+    //     ClassLoader.getResourceAsStream() -> java.io.ByteArrayInputStream
+    //
+    // Every one of them is a CONCRETE `ByteArrayInputStream`, which has its own
+    // exact-class registrations twenty lines above and reaches them first. The
+    // fallback was serving a shape the VM stopped producing.
+    //
+    // # And the shape it DOES still serve is measured identical without it
+    //
+    // `regression-suite/probes/W4BaseStream.java` drives the other population --
+    // an application subclass that declares only the abstract primitive and
+    // inherits the rest, which reaches these rows through the superclass walk
+    // (`H11-1`, `H11-3` N3). MEASURED, 26 cases, ZERO diffs against HotSpot
+    // 25.0.4+7 in both modes, and `--dump-native-registry` on the same run shows
+    // thirteen of the fourteen rows taking `invocations: 0` while
+    // `read([BII)I` takes 1 -- the positive control that makes the zeros
+    // informative rather than merely absent (`[zero@consumer]`).
+    //
+    // # Trap 4, per row rather than assumed
+    //
+    // `--dump-native-registry` unioned over 105 per-vector strict-mode boots:
+    // `dupX = 0` for all eleven. The deletions remove eleven rows and promote
+    // nobody. Two rows in these families were DELIBERATELY LEFT, and both have
+    // a rival underneath:
+    //
+    //   * `java/io/OutputStream.write([B)V` -- `native-builtins/src/lib.rs`
+    //     owns it, `invocations = 10`. Not this crate's to retire.
+    //   * `java/io/InputStream.transferTo` -- `phases_late/zip_streams.rs`
+    //     registers the same triple, so retiring this copy PROMOTES that one.
+    //     See the note on its registration below.
+    //
+    // `java/io/FilterOutputStream.close()V` also stays: `dupX = 1`, and the
+    // comment on it records the kafka gzip truncation it was added for.
     registry.register("java/io/InputStream", "read", "()I", native_bais_read);
-    registry.register(
-        "java/io/InputStream",
-        "read",
-        "([B)I",
-        native_bais_read_byte_array,
-    );
-    registry.register(
-        "java/io/InputStream",
-        "read",
-        "([BII)I",
-        native_bais_read_bytes,
-    );
-    registry.register(
-        "java/io/InputStream",
-        "available",
-        "()I",
-        native_bais_available,
-    );
-    registry.register("java/io/InputStream", "close", "()V", native_bais_close);
-    registry.register("java/io/InputStream", "skip", "(J)J", native_is_skip);
-    registry.register(
-        "java/io/InputStream",
-        "readAllBytes",
-        "()[B",
-        native_is_read_all_bytes,
-    );
-    registry.register(
-        "java/io/InputStream",
-        "readNBytes",
-        "(I)[B",
-        native_is_read_n_bytes,
-    );
-    registry.register(
-        "java/io/InputStream",
-        "readNBytes",
-        "([BII)I",
-        native_is_read_n_bytes_buf,
-    );
     // `SyntheticStub`, stated. `java.io.InputStream.transferTo` is ordinary
     // bytecode in `java.base` — a read/write loop — so contract §1.5 cannot call
     // this a bridge, and `phases_late/zip_streams.rs` registers the same triple
@@ -7434,15 +7460,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // --- java.io.OutputStream (base class fallback) ---
+    // `write([BII)V`, `flush()V` and `close()V` retired here -- see the note on
+    // the `InputStream` block above, which covers both families. `write(I)V`
+    // stays because `java.io.OutputStream.write(int)` is ABSTRACT: there is no
+    // bytecode behind it, so it is a stand-in and not a shadow.
     registry.register("java/io/OutputStream", "write", "(I)V", native_baos_write);
-    registry.register(
-        "java/io/OutputStream",
-        "write",
-        "([BII)V",
-        native_baos_write_bytes,
-    );
-    registry.register("java/io/OutputStream", "flush", "()V", native_baos_flush);
-    registry.register("java/io/OutputStream", "close", "()V", native_baos_close);
     // FilterOutputStream.close() MUST flush and then close the wrapped stream
     // (`out`, slot 0). Without this, a `DataOutputStream`/`BufferedOutputStream`
     // wrapping e.g. a `GZIPOutputStream` resolved its inherited `close()` to the
@@ -7541,38 +7563,15 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
 // any concrete InputStream subtype registered in the native registry.
 // ===========================================================================
 
-/// InputStream.skip(long n) → skip n bytes via repeated read()
-fn native_is_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Long(0))),
-    };
-    let n = match args.get(1) {
-        Some(Value::Long(v)) => *v,
-        Some(Value::Int(v)) => *v as i64,
-        _ => 0,
-    };
-    let mut skipped: i64 = 0;
-    // Each delegated read is GC-capable; `this` is reused by the next loop
-    // iteration, so a raw native local would become stale after a collection.
-    let this_pin = ctx.pin_native_root(this);
-    for _ in 0..n {
-        let this = ctx.read_native_pin(this_pin, this);
-        let b = match ctx.invoke_virtual(this, "read", "()I", &[]) {
-            Ok(result) => result,
-            Err(error) => {
-                ctx.unpin_native_roots(this_pin);
-                return Err(error);
-            }
-        };
-        match b {
-            Some(Value::Int(-1)) | None => break,
-            _ => skipped += 1,
-        }
-    }
-    ctx.unpin_native_roots(this_pin);
-    Ok(Some(Value::Long(skipped)))
-}
+// `native_is_skip`, `native_is_read_n_bytes` and `native_is_read_n_bytes_buf`
+// were DELETED 2026-08-22 (WORKER 4) with the `java/io/InputStream` rows that
+// were their only call sites -- see the retirement note on that registration
+// block. Each was a Rust transcription of the corresponding `java.base` default
+// body; `git log -S native_is_read_n_bytes` has them.
+//
+// `native_is_read_all_bytes` SURVIVES and is deliberately not deleted with
+// them: `process.rs` registers it on its own class, so it has a live call site
+// that does not go through the base-class fallback.
 
 /// InputStream.readAllBytes() → byte[] (Java 9+)
 ///
@@ -7645,113 +7644,6 @@ pub(crate) fn native_is_read_all_bytes(
     let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
     ctx.write_byte_array_from(arr, 0, &bytes);
     Ok(Some(Value::Object(Some(arr))))
-}
-
-/// InputStream.readNBytes(int n) → byte[] (Java 11+) — reads exactly n bytes (or EOF)
-///
-/// Same one-byte-per-`invoke_virtual` slowness as `native_is_read_all_bytes`
-/// (see its doc comment) — rewritten to the same bulk-`read([BII)I` pattern.
-fn native_is_read_n_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => {
-            let arr = ctx.new_array(ArrayElementType::Byte, 0);
-            return Ok(Some(Value::Object(Some(arr))));
-        }
-    };
-    let n = match args.get(1) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
-        _ => 0,
-    };
-
-    let this_pin = ctx.pin_native_root(this);
-    const CHUNK: usize = 16 * 1024;
-    let chunk_len = n.min(CHUNK).max(1);
-    let chunk_buf = ctx.new_array(ArrayElementType::Byte, chunk_len);
-    let chunk_pin = ctx.pin_native_root(chunk_buf);
-    let mut bytes: Vec<u8> = Vec::with_capacity(n);
-    let mut scratch = vec![0u8; chunk_len];
-    while bytes.len() < n {
-        let want = (n - bytes.len()).min(chunk_len);
-        let this_cur = ctx.read_native_pin(this_pin, this);
-        let chunk_cur = ctx.read_native_pin(chunk_pin, chunk_buf);
-        let read = match ctx.invoke_virtual(
-            this_cur,
-            "read",
-            "([BII)I",
-            &[
-                Value::Object(Some(chunk_cur)),
-                Value::Int(0),
-                Value::Int(want as i32),
-            ],
-        ) {
-            Ok(Some(Value::Int(r))) if r > 0 => r as usize,
-            Ok(_) => break,
-            Err(e) => {
-                ctx.unpin_native_roots(this_pin);
-                return Err(e);
-            }
-        };
-        let chunk_cur = ctx.read_native_pin(chunk_pin, chunk_buf);
-        let copied = ctx.read_byte_array_into(chunk_cur, 0, &mut scratch[..read]);
-        bytes.extend_from_slice(&scratch[..copied]);
-    }
-    ctx.unpin_native_roots(this_pin);
-    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
-    ctx.write_byte_array_from(arr, 0, &bytes);
-    Ok(Some(Value::Object(Some(arr))))
-}
-
-/// InputStream.readNBytes(byte[] buf, int off, int len) → int (Java 11+)
-///
-/// Same one-byte-per-`invoke_virtual` slowness as `native_is_read_all_bytes`
-/// — rewritten to bulk-read directly into the caller's own `buf` (no extra
-/// copy needed since the destination is already a real array).
-fn native_is_read_n_bytes_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let buf = match args.get(1) {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
-        _ => 0,
-    };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => (*v).max(0) as usize,
-        _ => 0,
-    };
-
-    let this_pin = ctx.pin_native_root(this);
-    let buf_pin = ctx.pin_native_root(buf);
-    let mut count = 0usize;
-    while count < len {
-        let this_cur = ctx.read_native_pin(this_pin, this);
-        let buf_cur = ctx.read_native_pin(buf_pin, buf);
-        let read = match ctx.invoke_virtual(
-            this_cur,
-            "read",
-            "([BII)I",
-            &[
-                Value::Object(Some(buf_cur)),
-                Value::Int((off + count) as i32),
-                Value::Int((len - count) as i32),
-            ],
-        ) {
-            Ok(Some(Value::Int(r))) if r > 0 => r as usize,
-            Ok(_) => break,
-            Err(e) => {
-                ctx.unpin_native_roots(this_pin);
-                return Err(e);
-            }
-        };
-        count += read;
-    }
-    ctx.unpin_native_roots(this_pin);
-    Ok(Some(Value::Int(count as i32)))
 }
 
 /// InputStream.transferTo(OutputStream out) -> long (Java 9+)
