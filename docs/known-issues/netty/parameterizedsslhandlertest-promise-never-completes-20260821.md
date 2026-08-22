@@ -1,135 +1,231 @@
-# `ParameterizedSslHandlerTest` — a netty promise that never completes, ~1 run in 13
+# `ParameterizedSslHandlerTest` — a completed promise whose waiter is never woken
 
-**Status: OPEN, and RE-SCOPED. It is one defect, it is not TLS-specific, and it
-is not either of the two mechanisms the previous revision proposed.** Six
-observations now span **five different test methods** and **four different
-awaited operations** — including `ServerBootstrap.bind()`, which involves no
-TLS, no peer and no close_notify at all.
+**Status: ROOT CAUSE LOCALISED. The awaited promise is ALREADY COMPLETE and the
+waiter IS registered, yet the thread stays parked in `Object.wait()` forever.
+This is a memory-ordering defect around CratonVM's monitor, not a netty, TLS or
+selector problem.** The remaining work is to decide which of two reads went
+stale and to fix it.
 
-Supersedes `…-promise-never-completes-20260820.md`, whose §"What it would take
-to close" asked whether the two known wait sites were one defect. They are, and
-the question was too narrow: there are not two sites.
+## The measurement that settles it
 
-## The rate
-
-**3 stalls in 40 runs (7.5%)** on a clean loop, `dev` @ `c21d766ad`, Linux
-(Azure `vm1`), G1, `--stack-dump-on-timeout=420`. Consistent with the previously
-recorded ~1 in 14. A passing run is ~78 s; a stalled one burns the full 420 s
-watchdog.
-
-## Six observations — the wait site is not the variable
-
-Every BCI below was resolved with `javap -c -l` before being named, per this
-page's own earlier lesson.
-
-| # | test method | awaited object | operation |
-|---|---|---|---|
-| 1 | `testCloseNotifyNotWaitForResponse` | `ChannelFuture` | **connect** |
-| 2 | `testAlertProducedAndSend` | `Promise` | alert → `exceptionCaught` |
-| 3 | `reentryOnHandshakeCompleteNioChannel` | `ChannelFuture` | **close** |
-| 4 | `testCompositeBufSizeEstimationGuaranteesSynchronousWrite` | `ChannelFuture` | **bind** |
-| 5 | `testCloseNotifyReceivedTimeout` | `Promise` | close_notify |
-| 6 | `testCompositeBufSizeEstimationGuaranteesSynchronousWrite` | `ChannelFuture` | **close** |
-
-Rows 3–6 are new. Row 4 is the one that settles the framing:
+At stall time, with the watchdog dumping the state of the object the thread is
+parked on:
 
 ```
-140: invokevirtual ServerBootstrap.bind:(Ljava/net/SocketAddress;)Lio/netty/channel/ChannelFuture;
-143: invokeinterface ChannelFuture.syncUninterruptibly:()   <-- parked here
+[WAIT-OBJECT] obj=0x2004a843cc8
+  class=io/netty/bootstrap/AbstractBootstrap$PendingRegistrationPromise
+  result=Some(Object(Some(ObjectRef { ptr: 0x200437e6c08 })))
+  waiters=Some(Int(1))
 ```
 
-A server bind has no TLS engine, no peer, and no alert. **Any promise completed
-by the netty event loop can fail to complete.** The close_notify and alert
-stories were both artifacts of small samples.
+Both halves matter:
 
-## What the stall actually looks like
+* **`result != null`** — the promise **has completed**. Nothing is outstanding;
+  the reactor did its job.
+* **`waiters == 1`** — the parked thread **did** register itself
+  (`incWaiters()`) before calling `wait()`.
 
-Measured with a new selector census printed by the watchdog
-(`nio_selector::dump_selector_state_to_stderr`, this branch) plus `/proc`
-sampling of a live stalled process.
+> ### ⚠ This dump is UNSOUND under a moving collector — read the caveat
+>
+> `Monitor::wait` captures the awaited `ObjectRef` at entry and holds it as a
+> plain Rust local for the whole wait. **Nothing remaps it.** `monitor_wait`
+> does remap once, from the GC pointer map, but only *before* entering the wait;
+> after that the thread is parked and any G1 evacuation moves the promise out
+> from under that address. Over a 420 s stall there are many collections.
+>
+> **Correction:** an earlier revision of this box also named
+> `thread_registry`'s `jmx_waiting_monitor` as unforwarded. That was **wrong**.
+> It is pushed into `all_roots` during root scanning and rewritten by
+> `update_thread_objs_after_gc` (gc.rs step 21) — exactly as its own doc comment
+> claims. The only unforwarded reference was ever `Monitor::wait`'s local, and
+> the registry copy is therefore the fix, not a second instance of the bug.
+>
+> So the `[WAIT-OBJECT]` line above may be reading the **pre-relocation copy**,
+> and G1 leaves that copy intact in the from-region until it is reused — which
+> is exactly why the fields still parse as a plausible `DefaultPromise`. The
+> same applies to the orphan check below: its `0 hits` is not trustworthy in
+> either direction, because it re-reads the mark word through the same stale
+> address.
+>
+> **The conclusion does not rest on this dump.** It rests on the
+> `CRATONVM_WAIT_SPURIOUS_MS` A/B: waking the parked thread makes the run
+> complete, and when it wakes it re-evaluates `isDone()` *in Java*, through a
+> properly remapped reference. That is sound, and it is what establishes the
+> promise was already complete. Treat the field dump as corroboration that has
+> not earned its place until the handle is made GC-safe.
+>
+> Fixing the instrument means holding the awaited object in something the
+> collector forwards (a pinned native root, or re-reading it from a scanned
+> slot on each 5 ms poll) — worth doing before this dump is cited again.
 
-**The reactors are alive and cycling — not deadlocked, not blocked forever.**
-Two `/proc` samples 6 s apart on a live stall: of 10 threads in `ep_poll` at
-sample A, **4 had left it by sample B**, and several moved `utime`. They enter
-and leave `epoll_wait` normally.
+And it is parked at `DefaultPromise.awaitUninterruptibly` BCI 31, which `javap`
+resolves to `Object.wait()`, in `futex_do_wait`, burning no CPU.
 
-**The event loop group for the stalled test is alive.** In the stall analysed,
-group 67 had 3 live threads; groups 60–66 were fully dead (expected — earlier
-tests).
+So a `notifyAll()` that should have been sent either never was, or was sent to a
+monitor with no waiters recorded. netty's completer is:
 
-**At stall time exactly ONE key is registered in the entire process:**
-
-```
-selector id=1042 open=true woken=false in_flight_selects=1 keys=1
-  slot=1610612931 net_fd=1610612931 interest=0x10 ready=0x0 cancelled=false listener=true
-```
-
-`interest=0x10` is `OP_ACCEPT` — the server listener. The channel whose
-`close()` promise is pending is **not registered with any selector**, and
-`woken=false` on every open selector, so no wakeup is outstanding either.
-
-## Two mechanisms refuted
-
-**Lost `wakeup()` is not it, in isolation.** netty's `NioIoHandler` blocks in
-`Selector.select(timeoutMillis)` (resolved: `NioIoHandler.select@136` is
-`Selector.select:(J)I`, the *timed* overload — not the indefinite one), so a
-lost wakeup only costs latency. A dedicated probe
-(`probes/SelectorWakeupRaceProbe.java`, sweeping the select-entry window)
-issued 5000 wakeups against a blocked `select()`: **0 lost on CratonVM, 0 on
-HotSpot**.
-
-**"The timed select never returns" is not it either.** That was the natural
-reading of a thread deposited at `NioIoHandler.select@136` for 420 s, but a
-deposit cannot distinguish *blocked once* from *looping*. The `/proc` samples
-show looping. Do not read a repeated deposit as a single long block.
-
-## A separate defect found on the way: the selector registry never shrinks
-
-The census counted **1056 selectors, 1040 of them `open=false`**, in a single
-run of one test class.
-
-`selector_close` sets `st.open = false`; the only mutation of the registry map
-is the `insert` in `selector_register_new`. Nothing ever removes an entry, so
-the map grows monotonically for the life of the process.
-
-That is not merely memory: `deregister_fd_everywhere` — called on **every
-channel close** — does
-
-```rust
-let regs = selectors_read();
-for (_sel_id, sel) in regs.iter() {
-    let mut st = sel.lock();          // every selector, open or long dead
-    st.keys.remove(&net_fd);
+```java
+private synchronized boolean checkNotifyWaiters() {
+    if (waiters > 0) { notifyAll(); }   // waiters is a PLAIN int
+    ...
 }
 ```
 
-so each channel close acquires ~1000 mutexes by the end of this class, and more
-in a longer-lived process. Worth fixing on its own merits, and a plausible
-contributor to a timing-sensitive race that only shows up well into a run.
-**Not yet demonstrated to cause this stall** — the stalls here occur at varied
-points, and a leak that grows monotonically would predict a strong bias toward
-late tests, which the six observations do not obviously show.
+and the waiter's side is
 
-## What to do next
+```java
+synchronized (this) {                    // DefaultPromise.await*, BCI 18
+    while (!isDone()) {                  // BCI 20 — volatile read of `result`
+        incWaiters();                    // BCI 27 — waiters++
+        wait();                          // BCI 31
+    }
+}
+```
 
-1. **Instrument the netty side, not the selector.** The selector state at stall
-   time is unremarkable: reactors cycling, no outstanding wakeup, no stuck key.
-   The unanswered question is whether the pending task is in an event loop's
-   task queue at all. A `taskQueue.size()` / `hasTasks()` probe at watchdog time
-   would separate "task queued and never run" from "task never queued".
-2. Fix the registry leak and re-measure the rate. It is a real defect
-   regardless, and removing it removes a confound.
-3. Keep the census (cheap, only fires on the watchdog) and add the pending-task
-   count to it.
+Both blocks synchronize on the same object, and the orphan check (below) proves
+they resolve the same monitor. With correct `synchronized` semantics the
+observed state is unreachable. Exactly one of these reads must have been stale:
+
+1. **the waiter's volatile read of `result` at BCI 20** — if it saw `null` after
+   the completer had already published a non-null `result` and run
+   `checkNotifyWaiters()` (legitimately seeing `waiters == 0`), the waiter parks
+   with nobody left to notify it; or
+2. **the completer's plain read of `waiters`** — if it saw `0` after the
+   waiter's `waiters++` inside the monitor, it skips `notifyAll()` entirely.
+
+Either is a happens-before failure across `monitorenter`/`monitorexit`.
+
+## Why it is none of the things previously proposed
+
+| hypothesis | how it died |
+|---|---|
+| close_notify never arrives / alert never flushed | six observations span **five** test methods and **four** operations, incl. `ServerBootstrap.bind()` — no TLS, no peer, no alert |
+| lost `Selector.wakeup()` | `NioIoHandler.select@136` resolves to `Selector.select:(J)I`, the **timed** overload, so a lost wakeup costs latency not a hang; a sweeping probe lost **0 of 5000** wakeups |
+| the timed select never returns | two `/proc` samples 6 s apart: 4 of 10 threads left `ep_poll`, several moved `utime` — the reactors cycle normally |
+| a moving GC relocates the monitor | the monitor lives in the object's **mark word**, so it travels with the object |
+| `prune_dead` orphans the waiter | only ZGC calls it; these runs are **G1**, which calls `remap_after_gc` only |
+| the waiter is orphaned from its monitor | the orphan check re-reads the mark word on the existing 5 ms poll — **0 hits on a reproduced stall**, and it is on the branch that actually runs (`interrupted` is always `Some`) |
+
+## Rate, and what does not move it
+
+| arm | runs | stalls |
+|---|---:|---:|
+| baseline (`c21d766ad`) | 40 | 3 |
+| baseline (spurious binary, switch OFF) | 40 | 2 |
+| `CRATONVM_JIT_DENY=DefaultPromise` (orphan binary) | 10 | 0 |
+| `CRATONVM_JIT_DENY=DefaultPromise` (fields binary, engagement proven) | 50 | **4** |
+
+~5–7.5%.
+
+**The JIT is REFUTED.** The first deny arm (0/10) proved nothing — 10 runs at a
+6% rate expects 0.6 — so it was re-run toward 50 with the lever's engagement
+proven first (below). It stalled at **run 4**, which settled it without needing
+50 — 50 runs were only ever required to demonstrate *absence*, and one stall
+demonstrates *presence*. The arm was left to finish anyway and ended
+**4 stalls in 50 (8%)**, statistically indistinguishable from the 6.25%
+baseline (5/80): the lever moves the rate not at all. The stalled run carries the identical signature, with
+`DefaultPromise` force-interpreted:
+
+```
+[WAIT-OBJECT] class=io/netty/util/concurrent/DefaultPromise
+              result=Some(Object(Some(...)))  waiters=Some(Int(1))
+orphan hits: 0
+```
+
+So the stale read is **not** in `DefaultPromise`'s compiled code, and a compiled
+`monitorenter`/`monitorexit` missing a fence is no longer the candidate. **The
+defect is tier-independent — it is in the VM's monitor implementation itself**
+(the interpreter path included), or in the `Object.wait`/`notifyAll`
+bookkeeping around it.
+
+Engagement was proven before trusting either arm: with the lever set,
+`still-interpreted` rises 20 → 32 and the hot-but-stuck list names the denied
+methods outright —
+
+```
+42036 invocations  compile-failed  DefaultPromise.isDone0(Ljava/lang/Object;)Z
+29492 invocations  compile-failed  DefaultPromise.isDone()Z
+```
+
+`isDone`/`isDone0` are precisely the volatile `result` read at BCI 20, i.e. the
+arm did test candidate (1) directly.
+
+## Instruments added (all default-OFF or watchdog-only)
+
+* `nio_selector::dump_selector_state_to_stderr` — selector key census on the
+  watchdog. Showed the selector side is unremarkable: reactors cycling, no
+  outstanding wakeup, and exactly one key process-wide (the listener,
+  `OP_ACCEPT`, `ready=0`).
+* `CRATONVM_WAIT_SPURIOUS_MS=<n>` — makes an untimed `Object.wait()` return to
+  Java after `n` ms (JLS 17.2.1 permits a spurious wakeup). A one-binary A/B:
+  at 30 s, runs that would hang 420 s instead **passed at baseline + 30 s**,
+  which is what first proved the promise was already complete.
+  Engagement-proven: with the switch unset a never-notified waiter parks
+  forever; with it set the waiter returns.
+* the orphan check, and `dump_wait_object_state` (the `[WAIT-OBJECT]` line
+  above) — **both unsound under a moving collector; see the caveat box.**
+
+**Do not read `CRATONVM_WAIT_SPURIOUS_MS` as a fix.** It converts a permanent
+hang into an `n`-second delay by papering over a lost wakeup; at 100 ms it also
+cost 69% wall (72.5 s → 122.8 s), so it is a diagnostic, not a mitigation.
+
+## Also found: the selector registry never shrinks
+
+1056 selectors in one run of one class, 1040 of them closed. `selector_close`
+sets `open = false` and nothing removes the map entry, so
+`deregister_fd_everywhere` — called on **every channel close** — locks ~1000
+dead mutexes by the end of the class. A real defect on its own merits;
+explicitly **not** shown to cause this stall.
+
+## Next
+
+0. ~~Make the wait-site handle GC-safe first~~ — **DONE** (`95c210f37`).
+   `Monitor::wait`'s local was the only unforwarded reference;
+   `jmx_waiting_monitor` was already rooted and remapped, so resolving through
+   it (`install_wait_object_resolve` → `peek_jmx_waiting_monitor`) makes the
+   dump sound. The line now names which handle it used, so a silent fallback
+   cannot pass as a sound reading, and prints an explicit `RELOCATED` line when
+   the entry pointer and the live one disagree — which measures the staleness
+   instead of merely suspecting it.
+
+   **Re-taken, and the original reading holds.** First stall on the GC-safe
+   binary:
+
+   ```
+   [WAIT-OBJECT] handle=registry-remapped obj=0x20061300748
+   [WAIT-OBJECT] class=io/netty/channel/DefaultChannelPromise
+                 result=Some(Object(Some(...)))  waiters=Some(Int(1))
+   ```
+
+   `handle=registry-remapped` confirms the resolver engaged rather than
+   silently falling back. **No `RELOCATED` line** — the entry pointer and the
+   live pointer were identical, so in this instance the promise never moved and
+   the earlier stale-local dumps were in fact reading the right memory. The
+   caveat was worth raising (it was unfalsifiable as written), but the specific
+   failure it warned about did not materialise. `result != null`,
+   `waiters == 1`, no orphan — now on a handle that cannot lie.
+1. A plain missing fence is now UNLIKELY and should not be assumed: the thin
+   path CASes `Acquire` on lock (`try_thin_lock`) and `Release` on unlock
+   (`try_thin_unlock`), and the inflated path goes through a
+   `parking_lot::Mutex` — a release/acquire pair there publishes ordinary heap
+   writes just as well as Java fields, because it is one hardware edge. An
+   earlier revision of this page asserted "nothing publishes them"; that was
+   wrong. Audit instead the **inflation transition** and the
+   thin→inflated handover, where the two orderings meet.
+2. Cheapest confirmation: log `waiters` as the completer reads it, next to the
+   value the waiter wrote — through a GC-safe handle per step 0. A 0-vs-1
+   disagreement names the failing edge directly and needs one stall, not a rate.
+3. Fix the ordering; re-measure the rate over ≥40 runs.
+4. Fix the selector-registry leak independently.
 
 ## Repro
 
 ```bash
-/tmp/sslloop/sslloop.sh 40 <tag>          # rate + watchdog census
-/tmp/sslloop/sslloopC.sh 30 <tag>         # live /proc sampling, no watchdog
+/tmp/sslloop/sslloop.sh 40 <tag>     # rate + watchdog census + [WAIT-OBJECT]
+/tmp/sslloop/sslloopC.sh 30 <tag>    # live /proc sampling, no watchdog
 ```
 
-Both on Azure `vm1`; the binary must be built from this branch for the census.
-`gen-openssl-args.sh -o /tmp/ossl.args` first, and confirm
-`OpenSsl.isAvailable == true` (BoringSSL) or the parameterisations silently
-change.
+Azure `vm1`; `gen-openssl-args.sh -o /tmp/ossl.args` first and confirm
+`OpenSsl.isAvailable == true`. **The host carries other sessions' builds** — a
+load average of 168 on 8 cores was seen, which invalidates any sequential A/B;
+interleave the arms (`/tmp/sslloop/sslab.sh`) or check `uptime` first.

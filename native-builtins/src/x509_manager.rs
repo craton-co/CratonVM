@@ -3419,18 +3419,59 @@ fn ocsp_http_post(
     };
 
     let addr = format!("{host}:{port}");
+    // Every syscall below runs with this thread marked GC-BLOCKED, and that is
+    // not an optimisation — without it this function can hang the whole VM.
+    //
+    // `check_ocsp` is called from certificate validation, i.e. from inside the
+    // TLS handshake, on a thread the collector counts as a cooperative mutator.
+    // A stop-the-world pause that begins while this thread is parked in
+    // `connect`/`write`/`read` then waits for a safepoint the thread cannot
+    // reach until the responder answers — `STW cross-thread JIT takeover is
+    // still waiting for cooperative mutators`, repeating forever. That is
+    // exactly the shape `t27_tls::gc_blocked_syscall` was written for, and this
+    // was the one path still doing raw blocking socket I/O without it.
+    //
+    // DEFENSIVE, and labelled as such: no test in this tree is currently known
+    // to fail because of it. It was added while chasing
+    // `ocsp.TestOcspSoftFailInternalError`, whose log ends on exactly that
+    // warning — but that turned out NOT to be this: the log never reaches an
+    // OCSP fetch at all (`grep -ci ocsp` = 0), and two `/proc` samples 6 s
+    // apart showed `utime` unchanged at 32 with `main-vm` in
+    // `locks_lock_inode_wait`, i.e. blocked on the test fixture's own
+    // `ocsp-responder.lock` flock. That class's real problem is elsewhere; see
+    // `known-issues/tomcat/`.
+    //
+    // What justifies keeping the region anyway is the hazard class, which this
+    // tree has already paid for twice: `t27_tls::gc_blocked_syscall` and
+    // `net_phase_e`'s `re5` note both record a MEASURED, HotSpot-divergent hang
+    // from precisely this shape — a blocking socket call on a thread the
+    // collector still counts as cooperative. `ocsp_http_post` was the last
+    // handshake-reachable path still doing it. The cost is one thread-state
+    // flag per syscall.
+    //
+    // The region goes around the SYSCALL and nowhere wider. `GcBlockingSocket`
+    // puts it there by construction, for the same reason it wraps rustls's
+    // socket rather than rustls's exchange: a GC-blocked thread must not run
+    // bytecode, and the response parsing below allocates.
+    //
     // The host comes from an OCSP responder URL, i.e. text that never passed
     // through `InetAddress` — fold an IPv4-mapped destination to plain IPv4 so
     // Windows can dial it (an AF_INET6 socket cannot reach one). See
     // `outbound_policy::normalize_connect_addr`.
-    let mut stream = cratonvm_native_io::outbound_policy::connect_str_normalized(&addr)
-        .map_err(|e| format!("connect {addr}: {e}"))?;
+    let stream = {
+        let _blocked = crate::t27_tls::gc_blocked_syscall();
+        cratonvm_native_io::outbound_policy::connect_str_normalized(&addr)
+            .map_err(|e| format!("connect {addr}: {e}"))?
+    };
+    // `setsockopt` does not block, so it must NOT open a region — which is what
+    // the wrapper's `get_ref` is for. Set before wrapping, same effect.
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|e| format!("set_write_timeout: {e}"))?;
+    let mut stream = crate::net_phase_e::GcBlockingSocket::new(stream);
 
     let mut req = Vec::with_capacity(256 + request_der.len());
     req.extend_from_slice(format!("POST {path} HTTP/1.1\r\n").as_bytes());
@@ -5103,6 +5144,50 @@ fn check_server_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Publish this thread's native context so the OCSP fetch far below can
+    // mark the thread GC-BLOCKED around its socket syscalls.
+    //
+    // Without this the VM DEADLOCKS, and the path is not the obvious one.
+    // `check_revocation` -> `check_ocsp` -> `ocsp_http_post` blocks in `recv`
+    // on the OCSP responder. `ocsp_http_post` wraps its socket in
+    // `GcBlockingSocket`, but that wrapper calls `gc_blocked_syscall()`, which
+    // reads a thread-local published by `set_active_native_context` and
+    // degrades to an INERT guard when none is. Both existing publishers are on
+    // the HTTPS **client** path (`http_url_connection::perform`, and
+    // `net_phase_e`'s raw-socket path). This is the **server** side —
+    // `checkClientTrusted`, the server validating the client's certificate —
+    // so no context was ever published and the wrapper did nothing.
+    //
+    // MEASURED with `sudo gdb -p` on `ocsp.TestOcspSoftFailInternalError`,
+    // which stalls at a 900 s cap where HotSpot passes 20 tests. The VM logs
+    // `STW cross-thread JIT takeover is still waiting for cooperative mutators
+    // rounds=64 pending=1 taken=0` — exactly one uncooperative thread — and
+    // that thread's stack is:
+    //
+    // ```text
+    //   check_client_trusted -> do_check_trusted -> validate_chain
+    //     -> validate_ordered_chain -> check_revocation -> check_ocsp
+    //       -> ocsp_http_post -> GcBlockingSocket::read -> recv(fd=19)
+    // ```
+    //
+    // It is parked in `recv` while the collector still counts it as a
+    // cooperative mutator, so the stop-the-world request can never be
+    // satisfied: the thread is neither in JIT code (cannot be taken over) nor
+    // at a safepoint (cannot cooperate). Every other thread — including the
+    // client half of the very exchange that responder answer belongs to — is
+    // parked at that barrier behind it.
+    //
+    // Publishing does NOT mark the thread blocked; it only makes the region
+    // `GcBlockingSocket` opens around each syscall reachable. This function
+    // runs Java (`invoke_virtual` on the delegate `TrustManager`, allocations),
+    // which a blocked thread must never do — and does not have to, because the
+    // region covers the syscall and nothing wider. Same split
+    // `t27_tls::gc_blocked_syscall` documents for rustls.
+    //
+    // The guard save/restores rather than clears (see
+    // `ActiveNativeContextGuard`): this is the second publisher, and on the
+    // client path `perform` has already published one that must survive.
+    let _active_ctx = crate::t27_tls::set_active_native_context(ctx);
     let this = this_arg(args)?;
     let id = get_tm_id(ctx, this);
     let chain_val = match args.get(1) {

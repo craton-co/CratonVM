@@ -192,6 +192,18 @@ pub fn signal_stack_dump_to_waiters() {
 /// hot contended-enter path stays byte-for-byte unchanged in normal runs
 /// (plain `entry_condvar.wait`); the poll variant runs only under the flag.
 /// Read once and cached so the per-enter check is a single relaxed load.
+/// `CRATONVM_WAIT_SPURIOUS_MS=<n>` — see the call site in `Monitor::wait`.
+/// Diagnostic only; `None` (unset) leaves the wait loop unchanged.
+fn wait_spurious_ms() -> Option<u64> {
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_WAIT_SPURIOUS_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    })
+}
+
 pub fn mon_enter_dump_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_MONENTER").is_ok())
@@ -228,6 +240,49 @@ where
     F: Fn(ThreadId) + Send + Sync + 'static,
 {
     let _ = WAIT_SITE_DUMP.set(Arc::new(f));
+}
+
+/// Callback installed by the VM to print the state of the object a thread is
+/// parked on in `Object.wait()`. Separate from [`WAIT_SITE_DUMP`] because it
+/// needs heap + class metadata, which `monitor.rs` has no handle on.
+type WaitObjectDumpFn = Arc<dyn Fn(ObjectRef) + Send + Sync>;
+static WAIT_OBJECT_DUMP: std::sync::OnceLock<WaitObjectDumpFn> = std::sync::OnceLock::new();
+
+pub fn install_wait_object_dump<F>(f: F)
+where
+    F: Fn(ObjectRef) + Send + Sync + 'static,
+{
+    let _ = WAIT_OBJECT_DUMP.set(Arc::new(f));
+}
+
+fn emit_wait_object_state(obj: ObjectRef) {
+    if let Some(f) = WAIT_OBJECT_DUMP.get() {
+        f(obj);
+    }
+}
+
+/// Resolve the object a thread is parked on, through a handle the collector
+/// FORWARDS.
+///
+/// `Monitor::wait`'s own `obj` parameter is a plain Rust local that survives
+/// the whole wait and is never remapped, so under a moving collector it goes
+/// stale the first time the object is evacuated. The thread registry's
+/// `jmx_waiting_monitor` is scanned as a root and rewritten by
+/// `update_thread_objs_after_gc`, so it is the address that is still correct
+/// at dump time. Returns `None` when no resolver is installed (unit tests),
+/// leaving the caller to fall back to its own local.
+type WaitObjectResolveFn = Arc<dyn Fn(ThreadId) -> Option<ObjectRef> + Send + Sync>;
+static WAIT_OBJECT_RESOLVE: std::sync::OnceLock<WaitObjectResolveFn> = std::sync::OnceLock::new();
+
+pub fn install_wait_object_resolve<F>(f: F)
+where
+    F: Fn(ThreadId) -> Option<ObjectRef> + Send + Sync + 'static,
+{
+    let _ = WAIT_OBJECT_RESOLVE.set(Arc::new(f));
+}
+
+fn resolve_wait_object(thread_id: ThreadId) -> Option<ObjectRef> {
+    WAIT_OBJECT_RESOLVE.get().and_then(|f| f(thread_id))
 }
 
 fn emit_wait_site_frames(thread_id: ThreadId) {
@@ -970,6 +1025,12 @@ impl Monitor {
         thread_id: ThreadId,
         timeout_ms: Option<u64>,
         interrupted: Option<&std::sync::atomic::AtomicBool>,
+        // DIAGNOSTIC ONLY (netty promise stall): the object this monitor was
+        // reached through, so the poll loop can re-read its mark word and prove
+        // whether the waiter has been ORPHANED — parked on a monitor the object
+        // no longer points at, so any later `notifyAll()` inflates a different
+        // one and never reaches here. Carries no semantics.
+        waited_on: Option<ObjectRef>,
     ) -> Result<bool, MonitorError> {
         let mut state = self.state.lock();
         if state.owner != Some(thread_id) {
@@ -1004,6 +1065,7 @@ impl Monitor {
         let poll_interval = std::time::Duration::from_millis(5);
         let mut was_interrupted = false;
         let mut frames_dumped = false;
+        let mut orphan_reported = false;
         match timeout_ms {
             Some(ms) if ms > 0 => {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
@@ -1061,8 +1123,31 @@ impl Monitor {
                 // Untimed wait. Loop with periodic interrupt checks until
                 // notify() wakes us or the interrupt flag is set.
                 if let Some(flag) = interrupted {
+                    // DIAGNOSTIC A/B (netty ParameterizedSslHandlerTest promise
+                    // stall, 2026-08-21). `CRATONVM_WAIT_SPURIOUS_MS=<n>` makes
+                    // this untimed wait return to Java after `n` ms even with no
+                    // notify. A spurious wakeup is explicitly permitted by
+                    // JLS 17.2.1, and every correct caller re-checks its
+                    // condition in a `while` loop — netty's
+                    // `DefaultPromise.awaitUninterruptibly` does exactly that.
+                    //
+                    // It exists to PARTITION the stall, on ONE binary, without a
+                    // cross-binary comparison: if the stall disappears under it,
+                    // the promise had already completed and the notification was
+                    // lost, so the defect is in this monitor. If the stall
+                    // survives, the promise was never completed and the defect is
+                    // upstream, in whatever should have run the task.
+                    //
+                    // Default OFF: unset leaves the loop byte-for-byte as it was.
+                    let spurious_after = wait_spurious_ms();
+                    let started = std::time::Instant::now();
                     loop {
                         let result = self.wait_condvar.wait_for(&mut state, poll_interval);
+                        if let Some(ms) = spurious_after {
+                            if started.elapsed() >= std::time::Duration::from_millis(ms) {
+                                break;
+                            }
+                        }
                         if flag.load(std::sync::atomic::Ordering::Acquire) {
                             was_interrupted = true;
                             // LOST-WAKEUP FIX (see the timed branch above): if a
@@ -1081,6 +1166,98 @@ impl Monitor {
                             && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire)
                         {
                             emit_wait_site_frames(thread_id);
+                            // WAITED-ON OBJECT STATE (diagnostic). The orphan check
+                            // below came back CLEAN on a reproduced stall, so the
+                            // waiter IS parked on the monitor its object points at
+                            // and a notifier would resolve the same one. What is
+                            // left to distinguish is netty's own bookkeeping:
+                            //
+                            //   result != null && waiters >= 1
+                            //       the promise completed AND this waiter had
+                            //       registered — so `checkNotifyWaiters` either
+                            //       never ran or read a stale `waiters`, i.e. the
+                            //       monitor is not establishing happens-before.
+                            //   result != null && waiters == 0
+                            //       the increment is not visible here at all.
+                            //   result == null
+                            //       the promise never completed — the 30 s A/B
+                            //       result would then need re-examining.
+                            //
+                            // Only the VM can read those fields, hence the
+                            // callback; `emit_wait_site_frames` uses the same
+                            // pattern for exactly this reason.
+                            // GC-SAFE HANDLE. `waited_on` is the ObjectRef this
+                            // call was ENTERED with, held as a plain Rust local
+                            // for the whole wait — and a moving collector
+                            // relocates the object out from under it. G1 leaves
+                            // the from-copy intact until the region is reused,
+                            // so a stale read still parses as a plausible object
+                            // and quietly reports pre-relocation field values.
+                            // That is how the first version of this instrument
+                            // produced an unfalsifiable `result`/`waiters` line.
+                            //
+                            // The registry's `jmx_waiting_monitor` IS a scanned
+                            // root AND is forwarded by
+                            // `update_thread_objs_after_gc` (gc.rs step 21), so
+                            // resolving through it yields the CURRENT address.
+                            // Fall back to `waited_on` only when the resolver is
+                            // not installed (unit tests).
+                            // Report WHICH handle was used, and whether the two
+                            // disagree. A disagreement is the direct measurement
+                            // that the object was relocated during the wait —
+                            // i.e. proof that the earlier stale-local instrument
+                            // was reading a dead address, rather than a
+                            // suspicion about it. `handle=stale-local` means the
+                            // resolver was never installed and this line is back
+                            // to being untrustworthy; say so rather than let a
+                            // silent fallback look like a sound reading.
+                            let resolved = resolve_wait_object(thread_id);
+                            let (live, src) = match resolved {
+                                Some(o) => (Some(o), "registry-remapped"),
+                                None => (waited_on, "stale-local(UNSOUND-FALLBACK)"),
+                            };
+                            if let (Some(r), Some(w)) = (resolved, waited_on) {
+                                if !std::ptr::eq(r.as_ptr(), w.as_ptr()) {
+                                    eprintln!(
+                                        "[WAIT-OBJECT] RELOCATED during the wait: \
+                                         entered_with={:p} now={:p} — any field read through \
+                                         the entry pointer is a stale-copy read.",
+                                        w.as_ptr(),
+                                        r.as_ptr(),
+                                    );
+                                }
+                            }
+                            if let Some(obj) = live {
+                                eprintln!("[WAIT-OBJECT] handle={src} obj={:p}", obj.as_ptr());
+                                emit_wait_object_state(obj);
+                            }
+                            // ORPHAN CHECK. If the object's mark word stops
+                            // pointing at `self`, a later `notifyAll()` inflates
+                            // a DIFFERENT monitor and can never reach this
+                            // waiter. Runs here — once, when the watchdog has
+                            // already fired — rather than on every 5 ms poll:
+                            // per-poll it cost a registry lock under the monitor
+                            // state lock for a question only asked at a stall.
+                            if !orphan_reported {
+                                if let Some(obj) = live {
+                                    let cur = header_of(obj).mark_word.load(Ordering::Acquire);
+                                    let still_ours = monitor_ptr_from_mark(cur)
+                                        .is_some_and(|p| std::ptr::eq(p, self as *const Monitor));
+                                    if !still_ours {
+                                        orphan_reported = true;
+                                        eprintln!(
+                                            "[MONITOR-ORPHAN] thread {thread_id:?} is parked in \
+                                             Object.wait() on a monitor the object no longer \
+                                             points at — obj={:p} mark_state={} monitor={:p}. Any \
+                                             later notify()/notifyAll() inflates a DIFFERENT \
+                                             monitor and cannot reach this waiter.",
+                                            obj.as_ptr(),
+                                            ObjectHeader::mark_state(cur),
+                                            self as *const Monitor,
+                                        );
+                                    }
+                                }
+                            }
                             frames_dumped = true;
                         }
                         // If the condvar was signalled (not timed out), break
@@ -1933,7 +2110,7 @@ impl MonitorTable {
     ) -> Result<bool, MethodCallFailed> {
         let monitor = self.ensure_inflated(obj_ref, thread_id)?;
         monitor
-            .wait(thread_id, timeout_ms, interrupted)
+            .wait(thread_id, timeout_ms, interrupted, Some(obj_ref))
             .map_err(|MonitorError::NotOwner| {
                 MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::IllegalMonitorStateException {

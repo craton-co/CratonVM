@@ -487,19 +487,47 @@ impl rustls::client::ClientSessionStore for TracingClientSessionStore {
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — the server twin of
 /// `ctx_client_session_store_table`, same single `or_insert_with` site.
 fn ctx_server_session_store_table(
-) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
     static T: OnceLock<
-        cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
+        cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
     > = OnceLock::new();
     T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
+/// One session cache per `SSLContext` **and per client-auth policy**.
+///
+/// The `bool` half of that key is load-bearing, and the bug it fixes is
+/// `TestClientCert`'s entire failing set. A resumed TLS 1.2 session replays the
+/// original handshake's outcome: the server sends no `CertificateRequest`, so
+/// the client is never asked for a certificate. A connection that IS requesting
+/// client auth must therefore not be allowed to resume a session established
+/// WITHOUT it — the resumption silently cancels the request.
+///
+/// That is precisely what defeated `wants_deferred_client_auth` (see its doc).
+/// The deferred mechanism exists to answer Tomcat's post-handshake
+/// `setNeedClientAuth(true)` by offering client auth on the NEXT connection,
+/// because rustls has no renegotiation. MEASURED on `dev@151f7831a`: it did
+/// offer it — `engine_begin request=true` on the second engine — and then the
+/// client resumed the first connection's no-client-auth session, so
+/// `JavaKeyManagerResolver::resolve` was called **zero** times across the whole
+/// class against **16** `has_certs` calls. The resolver was fully configured
+/// and simply never consulted.
+///
+/// Sessions established WITH client auth still resume among themselves, so the
+/// cost is one full handshake per policy transition, not per connection.
+///
+/// Real JSSE reaches the same outcome by a different route: its session object
+/// carries the peer certificates, and it declines to resume into a connection
+/// whose client-auth requirement that session cannot satisfy. rustls's
+/// `StoresServerSessions` is an opaque blob store with no such visibility,
+/// which is why the partition lives in the KEY rather than in a predicate.
 fn ctx_server_session_store(
     key: u64,
+    client_auth_requested: bool,
 ) -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
     ctx_server_session_store_table()
         .lock()
-        .entry(key)
+        .entry((key, client_auth_requested))
         .or_insert_with(|| {
             let inner: Arc<dyn rustls::server::StoresServerSessions + Send + Sync> =
                 rustls::server::ServerSessionMemoryCache::new(256);
@@ -2976,12 +3004,30 @@ fn mark_trust_check_done(id: i32) {
 /// handshake loop), so the raw pointer never outlives the native call frame
 /// that created it.
 pub(crate) struct ActiveNativeContextGuard {
-    _private: (),
+    /// What was published when this guard was created; restored on drop.
+    ///
+    /// SAVE/RESTORE, not clear-to-`None`, since 2026-08-22. Clearing is correct
+    /// for exactly one publisher and silently wrong for two: an inner
+    /// `set_active_native_context` would take the window away from the OUTER
+    /// frame when it returned, and every later `with_active_native_context`
+    /// there would degrade to `None` — which for
+    /// `JavaKeyManagerResolver::resolve` means "no client certificate", a
+    /// silent wrong answer rather than a crash.
+    ///
+    /// Nothing nested until `do_check_trusted` started publishing (see that
+    /// call site). Making the guard re-entrant is what allows a second
+    /// publisher to exist at all, and it costs one word.
+    ///
+    /// Restoring is sound for the same reason publishing is: the outer pointer
+    /// came from a frame that is still live — this guard is nested inside it —
+    /// so it cannot have expired while this guard was alive.
+    prev: Option<*mut (dyn NativeContext + 'static)>,
 }
 
 impl Drop for ActiveNativeContextGuard {
     fn drop(&mut self) {
-        ACTIVE_TLS_NATIVE_CTX.with(|c| c.set(None));
+        let prev = self.prev;
+        ACTIVE_TLS_NATIVE_CTX.with(|c| c.set(prev));
     }
 }
 
@@ -2999,8 +3045,8 @@ pub(crate) fn set_active_native_context(ctx: &mut dyn NativeContext) -> ActiveNa
     // before the real `ctx` borrow this pointer came from could expire —
     // see the guard's doc and `with_active_native_context`'s SAFETY note.
     let ptr: *mut (dyn NativeContext + 'static) = unsafe { std::mem::transmute(ptr) };
-    ACTIVE_TLS_NATIVE_CTX.with(|c| c.set(Some(ptr)));
-    ActiveNativeContextGuard { _private: () }
+    let prev = ACTIVE_TLS_NATIVE_CTX.with(|c| c.replace(Some(ptr)));
+    ActiveNativeContextGuard { prev }
 }
 
 /// Reborrow the `ctx` published by `set_active_native_context`, if any is
@@ -8195,6 +8241,100 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+
+    /// A nested `set_active_native_context` must RESTORE the outer window, not
+    /// clear it.
+    ///
+    /// There are two publishers now — `http_url_connection::perform` on the
+    /// client path and `x509_manager::do_check_trusted` on the server path —
+    /// and on a client connection that validates a chain they nest. With the
+    /// old clear-to-`None` drop, the inner guard's return would leave the outer
+    /// frame with no window, and every later `with_active_native_context` there
+    /// would answer `None`. For `JavaKeyManagerResolver::resolve` that is not a
+    /// crash, it is "no client certificate" — a silent wrong answer, on the one
+    /// path whose whole job is to produce one.
+    ///
+    /// Asserted through `with_active_native_context`, the real reader, rather
+    /// than by inspecting the thread-local: that is what every consumer
+    /// actually calls.
+    #[test]
+    fn a_nested_active_native_context_restores_the_outer_one() {
+        use crate::test_utils::MockNativeContext;
+        let mut outer = MockNativeContext::new();
+        let mut inner = MockNativeContext::new();
+
+        assert!(
+            super::with_active_native_context(|_| ()).is_none(),
+            "no window should be published before the first guard"
+        );
+        let outer_guard = super::set_active_native_context(&mut outer);
+        let outer_ptr = ACTIVE_TLS_NATIVE_CTX.with(|c| c.get());
+        assert!(outer_ptr.is_some(), "the outer guard must publish a window");
+        {
+            let _inner_guard = super::set_active_native_context(&mut inner);
+            let inner_ptr = ACTIVE_TLS_NATIVE_CTX.with(|c| c.get());
+            assert!(inner_ptr.is_some());
+            assert!(
+                !std::ptr::addr_eq(inner_ptr.unwrap(), outer_ptr.unwrap()),
+                "the inner guard must publish ITS context while it is alive"
+            );
+        }
+        assert!(
+            super::with_active_native_context(|_| ()).is_some(),
+            "the inner guard cleared the window instead of restoring it — the \
+             enclosing frame is now running with no published context, and every \
+             `with_active_native_context` in it silently answers None"
+        );
+        assert!(
+            std::ptr::addr_eq(
+                ACTIVE_TLS_NATIVE_CTX.with(|c| c.get()).unwrap(),
+                outer_ptr.unwrap()
+            ),
+            "the restored window must be the OUTER context, not some other one"
+        );
+        drop(outer_guard);
+        assert!(
+            super::with_active_native_context(|_| ()).is_none(),
+            "the outermost guard must still clear the window on the way out"
+        );
+    }
+
+    /// A server session cache is per `SSLContext` **and per client-auth
+    /// policy** — a connection asking for a client certificate must not be
+    /// able to resume one that did not.
+    ///
+    /// Resuming across that boundary replays a handshake that sent no
+    /// `CertificateRequest`, so the client is never asked and the request is
+    /// silently cancelled. That is what defeated `wants_deferred_client_auth`
+    /// and produced `TestClientCert`'s whole failing set: the second engine
+    /// really did offer client auth (`engine_begin request=true`, measured)
+    /// and `JavaKeyManagerResolver::resolve` was still called zero times.
+    ///
+    /// Asserted on `Arc::ptr_eq`, which is the property that matters — two
+    /// distinct caches, not merely two lookups. The same-policy case is
+    /// asserted too, because a partition that never shares would silently
+    /// disable resumption altogether and still pass a difference-only check.
+    #[test]
+    fn a_server_session_cache_is_partitioned_by_client_auth_policy() {
+        let key = 0x5eed_0000_0000_0001u64;
+        let without = super::ctx_server_session_store(key, false);
+        let with = super::ctx_server_session_store(key, true);
+        assert!(
+            !Arc::ptr_eq(&without, &with),
+            "a client-auth connection shares the no-client-auth session cache, so it \
+             can resume a session that carries no client certificate — the resumption \
+             then cancels the CertificateRequest and the peer is never asked"
+        );
+        assert!(
+            Arc::ptr_eq(&without, &super::ctx_server_session_store(key, false)),
+            "same context, same policy must share ONE cache — otherwise this \
+             partition has disabled server-side resumption instead of scoping it"
+        );
+        assert!(
+            Arc::ptr_eq(&with, &super::ctx_server_session_store(key, true)),
+            "same context, same policy must share ONE cache (client-auth side)"
+        );
+    }
 
     /// The exact PKCS#8 key CratonVM lifts out of Spring Boot's
     /// `spring-boot-ldap` test keystore
@@ -13630,11 +13770,15 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         state.client_auth_requested |= state.need_client_auth || state.want_client_auth;
         // Share this SSLContext's server-side session store across its engines,
         // for the same reason as the client's — a server that forgets every
-        // session cannot honour a resumption attempt.
+        // session cannot honour a resumption attempt — but PARTITIONED by
+        // whether this engine is asking for a client certificate. Resuming
+        // across that boundary replays a handshake that asked for none, which
+        // silently cancels the request. See `ctx_server_session_store`.
         let config = match state.trust_managers_ctx_key {
             Some(k) => {
                 let mut cloned = (*config).clone();
-                cloned.session_storage = ctx_server_session_store(k);
+                cloned.session_storage =
+                    ctx_server_session_store(k, state.client_auth_requested);
                 Arc::new(cloned)
             }
             None => config,

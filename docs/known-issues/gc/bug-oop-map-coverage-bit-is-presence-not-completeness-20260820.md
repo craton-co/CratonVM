@@ -1,5 +1,19 @@
 # `fully_oop_covered` asserts a map EXISTS, not that it lists every live oop
 
+## Status
+
+**FIXED 2026-08-21** — the suppression this bit licenses is now **opt-in**
+(`CRATONVM_GC_PRECISE_ONLY_ROOTS=1`), because the bit cannot be made sound at a
+price worth paying and it was measured to be worth ~0.1 % of collections. The
+runtime oracle named in the contract now gates the suppression when it is on,
+and it can now *see* the cycles it gates — which it could not before, for a
+structural reason nobody had noticed.
+
+Two earlier rounds closed the codegen half (`30370b165`, `3d430ea69`), and a
+third (`53876976a`) split the per-cycle PROOF from the SUPPRESSION so the proof
+is computed on every collector rather than short-circuited away on two of them.
+This round closes the last piece: the suppression itself.
+
 ## What the bit is spent on
 
 `CompiledMethod::fully_oop_covered` is the codegen half of the proof that lets
@@ -20,35 +34,9 @@ cm.fully_oop_covered = compiler.precise_maps
 
 `safepoint_pcs ⊆ mapped_safepoint_pcs` is a **presence** test: every GC-capable
 safepoint recorded *an* entry. It says nothing about whether the entry lists
-every live oop at that safepoint. And `mapped_safepoint_pcs.insert(...)` runs
-whenever the precise gate is on, before the slot list is examined — so a
-safepoint whose map dropped **every** oop still counts as mapped.
+every live oop at that safepoint.
 
-Three drops in `emit_oop_map_for_safepoint` are unconditional and silent, and
-none of them clears the bit:
-
-| # | the drop | what is lost |
-|---|---|---|
-| 1 | `if !self.stack_oop_marks[i] { continue; }` | an operand-stack oop the mark vector does not know about — including marks **padded with `false`** when `stack.len() != stack_oop_marks.len()` |
-| 2 | `if let StackSlot::Frame(off) = self.stack[i]` | an oop operand still resident in a register/scratch slot: no `else`, nothing recorded |
-| 3 | `if let Ok(i16_off) = i16::try_from(off)` | any slot beyond ±32767 from `rbp` |
-
-Drop 1 is the interesting one because the compiler already knows when it has
-happened. `stack_oop_marks_exact` is set `false` on desync and IS consulted —
-`can_elide_self_call_register_spill` and the shadow-publication predicate both
-fail closed on it. `fully_oop_covered` does not consult it. The same fact that
-is trusted to veto a spill elision is not trusted to veto the coverage claim.
-
-The emitter's own comment says the padding is safe *because of the backstop*:
-
-> padding with `false` (non-oop) stays SOUND because
-> `conservative_roots::scan_one_frame_precise` also conservatively sweeps the
-> frame region — but a desync would silently degrade precision (and is unsafe
-> for the *moving* path)
-
-That is exactly the backstop the bit is spent to suppress.
-
-## The contract was written down, and it is not honoured
+## The contract was written down, and it could not have been honoured
 
 `jit/src/x64/driver.rs`, immediately above the assignment:
 
@@ -56,159 +44,103 @@ That is exactly the backstop the bit is spent to suppress.
 > `CRATONVM_DBG_VERIFY_OOP_MAPS` oracle (Stage G0) is the SUFFICIENT proof that
 > must gate the actual backstop suppression before the moving path relies on it.
 
-The oracle gates nothing. `grep` for its counters outside its own module returns
-no consumers: it is a default-off diagnostic. The suppression runs on the
-necessary condition alone.
-
-## Measured
-
-`CRATONVM_DBG_VERIFY_OOP_MAPS=1`, oracle rewritten to walk the RBP chain and
-union each frame's own maps at its own frame base (the previous version built
-its mapped set from one method's maps at one frame base, so a nested callee's
-correct slots read as unmapped — its counts were an upper bound and unusable).
-Hits are recorded as distinct `(method, slot offset)` pairs and only on frames
-whose `fully_oop_covered` is `true`.
+The previous round of this page recorded that the oracle "gates nothing" —
+`grep` for its counters outside its own module returns no consumers. That is
+true and it understates the problem. **The oracle could not have gated it**,
+because of where it runs:
 
 ```text
-probe (generational)  DISTINCT never-mapped sites=4  by_class={"operand-spill": 4}
-                      all four in one method, at rbp-0x80/0x90/0xa0/0xa8
-ntru  (gen / g1)      4 / 2 hits, all class=operand-spill
-probe (G1)            0 sites, 24 frames, 336 words
+collect_roots
+  └── if !moving_young_precise_only {          <-- the suppression
+        scan_active_jit_frames                 <-- skipped when suppressing
+          └── scan_one_frame_precise
+                └── verify_precise_covers_conservative   <-- THE ORACLE
 ```
 
-**Every hit is in the operand-spill region.** Zero in the three storage classes
-the `refresh_moving_young_coverage_for_current_thread` module block predicts as
-undescribed (scalar-replacement fields, LICM hoist slots, the full-GPR
-safepoint spill area). The gap is not in what the model admits it cannot
-describe — it is in the operand stack, which the model claims.
+The oracle lives inside the scan the suppression skips. **On every cycle that
+spent the bit, the instrument designated to check it was not running.** The
+relationship is not "the wire was never connected" but "the wire, if connected,
+would have measured the wrong cycles."
 
-## What this does NOT establish
+That retro-actively qualifies every number this page has ever reported. The
+`while_covered=0` table in the previous round — three collectors, ~5 880 frames,
+~90 700 verifiable words — was collected entirely on cycles that did **not**
+take the suppression. It is evidence that the maps are good on the ordinary
+path. It has never been evidence about the path the bit licenses.
 
-* **No individual site is proven to be a live oop.** The oracle validates a word
-  with `is_object_address`, so a primitive whose bits land on a live object
-  header reads as an unmapped oop. Four adjacent slots in one method is a poor
-  fit for coincidence, but the mechanism above is established by *reading the
-  emitter*, not by these counts.
-* **No end-to-end corruption is demonstrated for the generational collector.**
-  On every workload measured, true generational (`-XX:+UseGenerationalGC`)
-  reports `incomplete=true` for other obligations on every collection, so it
-  never takes the suppression:
+## Measured 2026-08-21, on `dev@ee4cdf528`
 
-  ```text
-  truegen  precise_only=false  incomplete=true  ybounds=true   8 of 8 collections
-  ```
+`PolynomialTest` (`bc-java` ntru), `--Xmx 1g`, three collectors,
+`CRATONVM_DBG_JIT_ROOTSCAN=1` + `CRATONVM_DBG_VERIFY_OOP_MAPS=1`:
 
-  The two collectors where the proof *did* pass are G1 and ZGC, and
-  `collect_roots` no longer lets either take the branch. So the exposure that
-  remains is latent: a workload where generational's other obligations all pass
-  would take a suppression backed by this bit.
+| collector | collections | `precise_only=true` | `never_mapped` | `while_covered` | result |
+|---|---:|---:|---:|---:|---|
+| generational | 6 | **1** | 0 | 0 | FAIL |
+| G1 | 1 | 0 | 0 | 0 | OK |
+| ZGC | 3 | 0 | 4 | 0 | OK |
 
-## Relationship to the G1 bug
+The staged-argument fix still holds: `while_covered` is 0 everywhere. ZGC's four
+`never_mapped` hits are on frames that correctly report `covered=false`.
 
-`bug-g1-evacuates-live-jit-reference-20260819.md` is the same defect observed
-from the consumer end: G1 skipped the conservative scan on this proof, published
-no pins, and evacuated a live `StringLatin1.newString` reference. That record's
-fix stops G1 depending on the bit. This record is the bit itself.
+### The generational failure is NOT this bug — tested, not assumed
 
-## The frame has TWO coverage vocabularies, and the bit describes only one
+The table above is suggestive in the worst way: the only collector that takes
+the suppression is the only one that fails, with
+`IllegalFormatConversionException: d != java.lang.Object` — the exact signature
+of a reference read back stale after the collector moved it, i.e. what a missing
+root looks like.
 
-The three drops above are real, and closing them was tried — every one now sets
-`map_incomplete` and withholds the safepoint from `mapped_safepoint_pcs`
-(`30370b165`). **It changed nothing on the measured workload**, and that result
-is what identifies the actual mechanism:
+It is a coincidence. A kill switch was added so the question could be settled
+inside **one binary**, and ABBA-interleaved, three reps per arm:
 
-```text
-probe-fixed          DISTINCT sites=4 {"operand-spill": 4}  while_covered=20
-probe-presenceonly   DISTINCT sites=4 {"operand-spill": 4}  while_covered=20
-```
+| arm | `precise_only=true` per run | PASS | FAIL |
+|---|---:|---:|---:|
+| suppression ON (then-default) | 2, 2, 6 | 2 | 1 |
+| suppression OFF | 0, 0, 0 | 2 | 1 |
 
-Byte-identical arms means `map_incomplete` never fired: nothing was *dropped*.
-Those oops were never in the precise vocabulary to begin with.
+Identical distributions. Removing the suppression entirely does not fix the
+failure, so the failure is not the suppression's. It belongs to
+`bug-generational-ntru-unpinned-jit-reference-20260821.md`, which reports the
+same signature on pristine `dev` and was already open.
 
-`emit_pre_safepoint_spill` says what the other vocabulary is. The conservative
-bound it publishes:
+Worth recording separately: that page calls the failure **deterministic**
+("FAIL 3/3"). Across the six runs here it was **2 of 6**, on a host whose load
+moved between 5 and 42. It is load-sensitive, not deterministic, and an A/B that
+assumes determinism will read noise as a result.
 
-> Includes the **staged invoke-argument buffer**, which sits above the operand
-> stack in the same spill reserve and is live for the duration of the call.
+### The suppression is worth ~0.1 % of collections
 
-and, twenty lines further down, the blind spill of every used callee-saved GPR:
+`CRATONVM_GC_STRESS` forces a collection every N bytes, which turns "wait for a
+rare pause shape" into a schedule that can be counted. Same workload, same
+binary:
 
-> an oop can also live in a callee-saved register as an operand-stack temporary
-> that survives the call, or via a value the per-slot oop tracker fails to tag
+| stress step | collections | `precise_only=true` | share |
+|---|---:|---:|---:|
+| none | 10 | 0 | 0 % |
+| 64 MB | 3 735 | 0 | 0 % |
+| 16 MB | 14 420 | 2 | 0.014 % |
+| 1 MB | 46 135 | 31 | 0.067 % |
+| 1 MB (longer) | 70 144 | 84 | 0.120 % |
 
-Both are deliberate conservative coverage for oops the precise map does not
-name. Staged invoke arguments have already been popped off `self.stack` by the
-time the map is built, so no map can name them; they sit in the operand-spill
-reserve and are live across the call. That is exactly the measured signature —
-four adjacent slots in the operand-spill region, named by no map at any
-safepoint of the method (`wrong_map=0`), on a frame asserting full coverage.
+**The other 99.9 % of collections already run the conservative scan**, so
+whatever the branch saves is bounded by that share.
 
-So the defect is not that the map loses entries. It is that **the frame is kept
-safe by two mechanisms and `fully_oop_covered` describes only one of them**, while
-being spent to suppress the other.
+**Re-measured after merging 220 dev commits**, because two of them change the
+premise directly: `f4d697453` makes the optimizing tier compute
+`fully_oop_covered` at all (so more methods can carry it), and `53876976a`
+splits the per-cycle proof from the suppression so the proof runs on every
+collector. Either could have raised engagement enough to change the trade.
 
-## The repair — LANDED (`3d430ea69`)
+| tree | collections | `precise_only=true` | share |
+|---|---:|---:|---:|
+| `ee4cdf528` (pre-merge), 16 MB stress | 14 420 | 2 | 0.014 % |
+| merged with `2b034da6d`, 16 MB stress | **70 066** | **6** | **0.009 %** |
+| merged, same stress, default (opt-in off) | 3 539 | **0** | 0 % |
 
-Two halves, matching the two ways an argument is staged.
-
-**Named.** The staged invoke-argument buffer is now in the precise map.
-`pop_invoke_args` returns each argument's oop mark alongside its slot
-(`pop_stack` discards the mark, which is fine only while the value goes back
-onto the stack model), the two staged-buffer sites record the buffer offset of
-every reference argument, and `emit_oop_map_for_safepoint` merges them. They
-become precise roots, so a moving collection REWRITES them rather than merely
-marking them — the property the coverage claim is actually spent on.
-
-**Withdrawn.** The other three staging sites put arguments where no oop map can
-name them: the native-ABI outgoing-argument area, the direct-call service slots,
-and an inlined callee's parameter locals. Those set
-`pending_staged_args_unmapped`, so the safepoint goes incomplete and the method
-loses `fully_oop_covered` rather than claiming coverage it does not have — and
-only when a reference is actually staged there, so a call with no reference
-arguments keeps its coverage.
-
-Both pendings are TAKEN by the map, like `pending_live_frame_hi`, so a staging
-site that emits no map cannot leak slots into a later safepoint.
-
-### Measured after
-
-`while_covered` — never-mapped oops on frames ASSERTING coverage, which is the
-quantity the bit's soundness is about — is **zero on every arm**:
-
-```text
-                      before                    after
-ntru  G1              never_mapped=2  (wc=2)    never_mapped=0  (wc=0)   PASS
-ntru  generational    never_mapped=4  (wc=4)    never_mapped=0  (wc=0)   PASS
-ntru  default (ZGC)   never_mapped=6  (wc=6)    never_mapped=4  (wc=0)   PASS
-probe generational    sites=4, wc=20            wc=0
-probe G1              0                         0
-```
-
-ntru is the stable measurement — ~5880 frames and ~90 700 verifiable words per
-run, three collectors. The four residual hits on the ZGC arm are on frames that
-correctly report `covered=false`, so they say nothing about the bit.
-
-`wrong_map` on ntru fell from 13 724 to 11 312, which is the same fix seen from
-the other side: ~2 400 words that were named by SOME map of the method are now
-named by the ACTIVE one.
-
-Cost: `precise_only_true` is unchanged — 0 on G1, 0 on ZGC, 1 on generational,
-before and after. The fail-closed half cost no measurable coverage on these
-workloads.
-
-### What this still does not prove
-
-`while_covered=0` holds over the workloads measured; it is not a proof. The
-probe's frame shape varies run to run (17→41 frames, 5→13 unreadable), so its
-counts are not a clean before/after pair — the ntru rows are. And the oracle's
-false-positive mode is unchanged: a primitive whose bits land on a live object
-header still reads as an unmapped oop, which is the likeliest reading of the
-four residual ZGC hits.
-
-The fail-closed drop accounting in `30370b165` stays: those drops are genuine
-unsoundness whenever they fire, it is the correct direction, and it is measured
-to cost nothing here (`map_incomplete` never fired on any workload run). It is
-hardening, not the fix for the sites above.
+Lower, not higher, on an order of magnitude more collections. The default flip
+is better supported after the merge than before it. This is the number that
+decides the trade, and it is an engagement count — it needed no quiet host,
+which is fortunate, because the host spent this session between load 5 and 168.
 
 ## Follow-up 2026-08-21: the verdict is now COMPUTED on every collector
 
@@ -252,18 +184,86 @@ verifier honestly reports that it cannot classify. Its behaviour is unchanged �
 ZGC acts on it: `relocate_stw` now compacts when the proof holds. See
 `known-issues/h2/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`.
 
-## Status of the suppression
+## The repair
 
-`precise_only_true` counted per run, with all fixes in:
+**The suppression is opt-in.** `CRATONVM_GC_PRECISE_ONLY_ROOTS=1` restores it;
+the default is now to always run the conservative scan. A 0.1 %-engagement
+optimisation is not worth a soundness argument that cannot be obtained, and the
+flag keeps the old behaviour one binary away for anyone who wants to measure it.
+
+**The oracle now gates, and can now see.** When the suppression is opted back in
+AND the oracle is enabled, `collect_roots` verifies *before* it suppresses:
+`verify_active_coverage_into` walks the same frames the backstop would and asks
+the oracle about them. A refutation withdraws the suppression for that cycle and
+latches for the process — the refutation is a statement about compiled code that
+is still in the code cache, not about a moment, so a later cycle that happens
+not to re-observe it has learned nothing new. New
+`incomplete_reason::COVERAGE_ORACLE_REFUTED`, the only reason code produced by
+*checking an answer* rather than by failing to establish a precondition.
+
+Verifying costs the same frame walk as the scan it would skip — which is the
+honest reason the gate cannot be made default-on, and a further argument that
+the suppression is not worth having.
+
+**The gate is proved to fire.** A gate whose branch has never executed is
+indistinguishable from a broken one, and `while_covered` is 0 on every workload,
+so nothing in the tree will exercise it. `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE=1`
+forces a refutation without a real unmapped oop:
+
+| arm (`--Xmx 1g`, generational, `CRATONVM_GC_STRESS`) | collections | `precise_only=true` | `REFUTED` |
+|---|---:|---:|---:|
+| default (suppression off) | 21 517 | **0** | 0 |
+| `PRECISE_ONLY_ROOTS=1` | 35 384 | **5** | 0 |
+| `PRECISE_ONLY_ROOTS=1` + `FORCE_REFUTE=1` | 6 653 | **0** | **1** |
+
+Row 2 is the control that makes row 3 mean something: the same configuration
+without the forced refutation takes the branch 5 times, so row 3's zero is the
+gate withdrawing a suppression that would otherwise have happened, not a run
+that never had one to withdraw. (An earlier attempt at this proof produced
+`precise_only=0` in *both* arms and proved nothing — the workload simply never
+reached a suppression that run. `CRATONVM_GC_STRESS` is what makes the branch
+frequent enough to be a control.)
 
 ```text
-probe    G1 / generational      0    (never takes the suppression)
-ntru     G1                     0
-ntru     -XX:+UseGenerationalGC 1    <- first observed instance; test PASSED
-ntru     default (ZGC)          0
+[VERIFY-OOP-MAPS] REFUTED: a frame asserting fully_oop_covered holds an in-band
+oop no map names. Conservative JIT backstop is now forced ON for the rest of
+this process.
+[jitroots] precise_only=false moving_young=true incomplete=true ...
 ```
 
-The single generational instance is the first time any run here has reached
-"verifier ran, verifier passed, collector moved". It did not corrupt, which is
-consistent with the mechanism above being latent rather than always fatal — the
-suppressed pause has to coincide with a staged-argument oop that actually moves.
+The message prints once — the latch is one-way — and every subsequent
+`[jitroots]` line carries `precise_only=false incomplete=true`.
+
+## What this still does not establish
+
+* **No unmapped oop was found on a suppressed cycle.** The gate is a backstop
+  built because the proof is unobtainable, not because a violation was caught.
+* **The oracle's false-positive mode is unchanged**: a primitive whose bits land
+  on a live object header still reads as an unmapped oop. With the gate armed,
+  that now costs a withdrawn suppression rather than a log line — the safe
+  direction, and at 0.1 % engagement it costs essentially nothing.
+* The three unconditional drops in `emit_oop_map_for_safepoint` still fail closed
+  from `30370b165`. That hardening never fired on any workload measured.
+
+## Relationship to the other records
+
+* `bug-g1-evacuates-live-jit-reference-20260819.md` — the same defect from the
+  consumer end. Its fix stopped G1 depending on the bit; this record is the bit.
+* `bug-generational-ntru-unpinned-jit-reference-20260821.md` — the failure that
+  looks like this one and is not, per the A/B above. Its determinism claim needs
+  re-checking.
+* `feature-designs/zgc-jit-load-barrier.md` — owns the membership-walk cost that
+  the same frames pay on the other collector.
+
+## Reproducing
+
+```bash
+# engagement: how often is the bit actually spent?
+CRATONVM_DBG_JIT_ROOTSCAN=1 CRATONVM_GC_STRESS=1048576 \
+  <cratonvm> -XX:+UseGenerationalGC --Xmx 1g ... 2>&1 \
+  | grep -c 'precise_only=true'
+
+# the gate, forced (needs the opt-in, or there is no suppression to withdraw)
+CRATONVM_GC_PRECISE_ONLY_ROOTS=1 CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE=1 \
+CRATONVM_DBG_JIT_ROOTSCAN=1 CRATONVM_GC_STRESS=16777216 <cratonvm> ...
+```

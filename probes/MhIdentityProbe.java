@@ -94,5 +94,29 @@ public class MhIdentityProbe {
         MethodHandle ignored = reg.asFixedArity();
         row("I28 eval#2 after someone else adapted", () -> reg.invokeWithArguments(new Object[] {null}));
         row("I29 ignored.isVarargsCollector", () -> ignored.isVarargsCollector());
+
+        // asType's twin: explicitCastArguments stamps a type the same way.
+        MethodHandle n = L.findStatic(MhIdentityProbe.class, "vf", vfType);
+        MethodHandle o = MethodHandles.explicitCastArguments(n,
+                MethodType.methodType(Object.class, Object.class));
+        row("I30 o.type", () -> o.type());
+        row("I31 n.type AFTER explicitCastArguments", () -> n.type());
+        row("I32 n==o", () -> n == o);
+        row("I33 n.iwa(x,y) AFTER explicitCastArguments", () -> n.invokeWithArguments("x", "y"));
+
+        // asType to the SAME type is the identity on every JDK, so it is the
+        // one shape a copying implementation must NOT copy.
+        MethodHandle p = L.findStatic(MhIdentityProbe.class, "vf", vfType);
+        row("I34 p.asType(sameType)==p", () -> p.asType(vfType) == p);
+        row("I35 p.isVarargsCollector AFTER same-type asType", () -> p.isVarargsCollector());
+
+        // Two asType calls off ONE receiver must not see each other.
+        MethodHandle q = L.findStatic(MhIdentityProbe.class, "vf", vfType);
+        MethodHandle q1 = q.asType(MethodType.methodType(Object.class, Object.class));
+        MethodHandle q2 = q.asType(MethodType.methodType(String.class, String.class));
+        row("I36 q1.type", () -> q1.type());
+        row("I37 q2.type", () -> q2.type());
+        row("I38 q.type", () -> q.type());
+        row("I39 q1!=q2", () -> q1 != q2);
     }
 }

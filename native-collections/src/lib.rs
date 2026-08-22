@@ -29571,6 +29571,15 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 let val_fn_pin = ctx.pin_native_root(val_fn);
                 let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
                 let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(elements.len());
+                // Duplicate-key detection, bucketed by `hashCode`.
+                //
+                // Maps a key's Java hash to the indices in `pairs` whose key
+                // hashed the same, so a new key is compared with `equals`
+                // against its own bucket rather than against every key
+                // collected so far. Holds indices, never addresses, so a
+                // moving collection between elements cannot invalidate it.
+                let mut by_hash: std::collections::HashMap<i32, Vec<usize>> =
+                    std::collections::HashMap::new();
                 for i in 0..elements.len() {
                     let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
                     let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
@@ -29600,26 +29609,52 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     // implementation silently last-wins-merged, so callers relying on
                     // the throw never saw it (e.g. keycloak IssuerSignedJWT.build()
                     // detects duplicate claim names exactly this way, then rethrows as
-                    // IllegalArgumentException). Detect duplicates by Java `equals`
-                    // over the keys collected so far and throw to match the JDK.
-                    if let Value::Object(Some(_)) = k {
-                        for (j, (existing_k, _)) in pairs.iter().enumerate() {
-                            // cceres3: `equals` re-enters Java — refresh both keys
-                            let existing_k = read_pinned_elem(ctx, pair_handles[j].0, *existing_k);
-                            let k_cur = read_pinned_elem(ctx, k_handle, k);
-                            if let (Value::Object(Some(eref)), Value::Object(Some(kref))) =
-                                (existing_k, k_cur)
-                            {
-                                if map_keys_equal(ctx, kref, eref)? {
-                                    return Err(
+                    // IllegalArgumentException).
+                    //
+                    // That throw was restored with a scan of every key collected
+                    // so far, calling Java `equals` on each — O(n^2) `equals`
+                    // re-entries for an n-element stream. Real OpenJDK spends
+                    // O(1) here: its accumulator is `map.putIfAbsent(k, v)` and
+                    // it throws when that returns non-null, so only keys landing
+                    // in the SAME HASH BUCKET are ever compared. Bucketing by
+                    // `map_hash_key` reproduces that, and reproduces it more
+                    // faithfully than the full scan did: a class whose
+                    // `equals`/`hashCode` disagree now behaves as it does on the
+                    // JDK's hash map rather than as an exhaustive comparison.
+                    //
+                    // Measured on `IntStream.range(0, n).boxed().collect(toMap(..))`:
+                    // the scan cost 2.7s at n=4000 and 11.1s at n=8000 (4.09x for
+                    // a 2x size — quadratic), against ~12ms on HotSpot. A 128,256
+                    // entry tokenizer vocabulary, which is what GPULlama3 builds
+                    // while loading a Llama-3.2 model, extrapolates to ~46 minutes
+                    // and was reported as a model-load livelock.
+                    if let Value::Object(Some(kref)) = k {
+                        // `hashCode` re-enters Java; refresh `k` afterwards.
+                        let h = map_hash_key(ctx, kref)?;
+                        let k_cur = read_pinned_elem(ctx, k_handle, k);
+                        if let Some(bucket) = by_hash.get(&h) {
+                            for &j in bucket {
+                                // cceres3: `equals` re-enters Java — refresh both keys
+                                let existing_k =
+                                    read_pinned_elem(ctx, pair_handles[j].0, pairs[j].0);
+                                let k_cur = read_pinned_elem(ctx, k_handle, k_cur);
+                                if let (
+                                    Value::Object(Some(eref)),
+                                    Value::Object(Some(kref_cur)),
+                                ) = (existing_k, k_cur)
+                                {
+                                    if map_keys_equal(ctx, kref_cur, eref)? {
+                                        return Err(
                                     cratonvm_types::error::RuntimeError::IllegalStateException {
                                         message: "Duplicate key".to_string(),
                                     }
                                     .into(),
                                 );
+                                    }
                                 }
                             }
                         }
+                        by_hash.entry(h).or_default().push(pairs.len());
                     }
                     pairs.push((k, v));
                     pair_handles.push((k_handle, v_handle));
@@ -29659,6 +29694,11 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     .unwrap_or(usize::MAX);
                 let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
                 let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(elements.len());
+                // Key index for the duplicate/merge lookup, bucketed by Java
+                // `hashCode`. Holds indices into `pairs`, never addresses, so a
+                // moving collection between elements cannot invalidate it.
+                let mut by_hash: std::collections::HashMap<i32, Vec<usize>> =
+                    std::collections::HashMap::new();
                 for i in 0..elements.len() {
                     let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
                     let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
@@ -29682,14 +29722,52 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         )?
                         .unwrap_or(Value::Object(None));
                     let mut v_handle = pin_value(ctx, v);
+                    // Find an existing entry for this key, bucketed by
+                    // `hashCode` rather than by scanning every pair — see the
+                    // COLLECTOR_TAG_TO_MAP arm above for why the scan was
+                    // O(n^2) and why the JDK's own accumulator is not.
+                    //
+                    // The comparison is `values_equal_deep`, not
+                    // `values_equal`: the latter takes an IMMUTABLE context
+                    // and therefore cannot invoke a user `equals` at all, so
+                    // these two merges missed every duplicate whose key class
+                    // defined its own equality.
+                    // `Stream.of(k, other, k).collect(toMap(c -> c, c -> 1,
+                    // Integer::sum))` came back with the key unmerged at 1
+                    // instead of 2, the third element silently last-wins-ing
+                    // in `make_map_of` instead. The 2-arg arm above always
+                    // used the Java-invoking comparison; these two did not.
                     let mut idx = None;
-                    for (j, (ek, _)) in pairs.iter().enumerate() {
-                        let ek = read_pinned_elem(ctx, pair_handles[j].0, *ek);
-                        let k_cur = read_pinned_elem(ctx, k_handle, k);
-                        if values_equal(ctx, &ek, &k_cur) {
-                            idx = Some(j);
-                            break;
+                    let k_hash = match k {
+                        Value::Object(Some(kref)) => Some(map_hash_key(ctx, kref)?),
+                        _ => None,
+                    };
+                    match k_hash.and_then(|h| by_hash.get(&h)) {
+                        Some(bucket) => {
+                            for &j in bucket {
+                                let ek = read_pinned_elem(ctx, pair_handles[j].0, pairs[j].0);
+                                let k_cur = read_pinned_elem(ctx, k_handle, k);
+                                if values_equal_deep(ctx, &ek, &k_cur)? {
+                                    idx = Some(j);
+                                    break;
+                                }
+                            }
                         }
+                        // A key that is not an object reference (so it has no
+                        // Java `hashCode` to bucket by) keeps the exhaustive
+                        // scan. Stream elements mapped to map keys are boxed
+                        // references in practice, so this is the cold path.
+                        None if k_hash.is_none() => {
+                            for (j, (ek, _)) in pairs.iter().enumerate() {
+                                let ek = read_pinned_elem(ctx, pair_handles[j].0, *ek);
+                                let k_cur = read_pinned_elem(ctx, k_handle, k);
+                                if values_equal_deep(ctx, &ek, &k_cur)? {
+                                    idx = Some(j);
+                                    break;
+                                }
+                            }
+                        }
+                        None => {}
                     }
                     if let Some(j) = idx {
                         let existing = read_pinned_elem(ctx, pair_handles[j].1, pairs[j].1);
@@ -29710,6 +29788,9 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         pairs[j].1 = merged;
                         pair_handles[j].1 = v_handle;
                     } else {
+                        if let Some(h) = k_hash {
+                            by_hash.entry(h).or_default().push(pairs.len());
+                        }
                         pairs.push((k, v));
                         pair_handles.push((k_handle, v_handle));
                     }
@@ -29762,6 +29843,10 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     .unwrap_or(usize::MAX);
                 let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
                 let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(elements.len());
+                // Key index for the merge lookup, bucketed by Java `hashCode`.
+                // Holds indices into `pairs`, never addresses.
+                let mut by_hash: std::collections::HashMap<i32, Vec<usize>> =
+                    std::collections::HashMap::new();
                 for i in 0..elements.len() {
                     let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
                     let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
@@ -29785,14 +29870,52 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         )?
                         .unwrap_or(Value::Object(None));
                     let mut v_handle = pin_value(ctx, v);
+                    // Find an existing entry for this key, bucketed by
+                    // `hashCode` rather than by scanning every pair — see the
+                    // COLLECTOR_TAG_TO_MAP arm above for why the scan was
+                    // O(n^2) and why the JDK's own accumulator is not.
+                    //
+                    // The comparison is `values_equal_deep`, not
+                    // `values_equal`: the latter takes an IMMUTABLE context
+                    // and therefore cannot invoke a user `equals` at all, so
+                    // these two merges missed every duplicate whose key class
+                    // defined its own equality.
+                    // `Stream.of(k, other, k).collect(toMap(c -> c, c -> 1,
+                    // Integer::sum))` came back with the key unmerged at 1
+                    // instead of 2, the third element silently last-wins-ing
+                    // in `make_map_of` instead. The 2-arg arm above always
+                    // used the Java-invoking comparison; these two did not.
                     let mut idx = None;
-                    for (j, (ek, _)) in pairs.iter().enumerate() {
-                        let ek = read_pinned_elem(ctx, pair_handles[j].0, *ek);
-                        let k_cur = read_pinned_elem(ctx, k_handle, k);
-                        if values_equal(ctx, &ek, &k_cur) {
-                            idx = Some(j);
-                            break;
+                    let k_hash = match k {
+                        Value::Object(Some(kref)) => Some(map_hash_key(ctx, kref)?),
+                        _ => None,
+                    };
+                    match k_hash.and_then(|h| by_hash.get(&h)) {
+                        Some(bucket) => {
+                            for &j in bucket {
+                                let ek = read_pinned_elem(ctx, pair_handles[j].0, pairs[j].0);
+                                let k_cur = read_pinned_elem(ctx, k_handle, k);
+                                if values_equal_deep(ctx, &ek, &k_cur)? {
+                                    idx = Some(j);
+                                    break;
+                                }
+                            }
                         }
+                        // A key that is not an object reference (so it has no
+                        // Java `hashCode` to bucket by) keeps the exhaustive
+                        // scan. Stream elements mapped to map keys are boxed
+                        // references in practice, so this is the cold path.
+                        None if k_hash.is_none() => {
+                            for (j, (ek, _)) in pairs.iter().enumerate() {
+                                let ek = read_pinned_elem(ctx, pair_handles[j].0, *ek);
+                                let k_cur = read_pinned_elem(ctx, k_handle, k);
+                                if values_equal_deep(ctx, &ek, &k_cur)? {
+                                    idx = Some(j);
+                                    break;
+                                }
+                            }
+                        }
+                        None => {}
                     }
                     if let Some(j) = idx {
                         let existing = read_pinned_elem(ctx, pair_handles[j].1, pairs[j].1);
@@ -29813,6 +29936,9 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         pairs[j].1 = merged;
                         pair_handles[j].1 = v_handle;
                     } else {
+                        if let Some(h) = k_hash {
+                            by_hash.entry(h).or_default().push(pairs.len());
+                        }
                         pairs.push((k, v));
                         pair_handles.push((k_handle, v_handle));
                     }

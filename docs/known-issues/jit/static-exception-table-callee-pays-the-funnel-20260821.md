@@ -1,7 +1,18 @@
 # A statically-bound callee with an exception table pays the dispatch funnel — 10.2x, and an OSR body cannot escape it at all
 
-**Status: OPEN — root-caused and measured; the flip is NOT recommended on this
-evidence, and the OSR half is untouched.**
+**Status: the static-door ban is LIFTED (default-ON, 2026-08-21). The OSR half
+is OPEN and is now the whole of this page's remaining content.**
+
+> **The flip was made against this page's own recommendation, deliberately.**
+> The section below still says the census does not justify it, and that has not
+> changed — no workload win was found or is claimed. It was flipped on the
+> consistency argument instead: the statically bound door, which is the EASY
+> case, was 11x worse than the virtual door that had already been lifted on the
+> same evidence. A default that makes the simpler path the slower path is not a
+> conservative default. The correctness case for lifting it is
+> `probes/ExcTableDirectCallOracle.java` (below); the performance case is that
+> there isn't one, and the page says so rather than being rewritten to agree
+> with the decision.
 Found 2026-08-21 while pricing `ir_unresumable_protected_trap`, where a hot
 method with a `try`/`finally` measured ~12.8x the same arithmetic without one on
 BOTH tiers. That gap is not the tier and not that rule. It is this.
@@ -108,9 +119,12 @@ refuses 13x more than the others. Correctness holds in both arms —
 So the switch's "pending its own measurement" is **answered, in the negative**:
 the per-call multiplier is 10.2x and real, the population is 3-228 sites per
 class, and the two do not multiply into anything a workload can see. Flipping
-the default would be a consistency argument — the static door being 11x worse
-than the virtual door for the same callee shape is genuinely ugly — not a
-measured win. **Do not flip it on this evidence.**
+the default is a consistency argument — the static door being 11x worse than the
+virtual door for the same callee shape is genuinely ugly — not a measured win.
+
+**It was flipped on 2026-08-21 on exactly that basis**, with the performance
+verdict left standing above. What changed was not the evidence but the weight
+put on the asymmetry with the already-lifted virtual door.
 
 ### Why the two findings are coupled
 
@@ -128,17 +142,47 @@ rather than the flip being retried on more workloads.
 ## Next steps, in order
 
 1. ~~**Census**~~ — done, above.
-2. **Do NOT flip `direct_call_exc_table_publish_enabled` yet** — the census
-   does not support it. If it is ever flipped on consistency grounds it is one
-   line, and the interlocks it needs are already written and enforced
-   (`sp_ic_deopt_check_mode() == On`, plus the contiguous service-argument slots
-   `emit_inline_callee_deopt_check` needs — a site that cannot reserve them is a
-   compile failure, `direct-call-service-slots`, not an unserviced raw edge).
-   That flip still needs the vm suite, not just the probe: it changes codegen
-   for every statically bound exception-table callee. The two real classes run
-   here are evidence it is SAFE, not evidence it is worth it.
+2. ~~**Flip the default**~~ — DONE 2026-08-21, see "The flip" below.
 3. **Give OSR bodies the direct-bind ladder**, or record why they cannot have
    it. This is the larger of the two and it is independent of the switch.
+
+## The flip (2026-08-21)
+
+`CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` is default-ON; `=0` restores the ban.
+The interlock is untouched and is **not** a knob: `SP_IC_DEOPT_CHECK != On`
+still forces the ban back on whatever the flag says, because publishing a direct
+`CALL` while the `i64::MIN` sentinel check is suppressed is the unsound state the
+MIC sibling's page already recorded being fooled by (207.04 ns/op with the
+interlock holding, 24.12 without it — a refusal read as a pass).
+
+**The correctness case, which is the only thing that mattered.** The ban had one
+stated reason: *"a raw `CALL` has no Rust frame to notice the `i64::MIN`
+sentinel and run the callee's own handler."*
+`probes/ExcTableDirectCallOracle.java` falsifies it directly — a callee's own
+handler, its `finally`, a wrong-type handler that must NOT catch, a nested
+catch, and a rethrow-of-a-different-type, including the **implicit** AIOOBE /
+NPE / div-by-zero cases which are the ones that actually leave through the
+sentinel. Output is byte-identical across HotSpot 25, the new default, and the
+ban restored.
+
+The probe routes every guarded call through an ordinary frame (`driver`), not
+from its own loop — an OSR body never consults the gate, so a probe that called
+these methods from its hot loop would pass without ever baking the direct `CALL`
+it claims to test. Engagement, `CRATONVM_DBG=intrinsic-stats`:
+
+| arm | binds | `callee-exception-table` refusals |
+|---|---|---|
+| default (lifted) | 2 bound, 26 left | **absent** |
+| `=0` (ban) | 0 bound, 23 left | **16** |
+
+**Validation.** `cargo test -p cratonvm-jit` (15 binaries), `-p cratonvm-jit-api`
+and `-p cratonvm-types` green; the `cratonvm-vm` suite green; netty
+`BigEndianHeapByteBufTest` 414/414, `ZstdDecoderTest` 8/8,
+`Http2MultiplexCodecTest` 63/63, `NonStickyEventExecutorGroupTest` 10/10 in the
+new default, with the first two also run under the ban for comparison.
+`jit::direct_exc_table_publish_policy` pins the default and the interlock as a
+pure decision table — no environment mutation, because `set_var` in a parallel
+test binary is a data race rather than a visibility question.
 
 ## Reproduce
 

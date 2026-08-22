@@ -6101,6 +6101,65 @@ impl SharedVm {
         out.push_str("      \"truncated\": null,\n");
         out.push_str("      \"dropped\": null\n");
         out.push_str("    }\n");
+        // A SIBLING object again, and for the sharpest version of
+        // `observation_sink`'s reason. `CRATONVM_ENFORCE_NATIVE_SHADOW` does
+        // not add rows to this report -- it REMOVES them, because an enforced
+        // shadow does not dispatch and so never produces a
+        // `bridge-ran-over-bytecode` row. An armed report and an unarmed one
+        // were therefore indistinguishable in every field, and the armed
+        // one's emptier `violations[]` reads as the better result. It is not;
+        // it is a different question.
+        //
+        // `doors` is the other half. Until 2026-08-21 the dial had exactly
+        // one live call site (`resolve_step1_native`), so `scope` alone would
+        // still have overstated what an armed run measured: 890 of 947 armed
+        // `Bridge` dispatches never asked it, and
+        // `refusals.interpreter_shadow_unenforced` read `0` for all 890,
+        // because that one call site is also the only recorder of the
+        // native-won half.
+        //
+        // **`declined_no_bytecode` is NOT a leak count, and an earlier draft of
+        // this object called it one.** `reached` minus `yielded` is the dial
+        // being ASKED and answering no, and after the three cheap guards the
+        // only remaining reason to answer no is `dispatch_has_code == false` --
+        // there is no concrete bytecode to yield TO, so the native runs exactly
+        // as step 1 has always let it. Armed for `java/util/HashMap` it is 0,
+        // which is why the wrong name survived its first checks; armed for
+        // `all` it is 494 of 19 931. A widening scope cannot widen a leak.
+        //
+        // The question the wrong name implied -- does some door serve a
+        // `Bridge` WITHOUT asking? -- this counter cannot answer, because a
+        // door that never calls `note_dial_door` is invisible to it. It is
+        // answered statically instead, by the three source-witness tests in
+        // `native_override.rs` (`the_unrouted_invoke_or_native_doors_ask_the_
+        // enforcement_dial`, `the_warm_invoke_cache_door_asks_the_enforcement_
+        // dial`, and the scan that pins the helper's spelling so the other two
+        // cannot silently degrade to searching for nothing).
+        out.push_str("  },\n  \"enforcement_dial\": {\n");
+        out.push_str(&format!(
+            "    \"scope\": {},\n",
+            json_escape(&crate::runtime::env_cache::enforce_shadow_scope().report_spelling())
+        ));
+        let doors = crate::vm::dial_door_counts();
+        let reached: u64 = doors.iter().map(|(_, r, _)| *r).sum();
+        let yielded: u64 = doors.iter().map(|(_, _, y)| *y).sum();
+        out.push_str(&format!("    \"reached\": {reached},\n"));
+        out.push_str(&format!("    \"yielded\": {yielded},\n"));
+        out.push_str(&format!(
+            "    \"declined_no_bytecode\": {},\n",
+            reached.saturating_sub(yielded)
+        ));
+        out.push_str("    \"doors\": [");
+        for (i, (door, r, y)) in doors.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "\n      {{\"door\": {}, \"reached\": {r}, \"yielded\": {y}}}",
+                json_escape(door)
+            ));
+        }
+        out.push_str("\n    ]\n");
         out.push_str("  }\n}\n");
 
         use std::io::Write;
@@ -7996,6 +8055,47 @@ pub fn dump_wait_site_thread_local(shared: &SharedVm) {
     }
 }
 
+/// Print the state of the object a thread is parked on in `Object.wait()`.
+///
+/// The netty `ParameterizedSslHandlerTest` stall bottoms out in
+/// `DefaultPromise.await`/`awaitUninterruptibly` at the `Object.wait()` BCI, a
+/// 30 s-spurious-wakeup A/B showed the awaited promise is ALREADY complete, and
+/// the orphan check came back clean — so the waiter is on the right monitor and
+/// a notifier would resolve the same one. The remaining question is netty's own
+/// bookkeeping, which lives in two fields of the promise:
+///
+/// * `result`  — non-null once the promise completes (set OUTSIDE the monitor).
+/// * `waiters` — a PLAIN int the waiter increments inside the monitor
+///   immediately before `wait()`; `checkNotifyWaiters()` skips `notifyAll()`
+///   entirely when it reads 0.
+///
+/// `result != null` with `waiters >= 1` here means the completer either never
+/// ran `checkNotifyWaiters` or read a stale `waiters` — i.e. the monitor is not
+/// establishing happens-before between the two `synchronized` blocks.
+pub fn dump_wait_object_state(shared: &SharedVm, obj: ObjectRef) {
+    let cid = shared.mem.heap.class_id_of(obj);
+    let name = shared
+        .classes
+        .class_manager
+        .read()
+        .class_store
+        .get(cid)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| format!("<class_id {cid:?}>"));
+    let field = |f: &str| -> Option<cratonvm_types::Value> {
+        let cm = shared.classes.class_manager.read();
+        let idx = super::vm_exec::resolve_field_index_in_hierarchy(cid, f, &cm.class_store)?;
+        drop(cm);
+        Some(shared.mem.heap.get_field(obj, idx))
+    };
+    eprintln!(
+        "[WAIT-OBJECT] obj={:p} class={name} result={:?} waiters={:?}",
+        obj.as_ptr(),
+        field("result"),
+        field("waiters"),
+    );
+}
+
 impl SharedVm {
     /// Placeholder split-impl — see the inherent impl above. The split is
     /// purely so the thread-local helpers above can sit between two impl
@@ -8772,6 +8872,30 @@ impl Vm {
                 if let Some(s) = weak.upgrade() {
                     crate::vm::vm_init::dump_wait_site_thread_local(&s);
                 }
+            });
+        }
+        // Companion to the frame dump above: the STATE of the object the thread
+        // is parked on. See `dump_wait_object_state` for why those two fields
+        // are the ones that decide the netty promise stall.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_object_dump(move |obj| {
+                if let Some(s) = weak.upgrade() {
+                    crate::vm::vm_init::dump_wait_object_state(&s, obj);
+                }
+            });
+        }
+        // And the GC-SAFE handle for that dump. `Monitor::wait` holds the
+        // awaited `ObjectRef` as a plain local for the whole wait, which a
+        // moving collector invalidates; `jmx_waiting_monitor` is a scanned root
+        // that `update_thread_objs_after_gc` (gc.rs step 21) forwards, so it is
+        // the address still valid at dump time. Without this the dump silently
+        // reports pre-relocation field values.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_object_resolve(move |tid| {
+                let s = weak.upgrade()?;
+                s.threads.thread_registry.peek_jmx_waiting_monitor(tid)
             });
         }
 

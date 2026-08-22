@@ -902,6 +902,7 @@ fn resolve_native_for_dispatch(
         .kind_of_id(id)
         .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
     match crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::DispatchDoor::NoCodeRescue,
         crate::vm::dispatch_policy(shared),
         class_name,
         method_name,
@@ -1998,12 +1999,12 @@ pub fn execute(
             // `SyntheticStub` must reach that adjudication to be *refused*
             // rather than be quietly compiled around. So the kind is read
             // (`find_with_kind`, identical cost) but deliberately not filtered.
-            let native_skip = if shared
-                .natives
-                .native_methods
-                .find_with_kind(&class_name_str, method_name, method_descriptor)
-                .is_some()
-            {
+            let native_skip = if native_override::registered_native_will_run(
+                shared,
+                &class_name_str,
+                method_name,
+                method_descriptor,
+            ) {
                 true
             } else if !crate::runtime::env_cache::jit_native_shadow_caller_seal() {
                 // MEASUREMENT LEVER ONLY — `CRATONVM_JIT=-native-shadow-caller-seal`.

@@ -23,7 +23,7 @@ use crate::emitter::{LoweringError, RegKind};
 use crate::lowering::loop_recog::{instr_size, CountedLoop, NestedLoop};
 use crate::signature::KernelSignature;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 
 /// One slot of typed JVM state.
@@ -966,39 +966,131 @@ impl<'a> Emitter<'a> {
         self.copy_matching_state(source, &target, predicate, target_pc)
     }
 
+    /// Build the register state a join point will use, given the FIRST
+    /// edge that reaches it.
+    ///
+    /// The obvious implementation — mint a fresh "phi" register for
+    /// every live slot — is what this used to do, and it is quadratic
+    /// in the wrong thing: every edge into every join then copies
+    /// *every* live local and stack slot, including the overwhelming
+    /// majority that are identical on both sides of the branch. The two
+    /// edges out of one `if` carry literally the same state, so that
+    /// alone emitted `2 * live_slots` pointless `mov`s per branch. On
+    /// the ray-tracer kernel (about 130 live locals, seven branches)
+    /// the emitted PTX was 3299 `mov.f32` out of 4069 instructions, and
+    /// ptxas kept 933 of them as `FSEL` in the SASS — 38% of the
+    /// executed kernel was reconciling values that never differed.
+    ///
+    /// Instead, adopt the incoming registers as the join's registers.
+    /// A later edge whose slot holds a different register then copies
+    /// into the adopted one, which is exactly the phi — and a later
+    /// edge that agrees copies nothing (`copy_reg` short-circuits on
+    /// equal names). Correct because an edge's copies are the last
+    /// thing it does before transferring to the join, so the adopted
+    /// register cannot be live on that path for any other reason.
+    ///
+    /// Two slots must still get a fresh register, because for them
+    /// "write the adopted register" is not a private act:
+    ///
+    /// * **Aliased slots.** `iload x; istore y` leaves both locals
+    ///   bound to the *same* register. Merging local `x` by writing
+    ///   that register would silently also change local `y`. Any name
+    ///   appearing more than once in the state is therefore freshened.
+    /// * **Reserved registers.** `tid`, the recovered nested indices,
+    ///   the loop bound, the return value and the parameter array
+    ///   pointers are all read from `Emitter` fields rather than
+    ///   through the block state, so a merge that overwrote one would
+    ///   corrupt a value the rest of the kernel still reads.
+    ///
+    /// `U64` slots keep their register unconditionally, as before:
+    /// array references are *identified* by their parameter pointer
+    /// register (`array_param_of` resolves an `aload`ed reference that
+    /// way), so a phi register would be an array the array lowering
+    /// cannot resolve. Being reserved, they are also refused as a copy
+    /// destination by `copy_reg`, which turns "two different arrays
+    /// merge here" from a silently clobbered pointer into a CPU
+    /// fallback.
     fn canonicalise_state(&mut self, source: &BlockState) -> BlockState {
-        let fresh = |r: &Reg, regs: &mut RegPool| Reg {
-            kind: r.kind,
-            // Array references are identified by the original parameter
-            // pointer register (`array_param_of` uses that identity to find
-            // its length/ABI slot).  A verifier-valid join can only merge
-            // compatible references, so keep that binding rather than
-            // inventing a phi register the array lowering cannot resolve.
-            name: if r.kind == RegKind::U64 {
-                r.name.clone()
-            } else {
-                regs.fresh(r.kind)
-            },
-            wide: r.wide,
-        };
-        BlockState {
-            stack: OpStack(
-                source
-                    .stack
-                    .0
-                    .iter()
-                    .map(|r| fresh(r, &mut self.regs))
-                    .collect(),
-            ),
-            locals: Locals(
-                source
-                    .locals
-                    .0
-                    .iter()
-                    .map(|r| r.as_ref().map(|r| fresh(r, &mut self.regs)))
-                    .collect(),
-            ),
+        let mut occurrences: HashMap<&str, u32> = HashMap::new();
+        for r in source
+            .stack
+            .0
+            .iter()
+            .chain(source.locals.0.iter().flatten())
+        {
+            *occurrences.entry(r.name.as_str()).or_insert(0) += 1;
         }
+        let adoptable = |r: &Reg, occurrences: &HashMap<&str, u32>, this: &Self| -> bool {
+            r.kind == RegKind::U64
+                || (occurrences.get(r.name.as_str()).copied().unwrap_or(0) == 1
+                    && !this.is_reserved_reg(&r.name))
+        };
+        // Two passes so the borrow of `source` for `occurrences` ends
+        // before `self.regs` is mutated.
+        let keep_stack: Vec<bool> = source
+            .stack
+            .0
+            .iter()
+            .map(|r| adoptable(r, &occurrences, self))
+            .collect();
+        let keep_locals: Vec<bool> = source
+            .locals
+            .0
+            .iter()
+            .map(|slot| slot.as_ref().is_some_and(|r| adoptable(r, &occurrences, self)))
+            .collect();
+        drop(occurrences);
+
+        let mut stack = Vec::with_capacity(source.stack.0.len());
+        for (r, &keep) in source.stack.0.iter().zip(&keep_stack) {
+            stack.push(if keep {
+                r.clone()
+            } else {
+                Reg {
+                    kind: r.kind,
+                    name: self.regs.fresh(r.kind),
+                    wide: r.wide,
+                }
+            });
+        }
+        let mut locals = Vec::with_capacity(source.locals.0.len());
+        for (slot, &keep) in source.locals.0.iter().zip(&keep_locals) {
+            locals.push(slot.as_ref().map(|r| {
+                if keep {
+                    r.clone()
+                } else {
+                    Reg {
+                        kind: r.kind,
+                        name: self.regs.fresh(r.kind),
+                        wide: r.wide,
+                    }
+                }
+            }));
+        }
+        BlockState {
+            stack: OpStack(stack),
+            locals: Locals(locals),
+        }
+    }
+
+    /// Registers the emitter reads from its own fields rather than
+    /// through the block state, and which a join merge therefore must
+    /// never adopt as a copy destination.
+    fn is_reserved_reg(&self, name: &str) -> bool {
+        for reserved in [
+            self.tid_reg.as_ref(),
+            self.tid_reg_inner.as_ref(),
+            self.bound_reg.as_ref(),
+            self.ret_value_reg.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if reserved.name == name {
+                return true;
+            }
+        }
+        self.param_ptr_reg.iter().any(|p| p == name)
     }
 
     fn copy_matching_state(
@@ -1048,6 +1140,23 @@ impl<'a> Emitter<'a> {
         }
         if from.name == to.name {
             return Ok(());
+        }
+        // A join must never write a register the emitter reads from one
+        // of its own fields: `tid`, the loop bound, the return value, or
+        // an array parameter's pointer. `canonicalise_state` refuses to
+        // ADOPT those, so reaching here means two predecessors genuinely
+        // disagree about one, most plausibly two different arrays merging
+        // into the same reference slot. Overwriting a parameter pointer
+        // would silently corrupt every later access through it, so refuse
+        // the method and let it run on the CPU.
+        if self.is_reserved_reg(&to.name) {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "control-flow join pc={target_pc} would merge into reserved \
+                 register {} (tid / loop bound / return value / array \
+                 parameter pointer): predecessors disagree about a value the \
+                 kernel reads outside the block state",
+                to.name
+            )));
         }
         let suffix = match from.kind {
             RegKind::U32 => "u32",
@@ -1323,9 +1432,18 @@ impl<'a> Emitter<'a> {
             0x8A => self.conv("cvt.rn.f64.s64", RegKind::S64, RegKind::F64)?, // l2d
             0x8B => self.conv("cvt.rzi.s32.f32", RegKind::F32, RegKind::S32)?, // f2i
             0x8C => self.conv("cvt.rzi.s64.f32", RegKind::F32, RegKind::S64)?, // f2l
+            // f2d — but see `float_sqrt_triple_at`: when this widen exists
+            // only to reach `Math.sqrt(D)D` and is narrowed straight back,
+            // leave the value as F32 and let `invokestatic` emit a single
+            // `sqrt.rn.f32`. Skipping the widen here is what tells the two
+            // later arms the collapse is in progress.
+            0x8D if self.float_sqrt_triple_at(pc) => {}
             0x8D => self.conv("cvt.f64.f32", RegKind::F32, RegKind::F64)?, // f2d
             0x8E => self.conv("cvt.rzi.s32.f64", RegKind::F64, RegKind::S32)?, // d2i
             0x8F => self.conv("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
+            // d2f — a no-op when the value on the stack is already F32,
+            // which happens only for the collapsed float-sqrt triple.
+            0x90 if self.stack.0.last().map(|r| r.kind) == Some(RegKind::F32) => {}
             0x90 => self.conv("cvt.rn.f32.f64", RegKind::F64, RegKind::F32)?, // d2f
             0x91 => self.conv_truncate_i32(8)?,                            // i2b
             // i2c — Java `char` is an UNSIGNED 16-bit value, so JVMS i2c
@@ -1588,6 +1706,71 @@ impl<'a> Emitter<'a> {
     /// and dispatch to the matching intrinsic's PTX lowering. See the
     /// module-level AUDIT comment above and
     /// `analyzer::resolve_math_intrinsic` for the curated table and the
+
+    /// Is the instruction at `pc` the `f2d` of a `(float) Math.sqrt(f)`?
+    ///
+    /// `java.lang.Math` declares square root only as `sqrt(D)D`, so there is
+    /// no way to spell a float square root in Java except
+    ///
+    /// ```text
+    /// f2d                              (widen the float to double)
+    /// invokestatic Math.sqrt:(D)D      (correctly-rounded f64 sqrt)
+    /// d2f                              (round the result back to float)
+    /// ```
+    ///
+    /// and javac emits those three adjacent. Lowered literally that is a
+    /// DOUBLE-precision square root, which on a consumer GPU is a disaster:
+    /// Turing runs FP64 at 1/32 of FP32 rate, and `sqrt.rn.f64` expands to a
+    /// `MUFU.RSQ64H` plus a Newton-Raphson chain of `DFMA`/`DMUL`. The
+    /// four-sphere ray tracer has eight of these per pixel and its SASS came
+    /// out with 76 FP64 instructions against ~250 FP32 ones — the f64 sqrts
+    /// alone outweighed the entire rest of the kernel.
+    ///
+    /// Collapsing the triple to one `sqrt.rn.f32` is **bit-exact**, not an
+    /// approximation. Rounding a square root through binary64 and then to
+    /// binary32 gives the correctly-rounded binary32 result whenever
+    /// `p64 >= 2 * p32 + 2`, and 53 >= 50. That is the classical
+    /// innocuous-double-rounding condition for square root, and it was
+    /// checked here the blunt way rather than cited: all 2^32 float bit
+    /// patterns, `(x as f64).sqrt() as f32` against `x.sqrt()`, zero
+    /// mismatches — including subnormals, both zeros, both infinities and
+    /// the NaNs. `sqrt.rn.f32` (not `.approx`, not `.ftz`) is required for
+    /// that to hold.
+    ///
+    /// Matching the whole triple rather than just the call matters: an
+    /// `f2d` that is NOT feeding a narrowed sqrt still widens normally, and
+    /// a genuine `double` square root still lowers to `sqrt.rn.f64`.
+    fn float_sqrt_triple_at(&self, pc: usize) -> bool {
+        // f2d (1 byte) ; invokestatic (3 bytes) ; d2f
+        if self.bytes.get(pc) != Some(&0x8D) || self.bytes.get(pc + 1) != Some(&0xB8) {
+            return false;
+        }
+        if self.bytes.get(pc + 4) != Some(&0x90) {
+            return false;
+        }
+        let (Some(&hi), Some(&lo)) = (self.bytes.get(pc + 2), self.bytes.get(pc + 3)) else {
+            return false;
+        };
+        let Some(cp) = self.cp else { return false };
+        let index = u16::from_be_bytes([hi, lo]);
+        let Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }) = cp.get(index)
+        else {
+            return false;
+        };
+        let Some(class_name) = cp.get_class_name(*class_index) else {
+            return false;
+        };
+        let Some((method_name, descriptor)) = cp.get_name_and_type(*name_and_type_index) else {
+            return false;
+        };
+        matches!(
+            resolve_math_intrinsic(class_name, method_name, descriptor),
+            Some(MathIntrinsic::SqrtF64)
+        )
+    }
     /// exactness rationale for each entry.
     fn invokestatic(&mut self, index: u16) -> Result<(), LoweringError> {
         let cp = self.cp.ok_or_else(|| {
@@ -1621,6 +1804,18 @@ impl<'a> Emitter<'a> {
                 ))
             })?;
         match resolve_math_intrinsic(class_name, method_name, descriptor) {
+            // `Math.sqrt` is only declared `(D)D`, so a float square root in
+            // Java is always spelled `(float) Math.sqrt(f)` and always
+            // arrives here with an `f2d` in front and a `d2f` behind. When
+            // `f2d` recognised that triple it left the operand as F32 (see
+            // `float_sqrt_triple_at`), and the whole thing collapses to one
+            // `sqrt.rn.f32`. Otherwise the operand really is a double and
+            // the f64 square root is what the program asked for.
+            Some(MathIntrinsic::SqrtF64) if self.stack.0.last().map(|r| r.kind)
+                == Some(RegKind::F32) =>
+            {
+                self.unop_f32("sqrt.rn.f32")
+            }
             Some(MathIntrinsic::SqrtF64) => self.unop_f64("sqrt.rn.f64"),
             Some(MathIntrinsic::AbsF32) => self.unop_f32("abs.f32"),
             Some(MathIntrinsic::AbsF64) => self.unop_f64("abs.f64"),
@@ -2178,13 +2373,40 @@ impl<'a> Emitter<'a> {
         let b = self.stack.pop()?;
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::F32);
-        // div on f32 needs an explicit rounding mode in PTX; rn.f32
-        // family. AUDIT 2026-05-16/2026-07-11: PTX still has no
-        // `rem.f32` mnemonic, so this single-instruction `binop_f32`
-        // helper still has no `"rem.f32"` arm — `frem` (0x72) is not a
-        // `binop_f32` at all, it dispatches to the dedicated multi-
-        // instruction `frem_f32` helper instead (see its doc comment).
+        // Every float arithmetic mnemonic carries an EXPLICIT `.rn`
+        // rounding mode. `div` has always needed one (PTX has no bare
+        // `div.f32`), but `add`/`sub`/`mul` accept the bare form and
+        // default to round-to-nearest-even — which reads as "already
+        // correct" and is not. The PTX ISA makes the rounding modifier
+        // the switch that also controls CONTRACTION: an unrounded
+        // `mul.f32` feeding an unrounded `add.f32` may be fused by
+        // ptxas into a single `fma.rn.f32`, while an operation with an
+        // explicit rounding modifier is never contracted.
+        //
+        // AUDIT 2026-08-21, measured on sm_75 with `ptxas -O3`:
+        // `mul.f32` + `add.f32` compiled to one `FFMA`, whereas
+        // `mul.rn.f32` + `add.rn.f32` compiled to `FMUL` + `FADD`. The
+        // fused form rounds ONCE where JLS §15.17.1/§15.18.2 require
+        // the product to be rounded to float before the add, so every
+        // kernel containing an `a*b + c` chain silently computed a
+        // different (more accurate, but not Java) result on the device
+        // than on the CPU. That is the root cause of the 640x480
+        // ray-tracer checksum divergence found on 2026-08-21; the
+        // earlier fixtures stayed bit-exact only because none of them
+        // had a mul-then-add pair to contract. Java has an explicit
+        // `Math.fma` for the fused form, lowered by `fma_f32` — fusing
+        // is the programmer's call, never the backend's. See the
+        // "Float bit-exactness" section of the GPU reference doc.
+        //
+        // AUDIT 2026-05-16/2026-07-11: PTX still has no `rem.f32`
+        // mnemonic, so this single-instruction `binop_f32` helper still
+        // has no `"rem.f32"` arm — `frem` (0x72) is not a `binop_f32`
+        // at all, it dispatches to the dedicated multi-instruction
+        // `frem_f32` helper instead (see its doc comment).
         let m = match mnemonic {
+            "add.f32" => "add.rn.f32",
+            "sub.f32" => "sub.rn.f32",
+            "mul.f32" => "mul.rn.f32",
             "div.f32" => "div.rn.f32",
             other => other,
         };
@@ -2197,7 +2419,13 @@ impl<'a> Emitter<'a> {
         let b = self.stack.pop()?;
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::F64);
+        // Same explicit-`.rn` rule as `binop_f32` — see its comment for
+        // why the bare mnemonics are a bit-exactness hazard rather than
+        // a harmless default.
         let m = match mnemonic {
+            "add.f64" => "add.rn.f64",
+            "sub.f64" => "sub.rn.f64",
+            "mul.f64" => "mul.rn.f64",
             "div.f64" => "div.rn.f64",
             other => other,
         };
@@ -3271,6 +3499,37 @@ pub(crate) fn locate_bound(
     }
     let bound_pc = prev_ops[prev_ops.len() - 1];
     let bound_op = bytes[bound_pc];
+
+    // `i < arr.length` written inline: the bound is produced right here
+    // by `aload arr; arraylength`, with no cached local in between. Same
+    // destination as the cached-length form — the array parameter's
+    // `pN_len` — just reached without the round trip through a local.
+    if bound_op == 0xBE {
+        let aload_pc = *prev_ops
+            .get(prev_ops.len().wrapping_sub(2))
+            .ok_or_else(|| {
+                LoweringError::UnsupportedNode(
+                    "inline `arraylength` loop bound has no preceding instruction".into(),
+                )
+            })?;
+        let aload_op = bytes[aload_pc];
+        let src_local = match aload_op {
+            0x2A..=0x2D => (aload_op - 0x2A) as u16,
+            0x19 => bytes[aload_pc + 1] as u16,
+            0xC4 if bytes[aload_pc + 1] == 0x19 => {
+                u16::from_be_bytes([bytes[aload_pc + 2], bytes[aload_pc + 3]])
+            }
+            _ => {
+                return Err(LoweringError::UnsupportedNode(format!(
+                    "inline `arraylength` loop bound at pc={bound_pc} is not taken \
+                     from a plain `aload` (op 0x{aload_op:02x}) — the array must be \
+                     a method parameter for its length to be a kernel parameter"
+                )));
+            }
+        };
+        return param_len_for_local(sig, src_local);
+    }
+
     let bound_local = match bound_op {
         0x1A..=0x1D => Some((bound_op - 0x1A) as u16),
         0x15 => Some(bytes[bound_pc + 1] as u16),

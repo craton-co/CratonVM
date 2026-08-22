@@ -242,6 +242,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "callee-deopt", on_key: Some("CRATONVM_DBG_CALLEE_DEOPT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "layout-alias", on_key: Some("CRATONVM_DBG_LAYOUT_ALIAS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "check-override", on_key: Some("CRATONVM_DBG_CHECK_OVERRIDE"), off_key: None, off_word: None },
+    // The enforcement dial's per-door census. The TOTALS print on any armed
+    // run without this; the token adds the per-triple rows.
+    E { group: Group::DBG, token: "dial-doors", on_key: Some("CRATONVM_DBG_DIAL_DOORS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "direct-memory", on_key: Some("CRATONVM_DBG_DM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupx-trace", on_key: Some("CRATONVM_DBG_DUPX_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "read0-latency", on_key: Some("CRATONVM_DBG_READ0LAT"), off_key: None, off_word: None },
@@ -390,6 +393,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gc-overhead", on_key: Some("CRATONVM_DBG_GC_OVERHEAD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-stats", on_key: Some("CRATONVM_GC_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-stress", on_key: Some("CRATONVM_DBG_GC_STRESS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcpart", on_key: Some("CRATONVM_DBG_GCPART"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gcpause", on_key: Some("CRATONVM_DBG_GCPAUSE"), off_key: None, off_word: None },
@@ -403,6 +407,7 @@ pub const INVENTORY: &[E] = &[
     // agreement checks accepted it.
     E { group: Group::DBG, token: "stack-kinds", on_key: Some("CRATONVM_DBG_STACK_KINDS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gocbf", on_key: Some("CRATONVM_DBG_GOCBF"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "gpu-dump-ptx", on_key: Some("CRATONVM_GPU_DUMP_PTX"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-trace-bytes", on_key: Some("CRATONVM_GPU_TRACE_BYTES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gse", on_key: Some("CRATONVM_DBG_GSE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "h2parserread", on_key: Some("CRATONVM_DBG_H2PARSERREAD"), off_key: None, off_word: None },
@@ -690,6 +695,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "sc-write", on_key: Some("CRATONVM_DBG_SC_WRITE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "scalar-deopt", on_key: Some("CRATONVM_DBG_SCALAR_DEOPT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "scalar-new", on_key: Some("CRATONVM_DBG_SCALAR_NEW"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "scanner-debug", on_key: Some("CRATONVM_SCANNER_DEBUG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "seed-all-old", on_key: Some("CRATONVM_DBG_SEED_ALL_OLD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "seedhunt", on_key: Some("CRATONVM_DBG_SEEDHUNT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sel", on_key: Some("CRATONVM_DBG_SEL"), off_key: None, off_word: None },
@@ -986,7 +992,7 @@ pub const INVENTORY: &[E] = &[
     // Default-OFF pending its own measurement (16 refused binds on netty's
     // BigEndianHeapByteBufTest against 736 for the native shadow), and
     // interlocked with `sp-ic-deopt-check` the same way.
-    E { group: Group::JIT, token: "direct-exc-table-publish", on_key: Some("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "direct-exc-table-publish", on_key: Some("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "mic-rust-entry-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_MIC_RUST_ENTRY_CACHE"), off_word: None },
     // The three moving-young ("my-") bisect levers. All default-ON, all read
     // `0`/`false` as off, and `my-shadow-emission` is read identically by
@@ -1216,6 +1222,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-coverage-pin", on_key: Some("CRATONVM_G1_COVERAGE_PIN"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-pin-empty-publication", on_key: Some("CRATONVM_G1_PIN_EMPTY_PUBLICATION"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-precise-only-roots", on_key: Some("CRATONVM_G1_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "precise-only-roots", on_key: Some("CRATONVM_GC_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-evac-retry", on_key: None, off_key: Some("CRATONVM_G1_NO_EVAC_RETRY"), off_word: None },
     E { group: Group::GC, token: "g1-live-region-memo", on_key: None, off_key: Some("CRATONVM_G1_NO_LIVE_REGION_MEMO"), off_word: None },
     E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: Some("0") },
@@ -1465,6 +1472,7 @@ pub const INVENTORY: &[E] = &[
     // is what sets `CRATONVM_STRIPED_COUNTERS_OFF`.
     E { group: Group::THREADS, token: "striped-counters", on_key: None, off_key: Some("CRATONVM_STRIPED_COUNTERS_OFF"), off_word: None },
     E { group: Group::THREADS, token: "thread-start-grace-ms", on_key: Some("CRATONVM_THREAD_START_GRACE_MS"), off_key: None, off_word: None },
+    E { group: Group::THREADS, token: "wait-spurious-ms", on_key: Some("CRATONVM_WAIT_SPURIOUS_MS"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "aot-hmac-key", on_key: Some("CRATONVM_AOT_HMAC_KEY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "jca-lenient-getinstance", on_key: Some("CRATONVM_JCA_LENIENT_GETINSTANCE"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "block-private-nets", on_key: Some("CRATONVM_BLOCK_PRIVATE_NETS"), off_key: None, off_word: None },

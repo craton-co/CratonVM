@@ -170,6 +170,63 @@ public class MhVarargsNullProbe {
                 () -> varargsFunction((String[]) null));
         row("F04 plain java varargsFunction(null-as-element)",
                 () -> varargsFunction(new String[] {null}));
+
+        // ---- the inexact `invoke` door, by CALL-SITE parameter type -------
+        // `invoke` compiles to `asType(callSiteType)`, so what the caller
+        // WROTE at the call site decides whether the collector wraps. These
+        // rows are the ones a VM that cannot see its call-site descriptor
+        // gets wrong.
+        row("G01 vf.invoke(new String[0]) [exact array type]",
+                () -> (String) vf.invoke(new String[0]));
+        row("G02 vf.invoke((Object) new String[0])",
+                () -> (String) vf.invoke((Object) new String[0]));
+        row("G03 ov.invoke((String[]) null) [Object[] param, String[] site]",
+                () -> (String) ov.invoke((String[]) null));
+        row("G04 ov.invoke(new String[] {\"a\"}) [subtype array]",
+                () -> (String) ov.invoke(new String[] {"a"}));
+        row("G05 mx.invoke(\"a\", (Object) new String[] {\"b\"})",
+                () -> (String) mx.invoke("a", (Object) new String[] {"b"}));
+        row("G06 mx.invoke(\"a\", new String[] {\"b\"}) [exact array type]",
+                () -> (String) mx.invoke("a", new String[] {"b"}));
+        row("G07 vf.invoke((Object) \"a\")", () -> (String) vf.invoke((Object) "a"));
+        row("G08 iv.invoke((Object) null)", () -> (String) iv.invoke((Object) null));
+        row("G09 iv.invoke((int[]) null)", () -> (String) iv.invoke((int[]) null));
+        // A VIRTUAL collector: the call site names the receiver, `MH_DESC` does
+        // not, so the two have to be aligned before the trailing types can be
+        // compared at all.
+        row("G10 inst.invoke(recv,(Object) null)",
+                () -> (String) inst.invoke(new MhVarargsNullProbe(), (Object) null));
+        row("G11 inst.invoke(recv,(String[]) null)",
+                () -> (String) inst.invoke(new MhVarargsNullProbe(), (String[]) null));
+        row("G12 inst.invoke(recv,new String[] {a})",
+                () -> (String) inst.invoke(new MhVarargsNullProbe(), new String[] {"a"}));
+        row("G13 inst.invoke(recv,a,b)",
+                () -> (String) inst.invoke(new MhVarargsNullProbe(), "a", "b"));
+
+        // ---- a FIXED-ARITY handle refuses; it does not gather -------------
+        MethodHandle fa = vf.asFixedArity();
+        row("H01 fa.isVarargsCollector", () -> fa.isVarargsCollector());
+        row("H02 fa.iwa(x,y)", () -> fa.invokeWithArguments("x", "y"));
+        row("H03 fa.iwa(x)", () -> fa.invokeWithArguments("x"));
+        row("H04 fa.iwa(new String[]{x})",
+                () -> fa.invokeWithArguments(new Object[] {new String[] {"x"}}));
+        row("H05 fa.iwa()", () -> fa.invokeWithArguments());
+        row("H06 fa.invoke(x,y)", () -> (String) fa.invoke("x", "y"));
+        row("H07 fa.invokeExact(new String[]{x})",
+                () -> (String) fa.invokeExact(new String[] {"x"}));
+        MethodHandle mfa = mx.asFixedArity();
+        row("H08 mfa.iwa(a,b,c)", () -> mfa.invokeWithArguments("a", "b", "c"));
+        row("H09 mfa.iwa(a,new String[]{b})",
+                () -> mfa.invokeWithArguments("a", new String[] {"b"}));
+
+        // ---- a NON-varargs target reached with too many arguments ---------
+        // The JRuby shape `collect_trailing_varargs`' `arity_excess` trigger
+        // exists for: a plain (non-ACC_VARARGS) array parameter, more flat
+        // values than params. `fx` is exactly that method.
+        row("H10 fx.iwa(a,b) [plain String[] param, 2 flat args]",
+                () -> fx.invokeWithArguments("a", "b"));
+        row("H11 fx.iwa(new String[]{a,b})",
+                () -> fx.invokeWithArguments(new Object[] {new String[] {"a", "b"}}));
     }
 
     /** Mirrors FunctionReference.executeFunctionViaMethodHandle's varargs repackaging. */
