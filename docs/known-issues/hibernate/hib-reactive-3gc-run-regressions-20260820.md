@@ -1131,6 +1131,47 @@ caught, and it is repaired by the same change.
 FAIL is either a different defect or environment-dependent; this session has no
 evidence either way and is not claiming it.
 
+### 8.6.1 Full suite, three collectors, MySQL — 2026-08-22
+
+The whole 249-class `testlist.txt` on the fixed binary against **MySQL** in
+Docker (Testcontainers, one container per class), all three collectors, with a
+real-HotSpot control on the same database, list, argfile and shard count. Full
+write-up:
+[`RESULTS-20260822-3gc-mysql-local.md`](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260822-3gc-mysql-local.md).
+
+204 runnable classes per arm (249 minus the 45 no-`@@RESULT` classes):
+
+| GC | PASS | failures HotSpot does NOT share |
+|---|---:|---:|
+| ZGC (default) | 202 | **1** |
+| G1 | 201 | **2** |
+| Generational | 199 | **4** |
+
+Every class in this section's family PASSes on all three collectors:
+`FilterWithPaginationTest`, `CriteriaMutationQueryTest`, `OneToManyTest`,
+`RowIdUpdateAndDeleteTest`, `ReactiveStatelessWithBatchTest`,
+`QuerySpecificationTest`, `MutationDelegateIdentityTest`.
+
+What remains is four classes, none of them this defect:
+`MultithreadedInsertionWithLazyConnectionTest` (all three arms, PASSes on
+HotSpot — the suite's longest-standing item and the obvious next target),
+`techempower.TechEmpowerTest` (G1 + Generational, PASSes on ZGC),
+`MultithreadedIdentityGenerationTest` and `SoftDeleteCollectionTest`
+(Generational only). The last three are single observations and have not been
+repeated.
+
+**One methodology warning from that run, because it nearly produced the wrong
+answer.** The first pass ran the three arms concurrently at 3 shards each — nine
+simultaneous MySQL container boots — and reported 25/22/20 FAIL, *including
+`FilterWithPaginationTest` at `found=35 ok=0 failed=35`*, i.e. this section's own
+witness class failing every test in it. The cause was
+`IllegalStateException: Could not find a valid Docker environment`: the daemon
+was saturated. Re-running the 28-class non-PASS union one arm at a time at 2
+shards — matching the HotSpot control's concurrency — collapsed it to 2/3/5.
+**When a suite's setup depends on a shared external resource, fork count is an
+experimental variable, and an arm run at 9-way against a control run at 2-way is
+not an A/B.**
+
 ### 8.7 What this does NOT settle
 
 Section 7's sweep found 6 of 8 other still-FAIL classes clear under `--jit off`;

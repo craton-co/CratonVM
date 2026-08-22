@@ -9960,6 +9960,14 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .find_all_resource_urls(name)
     }
 
+    fn find_resource_urls_in_segment(&self, name: &str, segment: u8) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .find_resource_urls_in_segment(name, segment as usize)
+    }
+
     fn next_resource_url(
         &self,
         name: &str,
