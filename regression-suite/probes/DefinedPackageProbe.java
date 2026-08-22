@@ -69,5 +69,10 @@ public class DefinedPackageProbe {
         // implying it proved something.
         System.out.println("NOTE: (4) is a WEAK control — a class in the unnamed");
         System.out.println("      package answers null on a conforming VM as well.");
+        System.out.println("      The STRONG control needs a class in a NAMED package on the");
+        System.out.println("      classpath, which a single-file probe cannot carry. It was");
+        System.out.println("      measured separately and is reproduced in WORKER-5-NOTE-8 §7:");
+        System.out.println("      com.example.app resolves non-null on HotSpot and on the fixed");
+        System.out.println("      VM, so the fix narrows the probe WITHOUT blinding it.");
     }
 }
