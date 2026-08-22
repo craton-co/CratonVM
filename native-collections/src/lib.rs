@@ -15358,10 +15358,20 @@ const MAP_VIEW_CARRIERS: &[&str] = &[
     "java/util/HashMap$Values",
     "java/util/LinkedHashMap$LinkedValues",
     "java/util/TreeMap$Values",
-    "java/util/TreeMap$EntrySet",
+    TM_ENTRY_SET_CARRIER,
     "java/util/Hashtable$ValueCollection",
     "java/util/concurrent/ConcurrentHashMap$ValuesView",
 ];
+
+/// The ONE [`MAP_VIEW_CARRIERS`] member that holds `Map.Entry` elements rather
+/// than plain values.
+///
+/// Named rather than spelled out at each of its uses because that asymmetry is
+/// load-bearing: every predicate over `MAP_VIEW_CARRIERS` that means "values"
+/// has to exclude this class, and every one that classifies a carrier by its
+/// contents has to prefer it over the guess. See
+/// [`view_carrier_holds_entries_by_class`].
+const TM_ENTRY_SET_CARRIER: &str = "java/util/TreeMap$EntrySet";
 
 /// `true` iff `name` is one of the [`MAP_VIEW_CARRIERS`]. Cold path only: the
 /// per-call answer comes from the `AlLayout` memo, which consults this once per
@@ -15741,15 +15751,26 @@ fn make_view_list_of(
     let list = alloc_view_carrier(ctx, carrier)?;
     let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
+    // `buf` is pinned for the same reason `tm_resync_view_inner` pins its own:
+    // it is the only reference to a freshly allocated array until `al_set_data`
+    // lands, and `make_list_of` next door has always pinned its equivalent. The
+    // window here is short and today contains no allocation, which is exactly
+    // how the twin in `tm_resync_view_inner` read before a `tm_obj_key` call
+    // grew into it.
     let buf = alloc_ref_array(ctx, cap);
+    let buf_pin = ctx.pin_native_root(buf);
     for (i, val) in vals.iter().enumerate() {
         let val = read_pinned_elem(ctx, val_handles[i], *val);
+        let buf = ctx.read_native_pin(buf_pin, buf);
         ctx.set_array_element(buf, i, val);
     }
     let source = ctx.read_native_pin(source_pin, source);
+    let buf = ctx.read_native_pin(buf_pin, buf);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
     let list = ctx.read_native_pin(list_pin, list);
     store_view_carrier_backref(ctx, list, source);
+    let list = ctx.read_native_pin(list_pin, list);
+    let buf = ctx.read_native_pin(buf_pin, buf);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, vals.len() as i32);
     ctx.unpin_native_roots(first_pin);
@@ -16109,6 +16130,48 @@ fn is_synthetic_map_entry_class(name: &str) -> bool {
             || name.ends_with("$SimpleImmutableEntry"))
 }
 
+/// Mint one live `java.util.AbstractMap$SimpleEntry` per collected pair.
+///
+/// `source_pin` must ALREADY root `source`; the pairs are pinned here. Shared by
+/// [`resync_values_view`] and [`vc_route`] so the two entry-view rebuilds cannot
+/// drift — before this existed only the first had the branch at all, and
+/// `vc_route` re-expressed an `entrySet()` receiver as its map's VALUES.
+///
+/// GC-SAFETY: `alloc_live_entry` allocates once per pair, so an earlier
+/// iteration's allocation can relocate a later iteration's key/value AND the
+/// source map that every minted entry embeds. Both are re-read through their
+/// pins immediately before each use.
+fn live_entries_for_pairs(
+    ctx: &mut dyn NativeContext,
+    source_pin: usize,
+    source: ObjectRef,
+    pairs: &[(Value, Value)],
+) -> Result<Vec<Value>, MethodCallFailed> {
+    let mut flat: Vec<Value> = Vec::with_capacity(pairs.len() * 2);
+    for (k, v) in pairs {
+        flat.push(*k);
+        flat.push(*v);
+    }
+    let (_flat_pin, flat_handles) = pin_value_slice(ctx, &flat);
+    let mut out = Vec::with_capacity(pairs.len());
+    for i in 0..pairs.len() {
+        let k = read_pinned_elem(ctx, flat_handles[2 * i], flat[2 * i]);
+        let v = read_pinned_elem(ctx, flat_handles[2 * i + 1], flat[2 * i + 1]);
+        let source_cur = ctx.read_native_pin(source_pin, source);
+        // Real Map.Entry impl (see `native_tm_entry_set`): reflective property
+        // access over rebuilt TreeMap entrySet elements.
+        let entry = alloc_live_entry(
+            ctx,
+            "java/util/AbstractMap$SimpleEntry",
+            k,
+            v,
+            source_cur,
+        )?;
+        out.push(Value::Object(Some(entry)));
+    }
+    Ok(out)
+}
+
 fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     let source = match values_view_source(ctx, list) {
         Some(s) => s,
@@ -16142,39 +16205,22 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) -> Result<Ob
     // stale `list`.
 
     let vals: Vec<Value> = if is_entry_view {
-        let mut flat_entries: Vec<Value> = Vec::with_capacity(entries.len() * 2);
-        for (k, v) in &entries {
-            flat_entries.push(*k);
-            flat_entries.push(*v);
-        }
-        let (_entries_pin, entries_handles) = pin_value_slice(ctx, &flat_entries);
-        let mut out = Vec::with_capacity(entries.len());
-        for i in 0..entries.len() {
-            let k = read_pinned_elem(ctx, entries_handles[2 * i], flat_entries[2 * i]);
-            let v = read_pinned_elem(ctx, entries_handles[2 * i + 1], flat_entries[2 * i + 1]);
-            let source_cur = ctx.read_native_pin(source_pin, source);
-            let entry = alloc_live_entry(
-                ctx,
-                // Real Map.Entry impl (see native_tm_entry_set): reflective
-                // property access over rebuilt TreeMap entrySet elements.
-                "java/util/AbstractMap$SimpleEntry",
-                k,
-                v,
-                source_cur,
-            )?;
-            out.push(Value::Object(Some(entry)));
-        }
-        out
+        live_entries_for_pairs(ctx, source_pin, source, &entries)?
     } else {
         entries.into_iter().map(|(_, v)| v).collect()
     };
 
     let (_vals_pin, vals_handles) = pin_value_slice(ctx, &vals);
     let cap = vals.len().max(AL_DEFAULT_CAPACITY) + 1;
+    // Pinned for the reason spelled out on `tm_resync_view_inner`'s publish
+    // block: a freshly allocated array whose only reference is a Rust local is
+    // one allocation away from being written into a from-space object.
     let buf = alloc_ref_array(ctx, cap);
+    let buf_pin = ctx.pin_native_root(buf);
     let list = ctx.read_native_pin(list_pin, list);
     let source = ctx.read_native_pin(source_pin, source);
     let vals = read_value_slice(ctx, &vals_handles, &vals);
+    let buf = ctx.read_native_pin(buf_pin, buf);
     for (i, v) in vals.iter().enumerate() {
         ctx.set_array_element(buf, i, *v);
     }
@@ -16223,7 +16269,84 @@ fn view_source_in(ctx: &dyn NativeContext, data: ObjectRef, size: i32) -> Option
 /// applies, factored out so the two callers cannot drift. An EMPTY view answers
 /// `false`: with no head element there is nothing to classify, and every caller
 /// of this predicate wants `values()` to be the default reading.
+///
+/// The head-element reading is now the FALLBACK, not the answer: see
+/// [`view_carrier_holds_entries_by_class`] for the two ways it reached "values"
+/// on a genuine `entrySet()` and what asking the class first closes.
 fn al_view_holds_entries(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
+    if let Some(by_class) = view_carrier_holds_entries_by_class(ctx, list) {
+        if cratonvm_types::flags::runtime_var("CRATONVM_DBG_VIEWKIND").is_ok() {
+            let by_head = al_view_holds_entries_by_head(ctx, list);
+            if by_head != by_class {
+                let (data, size) = al_state(ctx, list);
+                eprintln!(
+                    "[VIEWKIND] carrier={} class_says_entries={by_class} head_says_entries={by_head} \
+                     data={} size={size} dlen={} head_class={}",
+                    ctx.class_name_of_id(ctx.class_id_of_object(list))
+                        .unwrap_or_else(|| "<unknown>".into()),
+                    data.is_some(),
+                    data.map(|d| ctx.array_length(d) as i64).unwrap_or(-1),
+                    match data.filter(|_| size > 0).map(|d| ctx.get_array_element(d, 0)) {
+                        Some(Value::Object(Some(e))) => ctx
+                            .class_name_of_id(ctx.class_id_of_object(e))
+                            .unwrap_or_else(|| "<unnamed>".into()),
+                        Some(other) => format!("<non-ref {other:?}>"),
+                        None => "<no head>".to_string(),
+                    },
+                );
+            }
+        }
+        return by_class;
+    }
+    al_view_holds_entries_by_head(ctx, list)
+}
+
+/// What a view carrier's own CLASS says it holds: `Some(true)` for the
+/// entry-shaped carrier, `Some(false)` for a values-shaped one, and `None` for
+/// a carrier whose class does not name its kind — the `java/util/ArrayList`
+/// fallback [`alloc_view_carrier`] takes when the real class cannot be had.
+///
+/// [`MAP_VIEW_CARRIERS`] has exactly one entry-shaped member
+/// ([`TM_ENTRY_SET_CARRIER`], minted only by `native_tm_entry_set`) and five
+/// values-shaped ones, so the class is a COMPLETE and exact answer for every
+/// carrier this crate mints under a real JDK — and, unlike the head element, it
+/// is readable whatever state the element array is in.
+///
+/// That last property is the whole point. The head-element reading in
+/// [`al_view_holds_entries_by_head`] answers "values" for anything it cannot
+/// classify, and there are two ordinary ways to reach that verdict on a genuine
+/// `entrySet()`:
+///
+/// * the view was EMPTY when the carrier was minted, so there is no head
+///   element to read. MEASURED, no GC involved: `new TreeMap<>().entrySet()`
+///   held across two `put`s then iterated answered `[v1, v2]` where HotSpot
+///   25.0.3+9 answers `[k1=v1, k2=v2]`;
+/// * the head element could not be classified during a moving collection, which
+///   is how the `RTreeRangeGc` regression vector reddened on the default
+///   collector — `headMap(k, false).entrySet()` handed back 300 `V` objects and
+///   the vector's `checkcast` to `Map.Entry` failed.
+///
+/// Both faces are one defect — a kind INFERRED from data, allowed to default to
+/// the wrong answer — and both close by asking the class first.
+fn view_carrier_holds_entries_by_class(ctx: &dyn NativeContext, view: ObjectRef) -> Option<bool> {
+    let name = ctx.class_name_arc_of_id(ctx.class_id_of_object(view))?;
+    if &*name == TM_ENTRY_SET_CARRIER {
+        return Some(true);
+    }
+    if is_map_view_carrier(&name) {
+        return Some(false);
+    }
+    None
+}
+
+/// The head-element reading of [`al_view_holds_entries`], for a carrier whose
+/// class does not name its kind.
+///
+/// Restricted to our synthetic entry classes so an app value type named
+/// `*Entry` is not misread as an entry. An EMPTY view answers `false`: with no
+/// head element there is nothing to classify. That default is exactly why this
+/// is no longer consulted first.
+fn al_view_holds_entries_by_head(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
     let (data, size) = al_state(ctx, list);
     match data {
         Some(d) if size > 0 => match ctx.get_array_element(d, 0) {
@@ -16280,6 +16403,15 @@ fn al_view_holds_entries(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
 /// `ArrayList`-shaped carrier and the real class from drifting apart while the
 /// two shapes coexist.
 fn al_is_values_view(ctx: &dyn NativeContext, list: ObjectRef) -> bool {
+    // [`TM_ENTRY_SET_CARRIER`] is in `MAP_VIEW_CARRIERS` — so
+    // `is_values_view_class` admits it — and it is the one member that is NOT a
+    // values view. Its real class extends `AbstractSet`, which DOES override
+    // equals/hashCode, so the content-based answer is the correct one for it
+    // and the identity answer below would be a divergence in the opposite
+    // direction from the one this predicate exists to stop.
+    if view_carrier_holds_entries_by_class(ctx, list) == Some(true) {
+        return false;
+    }
     if is_values_view_class(ctx, list) {
         return true;
     }
@@ -16462,6 +16594,22 @@ fn vc_route(
     if is_own_view_carrier(ctx, this) {
         return None;
     }
+    // `MAP_VIEW_CARRIERS` is not all values — [`TM_ENTRY_SET_CARRIER`] is an
+    // ENTRY set — and re-expressing one as `entries.map(|(_, v)| v)` is how
+    // `RTreeRangeGc`'s `headMap(k, false).entrySet()` handed back 300 `V`
+    // objects. Ask the CLASS what this receiver holds and mint that shape. The
+    // marker test above asks "did WE mint it", which is a different question;
+    // it was answering this one by omission, so a receiver it declined for any
+    // reason silently changed kind.
+    let holds_entries = view_carrier_holds_entries_by_class(ctx, this) == Some(true);
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_VIEWKIND").is_ok() {
+        eprintln!(
+            "[VIEWKIND] vc_route rebuilding carrier={} holds_entries={holds_entries} \
+             (the own-carrier marker test declined it)",
+            ctx.class_name_of_id(ctx.class_id_of_object(this))
+                .unwrap_or_else(|| "<unknown>".into()),
+        );
+    }
     let source = values_view_class_source(ctx, this)?;
     // GC-safety, and the pins go up FIRST — before `collect_entries_any`, not
     // between it and `make_view_list_of`. Two distinct hazards:
@@ -16487,7 +16635,17 @@ fn vc_route(
             return Some(Err(e));
         }
     };
-    let vals: Vec<Value> = entries.into_iter().map(|(_, v)| v).collect();
+    let vals: Vec<Value> = if holds_entries {
+        match live_entries_for_pairs(ctx, source_pin, source, &entries) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(source_pin);
+                return Some(Err(e));
+            }
+        }
+    } else {
+        entries.into_iter().map(|(_, v)| v).collect()
+    };
     let source = ctx.read_native_pin(source_pin, source);
     // The carrier comes from the SOURCE map, not from `this`: this function
     // rebuilds the carrier `native_map_values` would have produced for that
@@ -16495,7 +16653,16 @@ fn vc_route(
     // `make_view_list_of` call site derives it the same way. (The parameter and
     // this call site arrived on opposite sides of the 2026-08-16 `dev` merge,
     // which is why git produced a clean 3-argument call to a 4-argument fn.)
-    let carrier = values_carrier_for(&*ctx, source);
+    //
+    // The entry-shaped receiver keeps its OWN class: `values_carrier_for` only
+    // knows the five values carriers, so deriving it from the source here would
+    // hand an `entrySet()` back under `TreeMap$Values` — the class half of the
+    // same mix-up the `vals` branch above closes.
+    let carrier = if holds_entries {
+        TM_ENTRY_SET_CARRIER
+    } else {
+        values_carrier_for(&*ctx, source)
+    };
     let list = match make_view_list_of(ctx, source, &vals, carrier) {
         Ok(l) => l,
         Err(e) => {
@@ -45821,6 +45988,10 @@ fn tm_resync_view_inner(
     hi = read_pinned_elem(ctx, hi_pin, hi);
 
     let mut kept: Vec<usize> = Vec::with_capacity(pinned.len());
+    // CRATONVM_DBG_VIEWRESYNC verdict histogram - a view that comes back empty
+    // has either seen no pairs at all or had every comparison land outside the
+    // range, and those are different defects.
+    let (mut dbg_lt, mut dbg_eq, mut dbg_gt) = (0usize, 0usize, 0usize);
     for i in 0..pinned.len() {
         // Only the key is compared; `_v` exists because `refresh` re-reads the
         // pair as a unit.
@@ -45838,6 +46009,11 @@ fn tm_resync_view_inner(
             cmp = read_pinned_elem(ctx, cmp_pin, cmp);
             lo = read_pinned_elem(ctx, lo_pin, lo);
             hi = read_pinned_elem(ctx, hi_pin, hi);
+            match c.cmp(&0) {
+                std::cmp::Ordering::Less => dbg_lt += 1,
+                std::cmp::Ordering::Equal => dbg_eq += 1,
+                std::cmp::Ordering::Greater => dbg_gt += 1,
+            }
             if c < 0 || (c == 0 && !spec.lo_inclusive) {
                 keep = false;
             }
@@ -45854,6 +46030,11 @@ fn tm_resync_view_inner(
             cmp = read_pinned_elem(ctx, cmp_pin, cmp);
             lo = read_pinned_elem(ctx, lo_pin, lo);
             hi = read_pinned_elem(ctx, hi_pin, hi);
+            match c.cmp(&0) {
+                std::cmp::Ordering::Less => dbg_lt += 1,
+                std::cmp::Ordering::Equal => dbg_eq += 1,
+                std::cmp::Ordering::Greater => dbg_gt += 1,
+            }
             if c > 0 || (c == 0 && !spec.hi_inclusive) {
                 keep = false;
             }
@@ -45864,29 +46045,71 @@ fn tm_resync_view_inner(
     }
     let _ = (lo, hi, cmp);
 
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_VIEWRESYNC").is_ok() {
+        let hi_now = read_pinned_elem(ctx, hi_pin, hi);
+        eprintln!(
+            "[VIEWRESYNC] view={:#x} source={:#x} pairs={} kept={} lo_bounded={} lo_inc={} \
+hi_bounded={} hi_inc={} desc={} hi={:?} verdicts(lt/eq/gt)={}/{}/{}",
+            ctx.read_native_pin(view_pin, view).as_ptr() as usize,
+            source.as_ptr() as usize,
+            pinned.len(),
+            kept.len(),
+            spec.lo_bounded,
+            spec.lo_inclusive,
+            spec.hi_bounded,
+            spec.hi_inclusive,
+            spec.descending,
+            hi_now,
+            dbg_lt,
+            dbg_eq,
+            dbg_gt,
+        );
+    }
+
     // Publish. The source's order is ascending, so a descending view is the same
     // selection read back to front — and the view's comparator slot (set once at
     // creation, never touched here) is already the reversed one, so the array
     // stays consistent with what `tm_binary_search` will assume about it.
     let n = kept.len();
+    // GC-SAFETY, and the ORDER of the next dozen lines is the whole of it. This
+    // block used to allocate `buf`, then release EVERY pin, and only then write
+    // `buf` into `view` -- so between the release and the writes both objects
+    // were reachable from nothing but a Rust local. A relocating collection in
+    // that window left `tm_set_slot` writing the array into a from-space `view`,
+    // and the view kept the `TM_FIELD_SIZE = 0` its constructor had just set:
+    // `headMap(k, false)` came back EMPTY, which is the failure mode
+    // `W7-1-treemap-views-and-iterator-remove-contract` exists to refuse and the
+    // one a caller that only iterates cannot see. MEASURED: `RTreeRangeGc`
+    // failed 12/12 with "0 entries, expected 300" and passed 12/12 under
+    // `CRATONVM_ZGC_RELOCATE=0` on the same binary.
+    //
+    // So: pin `buf` too, re-read both through their pins immediately before each
+    // use, and unpin only after the last write has landed.
     let buf = alloc_ref_array(ctx, (n * 2).max(TM_DEFAULT_CAPACITY * 2));
+    let buf_pin = ctx.pin_native_root(buf);
     for (out, src_idx) in kept.iter().enumerate() {
         let slot = if spec.descending { n - 1 - out } else { out };
         let (k, v) = pinned.get(&*ctx, *src_idx);
+        let buf = ctx.read_native_pin(buf_pin, buf);
         ctx.set_array_element(buf, slot * 2, k);
         ctx.set_array_element(buf, slot * 2 + 1, v);
     }
     let view = ctx.read_native_pin(view_pin, view);
-    ctx.unpin_native_roots(view_pin);
     // A view never uses the fast-mode BTreeMap: its ordering can be a reversed
     // comparator, which `TreeKey`'s derived `Ord` cannot express.
     tm_fast_table()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&tm_obj_key(ctx, view));
+    let view = ctx.read_native_pin(view_pin, view);
     tm_set_force_array(ctx, view);
+    let view = ctx.read_native_pin(view_pin, view);
+    let buf = ctx.read_native_pin(buf_pin, buf);
     tm_set_slot(ctx, view, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, view, TM_FIELD_SIZE, Value::Int(n as i32));
+    // `view_pin` is the earliest handle this function pushed, so releasing it
+    // unwinds `buf_pin` and the pair pins with it.
+    ctx.unpin_native_roots(view_pin);
     Ok(())
 }
 
@@ -49858,7 +50081,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .map(|i| read_pinned_elem(ctx, entry_pins[i], entries[i]))
         .collect();
     let this = ctx.read_native_pin(this_pin, this);
-    let list = make_view_list_of(ctx, this, &entries, "java/util/TreeMap$EntrySet")?;
+    let list = make_view_list_of(ctx, this, &entries, TM_ENTRY_SET_CARRIER)?;
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }

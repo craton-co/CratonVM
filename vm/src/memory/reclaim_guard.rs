@@ -665,6 +665,84 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
 /// has already gone wrong; it takes the snapshot mutex, which is why it is a
 /// separate call rather than folded into `report_reclaimed_receiver` (that one
 /// is reached in bulk on healthy runs).
+/// The PRODUCER side of a corrupt `Value` cell.
+///
+/// `heap::read_value_cell_checked` reports the cell and stops there - it runs in
+/// the collector crate and cannot see a Java frame. This runs on the VM side of
+/// the same read, where the receiver and the owning thread's frames are both in
+/// hand, and it asks the three questions the cell record cannot:
+///
+/// 1. WHAT is the receiver now - class, kind, generation, field count. Two
+///    heap-pointer-shaped raw words in a slot the reader expected to hold a
+///    `(tag, payload)` pair is the signature of a swept-then-re-served block,
+///    and the receiver's current class names what re-served it.
+/// 2. Was the address reclaimed - [`report_reclaimed_receiver_forced`], the same
+///    verdict the failed-cast terminal asks for, `_forced` because the re-served
+///    face carries a perfectly valid class id and the gated entry point is
+///    silent on exactly that face.
+/// 3. WHO is holding it - [`report_root_slice_provenance`] plus the frame walk,
+///    which is what turns "something handed a stale reference to a native" into
+///    a named bytecode.
+///
+/// Rate-limited as a whole. Armed by `CRATONVM_DBG_CORRUPT_CELL`; the caller
+/// pays one relaxed load per field read while armed and nothing otherwise.
+pub(crate) fn report_corrupt_cell_producer(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    recv: cratonvm_types::ObjectRef,
+    index: usize,
+    slot: usize,
+    raw0: u64,
+    raw1: u64,
+) {
+    static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
+        return;
+    }
+    let addr = recv.as_ptr() as usize;
+    let cid = shared.mem.heap.class_id_of(recv).as_u32();
+    let name = class_name_of(shared, cid);
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        slot = format!("{slot:#x}"),
+        slot_index = index,
+        raw0 = format!("{raw0:#018x}"),
+        raw1 = format!("{raw1:#018x}"),
+        receiver_class = %name,
+        receiver_kind = ?shared.mem.heap.kind_of(recv),
+        receiver_fields = shared.mem.heap.num_fields(recv),
+        in_heap = shared.mem.heap.is_heap_addr(addr).is_some(),
+        in_young = shared.mem.heap.is_in_young_addr(addr),
+        collections_now = shared.mem.heap.collection_count(),
+        "the RECEIVER of the read that decoded a corrupt Value cell. Its class \
+         is what re-served the block, not what the holder thinks it is holding.",
+    );
+    report_reclaimed_receiver_forced(shared, addr, "corrupt-cell", &name, cid);
+    report_root_slice_provenance(shared, thread, addr, "corrupt-cell");
+    let frames: Vec<String> = thread
+        .frames
+        .iter()
+        .rev()
+        .take(24)
+        .map(|f| {
+            format!(
+                "{}.{}{} pc={}",
+                f.class_name(),
+                f.method_name(),
+                f.method_descriptor(),
+                f.pc
+            )
+        })
+        .collect();
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        site = "corrupt-cell",
+        "...and the Java stack that reached it, top first:\n  {}",
+        frames.join("\n  "),
+    );
+}
+
 pub(crate) fn report_root_slice_provenance(
     shared: &SharedVm,
     thread: &JvmThread,

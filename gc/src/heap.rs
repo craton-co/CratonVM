@@ -2341,13 +2341,59 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
 ///
 /// # Safety
 /// The pointer must be valid, readable for 16 bytes, and 8-byte aligned.
+/// Corrupt-`Value`-cell telemetry, published for the VM.
+///
+/// The guard below lives in the collector crate, so it can name the CELL - the
+/// address and the two words it holds - and nothing else. The question the
+/// record it belongs to actually asks is the other half: which reference points
+/// at a block that was swept and re-served, and who is holding it. Only the VM
+/// can answer that, because only the VM has the receiver and the owning thread's
+/// frames. Publishing the hit count lets a VM-side field read notice "that read
+/// tripped the guard" and report the producer at the moment it happens; the
+/// three coordinates let it report the same cell the guard did.
+///
+/// Relaxed throughout: this is a diagnostic on an already-failed path, and the
+/// only ordering that matters - the counter moving before the reader re-reads it
+/// - comes from the read being sequenced between the two loads on one thread.
+pub(crate) static CORRUPT_CELL_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CORRUPT_CELL_SLOT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CORRUPT_CELL_RAW0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CORRUPT_CELL_RAW1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many corrupt `Value` cells this process has decoded. See
+/// [`CORRUPT_CELL_HITS`].
+pub fn corrupt_cell_hits() -> u64 {
+    CORRUPT_CELL_HITS.load(Ordering::Relaxed)
+}
+
+/// `(slot address, raw word 0, raw word 1)` of the last corrupt cell decoded.
+/// Meaningful only when [`corrupt_cell_hits`] is non-zero.
+pub fn corrupt_cell_last() -> (usize, u64, u64) {
+    (
+        CORRUPT_CELL_SLOT.load(Ordering::Relaxed),
+        CORRUPT_CELL_RAW0.load(Ordering::Relaxed),
+        CORRUPT_CELL_RAW1.load(Ordering::Relaxed),
+    )
+}
+
 pub(crate) unsafe fn read_value_cell_checked(ptr: *const Value, site: &'static str) -> Value {
     match cratonvm_types::read_value_checked_atomic(ptr) {
         Some(v) => v,
         None => {
-            static CORRUPT_HITS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = CORRUPT_HITS.fetch_add(1, Ordering::Relaxed);
+            let n = CORRUPT_CELL_HITS.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: caller contract - 16 readable, 8-byte-aligned bytes.
+            CORRUPT_CELL_SLOT.store(ptr as usize, Ordering::Relaxed);
+            CORRUPT_CELL_RAW0.store(
+                (*(ptr as *const std::sync::atomic::AtomicU64)).load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            CORRUPT_CELL_RAW1.store(
+                (*((ptr as *const u8).add(8) as *const std::sync::atomic::AtomicU64))
+                    .load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             if n < 32 || gc_flags().diag_hib32 {
                 // SAFETY: caller contract — 16 readable, 8-byte-aligned bytes.
                 // Read atomically per word so the diagnostic itself cannot tear
