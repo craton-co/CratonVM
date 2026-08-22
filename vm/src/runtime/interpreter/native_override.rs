@@ -8231,17 +8231,40 @@ mod enforcement_dial_door_tests {
              Either consult the dial at the force site, or add a row with the reason."
         );
 
-        // The exemption list must not rot: a row naming a file that no longer
-        // forces anything is a stale approval that reads as coverage.
+        // The exemption list must not rot, in EITHER direction, and the second
+        // direction is the one that actually happens.
+        //
+        //   * a row naming a file that no longer forces anything is a stale
+        //     approval;
+        //   * a row naming a file that has since been WIRED is worse — it is a
+        //     standing approval for a hole somebody already filled, and nothing
+        //     would ever remove it.
+        //
+        // With both checked, this list can only shrink: wiring a force site
+        // turns the gate red until its row is deleted.
         for (name, _) in FORCE_SITES_EXEMPT {
-            let still = files.iter().any(|f| {
-                f.file_name().unwrap().to_string_lossy() == *name
-                    && std::fs::read_to_string(f).is_ok_and(|s| calls_force(&s))
-            });
+            let found = files
+                .iter()
+                .find(|f| f.file_name().unwrap().to_string_lossy() == *name)
+                .and_then(|f| std::fs::read_to_string(f).ok());
+            let Some(src) = found else {
+                panic!(
+                    "FORCE_SITES_EXEMPT names `{name}`, which is not a file under vm/src. \
+                     Drop the row — a row that matches nothing reads as a reviewed hole."
+                );
+            };
             assert!(
-                still,
+                calls_force(&src),
                 "FORCE_SITES_EXEMPT names `{name}`, which no longer calls the force helper. \
                  Drop the row — a stale exemption reads as a reviewed hole."
+            );
+            assert!(
+                !(src.contains("jdk_only_dial_yields_to_bytecode")
+                    || src.contains("enforce_shadow_scope()")),
+                "FORCE_SITES_EXEMPT still names `{name}`, but it NOW CONSULTS THE DIAL. \
+                 Delete the row. An exemption that outlives the hole it excused is a \
+                 standing approval nobody will ever revisit, and it makes the list read \
+                 as bigger than the remaining problem."
             );
         }
     }
