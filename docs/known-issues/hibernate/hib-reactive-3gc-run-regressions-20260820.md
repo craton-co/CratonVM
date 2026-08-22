@@ -1359,3 +1359,32 @@ dispatch cost that makes this class slow.
 `techempower.TechEmpowerTest` is still not measured (5-minute fixture deadline,
 same family, and section 9.3's reasoning about host load applies to it more
 strongly than to this class).
+
+### 9.6 …and then it WAS measured, and it is not a perf class at all
+
+Measured the same day on a quiet host (load 6.8–14), and the "same family"
+assumption in 9.5 and 9.3 — inherited from
+[residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md)
+section 2.1 — **does not hold**:
+
+| arm | result | wall |
+|---|---|---|
+| real HotSpot | PASS 1/1 | 13.3 s |
+| CratonVM `--jit off` | **PASS 3/3** | 74.9 / 72.2 / 72.6 s |
+| CratonVM `--jit on` | FAIL 4/4 | 31.3 / 22.5 / 21.7 / 305.8 s |
+
+`techempower.TechEmpowerTest` **passes on CratonVM in ~72 s**, well inside its
+own 5-minute fixture deadline, with the JIT off. It never needed a raised
+budget and it is not bound by dispatch cost. With the JIT on it fails — 3 of 4
+times with a fast WRONG ANSWER (a server-side `NullPointerException` because
+`session.find(World.class, id)` returned `null` for an id the benchmark
+guarantees exists, surfacing as HTTP 500 in ~25 s), and 1 of 4 times on the
+fixture deadline. That bimodality is why it was misfiled: the earlier records
+only ever caught the timeout mode.
+
+It is **not** the section 8 defect — the 500 was already present pre-`b8fa0585e`
+(section 7.3) and reproduces on a binary containing it.
+
+Full write-up, evidence, reproducer, and the one query that would split the
+remaining search space:
+[techempower-jit-wrong-answer-20260822.md](../jit/techempower-jit-wrong-answer-20260822.md).
