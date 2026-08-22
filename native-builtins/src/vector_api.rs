@@ -19,12 +19,12 @@ use cratonvm_types::error::MethodCallFailed;
 // ---------------------------------------------------------------------------
 // Element type codes
 // ---------------------------------------------------------------------------
-const ELEM_BYTE: u8 = 0;
-const ELEM_SHORT: u8 = 1;
-const ELEM_INT: u8 = 2;
-const ELEM_LONG: u8 = 3;
-const ELEM_FLOAT: u8 = 4;
-const ELEM_DOUBLE: u8 = 5;
+pub(crate) const ELEM_BYTE: u8 = 0;
+pub(crate) const ELEM_SHORT: u8 = 1;
+pub(crate) const ELEM_INT: u8 = 2;
+pub(crate) const ELEM_LONG: u8 = 3;
+pub(crate) const ELEM_FLOAT: u8 = 4;
+pub(crate) const ELEM_DOUBLE: u8 = 5;
 
 // ---------------------------------------------------------------------------
 // VectorSpeciesConfig
@@ -320,7 +320,7 @@ fn lane_arg_bits(args: &[Value], idx: usize, elem_type: u8) -> i64 {
     }
 }
 
-fn array_lane_bits(
+pub(crate) fn array_lane_bits(
     ctx: &mut dyn NativeContext,
     arr: ObjectRef,
     index: usize,
@@ -346,7 +346,7 @@ fn array_lane_bits(
     }
 }
 
-fn lane_bits_to_value(elem_type: u8, bits: i64) -> Value {
+pub(crate) fn lane_bits_to_value(elem_type: u8, bits: i64) -> Value {
     match elem_type {
         ELEM_BYTE => Value::Int(bits as i8 as i32),
         ELEM_SHORT => Value::Int(bits as i16 as i32),
@@ -358,7 +358,7 @@ fn lane_bits_to_value(elem_type: u8, bits: i64) -> Value {
     }
 }
 
-fn wrap_integral_lane(elem_type: u8, value: i64) -> i64 {
+pub(crate) fn wrap_integral_lane(elem_type: u8, value: i64) -> i64 {
     match elem_type {
         ELEM_BYTE => value as i8 as i64,
         ELEM_SHORT => value as i16 as i64,
