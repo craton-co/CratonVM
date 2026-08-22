@@ -235,11 +235,12 @@ two vectors it named passed standalone on both binaries.
   defect, but nothing showed it is correct either, and it is cheap to assert.
   Left open deliberately rather than closed by association.
 * ~~**N3 — `RTreeRangeGc` is the one red cell.**~~ **All three arms are green.**
-* **N4 — audit the SAME SHAPE elsewhere.** `tm_sync_native_state` was one
-  funnel with 34 callers; any other native that allocates and then reuses a
-  bare receiver has this bug. `ts_`/`cslm_`/`lhm_` sync funnels are the obvious
-  places to look, and the `&mut` spelling makes such an audit compiler-checked
-  rather than a grep.
+* ~~**N4 — audit the SAME SHAPE elsewhere.**~~ **DONE — `WORKER-5-NOTE-11`.**
+  Seventeen funnels in `native-collections` match the shape, five have callers
+  that reuse the receiver, and **one** (`resync_view_set`, 8 of 10 sites) still
+  had the bug; it is fixed with the same `&mut` pattern but is LATENT — no
+  reproduction. `resync_ts_view` and `resync_values_view` were already correct
+  at all 19 of their call sites. The audit is scoped to that one crate.
 
 ---
 
