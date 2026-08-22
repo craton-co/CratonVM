@@ -482,6 +482,12 @@ harness_load_uncounted "$HERE/harness-uncounted.txt"
 # harness-vmfault.sh; its --selftest carries the negative controls.
 . "$HERE/harness-vmfault.sh" || { echo "ERROR: cannot source $HERE/harness-vmfault.sh"; exit 3; }
 
+# The census arithmetic. `sort -u` over whole JSON lines unions
+# (triple, native_kind, outcome), not triples, so the same method was counted
+# more than once; and the saturation grep asks for `truncated: true`, which
+# cannot match the one sink that renders `null`. See harness-census.sh.
+. "$HERE/harness-census.sh" || { echo "ERROR: cannot source $HERE/harness-census.sh"; exit 3; }
+
 # Copy every non-source file under $1 into $2, preserving relative paths.
 copy_tree() {
   [ -d "$1" ] || return 0
@@ -969,32 +975,36 @@ if [ -n "$STRICT_REPORT" ]; then
   jr_found=$(ls "$REPORTDIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
   jr_rows=$(grep -h '"kind":"native-shadows-bytecode"' "$REPORTDIR"/*.json 2>/dev/null \
               | sed 's/^[[:space:]]*//; s/,$//' | sort -u)
-  jr_native=$(printf '%s\n' "$jr_rows" | grep -c '"outcome":"native-won"')
-  jr_bytecode=$(printf '%s\n' "$jr_rows" | grep -c '"outcome":"bytecode-won"')
+  # The whole-line counts, KEPT because every record written before 2026-08-21
+  # quotes them and a reader has to be able to reconcile the two.
+  jr_native_lines=$(printf '%s\n' "$jr_rows" | grep -c '"outcome":"native-won"')
+  jr_bytecode_lines=$(printf '%s\n' "$jr_rows" | grep -c '"outcome":"bytecode-won"')
+  # The counts by TRIPLE, which is the unit docs/known-issues/jdk-only/ quotes.
+  jr_sum=$(printf '%s\n' "$jr_rows" | census_shadow_summary)
+  jr_native=$(printf '%s' "$jr_sum" | sed -n 's/.* native=\([0-9]*\).*/\1/p')
+  jr_bytecode=$(printf '%s' "$jr_sum" | sed -n 's/.* bytecode=\([0-9]*\).*/\1/p')
+  jr_both=$(printf '%s' "$jr_sum" | sed -n 's/.* both=\([0-9]*\).*/\1/p')
+  jr_bconly=$(printf '%s' "$jr_sum" | sed -n 's/.* bytecode_only=\([0-9]*\).*/\1/p')
   jr_stubs=$(grep -h '"kind":"synthetic-native-registered"' "$REPORTDIR"/*.json 2>/dev/null \
                | sed 's/^[[:space:]]*//; s/,$//' | sort -u | grep -c '"kind"')
   jr_unenf=$(grep -h '"interpreter_shadow_unenforced": ' "$REPORTDIR"/*.json 2>/dev/null \
                | sed 's/[^0-9]//g' | awk '{s+=$1} END {print s+0}')
   jr_compat=$(grep -h '"compatibility_classes": ' "$REPORTDIR"/*.json 2>/dev/null \
                 | sed 's/[^0-9]//g' | awk '{s+=$1} END {print s+0}')
-  # The number that says whether every figure above is a total or a FLOOR.
-  # `truncated` is emitted by all three of the report's bounded collections, so
-  # a file matching it had at least one of them overflow; `dropped` sums what
-  # they could not name. Both are new on 2026-08-20 — before that the only
-  # signal was a boolean inside the file that nothing read, which is why every
-  # shadow count in docs/known-issues/jdk-only/ is a floor.
-  jr_trunc=$(grep -l '"truncated": true' "$REPORTDIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
-  jr_dropped=$(grep -h '"dropped": ' "$REPORTDIR"/*.json 2>/dev/null | grep -v null \
-                 | sed 's/[^0-9]//g' | awk '{s+=$1} END {print s+0}')
+  # Whether every figure above is a total, a FLOOR, or UNKNOWN is
+  # census_saturation's job — see harness-census.sh for why `null` is a third
+  # answer and not a quiet `false`.
   echo "JDK-ONLY CENSUS ($jr_found of $report_expected per-vector reports written):"
-  echo "  native-shadows-bytecode, UNION over vectors: $jr_native native-won (the defect), $jr_bytecode bytecode-won (the contract working)"
+  echo "  native-shadows-bytecode, UNION over vectors, counted by TRIPLE:"
+  echo "    $jr_native native-won (the defect)   ·   $jr_bytecode bytecode-won"
+  echo "    of the $jr_bytecode bytecode-won triples, $jr_both ALSO ran the native in another"
+  echo "    vector; $jr_bconly were bytecode-won and NEVER native — that is 'the contract"
+  echo "    working', and it is the only one of these numbers that means it."
+  echo "    (whole-line rows, the pre-2026-08-21 figures: $jr_native_lines / $jr_bytecode_lines. A whole-line"
+  echo "     sort -u unions (triple, native_kind, outcome), so a triple that dispatched"
+  echo "     two ways is counted twice. harness-census.sh has the measurement.)"
   echo "  synthetic-native-registered, UNION: $jr_stubs   ·   interpreter_shadow_unenforced, SUM: $jr_unenf   ·   compatibility_classes, SUM: $jr_compat"
-  if [ "$jr_trunc" -gt 0 ]; then
-    echo "  SATURATED: $jr_trunc report(s) truncated a bounded collection and dropped ~$jr_dropped row(s)."
-    echo "    EVERY count above is a FLOOR. Re-run with CRATONVM_NATIVE_SHADOW_SINK_CAP=<bigger> to make them totals."
-  else
-    echo "  saturation: none — no report truncated a bounded collection, so the counts above are totals, not floors."
-  fi
+  census_saturation "$REPORTDIR" || true
   if [ "$jr_found" -lt "$report_expected" ]; then
     echo "  NOTE: $((report_expected-jr_found)) vector(s) produced no report (a crash before the exit hook, or a write failure)."
     echo "    Their shadows are missing from the union above. This does NOT affect any vector's verdict."
