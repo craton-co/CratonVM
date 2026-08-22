@@ -1,7 +1,8 @@
 # WORKER-5 NOTE 7 — acceptance: the arms did not move, the one number that did is noise in both directions, and the binary matters
 
-**Status: MEASURED.** Lane WORKER-5, 2026-08-21. **Fifteen full suite runs**,
-JDK 25.0.3+9 (`cygpath -m` form), `TIMEOUT=600`, strictly serial.
+**Status: MEASURED.** Lane WORKER-5, 2026-08-21/22. **Eighteen full suite
+sweeps and fifteen single-vector runs**, across three VM binaries, JDK 25.0.3+9
+(`cygpath -m` form), `TIMEOUT=600`, strictly serial.
 
 §6 of the brief: *"You mostly do not change VM behaviour, so the arms should not
 move."* The expected numbers changed under this lane while it ran — H0's
@@ -31,6 +32,82 @@ an assumption from its timestamp: its strict census reports
 `synthetic-native-registered, UNION: **1610**` where r10 reports **1622**. 1610
 is exactly the figure H0's own update quotes as the narrowest confirmation that
 the Comparator guard took effect. Two lanes, two measurements, same number.
+
+## 1a. After merging WORKER 2 and WORKER 3 — and the binary problem is now the story
+
+Origin's handoff branch moved again while this lane was finishing (WORKER 2's
+collection object model, WORKER 3's retirements, two new vectors taking the
+corpus to 107). **No Windows binary on this host contains that tree.** The
+newest, `cratonvm-r12.exe` (22:22 local = 01:22 UTC), predates WORKER 3's merge
+`d828a329d` (01:24 UTC) by two minutes.
+
+So the merged tree was measured on r12 against a CONTROL that is
+`regression-suite/run.sh` **exactly as origin has it** (`e080feaa2`) — H0's and
+WORKER 2/3's changes, without this lane's three hunks. Same binary, same JDK,
+same vectors; the only variable is this lane.
+
+| arm | control (origin's run.sh) | new (this lane's) |
+|---|---|---|
+| `SUITE=all CRATONVM_ARGS=--jdk-only` | 105 / 2 failed | **106 / 1 failed** |
+| `SUITE=all` | 105 / 2 failed | 105 / 2 failed |
+| `SUITE=core` | 65 / 2 failed | 65 / 2 failed |
+
+Failures in every cell: `RTreeRangeGc`, `RLangPackages`.
+
+### 1a.1 `RLangPackages` fails because the binary predates the fix it tests
+
+It is one of WORKER 3's two new vectors and r12 does not contain their work. It
+fails identically under both harnesses. Not this lane's, and not evidence about
+the merged tree — evidence about r12.
+
+### 1a.2 The strict arm's one-cell difference is a FLAKE, and that is measured
+
+Control 105/2 and new 106/1 differ on `RTreeRangeGc`. A pass/fail difference is
+not something to wave at, so the vector was run **alone, twelve times, ABBA
+interleaved** (`ONLY=RTreeRangeGc`, strict, r12) so that order cannot explain
+the answer:
+
+```text
+CTL FAIL · NEW FAIL · NEW FAIL · CTL FAIL
+CTL PASS · NEW FAIL · NEW FAIL · CTL PASS
+CTL FAIL · NEW FAIL · NEW PASS · CTL FAIL
+                       control 4 FAIL / 2 PASS
+                       new     5 FAIL / 1 PASS
+```
+
+**Both harnesses produce both outcomes.** Three further solo runs gave PASS,
+PASS, FAIL. `RTreeRangeGc` is flaky on r12; the one-cell difference is that
+flake landing on opposite sides of two full sweeps, not a change in behaviour.
+
+### 1a.3 Two findings for other lanes, neither actionable here
+
+* **`RTreeRangeGc` PASSED on r11 and is FLAKY on r12**, in `--jdk-only` and in
+  compatible mode. Every failure is the same shape — an
+  `ERROR cratonvm::gc::guard:` line, then
+  `HARNESS ERROR [G2] … nothing survives extract()`. Between those two binaries
+  sit WORKER 2's collection changes, including `cf714cf12`
+  (*"TreeMap's modCount was pinned at 0 for the life of every map"*), and
+  `RTreeRangeGc` is a TreeMap vector. **ARGUED, not measured** — nothing here
+  bisects it, and r12's exact provenance is unknown. `native-collections` is
+  WORKER 2's surface.
+* **`RLangPackages` publishes no check count** and is not in
+  `regression-suite/harness-uncounted.txt`, so the harness flags `[G3]` on every
+  run. That is a registration gap in a new vector, independent of whether the
+  vector passes.
+
+### 1a.4 What the classifier did on a real failure
+
+Both failures are named rather than anonymous. `RTreeRangeGc` renders as
+
+```text
+rc=1: unclassified: … ERROR cratonvm::gc::guard: …
+```
+
+which is H0's fall-through tagging a failure **no pattern in the pre-2026-08-21
+list matches**. Under the old harness both of these printed a bare
+`cratonvm rc=1`. The merged classifier is doing its job on failures neither
+lane wrote it for — though the 90-character truncation cuts the guard's message
+mid-sentence, which is worth widening.
 
 ## 2. Control vs new, because `run.sh` was modified
 
@@ -157,9 +234,11 @@ to remove:
 
 ## 7. What this does NOT establish
 
-* **Nothing was measured on a binary built from the merged tree.** r11 is the
-  closest available and contains `ecd4f56e1`; a change landing after 18:42 is
-  not in any arm here. The sink-cap fix (`WORKER-5-NOTE-6` §1) is in NO Windows
+* **Nothing was measured on a binary built from the merged tree**, and after
+  the WORKER 2/3 merge that gap is wide enough to matter (§1a): r12 predates the
+  final merge by two minutes, so two vectors fail on it for reasons that are
+  the binary's, not the tree's. The merged tree's own 107/107 claim is WORKER
+  3's, measured on their binary, and this lane did not reproduce it. The sink-cap fix (`WORKER-5-NOTE-6` §1) is in NO Windows
   binary — it is verified separately on a Linux build, six runtime arms plus
   eight unit tests.
 * **`interpreter_shadow_unenforced`'s variance is bounded, not explained** (§3).
@@ -182,5 +261,11 @@ to remove:
   arm is `interpreter_shadow_unenforced`, and the CONTROL varies against itself
   (8646–8648) — noise, MEASURED over eight runs. r11's
   `synthetic-native-registered: 1610` independently corroborates H0's figure.
+  After merging WORKER 2/3 (§1a) no local binary matches the tree; against
+  origin's own `run.sh` on r12 the arms agree in two cells of three, and the
+  third is `RTreeRangeGc` flaking — 12 ABBA-interleaved solo runs give both
+  outcomes under BOTH harnesses. **`RTreeRangeGc` passed on r11 and is flaky on
+  r12** (ARGUED: WORKER 2's TreeMap work sits between them), and
+  **`RLangPackages` publishes no check count**, tripping `[G3]` every run.
   Includes every gate this lane touched, how each was made to fail, and the four
   times a check caught a defect in a check.

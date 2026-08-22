@@ -167,12 +167,11 @@ backend and the mechanism is not on this record's critical path. What is
 stated above is measured — the instruction counts come from
 `tornado --printKernel`, and the pixel counts from `FrameDiff`.
 
-## 7. Performance result — the original headline does not hold
+## 7. Performance result — measured twice, and the second time changed it
 
 The record's "~1.3-1.4x faster than TornadoVM in steady state" was
 measured at one resolution. It is not a steady-state figure: it is the
-value the ratio happens to take at 640x480, on a curve that falls
-monotonically with problem size.
+value the ratio happens to take at 640x480.
 
 `bench-gpu/run-raytracer-interleaved.sh` measures the two GPU arms
 **paired** — alternating which runs first within each round, six rounds,
@@ -181,44 +180,60 @@ and both arms spend real host time marshalling and launching. Two
 unpaired sweeps forty minutes apart disagreed about which arm was faster
 at 1920x1440, which is what motivated pairing.
 
-| n (pixels) | CratonVM `--gpu` | TornadoVM PTX | CratonVM ahead by | rounds won |
-|---:|---:|---:|---:|---:|
-| 307,200 | **0.418 ms** | 0.675 ms | **38.2%** | 6/6 |
-| 1,228,800 | **1.311 ms** | 1.496 ms | **12.4%** | 6/6 |
-| 2,764,800 | **2.711 ms** | 2.821 ms | 3.9% | 4/6 |
+**First measurement, before the two kernel-quality fixes in §8:**
 
-CratonVM is ahead everywhere measured, but **the margin collapses
-monotonically with n**, and by 1920x1440 it is inside round-to-round
-noise — two of six rounds go the other way. Fitting the two ends
-separates why:
+| n (pixels) | CratonVM `--gpu` | TornadoVM PTX | CratonVM ahead | rounds won |
+|---:|---:|---:|---:|---:|
+| 307,200 | 0.418 ms | 0.675 ms | 38.2% | 6/6 |
+| 1,228,800 | 1.311 ms | 1.496 ms | 12.4% | 6/6 |
+| 2,764,800 | 2.711 ms | 2.821 ms | 3.9% | 4/6 |
+
+That collapsing margin was the finding: CratonVM won on *launch
+overhead*, lost slightly on per-pixel throughput, and the two crossed
+somewhere above five million pixels. Fitting the ends:
 
 | | fixed per call | per pixel |
 |---|---:|---:|
-| CratonVM `--gpu` | **0.191 ms** | 0.911 ns |
+| CratonVM `--gpu` | 0.191 ms | 0.911 ns |
 | TornadoVM PTX | 0.436 ms | **0.863 ns** |
 
-**CratonVM's per-launch overhead is ~2.3x lower; its per-pixel kernel
-cost is ~6% higher.** Extrapolated, the two cross somewhere above five
-million pixels. A single-resolution measurement cannot tell those two
-facts apart, which is why the original 1.3-1.4x claim was not so much
-wrong as undecomposed — and why quoting any one ratio as "the speedup"
-for this pair is the wrong shape of claim to make.
+**Then the per-pixel cost was decomposed and the larger half fixed.**
+`bench-gpu/GpuTransferFloor.java` runs the same launch shape and the same
+bytes out with no arithmetic, which prices the floor at **0.327 ns/pixel
+— 12.2 GB/s, PCIe line rate**, leaving 0.584 ns/pixel of actual compute.
+§8's float-sqrt collapse cut that compute to 0.237 ns/pixel. Re-measured,
+same box, host control at its idle baseline in every round:
 
-For the same reason the CPU columns are omitted from the table above:
-they are not paired, and the HotSpot control drifted between 8.2 ms and
-14 ms at 640x480 across this session depending on what else the box was
-doing. The GPU arms barely move under that load (they are GPU-bound),
-which is exactly why they can be compared to each other and not to
-numbers from another day. The interleaved script prints the control
-alongside each round and flags it, rather than silently averaging a
-loaded round in.
+| n (pixels) | CratonVM `--gpu` | TornadoVM PTX | CratonVM ahead | rounds won |
+|---:|---:|---:|---:|---:|
+| 307,200 | **0.277 ms** | 0.576 ms | **52.0%** | 6/6 |
+| 1,228,800 | **0.787 ms** | 1.407 ms | **44.1%** | 6/6 |
+| 2,764,800 | **1.663 ms** | 2.637 ms | **36.9%** | 6/6 |
 
-CratonVM's CPU path is a separate matter: roughly 11x slower than HotSpot
-on this kernel, and flat in that ratio across the whole sweep — 9.8 ms vs
-0.62 ms at 19,200 pixels, 782 ms vs 71 ms at 2,764,800. A constant ratio
-across a 144x range in n says this is per-iteration work, not a fixed
-cost or a scaling cliff. Not this record's subject; left open in §9 with
-the one concrete lead found.
+| | fixed per call | per pixel |
+|---|---:|---:|
+| CratonVM `--gpu` | **0.104 ms** | **0.564 ns** |
+| TornadoVM PTX | 0.319 ms | 0.839 ns |
+
+**CratonVM is now ahead on both axes** — 3.1x lower fixed cost and 33%
+lower per-pixel cost — so the crossover is gone rather than moved. The
+margin still shrinks with n, because the fixed-cost advantage amortises
+away and what remains is a per-pixel ratio; it now shrinks toward ~33%
+rather than toward zero.
+
+The honest reading of the pair of tables is not "CratonVM is 1.5x faster
+than TornadoVM". It is that a single-resolution ratio measured neither
+VM: the first table's 38/12/4% was one kernel-quality defect away from
+the second table's 52/44/37%, and nothing about either VM's architecture
+changed in between.
+
+For the same reason the CPU columns are omitted here: they are not
+paired, and the HotSpot control drifted between 8.2 ms and 14 ms at
+640x480 across this session depending on what else the box was doing. The
+GPU arms barely move under that load (they are GPU-bound), which is
+exactly why they can be compared to each other and not to numbers from
+another day. The interleaved script prints the control alongside each
+round and flags it, rather than silently averaging a loaded round in.
 
 ## 8. The join-state blowup found while looking at the kernel
 
@@ -326,6 +341,73 @@ because `-0.0 == 0.0` is true and `NaN == NaN` is false, so `==` would
 notice neither bug. It agrees bit-for-bit three ways: HotSpot, the
 CratonVM JIT, and the CratonVM interpreter under `--nojit`.
 
+## 8c. Every float square root was running in DOUBLE precision
+
+The join-state work in §8 cut the instruction count 2.25x and moved
+wall-clock almost not at all, which said the remaining cost was not
+instruction *count*. Pricing the transfer floor
+(`bench-gpu/GpuTransferFloor.java`: same launch shape, same bytes out, no
+arithmetic) split the per-pixel cost cleanly:
+
+| | per pixel | |
+|---|---:|---|
+| transfer + launch floor | 0.327 ns | 12.2 GB/s — PCIe line rate, nothing to win |
+| ray-tracer compute | 0.584 ns | the target |
+
+And a census of the SASS said what the compute was:
+
+    47 DFMA   28 DMUL   1 DADD   9 MUFU.RSQ64H   2 DSETP
+
+**76 double-precision instructions per thread**, against ~250
+single-precision ones. Turing runs FP64 at **1/32** of FP32 rate, so
+those 76 outweighed the entire rest of the kernel.
+
+They come from a language detail, not from the kernel. `java.lang.Math`
+declares square root only as `sqrt(D)D`, so a float square root can only
+be written `(float) Math.sqrt(f)`, and javac emits
+
+```text
+f2d ; invokestatic Math.sqrt:(D)D ; d2f
+```
+
+Lowered literally that is a genuine f64 square root, and `sqrt.rn.f64`
+expands to `MUFU.RSQ64H` plus a Newton-Raphson chain. The ray tracer has
+eight per pixel.
+
+The triple now lowers to one `sqrt.rn.f32`, and this is **bit-exact**.
+Double rounding of a square root — through binary64, then to binary32 —
+gives the correctly-rounded binary32 result whenever `p64 >= 2*p32 + 2`,
+and 53 >= 50. Rather than cite the theorem it was checked exhaustively:
+all 2^32 float bit patterns, `(x as f64).sqrt() as f32` against
+`x.sqrt()`, **zero mismatches**, subnormals and both zeros and both
+infinities and the NaNs included. `sqrt.rn.f32` — not `.approx`, not
+`.ftz` — is what makes that hold.
+
+Matching the whole triple is the load-bearing part. A real `double[]`
+square root, and a float widened to double whose sqrt result is *kept* as
+a double (`f2d; sqrt(D)D; dastore`, no `d2f`), both still lower to
+`sqrt.rn.f64`; collapsing either would change results, and both are
+pinned by fixtures.
+
+|  | before | after |
+|---|---:|---:|
+| PTX f64 ops | 8 sqrt + 8 widen + 8 narrow | **0** |
+| SASS FP64 ops | 76 | **0** |
+| SASS total | 1080 | 928 |
+| registers | 26 | 22 |
+| per-pixel compute | 0.584 ns | **0.237 ns** |
+
+Frames stayed bit-identical to HotSpot at all five resolutions, the GPU
+CI gate passes, and the ptxas round-trip tests assemble the new PTX with
+the real NVIDIA assembler.
+
+**This generalises well beyond the ray tracer.** Any offloaded Java
+kernel doing float math hits it, because there is no other way to spell a
+float square root in Java. It also explains why §8's instruction-count
+win did not show up in wall-clock: the instructions that mattered were
+1/32-rate ones, and counting instructions weighted them the same as the
+rest.
+
 ## 9. Residuals
 
 **Closed by this work:**
@@ -362,6 +444,21 @@ CratonVM JIT, and the CratonVM interpreter under `--nojit`.
   the `Math.min` work in §8b took it from ~11x. Where the remaining 5.3x
   goes is unprofiled.
 * TornadoVM's own GPU-vs-Java divergence (§6) is reported, not diagnosed.
+* **The GPU per-pixel cost is now 58% transfer, 42% compute** (a 0.327 ns
+  floor against 0.564 ns total). The dispatch sequence is strictly serial
+  — upload, launch, synchronize, download — so a chunked stream pipeline
+  overlapping the writeback of chunk N with the kernel on chunk N+1 could
+  hide the smaller half behind the larger: worth up to ~40%. The
+  stream/event infrastructure already exists; what does not is a story for
+  a mid-stream bounds-failure deopt, which is why this is filed rather
+  than attempted.
+* **18% of the kernel SASS is branch-reconvergence machinery** — 67 `BRA`
+  plus 32 `BSSY`/`BSYNC`/`BMOV` triples — from the short-circuit `&&`s and
+  from ternaries whose arms contain a call. The kernel is written
+  branchlessly on purpose and the lowerer turns it back into branches.
+  If-converting a branch whose arms are short and side-effect-free into
+  `selp` would remove most of that, but it is maybe 6% of total time, so
+  it is worth less than the overlap above.
 
 ## 10. Reproduction
 

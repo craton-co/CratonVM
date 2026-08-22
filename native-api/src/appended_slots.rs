@@ -59,7 +59,7 @@
 // `is_class_synthetic_stub` / `ensure_class_initialized` /
 // `class_num_total_fields`; `NativeContext` is the empty aggregate over the
 // access traits, so it alone does not bring those methods into scope.
-use crate::registry::{NativeClassAccess, NativeContext};
+use crate::registry::{NativeClassAccess, NativeContext, NativeHeapAccess};
 
 /// The private-slot base for `class_name`, loading and initialising it first.
 ///
@@ -87,6 +87,49 @@ pub fn base_for_class(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
     match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => ctx.class_num_total_fields(cid),
         Err(_) => 0,
+    }
+}
+
+/// The private-slot base for the object `this`, with the width guard that says
+/// "this receiver is not one I allocated".
+///
+/// The accessor-side twin of [`base_for_class`], and the guard is load-bearing
+/// in BOTH directions:
+///
+///   * a receiver the native did NOT allocate — a real `sun.nio.ch.*Impl` built
+///     by JDK bytecode, or a stub-mode object — is too narrow for
+///     `base + width`, so the base collapses to 0 and the accessor reads
+///     exactly the slots it read before the private map moved. Never a new
+///     refusal, never an out-of-range access.
+///   * an allocator that failed to resolve its class and fell back to the
+///     untyped sentinel gets a `cratonvm/synthetic/AnonymousObject$N`
+///     substitute declaring exactly `width` fields; a later `base_for_class` on
+///     that receiver would answer `width` and disagree with the 0 the allocator
+///     used. The width check sends it back to 0, which is the base that was
+///     actually used.
+///
+/// Written out three times (`pipe.rs::channel_private_base`,
+/// `native-io/src/concrete_receiver.rs`, and this) before it moved here; the
+/// two callers now forward.
+#[must_use]
+pub fn base_for_object(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    width: usize,
+) -> usize {
+    // Bound to a local before the match: the arm needs `ctx` mutably, and a
+    // `match ctx.class_name_of_id(..)` would keep the scrutinee's shared
+    // reborrow alive for the whole match.
+    let class_id = ctx.class_id_of_object(this);
+    let class_name = ctx.class_name_of_id(class_id);
+    let base = match class_name {
+        Some(name) => base_for_class(ctx, &name),
+        None => 0,
+    };
+    if ctx.object_num_fields(this) >= base + width {
+        base
+    } else {
+        0
     }
 }
 

@@ -480,6 +480,19 @@ explicit `.rn` rounding modifier — `add.rn.f32`, `sub.rn.f32`,
   implement neither Java's "NaN result if either argument is NaN" rule
   nor its "−0.0 is strictly smaller than +0.0" rule, so the lowerer
   builds both out of ordered predicates and selects (`minmax_f32`).
+* A float square root lowers to **one `sqrt.rn.f32`**, not to an f64
+  square root with a widen and a narrow around it. `java.lang.Math`
+  declares square root only as `sqrt(D)D`, so `(float) Math.sqrt(f)` is
+  the only way to write one and always compiles to
+  `f2d; invokestatic sqrt(D)D; d2f`. Lowering that literally runs the
+  whole thing in double precision, which on a consumer GPU costs 32x —
+  Turing's FP64 rate. Collapsing it is exact rather than an
+  approximation: double rounding of a square root is innocuous when
+  `p64 >= 2*p32 + 2`, and 53 >= 50. That was verified over all 2^32
+  float bit patterns rather than cited. Only the complete triple
+  collapses — a genuine `double` square root, or one whose result is
+  kept as a double, still emits `sqrt.rn.f64`. See
+  `float_sqrt_triple_at`.
 
 The contraction hazard was latent from the day the lowerer was written
 and only surfaced on 2026-08-21, because none of the earlier fixtures

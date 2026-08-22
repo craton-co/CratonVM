@@ -1,14 +1,19 @@
 # jdk-only method-granular multi-image sweep — H25-1 N1
-# regenerate: scripts/jdk-only-image-method-index.py per image, then scripts/jdk-only-no-image-methods.py --tsv
+# regenerate: scripts/jdk-only-image-method-index.py per image, then scripts/jdk-only-image-method-sweep.py --tsv
 # census: cratonvm-r11.exe --jdk-only --dump-native-registry (10378 registrations, strict mode)
 # images: jdk17-linux=17.0.20.1 jdk17-mac-x64=17.0.20.1 jdk17-windows=17.0.20 jdk21-linux=21.0.12 jdk21-mac-x64=21.0.12 jdk21-windows=21.0.12 jdk25-linux=25.0.4 jdk25-mac-x64=25.0.4 jdk25-windows=25.0.4
 # canary java/lang/StringUTF16.isBigEndian()Z: cross-version
-# verdicts: cross-version=386 dead-everywhere=305 live=8812 no-image-class=875
+# verdicts: cross-version=386 dead-everywhere=263 field-shaped=42 live=8812 no-image-class=875
 #
 # cross-version rows MUST NOT be deleted: an image this host does not
-# run declares the method. dead-everywhere rows are the retirable
-# population, and retiring them is predicted to move the shadow census
-# by ZERO — they are never dispatched (H25-1 §3).
+# run declares the method.
+# field-shaped rows MUST NOT be deleted either: the name IS on the
+# hierarchy, as a FIELD. An index built from the method table alone calls
+# them dead and is wrong; WORKER 3's independent javap sweep found the
+# same shape (38 rows there, 42 here).
+# dead-everywhere rows are the retirable population, and retiring them is
+# predicted to move the shadow census by ZERO — they are never
+# dispatched (H25-1 §3).
 verdict	shape	class	name	descriptor	owns_slot	registered_by	declared_by
 cross-version	-	com/sun/management/internal/OperatingSystemImpl	getMaxFileDescriptorCount0	()J	yes	native-builtins/src/jmx.rs:3404	jdk17-linux,jdk17-mac-x64,jdk21-linux,jdk21-mac-x64,jdk25-linux,jdk25-mac-x64
 cross-version	-	com/sun/management/internal/OperatingSystemImpl	getOpenFileDescriptorCount0	()J	yes	native-builtins/src/jmx.rs:3404	jdk17-linux,jdk17-mac-x64,jdk21-linux,jdk21-mac-x64,jdk25-linux,jdk25-mac-x64
@@ -426,8 +431,6 @@ dead-everywhere	truly-gone	java/lang/Object	combiner	()Ljava/util/function/Binar
 dead-everywhere	truly-gone	java/lang/Object	finisher	()Ljava/util/function/Function;	yes	native-collections/src/lib.rs:26857	-
 dead-everywhere	truly-gone	java/lang/Object	registerNatives	()V	yes	native-builtins/src/lib.rs:10272	-
 dead-everywhere	truly-gone	java/lang/Object	supplier	()Ljava/util/function/Supplier;	yes	native-collections/src/lib.rs:26845	-
-dead-everywhere	truly-gone	java/lang/ProcessBuilder$Redirect	INHERIT	()Ljava/lang/ProcessBuilder$Redirect;	yes	native-builtins/src/phases_late.rs:1633	-
-dead-everywhere	truly-gone	java/lang/ProcessBuilder$Redirect	PIPE	()Ljava/lang/ProcessBuilder$Redirect;	yes	native-builtins/src/phases_late.rs:1623	-
 dead-everywhere	near-miss	java/lang/StackStreamFactory$AbstractStackWalker	callStackWalk	(JIIII[Ljava/lang/Object;)I	yes	native-builtins/src/lang_stackwalker.rs:736	-
 dead-everywhere	near-miss	java/lang/StackStreamFactory$AbstractStackWalker	callStackWalk	(JIII[Ljava/lang/Object;[Ljava/lang/Class;)Ljava/lang/Object;	yes	native-builtins/src/lang_stackwalker.rs:666	-
 dead-everywhere	truly-gone	java/lang/StackStreamFactory$AbstractStackWalker	checkStackWalkModes	()Z	yes	native-builtins/src/stack_walker.rs:475	-
@@ -451,7 +454,6 @@ dead-everywhere	truly-gone	java/lang/System$1	newStringUtf8NoRepl	([BII)Ljava/la
 dead-everywhere	truly-gone	java/lang/Thread	destroy	()V	yes	native-builtins/src/deprecated_lang.rs:382	-
 dead-everywhere	truly-gone	java/lang/Throwable	getStackTraceDepth	()I	yes	native-builtins/src/lib.rs:15857	-
 dead-everywhere	truly-gone	java/lang/Throwable	getStackTraceElement	(I)Ljava/lang/StackTraceElement;	yes	native-builtins/src/lib.rs:15863	-
-dead-everywhere	truly-gone	java/lang/foreign/MemorySegment	NULL	Ljava/lang/foreign/MemorySegment;	yes	native-builtins/src/phases_late/foreign_ffm.rs:2974	-
 dead-everywhere	truly-gone	java/lang/foreign/MemorySegment	allocateFrom	(Ljava/lang/foreign/Arena;Ljava/lang/foreign/ValueLayout;I)Ljava/lang/foreign/MemorySegment;	yes	native-builtins/src/panama.rs:1207	-
 dead-everywhere	truly-gone	java/lang/foreign/MemorySegment	allocateFrom	(Ljava/lang/foreign/Arena;Ljava/lang/foreign/ValueLayout;J)Ljava/lang/foreign/MemorySegment;	yes	native-builtins/src/panama.rs:1233	-
 dead-everywhere	near-miss	java/lang/foreign/MemorySegment	get	(Ljava/lang/foreign/ValueLayout;J)Ljava/lang/Object;	yes	native-builtins/src/panama.rs:817	-
@@ -459,15 +461,6 @@ dead-everywhere	near-miss	java/lang/foreign/MemorySegment	getAtIndex	(Ljava/lang
 dead-everywhere	near-miss	java/lang/foreign/MemorySegment	set	(Ljava/lang/foreign/ValueLayout;JLjava/lang/Object;)V	yes	native-builtins/src/panama.rs:825	-
 dead-everywhere	near-miss	java/lang/foreign/MemorySegment	setAtIndex	(Ljava/lang/foreign/ValueLayout;JLjava/lang/Object;)V	yes	native-builtins/src/panama.rs:901	-
 dead-everywhere	near-miss	java/lang/foreign/MemorySegment	toArray	(Ljava/lang/foreign/ValueLayout$OfBoolean;)[Z	yes	native-builtins/src/panama.rs:1858	-
-dead-everywhere	truly-gone	java/lang/foreign/ValueLayout	ADDRESS	Ljava/lang/foreign/AddressLayout;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3119	-
-dead-everywhere	truly-gone	java/lang/foreign/ValueLayout	JAVA_BOOLEAN	Ljava/lang/foreign/ValueLayout$OfBoolean;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3056	-
-dead-everywhere	truly-gone	java/lang/foreign/ValueLayout	JAVA_BYTE	Ljava/lang/foreign/ValueLayout$OfByte;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3047	-
-dead-everywhere	truly-gone	java/lang/foreign/ValueLayout	JAVA_CHAR	Ljava/lang/foreign/ValueLayout$OfChar;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3065	-
-dead-everywhere	truly-gone	java/lang/foreign/ValueLayout	JAVA_DOUBLE	Ljava/lang/foreign/ValueLayout$OfDouble;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3110	-
-dead-everywhere	truly-gone	java/lang/foreign/ValueLayout	JAVA_FLOAT	Ljava/lang/foreign/ValueLayout$OfFloat;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3101	-
-dead-everywhere	truly-gone	java/lang/foreign/ValueLayout	JAVA_INT	Ljava/lang/foreign/ValueLayout$OfInt;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3083	-
-dead-everywhere	truly-gone	java/lang/foreign/ValueLayout	JAVA_LONG	Ljava/lang/foreign/ValueLayout$OfLong;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3092	-
-dead-everywhere	truly-gone	java/lang/foreign/ValueLayout	JAVA_SHORT	Ljava/lang/foreign/ValueLayout$OfShort;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3074	-
 dead-everywhere	truly-gone	java/lang/invoke/MethodHandleImpl$1	findMethodHandleType	(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;	yes	native-builtins/src/shared_secrets_bridge.rs:1962	-
 dead-everywhere	truly-gone	java/lang/invoke/MethodHandleImpl$1	linkMethodHandleConstant	(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;	yes	native-builtins/src/shared_secrets_bridge.rs:1968	-
 dead-everywhere	truly-gone	java/lang/invoke/MethodHandleImpl$1	makeClassValueMap	()Ljava/util/Map;	yes	native-builtins/src/shared_secrets_bridge.rs:1974	-
@@ -484,8 +477,6 @@ dead-everywhere	truly-gone	java/net/InetAddress$1	getHostFromNameService	(Ljava/
 dead-everywhere	truly-gone	java/nio/Buffer$1	scaleShifts	(Ljava/nio/Buffer;)I	yes	native-builtins/src/shared_secrets_bridge.rs:2675	-
 dead-everywhere	near-miss	java/nio/Buffer$2	acquireSession	(Ljava/nio/Buffer;)Ljava/lang/foreign/MemorySegment$Scope;	yes	native-builtins/src/shared_secrets_bridge.rs:2623	-
 dead-everywhere	truly-gone	java/nio/Buffer$2	getBufferPool	()Ljava/lang/management/BufferPoolMXBean;	yes	native-builtins/src/shared_secrets_bridge.rs:2602	-
-dead-everywhere	truly-gone	java/nio/ByteOrder	BIG_ENDIAN	Ljava/nio/ByteOrder;	yes	native-builtins/src/servlet.rs:8261	-
-dead-everywhere	truly-gone	java/nio/ByteOrder	LITTLE_ENDIAN	Ljava/nio/ByteOrder;	yes	native-builtins/src/servlet.rs:8264	-
 dead-everywhere	truly-gone	java/nio/DirectByteBuffer	allocateDirect0	(I)Ljava/nio/ByteBuffer;	yes	native-io/src/direct_buffer.rs:2110	-
 dead-everywhere	truly-gone	java/nio/DirectByteBuffer	cleanNative0	()V	yes	native-io/src/direct_buffer.rs:2163	-
 dead-everywhere	truly-gone	java/nio/DirectByteBuffer	freeMemoryExplicit	(JJ)V	yes	native-io/src/direct_buffer.rs:2202	-
@@ -531,28 +522,6 @@ dead-everywhere	truly-gone	java/security/Provider$EngineDescription	<clinit>	()V
 dead-everywhere	truly-gone	java/security/Provider$ServiceKey	<clinit>	()V	yes	native-builtins/src/jca/provider_chain.rs:5268	-
 dead-everywhere	truly-gone	java/util/HashSet	comparator	()Ljava/util/Comparator;	yes	native-collections/src/lib.rs:2733	-
 dead-everywhere	truly-gone	java/util/LinkedHashSet	comparator	()Ljava/util/Comparator;	yes	native-collections/src/lib.rs:2733	-
-dead-everywhere	truly-gone	java/util/Locale	CANADA	Ljava/util/Locale;	yes	native-builtins/src/lib.rs:19397	-
-dead-everywhere	truly-gone	java/util/Locale	CANADA_FRENCH	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1589	-
-dead-everywhere	truly-gone	java/util/Locale	CHINA	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1586	-
-dead-everywhere	truly-gone	java/util/Locale	CHINESE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1597	-
-dead-everywhere	truly-gone	java/util/Locale	ENGLISH	Ljava/util/Locale;	yes	native-builtins/src/lib.rs:19385	-
-dead-everywhere	truly-gone	java/util/Locale	FRANCE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1581	-
-dead-everywhere	truly-gone	java/util/Locale	FRENCH	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1592	-
-dead-everywhere	truly-gone	java/util/Locale	GERMAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1593	-
-dead-everywhere	truly-gone	java/util/Locale	GERMANY	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1582	-
-dead-everywhere	truly-gone	java/util/Locale	ITALIAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1594	-
-dead-everywhere	truly-gone	java/util/Locale	ITALY	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1583	-
-dead-everywhere	truly-gone	java/util/Locale	JAPAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1584	-
-dead-everywhere	truly-gone	java/util/Locale	JAPANESE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1595	-
-dead-everywhere	truly-gone	java/util/Locale	KOREA	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1585	-
-dead-everywhere	truly-gone	java/util/Locale	KOREAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1596	-
-dead-everywhere	truly-gone	java/util/Locale	PRC	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1587	-
-dead-everywhere	truly-gone	java/util/Locale	ROOT	Ljava/util/Locale;	yes	native-builtins/src/lib.rs:19379	-
-dead-everywhere	truly-gone	java/util/Locale	SIMPLIFIED_CHINESE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1590	-
-dead-everywhere	truly-gone	java/util/Locale	TAIWAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1588	-
-dead-everywhere	truly-gone	java/util/Locale	TRADITIONAL_CHINESE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1591	-
-dead-everywhere	truly-gone	java/util/Locale	UK	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1580	-
-dead-everywhere	truly-gone	java/util/Locale	US	Ljava/util/Locale;	yes	native-builtins/src/lib.rs:19391	-
 dead-everywhere	truly-gone	java/util/TimeZone	getOffsetsByWall	(J[I)I	yes	native-builtins/src/lib.rs:20901	-
 dead-everywhere	truly-gone	java/util/TreeMap	iterator	()Ljava/util/Iterator;	yes	native-collections/src/lib.rs:50007	-
 dead-everywhere	near-miss	java/util/TreeMap$KeySet	<init>	(Ljava/util/Collection;)V	yes	native-collections/src/lib.rs:50178	-
@@ -561,10 +530,6 @@ dead-everywhere	truly-gone	java/util/TreeMap$KeySet	readObject	(Ljava/io/ObjectI
 dead-everywhere	truly-gone	java/util/TreeMap$KeySet	writeObject	(Ljava/io/ObjectOutputStream;)V	yes	native-collections/src/lib.rs:50189	-
 dead-everywhere	near-miss	java/util/concurrent/CopyOnWriteArraySet	<init>	(I)V	yes	native-collections/src/lib.rs:16478	-
 dead-everywhere	near-miss	java/util/concurrent/CopyOnWriteArraySet	<init>	(IF)V	yes	native-collections/src/lib.rs:16479	-
-dead-everywhere	truly-gone	java/util/jar/Attributes$Name	MAIN_CLASS	Ljava/util/jar/Attributes$Name;	no	native-builtins/src/lib.rs:8730	-
-dead-everywhere	truly-gone	java/util/jar/Attributes$Name	MAIN_CLASS	Ljava/util/jar/Attributes$Name;	yes	native-builtins/src/phases_late/jar_manifest.rs:748	-
-dead-everywhere	truly-gone	java/util/jar/Attributes$Name	MANIFEST_VERSION	Ljava/util/jar/Attributes$Name;	no	native-builtins/src/lib.rs:8724	-
-dead-everywhere	truly-gone	java/util/jar/Attributes$Name	MANIFEST_VERSION	Ljava/util/jar/Attributes$Name;	yes	native-builtins/src/phases_late/jar_manifest.rs:732	-
 dead-everywhere	near-miss	java/util/logging/Logger	log	(Ljava/util/logging/Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V	yes	native-builtins/src/logmanager.rs:7002	-
 dead-everywhere	near-miss	java/util/stream/DoubleStream	onClose	(Ljava/lang/Runnable;)Ljava/util/stream/DoubleStream;	no	native-builtins/src/streams.rs:200	-
 dead-everywhere	near-miss	java/util/stream/DoubleStream	onClose	(Ljava/lang/Runnable;)Ljava/util/stream/DoubleStream;	yes	native-collections/src/lib.rs:24084	-
@@ -590,8 +555,6 @@ dead-everywhere	near-miss	jdk/internal/loader/URLClassPath	closeLoaders	()V	yes	
 dead-everywhere	near-miss	jdk/internal/loader/URLClassPath	getURLs	(Z)[Ljava/net/URL;	yes	native-builtins/src/classloader.rs:6145	-
 dead-everywhere	near-miss	jdk/internal/misc/Signal	handle	(Ljdk/internal/misc/Signal;Ljdk/internal/misc/SignalHandler;)Ljdk/internal/misc/SignalHandler;	no	native-builtins/src/deprecated_internal.rs:1534	-
 dead-everywhere	near-miss	jdk/internal/misc/Signal	handle	(Ljdk/internal/misc/Signal;Ljdk/internal/misc/SignalHandler;)Ljdk/internal/misc/SignalHandler;	yes	native-builtins/src/deprecated_internal.rs:1534	-
-dead-everywhere	truly-gone	jdk/internal/misc/Signal	number	(Ljava/lang/String;)I	no	native-builtins/src/deprecated_internal.rs:1599	-
-dead-everywhere	truly-gone	jdk/internal/misc/Signal	number	(Ljava/lang/String;)I	yes	native-builtins/src/deprecated_internal.rs:1599	-
 dead-everywhere	truly-gone	jdk/internal/misc/Unsafe	acquireFence	()V	yes	native-builtins/src/unsafe_natives.rs:2018	-
 dead-everywhere	truly-gone	jdk/internal/misc/Unsafe	addressSize0	()I	no	native-builtins/src/unsafe_jdk25.rs:229	-
 dead-everywhere	truly-gone	jdk/internal/misc/Unsafe	addressSize0	()I	yes	native-builtins/src/unsafe_jdk25.rs:229	-
@@ -701,3 +664,45 @@ dead-everywhere	near-miss	sun/nio/ch/WindowsSelectorImpl	setWakeupSocket0	(II)V	
 dead-everywhere	near-miss	sun/nio/ch/WindowsSelectorImpl$SubSelector	poll0	(JI[I[I[IJ)I	yes	native-io/src/nio_selector.rs:4508	-
 dead-everywhere	truly-gone	sun/security/ssl/SSLEngineImpl	setApplicationProtocols	([Ljava/lang/String;)V	yes	native-builtins/src/t27_tls.rs:16363	-
 dead-everywhere	truly-gone	sun/security/util/DerValue	getEncoded	()[B	yes	native-builtins/src/phases_late/ssl_security.rs:8189	-
+field-shaped	-	java/lang/ProcessBuilder$Redirect	INHERIT	()Ljava/lang/ProcessBuilder$Redirect;	yes	native-builtins/src/phases_late.rs:1633	-
+field-shaped	-	java/lang/ProcessBuilder$Redirect	PIPE	()Ljava/lang/ProcessBuilder$Redirect;	yes	native-builtins/src/phases_late.rs:1623	-
+field-shaped	-	java/lang/foreign/MemorySegment	NULL	Ljava/lang/foreign/MemorySegment;	yes	native-builtins/src/phases_late/foreign_ffm.rs:2974	-
+field-shaped	-	java/lang/foreign/ValueLayout	ADDRESS	Ljava/lang/foreign/AddressLayout;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3119	-
+field-shaped	-	java/lang/foreign/ValueLayout	JAVA_BOOLEAN	Ljava/lang/foreign/ValueLayout$OfBoolean;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3056	-
+field-shaped	-	java/lang/foreign/ValueLayout	JAVA_BYTE	Ljava/lang/foreign/ValueLayout$OfByte;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3047	-
+field-shaped	-	java/lang/foreign/ValueLayout	JAVA_CHAR	Ljava/lang/foreign/ValueLayout$OfChar;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3065	-
+field-shaped	-	java/lang/foreign/ValueLayout	JAVA_DOUBLE	Ljava/lang/foreign/ValueLayout$OfDouble;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3110	-
+field-shaped	-	java/lang/foreign/ValueLayout	JAVA_FLOAT	Ljava/lang/foreign/ValueLayout$OfFloat;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3101	-
+field-shaped	-	java/lang/foreign/ValueLayout	JAVA_INT	Ljava/lang/foreign/ValueLayout$OfInt;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3083	-
+field-shaped	-	java/lang/foreign/ValueLayout	JAVA_LONG	Ljava/lang/foreign/ValueLayout$OfLong;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3092	-
+field-shaped	-	java/lang/foreign/ValueLayout	JAVA_SHORT	Ljava/lang/foreign/ValueLayout$OfShort;	yes	native-builtins/src/phases_late/foreign_ffm.rs:3074	-
+field-shaped	-	java/nio/ByteOrder	BIG_ENDIAN	Ljava/nio/ByteOrder;	yes	native-builtins/src/servlet.rs:8261	-
+field-shaped	-	java/nio/ByteOrder	LITTLE_ENDIAN	Ljava/nio/ByteOrder;	yes	native-builtins/src/servlet.rs:8264	-
+field-shaped	-	java/util/Locale	CANADA	Ljava/util/Locale;	yes	native-builtins/src/lib.rs:19397	-
+field-shaped	-	java/util/Locale	CANADA_FRENCH	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1589	-
+field-shaped	-	java/util/Locale	CHINA	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1586	-
+field-shaped	-	java/util/Locale	CHINESE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1597	-
+field-shaped	-	java/util/Locale	ENGLISH	Ljava/util/Locale;	yes	native-builtins/src/lib.rs:19385	-
+field-shaped	-	java/util/Locale	FRANCE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1581	-
+field-shaped	-	java/util/Locale	FRENCH	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1592	-
+field-shaped	-	java/util/Locale	GERMAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1593	-
+field-shaped	-	java/util/Locale	GERMANY	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1582	-
+field-shaped	-	java/util/Locale	ITALIAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1594	-
+field-shaped	-	java/util/Locale	ITALY	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1583	-
+field-shaped	-	java/util/Locale	JAPAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1584	-
+field-shaped	-	java/util/Locale	JAPANESE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1595	-
+field-shaped	-	java/util/Locale	KOREA	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1585	-
+field-shaped	-	java/util/Locale	KOREAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1596	-
+field-shaped	-	java/util/Locale	PRC	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1587	-
+field-shaped	-	java/util/Locale	ROOT	Ljava/util/Locale;	yes	native-builtins/src/lib.rs:19379	-
+field-shaped	-	java/util/Locale	SIMPLIFIED_CHINESE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1590	-
+field-shaped	-	java/util/Locale	TAIWAN	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1588	-
+field-shaped	-	java/util/Locale	TRADITIONAL_CHINESE	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1591	-
+field-shaped	-	java/util/Locale	UK	Ljava/util/Locale;	yes	native-builtins/src/locale_bootstrap.rs:1580	-
+field-shaped	-	java/util/Locale	US	Ljava/util/Locale;	yes	native-builtins/src/lib.rs:19391	-
+field-shaped	-	java/util/jar/Attributes$Name	MAIN_CLASS	Ljava/util/jar/Attributes$Name;	no	native-builtins/src/lib.rs:8730	-
+field-shaped	-	java/util/jar/Attributes$Name	MAIN_CLASS	Ljava/util/jar/Attributes$Name;	yes	native-builtins/src/phases_late/jar_manifest.rs:748	-
+field-shaped	-	java/util/jar/Attributes$Name	MANIFEST_VERSION	Ljava/util/jar/Attributes$Name;	no	native-builtins/src/lib.rs:8724	-
+field-shaped	-	java/util/jar/Attributes$Name	MANIFEST_VERSION	Ljava/util/jar/Attributes$Name;	yes	native-builtins/src/phases_late/jar_manifest.rs:732	-
+field-shaped	-	jdk/internal/misc/Signal	number	(Ljava/lang/String;)I	no	native-builtins/src/deprecated_internal.rs:1599	-
+field-shaped	-	jdk/internal/misc/Signal	number	(Ljava/lang/String;)I	yes	native-builtins/src/deprecated_internal.rs:1599	-

@@ -1432,9 +1432,18 @@ impl<'a> Emitter<'a> {
             0x8A => self.conv("cvt.rn.f64.s64", RegKind::S64, RegKind::F64)?, // l2d
             0x8B => self.conv("cvt.rzi.s32.f32", RegKind::F32, RegKind::S32)?, // f2i
             0x8C => self.conv("cvt.rzi.s64.f32", RegKind::F32, RegKind::S64)?, // f2l
+            // f2d — but see `float_sqrt_triple_at`: when this widen exists
+            // only to reach `Math.sqrt(D)D` and is narrowed straight back,
+            // leave the value as F32 and let `invokestatic` emit a single
+            // `sqrt.rn.f32`. Skipping the widen here is what tells the two
+            // later arms the collapse is in progress.
+            0x8D if self.float_sqrt_triple_at(pc) => {}
             0x8D => self.conv("cvt.f64.f32", RegKind::F32, RegKind::F64)?, // f2d
             0x8E => self.conv("cvt.rzi.s32.f64", RegKind::F64, RegKind::S32)?, // d2i
             0x8F => self.conv("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
+            // d2f — a no-op when the value on the stack is already F32,
+            // which happens only for the collapsed float-sqrt triple.
+            0x90 if self.stack.0.last().map(|r| r.kind) == Some(RegKind::F32) => {}
             0x90 => self.conv("cvt.rn.f32.f64", RegKind::F64, RegKind::F32)?, // d2f
             0x91 => self.conv_truncate_i32(8)?,                            // i2b
             // i2c — Java `char` is an UNSIGNED 16-bit value, so JVMS i2c
@@ -1697,6 +1706,71 @@ impl<'a> Emitter<'a> {
     /// and dispatch to the matching intrinsic's PTX lowering. See the
     /// module-level AUDIT comment above and
     /// `analyzer::resolve_math_intrinsic` for the curated table and the
+
+    /// Is the instruction at `pc` the `f2d` of a `(float) Math.sqrt(f)`?
+    ///
+    /// `java.lang.Math` declares square root only as `sqrt(D)D`, so there is
+    /// no way to spell a float square root in Java except
+    ///
+    /// ```text
+    /// f2d                              (widen the float to double)
+    /// invokestatic Math.sqrt:(D)D      (correctly-rounded f64 sqrt)
+    /// d2f                              (round the result back to float)
+    /// ```
+    ///
+    /// and javac emits those three adjacent. Lowered literally that is a
+    /// DOUBLE-precision square root, which on a consumer GPU is a disaster:
+    /// Turing runs FP64 at 1/32 of FP32 rate, and `sqrt.rn.f64` expands to a
+    /// `MUFU.RSQ64H` plus a Newton-Raphson chain of `DFMA`/`DMUL`. The
+    /// four-sphere ray tracer has eight of these per pixel and its SASS came
+    /// out with 76 FP64 instructions against ~250 FP32 ones — the f64 sqrts
+    /// alone outweighed the entire rest of the kernel.
+    ///
+    /// Collapsing the triple to one `sqrt.rn.f32` is **bit-exact**, not an
+    /// approximation. Rounding a square root through binary64 and then to
+    /// binary32 gives the correctly-rounded binary32 result whenever
+    /// `p64 >= 2 * p32 + 2`, and 53 >= 50. That is the classical
+    /// innocuous-double-rounding condition for square root, and it was
+    /// checked here the blunt way rather than cited: all 2^32 float bit
+    /// patterns, `(x as f64).sqrt() as f32` against `x.sqrt()`, zero
+    /// mismatches — including subnormals, both zeros, both infinities and
+    /// the NaNs. `sqrt.rn.f32` (not `.approx`, not `.ftz`) is required for
+    /// that to hold.
+    ///
+    /// Matching the whole triple rather than just the call matters: an
+    /// `f2d` that is NOT feeding a narrowed sqrt still widens normally, and
+    /// a genuine `double` square root still lowers to `sqrt.rn.f64`.
+    fn float_sqrt_triple_at(&self, pc: usize) -> bool {
+        // f2d (1 byte) ; invokestatic (3 bytes) ; d2f
+        if self.bytes.get(pc) != Some(&0x8D) || self.bytes.get(pc + 1) != Some(&0xB8) {
+            return false;
+        }
+        if self.bytes.get(pc + 4) != Some(&0x90) {
+            return false;
+        }
+        let (Some(&hi), Some(&lo)) = (self.bytes.get(pc + 2), self.bytes.get(pc + 3)) else {
+            return false;
+        };
+        let Some(cp) = self.cp else { return false };
+        let index = u16::from_be_bytes([hi, lo]);
+        let Some(ConstantPoolEntry::MethodReference {
+            class_index,
+            name_and_type_index,
+        }) = cp.get(index)
+        else {
+            return false;
+        };
+        let Some(class_name) = cp.get_class_name(*class_index) else {
+            return false;
+        };
+        let Some((method_name, descriptor)) = cp.get_name_and_type(*name_and_type_index) else {
+            return false;
+        };
+        matches!(
+            resolve_math_intrinsic(class_name, method_name, descriptor),
+            Some(MathIntrinsic::SqrtF64)
+        )
+    }
     /// exactness rationale for each entry.
     fn invokestatic(&mut self, index: u16) -> Result<(), LoweringError> {
         let cp = self.cp.ok_or_else(|| {
@@ -1730,6 +1804,18 @@ impl<'a> Emitter<'a> {
                 ))
             })?;
         match resolve_math_intrinsic(class_name, method_name, descriptor) {
+            // `Math.sqrt` is only declared `(D)D`, so a float square root in
+            // Java is always spelled `(float) Math.sqrt(f)` and always
+            // arrives here with an `f2d` in front and a `d2f` behind. When
+            // `f2d` recognised that triple it left the operand as F32 (see
+            // `float_sqrt_triple_at`), and the whole thing collapses to one
+            // `sqrt.rn.f32`. Otherwise the operand really is a double and
+            // the f64 square root is what the program asked for.
+            Some(MathIntrinsic::SqrtF64) if self.stack.0.last().map(|r| r.kind)
+                == Some(RegKind::F32) =>
+            {
+                self.unop_f32("sqrt.rn.f32")
+            }
             Some(MathIntrinsic::SqrtF64) => self.unop_f64("sqrt.rn.f64"),
             Some(MathIntrinsic::AbsF32) => self.unop_f32("abs.f32"),
             Some(MathIntrinsic::AbsF64) => self.unop_f64("abs.f64"),

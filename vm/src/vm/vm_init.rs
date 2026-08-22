@@ -8885,6 +8885,19 @@ impl Vm {
                 }
             });
         }
+        // And the GC-SAFE handle for that dump. `Monitor::wait` holds the
+        // awaited `ObjectRef` as a plain local for the whole wait, which a
+        // moving collector invalidates; `jmx_waiting_monitor` is a scanned root
+        // that `update_thread_objs_after_gc` (gc.rs step 21) forwards, so it is
+        // the address still valid at dump time. Without this the dump silently
+        // reports pre-relocation field values.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_object_resolve(move |tid| {
+                let s = weak.upgrade()?;
+                s.threads.thread_registry.peek_jmx_waiting_monitor(tid)
+            });
+        }
 
         // Register the main thread (id 0) in the thread registry.
         let main_thread = Box::new(JvmThread::new(ThreadId(0), "main"));
