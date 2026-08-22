@@ -53142,22 +53142,27 @@ use std::sync::Arc;
         assert!(matches!(set, Value::Object(Some(_))));
     }
 
-    #[test]
-    fn auto_closeable_close_p70() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-
-        // AutoCloseable.close is a no-op
-        call_native(
-            &shared,
-            &mut thread,
-            "java/lang/AutoCloseable",
-            "close",
-            "()V",
-            &[Value::Object(None)],
-        )
-        .unwrap();
-    }
+    // `auto_closeable_close_p70` was REMOVED 2026-08-21 (WORKER 4), together
+    // with the registration it was asserting.
+    //
+    // It called `call_native(.., "java/lang/AutoCloseable", "close", "()V", ..)`
+    // with a NULL receiver and asserted only that the call did not error --
+    // i.e. it asserted that a row existed, not that anything worked. That is
+    // exactly what made it a blocker rather than a protection: `call_native`
+    // `panic!`s on an unregistered triple, so the test would have gone red for
+    // the deletion and for nothing else.
+    //
+    // What the deleted registration was for, and why it went, is written out
+    // at the foot of `native-io/src/lib.rs::register_scanner_natives`:
+    // dispatch keys on the RECEIVER's runtime class, the one fallback walk
+    // follows `superclass` links and never visits an interface, a second gate
+    // at step 6 of `execute_invoke_kind` drops interface instance-method
+    // natives outright, nothing in the tree mints a `java/lang/AutoCloseable`,
+    // and the row measured `invocations: 0` across 15 corpus vectors plus a
+    // purpose-built try-with-resources probe while the user's own `close()`
+    // ran byte-identically to HotSpot. `docs/known-issues/jdk-only/H11-3-*.md`
+    // N1 is the record; it wrote this deletion out verbatim and could not make
+    // it because that lane did not own this file.
 
     // ===== Phase 71 Tests =====
 
