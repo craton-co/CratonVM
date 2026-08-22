@@ -3,13 +3,28 @@
 ## What is failing
 
 `org.bouncycastle.pqc.math.ntru.test.PolynomialTest` under
-`-XX:+UseGenerationalGC`, on **pristine `dev`**, deterministically:
+`-XX:+UseGenerationalGC`, on **pristine `dev`**:
 
 ```text
 gen-devpure-1  FAIL  IllegalFormatConversionException: d != java.lang.Object
 gen-devpure-2  FAIL  IllegalFormatConversionException: d != java.lang.Object
 gen-devpure-3  FAIL  IllegalFormatConversionException: d != java.lang.Object
 ```
+
+> **CORRECTION (2026-08-21, later the same day).** This section originally said
+> "deterministically". **It is not deterministic — it is intermittent**, and
+> that word was wrong. An attempted bisect ran the same commit `cae49a85c` as
+> its BAD endpoint and got **PASS 2/2**, and one interior commit reported
+> `run1=PASS run2=SIG` in a single step. Three consecutive failures were real
+> but did not establish determinism.
+>
+> The likeliest reading is host load: the 3/3 runs happened while a 53-class
+> gate and other jobs were saturating the box; the bisect endpoints ran on a
+> quiet one. That matches this host's recorded behaviour, where load flips
+> PASS/FAIL and not only timings.
+>
+> Everything below that depends on the failure being reliable — including the
+> regression *window* — is weaker than it reads. See the bisect section.
 
 That is the signature of `bug-g1-evacuates-live-jit-reference-20260819.md` — a
 live reference the collector's root set did not contain, read back stale after
@@ -41,8 +56,35 @@ generational**, so the tempting narrower claim ("it broke in dev's last 41
 commits") is not supported by anything measured. Do not repeat it without
 bisecting.
 
-That leaves roughly 240 commits in the window. Bisecting it is the obvious next
-step and has not been done.
+That leaves roughly 240 commits in the window.
+
+## The bisect was attempted and is VOID
+
+`git bisect run` over `684f37e14..cae49a85c`, probe = build + run, matching the
+exception signature rather than the exit code, two passes required for "good":
+
+```text
+BAD  end (cae49a85c)  exit=0   <- the endpoint should have been BAD
+GOOD end (684f37e14)  exit=0
+78606e45d  BAD  (run1=PASS run2=SIG - flaky)
+…                                   walked to 819ad679a
+```
+
+**The BAD endpoint passed, so the run proves nothing** and `819ad679a` is not a
+result. With an intermittent failure a two-run pass cannot establish "good" —
+any commit can pass twice by chance — so every GOOD verdict in that trace is
+unsound, and the bisect walked a tree of unreliable answers to a confident
+conclusion. Do not cite it.
+
+What has to happen first is the **rate** at both endpoints, interleaved so load
+lands on both. The question that decides whether a bisect is even meaningful is
+whether `684f37e14` fails at all: if it does, there is no regression here, only
+a long-standing intermittent defect, and the window framing above is wrong
+rather than merely wide.
+
+A bisect over an intermittent failure needs enough repetitions per step to
+separate "good" from "unlucky", which multiplies an already ~8-step, ~10-minute-
+per-step search. Establish the rate before paying for that.
 
 ## What the failing run shows
 
@@ -88,7 +130,7 @@ cratonvm --java-home /data/toolchain/jdk-25 -XX:+UseGenerationalGC --Xmx 1g \
     junit.textui.TestRunner org.bouncycastle.pqc.math.ntru.test.PolynomialTest
 ```
 
-Deterministic, ~2 minutes. `CRATONVM_DBG_JIT_ROOTSCAN=1` prints one line per
+**Intermittent** — budget many repetitions, not one. ~2 minutes per run. `CRATONVM_DBG_JIT_ROOTSCAN=1` prints one line per
 collection (`precise_only` / `incomplete` / `scan_added`), which is what
 distinguishes "the scan was skipped" from "the scan ran and found nothing" — the
 distinction that took the G1 case three wrong hypotheses to get right.

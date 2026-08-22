@@ -3905,7 +3905,6 @@ impl Compiler {
                 // tableswitch — jump table for dense tables, CMP chain for small
                 0xaa => {
                     self.flush_scratch_registers();
-                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -3966,7 +3965,35 @@ impl Compiler {
                         pc += 4;
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    if def_target <= base_pc || targets.iter().any(|&target| target <= base_pc) {
+                    let any_backward =
+                        def_target <= base_pc || targets.iter().any(|&target| target <= base_pc);
+                    // Canonicalize the operands that OUTLIVE this switch, exactly
+                    // as the `ifeq`/`if_icmp`/`goto` arms do — and before popping
+                    // the key, so the key participates in the relocation and
+                    // cannot be clobbered by another slot's move (the same
+                    // ordering rule those arms state).
+                    //
+                    // Every arm of a switch is a branch target, and a target
+                    // revived from dead code rebuilds the operand stack at the
+                    // canonical `base_spill_offset + i*8` — a layout NOTHING was
+                    // establishing here, so any operand this basic block left at
+                    // a non-canonical offset was read from the wrong slot by
+                    // every arm. That is the second half of ECJ's
+                    // `OperandStack.pop(OperandCategory)` miscompile: the inlined
+                    // `TypeIds.getCategory` result sat above its semantic depth
+                    // (fixed in `x64/inlining.rs`) and this `tableswitch` was the
+                    // one branch shape in the walk that did not repair it, so the
+                    // `if_icmpeq` at the merge compared the raw `TypeBinding.id`
+                    // (tomcat/ecj-operandstack-*.md).
+                    //
+                    // Forward-only, mirroring those arms: a backward target's
+                    // layout was fixed when the walk emitted it, and relocating
+                    // to suit a forward merge would disagree with it.
+                    if !any_backward && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
+                    let key_slot = self.pop_stack();
+                    if any_backward {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
@@ -4065,7 +4092,6 @@ impl Compiler {
                 // lookupswitch — CMP chain for small, binary search for large
                 0xab => {
                     self.flush_scratch_registers();
-                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -4120,7 +4146,18 @@ impl Compiler {
                         pairs.push((key, target));
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    if def_target <= base_pc || pairs.iter().any(|&(_, target)| target <= base_pc) {
+                    let any_backward = def_target <= base_pc
+                        || pairs.iter().any(|&(_, target)| target <= base_pc);
+                    // Same canonicalization the `tableswitch` arm above performs,
+                    // and for the same reason — see the note there. The two
+                    // switch arms are the only branch shapes in this walk that
+                    // were not establishing the canonical layout their own
+                    // targets are revived with.
+                    if !any_backward && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
+                    let key_slot = self.pop_stack();
+                    if any_backward {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
