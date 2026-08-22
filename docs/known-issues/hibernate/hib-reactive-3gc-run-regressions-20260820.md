@@ -753,3 +753,148 @@ the terminal call to fire twice once JIT-compiled.
    committed (see 6.1) since it produced a clean negative on an already-
    eliminated theory; recreate it if the identity-hash angle needs
    revisiting for a different mechanism.
+
+---
+
+## 7. 2026-08-22 — `--jit off` swept across all 8 other classes from section 5's still-FAIL list: 6/8 confirmed the same defect, 2/8 are the already-known separate lambda-dispatch-timeout family
+
+Section 6 established the JIT-dispatch mechanism on `FilterWithPaginationTest`
+alone. This section runs the same `--jit on` vs `--jit off` A/B across the
+other 8 classes section 5 listed as still genuinely failing (not the
+`nio_selector.rs`-fixed six, not the two host-locale classes). Same idle
+Azure host (load was NOT quiet this time — up to load average 31 from other
+concurrent sessions' work partway through, see the build-time note below —
+but this A/B is a coarse PASS/FAIL comparison, not fine-grained timing, so
+host contention is not expected to change the verdict, only the wall-clock
+numbers), fresh binary (`cratonvm-nojitsweep`, current `dev` tip + this
+branch, no code changes), `--shards 8` (one class per shard), `--timeout
+120` (the flat default — no per-class overrides applied, so the two
+already-known slow classes are expected to hit the cap regardless of JIT
+state; see below).
+
+### 7.1 Six classes: clean PASS under `--jit off`, the exact same cascade shape under `--jit on`
+
+| class | `--jit off` | `--jit on` | first exception (jit on) |
+|---|---|---|---|
+| `RowIdUpdateAndDeleteTest` | PASS 6/6, 31.4s | FAIL 4/6, 26.9s | `Unmanaged instance passed to remove()` |
+| `OneToManyTest` | PASS 8/8, 29.2s | FAIL 6/8, 29.6s | `UnexpectedAccessToTheDatabase` |
+| `QuerySpecificationTest` | PASS 52/52, 39.1s | FAIL 50/52, 37.1s | `IllegalStateException: Illegal pop() with non-matching JdbcValuesSourceProcessingState` |
+| `CriteriaMutationQueryTest` | PASS 9/9, 28.0s | FAIL 7/9, 27.1s | `UnexpectedAccessToTheDatabase` |
+| `ReactiveStatelessWithBatchTest` | PASS 24/24, 35.1s | FAIL 22/24, 31.1s | `UnexpectedAccessToTheDatabase` |
+
+(`FilterWithPaginationTest`, section 6, is the sixth — `Unmanaged instance
+passed to remove()`.)
+
+Every `--jit on` failure is the exact two-step cascade section 2.1 first
+described: one `@AfterEach`/mid-test failure (`Unmanaged instance passed to
+remove()` or `UnexpectedAccessToTheDatabase` — both already-established
+symptoms of the same underlying `contains()`-sees-a-status-it-shouldn't
+mechanism section 6 characterized), then exactly one downstream
+`ConstraintViolationException: duplicate key` from the next test method's
+`@BeforeEach` re-inserting rows the failed cleanup never deleted. `failed=2`
+on every one of the five FAIL rows above, matching the pattern exactly.
+**`QuerySpecificationTest`'s first exception is a new shape**
+(`IllegalStateException` about a JDBC-values-processing-state stack
+mismatch, not `Unmanaged instance`/`UnexpectedAccessToTheDatabase`
+directly) — plausibly a different symptom of the same root double-fire (a
+second, unexpected re-entry into query-result processing rather than into
+delete processing), not investigated further this session, but it fits the
+"one call site fires twice" shape the section 6 finding already establishes
+and is not evidence of a fourth, unrelated defect.
+
+**This is the same defect, now confirmed on 6 of 6 classes checked, with the
+same clean `--jit off`/`--jit on` A/B section 6 already established for
+`FilterWithPaginationTest`.**
+
+### 7.2 One class hung under `--jit on` that passed under `--jit off`: `ReactiveStatelessProxyUpdateTest`
+
+`--jit off`: PASS 4/4, 28.4s. `--jit on`: HANG at the flat 120s cap (no
+`class-overrides.tsv` entry raises it here). This is **not** a new finding —
+section 2.1 already named this class as "the one outlier — a plain 120s
+`TimeoutException` in `testLazyInitializationExceptionWithMutiny`,
+`failed=1` — not yet connected to the other six" and explicitly left it
+untriaged. This run doesn't resolve that; it only adds that the hang, like
+the cascade, does not reproduce under `--jit off`, which is at least
+consistent with (but does not prove) the same JIT root cause. Worth a
+dedicated `--jit off` vs `on` timing/repeat check on its own before folding
+it into section 6's finding as a seventh confirmed instance.
+
+### 7.3 Two classes are unaffected either way — the already-known lambda-dispatch-timeout family, at the WRONG timeout for this check
+
+`techempower.TechEmpowerTest` and `MultithreadedInsertionWithLazyConnectionTest`
+are the two classes `class-overrides.tsv` deliberately does NOT give a
+raised timeout to (its own comment: "The other three
+(`MultithreadedInsertionWithLazyConnectionTest`, `it.LocalContextTest`,
+`techempower.TechEmpowerTest`) are deliberately NOT here" — because their
+own fixture code has a hardcoded Vert.x deadline no runner flag can reach,
+per `residual-seven-after-the-afc-fix-20260817.md` section 2.1). At the flat
+120s cap used here (no override), both HANG under `--jit off`;
+`MultithreadedInsertionWithLazyConnectionTest` also HANGs under `--jit on`;
+`techempower.TechEmpowerTest` returns a FAIL under `--jit on` at 17.7s, but
+its failure (`AssertionError: Expected status code 200 or 204, but was
+500`) is an HTTP-layer failure unrelated to the persistence-context cascade
+— plausibly just this class not getting far enough into its own workload
+before whatever caused the 500 (a fixture/setup issue at this short a
+timeout, most likely), not a JIT correctness finding either way. **This
+result is inconclusive for both classes at this timeout** — the already-
+documented volume/lambda-dispatch-cost explanation for both stands
+unchanged; re-run with the per-class overrides these two classes actually
+need (900s+, per the residual-seven doc's own measured wall-clocks) before
+drawing any `--jit on`/`off` conclusion for this pair.
+
+### 7.4 A harness quirk found in passing: `docker\.sock` in the NO-DB signature pattern matches a SUCCESS log line
+
+This worktree's copy of `run-hibernate-reactive-suite.sh` has a DIFFERENT
+(and separately buggy) NO-DB-tagging implementation than the one section 5
+described — this one checks `"Could not find a valid Docker environment|
+Connection refused|No such host|docker\.sock"` (note the added `docker\.sock`
+alternative) against `"$tmp" "$RAW"` and, if it matches, prepends `NO-DB: `
+to the signature (or substitutes the literal fallback text
+`"connection-refused"` if the primary exception-signature grep found
+nothing). **`docker\.sock` matches Testcontainers' own routine, successful
+startup log line** — `DockerClientProviderStrategy - Found Docker
+environment with local Unix socket (unix:///var/run/docker.sock)` — which
+every one of this section's runs prints on a normal, working Docker
+connection. Every FAIL row in this section's sweep was mislabeled
+`NO-DB: connection-refused` in `results.tsv` even though `found`/`ok` were
+never 0 and the real exception (visible in `raw.log`, section 7.1's table)
+is the persistence-context cascade, not a connectivity failure. Section 5's
+own warning applies here too: **don't trust the `sig` column at face value**
+— check `found`/`ok` against 0 and read the actual `@@TESTFAIL` block before
+concluding "no DB." This script is gitignored, so (as with section 5) no
+fix is committed here; the fix is to drop `docker\.sock` from the pattern
+(or match only "Could not connect to Docker" / a `ConnectException` thrown
+from inside the harness's own containers setup, not a raw log line that
+also appears on success).
+
+**FIXED 2026-08-22.** Applied directly to both Azure copies of the script
+(`/data/cratonvm/apps/hibernate-reactive-suite-runner/` and
+`/data/cvm-hibreactive-idle-20260820/apps/hibernate-reactive-suite-runner/`
+— the two found with this bug; the older Windows-box copy carries only
+section 5's original `"$tmp" "$RAW"` scope bug, in a differently-shaped
+`sig`-generation block, not touched here): dropped the `docker\.sock`
+alternative, and — since the surrounding code was already being edited —
+also fixed section 5's still-live `"$tmp" "$RAW"` scope issue in this same
+block (it checked both; now only `"$tmp"`, this class's own output).
+Verified both corrections against real data rather than by inspection
+alone: the new pattern no longer matches this section's own saved
+`raw.log`s that previously false-positived (re-checked directly, `grep`
+against the old pattern still matches, against the new pattern no longer
+does), and a synthetic genuine `ConnectException: Connection refused` log
+still matches the new pattern, so real no-DB detection is unaffected.
+`bash -n` passes on both files. Still gitignored, so this is a local fix on
+the two hosts/worktrees touched, not a commit — the next session working
+from a *different* worktree's copy of this script should apply the same
+change (or copy the fixed file) if it hits this again.
+
+### 7.5 Updated status
+
+Of the 9 classes now checked with `--jit on` vs `--jit off` (`FilterWithPaginationTest`
+plus these 8): **6 confirmed** to be the section 6 JIT-dispatch defect
+(clean `--jit off` PASS, exact cascade shape under `--jit on`), **1 plausible
+but unconfirmed** (`ReactiveStatelessProxyUpdateTest` — hangs one way,
+passes the other, but was already a separate untriaged outlier), and **2
+inconclusive** at this timeout (the already-known, separately-documented
+lambda-dispatch-timeout family, needs its own real per-class-override
+timeout before a `--jit` verdict means anything for those two). No class
+checked this session contradicts the section 6 finding.

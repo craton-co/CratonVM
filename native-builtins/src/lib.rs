@@ -10600,6 +10600,28 @@ pub fn register_essential_natives_with_shims(
         essential_quarkus_locale_convert,
     );
 
+    // CLUSTER ROOT (H4-1, 2026-08-20) — the first note written in this file
+    // after contract §8's ban was lifted for wave 2, and it is a "do not start
+    // here" rather than a change.
+    //
+    // This registration is the entry point of the Properties/Hashtable
+    // state-ownership cluster `G88-1` §6 stopped on. The object below is a
+    // synthetic `Properties` whose inherited `map` ConcurrentHashMap is
+    // permanently null, and every `Properties.*` native in
+    // `properties_sidetable.rs` exists to make it behave like a Map at all.
+    // Retag those `SyntheticStub` and `register_inner`'s `JdkOnly` arm drops
+    // them, which reproduces the 2026-07-14 regression on purpose:
+    // `InternalError: null property: java.home` from `java.util.Locale
+    // .<clinit>`. So the cluster's first move is to make THIS return a real
+    // `Properties` — real `<init>`, real `map` — not to move a tag.
+    //
+    // `G88-1` §6 named contract §8 as the structural blocker on the ground
+    // that the larger half of the cluster lives in this file. Measured
+    // 2026-08-20: registrations whose TARGET class is `java/util/Properties`
+    // or `java/util/Hashtable` in `native-builtins/src/lib.rs` number **zero**
+    // — the 67 are in `properties_sidetable.rs` (32), `deprecated_util.rs`,
+    // `deprecated_io_util.rs` and `wildfly_naming.rs`. The full table and the
+    // rest of the cluster are on `register_properties_sidetable`.
     registry.register(
         "java/lang/System",
         "getProperties",
@@ -14016,48 +14038,33 @@ pub fn register_essential_natives_with_shims(
         },
     );
 
-    // T1.5.1 — `Thread.stop0(Object)` async-exception delivery.
+    // T1.5.1 — `Thread.stop0(Object)` / `Thread.stop()`: REGISTERED NOWHERE
+    // IN THIS FILE, and that is a deletion, not an omission.
     //
-    // `args[0]` is the target `Thread` object (the receiver of the
-    // instance method); `args[1]` is the `Throwable` to deliver. We
-    // post it into the target thread's registry slot; the target
-    // raises it at its next safepoint via
-    // `interpreter::check_pending_async_exception`.
+    // Both triples used to be registered here AND in
+    // `deprecated_lang.rs::register_deprecated_lang_natives`, which runs later
+    // and therefore owned both slots. MEASURED from
+    // `--dump-native-registry --explain-jdk-only --jdk-only`:
     //
-    // The deprecated-for-removal no-arg `Thread.stop()` is a thin
-    // wrapper that would allocate a `ThreadDeath` and delegate; we
-    // fall back to setting the interrupt flag, which is the
-    // spec-permitted safe alternative when `stop()` is invoked
-    // without its argument.
-    registry.register(
-        "java/lang/Thread",
-        "stop0",
-        "(Ljava/lang/Object;)V",
-        |ctx, args| {
-            let target = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let throwable = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let _ = ctx.thread_post_async_exception(target, throwable);
-            Ok(None)
-        },
-    );
-    registry.register("java/lang/Thread", "stop", "()V", |ctx, args| {
-        let target = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(None),
-        };
-        // Deprecated-for-removal no-arg form: fall back to
-        // setting the interrupt flag per the safe-default
-        // spec note. Real-world callers should use
-        // `stop0(Throwable)` or `interrupt()` directly.
-        ctx.thread_interrupt(target);
-        Ok(None)
-    });
+    // ```text
+    //   stop  ()V                  lib.rs  owns_slot=false   deprecated_lang.rs  owns_slot=true
+    //   stop0 (Ljava/lang/Object;)V lib.rs  owns_slot=false   deprecated_lang.rs  owns_slot=true
+    // ```
+    //
+    // So neither body here has ever run. That made them a LANDMINE rather than
+    // dead weight: a census-driven retirement of the `deprecated_lang.rs`
+    // registration — which is what the row counts recommend, and what
+    // `docs/known-issues/jdk-only/H25-3-*.md` R1 was written to refuse —
+    // would have PROMOTED the `stop()` closure that was here, turning a method
+    // that correctly throws `UnsupportedOperationException` into one that
+    // silently interrupts the target thread and returns normally. The census
+    // would have fallen by one and the change would have scored as a win.
+    //
+    // `stop()` is now served by the real bytecode of every supported image
+    // (JDK 21/25 throw `UnsupportedOperationException`; JDK 17 does the real
+    // deprecated work through `stop0`). `stop0` keeps its single
+    // `deprecated_lang.rs` registration, because JDK 17 declares it — see the
+    // note there.
 
     // T1.6.7 — `Thread.holdsLock(Object)` real implementation.
     // Was a constant `return false` stub. Now consults the per-thread
@@ -19496,15 +19503,32 @@ pub fn register_essential_natives_with_shims(
         native_uri_init,
     );
 
-    // WP6.2 follow-up — `java.util.HexFormat.formatHex(byte[])` /
-    // `formatHex(byte[],int,int)` for `apps/digest_probe/DigestProbe.java`.
-    // Real-JDK bytecode for `HexFormat` produces empty strings in real-JDK
-    // mode (Formatter dependency chain isn't fully wired), so digest
-    // outputs render as `SHA-256 = ` even though the underlying bytes
-    // are correct. Register a small native that walks the byte array and
-    // emits lowercase hex digits, matching the JDK contract for the
-    // default `HexFormat.of()` (no delimiter, no prefix/suffix, lowercase).
-    register_hex_format_real_jdk_natives(registry);
+    // RETIRED 2026-08-21 (H22-1) — `register_hex_format_real_jdk_natives` used
+    // to be called here, and it called `phases_late::register_p64_hex_format`
+    // last. Between them they registered 42 natives on `java/util/HexFormat`
+    // (16 + 26), of which 26 owned their slot and 25 of those 26 are declared
+    // with a `Code` attribute in the JDK 25 image; the whole class is now left
+    // to real JDK bytecode in every shipping mode.
+    //
+    // The premise above ("real-JDK bytecode for HexFormat produces empty
+    // strings") is a 2026 statement about a Formatter static-init chain that
+    // has since been wired. MEASURED 2026-08-21 on `cratonvm-r5.exe` with
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/HexFormat`, which makes
+    // contract §1.4 enforced and is exactly what this deletion does
+    // permanently: a 30-assertion HexFormat probe (`formatHex`, ranged
+    // `formatHex`, `parseHex`, upper/lower, delimiter, prefix, suffix, all
+    // five `toHexDigits` overloads, `fromHexDigits*`, `isHexDigit`,
+    // `toString`, `equals`, `hashCode`, and the two panic paths W8-C15-2
+    // named) is byte-identical to HotSpot 25.0.3+9 on stdout. `H14-3` §1
+    // priced the same prefix over the 104-vector corpus at a net cost of ZERO.
+    //
+    // `register_p64_hex_format` itself is NOT deleted: under the
+    // `synthetic-jdk` feature there is no `java/util/HexFormat` bytecode to
+    // fall back to, and it stays reachable from `register_phase64_natives`,
+    // whose `DELIBERATE_SYNTHETIC_ONLY_FAMILIES` verdict is already "REAL-JDK
+    // BYTECODE: all 2 exclusive classes exist in JDK 25". This is the
+    // difference between retiring a native and deleting it.
+    // docs/known-issues/jdk-only/H22-1-*.md
 
     // String.format / Formatter — same root cause family as HexFormat.
     // Real-JDK bytecode for `String.format(String, Object...)` and
@@ -21452,299 +21476,26 @@ pub fn register_essential_natives_with_shims(
     tracing::info!(count = after - before, "Registered essential natives");
 }
 
-/// `java/util/HexFormat` natives required in real-JDK mode.  The JDK 25
-/// bytecode for `formatHex(byte[])` returns an empty string in our
-/// environment because `Formatter`'s static-init chain is short-circuited
-/// (intentionally — see `jca/cipher::register_cipher_clinit_shim`).  Register
-/// a self-contained native that materialises the lowercase hex string from
-/// the input bytes directly.
-///
-/// Symptom this fixes: `DigestProbe` printed `SHA-256 = ` (empty) even
-/// though the digest bytes were correct (32 bytes of valid SHA-256 output).
-/// The `formatHex` path was the missing link.
-fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
-    // census-tag: HexFormat fast-path replicating real JDK bytecode (exact).
-    let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
-    let hf = "java/util/HexFormat";
-
-    // HexFormat.of() — return a synthetic instance with all four
-    // instance-field slots populated.  Real-JDK `HexFormat` declares
-    // fields in this order: delimiter, prefix, suffix, ucase.  The JDK
-    // bytecode for `withUpperCase()`, `withLowerCase()`, `withPrefix()`,
-    // `withSuffix()`, `withDelimiter()`, and `formatHex(byte[])` reads
-    // these fields with `getfield`; if any slot is null the constructor
-    // path (`new HexFormat(delimiter, prefix, suffix, ucase)` →
-    // `Objects.requireNonNull(delimiter, "delimiter")`) throws NPE.
-    //
-    // This NPE was previously swallowed by `ClassFileDumper.<clinit>`
-    // (which calls `HexFormat.of().withUpperCase()` for its `HEX` static
-    // field) and propagated to `MethodHandles$Lookup.<clinit>` —
-    // appearing as a B6 silent-swallow on every probe boot.  Initializing
-    // the fields here lets the real-JDK `withUpperCase()` bytecode run
-    // to completion against a well-formed receiver.
-    registry.register(hf, "of", "()Ljava/util/HexFormat;", |ctx, _args| {
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
-        let empty = ctx.create_string("");
-        ctx.set_field(obj, 0, Value::Object(Some(empty))); // delimiter
-        let empty2 = ctx.create_string("");
-        ctx.set_field(obj, 1, Value::Object(Some(empty2))); // prefix
-        let empty3 = ctx.create_string("");
-        ctx.set_field(obj, 2, Value::Object(Some(empty3))); // suffix
-        ctx.set_field(obj, 3, Value::Int(0)); // ucase = false
-        Ok(Some(Value::Object(Some(obj))))
-    });
-
-    // ofDelimiter(String) — used by callers that want a non-empty
-    // delimiter.  Mirrors the layout of `of()` but writes the caller's
-    // delimiter to slot 0.
-    registry.register(
-        hf,
-        "ofDelimiter",
-        "(Ljava/lang/String;)Ljava/util/HexFormat;",
-        |ctx, args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
-            ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-            let empty1 = ctx.create_string("");
-            ctx.set_field(obj, 1, Value::Object(Some(empty1)));
-            let empty2 = ctx.create_string("");
-            ctx.set_field(obj, 2, Value::Object(Some(empty2)));
-            ctx.set_field(obj, 3, Value::Int(0));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-
-    // withUpperCase() / withLowerCase() — return a copy of `this` with
-    // the `ucase` slot flipped.  Without these two, real-JDK
-    // `ClassFileDumper.<clinit>` calls `HexFormat.of().withUpperCase()`,
-    // which reaches the JDK constructor `(String,String,String,Z)` that
-    // calls `Objects.requireNonNull(delimiter, "delimiter")` — NPE if
-    // any of the three String slots are null.  Returning a fresh
-    // synthetic from the native layer skips that path entirely.
-    registry.register(
-        hf,
-        "withUpperCase",
-        "()Ljava/util/HexFormat;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
-            ctx.set_field(obj, 0, ctx.get_field(this, 0));
-            ctx.set_field(obj, 1, ctx.get_field(this, 1));
-            ctx.set_field(obj, 2, ctx.get_field(this, 2));
-            ctx.set_field(obj, 3, Value::Int(1));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    registry.register(
-        hf,
-        "withLowerCase",
-        "()Ljava/util/HexFormat;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
-            ctx.set_field(obj, 0, ctx.get_field(this, 0));
-            ctx.set_field(obj, 1, ctx.get_field(this, 1));
-            ctx.set_field(obj, 2, ctx.get_field(this, 2));
-            ctx.set_field(obj, 3, Value::Int(0));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-
-    // withDelimiter / withPrefix / withSuffix — companion mutators that
-    // return a fresh synthetic with the corresponding slot replaced.
-    // Same NPE-avoidance reasoning as `withUpperCase` above.
-    registry.register(
-        hf,
-        "withDelimiter",
-        "(Ljava/lang/String;)Ljava/util/HexFormat;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
-            ctx.set_field(obj, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 1, ctx.get_field(this, 1));
-            ctx.set_field(obj, 2, ctx.get_field(this, 2));
-            ctx.set_field(obj, 3, ctx.get_field(this, 3));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    registry.register(
-        hf,
-        "withPrefix",
-        "(Ljava/lang/String;)Ljava/util/HexFormat;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
-            ctx.set_field(obj, 0, ctx.get_field(this, 0));
-            ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 2, ctx.get_field(this, 2));
-            ctx.set_field(obj, 3, ctx.get_field(this, 3));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    registry.register(
-        hf,
-        "withSuffix",
-        "(Ljava/lang/String;)Ljava/util/HexFormat;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
-            ctx.set_field(obj, 0, ctx.get_field(this, 0));
-            ctx.set_field(obj, 1, ctx.get_field(this, 1));
-            ctx.set_field(obj, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 3, ctx.get_field(this, 3));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-
-    // Accessor natives — `delimiter()`, `prefix()`, `suffix()`,
-    // `isUpperCase()` simply read from the populated slots.  Provide
-    // them so callers that bypass the bytecode (e.g. real-JDK
-    // `formatHex` chains that read configuration before encoding) see
-    // the values written by `of()` rather than a null/zero default.
-    registry.register(hf, "delimiter", "()Ljava/lang/String;", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    registry.register(hf, "prefix", "()Ljava/lang/String;", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-    registry.register(hf, "suffix", "()Ljava/lang/String;", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        Ok(Some(ctx.get_field(this, 2)))
-    });
-    registry.register(hf, "isUpperCase", "()Z", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        Ok(Some(ctx.get_field(this, 3)))
-    });
-
-    // formatHex([B)Ljava/lang/String;
-    registry.register(hf, "formatHex", "([B)Ljava/lang/String;", |ctx, args| {
-        let arr = match args.get(1) {
-            Some(Value::Object(Some(a))) => *a,
-            _ => {
-                let s = ctx.create_string("");
-                return Ok(Some(Value::Object(Some(s))));
-            }
-        };
-        let len = ctx.array_length(arr);
-        let mut hex = String::with_capacity(len * 2);
-        for i in 0..len {
-            let b = match ctx.get_array_element(arr, i) {
-                Value::Int(v) => v as u8,
-                _ => 0,
-            };
-            hex.push_str(&format!("{:02x}", b));
-        }
-        let s = ctx.create_string(&hex);
-        Ok(Some(Value::Object(Some(s))))
-    });
-
-    // formatHex([BII)Ljava/lang/String;
-    registry.register(hf, "formatHex", "([BII)Ljava/lang/String;", |ctx, args| {
-        let arr = match args.get(1) {
-            Some(Value::Object(Some(a))) => *a,
-            _ => {
-                let s = ctx.create_string("");
-                return Ok(Some(Value::Object(Some(s))));
-            }
-        };
-        let from = match args.get(2) {
-            Some(Value::Int(v)) => *v as usize,
-            _ => 0,
-        };
-        let to = match args.get(3) {
-            Some(Value::Int(v)) => *v as usize,
-            _ => 0,
-        };
-        let total = ctx.array_length(arr);
-        if from > to || to > total {
-            return Err(cratonvm_types::error::RuntimeError::aioobe_index_only(to as i32).into());
-        }
-        let len = to - from;
-        let mut hex = String::with_capacity(len * 2);
-        for i in from..to {
-            let b = match ctx.get_array_element(arr, i) {
-                Value::Int(v) => v as u8,
-                _ => 0,
-            };
-            hex.push_str(&format!("{:02x}", b));
-        }
-        let s = ctx.create_string(&hex);
-        Ok(Some(Value::Object(Some(s))))
-    });
-
-    // toHexDigits(B)/toHexDigits(I)/toHexDigits(J) — convenience
-    // overloads used by JDK callers that don't go through formatHex.
-    registry.register(hf, "toHexDigits", "(B)Ljava/lang/String;", |ctx, args| {
-        let b = match args.get(1) {
-            Some(Value::Int(v)) => *v as u8,
-            _ => 0,
-        };
-        let s = format!("{:02x}", b);
-        let obj = ctx.create_string(&s);
-        Ok(Some(Value::Object(Some(obj))))
-    });
-    registry.register(hf, "toHexDigits", "(I)Ljava/lang/String;", |ctx, args| {
-        let v = match args.get(1) {
-            Some(Value::Int(v)) => *v,
-            _ => 0,
-        };
-        let s = format!("{:08x}", v as u32);
-        let obj = ctx.create_string(&s);
-        Ok(Some(Value::Object(Some(obj))))
-    });
-    registry.register(hf, "toHexDigits", "(J)Ljava/lang/String;", |ctx, args| {
-        let v = match args.get(1) {
-            Some(Value::Long(v)) => *v,
-            _ => 0,
-        };
-        let s = format!("{:016x}", v as u64);
-        let obj = ctx.create_string(&s);
-        Ok(Some(Value::Object(Some(obj))))
-    });
-    // The bodies above build their answer with `{:02x}` and never read the
-    // RECEIVER, so every `HexFormat.with*` setting — uppercase, delimiter,
-    // prefix, suffix — was inert: an option object with no reader. They also
-    // carried two panics reachable from ordinary bytecode (`formatHex(b,3,1)`
-    // underflows a usize; `parseHex` byte-slices a String) and answered
-    // `isHexDigit(0x661) == true` through an `as u8` truncation.
-    //
-    // `register_p64_hex_format` is the corrected twin. Registering it LAST is
-    // deliberate: `register()` is last-write-wins, and until this call existed
-    // the phases_late family only ever won in synthetic-jdk mode, so the
-    // shipping default ran the broken copy.
-    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
-    crate::phases_late::register_p64_hex_format(registry);
-    registry.set_category(__prev_cat);
-}
+// RETIRED 2026-08-21 (H22-1) — `fn register_hex_format_real_jdk_natives`
+// stood here (293 lines). It registered 16 natives on `java/util/HexFormat`
+// whose bodies built their answer with `{:02x}` and never read the RECEIVER
+// — and MEASURED from `--dump-native-registry --explain-jdk-only`, **all 16
+// carried `owns_slot: false`**: every one lost its slot to the corrected twin
+// this function itself called LAST, so not a single body here could ever run.
+// The function's only live effect was that tail call.
+//
+// That is why the two had to move together. `phases_late::register_p64_hex_format`
+// owns all 26 reachable `java/util/HexFormat` slots; retiring it alone would
+// have PROMOTED these 16 dead ones and looked like "no effect" (`H14-1` §5's
+// trap). Deleting this function is what makes the twin's retirement real, and
+// deleting the twin's ONLY shipping call site — which lived here — is what
+// leaves `HexFormat` to real JDK bytecode. `of()` also fabricated its receiver
+// with `try_alloc_concurrent_synthetic("java/util/HexFormat", 4)`, so this
+// removes an untyped-allocation site as well.
+//
+// MEASURED 2026-08-21: 30 HexFormat assertions byte-identical to HotSpot
+// 25.0.3+9 with the class armed; `H14-3` §1 row 5 priced the corpus at a
+// net cost of zero vectors. docs/known-issues/jdk-only/H22-1-*.md
 
 /// `java.lang.String.format` / `java.util.Formatter` natives required in
 /// real-JDK mode.  The JDK 25 bytecode for `String.format(String, Object...)`

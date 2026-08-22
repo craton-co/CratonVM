@@ -487,19 +487,47 @@ impl rustls::client::ClientSessionStore for TracingClientSessionStore {
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0) — the server twin of
 /// `ctx_client_session_store_table`, same single `or_insert_with` site.
 fn ctx_server_session_store_table(
-) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>> {
     static T: OnceLock<
-        cratonvm_types::lock_order::OrderedPlMutex<HashMap<u64, Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
+        cratonvm_types::lock_order::OrderedPlMutex<HashMap<(u64, bool), Arc<dyn rustls::server::StoresServerSessions + Send + Sync>>>,
     > = OnceLock::new();
     T.get_or_init(|| cratonvm_types::lock_order::OrderedPlMutex::new(HashMap::new(), cratonvm_types::lock_order::LockLevel::Scratch))
 }
 
+/// One session cache per `SSLContext` **and per client-auth policy**.
+///
+/// The `bool` half of that key is load-bearing, and the bug it fixes is
+/// `TestClientCert`'s entire failing set. A resumed TLS 1.2 session replays the
+/// original handshake's outcome: the server sends no `CertificateRequest`, so
+/// the client is never asked for a certificate. A connection that IS requesting
+/// client auth must therefore not be allowed to resume a session established
+/// WITHOUT it — the resumption silently cancels the request.
+///
+/// That is precisely what defeated `wants_deferred_client_auth` (see its doc).
+/// The deferred mechanism exists to answer Tomcat's post-handshake
+/// `setNeedClientAuth(true)` by offering client auth on the NEXT connection,
+/// because rustls has no renegotiation. MEASURED on `dev@151f7831a`: it did
+/// offer it — `engine_begin request=true` on the second engine — and then the
+/// client resumed the first connection's no-client-auth session, so
+/// `JavaKeyManagerResolver::resolve` was called **zero** times across the whole
+/// class against **16** `has_certs` calls. The resolver was fully configured
+/// and simply never consulted.
+///
+/// Sessions established WITH client auth still resume among themselves, so the
+/// cost is one full handshake per policy transition, not per connection.
+///
+/// Real JSSE reaches the same outcome by a different route: its session object
+/// carries the peer certificates, and it declines to resume into a connection
+/// whose client-auth requirement that session cannot satisfy. rustls's
+/// `StoresServerSessions` is an opaque blob store with no such visibility,
+/// which is why the partition lives in the KEY rather than in a predicate.
 fn ctx_server_session_store(
     key: u64,
+    client_auth_requested: bool,
 ) -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
     ctx_server_session_store_table()
         .lock()
-        .entry(key)
+        .entry((key, client_auth_requested))
         .or_insert_with(|| {
             let inner: Arc<dyn rustls::server::StoresServerSessions + Send + Sync> =
                 rustls::server::ServerSessionMemoryCache::new(256);
@@ -8196,6 +8224,43 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
 
+    /// A server session cache is per `SSLContext` **and per client-auth
+    /// policy** — a connection asking for a client certificate must not be
+    /// able to resume one that did not.
+    ///
+    /// Resuming across that boundary replays a handshake that sent no
+    /// `CertificateRequest`, so the client is never asked and the request is
+    /// silently cancelled. That is what defeated `wants_deferred_client_auth`
+    /// and produced `TestClientCert`'s whole failing set: the second engine
+    /// really did offer client auth (`engine_begin request=true`, measured)
+    /// and `JavaKeyManagerResolver::resolve` was still called zero times.
+    ///
+    /// Asserted on `Arc::ptr_eq`, which is the property that matters — two
+    /// distinct caches, not merely two lookups. The same-policy case is
+    /// asserted too, because a partition that never shares would silently
+    /// disable resumption altogether and still pass a difference-only check.
+    #[test]
+    fn a_server_session_cache_is_partitioned_by_client_auth_policy() {
+        let key = 0x5eed_0000_0000_0001u64;
+        let without = super::ctx_server_session_store(key, false);
+        let with = super::ctx_server_session_store(key, true);
+        assert!(
+            !Arc::ptr_eq(&without, &with),
+            "a client-auth connection shares the no-client-auth session cache, so it \
+             can resume a session that carries no client certificate — the resumption \
+             then cancels the CertificateRequest and the peer is never asked"
+        );
+        assert!(
+            Arc::ptr_eq(&without, &super::ctx_server_session_store(key, false)),
+            "same context, same policy must share ONE cache — otherwise this \
+             partition has disabled server-side resumption instead of scoping it"
+        );
+        assert!(
+            Arc::ptr_eq(&with, &super::ctx_server_session_store(key, true)),
+            "same context, same policy must share ONE cache (client-auth side)"
+        );
+    }
+
     /// The exact PKCS#8 key CratonVM lifts out of Spring Boot's
     /// `spring-boot-ldap` test keystore
     /// (`.../ldap/autoconfigure/embedded/test.jks`, alias `mykey`, 335 bytes),
@@ -13630,11 +13695,15 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
         state.client_auth_requested |= state.need_client_auth || state.want_client_auth;
         // Share this SSLContext's server-side session store across its engines,
         // for the same reason as the client's — a server that forgets every
-        // session cannot honour a resumption attempt.
+        // session cannot honour a resumption attempt — but PARTITIONED by
+        // whether this engine is asking for a client certificate. Resuming
+        // across that boundary replays a handshake that asked for none, which
+        // silently cancels the request. See `ctx_server_session_store`.
         let config = match state.trust_managers_ctx_key {
             Some(k) => {
                 let mut cloned = (*config).clone();
-                cloned.session_storage = ctx_server_session_store(k);
+                cloned.session_storage =
+                    ctx_server_session_store(k, state.client_auth_requested);
                 Arc::new(cloned)
             }
             None => config,

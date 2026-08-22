@@ -85,6 +85,45 @@
 //! Both layers are behaviour-named rather than source-scanning: a check that
 //! grepped for `compile_with_param_slots(` would have died the day `x64.rs`
 //! was split, as five checks in this repository did.
+//!
+//! # The direct-call plan is a SECOND thing every door builds, and the gate
+//! # did not cover it — H20-1
+//!
+//! `compile_with_param_slots` takes `direct_calls: Vec<(usize, JitDirectCall)>`
+//! as **data**, and each door builds its own. `H12-1` MEASURED the
+//! consequence on 2026-08-20: under `--jdk-only` the [`CompileDoor::MethodEntry`]
+//! ladder examined seven `invokestatic` sites and refused all seven, while
+//! [`CompileDoor::Osr`] bound `Thread.currentThread` — a `bridge` row — and
+//! compiled code called it 298 000 times. `--real-jdk` reported the identical
+//! per-door profile, i.e. that door never asked which mode it was in.
+//!
+//! **The `CompileAdmission` trick does not transplant onto this.** It works for
+//! the backend entry because the refusal is safe at a choke point downstream of
+//! every door: "do not compile" is a fallback every caller already has. A
+//! direct-bind refusal has no downstream point at all. `x64/driver.rs`'s
+//! `reserve_stack_floor` walk defines a raw self-call as *an `invokestatic` pc
+//! with neither an invoke-info entry nor a direct-call plan*, and every ladder
+//! pushes its row and then `continue`s past the `invoke_info` construction for
+//! that pc — so a row dropped after the door leaves the pc with no metadata and
+//! the backend compiles `Thread.currentThread()` as a call to the enclosing
+//! method. Filtering downstream would trade an open door for a wild jump.
+//!
+//! So this module supplies the pieces and the door does the refusing, at the
+//! bind site, in the shape `try_compile_inner` already uses
+//! (`if entry != 0 { push; continue; }` — a refusal *falls through*):
+//!
+//! * [`DirectCallPolicy`] — the witness, with **no** `Default`, and three
+//!   states rather than two so "never asked" stays representable;
+//! * [`CompileAdmission::declare_direct_call_policy`] /
+//!   [`CompileAdmission::admits_direct_bind`] — the rule, stated once;
+//! * [`CompileDoor::builds_direct_calls`] — an exhaustive `match`, so a fourth
+//!   door cannot be added without answering it;
+//! * [`undeclared_direct_bind_rows`] — the counter, mirroring
+//!   [`ungated_backend_entries`]: it does not stop the accident, it makes the
+//!   bypass a number instead of a silence.
+//!
+//! The VM half is `vm/src/jit/helpers.rs::admit_direct_native_entry`, which is
+//! where the registry's `NativeKind` can actually be read.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,6 +164,112 @@ impl CompileDoor {
             CompileDoor::MethodEntry => "method-entry",
             CompileDoor::EagerFirstCall => "eager-first-call",
             CompileDoor::Osr => "osr",
+        }
+    }
+
+    /// Whether this door builds its own `direct_calls` plan, and therefore owes
+    /// the JDK-only direct-bind question before it binds a helper that shadows
+    /// a registered native.
+    ///
+    /// # Why this is a `match` and not a doc sentence — H20-1
+    ///
+    /// The module doc above has named three doors since it was written, and
+    /// `H12-1` (2026-08-20) still MEASURED two of them binding a `bridge` row
+    /// under `--jdk-only` while the third refused all seven sites it examined.
+    /// The table was right and nothing read it. This `match` is the same fact
+    /// with the compiler as its reader: a fourth `CompileDoor` variant makes it
+    /// non-exhaustive, so whoever adds the door has to answer the question
+    /// before the crate builds. That is the whole difference between
+    /// [`a-premise-in-a-comment-is-not-a-compile-time-link`] and a link.
+    ///
+    /// `true` for all three today. Kept as an explicit per-variant answer
+    /// rather than `true` because the answer is a property of the door's
+    /// ladder, not of the enum: a future door that reaches the backend with
+    /// `Vec::new()` owes nothing, and should be able to say so here.
+    ///
+    /// [`a-premise-in-a-comment-is-not-a-compile-time-link`]: crate::compile_gate
+    pub const fn builds_direct_calls(self) -> bool {
+        match self {
+            // `try_compile_inner`'s single-pass and IR ladders. The one door
+            // that asks: every bind goes through `crate::direct_native_helper`
+            // or `direct_native_helper_for_impl`.
+            CompileDoor::MethodEntry => true,
+            // `direct_calls_early` — `Math.sqrt`, `Integer.valueOf(I)`,
+            // `Integer.intValue()`. Both registered rows are `intrinsic`, so
+            // this door is *incidentally* correct and structurally unguarded.
+            CompileDoor::EagerFirstCall => true,
+            // `direct_calls2` — eleven push sites, five of them `bridge` rows.
+            // The door H12-1 measured binding in strict mode.
+            CompileDoor::Osr => true,
+        }
+    }
+
+    /// Where this door's direct-call ladder lives, for a refusal message that
+    /// names the file the reader has to open.
+    ///
+    /// Three files in two crates, which is `H12-2` §1a's third reason a
+    /// call-site grep could not produce the bind matrix.
+    pub const fn direct_call_ladder(self) -> &'static str {
+        match self {
+            CompileDoor::MethodEntry => "jit/src/lib.rs::try_compile_inner",
+            CompileDoor::EagerFirstCall => {
+                "vm/src/runtime/interpreter.rs::direct_calls_early"
+            }
+            CompileDoor::Osr => {
+                "vm/src/runtime/interpreter/jit_bridge.rs::direct_calls2"
+            }
+        }
+    }
+}
+
+/// The execution policy in force for one compilation, as the direct-call
+/// ladders must see it.
+///
+/// # Why a two-variant enum and not `bool`
+///
+/// There are three states a door can be in, not two: `Compatible`, `JdkOnly`,
+/// and **never asked**. A `bool` collapses the third into the first, which is
+/// exactly the shape of the defect — the OSR door has been passing an implicit
+/// "compatible" to a question it never knew existed, and `--real-jdk` and
+/// `--jdk-only` MEASURED an identical bind profile because of it. Keeping
+/// "undeclared" representable is what lets [`undeclared_direct_bind_rows`]
+/// count it.
+///
+/// Deliberately not `Default`: there is no defensible default, and deriving one
+/// would re-create the collapse this type exists to prevent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectCallPolicy {
+    /// `--real-jdk`. Every thin helper may bind.
+    Compatible,
+    /// `--jdk-only`. Only a reviewed `NativeKind::Intrinsic` row may bind;
+    /// a `Bridge` row must defer to the real JDK bytecode.
+    JdkOnly,
+}
+
+impl DirectCallPolicy {
+    /// Build from the VM's `is_jdk_only()`.
+    ///
+    /// Named rather than `From<bool>` so the call site reads as an answer to a
+    /// question, and so a grep for the answer finds every door.
+    pub const fn from_jdk_only(jdk_only: bool) -> Self {
+        if jdk_only {
+            DirectCallPolicy::JdkOnly
+        } else {
+            DirectCallPolicy::Compatible
+        }
+    }
+
+    /// Whether this policy admits a direct bind onto a shadow of a registered
+    /// native whose kind is (or is not) a reviewed `Intrinsic`.
+    ///
+    /// The rule is `crate::direct_native_helper`'s, stated once: `Compatible`
+    /// admits everything; `JdkOnly` admits `Intrinsic` and nothing else —
+    /// `Bridge`, `SyntheticStub` and unregistered all refuse, which is the
+    /// fail-closed direction.
+    pub const fn admits_shadow_bind(self, is_reviewed_intrinsic: bool) -> bool {
+        match self {
+            DirectCallPolicy::Compatible => true,
+            DirectCallPolicy::JdkOnly => is_reviewed_intrinsic,
         }
     }
 }
@@ -182,6 +327,13 @@ static REFUSALS: [AtomicU64; 3] = [
     AtomicU64::new(0),
 ];
 static UNGATED_BACKEND_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// Direct-call rows that reached the backend under an admission whose door
+/// never declared a [`DirectCallPolicy`]. See [`undeclared_direct_bind_rows`].
+static UNDECLARED_DIRECT_BIND_ROWS: [AtomicU64; 3] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 thread_local! {
     /// Depth of open admissions on this thread. A count rather than a flag
@@ -204,12 +356,102 @@ pub struct CompileAdmission {
     /// [`CompileAdmission::for_backend_test`], whose whole point is that it
     /// does not — see there.
     opened_scope: bool,
+    /// `0` = the door never declared one, `1` = `Compatible`, `2` = `JdkOnly`.
+    ///
+    /// An `AtomicU8` rather than a `Cell` so the token keeps its auto traits: a
+    /// `Cell` would make `CompileAdmission` `!Sync`, and this type is held
+    /// across a whole compilation whose shape this lane could not build and
+    /// check. Relaxed throughout — the value is written and read by the one
+    /// thread that owns the compilation.
+    direct_call_policy: std::sync::atomic::AtomicU8,
 }
+
+const DIRECT_POLICY_UNDECLARED: u8 = 0;
+const DIRECT_POLICY_COMPATIBLE: u8 = 1;
+const DIRECT_POLICY_JDK_ONLY: u8 = 2;
 
 impl CompileAdmission {
     /// Which door this admission was granted to.
     pub fn door(&self) -> CompileDoor {
         self.door
+    }
+
+    /// Declare the execution policy this compilation's direct-call ladder must
+    /// obey. Call it once, before building `direct_calls`.
+    ///
+    /// # What this buys, and what it does not — H20-1
+    ///
+    /// It does **not** filter anything by itself, and it deliberately cannot:
+    /// see [`admits_direct_bind`] and [`note_direct_binds`] for the two halves.
+    /// What it buys is that "this door never asked" stops being invisible.
+    /// Before it, `--jdk-only` and `--real-jdk` MEASURED an identical per-door
+    /// bind profile (`H12-1` §3b) and no counter in the tree could tell a door
+    /// that refused from a door that never asked.
+    ///
+    /// Idempotent and last-write-wins; a door that declares twice with
+    /// different answers is a bug this cannot see, which is why the *decision*
+    /// is [`admits_direct_bind`]'s and not this method's.
+    pub fn declare_direct_call_policy(&self, policy: DirectCallPolicy) {
+        let v = match policy {
+            DirectCallPolicy::Compatible => DIRECT_POLICY_COMPATIBLE,
+            DirectCallPolicy::JdkOnly => DIRECT_POLICY_JDK_ONLY,
+        };
+        self.direct_call_policy
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The policy this compilation's door declared, or `None` if it never did.
+    ///
+    /// `None` is the state the OSR and eager first-call doors are in as this
+    /// lands, and it is the state [`undeclared_direct_bind_rows`] counts.
+    pub fn direct_call_policy(&self) -> Option<DirectCallPolicy> {
+        match self
+            .direct_call_policy
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            DIRECT_POLICY_COMPATIBLE => Some(DirectCallPolicy::Compatible),
+            DIRECT_POLICY_JDK_ONLY => Some(DirectCallPolicy::JdkOnly),
+            _ => None,
+        }
+    }
+
+    /// May this compilation bind a direct call onto a helper that shadows a
+    /// registered native?
+    ///
+    /// `is_reviewed_intrinsic` is the VM's answer for the triple whose native
+    /// actually runs — the registry's `NativeKind == Intrinsic`, which is
+    /// §1.4's reviewed exception. It is a closure because only the strict arm
+    /// needs it and only for a row that is otherwise bindable, and because this
+    /// crate cannot see `NativeKind` at all.
+    ///
+    /// # This must be called at the BIND SITE, before the ladder's `continue`
+    ///
+    /// It is the *only* place a refusal is safe, and that is a property of the
+    /// backend, not a style preference. `jit/src/x64/driver.rs`'s
+    /// `reserve_stack_floor` walk states the rule: *"a raw self-call site is an
+    /// `invokestatic` pc with neither an invoke-info entry nor a direct-call
+    /// plan"*. Every ladder pushes its row and then `continue`s **past** the
+    /// `invoke_info` construction for that pc, so a row deleted downstream —
+    /// in this crate, in the backend, anywhere after the door — leaves the pc
+    /// with no metadata at all, and the `0xb8` arm then compiles
+    /// `Thread.currentThread()` as a call to the enclosing method.
+    ///
+    /// `try_compile_inner` already has the correct shape and is the model:
+    /// `if entry != 0 { push; continue; }`, so a refusal *falls through* to the
+    /// code that builds the fallback. A door must do the same with this.
+    ///
+    /// # Undeclared is admitted, and counted
+    ///
+    /// A door that never called [`declare_direct_call_policy`] gets `true`,
+    /// because the alternative is worse than the defect: refusing a bind for a
+    /// door that has not been taught to fall through would strand the pc in the
+    /// no-metadata state described above. The bypass is made loud instead of
+    /// safe-by-guess — [`note_direct_binds`] counts it.
+    pub fn admits_direct_bind(&self, is_reviewed_intrinsic: impl FnOnce() -> bool) -> bool {
+        match self.direct_call_policy() {
+            Some(p) => p.admits_shadow_bind(is_reviewed_intrinsic()),
+            None => true,
+        }
     }
 
     /// A token for a **test** that drives the backend directly.
@@ -233,6 +475,12 @@ impl CompileAdmission {
             door: CompileDoor::MethodEntry,
             _epoch: crate::open_compile_epoch_witness(),
             opened_scope: false,
+            // Undeclared, like a door that never asked — so a test that hands
+            // the backend direct calls is counted by
+            // `undeclared_direct_bind_rows` exactly as a production bypass
+            // would be. Same reasoning as `opened_scope: false`: the escape
+            // hatch must not launder anything.
+            direct_call_policy: std::sync::atomic::AtomicU8::new(DIRECT_POLICY_UNDECLARED),
         }
     }
 }
@@ -319,7 +567,61 @@ pub fn admit(
         door,
         _epoch: epoch,
         opened_scope: true,
+        // Undeclared until the door says otherwise. `admit`'s signature is
+        // deliberately unchanged: adding a required parameter here would have
+        // been the strongest possible enforcement — three production call
+        // sites, two of them the very doors that need it — but two of those
+        // three are in `vm/src/runtime/interpreter/**`, which this lane does
+        // not own and could not build. H20-1 §6 specifies that change as O1;
+        // this field is the half that could land green.
+        direct_call_policy: std::sync::atomic::AtomicU8::new(DIRECT_POLICY_UNDECLARED),
     })
+}
+
+/// Record that `n` direct-call rows reached the backend under `admission`.
+///
+/// Called once per backend entry from `x64::compile_with_param_slots`. The
+/// second layer, in the shape this module's doc already argues for the backend
+/// entry itself: *"The type system stops the accident; the counter stops the
+/// deliberate misuse."* Here the type system cannot stop the accident at all —
+/// see [`CompileAdmission::admits_direct_bind`] for why a refusal is only safe
+/// at the bind site, one crate away — so for now the counter is the whole
+/// instrument.
+///
+/// # H12-1 N2: this is the first counter that can see the OSR door's binds
+///
+/// `THREAD_CURRENT_THREAD_SITES_OSR` is the only per-door bind counter in the
+/// tree that reaches the OSR door, and it covers one triple. `H7-1` §6c
+/// predicted `collection_direct_helper_sites() == (0,0,0)` under `--jdk-only`
+/// and treated a non-zero as its falsifier — but those counters live in
+/// `try_compile_inner`'s ladder and are blind to the door where the HashMap
+/// binds actually happen, so the prediction was confirmed by an instrument that
+/// could not see the case it was about. This counts every row from every door.
+pub fn note_direct_binds(admission: &CompileAdmission, n: usize) {
+    if n == 0 {
+        return;
+    }
+    if admission.direct_call_policy().is_none() {
+        UNDECLARED_DIRECT_BIND_ROWS[admission.door.index()]
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+/// Direct-call rows bound by `door` in compilations whose door never declared a
+/// [`DirectCallPolicy`].
+///
+/// **Expected to reach zero at every door once H20-1's O1/O2 land, and to be
+/// asserted zero from the VM thereafter.** Until then it is the size of the
+/// bypass, per door, which no instrument in this tree reported before.
+///
+/// # Reading a zero
+///
+/// Ambiguous alone, for the reason `JIT_DIRECT_HELPER_JDK_ONLY_REFUSALS`' doc
+/// gives: "no rows bound" and "every door declared" print the same `0`. Read it
+/// beside [`admissions`] for the same door — a door with admissions and zero
+/// undeclared rows has been taught; a door with no admissions has not run.
+pub fn undeclared_direct_bind_rows(door: CompileDoor) -> u64 {
+    UNDECLARED_DIRECT_BIND_ROWS[door.index()].load(Ordering::Relaxed)
 }
 
 /// Compiles admitted through `door`.
@@ -360,6 +662,7 @@ pub(crate) fn reset_for_test() {
     for d in CompileDoor::ALL {
         ADMISSIONS[d.index()].store(0, Ordering::Relaxed);
         REFUSALS[d.index()].store(0, Ordering::Relaxed);
+        UNDECLARED_DIRECT_BIND_ROWS[d.index()].store(0, Ordering::Relaxed);
     }
     UNGATED_BACKEND_ENTRIES.store(0, Ordering::Relaxed);
 }
@@ -507,6 +810,142 @@ mod tests {
         );
         drop(t);
         assert!(!admission_is_open());
+    }
+
+    /// A fresh admission has NOT declared a policy, and says so.
+    ///
+    /// Written as its own test because the whole instrument depends on
+    /// "undeclared" being distinguishable from "compatible": `H12-1` §3b's
+    /// sharpest fact is that `--jdk-only` and `--real-jdk` produced an
+    /// identical bind profile, i.e. the door was answering "compatible" to a
+    /// question nobody asked it.
+    #[test]
+    fn a_fresh_admission_has_not_declared_a_direct_call_policy() {
+        let _guard = COUNTER_LOCK.lock();
+        let a = admit(&unique("undeclared"), "m", "()V", CompileDoor::Osr).expect("admits");
+        assert_eq!(a.direct_call_policy(), None);
+        a.declare_direct_call_policy(DirectCallPolicy::JdkOnly);
+        assert_eq!(a.direct_call_policy(), Some(DirectCallPolicy::JdkOnly));
+        a.declare_direct_call_policy(DirectCallPolicy::Compatible);
+        assert_eq!(a.direct_call_policy(), Some(DirectCallPolicy::Compatible));
+    }
+
+    /// The admission rule, in all three states, against both kinds.
+    ///
+    /// The `JdkOnly`/`Bridge` cell is the only `false` in the table, and it is
+    /// the cell the OSR door was MEASURED getting wrong 298 000 times.
+    #[test]
+    fn the_direct_bind_rule_refuses_exactly_one_cell() {
+        let _guard = COUNTER_LOCK.lock();
+        let a = admit(&unique("rule"), "m", "()V", CompileDoor::Osr).expect("admits");
+
+        // Undeclared admits both, deliberately — see `admits_direct_bind`.
+        assert!(a.admits_direct_bind(|| true));
+        assert!(a.admits_direct_bind(|| false));
+
+        a.declare_direct_call_policy(DirectCallPolicy::Compatible);
+        assert!(a.admits_direct_bind(|| true));
+        assert!(
+            a.admits_direct_bind(|| false),
+            "compatible mode binds a Bridge shadow; that is what it is for"
+        );
+
+        a.declare_direct_call_policy(DirectCallPolicy::JdkOnly);
+        assert!(
+            a.admits_direct_bind(|| true),
+            "a reviewed Intrinsic is 1.4's exception and still binds under strict"
+        );
+        assert!(
+            !a.admits_direct_bind(|| false),
+            "a Bridge shadow must defer to the real JDK bytecode under --jdk-only"
+        );
+    }
+
+    /// `Compatible` must not be reachable by forgetting to answer.
+    #[test]
+    fn the_policy_witness_has_no_default() {
+        assert_eq!(
+            DirectCallPolicy::from_jdk_only(true),
+            DirectCallPolicy::JdkOnly
+        );
+        assert_eq!(
+            DirectCallPolicy::from_jdk_only(false),
+            DirectCallPolicy::Compatible
+        );
+        // The rule, stated once, asserted here so a future edit to
+        // `admits_shadow_bind` has to come past a test.
+        assert!(DirectCallPolicy::Compatible.admits_shadow_bind(false));
+        assert!(!DirectCallPolicy::JdkOnly.admits_shadow_bind(false));
+    }
+
+    /// The bypass witness: rows under an undeclared admission are counted, rows
+    /// under a declared one are not.
+    ///
+    /// The with/without pair is written out for the reason
+    /// `the_ungated_witness_fires_only_without_a_token` gives: a counter that
+    /// never moves and one that always moves both read as "zero" from the VM.
+    #[test]
+    fn undeclared_direct_binds_are_counted_and_declared_ones_are_not() {
+        let _guard = COUNTER_LOCK.lock();
+        let before = undeclared_direct_bind_rows(CompileDoor::Osr);
+
+        let a = admit(&unique("rows-undeclared"), "m", "()V", CompileDoor::Osr).expect("admits");
+        note_direct_binds(&a, 7);
+        assert_eq!(
+            undeclared_direct_bind_rows(CompileDoor::Osr),
+            before + 7,
+            "a door that never declared a policy has its rows counted"
+        );
+
+        a.declare_direct_call_policy(DirectCallPolicy::JdkOnly);
+        note_direct_binds(&a, 5);
+        assert_eq!(
+            undeclared_direct_bind_rows(CompileDoor::Osr),
+            before + 7,
+            "a door that declared is not counted"
+        );
+
+        // A compile with no direct calls must not move it either way.
+        note_direct_binds(&a, 0);
+        let b = admit(&unique("rows-empty"), "m", "()V", CompileDoor::Osr).expect("admits");
+        note_direct_binds(&b, 0);
+        assert_eq!(undeclared_direct_bind_rows(CompileDoor::Osr), before + 7);
+    }
+
+    /// Every door that builds a `direct_calls` plan owes the question, and
+    /// names the ladder that owes it.
+    ///
+    /// The point is not the current answers — all three are `true` — but that
+    /// `builds_direct_calls` is an exhaustive `match`, so a fourth door cannot
+    /// be added without one. This test pins the ladder names beside them so a
+    /// door whose ladder moves file is a red test rather than a stale doc.
+    #[test]
+    fn every_door_answers_the_direct_call_question() {
+        for door in CompileDoor::ALL {
+            assert!(
+                door.builds_direct_calls(),
+                "{} builds direct calls today; if that changed, change this test \
+                 and say why in the record",
+                door.label()
+            );
+            assert!(
+                door.direct_call_ladder().contains(".rs"),
+                "{} must name the file its ladder lives in",
+                door.label()
+            );
+        }
+        let mut ladders: Vec<&str> = CompileDoor::ALL
+            .iter()
+            .map(|d| d.direct_call_ladder())
+            .collect();
+        ladders.sort_unstable();
+        ladders.dedup();
+        assert_eq!(
+            ladders.len(),
+            CompileDoor::ALL.len(),
+            "three doors, three distinct ladders — H12-2 1a's third reason a \
+             grep could not produce the bind matrix"
+        );
     }
 
     #[test]

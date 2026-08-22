@@ -13,7 +13,9 @@ it, or extend the feature, read on.
 > → lower to PTX → load → marshal → launch → writeback/deopt — is
 > implemented and validated on real hardware (RTX 2060, sm_75, CUDA
 > driver 591.86). Checksums match HotSpot bit-for-bit on every kernel
-> tested, including integer/long reductions. See
+> tested, including integer/long reductions and a four-sphere ray
+> tracer whose per-pixel `a*b + c` chains are what first exposed the
+> ptxas FMA-contraction hazard (see "Float bit-exactness" below). See
 > [`../../README.md`](../../README.md)'s "GPU offload benchmarks"
 > section and [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md)
 > for numbers. The hardware-validation follow-ups this status reflects are
@@ -449,6 +451,48 @@ built with `--features gpu-driver`, run with `--gpu` on a real GPU:
    1 repeats on every call — this is intentional: an eligible site
    whose array size varies per call must keep re-checking
    `--gpu-min-work`.
+
+## Float bit-exactness
+
+The offload contract is that `--gpu` never changes a result. For
+floating-point kernels that is a claim about *rounding*, and it is easy
+to lose without noticing, because the ways to lose it all make the answer
+**more** accurate rather than visibly wrong.
+
+Every float arithmetic instruction the lowerer emits therefore carries an
+explicit `.rn` rounding modifier — `add.rn.f32`, `sub.rn.f32`,
+`mul.rn.f32`, `div.rn.f32`, and the `f64` twins. This is not decoration:
+
+* PTX's bare `add.f32` / `mul.f32` already *default* to
+  round-to-nearest-even, so the modifier looks redundant. It is not. Per
+  the PTX ISA, an instruction written without a rounding modifier is
+  eligible for **contraction**, and one written with a modifier is not.
+  Measured on sm_75 with `ptxas -O3`, `mul.f32` followed by `add.f32`
+  assembles to a single `FFMA`; `mul.rn.f32` followed by `add.rn.f32`
+  assembles to `FMUL` + `FADD`.
+* `FFMA` rounds once. JLS §15.17.1/§15.18.2 require the product to be
+  rounded to `float` *before* the addition — two roundings. Java spells
+  the single-rounding form `Math.fma`, which the lowerer emits as
+  `fma.rn.f32`. Fusing is the programmer's call, never the backend's.
+* `div` must be `div.rn` (correctly rounded), not `div.full` or
+  `div.approx`, which carry up to ~2 ULP of error.
+* `Math.min`/`Math.max` are **not** PTX `min.f32`/`max.f32`. Those
+  implement neither Java's "NaN result if either argument is NaN" rule
+  nor its "−0.0 is strictly smaller than +0.0" rule, so the lowerer
+  builds both out of ordered predicates and selects (`minmax_f32`).
+
+The contraction hazard was latent from the day the lowerer was written
+and only surfaced on 2026-08-21, because none of the earlier fixtures
+contained a mul-then-add pair to contract — a kernel needs an `a*b + c`
+chain before the two spellings can diverge at all. The regression test
+`float_arithmetic_always_carries_an_explicit_rounding_mode` asserts on
+the rendered PTX text, so it runs everywhere and does not need a CUDA
+toolkit.
+
+To inspect what a kernel actually compiled to, set
+`CRATONVM_GPU_DUMP_PTX=<dir>`; each lowered kernel is written to
+`<dir>/<class>.<method>.ptx`.
+
 
 ## Testing
 

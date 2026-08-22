@@ -1020,9 +1020,49 @@ fn pipe_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let source = alloc_channel(ctx, "sun/nio/ch/SourceChannelImpl", false, read_id);
     let sink = alloc_channel(ctx, "sun/nio/ch/SinkChannelImpl", true, write_id);
 
-    let pipe_cid = ctx
-        .ensure_class_initialized("java/nio/channels/Pipe")
-        .unwrap_or_else(|_| ClassId::new(0));
+    // The wrapper is minted AS `sun/nio/ch/PipeImpl`, the class HotSpot
+    // 25.0.3+9 constructs here, and NOT as the abstract `java/nio/channels/
+    // Pipe` this line used to name.
+    //
+    // **The defect.** `ensure_class_initialized("java/nio/channels/Pipe")`
+    // resolves to the real, ABSTRACT JDK class, so `alloc_object` then minted
+    // an object whose runtime class is abstract — a receiver `new` cannot
+    // produce (JVMS §6.5 makes it an `InstantiationError`). MEASURED
+    // (`H21-1` §2): `Pipe.open().getClass()` answered
+    // `java.nio.channels.Pipe`, `Modifier.isAbstract == true`, in BOTH modes,
+    // against `sun.nio.ch.PipeImpl` on the oracle. The two CHANNELS were
+    // already right (`SourceChannelImpl` / `SinkChannelImpl`, above); only the
+    // wrapper was not.
+    //
+    // **Why the slot indices survive the change, measured rather than hoped.**
+    // `javap -p sun.nio.ch.PipeImpl` on 25.0.3+9 declares exactly two instance
+    // fields, in this order:
+    //
+    //     private final sun.nio.ch.SourceChannelImpl source;   // slot 0
+    //     private final sun.nio.ch.SinkChannelImpl   sink;     // slot 1
+    //
+    // — the same two slots, in the same order, that `PIPE_WRAPPER_FIELD_SOURCE`
+    // / `_SINK` already name, holding values of exactly the declared types. So
+    // the writes below land on the REAL fields instead of on private slots
+    // above a zero-field layout, and `PipeImpl.source()`'s own bytecode would
+    // return the right object even if it ran. It does not run: `source`/`sink`
+    // are registered on `sun/nio/ch/PipeImpl` as well as on the abstract class
+    // (see `register_pipe_real`), and dispatch keys on the receiver
+    // (`H11-1`), so these natives keep answering.
+    //
+    // `Pipe.open()` itself is STATIC — no receiver — so its registration stays
+    // on `java/nio/channels/Pipe`, where the constant-pool class is the key.
+    // `[route discrim]`.
+    // Written as a `match` rather than `.or_else(|_| ctx…)` on purpose: the
+    // closure form needs a second mutable borrow of `ctx` and this lane was
+    // forbidden to build, so it may not lean on a borrow-checker judgement it
+    // cannot check.
+    let pipe_cid = match ctx.ensure_class_initialized("sun/nio/ch/PipeImpl") {
+        Ok(cid) => cid,
+        Err(_) => ctx
+            .ensure_class_initialized("java/nio/channels/Pipe")
+            .unwrap_or_else(|_| ClassId::new(0)),
+    };
     let wrapper = ctx.alloc_object(pipe_cid, 2);
     ctx.set_field(
         wrapper,
@@ -1386,24 +1426,82 @@ fn channel_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // already bridges elsewhere. Likely disposition is "move down a layer or
 // delete", but that needs `invocations` to confirm nothing depends on the
 // current placement.
+//
+// CENSUS TAKEN 2026-08-20 (H11). The `invocations` this comment asked for, from
+// `--dump-native-registry` on `fe59bf9d9` under `--jdk-only`, driving a real
+// `Pipe.open()` + `write` + `read` + `close` through `Pipe.SinkChannel`- and
+// `Pipe.SourceChannel`-TYPED locals (so the constant-pool class at every call
+// site is the ABSTRACT nested class):
+//
+//     sun/nio/ch/SourceChannelImpl.read(Ljava/nio/ByteBuffer;)I   invocations: 1
+//     sun/nio/ch/SinkChannelImpl.write(Ljava/nio/ByteBuffer;)I    invocations: 1
+//     sun/nio/ch/{Source,Sink}ChannelImpl.close()V                invocations: 1
+//     java/nio/channels/Pipe$SourceChannel.read(…)I               invocations: 0
+//     java/nio/channels/Pipe$SinkChannel.write(…)I                invocations: 0
+//     java/nio/channels/Pipe$SourceChannel.close()V               invocations: 0
+//     java/nio/channels/Pipe$SinkChannel.close()V                 invocations: 0
+//
+// and `pipe.source().getClass().getName()` answers `sun.nio.ch.SourceChannelImpl`
+// on CratonVM, the same string HotSpot 25.0.3+9 gives. So `pipe_open`'s choice
+// to allocate the two `Impl` classes (below, ~line 1024) is the right one and
+// this family is ALREADY "in the right place" — it is not an instance of the
+// P1 row's "bridges on the abstract public API".
+//
+// The six abstract rows are consequently DEAD WEIGHT for every receiver this VM
+// mints. **Do not delete them from this file on that basis alone.**
+// `native-builtins/src/phases_late/net_channels.rs` (~2281–2400) registers the
+// SAME six triples with a DIFFERENT implementation — its callbacks read the fd
+// from field slot 1 and the open flag from slot 0, a layout unrelated to this
+// module's. Today this file wins the slot (`owns_slot: true` on all six).
+// Deleting these lines does not remove the registrations; it hands them to an
+// incompatible body. `[2 producers, 1 slot]` / `[dup nati]`. Retiring them is a
+// single commit spanning both crates, with a build.
+//
+// The one population that CAN still reach these rows is an application subclass
+// of `Pipe.SourceChannel` / `Pipe.SinkChannel` (both constructors are
+// `protected`): its receiver carries the user's class name, declares none of
+// these methods, and `try_stackless_invoke`'s superclass walk then finds the
+// abstract row and hijacks it. That is a hazard, not a service.
 /// Register the WP3.7 Pipe natives.  Idempotent.
 pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pipe = "java/nio/channels/Pipe";
+    // `open()` is STATIC. There is no receiver, so the key is the constant-pool
+    // class and this row must stay on the abstract public class — the one place
+    // in this function where the abstract spelling is the CORRECT one, not a
+    // leftover. `H11-1` §2.1.
     r.register(pipe, "open", "()Ljava/nio/channels/Pipe;", pipe_open);
-    r.register(
-        pipe,
-        "source",
-        "()Ljava/nio/channels/Pipe$SourceChannel;",
-        pipe_source,
-    );
-    r.register(
-        pipe,
-        "sink",
-        "()Ljava/nio/channels/Pipe$SinkChannel;",
-        pipe_sink,
-    );
+    // `source()` / `sink()` are INSTANCE methods, so the key is the receiver's
+    // runtime class, and since 2026-08-21 `pipe_open` mints
+    // `sun/nio/ch/PipeImpl` (see the comment at its allocation). Both spellings
+    // are registered:
+    //
+    //   * `sun/nio/ch/PipeImpl` — the receiver this VM now builds, and the one
+    //     that actually dispatches. Without this row the real `PipeImpl.source()`
+    //     bytecode would run instead: harmless here only because the slot map
+    //     happens to coincide, and this crate does not get to rely on that.
+    //   * `java/nio/channels/Pipe` — kept, NOT retired. `native-builtins/src/
+    //     phases_late/net_channels.rs` registers the same triples with an
+    //     incompatible field layout and loses the slot to this file today;
+    //     deleting these two lines would not remove a native, it would hand the
+    //     slot to that body. `[2 producers, 1 slot]` / `H11-2` §4. It is also
+    //     still the fallback class when `sun.nio.ch.PipeImpl` is absent from
+    //     the image.
+    for p in [pipe, "sun/nio/ch/PipeImpl"] {
+        r.register(
+            p,
+            "source",
+            "()Ljava/nio/channels/Pipe$SourceChannel;",
+            pipe_source,
+        );
+        r.register(
+            p,
+            "sink",
+            "()Ljava/nio/channels/Pipe$SinkChannel;",
+            pipe_sink,
+        );
+    }
 
     // SourceChannelImpl
     let source = "sun/nio/ch/SourceChannelImpl";
@@ -1422,8 +1520,17 @@ pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
         channel_configure_blocking,
     );
 
-    // Abstract SourceChannel — same implementations, different
-    // declared class so Java-side dispatch lands here either way.
+    // Abstract SourceChannel — same implementations, different declared class.
+    //
+    // CORRECTION 2026-08-20 (H11): this comment used to end "so Java-side
+    // dispatch lands here either way". It does not. Dispatch keys on the
+    // RECEIVER's runtime class, which for every pipe this VM opens is
+    // `sun/nio/ch/SourceChannelImpl` (see `pipe_open`), and the rows above
+    // answer. MEASURED at `invocations: 0` for all three of these while the
+    // `Impl` rows took the calls — the census block at the head of this
+    // function has the numbers. Kept only because `native-builtins` registers
+    // the same triples with an incompatible body; see that block before
+    // touching a line here.
     let abstract_source = "java/nio/channels/Pipe$SourceChannel";
     r.register(
         abstract_source,

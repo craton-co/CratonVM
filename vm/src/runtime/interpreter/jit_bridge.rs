@@ -197,12 +197,16 @@ pub(super) fn compile_osr_artifact(
     // S111r15 — same native-shadow guard as the other JIT entry points
     // (`try_jit_compile_callee`, `try_jit_upgrade_with_gate`, first-call
     // compile path). OSR must respect the native registration too.
-    if shared
-        .natives
-        .native_methods
-        .find(class_name_check, method_name_check, &method_descriptor)
-        .is_some()
-    {
+    // `registered_native_will_run`, not `find(..).is_some()`: a stub-tagged
+    // native on an allow-listed class never runs while the real body is loaded,
+    // so refusing to compile that body is refusing to compile the code that
+    // actually executes. See the predicate's doc for the measurements.
+    if registered_native_will_run(
+        shared,
+        class_name_check,
+        method_name_check,
+        &method_descriptor,
+    ) {
         return None;
     }
 
@@ -3284,6 +3288,7 @@ fn elidable_ctor_native_would_run(shared: &SharedVm, class_name: &str) -> bool {
         .native_methods
         .find_with_kind(class_name, "<init>", "()V");
     crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::DispatchDoor::ElidableCtor,
         crate::vm::dispatch_policy(shared),
         class_name,
         "<init>",
@@ -3524,18 +3529,14 @@ pub(super) fn jit_invoke_targets_native_shadow(
     // decision. Treat forced real-JDK overrides exactly like registered
     // native shadows, so a caller of Class's Signature bridge cannot enter
     // the incompatible JDK bytecode body.
+    // Both arms ask `registered_native_will_run` rather than
+    // `find(..).is_some()`: a native the arbitration always yields is not a
+    // shadow, and sealing the caller for it costs tier-up while protecting
+    // nothing. Every other triple answers exactly as before.
     let direct = force_native_over_real_jdk_bytecode(&target_class, &method_name, &descriptor)
-        || shared
-            .natives
-            .native_methods
-            .find(&target_class, &method_name, &descriptor)
-            .is_some();
+        || registered_native_will_run(shared, &target_class, &method_name, &descriptor);
     let inherited = declaring_class.as_ref().is_some_and(|declaring_class| {
-        shared
-            .natives
-            .native_methods
-            .find(declaring_class, &method_name, &descriptor)
-            .is_some()
+        registered_native_will_run(shared, declaring_class, &method_name, &descriptor)
     });
     // Interface-dispatch blind spot: for `invokeinterface`, `declaring_class`
     // above is resolved by walking UP FROM THE INTERFACE (`find_method_recursive`
@@ -3903,16 +3904,12 @@ pub(super) fn try_jit_upgrade_with_gate(
     // `Object.equals`. A bytecode override that merely has an identity native
     // somewhere up its ancestor chain is allowed to compile.
     {
-        if shared
-            .natives
-            .native_methods
-            .find(
-                &cached.class_name,
-                &cached.method_name,
-                &cached.method_descriptor,
-            )
-            .is_some()
-        {
+        if registered_native_will_run(
+            shared,
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+        ) {
             if crate::runtime::env_cache::dbg_bblp()
                 && cached.class_name.contains("LazyProjection")
                 && &*cached.method_name == "equals"
@@ -5705,12 +5702,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // ATNConfig/DFAState `hashCode` are ~58% of the Groovy-parse profile) never
     // compiled, ~100x slower than HotSpot (Spring Boot buildSrc
     // `SpringRepositoriesExtensionTests` hang).
-    if shared
-        .natives
-        .native_methods
-        .find(class_name, method_name, descriptor)
-        .is_some()
-    {
+    if registered_native_will_run(shared, class_name, method_name, descriptor) {
         return None;
     }
     // Look up the method bytecode

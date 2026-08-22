@@ -11,7 +11,7 @@
 use crate::{DeviceCaps, DeviceError, KernelArgs, LaunchConfig, Result};
 use std::marker::PhantomData;
 
-pub(crate) fn probe() -> Result<DeviceCaps> {
+pub(crate) fn probe_device(_device_ordinal: u32) -> Result<DeviceCaps> {
     Err(DeviceError::NoDriver)
 }
 

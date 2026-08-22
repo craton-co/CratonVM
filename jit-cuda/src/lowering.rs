@@ -944,12 +944,56 @@ mod tests {
         // Two float loads from arrays
         assert!(text.matches("ld.global.f32").count() >= 2);
         // One float multiply + one float add
-        assert!(text.contains("mul.f32"));
-        assert!(text.contains("add.f32"));
+        assert!(text.contains("mul.rn.f32"));
+        assert!(text.contains("add.rn.f32"));
         // One float store
         assert!(text.contains("st.global.f32"));
         // Bounds fail
         assert!(text.contains("L_bounds_fail:"));
+    }
+
+    /// Every float arithmetic instruction must carry an explicit
+    /// rounding modifier.
+    ///
+    /// This is not style. Per the PTX ISA, `mul`/`add`/`sub` written
+    /// WITHOUT a rounding modifier are eligible for contraction, and
+    /// ptxas -O3 does contract them: `mul.f32` + `add.f32` becomes one
+    /// `FFMA` on sm_75, which rounds once where JLS §15.17.1/§15.18.2
+    /// require the product to be rounded to float before the add. A
+    /// modifier-carrying instruction is never contracted, so the `.rn`
+    /// spelling is what keeps a lowered kernel bit-identical to the
+    /// interpreter. Asserting on the rendered text (rather than on the
+    /// SASS, which needs a CUDA toolkit) makes this a plain unit test
+    /// that runs everywhere. `saxpy` is the right fixture because
+    /// `a*x[i] + y[i]` is exactly the shape that contracts.
+    ///
+    /// See `emit::binop_f32`'s comment for the measurement this pins.
+    #[test]
+    fn float_arithmetic_always_carries_an_explicit_rounding_mode() {
+        let f32_kernel = lower_fixture("EligibleSaxpy", "saxpy", "(F[F[F[F)V").render();
+        let f64_kernel = lower_fixture_with_pool("EligibleLdcDouble", "fma", "([D[D)V").render();
+        for (class, method, text) in [
+            ("EligibleSaxpy", "saxpy", &f32_kernel),
+            ("EligibleLdcDouble", "fma", &f64_kernel),
+        ] {
+            for line in text.lines() {
+                let op = line.trim();
+                for bare in [
+                    "add.f32 ", "sub.f32 ", "mul.f32 ", "div.f32 ", "add.f64 ", "sub.f64 ",
+                    "mul.f64 ", "div.f64 ",
+                ] {
+                    assert!(
+                        !op.starts_with(bare),
+                        "{class}.{method}: `{op}` has no rounding modifier, so ptxas may \
+                         contract it into an FMA and break bit-exactness with the CPU path"
+                    );
+                }
+            }
+            assert!(
+                text.contains(".rn.f32") || text.contains(".rn.f64"),
+                "{class}.{method}: expected at least one rounded float op in:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -1364,6 +1408,95 @@ mod tests {
         assert!(text.contains("add.s32"));
     }
 
+    /// `for (int i = 0; i < out.length; i++)` must lower, not fall back.
+    ///
+    /// javac emits `iload iv; aload out; arraylength; if_icmpge` for the
+    /// inline form and `iload iv; iload n; if_icmpge` for the hoisted
+    /// one. The recognizer used to insist on two `iload`s, so the inline
+    /// form — the shape most people write first — was rejected with
+    /// "does not have the canonical operand shape" and ran on the CPU,
+    /// while the identical computation with the length hoisted into a
+    /// local offloaded. The two bounds are the same array parameter's
+    /// `pN_len`, so the emitted kernels should agree instruction for
+    /// instruction.
+    #[test]
+    fn inline_arraylength_loop_bound_lowers_like_the_hoisted_form() {
+        let inline =
+            lower_fixture("EligibleInlineLengthBound", "scaleInline", "([I[I)V").render();
+        let hoisted =
+            lower_fixture("EligibleInlineLengthBound", "scaleHoisted", "([I[I)V").render();
+
+        assert!(
+            inline.contains(".visible .entry EligibleInlineLengthBound__scaleInline_"),
+            "inline .length bound did not lower:\n{inline}"
+        );
+        // The bound must resolve to the OUT parameter's length (p1_len),
+        // not the input's — `out.length` is what the source said.
+        assert!(
+            inline.contains("[p1_len]"),
+            "expected the bound to read p1_len:\n{inline}"
+        );
+
+        // Everything from the loop guard onward must be the same opcode
+        // sequence. The two prologues legitimately differ by one
+        // instruction: the hoisted form's `int n = out.length;` is a real
+        // pre-loop statement and materialises a cached local, which the
+        // inline form has no reason to emit. So the inline spelling is
+        // one instruction SHORTER, never longer.
+        let body_opcodes = |text: &str| -> Vec<String> {
+            let (_, body) = text
+                .split_once("bra L_done;")
+                .expect("the loop guard's early-out");
+            body.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
+                .map(|l| {
+                    l.split_whitespace()
+                        .find(|t| !t.starts_with('@'))
+                        .unwrap_or_default()
+                        .trim_end_matches(';')
+                        .to_string()
+                })
+                .collect()
+        };
+        assert_eq!(
+            body_opcodes(&inline),
+            body_opcodes(&hoisted),
+            "inline and hoisted `.length` bounds should emit the same body\n\
+             inline:\n{inline}\nhoisted:\n{hoisted}"
+        );
+
+        let count = |text: &str| text.lines().filter(|l| l.trim().ends_with(';')).count();
+        assert!(
+            count(&inline) <= count(&hoisted),
+            "the inline spelling should not be longer than the hoisted one \
+             ({} vs {}):\ninline:\n{inline}\nhoisted:\n{hoisted}",
+            count(&inline),
+            count(&hoisted)
+        );
+    }
+
+    /// The inline-bound path resolves the ARRAY PARAMETER, not its
+    /// element type: a `float[]` kernel takes the same route.
+    ///
+    /// Needs the pool-aware entry point — the `3f` multiplier is an `ldc`,
+    /// which the CP-free analyzer rejects with `Reason::LoadConstant`.
+    #[test]
+    fn inline_arraylength_loop_bound_works_for_a_float_array() {
+        let text = lower_fixture_with_pool(
+            "EligibleInlineLengthBound",
+            "scaleFloatInline",
+            "([F[F)V",
+        )
+        .render();
+        assert!(
+            text.contains(".visible .entry EligibleInlineLengthBound__scaleFloatInline_"),
+            "float inline .length bound did not lower:\n{text}"
+        );
+        assert!(text.contains("[p1_len]"), "expected p1_len bound:\n{text}");
+        assert!(text.contains("mul.rn.f32"), "expected the float body:\n{text}");
+    }
+
     #[test]
     fn canonical_loop_recognizer_records_unit_stride() {
         // White-box: the recognizer accepts the canonical loop and
@@ -1689,8 +1822,8 @@ mod tests {
             text.contains(&lit2),
             "expected exact-bit float immediate {lit2} in:\n{text}"
         );
-        assert!(text.contains("mul.f32"));
-        assert!(text.contains("add.f32"));
+        assert!(text.contains("mul.rn.f32"));
+        assert!(text.contains("add.rn.f32"));
     }
 
     #[test]
@@ -1703,7 +1836,7 @@ mod tests {
             text.contains(&lit),
             "expected exact-bit double immediate {lit} in:\n{text}"
         );
-        assert!(text.contains("mul.f64"));
+        assert!(text.contains("mul.rn.f64"));
     }
 
     /// The CP-free `lower_method` entry point must not silently accept
@@ -1861,20 +1994,95 @@ mod tests {
             "expected an if predicate:\n{text}"
         );
         assert!(
-            text.lines()
-                .any(|line| line.trim_start().starts_with("@%p") && line.contains(" mov.s32"))
-                && text.lines().any(|line| {
-                    line.trim_start().starts_with("@!%p") && line.contains(" mov.s32")
-                }),
-            "expected predicated merge moves:\n{text}"
-        );
-        assert!(
             text.contains("bra L_body_"),
             "expected a real body label branch:\n{text}"
         );
         assert!(
             text.matches("L_body_").count() >= 2,
             "expected CFG labels:\n{text}"
+        );
+
+        // The two arms both assign `value`, so the join must reconcile
+        // them. Pin the reconciliation SEMANTICALLY rather than by
+        // instruction shape: whatever register the post-join array store
+        // reads must be written somewhere in each arm.
+        //
+        // This used to assert on a `@%p mov` / `@!%p mov` pair, which was
+        // the old join lowering's habit of minting a phi register for
+        // every live slot and predicate-copying into it on both edges out
+        // of the branch. Both edges out of one `if` carry identical
+        // state, so those copies never did anything; `canonicalise_state`
+        // now adopts the incoming registers instead and only the arm that
+        // disagrees copies. Asserting the old shape would forbid the fix.
+        let join_label = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("L_body_"))
+            .next_back()
+            .expect("a join label")
+            .trim()
+            .to_string();
+        let (arms, join) = text
+            .split_once(&join_label)
+            .expect("join label splits the body");
+        let merged = join
+            .lines()
+            .find_map(|l| {
+                let t = l.trim_start();
+                t.strip_prefix("st.global.s32 [")
+                    .and_then(|rest| rest.split_once("], "))
+                    .map(|(_, reg)| reg.trim_end_matches(';').to_string())
+            })
+            .expect("the post-join array store");
+        let writes: Vec<&str> = arms
+            .lines()
+            .filter(|l| {
+                l.trim_start()
+                    .split_once(' ')
+                    .is_some_and(|(_, ops)| ops.trim_start().starts_with(&format!("{merged},")))
+            })
+            .collect();
+        assert!(
+            writes.len() >= 2,
+            "the merged register {merged} must be written on both arms before the \
+             join, found {writes:?} in:\n{text}"
+        );
+    }
+
+    /// The join lowering must not emit a copy per live slot per edge.
+    ///
+    /// `absOrIncrement` has exactly one local (`value`) that differs
+    /// between the two arms; `i`, `n`, and both array references are the
+    /// same register on both sides. A join reconciliation that copies
+    /// everything scales with the number of live slots rather than with
+    /// the number of slots that actually disagree — on the ray-tracer
+    /// kernel that was 3299 `mov.f32` in a 4069-instruction kernel, 933
+    /// of which survived into the SASS as `FSEL`.
+    ///
+    /// One merge move is the correct count here. The bound is deliberately
+    /// tight: a regression to per-slot copying would blow straight past it.
+    #[test]
+    fn join_reconciliation_copies_only_the_slots_that_disagree() {
+        let text = lower_fixture("EligibleBranchingLoop", "absOrIncrement", "([I[I)V").render();
+        let merge_moves = text
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                // `mov.s32 %rN, %rM` between two registers. The prologue's
+                // `mov.s32 %rN, 0` / `mov.s32 %rN, 1` constant loads are
+                // not merges.
+                t.starts_with("mov.s32 ")
+                    && t.split(", ").nth(1).is_some_and(|src| src.starts_with('%'))
+            })
+            .count();
+        assert!(
+            merge_moves <= 2,
+            "expected at most a couple of register-to-register merge moves for a \
+             single disagreeing local, got {merge_moves}:\n{text}"
+        );
+        assert!(
+            !text.contains("@%p0 mov") && !text.contains("@!%p0 mov"),
+            "the two edges out of one `if` carry identical state; neither should \
+             emit predicated state copies:\n{text}"
         );
     }
 
@@ -1931,8 +2139,8 @@ mod tests {
         assert!(text.contains("abs.f32"), "missing float abs\n{text}");
         // Math.fma(float,float,float) → single-rounding fma.
         assert!(text.contains("fma.rn.f32"), "missing float fma\n{text}");
-        assert!(text.contains("mul.f32"));
-        assert!(text.contains("add.f32"));
+        assert!(text.contains("mul.rn.f32"));
+        assert!(text.contains("add.rn.f32"));
         assert!(text.contains("st.global.f32"));
     }
 

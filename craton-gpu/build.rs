@@ -49,8 +49,9 @@ fn main() {
     //      diagnosed via cargo:warning and then ignored,
     //   2. craton-gpu-java/src/main/java beside the CratonVM workspace
     //      checkout (portable sibling checkout; tried on every platform),
-    //   3. C:/craton/craton-gpu-java/src/main/java (Windows-only default
-    //      install; never consulted on Linux/macOS).
+    //   3. C:/craton/gpu-java/src/main/java, then
+    //      C:/craton/craton-gpu-java/src/main/java (Windows-only defaults;
+    //      never consulted on Linux/macOS).
     // If none exists, the build script emits empty paths and a warning. The
     // build never fails.
     println!("cargo:rerun-if-env-changed=CRATON_GPU_JAVA_SRC");
@@ -273,9 +274,17 @@ fn documented_sibling_java_root(manifest_dir: &Path) -> PathBuf {
 
 fn platform_fallback_java_root(sibling: PathBuf, is_windows: bool) -> PathBuf {
     if is_windows {
-        let win_default = PathBuf::from("C:/craton/craton-gpu-java/src/main/java");
+        // The real checkout lives at C:/craton/gpu-java (not
+        // craton-gpu-java) on this box. Tried first; the old guess is kept
+        // as a second candidate in case a differently-named checkout is
+        // ever used instead.
+        let win_default = PathBuf::from("C:/craton/gpu-java/src/main/java");
         if win_default.is_dir() {
             return win_default;
+        }
+        let win_default_legacy = PathBuf::from("C:/craton/craton-gpu-java/src/main/java");
+        if win_default_legacy.is_dir() {
+            return win_default_legacy;
         }
         return win_default;
     }

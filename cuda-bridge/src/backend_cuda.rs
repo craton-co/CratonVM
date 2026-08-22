@@ -51,8 +51,9 @@ fn map_err<E: std::fmt::Debug>(stage: &str) -> impl FnOnce(E) -> DeviceError + '
     move |e| DeviceError::Driver(format!("{stage}: {e:?}"))
 }
 
-pub(crate) fn probe() -> Result<DeviceCaps> {
-    let dev = CudaDevice::new(0).map_err(map_err("CudaDevice::new(0)"))?;
+pub(crate) fn probe_device(device_ordinal: u32) -> Result<DeviceCaps> {
+    let dev = CudaDevice::new(device_ordinal as usize)
+        .map_err(map_err("CudaDevice::new(device_ordinal)"))?;
     let name = dev.name().map_err(map_err("device name"))?;
     let attr = |a| dev.attribute(a).map_err(map_err("device attribute"));
     let major = attr(
@@ -73,7 +74,7 @@ pub(crate) fn probe() -> Result<DeviceCaps> {
             .map_err(map_err("total memory"))?
     };
     Ok(DeviceCaps {
-        ordinal: 0,
+        ordinal: device_ordinal,
         name,
         compute_major: major as u32,
         compute_minor: minor as u32,

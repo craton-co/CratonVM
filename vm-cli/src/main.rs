@@ -2302,7 +2302,15 @@ fn active_jdk_mode_line() -> String {
     match ACTIVE_JDK_MODE.get() {
         Some((mode, Some(home))) => format!("jdk mode: {mode} (java.home={home})"),
         Some((mode, None)) => format!("jdk mode: {mode}"),
-        None => "jdk mode: <not yet resolved — failure occurred during argument parsing>".into(),
+        // NOT "during argument parsing". This arm is reached whenever the
+        // OnceLock is unset, and the class library is selected LATE: a
+        // `--java-home` that clap accepted but that carries no `jmods/` or
+        // `lib/modules` lands here too, and that is the common case (a POSIX
+        // path spelling on Windows reaches it with rc=1). Naming a phase this
+        // function cannot observe sent two separate triage records after the
+        // argument parser for a fault that was never in it.
+        None => "jdk mode: <not yet resolved — the failure occurred before the class library was selected>"
+            .into(),
     }
 }
 
@@ -3029,13 +3037,40 @@ fn write_jdk_only_dumps(args: &Args, shared: &cratonvm_vm::SharedVm) {
                 // whole failure mode is that a truncated list reads as a
                 // complete one.
                 if cratonvm_vm::vm::jdk_only_native_shadow_sink_saturated() {
+                    // The drop count is what makes this line actionable rather
+                    // than merely alarming: it says HOW SHORT the list is, and
+                    // it names the knob that fixes it. Before 2026-08-20 the
+                    // only advice available here was "narrow the workload",
+                    // which is the opposite of what a census run wants and is
+                    // how every shadow figure in docs/known-issues/jdk-only/
+                    // came to be a floor.
+                    let dropped = cratonvm_vm::vm::jdk_only_native_shadow_sink_dropped();
+                    let recorded = cratonvm_vm::vm::jdk_only_native_shadow_sink_len();
                     eprintln!(
                         "[cratonvm] warning: the JDK-only observation sink SATURATED at {} \
-                         distinct rows — the shadow rows in violations[] are a FLOOR, not the \
-                         population, and refusals.interpreter_shadow_unenforced stopped \
-                         advancing when it filled. Narrow the workload to read the list as \
-                         exhaustive.",
+                         distinct rows and dropped ~{dropped} more — violations[] names \
+                         {recorded} of roughly {} shadows, so the rows are a FLOOR and the \
+                         TOTAL is the sum. Re-run with \
+                         CRATONVM_NATIVE_SHADOW_SINK_CAP={} to name all of them; do NOT \
+                         narrow the workload, that is what censors the census.",
                         cratonvm_vm::vm::jdk_only_native_shadow_cap(),
+                        recorded as u64 + dropped,
+                        (recorded as u64 + dropped).saturating_mul(2).max(8192),
+                    );
+                }
+                // The JIT fast-path sink is a SECOND bounded collection feeding
+                // the same `violations[]`, and until 2026-08-20 it had no
+                // saturation signal anywhere — not in the file and not on this
+                // line. A reader who saw no warning concluded the list was
+                // complete; it was complete for one source of three.
+                if cratonvm_vm::jit::helpers::jdk_only_jit_helper_sink_saturated() {
+                    eprintln!(
+                        "[cratonvm] warning: the JDK-only JIT fast-path violation sink \
+                         SATURATED at {} rows and dropped {} refusal(s) it could not name — \
+                         observation_sink.jit_fastpath in the report carries the same two \
+                         numbers. Same remedy: raise CRATONVM_NATIVE_SHADOW_SINK_CAP.",
+                        cratonvm_vm::jit::helpers::jdk_only_jit_helper_violation_cap(),
+                        cratonvm_vm::jit::helpers::jdk_only_jit_helper_sink_dropped(),
                     );
                 }
             }
@@ -5171,6 +5206,11 @@ fn run() -> Result<()> {
     // deletion exercise those two records describe but never measured.
     cratonvm_vm::vm::dump_check_override_census();
     cratonvm_vm::vm::dump_canonical_census();
+    // The enforcement dial's per-door census (`H17-3` N1). Silent unless
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW` is armed or `CRATONVM_DBG_DIAL_DOORS`
+    // is set; `reached - yielded` per door is the price the dial is not
+    // charging.
+    cratonvm_vm::vm::dump_dial_door_census();
 
     // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown
     // (env-gated inside `dump_now` callers; `enabled()` re-checked here).

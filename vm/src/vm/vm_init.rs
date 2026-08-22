@@ -5540,9 +5540,12 @@ impl SharedVm {
     /// addresses into a per-VM struct); until then this is over-reporting in
     /// the strict direction, which is the safe direction for a diagnostic.
     ///
-    /// Each sink is append-only and bounded at 256 entries with an internal
-    /// dedup, so a positional watermark into these vectors is stable across
-    /// calls — that is what `--trace-jdk-only` uses to drain incrementally.
+    /// Each sink is append-only and bounded (4096 entries by default since
+    /// 2026-08-20, `CRATONVM_NATIVE_SHADOW_SINK_CAP`) with an internal dedup, so
+    /// a positional watermark into these vectors is stable across calls — that
+    /// is what `--trace-jdk-only` uses to drain incrementally. Do not re-derive
+    /// the bound from a literal here: the report's `observation_sink` object
+    /// publishes each sink's actual `cap`, and what it dropped.
     pub fn jdk_only_process_violations(
         &self,
     ) -> [Vec<cratonvm_types::error::JdkOnlyViolation>; JDK_ONLY_PROCESS_SINKS] {
@@ -5577,8 +5580,9 @@ impl SharedVm {
     /// summary line.
     ///
     /// These are not a second spelling of `violations[]`. Every sink above is
-    /// deduplicated by triple and capped at 256 entries; these counters are
-    /// uncapped `AtomicU64`s incremented once per refusal event. A run that
+    /// deduplicated by triple and CAPPED (see `observation_sink` in the report
+    /// for each one's cap and drop count); these counters are uncapped
+    /// `AtomicU64`s incremented once per refusal event. A run that
     /// refuses `HashMap.put` ten million times contributes **one** row to
     /// `violations[]` and ten million to `jit_direct_native_binds`. Reporting
     /// only the rows would understate the blast radius; reporting only the
@@ -5644,7 +5648,12 @@ impl SharedVm {
     ///   // repeat it. Renaming would break the schema, so this note is the
     ///   // fix. If the schema is ever versioned up, rename it then.
     ///   "observation_sink": {
-    ///     "recorded": 81, "cap": 256, "saturated": false
+    ///     "recorded": 81, "cap": 4096, "saturated": false,
+    ///     "truncated": false, "dropped": 0,
+    ///     "jit_fastpath": { "recorded": 3, "cap": 4096,
+    ///                       "truncated": false, "dropped": 0 },
+    ///     "jit_compile":  { "recorded": 0, "cap": 256,
+    ///                       "truncated": null, "dropped": null }
     ///   }
     /// }
     /// ```
@@ -5668,13 +5677,35 @@ impl SharedVm {
     /// number on exactly the runs that raised it.
     ///
     /// `saturated` is **not** `recorded == cap`: a run whose last distinct
-    /// observation is the 256th fills the sink exactly and drops nothing. See
+    /// observation exactly fills the sink drops nothing. See
     /// [`crate::vm::jdk_only_native_shadow_sink_saturated`].
     ///
-    /// `saturated: true` also condemns a COUNTER, not just a list:
-    /// `refusals.interpreter_shadow_unenforced` stops advancing once the sink is
-    /// full, because the hierarchy walk that discovers a shadow is skipped when
-    /// the sink can no longer learn one.
+    /// # 2026-08-20: `truncated`, `dropped`, and the other two sinks
+    ///
+    /// **A boolean nobody reads was the whole signal, and it capped every
+    /// number in `docs/known-issues/jdk-only/`.** Three fixes, in the order
+    /// they matter:
+    ///
+    /// 1. **`dropped`** — a monotonic counter that keeps counting past the cap,
+    ///    so `recorded + dropped` is the population and a floor becomes a
+    ///    total. This is the load-bearing half; a bigger cap is still a cap.
+    /// 2. **`truncated`** — the same bit as `saturated`, emitted under the name
+    ///    a reader actually looks for. `saturated` stays because every record
+    ///    written before today quotes it.
+    /// 3. **`jit_fastpath` / `jit_compile`** — the other two bounded
+    ///    collections feeding `violations[]` had *no* saturation signal at all,
+    ///    so `truncated: false` at the top level answered for one source of
+    ///    three. `jit_compile`'s two fields are `null`, not `false`: that sink
+    ///    lives in `cratonvm_jit` and has no counter yet, and an unmeasured
+    ///    thing must not render as a clean one.
+    ///
+    /// `saturated: true` used to condemn a COUNTER as well as a list —
+    /// `refusals.interpreter_shadow_unenforced` stopped advancing once the sink
+    /// filled, because the hierarchy walk that discovers a shadow was skipped
+    /// for every triple. **That is fixed at the source**: the walk is now
+    /// skipped per-triple rather than per-run, so the counter keeps advancing
+    /// past saturation and only the IDENTITIES are lost — which is what
+    /// `dropped` counts.
     ///
     /// The **only** report writer: `--jdk-only-report` calls this. `verbose` is
     /// `--explain-jdk-only`; **false redacts and is the default**, applied
@@ -5819,7 +5850,14 @@ impl SharedVm {
         // VM-scoped sources so all five sort together under one comparator. The
         // sort is what makes the report reproducible, and it only works if
         // every source enters the same vector before it runs.
-        for sink in self.jdk_only_process_violations() {
+        //
+        // Bound rather than consumed in place, so the `observation_sink` block
+        // at the bottom can report each sink's ROW COUNT without re-taking its
+        // mutex and re-cloning its `Vec` — and, more importantly, so the row
+        // count it publishes is the same snapshot these rows came from. Two
+        // separate reads could disagree on a VM that is still running.
+        let process_sinks = self.jdk_only_process_violations();
+        for sink in &process_sinks {
             violations.extend(
                 sink.iter()
                     .map(|v| (v.kind().to_string(), v.summary(), v.to_json())),
@@ -6000,9 +6038,113 @@ impl SharedVm {
             crate::vm::jdk_only_native_shadow_cap()
         ));
         out.push_str(&format!(
-            "    \"saturated\": {}\n",
+            "    \"saturated\": {},\n",
             crate::vm::jdk_only_native_shadow_sink_saturated()
         ));
+        // `truncated` is the same bit as `saturated`, under the name a reader
+        // reaches for. Both are emitted because `saturated` is the name every
+        // record written before 2026-08-20 quotes, and renaming a key to make a
+        // point is how a machine consumer breaks silently. They can never
+        // disagree — one expression feeds both.
+        out.push_str(&format!(
+            "    \"truncated\": {},\n",
+            crate::vm::jdk_only_native_shadow_sink_saturated()
+        ));
+        // The number that turns the list from a floor into a total.
+        // `recorded + dropped` is the distinct population this run observed;
+        // `recorded` alone is what it had room to NAME. See
+        // `crate::vm::jdk_only_native_shadow_sink_dropped` for the one way this
+        // errs (upward, via filter collisions) and why.
+        out.push_str(&format!(
+            "    \"dropped\": {},\n",
+            crate::vm::jdk_only_native_shadow_sink_dropped()
+        ));
+        // Per-source sub-objects for the OTHER two bounded collections that
+        // feed `violations[]`. Until 2026-08-20 this object described only the
+        // interpreter's sink, so a reader who checked `truncated: false` and
+        // concluded "the list is complete" was right about one of three
+        // sources and had no way to ask about the other two.
+        out.push_str("    \"jit_fastpath\": {\n");
+        out.push_str(&format!(
+            "      \"recorded\": {},\n",
+            process_sinks[1].len()
+        ));
+        out.push_str(&format!(
+            "      \"cap\": {},\n",
+            crate::jit::helpers::jdk_only_jit_helper_violation_cap()
+        ));
+        out.push_str(&format!(
+            "      \"truncated\": {},\n",
+            crate::jit::helpers::jdk_only_jit_helper_sink_saturated()
+        ));
+        out.push_str(&format!(
+            "      \"dropped\": {}\n",
+            crate::jit::helpers::jdk_only_jit_helper_sink_dropped()
+        ));
+        out.push_str("    },\n");
+        // `cratonvm_jit`'s compile-time sink is capped too and has NO drop
+        // counter, because the fix for it is a one-line change in
+        // `jit/src/lib.rs :: record_jdk_only_direct_native_refusal` and this
+        // lane does not own that file. `null` rather than `false`: an absent
+        // measurement must not render as a clean one — the same rule the
+        // `partial` class buckets above obey. See the H1-1 record's
+        // OUT-OF-FILE EDITS REQUIRED section for the exact patch.
+        out.push_str("    \"jit_compile\": {\n");
+        out.push_str(&format!(
+            "      \"recorded\": {},\n",
+            process_sinks[0].len()
+        ));
+        out.push_str(&format!(
+            "      \"cap\": {},\n",
+            cratonvm_jit::JDK_ONLY_VIOLATION_CAP
+        ));
+        out.push_str("      \"truncated\": null,\n");
+        out.push_str("      \"dropped\": null\n");
+        out.push_str("    }\n");
+        // A SIBLING object again, and for the sharpest version of
+        // `observation_sink`'s reason. `CRATONVM_ENFORCE_NATIVE_SHADOW` does
+        // not add rows to this report -- it REMOVES them, because an enforced
+        // shadow does not dispatch and so never produces a
+        // `bridge-ran-over-bytecode` row. An armed report and an unarmed one
+        // were therefore indistinguishable in every field, and the armed
+        // one's emptier `violations[]` reads as the better result. It is not;
+        // it is a different question.
+        //
+        // `doors` is the other half. Until 2026-08-21 the dial had exactly
+        // one live call site (`resolve_step1_native`), so `scope` alone would
+        // still have overstated what an armed run measured: 890 of 947 armed
+        // `Bridge` dispatches never asked it, and
+        // `refusals.interpreter_shadow_unenforced` read `0` for all 890,
+        // because that one call site is also the only recorder of the
+        // native-won half. The per-door columns are what make that visible
+        // instead of silent: `reached` minus `yielded`, summed, is the number
+        // of dispatches the arming did not reach, and on a fixed binary it is
+        // zero.
+        out.push_str("  },\n  \"enforcement_dial\": {\n");
+        out.push_str(&format!(
+            "    \"scope\": {},\n",
+            json_escape(&crate::runtime::env_cache::enforce_shadow_scope().report_spelling())
+        ));
+        let doors = crate::vm::dial_door_counts();
+        let reached: u64 = doors.iter().map(|(_, r, _)| *r).sum();
+        let yielded: u64 = doors.iter().map(|(_, _, y)| *y).sum();
+        out.push_str(&format!("    \"reached\": {reached},\n"));
+        out.push_str(&format!("    \"yielded\": {yielded},\n"));
+        out.push_str(&format!(
+            "    \"leaked\": {},\n",
+            reached.saturating_sub(yielded)
+        ));
+        out.push_str("    \"doors\": [");
+        for (i, (door, r, y)) in doors.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "\n      {{\"door\": {}, \"reached\": {r}, \"yielded\": {y}}}",
+                json_escape(door)
+            ));
+        }
+        out.push_str("\n    ]\n");
         out.push_str("  }\n}\n");
 
         use std::io::Write;
@@ -7898,6 +8040,47 @@ pub fn dump_wait_site_thread_local(shared: &SharedVm) {
     }
 }
 
+/// Print the state of the object a thread is parked on in `Object.wait()`.
+///
+/// The netty `ParameterizedSslHandlerTest` stall bottoms out in
+/// `DefaultPromise.await`/`awaitUninterruptibly` at the `Object.wait()` BCI, a
+/// 30 s-spurious-wakeup A/B showed the awaited promise is ALREADY complete, and
+/// the orphan check came back clean — so the waiter is on the right monitor and
+/// a notifier would resolve the same one. The remaining question is netty's own
+/// bookkeeping, which lives in two fields of the promise:
+///
+/// * `result`  — non-null once the promise completes (set OUTSIDE the monitor).
+/// * `waiters` — a PLAIN int the waiter increments inside the monitor
+///   immediately before `wait()`; `checkNotifyWaiters()` skips `notifyAll()`
+///   entirely when it reads 0.
+///
+/// `result != null` with `waiters >= 1` here means the completer either never
+/// ran `checkNotifyWaiters` or read a stale `waiters` — i.e. the monitor is not
+/// establishing happens-before between the two `synchronized` blocks.
+pub fn dump_wait_object_state(shared: &SharedVm, obj: ObjectRef) {
+    let cid = shared.mem.heap.class_id_of(obj);
+    let name = shared
+        .classes
+        .class_manager
+        .read()
+        .class_store
+        .get(cid)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| format!("<class_id {cid:?}>"));
+    let field = |f: &str| -> Option<cratonvm_types::Value> {
+        let cm = shared.classes.class_manager.read();
+        let idx = super::vm_exec::resolve_field_index_in_hierarchy(cid, f, &cm.class_store)?;
+        drop(cm);
+        Some(shared.mem.heap.get_field(obj, idx))
+    };
+    eprintln!(
+        "[WAIT-OBJECT] obj={:p} class={name} result={:?} waiters={:?}",
+        obj.as_ptr(),
+        field("result"),
+        field("waiters"),
+    );
+}
+
 impl SharedVm {
     /// Placeholder split-impl — see the inherent impl above. The split is
     /// purely so the thread-local helpers above can sit between two impl
@@ -8674,6 +8857,30 @@ impl Vm {
                 if let Some(s) = weak.upgrade() {
                     crate::vm::vm_init::dump_wait_site_thread_local(&s);
                 }
+            });
+        }
+        // Companion to the frame dump above: the STATE of the object the thread
+        // is parked on. See `dump_wait_object_state` for why those two fields
+        // are the ones that decide the netty promise stall.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_object_dump(move |obj| {
+                if let Some(s) = weak.upgrade() {
+                    crate::vm::vm_init::dump_wait_object_state(&s, obj);
+                }
+            });
+        }
+        // And the GC-SAFE handle for that dump. `Monitor::wait` holds the
+        // awaited `ObjectRef` as a plain local for the whole wait, which a
+        // moving collector invalidates; `jmx_waiting_monitor` is a scanned root
+        // that `update_thread_objs_after_gc` (gc.rs step 21) forwards, so it is
+        // the address still valid at dump time. Without this the dump silently
+        // reports pre-relocation field values.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_object_resolve(move |tid| {
+                let s = weak.upgrade()?;
+                s.threads.thread_registry.peek_jmx_waiting_monitor(tid)
             });
         }
 

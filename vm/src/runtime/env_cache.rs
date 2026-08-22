@@ -726,6 +726,25 @@ impl EnforceShadowScope {
         }
     }
 
+    /// How this scope should be spelled in `--jdk-only-report`.
+    ///
+    /// An armed report and an unarmed one were byte-identical in every field a
+    /// reader could use to tell them apart, which is how four records came to
+    /// quote armed cells beside unarmed ones. The dial changes what the whole
+    /// census MEANS -- under `enforce` the bridge does not run, so the
+    /// `bridge-ran-over-bytecode` half of `violations[]` is empty by
+    /// construction rather than for want of shadows -- so the report has to say
+    /// which one it is. `"off"` is written out rather than omitted for the same
+    /// reason `observation_sink` is written in `Compatible`: an absent field is
+    /// ambiguous between "unarmed" and "this binary cannot answer".
+    pub fn report_spelling(&self) -> String {
+        match self {
+            EnforceShadowScope::Off => "off".to_string(),
+            EnforceShadowScope::All => "all".to_string(),
+            EnforceShadowScope::Prefixes(p) => p.join(","),
+        }
+    }
+
     /// Does enforcement apply to a dispatch on `class_name` (internal form)?
     pub fn covers(&self, class_name: &str) -> bool {
         match self {
