@@ -401,6 +401,63 @@ counters are run-to-run noisy on this workload and a single-sample diff of them
 means nothing. The identity set is the part that had to hold, and it does.
 ---
 
+## 10. What actually landed, and on which tip
+
+Landed on `dev` as `ee7bb87d4`. `dev` moved under this lane four times while it
+was verifying, so the honest statement is not one pair of numbers but which
+control each pair was measured against:
+
+| base | control (pristine) | with the fix | armed `HashMap` |
+|---|---|---|---|
+| `1fcc241e0` | 103/104 · 98/104 · 62/64 | identical | 81 → 86 |
+| `ee4cdf528` | 103/104 · 98/104 · 62/64 | identical | 81 → 86 |
+| `20fcda31e` | 102/104 · 97/104 · 61/64 | identical but one flake | 80 → 85 |
+| `07c705309` (landed) | — | 103/105 · 103/105 · 63/65 | 86/105 |
+
+The corpus grew by one vector and `dev` closed five `SUITE=all` failures during
+the same window, which is why the landed row's denominators and its `SUITE=all`
+cell do not line up with the rows above it. **The delta is the claim, not the
+absolute**, and the delta was controlled three times: unarmed identical
+class-for-class, armed `+5`.
+
+The landing tip was built, its report parsed rather than read
+(`enforcement_dial.leaked == 0` over 2 617 armed reached dispatches), and
+`cratonvm-types`, `enforcement_dial_door_tests` and `jdk_only_dispatch` are
+green on it.
+
+### Three gates were red on `dev` itself and are fixed in the same push
+
+Not this lane's files, and not this lane's doing — MEASURED on a pristine
+`origin/dev` checkout at `07c705309`, same failures, same names. A branch
+landing on `dev` inherits them, so they are fixed here rather than left:
+
+* `doc_citation_paths` — six lines in three published records carried a path
+  into the unpublished internal tree (a link a public reader cannot follow),
+  and one citation
+  in `jit/src/x64/tests.rs` named a page that moved when it was retired out of
+  `fixed-suite-bugs/tomcat/`. That one is **wrapped across two `//` lines**,
+  which is why a single-line replace reported success and changed nothing.
+* `flag_declaration_guard` — `CRATONVM_GPU_DUMP_PTX` and
+  `CRATONVM_WAIT_SPURIOUS_MS` were read by code and declared nowhere, so each
+  was served by a live `getenv` rather than the latched `VmFlags` snapshot.
+  `WAIT_SPURIOUS_MS` is filed under `Group::THREADS` and **not** `Group::DBG`
+  on purpose: DBG's own doc comment promises that no token in it changes a
+  program's result save three named exceptions, and making an untimed
+  `Object.wait` return without a `notify` plainly does.
+
+### Not done, and why
+
+`claude/jdk-only-mode-handoff-09b48c` could not take a `dev` merge from this
+lane. The single conflict is in `native-io/src/nio_selector.rs`, between `dev`'s
+2026-08-20 fix (*stop `Selector.open()` nulling `SelectorImpl.selectedKeys`* —
+`SI_OPEN_FLAG` aliases a reference-typed field, so do not write an `Int` there)
+and that branch's 2026-08-22 `concrete_base` rework. Both sides are plausibly
+right on their own path, the older of the two is what closed a netty stall, and
+the file belongs to WORKER 4. **Resolving it is a semantic call for that lane,
+not a merge this lane should guess**, so it was aborted rather than pushed. The
+dial work reaches that branch with any routine `dev` merge.
+---
+
 ## NOMINATIONS
 
 * **N1 — the native-won recorder has the same one-door defect the dial had.**
