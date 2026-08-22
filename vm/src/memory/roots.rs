@@ -993,9 +993,21 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     if dbg_jit_rootscan() {
         let frames = crate::jit::conservative_roots::active_compiled_frames();
         let labels: Vec<&str> = frames.iter().map(|(_, l, _, _)| l.as_str()).collect();
+        // `osr_reason=` is a CUMULATIVE snapshot (bad_shadow_layout,
+        // debug_disabled, bad_map_coverage, missing_exact_rbp), not a
+        // per-cycle value — this line already runs at a cost only a debug
+        // build accepts, and OSR fallback is checked per JIT-entry-chain
+        // frame, not per collection, so there is no single-cycle count to
+        // report. Read the growth between two lines, or the tail line before
+        // exit. See `conservative_roots::osr_fallback_reason` for what each
+        // bucket means.
+        let (osr_bad_shadow, osr_debug_disabled, osr_bad_map, osr_missing_rbp) =
+            crate::jit::conservative_roots::osr_fallback_reason::snapshot();
         eprintln!(
             "[jitroots] precise_only={precise_only} proven={proven} moving_young={moving_young} \
-             osr_fb={osr_fb} incomplete={incomplete} reason={reason} chain={chain} \
+             osr_fb={osr_fb} osr_reason=(shadow={osr_bad_shadow} debug={osr_debug_disabled} \
+             map_coverage={osr_bad_map} exact_rbp={osr_missing_rbp}) \
+             incomplete={incomplete} reason={reason} chain={chain} \
              any_jit={any_jit} \
              scan_added={added} is_g1={is_g1} ybounds={ybounds} frames={labels:?}",
             precise_only = moving_young_precise_only,

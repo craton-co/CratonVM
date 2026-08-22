@@ -97,8 +97,21 @@ impl LaunchConfig {
 ///
 /// Returns `Err(DeviceError::NoDriver)` on machines without a driver
 /// or when the crate was built without the `cuda` feature.
+/// Shorthand for [`probe_device(0)`](probe_device).
 pub fn probe() -> Result<DeviceCaps> {
-    backend::probe()
+    probe_device(0)
+}
+
+/// Probe a specific device ordinal.
+///
+/// [`probe`] always described device 0, which was fine while its only
+/// caller was `--gpu-info`, but the offload cache needs the compute
+/// capability of the device it is actually going to launch on: that is
+/// what picks the `sm_XX` its kernels are lowered for. Reporting device
+/// 0's capability for a run pinned to `--gpu-device 1` would silently
+/// target the wrong architecture.
+pub fn probe_device(device_ordinal: u32) -> Result<DeviceCaps> {
+    backend::probe_device(device_ordinal)
 }
 
 /// A CUDA context bound to one device. Cheap to clone; the underlying
