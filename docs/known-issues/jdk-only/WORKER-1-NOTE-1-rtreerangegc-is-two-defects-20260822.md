@@ -55,13 +55,22 @@ With a 25% flake in play, control and arm disagree about `RTreeRangeGc` roughly
 would therefore report `REGRESSION` or `REPAIRED` on a large fraction of weekly
 runs, for a vector nobody changed.
 
-**So the baseline is deliberately NOT taken yet, and that is the finding rather
-than an omission.** The workflow's own header explains why this matters: it
-cites `G89-1`, a ratchet that was red in blocking CI for five days and
-"adjudicated nothing", as the reason this job is non-blocking. A gate that cries
-wolf 3 weeks in 8 fails the same way. **A flaky vector has to be quarantined
-before a baseline exists, never after** — after, the noise is indistinguishable
-from the signal the baseline was taken to detect.
+**A flaky vector has to be quarantined before a baseline exists, never after**
+— after, the noise is indistinguishable from the signal the baseline was taken
+to detect. The workflow's own header says why that matters: it cites `G89-1`, a
+ratchet red in blocking CI for five days that "adjudicated nothing", as the
+reason this job is non-blocking. A gate that cries wolf 3 weeks in 8 fails the
+same way.
+
+**RESOLVED 2026-08-22.** `regression-suite/known-flaky.txt` now exists and the
+sweep honours it, so the quarantine came first and the baseline followed the
+same day. `RTreeRangeGc` is excluded from every cell and **reported** rather
+than dropped, with a check that shouts if it ever stops being flaky. MEASURED
+proof that this was the whole problem: two independent sweeps produced
+**identical failing SETS** for all six prefixes while the pass COUNTS moved
+(`HashSet` 105 then 106, `ConcurrentHashMap` 103 then 104) — the movement was
+this vector landing in a different arm each time, and it no longer reaches a
+cell. The baseline re-runs `unchanged` on all six.
 
 ## 4. What this record does NOT claim
 
@@ -77,11 +86,15 @@ from the signal the baseline was taken to detect.
 
 ## NOMINATIONS
 
-* **N1 — the harness has no flaky-quarantine mechanism.** `harness-uncounted.txt`
-  covers check counts, not flakiness. Until one exists, every instrument that
-  baselines a failing SET (this script, and any successor) is one flaky vector
-  away from being ignored. That is the blocking item for the `25-linux`
-  baseline, and it belongs to whoever owns `regression-suite/`.
+* **N1 — DONE 2026-08-22.** `regression-suite/known-flaky.txt` is the shared
+  list, and `scripts/jdk-only-blast-radius.sh` is its first consumer. It
+  deliberately does **not** change `run.sh`'s own pass/fail counting: moving
+  every published denominator to accommodate a flake is the cure being worse
+  than the disease, so instruments opt in. Three guards keep it from becoming a
+  way to make failures disappear — a row needs a measured rate and a record, a
+  consumer must print what it excluded, and a quarantined vector that fails in
+  EVERY arm triggers a loud warning that the quarantine has become a blindfold.
+  A row naming a vector the corpus does not schedule is a hard error.
 * **N2 — diagnose the compatible-mode half.** It is deterministic, which makes
   it the cheap one, and it is what makes `SUITE=all` read one worse than
   `--jdk-only` on every branch measured this week.

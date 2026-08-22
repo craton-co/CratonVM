@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1223;
+const BASELINE_TOTAL_DRIFT: usize = 1221;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1358;
+const BASELINE_TOTAL_PAIRS: usize = 1356;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -1661,13 +1661,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/net/ServerSocket", "getLocalPort", "()I"),
             ("java/net/ServerSocket", "getLocalSocketAddress", "()Ljava/net/SocketAddress;"),
             ("java/net/ServerSocket", "isBound", "()Z"),
-        ],
-    ),
-    (
-        "register_pe2_string_marshaling",
-        &[
-            ("java/lang/foreign/MemorySegment", "getUtf8String", "(J)Ljava/lang/String;"),
-            ("java/lang/foreign/MemorySegment", "reinterpret", "(J)Ljava/lang/foreign/MemorySegment;"),
         ],
     ),
     (
