@@ -159,6 +159,35 @@ why the corpus's `--jdk-only` arm stayed green at 106/107 while `SUITE=all` and
 this week that strict mode does not have, and an argument for the mode rather
 than a cost of it.
 
+> **THE INFERENCE IS CONTESTED, 2026-08-22 (WORKER round, `4730f4acc`).** The
+> MEASUREMENT above stands — the vector is compatible-FAIL / strict-PASS, and
+> that reproduces. What is challenged is the sentence after "therefore".
+>
+> That lane built a 3-walk range-view repro and its arms disagree with the
+> vector's on **two of eight**: it **FAILS under `--jdk-only`**, where the
+> vector passes, and **PASSES on generational**, where the vector fails. If a
+> range-view relocation gap reproduces with the substituted collection natives
+> out of the picture, then either "the substitution layer holds the unrooted
+> reference" is too narrow, or **there are two defects** and the mode arm is
+> separating them rather than locating one.
+>
+> They explicitly decline to call their repro a diagnosis of this vector, which
+> is the right call and the reason to trust the rest: *"a probe reporting its own
+> reach as the defect"* is the error this directory keeps recording. Treat the
+> `--jdk-only` PASS as an observation about the VECTOR, not as a proven
+> localisation, until the two are shown to be the same defect.
+>
+> **They also closed this record's own loose end.** Pristine `origin/dev` was
+> built and is **red 3/3 on the isolated `--Xmx 64m` repro**, with every control
+> in this record reproducing on it. The "dev is already red" claim below is no
+> longer an inference from a table.
+>
+> **And the range views are confirmed, with a control** — one view kind per
+> process, two runs each: `headMap(k)`, `tailMap(k)` and `headMap(k,false)` fail
+> at walk 18, `subMap(k,k)` at walk 3, and **the map itself is clean over 64
+> walks**. So the earlier "start at the range-VIEW machinery" pointer is right,
+> and whole-map iteration is not implicated.
+
 `RTreeRangeGc.checkMap` walks TreeMap/TreeSet range views. This area has prior
 form: `b2e13e441 fix(collections): TreeMap/TreeSet snapshot walks dereferenced
 relocated ObjectRefs` is the same shape — a snapshot walk holding an address
