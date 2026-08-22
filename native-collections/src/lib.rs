@@ -44724,9 +44724,15 @@ fn tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
 /// side-table is the sole authoritative store (see `TmArrayState`).
 fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
     let key = tm_obj_key(ctx, this);
+    // Captured under the same lock that is about to overwrite it, so the
+    // structural-change test below cannot race its own write.
+    let mut size_changed = false;
     {
         let mut tbl = tm_array_table().lock().unwrap();
         let st = tbl.entry(key).or_default();
+        if slot == TM_FIELD_SIZE {
+            size_changed = !matches!(v, Value::Int(n) if n == st.size);
+        }
         match slot {
             TM_FIELD_DATA => {
                 st.data = match v {
@@ -44756,6 +44762,23 @@ fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Val
                     ctx.set_field(this, real, Value::Int(n));
                 }
             }
+        }
+        // `modCount` is the OTHER field real `TreeMap` bytecode reads without
+        // going through a native, and it was pinned at 0 for the life of every
+        // map this VM built. MEASURED, 20 puts + 1 remove: HotSpot 25.0.3+9
+        // reports `modCount=21`, CratonVM reported `modCount=0`.
+        //
+        // A size change is exactly a STRUCTURAL modification, which is exactly
+        // what `TreeMap` bumps `modCount` for — and the correspondence holds in
+        // both directions, which is why this is gated on the size actually
+        // changing rather than on the setter being called: `put` of an EXISTING
+        // key does not change the size and does not bump `modCount` on HotSpot
+        // either, while `put` of a new key, `remove` of a present key and
+        // `clear` of a non-empty map each do both. A redundant same-value write
+        // through this setter must not inflate the count, so the test is on the
+        // value, not on the call.
+        if size_changed {
+            bump_map_mod_count(ctx, this);
         }
     }
     // Mirror the comparator to the real JDK `comparator` field. Real-bytecode
