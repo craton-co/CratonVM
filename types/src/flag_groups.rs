@@ -639,6 +639,7 @@ pub const INVENTORY: &[E] = &[
     // want per-site COUNTS rather than per-site presence.
     E { group: Group::DBG, token: "overlay-nodedup", on_key: Some("CRATONVM_DBG_OVERLAY_NODEDUP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-prune", on_key: Some("CRATONVM_DBG_OVERLAY_PRUNE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "tmview", on_key: Some("CRATONVM_DBG_TMVIEW"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "parklat", on_key: Some("CRATONVM_DBG_PARKLAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pb", on_key: Some("CRATONVM_DBG_PB"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pbe", on_key: Some("CRATONVM_DBG_PBE"), off_key: None, off_word: None },
