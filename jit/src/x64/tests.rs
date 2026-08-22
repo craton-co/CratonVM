@@ -2872,6 +2872,169 @@ fn test_compile_math_min_max_long_intrinsic() {
     assert_eq!(m3, 4, "Math.max(-7L, 4L) must be 4 (was {m3})");
 }
 
+/// `Math.min`/`Math.max` for float and double, at the corners SSE gets
+/// wrong.
+///
+/// The point of this test is not that `min(3, 5) == 3` -- a bare `MINSS`
+/// gets that right. It is the two cases `MINSS` gets WRONG, both of which
+/// are silently invisible to `==`:
+///
+///   * `-0.0` vs `+0.0`. `MINSS` treats them as equal and returns its
+///     second operand, so a naive lowering makes `Math.min` order-dependent
+///     when Java says the answer is `-0.0` either way round. Asserted on
+///     raw bits, since `-0.0 == 0.0` is true.
+///   * NaN. `MINSS` returns the OTHER operand when either input is NaN;
+///     Java returns the NaN one, payload included. Two distinct payloads
+///     are used so "returned some NaN" cannot pass for "returned the right
+///     argument".
+#[test]
+#[allow(deprecated)] // uses MATH_*_INTRINSIC aliases
+fn test_compile_math_min_max_float_double_intrinsic() {
+    // float f(float a, float b) { return Math.min(a, b); }
+    // fload_0 (0x22), fload_1 (0x23), invokestatic (0xb8 0x00 0x01), freturn (0xae)
+    let code_f: Vec<u8> = vec![0x22, 0x23, 0xb8, 0x00, 0x01, 0xae, 0, 0];
+    // double g(double a, double b) { return Math.min(a, b); }
+    // dload_0 (0x26), dload_1 (0x27), invokestatic, dreturn (0xaf). This
+    // JIT keeps every value in one 64-bit slot, so a double is dload_1 and
+    // not dload_2 -- see test_compile_dadd for the same convention.
+    let code_d: Vec<u8> = vec![0x26, 0x27, 0xb8, 0x00, 0x01, 0xaf, 0, 0];
+
+    let build = |code: &[u8], entry: usize, ret: u8| {
+        compile(
+            code,
+            6,
+            2,
+            2,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                2,
+                crate::JitDirectCall {
+                    entry,
+                    needs_context: false,
+                    num_params: 2,
+                    return_type: ret,
+                    guard_class_id: 0,
+                },
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .unwrap()
+    };
+
+    let min_f = build(&code_f, crate::MATH_MIN_FLOAT_INTRINSIC, b'F');
+    let max_f = build(&code_f, crate::MATH_MAX_FLOAT_INTRINSIC, b'F');
+    let min_d = build(&code_d, crate::MATH_MIN_DOUBLE_INTRINSIC, b'D');
+    let max_d = build(&code_d, crate::MATH_MAX_DOUBLE_INTRINSIC, b'D');
+
+    // The JIT value ABI carries floats as raw bits in an integer slot.
+    // Cast: f32 bits -> i64 slot (zero-extended, no truncation).
+    let fbits = |v: f32| v.to_bits() as i64;
+    let dbits = |v: f64| v.to_bits() as i64;
+    let call_f = |m: &crate::CompiledMethod, a: f32, b: f32| -> u32 {
+        // SAFETY: calling JIT-compiled machine code produced by `compile`
+        // above from valid bytecode, in an executable mmap region.
+        let r = unsafe { m.try_call(&[fbits(a), fbits(b)]).expect("test JIT call") };
+        r as u32 // Cast: JIT ABI convention -- low 32 bits are the float
+    };
+    let call_d = |m: &crate::CompiledMethod, a: f64, b: f64| -> u64 {
+        // SAFETY: as above.
+        let r = unsafe { m.try_call(&[dbits(a), dbits(b)]).expect("test JIT call") };
+        r as u64 // Cast: JIT ABI convention
+    };
+
+    // Two distinct NaN payloads.
+    let nan_a = f32::from_bits(0x7FC0_0001);
+    let nan_b = f32::from_bits(0x7FC0_0002);
+    let nan_a_d = f64::from_bits(0x7FF8_0000_0000_0001);
+    let nan_b_d = f64::from_bits(0x7FF8_0000_0000_0002);
+
+    // --- ordinary ordering ---
+    assert_eq!(call_f(&min_f, 3.0, 5.0), 3.0f32.to_bits());
+    assert_eq!(call_f(&min_f, 5.0, 3.0), 3.0f32.to_bits());
+    assert_eq!(call_f(&max_f, 3.0, 5.0), 5.0f32.to_bits());
+    assert_eq!(call_f(&max_f, 5.0, 3.0), 5.0f32.to_bits());
+    assert_eq!(call_f(&min_f, -7.0, 4.0), (-7.0f32).to_bits());
+    assert_eq!(call_f(&max_f, -7.0, 4.0), 4.0f32.to_bits());
+
+    // --- signed zero: -0.0 is strictly smaller than +0.0 ---
+    assert_eq!(
+        call_f(&min_f, 0.0, -0.0),
+        (-0.0f32).to_bits(),
+        "Math.min(+0.0f, -0.0f) must be -0.0f, not +0.0f (bare MINSS returns its second operand)"
+    );
+    assert_eq!(call_f(&min_f, -0.0, 0.0), (-0.0f32).to_bits());
+    assert_eq!(call_f(&min_f, -0.0, -0.0), (-0.0f32).to_bits());
+    assert_eq!(call_f(&min_f, 0.0, 0.0), 0.0f32.to_bits());
+    assert_eq!(
+        call_f(&max_f, 0.0, -0.0),
+        0.0f32.to_bits(),
+        "Math.max(+0.0f, -0.0f) must be +0.0f"
+    );
+    assert_eq!(call_f(&max_f, -0.0, 0.0), 0.0f32.to_bits());
+    assert_eq!(call_f(&max_f, -0.0, -0.0), (-0.0f32).to_bits());
+    // A zero against a non-zero must not take the zero path.
+    assert_eq!(call_f(&min_f, -0.0, 1.0), (-0.0f32).to_bits());
+    assert_eq!(call_f(&min_f, 1.0, -0.0), (-0.0f32).to_bits());
+
+    // --- NaN: the result is the NaN ARGUMENT, payload and all ---
+    assert_eq!(
+        call_f(&min_f, nan_a, 5.0),
+        nan_a.to_bits(),
+        "Math.min(NaN, x) must return the NaN argument with its payload"
+    );
+    assert_eq!(call_f(&min_f, 5.0, nan_b), nan_b.to_bits());
+    assert_eq!(call_f(&max_f, nan_a, 5.0), nan_a.to_bits());
+    assert_eq!(call_f(&max_f, 5.0, nan_b), nan_b.to_bits());
+    // Both NaN: the JDK body tests `a != a` first, so `a` wins.
+    assert_eq!(call_f(&min_f, nan_a, nan_b), nan_a.to_bits());
+    assert_eq!(call_f(&max_f, nan_a, nan_b), nan_a.to_bits());
+
+    // --- infinities ---
+    assert_eq!(
+        call_f(&min_f, f32::NEG_INFINITY, 0.0),
+        f32::NEG_INFINITY.to_bits()
+    );
+    assert_eq!(
+        call_f(&max_f, f32::INFINITY, 0.0),
+        f32::INFINITY.to_bits()
+    );
+    assert_eq!(call_f(&min_f, f32::INFINITY, nan_a), nan_a.to_bits());
+
+    // --- the same grid for double ---
+    assert_eq!(call_d(&min_d, 3.0, 5.0), 3.0f64.to_bits());
+    assert_eq!(call_d(&max_d, 3.0, 5.0), 5.0f64.to_bits());
+    assert_eq!(call_d(&min_d, -7.0, 4.0), (-7.0f64).to_bits());
+    assert_eq!(call_d(&min_d, 0.0, -0.0), (-0.0f64).to_bits());
+    assert_eq!(call_d(&min_d, -0.0, 0.0), (-0.0f64).to_bits());
+    assert_eq!(call_d(&max_d, 0.0, -0.0), 0.0f64.to_bits());
+    assert_eq!(call_d(&max_d, -0.0, 0.0), 0.0f64.to_bits());
+    assert_eq!(call_d(&max_d, -0.0, -0.0), (-0.0f64).to_bits());
+    assert_eq!(call_d(&min_d, nan_a_d, 5.0), nan_a_d.to_bits());
+    assert_eq!(call_d(&min_d, 5.0, nan_b_d), nan_b_d.to_bits());
+    assert_eq!(call_d(&max_d, nan_a_d, 5.0), nan_a_d.to_bits());
+    assert_eq!(call_d(&max_d, 5.0, nan_b_d), nan_b_d.to_bits());
+    assert_eq!(
+        call_d(&min_d, f64::NEG_INFINITY, 0.0),
+        f64::NEG_INFINITY.to_bits()
+    );
+}
+
 #[test]
 fn test_compile_dreturn() {
     // double f(double x) { return x; }

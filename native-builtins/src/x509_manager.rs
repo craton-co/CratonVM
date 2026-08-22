@@ -3419,18 +3419,59 @@ fn ocsp_http_post(
     };
 
     let addr = format!("{host}:{port}");
+    // Every syscall below runs with this thread marked GC-BLOCKED, and that is
+    // not an optimisation — without it this function can hang the whole VM.
+    //
+    // `check_ocsp` is called from certificate validation, i.e. from inside the
+    // TLS handshake, on a thread the collector counts as a cooperative mutator.
+    // A stop-the-world pause that begins while this thread is parked in
+    // `connect`/`write`/`read` then waits for a safepoint the thread cannot
+    // reach until the responder answers — `STW cross-thread JIT takeover is
+    // still waiting for cooperative mutators`, repeating forever. That is
+    // exactly the shape `t27_tls::gc_blocked_syscall` was written for, and this
+    // was the one path still doing raw blocking socket I/O without it.
+    //
+    // DEFENSIVE, and labelled as such: no test in this tree is currently known
+    // to fail because of it. It was added while chasing
+    // `ocsp.TestOcspSoftFailInternalError`, whose log ends on exactly that
+    // warning — but that turned out NOT to be this: the log never reaches an
+    // OCSP fetch at all (`grep -ci ocsp` = 0), and two `/proc` samples 6 s
+    // apart showed `utime` unchanged at 32 with `main-vm` in
+    // `locks_lock_inode_wait`, i.e. blocked on the test fixture's own
+    // `ocsp-responder.lock` flock. That class's real problem is elsewhere; see
+    // `known-issues/tomcat/`.
+    //
+    // What justifies keeping the region anyway is the hazard class, which this
+    // tree has already paid for twice: `t27_tls::gc_blocked_syscall` and
+    // `net_phase_e`'s `re5` note both record a MEASURED, HotSpot-divergent hang
+    // from precisely this shape — a blocking socket call on a thread the
+    // collector still counts as cooperative. `ocsp_http_post` was the last
+    // handshake-reachable path still doing it. The cost is one thread-state
+    // flag per syscall.
+    //
+    // The region goes around the SYSCALL and nowhere wider. `GcBlockingSocket`
+    // puts it there by construction, for the same reason it wraps rustls's
+    // socket rather than rustls's exchange: a GC-blocked thread must not run
+    // bytecode, and the response parsing below allocates.
+    //
     // The host comes from an OCSP responder URL, i.e. text that never passed
     // through `InetAddress` — fold an IPv4-mapped destination to plain IPv4 so
     // Windows can dial it (an AF_INET6 socket cannot reach one). See
     // `outbound_policy::normalize_connect_addr`.
-    let mut stream = cratonvm_native_io::outbound_policy::connect_str_normalized(&addr)
-        .map_err(|e| format!("connect {addr}: {e}"))?;
+    let stream = {
+        let _blocked = crate::t27_tls::gc_blocked_syscall();
+        cratonvm_native_io::outbound_policy::connect_str_normalized(&addr)
+            .map_err(|e| format!("connect {addr}: {e}"))?
+    };
+    // `setsockopt` does not block, so it must NOT open a region — which is what
+    // the wrapper's `get_ref` is for. Set before wrapping, same effect.
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|e| format!("set_write_timeout: {e}"))?;
+    let mut stream = crate::net_phase_e::GcBlockingSocket::new(stream);
 
     let mut req = Vec::with_capacity(256 + request_der.len());
     req.extend_from_slice(format!("POST {path} HTTP/1.1\r\n").as_bytes());

@@ -63,12 +63,12 @@ pub use cuda_bridge::{
 pub fn host_view_i32(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i32> {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "host_view_i32: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Int,
         "host_view_i32: not an int[]"
     );
@@ -116,12 +116,12 @@ pub fn host_view_i32(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
 pub fn host_view_i64(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i64> {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "host_view_i64: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Long,
         "host_view_i64: not a long[]"
     );
@@ -160,12 +160,12 @@ pub fn host_view_i64(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
 pub fn host_view_f32(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<f32> {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "host_view_f32: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Float,
         "host_view_f32: not a float[]"
     );
@@ -204,12 +204,12 @@ pub fn host_view_f32(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
 pub fn host_view_f64(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<f64> {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "host_view_f64: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Double,
         "host_view_f64: not a double[]"
     );
@@ -248,12 +248,12 @@ pub fn host_view_f64(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
 pub fn host_view_i16(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i16> {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "host_view_i16: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Short,
         "host_view_i16: not a short[]"
     );
@@ -306,9 +306,9 @@ pub fn host_view_i16(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
 /// Copy a Java `byte[]` into a packed host `Vec<i8>`.
 pub fn host_view_i8(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i8> {
     let header = heap.get_header(obj);
-    assert_eq!(header.kind, ObjectKind::Array, "host_view_i8: not an array");
+    assert_eq!(header.kind(), ObjectKind::Array, "host_view_i8: not an array");
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Byte,
         "host_view_i8: not a byte[]"
     );
@@ -363,12 +363,12 @@ pub fn host_view_i8(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) 
 pub fn write_back_i32(obj: ObjectRef, heap: &VmHeap, src: &[i32], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "write_back_i32: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Int,
         "write_back_i32: not an int[]"
     );
@@ -410,12 +410,12 @@ pub fn write_back_i32(obj: ObjectRef, heap: &VmHeap, src: &[i32], _token: &Safep
 pub fn write_back_i64(obj: ObjectRef, heap: &VmHeap, src: &[i64], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "write_back_i64: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Long,
         "write_back_i64: not a long[]"
     );
@@ -453,12 +453,12 @@ pub fn write_back_i64(obj: ObjectRef, heap: &VmHeap, src: &[i64], _token: &Safep
 pub fn write_back_f32(obj: ObjectRef, heap: &VmHeap, src: &[f32], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "write_back_f32: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Float,
         "write_back_f32: not a float[]"
     );
@@ -496,12 +496,12 @@ pub fn write_back_f32(obj: ObjectRef, heap: &VmHeap, src: &[f32], _token: &Safep
 pub fn write_back_f64(obj: ObjectRef, heap: &VmHeap, src: &[f64], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "write_back_f64: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Double,
         "write_back_f64: not a double[]"
     );
@@ -545,12 +545,12 @@ pub fn write_back_f64(obj: ObjectRef, heap: &VmHeap, src: &[f64], _token: &Safep
 pub fn write_back_i16(obj: ObjectRef, heap: &VmHeap, src: &[i16], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "write_back_i16: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Short,
         "write_back_i16: not a short[]"
     );
@@ -601,12 +601,12 @@ pub fn write_back_i16(obj: ObjectRef, heap: &VmHeap, src: &[i16], _token: &Safep
 pub fn write_back_i8(obj: ObjectRef, heap: &VmHeap, src: &[i8], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
-        header.kind,
+        header.kind(),
         ObjectKind::Array,
         "write_back_i8: not an array"
     );
     assert_eq!(
-        header.element_type,
+        header.element_type(),
         ArrayElementType::Byte,
         "write_back_i8: not a byte[]"
     );
@@ -701,7 +701,7 @@ fn zerocopy_enabled() -> bool {
 /// skips those helpers, so it must perform the same check itself.
 fn zerocopy_shape_ok(obj: ObjectRef, heap: &VmHeap, expected: ArrayElementType) -> bool {
     let header = heap.get_header(obj);
-    header.kind == ObjectKind::Array && header.element_type == expected
+    header.kind() == ObjectKind::Array && header.element_type() == expected
 }
 
 macro_rules! direct_xfer {
