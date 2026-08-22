@@ -456,7 +456,7 @@ pub fn osr_exception_table_allowed() -> bool {
 }
 
 /// `CRATONVM_JIT_INLINE_CALLS` — allow a call INSIDE a spliced (inlined) body.
-/// **Default: OFF.**
+/// **Default: ON since 2026-08-20; `=0` restores the refusal.**
 ///
 /// Until this existed, `resolve_inline_site_from` rejected any callee
 /// containing an `invoke*`, so inlining reached only call-free leaves. That is
@@ -471,23 +471,46 @@ pub fn osr_exception_table_allowed() -> bool {
 /// pool (`InlineSite::invoke_targets`). It is not a cheaper call; the win is
 /// that the ENCLOSING body becomes inlineable at all.
 ///
-/// Default-OFF because the inline emitter's failure mode is a silent wrong
-/// answer, and because the gate is what makes a bisect possible: one binary,
-/// two arms. Read once and cached.
+/// It shipped default-OFF, on the argument that the inline emitter's failure
+/// mode is a silent wrong answer and that the gate is what makes a bisect
+/// possible. Both halves are still true; what changed is that the arm has now
+/// been measured rather than reasoned about, and a feature nobody runs is worth
+/// nothing:
+///
+/// * `probes/AssertChainProbe`, one binary, interleaved, `assertFull`:
+///   **176.5/166.5 -> 124.4/121.2 ns/iter, -29%/-27%**, with
+///   `inline-nest` + `inline-splice-devirt` (the three move together; each on
+///   its own does nothing, see their own docs). The Azure figure for the same
+///   set was -24%.
+/// * The whole netty `codec-http` suite, 103 classes, same binary, flags off
+///   and on: **identical result sets**, including which three classes miss the
+///   180 s wall.
+/// * `regression-suite/run.sh`, 64 vectors, three arms (default / local
+///   handlers / everything): identical, 63 pass and the one pre-existing
+///   `RImmutableFactoryTypes` failure that is also there on unmodified `dev`.
+///
+/// The bisect lever is unchanged in the other direction: `=0` (also `false`)
+/// restores the refusal, so one binary still has two arms. Read once and
+/// cached.
 #[inline]
 pub fn jit_inline_calls() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
-        matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_CALLS"),
-            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
-        )
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_CALLS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
     })
 }
 
 /// `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` — devirtualise a `invokevirtual` /
 /// `invokeinterface` INSIDE a spliced body, behind a receiver class-id guard.
-/// **Default: OFF.**
+/// **Default: ON since 2026-08-20; `=0` restores the refusal.** The measured
+/// case for the flip is on [`jit_inline_calls`] — the three flags move together
+/// and none of them does anything alone.
 ///
 /// Nesting on its own reaches only statically bound calls, which is why it
 /// recovered the step-4 regression without beating the baseline: the JUnit
@@ -511,10 +534,13 @@ pub fn jit_inline_calls() -> bool {
 pub fn jit_inline_splice_devirt() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
-        matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_SPLICE_DEVIRT"),
-            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
-        )
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_SPLICE_DEVIRT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
     })
 }
 
@@ -568,7 +594,10 @@ pub fn jit_inline_call_dispatch() -> bool {
 }
 
 /// `CRATONVM_JIT_INLINE_NEST` — splice a call that is itself inside a spliced
-/// body, up to `cratonvm_jit::MAX_INLINE_NEST_DEPTH` levels. **Default: OFF.**
+/// body, up to `cratonvm_jit::MAX_INLINE_NEST_DEPTH` levels. **Default: ON
+/// since 2026-08-20; `=0` restores the refusal.** The measured case for the
+/// flip is on [`jit_inline_calls`] — the three flags move together and none of
+/// them does anything alone.
 ///
 /// Requires [`jit_inline_calls`]: nesting resolves its candidates out of
 /// `InlineSite::invoke_targets`, which stays empty with that gate off. Kept
@@ -585,10 +614,13 @@ pub fn jit_inline_call_dispatch() -> bool {
 pub fn jit_inline_nest() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
-        matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_NEST"),
-            Ok(ref v) if v != "0" && !v.eq_ignore_ascii_case("false")
-        )
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_NEST") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
     })
 }
 
@@ -691,6 +723,25 @@ impl EnforceShadowScope {
             // nothing while reading as armed. Say so here rather than letting a
             // typo produce a silently-inert run that looks like a green result.
             EnforceShadowScope::Prefixes(p) => p.is_empty(),
+        }
+    }
+
+    /// How this scope should be spelled in `--jdk-only-report`.
+    ///
+    /// An armed report and an unarmed one were byte-identical in every field a
+    /// reader could use to tell them apart, which is how four records came to
+    /// quote armed cells beside unarmed ones. The dial changes what the whole
+    /// census MEANS -- under `enforce` the bridge does not run, so the
+    /// `bridge-ran-over-bytecode` half of `violations[]` is empty by
+    /// construction rather than for want of shadows -- so the report has to say
+    /// which one it is. `"off"` is written out rather than omitted for the same
+    /// reason `observation_sink` is written in `Compatible`: an absent field is
+    /// ambiguous between "unarmed" and "this binary cannot answer".
+    pub fn report_spelling(&self) -> String {
+        match self {
+            EnforceShadowScope::Off => "off".to_string(),
+            EnforceShadowScope::All => "all".to_string(),
+            EnforceShadowScope::Prefixes(p) => p.join(","),
         }
     }
 

@@ -107,6 +107,71 @@ pub(super) fn remember_vtable_native_shadow(
     }
 }
 
+/// Would a native registered for this triple ACTUALLY run, or is it one the
+/// arbitration always yields to the real JDK body?
+///
+/// # Why the fast paths cannot just ask `find(..).is_some()`
+///
+/// [`execute_invokevirtual_vtable_fast`] bails to the slow, fully name-keyed
+/// dispatch route the moment ANY native is registered for the triple, and
+/// remembers that verdict in `thread.native_shadow_cache` — so the bail is
+/// permanent for that call site. But a `SyntheticStub` on a
+/// [`real_protected_stub_class`] whose real bytecode is loaded LOSES the
+/// arbitration at every dispatch site
+/// ([`synthetic_stub_yields_with_cm`]). The call site therefore paid for the
+/// slow route and got exactly the bytecode a cached entry would have given it.
+///
+/// `populate_virtual_invoke_cache` already asks this question before publishing
+/// a `VirtualNative` target — it "publishes nothing" and falls through to the
+/// bytecode target. That fix could never take effect, because the fast path
+/// above it returned `CacheMiss` before population was ever reached.
+///
+/// MEASURED 2026-08-22 on `perf/webclient-reactive-20260821`, 200k-iteration
+/// loops, HotSpot 25 control in brackets:
+///
+/// | call | CratonVM | HotSpot |
+/// |---|---:|---:|
+/// | `Instant.getNano()` (native, always yielded) | 1627 ns | 2.3 ns |
+/// | `Instant.compareTo()` (same class, no native) | 39 ns | 2.9 ns |
+/// | `ReentrantLock.lock()`+`unlock()` | 1760 ns | 11.9 ns |
+/// | `AtomicBoolean.compareAndSet()` | 4325 ns | 5.5 ns |
+/// | `LinkedBlockingDeque.peek()` | 1820 ns | 11.3 ns |
+/// | `StringJoiner.length()` | 2924 ns | 5.2 ns |
+/// | `Duration.getSeconds()` (control, no native) | 24 ns | 2.3 ns |
+///
+/// The 40-70x spread between two methods of the SAME class is the lost inline
+/// cache entry and nothing else. `java.time.Instant.now()` alone runs 1_240_308
+/// times in one `WebClientIntegrationTests` run.
+///
+/// Returning `true` reproduces the previous behaviour exactly for every triple
+/// that is not a yielded stub, so nothing outside the twelve-class allow-list
+/// changes.
+fn registered_native_actually_shadows(
+    shared: &SharedVm,
+    cm: &crate::classloading::ClassManager,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    // Same ordering as `synthetic_stub_kind_should_yield_to_real_bytecode`:
+    // both cheap terms short-circuit before anything touches the class store.
+    // Spelled out here rather than delegating to the shared
+    // `registered_native_will_run`, because this site runs UNDER the
+    // class-manager read guard the caller already holds and that sibling takes
+    // its own `read()` - a nested read is the writer-starvation trap
+    // `synthetic_stub_yields_with_cm` was split out to avoid.
+    let kind = shared
+        .natives
+        .native_methods
+        .kind_of(class_name, method_name, descriptor);
+    if kind != Some(cratonvm_native_api::NativeKind::SyntheticStub)
+        || !real_protected_stub_class(class_name)
+    {
+        return true;
+    }
+    !synthetic_stub_yields_with_cm(cm, class_name, method_name, descriptor)
+}
+
 #[inline]
 pub(super) fn execute_invokevirtual_vtable_fast(
     shared: &SharedVm,
@@ -578,7 +643,18 @@ pub(super) fn execute_invokevirtual_vtable_fast(
                         .natives
                         .native_methods
                         .find(rcv_name, &method_name, &method_descriptor)
-                        .is_some();
+                        .is_some()
+                    // A stub-tagged native on an allow-listed class never runs
+                    // while the real body is loaded, so it is not a shadow and
+                    // bailing this call site to the slow path forever buys
+                    // nothing — see `registered_native_actually_shadows`.
+                    && registered_native_actually_shadows(
+                        shared,
+                        &cm,
+                        rcv_name,
+                        &method_name,
+                        &method_descriptor,
+                    );
                 if direct_native_shadow {
                     remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
                     if &**rcv_name == "java/lang/invoke/ConstantCallSite"
@@ -660,7 +736,18 @@ pub(super) fn execute_invokevirtual_vtable_fast(
                                     .natives
                                     .native_methods
                                     .find(&parent.name, &method_name, &method_descriptor)
-                                    .is_some();
+                                    .is_some()
+                                // Same yielded-stub exclusion as the
+                                // receiver's-own-class probe above: an
+                                // inherited stub that loses the arbitration is
+                                // not a shadow either.
+                                && registered_native_actually_shadows(
+                                    shared,
+                                    &cm,
+                                    &parent.name,
+                                    &method_name,
+                                    &method_descriptor,
+                                );
                             if has_native {
                                 remember_vtable_native_shadow(
                                     thread,

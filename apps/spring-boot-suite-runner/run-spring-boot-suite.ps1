@@ -903,6 +903,11 @@ function Get-EffectiveClassTimeoutSec {
     # CPU-heavy under CratonVM. Run to natural completion in 470.1s
     # (`Test run finished after 470134 ms`, 76/78 passed). Keep headroom
     # above that observed time instead of reporting a false HANG.
+    # STALE since the fixture renamed this module: the class is now
+    # `module/spring-boot-rabbitmq|org.springframework.boot.rabbitmq.autoconfigure.RabbitAutoConfigurationTests`,
+    # so this key has matched nothing and the 900s budget was never applied to
+    # the class it was written for. Kept in case an older fixture checkout is
+    # used; the live key is in .suite/class-timeouts.tsv.
     'module/spring-boot-amqp|org.springframework.boot.amqp.autoconfigure.RabbitAutoConfigurationTests' = 900
     # JACKSON-BUDGET.1 (2026-08-05): this class has been reported as a HANG at
     # the standard 300s shard timeout in every full-suite run that did not
@@ -987,6 +992,25 @@ function Get-EffectiveClassTimeoutSec {
     # suite has always seen it flip between HANG and PASS. See
     # fixed-suite-bugs/springboot/pulsarautoconfigurationtests-onbeancondition-multivaluemap-classcastexception-flake-FIXED-20260811.md.
     'module/spring-boot-pulsar|org.springframework.boot.pulsar.autoconfigure.PulsarAutoConfigurationTests' = 900
+  }
+  # The same budgets, in a form the Linux shard driver can read too
+  # (`linux-oracles/run-sb-gc-shard.sh`). The ad-hoc copy of that driver which
+  # ran the 2026-08-19 three-collector sweep re-implemented the launch and
+  # dropped this table entirely, so every class above the 300-second default
+  # came back HANG -- eight of the nine HANG rows in the 2026-08-21 re-run,
+  # all of which pass with test counts identical to HotSpot once given the
+  # budget already recorded here. One table, two readers, so that cannot
+  # recur. The file wins where both define a key; the inline table above
+  # remains the fallback, so a missing file changes nothing.
+  $timeoutsFile = Join-Path $PSScriptRoot '.suite/class-timeouts.tsv'
+  if (Test-Path -LiteralPath $timeoutsFile) {
+    foreach ($row in @(Import-Csv -LiteralPath $timeoutsFile -Delimiter "`t")) {
+      if (-not $row.module -or -not $row.class) { continue }
+      $seconds = 0
+      if ([int]::TryParse([string]$row.seconds, [ref]$seconds) -and $seconds -gt 0) {
+        $slowClasses["$($row.module)|$($row.class)"] = $seconds
+      }
+    }
   }
   $key = "$($ClassRow.module)|$($ClassRow.class)"
   if ($slowClasses.ContainsKey($key)) {

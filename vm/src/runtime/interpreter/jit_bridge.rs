@@ -197,12 +197,16 @@ pub(super) fn compile_osr_artifact(
     // S111r15 — same native-shadow guard as the other JIT entry points
     // (`try_jit_compile_callee`, `try_jit_upgrade_with_gate`, first-call
     // compile path). OSR must respect the native registration too.
-    if shared
-        .natives
-        .native_methods
-        .find(class_name_check, method_name_check, &method_descriptor)
-        .is_some()
-    {
+    // `registered_native_will_run`, not `find(..).is_some()`: a stub-tagged
+    // native on an allow-listed class never runs while the real body is loaded,
+    // so refusing to compile that body is refusing to compile the code that
+    // actually executes. See the predicate's doc for the measurements.
+    if registered_native_will_run(
+        shared,
+        class_name_check,
+        method_name_check,
+        &method_descriptor,
+    ) {
         return None;
     }
 
@@ -1070,6 +1074,33 @@ pub(super) fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // `Long.valueOf(J)` — the twin of the `Integer.valueOf(I)`
+                    // recognition directly above, at this door for the same
+                    // stated reason: an OSR body is where a hot boxing loop
+                    // actually runs. `num_params: 1`, not 2 — the JIT counts one
+                    // operand slot per PARAMETER, not JVMS category-2 pairs.
+                    if invoke_kind == 3
+                        && cratonvm_jit::long_box_direct_helpers_enabled()
+                        && target_class == "java/lang/Long"
+                        && mn == "valueOf"
+                        && desc == "(J)Ljava/lang/Long;"
+                    {
+                        let entry =
+                            crate::jit::helpers::jit_long_value_of_direct as *const () as usize;
+                        cratonvm_jit::LONG_VALUE_OF_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
                     // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
                     // `AtomicInteger` read-modify-write family, through the
                     // SAME matcher `jit::try_compile_inner` uses so the two
@@ -1144,6 +1175,81 @@ pub(super) fn compile_osr_artifact(
                             },
                         ));
                         continue;
+                    }
+                    // `Long.longValue()` — the twin of `Integer.intValue()`
+                    // directly above. `java/lang/Long` is `final` on the same
+                    // terms, so a site declared against it is statically
+                    // monomorphic and needs no receiver guard; the helper
+                    // handles the null-receiver NPE and declines anything that
+                    // fails heap validation to the generic dispatcher.
+                    if invoke_kind == 0
+                        && cratonvm_jit::long_box_direct_helpers_enabled()
+                        && target_class == "java/lang/Long"
+                        && mn == "longValue"
+                        && desc == "()J"
+                    {
+                        let entry =
+                            crate::jit::helpers::jit_long_long_value_direct as *const () as usize;
+                        cratonvm_jit::LONG_LONG_VALUE_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        direct_calls2.push((
+                            pc,
+                            crate::jit::JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                return_type: b'J',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                    // `VarHandle` read modes on an instance field with a
+                    // primitive return — parity with `jit::try_compile`'s
+                    // recognition (see `cratonvm_jit::VARHANDLE_READ_DIRECT_FNS`).
+                    //
+                    // THIS is the load-bearing door for the workload that
+                    // motivates the bind. netty checks `refCnt` on every
+                    // buffer accessor, so the reads happen inside the
+                    // byte-transfer LOOPS of `SnappyFrameDecoder` and
+                    // `ByteToMessageDecoder`, and a loop body is what OSR
+                    // compiles. A single-pass-only bind would report sites and
+                    // move nothing.
+                    //
+                    // Unlike its neighbours here this one asks the policy
+                    // question, because the answer is not the same for every
+                    // bind: the four read modes are registered
+                    // `NativeKind::Bridge`, which JDK-ONLY-WAVE2 §1.4 does not
+                    // permit a compile-time bake of. `dispatch_policy` is the
+                    // same source `jit::try_compile`'s `jdk_only` argument comes
+                    // from, so both doors refuse together.
+                    if invoke_kind == 0
+                        && cratonvm_jit::varhandle_read_direct_helpers_enabled()
+                        && target_class == "java/lang/invoke/VarHandle"
+                        && !crate::vm::dispatch_policy(shared).is_jdk_only()
+                    {
+                        if let Some(slot) = cratonvm_jit::varhandle_read_helper_slot(&mn, &desc) {
+                            // The helper address is taken directly rather than
+                            // read out of the jit-crate cell, for the
+                            // registration-order reason spelled out on the
+                            // `Integer.valueOf` recognition above: this path can
+                            // run before `build_helpers` has published them.
+                            let entry = crate::jit::helpers::varhandle_read_direct_fn(slot);
+                            cratonvm_jit::VARHANDLE_READ_SITES_OSR
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: cratonvm_jit::VARHANDLE_READ_RETURNS
+                                        [slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len()],
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
                     }
                     // Exact-HashMap `put`/`get` thin direct calls — parity
                     // with `jit::try_compile`'s recognition (guard-free: the
@@ -1619,7 +1725,7 @@ pub(super) fn compile_osr_artifact(
             // string constant (StringRegexOnly.run: `Pattern.compile("(\\d+)")`)
             // then interpreted its entire workload.
             let mut ldc_info2: Vec<(usize, i64)> = Vec::new();
-            let mut ldc_string_info2: Vec<(usize, *const u8, usize)> = Vec::new();
+            let mut ldc_string_info2: Vec<(usize, u32, u16)> = Vec::new();
             // Class-`ldc` sites, served at run time by `helpers.ldc_class_cp`.
             // Before this an OSR artifact refused any method containing one.
             let mut ldc_class_info2: Vec<(usize, u32, u16)> = Vec::new();
@@ -1642,13 +1748,13 @@ pub(super) fn compile_osr_artifact(
                         Some(ConstantPoolEntry::StringReference { string_index })
                             if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
                         {
+                            // The SITE, for the reason the `try_compile`
+                            // resolver records one: the recorded resolution is
+                            // keyed `(class, cp index)`. `get_utf8` is only the
+                            // representability test.
                             match class.constant_pool.get_utf8(*string_index) {
-                                Some(s) => {
-                                    let boxed: Box<str> = s.to_string().into_boxed_str();
-                                    let ptr = boxed.as_ptr();
-                                    let len = boxed.len();
-                                    owned_jit_strings2.push(boxed);
-                                    ldc_string_info2.push((pc, ptr, len));
+                                Some(_) => {
+                                    ldc_string_info2.push((pc, class_id.as_u32(), cp_idx));
                                     continue;
                                 }
                                 None => return None,
@@ -1940,6 +2046,51 @@ pub(super) fn compile_osr_artifact(
                     })
                     .collect(),
             );
+            // ── Compiled local exception handlers, OSR tier ─────────────────
+            //
+            // The same table a fourth time, with catch TYPES, so this artifact
+            // can run its own `catch` blocks instead of leaving compiled code
+            // for every one of them.
+            //
+            // This door matters MORE than the method-entry one, not less: a
+            // `@Test` body is invoked once, so OSR is its only route out of the
+            // interpreter, and `HttpHeaderValidationUtilTest`'s two exhaustive
+            // loops — the class this feature was written for — are exactly that
+            // shape. Staging it only in `jit::try_compile` would have left the
+            // feature structurally inert on the population it exists for.
+            //
+            // Staged only when every catch type resolves: a partial table would
+            // make a site answer "propagate" where the real table has a match —
+            // a slower answer arrived at by a lie.
+            if cratonvm_jit::local_handlers_enabled() && !osr_exception_table.is_empty() {
+                let cm_lock = shared.classes.class_manager.read();
+                let table = cm_lock.get_class(class_id).and_then(|class| {
+                    let mut rows: Vec<(usize, usize, usize, &'static str)> =
+                        Vec::with_capacity(osr_exception_table.len());
+                    for e in osr_exception_table.iter() {
+                        let name: &'static str = if e.catch_type == 0 {
+                            ""
+                        } else {
+                            match class.constant_pool.get_class_name(e.catch_type) {
+                                Some(n) => cratonvm_jit::intern_catch_type_name(n),
+                                None => return None,
+                            }
+                        };
+                        rows.push((
+                            // Widening: classfile pcs are u16.
+                            e.start_pc as usize,
+                            e.end_pc as usize,
+                            e.handler_pc as usize,
+                            name,
+                        ));
+                    }
+                    Some(rows)
+                });
+                drop(cm_lock);
+                if let Some(table) = table {
+                    crate::jit::x64::set_pending_local_handler_table(table, class_id.as_u32());
+                }
+            }
             // This artifact's install epoch was stamped by the `compile_gate`
             // admission at the top of this closure — before the class loading
             // and constant-pool resolution above, not here. A witness opened at
@@ -3137,6 +3288,7 @@ fn elidable_ctor_native_would_run(shared: &SharedVm, class_name: &str) -> bool {
         .native_methods
         .find_with_kind(class_name, "<init>", "()V");
     crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::DispatchDoor::ElidableCtor,
         crate::vm::dispatch_policy(shared),
         class_name,
         "<init>",
@@ -3377,18 +3529,14 @@ pub(super) fn jit_invoke_targets_native_shadow(
     // decision. Treat forced real-JDK overrides exactly like registered
     // native shadows, so a caller of Class's Signature bridge cannot enter
     // the incompatible JDK bytecode body.
+    // Both arms ask `registered_native_will_run` rather than
+    // `find(..).is_some()`: a native the arbitration always yields is not a
+    // shadow, and sealing the caller for it costs tier-up while protecting
+    // nothing. Every other triple answers exactly as before.
     let direct = force_native_over_real_jdk_bytecode(&target_class, &method_name, &descriptor)
-        || shared
-            .natives
-            .native_methods
-            .find(&target_class, &method_name, &descriptor)
-            .is_some();
+        || registered_native_will_run(shared, &target_class, &method_name, &descriptor);
     let inherited = declaring_class.as_ref().is_some_and(|declaring_class| {
-        shared
-            .natives
-            .native_methods
-            .find(declaring_class, &method_name, &descriptor)
-            .is_some()
+        registered_native_will_run(shared, declaring_class, &method_name, &descriptor)
     });
     // Interface-dispatch blind spot: for `invokeinterface`, `declaring_class`
     // above is resolved by walking UP FROM THE INTERFACE (`find_method_recursive`
@@ -3756,16 +3904,12 @@ pub(super) fn try_jit_upgrade_with_gate(
     // `Object.equals`. A bytecode override that merely has an identity native
     // somewhere up its ancestor chain is allowed to compile.
     {
-        if shared
-            .natives
-            .native_methods
-            .find(
-                &cached.class_name,
-                &cached.method_name,
-                &cached.method_descriptor,
-            )
-            .is_some()
-        {
+        if registered_native_will_run(
+            shared,
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+        ) {
             if crate::runtime::env_cache::dbg_bblp()
                 && cached.class_name.contains("LazyProjection")
                 && &*cached.method_name == "equals"
@@ -4149,10 +4293,18 @@ pub(super) fn try_jit_upgrade_with_gate(
             ConstantPoolEntry::StringReference { string_index }
                 if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
             {
+                // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
+                // `(class, cp index)`. `get_utf8` is only the representability
+                // test the `get_utf8_wide` guard above pairs with -- a
+                // lone-surrogate literal cannot be pooled on a Rust `String`
+                // and stays uncompilable, exactly as before.
                 class
                     .constant_pool
                     .get_utf8(*string_index)
-                    .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+                    .map(|_| cratonvm_jit::JitLdcConstant::String {
+                        holder_class_id: class_id.as_u32(),
+                        cp_idx,
+                    })
             }
             // `ldc <Class>`: the mirror is a heap object and the target class
             // may not be loaded yet, so report the SITE — referencing class id
@@ -4616,10 +4768,18 @@ pub(super) fn try_jit_upgrade_with_gate(
                     ConstantPoolEntry::StringReference { string_index }
                         if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
                     {
+                        // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
+                        // `(class, cp index)`. `get_utf8` is only the representability
+                        // test the `get_utf8_wide` guard above pairs with -- a
+                        // lone-surrogate literal cannot be pooled on a Rust `String`
+                        // and stays uncompilable, exactly as before.
                         class
                             .constant_pool
                             .get_utf8(*string_index)
-                            .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+                            .map(|_| cratonvm_jit::JitLdcConstant::String {
+                                holder_class_id: class_id.as_u32(),
+                                cp_idx,
+                            })
                     }
                     // `ldc <Class>` — see the matching arm in the enclosing
                     // method's resolver.
@@ -5542,12 +5702,7 @@ pub(super) fn try_jit_compile_callee_slow(
     // ATNConfig/DFAState `hashCode` are ~58% of the Groovy-parse profile) never
     // compiled, ~100x slower than HotSpot (Spring Boot buildSrc
     // `SpringRepositoriesExtensionTests` hang).
-    if shared
-        .natives
-        .native_methods
-        .find(class_name, method_name, descriptor)
-        .is_some()
-    {
+    if registered_native_will_run(shared, class_name, method_name, descriptor) {
         return None;
     }
     // Look up the method bytecode
@@ -5963,10 +6118,18 @@ pub(super) fn try_jit_compile_callee_slow(
             ConstantPoolEntry::StringReference { string_index }
                 if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
             {
+                // The SITE, not the text: the record JVMS 5.4.3 keeps is keyed
+                // `(class, cp index)`. `get_utf8` is only the representability
+                // test the `get_utf8_wide` guard above pairs with -- a
+                // lone-surrogate literal cannot be pooled on a Rust `String`
+                // and stays uncompilable, exactly as before.
                 class
                     .constant_pool
                     .get_utf8(*string_index)
-                    .map(|s| cratonvm_jit::JitLdcConstant::String(s.to_string()))
+                    .map(|_| cratonvm_jit::JitLdcConstant::String {
+                        holder_class_id: cid.as_u32(),
+                        cp_idx,
+                    })
             }
             // `ldc <Class>`: the mirror is a heap object and the target class
             // may not be loaded yet, so report the SITE — referencing class id

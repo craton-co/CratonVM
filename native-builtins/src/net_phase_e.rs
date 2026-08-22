@@ -3254,7 +3254,30 @@ pub(crate) fn uri_percent_decode_units(input: &[u16]) -> Vec<u16> {
 ///
 /// A `?` that appears AFTER the `#` belongs to the fragment, not to a query —
 /// the same precedence the text splitter applies.
+///
+/// An OPAQUE URI has NO query at all: its whole scheme-specific part is one
+/// undivided string in which `?` is an ordinary character, and only the
+/// fragment is split off it (`java.net.URI`'s `parse`/`parseHierarchical`
+/// split — `Parser.parse` only calls `parseHierarchical` when the SSP begins
+/// with `/`). `mailto:user@example.com?subject=hello` therefore has
+/// `getRawQuery() == null` and a scheme-specific part of
+/// `user@example.com?subject=hello`, which is exactly what Spring's
+/// `WebClientUtils.getRequestDescription` leans on — its
+/// `rawUserInfo == null && rawQuery == null && rawFragment == null` test is
+/// commented "also handles Opaque URI, which has only schemeSpecificPart".
+/// Answering `subject=hello` here sent it down the hierarchical rebuild, which
+/// has no path or host to append and produced `GET mailto:`
+/// (`WebClientUtilsTests.opaqueUriUnchanged`; `probes/OpaqueUriProbe.java`
+/// rows O01/O04/O09/O11/C01/C03).
+///
+/// Opacity is asked of [`uri_select_raw_path_units`] rather than spelled a
+/// second time here: "the path is null" IS the JDK's definition of an opaque
+/// URI, so the two can never drift apart. The `getQuery`/`getRawQuery`
+/// registrations already CLAIMED to handle this ("Opaque URIs keep a literal
+/// `?` inside the scheme-specific part"); they lost it when they moved off
+/// `uri_split` onto this splitter.
 pub(crate) fn uri_query_units(raw: &[u16]) -> Option<Vec<u16>> {
+    uri_select_raw_path_units(raw)?;
     let hash = u_find(raw, b'#');
     let q = u_find(raw, b'?').filter(|&qi| hash.is_none_or(|h| qi < h))?;
     let rest = &raw[q + 1..];
@@ -3313,6 +3336,17 @@ pub(crate) fn uri_select_raw_path_units(raw: &[u16]) -> Option<Vec<u16>> {
     };
     let end = u_find_any(after_auth, b"?#").unwrap_or(after_auth.len());
     Some(after_auth[..end].to_vec())
+}
+
+/// Is this URI text OPAQUE — absolute, with a scheme-specific part that does
+/// not begin with `/`?
+///
+/// Defined as "the path is null", which is how `java.net.URI` itself draws the
+/// line, so this can never disagree with [`uri_select_raw_path_units`].
+/// The empty string is a relative reference, not an opaque URI.
+pub(crate) fn uri_text_is_opaque(raw: &str) -> bool {
+    let units: Vec<u16> = raw.encode_utf16().collect();
+    uri_select_raw_path_units(&units).is_none()
 }
 
 /// Byte index of the scheme-terminating `:`, or `None` for a relative
@@ -3376,20 +3410,21 @@ fn uri_raw_scheme_specific_part_units(raw: &[u16]) -> Vec<u16> {
 
 /// RFC 3986 §5.3 path-merge: combine a base hierarchical path with a
 /// relative reference path.
-fn uri_merge_paths(base_path: &str, ref_path: &str, base_has_authority: bool) -> String {
-    if base_has_authority && base_path.is_empty() {
-        let mut s = String::from("/");
-        s.push_str(ref_path);
-        s
-    } else {
-        match base_path.rfind('/') {
-            Some(i) => {
-                let mut s = base_path[..=i].to_string();
-                s.push_str(ref_path);
-                s
-            }
-            None => ref_path.to_string(),
+fn uri_merge_paths(base_path: &str, ref_path: &str) -> String {
+    // `java.net.URI.resolvePath`, which is simply "everything up to and
+    // including the base's last `/`, then the child" — with NO special case for
+    // an authority-bearing base whose path is empty. That case used to
+    // fabricate a leading `/` here, so `URI.create("https://h").resolve("")`
+    // answered `https://h/` where HotSpot answers `https://h`
+    // (`probes/OpaqueUriProbe.java` S17: the JDK's `i >= 0` guard simply
+    // declines to prepend anything when there is no `/` to cut at).
+    match base_path.rfind('/') {
+        Some(i) => {
+            let mut s = base_path[..=i].to_string();
+            s.push_str(ref_path);
+            s
         }
+        None => ref_path.to_string(),
     }
 }
 
@@ -3427,7 +3462,26 @@ fn uri_remove_dot_segments_units(path: &[u16]) -> Result<Vec<u16>, MethodCallFai
             continue;
         }
         if is_dotdot(seg) {
-            out.pop();
+            // `java.net.URI.normalize` does NOT clamp at the root, and RFC 3986's
+            // `remove_dot_segments` does — this used to do the latter. A `..`
+            // with nothing to pop, or with another `..` already on top, is KEPT.
+            // MEASURED on HotSpot 25 (`probes/OpaqueUriProbe.java`):
+            //
+            //   /a/../../x     -> /../x        (N02)      not  /x
+            //   a/../../b      -> ../b         (N04)      not  b
+            //   a/b/../../../c -> ../c         (N10)      not  c
+            //
+            // The JDK's own `removeDots` says so in a comment — "DEVIATION:
+            // RFC2396 says .. can be removed even if it is at the start" — and
+            // then declines to. `resolve` inherits the rule through this
+            // function, which is why `https://h/a/b` resolve `../../x` is
+            // `https://h/../x` (S27).
+            match out.last() {
+                Some(prev) if !is_dotdot(prev) => {
+                    out.pop();
+                }
+                _ => out.push(seg),
+            }
             continue;
         }
         out.push(seg);
@@ -3821,36 +3875,64 @@ fn uri_host_is_valid(host: &str) -> bool {
 
 /// RFC 3986 §5.2 — resolve a reference against a base URI string.
 fn uri_resolve_ref(base: &str, reference: &str) -> Result<String, MethodCallFailed> {
-    if reference.is_empty() {
-        return Ok(base.to_string());
+    // `URI.resolve`'s very first act: "if (child.isOpaque() || base.isOpaque())
+    // return child" — verbatim, and BEFORE the empty-reference shortcut, since
+    // RFC 3986 §5 reference resolution is defined only over hierarchical URIs.
+    // An opaque base has no path to merge against, so nothing of it survives
+    // into the result. Measured: `URI.create("mailto:a@b").resolve("c@d")` is
+    // `c@d` on HotSpot and was `mailto:c@d` here
+    // (`probes/OpaqueUriProbe.java` row R01).
+    //
+    // Note the JDK returns the child UNNORMALIZED in this arm — it is the
+    // argument object itself, not a rebuild — so this returns the reference
+    // text verbatim rather than routing it through `uri_remove_dot_segments`.
+    if uri_text_is_opaque(reference) || uri_text_is_opaque(base) {
+        return Ok(reference.to_string());
     }
     let (r_scheme, r_auth, r_path, r_query, r_frag) = uri_split(reference);
-    // Reference has a scheme → it is absolute, return as-is (normalized).
+    // 5.2 (3) — a reference that carries its own scheme IS the result. The JDK
+    // returns the argument OBJECT here, so it is NOT normalized: measured,
+    // `https://h/a/b` resolve `https://x/p/../q` is `https://x/p/../q`, dot
+    // segments and all (`probes/OpaqueUriProbe.java` S11/S12, and R15 — the
+    // row this arm used to get wrong by rebuilding through
+    // `uri_remove_dot_segments`).
     if r_scheme.is_some() {
-        let path = uri_remove_dot_segments(&r_path)?;
-        return Ok(uri_recompose(&r_scheme, &r_auth, &path, &r_query, &r_frag));
+        return Ok(reference.to_string());
     }
     let (b_scheme, b_auth, b_path, b_query, _b_frag) = uri_split(base);
-    let (t_auth, t_path, t_query);
+    // 5.2 (2) — "reference to the current document": a LONE fragment, and only
+    // that. The base's path AND query both survive it, which is what separates
+    // it from every other empty-path reference. `?q=2` does not qualify (its
+    // query is non-null) and neither does the empty string (no fragment), and
+    // both of those take the 6a directory step below instead — S02 against
+    // S01/S03.
+    if r_auth.is_none() && r_path.is_empty() && r_frag.is_some() && r_query.is_none() {
+        return Ok(uri_recompose(&b_scheme, &b_auth, &b_path, &b_query, &r_frag));
+    }
+    // Every remaining arm takes the CHILD's query and fragment, never the
+    // base's — `ru.query = child.query` sits above the authority branch in the
+    // JDK. That is why `https://h/a/b?q=1` resolve `<empty>` loses `q=1`.
+    let (t_auth, t_path);
     if r_auth.is_some() {
+        // 5.2 (4) — the reference's authority wins and its path is taken
+        // VERBATIM. Measured: `//other/p/../q` keeps its dot segments (S10).
         t_auth = r_auth;
-        t_path = uri_remove_dot_segments(&r_path);
-        t_query = r_query;
-    } else if r_path.is_empty() {
-        t_auth = b_auth.clone();
-        t_path = Ok(b_path.clone());
-        t_query = r_query.or(b_query);
+        t_path = Ok(r_path.clone());
     } else {
         t_auth = b_auth.clone();
         if r_path.starts_with('/') {
-            t_path = uri_remove_dot_segments(&r_path);
+            // 5.2 (5) — an absolute reference path is verbatim too (S25/S26).
+            t_path = Ok(r_path.clone());
         } else {
-            let merged = uri_merge_paths(&b_path, &r_path, b_auth.is_some());
+            // 5.2 (6) — merge against the base's DIRECTORY, then normalize.
+            // An EMPTY reference path lands here as well, which is the whole
+            // of R13: `https://h/a/b?q=1` resolve `<empty>` is `https://h/a/`,
+            // not the base.
+            let merged = uri_merge_paths(&b_path, &r_path);
             t_path = uri_remove_dot_segments(&merged);
         }
-        t_query = r_query;
     }
-    Ok(uri_recompose(&b_scheme, &t_auth, &t_path?, &t_query, &r_frag))
+    Ok(uri_recompose(&b_scheme, &t_auth, &t_path?, &r_query, &r_frag))
 }
 
 /// RFC 3986 §5.3 — recompose component parts into a URI string.
@@ -4464,24 +4546,34 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // isAbsolute() → true if scheme is non-null
+    // isAbsolute() → true if scheme is non-null.
+    //
+    // "Has a colon somewhere" is NOT that test: a colon inside a relative
+    // reference's first path segment is an ordinary character, which is why
+    // `uri_scheme_colon` also demands an ALPHA start and an alphanumeric/`+-.`
+    // body before the colon. MEASURED on HotSpot 25:
+    // `URI.create("/redirect:account?q=1")` is neither absolute nor opaque,
+    // and both answered `true` here (`probes/OpaqueUriProbe.java` row H11) —
+    // the same relative-path-with-colon shape `uri_scheme_colon` was written
+    // for when it was added for Spring's redirect view names.
     r.register(uri, "isAbsolute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
-        let is_abs = raw.contains(':');
+        let is_abs = uri_scheme_colon(&raw).is_some();
         Ok(Some(Value::Int(if is_abs { 1 } else { 0 })))
     });
 
-    // isOpaque() → true if scheme-specific-part doesn't start with '/'
+    // isOpaque() → absolute, with a scheme-specific part that does not start
+    // with '/'. Delegated to `uri_text_is_opaque` so this can never disagree
+    // with the null-path rule `getPath`/`getRawQuery` are built on.
     r.register(uri, "isOpaque", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
-        let is_opaque = if let Some(i) = raw.find(':') {
-            !raw[i + 1..].starts_with('/')
+        Ok(Some(Value::Int(if uri_text_is_opaque(&raw) {
+            1
         } else {
-            false
-        };
-        Ok(Some(Value::Int(if is_opaque { 1 } else { 0 })))
+            0
+        })))
     });
 
     // toURL() → synthetic URL from raw string
@@ -8029,13 +8121,20 @@ pub(crate) struct GcBlockingSocket<S> {
 }
 
 impl<S> GcBlockingSocket<S> {
-    fn new(inner: S) -> Self {
+    /// `pub(crate)` since 2026-08-22: `x509_manager::ocsp_http_post` needs the
+    /// same treatment. Its OCSP fetch runs from inside certificate validation,
+    /// i.e. from inside the very handshake this wrapper exists for, and it was
+    /// doing raw blocking `connect`/`write`/`read` with no region at all — the
+    /// precise shape `gc_blocked_syscall`'s doc describes, and the last
+    /// handshake-reachable path still doing it. DEFENSIVE: no test is known to
+    /// fail on it today (see that call site for what was and was not measured).
+    pub(crate) fn new(inner: S) -> Self {
         Self { inner }
     }
 
     /// The underlying socket, for the non-blocking calls (`set_read_timeout`
     /// and friends) that must NOT open a region.
-    fn get_ref(&self) -> &S {
+    pub(crate) fn get_ref(&self) -> &S {
         &self.inner
     }
 }
@@ -10396,6 +10495,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(conn, "method", Value::Object(Some(m)));
             ctx.set_field_by_name(conn, "doInput", Value::Int(1));
             ctx.set_field_by_name(conn, "connected", Value::Int(0));
+            // `URLConnection`'s field initialiser is `useCaches =
+            // defaultUseCaches`, i.e. true. The constructor that would run it
+            // never runs on this ALLOCATED carrier, so the field arrives
+            // zeroed. Nothing in `perform` consults it, but `getUseCaches()`
+            // reports it — see `register_https_delegate_forwarders`, which
+            // routes the https carrier's delegate-forwarding override back to
+            // that inherited one-`getfield` body — and a fresh connection that
+            // answers `false` is reporting a value the caller never chose.
+            ctx.set_field_by_name(conn, "useCaches", Value::Int(1));
             Ok(Some(Value::Object(Some(conn))))
         },
     );
@@ -14802,6 +14910,19 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "init",
         "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
         |ctx, args| {
+            // A third party's SPI owns its own init. `SSLContext.init` is
+            // `final` and its entire body is
+            // `contextSpi.engineInit(km, tm, sr)`; everything below records the
+            // managers in CratonVM's side tables for the rustls engine, which
+            // such a context will never use. See `jca::ssl_context_spi`.
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineInit",
+                "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
@@ -14939,6 +15060,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetSocketFactory",
+                "()Ljavax/net/ssl/SSLSocketFactory;",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
@@ -14960,6 +15089,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getServerSocketFactory",
         "()Ljavax/net/ssl/SSLServerSocketFactory;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetServerSocketFactory",
+                "()Ljavax/net/ssl/SSLServerSocketFactory;",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             let f = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 1)?;
             ctx.set_field(f, 0, Value::Object(Some(this)));
@@ -14971,9 +15108,31 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getProtocol",
         "()Ljava/lang/String;",
         |ctx, args| {
+            // A REAL `javax.net.ssl.SSLContext` — one JDK bytecode built around
+            // a provider's SPI, ours or a third party's — has `provider` in
+            // slot 0 and `protocol` in slot 2 (`javap -p --module java.base
+            // javax.net.ssl.SSLContext`, JDK 25). Reading slot 0 on one of
+            // those echoed the PROVIDER back as a protocol name:
+            // `getInstance("TLSv1.3", new BouncyCastleJsseProvider())` answered
+            // "BCJSSE version 1.0023" where HotSpot answers "TLSv1.3". The
+            // slot-0 read below is right only for the synthetic shape this
+            // registration's own `getInstance` allocates.
+            if let Some(v) = crate::jca::ssl_context_spi::real_context_protocol(ctx, args) {
+                return Ok(Some(v));
+            }
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 0)))
         },
+    );
+    // getProvider() — see `jca::ssl_context_spi::ssl_context_provider`. Not
+    // registered at all until 2026-08-20, so the real bytecode answered it:
+    // `return provider;`, which is slot 0 — the PROTOCOL on every synthetic
+    // layout. `getProvider()` handed back a `java.lang.String`.
+    r.register(
+        ctx_cls,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        |ctx, args| crate::jca::ssl_context_spi::ssl_context_provider(ctx, args),
     );
     // getSupportedSSLParameters() — Tomcat's JSSEUtil.initialise() reads the
     // supported protocols + cipher suites here. The synthetic SSLContext has no
@@ -14987,6 +15146,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getSupportedSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineGetSupportedSSLParameters",
+                "()Ljavax/net/ssl/SSLParameters;",
+            ) {
+                return r;
+            }
             let protocols = ["TLSv1.3", "TLSv1.2", "TLSv1.1"];
             // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
             // Tomcat's `JSSEUtil.initialise()` reads this list and
@@ -15028,6 +15195,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getDefaultSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                _args,
+                "engineGetDefaultSSLParameters",
+                "()Ljavax/net/ssl/SSLParameters;",
+            ) {
+                return r;
+            }
             let protocols = ["TLSv1.3", "TLSv1.2"];
             // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
             // Tomcat's `JSSEUtil.initialise()` reads this list and
@@ -15068,6 +15243,24 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
     ] {
         r.register(ctx_cls, "createSSLEngine", desc, |ctx, args| {
+            // A BouncyCastle (or any third-party) context must hand back the
+            // engine ITS provider builds. Allocating CratonVM's rustls-backed
+            // `sun.security.ssl.SSLEngineImpl` unconditionally gave such a
+            // caller a SunJSSE-named engine BC never built and never
+            // initialised — `engine.toString()` alone threw
+            // `NullPointerException: Cannot read field "conSession"`.
+            // The no-arg and (host, port) overloads share this closure, hence
+            // the arity test rather than a per-descriptor guard.
+            let spi_desc = if args.len() >= 3 {
+                "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;"
+            } else {
+                "()Ljavax/net/ssl/SSLEngine;"
+            };
+            if let Some(r) =
+                crate::jca::ssl_context_spi::spi_delegate(ctx, args, "engineCreateSSLEngine", spi_desc)
+            {
+                return r;
+            }
             let eng0 = try_alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4)?;
             // Everything below this point allocates (a ReentrantLock, and the
             // peer-host String further down), so `eng` must be pinned and
@@ -15121,6 +15314,16 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                     let eng = ctx.read_native_pin(eng_pin, eng0);
                     crate::t27_tls::set_engine_peer_host(ctx, eng, host, port);
                 }
+            } else {
+                // `javax.net.ssl.SSLEngine` declares `private int peerPort = -1`
+                // and the no-arg `SSLEngine()` leaves it there, so HotSpot's
+                // `createSSLEngine()` engine reports port -1. A synthetic
+                // allocation leaves the slot at its untagged 0, which is a
+                // legal-looking port number that no caller asked for and which
+                // `SSLEngine.toString()` prints. `peerHost` needs no such seed:
+                // its default IS null.
+                let eng = ctx.read_native_pin(eng_pin, eng0);
+                ctx.set_field_by_name(eng, "peerPort", Value::Int(-1));
             }
             let eng = ctx.read_native_pin(eng_pin, eng0);
             ctx.unpin_native_roots(eng_pin);
@@ -15136,6 +15339,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getClientSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetClientSessionContext",
+                "()Ljavax/net/ssl/SSLSessionContext;",
+            ) {
+                return r;
+            }
             // One carrier per (SSLContext, side), not one per call — see
             // `ssc_carrier` for the measured identity row this restores. The
             // GC-safety that used to live here moved in there with it.
@@ -15152,6 +15363,14 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getServerSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
         |ctx, args| {
+            if let Some(r) = crate::jca::ssl_context_spi::spi_delegate(
+                ctx,
+                args,
+                "engineGetServerSessionContext",
+                "()Ljavax/net/ssl/SSLSessionContext;",
+            ) {
+                return r;
+            }
             let this = obj_arg(args, 0)?;
             let carrier = ssc_carrier(ctx, this, SSC_TAG_SERVER)?;
             Ok(Some(Value::Object(Some(carrier))))
@@ -20805,6 +21024,143 @@ mod tests {
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
+
+    /// An OPAQUE URI has no query — the `?` inside its scheme-specific part is
+    /// an ordinary character.
+    ///
+    /// Every row is a MEASURED HotSpot 25.0.3+9 `getRawQuery()` from
+    /// `probes/OpaqueUriProbe.java`, so a future reader can re-run rather than
+    /// re-derive. `mailto:user@example.com?subject=hello` is the one that broke
+    /// `WebClientUtilsTests.opaqueUriUnchanged`.
+    #[test]
+    fn an_opaque_uri_has_no_query() {
+        let q = |s: &str| {
+            let u: Vec<u16> = s.encode_utf16().collect();
+            uri_query_units(&u).map(|v| String::from_utf16_lossy(&v))
+        };
+        // MEASURED null on HotSpot — opaque.
+        assert_eq!(q("mailto:user@example.com?subject=hello"), None);
+        assert_eq!(q("mailto:a@b.com?s=1#frag"), None);
+        assert_eq!(q("classpath:foo/bar.xml?a=b"), None);
+        assert_eq!(q("http:comp.lang.java?q=1"), None);
+        assert_eq!(q("a:b/c?d=e"), None);
+        assert_eq!(q("mailto:?subject=hello"), None);
+        // MEASURED non-null on HotSpot — hierarchical, including the relative
+        // reference whose colon sits inside a path segment.
+        assert_eq!(
+            q("https://api.example.com/search?q=test&page=1"),
+            Some("q=test&page=1".into())
+        );
+        assert_eq!(q("https://host/page?q=1#section"), Some("q=1".into()));
+        assert_eq!(q("/api/search?q=test"), Some("q=test".into()));
+        assert_eq!(q("file:/tmp/x?a=b"), Some("a=b".into()));
+        assert_eq!(q("/redirect:account?q=1"), Some("q=1".into()));
+        assert_eq!(q("relative/path?q=1#f"), Some("q=1".into()));
+        // A `?` after the `#` belongs to the fragment, on both shapes.
+        assert_eq!(q("https://host/page#frag?param=value"), None);
+        assert_eq!(q("https://host/page"), None);
+    }
+
+    /// `isOpaque()` / `isAbsolute()` must ask the SCHEME rule, not whether a
+    /// colon appears anywhere. MEASURED rows from the same probe.
+    #[test]
+    fn a_colon_in_a_relative_path_is_not_a_scheme() {
+        assert!(uri_text_is_opaque("mailto:user@example.com?subject=hello"));
+        assert!(uri_text_is_opaque("urn:isbn:096139210x"));
+        assert!(uri_text_is_opaque("a:b/c?d=e"));
+        // H11 — HotSpot: isOpaque=false, isAbsolute=false. Both read `true`
+        // before this change.
+        assert!(!uri_text_is_opaque("/redirect:account?q=1"));
+        assert!(uri_scheme_colon("/redirect:account?q=1").is_none());
+        // H12 — a relative reference whose FIRST segment carries the colon IS
+        // parsed as a scheme by the JDK (`redirect` is a legal scheme name).
+        assert!(uri_text_is_opaque("redirect:account/x"));
+        // Hierarchical and relative controls.
+        assert!(!uri_text_is_opaque("https://host/page?q=1"));
+        assert!(!uri_text_is_opaque("file:/tmp/x"));
+        assert!(!uri_text_is_opaque("/api/search?q=test"));
+        assert!(!uri_text_is_opaque(""));
+        assert!(uri_scheme_colon("https://host/page").is_some());
+        assert!(uri_scheme_colon("relative/path?q=1#f").is_none());
+        // A scheme name may not start with a digit.
+        assert!(uri_scheme_colon("1abc:x").is_none());
+    }
+
+    /// An opaque base has no path to merge, so RFC 3986 §5 resolution does not
+    /// apply and `URI.resolve` hands back the child unchanged — its literal
+    /// first line, `if (child.isOpaque() || base.isOpaque()) return child`.
+    #[test]
+    fn resolving_against_an_opaque_base_yields_the_reference() {
+        let r = |b: &str, c: &str| uri_resolve_ref(b, c).unwrap();
+        // R01/R06/R07 — MEASURED on HotSpot.
+        assert_eq!(r("mailto:a@b", "c@d"), "c@d");
+        assert_eq!(r("mailto:a@b", "https://h/p"), "https://h/p");
+        assert_eq!(r("mailto:a@b", ""), "");
+        // R08 — an OPAQUE reference is returned verbatim off a hierarchical
+        // base, query and all.
+        assert_eq!(r("https://h/a/b", "mailto:c@d?x=1"), "mailto:c@d?x=1");
+        // The hierarchical path is untouched by the short-circuit.
+        assert_eq!(r("https://h/a/b", "c"), "https://h/a/c");
+        assert_eq!(r("https://h/a/b", "/d"), "https://h/d");
+    }
+
+    /// `java.net.URI.normalize` does not clamp `..` at the root.
+    ///
+    /// Every row MEASURED on HotSpot 25 — `probes/OpaqueUriProbe.java`'s
+    /// N-block. RFC 3986's `remove_dot_segments` discards a leading `..`,
+    /// which is what this used to do.
+    #[test]
+    fn a_leading_dotdot_survives_normalization() {
+        let n = |s: &str| uri_remove_dot_segments(s).unwrap();
+        assert_eq!(n("/a/../../x"), "/../x", "N02");
+        assert_eq!(n("a/../../b"), "../b", "N04");
+        assert_eq!(n("a/b/../../../c"), "../c", "N10");
+        assert_eq!(n("/../x"), "/../x", "N08");
+        // And the ordinary cases are untouched.
+        assert_eq!(n("/a/b/../c"), "/a/c", "N03");
+        assert_eq!(n("/a/./b"), "/a/b", "N05");
+        assert_eq!(n("/a/b/.."), "/a/", "N06");
+        assert_eq!(n("/a/b/."), "/a/b/", "N07");
+        assert_eq!(n("/a//b"), "/a/b", "N11");
+        assert_eq!(n("./a/b"), "a/b", "N12");
+        assert_eq!(n(""), "");
+    }
+
+    /// `URI.resolve` is RFC 2396. Every row is a MEASURED S-row.
+    #[test]
+    fn resolve_follows_the_jdks_rfc2396_arms() {
+        let r = |b: &str, c: &str| uri_resolve_ref(b, c).unwrap();
+        let base = "https://h/a/b?q=1";
+        // An EMPTY reference keeps the base's DIRECTORY and drops its query —
+        // there is no "return the base" shortcut in the JDK.
+        assert_eq!(r(base, ""), "https://h/a/", "S01");
+        // A LONE FRAGMENT is the one arm that keeps path AND query.
+        assert_eq!(r(base, "#f"), "https://h/a/b?q=1#f", "S02");
+        // A query-only reference does NOT qualify for that arm.
+        assert_eq!(r(base, "?q=2"), "https://h/a/?q=2", "S03");
+        assert_eq!(r(base, "?q=2#f"), "https://h/a/?q=2#f", "S04");
+        assert_eq!(r(base, "."), "https://h/a/", "S05");
+        assert_eq!(r(base, ".."), "https://h/", "S06");
+        assert_eq!(r(base, "c"), "https://h/a/c", "S08");
+        // An AUTHORITY, an ABSOLUTE PATH and a SCHEME are each taken verbatim.
+        assert_eq!(r(base, "//other/p/../q"), "https://other/p/../q", "S10");
+        assert_eq!(r(base, "https://x/p/../q"), "https://x/p/../q", "S11");
+        assert_eq!(r(base, "/p/../q"), "https://h/p/../q", "S25");
+        assert_eq!(r(base, "/p/./q"), "https://h/p/./q", "S26");
+        // The empty-reference directory step, at every path shape.
+        assert_eq!(r("https://h/a/", ""), "https://h/a/", "S14");
+        assert_eq!(r("https://h/a", ""), "https://h/", "S15");
+        assert_eq!(r("https://h/", ""), "https://h/", "S16");
+        assert_eq!(r("https://h", ""), "https://h", "S17");
+        assert_eq!(r("/base/path?q=1", ""), "/base/", "S22");
+        assert_eq!(r("file:/a/b", ""), "file:/a/", "S30");
+        // `..` survives the root here too.
+        assert_eq!(r("https://h/a/b", "../../x"), "https://h/../x", "S27");
+        // An opaque base or reference short-circuits (R01/S13/S24).
+        assert_eq!(r("mailto:a@b", "c@d"), "c@d");
+        assert_eq!(r("mailto:a@b", "#f"), "#f", "S24");
+        assert_eq!(r(base, "mailto:c@d?x=1"), "mailto:c@d?x=1", "S13");
+    }
 
     /// Behavioural cover for [`gc_scan_ds_roots`] / [`gc_update_ds_refs`].
     ///

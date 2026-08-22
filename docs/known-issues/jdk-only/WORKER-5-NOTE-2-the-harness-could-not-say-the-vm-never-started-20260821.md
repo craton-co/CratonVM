@@ -57,6 +57,29 @@ argument parsing>`. That banner is a reliable KEY — it is emitted exactly when
 the VM exits before resolving its mode, which is the thing worth detecting — and
 an unreliable DESCRIPTION. This classifier greps it and does not quote it.
 
+> **FIXED AT THE SOURCE, 2026-08-21 (H0).** The banner no longer lies. Reaching
+> `None` there means only that `ACTIVE_JDK_MODE` -- a `OnceLock` set when the
+> class library is selected -- was never set, and there are TWO ways to do that:
+> clap refusing the command line (rc=2, and clap prints its own `error:` line
+> anyway), or the JDK image failing validation at `vm-cli/src/main.rs:3844`
+> (rc=1, the common one). The arm asserted the first and was reached by the
+> second. It now reads `<not yet resolved — the failure occurred before the
+> class library was selected>`, which is true of both.
+>
+> **This record's design survived the change, and that is the point.** Matching
+> on the PREFIX `jdk mode: <not yet resolved` rather than on the sentence meant
+> a fix to the sentence could not break the classifier -- it still passes, and
+> the truncated `— x` fixture was already asserting exactly that property.
+> The three selftest fixtures that quoted the old sentence in full were
+> refreshed to the new one so they keep describing a VM that exists; a fixture
+> that outlives the output it imitates is a quiet lie even when the test is
+> green.
+>
+> Independently measured, three invocations of `cratonvm-r11`: a POSIX spelling
+> of a REAL jdk, and a path that does not exist at all, BOTH return **rc=0** for
+> `-version` and print `JDK class library root: NONE FOUND`. Argument parsing
+> accepted both. See `fix(diag): the mode line named a phase it cannot observe`.
+
 Category 1 is therefore two classes now:
 
 | output also carries | class |

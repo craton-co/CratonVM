@@ -1635,26 +1635,36 @@ pub(super) fn sp_tailcall_enabled() -> bool {
     })
 }
 
-/// Bisect toggle (`CRATONVM_JIT_SELF_TAILCALL=0`) — demote the single-pass
-/// direct SELF tail-call (arguments into the parameter locals, then `JMP` back
-/// to `body_entry_offset`) to the ordinary self-recursive `CALL`, so every
-/// activation gets its own native frame again.
+/// Whether the single-pass backend lowers a direct SELF tail-call by loading
+/// the arguments into the parameter locals and `JMP`ping back to
+/// `body_entry_offset` instead of emitting a `CALL`.
 ///
-/// Unlike [`sp_tailcall_enabled`], which governs the SIBLING tail-call, this
-/// one governs a method jumping back into itself. That form is invisible to
-/// every Java stack walk and makes `StackOverflowError` unreachable for a
-/// method the optimizing tier never recompiles — see
-/// `docs/known-issues/jit/jit-eliminates-self-tail-call-frames-20260819.md`,
-/// which had to borrow `CRATONVM_TIER_C2_THRESHOLD` as an A/B lever precisely
-/// because this switch did not exist.
+/// **Default OFF** (`CRATONVM_JIT_SELF_TAILCALL=1` opts back in). The `JMP`
+/// form reuses one native frame for every activation, which HotSpot and this
+/// VM's own interpreter do not, and the divergence is not cosmetic:
+/// `StackOverflowError` becomes unreachable, and every activation is invisible
+/// to `StackWalker`, `Throwable.getStackTrace()`, `Reflection.getCallerClass`
+/// and anything built on them.
+///
+/// It was defaulted OFF once it was priced, not on principle. Measured, one
+/// binary, interleaved: for a method the C1→C2 supersede claims the lowering is
+/// worth **nothing** — both arms 5.4 ns/level, because the optimizing body has
+/// already replaced the C1 one before the timed loop — and for a method the
+/// supersede refuses (`c2_upgrade_would_engage` rejects any method that
+/// allocates) it is worth **5.5x**. That second population is exactly the one
+/// that keeps the C1 body for the life of the process, so it is also exactly
+/// the one whose `StackOverflowError` can never fire. There is no
+/// configuration that buys the speed without the permanent loss.
+///
+/// Unlike [`sp_tailcall_enabled`], which governs the SIBLING tail-call (a `JMP`
+/// into ANOTHER method's entry), this one governs a method jumping back into
+/// itself. See
+/// `fixed-suite-bugs/jit/jit-eliminates-self-tail-call-frames-FIXED-20260820.md`.
 pub(super) fn self_tailcall_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        !matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_TAILCALL").as_deref(),
-            Ok("0")
-        )
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SELF_TAILCALL").is_some()
     })
 }
 
@@ -3488,6 +3498,23 @@ pub(super) fn branch_targets_at(
 /// Sized `code_len + 1` to match the emitter's own `branch_targets` map, so the
 /// two are indexed by the same `pc`.
 pub(super) fn compute_reachable_pcs(code: &[u8], code_len: usize) -> Option<Vec<bool>> {
+    compute_reachable_pcs_with_roots(code, code_len, &[])
+}
+
+/// [`compute_reachable_pcs`] with extra entry points.
+///
+/// The only producer of extras is compiled local exception handlers: an
+/// exception edge is a real predecessor that no branch instruction names, so a
+/// handler body reachable ONLY that way is invisible to the walk above and
+/// stays dead. Passing its `handler_pc` as a root makes the block — and
+/// everything it reaches — live code, which is exactly the change from "a
+/// handler body is dead code in the emitted image" to "this method runs its own
+/// `catch`". An empty slice is byte-for-byte [`compute_reachable_pcs`].
+pub(super) fn compute_reachable_pcs_with_roots(
+    code: &[u8],
+    code_len: usize,
+    extra_roots: &[usize],
+) -> Option<Vec<bool>> {
     if code_len > code.len() {
         return None;
     }
@@ -3497,6 +3524,12 @@ pub(super) fn compute_reachable_pcs(code: &[u8], code_len: usize) -> Option<Vec<
     }
     reachable[0] = true;
     let mut work = vec![0usize];
+    for &root in extra_roots {
+        if root < code_len && !reachable[root] {
+            reachable[root] = true;
+            work.push(root);
+        }
+    }
     let mut targets: Vec<usize> = Vec::new();
     while let Some(pc) = work.pop() {
         // A branch INTO the middle of an instruction decodes garbage from here
@@ -4942,6 +4975,50 @@ fn rewrite_loop_copies(
 // cannot throw, so eliding it cannot change the sequence above; its ONE
 // observable effect is the safepoint poll, and that is asserted separately
 // and quantitatively in `every_transform_preserves_the_backedge_poll`.
+
+#[cfg(test)]
+mod reachability_roots {
+    use super::*;
+
+    /// `return; <handler body>` — the shape javac emits when a `try` block
+    /// returns. The handler is reachable from nothing the bytecode names.
+    ///
+    /// Without a root it is dead, which is the pre-2026-08-20 world and why
+    /// "a handler body is dead code in the emitted image" was true. With one it
+    /// is live, and so is everything it falls through to — which is what makes
+    /// `pc_to_native[handler_pc]` a real address for a local-handler stub to
+    /// jump to instead of the `-1` that would reject the whole method.
+    #[test]
+    fn a_handler_root_revives_the_block_and_nothing_else_does() {
+        // 0: return
+        // 1: astore_0        <- handler_pc
+        // 2: return
+        let code = [0xb1u8, 0x4b, 0xb1];
+        let without = compute_reachable_pcs(&code, code.len()).expect("statically known CFG");
+        assert!(without[0]);
+        assert!(!without[1], "nothing branches to a handler body");
+        assert!(!without[2]);
+
+        let with = compute_reachable_pcs_with_roots(&code, code.len(), &[1])
+            .expect("statically known CFG");
+        assert!(with[0]);
+        assert!(with[1], "the handler root makes its own block live");
+        assert!(with[2], "and everything the handler falls through to");
+    }
+
+    /// An empty root list must be the identity, because that is every compile
+    /// that arms no local handlers — i.e. every compile until someone sets the
+    /// flag.
+    #[test]
+    fn no_roots_is_the_identity() {
+        // 0: iconst_0  1: ifeq +4 (->5)  4: return  5: return
+        let code = [0x03u8, 0x99, 0x00, 0x04, 0xb1, 0xb1];
+        assert_eq!(
+            compute_reachable_pcs(&code, code.len()),
+            compute_reachable_pcs_with_roots(&code, code.len(), &[]),
+        );
+    }
+}
 
 #[cfg(test)]
 mod loop_xform_tests {

@@ -86,7 +86,24 @@ fi
 
 OUTDIR="$TC_ROOT/.suite/results/$RUN_NAME/shard-$SHARD_IDX"
 mkdir -p "$OUTDIR"
+# The examples webapp's compiled classes are a TEST-classpath entry upstream,
+# not just a webapp payload: Tomcat's own build.xml puts
+# `${tomcat.build}/webapps/examples/WEB-INF/classes` FIRST on
+# `tomcat.test.classpath` (build.xml:248), because `test/util/TestCookieFilter`
+# exercises `util.CookieFilter`, which lives in
+# `webapps/examples/WEB-INF/classes/util/` and is compiled by `ant deploy` —
+# NOT by `ant test-compile`, so it never lands in `output/testclasses`.
+# `cp-linux-fixed.txt` omitted it and `util.TestCookieFilter` failed with
+# `NoClassDefFoundError: util/CookieFilter` — identically on HotSpot, i.e. a
+# fixture gap that reads like a VM defect. The Windows harness
+# (`run-tomcat-suite.ps1`) has always had this entry; this is the Linux side
+# catching up. Prepended, matching upstream's order. Guarded so a fixture built
+# without `ant deploy` does not get an empty classpath element.
 CP="$(cat "$CP_FILE"):$HAMCREST_JAR"
+EXAMPLES_CLASSES="$TC_ROOT/output/build/webapps/examples/WEB-INF/classes"
+if [ -d "$EXAMPLES_CLASSES" ]; then
+  CP="$EXAMPLES_CLASSES:$CP"
+fi
 
 RESULTS="$OUTDIR/results.csv"
 touch "$RESULTS"

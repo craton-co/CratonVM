@@ -31,8 +31,10 @@ compiled output through Cargo's `DEP_CRATON_GPU_ANNOTATIONS_*` mechanism (the
 2. **`../craton-gpu-java/src/main/java` from the CratonVM workspace root** - a
    sibling `craton-gpu-java` checkout next to the workspace. Portable; tried on
    every platform.
-3. **`C:/craton/craton-gpu-java/src/main/java`** - a default install location,
-   consulted **only on Windows**.
+3. **`C:/craton/gpu-java/src/main/java`** - a default install location,
+   consulted **only on Windows**. `C:/craton/craton-gpu-java/src/main/java`
+   (the old guessed name) is tried after it as a second Windows-only
+   fallback, in case a checkout under that name exists instead.
 
 If none of these exists the build does **not** fail: it produces an empty
 annotations directory, emits an empty `ANNOTATIONS_JAR`, and logs a

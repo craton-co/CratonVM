@@ -3,7 +3,13 @@
 # and JVM args as one.sh. Cheap smoke signal when the full class is too
 # expensive to run on a loaded shared box.
 set -u
-HERE=/data/data/wt-aotsegv-20260806/apps/spring-suite-runner
+# Resolve from THIS script, the way `one.sh` and `hs.sh` do. This line used to
+# be an absolute path into the worktree the script happened to be written in
+# (`/data/data/wt-aotsegv-20260806/...`), which has since been swept: every
+# invocation from any other checkout died in `awk: cannot open file
+# .../meta/all-classes.tsv`, reported as "class not in index: <fqcn>" — a
+# message that reads as a missing test class rather than a missing runner.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPRING="${SPRING:-/data/data/wt-springsuite8b-20260726/apps/spring-framework}"
 JDK="${JDK25:-/home/victor/jdk25}"
 BIN="${CRATONVM_BIN:?set CRATONVM_BIN}"

@@ -1431,9 +1431,37 @@ impl<JitMethod: Clone> InvokeCache<JitMethod> {
 
     /// Look up an invoke-cache entry. Stale entries (whose declaring class
     /// has been redefined since the entry was populated) are *not* returned
-    /// from this getter — they're auto-evicted and the call site falls
-    /// through to the slow path which re-resolves against the freshly
-    /// installed bytecode.  See [`RedefineGate`] for the underlying check.
+    /// from this getter — the call site falls through to the slow path, which
+    /// re-resolves against the freshly installed bytecode and overwrites this
+    /// slot. See [`RedefineGate`] for the underlying check.
+    ///
+    /// # One hash probe, not two
+    ///
+    /// This is the interpreter's most frequent map lookup — every
+    /// `invokevirtual` / `invokespecial` / `invokestatic` that a call site has
+    /// warmed comes through it. It used to hash `key` TWICE per hit: once to
+    /// test staleness through a borrow it immediately dropped, and once more to
+    /// return the value. `InvokeCache::get` was the single hottest symbol in
+    /// every profile taken of `WebClientIntegrationTests` and of the isolated
+    /// WebClient exchange it is built from (2.65-2.95% of all samples, ahead of
+    /// `execute_frame_from_index` itself), and half of that was the duplicate
+    /// probe.
+    ///
+    /// # Why dropping the eviction is safe
+    ///
+    /// The `remove` this replaces was an optimisation, not a correctness term.
+    /// A stale entry that stays in the map is still *reported* as a miss by the
+    /// `filter` below, so no caller can ever dispatch through it — and the miss
+    /// sends that call site down the slow path, which ends in
+    /// `populate_invoke_cache` -> [`Self::put`], and `put` overwrites the SAME
+    /// key. The slot therefore heals on the very next call rather than being
+    /// vacated on this one, and the table cannot grow: a key that is present
+    /// stays present, whether it holds the stale entry or its replacement.
+    ///
+    /// A call site that goes stale and is then never executed again keeps one
+    /// entry alive until the cache is dropped with its thread. That is the same
+    /// footprint the entry had before it went stale, and staleness only arises
+    /// from a JVMTI redefine or a C1->C2 supersede, both rare by construction.
     #[inline]
     pub fn get(
         &mut self,
@@ -1441,19 +1469,10 @@ impl<JitMethod: Clone> InvokeCache<JitMethod> {
         cp_index: u16,
         is_special: bool,
     ) -> Option<&CachedInvokeTarget<JitMethod>> {
-        let key = (caller_class, cp_index, is_special);
-        // WP2.4-F1: O(1) generation check on hit. If the entry is stale,
-        // remove it and pretend we never had it; the caller will repopulate.
-        let stale = self
-            .entries
-            .get(&key)
-            .map(|t| t.is_stale())
-            .unwrap_or(false);
-        if stale {
-            self.entries.remove(&key);
-            return None;
-        }
-        self.entries.get(&key)
+        // WP2.4-F1: O(1) generation check on hit, folded into the same probe.
+        self.entries
+            .get(&(caller_class, cp_index, is_special))
+            .filter(|t| !t.is_stale())
     }
 
     pub fn put(

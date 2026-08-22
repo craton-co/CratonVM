@@ -8,14 +8,22 @@
  * here what it costs on H2's own Trace, the number is the generic per-call cost
  * and H2's tracing is not a discrete inefficiency.
  *
- * Measured 2026-08-10, interleaved arms on one Azure host at load 11-12:
+ * Re-measured 2026-08-21, interleaved arms, MIN of 5 on one Azure host at
+ * load 4.4-6.6 (the minimum is the least-contaminated sample on a shared box):
  *
- *   HotSpot -Xint      46 - 49 ns net per 3-call chain,  6 - 11 ns/iter loop-only
- *   cratonvm --nojit   1756 - 2231 ns                  125 - 153 ns/iter
+ *   HotSpot -Xint      31.85 ns net per 3-call chain,   5.46 ns/iter loop-only
+ *   cratonvm --nojit  871.76 ns                        80.98 ns/iter
  *
- * i.e. ~40-48x on the calls and ~13-21x on the call-free loop: a call level is
- * ~700 ns interpreted against ~15 ns. See
- * docs/known-issues/h2/h2-update-path-throughput-20260802.md.
+ * i.e. ~27x on the calls and ~15x on the call-free loop: A CALL LEVEL IS
+ * ~291 ns INTERPRETED against ~10.6 ns. The 2026-08-10 reading of this same
+ * probe was ~700 ns and 40-48x; the call-free loop ratio did not move
+ * (13-21x then, 14.8x now), so the whole improvement is in the CALL path.
+ *
+ * READ THE INTERNAL RATIO, NOT THE ABSOLUTE. Per rep the chain/loop ratio was
+ * 10.8, 10.2, 9.9 for cratonvm and 5.6, 4.6, 5.0 for HotSpot while the
+ * absolutes moved 40%: host speed cancels, the shape does not.
+ *
+ * See performance/h2-update-path-throughput-RETIRED-20260821.md.
  *
  * Two anti-measurement-bug precautions, both learned the hard way here:
  *

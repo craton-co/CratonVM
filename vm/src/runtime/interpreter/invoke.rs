@@ -3869,6 +3869,20 @@ pub(super) fn try_stackless_invoke(
             None
         }
     });
+    // THE door for `MethodHandle.invoke`: the interpreter's stackless path,
+    // not `vm_exec`'s signature-polymorphic block, which the ClassId-resolved
+    // route reaches and this one does not. Measured by arming there first and
+    // watching the consuming native print `None` for all sixteen rows.
+    //
+    // `invoke` is the one entry whose collect-or-passthrough answer depends on
+    // the type the CALLER WROTE — `mh.invoke((String[]) null)` passes the null
+    // through, `mh.invoke((Object) null)` collects it — and `descriptor` here
+    // is exactly that type. See `cratonvm_native_api::poly_call_site`.
+    if method_name == "invoke"
+        && crate::vm::vm_exec::is_method_handle_signature_polymorphic_receiver(class_name)
+    {
+        cratonvm_native_api::poly_call_site::arm(descriptor);
+    }
     if crate::runtime::env_cache::dbg_mh_stack()
         && matches!(method_name, "invoke" | "invokeExact" | "invokeBasic")
     {
@@ -4225,6 +4239,7 @@ pub(super) fn try_stackless_invoke(
                 .kind_of_id(id)
                 .unwrap_or(cratonvm_native_api::NativeKind::Bridge);
             match crate::vm::resolve_native_dispatch_wave1(
+                crate::vm::DispatchDoor::StacklessForce,
                 crate::vm::dispatch_policy(shared),
                 &class_name_arc,
                 method_name,

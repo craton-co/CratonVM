@@ -41,11 +41,25 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # The declared public type of a .java file, or empty. Kept as a function so the
 # selftest can drive it over files it writes itself — a name check nobody has
 # watched reject a bad name is decoration.
+#
+# `grep -a`, and it is not defensive tidiness. A .java file may legitimately
+# contain a NUL byte: `regression-suite/probes/W4Data.java` writes
+# `d.writeUTF("a\0b")` to exercise modified UTF-8, and `file(1)` calls it
+# `data`. Without `-a`, GNU grep prints `Binary file (standard input) matches`
+# INSTEAD OF the matched line, and this function returned that sentence as the
+# declared type name — so the gate reported
+#
+#     NAME  W4Data.java declares 'public Binary file (standard input) matches'
+#
+# on a probe that compiles perfectly (`javac` rc=0). **A false NAME mismatch is
+# worse than no check**: it blocks CI on a good file and teaches the reader to
+# ignore the gate. `LC_ALL=C` for the same class of reason — a multi-byte
+# locale can make `sed` fail on the same bytes.
 public_type() {
-  sed -E 's://.*::' "$1" \
-    | grep -oE '(^|[[:space:]])public[[:space:]]+((final|abstract|sealed|non-sealed|static)[[:space:]]+)*(class|interface|enum|record)[[:space:]]+[A-Za-z0-9_$]+' \
+  LC_ALL=C sed -E 's://.*::' "$1" \
+    | LC_ALL=C grep -aoE '(^|[[:space:]])public[[:space:]]+((final|abstract|sealed|non-sealed|static)[[:space:]]+)*(class|interface|enum|record)[[:space:]]+[A-Za-z0-9_$]+' \
     | head -1 \
-    | sed -E 's/.*(class|interface|enum|record)[[:space:]]+//'
+    | LC_ALL=C sed -E 's/.*(class|interface|enum|record)[[:space:]]+//'
 }
 
 if [ "${1:-}" = "--selftest" ]; then
@@ -61,9 +75,15 @@ if [ "${1:-}" = "--selftest" ]; then
   printf 'class NotPublic {}\n'                         > "$t/NotPublic.java"
   # The exact shape that broke Sweep5CollectionContracts.
   printf 'public class Sweep5 {}\n'                     > "$t/Sweep5CollectionContracts.java"
+  # A NUL byte in a string literal is LEGAL and REAL: W4Data.java writes
+  # `d.writeUTF("a\0b")` to exercise modified UTF-8, so `file(1)` calls that
+  # probe `data`. Without `grep -a`, public_type() returned the literal string
+  # 'Binary file (standard input) matches' as the declared type, and the gate
+  # reported a NAME MISMATCH on a probe javac accepts. See public_type().
+  printf 'public class Nul { String s = "a\000b"; }\n'   > "$t/Nul.java"
 
   for pair in "Good:Good" "Fin:Fin" "E:E" "R:R" "I:I" "Real:Real" \
-              "NotPublic:" "Sweep5CollectionContracts:Sweep5"; do
+              "NotPublic:" "Nul:Nul" "Sweep5CollectionContracts:Sweep5"; do
     f=${pair%%:*}; want=${pair#*:}
     got=$(public_type "$t/$f.java")
     if [ "$got" = "$want" ]; then echo "  ok   public_type($f.java) = '${want:-<none>}'"
