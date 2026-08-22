@@ -199,16 +199,20 @@ concern (failure 2's blast radius: `java.net.URI` sits under class loading,
 remaining MethodHandle corners). Driver: `/data/tnf-spring-ab.sh` over
 `apps/spring-suite-runner/one.sh`.
 
-## What is still open
+## What was left open, and then closed the same day
 
-Nine measured rows across the three probes still diverge, in four groups, and
-each is recorded with its mechanism and why it was left in
-`docs/known-issues/spring/methodhandle-and-uri-divergences-20260821.md`. In
-short: the inexact `invoke` door cannot see its call-site descriptor
-(C03/C07/C09); CratonVM stays more forgiving than HotSpot about an
+Nine measured rows across the three probes still diverged when this change
+landed, in four groups: the inexact `invoke` door could not see its call-site
+descriptor (C03/C07/C09); CratonVM stayed more forgiving than HotSpot about an
 already-packed array and an over-long argument list (B06, I06); `asType` still
-adapts the receiver in place (I13/I14); and two hierarchical `URI.resolve`
-behaviours outside the opaque family are wrong (R13/R15).
+adapted the receiver in place (I13/I14); and two hierarchical `URI.resolve`
+behaviours outside the opaque family were wrong (R13/R15).
+
+**All nine were fixed later the same day** — see the
+`methodhandle-and-uri-divergences-20260821` write-up beside this one. The three
+probes are now byte-for-byte equal to HotSpot across all 736 rows, so a diff
+against their oracles is a pure regression signal rather than a list with known
+exceptions in it.
 
 ## Files
 

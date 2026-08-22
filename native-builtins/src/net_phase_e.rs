@@ -3410,20 +3410,21 @@ fn uri_raw_scheme_specific_part_units(raw: &[u16]) -> Vec<u16> {
 
 /// RFC 3986 §5.3 path-merge: combine a base hierarchical path with a
 /// relative reference path.
-fn uri_merge_paths(base_path: &str, ref_path: &str, base_has_authority: bool) -> String {
-    if base_has_authority && base_path.is_empty() {
-        let mut s = String::from("/");
-        s.push_str(ref_path);
-        s
-    } else {
-        match base_path.rfind('/') {
-            Some(i) => {
-                let mut s = base_path[..=i].to_string();
-                s.push_str(ref_path);
-                s
-            }
-            None => ref_path.to_string(),
+fn uri_merge_paths(base_path: &str, ref_path: &str) -> String {
+    // `java.net.URI.resolvePath`, which is simply "everything up to and
+    // including the base's last `/`, then the child" — with NO special case for
+    // an authority-bearing base whose path is empty. That case used to
+    // fabricate a leading `/` here, so `URI.create("https://h").resolve("")`
+    // answered `https://h/` where HotSpot answers `https://h`
+    // (`probes/OpaqueUriProbe.java` S17: the JDK's `i >= 0` guard simply
+    // declines to prepend anything when there is no `/` to cut at).
+    match base_path.rfind('/') {
+        Some(i) => {
+            let mut s = base_path[..=i].to_string();
+            s.push_str(ref_path);
+            s
         }
+        None => ref_path.to_string(),
     }
 }
 
@@ -3461,7 +3462,26 @@ fn uri_remove_dot_segments_units(path: &[u16]) -> Result<Vec<u16>, MethodCallFai
             continue;
         }
         if is_dotdot(seg) {
-            out.pop();
+            // `java.net.URI.normalize` does NOT clamp at the root, and RFC 3986's
+            // `remove_dot_segments` does — this used to do the latter. A `..`
+            // with nothing to pop, or with another `..` already on top, is KEPT.
+            // MEASURED on HotSpot 25 (`probes/OpaqueUriProbe.java`):
+            //
+            //   /a/../../x     -> /../x        (N02)      not  /x
+            //   a/../../b      -> ../b         (N04)      not  b
+            //   a/b/../../../c -> ../c         (N10)      not  c
+            //
+            // The JDK's own `removeDots` says so in a comment — "DEVIATION:
+            // RFC2396 says .. can be removed even if it is at the start" — and
+            // then declines to. `resolve` inherits the rule through this
+            // function, which is why `https://h/a/b` resolve `../../x` is
+            // `https://h/../x` (S27).
+            match out.last() {
+                Some(prev) if !is_dotdot(prev) => {
+                    out.pop();
+                }
+                _ => out.push(seg),
+            }
             continue;
         }
         out.push(seg);
@@ -3869,36 +3889,50 @@ fn uri_resolve_ref(base: &str, reference: &str) -> Result<String, MethodCallFail
     if uri_text_is_opaque(reference) || uri_text_is_opaque(base) {
         return Ok(reference.to_string());
     }
-    if reference.is_empty() {
-        return Ok(base.to_string());
-    }
     let (r_scheme, r_auth, r_path, r_query, r_frag) = uri_split(reference);
-    // Reference has a scheme → it is absolute, return as-is (normalized).
+    // 5.2 (3) — a reference that carries its own scheme IS the result. The JDK
+    // returns the argument OBJECT here, so it is NOT normalized: measured,
+    // `https://h/a/b` resolve `https://x/p/../q` is `https://x/p/../q`, dot
+    // segments and all (`probes/OpaqueUriProbe.java` S11/S12, and R15 — the
+    // row this arm used to get wrong by rebuilding through
+    // `uri_remove_dot_segments`).
     if r_scheme.is_some() {
-        let path = uri_remove_dot_segments(&r_path)?;
-        return Ok(uri_recompose(&r_scheme, &r_auth, &path, &r_query, &r_frag));
+        return Ok(reference.to_string());
     }
     let (b_scheme, b_auth, b_path, b_query, _b_frag) = uri_split(base);
-    let (t_auth, t_path, t_query);
+    // 5.2 (2) — "reference to the current document": a LONE fragment, and only
+    // that. The base's path AND query both survive it, which is what separates
+    // it from every other empty-path reference. `?q=2` does not qualify (its
+    // query is non-null) and neither does the empty string (no fragment), and
+    // both of those take the 6a directory step below instead — S02 against
+    // S01/S03.
+    if r_auth.is_none() && r_path.is_empty() && r_frag.is_some() && r_query.is_none() {
+        return Ok(uri_recompose(&b_scheme, &b_auth, &b_path, &b_query, &r_frag));
+    }
+    // Every remaining arm takes the CHILD's query and fragment, never the
+    // base's — `ru.query = child.query` sits above the authority branch in the
+    // JDK. That is why `https://h/a/b?q=1` resolve `<empty>` loses `q=1`.
+    let (t_auth, t_path);
     if r_auth.is_some() {
+        // 5.2 (4) — the reference's authority wins and its path is taken
+        // VERBATIM. Measured: `//other/p/../q` keeps its dot segments (S10).
         t_auth = r_auth;
-        t_path = uri_remove_dot_segments(&r_path);
-        t_query = r_query;
-    } else if r_path.is_empty() {
-        t_auth = b_auth.clone();
-        t_path = Ok(b_path.clone());
-        t_query = r_query.or(b_query);
+        t_path = Ok(r_path.clone());
     } else {
         t_auth = b_auth.clone();
         if r_path.starts_with('/') {
-            t_path = uri_remove_dot_segments(&r_path);
+            // 5.2 (5) — an absolute reference path is verbatim too (S25/S26).
+            t_path = Ok(r_path.clone());
         } else {
-            let merged = uri_merge_paths(&b_path, &r_path, b_auth.is_some());
+            // 5.2 (6) — merge against the base's DIRECTORY, then normalize.
+            // An EMPTY reference path lands here as well, which is the whole
+            // of R13: `https://h/a/b?q=1` resolve `<empty>` is `https://h/a/`,
+            // not the base.
+            let merged = uri_merge_paths(&b_path, &r_path);
             t_path = uri_remove_dot_segments(&merged);
         }
-        t_query = r_query;
     }
-    Ok(uri_recompose(&b_scheme, &t_auth, &t_path?, &t_query, &r_frag))
+    Ok(uri_recompose(&b_scheme, &t_auth, &t_path?, &r_query, &r_frag))
 }
 
 /// RFC 3986 §5.3 — recompose component parts into a URI string.
@@ -21052,6 +21086,64 @@ mod tests {
         // The hierarchical path is untouched by the short-circuit.
         assert_eq!(r("https://h/a/b", "c"), "https://h/a/c");
         assert_eq!(r("https://h/a/b", "/d"), "https://h/d");
+    }
+
+    /// `java.net.URI.normalize` does not clamp `..` at the root.
+    ///
+    /// Every row MEASURED on HotSpot 25 — `probes/OpaqueUriProbe.java`'s
+    /// N-block. RFC 3986's `remove_dot_segments` discards a leading `..`,
+    /// which is what this used to do.
+    #[test]
+    fn a_leading_dotdot_survives_normalization() {
+        let n = |s: &str| uri_remove_dot_segments(s).unwrap();
+        assert_eq!(n("/a/../../x"), "/../x", "N02");
+        assert_eq!(n("a/../../b"), "../b", "N04");
+        assert_eq!(n("a/b/../../../c"), "../c", "N10");
+        assert_eq!(n("/../x"), "/../x", "N08");
+        // And the ordinary cases are untouched.
+        assert_eq!(n("/a/b/../c"), "/a/c", "N03");
+        assert_eq!(n("/a/./b"), "/a/b", "N05");
+        assert_eq!(n("/a/b/.."), "/a/", "N06");
+        assert_eq!(n("/a/b/."), "/a/b/", "N07");
+        assert_eq!(n("/a//b"), "/a/b", "N11");
+        assert_eq!(n("./a/b"), "a/b", "N12");
+        assert_eq!(n(""), "");
+    }
+
+    /// `URI.resolve` is RFC 2396. Every row is a MEASURED S-row.
+    #[test]
+    fn resolve_follows_the_jdks_rfc2396_arms() {
+        let r = |b: &str, c: &str| uri_resolve_ref(b, c).unwrap();
+        let base = "https://h/a/b?q=1";
+        // An EMPTY reference keeps the base's DIRECTORY and drops its query —
+        // there is no "return the base" shortcut in the JDK.
+        assert_eq!(r(base, ""), "https://h/a/", "S01");
+        // A LONE FRAGMENT is the one arm that keeps path AND query.
+        assert_eq!(r(base, "#f"), "https://h/a/b?q=1#f", "S02");
+        // A query-only reference does NOT qualify for that arm.
+        assert_eq!(r(base, "?q=2"), "https://h/a/?q=2", "S03");
+        assert_eq!(r(base, "?q=2#f"), "https://h/a/?q=2#f", "S04");
+        assert_eq!(r(base, "."), "https://h/a/", "S05");
+        assert_eq!(r(base, ".."), "https://h/", "S06");
+        assert_eq!(r(base, "c"), "https://h/a/c", "S08");
+        // An AUTHORITY, an ABSOLUTE PATH and a SCHEME are each taken verbatim.
+        assert_eq!(r(base, "//other/p/../q"), "https://other/p/../q", "S10");
+        assert_eq!(r(base, "https://x/p/../q"), "https://x/p/../q", "S11");
+        assert_eq!(r(base, "/p/../q"), "https://h/p/../q", "S25");
+        assert_eq!(r(base, "/p/./q"), "https://h/p/./q", "S26");
+        // The empty-reference directory step, at every path shape.
+        assert_eq!(r("https://h/a/", ""), "https://h/a/", "S14");
+        assert_eq!(r("https://h/a", ""), "https://h/", "S15");
+        assert_eq!(r("https://h/", ""), "https://h/", "S16");
+        assert_eq!(r("https://h", ""), "https://h", "S17");
+        assert_eq!(r("/base/path?q=1", ""), "/base/", "S22");
+        assert_eq!(r("file:/a/b", ""), "file:/a/", "S30");
+        // `..` survives the root here too.
+        assert_eq!(r("https://h/a/b", "../../x"), "https://h/../x", "S27");
+        // An opaque base or reference short-circuits (R01/S13/S24).
+        assert_eq!(r("mailto:a@b", "c@d"), "c@d");
+        assert_eq!(r("mailto:a@b", "#f"), "#f", "S24");
+        assert_eq!(r(base, "mailto:c@d?x=1"), "mailto:c@d?x=1", "S13");
     }
 
     /// Behavioural cover for [`gc_scan_ds_roots`] / [`gc_update_ds_refs`].
