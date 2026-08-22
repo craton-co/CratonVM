@@ -1,8 +1,14 @@
 # WORKER-5 NOTE 5 — one case per process turns `H0-8`'s retraction into a disproof, and `size()` makes the map WORSE
 
-**Status: MEASURED.** Lane WORKER-5, 2026-08-21, at `22cb4338d`, against
+**Status: MEASURED.** Lane WORKER-5, 2026-08-21, against
 `C:/craton/cratonvm-r10.exe`, oracle HotSpot 25.0.3+9. No VM change. Answers
 `H0-8` N4.
+
+> **Re-run on `cratonvm-r11.exe` after merging H0's `dab993033`** (which brings
+> `ecd4f56e1`, a `java/util/Comparator` guard in `native-collections`). All six
+> cases reproduce **exactly**, in both arms and against the oracle, and the run
+> is again `ok — every case gave one stable answer per arm across 3 rotated
+> rounds`. `withsize` still gives **0**.
 
 ---
 

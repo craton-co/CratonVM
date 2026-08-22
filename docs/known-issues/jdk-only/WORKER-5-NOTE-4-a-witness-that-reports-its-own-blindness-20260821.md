@@ -1,7 +1,13 @@
 # WORKER-5 NOTE 4 — ten of thirteen witness signals are blind, and the three that are not ask WHICH CODE RAN rather than WHAT IT COMPUTED
 
-**Status: MEASURED.** Lane WORKER-5, 2026-08-21, at `22cb4338d`, against
+**Status: MEASURED.** Lane WORKER-5, 2026-08-21, against
 `C:/craton/cratonvm-r10.exe`, oracle HotSpot 25.0.3+9. No VM change.
+
+> **Re-run on `cratonvm-r11.exe` after merging H0's `dab993033`** (which brings
+> `ecd4f56e1`, a `java/util/Comparator` guard in `native-collections`). The whole
+> table below reproduces **exactly** — 3 of 13 for `put` and `get`, 1 of 14 for
+> `iterate`, same signals, same values, same oracle column. A change in the
+> collection natives did not move the HashMap witness.
 
 ---
 
