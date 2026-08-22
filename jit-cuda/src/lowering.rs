@@ -215,6 +215,7 @@ fn lower_method_with_pool_impl(
     // D→H copy for read-only array inputs (closing the residual
     // perf gap to TornadoVM left by the Phase 10 #1 residency cache).
     let writes_param_mask = emitter.writes_param_mask;
+    let reads_param_mask = emitter.reads_param_mask;
 
     let reg_decls = emitter.emit_reg_decls();
     let body = emitter.into_body();
@@ -230,6 +231,7 @@ fn lower_method_with_pool_impl(
         sm_minor,
         kernels: vec![kernel],
         writes_param_mask,
+        reads_param_mask,
     })
 }
 
@@ -457,6 +459,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero: false,
         };
@@ -483,6 +486,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero: false,
         };
@@ -503,6 +507,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero,
         };
@@ -553,6 +558,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero,
         };
@@ -577,6 +583,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero,
         };
@@ -732,6 +739,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero: false,
         };
@@ -969,6 +977,55 @@ mod tests {
         assert!(text.contains("st.global.f32"));
         // Bounds fail
         assert!(text.contains("L_bounds_fail:"));
+    }
+
+    /// `reads_param_mask` must name exactly the params read element-wise.
+    ///
+    /// The chunked writeback commits a chunk into the Java array as its
+    /// event fires — before the bounds-failure flag has been read — so it
+    /// may only do that for an array the kernel does NOT also read. This
+    /// pins the two directions on one kernel: `saxpy(a, x[], y[], out[])`
+    /// reads x and y, writes out, and never reads out.
+    #[test]
+    fn reads_param_mask_names_only_the_arrays_read() {
+        let m = lower_fixture("EligibleSaxpy", "saxpy", "(F[F[F[F)V");
+        // Params: 0 = float a (scalar), 1 = x[], 2 = y[], 3 = out[].
+        let reads = m.reads_param_mask;
+        let writes = m.writes_param_mask;
+        assert_eq!(reads & 1, 0, "a scalar param is never an element read");
+        assert_ne!(reads & (1 << 1), 0, "x[] is read:\nreads={reads:#b}");
+        assert_ne!(reads & (1 << 2), 0, "y[] is read:\nreads={reads:#b}");
+        assert_eq!(
+            reads & (1 << 3),
+            0,
+            "out[] is written but never read; marking it read would refuse \
+             a chunked writeback that is in fact safe\nreads={reads:#b}"
+        );
+        assert_ne!(writes & (1 << 3), 0, "out[] is written:\nwrites={writes:#b}");
+        // The set a chunked dispatch may stream out early.
+        assert_eq!(
+            writes & !reads,
+            1 << 3,
+            "only out[] should be eligible for early commit\n\
+             writes={writes:#b} reads={reads:#b}"
+        );
+    }
+
+    /// An array that is READ AND WRITTEN must not be eligible for early
+    /// commit — `out[i] = out[i] + 1` is the shape that would break.
+    #[test]
+    fn an_array_read_and_written_is_refused_for_early_commit() {
+        let m = lower_fixture("EligibleReadModifyWrite", "bump", "([I)V");
+        let reads = m.reads_param_mask;
+        let writes = m.writes_param_mask;
+        assert_ne!(reads & 1, 0, "a[] is read:\nreads={reads:#b}");
+        assert_ne!(writes & 1, 0, "a[] is written:\nwrites={writes:#b}");
+        assert_eq!(
+            writes & !reads,
+            0,
+            "a read-modify-write array must not be streamed out before the \
+             failure flag is known\nwrites={writes:#b} reads={reads:#b}"
+        );
     }
 
     /// Every float arithmetic instruction must carry an explicit
@@ -2400,6 +2457,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero: false,
         };
