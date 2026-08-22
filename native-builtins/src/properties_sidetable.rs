@@ -3716,6 +3716,68 @@ fn native_properties_store_writer(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(None)
 }
 
+/// # The Properties/Hashtable ownership cluster, mapped (H4-1, 2026-08-20)
+///
+/// `G88-1` §6 stopped the `Wholesale Bridge over-tagging` row here, on the
+/// ground that the cluster is "58 % outside the crate" and that the larger half
+/// lives in `native-builtins/src/lib.rs`, which contract §8 forbade editing.
+/// **The crate half is real; the file claim is not.** Registrations whose
+/// TARGET class is `java/util/Properties` or `java/util/Hashtable`, by file
+/// (`grep -rn '"java/util/Properties",' --include=*.rs`, 2026-08-20):
+///
+/// | file | rows |
+/// |---|---:|
+/// | `native-builtins/src/properties_sidetable.rs` (this one) | 32 |
+/// | `native-builtins/src/deprecated_util.rs` | 6 + the `ht` loop |
+/// | `native-builtins/src/deprecated_io_util.rs` | 4 + the `ht` loop |
+/// | `native-builtins/src/wildfly_naming.rs` | 3 |
+/// | **`native-builtins/src/lib.rs`** | **0** |
+/// | `native-collections/src/lib.rs` (`register_properties_natives`) | 43 + 6 |
+///
+/// The 49 on the `native-collections` side reproduce exactly; the 67 on this
+/// side are spread over four files and **none of them is the file the contract
+/// named**. Contract §8 was therefore never the blocker for this cluster, and
+/// `HANDOFF-20260819.md` §1 says as much in general terms ("It names **one
+/// file**, not the crate").
+///
+/// ## What the blocker actually is
+///
+/// `System.getProperties()` (registered in `native-builtins/src/lib.rs`) hands
+/// back a *synthetic* `Properties` singleton whose inherited `map`
+/// `ConcurrentHashMap` is deliberately never populated — see the note below,
+/// which records what happened on 2026-07-14 when these registrations were
+/// dropped by accident: `InternalError: null property: java.home` out of
+/// `java.util.Locale.<clinit>`, i.e. any real-JDK-mode program touching
+/// `Locale`. Retagging this registrar `SyntheticStub` reproduces that failure
+/// under `--jdk-only` by design, because `register_inner`'s `JdkOnly` arm drops
+/// the registration outright.
+///
+/// So the cluster's entry condition is not a tag but a *producer* migration,
+/// and the producers are:
+///
+/// 1. `System.getProperties()`'s synthetic singleton (`native-builtins/src/lib.rs`);
+/// 2. the 3 `try_alloc_concurrent_synthetic(_, "java/util/Properties", n)` and
+///    4 `"java/util/Hashtable"` sites outside `native-collections`;
+/// 3. `java.security.Provider extends Properties` — `jca/provider_chain.rs`
+///    reads `Hashtable.table:[Ljava/util/Hashtable$Entry;` and `Hashtable.count`
+///    directly, so the JCA registry is a second consumer of this state;
+/// 4. this file's own 4 direct calls into `native-collections`' map natives.
+///
+/// ## And one edge that runs the other way
+///
+/// This module's enumeration natives mint their views
+/// through `cratonvm_native_collections::make_live_values_list` /
+/// `make_static_entry_set`, which pick a carrier via `set_view_carrier_for` —
+/// `java/util/Hashtable$KeySet` / `$EntrySet` / `$ValueCollection`. Those three
+/// carriers are registered in `native-collections`'
+/// `register_{map,set}_view_carrier_natives`, and their `iterator` row mints a
+/// `java/util/HashMap$KeyIterator`. **So the Properties cluster reaches into
+/// the HashMap cluster's iterator carriers**, which is why the two cannot be
+/// sequenced independently. See the cluster note on
+/// `register_set_view_carrier_natives`.
+///
+/// Full map and verification plan:
+/// `docs/known-issues/jdk-only/H4-1-the-cluster-that-is-not-a-tag-20260820.md`.
 pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
     // FIX (2026-07-14, java.home/Locale bootstrap regression): every native
     // in this function is a permanent, correctness-critical BRIDGE, not an

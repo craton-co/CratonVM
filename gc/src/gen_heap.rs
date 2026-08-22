@@ -1635,6 +1635,150 @@ pub fn clear_jit_read_bounds() {
     }
 }
 
+/// Clear the read table only if slot 0 still names `owned_base` -- the
+/// owner-checked form, for the same reason [`clear_movable_bounds_owned_by`]
+/// exists. `GenerationalHeap::drop` already open-codes this test; ZGC's `Drop`
+/// called the unconditional form until 2026-08-21.
+pub fn clear_jit_read_bounds_owned_by(owned_base: usize) {
+    if JIT_READ_BOUNDS.words[0].load(Ordering::Acquire) == owned_base {
+        clear_jit_read_bounds();
+    }
+}
+
+/// Process-global mirror of the address range a **relocating collection may
+/// move**, for collectors that do not fill [`JIT_REGION_BOUNDS`].
+///
+/// # Why a THIRD table
+///
+/// The band verifier
+/// (`conservative_roots::moving_young_unpublished_frame_oop_present`) has to
+/// classify a stack word as "an object a moving cycle could relocate" before it
+/// can ask "is it published in the precise map?". It asked
+/// [`addr_in_published_young_regions`], which reads [`JIT_REGION_BOUNDS`] —
+/// and that table is generational-only, so on G1 and ZGC the predicate answered
+/// `false` for every address in the process and the verifier passed without
+/// having verified anything. [`published_young_regions_are_live`] exists so a
+/// caller can fail closed on exactly that, and it does.
+///
+/// Filling [`JIT_REGION_BOUNDS`] would fix the verifier and break something
+/// else: that table's load-bearing second job is the STORE-side question "may
+/// an inline reference store skip the collector's write barrier", which G1 and
+/// ZGC answer by leaving it empty (`audits/g1-audit.md` §8.1, G1-2). One table,
+/// two questions, opposite answers — which is the same reason
+/// [`JitReadBoundsTable`] exists rather than the read side being folded in.
+/// This is the third question and it gets the third table.
+///
+/// # What "movable" means here
+///
+/// Whatever the running collector's relocating phase may move, and it is safe
+/// for this to be a SUPERSET. An address wrongly called movable costs one
+/// diverted (non-moving) collection; an address wrongly called immovable is how
+/// a verifier reports a clean frame it never inspected. So a collector that
+/// cannot cheaply name its exact movable set should publish its whole arena.
+///
+/// # Who publishes
+///
+/// * **Generational** — nobody. It already answers through
+///   [`addr_in_published_young_regions`], and [`addr_is_movable`] consults both.
+///   Leaving it out keeps its behaviour byte-identical.
+/// * **ZGC** — its arena envelope, in slot 0, at construction, cleared on
+///   `Drop`. The envelope is captured once and the arena is never grown, so the
+///   bounds cannot go stale (the same argument `conservative_addr_span` and the
+///   object-start bitmap already rest on).
+/// * **G1** — nobody yet. It evacuates rather than sliding and protects
+///   conservative JIT roots by PINNING their regions instead
+///   (`roots.rs`'s `add_pinned_jit_root`), so it does not consume this verdict.
+#[repr(C)]
+pub struct MovableBoundsTable {
+    pub words: [AtomicUsize; 6],
+}
+
+pub static MOVABLE_BOUNDS: MovableBoundsTable = MovableBoundsTable {
+    words: [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ],
+};
+
+/// Publish `[base, end)` into slot `slot` (0..3) of [`MOVABLE_BOUNDS`].
+pub fn publish_movable_bounds(slot: usize, base: usize, end: usize) {
+    if slot >= 3 {
+        return;
+    }
+    MOVABLE_BOUNDS.words[slot * 2].store(base, Ordering::Release);
+    MOVABLE_BOUNDS.words[slot * 2 + 1].store(end, Ordering::Release);
+}
+
+/// Zero the whole movable table — the teardown counterpart, so a dropped heap
+/// cannot leave bounds naming freed arena memory.
+///
+/// Prefer [`clear_movable_bounds_owned_by`]: this table is PROCESS-GLOBAL and a
+/// heap that clears it unconditionally wipes the bounds a different, still-live
+/// heap published. `GenerationalHeap::drop` learned that the hard way for
+/// [`JIT_REGION_BOUNDS`] — and the cost is not merely a slower fast path here,
+/// because an empty table makes the frame-band verifier vacuous, which is the
+/// whole reason this table exists.
+pub fn clear_movable_bounds() {
+    for w in MOVABLE_BOUNDS.words.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
+/// Clear the movable table only if slot 0 still names `owned_base`.
+///
+/// The discriminator is the publisher's own arena base: a table still naming it
+/// is a table this heap published and nobody has replaced. Exactly the shape
+/// `GenerationalHeap::drop` uses for the other two tables, and for the same
+/// measured reason — a short-lived heap (a sizing probe, an init-time heap
+/// replaced once `-Xmx` is parsed) must not wipe a live heap's bounds.
+pub fn clear_movable_bounds_owned_by(owned_base: usize) {
+    if MOVABLE_BOUNDS.words[0].load(Ordering::Acquire) == owned_base {
+        clear_movable_bounds();
+    }
+}
+
+/// Whether [`MOVABLE_BOUNDS`] carries any pair at all.
+pub fn movable_bounds_published() -> bool {
+    (0..3).any(|i| MOVABLE_BOUNDS.words[i * 2].load(Ordering::Acquire) != 0)
+}
+
+/// Is `addr` inside a published movable range?
+pub fn addr_in_movable_bounds(addr: usize) -> bool {
+    for i in 0..3 {
+        let base = MOVABLE_BOUNDS.words[i * 2].load(Ordering::Acquire);
+        let end = MOVABLE_BOUNDS.words[i * 2 + 1].load(Ordering::Acquire);
+        if base != 0 && addr >= base && addr < end {
+            return true;
+        }
+    }
+    false
+}
+
+/// **Can a relocating collection move something at `addr`?** — the union of the
+/// generational young table and [`MOVABLE_BOUNDS`].
+///
+/// This is what the band verifier must ask. Asking
+/// [`addr_in_published_young_regions`] alone is what made the verifier vacuous
+/// on every collector but one.
+pub fn addr_is_movable(addr: usize) -> bool {
+    addr_in_published_young_regions(addr) || addr_in_movable_bounds(addr)
+}
+
+/// Whether ANY collector has published a movable range this verifier can test
+/// against — the fail-closed gate.
+///
+/// A predicate built on [`addr_is_movable`] is vacuous while this is `false`,
+/// exactly as [`published_young_regions_are_live`] documents for its own table,
+/// and a caller that reads a quiet verifier as a clean one is measuring an
+/// unpublished table.
+pub fn movable_bounds_are_live() -> bool {
+    published_young_regions_are_live() || movable_bounds_published()
+}
+
 /// How many identity hash codes a thread claims per global `fetch_add`.
 /// See [`GenerationalHeap::next_hash`] for the trade-off this number sets.
 const IDENTITY_HASH_BLOCK: i32 = 64;

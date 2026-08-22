@@ -91,6 +91,92 @@ jobs:
           printf '  %s\n' "${files[@]}"
           rustfmt --check --edition 2021 "${files[@]}"
 
+  # DOES EVERY .rs FILE THIS DIFF TOUCHED STILL PARSE?
+  #
+  # `native-builtins/tests/stub_ratchet.rs` HAD NOT PARSED SINCE MERGE
+  # `26e4b5db4`, which spliced two versions of one failure message and kept both
+  # argument lists. The whole `--test stub_ratchet` binary went with it, and that
+  # gate is the cited evidence for the P0 *Residual synthetic native set* row.
+  # It was blocking CI in both configurations and `origin/dev` still carried the
+  # break days later. With `G89-1`'s finding that the same gate had been RED
+  # since 2026-08-14, it adjudicated nothing for six days and then adjudicated
+  # nothing at all. (`H3-1`; `docs/known-issues/jdk-only/HANDOFF-20260820.md` §3.)
+  #
+  # WHY THIS IS NOT A DUPLICATE OF THE `fmt` JOB ABOVE, WHICH ALREADY RUNS
+  # `rustfmt --check` OVER THE SAME FILES.
+  #
+  # `rustfmt --check` exits 1 for TWO unrelated reasons and `fmt` reads only the
+  # exit code, so its red says "one of these two things happened":
+  #
+  #     a formatting diff   -> written to STDOUT  ("Diff in <file>:<line>:")
+  #     a parse error       -> written to STDERR  ("error: ...")
+  #
+  # MEASURED, not assumed (lane H10, 2026-08-20, rustfmt 1.9.0-stable):
+  # `26e4b5db4`'s copy of `stub_ratchet.rs` produces 32 stderr errors, all
+  # lexer/parse, and ZERO bytes of stdout; the same file at HEAD produces zero
+  # stderr and a 1565-byte formatting diff. And this workspace is NOT
+  # rustfmt-clean — `types/src/flag_groups.rs` prints a diff on an untouched
+  # checkout — so the overwhelmingly common cause of a red `fmt` is the harmless
+  # one. A verdict that conflates "this file is laid out differently" with "this
+  # file is not Rust" cannot report the second.
+  #
+  # This job reads STDERR ONLY. Its red means exactly one thing, it is always
+  # actionable, and it is a SEPARATE JOB rather than a step so that neither gate
+  # can stand in front of the other — the `fmt`-first arrangement is what kept
+  # `cargo clippy --workspace --all-targets` from running on `dev` for weeks
+  # (see the `fmt` job's own header).
+  #
+  # WHAT IT DOES NOT CATCH. It is a PARSE check, not a type check. A file that
+  # parses can still fail to compile: a call with the wrong argument list that
+  # leaves the token stream balanced passes here, as does any unresolved name,
+  # missing import, borrow error or trait bound. `cargo check` is still the gate
+  # for that; this one costs seconds and needs no toolchain build, which is why
+  # it can run in front of it rather than instead of it.
+  merge-parse:
+    name: Parse check (changed files)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Every changed .rs file must parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git rev-parse "$head^" 2>/dev/null || echo "$head")"
+            fi
+          fi
+          # EVERY .rs the diff touched, never a fixed list. Plus, when $head is
+          # a MERGE, the diff against its OTHER parents: a bad conflict
+          # resolution differs from at least one parent, and on a push whose
+          # `before` happens to be one of them the two-dot diff alone can miss
+          # the half that arrived from the other side.
+          {
+            git diff --name-only --diff-filter=ACMR "$base" "$head" -- '*.rs' || true
+            for p in $(git rev-list --parents -n 1 "$head" | cut -d' ' -f2-); do
+              git diff --name-only --diff-filter=ACMR "$p" "$head" -- '*.rs' || true
+            done
+          } | grep -v '^native-builtins/vendor/' | sort -u > changed-rs.txt || true
+          echo "changed .rs files: $(wc -l < changed-rs.txt)"
+          # --quiet suppresses the per-clean-file line; failures always print.
+          # The script exits 3 on a missing prerequisite, which must fail the
+          # job: "rustfmt was not installed" is not a pass.
+          bash scripts/merge-parse-check.sh --quiet \
+            --files "$(tr '\n' ' ' < changed-rs.txt)"
+
   build-and-test:
     name: Build & Test
     runs-on: ${{ matrix.os }}

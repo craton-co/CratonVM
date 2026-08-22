@@ -3905,7 +3905,6 @@ impl Compiler {
                 // tableswitch — jump table for dense tables, CMP chain for small
                 0xaa => {
                     self.flush_scratch_registers();
-                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -3966,7 +3965,35 @@ impl Compiler {
                         pc += 4;
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    if def_target <= base_pc || targets.iter().any(|&target| target <= base_pc) {
+                    let any_backward =
+                        def_target <= base_pc || targets.iter().any(|&target| target <= base_pc);
+                    // Canonicalize the operands that OUTLIVE this switch, exactly
+                    // as the `ifeq`/`if_icmp`/`goto` arms do — and before popping
+                    // the key, so the key participates in the relocation and
+                    // cannot be clobbered by another slot's move (the same
+                    // ordering rule those arms state).
+                    //
+                    // Every arm of a switch is a branch target, and a target
+                    // revived from dead code rebuilds the operand stack at the
+                    // canonical `base_spill_offset + i*8` — a layout NOTHING was
+                    // establishing here, so any operand this basic block left at
+                    // a non-canonical offset was read from the wrong slot by
+                    // every arm. That is the second half of ECJ's
+                    // `OperandStack.pop(OperandCategory)` miscompile: the inlined
+                    // `TypeIds.getCategory` result sat above its semantic depth
+                    // (fixed in `x64/inlining.rs`) and this `tableswitch` was the
+                    // one branch shape in the walk that did not repair it, so the
+                    // `if_icmpeq` at the merge compared the raw `TypeBinding.id`
+                    // (tomcat/ecj-operandstack-*.md).
+                    //
+                    // Forward-only, mirroring those arms: a backward target's
+                    // layout was fixed when the walk emitted it, and relocating
+                    // to suit a forward merge would disagree with it.
+                    if !any_backward && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
+                    let key_slot = self.pop_stack();
+                    if any_backward {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
@@ -4065,7 +4092,6 @@ impl Compiler {
                 // lookupswitch — CMP chain for small, binary search for large
                 0xab => {
                     self.flush_scratch_registers();
-                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -4120,7 +4146,18 @@ impl Compiler {
                         pairs.push((key, target));
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    if def_target <= base_pc || pairs.iter().any(|&(_, target)| target <= base_pc) {
+                    let any_backward = def_target <= base_pc
+                        || pairs.iter().any(|&(_, target)| target <= base_pc);
+                    // Same canonicalization the `tableswitch` arm above performs,
+                    // and for the same reason — see the note there. The two
+                    // switch arms are the only branch shapes in this walk that
+                    // were not establishing the canonical layout their own
+                    // targets are revived with.
+                    if !any_backward && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
+                    let key_slot = self.pop_stack();
+                    if any_backward {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
@@ -5604,6 +5641,135 @@ impl Compiler {
                             // CMOVcc RAX, RCX (REX.W): 48 0F 4c C1
                             self.buf.emit(&[0x48, 0x0F, cc, 0xC1]);
                             self.push_from_rax();
+                        } else if callee_entry == crate::MATH_MIN_FLOAT_INTRINSIC
+                            || callee_entry == crate::MATH_MAX_FLOAT_INTRINSIC
+                            || callee_entry == crate::MATH_MIN_DOUBLE_INTRINSIC
+                            || callee_entry == crate::MATH_MAX_DOUBLE_INTRINSIC
+                        {
+                            // `Math.min`/`Math.max` for float and double.
+                            //
+                            // SSE's MINSS/MAXSS are NOT Math.min/Math.max.
+                            // Per the SDM, `MINSS dst, src` returns `src`
+                            // whenever both operands are zero or either is
+                            // NaN. Java's javadoc requires the opposite in
+                            // both cases:
+                            //
+                            //   * "If either value is NaN, then the result is
+                            //     NaN" -- and the JDK body returns the NaN
+                            //     ARGUMENT, whose payload bits are observable
+                            //     through `Float.floatToRawIntBits`.
+                            //   * "this method considers negative zero to be
+                            //     strictly smaller than positive zero", so
+                            //     min(+0.0f, -0.0f) is -0.0f whichever way
+                            //     round the arguments come, and max is +0.0f.
+                            //
+                            // The sequence below gets both right. For `min`:
+                            //
+                            //     t1 = MINSS(a, b)      ; a<b ? a : b
+                            //     t2 = MINSS(b, a)      ; b<a ? b : a
+                            //     r  = t1 OR t2
+                            //
+                            // For ordered, unequal inputs t1 == t2 == the
+                            // smaller value, so the OR is the identity. For
+                            // +-0.0 the two MINSSs return the two DIFFERENT
+                            // zeros, and OR-ing their bit patterns sets the
+                            // sign bit iff either was -0.0 -- exactly "the
+                            // result is negative zero whenever one of them
+                            // is". `max` is the mirror image: MAXSS and AND,
+                            // so the sign survives only when BOTH were -0.0.
+                            //
+                            // NaN is then patched with two never-taken
+                            // branches rather than folded into the bitwise
+                            // trick, because OR-ing a NaN with the other
+                            // operand's bits yields *a* NaN but not *the* NaN
+                            // Java returns. `Math.min(a, NaN)` returns the
+                            // second argument (`a <= b ? a : b` in the JDK
+                            // body is false when unordered) and
+                            // `Math.min(NaN, b)` returns the first.
+                            let is_double = callee_entry == crate::MATH_MIN_DOUBLE_INTRINSIC
+                                || callee_entry == crate::MATH_MAX_DOUBLE_INTRINSIC;
+                            let is_min = callee_entry == crate::MATH_MIN_FLOAT_INTRINSIC
+                                || callee_entry == crate::MATH_MIN_DOUBLE_INTRINSIC;
+                            self.flush_xmm0_slots();
+                            let b_slot = self.pop_stack();
+                            let a_slot = self.pop_stack();
+                            self.load_slot_to_reg(RAX, a_slot);
+                            self.emit_movq_xmm_from_rax(0); // XMM0 = a
+                            self.load_slot_to_reg(RAX, b_slot);
+                            self.emit_movq_xmm_from_rax(1); // XMM1 = b
+
+                            // MOVAPS/MOVAPD XMM2 <- XMM0 (save `a`) and
+                            // XMM3 <- XMM1 (save `b`) for the NaN fixups.
+                            let movap: &[u8] = if is_double {
+                                &[0x66, 0x0F, 0x28]
+                            } else {
+                                &[0x0F, 0x28]
+                            };
+                            self.buf.emit(movap);
+                            self.buf.emit_byte(0xD0); // XMM2 <- XMM0
+                            self.buf.emit(movap);
+                            self.buf.emit_byte(0xD9); // XMM3 <- XMM1
+
+                            // MIN/MAX SS/SD: XMM0 op= XMM1, then XMM1 op= XMM2.
+                            let prefix = if is_double { 0xF2u8 } else { 0xF3u8 };
+                            let op = if is_min { 0x5Du8 } else { 0x5Fu8 };
+                            self.buf.emit(&[prefix, 0x0F, op, 0xC1]); // XMM0, XMM1
+                            self.buf.emit(&[prefix, 0x0F, op, 0xCA]); // XMM1, XMM2
+
+                            // ORPS/ORPD for min, ANDPS/ANDPD for max.
+                            let bitop = if is_min { 0x56u8 } else { 0x54u8 };
+                            if is_double {
+                                self.buf.emit(&[0x66, 0x0F, bitop, 0xC1]);
+                            } else {
+                                self.buf.emit(&[0x0F, bitop, 0xC1]);
+                            }
+
+                            // NaN fixups. UCOMISS/UCOMISD sets PF when its
+                            // operands are unordered, so comparing a register
+                            // with itself tests "is this NaN".
+                            let ucomis: &[u8] = if is_double {
+                                &[0x66, 0x0F, 0x2E]
+                            } else {
+                                &[0x0F, 0x2E]
+                            };
+                            // UCOMIS XMM2, XMM2 -- is `a` NaN?
+                            self.buf.emit(ucomis);
+                            self.buf.emit_byte(0xD2);
+                            // JNP .check_b (a is not NaN)
+                            self.buf.emit(&[0x7B, 0x00]);
+                            let jnp_check_b = self.buf.pos() - 1;
+                            // MOVAP XMM0 <- XMM2: return `a` with its exact bits.
+                            self.buf.emit(movap);
+                            self.buf.emit_byte(0xC2);
+                            // JMP .done
+                            self.buf.emit(&[0xEB, 0x00]);
+                            let jmp_done = self.buf.pos() - 1;
+
+                            let check_b = self.buf.pos();
+                            // UCOMIS XMM3, XMM3 -- is `b` NaN?
+                            self.buf.emit(ucomis);
+                            self.buf.emit_byte(0xDB);
+                            // JNP .done (neither is NaN: keep the bitwise result)
+                            self.buf.emit(&[0x7B, 0x00]);
+                            let jnp_done = self.buf.pos() - 1;
+                            // MOVAP XMM0 <- XMM3: return `b` with its exact bits.
+                            self.buf.emit(movap);
+                            self.buf.emit_byte(0xC3);
+
+                            let done = self.buf.pos();
+                            for (patch, target) in
+                                [(jnp_check_b, check_b), (jmp_done, done), (jnp_done, done)]
+                            {
+                                // Cast: usize offsets to i64 for the rel8 patch math.
+                                let rel = target as i64 - (patch as i64 + 1);
+                                debug_assert!(
+                                    (-128..=127).contains(&rel),
+                                    "Math.min/max fp intrinsic rel8 out of range: {rel}"
+                                );
+                                Self::patch_rel8_or_bail(&mut self.buf, patch, rel);
+                            }
+
+                            self.stack_push(StackSlot::Xmm(0), is_double);
                         } else if callee_entry == crate::MATH_MULTIPLY_HIGH_INTRINSIC
                             || callee_entry == crate::MATH_UNSIGNED_MULTIPLY_HIGH_INTRINSIC
                         {
@@ -10477,6 +10643,10 @@ impl Compiler {
                                         },
                                         self.helpers.service_callee_deopt,
                                         info as usize,
+                                        // This backend stages its outgoing
+                                        // arguments into one descending block,
+                                        // so element 0 already names it.
+                                        arg_offsets[0],
                                     ),
                                 );
                             }

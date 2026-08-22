@@ -39,8 +39,18 @@
 //!
 //! Synthetic-mode uses the fd_table-based `<init>`/`read`/`write`
 //! overrides in `lib.rs::register_io_extras_natives`; those remain
-//! unchanged.  The two systems never collide because they register
-//! different method names.
+//! unchanged.
+//!
+//! **They collide on exactly one name, and the claim that they "never collide
+//! because they register different method names" was false for three years.**
+//! `getFilePointer()J` is on both lists, because it is the one JDK 25 RAF
+//! method that is simultaneously public API (so the synthetic block
+//! re-implements it) and `ACC_NATIVE` (so this module bridges it). This
+//! registrar runs six lines after the synthetic one and used to register that
+//! row unconditionally, so the synthetic arm never got its own body and
+//! `getFilePointer()` answered a constant 0 there. Gated at the call site
+//! below as of H8-1, 2026-08-20. Everything else on the two lists really is
+//! disjoint — see the row comment for the full derivation.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -547,6 +557,12 @@ fn native_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // `setLength` in this marker came from a static read of pre-JDK-19 spellings;
 // the census names the descriptors this crate actually registers.) Residuals:
 // retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
+//
+// COUNT CAVEAT (H8-1, 2026-08-20): the counts above describe the DEFAULT arm.
+// `getFilePointer` is now gated on `crate::real_raf_enabled()`, so under
+// `CRATONVM_SYNTHETIC_RAF=1` this registrar contributes one row fewer and the
+// synthetic twin in `lib.rs::register_io_extras_natives` owns that triple
+// instead. See the row's own comment for why.
 pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) {
     use cratonvm_native_api::NativeKind;
     let __prev_cat = registry.current_category();
@@ -576,13 +592,43 @@ pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) 
         native_writeBytes0,
         NativeKind::Bridge,
     );
-    registry.register_with_kind(
-        raf,
-        "getFilePointer",
-        "()J",
-        native_getFilePointer,
-        NativeKind::Bridge,
-    );
+    // THE ONE ROW ON THIS REGISTRAR THAT THE SYNTHETIC-RAF GATE HAS TO REACH.
+    //
+    // `getFilePointer()J` is the only method that is both (a) `public native`
+    // on JDK 25 — `javap -p -s java.io.RandomAccessFile` on
+    // `jdk-25.0.3.9-hotspot` shows `public native long getFilePointer()`, the
+    // sole ACC_NATIVE method of the ten here that is not `private` — and
+    // (b) part of the PUBLIC surface that `register_io_extras_natives`
+    // re-implements inside its `if !real_raf_enabled()` block. It is the whole
+    // intersection of the two lists: the other nine here are `open0`, `read0`,
+    // `readBytes0`, `write0`, `writeBytes0`, `seek0`, `length0`, `setLength0`,
+    // `initIDs`, none of which the synthetic block names.
+    //
+    // Until 2026-08-20 this row was UNCONDITIONAL while its twin was gated,
+    // and `register_random_access_file_natives` runs six lines AFTER
+    // `register_io_extras_natives` in `register_io_natives`, so this row won
+    // in BOTH settings of the flag and `CRATONVM_SYNTHETIC_RAF=1` could not
+    // reach `getFilePointer` at all. That is not a harmless overlap: the two
+    // bodies read DIFFERENT layouts. `native_getFilePointer` below goes
+    // through `read_fd`, i.e. `this.fd` as a `FileDescriptor` OBJECT; the
+    // synthetic `native_raf_init` writes an `Int` fd into slot 0 and no
+    // `FileDescriptor` at all. So in the synthetic arm `raf_fd_object`
+    // answered `None` and `getFilePointer()` returned a constant **0** —
+    // silently, for every RAF — while `seek`/`length`/`read` all worked off
+    // the synthetic layout. `[flag != mode drops it]`.
+    //
+    // Gated here rather than un-gating the synthetic twin: `getFilePointer` is
+    // genuinely ACC_NATIVE, so in the DEFAULT (real-RAF) arm this Bridge is
+    // the only implementation there is and must stay. H8-1, 2026-08-20.
+    if crate::real_raf_enabled() {
+        registry.register_with_kind(
+            raf,
+            "getFilePointer",
+            "()J",
+            native_getFilePointer,
+            NativeKind::Bridge,
+        );
+    }
     registry.register_with_kind(raf, "seek0", "(J)V", native_seek0, NativeKind::Bridge);
     registry.register_with_kind(raf, "length0", "()J", native_length0, NativeKind::Bridge);
     registry.register_with_kind(raf, "setLength0", "(J)V", native_setLength0, NativeKind::Bridge);

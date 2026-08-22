@@ -165,6 +165,8 @@ impl JitCodeRegion {
         // Insert maintaining the sorted-by-start invariant.
         let idx = self.regions.partition_point(|&(s, _)| s < start);
         self.regions.insert(idx, (start, end));
+        bump_regions_epoch();
+        publish_region_snapshot(self);
     }
 
     fn deregister(&mut self, ptr: *const u8) {
@@ -175,19 +177,35 @@ impl JitCodeRegion {
         if lo < self.regions.len() && self.regions[lo].0 == addr {
             self.regions.remove(lo);
         }
+        // Bumped unconditionally, including when nothing was removed. A
+        // deregister that found nothing left the list unchanged, so the extra
+        // bump only costs the memo a refill -- and getting the "did it change?"
+        // predicate wrong in the other direction is a stale memo.
+        bump_regions_epoch();
+        publish_region_snapshot(self);
     }
 
     fn contains(&self, ptr: *const u8) -> bool {
-        let addr = ptr as usize;
-        // Binary search: find the last region whose start <= addr, then check
-        // it covers `addr`. Non-overlapping + sorted means this is the only
-        // candidate region.
+        self.region_containing(ptr as usize).is_some()
+    }
+
+    /// The region covering `addr`, or `None`.
+    ///
+    /// Binary search: find the last region whose start <= addr, then check it
+    /// covers `addr`. Non-overlapping + sorted means this is the only candidate
+    /// region.
+    ///
+    /// Returns the BOUNDS rather than a bool because [`validate_code_ptr`]'s
+    /// per-thread memo remembers the region it landed in, so the next pointer
+    /// into the same compiled body answers from a register compare instead of
+    /// re-taking the global lock.
+    fn region_containing(&self, addr: usize) -> Option<(usize, usize)> {
         let idx = self.regions.partition_point(|&(s, _)| s <= addr);
         if idx == 0 {
-            return false;
+            return None;
         }
         let (start, end) = self.regions[idx - 1];
-        addr >= start && addr < end
+        (addr >= start && addr < end).then_some((start, end))
     }
 }
 
@@ -196,10 +214,153 @@ fn jit_code_regions() -> &'static Mutex<JitCodeRegion> {
     REGIONS.get_or_init(|| Mutex::new(JitCodeRegion::new()))
 }
 
+/// Generation of the JIT code region list.
+///
+/// Bumped by [`JitCodeRegion::register`] and [`JitCodeRegion::deregister`],
+/// which are the ONLY two mutators and both run with `jit_code_regions()`'s
+/// lock held. So a reader that observes the same value at two moments has
+/// observed a region list that was byte-identical throughout -- which is the
+/// whole soundness argument for the per-thread memo in [`validate_code_ptr`].
+///
+/// Starts at 0 and only ever rises, so `u64::MAX` is available as the memo's
+/// "never filled" sentinel: one bump per `ExecutableBuffer` create or drop, so
+/// reaching it would take 2^64 compiles.
+static REGIONS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that the region list changed. Called with the lock held.
+#[inline]
+fn bump_regions_epoch() {
+    REGIONS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Hits and misses on the [`validate_code_ptr`] memo, so a run can say whether
+/// the fast path is being taken at all rather than leaving that to a timing
+/// wash. A feature that reports itself on while contributing nothing looks
+/// identical to one that helps, in a table of wall times.
+///
+/// GATED, and that is not a style choice. A `fetch_add` on a process-global
+/// `AtomicU64` per compiled call is precisely the shape of serialisation this
+/// change exists to remove: the first cut of the memo counted unconditionally
+/// and would have replaced a `Mutex` with a contended cache line, which at 25
+/// threads is not obviously the better of the two. It is read once through a
+/// `OnceLock` and is a relaxed load plus a not-taken branch when off.
+static CODE_PTR_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CODE_PTR_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether to count snapshot hits/misses. `CRATONVM_DBG_JIT_METHOD_STATS`, the
+/// same switch that prints them.
+#[inline]
+fn code_ptr_memo_census_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(v) = ON.get() {
+        return *v;
+    }
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_METHOD_STATS").is_some()
+    })
+}
+
+#[inline]
+fn note_code_ptr_memo(hit: bool) {
+    if !code_ptr_memo_census_enabled() {
+        return;
+    }
+    let c = if hit {
+        &CODE_PTR_MEMO_HITS
+    } else {
+        &CODE_PTR_MEMO_MISSES
+    };
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(hits, misses)` on the code-pointer memo this run. Both are zero unless
+/// `CRATONVM_DBG_JIT_METHOD_STATS` was set — see the counters' doc.
+pub fn code_ptr_memo_stats() -> (u64, u64) {
+    (
+        CODE_PTR_MEMO_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        CODE_PTR_MEMO_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// How many times the region list has changed this run. Printed beside the
+/// hit/miss pair because the two failure modes look identical from the ratio
+/// alone: a memo that is too NARROW (several hot regions, one slot) and a memo
+/// whose epoch churns (every compile flushes every thread) both read as "mostly
+/// misses", and they want opposite fixes.
+pub fn code_ptr_regions_epoch() -> u64 {
+    REGIONS_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Default-ON kill switch for the memo: `CRATONVM_JIT=-code-ptr-memo`.
+///
+/// Exists so the change can be A/B-ed inside ONE binary. A cross-binary
+/// comparison of a ~1.5% symbol, on a host whose run-to-run spread on this
+/// workload is 20%, is not a measurement.
+pub fn code_ptr_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CODE_PTR_MEMO").is_none()
+    })
+}
+
+/// Lock-free snapshot of the region list, for [`validate_code_ptr`].
+///
+/// # Why a snapshot and not a memo
+///
+/// The first two cuts of this were a per-thread memo of the last region(s) this
+/// thread validated into, and both were measured and both were too narrow.
+/// Every compiled method gets its own [`ExecutableBuffer`], so a thread running
+/// interpreted Java calls into a rotating set of regions and a small cache is
+/// evicted by the next call. On `H2UpdateScaleProbe 1 2000 10000`:
+///
+/// | memo | hits | misses | hit rate |
+/// |---|---:|---:|---:|
+/// | 1 way | 263 299 | 3 225 254 | **7.5 %** |
+/// | 16 ways, direct-mapped on the page | 1 163 588 | 2 477 691 | **32 %** |
+///
+/// A 32 % hit rate is a fast path that pays for itself twice and delivers once.
+/// The `region_epoch` printed beside those counters was **1 838** against 3.6 M
+/// calls, which is the number that decides the design: the list barely changes,
+/// so the right structure is not a cache of PART of it but a whole immutable
+/// copy that readers share and a writer replaces. That is
+/// read-copy-update, which is what `ArcSwap` is, and `JitCache::methods`
+/// already uses it for the identical shape one screen down.
+///
+/// The snapshot is rebuilt under `jit_code_regions()`'s lock by whichever
+/// mutator changed the list, so a reader never sees a torn one and never takes
+/// a lock at all.
+static JIT_CODE_REGION_SNAPSHOT: std::sync::OnceLock<arc_swap::ArcSwap<Vec<(usize, usize)>>> =
+    std::sync::OnceLock::new();
+
+fn jit_code_region_snapshot() -> &'static arc_swap::ArcSwap<Vec<(usize, usize)>> {
+    JIT_CODE_REGION_SNAPSHOT.get_or_init(|| arc_swap::ArcSwap::from_pointee(Vec::new()))
+}
+
+/// Republish the snapshot. Called with `jit_code_regions()`'s lock held, by the
+/// two mutators, so the copy taken here is of a list nobody is editing.
+fn publish_region_snapshot(regions: &JitCodeRegion) {
+    jit_code_region_snapshot().store(std::sync::Arc::new(regions.regions.clone()));
+}
+
 /// Validate that a pointer is safe to transmute to a function pointer.
 ///
 /// Checks: non-null, properly aligned, and falls within a known JIT code region.
 /// Returns `Ok(())` if valid, or a descriptive error string.
+///
+/// # Why this is not just a lock and a binary search
+///
+/// It is on EVERY compiled call -- `CompiledMethod::try_call` and
+/// `try_call_with_context` both validate the entry they are about to jump to --
+/// and it took a global `std::sync::Mutex` to do it. Single-threaded on the H2
+/// UPDATE path that is 1.54% of CPU (`perf`, flat self-attribution,
+/// 2026-08-21); at 25 threads it is a serialisation point on a path with
+/// nothing else to serialise on, which is the shape
+/// `performance/h2-update-path-throughput-RETIRED-20260821.md` calls
+/// "genuinely scaling rather than constant-factor work".
+///
+/// The memo takes the lock out of the steady state without weakening the check:
+/// see [`CODE_PTR_MEMO`] for why an epoch match is a stronger statement than the
+/// locked lookup makes, not a weaker one.
 pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
     if ptr.is_null() {
         return Err("null JIT code pointer");
@@ -209,11 +370,42 @@ pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
     if (ptr as usize) % 4 != 0 {
         return Err("misaligned JIT code pointer");
     }
+    let addr = ptr as usize;
+    if code_ptr_memo_enabled() {
+        // One `ArcSwap` load and a binary search over the thread's borrowed
+        // snapshot. No lock, no allocation, and -- unlike the memo this
+        // replaced -- an exact answer on the FIRST probe of every region, so
+        // there is no hit rate to be disappointed by.
+        let snapshot = jit_code_region_snapshot().load();
+        let hit = region_containing_in(&snapshot, addr).is_some();
+        note_code_ptr_memo(hit);
+        if hit {
+            return Ok(());
+        }
+        // A miss here is not automatically an error: the snapshot is published
+        // by the mutators, and `JitCodeRegion::new()`'s empty initial value is
+        // live until the first `ExecutableBuffer` exists. Fall through to the
+        // authoritative locked lookup rather than reporting a region that
+        // exists as absent -- the snapshot is an accelerator, never the source
+        // of truth.
+    }
     let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
     if !regions.contains(ptr) {
         return Err("JIT code pointer outside known code regions");
     }
     Ok(())
+}
+
+/// [`JitCodeRegion::region_containing`] over a bare sorted slice, so the
+/// snapshot and the locked list run the identical search.
+#[inline]
+fn region_containing_in(regions: &[(usize, usize)], addr: usize) -> Option<(usize, usize)> {
+    let idx = regions.partition_point(|&(s, _)| s <= addr);
+    if idx == 0 {
+        return None;
+    }
+    let (start, end) = regions[idx - 1];
+    (addr >= start && addr < end).then_some((start, end))
 }
 
 pub use cratonvm_jit_api::{count_param_slots, CachedBytecodeMethod, JitRuntimeHelpers};
@@ -8355,6 +8547,30 @@ pub enum JitIntrinsic {
     /// `Math/StrictMath.unsignedMultiplyHigh(JJ)J` — high 64 bits of the
     /// UNSIGNED 128-bit product, emitted as a one-operand `MUL r64`.
     MathUnsignedMultiplyHigh = 15,
+    /// `Math/StrictMath.min(FF)F` / `max(FF)F` / `min(DD)D` / `max(DD)D`.
+    ///
+    /// The `int` and `long` forms have been intrinsics since Round-8; these
+    /// four had not, so every `Math.min(float,float)` from compiled code ran
+    /// the JDK's Java body — which is not a one-liner. It tests for NaN,
+    /// then tests both arguments against zero, then calls
+    /// `Float.floatToRawIntBits` and reads a `static final long`, before
+    /// finally doing the comparison.
+    ///
+    /// Measured on the four-sphere ray tracer (three `Math.min(float,float)`
+    /// per pixel, 307,200 pixels): replacing the calls with plain ternaries
+    /// in the Java source cut that kernel's CratonVM CPU time from 145 ms to
+    /// 77 ms. Roughly **47% of the kernel was inside `Math.min`**, about
+    /// 74 ns per call. The same probe with `Math.sqrt` removed showed no
+    /// change, confirming the cost was these calls and not FP work.
+    ///
+    /// Lowered inline — see the `MATH_MIN_FLOAT_INTRINSIC` arm in
+    /// `x64/bytecode_walk.rs` for the SSE sequence and, more importantly,
+    /// for why `MINSS` alone is NOT `Math.min`: it implements neither the
+    /// NaN rule nor the signed-zero rule.
+    MathMinFloat = 16,
+    MathMaxFloat = 17,
+    MathMinDouble = 18,
+    MathMaxDouble = 19,
 
     // ===== INTRINSIC REGION BEGIN: INT_BITS =====
     // java.lang.Integer bit-manipulation intrinsics (Phase 1a). Variant
@@ -8676,6 +8892,10 @@ mod math_intrinsic_aliases {
     pub const MATH_MULTIPLY_HIGH_INTRINSIC: usize = JitIntrinsic::MathMultiplyHigh.as_entry();
     pub const MATH_UNSIGNED_MULTIPLY_HIGH_INTRINSIC: usize =
         JitIntrinsic::MathUnsignedMultiplyHigh.as_entry();
+    pub const MATH_MIN_FLOAT_INTRINSIC: usize = JitIntrinsic::MathMinFloat.as_entry();
+    pub const MATH_MAX_FLOAT_INTRINSIC: usize = JitIntrinsic::MathMaxFloat.as_entry();
+    pub const MATH_MIN_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathMinDouble.as_entry();
+    pub const MATH_MAX_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathMaxDouble.as_entry();
 }
 pub use math_intrinsic_aliases::*;
 
@@ -8873,9 +9093,15 @@ pub fn jdk_only_jit_violations() -> Vec<cratonvm_types::error::JdkOnlyViolation>
 /// `#[cold]` + `#[inline(never)]`, mirroring `vm_exec.rs`'s reject helpers: the
 /// `String` allocations here exist only on the reject path and are never
 /// reachable in Compatible mode.
+/// H20-1: `pub` so the OSR and eager first-call ladders — which live in the VM
+/// crate and cannot reach [`direct_native_helper`] at all — record their
+/// refusals in the SAME violation list and the SAME counter as the MethodEntry
+/// door. Two doors refusing the same triple into two different reports would be
+/// a per-door `--jdk-only-report`, which is exactly the drift
+/// `compile_gate`'s module doc says keeps happening here.
 #[cold]
 #[inline(never)]
-fn record_jdk_only_direct_native_refusal(class: &str, method: &str, descriptor: &str) {
+pub fn record_jdk_only_direct_native_refusal(class: &str, method: &str, descriptor: &str) {
     JDK_ONLY_DIRECT_NATIVE_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut recorded = jdk_only_violations().lock();
     if recorded.len() >= JDK_ONLY_VIOLATION_CAP {
@@ -8955,6 +9181,69 @@ fn direct_native_helper(
     entry
 }
 
+/// [`direct_native_helper`] for a ladder whose CALL-SITE class is not the class
+/// whose native the helper actually runs.
+///
+/// # H7-1: a serviceability predicate must mirror the dispatch it guards
+///
+/// Two of the collection ladders below recognise an `invokeinterface` against
+/// an interface — `java/util/Map.get` and
+/// `java/util/concurrent/ConcurrentMap.get` — and bind a helper that runs the
+/// *implementation's* native: `native_hashmap_get_exact`, registered on
+/// `java/util/HashMap`, and `native_chm_get`, registered on
+/// `java/util/concurrent/ConcurrentHashMap`. `direct_native_helper` asks the
+/// registry about the triple it is handed, so those two sites were asking
+/// §1.4's reviewed-exception question about a row that is not the one that
+/// runs.
+///
+/// It happens to answer correctly today: all four rows are `bridge` in
+/// `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, so both questions
+/// refuse. That is a coincidence of the current tagging, not a property of the
+/// code — and the whole point of `H4-1`/`H0-3` is that this cluster's tagging
+/// is what somebody is about to change. A retag that moved only the interface
+/// row to `Intrinsic` would bind, under `--jdk-only`, a helper whose
+/// implementation is still a `Bridge`: compiled code back in front of real
+/// bytecode that the interpreter would have run, with no arm able to see the
+/// difference.
+///
+/// So both rows must be approved. `Intrinsic` is §1.4's *reviewed* exception;
+/// requiring the review to cover the row that actually executes is what the
+/// exception means. Refusing names the implementing class, because that is the
+/// registration the refusal is about.
+///
+/// Costs one extra resolver call, on the strict arm, at compile time, only for
+/// a triple whose cell is already non-zero and whose site class differs from
+/// its implementing class.
+#[inline]
+fn direct_native_helper_for_impl(
+    cell: &std::sync::atomic::AtomicUsize,
+    jdk_only: bool,
+    intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
+    site_class: &str,
+    impl_class: &str,
+    method: &str,
+    descriptor: &str,
+) -> usize {
+    let entry = direct_native_helper(
+        cell,
+        jdk_only,
+        intrinsic_resolver,
+        site_class,
+        method,
+        descriptor,
+    );
+    if entry == 0 || !jdk_only || site_class == impl_class {
+        return entry;
+    }
+    let approved =
+        intrinsic_resolver.is_some_and(|is_intrinsic| is_intrinsic(impl_class, method, descriptor));
+    if !approved {
+        record_jdk_only_direct_native_refusal(impl_class, method, descriptor);
+        return 0;
+    }
+    entry
+}
+
 // ---------------------------------------------------------------------------
 // JDK-ONLY-NOTE — native-dispatch sites reachable from compiled code that this
 // crate cannot fix, recorded here because they are the JIT's obligations even
@@ -8983,10 +9272,25 @@ fn direct_native_helper(
 //
 //  3. `vm/src/jit/helpers.rs::build_helpers` — must call
 //     [`set_jit_execution_policy`] with `config.execution_policy()` BEFORE the
-//     first compilation, and should skip the `set_*_direct_fn` registrations
-//     entirely under `JdkOnly` (belt and braces: this crate already refuses to
-//     bind them, but not registering them at all makes the refusal
-//     unreachable rather than merely correct).
+//     first compilation.
+//
+//     This item used to continue: "and should skip the `set_*_direct_fn`
+//     registrations entirely under `JdkOnly` (belt and braces …)".
+//     **WITHDRAWN 2026-08-21 (H20-1), for two independent reasons.**
+//
+//     (a) It asks for something that was deliberately deleted. The module
+//     comment ~300 lines above this one records the `*_DIRECT_FN` cells being
+//     registered *unconditionally* as of 2026-08-06, because withholding a
+//     process-invariant `fn` address was never per-VM protection — it was a
+//     process-wide side effect on every other VM in the process. Re-adding it
+//     would re-introduce that bug. An open ask for a closed decision is how
+//     `vm/src/jit/helpers.rs` came to carry two contradictory paragraphs about
+//     the same registrations for two weeks.
+//
+//     (b) It would not have covered the doors that need covering. Item 7
+//     below: both direct doors take helper addresses as
+//     `NAME as *const () as usize`, never reading the cells, so zeroing the
+//     cells is invisible to them.
 //
 //  4. `cp_elidable_init_resolver` (supplied to `try_compile` by
 //     `vm/src/runtime/interpreter.rs`) decides whether a `<init>` may be
@@ -9004,6 +9308,28 @@ fn direct_native_helper(
 //
 //  6. `MONITOR_ENTER_DIRECT_FN` / `MONITOR_EXIT_DIRECT_FN` are VM monitor
 //     services, not registered natives. Not a dispatch site; no action.
+//
+//  7. `vm/src/runtime/interpreter/jit_bridge.rs`'s OSR direct-call ladder and
+//     `vm/src/runtime/interpreter.rs`'s eager first-call ladder each build
+//     `direct_calls` themselves and hand it to `x64::compile_with_param_slots`,
+//     so neither reaches [`direct_native_helper`]. Both take helper addresses
+//     as `NAME as *const () as usize` rather than reading the `*_DIRECT_FN`
+//     cell, so item 3's withdrawn belt-and-braces would not have covered them
+//     either. MEASURED 2026-08-20: under `--jdk-only` the OSR door bound
+//     `jit_thread_current_thread_direct` (a `bridge` row) and compiled code
+//     called it 298 000 times while the MethodEntry door refused all seven
+//     sites it examined; `--real-jdk` reported the identical `OSR 1`. See
+//     H12-1.
+//
+//     The largest such paths in the tree, and the reason items 1-6 read as a
+//     complete list for three months while they were not.
+//
+//     The remedy is [`compile_gate::CompileAdmission::admits_direct_bind`] plus
+//     `vm/src/jit/helpers.rs::admit_direct_native_entry`, called AT THE BIND
+//     SITE. It cannot be applied downstream: a row removed after the door
+//     leaves the pc with neither invoke-info nor a direct-call plan, which
+//     `x64/driver.rs`'s `reserve_stack_floor` walk defines as a raw self-call.
+//     See H20-1.
 // ---------------------------------------------------------------------------
 
 /// Process-global pointer to the VM-side
@@ -9081,6 +9407,54 @@ pub fn set_string_latin1_lower_direct_fn(addr: usize) {
 }
 pub fn set_concurrent_hashmap_get_direct_fn(addr: usize) {
     CONCURRENT_HASHMAP_GET_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Call sites bound to one of the three COLLECTION thin direct helpers, per
+/// compile door (only the single-pass ladder recognises these three today —
+/// see the scope note in the IR ladder above `THREAD_CURRENT_THREAD_SITES_IR`).
+///
+/// # H7-1: why a counter, and why this one
+///
+/// `H4-1` §1c and `H0-3` are about VM-side writers of a container's state that
+/// the native registry cannot see. These three binds put a *compiled* one in
+/// that population: after them, a `HashMap.get` in a tiered-up method and the
+/// same `HashMap.get` interpreted reach the map's state by two different
+/// routes. Nothing in the arms could say whether a given run had any such site
+/// at all — `--jdk-only-report` marks the four registry rows'
+/// [`invocations`] incomplete (`DIRECT_CALL_HELPER_NATIVES` in
+/// `vm/src/jit/helpers.rs`) but "incomplete" is a static claim about wiring,
+/// not a count of what this run bound.
+///
+/// So this is the same instrument, and the same lesson, as `LEAF_NATIVE_HITS`:
+/// **timings cannot tell "the fast path was never installed" from "it was
+/// installed and is no faster"** — and a strict-mode run cannot tell "the gate
+/// refused" from "no compile ever reached the site". Read beside
+/// [`jdk_only_direct_native_refusals`], the two together answer both:
+///
+/// | sites | refusals | reading |
+/// |---|---|---|
+/// | 0 | 0 | no compiled site ever saw one of these calls — the run says NOTHING about the gate |
+/// | 0 | >0 | the gate fired; strict mode is taking the interpreter's route |
+/// | >0 | 0 | compiled code holds a second entry into the map's state (expected under `--real-jdk`) |
+/// | >0 | >0 | two VMs in one process, or a policy that changed between compiles |
+///
+/// Relaxed adds on a cold compile path; nothing here is on a hot path.
+pub static HASHMAP_GET_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static HASHMAP_PUT_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CONCURRENT_HASHMAP_GET_DIRECT_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(HashMap.get, HashMap.put, ConcurrentMap.get)` sites bound to a collection
+/// thin direct helper since process start. See
+/// [`HASHMAP_GET_DIRECT_SITES`] for how to read it.
+pub fn collection_direct_helper_sites() -> (u64, u64, u64) {
+    (
+        HASHMAP_GET_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        HASHMAP_PUT_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        CONCURRENT_HASHMAP_GET_DIRECT_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// Register the `Integer.intValue` thin direct-call helper (called once from
@@ -9655,6 +10029,15 @@ pub fn try_resolve_intrinsic(
             ("max", "(II)I") => Some((JitIntrinsic::MathMaxInt, 2, b'I')),
             ("min", "(JJ)J") => Some((JitIntrinsic::MathMinLong, 2, b'J')),
             ("max", "(JJ)J") => Some((JitIntrinsic::MathMaxLong, 2, b'J')),
+            // The float/double twins of the two lines above. These four were
+            // missing for a long time, so a `Math.min(float,float)` in a hot
+            // loop paid a full Java-method dispatch into a JDK body that
+            // itself calls `Float.floatToRawIntBits` — measured at ~74 ns a
+            // call, 47% of a ray-tracer kernel. See `JitIntrinsic::MathMinFloat`.
+            ("min", "(FF)F") => Some((JitIntrinsic::MathMinFloat, 2, b'F')),
+            ("max", "(FF)F") => Some((JitIntrinsic::MathMaxFloat, 2, b'F')),
+            ("min", "(DD)D") => Some((JitIntrinsic::MathMinDouble, 2, b'D')),
+            ("max", "(DD)D") => Some((JitIntrinsic::MathMaxDouble, 2, b'D')),
             // High 64 bits of the 128-bit product — one `IMUL`/`MUL r64`.
             // Hottest leaf in SunEC P-256 Montgomery field arithmetic.
             ("multiplyHigh", "(JJ)J") => Some((JitIntrinsic::MathMultiplyHigh, 2, b'J')),
@@ -15099,7 +15482,11 @@ pub fn shadow_overflow_status() -> Option<(usize, Option<String>)> {
 
 /// How the direct-entry arms should treat a compiled callee's raw return
 /// register — see `emit_inline_callee_deopt_check`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// `Debug` is derived so the interlock's own test can NAME the mode it is
+/// asserting about; a failure that says `Off must force the ban on` is worth
+/// more than one that says `assertion failed`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpIcDeoptCheck {
     /// Compare against `i64::MIN` at every direct-entry call (the default).
     On,
@@ -15144,22 +15531,72 @@ pub fn sp_ic_deopt_check_mode() -> SpIcDeoptCheck {
 ///    (`direct-call-service-slots`) rather than an unserviced raw edge, so
 ///    "bound" implies "serviced" for every Java callee.
 ///
-/// Default-OFF pending its own measurement: on netty's
-/// `BigEndianHeapByteBufTest` this gate accounts for 16 of 892 refused binds,
-/// against 736 for the native shadow, so it is a much smaller population than
-/// the virtual-site ban and is not worth defaulting on unmeasured.
-/// `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=1` opts in.
+/// **Default-ON since 2026-08-21.** `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=0`
+/// restores the ban.
+///
+/// The measurement it was waiting for was taken and it is two-sided, so read
+/// both halves before changing this again
+/// (`static-exception-table-callee-pays-the-funnel-20260821.md`):
+///
+///  * **per call, 10.2x.** `probes/NativeFunnelFloorProbe.java`, ABBA on one
+///    binary: a static callee with a never-taken `try`/`catch`, reached from an
+///    ordinary frame, goes 107.30 -> 10.57 ns/op with both controls flat. Under
+///    the ban it takes `jit_invoke_dispatch` on every call — 1 187 000 funnel
+///    entries against zero for the same callee without the table.
+///  * **per workload, nothing measurable.** 3-228 such sites per netty class
+///    against 117-1 252 left on the helper, `native-shadow` dominating every
+///    one, and an ABBA on the 228-site class moving nothing against a 39 %
+///    spread.
+///
+/// So the flip is NOT justified by a workload win, and pretending otherwise
+/// would be the kind of claim this tree does not make. What justifies it is
+/// consistency and cost: the virtual/interface sibling
+/// (`mic_publish_exception_table_callees`) had the IDENTICAL ban for the
+/// IDENTICAL stated reason, was measured at 8.7x, and was lifted — leaving the
+/// statically bound door, which is the EASY case, 11x worse than the virtual
+/// one for the same callee (9.2 ns against 107). A default that makes the
+/// simpler path the slower path is not a conservative default, it is a bug that
+/// happens to be quiet.
+///
+/// The stated reason for the ban has expired, and `probes/ExcTableDirectCallOracle.java`
+/// is what says so rather than the argument above: a callee's own handler,
+/// `finally`, wrong-type non-catch, nested catch and rethrow all behave
+/// identically under HotSpot, under the ban and with it lifted — including the
+/// IMPLICIT AIOOBE/NPE/div-by-zero cases, which are the ones that actually
+/// leave through the `i64::MIN` sentinel the ban's reason names.
+///
+/// The population note that used to stand here (16 of 892 refused binds on
+/// `BigEndianHeapByteBufTest`) is still true and is still the reason not to
+/// expect a workload win; the current census puts it at 17 of 732.
 pub fn direct_call_exc_table_publish_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        if sp_ic_deopt_check_mode() != SpIcDeoptCheck::On {
-            return false;
-        }
-        matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH").as_deref(),
-            Ok("1") | Ok("true")
+        direct_call_exc_table_publish_decision(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH")
+                .as_deref()
+                .ok(),
+            sp_ic_deopt_check_mode(),
         )
     })
+}
+
+/// The policy of [`direct_call_exc_table_publish_enabled`] as a pure function
+/// of its two inputs.
+///
+/// Split out so the decision table can be unit-tested without an environment
+/// variable. The public entry point memoises in a `OnceLock` and reads the
+/// process environment, so a test that exercised IT would have to mutate
+/// `environ` — which is a data race in a parallel test binary, not a
+/// visibility question, and is exactly the pattern that was removed from
+/// `native-builtins` on 2026-08-20.
+fn direct_call_exc_table_publish_decision(flag: Option<&str>, check: SpIcDeoptCheck) -> bool {
+    // The interlock is NOT a knob, and the default flipping does not make it
+    // one: publishing while the sentinel check is suppressed is unsound, so a
+    // suppressed check forces the ban back on whatever the flag says.
+    if check != SpIcDeoptCheck::On {
+        return false;
+    }
+    !matches!(flag, Some("0") | Some("false") | Some("off"))
 }
 
 pub fn direct_jit_callee_calls_enabled() -> bool {
@@ -20683,15 +21120,32 @@ fn try_compile_inner(
                 {
                     // JDK-ONLY-WAVE2: see the marker on the
                     // `StringLatin1.toLowerCase` bind above — same list.
-                    let entry = direct_native_helper(
+                    // H7-1: the site names the INTERFACE; the helper runs
+                    // `native_chm_get`, registered on `ConcurrentHashMap`.
+                    // Both rows must be admitted — see
+                    // `direct_native_helper_for_impl`.
+                    let entry = direct_native_helper_for_impl(
                         &CONCURRENT_HASHMAP_GET_DIRECT_FN,
                         jdk_only,
                         intrinsic_resolver,
                         &class_name,
+                        "java/util/concurrent/ConcurrentHashMap",
                         &method_name,
                         &descriptor,
                     );
                     if entry != 0 {
+                        // H7-1 instrument — see `CONCURRENT_HASHMAP_GET_DIRECT_SITES`.
+                        // The POLICY question above was asked about
+                        // `java/util/concurrent/ConcurrentMap.get`, the
+                        // INTERFACE named at the call site; the helper this
+                        // binds runs `native_chm_get`, which is registered on
+                        // `ConcurrentHashMap` as well. Both rows are `bridge`
+                        // today (`scripts/baselines/jdk-only-kind-map-25-linux.tsv`),
+                        // so the refusal is correct — but it is correct about
+                        // the interface row, and a retag that moved only ONE of
+                        // the two would separate them. See H7-1 §OUT-OF-FILE.
+                        CONCURRENT_HASHMAP_GET_DIRECT_SITES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         needs_heap = true;
                         direct_calls.push((
                             pc,
@@ -20740,12 +21194,17 @@ fn try_compile_inner(
                     {
                         // JDK-ONLY-WAVE2: see the marker on the
                         // `StringLatin1.toLowerCase` bind above — same list.
+                        // H7-1: `put` is only reached from the
+                        // `invokevirtual java/util/HashMap` arm, so site class
+                        // and implementing class coincide; routed through the
+                        // same helper as `get` so the two stay one rule.
                         Some((
-                            direct_native_helper(
+                            direct_native_helper_for_impl(
                                 &HASHMAP_PUT_DIRECT_FN,
                                 jdk_only,
                                 intrinsic_resolver,
                                 &class_name,
+                                "java/util/HashMap",
                                 &method_name,
                                 &descriptor,
                             ),
@@ -20756,12 +21215,18 @@ fn try_compile_inner(
                     {
                         // JDK-ONLY-WAVE2: see the marker on the
                         // `StringLatin1.toLowerCase` bind above — same list.
+                        // H7-1: this arm also fires for
+                        // `invokeinterface java/util/Map.get`, where the site
+                        // class is the INTERFACE and the helper runs
+                        // `native_hashmap_get_exact`, registered on
+                        // `java/util/HashMap`. Both rows must be admitted.
                         Some((
-                            direct_native_helper(
+                            direct_native_helper_for_impl(
                                 &HASHMAP_GET_DIRECT_FN,
                                 jdk_only,
                                 intrinsic_resolver,
                                 &class_name,
+                                "java/util/HashMap",
                                 &method_name,
                                 &descriptor,
                             ),
@@ -20772,6 +21237,22 @@ fn try_compile_inner(
                     };
                     if let Some((entry, num_params)) = recognized {
                         if entry != 0 {
+                            // H7-1 instrument — see `HASHMAP_GET_DIRECT_SITES`.
+                            // Note which triple the POLICY question above was
+                            // asked about: for the `invoke_kind == 2` arm it is
+                            // `java/util/Map.get`, the INTERFACE, while the
+                            // helper this binds runs `native_hashmap_get_exact`
+                            // against a `java/util/HashMap` receiver. Both rows
+                            // are `bridge` today, so today's refusal is right;
+                            // it is right about the interface row. H7-1
+                            // §OUT-OF-FILE asks for the two to be tied.
+                            if num_params == 2 {
+                                HASHMAP_PUT_DIRECT_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                HASHMAP_GET_DIRECT_SITES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             needs_heap = true;
                             direct_calls.push((
                                 pc,
@@ -22416,6 +22897,60 @@ mod long_box_direct_bind_tests {
 }
 
 #[cfg(test)]
+mod direct_exc_table_publish_policy {
+    use super::*;
+
+    /// The default is ON as of 2026-08-21, and `=0` is what restores the ban.
+    ///
+    /// Pinned because the flip is NOT justified by a workload win — it is
+    /// justified by the static door otherwise being 11x worse than the virtual
+    /// door for the same callee — so the next person to read the census could
+    /// reasonably conclude it should go back. If they do, it should be a
+    /// decision that edits this test, not a silent polarity slip.
+    #[test]
+    fn the_default_is_on_and_zero_restores_the_ban() {
+        assert!(
+            direct_call_exc_table_publish_decision(None, SpIcDeoptCheck::On),
+            "unset must mean ON since 2026-08-21",
+        );
+        for off in ["0", "false", "off"] {
+            assert!(
+                !direct_call_exc_table_publish_decision(Some(off), SpIcDeoptCheck::On),
+                "`{off}` must restore the ban",
+            );
+        }
+        for on in ["1", "true", ""] {
+            assert!(
+                direct_call_exc_table_publish_decision(Some(on), SpIcDeoptCheck::On),
+                "`{on}` must not restore the ban",
+            );
+        }
+    }
+
+    /// The interlock outranks the flag, in BOTH directions.
+    ///
+    /// Publishing a direct `CALL` while the `i64::MIN` sentinel check is
+    /// suppressed is the unsound state — the callee's own handler would never
+    /// run — and the MIC sibling's page records a throughput reading that was
+    /// mistaken for a pass because of exactly this
+    /// (`207.04 ns/op` with the interlock holding, `24.12` without it). The
+    /// default flipping must not turn the interlock into a knob.
+    #[test]
+    fn a_suppressed_sentinel_check_forces_the_ban_back_on() {
+        for check in [SpIcDeoptCheck::Off, SpIcDeoptCheck::SkipVoid] {
+            assert!(
+                !direct_call_exc_table_publish_decision(None, check),
+                "{check:?} must force the ban on even with the flag unset",
+            );
+            assert!(
+                !direct_call_exc_table_publish_decision(Some("1"), check),
+                "{check:?} must force the ban on even when the flag asks for it",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod varhandle_read_direct_bind_tests {
     use super::*;
 
@@ -23344,6 +23879,182 @@ mod tests {
         assert_eq!(
             direct_native_helper(&CELL, false, Some(&bridge), "java/util/HashMap", "put", "()V"),
             0xfeed_face
+        );
+    }
+
+    /// H7-1 — the gate that is the ONLY thing keeping the interpreter and
+    /// compiled code from answering a map lookup two different ways under
+    /// `--jdk-only`, pinned per triple.
+    ///
+    /// `H4-1` O1 called the six collection direct helpers "blocking" because
+    /// their failure mode is a tier-dependent wrong answer no arm diffs for.
+    /// The reason strict mode is nonetheless consistent today is entirely this
+    /// function: all four triples the collection ladders ask about are
+    /// `bridge` in `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, so the
+    /// `Intrinsic`-only admission refuses every one and the call falls to the
+    /// generic, policy-checked dispatcher — the same route the interpreter
+    /// takes. **That fact is load-bearing and was written down nowhere.**
+    ///
+    /// The second half is the part that would have rotted: the ladders ask
+    /// about the triple named at the CALL SITE, which for the two
+    /// `invokeinterface` arms is `java/util/Map.get` and
+    /// `java/util/concurrent/ConcurrentMap.get` — not the `java/util/HashMap`
+    /// / `java/util/concurrent/ConcurrentHashMap` row whose native the helper
+    /// actually runs. Both rows in each pair are `bridge` today, so the two
+    /// questions currently agree; a retag moving only the interface row to
+    /// `Intrinsic` would have bound a helper whose implementation is still a
+    /// `Bridge`, under strict mode, silently. `direct_native_helper_for_impl`
+    /// closes that, and the last block here is the executable statement of it.
+    #[test]
+    fn strict_mode_refuses_every_collection_direct_helper() {
+        static CELL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        CELL.store(0x0c0f_fee0, std::sync::atomic::Ordering::Relaxed);
+
+        // What the registry says today for the four triples the collection
+        // ladders name. Source: scripts/baselines/jdk-only-kind-map-25-linux.tsv
+        // (rows 6554, 6560, 6851, 7602), all `bridge`.
+        // "Is this triple a reviewed `Intrinsic`?" — `false` for all four,
+        // because all four are `bridge`. Written as a constant `false` rather
+        // than a name list so the test cannot drift into asserting a list it
+        // maintains itself; the TSV is the source and it is cited above.
+        let as_measured_today = |_c: &str, _m: &str, _d: &str| -> bool { false };
+
+        const COLLECTION_LADDER_TRIPLES: [(&str, &str, &str); 4] = [
+            // `jit_hashmap_get_direct`, invokevirtual arm.
+            (
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // `jit_hashmap_put_direct`.
+            (
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // `jit_hashmap_get_direct`, invokeinterface arm — the INTERFACE.
+            (
+                "java/util/Map",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            // `jit_concurrent_hashmap_get_direct` — also the INTERFACE.
+            (
+                "java/util/concurrent/ConcurrentMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+        ];
+
+        for (class, method, descriptor) in COLLECTION_LADDER_TRIPLES {
+            let before = jdk_only_direct_native_refusals();
+            assert_eq!(
+                direct_native_helper(
+                    &CELL,
+                    true,
+                    Some(&as_measured_today),
+                    class,
+                    method,
+                    descriptor
+                ),
+                0,
+                "{class}.{method}{descriptor} is a Bridge: binding it under \
+                 --jdk-only would give compiled code a second entry into the \
+                 map's state while the interpreter took the bytecode route"
+            );
+            assert!(
+                jdk_only_direct_native_refusals() > before,
+                "{class}.{method}{descriptor} must be REFUSED, not merely unbound \
+                 — a silent zero is indistinguishable from an unwired cell"
+            );
+            // …and compatible mode still binds it, which is why this whole
+            // family is a compatible-mode concern and moves strict mode by
+            // exactly zero.
+            assert_eq!(
+                direct_native_helper(
+                    &CELL,
+                    false,
+                    Some(&as_measured_today),
+                    class,
+                    method,
+                    descriptor
+                ),
+                0x0c0f_fee0,
+                "{class}.{method}{descriptor} must still bind under --real-jdk"
+            );
+        }
+
+        // Retagging ONLY the interface row must NOT open the door: the helper
+        // this ladder binds runs `native_hashmap_get_exact`, registered on
+        // `java/util/HashMap`, which is still a `Bridge`.
+        let interface_only_intrinsic =
+            |class: &str, _m: &str, _d: &str| -> bool { class == "java/util/Map" };
+        let before = jdk_only_direct_native_refusals();
+        assert_eq!(
+            direct_native_helper_for_impl(
+                &CELL,
+                true,
+                Some(&interface_only_intrinsic),
+                "java/util/Map",
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;"
+            ),
+            0,
+            "an Intrinsic on the INTERFACE row must not admit a helper whose \
+             implementing row is still a Bridge"
+        );
+        assert!(
+            jdk_only_direct_native_refusals() > before,
+            "the implementing-row refusal must be counted too"
+        );
+
+        // Both rows Intrinsic: §1.4's reviewed exception genuinely covers the
+        // code that runs, so it binds.
+        let both_intrinsic = |class: &str, _m: &str, _d: &str| -> bool {
+            matches!(class, "java/util/Map" | "java/util/HashMap")
+        };
+        assert_eq!(
+            direct_native_helper_for_impl(
+                &CELL,
+                true,
+                Some(&both_intrinsic),
+                "java/util/Map",
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;"
+            ),
+            0x0c0f_fee0,
+            "when BOTH rows are reviewed Intrinsics the bind is admitted"
+        );
+
+        // And when the site class already IS the implementing class, the
+        // second question is skipped rather than asked twice. That property is
+        // asserted through the RESOLVER's own call count rather than through
+        // `jdk_only_direct_native_refusals`, which is a process-global that
+        // every other test in this binary also moves — an exact delta on it
+        // would be a race, not a check.
+        let asked = std::cell::Cell::new(0usize);
+        let counting = |_c: &str, _m: &str, _d: &str| -> bool {
+            asked.set(asked.get() + 1);
+            false
+        };
+        assert_eq!(
+            direct_native_helper_for_impl(
+                &CELL,
+                true,
+                Some(&counting),
+                "java/util/HashMap",
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+            ),
+            0
+        );
+        assert_eq!(
+            asked.get(),
+            1,
+            "site class == implementing class: the registry must be asked once, not twice"
         );
     }
     /// Poll `cond` until it holds, for up to ~1s.
@@ -25891,6 +26602,122 @@ mod tests {
     }
 
     // ── validate_code_ptr tests ─────────────────────────────────────
+
+    /// The memo must not change any ANSWER, only the cost of reaching it.
+    ///
+    /// Both arms are exercised in one process on purpose: routing this through
+    /// `CRATONVM_JIT_NO_CODE_PTR_MEMO` would be a `set_var` race against every
+    /// other test in this binary (see
+    /// `reference_set_var_in_a_parallel_test_suite_is_a_data_race`), so the
+    /// test drives the two implementations directly instead.
+    #[test]
+    fn code_ptr_memo_agrees_with_the_locked_lookup_on_every_probe() {
+        // A real region, so both arms have something to find.
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let base = buf.as_ptr() as usize;
+        let probes = [
+            base,
+            base + 4,
+            base + 4092,
+            base + 4096, // one past the end
+            base.wrapping_sub(4),
+            0x1000,
+        ];
+        for p in probes {
+            let ptr = p as *const u8;
+            let memo_answer = validate_code_ptr(ptr).is_ok();
+            let locked_answer = {
+                let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+                !ptr.is_null() && (p % 4 == 0) && regions.contains(ptr)
+            };
+            assert_eq!(
+                memo_answer, locked_answer,
+                "memo and locked lookup disagree at {p:#x} (region {base:#x}..{:#x})",
+                base + 4096
+            );
+        }
+        // A second pass, now that the memo is warm, must give the same answers:
+        // a warm memo that starts admitting addresses outside its region is the
+        // failure this whole design has to exclude.
+        for p in probes {
+            let ptr = p as *const u8;
+            let memo_answer = validate_code_ptr(ptr).is_ok();
+            let locked_answer = {
+                let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+                !ptr.is_null() && (p % 4 == 0) && regions.contains(ptr)
+            };
+            assert_eq!(memo_answer, locked_answer, "warm memo disagrees at {p:#x}");
+        }
+    }
+
+    /// A dropped buffer must stop validating, memo or no memo.
+    ///
+    /// This is the one thing an address-keyed cache can get wrong, and the only
+    /// reason [`REGIONS_EPOCH`] exists. Without the epoch the memo would keep
+    /// admitting a pointer into a region that has been unmapped -- and the
+    /// caller's next act is `transmute` and `call`.
+    #[test]
+    fn dropping_a_region_invalidates_a_warm_memo() {
+        let (base, len) = {
+            let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+            let base = buf.as_ptr() as usize;
+            // Warm the memo on this region.
+            assert!(
+                validate_code_ptr(base as *const u8).is_ok(),
+                "a live region must validate"
+            );
+            (base, 4096usize)
+        };
+        // `buf` is dropped: `deregister` ran and bumped the epoch.
+        let _ = len;
+        assert!(
+            validate_code_ptr(base as *const u8).is_err(),
+            "a pointer into an unmapped region must stop validating even though \
+             the memo was warm for it"
+        );
+    }
+
+    /// The epoch is what the memo trusts, so it must actually move.
+    #[test]
+    fn registering_and_deregistering_move_the_regions_epoch() {
+        let before = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let after_register = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            after_register > before,
+            "register must bump the epoch ({before} -> {after_register})"
+        );
+        drop(buf);
+        let after_drop = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            after_drop > after_register,
+            "deregister must bump the epoch ({after_register} -> {after_drop})"
+        );
+    }
+
+    /// The kill switch's `off_key` must be the key the reader reads.
+    ///
+    /// Mirrors `native_site_cache_default_is_on_and_the_kill_switch_kills`: a
+    /// kill switch wired to a key nothing reads is a switch that reports itself
+    /// present and does nothing.
+    #[test]
+    fn code_ptr_memo_default_is_on_and_its_kill_switch_is_declared() {
+        assert!(
+            code_ptr_memo_enabled(),
+            "the memo is default-ON; no test in this binary sets \
+             CRATONVM_JIT_NO_CODE_PTR_MEMO"
+        );
+        let entry = cratonvm_types::flag_groups::INVENTORY
+            .iter()
+            .find(|e| e.token == "code-ptr-memo")
+            .expect("code-ptr-memo must be a declared JIT token");
+        assert_eq!(
+            entry.off_key,
+            Some("CRATONVM_JIT_NO_CODE_PTR_MEMO"),
+            "the kill switch's off_key must be the key `code_ptr_memo_enabled` reads"
+        );
+        assert_eq!(entry.on_key, None, "a default-ON kill switch has no on_key");
+    }
 
     #[test]
     fn test_validate_code_ptr_null() {

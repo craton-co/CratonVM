@@ -5028,7 +5028,26 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let line_str = ctx.create_string(&command_line);
         let this_cur = ctx.read_native_pin(this_pin, this);
         ctx.set_field_by_name(this_cur, "commandLine", Value::Object(Some(line_str)));
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len());
+        // `String[]`, not `Object[]`. `ProcessHandle.Info.arguments()` is
+        // declared `Optional<String[]>`, and `new_array(Reference, n)` produces
+        // an array whose runtime component type is `java.lang.Object`. On Linux
+        // this is the ONLY reason `RJdkOptionalShape` fails:
+        //
+        //   AssertionError: process.info.arguments: get() on a PRESENT Optional
+        //   must return a [Ljava.lang.String;, got [Ljava.lang.Object;
+        //
+        // It is invisible on Windows because `os_process_cmdline` finds no
+        // command line for most pids there, so the field stays null and the
+        // vector's law skips the row — a platform-shaped blind spot, not a
+        // platform-shaped defect.
+        //
+        // (Edited by WORKER 3, whose subject is the java.lang rows: the class
+        // is `java.lang.ProcessHandle$Info` but the file is WORKER 4's. Four
+        // lines, no behaviour change beyond the component type.)
+        let arr = match ctx.class_id_by_name("java/lang/String") {
+            Some(cid) => ctx.new_ref_array(cid, arguments.len()),
+            None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len()),
+        };
         let arr_pin = ctx.pin_native_root(arr);
         for (i, a) in arguments.iter().enumerate() {
             let s = ctx.create_string(a);
@@ -5112,6 +5131,39 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 //
 // Details and the per-row table:
 // retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
+// WHERE `java/lang/Runtime.exec` IS *NOT*. Recorded 2026-08-20 (H3-1) because
+// `G89-1` N2 points a reader at this file for it and the tree says otherwise.
+//
+// This registrar owns **26 `SyntheticStub` rows** — 13 on
+// `SYNTHETIC_PROCESS_CLASS`, 1 `ProcessExitWaiter.run`, 5 on the synthetic pipe
+// OUTPUT stream, 6 on the synthetic pipe INPUT stream, and
+// `java/lang/ProcessBuilder.start()Ljava/lang/Process;` — and **none of them is
+// a `Runtime.exec` overload**. All six `exec` overloads are registered in
+// `native-builtins/src/lib.rs` (search `"java/lang/Runtime"` + `"exec"`), which
+// contract §8 places off limits for wave 1. `G89-1` §3b names that file
+// correctly; only N2's prose points here.
+//
+// The analysis N2 asks for is nevertheless settled, twice over:
+//
+//   * `javap -p java.lang.Runtime` on the JDK 25 image (Microsoft build
+//     25.0.3+9, re-verified 2026-08-20): the ONLY `ACC_NATIVE` members are
+//     `availableProcessors`, `freeMemory`, `totalMemory`, `maxMemory` and
+//     `gc`. **All six `exec` overloads are ordinary bytecode**, five of them
+//     one-line delegations and the sixth
+//     `exec(String[],String[],File)` = `new ProcessBuilder(cmdarray)
+//     .environment(envp).directory(dir).start()`.
+//   * The registration site in `lib.rs` already states exactly that, dated
+//     2026-08-12 (W7-17 N1), with a measured two-arm probe, and it is why all
+//     six are `register_with_kind(..., SyntheticStub)` today. They are
+//     therefore ALREADY dropped under `--jdk-only`, and the JDK's own `exec`
+//     already runs there — reaching `ProcessBuilder.start()` and, below it,
+//     `ProcessImpl.create` (windows) / `ProcessImpl.forkAndExec` (linux), both
+//     of which THIS registrar supplies as genuine `Bridge`s.
+//
+// So the honest verdict on all six is KEEP-AS-STUB-WITH-A-STATED-REASON, and
+// the residual work is a `Compatible`-mode deletion inside a §8-reserved file,
+// i.e. wave 2. Do not "fix" it by adding a seventh copy here.
+
 /// Register every WP1.12-owned subprocess native.  Called from
 /// `register_io_natives` at VM boot.
 pub fn register_process_natives(registry: &mut NativeMethodRegistry) {

@@ -9,7 +9,18 @@ import java.sql.Statement;
  * values` through one PreparedStatement on one connection.
  *
  * Phases are timed separately so VM start / H2 class load (a flat ~40 CPU-s
- * tax on this VM, see h2-update-path-throughput-20260802.md) can be
+ * tax on this VM, see h2-update-path-throughput-RETIRED-20260821.md) can be
+ *
+ * Re-measured 2026-08-21, four arms interleaved, min of 3, load 5.1-9.7:
+ * HotSpot C2 237.9 ms / -Xint 1548.4 ms / cratonvm JIT 7415.3 ms / cratonvm
+ * --nojit 12656.4 ms. That is 8.2x INTERPRETER TO INTERPRETER (was 10.5x on
+ * 2026-08-07) and the JIT is worth 1.71x on this shape.
+ *
+ * QUOTE THE -Xint COLUMN, NEVER THE C2 ONE. Across those three reps at load
+ * 5.1 / 7.8 / 9.7 the C2 arm read 237.9 / 861.7 / 383.2 ms -- a 3.6x swing --
+ * while -Xint moved 9% and cratonvm --nojit 18%. C2 is the only arm short
+ * enough for scheduler noise to dominate it, so every C2-relative ratio this
+ * probe has ever produced (556x, 141x) was measuring the host.
  * subtracted from the loop cost rather than folded into it.
  *
  * Usage: H2InsertLoopProbe <rows> <reps> [dbdir]

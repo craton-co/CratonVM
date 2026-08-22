@@ -2027,15 +2027,20 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
 
     // --- MethodHandle (1-field: name=0 for debugging) ---
     let mh = "java/lang/invoke/MethodHandle";
-    r.register(
-        mh,
-        "type",
-        "()Ljava/lang/invoke/MethodType;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
+    // `type()` is NOT registered here. It was, with a body that returned
+    // `ctx.get_field(this, 0)` raw, and it never ran once:
+    // `register_t4_method_handle_invoke` runs after this registrar on every
+    // boot arm (`vm/src/vm/vm_init.rs` :2594 and :3298, and
+    // `native-builtins/src/lib.rs`'s synthetic chain) and registers the same
+    // triple with the C19 body that prefers the real-JDK `type` field and
+    // falls back to the synthetic descriptor.
+    //
+    // MEASURED, `--dump-native-registry --explain-jdk-only --jdk-only`:
+    // `java/lang/invoke/MethodHandle.type()Ljava/lang/invoke/MethodType;`
+    // appears twice, `owns_slot=false` here and `owns_slot=true` there.
+    // Deleting the loser is inert; leaving it in place is a landmine, because a
+    // lane retiring the WINNER on a census row would promote this raw slot-0
+    // read in its place.
     r.register(mh, "toString", "()Ljava/lang/String;", |ctx, _args| {
         let s = ctx.create_string("MethodHandle");
         Ok(Some(Value::Object(Some(s))))
@@ -2117,21 +2122,30 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     });
 
     // --- MethodHandles (static utility) ---
+    //
+    // `lookup()` and `privateLookupIn(Class, Lookup)` are NOT registered here,
+    // and the reason is the header comment thirty lines below this one, which
+    // already stated the rule: *"we do not provide stub overrides here — the
+    // real ones take precedence and a stub would only run if the late phase is
+    // not also invoked"*. These two were violations of it, and they were the
+    // dangerous kind.
+    //
+    // Both stubs allocated a bare `MethodHandles$Lookup` and returned it with
+    // slot 0 — the lookup class — NEVER WRITTEN. That is verbatim defect #1 in
+    // `native-builtins/tests/duplicate_registration_gate.rs`'s header: *"a
+    // placeholder registered late shadowed the real implementation; the
+    // returned Lookup's slot 0 was never written, so lookupClass() answered
+    // null. Broke RJdkHidden AND RJdkStrict."*
+    //
+    // MEASURED, `--dump-native-registry --explain-jdk-only --jdk-only`: both
+    // triples appear twice, `owns_slot=false` here and `owns_slot=true` in
+    // `register_p63_method_handles_lookup`, which runs immediately after this
+    // registrar on every boot arm — `vm/src/vm/vm_init.rs` :2588 and :3295,
+    // and `phases_late.rs::register_phase63_natives` for the synthetic chain.
+    // So the deletion is inert TODAY and removes the promotion hazard for
+    // tomorrow.
     let mhs = "java/lang/invoke/MethodHandles";
-    r.register(
-        mhs,
-        "lookup",
-        "()Ljava/lang/invoke/MethodHandles$Lookup;",
-        |ctx, _args| {
-            let lookup =
-                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
-            Ok(Some(Value::Object(Some(lookup))))
-        },
-    );
-    r.register(mhs, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", |ctx, _args| {
-        let lookup = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
-        Ok(Some(Value::Object(Some(lookup))))
-    });
+    let _ = mhs;
 
     // NOT REGISTERED HERE: `MethodHandles.arrayElementVarHandle`.
     //
@@ -2271,11 +2285,11 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // stub overrides here — the real ones take precedence and a stub would
     // only run if the late phase is not also invoked (which would indicate
     // a broken VM startup).
-    let lk = "java/lang/invoke/MethodHandles$Lookup";
-    r.register(lk, "lookupClass", "()Ljava/lang/Class;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
+    //
+    // `MethodHandles$Lookup.lookupClass()` is NOT registered here either — the
+    // third of the same set, `owns_slot=false` in the dump, overwritten by
+    // `register_p63_method_handles_lookup`. It is the READ side of the null
+    // slot 0 the two deleted stubs above produced, so all three went together.
 
     // Lookup.defineHiddenClass: NOT registered here, deliberately.
     //
@@ -2303,6 +2317,18 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     // its side-table meta. `sun.security.provider.SHA3.<clinit>` chains
     // `byteArrayViewVarHandle(...).withInvokeExactBehavior()`, which would
     // otherwise hit AbstractMethodError on our synthetic VarHandle.
+    //
+    // DO NOT RETIRE — these two and `accessModeTypeUncached` below are
+    // `declared, NO Code, not ACC_NATIVE` on all nine supported images
+    // (MEASURED, `javap -p --system <image> java.lang.invoke.VarHandle`;
+    // re-derivable with `scripts/jdk-only-no-image-methods.py`). The standard
+    // retirement argument — "real JDK bytecode is behind it, so deleting the
+    // native leaves something to run" — is FALSE for them: this registration is
+    // the only implementation that exists for the receiver, and the sentence
+    // above about `AbstractMethodError` is what the retirement would restore.
+    // `H14-1` 4 sized that bucket at 2 rows because the corpus dispatched 2;
+    // `H25-2` measured the registry and found 1,405 over 193 classes. These are
+    // three of them, marked per `H25-2` N3.
     r.register(
         vh,
         "withInvokeExactBehavior",
@@ -8111,12 +8137,16 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
 
 pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     // Mixed block:
-    //   * MethodHandleProxies.asInterfaceInstance is still a SIMPLIFIED stub —
-    //     it returns the MH itself as the "proxy". `isWrapperInstance` and
-    //     `wrapperInstanceTarget` are now answered CONSISTENTLY with that
+    //   * MethodHandleProxies.asInterfaceInstance is a SIMPLIFIED stub — it
+    //     returns the MH itself as the "proxy" — and `isWrapperInstance` /
+    //     `wrapperInstanceTarget` are answered CONSISTENTLY with that
     //     (is-a-MethodHandle / the handle itself) instead of the old blanket
     //     0/null, which contradicted what `asInterfaceInstance` had just
     //     returned. `wrapperInstanceType` is not registered — see below.
+    //     SINCE 2026-08-21 (H19) all three are registered ONLY when this
+    //     registry is NOT being populated for a real JDK image: against a real
+    //     image the simplification is a `ClassCastException` at every call
+    //     site and the JDK's own bytecode is measured correct. See the guard.
     //   * LambdaMetafactory.metafactory / altMetafactory are now a faithful
     //     bridge to the VM's real lambda-proxy machinery (the same one the
     //     `invokedynamic` opcode uses): they register a proxy class via
@@ -8131,15 +8161,73 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // MethodHandleProxies
     let mhp = "java/lang/invoke/MethodHandleProxies";
-    r.register(
-        mhp,
-        "asInterfaceInstance",
-        "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;)Ljava/lang/Object;",
-        |_ctx, args| {
-            // Return the method handle as the proxy (simplified)
-            Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
-        },
-    );
+    // NOT REGISTERED WHEN A REAL JDK IMAGE IS LOADED (H19, 2026-08-21).
+    //
+    // The three registrations below are the `asInterfaceInstance`
+    // simplification and the two queries that were made consistent with it.
+    // They are correct only in the synthetic-JDK image, where
+    // `MethodHandleProxies` has no bytecode at all. Against a real image they
+    // are the entire defect: `asInterfaceInstance` reads `args[1]` and IGNORES
+    // `args[0]` (the interface), so every call site got the `MethodHandle`
+    // itself and threw
+    // `ClassCastException: java.lang.invoke.MethodHandle cannot be cast to
+    // <the requested interface>`.
+    //
+    // The historical reason for the simplification is GONE. The real
+    // `MethodHandleProxies` spins a proxy whose `<init>` does
+    // `target.asType(<MT>)` off an `ldc` of a `CONSTANT_MethodType`, which the
+    // interpreter used to refuse; `vm/src/runtime/interpreter/constants.rs`
+    // decodes both tags today and does so mode-independently.
+    //
+    // MEASURED 2026-08-21 (`C:/craton/cratonvm-r5.exe`, oracle HotSpot
+    // 25.0.3+9), the same program in three arms — the `--jdk-only` arm is the
+    // experiment, because these rows are already dropped there as
+    // `SyntheticStub`:
+    //
+    //   asInterfaceInstance(Greeter.class, mh).getClass()
+    //     HotSpot     jdk.MHProxy1.…$Greeter/0x…       greet("bob") = "hi bob"
+    //     --jdk-only  jdk.MHProxy1.…$Greeter           greet("bob") = "hi bob"
+    //     Compatible  ClassCastException
+    //   isWrapperInstance(<raw MethodHandle>)
+    //     HotSpot false | --jdk-only false | Compatible TRUE
+    //   wrapperInstanceTarget(<raw MethodHandle>)
+    //     HotSpot IllegalArgumentException | --jdk-only IllegalArgumentException
+    //     Compatible returns the handle
+    //   two asInterfaceInstance calls yield distinct instances
+    //     HotSpot true | --jdk-only true | Compatible FALSE
+    //
+    // WHY A GUARD AND NOT A DELETION. `docs/known-issues/jdk-only/H15-3` §1.4
+    // proposed deleting these three outright. Deletion is not available to this
+    // lane and would be red in CI: `vm/src/vm/tests.rs`'s
+    // `method_handle_proxies_p68` calls `isWrapperInstance` through
+    // `call_native`, which PANICS (`"{class}.{method}{descriptor} not
+    // registered"`) on an absent registration, and
+    // `cargo test -p cratonvm-vm --lib --features synthetic-jdk` is a blocking
+    // job. That registry is built by `NativeMethodRegistry::new()` and never
+    // calls `set_drop_real_layout_synthetic`, so the guard below leaves it —
+    // and the synthetic-JDK image, which has no `MethodHandleProxies` bytecode
+    // to fall back to — untouched.
+    //
+    // `drops_real_layout_synthetic()` is the predicate the registry documents
+    // for exactly this question, and a `#[cfg(feature = "synthetic-jdk")]`
+    // guard is explicitly NOT equivalent (`native-api/src/registry.rs`): the
+    // Cargo feature decides what is compiled, the launcher flag decides which
+    // class library loads. Both real-JDK arms of `vm_init` set the flag before
+    // any `register_*` pass, so this drops in `--real-jdk`/Compatible AND in
+    // `--jdk-only` — a no-op for the latter, which already dropped them.
+    //
+    // docs/known-issues/jdk-only/H19-1-three-stand-ins-retired-against-a-real-image-20260821.md §1
+    if !r.drops_real_layout_synthetic() {
+        r.register(
+            mhp,
+            "asInterfaceInstance",
+            "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;)Ljava/lang/Object;",
+            |_ctx, args| {
+                // Return the method handle as the proxy (simplified)
+                Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+            },
+        );
+    }
     // The three queries below used to be blanket `false` / `null` / `null`,
     // which directly contradicted what `asInterfaceInstance` had just handed
     // the caller: under this simplification a "wrapper instance" IS the
@@ -8160,27 +8248,33 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             Ok(None)
         }
     }
-    r.register(
-        mhp,
-        "isWrapperInstance",
-        "(Ljava/lang/Object;)Z",
-        |ctx, args| {
-            let present = mhp_wrapper_handle(ctx, args)?.is_some();
-            Ok(Some(Value::Int(if present { 1 } else { 0 })))
-        },
-    );
-    r.register(
-        mhp,
-        "wrapperInstanceTarget",
-        "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| match mhp_wrapper_handle(ctx, args)? {
-            // Real JDK throws IllegalArgumentException for a non-wrapper; we
-            // keep the historical null there so an existing caller that never
-            // checked `isWrapperInstance` first does not start throwing.
-            Some(mh) => Ok(Some(Value::Object(Some(mh)))),
-            None => Ok(Some(Value::Object(None))),
-        },
-    );
+    // Same guard, same reasoning, and it has to be the same guard: these two
+    // are only coherent BESIDE the `asInterfaceInstance` simplification above.
+    // Dropping that one alone would leave `isWrapperInstance` answering `true`
+    // for a raw handle that the real `asInterfaceInstance` never produced.
+    if !r.drops_real_layout_synthetic() {
+        r.register(
+            mhp,
+            "isWrapperInstance",
+            "(Ljava/lang/Object;)Z",
+            |ctx, args| {
+                let present = mhp_wrapper_handle(ctx, args)?.is_some();
+                Ok(Some(Value::Int(if present { 1 } else { 0 })))
+            },
+        );
+        r.register(
+            mhp,
+            "wrapperInstanceTarget",
+            "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
+            |ctx, args| match mhp_wrapper_handle(ctx, args)? {
+                // Real JDK throws IllegalArgumentException for a non-wrapper; we
+                // keep the historical null there so an existing caller that never
+                // checked `isWrapperInstance` first does not start throwing.
+                Some(mh) => Ok(Some(Value::Object(Some(mh)))),
+                None => Ok(Some(Value::Object(None))),
+            },
+        );
+    }
     // `wrapperInstanceType` is deliberately NOT registered. The registration
     // deleted here keyed on `(Ljava/lang/Object;)Ljava/lang/Class;`, but the
     // real `MethodHandleProxies.wrapperInstanceType(Object)` returns a
@@ -12918,6 +13012,11 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // do not subclass BoundMethodHandle still get rebind() called by JDK
     // internals (e.g. Invokers, LambdaForm specialization). Return self so the
     // chain continues without "no Code attribute" internal errors.
+    //
+    // DO NOT RETIRE. Confirmed against all nine supported images: `rebind()` is
+    // `abstract` on `java.lang.invoke.MethodHandle` on every one of them, so
+    // there is no bytecode to fall back to and the comment above describes the
+    // exact failure a retirement would restore. `H25-2` N3.
     r.register(
         mh,
         "rebind",

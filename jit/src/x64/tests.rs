@@ -2872,6 +2872,169 @@ fn test_compile_math_min_max_long_intrinsic() {
     assert_eq!(m3, 4, "Math.max(-7L, 4L) must be 4 (was {m3})");
 }
 
+/// `Math.min`/`Math.max` for float and double, at the corners SSE gets
+/// wrong.
+///
+/// The point of this test is not that `min(3, 5) == 3` -- a bare `MINSS`
+/// gets that right. It is the two cases `MINSS` gets WRONG, both of which
+/// are silently invisible to `==`:
+///
+///   * `-0.0` vs `+0.0`. `MINSS` treats them as equal and returns its
+///     second operand, so a naive lowering makes `Math.min` order-dependent
+///     when Java says the answer is `-0.0` either way round. Asserted on
+///     raw bits, since `-0.0 == 0.0` is true.
+///   * NaN. `MINSS` returns the OTHER operand when either input is NaN;
+///     Java returns the NaN one, payload included. Two distinct payloads
+///     are used so "returned some NaN" cannot pass for "returned the right
+///     argument".
+#[test]
+#[allow(deprecated)] // uses MATH_*_INTRINSIC aliases
+fn test_compile_math_min_max_float_double_intrinsic() {
+    // float f(float a, float b) { return Math.min(a, b); }
+    // fload_0 (0x22), fload_1 (0x23), invokestatic (0xb8 0x00 0x01), freturn (0xae)
+    let code_f: Vec<u8> = vec![0x22, 0x23, 0xb8, 0x00, 0x01, 0xae, 0, 0];
+    // double g(double a, double b) { return Math.min(a, b); }
+    // dload_0 (0x26), dload_1 (0x27), invokestatic, dreturn (0xaf). This
+    // JIT keeps every value in one 64-bit slot, so a double is dload_1 and
+    // not dload_2 -- see test_compile_dadd for the same convention.
+    let code_d: Vec<u8> = vec![0x26, 0x27, 0xb8, 0x00, 0x01, 0xaf, 0, 0];
+
+    let build = |code: &[u8], entry: usize, ret: u8| {
+        compile(
+            code,
+            6,
+            2,
+            2,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                2,
+                crate::JitDirectCall {
+                    entry,
+                    needs_context: false,
+                    num_params: 2,
+                    return_type: ret,
+                    guard_class_id: 0,
+                },
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .unwrap()
+    };
+
+    let min_f = build(&code_f, crate::MATH_MIN_FLOAT_INTRINSIC, b'F');
+    let max_f = build(&code_f, crate::MATH_MAX_FLOAT_INTRINSIC, b'F');
+    let min_d = build(&code_d, crate::MATH_MIN_DOUBLE_INTRINSIC, b'D');
+    let max_d = build(&code_d, crate::MATH_MAX_DOUBLE_INTRINSIC, b'D');
+
+    // The JIT value ABI carries floats as raw bits in an integer slot.
+    // Cast: f32 bits -> i64 slot (zero-extended, no truncation).
+    let fbits = |v: f32| v.to_bits() as i64;
+    let dbits = |v: f64| v.to_bits() as i64;
+    let call_f = |m: &crate::CompiledMethod, a: f32, b: f32| -> u32 {
+        // SAFETY: calling JIT-compiled machine code produced by `compile`
+        // above from valid bytecode, in an executable mmap region.
+        let r = unsafe { m.try_call(&[fbits(a), fbits(b)]).expect("test JIT call") };
+        r as u32 // Cast: JIT ABI convention -- low 32 bits are the float
+    };
+    let call_d = |m: &crate::CompiledMethod, a: f64, b: f64| -> u64 {
+        // SAFETY: as above.
+        let r = unsafe { m.try_call(&[dbits(a), dbits(b)]).expect("test JIT call") };
+        r as u64 // Cast: JIT ABI convention
+    };
+
+    // Two distinct NaN payloads.
+    let nan_a = f32::from_bits(0x7FC0_0001);
+    let nan_b = f32::from_bits(0x7FC0_0002);
+    let nan_a_d = f64::from_bits(0x7FF8_0000_0000_0001);
+    let nan_b_d = f64::from_bits(0x7FF8_0000_0000_0002);
+
+    // --- ordinary ordering ---
+    assert_eq!(call_f(&min_f, 3.0, 5.0), 3.0f32.to_bits());
+    assert_eq!(call_f(&min_f, 5.0, 3.0), 3.0f32.to_bits());
+    assert_eq!(call_f(&max_f, 3.0, 5.0), 5.0f32.to_bits());
+    assert_eq!(call_f(&max_f, 5.0, 3.0), 5.0f32.to_bits());
+    assert_eq!(call_f(&min_f, -7.0, 4.0), (-7.0f32).to_bits());
+    assert_eq!(call_f(&max_f, -7.0, 4.0), 4.0f32.to_bits());
+
+    // --- signed zero: -0.0 is strictly smaller than +0.0 ---
+    assert_eq!(
+        call_f(&min_f, 0.0, -0.0),
+        (-0.0f32).to_bits(),
+        "Math.min(+0.0f, -0.0f) must be -0.0f, not +0.0f (bare MINSS returns its second operand)"
+    );
+    assert_eq!(call_f(&min_f, -0.0, 0.0), (-0.0f32).to_bits());
+    assert_eq!(call_f(&min_f, -0.0, -0.0), (-0.0f32).to_bits());
+    assert_eq!(call_f(&min_f, 0.0, 0.0), 0.0f32.to_bits());
+    assert_eq!(
+        call_f(&max_f, 0.0, -0.0),
+        0.0f32.to_bits(),
+        "Math.max(+0.0f, -0.0f) must be +0.0f"
+    );
+    assert_eq!(call_f(&max_f, -0.0, 0.0), 0.0f32.to_bits());
+    assert_eq!(call_f(&max_f, -0.0, -0.0), (-0.0f32).to_bits());
+    // A zero against a non-zero must not take the zero path.
+    assert_eq!(call_f(&min_f, -0.0, 1.0), (-0.0f32).to_bits());
+    assert_eq!(call_f(&min_f, 1.0, -0.0), (-0.0f32).to_bits());
+
+    // --- NaN: the result is the NaN ARGUMENT, payload and all ---
+    assert_eq!(
+        call_f(&min_f, nan_a, 5.0),
+        nan_a.to_bits(),
+        "Math.min(NaN, x) must return the NaN argument with its payload"
+    );
+    assert_eq!(call_f(&min_f, 5.0, nan_b), nan_b.to_bits());
+    assert_eq!(call_f(&max_f, nan_a, 5.0), nan_a.to_bits());
+    assert_eq!(call_f(&max_f, 5.0, nan_b), nan_b.to_bits());
+    // Both NaN: the JDK body tests `a != a` first, so `a` wins.
+    assert_eq!(call_f(&min_f, nan_a, nan_b), nan_a.to_bits());
+    assert_eq!(call_f(&max_f, nan_a, nan_b), nan_a.to_bits());
+
+    // --- infinities ---
+    assert_eq!(
+        call_f(&min_f, f32::NEG_INFINITY, 0.0),
+        f32::NEG_INFINITY.to_bits()
+    );
+    assert_eq!(
+        call_f(&max_f, f32::INFINITY, 0.0),
+        f32::INFINITY.to_bits()
+    );
+    assert_eq!(call_f(&min_f, f32::INFINITY, nan_a), nan_a.to_bits());
+
+    // --- the same grid for double ---
+    assert_eq!(call_d(&min_d, 3.0, 5.0), 3.0f64.to_bits());
+    assert_eq!(call_d(&max_d, 3.0, 5.0), 5.0f64.to_bits());
+    assert_eq!(call_d(&min_d, -7.0, 4.0), (-7.0f64).to_bits());
+    assert_eq!(call_d(&min_d, 0.0, -0.0), (-0.0f64).to_bits());
+    assert_eq!(call_d(&min_d, -0.0, 0.0), (-0.0f64).to_bits());
+    assert_eq!(call_d(&max_d, 0.0, -0.0), 0.0f64.to_bits());
+    assert_eq!(call_d(&max_d, -0.0, 0.0), 0.0f64.to_bits());
+    assert_eq!(call_d(&max_d, -0.0, -0.0), (-0.0f64).to_bits());
+    assert_eq!(call_d(&min_d, nan_a_d, 5.0), nan_a_d.to_bits());
+    assert_eq!(call_d(&min_d, 5.0, nan_b_d), nan_b_d.to_bits());
+    assert_eq!(call_d(&max_d, nan_a_d, 5.0), nan_a_d.to_bits());
+    assert_eq!(call_d(&max_d, 5.0, nan_b_d), nan_b_d.to_bits());
+    assert_eq!(
+        call_d(&min_d, f64::NEG_INFINITY, 0.0),
+        f64::NEG_INFINITY.to_bits()
+    );
+}
+
 #[test]
 fn test_compile_dreturn() {
     // double f(double x) { return x; }
@@ -11443,8 +11606,8 @@ fn compile_with_direct_call(
 }
 
 // -----------------------------------------------------------------------
-// Regression: fixed-suite-bugs/tomcat/
-//             ecj-operandstack-corruption-jsp-compilation-500s-FIXED.md
+// Regression: fixed-suite-bugs/
+//             ecj-operandstack-corruption-jsp-compilation-500s-FIXED-20260821.md
 // -----------------------------------------------------------------------
 //
 // A direct-call site that ALSO carries `invoke_info` reserves a cold-deopt
@@ -12118,6 +12281,238 @@ fn a_call_inside_a_spliced_body_reaches_the_dispatch_helper() {
         vec![5, 10],
         "arg[0] must be at the lowest address — a reversed buffer swaps these",
     );
+}
+
+/// Build a reference-returning `InlineSite` for `static Object id(Object o)`
+/// — `aload_0; areturn`.
+///
+/// `make_inline_site` hard-codes an all-`I` descriptor, and the shape these
+/// tests need is a REFERENCE result: only a reference is named in an oop map,
+/// which is the observable that says which frame slot the splice parked it in.
+fn identity_ref_inline_site() -> crate::InlineSite {
+    let mut site = make_inline_site(&[0x2a, 0xb0], 1, 1, true, b'L');
+    site.descriptor = "(Ljava/lang/Object;)Ljava/lang/Object;".to_string();
+    site
+}
+
+/// Compile [`DIRECT_CALL_RESULT_LIVE_AT_SAFEPOINT`] with the pc-1 call either
+/// SPLICED or dispatched, and return the oop-map frame slots recorded at the
+/// pc-4 safepoint — i.e. where the pc-1 call parked its reference result.
+fn spliced_result_slots_at_pc4(splice_pc1: bool) -> Vec<i16> {
+    // LEAK(intentional): compiled code stores raw pointers to these, so they
+    // must outlive it; the test process owns them for its (short) lifetime.
+    let sink = Box::leak(Box::new(JitInvokeInfo {
+        class_name: "T",
+        method_name: "sink",
+        descriptor: "()V",
+        num_jit_args: 0,
+        return_type: b'V',
+        invoke_kind: 3,
+        declaring_class_id: 0,
+    }));
+    let callee = Box::leak(Box::new(JitInvokeInfo {
+        class_name: "T",
+        method_name: "id",
+        descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;",
+        num_jit_args: 1,
+        return_type: b'L',
+        invoke_kind: 3,
+        declaring_class_id: 0,
+    }));
+    let invoke_info: Vec<(usize, *const JitInvokeInfo)> = vec![
+        (1usize, callee as *const JitInvokeInfo),
+        (4usize, sink as *const JitInvokeInfo),
+    ];
+    let mut inline_sites = HashMap::new();
+    if splice_pc1 {
+        inline_sites.insert(1usize, identity_ref_inline_site());
+    }
+    let compiled = compile(
+        &DIRECT_CALL_RESULT_LIVE_AT_SAFEPOINT,
+        DIRECT_CALL_RESULT_LIVE_AT_SAFEPOINT.len(),
+        1,
+        1,
+        true,
+        Vec::new(), // multianewarray_info
+        Vec::new(), // field_info
+        Vec::new(), // typecheck_info
+        Vec::new(), // static_field_info
+        Vec::new(), // new_info
+        Vec::new(), // anewarray_info
+        invoke_info,
+        Vec::new(), // direct_calls
+        Vec::new(), // mic_slots
+        Vec::new(), // pic_slots
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        inline_sites,
+        None, // string_layout
+    )
+    .expect("a reference-returning leaf callee must compile spliced and unspliced");
+    let mut slots = compiled
+        .oop_maps
+        .iter()
+        .find(|m| m.bytecode_pc == 4)
+        .map(|m| m.frame_slot_offsets.clone())
+        .unwrap_or_default();
+    slots.sort_unstable();
+    slots
+}
+
+/// A spliced callee's result must land at the operand-stack depth the CALLER's
+/// bytecode gives it — not at the top of the callee's own frame region.
+///
+/// `try_emit_inline_body` carves the callee's locals AND a
+/// `MAX_INLINE_MERGE_DEPTH` merge region out of the caller's spill area, and
+/// does it BEFORE the arguments are popped (it has to — an argument slot stays
+/// live until it is marshalled into a callee local). The cursor at the end of
+/// the splice therefore sits `callee_locals + MAX_INLINE_MERGE_DEPTH` slots
+/// above where the caller's operand stack actually tops out, and the `xreturn`
+/// arms used to push the result from THERE.
+///
+/// Inside the caller's basic block that is invisible: the linear walk writes
+/// and reads the same shifted slots and computes the right answer. It becomes
+/// wrong code at the first merge point that re-establishes depth from the
+/// bytecode — writer and reader then address different slots. That is the
+/// `AssertionError: Unexpected operand at stack top` every JSP compile threw
+/// once ECJ's `OperandStack.pop(OperandCategory)` tiered up
+/// (tomcat/ecj-operandstack-*.md); the same defect had been fixed once in the
+/// direct-call arms of `bytecode_walk.rs` on 2026-08-06 and came back through
+/// the splicer when `0f55466d0` (2026-08-18) taught it to inline a
+/// value-producing branch merge.
+///
+/// The oop map is the observable, exactly as in
+/// [`direct_call_result_slot_is_independent_of_service_arg_reservation`]: the
+/// slot a live reference is reported in IS the slot the result was pushed to.
+/// Negative control (fix reverted, test kept) reports the spliced arm five
+/// slots higher — one callee local plus the four-slot merge region.
+#[test]
+fn a_spliced_callees_result_lands_at_the_callers_operand_depth() {
+    let dispatched = spliced_result_slots_at_pc4(false);
+    let spliced = spliced_result_slots_at_pc4(true);
+    assert!(
+        !dispatched.is_empty(),
+        "the pc-1 reference result must be a mapped live oop at the pc-4 safepoint"
+    );
+    assert_eq!(
+        spliced, dispatched,
+        "the splice's callee-locals and merge-region reservations moved the \
+         return value off its operand-stack depth: the linear walk and every \
+         merge point after this call now disagree about which slot holds it"
+    );
+}
+
+/// ECJ's `OperandStack.pop(OperandCategory)` reduced to its skeleton, EXECUTED.
+///
+/// A value produced by an inlined call, held on the operand stack across a
+/// `tableswitch`, and compared against a constant pushed at a switch arm — the
+/// exact shape whose compiled body compared the raw `TypeBinding.id` against
+/// the expected category instead of `TypeIds.getCategory(id)`.
+///
+/// This one is satisfied by EITHER half of the fix (the splice pushing at the
+/// caller's depth, or the switch arms canonicalising the operands that outlive
+/// them), and that is deliberate: it asserts the end-to-end behaviour the
+/// tomcat page is about, while the two tests above pin the splice half on its
+/// own. `tableswitch`/`lookupswitch` were the only branch shapes in this walk
+/// that did not establish the canonical layout their own arms are revived with,
+/// which is why the shift reached the merge here and not through an `ifeq`.
+#[test]
+fn an_inlined_result_held_across_a_tableswitch_reaches_the_merge_intact() {
+    // callee: `static int category(int a) { return a == 1 ? 2 : 1; }`
+    //   0: iload_0
+    //   1: iconst_1
+    //   2: if_icmpne 7
+    //   5: iconst_2
+    //   6: ireturn
+    //   7: iconst_1     <- branch target
+    //   8: ireturn
+    let callee = make_inline_site(
+        &[0x1a, 0x04, 0xa0, 0x00, 0x05, 0x05, 0xac, 0x04, 0xac],
+        1,
+        1,
+        true,
+        b'I',
+    );
+
+    // caller: `static int f(int a, int sel) {
+    //             int cat = category(a);
+    //             int k = switch (sel) { case 0 -> 1; case 1 -> 2; default -> 3; };
+    //             return cat == k ? 1 : 0; }`
+    //
+    //    0: iload_0                          [a]
+    //    1: invokestatic #1                  [cat]        <- the splice
+    //    4: iload_1                          [cat, sel]
+    //    5: tableswitch low=0 high=1         [cat]
+    //         (6,7 padding; 8 default; 12 low; 16 high; 20 case0; 24 case1)
+    //   28: iconst_1                         [cat, 1]     <- case 0
+    //   29: goto 37
+    //   32: iconst_2                         [cat, 2]     <- case 1
+    //   33: goto 37
+    //   36: iconst_3                         [cat, 3]     <- default
+    //   37: if_icmpeq 42                     []
+    //   40: iconst_0
+    //   41: ireturn
+    //   42: iconst_1
+    //   43: ireturn
+    let mut caller: Vec<u8> = vec![
+        0x1a, // 0  iload_0
+        0xb8, 0x00, 0x01, // 1  invokestatic #1
+        0x1b, // 4  iload_1
+        0xaa, // 5  tableswitch
+        0x00, 0x00, // 6,7 padding to the 4-byte boundary
+    ];
+    caller.extend_from_slice(&(36i32 - 5).to_be_bytes()); //  8 default -> 36
+    caller.extend_from_slice(&0i32.to_be_bytes()); // 12 low
+    caller.extend_from_slice(&1i32.to_be_bytes()); // 16 high
+    caller.extend_from_slice(&(28i32 - 5).to_be_bytes()); // 20 case 0 -> 28
+    caller.extend_from_slice(&(32i32 - 5).to_be_bytes()); // 24 case 1 -> 32
+    caller.extend_from_slice(&[
+        0x04, // 28 iconst_1
+        0xa7, 0x00, 0x08, // 29 goto 37
+        0x05, // 32 iconst_2
+        0xa7, 0x00, 0x04, // 33 goto 37
+        0x06, // 36 iconst_3
+        0x9f, 0x00, 0x05, // 37 if_icmpeq 42
+        0x03, // 40 iconst_0
+        0xac, // 41 ireturn
+        0x04, // 42 iconst_1
+        0xac, // 43 ireturn
+    ]);
+    let caller_len = caller.len();
+    assert_eq!(caller_len, 44, "hand-assembled caller length");
+    caller.push(0); // padding, like every other method the JIT sees
+    caller.push(0);
+
+    let mut sites = HashMap::new();
+    sites.insert(1, callee);
+    let compiled = compile_with_inlines(&caller, caller_len, 2, 2, sites)
+        .expect("a branchy leaf callee held across a tableswitch must compile");
+
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap. The
+    // body is arithmetic and branches only — no helper is reached.
+    unsafe {
+        // a=1 -> cat=2; sel=1 -> k=2; equal.
+        // Under the bug the merge reads canonical slot 0, which still holds the
+        // `a` the caller pushed at pc 0: 1 vs 2 -> 0.
+        assert_eq!(
+            compiled.try_call(&[1, 1]).expect("test JIT call"),
+            1,
+            "the spliced result must be what the tableswitch merge compares"
+        );
+        // a=1 -> cat=2; sel=0 -> k=1; not equal. Under the bug: 1 vs 1 -> 1.
+        assert_eq!(compiled.try_call(&[1, 0]).expect("test JIT call"), 0);
+        // a=0 -> cat=1; sel=0 -> k=1; equal. Under the bug: 0 vs 1 -> 0.
+        assert_eq!(compiled.try_call(&[0, 0]).expect("test JIT call"), 1);
+        // a=3 -> cat=1; sel=9 -> default k=3; not equal.
+        assert_eq!(compiled.try_call(&[3, 9]).expect("test JIT call"), 0);
+        // a=1 -> cat=2; sel=9 -> default k=3; not equal. Under the bug: 1 vs 3
+        // -> 0 (agrees) — kept so the default arm is covered on both callee arms.
+        assert_eq!(compiled.try_call(&[1, 9]).expect("test JIT call"), 0);
+    }
 }
 
 /// A spliced call site with no resolved target must REFUSE the splice.

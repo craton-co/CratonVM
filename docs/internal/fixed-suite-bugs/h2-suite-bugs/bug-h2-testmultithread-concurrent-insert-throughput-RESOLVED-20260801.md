@@ -235,7 +235,7 @@ for it to block. See
    CPU per update **doubles** from 4 to 25 threads (3.6 → 7.8 ms) while
    HotSpot's falls (0.41 → 0.15). Now
    the retired `bug-h2-testmultithread-concurrent-update-timeout` write-up, and
-   after it `h2-update-path-throughput-20260802.md`.
+   after it `h2-update-path-throughput-RETIRED-20260821.md`.
 2. ~~**`NoSuchMethodError: java/lang/Object.next()`**~~ — reproduced with a
    receiver dump, promoted to its own page:
    `bug-h2-classid0-stale-address-family.md`. It is the ambiguous

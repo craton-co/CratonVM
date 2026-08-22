@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-466 tokens.
+469 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -69,6 +69,7 @@ export inherited from a parent shell.
 | `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
 | `layout-alias` | `CRATONVM_DBG_LAYOUT_ALIAS` |
 | `check-override` | `CRATONVM_DBG_CHECK_OVERRIDE` |
+| `dial-doors` | `CRATONVM_DBG_DIAL_DOORS` |
 | `direct-memory` | `CRATONVM_DBG_DM` |
 | `dupx-trace` | `CRATONVM_DBG_DUPX_TRACE` |
 | `read0-latency` | `CRATONVM_DBG_READ0LAT` |
@@ -202,6 +203,7 @@ export inherited from a parent shell.
 | `gc-overhead` | `CRATONVM_DBG_GC_OVERHEAD` |
 | `gc-stats` | `CRATONVM_GC_STATS` |
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
+| `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
 | `gcpart` | `CRATONVM_DBG_GCPART` |
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
@@ -212,6 +214,7 @@ export inherited from a parent shell.
 | `getstatic-prof` | `CRATONVM_DBG_GETSTATIC_PROF` |
 | `stack-kinds` | `CRATONVM_DBG_STACK_KINDS` |
 | `gocbf` | `CRATONVM_DBG_GOCBF` |
+| `gpu-dump-ptx` | `CRATONVM_GPU_DUMP_PTX` |
 | `gpu-trace-bytes` | `CRATONVM_GPU_TRACE_BYTES` |
 | `gse` | `CRATONVM_DBG_GSE` |
 | `h2parserread` | `CRATONVM_DBG_H2PARSERREAD` |
@@ -532,7 +535,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-211 tokens.
+212 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -690,6 +693,7 @@ export inherited from a parent shell.
 | `atomic-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_INTRINSIC` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
+| `code-ptr-memo` | `CRATONVM_JIT_NO_CODE_PTR_MEMO` |
 | `param-tag-scan` | `CRATONVM_JIT_NO_PARAM_TAG_SCAN` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
@@ -750,7 +754,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-65 tokens.
+66 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -767,6 +771,7 @@ export inherited from a parent shell.
 | `g1-coverage-pin` | `CRATONVM_G1_COVERAGE_PIN` |
 | `g1-pin-empty-publication` | `CRATONVM_G1_PIN_EMPTY_PUBLICATION` |
 | `g1-precise-only-roots` | `CRATONVM_G1_PRECISE_ONLY_ROOTS` |
+| `precise-only-roots` | `CRATONVM_GC_PRECISE_ONLY_ROOTS` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
 | `g1-live-region-memo` | `CRATONVM_G1_NO_LIVE_REGION_MEMO` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
@@ -893,7 +898,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-18 tokens.
+19 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -915,6 +920,7 @@ export inherited from a parent shell.
 | `stress-thread-states` | `CRATONVM_STRESS_THREAD_STATES` |
 | `striped-counters` | `CRATONVM_STRIPED_COUNTERS_OFF` |
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
+| `wait-spurious-ms` | `CRATONVM_WAIT_SPURIOUS_MS` |
 
 ## `CRATONVM_SECURITY`
 
