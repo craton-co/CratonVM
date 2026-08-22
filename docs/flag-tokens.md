@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-467 tokens.
+468 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -203,6 +203,7 @@ export inherited from a parent shell.
 | `gc-overhead` | `CRATONVM_DBG_GC_OVERHEAD` |
 | `gc-stats` | `CRATONVM_GC_STATS` |
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
+| `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
 | `gcpart` | `CRATONVM_DBG_GCPART` |
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
@@ -752,7 +753,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-64 tokens.
+66 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -769,6 +770,7 @@ export inherited from a parent shell.
 | `g1-coverage-pin` | `CRATONVM_G1_COVERAGE_PIN` |
 | `g1-pin-empty-publication` | `CRATONVM_G1_PIN_EMPTY_PUBLICATION` |
 | `g1-precise-only-roots` | `CRATONVM_G1_PRECISE_ONLY_ROOTS` |
+| `precise-only-roots` | `CRATONVM_GC_PRECISE_ONLY_ROOTS` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
 | `g1-live-region-memo` | `CRATONVM_G1_NO_LIVE_REGION_MEMO` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
@@ -806,6 +808,7 @@ export inherited from a parent shell.
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
 | `zgc-parmark` | `CRATONVM_ZGC_PARMARK` |
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
+| `zgc-relocate-proven-jit` | `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` |
 | `zgc-jit-read-bounds` | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
