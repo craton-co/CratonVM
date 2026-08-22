@@ -23895,6 +23895,31 @@ fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
 fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path_obj = obj_arg92(args, 0)?;
     let watcher = obj_arg92(args, 1)?;
+    // A CLOSED service refuses REGISTRATION too, not just `poll`/`take`, and it
+    // refuses it with `ClosedWatchServiceException`.
+    //
+    // MEASURED, `regression-suite/probes/W4Watch.java`, Linux/JDK 25.0.4:
+    //
+    //     dir.register(closedWatchService, ENTRY_CREATE)
+    //       HotSpot    java.nio.file.ClosedWatchServiceException
+    //       CratonVM   java.io.IOException
+    //
+    // `ws_require_open` and `closed_watch_service_exception` already existed --
+    // `poll` and `take` both call them, and both matched the oracle in the same
+    // run. This entry point simply never called it, so the closed state was
+    // discovered further down by whichever path check happened to fail and was
+    // reported as an I/O error.
+    //
+    // The comment on `closed_watch_service_exception` says why the TYPE is
+    // load-bearing: a watch loop is written as
+    // `catch (ClosedWatchServiceException ex) { running = false; }`, so any
+    // other type escapes the loop's own shutdown handling. A registration
+    // racing a `close()` on another thread is exactly when that happens.
+    //
+    // Checked FIRST, matching `LinuxWatchService.register`, which runs
+    // `checkOpen()` before it looks at the path at all -- so a closed service
+    // and a missing directory report the closed service, on both VMs.
+    ws_require_open(ctx, watcher)?;
     let kinds_arr = match args.get(2) {
         Some(Value::Object(Some(a))) => *a,
         _ => {
