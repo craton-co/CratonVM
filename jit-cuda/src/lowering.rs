@@ -2121,19 +2121,25 @@ mod tests {
         );
         let text = m.render();
         assert!(text.contains(".visible .entry EligibleMathKernel__sqrtAbsFma_"));
-        // Math.sqrt(double) → the correctly-rounded PTX sqrt.
+        // `(float) Math.sqrt((double) a[i])` is the only way to spell a
+        // float square root in Java, and it collapses to ONE correctly-
+        // rounded f32 sqrt: no widen, no f64 sqrt, no narrow. Bit-exact —
+        // see `float_sqrt_triple_at` for the exhaustive check behind it.
         assert!(
-            text.contains("sqrt.rn.f64"),
-            "missing correctly-rounded sqrt\n{text}"
-        );
-        // (double) a[i] widen and (float) narrow of the sqrt result.
-        assert!(
-            text.contains("cvt.f64.f32"),
-            "missing (double) widen of a[i]\n{text}"
+            text.contains("sqrt.rn.f32"),
+            "float sqrt triple should collapse to sqrt.rn.f32\n{text}"
         );
         assert!(
-            text.contains("cvt.rn.f32.f64"),
-            "missing (float) narrow of the sqrt result\n{text}"
+            !text.contains("sqrt.rn.f64"),
+            "the f64 sqrt should be gone from a float-only kernel\n{text}"
+        );
+        assert!(
+            !text.contains("cvt.f64.f32"),
+            "the (double) widen should be gone\n{text}"
+        );
+        assert!(
+            !text.contains("cvt.rn.f32.f64"),
+            "the (float) narrow should be gone\n{text}"
         );
         // Math.abs(float) → plain sign-bit-clear.
         assert!(text.contains("abs.f32"), "missing float abs\n{text}");
@@ -2142,6 +2148,63 @@ mod tests {
         assert!(text.contains("mul.rn.f32"));
         assert!(text.contains("add.rn.f32"));
         assert!(text.contains("st.global.f32"));
+    }
+
+    /// A genuine `double` square root must stay `sqrt.rn.f64`.
+    ///
+    /// The float-sqrt collapse keys on the exact `f2d; sqrt(D)D; d2f`
+    /// triple. A kernel over `double[]` has no widen and no narrow, so
+    /// nothing about it may change — the f64 result is what the program
+    /// asked for and is observable.
+    #[test]
+    fn double_sqrt_still_lowers_to_f64() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "sqrtDouble",
+            "([D[D)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(
+            text.contains("sqrt.rn.f64"),
+            "a double sqrt must stay f64\n{text}"
+        );
+        assert!(
+            !text.contains("sqrt.rn.f32"),
+            "a double sqrt must not be narrowed to f32\n{text}"
+        );
+    }
+
+    /// A float widened to double whose sqrt result is KEPT as a double
+    /// must stay `sqrt.rn.f64`.
+    ///
+    /// This is the case the collapse would silently corrupt if it matched
+    /// on the call alone rather than on the whole triple: the bytecode is
+    /// `f2d; invokestatic sqrt(D)D; dastore` — the widen is there, but no
+    /// `d2f` follows, so the DOUBLE result reaches the array and rounding
+    /// it through f32 would change the stored value.
+    #[test]
+    fn widened_float_sqrt_kept_as_double_does_not_collapse() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleMathKernel",
+            "sqrtWidenedKept",
+            "([F[D)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(
+            text.contains("cvt.f64.f32"),
+            "the widen must survive when the double result is kept\n{text}"
+        );
+        assert!(
+            text.contains("sqrt.rn.f64"),
+            "sqrt must stay f64 when its result is stored as a double\n{text}"
+        );
+        assert!(
+            !text.contains("sqrt.rn.f32"),
+            "collapsing here would change the stored value\n{text}"
+        );
+        assert!(text.contains("st.global.f64"), "expected a double store\n{text}");
     }
 
     #[test]

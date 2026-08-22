@@ -1,10 +1,10 @@
-# What is left of the SSL/TLS cluster: two renegotiation-emulation limits, and one stop-the-world stall — OPEN
+# What is left of the SSL/TLS cluster: two assertions that can see the renegotiation emulation — OPEN
 
 **Status: OPEN (2026-08-22).** Supersedes
 `ssl-client-cert-renegotiation-and-ocsp-hang-20260821.md`, which listed four
-failing classes as three unexplained defects. Two of those three are now
-resolved, and the third turned out not to be about TLS at all. This page is what
-survived.
+failing classes as three unexplained defects. All three are now resolved or
+reclassified; what survives is two assertions that can observe an accepted
+design limitation, and they are not worth "fixing" as they stand.
 
 Measured on `bin/cratonvm-tls-7b7f66ee5`, Azure Linux, real JDK 25,
 `apps/tomcat` fixture, one process per class.
@@ -64,75 +64,33 @@ runs show only the by-design renegotiation failure). The host was carrying a
 load average between 12 and 190 at the time. Treat a `testPost` red as noise
 unless it reproduces on a quiet host.
 
-## 2. `ocsp.TestOcspSoftFailInternalError` stalls — and it is not OCSP
+## 2. `ocsp.TestOcspSoftFailInternalError` — FIXED 2026-08-22, no longer open
 
-`rc=124` at a 900 s cap. HotSpot: **OK (20 tests)**. The superseded page guessed
-"a JIT-takeover wait"; the mechanism is now characterised, and the guess about
-*where* was wrong.
+The superseded page guessed "a JIT-takeover wait" and this page's first revision
+guessed "not OCSP at all". Both were wrong, and `sudo gdb -p` settled it: the
+server-side `checkClientTrusted` → `check_ocsp` → `ocsp_http_post` fetch blocked
+in `recv` while the collector still counted the thread as a cooperative mutator,
+so a stop-the-world request could never be satisfied and every other thread
+parked behind it. `rc=124` at a 1800 s cap → **OK (20 tests) in 7 s**.
 
-**What it is not.** Not the OCSP network fetch: `grep -ci ocsp` on the run's log
-is **0** — execution never reaches a responder request. The stall begins ~1 s
-after `Starting ProtocolHandler`. Not JIT-tier-specific: `CRATONVM_JIT_ENABLE=0`
-reproduces identically, ending on the same line. Reproduced 3/3.
+Record: `fixed-suite-bugs/ocsp-trust-check-parked-a-mutator-the-collector-still-counted-FIXED-20260822.md`
+(plain text — that tree is stripped from public history). The measurement hazard
+below is kept there too, because it outlives the defect.
 
-**What it is.** Two `/proc` samples 6 s apart on the stuck process:
+## A measurement hazard, recorded so the next person does not lose an hour to it
 
-```
-utime=32 stime=6      <- identical in both samples: genuinely blocked, not looping
-  main-vm            wchan=locks_lock_inode_wait   (that sample: fixture flock, see below)
-```
-
-and on a run with the lock free:
-
-```
-utime 743 -> 871 (climbing)      <- the PROCESS burns CPU
-  main-vm          wchan=wait_woken        <- the test thread is blocked
-  AsyncFileHandle  593 ticks              <- top CPU consumer, spinning
-  https-jsse-nio-  futex_do_wait  x10
-```
-
-Both `stdout` and the connector's own `catalina.<date>.log` stop at the same
-second and never advance, so `AsyncFileHandler` is spinning with nothing to
-write. The last line in every arm is
-
-```
-WARN cratonvm_vm::runtime::interpreter::gc_and_alloc: STW cross-thread JIT
-     takeover is still waiting for cooperative mutators rounds[...
-```
-
-That is the shape `t27_tls::gc_blocked_syscall` and `net_phase_e`'s `re5` note
-both describe: a stop-the-world request waits for a thread parked in a blocking
-syscall that the collector still counts as a cooperative mutator, and everything
-that needs a safepoint stalls behind it. This is a **GC/safepoint cooperation
-defect**, and belongs with the STW-takeover work, not with TLS.
-
-### Next steps for whoever picks this up
-
-* Name the syscall `main-vm` is in. `/proc/<tid>/syscall` reads empty here;
-  `strace -p` or a `gdb` thread apply bt would settle it in one attempt and is
-  the single highest-value next measurement.
-* `check_revocation` uses a fixed 30 s per-certificate timeout. If the stall is
-  a *very* long wait rather than a true deadlock, that constant is where the
-  time goes — but note the log shows no OCSP request at all, so this is a
-  secondary hypothesis, not the leading one.
-* This class was NOT in the 2026-08-14 census. It is worth bisecting whether the
-  stall is new; it was masked until 2026-08-22 by the `delegate` NPE, which
-  aborted these classes before they got this far.
-
-### A measurement hazard, recorded so the next person does not lose an hour to it
-
-The fixture takes an exclusive **`flock`** on
+The OCSP fixture takes an exclusive **`flock`** on
 `apps/tomcat/test/org/apache/tomcat/util/net/ocsp/ocsp-responder.lock`, so two
 concurrent CratonVM runs of *any* OCSP class serialise: the loser blocks in
 `locks_lock_inode_wait` for its whole timeout and scores an indistinguishable
 `rc=124`. Confirmed directly in `/proc/locks` (holder and waiter on inode
 `27810154`). Since `/data/cratonvm/apps/tomcat` is a **shared** fixture on a
-multi-session host, a neighbouring session is enough to cause it.
+multi-session host, a neighbouring session is enough to cause it. Run OCSP
+classes one at a time before believing a hang.
 
-Two consequences: run OCSP classes one at a time before believing a hang, and
-note that HotSpot takes a **POSIX** (`fcntl`) lock on that same file while
-CratonVM takes a **`flock`**. The two kinds do not block each other on Linux, so
-a CratonVM run and a HotSpot control do *not* serialise against one another —
-which is a divergence in `FileChannel.lock()`'s implementation worth its own
-look, and separately means a HotSpot control cannot be used to prove the lock
-was free.
+**Still open, and separable:** HotSpot takes a **POSIX** (`fcntl`) lock on that
+same file where CratonVM takes a **`flock`**. The two kinds do not block each
+other on Linux, so a CratonVM run and a HotSpot control do *not* serialise
+against one another — which means a HotSpot control cannot be used to prove the
+lock was free, and is a `FileChannel.lock()` implementation divergence worth its
+own look. Not investigated.

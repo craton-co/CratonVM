@@ -19,14 +19,41 @@
 // relative-error contract — it must still reject with `Reason::Invoke`
 // even under the loosened hint.
 public class EligibleMathKernel {
-    // sqrt.rn.f64 (Math.sqrt) + abs.f32 (Math.abs) + fma.rn.f32
-    // (Math.fma) in one canonical-loop body — the shape closing the
-    // documented `ALLOW_INTRINSIC_CALLS` gap in `docs/gpu/annotations.md`.
+    // sqrt (Math.sqrt) + abs.f32 (Math.abs) + fma.rn.f32 (Math.fma) in one
+    // canonical-loop body — the shape closing the documented
+    // `ALLOW_INTRINSIC_CALLS` gap in `docs/gpu/annotations.md`.
+    //
+    // The sqrt here is the `f2d; sqrt(D)D; d2f` triple that EVERY float
+    // square root in Java compiles to (Math.sqrt is declared only `(D)D`),
+    // and it lowers to a single `sqrt.rn.f32` — see `float_sqrt_triple_at`.
+    // `sqrtDouble` and `sqrtWidenedKept` below are the two shapes that must
+    // NOT collapse.
     public static void sqrtAbsFma(
             float[] a, float[] b, float[] out, float x, float y, float z) {
         int n = a.length;
         for (int i = 0; i < n; i++) {
             out[i] = (float) Math.sqrt((double) a[i]) * Math.abs(b[i]) + Math.fma(x, y, z);
+        }
+    }
+
+    /** A genuine double square root: no widen, no narrow, stays f64. */
+    public static void sqrtDouble(double[] a, double[] out) {
+        int n = a.length;
+        for (int i = 0; i < n; i++) {
+            out[i] = Math.sqrt(a[i]);
+        }
+    }
+
+    /**
+     * A float widened to double whose sqrt result is KEPT as a double:
+     * `f2d; sqrt(D)D; dastore`, with no `d2f`. The double result is
+     * observable, so collapsing to `sqrt.rn.f32` would change it. Must stay
+     * `sqrt.rn.f64`.
+     */
+    public static void sqrtWidenedKept(float[] a, double[] out) {
+        int n = a.length;
+        for (int i = 0; i < n; i++) {
+            out[i] = Math.sqrt(a[i]);
         }
     }
 
