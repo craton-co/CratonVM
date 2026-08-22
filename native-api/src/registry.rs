@@ -862,6 +862,37 @@ pub trait NativeClassAccess {
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
 
+    /// Does the VM's `checkcast`/`instanceof` admit an instance of `class_id`
+    /// as a `target_class_name` on a relationship that is **declared** rather
+    /// than present in the loaded class hierarchy?
+    ///
+    /// This is the reflection door onto the interpreter's
+    /// `typecheck::synthetic_implements` — the table that says a
+    /// `cratonvm/internal/SystemLogger` is a `System.Logger` and a
+    /// `cratonvm/internal/foreign/MemorySegmentImpl` is both a `MemorySegment`
+    /// and an `AbstractMemorySegmentImpl`. Those classes are concrete stand-ins
+    /// the VM mints itself, so the relationship exists nowhere a hierarchy walk
+    /// can find it.
+    ///
+    /// It exists for the same reason [`aastore_element_assignable`] does: the
+    /// rule was already written once, for the bytecode, and reflection asking a
+    /// SECOND, narrower question is how the two doors come to disagree about
+    /// one object. Measured, before this: `probes/FfmVectorSegmentProbe.java`'s
+    /// IDENTITY section reported `abstractBase=false` for a segment that a
+    /// `checkcast jdk/internal/foreign/AbstractMemorySegmentImpl` three frames
+    /// away had just admitted.
+    ///
+    /// `false` by default: a host with no interpreter behind it (the test
+    /// mocks) has no table to consult, and failing closed leaves the caller's
+    /// own hierarchy checks as the only answer — which is what it had before
+    /// this method existed.
+    ///
+    /// [`aastore_element_assignable`]: Self::aastore_element_assignable
+    fn synthetic_implements_declared(&self, class_id: ClassId, target_class_name: &str) -> bool {
+        let _ = (class_id, target_class_name);
+        false
+    }
+
     /// Get the superclass ClassId. Returns None for java/lang/Object.
     fn superclass_of(&self, class_id: ClassId) -> Option<ClassId>;
 
