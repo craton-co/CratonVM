@@ -1,7 +1,12 @@
 # WORKER-5 NOTE 2 — the harness could not say "the VM never started", and the discriminator was already in the VM's own output
 
-**Status: FIXED, MEASURED.** Lane WORKER-5, 2026-08-21, at `22cb4338d`, against
+**Status: FIXED, MEASURED.** Lane WORKER-5, 2026-08-21, against
 `C:/craton/cratonvm-r10.exe`. Verified end to end on both arms of the fault.
+
+> **Read §1.1 first.** H0 landed `dab993033` for the same defect while this
+> lane was working, and it **CORRECTED the diagnosis every earlier account of
+> trap 1 gave, including this record's first draft**. The two fixes are
+> complementary and both are in the tree; §7.1 says how they compose.
 
 ---
 
@@ -30,9 +35,37 @@ JDK="$(dirname "$(dirname "$(command -v javap)")")"
 
 yields the MSYS POSIX spelling; `run.sh` exports `MSYS_NO_PATHCONV=1` (line 60,
 deliberately, so the path reaches `cratonvm.exe` intact); so the POSIX path
-reaches `cratonvm.exe` **unconverted** and the VM refuses it during argument
-parsing. **Every vector in the run goes red for a reason the harness cannot
-name.**
+reaches `cratonvm.exe` **unconverted** and the VM exits before running anything.
+**Every vector in the run goes red for a reason the harness cannot name.**
+
+### 1.1 CORRECTION — it is not an argument-parsing failure, and three of us said it was
+
+`H24-2` said the VM "dies in argument parsing". H0 repeated it. **The first
+draft of this record repeated it, and so did the first version of the
+classifier's own output label.**
+
+It is wrong. The VM **accepts** the POSIX spelling on the command line and dies
+**validating the JDK image**:
+
+```
+Provide a valid JDK installation (must contain `jmods/` or `lib/modules`).
+```
+
+The reason three readers converged on the same error is that **the VM's own
+banner says so**: `jdk mode: <not yet resolved — failure occurred during
+argument parsing>`. That banner is a reliable KEY — it is emitted exactly when
+the VM exits before resolving its mode, which is the thing worth detecting — and
+an unreliable DESCRIPTION. This classifier greps it and does not quote it.
+
+Category 1 is therefore two classes now:
+
+| output also carries | class |
+|---|---|
+| `Provide a valid JDK installation` / `--java-home path does not exist` | `VM REJECTED THE JDK IMAGE` |
+| neither | `VM EXITED BEFORE RESOLVING ITS JDK MODE (launch/config)` |
+
+Both hints say in as many words that this is **not** a command-line parse
+failure, so the corrected diagnosis is carried where the next reader will be.
 
 ## 2. What the VM actually prints — MEASURED, `cratonvm-r10.exe`
 
@@ -40,7 +73,7 @@ The discriminator was already there and nothing read it.
 
 | fault | rc | the line that names it |
 |---|---:|---|
-| bad `--java-home` | 1 | `[cratonvm] jdk mode: <not yet resolved — failure occurred during argument parsing>` |
+| bad `--java-home` | 1 | `jdk mode: <not yet resolved …>` **plus** `Provide a valid JDK installation …` (the second line is the real cause — §1.1) |
 | unknown flag | 2 | `error: unexpected argument '--no-such-flag' found` + `Usage: cratonvm-r10.exe …` |
 | flag missing a value | 2 | `error: a value is required for '--java-home <PATH>' but none was supplied` |
 | conflicting modes | 2 | `error: the argument '--jdk-only' cannot be used with '--synthetic-jdk'` |
@@ -48,8 +81,8 @@ The discriminator was already there and nothing read it.
 
 **The last row is the control that makes the first a signal.** A VM that got far
 enough to resolve its JDK mode PRINTS the mode; a VM that did not prints
-`<not yet resolved`. So "could not parse its arguments" is a one-line grep and
-it is the line the harness never looked at.
+`<not yet resolved`. So "the VM never got as far as a vector" is a one-line
+grep, and it is the line the harness never looked at.
 
 The premise is pinned rather than assumed: the selftest asserts that the
 EXISTING alternation still finds nothing in the trap-1 output, and goes red if a
@@ -58,9 +91,10 @@ future VM starts printing `fatal` there.
 ## 3. The fix
 
 `regression-suite/harness-vmfault.sh` — a new file with `vm_fault_class` and
-`vm_fault_hint`, and all the tests. It classifies seven faults:
+`vm_fault_hint`, and all the tests. It classifies eight faults:
 
-* argument parse failure (the trap-1 shape),
+* **the JDK image rejected** — the trap-1 shape (§1.1),
+* any other exit before the JDK mode was resolved,
 * command-line rejection (rc=2 **and** `^error: ` **and** `^Usage: `/`try '--help'` — all three, because rc=2 alone and `error:` alone are each reachable by a vector),
 * missing main class,
 * `rc=124` — the harness's own `timeout`, not a failure. **Trap 7: `RMapGcStress` needs 233 s against a 120 s budget; use `TIMEOUT=600`.**
@@ -92,16 +126,20 @@ of `JDK=` differing:
 
 ```text
 POSIX --java-home     0 passed, 2 failed
-  RArraysMismatch FAIL  rc=1: HARNESS FAULT — VM COULD NOT PARSE ITS ARGUMENTS:
+  RArraysMismatch FAIL  rc=1: HARNESS FAULT — VM REJECTED THE JDK IMAGE:
                         --java-home path does not exist or is not a directory:
-                        /c/Program Files/Microsoft/jdk-25.0 [use cygpath -m …]
+                        /c/Program Files/Microsoft/jdk-25.0 [on MSYS use cygpath -m]
   …
   ENVIRONMENT: 2 vector(s) had no VM to answer them — the run below is not a
   measurement of CratonVM. Last seen: …
-    (the five-line cygpath hint, ONCE)
+    (the six-line hint, ONCE, saying explicitly that this is not a parse failure)
 
 cygpath -m form       2 passed, 0 failed        <- control, output unchanged
 ```
+
+(The label read `VM COULD NOT PARSE ITS ARGUMENTS` when first measured; the run
+above is the re-verification after §1.1's correction. The classification, the
+counts and the control arm are unchanged — only the sentence is.)
 
 The classifier was also driven against the **real binary**, not only against
 transcribed strings: four live runs (POSIX home, unknown flag, missing main
@@ -113,6 +151,7 @@ class, clean run) classify correctly, and the clean run falls through.
 
 ```text
   ok   bad --java-home / unknown flag / flag missing a value / missing main class
+  ok   startup failure that is not the image
   ok   timeout / not +x / no binary
   ok   real AssertionError                          (falls through)
   ok   vector exits 2 with its own error: line      (falls through)
@@ -120,7 +159,7 @@ class, clean run) classify correctly, and the clean run falls through.
   ok   clean pass                                   (falls through)
   ok   SIGSEGV                                      (falls through)
   ok   every classification is exactly one line
-  ok   vm_fault_hint covers all five classes and refuses anything else
+  ok   vm_fault_hint covers all six classes and refuses anything else
   ok   run.sh's existing sig grep is still blind to the trap-1 output (the premise)
 ```
 
@@ -176,6 +215,27 @@ command-line check requires all three signals rather than the obvious two.
 * **This changes reporting, not verdicts.** No vector that failed now passes,
   and no count moved. If a run's numbers change after this lands, that is a bug
   in this change.
+
+## 7.1 How this composes with H0's `dab993033`
+
+H0 fixed the same blindness from the other end, and the merge keeps both:
+
+* **`vm_fault_class` runs FIRST** and NAMES the fault. It is the only half that
+  can see the three faults which produce **no output at all** — rc=124 (with the
+  `TIMEOUT=600` remedy), rc=126/127 — because a fall-through over stdout has
+  nothing to fall through to.
+* **H0's chain runs in the `else`** and guarantees `why` is never bare for
+  anything this classifier declines: clap's `^error:`/`^Usage:` lines, then the
+  VM's own first non-noise line tagged `unclassified:`, then `no output`.
+
+Neither subsumes the other: mine is a named-fault table (precise, closed), H0's
+is a fall-through (imprecise, exhaustive). **The merged region was read line by
+line rather than trusted to the clean auto-merge** — nothing is lost and nothing
+fires twice.
+
+H0's is also the fix that produced the evidence for §2.1: its `unclassified:`
+tag surfaced `Provide a valid JDK installation …`, which is how the
+argument-parsing story was falsified at all.
 
 ## 8. NOMINATIONS
 
