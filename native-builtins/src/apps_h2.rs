@@ -1033,7 +1033,10 @@ fn h2_invalid_array_value(ctx: &mut dyn NativeContext, value: ObjectRef) -> Meth
         Ok(_) => return h2_internal_error(ctx, "Value.getTraceSQL returned null".to_string()),
         Err(error) => return error,
     };
+    // `create_string` allocates, and `trace_sql` is an ARGUMENT below.
+    let trace_pin = ctx.pin_native_root(trace_sql);
     let array = ctx.create_string("array");
+    let trace_sql = ctx.read_native_pin(trace_pin, trace_sql);
     match ctx.invoke(
         "org/h2/message/DbException",
         "getInvalidValueException",
@@ -1059,7 +1062,16 @@ fn h2_cardinality_expression_get_value(
         h2_object_field(ctx, this, "arg").ok_or_else(|| RuntimeError::NullPointerException {
             message: Some("CardinalityExpression.arg".to_string()),
         })?;
+    // `session` is PASSED as an argument to `arg.getValue(...)` after up to two
+    // callbacks, and `null` is compared by IDENTITY against a value produced by
+    // one — the COALESCE shape: a stale `ValueNull.INSTANCE` compares unequal
+    // to everything, so `CARDINALITY(NULL)` would return a count instead of
+    // NULL. `arg` is only ever a receiver but is pinned with them.
+    let session_pin = ctx.pin_native_root(session);
+    let arg_pin = ctx.pin_native_root(arg);
     let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
+    let null_pin = null.map(|n| ctx.pin_native_root(n));
+    let arg = ctx.read_native_pin(arg_pin, arg);
 
     let count = if h2_int_field(ctx, this, "max") != 0 {
         let type_info = h2_object_arg(
@@ -1080,6 +1092,8 @@ fn h2_cardinality_expression_get_value(
             }
         };
         if value_type != 40 {
+            let arg = ctx.read_native_pin(arg_pin, arg);
+            let session = ctx.read_native_pin(session_pin, session);
             let value = h2_object_arg(
                 &[h2_value_result(
                     ctx.invoke_virtual(
@@ -1119,6 +1133,8 @@ fn h2_cardinality_expression_get_value(
             }
         }
     } else {
+        let arg = ctx.read_native_pin(arg_pin, arg);
+        let session = ctx.read_native_pin(session_pin, session);
         let value = h2_object_arg(
             &[h2_value_result(
                 ctx.invoke_virtual(
@@ -1132,6 +1148,10 @@ fn h2_cardinality_expression_get_value(
             0,
             "CardinalityExpression value is null",
         )?;
+        // `null` was read before the callback above and is compared by IDENTITY
+        // here: without the re-read a relocated `ValueNull.INSTANCE` compares
+        // unequal and `CARDINALITY(NULL)` falls through to the type switch.
+        let null = null_pin.map(|pin| ctx.read_native_pin(pin, null.unwrap()));
         if null == Some(value) {
             return Ok(Some(h2_static_value(
                 ctx,
@@ -1139,6 +1159,10 @@ fn h2_cardinality_expression_get_value(
                 "INSTANCE",
             )?));
         }
+        // `value` is live across `getValueType` and is then read RAW
+        // (`class_id_of_object`, `array_length`) and passed as an ARGUMENT to
+        // `h2_invalid_array_value`.
+        let value_pin = ctx.pin_native_root(value);
         let value_type = match ctx.invoke_virtual(value, "getValueType", "()I", &[])? {
             Some(Value::Int(value)) => value,
             _ => {
@@ -1148,6 +1172,7 @@ fn h2_cardinality_expression_get_value(
                 ))
             }
         };
+        let value = ctx.read_native_pin(value_pin, value);
         match value_type {
             38 => {
                 let json = if ctx
@@ -1544,10 +1569,19 @@ fn h2_expression_column_get_value_bytecode(
 /// Exact fast path for the boolean values emitted by H2 predicates.
 fn h2_value_is_false(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let value = h2_object_arg(args, 0, "Value.isFalse receiver is null")?;
-    if h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE") == Some(value) {
+    // `h2_static_object` runs `<clinit>` the first time it sees a class, so the
+    // two lookups below are Java callbacks and `value` is compared to their
+    // results by IDENTITY. A stale `value` matches neither and this predicate
+    // then answers from `getBoolean()` on the wrong object.
+    let value_pin = ctx.pin_native_root(value);
+    let null = h2_static_object(ctx, "org/h2/value/ValueNull", "INSTANCE");
+    let value = ctx.read_native_pin(value_pin, value);
+    if null == Some(value) {
         return Ok(Some(Value::Int(0)));
     }
-    if h2_static_object(ctx, "org/h2/value/ValueBoolean", "FALSE") == Some(value) {
+    let false_value = h2_static_object(ctx, "org/h2/value/ValueBoolean", "FALSE");
+    let value = ctx.read_native_pin(value_pin, value);
+    if false_value == Some(value) {
         return Ok(Some(Value::Int(1)));
     }
     let boolean = match ctx.invoke_virtual(value, "getBoolean", "()Z", &[])? {
@@ -2072,6 +2106,11 @@ fn h2_long_data_type_binary_search(
         _ => 0,
     };
 
+    // `h2_boxed_long_value` falls back to `Long.longValue()` — a Java callback —
+    // when the box is not laid out as expected, so `storage` is held across a
+    // potential mover on every iteration.
+    let storage_pin = ctx.pin_native_root(storage);
+    let mut storage = storage;
     let key_value = h2_boxed_long_value(ctx, key)?;
     let mut low = 0i32;
     let mut high = size - 1;
@@ -2081,6 +2120,7 @@ fn h2_long_data_type_binary_search(
     }
 
     while low <= high {
+        storage = ctx.read_native_pin(storage_pin, storage);
         if x < 0 || x as usize >= ctx.array_length(storage) {
             return Err(RuntimeError::aioobe_index_only(x).into());
         }
@@ -2099,11 +2139,13 @@ fn h2_long_data_type_binary_search(
         } else if key_value < current {
             high = x - 1;
         } else {
+            ctx.unpin_native_roots(storage_pin);
             return Ok(Some(Value::Int(x)));
         }
         x = (((low as i64 + high as i64) as u64) >> 1) as i32;
     }
 
+    ctx.unpin_native_roots(storage_pin);
     Ok(Some(Value::Int(low ^ -1)))
 }
 
@@ -2256,6 +2298,13 @@ fn h2_constraint_check_existing_data(
         _ => return Ok(None),
     };
 
+    // `this` and `session` are held across every callback below and both are
+    // then handed on as ARGUMENTS — `session` to `Table.getRowCount`, both to
+    // `h2_constraint_run_existing_data_query`. An argument is not repaired by
+    // `load_and_forward`; only a receiver is. Pin both and re-read.
+    let this_pin = ctx.pin_native_root(this);
+    let session_pin = ctx.pin_native_root(session);
+
     let db = match ctx.invoke_virtual(session, "getDatabase", "()Lorg/h2/engine/Database;", &[])? {
         Some(Value::Object(Some(o))) => o,
         _ => return Ok(None),
@@ -2266,6 +2315,7 @@ fn h2_constraint_check_existing_data(
     ) {
         return Ok(None);
     }
+    let this = ctx.read_native_pin(this_pin, this);
 
     // H2's own `checkExistingData` type-checks the referencing against the
     // referenced columns as a SIDE EFFECT of PREPARING the probe query: the
@@ -2282,10 +2332,12 @@ fn h2_constraint_check_existing_data(
     // no-op on an empty table -- scanning it for orphaned rows.
     h2_constraint_check_column_types(ctx, this)?;
 
+    let this = ctx.read_native_pin(this_pin, this);
     let table = match ctx.get_field_by_name(this, "table") {
         Value::Object(Some(o)) => o,
         _ => return Ok(None),
     };
+    let session = ctx.read_native_pin(session_pin, session);
     if matches!(
         ctx.invoke_virtual(
             table,
@@ -2298,6 +2350,8 @@ fn h2_constraint_check_existing_data(
         return Ok(None);
     }
 
+    let this = ctx.read_native_pin(this_pin, this);
+    let session = ctx.read_native_pin(session_pin, session);
     h2_constraint_run_existing_data_query(ctx, this, session)
 }
 
@@ -2305,10 +2359,14 @@ fn h2_constraint_check_existing_data(
 /// column pair of a referential constraint -- the check H2 gets for free by
 /// preparing its probe query (see `h2_constraint_check_existing_data`).
 ///
-/// No pinning: `Column.getType()` is a plain field getter and cannot allocate,
-/// so no moving GC can run between reading the two `TypeInfo`s and passing them
-/// as arguments. `checkComparable` itself can allocate (it builds the exception
-/// message), but only after both refs are arguments and therefore rooted.
+/// The `t1`/`t2` window needs no pin of its own: `Column.getType()` is a plain
+/// field getter and cannot allocate, so no moving GC runs between reading the
+/// two `TypeInfo`s and passing them as arguments. What that reasoning missed
+/// when it was first written is the LOOP: `checkComparable` allocates (it
+/// builds the exception message) and `getType()` is a `ctx` callback, so both
+/// arrays and `this` are held across a mover from the second iteration onward.
+/// `h2_index_column` reads array elements through the raw ref, which nothing
+/// repairs. Pin the three, re-read them at the top of every iteration.
 fn h2_constraint_check_column_types(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -2321,25 +2379,46 @@ fn h2_constraint_check_column_types(
         Value::Object(Some(o)) => o,
         _ => return Ok(()),
     };
+    let columns_pin = ctx.pin_native_root(columns);
+    let ref_columns_pin = ctx.pin_native_root(ref_columns);
+    let mut columns = columns;
+    let mut ref_columns = ref_columns;
     let len = ctx.array_length(columns).min(ctx.array_length(ref_columns));
     for i in 0..len {
+        columns = ctx.read_native_pin(columns_pin, columns);
+        ref_columns = ctx.read_native_pin(ref_columns_pin, ref_columns);
         let col = h2_index_column(ctx, columns, i)?;
         let ref_col = h2_index_column(ctx, ref_columns, i)?;
+        let ref_col_pin = ctx.pin_native_root(ref_col);
         let t1 = match ctx.invoke_virtual(col, "getType", "()Lorg/h2/value/TypeInfo;", &[])? {
             Some(Value::Object(Some(o))) => o,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(ref_col_pin);
+                continue;
+            }
         };
+        // `ref_col` was live across `getType()` above and is the RECEIVER of
+        // the one below; `t1` is live across that same call and is then an
+        // ARGUMENT, which nothing repairs.
+        let ref_col = ctx.read_native_pin(ref_col_pin, ref_col);
+        let t1_pin = ctx.pin_native_root(t1);
         let t2 = match ctx.invoke_virtual(ref_col, "getType", "()Lorg/h2/value/TypeInfo;", &[])? {
             Some(Value::Object(Some(o))) => o,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(ref_col_pin);
+                continue;
+            }
         };
+        let t1 = ctx.read_native_pin(t1_pin, t1);
         ctx.invoke(
             "org/h2/value/TypeInfo",
             "checkComparable",
             "(Lorg/h2/value/TypeInfo;Lorg/h2/value/TypeInfo;)V",
             &[Value::Object(Some(t1)), Value::Object(Some(t2))],
         )?;
+        ctx.unpin_native_roots(ref_col_pin);
     }
+    ctx.unpin_native_roots(columns_pin);
     Ok(())
 }
 
@@ -2365,17 +2444,36 @@ fn h2_constraint_run_existing_data_query(
         _ => return Ok(None),
     };
 
+    // Everything below runs Java. `this` ends up an ARGUMENT to
+    // `getShortDescription`, `sql_obj` an ARGUMENT to `Session.prepare`, and
+    // the two arrays are read element-wise inside the SQL builders — none of
+    // which any repair path covers. `session`, `table` and `ref_table` are only
+    // ever receivers, but are pinned with them so the whole set has one rule.
+    let this_pin = ctx.pin_native_root(this);
+    let session_pin = ctx.pin_native_root(session);
+    let table_pin = ctx.pin_native_root(table);
+    let ref_table_pin = ctx.pin_native_root(ref_table);
+    let columns_pin = ctx.pin_native_root(columns);
+    let ref_columns_pin = ctx.pin_native_root(ref_columns);
+
     let column_sql = h2_index_columns_sql(ctx, columns, None)?;
+    let table = ctx.read_native_pin(table_pin, table);
     let table_sql = h2_sql_fragment(ctx, table)?;
+    let ref_table = ctx.read_native_pin(ref_table_pin, ref_table);
     let ref_table_sql = h2_sql_fragment(ctx, ref_table)?;
+    let columns = ctx.read_native_pin(columns_pin, columns);
     let not_null = h2_index_columns_is_not_null(ctx, columns)?;
+    let columns = ctx.read_native_pin(columns_pin, columns);
+    let ref_columns = ctx.read_native_pin(ref_columns_pin, ref_columns);
     let ref_join = h2_index_column_join_sql(ctx, columns, ref_columns)?;
 
     let sql = format!(
         "SELECT 1 FROM (SELECT {column_sql} FROM {table_sql} WHERE {not_null} ORDER BY {column_sql}) C WHERE NOT EXISTS(SELECT 1 FROM {ref_table_sql} P WHERE {ref_join})"
     );
     let sql_obj = ctx.create_string(&sql);
+    let sql_pin = ctx.pin_native_root(sql_obj);
 
+    let session = ctx.read_native_pin(session_pin, session);
     ctx.invoke_virtual(
         session,
         "startStatementWithinTransaction",
@@ -2384,6 +2482,10 @@ fn h2_constraint_run_existing_data_query(
     )?;
 
     let result = (|| -> MethodCallResult {
+        // The statement string was created before the call above and is passed
+        // as an ARGUMENT here: re-read it, not the pre-callback copy.
+        let sql_obj = ctx.read_native_pin(sql_pin, sql_obj);
+        let session = ctx.read_native_pin(session_pin, session);
         let prepared = match ctx.invoke_virtual(
             session,
             "prepare",
@@ -2411,6 +2513,9 @@ fn h2_constraint_run_existing_data_query(
             return Err(e);
         }
         if has_bad_row {
+            // `this` has been live across the whole prepare/query/close chain
+            // and is an ARGUMENT here.
+            let this = ctx.read_native_pin(this_pin, this);
             let desc = match ctx.invoke_special(
                 "org/h2/constraint/ConstraintReferential",
                 "getShortDescription",
@@ -2445,7 +2550,9 @@ fn h2_constraint_run_existing_data_query(
         Ok(None)
     })();
 
+    let session = ctx.read_native_pin(session_pin, session);
     let end_result = ctx.invoke_virtual(session, "endStatement", "()V", &[]);
+    ctx.unpin_native_roots(this_pin);
     match (result, end_result) {
         (Err(e), _) => Err(e),
         (Ok(_), Err(e)) => Err(e),
@@ -2453,11 +2560,23 @@ fn h2_constraint_run_existing_data_query(
     }
 }
 
+/// # Why the `columns` array is pinned in all three of these
+///
+/// Each loop body calls [`h2_sql_fragment`], which allocates a `StringBuilder`
+/// and then calls back into Java twice. Either can collect, and the
+/// `IndexColumn[]` these functions walk lives only in a Rust local — invisible
+/// to every root scan there is. Re-reading it through a pin on each iteration
+/// is what keeps `get_array_element` off a vacated address; the loop-carried
+/// binding is reassigned rather than shadowed, because a shadow declared inside
+/// the loop dies with the iteration and the next one would use the stale outer
+/// copy again (the mistake `h2_parser_test_token_fast` was fixed for).
 fn h2_index_columns_sql(
     ctx: &mut dyn NativeContext,
     columns: ObjectRef,
     prefix: Option<&str>,
 ) -> Result<String, MethodCallFailed> {
+    let columns_pin = ctx.pin_native_root(columns);
+    let mut columns = columns;
     let mut out = String::new();
     let len = ctx.array_length(columns);
     for i in 0..len {
@@ -2467,9 +2586,11 @@ fn h2_index_columns_sql(
         if let Some(prefix) = prefix {
             out.push_str(prefix);
         }
+        columns = ctx.read_native_pin(columns_pin, columns);
         let col = h2_index_column(ctx, columns, i)?;
         out.push_str(&h2_sql_fragment(ctx, col)?);
     }
+    ctx.unpin_native_roots(columns_pin);
     Ok(out)
 }
 
@@ -2477,16 +2598,20 @@ fn h2_index_columns_is_not_null(
     ctx: &mut dyn NativeContext,
     columns: ObjectRef,
 ) -> Result<String, MethodCallFailed> {
+    let columns_pin = ctx.pin_native_root(columns);
+    let mut columns = columns;
     let mut out = String::new();
     let len = ctx.array_length(columns);
     for i in 0..len {
         if i > 0 {
             out.push_str(" AND ");
         }
+        columns = ctx.read_native_pin(columns_pin, columns);
         let col = h2_index_column(ctx, columns, i)?;
         out.push_str(&h2_sql_fragment(ctx, col)?);
         out.push_str(" IS NOT NULL");
     }
+    ctx.unpin_native_roots(columns_pin);
     Ok(out)
 }
 
@@ -2495,19 +2620,28 @@ fn h2_index_column_join_sql(
     columns: ObjectRef,
     ref_columns: ObjectRef,
 ) -> Result<String, MethodCallFailed> {
+    let columns_pin = ctx.pin_native_root(columns);
+    let ref_columns_pin = ctx.pin_native_root(ref_columns);
+    let mut columns = columns;
+    let mut ref_columns = ref_columns;
     let mut out = String::new();
     let len = ctx.array_length(columns).min(ctx.array_length(ref_columns));
     for i in 0..len {
         if i > 0 {
             out.push_str(" AND ");
         }
+        columns = ctx.read_native_pin(columns_pin, columns);
         let col = h2_index_column(ctx, columns, i)?;
-        let ref_col = h2_index_column(ctx, ref_columns, i)?;
         out.push_str("C.");
         out.push_str(&h2_sql_fragment(ctx, col)?);
+        // `h2_sql_fragment` sits between the two array reads, so `ref_columns`
+        // is re-read here and not just at the top of the iteration.
+        ref_columns = ctx.read_native_pin(ref_columns_pin, ref_columns);
+        let ref_col = h2_index_column(ctx, ref_columns, i)?;
         out.push_str("=P.");
         out.push_str(&h2_sql_fragment(ctx, ref_col)?);
     }
+    ctx.unpin_native_roots(columns_pin);
     Ok(out)
 }
 
@@ -2538,6 +2672,12 @@ fn h2_sql_fragment(
     ctx: &mut dyn NativeContext,
     obj: ObjectRef,
 ) -> Result<String, MethodCallFailed> {
+    // `obj` is live across the `StringBuilder` allocation below and is then the
+    // RECEIVER of `getSQL`. A receiver is repaired by `load_and_forward`, but
+    // that barrier had no forwarding word to read on the default collector
+    // until 2026-08-17 and is the wrong thing to lean on when a pin costs
+    // nothing: pin and re-read instead.
+    let obj_pin = ctx.pin_native_root(obj);
     let sb = match ctx.new_object_initialized("java/lang/StringBuilder", "()V", &[])? {
         Some(Value::Object(Some(o))) => o,
         _ => {
@@ -2547,17 +2687,31 @@ fn h2_sql_fragment(
             .into())
         }
     };
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let sb_pin = ctx.pin_native_root(sb);
     ctx.invoke_virtual(
         obj,
         "getSQL",
         "(Ljava/lang/StringBuilder;I)Ljava/lang/StringBuilder;",
         &[Value::Object(Some(sb)), Value::Int(0)],
     )?;
+    // `getSQL` may have moved the builder; it is the receiver of `toString`
+    // below and, unlike an argument, would be repaired — but the same
+    // reasoning as above applies.
+    let sb = ctx.read_native_pin(sb_pin, sb);
     let s = match ctx.invoke_virtual(sb, "toString", "()Ljava/lang/String;", &[])? {
         Some(Value::Object(Some(o))) => o,
-        _ => return Ok(String::new()),
+        _ => {
+            ctx.unpin_native_roots(obj_pin);
+            return Ok(String::new());
+        }
     };
-    Ok(ctx.read_string(s).unwrap_or_default())
+    let text = ctx.read_string(s).unwrap_or_default();
+    // Released here rather than left to the outer native's watermark: this
+    // helper is called once per column inside the constraint loops, so an
+    // un-released pin per call would grow the thread's root vector linearly.
+    ctx.unpin_native_roots(obj_pin);
+    Ok(text)
 }
 
 /// Cached `CRATONVM_DBG_H2PARSERREAD` lookup.
@@ -2629,11 +2783,17 @@ fn h2_parser_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         // the native correctness shim slower than the JDK implementation in
         // Hibernate's concurrent parser workload. Decode only when composing
         // the exceptional diagnostic below.
+        // `read_string` resolves the class off the raw address
+        // (`class_id_of`) and is one of the few `ctx` readers with NO
+        // `load_and_forward` in front of it, so `s_obj` has to be re-read
+        // rather than left to the boundary repair.
+        let s_pin = ctx.pin_native_root(s_obj);
         let token_length =
             match crate::lang_string::native_string_length(ctx, &[Value::Object(Some(s_obj))])? {
                 Some(Value::Int(length)) => length,
                 _ => 0,
             };
+        let s_obj = ctx.read_native_pin(s_pin, s_obj);
         if token_length > 256 {
             let preview = ctx
                 .read_string(s_obj)
@@ -3145,10 +3305,16 @@ fn h2_db_exception(
         .or_else(|| ctx.class_id_by_name("java/lang/String"))
         .unwrap_or_else(|| ClassId::new(0));
     let arg_array = ctx.new_ref_array(string_class, args.len());
+    // Each `create_string` can collect, and `arg_array` is both the receiver of
+    // the stores and an ARGUMENT to `DbException.get` below.
+    let array_pin = ctx.pin_native_root(arg_array);
+    let mut arg_array = arg_array;
     for (i, arg) in args.iter().enumerate() {
         let s = ctx.create_string(arg);
+        arg_array = ctx.read_native_pin(array_pin, arg_array);
         ctx.set_array_element(arg_array, i, Value::Object(Some(s)));
     }
+    let arg_array = ctx.read_native_pin(array_pin, arg_array);
     match ctx.invoke(
         "org/h2/message/DbException",
         "get",
@@ -3182,6 +3348,13 @@ fn table_filter_prepare_on(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
 ) -> cratonvm_types::error::MethodCallResult {
+    // `this` is live across every callback in this function and is compared by
+    // IDENTITY against `nestedJoin` / `join` below — the self-join guard that
+    // stops the recursion. A stale `this` compares unequal to itself and the
+    // recursion never terminates. It is pinned once for the whole body.
+    let this_pin = ctx.pin_native_root(this);
+    let mut this = this;
+
     // Ensure `this.index` is non-null. If the optimiser never populated
     // the plan item for this filter, the index stays at null and the
     // rest of the method trips an NPE.
@@ -3199,6 +3372,7 @@ fn table_filter_prepare_on(
             if let Some(Value::Object(Some(_))) = scan {
                 // Propagate via the Java setter so masks/other side-effects
                 // (if any in subclasses) get the normal treatment.
+                this = ctx.read_native_pin(this_pin, this);
                 ctx.invoke_virtual(
                     this,
                     "setIndex",
@@ -3208,6 +3382,7 @@ fn table_filter_prepare_on(
             }
         }
     }
+    this = ctx.read_native_pin(this_pin, this);
 
     // Re-read index in case the Java setter wrote it. If it's still null
     // we skip the pruning loop; downstream will likely still fail but at
@@ -3216,13 +3391,18 @@ fn table_filter_prepare_on(
         Value::Object(Some(idx)) => Some(idx),
         _ => None,
     };
+    let index_pin = index_opt.map(|idx| ctx.pin_native_root(idx));
 
     // Walk indexConditions and drop conditions whose column is not
     // covered by the current index (mirrors the original bytecode).
     let conds_val = ctx.get_field_by_name(this, "indexConditions");
     if let Value::Object(Some(conds)) = conds_val {
+        let conds_pin = ctx.pin_native_root(conds);
+        let mut conds = conds;
+        let mut index_opt = index_opt;
         let mut i: i32 = 0;
         loop {
+            conds = ctx.read_native_pin(conds_pin, conds);
             let size_res = ctx.invoke_virtual(conds, "size", "()I", &[])?;
             let size = match size_res {
                 Some(Value::Int(n)) => n,
@@ -3253,20 +3433,29 @@ fn table_filter_prepare_on(
                     continue;
                 }
             };
+            // `col` is live across `getColumnId` and is then an ARGUMENT to
+            // `getColumnIndex`, which nothing repairs; `index` is the receiver
+            // of that call and has been live since before the loop.
+            let col_pin = ctx.pin_native_root(col);
             let col_id = ctx.invoke_virtual(col, "getColumnId", "()I", &[])?;
             let col_id_i = match col_id {
                 Some(Value::Int(n)) => n,
                 _ => {
+                    ctx.unpin_native_roots(col_pin);
                     i += 1;
                     continue;
                 }
             };
             if col_id_i < 0 {
+                ctx.unpin_native_roots(col_pin);
                 i += 1;
                 continue;
             }
+            let col = ctx.read_native_pin(col_pin, col);
             let mut should_remove = false;
             if let Some(index) = index_opt {
+                let index = index_pin.map_or(index, |pin| ctx.read_native_pin(pin, index));
+                index_opt = Some(index);
                 let idx_col = ctx.invoke_virtual(
                     index,
                     "getColumnIndex",
@@ -3279,22 +3468,28 @@ fn table_filter_prepare_on(
                     }
                 }
             }
+            ctx.unpin_native_roots(col_pin);
             if should_remove {
+                conds = ctx.read_native_pin(conds_pin, conds);
                 ctx.invoke_virtual(conds, "remove", "(I)Ljava/lang/Object;", &[Value::Int(i)])?;
                 // stay at same index (size shrank)
                 continue;
             }
             i += 1;
         }
+        ctx.unpin_native_roots(conds_pin);
     }
 
     // Recurse into nestedJoin / join (with the same self-join guard as
-    // the original) by reinvoking the native path.
+    // the original) by reinvoking the native path. The `!= this` guard is an
+    // IDENTITY comparison, so `this` is re-read immediately before each.
+    this = ctx.read_native_pin(this_pin, this);
     if let Value::Object(Some(nested)) = ctx.get_field_by_name(this, "nestedJoin") {
         if nested != this {
             table_filter_prepare_on(ctx, nested)?;
         }
     }
+    this = ctx.read_native_pin(this_pin, this);
     if let Value::Object(Some(join)) = ctx.get_field_by_name(this, "join") {
         if join != this {
             table_filter_prepare_on(ctx, join)?;
@@ -3302,9 +3497,23 @@ fn table_filter_prepare_on(
     }
 
     // Optimise filter/join conditions (the remaining tail of the
-    // original bytecode).
+    // original bytecode). `session` is read once and passed as an ARGUMENT to
+    // BOTH `optimizeCondition` calls, so it is live across the first one.
+    this = ctx.read_native_pin(this_pin, this);
     let session = ctx.get_field_by_name(this, "session");
+    let mut session_pin = match session {
+        Value::Object(Some(s)) => Some((ctx.pin_native_root(s), s)),
+        _ => None,
+    };
     if let Value::Object(Some(cond)) = ctx.get_field_by_name(this, "filterCondition") {
+        let session = match session_pin {
+            Some((pin, s)) => {
+                let s = ctx.read_native_pin(pin, s);
+                session_pin = Some((pin, s));
+                Value::Object(Some(s))
+            }
+            None => Value::Object(None),
+        };
         let opt = ctx.invoke_virtual(
             cond,
             "optimizeCondition",
@@ -3312,10 +3521,16 @@ fn table_filter_prepare_on(
             &[session],
         )?;
         if let Some(v) = opt {
+            this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "filterCondition", v);
         }
     }
+    this = ctx.read_native_pin(this_pin, this);
     if let Value::Object(Some(cond)) = ctx.get_field_by_name(this, "joinCondition") {
+        let session = match session_pin {
+            Some((pin, s)) => Value::Object(Some(ctx.read_native_pin(pin, s))),
+            None => Value::Object(None),
+        };
         let opt = ctx.invoke_virtual(
             cond,
             "optimizeCondition",
@@ -3323,10 +3538,12 @@ fn table_filter_prepare_on(
             &[session],
         )?;
         if let Some(v) = opt {
+            this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "joinCondition", v);
         }
     }
 
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -3545,5 +3762,199 @@ mod tests {
                 .expect("return"),
             Value::Int(42)
         );
+    }
+}
+
+/// The pin audit, as a ratchet rather than a one-off review.
+///
+/// `NativeContext::pin_native_root`'s contract: a native holding an
+/// `ObjectRef` across "`invoke` / `new_object_initialized` / any operation that
+/// can allocate" must pin it and re-read it afterwards. `vm_exec.rs`'s
+/// `forward_boundary_args` / `forward_boundary_value` repair a reference on the
+/// way INTO a callback and on the way into a field or array store, and every
+/// `NativeContext` entry point forwards its receiver — but as
+/// `forward_boundary_args`' own doc says, none of that makes per-site pinning
+/// unnecessary: the native's Rust local stays stale, so anything that compares
+/// it by IDENTITY, or reads a class id or a string off it, is still wrong.
+///
+/// `bug-h2-testmultithread-mvstore-writer-object-identity-20260816.md` records
+/// eight of these found one at a time in this file. This test is what stops the
+/// ninth from being written: any function here that moves the heap and pins
+/// nothing has to be named below, with the reason it is safe.
+#[cfg(test)]
+mod pin_audit_witness {
+    /// Read the working tree, not a runtime behaviour: the claim is about what
+    /// this file says.
+    const SRC: &str = include_str!("apps_h2.rs");
+
+    /// `ctx` operations that can run Java or allocate, and therefore can move
+    /// every object this file holds in a Rust local.
+    const MOVERS: &[&str] = &[
+        "ctx.invoke",
+        "ctx.new_object",
+        "ctx.new_ref_array",
+        "ctx.new_array",
+        "ctx.create_string",
+        "ctx.ensure_class_initialized",
+    ];
+
+    /// Functions that reach a mover and deliberately pin nothing, each with the
+    /// reason. "receiver-only" means every reference the function holds across
+    /// the mover is used solely as the RECEIVER of a later `ctx` call, which
+    /// `load_and_forward` repairs at the entry point.
+    const JUSTIFIED_UNPINNED: &[(&str, &str)] = &[
+        ("register_apps_h2_overrides", "registration only; holds no ObjectRef"),
+        ("h2_internal_error", "the string it creates is the very next call's argument"),
+        ("h2_new_empty_hashmap", "the allocation IS the value; nothing is held across it"),
+        ("h2_read_string_hash", "receiver-only"),
+        ("h2_column_hash_code", "no mover between the field reads and their use"),
+        ("h2_expression_column_get_value_bytecode", "forwards `args` untouched"),
+        ("h2_row_get", "hands its argument straight to the callee"),
+        ("h2_default_row_get_value", "no mover before the array read"),
+        ("h2_utils_get_resource", "the array it allocates is only ever its own store target"),
+        ("h2_boxed_long_value", "receiver-only"),
+        ("h2_parser_set_token_index", "hands its argument straight to the callee"),
+        ("h2_parser_advance_to", "receiver-only; the one value store is forwarded by set_field_by_name"),
+        ("h2_token_as_identifier_native", "hands its argument straight to the callee"),
+        ("h2_token_as_identifier_value", "the string it creates is returned immediately"),
+        ("h2_syntax_error", "hands its argument straight to the callee"),
+        ("table_filter_prepare", "hands its argument straight to the callee"),
+        ("h2_db_exception", "the array is re-read through a pin; see the body"),
+    ];
+
+    /// Top-level functions only, keyed on column 0.
+    ///
+    /// Every native in this file is declared at column 0; everything inside
+    /// `mod tests` is indented. Using the indentation is what keeps a `#[test]`
+    /// fn out of the audit without needing to brace-match a module whose format
+    /// strings contain braces of their own.
+    fn function_bodies_of(src: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut current: Option<(String, String)> = None;
+        for line in src.lines() {
+            let at_top_level = !line.starts_with(' ') && !line.starts_with('\t');
+            let after_fn = if at_top_level {
+                line.strip_prefix("pub(crate) fn ")
+                    .or_else(|| line.strip_prefix("pub(super) fn "))
+                    .or_else(|| line.strip_prefix("pub fn "))
+                    .or_else(|| line.strip_prefix("fn "))
+            } else {
+                None
+            };
+            if let Some(rest) = after_fn {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    if let Some(done) = current.take() {
+                        out.push(done);
+                    }
+                    current = Some((name, String::new()));
+                }
+            }
+            if let Some((_, body)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        if let Some(done) = current.take() {
+            out.push(done);
+        }
+        out
+    }
+
+    fn function_bodies() -> Vec<(String, String)> {
+        function_bodies_of(SRC)
+    }
+
+    /// The predicate itself, over arbitrary source, so the negative control
+    /// below exercises the same code the audit runs on the real file.
+    fn unpinned_movers_in(src: &str) -> Vec<String> {
+        function_bodies_of(src)
+            .into_iter()
+            .filter(|(name, body)| {
+                MOVERS.iter().any(|m| body.contains(m))
+                    && !body.contains("pin_native_root")
+                    && !JUSTIFIED_UNPINNED.iter().any(|(n, _)| n == name)
+            })
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    #[test]
+    fn the_corpus_is_the_file_this_test_thinks_it_is() {
+        // An absence proves nothing about a file that stopped containing the
+        // thing being scanned for. Anchor on two names this audit is about.
+        assert!(
+            SRC.contains("fn table_filter_prepare_on"),
+            "apps_h2.rs no longer defines `table_filter_prepare_on`, so this scan is reading \
+             the wrong text and its verdict means nothing"
+        );
+        assert!(
+            SRC.contains("pin_native_root"),
+            "apps_h2.rs contains no pins at all — the whole audit has been reverted"
+        );
+        let bodies = function_bodies();
+        assert!(
+            bodies.len() > 60,
+            "only {} top-level functions parsed out of apps_h2.rs; the parser is broken, not the file",
+            bodies.len()
+        );
+    }
+
+    /// A guard that cannot fail reads exactly like one that works.
+    ///
+    /// Feed the same predicate a function that breaks the rule and one that
+    /// keeps it, and check it separates them — otherwise the green above could
+    /// mean "the scan found nothing" or "the scan looks at nothing", and those
+    /// are not the same claim.
+    #[test]
+    fn the_scan_can_fail() {
+        let offending = "fn h2_synthetic_offender(ctx: &mut dyn NativeContext, v: ObjectRef) {\n\
+                             let other = ctx.invoke_virtual(v, \"x\", \"()V\", &[]);\n\
+                             let _ = (v, other);\n\
+                         }\n";
+        assert_eq!(
+            unpinned_movers_in(offending),
+            vec!["h2_synthetic_offender".to_string()],
+            "the predicate does not flag a function that calls back into Java holding a raw \
+             ObjectRef, so its silence on apps_h2.rs means nothing"
+        );
+
+        let compliant = "fn h2_synthetic_compliant(ctx: &mut dyn NativeContext, v: ObjectRef) {\n\
+                             let pin = ctx.pin_native_root(v);\n\
+                             let _ = ctx.invoke_virtual(v, \"x\", \"()V\", &[]);\n\
+                             let _ = ctx.read_native_pin(pin, v);\n\
+                         }\n";
+        assert!(
+            unpinned_movers_in(compliant).is_empty(),
+            "the predicate flags a function that DOES pin, so it would force noise into \
+             JUSTIFIED_UNPINNED instead of finding defects"
+        );
+    }
+
+    #[test]
+    fn every_h2_native_that_moves_the_heap_pins_or_is_named_as_safe() {
+        let offenders = unpinned_movers_in(SRC);
+        assert!(
+            offenders.is_empty(),
+            "these apps_h2 natives call back into Java (or allocate) while holding raw \
+             ObjectRefs and pin nothing: {offenders:?}. Either pin and re-read what is live \
+             across the call (see `h2_condition_and_or_get_value` for the idiom), or add the \
+             function to JUSTIFIED_UNPINNED with the reason it cannot go stale."
+        );
+    }
+
+    #[test]
+    fn the_justification_list_has_no_dead_entries() {
+        let names: Vec<String> = function_bodies().into_iter().map(|(n, _)| n).collect();
+        for (name, _) in JUSTIFIED_UNPINNED {
+            assert!(
+                names.iter().any(|n| n == name),
+                "JUSTIFIED_UNPINNED names `{name}`, which apps_h2.rs no longer defines. A stale \
+                 exception list is how an audit stops auditing."
+            );
+        }
     }
 }

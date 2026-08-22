@@ -521,11 +521,20 @@ pub mod incomplete_reason {
     /// not yet strong enough to permit a copying young collection.  JIT code
     /// remains enabled; this only selects the non-moving young sweep.
     pub const JIT_RELOCATION_UNSUPPORTED: usize = 13;
+    /// The frame-band verifier could not run: its young-residency test reads
+    /// `gen_heap::JIT_REGION_BOUNDS`, and that table is unpublished on this
+    /// collector, so every band word classifies as not-young and the verifier
+    /// would report "nothing unpublished" without having inspected anything.
+    ///
+    /// This is the fail-closed answer to a VACUOUS pass, and it belongs with
+    /// [`UNBOUNDED_FRAME_BAND`] rather than with [`UNPUBLISHED_FRAME_OOP`]: it
+    /// says the frame could not be inspected, not that an oop was missed.
+    pub const YOUNG_BOUNDS_UNPUBLISHED: usize = 14;
 
     /// One past the highest defined reason code. Sizes the per-reason counter
     /// array; a new variant must bump it (asserted by
     /// `every_incomplete_reason_has_a_label`).
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 15;
 
     /// Human-readable label for a reason code (for the fallback diagnostic).
     pub fn label(code: usize) -> &'static str {
@@ -543,6 +552,7 @@ pub mod incomplete_reason {
             UNPUBLISHED_FRAME_OOP => "compiled-frame-oop-not-published",
             UNBOUNDED_FRAME_BAND => "compiled-frame-band-unbounded",
             FOREIGN_INNERMOST_RBP => "innermost-rbp-belongs-to-unguarded-callee",
+            YOUNG_BOUNDS_UNPUBLISHED => "young-bounds-unpublished-verifier-vacuous",
             JIT_RELOCATION_UNSUPPORTED => "jit-relocation-contract-unproven",
             _ => "unknown",
         }
@@ -561,6 +571,7 @@ pub mod incomplete_reason {
 // reason as every other counter in this module.
 #[cfg(not(test))]
 static MOVING_YOUNG_REASON_COUNTS: [AtomicUsize; incomplete_reason::COUNT] = [
+    AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),

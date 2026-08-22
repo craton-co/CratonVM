@@ -498,6 +498,7 @@ dependencies = [
  "cratonvm-jit",
  "cratonvm-native-api",
  "cratonvm-native-builtins",
+ "cratonvm-native-io",
  "cratonvm-types",
  "cratonvm-vm",
  "mimalloc",

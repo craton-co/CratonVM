@@ -6,7 +6,7 @@
 the whole `TestTransaction` class passes on CratonVM the moment H2's lock budget
 is large enough to hold one of the two transactions. What is left is the
 throughput constant factor, which is not a defect with a fix and already has a
-page: `docs/known-issues/h2/h2-update-path-throughput-20260802.md`.
+page: `performance/h2-update-path-throughput-RETIRED-20260821.md`.
 
 This is the same shape as the retired
 `bug-h2-testmultithread-concurrent-update-timeout` write-up — "H2's own
@@ -204,7 +204,7 @@ cd "$H2"
 
 ## Related
 
-* `docs/known-issues/h2/h2-update-path-throughput-20260802.md` — where this
+* `performance/h2-update-path-throughput-RETIRED-20260821.md` — where this
   page's residual went, and the page that owns the constant factor.
 * the retired `bug-h2-testmultithread-concurrent-update-timeout-RESOLVED-20260802`
   write-up — the same mechanism at a 10 s budget instead of 50 ms.

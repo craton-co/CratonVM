@@ -3905,7 +3905,6 @@ impl Compiler {
                 // tableswitch — jump table for dense tables, CMP chain for small
                 0xaa => {
                     self.flush_scratch_registers();
-                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -3966,7 +3965,35 @@ impl Compiler {
                         pc += 4;
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    if def_target <= base_pc || targets.iter().any(|&target| target <= base_pc) {
+                    let any_backward =
+                        def_target <= base_pc || targets.iter().any(|&target| target <= base_pc);
+                    // Canonicalize the operands that OUTLIVE this switch, exactly
+                    // as the `ifeq`/`if_icmp`/`goto` arms do — and before popping
+                    // the key, so the key participates in the relocation and
+                    // cannot be clobbered by another slot's move (the same
+                    // ordering rule those arms state).
+                    //
+                    // Every arm of a switch is a branch target, and a target
+                    // revived from dead code rebuilds the operand stack at the
+                    // canonical `base_spill_offset + i*8` — a layout NOTHING was
+                    // establishing here, so any operand this basic block left at
+                    // a non-canonical offset was read from the wrong slot by
+                    // every arm. That is the second half of ECJ's
+                    // `OperandStack.pop(OperandCategory)` miscompile: the inlined
+                    // `TypeIds.getCategory` result sat above its semantic depth
+                    // (fixed in `x64/inlining.rs`) and this `tableswitch` was the
+                    // one branch shape in the walk that did not repair it, so the
+                    // `if_icmpeq` at the merge compared the raw `TypeBinding.id`
+                    // (tomcat/ecj-operandstack-*.md).
+                    //
+                    // Forward-only, mirroring those arms: a backward target's
+                    // layout was fixed when the walk emitted it, and relocating
+                    // to suit a forward merge would disagree with it.
+                    if !any_backward && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
+                    let key_slot = self.pop_stack();
+                    if any_backward {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
@@ -4065,7 +4092,6 @@ impl Compiler {
                 // lookupswitch — CMP chain for small, binary search for large
                 0xab => {
                     self.flush_scratch_registers();
-                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -4120,7 +4146,18 @@ impl Compiler {
                         pairs.push((key, target));
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    if def_target <= base_pc || pairs.iter().any(|&(_, target)| target <= base_pc) {
+                    let any_backward = def_target <= base_pc
+                        || pairs.iter().any(|&(_, target)| target <= base_pc);
+                    // Same canonicalization the `tableswitch` arm above performs,
+                    // and for the same reason — see the note there. The two
+                    // switch arms are the only branch shapes in this walk that
+                    // were not establishing the canonical layout their own
+                    // targets are revived with.
+                    if !any_backward && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
+                    let key_slot = self.pop_stack();
+                    if any_backward {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
@@ -7063,11 +7100,15 @@ impl Compiler {
                             // them. See
                             // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
                             let args_frame_top = self.next_spill_offset;
-                            let mut arg_slots = Vec::with_capacity(n);
-                            for _ in 0..n {
-                                arg_slots.push(self.pop_stack());
+                            let (arg_slots, arg_oops) = self.pop_invoke_args(n);
+                            // A reference staged into an area no oop map can name (the
+                            // native-ABI outgoing-argument area, the direct-call service
+                            // slots, or an inlined callee's parameter locals). The
+                            // conservative scan covers those and the precise map cannot,
+                            // so this method must not claim precise coverage here.
+                            if arg_oops.iter().any(|&o| o) {
+                                self.pending_staged_args_unmapped = true;
                             }
-                            arg_slots.reverse();
                             // Spill cursor as the bytecode's operand stack sees it
                             // now that this invoke's arguments are popped. The
                             // return value belongs HERE, not wherever the
@@ -7320,11 +7361,7 @@ impl Compiler {
                         // Capture spill offset BEFORE popping to prevent
                         // the args buffer from overlapping source Frame slots.
                         let pre_pop_spill = self.next_spill_offset;
-                        let mut arg_slots = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            arg_slots.push(self.pop_stack());
-                        }
-                        arg_slots.reverse();
+                        let (arg_slots, arg_oops) = self.pop_invoke_args(n);
                         // Cursor at the popped-args depth — the reclaim after
                         // the call restores THIS level (not `pre_pop_spill`).
                         // Restoring to pre_pop left the return value parked
@@ -7353,6 +7390,13 @@ impl Compiler {
                                 let buf_offset = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
                                 self.load_slot_to_reg(RAX, *slot);
                                 self.emit_store_local(buf_offset, RAX);
+                                // This argument leaves the simulated operand
+                                // stack here; if it is a reference, the
+                                // safepoint map below is the only thing that
+                                // can still name it.
+                                if arg_oops[i] {
+                                    self.pending_staged_arg_oops.push(buf_offset);
+                                }
                             }
                         }
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
@@ -7467,11 +7511,15 @@ impl Compiler {
                                 crate::deopt::DeoptReason::ReceiverTypeChanged,
                             );
                         }
-                        let mut arg_slots = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            arg_slots.push(self.pop_stack());
+                        let (arg_slots, arg_oops) = self.pop_invoke_args(n);
+                        // A reference staged into an area no oop map can name (the
+                        // native-ABI outgoing-argument area, the direct-call service
+                        // slots, or an inlined callee's parameter locals). The
+                        // conservative scan covers those and the precise map cannot,
+                        // so this method must not claim precise coverage here.
+                        if arg_oops.iter().any(|&o| o) {
+                            self.pending_staged_args_unmapped = true;
                         }
-                        arg_slots.reverse();
 
                         if is_tail_call && self.body_entry_offset > 0 {
                             // Tail-call optimization: load args into parameter locals
@@ -9386,11 +9434,15 @@ impl Compiler {
                             // them. See
                             // fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md.
                             let args_frame_top = self.next_spill_offset;
-                            let mut arg_slots = Vec::with_capacity(n);
-                            for _ in 0..n {
-                                arg_slots.push(self.pop_stack());
+                            let (arg_slots, arg_oops) = self.pop_invoke_args(n);
+                            // A reference staged into an area no oop map can name (the
+                            // native-ABI outgoing-argument area, the direct-call service
+                            // slots, or an inlined callee's parameter locals). The
+                            // conservative scan covers those and the precise map cannot,
+                            // so this method must not claim precise coverage here.
+                            if arg_oops.iter().any(|&o| o) {
+                                self.pending_staged_args_unmapped = true;
                             }
-                            arg_slots.reverse();
                             // Spill cursor as the bytecode's operand stack sees it
                             // now that this invoke's arguments are popped. The
                             // return value belongs HERE, not wherever the
@@ -9563,11 +9615,7 @@ impl Compiler {
                             // Capture spill offset BEFORE popping to prevent
                             // the args buffer from overlapping source Frame slots.
                             let pre_pop_spill = self.next_spill_offset;
-                            let mut arg_slots = Vec::with_capacity(n);
-                            for _ in 0..n {
-                                arg_slots.push(self.pop_stack());
-                            }
-                            arg_slots.reverse();
+                            let (arg_slots, arg_oops) = self.pop_invoke_args(n);
                             // Post-pop cursor — the restore point after the
                             // dispatch (see the invokestatic twin above for
                             // the Bug-4 frame-creep rationale).
@@ -9588,6 +9636,11 @@ impl Compiler {
                                     let buf_offset = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
                                     self.load_slot_to_reg(RAX, *slot);
                                     self.emit_store_local(buf_offset, RAX);
+                                    // See the invokestatic twin: the map below
+                                    // is the only remaining namer of this oop.
+                                    if arg_oops[i] {
+                                        self.pending_staged_arg_oops.push(buf_offset);
+                                    }
                                 }
                             }
 
