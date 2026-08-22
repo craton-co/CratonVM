@@ -415,8 +415,20 @@ pub mod disp_census {
     pub const MIC_RUST_CACHE: usize = 14;
     /// `jit_invoke_virtual_mic`: reached the megamorphic PIC secondary cache.
     pub const MIC_PIC: usize = 15;
+    /// An `invokestatic` to an uncompiled callee served from the call site's
+    /// cached interpreter frame template (`try_jit_static_bytecode_callee`).
+    ///
+    /// Counted because the whole point of that path is that it replaces a
+    /// by-name resolution, and a version of it that never fires is
+    /// indistinguishable from one that fires and buys nothing — the failure
+    /// mode this module's other counters exist for.
+    pub const OUT_STATIC_BC: usize = 16;
+    /// That path DECLINED, per call. A site's refusal is cached, so a large
+    /// number here against a small `out_static_bc` means the population is
+    /// genuinely ineligible rather than the cache thrashing.
+    pub const OUT_STATIC_BC_REFUSED: usize = 17;
 
-    const N: usize = 16;
+    const N: usize = 18;
     const NAMES: [&str; N] = [
         "kind_virtual",
         "kind_special",
@@ -434,9 +446,13 @@ pub mod disp_census {
         "mic_early_other",
         "mic_rust_cache",
         "mic_pic",
+        "out_static_bc",
+        "out_static_bc_refused",
     ];
 
     static COUNTS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -2241,7 +2257,15 @@ macro_rules! site_keyed_memos {
 /// they cache a compiled entry chosen on the strength of a `globally_named`
 /// test that nothing was re-running.
 ///
-/// `any_class_redefined` is folded in as cheap insurance. None of the three
+/// `STATIC_BYTECODE_CALLEE_CACHE` is here for the same reason and needs it
+/// most: it holds an interpreter frame template resolved through
+/// `get_loaded_class_id(info.class_name)`, i.e. keyed on a class NAME. A second
+/// loader defining that name is precisely the event that makes the template
+/// describe the wrong class's method — and it is invisible to the redefine and
+/// tier signals, so without this line the site would keep entering the first
+/// loader's body forever.
+///
+/// `any_class_redefined` is folded in as cheap insurance. None of the other
 /// memoized fields can actually move under redefinition (a `ClassId`'s name
 /// and `ACC_INTERFACE` are fixed at definition, and redefinition rewrites
 /// method bodies in place), but it is a sticky bool whose single false->true
@@ -2258,6 +2282,7 @@ fn flush_class_identity_dispatch_memos() {
             VIRTUAL_TARGET_CACHE.with(|c| c.borrow_mut().clear());
             DISPATCH_CACHE.with(|c| c.borrow_mut().clear());
             VIRTUAL_DISPATCH_CACHE.with(|c| c.borrow_mut().clear());
+            STATIC_BYTECODE_CALLEE_CACHE.with(|c| c.borrow_mut().clear());
         }
     });
 }
@@ -10878,6 +10903,14 @@ site_keyed_memos! {
     /// safe: the same generation and class-identity flushes that drop every
     /// other dispatch memo drop this one too.
     MIC_COMPILE_DECLINED: (JitSiteKey, u32) => u32;
+    /// `JitSiteKey -> ` the interpreter frame template for an `invokestatic`
+    /// callee the JIT did not compile, or `None` as a cached refusal.
+    ///
+    /// Keyed by the call site alone: a static call has no receiver, so the
+    /// target is a pure function of the site. Being a `site_keyed_memos!`
+    /// member is what makes it safe — the same generation and class-identity
+    /// flushes that drop every other dispatch memo drop this one too.
+    STATIC_BYTECODE_CALLEE_CACHE: JitSiteKey => Option<(std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>, crate::classloading::resolution::RedefineGate)>;
     /// `(JitSiteKey, receiver ClassId) -> CachedDispatchTarget`.
     ///
     /// Keyed exactly like `VIRTUAL_DISPATCH_CACHE`. Array receivers and
@@ -12359,6 +12392,16 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // so a process with one copy of the name takes the identical
             // previous path — including every special case
             // `invoke_or_native` carries that the on-class form does not.
+            // A callee the JIT did not compile: enter it through this site's
+            // cached interpreter frame template rather than re-resolving it
+            // from `info.class_name` on every call. Declines (and caches the
+            // refusal) for anything the by-name path must still handle.
+            if let Some(r) = try_jit_static_bytecode_callee(vm, thread, info, info_key, &values) {
+                match r {
+                    Ok(v) => v,
+                    Err(e) => return handle_jit_dispatch_error(vm, thread, e, info),
+                }
+            } else {
             let r = match jit_static_owner_override(vm, info) {
                 Some(owner) => crate::vm::invoke_static_shared_on_class(
                     vm,
@@ -12384,6 +12427,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     return handle_jit_dispatch_error(vm, thread, e, info);
                 }
             }
+            }
         }
         _ => None,
     };
@@ -12404,6 +12448,183 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         );
     }
     ret
+}
+
+/// A compiled caller's `invokestatic` to a callee the JIT did NOT compile.
+///
+/// # The cost this removes
+///
+/// Without it such a call falls out of `jit_invoke_dispatch`'s fast arms into
+/// `crate::vm::invoke_or_native` -> `invoke_on_class_shared_inner`, the fully
+/// name-keyed generic dispatch — so a call site that is monomorphic and whose
+/// callee never changes re-resolves the owner class from a STRING, re-runs the
+/// native-override arbitration, re-clones the `CodeAttribute` and re-pads the
+/// bytecode, on every single call. `perf`, steady state, on the denied arm of
+/// `probes/XferProbe.java`: `invoke_on_class_shared_inner` 14.72% self, the
+/// `(ClassLoaderId, Arc<str>)` by-name class lookup 3.41%, `__memcmp_evex_movbe`
+/// 3.04%, the native-override gate 1.93%, and `CodeAttribute::clone` +
+/// `padded_bytecode_for_method` + `Arc<[u8]>::drop_slow` 4.50%.
+///
+/// The interpreter pays none of it — its call sites hold a
+/// `CachedInvokeTarget::Bytecode` with a prebuilt `Arc<CachedBytecodeMethod>`.
+/// The JIT helper had a cache for a COMPILED callee (`DISPATCH_CACHE`,
+/// `VIRTUAL_DISPATCH_CACHE`) and none at all for an interpreted one, which is
+/// why compiling the caller and not the callee measured **5x slower than
+/// compiling neither** (1242-1902 ns/op against 236-385).
+///
+/// # Why `invokestatic` first
+///
+/// It is where the volume is — `CRATONVM_DBG=mic-prof` on
+/// `probes/ReactorProbe.java`: `kind_static=2_986_402` of
+/// `disp_calls=3_356_461`, 89% — and it has the smallest correctness surface:
+/// no receiver, so no virtual retarget, no interface rules and no
+/// receiver-class guard to re-test.
+///
+/// # Why it is safe to take instead of `invoke_or_native`
+///
+/// Same shape of argument as [`try_jit_site_cached_native_dispatch`]: every
+/// obligation is discharged ONCE, at resolution, and a site that cannot
+/// discharge them caches a refusal and never asks again. The resolution refuses
+/// unless ALL of these hold, so anything unusual keeps the old path verbatim:
+///
+/// * the invoke kind is `3` and the method name is not one `invoke_or_native`
+///   special-cases (`site_name_is_special_cased` — the same gate cascade the
+///   leaf-native path defers to);
+/// * `jit_static_owner_override` declines, i.e. no loader-faithful owner
+///   differs from the global by-name answer. That is what keeps the whole
+///   loader-identity surface — BUG-JIT-INVOKESPECIAL-LOADER-20260726 and the
+///   `AotIntegrationTests` static-owner hang — on the untouched path;
+/// * NO native anywhere has this `(name, descriptor)`
+///   (`might_have_method_descriptor`, the same cheap pre-filter
+///   `execute_invokevirtual_vtable_fast` uses). That one refusal removes the
+///   native-override, `SyntheticStub`-yield and redefine-shadow questions
+///   entirely rather than reproducing them — and it subsumes
+///   `force_native_over_real_jdk_bytecode`, whose triples name a REGISTERED
+///   native that must beat real JDK bytecode: with no registration carrying
+///   this `(name, descriptor)` at all, such a gate entry declines and the
+///   bytecode runs, which is what this path does;
+/// * the owner class is loaded AND already initialised — `invoke_shared` would
+///   run `<clinit>`, and this path must never be the thing that skips it.
+///   Initialisation is monotone, so checking once is checking forever;
+/// * `build_lambda_impl_cached` (nothing lambda-specific about it, see its doc)
+///   accepts the resolved method: not native, not `synchronized`, not abstract,
+///   has a `Code` attribute, no native shadow on the declaring class;
+/// * the method really is `static`, and its parameter count matches the decoded
+///   argument count.
+///
+/// Per hit, only what can change is re-tested: the declaring class's
+/// `RedefineGate`, and the process-wide `any_class_redefined` latch.
+///
+/// SAFETY: `values` are the caller's already-decoded arguments; `thread` is the
+/// JIT helper's own borrow.
+unsafe fn try_jit_static_bytecode_callee(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    info_key: JitSiteKey,
+    values: &[Value],
+) -> Option<Result<Option<Value>, crate::error::MethodCallFailed>> {
+    if !crate::runtime::env_cache::jit_static_bytecode_callee() {
+        return None;
+    }
+    if info.invoke_kind != 3 {
+        return None;
+    }
+    // A redefine can swap a body for a native (or the reverse) anywhere in the
+    // process; the cached template predates it. Cheap global latch, checked
+    // before the memo so a redefined process never serves one.
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
+    let cached = match STATIC_BYTECODE_CALLEE_CACHE.with(|c| c.borrow().get(&info_key).cloned()) {
+        Some(hit) => hit,
+        None => {
+            let resolved = resolve_static_bytecode_callee(vm, info);
+            STATIC_BYTECODE_CALLEE_CACHE.with(|c| {
+                c.borrow_mut().insert(info_key, resolved.clone());
+            });
+            resolved
+        }
+    };
+    let Some((cached, gate)) = cached else {
+        disp_census::note(disp_census::OUT_STATIC_BC_REFUSED);
+        return None;
+    };
+    if gate.is_stale() {
+        STATIC_BYTECODE_CALLEE_CACHE.with(|c| {
+            c.borrow_mut().remove(&info_key);
+        });
+        return None;
+    }
+    // A static callee takes exactly its declared parameters — no receiver. An
+    // arity disagreement means the decode and the template describe different
+    // methods, which is a refusal, never a guess.
+    if values.len() != cached.num_params as usize {
+        return None;
+    }
+    disp_census::note(disp_census::OUT_STATIC_BC);
+    thread.refill_pools_from_shared(
+        &vm.mem.operand_stack_pool,
+        &vm.mem.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+        cached,
+        values,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    Some(crate::runtime::interpreter::execute_prebuilt_frame(vm, thread, frame))
+}
+
+/// The once-per-site half of [`try_jit_static_bytecode_callee`]. Every refusal
+/// is cached as `None`, so an ineligible site asks these questions once.
+fn resolve_static_bytecode_callee(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<(
+    std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>,
+    crate::classloading::resolution::RedefineGate,
+)> {
+    if site_name_is_special_cased(info.method_name) {
+        return None;
+    }
+    // A loader-faithful owner that differs from the global by-name answer is
+    // exactly the case this path must not try to reproduce.
+    if jit_static_owner_override(vm, info).is_some() {
+        return None;
+    }
+    // No native may be in play for this triple, by either route.
+    if vm
+        .natives
+        .native_methods
+        .might_have_method_descriptor(info.method_name, info.descriptor)
+    {
+        return None;
+    }
+    let owner = {
+        let cm = vm.classes.class_manager.read();
+        cm.get_loaded_class_id(info.class_name)
+    }?;
+    if owner == ClassId::new(0) {
+        return None;
+    }
+    // `invoke_shared` would run `<clinit>` on the way in. Refuse until it has,
+    // rather than becoming the path that skips it.
+    if !crate::vm::is_class_initialized_via_manager(vm, owner) {
+        return None;
+    }
+    let (cached, gate) = crate::runtime::interpreter::build_lambda_impl_cached(
+        vm,
+        owner,
+        info.method_name,
+        info.descriptor,
+    )?;
+    if !cached.is_static {
+        return None;
+    }
+    Some((cached, gate))
 }
 
 /// The leaf-native fast path for compiled code, probed once per
@@ -18646,6 +18867,15 @@ mod tests {
         // key is `(site, receiver class)` like the two caches above.
         MIC_COMPILE_DECLINED.with(|c| {
             c.borrow_mut().insert((key, 77), 1);
+        });
+
+        // The interpreted-callee template memo. `None` is its cached REFUSAL,
+        // which is a real entry — storing it is what stops an ineligible site
+        // from re-resolving — so it has to be flushed like any other, and a
+        // recycled `JitInvokeInfo` address inheriting a refusal would silently
+        // deny the new site the fast path forever.
+        STATIC_BYTECODE_CALLEE_CACHE.with(|c| {
+            c.borrow_mut().insert(key, None);
         });
 
         // Every memo non-empty first, or the post-flush sweep proves nothing.
