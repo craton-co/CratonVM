@@ -1136,6 +1136,49 @@ mod windows_fault {
         if module_base != 0 && fault_addr >= module_base {
             let _ = writeln!(report, "#  faulting RVA: 0x{:X}", fault_addr - module_base);
         }
+        // WHICH BUILD these RVAs are RVAs into.
+        //
+        // Every address in this report is relative to a binary the report does
+        // not name, and `CRATONVM_SYMBOLIZE` resolves an RVA against WHATEVER
+        // binary it is handed — a near-miss build answers with plausible,
+        // entirely wrong function names and four-digit offsets. That is exactly
+        // how `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+        // spent two sessions unable to symbolize eight of its own crash logs:
+        // by the time anyone looked, nothing recorded which build produced
+        // them, and ten surviving binaries all disagreed.
+        //
+        // `TimeDateStamp` + `SizeOfImage` are what a symbol server keys a PE
+        // on, they are already mapped at `module_base`, and reading them is two
+        // loads with no allocation and no lock — which is what a fault handler
+        // can afford.
+        if module_base != 0 {
+            // SAFETY: `module_base` is the loaded image base of this process's
+            // own exe. A loaded PE always has a readable DOS header at +0 and
+            // NT headers at +e_lfanew; the bound below refuses a nonsense
+            // `e_lfanew` rather than trusting it.
+            unsafe {
+                let e_lfanew =
+                    core::ptr::read_unaligned((module_base + 0x3C) as *const u32) as usize;
+                if e_lfanew > 0 && e_lfanew < 0x1000 {
+                    let nt = module_base + e_lfanew;
+                    // "PE\0\0"
+                    if core::ptr::read_unaligned(nt as *const u32) == 0x0000_4550 {
+                        // IMAGE_FILE_HEADER.TimeDateStamp is at NT+4+4;
+                        // IMAGE_OPTIONAL_HEADER64.SizeOfImage at NT+24+56.
+                        let timestamp = core::ptr::read_unaligned((nt + 8) as *const u32);
+                        let size_of_image =
+                            core::ptr::read_unaligned((nt + 24 + 56) as *const u32);
+                        let _ = writeln!(
+                            report,
+                            "#  exe build id: timestamp=0x{:08X} size_of_image=0x{:X} \
+                             (CRATONVM_SYMBOLIZE is only meaningful against the binary \
+                             carrying BOTH of these)",
+                            timestamp, size_of_image
+                        );
+                    }
+                }
+            }
+        }
         if let Some(name) = cratonvm_jit::lookup_jit_method_name(fault_addr) {
             let _ = writeln!(report, "#  faulting JIT method: {}", name);
         }
@@ -1209,6 +1252,32 @@ mod windows_fault {
                     let _ = write!(line, "  {:>3}=0x{:016X}", name, unsafe { rd(ctx, *off) });
                 }
                 let _ = writeln!(report, "{}", line);
+            }
+            // Decode the faulting DATA address as an indexed load, when it is
+            // one: `base + index*scale`, over every register pair and the four
+            // x86-64 scales.
+            //
+            // This is 1156 integer compares in a path that runs once per fatal
+            // fault, and it answers the question a raw register dump makes the
+            // reader answer by hand. It is not hypothetical: all eight crash
+            // logs behind
+            // `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+            // satisfy `fault == r10 + rax*4` — a jump-table load with a
+            // garbage index — and nothing said so, so two sessions read the
+            // scattered addresses as random corruption instead.
+            //
+            // A `*4`/`*8` hit whose index register holds a LARGE value is the
+            // signature to look for: an `int[]`/jump-table index or an enum
+            // discriminant that should have been small, read out of memory that
+            // did not hold one.
+            if !op.is_empty() && data_addr != 0 {
+                let regs: Vec<(&str, u64)> = names_offs
+                    .iter()
+                    .map(|(n, o)| (*n, unsafe { rd(ctx, *o) }))
+                    .collect();
+                if let Some(line) = super::decode_indexed_load(&regs, data_addr) {
+                    let _ = writeln!(report, "{line}");
+                }
             }
         }
 
@@ -1515,6 +1584,96 @@ pub fn symbolize_rvas(_rvas: &[usize]) -> Vec<(usize, Option<String>)> {
     #[cfg(not(windows))]
     {
         Vec::new()
+    }
+}
+
+/// Describe the faulting data address as `base + index*scale` over the fault's
+/// own registers, if any pair explains it.
+///
+/// A register dump alone leaves this to the reader, and the reader does not do
+/// it: all eight crash logs behind
+/// `docs/known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+/// satisfy `fault == r10 + rax*4` — an unchecked jump-table load with a garbage
+/// index — and because nothing said so, two sessions read the wildly scattered
+/// fault addresses as random corruption and looked for an environmental cause.
+///
+/// A `*4` or `*8` hit whose INDEX register holds a large value is the signature
+/// worth acting on: an array index, or an enum discriminant that should have
+/// been small, read out of memory that did not hold one.
+///
+/// `base == 0` and `index == 0` are skipped because they make every address
+/// trivially decodable, and `base == data_addr` because a zero index is not an
+/// explanation. At most six matches are listed; more than that means the
+/// registers are too degenerate for the decode to say anything.
+pub(crate) fn decode_indexed_load(regs: &[(&str, u64)], data_addr: usize) -> Option<String> {
+    use std::fmt::Write as _;
+    if data_addr == 0 {
+        return None;
+    }
+    let mut decoded = String::new();
+    let mut hits = 0usize;
+    for (bname, bval) in regs {
+        let base = *bval as usize;
+        if base == 0 || base == data_addr {
+            continue;
+        }
+        for (iname, ival) in regs {
+            let idx = *ival as usize;
+            if idx == 0 {
+                continue;
+            }
+            for scale in [1usize, 2, 4, 8] {
+                if base.wrapping_add(idx.wrapping_mul(scale)) == data_addr {
+                    if hits < 6 {
+                        let _ = write!(decoded, " [{bname}+{iname}*{scale}]");
+                    }
+                    hits += 1;
+                }
+            }
+        }
+    }
+    if hits == 0 {
+        return None;
+    }
+    Some(format!(
+        "Faulting address decodes as an indexed load:{}{}",
+        decoded,
+        if hits > 6 { " ..." } else { "" }
+    ))
+}
+
+#[cfg(test)]
+mod indexed_load_decode_tests {
+    use super::decode_indexed_load;
+
+    /// The real thing: `hs_err_pid3512`'s own registers and fault address.
+    /// If this stops matching, the decoder has stopped being able to fire on
+    /// the crash it was written for.
+    #[test]
+    fn decodes_the_json_xml_segv_jump_table_load() {
+        let regs = [
+            ("rax", 0x0000_0000_EAF8_2DA0u64),
+            ("rcx", 0x0000_008D_769D_2C88),
+            ("rbx", 0x5B),
+            ("rbp", 6),
+            ("r10", 0x0000_7FF6_35D7_9014),
+            ("r11", 0),
+        ];
+        let line = decode_indexed_load(&regs, 0x0000_7FF9_E1B8_4694).expect("must decode");
+        assert!(line.contains("[r10+rax*4]"), "got: {line}");
+    }
+
+    #[test]
+    fn declines_when_nothing_explains_the_address() {
+        let regs = [("rax", 1u64), ("rbx", 2), ("rcx", 3)];
+        assert!(decode_indexed_load(&regs, 0xDEAD_BEEF).is_none());
+    }
+
+    /// A zero index would make every base "explain" the address.
+    #[test]
+    fn zero_index_and_zero_base_are_not_explanations() {
+        let regs = [("rax", 0u64), ("r10", 0x1000)];
+        assert!(decode_indexed_load(&regs, 0x1000).is_none());
     }
 }
 

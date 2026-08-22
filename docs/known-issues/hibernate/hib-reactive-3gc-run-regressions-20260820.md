@@ -1,17 +1,30 @@
-# hibernate-reactive 3-GC run (2026-08-20): one fixed defect, one open family
+# hibernate-reactive 3-GC run (2026-08-20): two defects, both now fixed
 
-**Status:** ONE real defect FIXED and MEASURED (`nio_selector.rs`'s `SelectorImpl`
-field corruption). A SECOND, more consequential family — a persistence-context
-correctness cascade — is characterized with a concrete mechanism and evidence
-trail but **not fixed**: root-causing it further needs step-through debugging
-of `CompletableFuture`/Vert.x continuation completion timing that this session
-could not do from log archaeology alone. **UPDATE 2026-08-21 (section 6):**
-the mechanism is now narrowed to a specific, reproducible symptom —
-`reactiveRemove(entity)` is invoked TWICE for one `ArrayLoop` array slot that
-is dispatched only ONCE — confirmed by identity-hash-correlated tracing
-across three independent runs on the idle Azure host. This is likely a
-CratonVM lambda/method-reference dispatch defect, not a Hibernate bug; the
-exact composition layer responsible is still open.
+**Status: BOTH FIXED (2026-08-22).**
+
+1. `nio_selector.rs`'s `SelectorImpl` field corruption — fixed and measured
+   2026-08-20, section 1.
+2. The persistence-context correctness cascade — `reactiveRemove(entity)`
+   invoked TWICE for one `ArrayLoop` array slot dispatched ONCE — **root-caused
+   and fixed 2026-08-22, section 8.** It is not a `CompletableFuture`/Vert.x
+   continuation-timing question and it is not in the composition chain: the JIT
+   lambda direct-call arm (`vm/src/jit/helpers.rs::try_lambda_site_direct_call`)
+   DROPPED the reconstructed frame of a deoptimized lambda body and let its
+   caller re-run that body from entry, re-executing every side effect the
+   compiled body had already committed. `CRATONVM_JIT_DENY` bisected it to
+   exactly one class (`CompletionStages$ArrayLoop`), `CRATONVM_JIT_LAMBDA_SITE=0`
+   was the one feature switch of twelve that cleared it, and the fix routes the
+   frame through the same `resume_deopted_body` the interpreter's one-shot door
+   already used. **Six of the seven new regressions this page opened with are
+   now measured PASS on the fixed binary** (`FilterWithPaginationTest`,
+   `CriteriaMutationQueryTest`, `OneToManyTest`, `ReactiveStatelessWithBatchTest`,
+   `RowIdUpdateAndDeleteTest`, and — a regression the runner's `passed.txt` had
+   not caught — `QuerySpecificationTest`), section 8.6.
+
+Sections 2-7 below are preserved as the trail that got there. Note that
+**section 6.4's conclusion is invalidated by section 8.2** — its instrument
+lived inside the very method whose compiled body is the defect, and adding it
+suppresses the failure.
 
 **Baseline:** the previous known-good state is
 [residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md)
@@ -898,3 +911,220 @@ inconclusive** at this timeout (the already-known, separately-documented
 lambda-dispatch-timeout family, needs its own real per-class-override
 timeout before a `--jit` verdict means anything for those two). No class
 checked this session contradicts the section 6 finding.
+
+---
+
+## 8. 2026-08-22 — FIXED. The defect is the JIT lambda direct-call arm dropping a deoptimized frame and letting its caller re-run the body
+
+Section 6 left the mechanism as "a chained lambda/method-reference composition
+executing its terminal side-effecting call twice for one outer invocation", with
+the composition layer unidentified. It is identified, and it is neither the
+composition chain nor `CompletableFuture`: it is
+`vm/src/jit/helpers.rs::try_lambda_site_direct_call`, the JIT-side half of the
+lambda tier-up.
+
+### 8.1 Reproduced locally, then bisected with `CRATONVM_JIT_DENY`
+
+`FilterWithPaginationTest` reproduces on this Windows box against a
+Testcontainers Postgres exactly as it does on Azure: **33/35, the same 2
+failures, on every one of 5 consecutive runs of the same binary**, and
+`--nojit` is **35/35**. That makes it a same-binary A/B that runs in ~30 s, so
+`CRATONVM_JIT_DENY` (a substring match on `Class.method`, and therefore on
+nested classes too) can bisect it:
+
+| `CRATONVM_JIT_DENY=` | result |
+|---|---|
+| `org/hibernate/reactive/util/impl/CompletionStages` | **35/35 PASS** |
+| `org/hibernate/reactive/` | **35/35 PASS** |
+| `CompletionStages$ArrayLoop` | **35/35 PASS** |
+| `CompletionStages.loop` | 33/35 FAIL |
+| `CompletionStages.applyToAll` | 33/35 FAIL |
+| `CompletionStages.alwaysContinue` | 33/35 FAIL |
+| `CompletionStages.voidFuture` | 33/35 FAIL |
+| `java/util/concurrent/CompletableFuture` | 33/35 FAIL |
+
+**Exactly one class matters: `CompletionStages$ArrayLoop`.** Everything else in
+`CompletionStages`, and `CompletableFuture` itself, is exonerated. Section 2's
+`CompletableFuture` theory is now refuted by measurement rather than argument.
+
+### 8.2 Instrumenting `ArrayLoop` HIDES the defect — which invalidates section 6.4
+
+Two source-level instruments were compiled into a patch directory placed ahead
+of `hibernate-reactive-core`'s jar on the classpath (verified live: the patched
+`ArrayLoop.nextIndex(I)I` shows up in `CRATONVM_DBG=jit-disasm` output):
+
+* a per-`ArrayLoop` `BitSet` of dispatched indices inside `next()` — **35/35 PASS**
+* a wrapper around the `index -> consumer.apply(index).thenCompose(...)` lambda
+  in `loop(int,int,IntPredicate,IntFunction)` — **35/35 PASS**
+
+Both instruments make the failure disappear, and neither ever fired. Two edits
+that do NOT add code did **not** hide it — renaming the private `next(int)`
+overload to `nextIndex(int)` (33/35 FAIL) and replacing the `current++`
+`dup_x1` idiom with `index = current; current = index + 1` (33/35 FAIL) — so
+the overload-resolution and `dup_x1` hypotheses are both refuted, and the
+hiding is specific to changing how much code is in the method.
+
+**This means section 6.4's central claim cannot be relied on.** That claim —
+"`ArrayLoop.next()` dispatched index 2 exactly once, yet `reactiveRemove` ran
+twice, so the duplication is BELOW the dispatch" — was measured with
+instrumentation inside `ArrayLoop.next()`, i.e. inside the one method whose
+compiled body IS the defect. An instrument that suppresses the thing it
+measures reports its absence.
+
+### 8.3 The one kill switch that clears it
+
+Twelve JIT feature switches were run against the same repro. Eleven changed
+nothing (`CRATONVM_JIT_OSR=0`, `LOCAL_HANDLERS=0`, `SELF_TAILCALL=0`,
+`SP_TAILCALL=0`, `DIRECT_CALLEE_CALLS=0`, `GUARDED_VIRTUAL_INLINE=0`,
+`SP_INLINE_PIC=0`, `SP_INLINE_MIC=0`, `METHOD_SITE_CACHE=0`,
+`BYTECODE_LOOP_XFORM=0`, and — as section 6.7 already recorded —
+`C2_SUPERSEDE=0`). One cleared it:
+
+```
+CRATONVM_JIT_LAMBDA_SITE=0   ->  35/35 PASS, 3/3 runs
+```
+
+(`CRATONVM_TIER_ENABLED=0` also passes, but that is the broad "compile nothing"
+control, not a mechanism.)
+
+### 8.4 The defect
+
+`CRATONVM_JIT_LAMBDA_SITE` gates `try_lambda_site_direct_call` — a compiled
+caller's SAM call served straight from the call site's cached target. Its deopt
+handling was:
+
+```rust
+// A deopt. The body did not complete, so its signals describe an
+// attempt that is being abandoned and are dropped with it ...
+// the generic path below re-runs the body ...
+drop(stashed);
+site.disable_direct();
+return None;
+```
+
+**"The body did not complete" is not "the body did nothing."** A deopt sentinel
+means the compiled body ran up to `rframe.bci` and stopped there. `stashed` is
+the reconstructed frame that makes resuming from that point possible; dropping
+it and returning `None` sends the call to the generic path, which re-enters the
+impl **from entry** and re-executes everything the compiled body had already
+committed.
+
+For this workload the impl is `CompletionStages.lambda$loop$4`, whose body is
+`consumer.apply(index).thenCompose(CompletionStages::alwaysContinue)`, and
+`consumer.apply(index)` reaches `ReactiveSessionImpl.reactiveRemove(entity)`.
+So one `ArrayLoop.next()` dispatch produces two `reactiveRemove` calls — the
+first from the compiled body before it trapped, the second from the interpreted
+re-run — with no second dispatch anywhere, which is precisely the signature
+section 6.4 recorded. The second delete then finds the entity already
+`DELETED`, which is section 6.3's status flip, and the failure surfaces as
+`IllegalArgumentException: Unmanaged instance passed to remove()` or, one test
+later, as `duplicate key value violates unique constraint "famousperson_pkey"`.
+
+The interpreter's own one-shot door got this right and says so in its own
+comment ("an `Ok(None)` decline re-runs the whole body from entry in the
+interpreter, which double-executes every side effect the compiled body already
+committed before it trapped"). **The two doors into the same compiled lambda
+impl disagreed, and only the compiled-caller one was wrong.** The
+`direct_disabled` latch was doing real work — it stops the SECOND and every
+later call from taking the broken arm — but the call that actually deopts was
+already lost.
+
+### 8.5 The fix
+
+`jit_bridge::resume_deopted_body` — the deopt-resume block factored out of
+`execute_jit_call_oneshot`, unchanged, and now shared.
+`try_lambda_site_direct_call` spends the reconstructed frame through it, keyed
+on the site's own impl identity (`LambdaJitSite::cached_impl()` — the identity
+`try_resume_trapped_callee` could not supply, because it matches on the CALL
+SITE's name, which for a SAM call is `apply`), runs the resumed frame to
+completion, and returns its value in the raw JIT ABI. An escaping exception
+goes into `jit_pending_exception`, the same contract the MIC hit path uses.
+
+Two ungated counters make the residual visible, reported in the
+`CRATONVM_DBG=lambda-jit` census line as `site_resumed=` / `site_unresumable=`:
+`site_unresumable` counts deopted bodies that still could not be resumed and
+were therefore re-run from entry. It is deliberately NOT gated on the debug
+switch, because a correctness residual that only exists when someone set an env
+var cannot answer "did any call re-execute" after the fact.
+
+Those counters are also the engagement evidence. On the fixed binary, one
+`FilterWithPaginationTest` run:
+
+```
+site_calls=8365 site_direct=832 site_no_code=4545 site_deopted=2988
+site_resumed=1 site_unresumable=0
+```
+
+**Exactly one call in the whole run resumes a reconstructed frame**, and zero
+are left unresumable. One deopting call, one body that would otherwise have been
+re-run, one duplicated `reactiveRemove`, two failing tests — the arithmetic
+closes.
+
+### 8.5.1 Why there is no synthetic unit fixture for this
+
+Four shapes were built and measured against `CRATONVM_DBG=lambda-jit`, and none
+of them reaches the arm, so none of them could carry a regression test that is
+not a vacuous green:
+
+| fixture shape | census |
+|---|---|
+| `IntUnaryOperator`, cold branch RETURNS | `site_calls=2 site_adapters=2 site_deopted=0` — an inline-cache thunk installs after two calls and Rust is never entered again |
+| `IntUnaryOperator`, cold branch THROWS | same; and with `CRATONVM_JIT_LAMBDA_ADAPTER=0`, `site_calls=398931 site_deopted=0` — a cold `throw` is served by the body's own exception path, not a deopt |
+| `IntFunction<Integer>`, receiver class swapped after warm-up | `site_calls=399093 site_deopted=0` — an interface call compiles to a PIC, which absorbs a new receiver class rather than trapping |
+| the same with a loop in the lambda body | `site_calls=399521 site_deopted=0` |
+
+The real trap in this workload is one specific speculation failing once in
+~8000 SAM calls. A fixture that asserts the invariant without reaching the arm
+would pass on the BROKEN binary too, which is worse than no test — so the
+verification here is the end-to-end table in 8.6 plus the ungated
+`site_unresumable` counter, and the shapes above are recorded so the next
+attempt starts past them rather than repeating them.
+
+### 8.6 Verification
+
+Same host, same Testcontainers Postgres, same `common.args`:
+
+| binary / arm | `FilterWithPaginationTest` |
+|---|---|
+| `cratonvm-hibfix-base` (dev `652956429`) | 33/35 FAIL, 5/5 runs |
+| `cratonvm-hibfix-base` `--nojit` | 35/35 PASS |
+| `cratonvm-hibfix-base` `CRATONVM_JIT_LAMBDA_SITE=0` | 35/35 PASS, 3/3 runs |
+| `cratonvm-hibfix-lambdaresume` (this fix, JIT on, no switches) | **35/35 PASS, 3/3 runs** |
+
+And the sibling classes, base binary versus fixed binary, JIT on, no switches,
+one run each:
+
+| class | base | fixed |
+|---|---|---|
+| `CriteriaMutationQueryTest` | 7/9 FAIL | **9/9 PASS** |
+| `OneToManyTest` | 6/8 FAIL | **8/8 PASS** |
+| `ReactiveStatelessWithBatchTest` | 22/24 FAIL | **24/24 PASS** |
+| `RowIdUpdateAndDeleteTest` | 4/6 FAIL | **6/6 PASS** |
+| `QuerySpecificationTest` | 50/52 FAIL | **52/52 PASS** |
+| `MutationDelegateIdentityTest` | 5/5 PASS | 5/5 PASS |
+
+**Five classes go FAIL to PASS on this fix alone**, and every one of them fails
+with exactly two tests, the same shape as `FilterWithPaginationTest`.
+`QuerySpecificationTest` is worth noting separately: it sits in the runner's
+`passed.txt`, so its base-binary FAIL here is a regression the list had not
+caught, and it is repaired by the same change.
+
+`MutationDelegateIdentityTest` passes on BOTH binaries on this box, so its Azure
+FAIL is either a different defect or environment-dependent; this session has no
+evidence either way and is not claiming it.
+
+### 8.7 What this does NOT settle
+
+Section 7's sweep found 6 of 8 other still-FAIL classes clear under `--jit off`;
+`--jit off` clearing a class means only "the JIT is involved". Five of those are
+now confirmed by re-running on the fixed binary (above). Not covered here, and
+unchanged by this fix as far as anything measured says:
+
+* `MutationDelegateIdentityTest` — does not reproduce on this box at all.
+* `ReactiveStatelessProxyUpdateTest` — section 7 already had it as "changed but
+  unconfirmed" (hangs one way, passes the other); left out of the A/B above
+  because a hang is not a comparable outcome, and it needs its own timeout
+  override first.
+* `techempower.TechEmpowerTest` and the two host-timezone/locale classes
+  (`ORMReactivePersistenceTest`, `DatabaseHibernateReactiveTest`) — separate,
+  already-documented families.
