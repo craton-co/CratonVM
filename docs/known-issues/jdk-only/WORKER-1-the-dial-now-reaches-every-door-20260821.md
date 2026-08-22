@@ -332,9 +332,9 @@ doors is N1.
   (WORKER 2's subject) that the dial newly *exposes*; neither is caused by it,
   and neither is fixed here.
 * **The three newly-red vectors** (`RMapResizeGc`, `RJdkBridge1`,
-  `RServiceLoaderDoubleSource`) are not diagnosed, only counted. Same
-  classification: an armed failure is real, and it is the price of the
-  retirement rather than a defect in the dial.
+  `RServiceLoaderDoubleSource`) are counted, and only one of them is named
+  (`RJdkBridge1`, §9). Same classification for all three: an armed failure is
+  real, and it is the price of the retirement rather than a defect in the dial.
 * **No throughput measurement.** The added cost on an unarmed path is one `Copy`
   policy read, one enum compare and one memoised bool per door; that is ARGUED
   from the code, not measured. Suite wall-clock was 1h42m–1h45m per three-arm
@@ -343,6 +343,62 @@ doors is N1.
   default policy, so the default configuration is covered by §4, but no arm ran
   with `--real-jdk` spelled explicitly.
 
+---
+
+## 9. MEASURED — re-verified on the merged state, against a NEW control
+
+`dev` moved eleven commits while this lane ran (`1fcc241e0` → `ee4cdf528`), so
+`origin/dev` was merged in and **every arm was re-run from scratch against a
+pristine rebuild of the NEW tip**. A fix verified only against the base it was
+cut from is a fix verified against a tree nobody will run.
+
+| arm | pristine `ee4cdf528` | merged, with the fix | moved? |
+|---|---|---|---|
+| `CRATONVM_ARGS=--jdk-only` | 103 / 104 | 103 / 104 | no |
+| `SUITE=all` | 98 / 104 | 98 / 104 | no |
+| `SUITE=core` | 62 / 64 | 62 / 64 | no |
+| armed `java/util/HashMap` | **81 / 104** | **86 / 104** | +5, as before |
+
+Two samples of every cell, armed cells interleaved, all sets identical
+class-for-class to the pre-merge measurement in §4 and §5. Ten suite runs in
+total across the two rounds, and **no rotating flake appeared in any of them** —
+so the numbers above are the stable sets, not one sample of a noisy one.
+
+### The one newly-red vector, named rather than counted
+
+`RJdkBridge1` — the `NativeKind::Bridge` census vector — fails armed at
+`props()`, in the `Properties.stringPropertyNames()` / `propertyNames()` checks
+(`src/RJdkBridge1.java:346-354`), with an `AssertionError`. `Properties` extends
+`Hashtable`, but `stringPropertyNames()`'s own body builds a `HashMap` and a
+`HashSet`, so a retired `HashMap` reaches it. That is a `java.util` object-model
+divergence the dial newly *exposes*; it is an armed failure and therefore real,
+and it is not caused by anything in this change. `RMapResizeGc` and
+`RServiceLoaderDoubleSource` are the other two, undiagnosed.
+
+### Trap 4 — no registration moved, checked rather than asserted
+
+162 triples are registered more than once and only the `owns_slot: true` one is
+reachable, so retiring the winner promotes the loser. **This change retires
+nothing** — the dial declines at dispatch, it does not touch the registry — but
+"my change cannot have done that" is the kind of claim this directory exists to
+correct, so it was checked. `--dump-native-registry` on both binaries:
+
+```text
+natives rows                                    10 442  ==  10 442
+(class, method, descriptor, kind, owns_slot)    identical
+```
+
+The dumps are **not** byte-identical: `invocations` differs. That is the
+instrument, not the change. Three runs of each binary on the identical workload:
+
+```text
+p1 (pristine)   bridge invocations  2796  2794  2794
+f3 (fixed)      bridge invocations  2794  2845  2798
+```
+
+The ranges overlap and both binaries hit 2794, so the per-slot invocation
+counters are run-to-run noisy on this workload and a single-sample diff of them
+means nothing. The identity set is the part that had to hold, and it does.
 ---
 
 ## NOMINATIONS
