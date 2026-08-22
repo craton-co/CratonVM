@@ -3106,6 +3106,38 @@ impl SharedVm {
                     // Iterator-based copy using virtual dispatch on the
                     // receiver's actual class.
                     //
+                    // Every call below goes through `invoke_virtual`, which
+                    // dispatches on the RECEIVER. The by-name `ctx.invoke(
+                    // <class>, ...)` this used to call resolves against the
+                    // named class's own bytecode and never consults
+                    // `should_force_registered_native_over_bytecode` — the gate
+                    // that exists precisely because a CratonVM-minted
+                    // `HashMap$KeyIterator` / `LinkedHashMap$LinkedKeyIterator`
+                    // carries its snapshot PAST the fields the real
+                    // `HashIterator` bytecode walks (`key_itr_base`), so the
+                    // real `hasNext()` reads an unset `next` field and answers
+                    // `false` on the FIRST element. The loop then broke at
+                    // i = 0 and every slot of the freshly allocated result
+                    // stayed null while `size()` had already fixed the length —
+                    // a right-length, all-null array, which is the single
+                    // hardest shape for a caller to notice.
+                    //
+                    // That is the whole of the Jetty embedded-JSP failure:
+                    // `ClassMatcher extends AbstractSet<String>` with
+                    // `iterator()` = `_entries.keySet().iterator()`, so
+                    // `ClassMatcher.getPatterns()` (`toArray(new String[size])`)
+                    // handed Jetty `[null]`. An all-null pattern set makes
+                    // `IncludeExcludeSet` answer "empty", and an EMPTY
+                    // hidden-class matcher matches EVERYTHING
+                    // (`ClassMatcher.combine`: empty patterns fall through to
+                    // the empty location set, whose `test` is vacuously true).
+                    // `WebAppClassLoader.loadClass` therefore discarded the
+                    // `org.apache.jasper.servlet.JspServlet` its parent had just
+                    // resolved, as "hidden", and threw
+                    // `ClassNotFoundException` from line 540 with no cause —
+                    // surfacing as `UnavailableException: Class loading error
+                    // for holder jsp==...JspServlet`.
+                    //
                     // GC-safety (DOM17 stale-canary backtrace, 2026-07-15):
                     // every `ctx.invoke` below can run a moving GC, and the
                     // pre-fix loop re-used `this`, the template array, the
@@ -3120,12 +3152,7 @@ impl SharedVm {
                         _ => None,
                     };
                     let result = (|| -> cratonvm_types::error::MethodCallResult {
-                        let recv_cid = ctx.class_id_of_object(this);
-                        let recv_class = ctx
-                            .class_name_of_id(recv_cid)
-                            .unwrap_or_else(|| "java/util/AbstractCollection".to_string());
-                        let size_v =
-                            ctx.invoke(&recv_class, "size", "()I", &[Value::Object(Some(this))])?;
+                        let size_v = ctx.invoke_virtual(this, "size", "()I", &[])?;
                         let size = match size_v {
                             Some(Value::Int(n)) => n.max(0) as usize,
                             _ => 0,
@@ -3151,12 +3178,8 @@ impl SharedVm {
                         };
                         let target_pin = ctx.pin_native_root(target);
                         let cur_this = ctx.read_native_pin(pin_base, this);
-                        let it_v = ctx.invoke(
-                            &recv_class,
-                            "iterator",
-                            "()Ljava/util/Iterator;",
-                            &[Value::Object(Some(cur_this))],
-                        )?;
+                        let it_v =
+                            ctx.invoke_virtual(cur_this, "iterator", "()Ljava/util/Iterator;", &[])?;
                         let it = match it_v {
                             Some(Value::Object(Some(o))) => o,
                             _ => {
@@ -3165,28 +3188,15 @@ impl SharedVm {
                             }
                         };
                         let it_pin = ctx.pin_native_root(it);
-                        let it_cid = ctx.class_id_of_object(it);
-                        let it_class = ctx
-                            .class_name_of_id(it_cid)
-                            .unwrap_or_else(|| "java/util/Iterator".to_string());
                         for i in 0..size {
                             let cur_it = ctx.read_native_pin(it_pin, it);
-                            let has = ctx.invoke(
-                                &it_class,
-                                "hasNext",
-                                "()Z",
-                                &[Value::Object(Some(cur_it))],
-                            )?;
+                            let has = ctx.invoke_virtual(cur_it, "hasNext", "()Z", &[])?;
                             if !matches!(has, Some(Value::Int(1))) {
                                 break;
                             }
                             let cur_it = ctx.read_native_pin(it_pin, it);
-                            let nxt = ctx.invoke(
-                                &it_class,
-                                "next",
-                                "()Ljava/lang/Object;",
-                                &[Value::Object(Some(cur_it))],
-                            )?;
+                            let nxt =
+                                ctx.invoke_virtual(cur_it, "next", "()Ljava/lang/Object;", &[])?;
                             let v = nxt.unwrap_or(Value::Object(None));
                             let cur_target = ctx.read_native_pin(target_pin, target);
                             ctx.set_array_element(cur_target, i, v);
@@ -6091,6 +6101,50 @@ impl SharedVm {
         out.push_str("      \"truncated\": null,\n");
         out.push_str("      \"dropped\": null\n");
         out.push_str("    }\n");
+        // A SIBLING object again, and for the sharpest version of
+        // `observation_sink`'s reason. `CRATONVM_ENFORCE_NATIVE_SHADOW` does
+        // not add rows to this report -- it REMOVES them, because an enforced
+        // shadow does not dispatch and so never produces a
+        // `bridge-ran-over-bytecode` row. An armed report and an unarmed one
+        // were therefore indistinguishable in every field, and the armed
+        // one's emptier `violations[]` reads as the better result. It is not;
+        // it is a different question.
+        //
+        // `doors` is the other half. Until 2026-08-21 the dial had exactly
+        // one live call site (`resolve_step1_native`), so `scope` alone would
+        // still have overstated what an armed run measured: 890 of 947 armed
+        // `Bridge` dispatches never asked it, and
+        // `refusals.interpreter_shadow_unenforced` read `0` for all 890,
+        // because that one call site is also the only recorder of the
+        // native-won half. The per-door columns are what make that visible
+        // instead of silent: `reached` minus `yielded`, summed, is the number
+        // of dispatches the arming did not reach, and on a fixed binary it is
+        // zero.
+        out.push_str("  },\n  \"enforcement_dial\": {\n");
+        out.push_str(&format!(
+            "    \"scope\": {},\n",
+            json_escape(&crate::runtime::env_cache::enforce_shadow_scope().report_spelling())
+        ));
+        let doors = crate::vm::dial_door_counts();
+        let reached: u64 = doors.iter().map(|(_, r, _)| *r).sum();
+        let yielded: u64 = doors.iter().map(|(_, _, y)| *y).sum();
+        out.push_str(&format!("    \"reached\": {reached},\n"));
+        out.push_str(&format!("    \"yielded\": {yielded},\n"));
+        out.push_str(&format!(
+            "    \"leaked\": {},\n",
+            reached.saturating_sub(yielded)
+        ));
+        out.push_str("    \"doors\": [");
+        for (i, (door, r, y)) in doors.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "\n      {{\"door\": {}, \"reached\": {r}, \"yielded\": {y}}}",
+                json_escape(door)
+            ));
+        }
+        out.push_str("\n    ]\n");
         out.push_str("  }\n}\n");
 
         use std::io::Write;
@@ -7986,6 +8040,47 @@ pub fn dump_wait_site_thread_local(shared: &SharedVm) {
     }
 }
 
+/// Print the state of the object a thread is parked on in `Object.wait()`.
+///
+/// The netty `ParameterizedSslHandlerTest` stall bottoms out in
+/// `DefaultPromise.await`/`awaitUninterruptibly` at the `Object.wait()` BCI, a
+/// 30 s-spurious-wakeup A/B showed the awaited promise is ALREADY complete, and
+/// the orphan check came back clean — so the waiter is on the right monitor and
+/// a notifier would resolve the same one. The remaining question is netty's own
+/// bookkeeping, which lives in two fields of the promise:
+///
+/// * `result`  — non-null once the promise completes (set OUTSIDE the monitor).
+/// * `waiters` — a PLAIN int the waiter increments inside the monitor
+///   immediately before `wait()`; `checkNotifyWaiters()` skips `notifyAll()`
+///   entirely when it reads 0.
+///
+/// `result != null` with `waiters >= 1` here means the completer either never
+/// ran `checkNotifyWaiters` or read a stale `waiters` — i.e. the monitor is not
+/// establishing happens-before between the two `synchronized` blocks.
+pub fn dump_wait_object_state(shared: &SharedVm, obj: ObjectRef) {
+    let cid = shared.mem.heap.class_id_of(obj);
+    let name = shared
+        .classes
+        .class_manager
+        .read()
+        .class_store
+        .get(cid)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| format!("<class_id {cid:?}>"));
+    let field = |f: &str| -> Option<cratonvm_types::Value> {
+        let cm = shared.classes.class_manager.read();
+        let idx = super::vm_exec::resolve_field_index_in_hierarchy(cid, f, &cm.class_store)?;
+        drop(cm);
+        Some(shared.mem.heap.get_field(obj, idx))
+    };
+    eprintln!(
+        "[WAIT-OBJECT] obj={:p} class={name} result={:?} waiters={:?}",
+        obj.as_ptr(),
+        field("result"),
+        field("waiters"),
+    );
+}
+
 impl SharedVm {
     /// Placeholder split-impl — see the inherent impl above. The split is
     /// purely so the thread-local helpers above can sit between two impl
@@ -8761,6 +8856,17 @@ impl Vm {
             crate::threading::monitor::install_wait_site_dump(move |_tid| {
                 if let Some(s) = weak.upgrade() {
                     crate::vm::vm_init::dump_wait_site_thread_local(&s);
+                }
+            });
+        }
+        // Companion to the frame dump above: the STATE of the object the thread
+        // is parked on. See `dump_wait_object_state` for why those two fields
+        // are the ones that decide the netty promise stall.
+        {
+            let weak = Arc::downgrade(&shared);
+            crate::threading::monitor::install_wait_object_dump(move |obj| {
+                if let Some(s) = weak.upgrade() {
+                    crate::vm::vm_init::dump_wait_object_state(&s, obj);
                 }
             });
         }

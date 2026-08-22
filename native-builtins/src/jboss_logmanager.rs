@@ -436,7 +436,19 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("cratonvm-block2c-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        std::env::set_var("org.jboss.boot.log.file", &path);
+        // A thread-scoped flag override rather than `set_var`: writing to
+        // `environ` from a test is a process-wide data race against every other
+        // test running in parallel (`setenv` may realloc and free the array
+        // under a concurrent `getenv`), and no local mutex can contain it. The
+        // production read is `flags::runtime_var("org.jboss.boot.log.file")`,
+        // which this override serves. The guard restores on drop.
+        let path_str = path.to_string_lossy().into_owned();
+        let _flags = cratonvm_types::flags::override_thread(
+            cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+                "org.jboss.boot.log.file",
+                Some(path_str.as_str()),
+            )]),
+        );
 
         let mut ctx = mock_ctx();
         let logger = crate::try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, 3)?;
@@ -462,7 +474,6 @@ mod tests {
             "boot log file must contain the logger name; saw: {:?}",
             contents
         );
-        std::env::remove_var("org.jboss.boot.log.file");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -471,8 +482,15 @@ mod tests {
         let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_for_tests();
         // No file path → only stderr. We just want the call not to
-        // panic on null-Level / null-message LogRecord shapes.
-        std::env::remove_var("org.jboss.boot.log.file");
+        // panic on null-Level / null-message LogRecord shapes. Overridden to
+        // "as if unset" on this thread rather than removed from `environ` —
+        // see the sibling test for why that distinction matters.
+        let _flags = cratonvm_types::flags::override_thread(
+            cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+                "org.jboss.boot.log.file",
+                None,
+            )]),
+        );
         let mut ctx = mock_ctx();
         let logger = crate::try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, 3)?;
         let rec = crate::try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 4)?;

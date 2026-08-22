@@ -367,7 +367,7 @@ audit the shrink was planned from:
   smaller header must move BOTH or the legacy arm reads the wrong cell. Added
   because the compact-only arm sent every legacy receiver to `jit_getfield`,
   which measured as 100% of that helper's calls on Generational; see
-  known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+  fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
 - `ir_lower.rs::emit_inline_getstatic` (added 2026-08-03, cov-01) — the direct
   `getstatic` read: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`
   as a disp32, from the class's **statics block** base. It bakes the field-cell

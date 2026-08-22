@@ -458,6 +458,88 @@ pub fn caller_chain_depth(fs: &FrameState) -> usize {
     depth
 }
 
+/// Every machine register `fs` names as the home of a value — GPRs as
+/// `(n, false)`, XMMs as `(n, true)` — across the whole caller chain.
+///
+/// The reason-9 exceptional-frame stub reconstructs those homes by spilling the
+/// live register file AT THE STUB and indexing it, so anything that runs
+/// between the trapping instruction and that stub has to preserve every
+/// register listed here. Compiled local handlers put a helper `CALL` on exactly
+/// that edge, and this is how that emitter proves the call cannot disturb a
+/// frame it may still have to fall through to.
+pub fn frame_state_register_homes(fs: &FrameState) -> Vec<(u8, bool)> {
+    let mut out = Vec::new();
+    let mut scope = Some(fs);
+    let mut seen = 0usize;
+    while let Some(f) = scope {
+        for v in f.locals.iter().chain(f.stack.iter()) {
+            match v {
+                FrameValue::Register(r)
+                | FrameValue::RegisterLong(r)
+                | FrameValue::RegisterRef(r) => out.push((*r, false)),
+                FrameValue::XmmFloat(x) | FrameValue::XmmDouble(x) => out.push((*x, true)),
+                _ => {}
+            }
+        }
+        seen += 1;
+        if seen >= MAX_SCOPE_CHAIN {
+            break;
+        }
+        scope = f.caller.as_deref();
+    }
+    out
+}
+
+/// [`first_unresumable_slot`], restricted to what a **RETHROW** point's
+/// consumer actually reads.
+///
+/// A `PendingException` (reason-9) frame is not a resume image — this crate
+/// says so in three places already — and it is not consumed like one. It is
+/// stashed by [`take_exceptional_frame`] and claimed by
+/// `route_jit_signal_exception` / `run_jit_callee_handler`, which read its
+/// `bci` and its `locals` and then build a handler frame whose operand stack is
+/// `[exception]` by JVMS §2.10. **The recorded operand stack is never read at
+/// all**, so an entry in it that could not be typed describes nothing that will
+/// ever be reconstructed.
+///
+/// Vetoing on it is not conservative, it is just wrong-sized, and it costs a
+/// whole artifact its OSR entry: `osr_exit_policy` is artifact-wide, so ONE
+/// untypeable stack entry at ONE throwing bci refuses entry at EVERY pc of the
+/// method. The population is not exotic — any `catch` block containing a call,
+/// in any method that touches a `long`/`float`/`double` (which makes every
+/// non-oop operand `Unsupported` for want of a per-entry width source), and
+/// `HttpHeaderValidationUtilTest`'s two exhaustive loops are exactly that.
+///
+/// Locals still veto, and must: the handler reads them, and entering one with
+/// zeroed non-parameter locals is the silent miscompile
+/// `route_jit_signal_exception` fails closed against.
+pub fn first_unresumable_local(fs: &FrameState) -> Option<String> {
+    let mut scope = Some(fs);
+    let mut depth = 0usize;
+    while let Some(f) = scope {
+        for (i, v) in f.locals.iter().enumerate() {
+            if value_blocks_resume(v) {
+                let scope_tag = if depth == 0 {
+                    String::new()
+                } else {
+                    format!("caller-scope-{depth} ")
+                };
+                return Some(format!("{scope_tag}local {i} ({v:?})"));
+            }
+        }
+        depth += 1;
+        if depth >= MAX_SCOPE_CHAIN {
+            return if f.caller.is_none() {
+                None
+            } else {
+                Some(format!("scope chain deeper than {MAX_SCOPE_CHAIN}"))
+            };
+        }
+        scope = f.caller.as_deref();
+    }
+    None
+}
+
 pub fn first_unresumable_slot(fs: &FrameState) -> Option<String> {
     let mut scope = Some(fs);
     let mut depth = 0usize;
@@ -8466,4 +8548,69 @@ mod frame_state_interning_tests {
             .starts_with("local 0 "));
     }
 
+    /// A RETHROW point's operand stack is never reconstructed, so it must not
+    /// veto — and its LOCALS must still veto, because the handler reads them.
+    ///
+    /// Both halves are asserted here, and both matter. Dropping the first
+    /// costs every method whose `catch` block contains a call its OSR entry
+    /// (the veto is artifact-wide). Dropping the second enters a handler on
+    /// zeroed non-parameter locals, which is the silent miscompile
+    /// `route_jit_signal_exception` fails closed against.
+    #[test]
+    fn a_rethrow_frame_is_judged_on_its_locals_only() {
+        let base = FrameState {
+            method_key: String::from("T.m()V"),
+            bci: 105,
+            locals: vec![FrameValue::Int(1)],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+
+        // The shape this exists for: `catch (E e) { g(-1, x); }` in a method
+        // that also touches a `long`, so the `-1` under the call's argument
+        // has no width source and comes out `Unsupported`.
+        let mut untypeable_stack = base.clone();
+        untypeable_stack.stack = vec![FrameValue::Unsupported, FrameValue::Object(0)];
+        assert!(
+            first_unresumable_slot(&untypeable_stack).is_some(),
+            "the general rule still sees it — this is the one a RESUME point is judged by"
+        );
+        assert_eq!(
+            first_unresumable_local(&untypeable_stack),
+            None,
+            "a RETHROW frame's stack is replaced by [exception]; it cannot block anything"
+        );
+
+        let mut untypeable_local = base;
+        untypeable_local.locals = vec![FrameValue::Int(1), FrameValue::Unsupported];
+        let msg =
+            first_unresumable_local(&untypeable_local).expect("a handler reads its locals");
+        assert!(msg.starts_with("local 1 "), "{msg}");
+    }
+
+    /// The narrow rule walks the WHOLE caller chain, exactly as the general one
+    /// does — an inlined caller's local is as much a handler input as the
+    /// innermost scope's.
+    #[test]
+    fn the_rethrow_rule_walks_caller_scopes_too() {
+        let caller = FrameState {
+            method_key: String::from("T.outer()V"),
+            bci: 4,
+            locals: vec![FrameValue::Unsupported],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        let fs = FrameState {
+            method_key: String::from("T.inner()V"),
+            bci: 0,
+            locals: vec![FrameValue::Int(1)],
+            stack: vec![FrameValue::Unsupported],
+            monitors: Vec::new(),
+            caller: Some(Box::new(caller)),
+        };
+        let msg = first_unresumable_local(&fs).expect("the caller's local blocks it");
+        assert!(msg.starts_with("caller-scope-1 local 0 "), "{msg}");
+    }
 }

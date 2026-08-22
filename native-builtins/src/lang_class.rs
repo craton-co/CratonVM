@@ -24716,12 +24716,25 @@ mod tests {
         );
         // The generic `Field.set` is the exception, and carries HotSpot's own
         // helpful NPE text.
+        //
+        // Compared against `ENSURE_OBJ_NPE` itself, not searched for inside
+        // `format!("{:?}")`. That is what this assertion did until now, and it
+        // could not pass: `Debug` for a `String` ESCAPES its quotes, so the
+        // rendering contains `because \"o\" is null` while the needle was the
+        // unescaped `because "o" is null`. The production message has been
+        // correct since the assertion was written (2026-08-18) — it is the
+        // literal `ENSURE_OBJ_NPE` this call passes in — and only the test was
+        // wrong. Matching the constant is also strictly stronger than a
+        // substring: it pins the whole text, including the `Object.getClass()`
+        // half that names WHICH dereference HotSpot reports.
         let with_msg = null_receiver_on_instance_field(false, None, Some(ENSURE_OBJ_NPE))
             .expect_err("a null receiver on an instance field must fail");
-        assert!(
-            format!("{with_msg:?}").contains("because \"o\" is null"),
-            "expected HotSpot's helpful NPE, got: {with_msg:?}"
-        );
+        match &with_msg {
+            MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { message: Some(m) },
+            )) => assert_eq!(m.as_str(), ENSURE_OBJ_NPE),
+            other => panic!("expected HotSpot's helpful NPE, got: {other:?}"),
+        }
         // ...and a STATIC field has no receiver to be null.
         assert!(null_receiver_on_instance_field(true, None, None).is_ok());
     }

@@ -14,7 +14,7 @@ the number of collections.
 **OPEN (2026-08-07).** A hard failure, not a slow one: `H2UpdateScaleProbe`'s
 `testConcurrentUpdate` shape dies with H2 `Out of memory` at `--Xmx 1g` and 2g
 where the pre-landing tip completes, and at 4g once the update count is raised.
-Split out of [`h2-update-path-throughput-20260802.md`](h2-update-path-throughput-20260802.md),
+Split out of [`h2-update-path-throughput-RETIRED-20260821.md`](h2-update-path-throughput-RETIRED-20260821.md),
 whose "not heap pressure" and "not the JIT-root path" bullets this refutes.
 
 ## Severity

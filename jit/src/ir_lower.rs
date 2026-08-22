@@ -520,8 +520,8 @@ struct Lowerer<'a> {
     anewarray_object: usize,
     monitor_enter: usize,
     monitor_exit: usize,
-    /// cov-01. `jit_ldc_string(vm, bytes, len) -> ObjectRef` — the interning
-    /// lookup an `Op::ConstString` lowers to. `jit_ldc_class_cp(vm, holder,
+    /// cov-01. `jit_ldc_string_cp(vm, holder, cp_idx) -> ObjectRef | 0` — the
+    /// recorded-or-interned literal an `Op::ConstString` lowers to. `jit_ldc_class_cp(vm, holder,
     /// cp_idx) -> mirror | 0` — the resolution an `Op::ConstClass` lowers to.
     /// `jit_getstatic(vm, class_id, field_index) -> value | i64::MIN` — the
     /// `<clinit>`-running slow path an `Op::LoadStatic` falls back to when the
@@ -530,12 +530,12 @@ struct Lowerer<'a> {
     /// All three are OptionalPtr in practice (a synthetic unit-test helper
     /// table leaves them 0), so `lower_inner` refuses a graph that would need
     /// an absent one rather than emitting a `CALL` through address zero.
-    ldc_string: usize,
+    ldc_string_cp: usize,
     ldc_class_cp: usize,
     getstatic: usize,
     /// cov-05. `jit_instanceof(vm, obj, name_ptr, name_len) -> 0/1` — the
     /// SAME `RequiredPtr` helper (jit-api) the single-pass backend's 0xc1 arm
-    /// calls; unlike `ldc_string`/`ldc_class_cp`/`getstatic` this one is
+    /// calls; unlike `ldc_string_cp`/`ldc_class_cp`/`getstatic` this one is
     /// never absent, so `Op::InstanceOf`'s lowering does not need an
     /// OptionalPtr guard.
     instanceof_check: usize,
@@ -1078,7 +1078,7 @@ impl<'a> Lowerer<'a> {
             anewarray_object: helpers.anewarray_object,
             monitor_enter: helpers.monitor_enter,
             monitor_exit: helpers.monitor_exit,
-            ldc_string: helpers.ldc_string,
+            ldc_string_cp: helpers.ldc_string_cp,
             ldc_class_cp: helpers.ldc_class_cp,
             getstatic: helpers.getstatic,
             instanceof_check: helpers.instanceof_check,
@@ -2371,7 +2371,7 @@ fn reloc_emit_enabled() -> bool {
     /// `plan_object_alloc`, so a class with a perfectly good registered compact
     /// layout is still allocated legacy. An arm that inlines only compact
     /// receivers therefore inlines almost nothing. See
-    /// known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md.
+    /// fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
     ///
     /// The legacy read is the uniform 16-byte `Value` cell at
     /// `HEADER_SIZE + field_index * SLOT_SIZE`, transcribed from the
@@ -2599,9 +2599,40 @@ fn reloc_emit_enabled() -> bool {
         for p in slow {
             self.patch_rel32_to_here(p);
         }
+        // For a REFERENCE field whose base node the IR already types `Ref`, use
+        // the helper that skips the `is_object_address` membership walk.
+        //
+        // The walk is validation against a stale receiver, and the proof we
+        // have here is the same one the PRIMITIVE trusted-oop arm above relies
+        // on — an arm that goes further and does a raw inline load off this
+        // very receiver. Handing it to a helper instead is a strictly weaker
+        // use of the same trust.
+        //
+        // This changes only the SLOW path. The inline path is untouched, so
+        // Generational — where containment passes and the inline ref load is
+        // taken — sees no difference at all. It is ZGC and G1, which publish no
+        // read bounds for reference loads, that take this path on 100% of
+        // reference accesses, and there the walk was the largest single cost of
+        // a field-dense run (`ZObjectStarts::contains` 11.1% +
+        // `is_object_address` 9.5% on `dev` @800d17cc8).
+        //
+        // `contains` is already a tight bitmap probe; the cost is one
+        // cache-missing random probe per access, so the fix is to stop asking,
+        // not to ask faster.
+        // Carried in `field_index`, NOT a new helper slot: `helpers_abi.rs`
+        // pins the table's field count, byte size and golden offsets with const
+        // assertions and an ABI version, all of which exist to keep the layout
+        // the JIT bakes frozen. A one-bit argument flag needs none of that, and
+        // the index is a small non-negative slot number with 62 spare bits.
+        let base_is_proven_oop = self.graph.nodes[base as usize].ty == IrType::Ref;
+        let arg2 = if ref_node && base_is_proven_oop {
+            field_index as u64 | cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP
+        } else {
+            field_index as u64
+        };
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
-        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as u64);
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[2], arg2);
         self.emit_mov_reg_imm64(RAX, self.getfield as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         self.emit_mov_reg_imm64(R10, i64::MIN as u64);
@@ -3647,6 +3678,11 @@ fn reloc_emit_enabled() -> bool {
             self.patch_rel32_to_here(p);
         }
         let arg_offsets: Vec<i32> = (0..num_args).map(|i| self.slot_of(inputs[2 + i])).collect();
+        // `arg_offsets` are each argument's own register-allocated home slot,
+        // which the stub loads into the ABI registers one at a time. They are
+        // NOT a contiguous block, so the callee-deopt service -- which reads
+        // `num_args` consecutive slots to rebuild the callee's incoming
+        // locals -- must be pointed at the staging block written above instead.
         done_patches.extend(crate::runtime_lowering::emit_hashed_vtable_stub(
             &mut self.buf,
             pic,
@@ -3655,6 +3691,7 @@ fn reloc_emit_enabled() -> bool {
             self.frame_record,
             self.service_callee_deopt,
             info_ptr,
+            self.args_stage_top_off,
         ));
 
         // ── Slow path: the resolving + cache-populating helper ────────────
@@ -5253,24 +5290,44 @@ fn reloc_emit_enabled() -> bool {
             //     `Op::New` uses — so it takes the same zero-test and the same
             //     conversion to the JIT-wide `i64::MIN` before the shared
             //     exception epilogue.
-            Op::ConstString { bytes, len } => {
-                let (bytes, len) = (*bytes, *len);
+            Op::ConstString {
+                holder_class_id,
+                cp_idx,
+            } => {
+                let (holder_class_id, cp_idx) = (*holder_class_id, *cp_idx);
                 let sp_live_hi = self.spill_high_water;
                 self.emit_safepoint_map(sp_live_hi);
                 let slot = self.alloc_slot(id);
-                self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
-                self.emit_mov_reg_imm64(CALL_ARG_REGS[1], bytes as u64);
-                self.emit_mov_reg_imm64(CALL_ARG_REGS[2], len as u64);
-                self.emit_mov_reg_imm64(RAX, self.ldc_string as u64);
-                self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
-                                              // The helper crossed the JIT boundary and may have run a
-                                              // collection, so this frame's mirror and any relocated
-                                              // published value must be restored before anything else
-                                              // reads the frame — the identical obligation
-                                              // `emit_call_return_check` discharges for `Op::Call`, minus
-                                              // the sentinel test this helper has no use for.
-                self.emit_post_call_frame_record();
+                // The same shared `(vm, holder_class_id, cp_idx)` stub the
+                // `Op::ConstClass` arm below uses, for the same reason: two
+                // sites that call helpers with one ABI must not each hand-roll
+                // it. It also emits the post-call frame republish the helper
+                // needs after crossing the JIT boundary.
+                crate::runtime_lowering::emit_ldc_class_cp_stub(
+                    &mut self.buf,
+                    self.context_slot_off,
+                    self.ldc_string_cp,
+                    holder_class_id,
+                    cp_idx,
+                    self.frame_record,
+                );
                 self.emit_shadow_reload();
+                // 0 = the constant-pool entry could not be re-read and a
+                // pending exception was published. The bytes-baked predecessor
+                // could not fail this way and so took no test; the CP-indexed
+                // form can, so it takes the same test `Op::ConstClass` does.
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+                self.buf.emit(&[0x0F, 0x85]); // JNZ resolved
+                let resolved_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+                self.buf.emit_byte(0xE9); // JMP shared exception epilogue
+                let exception_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.push_call_exc_patch(exception_patch);
+                let resolved = self.buf.pos();
+                let rel = resolved as i32 - (resolved_patch as i32 + 4);
+                Self::patch_or_bail(&mut self.buf, resolved_patch, rel);
                 self.store_rax(slot);
             }
             Op::ConstClass {
@@ -9522,12 +9579,12 @@ pub(crate) fn lower_inner_with_scopes(
     // on a runtime resolver's answer at emission time.
     for (helper, present, what) in [
         (
-            helpers.ldc_string,
+            helpers.ldc_string_cp,
             graph
                 .nodes
                 .iter()
                 .any(|n| matches!(n.op, Op::ConstString { .. })),
-            "ldc_string",
+            "ldc_string_cp",
         ),
         (
             helpers.ldc_class_cp,
@@ -10151,6 +10208,30 @@ pub(crate) fn lower_inner_with_scopes(
     // "this word is a register image" is the property the reader is testing.
     cm.sp_id_slot_off = sp_id_slot_off;
     cm.oop_maps = oop_maps;
+    // Stage A.2 (precise oop maps, B-K fix) parity with the x64 fast-tier
+    // driver (`x64/driver.rs`'s `cm.fully_oop_covered = compiler.precise_maps
+    // && ... && compiler.safepoint_pcs.is_subset(&compiler.mapped_safepoint_pcs)`).
+    // This backend never computed the field at all -- it stayed at the
+    // `CompiledMethod` default of `false` for every method this tier compiled,
+    // OSR or not, which blanket-failed `moving_young_osr_method_needs_fallback`'s
+    // precise-map check on every OSR artifact this backend ever produced.
+    // Measured 2026-08-22 on `TestKillProcessWhileWriting`: this is the
+    // disjunct that actually fires (`osr_reason=(... map_coverage=N ...)`),
+    // not the shadow layout and not a missing exact RBP -- both of which this
+    // backend gets right already.
+    //
+    // Unlike the fast tier, this backend needs no PC-based subset check: each
+    // `OopMapEntry` above already carries its own `moving_young_coverage_complete`
+    // (the shadow-push `coverable && (published || slots.is_empty())` verdict,
+    // computed per safepoint at the point it is emitted), and `cm.oop_maps` is
+    // the complete set this compilation ever pushed to -- so the aggregate is a
+    // straight AND over data already relied on elsewhere: it is the exact
+    // per-entry flag `gc_quiescence`'s per-cycle proof already consults for
+    // every non-OSR moving-young collection. An empty `oop_maps` makes this
+    // vacuously true, which is safe: `has_precise_oop_maps()` (`!oop_maps.is_empty()`)
+    // is what actually gates the fast tier's OR-branch on "no maps at all," so a
+    // vacuous true here never overrides that check.
+    cm.fully_oop_covered = cm.oop_maps.iter().all(|m| m.moving_young_coverage_complete);
     cm.osr_frame_size = frame_size;
     // OSR and the save area, stated where the artifact is published.
     //
@@ -11084,7 +11165,7 @@ mod tests {
     /// the remainder on the stack instead of falling back to the dispatch
     /// helper.
     ///
-    /// This is the blocker `httpcontentdecompressortest-hang-20260816.md`
+    /// This is the blocker `httpcontentdecompressortest-snappy-varhandle-bind-RETIRED-20260820.md`
     /// named: `emit_direct_cross_call` was register-only, so a site needing
     /// seven incoming slots kept the full `jit_invoke_dispatch` round trip no
     /// matter what the binding side had resolved. The map entry was recorded
@@ -15026,7 +15107,13 @@ mod tests {
                 },
             ),
             ("Call", Op::Call { info_ptr: 0 }),
-            ("ConstString", Op::ConstString { bytes: 0, len: 0 }),
+            (
+                "ConstString",
+                Op::ConstString {
+                    holder_class_id: 0,
+                    cp_idx: 0,
+                },
+            ),
             (
                 "ConstClass",
                 Op::ConstClass {

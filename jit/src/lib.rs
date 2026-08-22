@@ -165,6 +165,8 @@ impl JitCodeRegion {
         // Insert maintaining the sorted-by-start invariant.
         let idx = self.regions.partition_point(|&(s, _)| s < start);
         self.regions.insert(idx, (start, end));
+        bump_regions_epoch();
+        publish_region_snapshot(self);
     }
 
     fn deregister(&mut self, ptr: *const u8) {
@@ -175,19 +177,35 @@ impl JitCodeRegion {
         if lo < self.regions.len() && self.regions[lo].0 == addr {
             self.regions.remove(lo);
         }
+        // Bumped unconditionally, including when nothing was removed. A
+        // deregister that found nothing left the list unchanged, so the extra
+        // bump only costs the memo a refill -- and getting the "did it change?"
+        // predicate wrong in the other direction is a stale memo.
+        bump_regions_epoch();
+        publish_region_snapshot(self);
     }
 
     fn contains(&self, ptr: *const u8) -> bool {
-        let addr = ptr as usize;
-        // Binary search: find the last region whose start <= addr, then check
-        // it covers `addr`. Non-overlapping + sorted means this is the only
-        // candidate region.
+        self.region_containing(ptr as usize).is_some()
+    }
+
+    /// The region covering `addr`, or `None`.
+    ///
+    /// Binary search: find the last region whose start <= addr, then check it
+    /// covers `addr`. Non-overlapping + sorted means this is the only candidate
+    /// region.
+    ///
+    /// Returns the BOUNDS rather than a bool because [`validate_code_ptr`]'s
+    /// per-thread memo remembers the region it landed in, so the next pointer
+    /// into the same compiled body answers from a register compare instead of
+    /// re-taking the global lock.
+    fn region_containing(&self, addr: usize) -> Option<(usize, usize)> {
         let idx = self.regions.partition_point(|&(s, _)| s <= addr);
         if idx == 0 {
-            return false;
+            return None;
         }
         let (start, end) = self.regions[idx - 1];
-        addr >= start && addr < end
+        (addr >= start && addr < end).then_some((start, end))
     }
 }
 
@@ -196,10 +214,153 @@ fn jit_code_regions() -> &'static Mutex<JitCodeRegion> {
     REGIONS.get_or_init(|| Mutex::new(JitCodeRegion::new()))
 }
 
+/// Generation of the JIT code region list.
+///
+/// Bumped by [`JitCodeRegion::register`] and [`JitCodeRegion::deregister`],
+/// which are the ONLY two mutators and both run with `jit_code_regions()`'s
+/// lock held. So a reader that observes the same value at two moments has
+/// observed a region list that was byte-identical throughout -- which is the
+/// whole soundness argument for the per-thread memo in [`validate_code_ptr`].
+///
+/// Starts at 0 and only ever rises, so `u64::MAX` is available as the memo's
+/// "never filled" sentinel: one bump per `ExecutableBuffer` create or drop, so
+/// reaching it would take 2^64 compiles.
+static REGIONS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that the region list changed. Called with the lock held.
+#[inline]
+fn bump_regions_epoch() {
+    REGIONS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Hits and misses on the [`validate_code_ptr`] memo, so a run can say whether
+/// the fast path is being taken at all rather than leaving that to a timing
+/// wash. A feature that reports itself on while contributing nothing looks
+/// identical to one that helps, in a table of wall times.
+///
+/// GATED, and that is not a style choice. A `fetch_add` on a process-global
+/// `AtomicU64` per compiled call is precisely the shape of serialisation this
+/// change exists to remove: the first cut of the memo counted unconditionally
+/// and would have replaced a `Mutex` with a contended cache line, which at 25
+/// threads is not obviously the better of the two. It is read once through a
+/// `OnceLock` and is a relaxed load plus a not-taken branch when off.
+static CODE_PTR_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CODE_PTR_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether to count snapshot hits/misses. `CRATONVM_DBG_JIT_METHOD_STATS`, the
+/// same switch that prints them.
+#[inline]
+fn code_ptr_memo_census_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(v) = ON.get() {
+        return *v;
+    }
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_METHOD_STATS").is_some()
+    })
+}
+
+#[inline]
+fn note_code_ptr_memo(hit: bool) {
+    if !code_ptr_memo_census_enabled() {
+        return;
+    }
+    let c = if hit {
+        &CODE_PTR_MEMO_HITS
+    } else {
+        &CODE_PTR_MEMO_MISSES
+    };
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(hits, misses)` on the code-pointer memo this run. Both are zero unless
+/// `CRATONVM_DBG_JIT_METHOD_STATS` was set — see the counters' doc.
+pub fn code_ptr_memo_stats() -> (u64, u64) {
+    (
+        CODE_PTR_MEMO_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        CODE_PTR_MEMO_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// How many times the region list has changed this run. Printed beside the
+/// hit/miss pair because the two failure modes look identical from the ratio
+/// alone: a memo that is too NARROW (several hot regions, one slot) and a memo
+/// whose epoch churns (every compile flushes every thread) both read as "mostly
+/// misses", and they want opposite fixes.
+pub fn code_ptr_regions_epoch() -> u64 {
+    REGIONS_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Default-ON kill switch for the memo: `CRATONVM_JIT=-code-ptr-memo`.
+///
+/// Exists so the change can be A/B-ed inside ONE binary. A cross-binary
+/// comparison of a ~1.5% symbol, on a host whose run-to-run spread on this
+/// workload is 20%, is not a measurement.
+pub fn code_ptr_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CODE_PTR_MEMO").is_none()
+    })
+}
+
+/// Lock-free snapshot of the region list, for [`validate_code_ptr`].
+///
+/// # Why a snapshot and not a memo
+///
+/// The first two cuts of this were a per-thread memo of the last region(s) this
+/// thread validated into, and both were measured and both were too narrow.
+/// Every compiled method gets its own [`ExecutableBuffer`], so a thread running
+/// interpreted Java calls into a rotating set of regions and a small cache is
+/// evicted by the next call. On `H2UpdateScaleProbe 1 2000 10000`:
+///
+/// | memo | hits | misses | hit rate |
+/// |---|---:|---:|---:|
+/// | 1 way | 263 299 | 3 225 254 | **7.5 %** |
+/// | 16 ways, direct-mapped on the page | 1 163 588 | 2 477 691 | **32 %** |
+///
+/// A 32 % hit rate is a fast path that pays for itself twice and delivers once.
+/// The `region_epoch` printed beside those counters was **1 838** against 3.6 M
+/// calls, which is the number that decides the design: the list barely changes,
+/// so the right structure is not a cache of PART of it but a whole immutable
+/// copy that readers share and a writer replaces. That is
+/// read-copy-update, which is what `ArcSwap` is, and `JitCache::methods`
+/// already uses it for the identical shape one screen down.
+///
+/// The snapshot is rebuilt under `jit_code_regions()`'s lock by whichever
+/// mutator changed the list, so a reader never sees a torn one and never takes
+/// a lock at all.
+static JIT_CODE_REGION_SNAPSHOT: std::sync::OnceLock<arc_swap::ArcSwap<Vec<(usize, usize)>>> =
+    std::sync::OnceLock::new();
+
+fn jit_code_region_snapshot() -> &'static arc_swap::ArcSwap<Vec<(usize, usize)>> {
+    JIT_CODE_REGION_SNAPSHOT.get_or_init(|| arc_swap::ArcSwap::from_pointee(Vec::new()))
+}
+
+/// Republish the snapshot. Called with `jit_code_regions()`'s lock held, by the
+/// two mutators, so the copy taken here is of a list nobody is editing.
+fn publish_region_snapshot(regions: &JitCodeRegion) {
+    jit_code_region_snapshot().store(std::sync::Arc::new(regions.regions.clone()));
+}
+
 /// Validate that a pointer is safe to transmute to a function pointer.
 ///
 /// Checks: non-null, properly aligned, and falls within a known JIT code region.
 /// Returns `Ok(())` if valid, or a descriptive error string.
+///
+/// # Why this is not just a lock and a binary search
+///
+/// It is on EVERY compiled call -- `CompiledMethod::try_call` and
+/// `try_call_with_context` both validate the entry they are about to jump to --
+/// and it took a global `std::sync::Mutex` to do it. Single-threaded on the H2
+/// UPDATE path that is 1.54% of CPU (`perf`, flat self-attribution,
+/// 2026-08-21); at 25 threads it is a serialisation point on a path with
+/// nothing else to serialise on, which is the shape
+/// `performance/h2-update-path-throughput-RETIRED-20260821.md` calls
+/// "genuinely scaling rather than constant-factor work".
+///
+/// The memo takes the lock out of the steady state without weakening the check:
+/// see [`CODE_PTR_MEMO`] for why an epoch match is a stronger statement than the
+/// locked lookup makes, not a weaker one.
 pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
     if ptr.is_null() {
         return Err("null JIT code pointer");
@@ -209,11 +370,42 @@ pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
     if (ptr as usize) % 4 != 0 {
         return Err("misaligned JIT code pointer");
     }
+    let addr = ptr as usize;
+    if code_ptr_memo_enabled() {
+        // One `ArcSwap` load and a binary search over the thread's borrowed
+        // snapshot. No lock, no allocation, and -- unlike the memo this
+        // replaced -- an exact answer on the FIRST probe of every region, so
+        // there is no hit rate to be disappointed by.
+        let snapshot = jit_code_region_snapshot().load();
+        let hit = region_containing_in(&snapshot, addr).is_some();
+        note_code_ptr_memo(hit);
+        if hit {
+            return Ok(());
+        }
+        // A miss here is not automatically an error: the snapshot is published
+        // by the mutators, and `JitCodeRegion::new()`'s empty initial value is
+        // live until the first `ExecutableBuffer` exists. Fall through to the
+        // authoritative locked lookup rather than reporting a region that
+        // exists as absent -- the snapshot is an accelerator, never the source
+        // of truth.
+    }
     let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
     if !regions.contains(ptr) {
         return Err("JIT code pointer outside known code regions");
     }
     Ok(())
+}
+
+/// [`JitCodeRegion::region_containing`] over a bare sorted slice, so the
+/// snapshot and the locked list run the identical search.
+#[inline]
+fn region_containing_in(regions: &[(usize, usize)], addr: usize) -> Option<(usize, usize)> {
+    let idx = regions.partition_point(|&(s, _)| s <= addr);
+    if idx == 0 {
+        return None;
+    }
+    let (start, end) = regions[idx - 1];
+    (addr >= start && addr < end).then_some((start, end))
 }
 
 pub use cratonvm_jit_api::{count_param_slots, CachedBytecodeMethod, JitRuntimeHelpers};
@@ -1200,6 +1392,32 @@ pub fn intern_typecheck_target(name: &str, target_class_id: Option<u32>) -> (*co
     (interned.as_ptr(), interned.len())
 }
 
+/// Process-wide intern table for compiled local handlers' catch-type names.
+///
+/// A `JitLocalHandlerSite` holds `&'static str` catch types and outlives no
+/// particular compile, so the bytes cannot be owned by the artifact's
+/// `_jit_strings` (which is freed on tier-up while a *newer* artifact for the
+/// same method may still name the same catch type). A leaked intern is what
+/// every other by-name JIT site does — see [`intern_typecheck_target`] — and
+/// the population is bounded by the distinct catch types in the program.
+static CATCH_TYPE_NAME_INTERN: std::sync::OnceLock<
+    parking_lot::Mutex<rustc_hash::FxHashSet<&'static str>>,
+> = std::sync::OnceLock::new();
+
+/// Intern a catch-type name for a [`JitLocalHandlerSite`].
+pub fn intern_catch_type_name(name: &str) -> &'static str {
+    let table = CATCH_TYPE_NAME_INTERN.get_or_init(|| parking_lot::Mutex::new(Default::default()));
+    let mut table = table.lock();
+    match table.get(name) {
+        Some(existing) => existing,
+        None => {
+            let leaked: &'static str = Box::leak(String::from(name).into_boxed_str());
+            table.insert(leaked);
+            leaked
+        }
+    }
+}
+
 /// The `ClassId` the site whose class name lives at `name_ptr` resolved to at
 /// compile time, if it resolved at all.
 #[inline]
@@ -1764,6 +1982,98 @@ pub fn deopt_real_enabled() -> bool {
     )
 }
 
+/// Enter a compiled method's OWN `catch` block from compiled code
+/// (`CRATONVM_JIT_LOCAL_HANDLERS`, **default-ON; `=0` restores the old
+/// route**). Read-once cached.
+///
+/// With this off — the state this VM shipped in until 2026-08-20 — no `catch`
+/// block anywhere runs in compiled code. A caught exception leaves the
+/// artifact: reason-9 deopt, exceptional-frame reconstruction, an interpreted
+/// handler, and inside an OSR'd loop a re-entry at the next hot back edge.
+/// `probes/OsrExcRateProbe.java` prices that round trip at ~2 900 ns per catch
+/// against HotSpot's 6.7-16.
+///
+/// With it on, a throwing site inside one of this method's own protected
+/// ranges branches to a stub that asks
+/// [`JitLocalHandlerSite`] which handler applies and jumps straight into the
+/// compiled handler block, staying in the same frame — so the locals need no
+/// reconstruction because they were never left behind.
+///
+/// It shipped OFF for one day, which was long enough to measure it. What the
+/// flip rests on:
+///
+/// * `probes/OsrExcRateProbe`, one binary, two interleaved rounds: **1246-1377
+///   -> 60-120 ns per caught exception**, ~12x, with `sink` and `caught`
+///   byte-identical in every arm (HotSpot on the same host: 4.6-8);
+/// * `probes/LocalHandlerShapeProbe`, eight handler shapes including two typed
+///   handlers over one range, a strict-subclass catch, a propagating throw, a
+///   `finally`, a nested `try`, a rethrowing handler and a locals-survive
+///   arm: the same digest under HotSpot, under `--nojit`, and with this off
+///   and on;
+/// * the whole netty `codec-http` suite, 103 classes: **identical result
+///   sets**;
+/// * `regression-suite/run.sh`, 64 vectors: identical, 63 pass and the one
+///   pre-existing `RImmutableFactoryTypes` failure that is also there on
+///   unmodified `dev`.
+///
+/// `=0` (also `false`/`off`/`no`) restores the old route, so one binary still
+/// has two arms — which is how the two OSR-admission defects this feature
+/// exposed were found. `docs/known-issues/netty/
+/// httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md` is the
+/// class it was written for.
+pub fn local_handlers_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LOCAL_HANDLERS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+thread_local! {
+    /// Set for the duration of one compile that armed local handlers, so the
+    /// compile door can tell "this method refused for some unrelated reason"
+    /// from "this method refused with handler bodies newly in the image".
+    static LOCAL_HANDLERS_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Disarm local handlers for the NEXT compile on this thread. The compile
+    /// door sets it after a failed armed compile and retries once; see
+    /// [`disarm_local_handlers_once`].
+    static LOCAL_HANDLERS_DISARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Did the compile that just ran on this thread put handler bodies in the
+/// image? Read by the compile door to decide whether a refusal is worth
+/// retrying without them.
+pub fn local_handlers_were_armed() -> bool {
+    LOCAL_HANDLERS_ARMED.with(std::cell::Cell::get)
+}
+
+/// Record whether the compile now starting armed local handlers.
+pub fn note_local_handlers_armed(armed: bool) {
+    LOCAL_HANDLERS_ARMED.with(|c| c.set(armed));
+}
+
+/// Suppress local handlers for the next compile on this thread.
+///
+/// The feature emits handler bodies that were previously dead code, so a
+/// construct the single-pass emitter cannot model inside a `catch` block would
+/// turn a method that compiles today into one that does not — trading a
+/// throughput win for the loss of compilation entirely. The compile door
+/// therefore retries once with this set, which makes the feature unable to cost
+/// any method its artifact: the worst case is one wasted compile.
+pub fn disarm_local_handlers_once() {
+    LOCAL_HANDLERS_DISARMED.with(|c| c.set(true));
+}
+
+/// Take (clear) the one-shot disarm request.
+pub fn take_local_handlers_disarmed() -> bool {
+    LOCAL_HANDLERS_DISARMED.with(std::cell::Cell::take)
+}
+
 /// activate-ir-optimizer Front 3.2: guard-surviving scalar replacement
 /// (`CRATONVM_SCALAR_DEOPT`, default-OFF, read-once). When ON *and*
 /// `deopt_real_enabled()`, the IR lowerer emits a `FrameValue::VirtualObject`
@@ -2091,6 +2401,10 @@ pub struct CompiledMethod {
     /// Owned `JitInvokeInfo` structs. JIT code references these via raw pointers;
     /// they are freed when this `CompiledMethod` is dropped.
     pub _jit_invoke_infos: Vec<Box<JitInvokeInfo>>,
+    /// Owned [`JitLocalHandlerSite`] records, one per throwing bci this method
+    /// can catch itself. The local-handler stubs bake a raw pointer to each;
+    /// they are freed when this `CompiledMethod` is dropped.
+    pub _jit_local_handler_sites: Vec<Box<JitLocalHandlerSite>>,
     /// Owned monomorphic inline cache slots. JIT code references these via raw
     /// pointers; they are freed when this `CompiledMethod` is dropped.
     pub _jit_mic_slots: Vec<Box<JitMICSlot>>,
@@ -2533,6 +2847,7 @@ impl CompiledMethod {
             entry,
             needs_context: false,
             _jit_strings: Vec::new(),
+            _jit_local_handler_sites: Vec::new(),
             _jit_invoke_infos: Vec::new(),
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
@@ -2605,6 +2920,7 @@ impl CompiledMethod {
             entry,
             needs_context: true,
             _jit_strings: Vec::new(),
+            _jit_local_handler_sites: Vec::new(),
             _jit_invoke_infos: Vec::new(),
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
@@ -3978,7 +4294,20 @@ impl CompiledMethod {
                     format!("deopt point at bci {} holds monitors", p.bci),
                 ));
             }
-            if let Some(slot) = deopt::first_unresumable_slot(fs) {
+            // A RETHROW point is asked a NARROWER question, because it is
+            // consumed differently: `take_exceptional_frame` hands its `bci`
+            // and `locals` to the handler-frame builder, which then pushes
+            // `[exception]` as the operand stack by JVMS §2.10. The recorded
+            // stack is never read, so an entry in it that could not be typed
+            // describes nothing that will be reconstructed — and this veto is
+            // ARTIFACT-WIDE, so one such entry at one throwing bci costs the
+            // whole method its OSR entry. See `first_unresumable_local`.
+            let unresumable = if p.semantics.rethrow_exception {
+                deopt::first_unresumable_local(fs)
+            } else {
+                deopt::first_unresumable_slot(fs)
+            };
+            if let Some(slot) = unresumable {
                 return Err(osr_refusal(
                     OSR_REFUSE_UNRESUMABLE_EXIT,
                     format!(
@@ -7689,7 +8018,19 @@ pub enum JitLdcConstant {
     /// `cp_ldc2w_resolver`'s `(bits, is_double)` already has, for the same
     /// reason.
     Immediate { bits: i64, is_float: bool },
-    String(String),
+    /// A `CONSTANT_String` entry: `ldc "…"` pushes the interned literal.
+    ///
+    /// Carries the *referencing* class id and the CP index rather than the
+    /// literal's text, for the reason [`Self::ClassMirror`] carries them plus
+    /// one that is specific to strings: JVMS §5.4.3 resolves a constant-pool
+    /// entry once and records the result, the record is keyed
+    /// `(class, cp index)`, and the text is not that key. Carrying the bytes
+    /// instead made every execution re-derive the answer through the string
+    /// pool's `RwLock` and a hash of the whole literal.
+    String {
+        holder_class_id: u32,
+        cp_idx: u16,
+    },
     /// A `CONSTANT_Class` entry: `ldc <Class>` pushes that class's mirror.
     ///
     /// Carries the *referencing* class id and the CP index rather than a
@@ -8090,6 +8431,81 @@ pub struct JitInvokeInfo {
     pub declaring_class_id: u32,
 }
 
+/// Every handler in THIS method's own exception table that can catch a throw at
+/// one bci — so a compiled frame can enter its own `catch` block without
+/// leaving compiled code.
+///
+/// ## Why this exists
+///
+/// Until 2026-08-20 nothing in this VM ran a `catch` block in compiled code. A
+/// caught exception left the artifact entirely: reason-9 deopt, exceptional
+/// frame reconstruction, an interpreted handler, and — inside an OSR'd loop —
+/// a re-entry at the next hot back edge. Priced on
+/// `probes/OsrExcRateProbe.java` that round trip is **~2 900 ns per catch**
+/// against HotSpot's 6.7-16, and at `HttpHeaderValidationUtilTest`'s measured
+/// 7.7% throw rate it is 223 ns of a 21 ns/iteration budget — the largest
+/// single item on that class by an order of magnitude.
+///
+/// ## What the stub does with it
+///
+/// The compiled body's post-invoke sentinel edge branches to a per-site stub
+/// which calls `jit_local_handler_lookup(vm, site, out_exc)`. That returns the
+/// index into [`Self::candidates`] of the first handler whose catch type
+/// matches the pending throwable — JVMS order, so the answer is the
+/// interpreter's answer — or `-1`. On `-1` the stub falls through to exactly
+/// the edge that would have run before (the reason-9 deopt stub or the shared
+/// sentinel exit), so nothing about the propagating case changes. On a hit the
+/// helper has already stored the throwable into the frame slot the handler's
+/// operand stack starts at, and the stub jumps to the handler's compiled code.
+///
+/// ## The cache
+///
+/// One `u64`, not two `u32`s, and that is load-bearing: a reader must never be
+/// able to pair one throwable's class id with another's index. `0` is empty;
+/// otherwise the top bit is set, bits 32..62 hold the class id and the low 32
+/// hold the index (`-1` for "no local handler", which is worth caching too — a
+/// site that keeps propagating must not re-resolve catch types every time).
+pub struct JitLocalHandlerSite {
+    /// `(catch type name, handler bci)` in exception-table order, restricted to
+    /// the entries whose `[start_pc, end_pc)` covers [`Self::throw_bci`]. An
+    /// EMPTY name is a catch-all (`catch_type == 0`, i.e. `finally`), which
+    /// matches every throwable.
+    pub candidates: Vec<(&'static str, u32)>,
+    /// The class this method is declared in. A catch-type NAME is not a class
+    /// identity — two loaders can each define one — so the name is resolved
+    /// through this class's loader, exactly as `find_jit_exception_handler`
+    /// does for the interpreted route.
+    pub declaring_class_id: u32,
+    /// The throwing bci this site guards. Diagnostics only; the candidate list
+    /// was already filtered by it at compile time.
+    pub throw_bci: u32,
+    /// Monomorphic `(exception class id -> candidate index)` cache. See the
+    /// type doc for the encoding.
+    pub cache: std::sync::atomic::AtomicU64,
+}
+
+impl JitLocalHandlerSite {
+    /// `cache` is empty.
+    pub const CACHE_EMPTY: u64 = 0;
+
+    /// Encode a `(class id, index)` pair for [`Self::cache`].
+    #[inline]
+    pub fn encode_cache(class_id: u32, index: i32) -> u64 {
+        // Cast: the index is packed as raw bits and decoded back as `i32`.
+        (1u64 << 63) | ((class_id as u64) << 32) | (index as u32 as u64)
+    }
+
+    /// Decode [`Self::cache`], or `None` when it is empty.
+    #[inline]
+    pub fn decode_cache(raw: u64) -> Option<(u32, i32)> {
+        if raw & (1u64 << 63) == 0 {
+            return None;
+        }
+        // Cast: exact inverse of `encode_cache`.
+        Some((((raw >> 32) & 0x7fff_ffff) as u32, raw as u32 as i32))
+    }
+}
+
 /// Enumeration of every JIT call-site intrinsic.
 ///
 /// Each variant is mapped onto the `JitDirectCall.entry` sentinel space via
@@ -8131,6 +8547,30 @@ pub enum JitIntrinsic {
     /// `Math/StrictMath.unsignedMultiplyHigh(JJ)J` — high 64 bits of the
     /// UNSIGNED 128-bit product, emitted as a one-operand `MUL r64`.
     MathUnsignedMultiplyHigh = 15,
+    /// `Math/StrictMath.min(FF)F` / `max(FF)F` / `min(DD)D` / `max(DD)D`.
+    ///
+    /// The `int` and `long` forms have been intrinsics since Round-8; these
+    /// four had not, so every `Math.min(float,float)` from compiled code ran
+    /// the JDK's Java body — which is not a one-liner. It tests for NaN,
+    /// then tests both arguments against zero, then calls
+    /// `Float.floatToRawIntBits` and reads a `static final long`, before
+    /// finally doing the comparison.
+    ///
+    /// Measured on the four-sphere ray tracer (three `Math.min(float,float)`
+    /// per pixel, 307,200 pixels): replacing the calls with plain ternaries
+    /// in the Java source cut that kernel's CratonVM CPU time from 145 ms to
+    /// 77 ms. Roughly **47% of the kernel was inside `Math.min`**, about
+    /// 74 ns per call. The same probe with `Math.sqrt` removed showed no
+    /// change, confirming the cost was these calls and not FP work.
+    ///
+    /// Lowered inline — see the `MATH_MIN_FLOAT_INTRINSIC` arm in
+    /// `x64/bytecode_walk.rs` for the SSE sequence and, more importantly,
+    /// for why `MINSS` alone is NOT `Math.min`: it implements neither the
+    /// NaN rule nor the signed-zero rule.
+    MathMinFloat = 16,
+    MathMaxFloat = 17,
+    MathMinDouble = 18,
+    MathMaxDouble = 19,
 
     // ===== INTRINSIC REGION BEGIN: INT_BITS =====
     // java.lang.Integer bit-manipulation intrinsics (Phase 1a). Variant
@@ -8452,6 +8892,10 @@ mod math_intrinsic_aliases {
     pub const MATH_MULTIPLY_HIGH_INTRINSIC: usize = JitIntrinsic::MathMultiplyHigh.as_entry();
     pub const MATH_UNSIGNED_MULTIPLY_HIGH_INTRINSIC: usize =
         JitIntrinsic::MathUnsignedMultiplyHigh.as_entry();
+    pub const MATH_MIN_FLOAT_INTRINSIC: usize = JitIntrinsic::MathMinFloat.as_entry();
+    pub const MATH_MAX_FLOAT_INTRINSIC: usize = JitIntrinsic::MathMaxFloat.as_entry();
+    pub const MATH_MIN_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathMinDouble.as_entry();
+    pub const MATH_MAX_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathMaxDouble.as_entry();
 }
 pub use math_intrinsic_aliases::*;
 
@@ -9019,6 +9463,246 @@ pub fn set_integer_int_value_direct_fn(addr: usize) {
     INTEGER_INT_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `Long.valueOf(J)` / `Long.longValue()` twins of the two `Integer` cells
+/// above. `0` = not wired → the recognition is skipped and the sites use the
+/// generic dispatch helper.
+///
+/// **Why the twin was missing, and what it cost.** `Integer.valueOf`/`intValue`
+/// have had thin binds since 2026-07; `Long.valueOf`/`longValue` are registered
+/// natives on exactly the same terms (`lang_math.rs::register_wrapper_natives`:
+/// a 256-entry `-128..=127` identity cache and a field-0 read) and were not.
+/// Measured on ONE binary, same run, `probes/BoxRungRate.java`:
+///
+/// | rung | HotSpot 25 | CratonVM |
+/// |---|---:|---:|
+/// | `Integer.valueOf` alone | 1.9 ns | 153 ns |
+/// | `Long.valueOf` alone | 2.6 ns | **296 ns** |
+/// | `Integer.valueOf` + `intValue` | 0.24 ns | 151 ns |
+/// | `Long.valueOf` + `longValue` | 0.26 ns | **503 ns** |
+///
+/// The `Integer` PAIR costs the same as `Integer.valueOf` ALONE — `intValue`'s
+/// bind makes the unbox free. The `Long` pair costs `valueOf` plus another
+/// ~207 ns, which is `longValue()` paying the generic funnel. The arms differ
+/// only in which `*_DIRECT_FN` cell exists.
+///
+/// Censused with `--dump-native-registry` on `probes/HwtScaleProbe.java` (the
+/// `HashedWheelTimerTest.testExecutionOnTime` workload): `Long.valueOf` 99 496 +
+/// `Long.longValue` 100 000 calls for 100 000 expired timer tasks — one box and
+/// one unbox each, because the queue under test is a `BlockingQueue<Long>`.
+/// `Long` boxing is the `Integer` case's equal on every `Map<Long, …>`, every
+/// row identifier that reaches a collection, and every `AtomicLong` readout that
+/// is stored rather than consumed.
+pub static LONG_VALUE_OF_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static LONG_LONG_VALUE_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the `Long.valueOf` thin direct-call helper (called once from the
+/// VM's `build_helpers`).
+pub fn set_long_value_of_direct_fn(addr: usize) {
+    LONG_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Register the `Long.longValue` thin direct-call helper (called once from the
+/// VM's `build_helpers`).
+pub fn set_long_long_value_direct_fn(addr: usize) {
+    LONG_LONG_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS=0` — stop binding `Long.valueOf` /
+/// `Long.longValue` to their thin direct helpers and send both back through the
+/// generic native funnel. Default ON.
+///
+/// Same reason the `census-direct-helpers` switch beside it exists: the blast
+/// radius of these binds has to be measurable on ONE binary. A control built
+/// from a different commit manufactured a 13-19% "regression" on phases that
+/// contain neither call the last time that shortcut was taken.
+pub fn long_box_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Sites bound to the two `Long` boxing helpers, so "did this land" is
+/// answerable without a timing run — the lesson `LEAF_NATIVE_HITS` was added
+/// for, and the one `the field site cache shipped default-OFF for 13 days`
+/// was re-learned from.
+pub static LONG_VALUE_OF_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static LONG_LONG_VALUE_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(Long.valueOf, Long.longValue)` sites bound to a thin direct helper.
+pub fn long_box_direct_helper_sites() -> (u64, u64) {
+    (
+        LONG_VALUE_OF_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        LONG_LONG_VALUE_SITES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `VarHandle` READ-mode thin direct-call helper cells, one per
+/// (access mode, primitive return kind) pair — see
+/// [`varhandle_read_helper_slot`] for the index. `0` = not wired, and the
+/// recognition is skipped so the site uses the generic dispatch helper.
+///
+/// **Why this one.** `--dump-native-registry` on `NettyZipBombPhases snappy 4`
+/// (`HttpContentDecompressorTest`'s wall) counts **21 368 822**
+/// `java/lang/invoke/VarHandle.get` calls out of 26 673 142 native calls total
+/// — ~5.1 per output byte. `DataCompressionHttp2Test` censuses the same
+/// signature at 5 356 015 of 18 371 699 (29 %). Both are netty 4.2's reference
+/// count check: `AbstractByteBuf`'s checked accessors call `ensureAccessible()`
+/// -> `RefCnt.isLiveNonVolatile`, which is `(int) VH.get(instance)` on an
+/// ordinary `int` instance field.
+///
+/// A VM-side fast path for exactly this shape already exists
+/// (`vm/src/jit/helpers.rs::try_varhandle_instance_field_read`, keyed on the
+/// handle's identity hash), and it saves the field resolution and the boxing
+/// round trip — but it sits INSIDE `jit_invoke_dispatch`, so every call still
+/// pays the SATB flush, the reference-argument forwarding, the site-key
+/// revalidation and two thread-local map probes before reaching it. That is
+/// the per-call floor `Preconditions.checkIndex` and
+/// `Reference.reachabilityFence` were taken off for 143 -> 23 ns.
+///
+/// **Scope: primitive returns only.** A reference-returning read is left on
+/// the funnel deliberately. The generic path applies
+/// `unbox_poly_return_checked`, whose W6-1 rule turns *a boxed primitive
+/// reaching a non-`Object` reference return* into a `WrongMethodTypeException`
+/// — and that rule reads the CALL SITE's own descriptor, which a thin helper
+/// does not have (a baked direct call has no `JitInvokeInfo`). The synthetic
+/// call site these helpers fall back through carries an erased
+/// `(Ljava/lang/Object;)X` descriptor, which is indistinguishable from the real
+/// one for a primitive `X` and is NOT for a reference one.
+pub static VARHANDLE_READ_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_READ_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; VARHANDLE_READ_SLOTS];
+
+/// The `VarHandle` access modes served by [`VARHANDLE_READ_DIRECT_FNS`], in
+/// slot-major order. All four are plain reads of the variable; the VM's
+/// registry maps `getVolatile`/`getOpaque`/`getAcquire` to the same
+/// `varhandle_get` callback `get` uses, so binding them together does not
+/// widen what a bound site may do.
+pub const VARHANDLE_READ_MODES: [&str; 4] = ["get", "getVolatile", "getOpaque", "getAcquire"];
+
+/// The primitive return kinds served by [`VARHANDLE_READ_DIRECT_FNS`], in
+/// slot-minor order. `L` and `[` are absent on purpose — see the cells' own doc.
+pub const VARHANDLE_READ_RETURNS: [u8; 8] = [b'Z', b'B', b'C', b'S', b'I', b'J', b'F', b'D'];
+
+/// `VARHANDLE_READ_MODES.len() * VARHANDLE_READ_RETURNS.len()`.
+pub const VARHANDLE_READ_SLOTS: usize = 32;
+
+/// The single-reference-coordinate, primitive-return shape this bind serves,
+/// as a slot into [`VARHANDLE_READ_DIRECT_FNS`], or `None` when the site is
+/// not that shape.
+///
+/// The descriptor test is what keeps the bind to *instance field* reads
+/// without asking the VM anything at compile time:
+///
+/// * a **static-field** handle's read site is `()X` — zero coordinates;
+/// * an **array element** or **byte-array/ByteBuffer view** handle's is
+///   `([BI)X` / `(Ljava/nio/ByteBuffer;I)X` — two;
+/// * a **`MemorySegment`** handle's carries a `J` offset — also two.
+///
+/// Only an instance-field handle reads with exactly one reference coordinate,
+/// so `(L…;)X` / `([…)X` with a primitive `X` is the shape, and every other
+/// site keeps the dispatch it has today. The helper re-checks the handle
+/// itself at runtime and declines to the generic dispatcher when the side
+/// table does not describe it as a resolved instance field, so this test is a
+/// cheap pre-filter and not the correctness argument.
+pub fn varhandle_read_helper_slot(method: &str, descriptor: &str) -> Option<usize> {
+    let mode = VARHANDLE_READ_MODES.iter().position(|m| *m == method)?;
+    if !descriptor.starts_with('(') {
+        return None;
+    }
+    let close = descriptor.find(')')?;
+    // Exactly one parameter, and it is a reference. A leading `[` covers an
+    // array-TYPED field (`[I`, `[[B`, `[Ljava/lang/String;`), which is still an
+    // ordinary reference-valued instance field, not an array-ELEMENT handle.
+    let params = &descriptor[1..close];
+    let one_reference_param = match params.as_bytes().first() {
+        Some(b'L') => is_single_object_descriptor(params),
+        Some(b'[') => {
+            let elem = params.trim_start_matches('[');
+            match elem.as_bytes().first() {
+                Some(b'L') => is_single_object_descriptor(elem),
+                Some(c) => elem.len() == 1 && VARHANDLE_READ_RETURNS.contains(c),
+                None => false,
+            }
+        }
+        _ => false,
+    };
+    if !one_reference_param {
+        return None;
+    }
+    let ret = descriptor[close + 1..].as_bytes();
+    if ret.len() != 1 {
+        return None;
+    }
+    let kind = VARHANDLE_READ_RETURNS.iter().position(|r| *r == ret[0])?;
+    Some(mode * VARHANDLE_READ_RETURNS.len() + kind)
+}
+
+/// `Lfoo/Bar;` and nothing after it — one object descriptor consuming the
+/// whole slice. Two parameters (`Lfoo;Lbar;`) fail on the interior `;`.
+fn is_single_object_descriptor(s: &str) -> bool {
+    s.len() >= 3 && s.ends_with(';') && !s[1..s.len() - 1].contains(';')
+}
+
+/// Register the `VarHandle` read-mode thin direct-call helpers (called once
+/// from the VM's `build_helpers`). The array is indexed by
+/// [`varhandle_read_helper_slot`]; a `0` entry means that slot is not served
+/// and the sites that would use it keep the generic dispatch helper.
+pub fn set_varhandle_read_direct_fns(addrs: &[usize; VARHANDLE_READ_SLOTS]) {
+    for (cell, addr) in VARHANDLE_READ_DIRECT_FNS.iter().zip(addrs.iter()) {
+        cell.store(*addr, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS=0` — stop binding `VarHandle`
+/// read modes to their thin direct helpers and send every one back through the
+/// generic native funnel (where `try_varhandle_instance_field_read` still
+/// serves them, one funnel round trip later). Default ON.
+///
+/// Same reason the `census-direct-helpers` and `long-box-direct-helpers`
+/// switches beside it exist: the blast radius has to be measurable on ONE
+/// binary. A control built from a different commit manufactured a 13-19 %
+/// "regression" on phases containing neither call the last time that shortcut
+/// was taken.
+pub fn varhandle_read_direct_helpers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Sites bound to a `VarHandle` read helper, split by compile door, so "did
+/// this land" is answerable without a timing run. The OSR column is the one
+/// that matters here: netty reads `refCnt` inside the transfer loops, and a
+/// loop body is an OSR compilation.
+pub static VARHANDLE_READ_SITES_SINGLEPASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static VARHANDLE_READ_SITES_OSR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(single-pass, OSR)` `VarHandle` read sites bound to a thin direct helper.
+pub fn varhandle_read_direct_helper_sites() -> (u64, u64) {
+    (
+        VARHANDLE_READ_SITES_SINGLEPASS.load(std::sync::atomic::Ordering::Relaxed),
+        VARHANDLE_READ_SITES_OSR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// `Thread.currentThread()` thin direct-call helper — the JIT half of the
 /// funnel bypass the interpreter already has.
 ///
@@ -9345,6 +10029,15 @@ pub fn try_resolve_intrinsic(
             ("max", "(II)I") => Some((JitIntrinsic::MathMaxInt, 2, b'I')),
             ("min", "(JJ)J") => Some((JitIntrinsic::MathMinLong, 2, b'J')),
             ("max", "(JJ)J") => Some((JitIntrinsic::MathMaxLong, 2, b'J')),
+            // The float/double twins of the two lines above. These four were
+            // missing for a long time, so a `Math.min(float,float)` in a hot
+            // loop paid a full Java-method dispatch into a JDK body that
+            // itself calls `Float.floatToRawIntBits` — measured at ~74 ns a
+            // call, 47% of a ray-tracer kernel. See `JitIntrinsic::MathMinFloat`.
+            ("min", "(FF)F") => Some((JitIntrinsic::MathMinFloat, 2, b'F')),
+            ("max", "(FF)F") => Some((JitIntrinsic::MathMaxFloat, 2, b'F')),
+            ("min", "(DD)D") => Some((JitIntrinsic::MathMinDouble, 2, b'D')),
+            ("max", "(DD)D") => Some((JitIntrinsic::MathMaxDouble, 2, b'D')),
             // High 64 bits of the 128-bit product — one `IMUL`/`MUL r64`.
             // Hottest leaf in SunEC P-256 Montgomery field arithmetic.
             ("multiplyHigh", "(JJ)J") => Some((JitIntrinsic::MathMultiplyHigh, 2, b'J')),
@@ -14789,7 +15482,11 @@ pub fn shadow_overflow_status() -> Option<(usize, Option<String>)> {
 
 /// How the direct-entry arms should treat a compiled callee's raw return
 /// register — see `emit_inline_callee_deopt_check`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// `Debug` is derived so the interlock's own test can NAME the mode it is
+/// asserting about; a failure that says `Off must force the ban on` is worth
+/// more than one that says `assertion failed`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpIcDeoptCheck {
     /// Compare against `i64::MIN` at every direct-entry call (the default).
     On,
@@ -14834,22 +15531,72 @@ pub fn sp_ic_deopt_check_mode() -> SpIcDeoptCheck {
 ///    (`direct-call-service-slots`) rather than an unserviced raw edge, so
 ///    "bound" implies "serviced" for every Java callee.
 ///
-/// Default-OFF pending its own measurement: on netty's
-/// `BigEndianHeapByteBufTest` this gate accounts for 16 of 892 refused binds,
-/// against 736 for the native shadow, so it is a much smaller population than
-/// the virtual-site ban and is not worth defaulting on unmeasured.
-/// `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=1` opts in.
+/// **Default-ON since 2026-08-21.** `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH=0`
+/// restores the ban.
+///
+/// The measurement it was waiting for was taken and it is two-sided, so read
+/// both halves before changing this again
+/// (`static-exception-table-callee-pays-the-funnel-20260821.md`):
+///
+///  * **per call, 10.2x.** `probes/NativeFunnelFloorProbe.java`, ABBA on one
+///    binary: a static callee with a never-taken `try`/`catch`, reached from an
+///    ordinary frame, goes 107.30 -> 10.57 ns/op with both controls flat. Under
+///    the ban it takes `jit_invoke_dispatch` on every call — 1 187 000 funnel
+///    entries against zero for the same callee without the table.
+///  * **per workload, nothing measurable.** 3-228 such sites per netty class
+///    against 117-1 252 left on the helper, `native-shadow` dominating every
+///    one, and an ABBA on the 228-site class moving nothing against a 39 %
+///    spread.
+///
+/// So the flip is NOT justified by a workload win, and pretending otherwise
+/// would be the kind of claim this tree does not make. What justifies it is
+/// consistency and cost: the virtual/interface sibling
+/// (`mic_publish_exception_table_callees`) had the IDENTICAL ban for the
+/// IDENTICAL stated reason, was measured at 8.7x, and was lifted — leaving the
+/// statically bound door, which is the EASY case, 11x worse than the virtual
+/// one for the same callee (9.2 ns against 107). A default that makes the
+/// simpler path the slower path is not a conservative default, it is a bug that
+/// happens to be quiet.
+///
+/// The stated reason for the ban has expired, and `probes/ExcTableDirectCallOracle.java`
+/// is what says so rather than the argument above: a callee's own handler,
+/// `finally`, wrong-type non-catch, nested catch and rethrow all behave
+/// identically under HotSpot, under the ban and with it lifted — including the
+/// IMPLICIT AIOOBE/NPE/div-by-zero cases, which are the ones that actually
+/// leave through the `i64::MIN` sentinel the ban's reason names.
+///
+/// The population note that used to stand here (16 of 892 refused binds on
+/// `BigEndianHeapByteBufTest`) is still true and is still the reason not to
+/// expect a workload win; the current census puts it at 17 of 732.
 pub fn direct_call_exc_table_publish_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        if sp_ic_deopt_check_mode() != SpIcDeoptCheck::On {
-            return false;
-        }
-        matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH").as_deref(),
-            Ok("1") | Ok("true")
+        direct_call_exc_table_publish_decision(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH")
+                .as_deref()
+                .ok(),
+            sp_ic_deopt_check_mode(),
         )
     })
+}
+
+/// The policy of [`direct_call_exc_table_publish_enabled`] as a pure function
+/// of its two inputs.
+///
+/// Split out so the decision table can be unit-tested without an environment
+/// variable. The public entry point memoises in a `OnceLock` and reads the
+/// process environment, so a test that exercised IT would have to mutate
+/// `environ` — which is a data race in a parallel test binary, not a
+/// visibility question, and is exactly the pattern that was removed from
+/// `native-builtins` on 2026-08-20.
+fn direct_call_exc_table_publish_decision(flag: Option<&str>, check: SpIcDeoptCheck) -> bool {
+    // The interlock is NOT a knob, and the default flipping does not make it
+    // one: publishing while the sentinel check is suppressed is unsound, so a
+    // suppressed check forces the ban back on whatever the flag says.
+    if check != SpIcDeoptCheck::On {
+        return false;
+    }
+    !matches!(flag, Some("0") | Some("false") | Some("off"))
 }
 
 pub fn direct_jit_callee_calls_enabled() -> bool {
@@ -15398,6 +16145,76 @@ pub fn try_compile_with_invokespecial_resolver(
         jdk_only,
         intrinsic_resolver,
     );
+
+    // ── The compiled-local-handler safety net ───────────────────────────
+    //
+    // Arming local handlers puts `catch` bodies into the emitted image; before
+    // the feature they were dead code the walk skipped. So a construct the
+    // single-pass emitter cannot model inside a `catch` block — one that has
+    // never had to be modelled anywhere, because no handler body was ever
+    // emitted — would turn a method that compiles today into one that does
+    // not, trading a throughput win for the loss of compilation entirely.
+    //
+    // Retry once with the feature suppressed. That makes the worst case one
+    // wasted compile rather than a permanently interpreted method, and it is
+    // paid only on the failure path: a method that compiles armed never gets
+    // here, and a method that fails for an unrelated reason retries once and
+    // fails the same way. The bail site is cleared first so the retry's own
+    // refusal (or success) is what the bail-list and the stats table see.
+    let result = match result {
+        Some(cm) => Some(cm),
+        None if local_handlers_were_armed() => {
+            let _ = take_jit_bail_site();
+            disarm_local_handlers_once();
+            let mut retry_backend_attempted = false;
+            let retried = try_compile_inner(
+                cached,
+                cp_class_name_resolver,
+                cp_field_resolver,
+                cp_static_field_resolver,
+                cp_invoke_resolver,
+                cp_invokespecial_owner_resolver,
+                callee_compiler,
+                cp_new_resolver,
+                cp_ldc_resolver,
+                cp_ldc2w_resolver,
+                profile,
+                helpers,
+                inline_resolver,
+                string_layout_resolver,
+                cp_invoke_class_id_resolver,
+                cp_elidable_init_resolver,
+                optimize,
+                ir_emit_calls,
+                ir_emit_special_calls,
+                ir_emit_long,
+                ir_emit_virtual_calls,
+                ir_emit_fp,
+                cp_invokedynamic_descriptor_resolver,
+                class_id_name_resolver,
+                receiver_inline_resolver,
+                &mut retry_backend_attempted,
+                self_call_identity_stable,
+                &admission,
+                jdk_only,
+                intrinsic_resolver,
+            );
+            backend_attempted |= retry_backend_attempted;
+            if retried.is_some() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+            {
+                eprintln!(
+                    "[cratonvm-jitc] local-handlers: {}.{}{} refused with handler bodies in the image; compiled without them",
+                    cached.class_name, cached.method_name, cached.method_descriptor,
+                );
+            }
+            retried
+        }
+        None => None,
+    };
+    // The disarm is one-shot and consumed by the staging site, but a retry that
+    // never reached it (an early resolver bail) would leave it set for the next
+    // unrelated method on this thread.
+    let _ = take_local_handlers_disarmed();
 
     // Take once and use for all three sinks: the bail-list decision below, the
     // trace line (only when `CRATONVM_DBG_JITC` is on), and the per-method
@@ -16021,6 +16838,94 @@ fn precise_virtual_invokes_enabled() -> bool {
 /// "before the trap in pc order": the witness is a **loop**, where a store at a
 /// lower pc executes on the iteration *after* the one that traps. Pc order is
 /// not execution order, and the cheap conservative answer is the correct one.
+/// `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD=0` — **MEASUREMENT ONLY, AND
+/// UNSOUND.** Stop declining the optimizing tier to a protected range that
+/// carries an unresumable trap, and let it compile the method anyway.
+///
+/// # Do not ship a workload with this off
+///
+/// The refusal exists because the IR tier lowers array/field access and
+/// division to a **deopt guard**, `can_deopt_resume` is false on a production
+/// artifact, and the interpreter's fallback is to replay the method from entry
+/// — which it refuses when the range has already committed a store, raising a
+/// hard `InternalError`. With this switch off, a method whose trap ACTUALLY
+/// FIRES inside such a range gets that `InternalError` instead of the exception
+/// the program expected. Nothing about that changes here; the switch does not
+/// make the deopt resumable, it only stops the compiler from avoiding it.
+///
+/// # Why it exists anyway
+///
+/// The refusal has never had a price. `ir_unresumable_protected_trap`'s own
+/// doc argues the trade honestly — *"declining here is not 'stay interpreted' —
+/// it is 'use the backend that handles this shape', at single-pass code
+/// quality"* — but nobody has measured what that costs on a workload, and the
+/// shape it declines (`try { buf[i] = x; flush(); } finally { … }`) is ordinary
+/// Java. Scoping the deopt-resume capability without that number is guesswork.
+///
+/// The static shape is what the refusal keys on; the unsoundness only bites if
+/// the trap FIRES. On a workload that does not throw AIOOBE/NPE inside those
+/// ranges — the common case — an arm with this off is a correct program and a
+/// fair measurement of what the refusal costs. A workload that DOES trap there
+/// will fail loudly with the `InternalError`, and that failure is itself the
+/// answer for that workload.
+pub fn ir_unresumable_trap_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD")
+            .map(|v| {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Methods whose bytecode carries the unresumable-trap SHAPE, and methods the
+/// guard actually declined because of it.
+///
+/// Two counters and not one, because the A/B needs both halves. With the guard
+/// off, `shape` keeps counting and `refused` goes to zero — which is what says
+/// the OFF arm moved exactly `shape` methods and not some other number. A
+/// single counter cannot tell "the shape is rare" from "the switch is not
+/// wired".
+pub static IR_UNRESUMABLE_TRAP_SHAPE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static IR_UNRESUMABLE_TRAP_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(shape seen, actually declined)` for the unresumable-trap refusal.
+pub fn ir_unresumable_trap_counts() -> (u64, u64) {
+    (
+        IR_UNRESUMABLE_TRAP_SHAPE.load(std::sync::atomic::Ordering::Relaxed),
+        IR_UNRESUMABLE_TRAP_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// The admission GATE for [`ir_unresumable_protected_trap`]: applies the
+/// measurement switch and keeps the census.
+///
+/// Called from the eligibility conjunction ONLY — exactly once per compile
+/// attempt. The diagnostic ladder above deliberately calls the raw scan
+/// instead: it runs a second time under `CRATONVM_DBG_IR_COMPILES` /
+/// `metrics.is_enabled()`, and counting there would double every number the
+/// moment somebody turned the diagnostic on.
+fn ir_unresumable_trap_declines(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+) -> bool {
+    if ir_unresumable_protected_trap(code, code_len, exception_table).is_none() {
+        return false;
+    }
+    IR_UNRESUMABLE_TRAP_SHAPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !ir_unresumable_trap_guard_enabled() {
+        return false;
+    }
+    IR_UNRESUMABLE_TRAP_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 fn ir_unresumable_protected_trap(
     code: &[u8],
     code_len: usize,
@@ -16739,8 +17644,9 @@ fn try_compile_inner(
         } else if precise_exception_frames {
             "precise exception frames required (RBC.6: a handler reads a non-parameter local)"
                 .to_string()
-        } else if let Some((pc, op)) =
-            ir_unresumable_protected_trap(code, code_len, &cached.exception_table)
+        } else if let Some((pc, op)) = ir_unresumable_trap_guard_enabled()
+            .then(|| ir_unresumable_protected_trap(code, code_len, &cached.exception_table))
+            .flatten()
         {
             format!(
                 "an inline trap this tier deopts on (pc={pc}, opcode={op:#04x}) sits in a \
@@ -16909,7 +17815,7 @@ fn try_compile_inner(
         // unresumable deopt — see `ir_unresumable_protected_trap`. Falls
         // through to the single-pass backend, which throws and routes through
         // the exception table instead of deopting.
-        && ir_unresumable_protected_trap(code, code_len, &cached.exception_table).is_none()
+        && !ir_unresumable_trap_declines(code, code_len, &cached.exception_table)
         && ((!method_uses_category2(code, code_len, &cached.method_descriptor)
                 // inc 30: the pure int/long/ref IR path stays FP-free, so a
                 // float-using (cat-1) method is no longer admitted here — it
@@ -17039,28 +17945,30 @@ fn try_compile_inner(
         //     under `ir_emit_fp`, mirroring the `ldc2_w` gate directly above —
         //     the builder would otherwise emit an `Op::ConstF`/`Float` into a
         //     graph the FP tier is switched off for.
-        //   * `String` → the interned-literal SITE (`bytes`, `len`), not a
-        //     reference: the value is materialised by `helpers.ldc_string` on
-        //     every execution, because an `ObjectRef` baked at compile time can
-        //     relocate between two runs of the body.
+        //   * `String` → the CP-indexed SITE, served by
+        //     `helpers.ldc_string_cp`: the value is materialised at run time
+        //     because an `ObjectRef` baked at compile time can relocate between
+        //     two runs of the body, and it is keyed by the SITE rather than by
+        //     the literal's bytes because that is the key JVMS §5.4.3's
+        //     recorded resolution is filed under.
         //   * `ClassMirror` → the CP-indexed site, served by
         //     `helpers.ldc_class_cp` for the same reason plus one more:
         //     resolution can load a class, which runs arbitrary Java.
         //
         // A pc absent from all three (no resolver, a `MethodHandle` /
-        // `MethodType` / condy entry, an unwired class helper, or a float with
-        // the FP gate off) makes the builder's 0x12/0x13 arm bail that method
-        // to single-pass — the pre-existing behaviour, only narrower.
+        // `MethodType` / condy entry, an unwired class or string helper, or a
+        // float with the FP gate off) makes the builder's 0x12/0x13 arm bail
+        // that method to single-pass — the pre-existing behaviour, only
+        // narrower.
         //
-        // Keep-alive for the string-literal bytes whose ADDRESS the lowered
-        // body bakes as an imm64. Moved onto the finished `CompiledMethod`
-        // below, next to the `Op::Call` info boxes, so the pointer cannot
-        // outlive its pointee.
-        let mut ir_ldc_strings: Vec<Box<str>> = Vec::new();
+        // The `ir_ldc_strings` keep-alive that stood here is GONE with the
+        // bytes it kept alive: an `ldc <String>` site no longer bakes an
+        // address into the body, so there is nothing for the artifact to
+        // outlive.
         // cov-05: `instanceof`/`checkcast` target class-name bytes, whose
         // ADDRESS the lowered body bakes as an imm64 argument to
-        // `helpers.instanceof_check`/`helpers.checkcast`. Unlike
-        // `ir_ldc_strings` immediately above, these are NOT kept alive on the
+        // `helpers.instanceof_check`/`helpers.checkcast`. These are NOT kept
+        // alive on the
         // `CompiledMethod`: they are interned process-wide by
         // `intern_typecheck_class_name`, because the type-check helpers
         // memoize on the `(ptr, len)` pair in thread-locals that outlive any
@@ -17076,7 +17984,7 @@ fn try_compile_inner(
             if let Some(resolver) = cp_ldc_resolver {
                 let mut imm: std::collections::HashMap<usize, (i64, bool)> =
                     std::collections::HashMap::new();
-                let mut strs: std::collections::HashMap<usize, (usize, usize)> =
+                let mut strs: std::collections::HashMap<usize, (u32, u16)> =
                     std::collections::HashMap::new();
                 let mut classes: std::collections::HashMap<usize, (u32, u16)> =
                     std::collections::HashMap::new();
@@ -17087,10 +17995,17 @@ fn try_compile_inner(
                                 imm.insert(pc, (bits, is_float));
                             }
                         }
-                        Some(JitLdcConstant::String(text)) => {
-                            let boxed: Box<str> = text.into_boxed_str();
-                            strs.insert(pc, (boxed.as_ptr() as usize, boxed.len()));
-                            ir_ldc_strings.push(boxed);
+                        Some(JitLdcConstant::String {
+                            holder_class_id,
+                            cp_idx,
+                        }) => {
+                            // `ldc_string_cp` is an OptionalPtr, exactly like
+                            // `ldc_class_cp` below: omit the site rather than
+                            // plan a CALL to address 0, and let the builder
+                            // bail the method.
+                            if helpers.ldc_string_cp != 0 {
+                                strs.insert(pc, (holder_class_id, cp_idx));
+                            }
                         }
                         Some(JitLdcConstant::ClassMirror {
                             holder_class_id,
@@ -17871,6 +18786,43 @@ fn try_compile_inner(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
+                            // `Long.valueOf(J)` at THIS door too, for the reason
+                            // the two above are here: the netty workloads that
+                            // motivate it box inside loops, and a loop is
+                            // OSR-compiled at the optimizing tier, which is this
+                            // path. The `Integer.valueOf` twin is still
+                            // single-pass-only (see the scope note above) — it
+                            // is left that way deliberately, so the A/B on
+                            // `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` measures
+                            // the `Long` binds and nothing else.
+                            //
+                            // `Long.longValue()` cannot be bound here at all:
+                            // this door is gated `is_static || is_special`, and
+                            // `longValue` is an `invokevirtual`. That is the
+                            // same reason `Integer.intValue` is single-pass-only
+                            // and is a property of the door, not a decision.
+                            if direct_target.is_none()
+                                && long_box_direct_helpers_enabled()
+                                && is_static
+                                && direct_class == "java/lang/Long"
+                                && mn == "valueOf"
+                                && desc == "(J)Ljava/lang/Long;"
+                            {
+                                let entry = direct_native_helper(
+                                    &LONG_VALUE_OF_DIRECT_FN,
+                                    jdk_only,
+                                    intrinsic_resolver,
+                                    direct_class,
+                                    &mn,
+                                    &desc,
+                                );
+                                if entry != 0 {
+                                    direct_target = Some((entry, true));
+                                    direct_target_is_thin_helper = true;
+                                    LONG_VALUE_OF_SITES
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                             if direct_target.is_none()
                                 && !closes_cycle
                                 && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
@@ -18538,14 +19490,11 @@ fn try_compile_inner(
                             compiled._jit_strings = ir_call_strings;
                             compiled.has_dispatch = true;
                         }
-                        // cov-01: the same keep-alive obligation for an
-                        // `ldc <String>` site, whose UTF-8 bytes' ADDRESS is
-                        // baked into the body as an imm64 argument to
-                        // `helpers.ldc_string`. `append`, never assign — the
-                        // call strings may already be installed above, and
-                        // dropping either list frees memory the emitted code
-                        // still names.
-                        compiled._jit_strings.append(&mut ir_ldc_strings);
+                        // cov-01's `ldc <String>` keep-alive stood here and is
+                        // GONE: the site is CP-indexed now, so the body bakes a
+                        // `(class id, cp index)` pair rather than the literal's
+                        // address, and there are no bytes for the artifact to
+                        // outlive.
                         // cov-05: `instanceof`/`checkcast` target class names
                         // deliberately do NOT appear here — they are interned
                         // for the life of the process instead, so the
@@ -18938,7 +19887,7 @@ fn try_compile_inner(
     // With no resolver at all, `ldc_info` stays empty and the 0x12/0x13
     // codegen arm bails per-site instead.
     let mut ldc_info: Vec<(usize, i64)> = Vec::new();
-    let mut ldc_string_info: Vec<(usize, *const u8, usize)> = Vec::new();
+    let mut ldc_string_info: Vec<(usize, u32, u16)> = Vec::new();
     let mut ldc_class_info: Vec<(usize, u32, u16)> = Vec::new();
     // The `is_float`/`is_double` halves the codegen throws away. The deopt
     // operand-stack snapshot has no consuming opcode to ask for the width, so
@@ -18969,12 +19918,18 @@ fn try_compile_inner(
                         }
                         ldc_class_info.push((pc, holder_class_id, cp_idx));
                     }
-                    Some(JitLdcConstant::String(text)) => {
-                        let boxed: Box<str> = text.into_boxed_str();
-                        let ptr = boxed.as_ptr();
-                        let len = boxed.len();
-                        owned_strings.push(boxed);
-                        ldc_string_info.push((pc, ptr, len));
+                    Some(JitLdcConstant::String {
+                        holder_class_id,
+                        cp_idx,
+                    }) => {
+                        // Same OptionalPtr guard the `ClassMirror` arm above
+                        // takes: a hand-built test table leaves the helper 0,
+                        // and then this site keeps the historical whole-compile
+                        // bail rather than emitting a CALL to address 0.
+                        if helpers.ldc_string_cp == 0 {
+                            jitc_bail!("ldc_string_helper_unwired")
+                        }
+                        ldc_string_info.push((pc, holder_class_id, cp_idx));
                     }
                     None => {
                         // RBC.7 — same permanent-bail class as RBC.4 (scan
@@ -19678,6 +20633,50 @@ fn try_compile_inner(
                             continue;
                         }
                     }
+
+                    // `Long.valueOf(J)` — the twin of the `Integer.valueOf(I)`
+                    // bind directly above, on the same terms and for the same
+                    // reason (see `LONG_VALUE_OF_DIRECT_FN` for the measured
+                    // gap that says the twin was missing rather than declined).
+                    //
+                    // `num_params: 1` and not 2: the JIT's `count_param_slots`
+                    // counts one operand slot per PARAMETER, not JVMS
+                    // category-2 pairs, so the `J` argument the emitter pops
+                    // for this site is a single 64-bit slot — the same count
+                    // `INTEGER_VALUE_OF`'s `I` gets.
+                    if direct_jit_callee_calls_enabled
+                        && long_box_direct_helpers_enabled()
+                        && invoke_kind == 3
+                        && class_name == "java/lang/Long"
+                        && method_name == "valueOf"
+                        && descriptor == "(J)Ljava/lang/Long;"
+                    {
+                        // JDK-ONLY-WAVE2: see the marker on the
+                        // `StringLatin1.toLowerCase` bind above — same list.
+                        let entry = direct_native_helper(
+                            &LONG_VALUE_OF_DIRECT_FN,
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                        );
+                        if entry != 0 {
+                            LONG_VALUE_OF_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
                     // STATICALLY BOUND ONLY (`invokespecial` / `invokestatic`).
                     //
                     // `callee_compiler` is asked about the constant-pool
@@ -20000,6 +20999,113 @@ fn try_compile_inner(
                                 needs_context: true,
                                 num_params: 0,
                                 return_type: b'I',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+                // `VarHandle.get`/`getVolatile`/`getOpaque`/`getAcquire` on an
+                // instance field with a primitive return (see
+                // `VARHANDLE_READ_DIRECT_FNS`). `java/lang/invoke/VarHandle` is
+                // NOT final and the site is signature-polymorphic, so this is
+                // not a monomorphism argument like `Integer.intValue`'s above —
+                // it does not need to be. Every VarHandle read mode resolves to
+                // ONE registered native (`varhandle_get`) regardless of the
+                // receiver's concrete handle class, so there is no subclass
+                // whose override a guard would have to protect; and the helper
+                // re-validates the handle at runtime, declining to the generic
+                // dispatcher for anything the side table does not describe as a
+                // resolved instance field of the site's own return kind.
+                //
+                // `num_params: 1` — the single reference coordinate.
+                // `needs_context: true` puts `vm_ptr` in ARG_REGS[0], so the
+                // helper sees `(vm_ptr, varhandle, receiver)`.
+                if direct_jit_callee_calls_enabled
+                    && varhandle_read_direct_helpers_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/lang/invoke/VarHandle"
+                {
+                    if let Some(slot) = varhandle_read_helper_slot(&method_name, &descriptor) {
+                        // JDK-ONLY-WAVE2: see the marker on the
+                        // `StringLatin1.toLowerCase` bind above — same list.
+                        // The descriptor handed to the policy check is the
+                        // native's REGISTERED (erased) one, not the call site's:
+                        // `register_varhandle_natives` files every read mode
+                        // under `([Ljava/lang/Object;)Ljava/lang/Object;`, and
+                        // asking the registry about the site's own descriptor
+                        // would find nothing and refuse for the wrong reason.
+                        // All four modes are `NativeKind::Bridge`, so under
+                        // `JdkOnly` this bind is refused — deliberately, and on
+                        // the same terms as `HashMap.get`.
+                        let entry = direct_native_helper(
+                            &VARHANDLE_READ_DIRECT_FNS[slot],
+                            jdk_only,
+                            intrinsic_resolver,
+                            &class_name,
+                            &method_name,
+                            "([Ljava/lang/Object;)Ljava/lang/Object;",
+                        );
+                        if entry != 0 {
+                            VARHANDLE_READ_SITES_SINGLEPASS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 1,
+                                    return_type: VARHANDLE_READ_RETURNS
+                                        [slot % VARHANDLE_READ_RETURNS.len()],
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                // `Long.longValue()` — the twin of the `Integer.intValue()`
+                // bind directly above. `java/lang/Long` is `final` on exactly
+                // the same terms, so a site whose constant-pool class is
+                // `java/lang/Long` is statically monomorphic and the guard-free
+                // virtual direct-call path is sound; the helper handles the
+                // null-receiver NPE itself and declines any receiver that fails
+                // heap validation to the generic dispatcher.
+                if direct_jit_callee_calls_enabled
+                    && long_box_direct_helpers_enabled()
+                    && invoke_kind == 0
+                    && class_name == "java/lang/Long"
+                    && method_name == "longValue"
+                    && descriptor == "()J"
+                {
+                    // JDK-ONLY-WAVE2: see the marker on the
+                    // `StringLatin1.toLowerCase` bind above — same list.
+                    let entry = direct_native_helper(
+                        &LONG_LONG_VALUE_DIRECT_FN,
+                        jdk_only,
+                        intrinsic_resolver,
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                    );
+                    if entry != 0 {
+                        LONG_LONG_VALUE_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 0,
+                                // `b'J'`, and the emitter's return-value ladder
+                                // already handles it: it special-cases only
+                                // `D`/`F` (XMM) and `L`/`[` (oop marking), and
+                                // everything else — `I` and `J` alike — is one
+                                // `push_from_rax`. The JIT's operand stack is
+                                // one 64-bit slot per value, not JVMS
+                                // category-2 pairs.
+                                return_type: b'J',
                                 guard_class_id: 0,
                             },
                         ));
@@ -20581,6 +21687,50 @@ fn try_compile_inner(
             })
             .collect(),
     );
+    // The same table again, with the one thing a compiled `catch` needs that
+    // no liveness analysis does: WHICH throwables each entry takes.
+    //
+    // Staged only when the feature is on and the front end can name every
+    // catch type — a table with one unresolvable entry is staged as nothing at
+    // all, because a site built from a partial table would silently answer
+    // "propagate" where the real table has a match. `catch_type == 0` is a
+    // catch-all and carries the empty name rather than a resolution.
+    //
+    // `take_local_handlers_disarmed` is the retry channel: a compile that
+    // refused with handler bodies in the image comes back through here once
+    // with them suppressed, so the feature can cost a method throughput but
+    // never its artifact.
+    let local_handlers_requested = local_handlers_enabled()
+        && !cached.exception_table.is_empty()
+        && !take_local_handlers_disarmed();
+    if local_handlers_requested {
+        let mut table: Vec<(usize, usize, usize, &'static str)> =
+            Vec::with_capacity(cached.exception_table.len());
+        let mut resolvable = true;
+        for e in cached.exception_table.iter() {
+            let name: &'static str = if e.catch_type == 0 {
+                ""
+            } else {
+                match cp_class_name_resolver.as_ref().and_then(|r| r(e.catch_type)) {
+                    Some(n) => intern_catch_type_name(&n),
+                    None => {
+                        resolvable = false;
+                        break;
+                    }
+                }
+            };
+            table.push((
+                // Widening: classfile pcs are u16.
+                e.start_pc as usize,
+                e.end_pc as usize,
+                e.handler_pc as usize,
+                name,
+            ));
+        }
+        if resolvable {
+            x64::set_pending_local_handler_table(table, cached.declaring_class_id.as_u32());
+        }
+    }
     // Phase 10 (single-pass backend). Like `lower_inner`, this one call does
     // selection, encoding and buffer install together. The guard also covers
     // the `?` below: a backend bail is a compilation that spent this time.
@@ -21687,6 +22837,280 @@ mod code_buffer_retry_tests {
 }
 
 #[cfg(test)]
+mod long_box_direct_bind_tests {
+    use super::*;
+
+    /// The two `Long` cells must be DISTINCT from each other and from the two
+    /// `Integer` cells they are modelled on.
+    ///
+    /// This is not paranoia about copy-paste for its own sake: the whole bind
+    /// is a triple-to-helper-address map, and the failure mode of getting it
+    /// wrong is not a compile error — it is `Long.longValue()` calling
+    /// `jit_integer_int_value_direct`, which reads field 0 and returns whatever
+    /// `Value::Int` arm it finds, silently truncating every `long` above 2^31
+    /// in compiled code only. A pointer-equality check is the only thing that
+    /// catches that before a workload does.
+    #[test]
+    fn the_long_helper_cells_are_not_the_integer_ones() {
+        set_integer_value_of_direct_fn(0x1000);
+        set_integer_int_value_direct_fn(0x2000);
+        set_long_value_of_direct_fn(0x3000);
+        set_long_long_value_direct_fn(0x4000);
+
+        let iv = INTEGER_VALUE_OF_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let ii = INTEGER_INT_VALUE_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let lv = LONG_VALUE_OF_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let ll = LONG_LONG_VALUE_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!((iv, ii, lv, ll), (0x1000, 0x2000, 0x3000, 0x4000));
+        assert_ne!(lv, iv, "Long.valueOf is wired to Integer.valueOf's helper");
+        assert_ne!(ll, ii, "Long.longValue is wired to Integer.intValue's helper");
+        assert_ne!(lv, ll, "both Long cells hold one address");
+
+        // Leave the cells as `build_helpers` would find them: not wired. `0` is
+        // the established "use the generic dispatch helper" sentinel, so a test
+        // that ran before a real VM in the same process cannot leave a fake
+        // address behind for a compile to bake into a `CALL`.
+        set_integer_value_of_direct_fn(0);
+        set_integer_int_value_direct_fn(0);
+        set_long_value_of_direct_fn(0);
+        set_long_long_value_direct_fn(0);
+    }
+
+    /// The site counters start at zero and are independent, so a run that
+    /// reports `Long.valueOf=0 Long.longValue=N` is reporting two facts and not
+    /// one number twice. `the field site cache shipped default-OFF for 13 days`
+    /// is what this row is for: "the bind did not help" and "the bind never
+    /// happened" have to be distinguishable from the log line alone.
+    #[test]
+    fn the_two_long_site_counters_are_separate() {
+        let (before_v, before_l) = long_box_direct_helper_sites();
+        LONG_VALUE_OF_SITES.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        let (after_v, after_l) = long_box_direct_helper_sites();
+        assert_eq!(after_v, before_v + 3);
+        assert_eq!(after_l, before_l, "bumping valueOf moved the longValue tally");
+        LONG_LONG_VALUE_SITES.fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        let (final_v, final_l) = long_box_direct_helper_sites();
+        assert_eq!(final_v, before_v + 3);
+        assert_eq!(final_l, before_l + 5);
+    }
+}
+
+#[cfg(test)]
+mod direct_exc_table_publish_policy {
+    use super::*;
+
+    /// The default is ON as of 2026-08-21, and `=0` is what restores the ban.
+    ///
+    /// Pinned because the flip is NOT justified by a workload win — it is
+    /// justified by the static door otherwise being 11x worse than the virtual
+    /// door for the same callee — so the next person to read the census could
+    /// reasonably conclude it should go back. If they do, it should be a
+    /// decision that edits this test, not a silent polarity slip.
+    #[test]
+    fn the_default_is_on_and_zero_restores_the_ban() {
+        assert!(
+            direct_call_exc_table_publish_decision(None, SpIcDeoptCheck::On),
+            "unset must mean ON since 2026-08-21",
+        );
+        for off in ["0", "false", "off"] {
+            assert!(
+                !direct_call_exc_table_publish_decision(Some(off), SpIcDeoptCheck::On),
+                "`{off}` must restore the ban",
+            );
+        }
+        for on in ["1", "true", ""] {
+            assert!(
+                direct_call_exc_table_publish_decision(Some(on), SpIcDeoptCheck::On),
+                "`{on}` must not restore the ban",
+            );
+        }
+    }
+
+    /// The interlock outranks the flag, in BOTH directions.
+    ///
+    /// Publishing a direct `CALL` while the `i64::MIN` sentinel check is
+    /// suppressed is the unsound state — the callee's own handler would never
+    /// run — and the MIC sibling's page records a throughput reading that was
+    /// mistaken for a pass because of exactly this
+    /// (`207.04 ns/op` with the interlock holding, `24.12` without it). The
+    /// default flipping must not turn the interlock into a knob.
+    #[test]
+    fn a_suppressed_sentinel_check_forces_the_ban_back_on() {
+        for check in [SpIcDeoptCheck::Off, SpIcDeoptCheck::SkipVoid] {
+            assert!(
+                !direct_call_exc_table_publish_decision(None, check),
+                "{check:?} must force the ban on even with the flag unset",
+            );
+            assert!(
+                !direct_call_exc_table_publish_decision(Some("1"), check),
+                "{check:?} must force the ban on even when the flag asks for it",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod varhandle_read_direct_bind_tests {
+    use super::*;
+
+    /// The netty shape this bind exists for, at all four read modes.
+    ///
+    /// `RefCnt.isLiveNonVolatile` is `(int) VH.get(instance)` and `refCnt()` is
+    /// `(int) VH.getAcquire(instance) >>> 1`, so a filter that recognised only
+    /// `get` would leave the second of the two on the funnel and the class's
+    /// `retain`/`release` paths with it.
+    #[test]
+    fn the_netty_refcnt_shape_is_recognised_in_every_read_mode() {
+        let desc = "(Lio/netty/util/internal/RefCnt;)I";
+        let int_slot = VARHANDLE_READ_RETURNS.iter().position(|r| *r == b'I').unwrap();
+        for (mode, name) in VARHANDLE_READ_MODES.iter().enumerate() {
+            assert_eq!(
+                varhandle_read_helper_slot(name, desc),
+                Some(mode * VARHANDLE_READ_RETURNS.len() + int_slot),
+                "{name} on the netty refCnt descriptor",
+            );
+        }
+    }
+
+    /// Every slot is reachable and no two shapes share one.
+    ///
+    /// A collision would be silent: two different return kinds would land on
+    /// one helper, and the one whose kind lost would read the field with the
+    /// wrong descriptor. The count also pins `VARHANDLE_READ_SLOTS` against the
+    /// two tables it is supposed to be the product of.
+    #[test]
+    fn every_mode_return_pair_has_its_own_slot() {
+        let mut seen = std::collections::HashSet::new();
+        for name in VARHANDLE_READ_MODES {
+            for ret in VARHANDLE_READ_RETURNS {
+                let desc = format!("(Ljava/lang/Object;){}", ret as char);
+                let slot = varhandle_read_helper_slot(name, &desc)
+                    .unwrap_or_else(|| panic!("{name}{desc} was not recognised"));
+                assert!(slot < VARHANDLE_READ_SLOTS);
+                assert!(seen.insert(slot), "{name}{desc} collided on slot {slot}");
+            }
+        }
+        assert_eq!(seen.len(), VARHANDLE_READ_SLOTS);
+    }
+
+    /// The shapes that must NOT bind, each for its own reason.
+    ///
+    /// This is the whole correctness argument for using the descriptor as the
+    /// instance-field test, so every family that reads through a `VarHandle`
+    /// with a different coordinate list is listed explicitly rather than
+    /// summarised. A regression here does not fail loudly — it hands a helper
+    /// that assumes `[handle, receiver]` an argument list of a different
+    /// shape.
+    #[test]
+    fn only_a_single_reference_coordinate_with_a_primitive_return_binds() {
+        // A static-field handle: no coordinates at all.
+        assert_eq!(varhandle_read_helper_slot("get", "()I"), None);
+        // An array-element handle: (array, index).
+        assert_eq!(varhandle_read_helper_slot("get", "([II)I"), None);
+        // A byte-array / ByteBuffer view handle: (container, byte offset).
+        assert_eq!(varhandle_read_helper_slot("get", "([BI)J"), None);
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/nio/ByteBuffer;I)J"),
+            None
+        );
+        // A MemorySegment handle: (segment, long offset).
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/foreign/MemorySegment;J)I"),
+            None
+        );
+        // Two reference coordinates.
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;Ljava/lang/Object;)I"),
+            None
+        );
+        // A primitive coordinate is not an instance-field receiver.
+        assert_eq!(varhandle_read_helper_slot("get", "(I)I"), None);
+        // Reference returns are out of scope — `unbox_poly_return_checked`'s
+        // W6-1 rule reads the SITE's declared class, which a baked direct call
+        // cannot carry. See `VARHANDLE_READ_DIRECT_FNS`.
+        assert_eq!(
+            varhandle_read_helper_slot("get", "(Ljava/lang/Object;)Ljava/lang/String;"),
+            None
+        );
+        assert_eq!(varhandle_read_helper_slot("get", "(Ljava/lang/Object;)[I"), None);
+        // `void` is not a read.
+        assert_eq!(varhandle_read_helper_slot("get", "(Ljava/lang/Object;)V"), None);
+        // Write and read-modify-write modes are not read modes.
+        for name in ["set", "setVolatile", "setRelease", "getAndAdd", "compareAndSet"] {
+            assert_eq!(
+                varhandle_read_helper_slot(name, "(Ljava/lang/Object;)I"),
+                None,
+                "{name} bound as a read mode",
+            );
+        }
+    }
+
+    /// An array-TYPED instance field still binds: `[I` as a *coordinate* means
+    /// the receiver is an array-valued object reference, which is an ordinary
+    /// instance-field read, not the array-ELEMENT handle the row above rejects.
+    /// The two are told apart by the coordinate COUNT, and this is the row that
+    /// says a stricter "no `[` anywhere" filter would be over-broad.
+    #[test]
+    fn an_array_typed_receiver_is_still_one_reference_coordinate() {
+        assert!(varhandle_read_helper_slot("get", "([Ljava/lang/String;)I").is_some());
+        assert!(varhandle_read_helper_slot("get", "([[B)J").is_some());
+        assert_eq!(varhandle_read_helper_slot("get", "([Ljava/lang/String;I)I"), None);
+    }
+
+    /// The cells default to "not wired", and `set_varhandle_read_direct_fns`
+    /// lands each address on the slot the recognition will look it up under.
+    ///
+    /// The failure this catches is an off-by-one or reversed registration
+    /// order, which would not fail to compile and would not fail loudly: a
+    /// `get`-returning-`I` site would call the helper whose baked slot says
+    /// `getAcquire` returning `Z`, and read the right field with the wrong
+    /// return kind.
+    #[test]
+    fn the_slots_are_registered_in_recognition_order() {
+        let addrs: [usize; VARHANDLE_READ_SLOTS] =
+            std::array::from_fn(|i| 0x1000 + i * 0x10);
+        set_varhandle_read_direct_fns(&addrs);
+        for name in VARHANDLE_READ_MODES {
+            for ret in VARHANDLE_READ_RETURNS {
+                let desc = format!("(Ljava/lang/Object;){}", ret as char);
+                let slot = varhandle_read_helper_slot(name, &desc).unwrap();
+                assert_eq!(
+                    VARHANDLE_READ_DIRECT_FNS[slot].load(std::sync::atomic::Ordering::Relaxed),
+                    addrs[slot],
+                    "{name}{desc} -> slot {slot}",
+                );
+            }
+        }
+        // Leave the cells as `build_helpers` would find them — `0` is the
+        // "use the generic dispatch helper" sentinel, and a fake address left
+        // behind here would be baked into a `CALL` by a later compile in the
+        // same test binary.
+        set_varhandle_read_direct_fns(&[0; VARHANDLE_READ_SLOTS]);
+        assert!(VARHANDLE_READ_DIRECT_FNS
+            .iter()
+            .all(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 0));
+    }
+
+    /// The two door counters are separate, so `VarHandle.read=N/0` reports two
+    /// facts. The OSR column is the load-bearing one — netty reads `refCnt`
+    /// inside loop bodies — and a single-pass-only bind reporting a non-zero
+    /// total would otherwise read as success.
+    #[test]
+    fn the_two_varhandle_door_counters_are_separate() {
+        let (before_sp, before_osr) = varhandle_read_direct_helper_sites();
+        VARHANDLE_READ_SITES_SINGLEPASS.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        let (mid_sp, mid_osr) = varhandle_read_direct_helper_sites();
+        assert_eq!(mid_sp, before_sp + 2);
+        assert_eq!(mid_osr, before_osr, "bumping single-pass moved the OSR tally");
+        VARHANDLE_READ_SITES_OSR.fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        let (end_sp, end_osr) = varhandle_read_direct_helper_sites();
+        assert_eq!(end_sp, before_sp + 2);
+        assert_eq!(end_osr, before_osr + 7);
+    }
+}
+
+#[cfg(test)]
 mod tests {
 
     /// The `System.arraycopy` intrinsic's scratch homes must be allocated
@@ -22075,6 +23499,77 @@ mod tests {
                 "{label} must be recognised as a deopt-guarded trap"
             );
         }
+    }
+
+    /// `jit_ir_exception_stub_throw_bci`'s probe must stay ADMISSIBLE here.
+    ///
+    /// That e2e test is the only thing that shows the IR exception stub's
+    /// `jit_set_throw_bci` stamp reaching the interpreter's handler search and
+    /// running a `finally`; its codegen twin can only assert bytes. It also
+    /// needs the OPTIMIZING tier specifically — the single-pass backend and the
+    /// interpreter were always correct here — so it opens with an anti-vacuity
+    /// assertion and reports FAILED rather than passing when the tier declines
+    /// its probe.
+    ///
+    /// On 2026-08-17 this rule landed and declined it, and the test sat red for
+    /// four days saying "this run proves nothing" while nobody read it. The e2e
+    /// test cannot prevent that recurrence: it needs a built binary and a JDK,
+    /// so it is skippable and slow. THIS test needs neither and runs in
+    /// `cargo test -p cratonvm-jit`.
+    ///
+    /// Both shapes are pinned, because only the pair says the probe is admitted
+    /// for the right reason rather than because the rule stopped working.
+    #[test]
+    fn the_throw_bci_probe_body_stays_admissible_to_the_optimizing_tier() {
+        // `IrExceptionStubThrowBciProbe.body(int, int[])`, javac 25, verbatim:
+        //
+        //   0: aload_1  1: iconst_0  2: aload_1  3: iconst_0  4: iaload
+        //   5: iconst_1 6: iadd      7: iastore  8: iload_0
+        //   9: invokestatic #16
+        //  12: aload_1 13: iconst_0 14: aload_1 15: iconst_0 16: iaload
+        //  17: iconst_1 18: isub    19: iastore 20: goto 34
+        //  23: astore_2 24: aload_1 25: iconst_0 26: aload_1 27: iconst_0
+        //  28: iaload  29: iconst_1 30: isub    31: iastore
+        //  32: aload_2 33: athrow   34: return
+        let body = [
+            0x2b, 0x03, 0x2b, 0x03, 0x2e, 0x04, 0x60, 0x4f, 0x1a, 0xb8, 0x00, 0x10, 0x2b, 0x03,
+            0x2b, 0x03, 0x2e, 0x04, 0x64, 0x4f, 0xa7, 0x00, 0x0e, 0x3d, 0x2b, 0x03, 0x2b, 0x03,
+            0x2e, 0x04, 0x64, 0x4f, 0x2c, 0xbf, 0xb1,
+        ];
+        let table = |start: u16, end: u16| {
+            vec![cratonvm_reader::attribute::ExceptionTableEntry {
+                start_pc: start,
+                end_pc: end,
+                handler_pc: 23,
+                // 0 = catch-all, i.e. the `finally` whose region does not span
+                // the method — the property the defect needs.
+                catch_type: 0,
+            }]
+        };
+
+        // The shape the probe carries TODAY: the increment is hoisted above the
+        // `try`, so the range covers `iload_0` + `invokestatic` and nothing the
+        // IR tier lowers to a deopt guard.
+        assert_eq!(
+            ir_unresumable_protected_trap(&body, body.len(), &table(8, 12)),
+            None,
+            "the throw-bci probe's `body` must stay admissible to the optimizing \
+             tier — `vm/tests/jit_ir_exception_stub_throw_bci.rs` proves nothing \
+             about the IR exception stub without it. If this rule must decline \
+             the shape, the probe needs rewriting in the same commit, NOT a \
+             relaxed precondition."
+        );
+
+        // The shape it carried BEFORE 2026-08-21, with `n[0] = n[0] + 1` inside
+        // the `try`: range 0..12 catches the `iaload` at 4 next to the `iastore`
+        // at 7 and the invoke at 9. Pinned so this test cannot pass because the
+        // rule stopped recognising anything.
+        assert_eq!(
+            ir_unresumable_protected_trap(&body, body.len(), &table(0, 12)),
+            Some((4, 0x2e)),
+            "the pre-2026-08-21 probe shape must still be DECLINED — if it is \
+             not, this rule has stopped working and the row above is vacuous"
+        );
     }
 
     /// RBC.6's admission list must match what the lowerings actually publish.
@@ -25107,6 +26602,122 @@ mod tests {
     }
 
     // ── validate_code_ptr tests ─────────────────────────────────────
+
+    /// The memo must not change any ANSWER, only the cost of reaching it.
+    ///
+    /// Both arms are exercised in one process on purpose: routing this through
+    /// `CRATONVM_JIT_NO_CODE_PTR_MEMO` would be a `set_var` race against every
+    /// other test in this binary (see
+    /// `reference_set_var_in_a_parallel_test_suite_is_a_data_race`), so the
+    /// test drives the two implementations directly instead.
+    #[test]
+    fn code_ptr_memo_agrees_with_the_locked_lookup_on_every_probe() {
+        // A real region, so both arms have something to find.
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let base = buf.as_ptr() as usize;
+        let probes = [
+            base,
+            base + 4,
+            base + 4092,
+            base + 4096, // one past the end
+            base.wrapping_sub(4),
+            0x1000,
+        ];
+        for p in probes {
+            let ptr = p as *const u8;
+            let memo_answer = validate_code_ptr(ptr).is_ok();
+            let locked_answer = {
+                let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+                !ptr.is_null() && (p % 4 == 0) && regions.contains(ptr)
+            };
+            assert_eq!(
+                memo_answer, locked_answer,
+                "memo and locked lookup disagree at {p:#x} (region {base:#x}..{:#x})",
+                base + 4096
+            );
+        }
+        // A second pass, now that the memo is warm, must give the same answers:
+        // a warm memo that starts admitting addresses outside its region is the
+        // failure this whole design has to exclude.
+        for p in probes {
+            let ptr = p as *const u8;
+            let memo_answer = validate_code_ptr(ptr).is_ok();
+            let locked_answer = {
+                let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+                !ptr.is_null() && (p % 4 == 0) && regions.contains(ptr)
+            };
+            assert_eq!(memo_answer, locked_answer, "warm memo disagrees at {p:#x}");
+        }
+    }
+
+    /// A dropped buffer must stop validating, memo or no memo.
+    ///
+    /// This is the one thing an address-keyed cache can get wrong, and the only
+    /// reason [`REGIONS_EPOCH`] exists. Without the epoch the memo would keep
+    /// admitting a pointer into a region that has been unmapped -- and the
+    /// caller's next act is `transmute` and `call`.
+    #[test]
+    fn dropping_a_region_invalidates_a_warm_memo() {
+        let (base, len) = {
+            let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+            let base = buf.as_ptr() as usize;
+            // Warm the memo on this region.
+            assert!(
+                validate_code_ptr(base as *const u8).is_ok(),
+                "a live region must validate"
+            );
+            (base, 4096usize)
+        };
+        // `buf` is dropped: `deregister` ran and bumped the epoch.
+        let _ = len;
+        assert!(
+            validate_code_ptr(base as *const u8).is_err(),
+            "a pointer into an unmapped region must stop validating even though \
+             the memo was warm for it"
+        );
+    }
+
+    /// The epoch is what the memo trusts, so it must actually move.
+    #[test]
+    fn registering_and_deregistering_move_the_regions_epoch() {
+        let before = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let buf = ExecutableBuffer::new(4096).expect("executable buffer");
+        let after_register = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            after_register > before,
+            "register must bump the epoch ({before} -> {after_register})"
+        );
+        drop(buf);
+        let after_drop = REGIONS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            after_drop > after_register,
+            "deregister must bump the epoch ({after_register} -> {after_drop})"
+        );
+    }
+
+    /// The kill switch's `off_key` must be the key the reader reads.
+    ///
+    /// Mirrors `native_site_cache_default_is_on_and_the_kill_switch_kills`: a
+    /// kill switch wired to a key nothing reads is a switch that reports itself
+    /// present and does nothing.
+    #[test]
+    fn code_ptr_memo_default_is_on_and_its_kill_switch_is_declared() {
+        assert!(
+            code_ptr_memo_enabled(),
+            "the memo is default-ON; no test in this binary sets \
+             CRATONVM_JIT_NO_CODE_PTR_MEMO"
+        );
+        let entry = cratonvm_types::flag_groups::INVENTORY
+            .iter()
+            .find(|e| e.token == "code-ptr-memo")
+            .expect("code-ptr-memo must be a declared JIT token");
+        assert_eq!(
+            entry.off_key,
+            Some("CRATONVM_JIT_NO_CODE_PTR_MEMO"),
+            "the kill switch's off_key must be the key `code_ptr_memo_enabled` reads"
+        );
+        assert_eq!(entry.on_key, None, "a default-ON kill switch has no on_key");
+    }
 
     #[test]
     fn test_validate_code_ptr_null() {
@@ -30339,7 +31950,7 @@ mod layout_constant_inventory {
         // branch, `HEADER_SIZE + field_index * SLOT_SIZE` plus the payload bias
         // inside the 16-byte `Value` cell. It is the arm that stopped every
         // legacy-layout receiver from taking `jit_getfield` — see
-        // known-issues/jit/every-jit-getfield-takes-the-helper-because-the-guarded-inline-check-always-fails-20260817.md
+        // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md
         // — and it is a disp32 site in all three forms it emits
         // (`48 8B 80 disp32`, `8B 80 disp32`, `48 63 80 disp32`), so it does
         // not share the disp8 hazard either. `SLOT_SIZE` goes 5 -> 6 with it:
@@ -31059,6 +32670,49 @@ mod mic_devirt_evidence {
 /// invalidation silently skipped, leaving a devirtualised call bound to a
 /// method that now has a second implementor — is a miscompile, not a slowdown.
 /// So each case below is the equivalence, not the speed.
+#[cfg(test)]
+mod local_handler_site_cache {
+    use super::*;
+
+    /// The whole reason the cache is ONE `u64` and not two `u32`s: a reader
+    /// must never be able to pair one throwable's class id with another
+    /// throwable's answer. Round-tripping every field together is what says
+    /// the packing has that property.
+    #[test]
+    fn the_cache_round_trips_class_and_index_together() {
+        for (class_id, index) in [(1u32, 0i32), (0, 3), (0x7fff_ffff, -1), (1163, 2)] {
+            let raw = JitLocalHandlerSite::encode_cache(class_id, index);
+            assert_ne!(
+                raw,
+                JitLocalHandlerSite::CACHE_EMPTY,
+                "a populated cache must be distinguishable from an empty one, \
+                 including for class id 0 and index -1"
+            );
+            assert_eq!(
+                JitLocalHandlerSite::decode_cache(raw),
+                Some((class_id, index)),
+                "class {class_id} / index {index} did not survive the packing"
+            );
+        }
+    }
+
+    /// `-1` — "this frame does not catch it" — is worth caching: a site that
+    /// keeps propagating must not re-resolve its catch types on every throw.
+    /// So the empty state cannot be "index is negative"; it is its own bit.
+    #[test]
+    fn an_empty_cache_is_not_a_cached_propagate() {
+        assert_eq!(
+            JitLocalHandlerSite::decode_cache(JitLocalHandlerSite::CACHE_EMPTY),
+            None
+        );
+        let cached_propagate = JitLocalHandlerSite::encode_cache(7, -1);
+        assert_eq!(
+            JitLocalHandlerSite::decode_cache(cached_propagate),
+            Some((7, -1))
+        );
+    }
+}
+
 #[cfg(test)]
 mod invalidate_early_out {
     use super::*;
