@@ -1179,6 +1179,54 @@ impl<
         Ok(())
     }
 
+    /// Async device->host copy of a SUB-RANGE, starting at element
+    /// `offset` and running for `dst.len()` elements.
+    ///
+    /// The whole-buffer [`to_host_async_raw`](Self::to_host_async_raw)
+    /// cannot express a chunked writeback: overlapping chunk N's copy with
+    /// chunk N+1's kernel needs each copy to name its own slice of one
+    /// device buffer. Same `last_write` wait discipline as the full-buffer
+    /// form — the wait is on the buffer, because a chunked launch's writes
+    /// to *this* slice are ordered by the caller's own per-chunk event.
+    pub(crate) fn to_host_async_range_raw(
+        &self,
+        dst: &mut [T],
+        offset: usize,
+        user_stream: cudarc::driver::sys::CUstream,
+        wait_event: Option<cudarc::driver::sys::CUevent>,
+    ) -> Result<()> {
+        let end = offset.checked_add(dst.len()).ok_or_else(|| {
+            DeviceError::Memcpy("to_host_async_range: offset + len overflows".into())
+        })?;
+        if end > self.len() {
+            return Err(DeviceError::Memcpy(format!(
+                "to_host_async_range out of bounds: offset={offset} len={} buffer={}",
+                dst.len(),
+                self.len()
+            )));
+        }
+        let base = *DevicePtr::device_ptr(&*self.slice);
+        // Cast: element offset -> byte offset on the device pointer.
+        let src = base + (offset * std::mem::size_of::<T>()) as u64;
+        // SAFETY: the range is bounds-checked against the buffer above, so
+        // `src .. src + dst.len()*size_of::<T>()` lies inside the
+        // allocation. `wait_event` is kept alive by the `lib.rs` caller for
+        // the duration of this call, exactly as in `to_host_async_raw`.
+        unsafe {
+            if let Some(ev) = wait_event {
+                cudarc::driver::result::stream::wait_event(
+                    user_stream,
+                    ev,
+                    cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                )
+                .map_err(map_err("cuStreamWaitEvent user_stream<-last_write"))?;
+            }
+            cudarc::driver::result::memcpy_dtoh_async(dst, src, user_stream)
+                .map_err(map_err("cuMemcpyDtoHAsync range user_stream"))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn len(&self) -> usize {
         DeviceSlice::len(&*self.slice)
     }
@@ -1229,5 +1277,75 @@ impl<T: Send + Sync + 'static> DeviceBufferInner<T> {
         let addr = *DevicePtr::device_ptr(&*self.slice);
         let keep_alive: BufferKeepAlive = self.slice.clone();
         (addr, keep_alive)
+    }
+}
+
+/// Page-locked host allocation backing [`crate::PinnedHostBuffer`].
+pub(crate) struct PinnedHostInner<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+    _ctx: DeviceContextInner,
+    _marker: std::marker::PhantomData<T>,
+}
+
+// SAFETY: the allocation is a plain page-locked host region owned by this
+// value; the raw pointer is only dereferenced through `as_mut_slice`, whose
+// safety contract puts DMA ordering on the caller. Same argument the rest of
+// this crate makes for its `CUstream`/`CUevent` handles.
+unsafe impl<T: Copy + Send> Send for PinnedHostInner<T> {}
+// SAFETY: as above; shared references hand out no interior mutability of
+// their own.
+unsafe impl<T: Copy + Sync> Sync for PinnedHostInner<T> {}
+
+impl<T: Copy + Default> PinnedHostInner<T> {
+    pub(crate) fn new(ctx: &crate::DeviceContext, len: usize) -> Result<Self> {
+        let inner = ctx.inner().clone();
+        inner.bind_to_thread()?;
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| DeviceError::Memcpy("pinned host alloc size overflows".into()))?;
+        let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `raw` is a live out-param for the duration of the call and
+        // the context is bound on this thread just above.
+        unsafe {
+            cudarc::driver::sys::lib()
+                .cuMemAllocHost_v2(&mut raw, bytes.max(1))
+                .result()
+                .map_err(map_err("cuMemAllocHost"))?;
+        }
+        Ok(Self {
+            ptr: raw as *mut T,
+            len,
+            _ctx: inner,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// # Safety
+    /// See [`crate::PinnedHostBuffer::as_mut_slice`].
+    pub(crate) unsafe fn as_mut_slice(&self) -> &mut [T] {
+        std::slice::from_raw_parts_mut(self.ptr, self.len)
+    }
+}
+
+impl<T: Copy> Drop for PinnedHostInner<T> {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        // Binding can only fail if the context is already gone, in which
+        // case the allocation went with it.
+        if self._ctx.bind_to_thread().is_err() {
+            return;
+        }
+        // SAFETY: `ptr` came from `cuMemAllocHost_v2` in `new` and is freed
+        // exactly once, here.
+        unsafe {
+            let _ = cudarc::driver::sys::lib().cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
+        }
     }
 }
