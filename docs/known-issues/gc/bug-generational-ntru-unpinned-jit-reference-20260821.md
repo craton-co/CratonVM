@@ -76,15 +76,37 @@ any commit can pass twice by chance — so every GOOD verdict in that trace is
 unsound, and the bisect walked a tree of unreliable answers to a confident
 conclusion. Do not cite it.
 
-What has to happen first is the **rate** at both endpoints, interleaved so load
-lands on both. The question that decides whether a bisect is even meaningful is
-whether `684f37e14` fails at all: if it does, there is no regression here, only
-a long-standing intermittent defect, and the window framing above is wrong
-rather than merely wide.
+## The rate, measured — and it IS a regression
 
-A bisect over an intermittent failure needs enough repetitions per step to
-separate "good" from "unlucky", which multiplies an already ~8-step, ~10-minute-
-per-step search. Establish the rate before paying for that.
+Ten runs per endpoint, interleaved so host load lands on both equally:
+
+```text
+bad  cae49a85c   SIG=7  PASS=3     ~70% per run
+good 684f37e14   SIG=0  PASS=10    0/10, never reproduced
+```
+
+Two things follow.
+
+**The regression is real.** The good end is clean in ten runs, so this is not a
+long-standing intermittent defect that was always present — something inside
+`684f37e14..cae49a85c` introduced it. That was the question that decided whether
+bisecting is meaningful at all.
+
+**The void bisect is explained arithmetically, not vaguely.** At 70% per run,
+two consecutive passes occur 0.3² = **9%** of the time. The first probe required
+exactly two passes to call a commit good, so it carried a 9% chance of
+mislabelling *any* bad commit — and it spent that on the endpoint check. Nothing
+about the host or the tooling was wrong; the probe was simply under-powered for
+the rate, and the rate had not been measured.
+
+The re-run uses **six** consecutive clean passes for GOOD (0.3⁶ ≈ 0.07% per
+step, ~0.6% over eight steps) and exits on the first signature, so bad commits
+stay cheap and only genuinely good ones pay the full six.
+
+A GOOD verdict still means "did not reproduce in six", not proof: if the failure
+rate collapses near the introduction point, six passes buys less than that
+arithmetic suggests. Whatever commit the search names should be confirmed by
+re-running it and its parent directly, rather than trusting the walk.
 
 ## What the failing run shows
 
