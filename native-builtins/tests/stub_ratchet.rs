@@ -1013,7 +1013,58 @@ use cratonvm_types::compat::CompatibilityMode;
 /// management     1627 SyntheticStub out of 13628 total
 /// no-management  1616 SyntheticStub out of 13260 total
 /// ```
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1627;
+///
+/// # 1627 / 1616 -> 1573 / 1562, 2026-08-22 -- FIFTY-FOUR rows retired, and the
+/// same rows this file re-froze UPWARD nine hours earlier
+///
+/// The third case, at the largest scale this gate has recorded: -54 in BOTH
+/// configurations, every row from `native-io/src/watch.rs`, deleted rather than
+/// relabelled.
+///
+/// **This closes an arc that starts in the block above.** That entry re-froze
+/// 1609/1598 -> 1627/1616 for an abstract->concrete respelling: nine
+/// `UnixWatchService` rows became twenty-seven on `Bsd`/`Linux`/`MacOSXWatchService`
+/// because a registration on an abstract class can never be dispatched. The
+/// respelling was correct AND those twenty-seven are inside the fifty-four now
+/// gone -- making a row legal to dispatch is what made it measurable, and the
+/// measurement said none of them could ever fire.
+///
+/// **The evidence is the part to copy.** `WORKER-4-2` N5 had measured
+/// `invocations: 0` and REFUSED to delete, because a census of the DEFAULT build
+/// says nothing about `--features synthetic-jdk`. That refusal was right. This
+/// round made the missing build:
+///
+/// ```text
+///                             watch.rs rows   INVOKED   probe
+///   --jdk-only                       0            0      PASS
+///   --real-jdk                      54            0      PASS
+///   --features synthetic-jdk        54            0      PASS
+/// ```
+///
+/// and then asked the IMAGE rather than the census. `javap --module java.base`:
+/// the real natives on `sun.nio.fs.LinuxWatchService` are `eventSize`,
+/// `eventOffsets`, `inotifyInit`, `inotifyAddWatch`, `inotifyRmWatch`,
+/// `configureBlocking`, `socketpair` and `poll(int,int)` -- **not** the
+/// `init0`/`register0`/`take0`/`poll0(J)`/`cancel0`/`close0`/`reset0`/
+/// `pollEventKinds0`/`pollEventNames0` set that was registered. They were a
+/// CratonVM-defined API wearing `sun.nio.fs` names, so no JDK bytecode could
+/// ever have dispatched to them.
+///
+/// **A stub count is also a coverage CLAIM, and this one was false.** 54 rows
+/// spelled `sun/nio/fs/*` made the census read as covering that package. The
+/// retirement removes an over-count as well as a population.
+///
+/// The engine is deliberately KEPT: `open_watch_service`, `register_dir`,
+/// `poll_with_timeout`, `take_blocking`, `poll_events`, `reset_key`,
+/// `cancel_key`, `close_watch_service` are a real inotify-backed implementation
+/// with its own tests. What was wrong was the DOOR, not the room.
+///
+/// Totals moved 13260 -> 13385 and 13628 -> 13753, i.e. UP by ~125 while stubs
+/// fell 54 -- so this window is not a pure deletion; other work added Bridge
+/// rows alongside it. The two-column rule adjudicates that correctly as long as
+/// both numbers are read, which is why the second column is re-measured here
+/// rather than carried.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1573;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1028,7 +1079,7 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1627;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1616;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1562;
 
 /// The TOTAL registration count each baseline above was measured beside.
 ///
@@ -1058,13 +1109,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1616;
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
 /// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13628;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13753;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13260;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13385;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
