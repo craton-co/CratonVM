@@ -6784,6 +6784,19 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if let Some(r) = vc_route(ctx, args, native_al_iterator) {
         return r;
     }
+    // The `Hashtable` family's THIRD door. `keySet()` and `entrySet()` are
+    // set-shaped and route through `native_hs_iterator`; `values()` is
+    // ArrayList-shaped and arrives here, so without this the same map answered
+    // `Hashtable$Enumerator` for two of its views and `ArrayList$Itr` for the
+    // third. See [`real_ht_view_enumerator`] — java.base's own cursor, no
+    // natives registered on it and no force-native gate entry.
+    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+        if let Some(src_map) = values_view_source(&*ctx, recv) {
+            if let Some(e) = real_ht_view_enumerator(ctx, recv, src_map)? {
+                return Ok(Some(Value::Object(Some(e))));
+            }
+        }
+    }
     let input = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -17845,6 +17858,7 @@ const HT_ENUMERATOR: &str = "java/util/Hashtable$Enumerator";
 const HT_ENUMERATOR_CTOR: &str = "(Ljava/util/Hashtable;IZ)V";
 /// `Hashtable.KEYS` / `.VALUES` / `.ENTRIES`, the `type` argument above.
 const HT_ENUM_KEYS: i32 = 0;
+const HT_ENUM_VALUES: i32 = 1;
 const HT_ENUM_ENTRIES: i32 = 2;
 
 /// A real `Hashtable$Enumerator` over the Hashtable behind a `Hashtable$KeySet`
@@ -17906,6 +17920,12 @@ fn real_ht_view_enumerator(
     {
         Some("java/util/Hashtable$KeySet") => HT_ENUM_KEYS,
         Some("java/util/Hashtable$EntrySet") => HT_ENUM_ENTRIES,
+        // HotSpot answers ONE class for all three of a Hashtable's views.
+        // MEASURED: `ht.values().iterator()` is a `Hashtable$Enumerator` there
+        // and was a `java.util.ArrayList$Itr` here, because the values carrier
+        // is ArrayList-SHAPED and reaches `native_al_iterator` rather than
+        // `native_hs_iterator`. Same cursor, different door.
+        Some("java/util/Hashtable$ValueCollection") => HT_ENUM_VALUES,
         _ => return Ok(None),
     };
     // Never accept a stand-in: a fabricated `Hashtable$Enumerator` is exactly
