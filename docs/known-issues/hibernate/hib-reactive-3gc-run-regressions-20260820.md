@@ -900,6 +900,24 @@ the two hosts/worktrees touched, not a commit — the next session working
 from a *different* worktree's copy of this script should apply the same
 change (or copy the fixed file) if it hits this again.
 
+**Windows-box copy also fixed, same day.** That copy
+(`C:\craton\cratonvm\apps\hibernate-reactive-suite-runner\`) never had the
+`docker\.sock` alternative — only section 5's original `"$tmp" "$RAW"`
+scope bug, in its own differently-shaped `sig`-generation block (an
+if/else on a single combined `grep`, rather than the Azure copies' "compute
+sig first, then prepend NO-DB" shape). Applied the equivalent fix: both
+`grep` calls in that block now check `"$tmp"` only. Verified the same way —
+a synthetic repro (current class's own output holding a real cascade
+failure, `$RAW` holding an *earlier* class's genuine `ConnectException:
+Connection refused`) false-positives under the old two-argument `grep` and
+correctly does not under the fixed one-argument form; a synthetic genuine
+`ConnectException: Connection refused` in `$tmp` alone still matches, so
+real no-DB detection is unaffected there either. `bash -n` passes. All
+three known copies of this script (`/data/cratonvm`,
+`/data/cvm-hibreactive-idle-20260820`, and this Windows box) now carry the
+`$tmp`-only fix; only the Azure copies also needed the `docker\.sock`
+removal, since the Windows copy's pattern list never included it.
+
 ### 7.5 Updated status
 
 Of the 9 classes now checked with `--jit on` vs `--jit off` (`FilterWithPaginationTest`

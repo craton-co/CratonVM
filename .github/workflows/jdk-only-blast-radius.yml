@@ -46,17 +46,33 @@ name: JDK-only blast radius
 #   * The prefixes are NOT DISJOINT IN EFFECT: `LinkedHashMap extends HashMap`,
 #     and `HashSet` is backed by a `HashMap`, so arming one already enforces
 #     shadows the other's run touches.
-#   * A green cell means "these 105 vectors raise no objection", not "this
-#     family is retirable" — the corpus has no AWT vector at all (`G79-1`).
-#   * The dial is read at ONE dispatch site (`H7-1` N2), so every cell is a
-#     FLOOR for what a real retirement costs.
+#   * A green cell means "these vectors raise no objection", not "this family
+#     is retirable" — the corpus has no AWT vector at all (`G79-1`). The
+#     denominator moves; the script prints the live one.
+#   * **Cells measured before 2026-08-21 are void, and NOT in the direction the
+#     old caveat here claimed.** The dial then reached 1 of 14 dispatch doors
+#     (890 of 947 armed `Bridge` dispatches never asked it); it reaches all 14
+#     now. Half-armed measured MORE damage, not less — `java/util/HashMap`
+#     81/104 then, 86/104 once every door consulted the dial — because
+#     half-armed is a corrupt hybrid, not a partial retirement. An old cell is
+#     not a conservative version of a current one.
+#   * One conservatism survives and this one IS a floor: a yield needs concrete
+#     bytecode to yield to, so a triple whose shadowed method has no `Code`
+#     still runs its native. `--jdk-only-report`'s
+#     `enforcement_dial.declined_no_bytecode` counts exactly those.
 #
-# Only `25-linux` would be adjudicated here, and no baseline for that key
-# exists yet: the committed one is `25-windows` and is marked
-# `!adjudicating no`, so the script prints it as a reference and exits 2. That
-# is deliberate — a baseline from another key cannot score this one, and "no
-# baseline" must never read as "nothing moved". First person to run this on the
-# self-hosted image should take one with `--update-baseline`.
+# `25-linux` is what this job measures, and a baseline for that key was taken on
+# 2026-08-22 — before that, every scheduled run measured a table and scored
+# NOTHING, exiting 2 with a `::notice::` saying so.
+#
+# **The baseline deliberately EXCLUDES `RTreeRangeGc`**, and that is the whole
+# reason it was not taken sooner. That vector flips on the SAME BINARY (it
+# passed a `--jdk-only` arm and failed a `SUITE=all` arm nine minutes later, on
+# one build), so baselining it would make this job report REGRESSION/REPAIRED
+# noise every week. A gate that cries wolf is the `G89-1` failure this file's
+# own header cites as the reason it is non-blocking — so a flaky vector must be
+# characterised and excluded BEFORE a baseline is taken, never after.
+# See docs/known-issues/jdk-only/ for the flake's record.
 
 on:
   workflow_dispatch:

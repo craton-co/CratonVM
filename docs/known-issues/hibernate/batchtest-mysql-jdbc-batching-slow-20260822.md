@@ -15,6 +15,23 @@ answers, no crash. What this page is worth keeping for is the measurement
 below: it says where the 4.5-7.2x actually is, so throughput work aims at the
 right thing.
 
+## Context (from the original page, unchanged)
+
+Found while triaging the 50-class FAIL set from the 2026-08-21/22 Hibernate
+ORM x MySQL 3-GC full-suite run (see
+[`mysql-cross-class-stale-schema-shared-worker-db-20260822.md`](mysql-cross-class-stale-schema-shared-worker-db-20260822.md)
+for the full triage). Of that 50, 46 turned out to be a cross-class
+schema-reuse artifact and 3 more were pre-existing / not-CratonVM issues. This
+was the one residual that isolated cleanly, and the original page read that
+isolation as "a genuine, new, MySQL-specific CratonVM behavior". The first
+measurement below is the control that reading needed and never had.
+
+The original evidence, for the record: HotSpot (Temurin 25.0.3)
+`found=4 ok=4 failed=0` in 24 816 ms for the whole class; CratonVM (ZGC, JIT
+on) `found=4 ok=3 failed=1` in 140 786 ms, the failure being
+`TimeoutException: testBatchInsertUpdate(...) timed out after 120 seconds`.
+Both reproduce here.
+
 ## The control the original page never ran
 
 Same class, same method, same harness, same `common.args`, fresh never-used

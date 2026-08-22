@@ -8060,6 +8060,153 @@ mod enforcement_dial_door_tests {
         );
     }
 
+    /// Every production file that forces a native either asks the dial, or is
+    /// named here with a reason.
+    ///
+    /// # Why a source scan, and not a counter
+    ///
+    /// `enforcement_dial` in `--jdk-only-report` counts a door only when that
+    /// door calls `note_dial_door`. A door that calls neither the dial nor the
+    /// census is therefore **invisible to the census**: `reached` does not
+    /// rise, `declined_no_bytecode` does not rise, and an armed report reads
+    /// exactly as it does when every door is wired. **Counting cannot find a
+    /// missing counter.**
+    ///
+    /// That was not hypothetical. On 2026-08-22, after the fourteen-door fix,
+    /// `dispatch_virtual.rs` and `jit_bridge.rs` were each still forcing
+    /// natives through `force_native_over_real_jdk_bytecode` with ZERO dial
+    /// calls and ZERO census calls anywhere in the file — while the armed
+    /// report showed `reached == yielded` and nothing amiss. Lane WORKER 2 hit
+    /// the same gap from the other end: an armed `ConcurrentHashMap` dropping
+    /// stores and calling each one a fresh insert.
+    ///
+    /// So this gate is structural. Adding a new undialled force path is a RED
+    /// TEST rather than something the next lane discovers from a corrupted map.
+    #[test]
+    fn every_force_native_file_asks_the_dial_or_is_exempt() {
+        // EMPTY IS THE GOAL. A row is a known hole that has been written down,
+        // not an approval — and it must be edited to add one, which is the
+        // difference between this and a comment saying "be careful here".
+        const FORCE_SITES_EXEMPT: &[(&str, &str)] = &[
+            (
+                "dispatch_virtual.rs",
+                "vtable force path; memoizes into a per-entry force_native_cache \
+                 OnceLock, so the dial needs the memo to be dial-aware (the \
+                 2026-08-04 per-call-site drift hazard). Fixed on the handoff \
+                 branch by 089329af7; drop this row when that reaches dev.",
+            ),
+            (
+                "jit_bridge.rs",
+                "JIT direct-bind force path. A compiled site that binds a native \
+                 directly has no interpreter door to report through, so this needs \
+                 the bind to consult the dial, not a counter at a door.",
+            ),
+        ];
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+
+        fn calls_force(src: &str) -> bool {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("force_native_over_real_jdk_bytecode("))
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for f in &files {
+            let name = f.file_name().unwrap().to_string_lossy().to_string();
+            // `tests.rs` asserts the force TABLE's contents and dispatches
+            // nothing; `native_override.rs` defines both the helper and the dial.
+            if name == "tests.rs" || name == "native_override.rs" {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            if !calls_force(&src) {
+                continue;
+            }
+            checked += 1;
+            let asks = src.contains("jdk_only_dial_yields_to_bytecode")
+                || src.contains("enforce_shadow_scope()");
+            let exempt = FORCE_SITES_EXEMPT.iter().any(|(n, _)| *n == name);
+            if !asks && !exempt {
+                offenders.push(name);
+            }
+        }
+
+        assert!(
+            checked > 0,
+            "no file under vm/src calls `force_native_over_real_jdk_bytecode(`, so this scan \
+             is searching for a spelling that no longer exists and would pass on a tree with \
+             no force gate at all"
+        );
+        assert!(
+            offenders.is_empty(),
+            "{offenders:?} force natives through `force_native_over_real_jdk_bytecode` without \
+             ever consulting the enforcement dial, and without a row in FORCE_SITES_EXEMPT.\n\n\
+             The `enforcement_dial` report CANNOT catch this: a door that never calls \
+             `note_dial_door` does not raise `reached`, so an armed run looks identical to a \
+             correctly-wired one. That is how these two files stayed undialled through a lane \
+             that measured 890 of 947 leaked dispatches and believed it had closed all of \
+             them.\n\n\
+             Either consult the dial at the force site, or add a row with the reason."
+        );
+
+        // The exemption list must not rot, in EITHER direction, and the second
+        // direction is the one that actually happens.
+        //
+        //   * a row naming a file that no longer forces anything is a stale
+        //     approval;
+        //   * a row naming a file that has since been WIRED is worse — it is a
+        //     standing approval for a hole somebody already filled, and nothing
+        //     would ever remove it.
+        //
+        // With both checked, this list can only shrink: wiring a force site
+        // turns the gate red until its row is deleted.
+        for (name, _) in FORCE_SITES_EXEMPT {
+            let found = files
+                .iter()
+                .find(|f| f.file_name().unwrap().to_string_lossy() == *name)
+                .and_then(|f| std::fs::read_to_string(f).ok());
+            let Some(src) = found else {
+                panic!(
+                    "FORCE_SITES_EXEMPT names `{name}`, which is not a file under vm/src. \
+                     Drop the row — a row that matches nothing reads as a reviewed hole."
+                );
+            };
+            assert!(
+                calls_force(&src),
+                "FORCE_SITES_EXEMPT names `{name}`, which no longer calls the force helper. \
+                 Drop the row — a stale exemption reads as a reviewed hole."
+            );
+            assert!(
+                !(src.contains("jdk_only_dial_yields_to_bytecode")
+                    || src.contains("enforce_shadow_scope()")),
+                "FORCE_SITES_EXEMPT still names `{name}`, but it NOW CONSULTS THE DIAL. \
+                 Delete the row. An exemption that outlives the hole it excused is a \
+                 standing approval nobody will ever revisit, and it makes the list read \
+                 as bigger than the remaining problem."
+            );
+        }
+    }
+
     /// The scans above can fail.
     ///
     /// A guard that cannot fail reads exactly like one that works; this file

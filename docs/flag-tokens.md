@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-469 tokens.
+470 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -436,6 +436,7 @@ export inherited from a parent shell.
 | `sc-write` | `CRATONVM_DBG_SC_WRITE` |
 | `scalar-deopt` | `CRATONVM_DBG_SCALAR_DEOPT` |
 | `scalar-new` | `CRATONVM_DBG_SCALAR_NEW` |
+| `scanner-debug` | `CRATONVM_SCANNER_DEBUG` |
 | `seed-all-old` | `CRATONVM_DBG_SEED_ALL_OLD` |
 | `seedhunt` | `CRATONVM_DBG_SEEDHUNT` |
 | `sel` | `CRATONVM_DBG_SEL` |
