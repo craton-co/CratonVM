@@ -142,10 +142,10 @@ Collecting every measurement of this failure, in the order taken:
 | `e40c176d8` | SIG 0/15 | confirmation, interleaved |
 | `0fbb1df8a`, `927350e53` | SIG 0/15 each | same interleave |
 
-The rate tracks **when the runs happened** at least as strongly as **which
-commit** was built. That is the property that makes an ordinary bisect
-unusable here: an absolute per-commit verdict is measuring the box as much as
-the code.
+**An earlier version of this record read that table as "the rate tracks WHEN the
+run happened". That was wrong**, and a knob experiment plus pooling disproves it
+— see the two sections below. The rate tracks the COMMIT. The apparent
+time-correlation was small-sample noise being over-read.
 
 The one measurement that controls for it is the interleaved endpoint pair, and
 **it reproduced exactly**:
@@ -177,6 +177,50 @@ It also prices the search honestly. Detecting a 5% rate with confidence needs on
 the order of 60 reps per step, not 6 or 15 — and near the introduction point
 that is exactly the rate a bisect would face.
 
+## No knob makes it deterministic
+
+Same binary (`cae49a85c`) across five arms, 5 reps each, to see whether anything
+removes the variance. Heap pressure was the leading candidate — a smaller heap
+means more young collections and more chances at the race — and CPU contention
+was the other, because the rate *looked* load-correlated.
+
+```text
+baseline-1g    SIG=4 PASS=1 OTHER=0
+heap-512m      SIG=3 PASS=2 OTHER=0
+heap-256m      SIG=4 PASS=1 OTHER=0
+heap-128m      SIG=2 PASS=3 OTHER=0
+busy6-1g       SIG=4 PASS=0 OTHER=1
+```
+
+Nothing moves. Every arm sits in 40-80%, and at n=5 those are indistinguishable
+(the 95% interval for 4/5 is roughly 28-99%). **Only a large effect is excluded**
+— a knob that moved 70% to 95% would not be visible at this sample size — but
+none of heap size from 1 g down to 128 m, nor six busy cores, does anything
+detectable.
+
+The baseline arm reproduced (4/5) before the others ran, so the instrument was
+working; the script aborts if it does not, precisely so an unreadable run cannot
+present as five tidy rows of zeros.
+
+## Correction: the failure is NOT environment-sensitive
+
+Pooling every measurement ever taken at `cae49a85c`:
+
+```text
+3/3   0/2   7/10   7/10   4/5   4/5        = 21 SIG in 30 runs = 70%
+```
+
+That is a **stable ~70% Bernoulli**, not a rate that moves with the box. The one
+result that drove the whole "environment-sensitive" reading — the bisect
+endpoint's 0/2 — is simply the 9% case for a 70% coin, exactly as predicted. No
+load explanation was ever needed for it. And `busy6` at 80% is the direct test:
+saturating the CPU does not change the rate.
+
+So the diagnosis of why two bisects died changes. It was **not** the environment.
+It was a **rate gradient across the window** — ~70% at `cae49a85c`, ~5% at
+`e40c176d8` — met with probes powered for neither. A 2-rep probe misreads a 70%
+commit 9% of the time; a 6-rep probe misreads a 5% commit 74% of the time.
+
 ## What a workable method looks like
 
 If the interleaved result does reproduce, a bisect is still possible but each
@@ -191,12 +235,22 @@ and both produced confident answers that confirmation destroyed. A third of that
 KIND would do the same — but an interleaved A/B bisect is a different instrument,
 and the endpoint pair reproducing twice is evidence it works.
 
-The cost is the open question, not the validity: with the rate falling toward
-~5% near the introduction point, each step needs enough reps to separate 5% from
-0%, and that is ~60 runs per arm per step rather than 6. Before paying that,
-the thing to try is removing the variance instead of measuring around it — see
-whether any knob (heap size, collection frequency, CPU contention) drives the
-rate toward 100%, which would make every later question cheaper.
+Interleaving is still good practice but is **not** the thing that makes it work,
+since there is no environment effect to cancel. What makes it work is
+REPETITION MATCHED TO THE LOCAL RATE, and near the introduction point that rate
+is ~5%: separating 5% from 0% with confidence needs on the order of 60 runs per
+step, about 2 hours per step and ~16 hours for the search.
+
+Removing the variance was tried and failed (above), so that discount is not
+available.
+
+Given the cost, the better target is probably the MECHANISM rather than the
+commit. The failing run logs six `[moving-young]` fallbacks to the non-moving
+sweep, which relocates nothing — so either a cycle that did not fall back is the
+one that corrupts, or the damage is not a relocation at all.
+`CRATONVM_DBG_JIT_ROOTSCAN=1` prints one line per collection, and a single
+failing run under it answers which. That is one ~2-minute run with a 70% chance
+of landing the failure, against ~16 hours of bisecting.
 
 ## What the failing run shows
 
