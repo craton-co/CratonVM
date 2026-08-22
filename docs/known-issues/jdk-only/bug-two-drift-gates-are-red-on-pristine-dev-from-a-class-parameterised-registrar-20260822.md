@@ -1,4 +1,4 @@
-# Two drift gates are RED on pristine `dev`, and one refactor causes both
+# THREE drift gates are RED on pristine `dev`, and one refactor causes all of them
 
 **Status: OPEN, MEASURED, NOT THIS BRANCH'S.** 2026-08-22.
 
@@ -57,7 +57,28 @@ hide inside, and it explains both failures at once:
   which is 966 of the 1027 and pushes the blind region past its 1000 ceiling;
 * one scanner follows the call into the helper and the other does not, so
   `register_pe2_string_marshaling_on` is synthetic-only to one gate and unknown
-  to the other.
+  to the other;
+* and it reads as a NEWLY ORPHANED pass to a third gate in the sibling file,
+  `registrar_reachability.rs::no_registrar_silently_orphaned_into_the_synthetic_arm`:
+
+  ```text
+  1 registration pass(es) became synthetic-only:
+      register_pe2_string_marshaling_on
+          defined at native-builtins/src/panama.rs:6478
+          called from register_pe2_string_marshaling @ panama.rs:6472
+  ```
+
+  That gate exists for the case where a pass HAD a shipping call site and lost
+  it — "the `register_pe_panama` shape: one call site, inside
+  `register_synthetic_overrides`, and two modes running different code with
+  every test on the wrong one". Here it is a new name rather than a lost call
+  site, but the gate cannot tell those apart, which is the third symptom of the
+  same missing resolver form.
+
+**Provenance, checked rather than inferred:** this branch never touches
+`panama.rs` (`git log origin/dev..HEAD -- native-builtins/src/panama.rs` is
+empty), and `register_pe2_string_marshaling_on` arrives with `aecae7e51`
+*fix(ffm): every synthetic MemorySegment carried the INTERFACE as its class*.
 
 ## Do not fix it by raising the ceiling
 

@@ -415,7 +415,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_logging_natives", 20),
     ("register_m18_concurrent_fixes", 35),
     ("register_number_format_natives", 0),
-    ("register_pe_panama", 14),
+    ("register_pe_panama", 12),
     ("register_phase50_natives", 1),
     ("register_phase51_natives", 44),
     ("register_phase52_natives", 35),
