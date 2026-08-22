@@ -1580,6 +1580,24 @@ pub(super) fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, tar
         );
     }
 
+    // The `BufferPoolMXBean` instances CratonVM hands out
+    // (`native-builtins`' `jmx::CRATON_BUFFER_POOL_CLASS`), same shape and same
+    // reason as the two above: the receiver used to be stamped with the
+    // `java/lang/management/BufferPoolMXBean` interface, so it had no concrete
+    // methods and native lookup drops interface-declared instance natives.
+    //
+    // `PlatformManagedObject` is the supertype `ManagementFactory
+    // .getPlatformMXBeans` is generic over, and the one whose `checkcast` a
+    // caller storing the result in a `PlatformManagedObject` variable emits.
+    if obj_name == "cratonvm/internal/BufferPool" {
+        return matches!(
+            target_class_name,
+            "java/lang/management/BufferPoolMXBean"
+                | "java/lang/management/PlatformManagedObject"
+                | "jdk/internal/misc/VM$BufferPool"
+        );
+    }
+
     // Map.Entry implementations
     if target_class_name == "java/util/Map$Entry" {
         return matches!(
