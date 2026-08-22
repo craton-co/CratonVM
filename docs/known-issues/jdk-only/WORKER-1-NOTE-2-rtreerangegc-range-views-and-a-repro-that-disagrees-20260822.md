@@ -359,7 +359,7 @@ measured 2 fails in 20 on its own binary. All three are consistent with
 `WORKER-5`'s framing that "flaky" is a property of a BINARY AND A HOST. The
 vector now passes 25/25 in both modes.
 
-Full record: `rtreerangegc-was-three-collection-native-defects-FIXED-20260822`
+Full record: `rtreerangegc-was-four-collection-native-defects-FIXED-20260822`
 (internal). The parent page is retired into it.
 
 **What this note contributed, and it was the load-bearing part:** the

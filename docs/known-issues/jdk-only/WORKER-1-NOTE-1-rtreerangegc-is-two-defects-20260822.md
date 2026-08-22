@@ -104,7 +104,7 @@ and the split ran exactly where this page put it:
   backing array and bounds before two allocations and pinned nothing, so the
   per-loop pinning below protected an address that was already from-space.
 
-Full record: `rtreerangegc-was-three-collection-native-defects-FIXED-20260822`
+Full record: `rtreerangegc-was-four-collection-native-defects-FIXED-20260822`
 (internal). N2 is done; N3 is moot.
 
 **N1's own guard fires here, in the direction it was written for.** The
