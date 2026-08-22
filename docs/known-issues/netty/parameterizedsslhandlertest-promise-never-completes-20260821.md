@@ -31,9 +31,14 @@ Both halves matter:
 > plain Rust local for the whole wait. **Nothing remaps it.** `monitor_wait`
 > does remap once, from the GC pointer map, but only *before* entering the wait;
 > after that the thread is parked and any G1 evacuation moves the promise out
-> from under that address. `thread_registry`'s `jmx_waiting_monitor` is the same
-> shape — an `ObjectRef` that no GC pass scans or forwards. Over a 420 s stall
-> there are many collections.
+> from under that address. Over a 420 s stall there are many collections.
+>
+> **Correction:** an earlier revision of this box also named
+> `thread_registry`'s `jmx_waiting_monitor` as unforwarded. That was **wrong**.
+> It is pushed into `all_roots` during root scanning and rewritten by
+> `update_thread_objs_after_gc` (gc.rs step 21) — exactly as its own doc comment
+> claims. The only unforwarded reference was ever `Monitor::wait`'s local, and
+> the registry copy is therefore the fix, not a second instance of the bug.
 >
 > So the `[WAIT-OBJECT]` line above may be reading the **pre-relocation copy**,
 > and G1 leaves that copy intact in the from-region until it is reused — which
@@ -174,11 +179,15 @@ explicitly **not** shown to cause this stall.
 
 ## Next
 
-0. **Make the wait-site handle GC-safe first**, or every field-level measurement
-   here stays unfalsifiable. `Monitor::wait`'s `obj` and
-   `thread_registry::jmx_waiting_monitor` are both raw `ObjectRef`s that no GC
-   pass forwards. (The JMX one is a defect in its own right: a JMX query naming
-   a waiting thread's monitor reads a stale object under any moving collector.)
+0. ~~Make the wait-site handle GC-safe first~~ — **DONE** (`95c210f37`).
+   `Monitor::wait`'s local was the only unforwarded reference;
+   `jmx_waiting_monitor` was already rooted and remapped, so resolving through
+   it (`install_wait_object_resolve` → `peek_jmx_waiting_monitor`) makes the
+   dump sound. The line now names which handle it used, so a silent fallback
+   cannot pass as a sound reading, and prints an explicit `RELOCATED` line when
+   the entry pointer and the live one disagree — which measures the staleness
+   instead of merely suspecting it. **Re-take the `result`/`waiters` reading on
+   this binary before citing it.**
 1. A plain missing fence is now UNLIKELY and should not be assumed: the thin
    path CASes `Acquire` on lock (`try_thin_lock`) and `Release` on unlock
    (`try_thin_unlock`), and the inflated path goes through a
