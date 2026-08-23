@@ -188,16 +188,21 @@ fn ka_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 /// `init(Key)` / `init(Key, SecureRandom)` → `spi.engineInit(key, random)`.
+///
+/// A NULL key is FORWARDED, not refused. `javax.crypto.KeyAgreement.init` does
+/// no null check at all — its body is `spi.engineInit(key, random)` and
+/// nothing else — and whether a null key is usable is the SPI's question,
+/// not this layer's. BouncyCastle's NewHope answers "yes": the responder side
+/// of an NH exchange has no private key and inits with `(null, random)` by
+/// design (`pqc.jcajce.provider.test.NewHopeTest.testKeyExchange`, verbatim
+/// from the protocol). Refusing it here turned a supported exchange into
+/// `IllegalStateException: KeyAgreement.init: null key` on a call HotSpot
+/// completes.
 fn ka_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let key = match args.get(1) {
-        Some(Value::Object(Some(k))) => *k,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "KeyAgreement.init: null key".into(),
-            }
-            .into())
-        }
+        Some(Value::Object(k)) => *k,
+        _ => None,
     };
     let random = match args.get(2) {
         Some(Value::Object(opt)) => Value::Object(*opt),
@@ -213,7 +218,7 @@ fn ka_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         spi,
         "engineInit",
         "(Ljava/security/Key;Ljava/security/SecureRandom;)V",
-        &[Value::Object(Some(key)), random],
+        &[Value::Object(key), random],
     )?;
     Ok(None)
 }
@@ -233,14 +238,10 @@ fn ka_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// healthy right up to the one overload nobody registered.
 fn ka_init_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Forwarded rather than refused, for the reason `ka_init` gives.
     let key = match args.get(1) {
-        Some(Value::Object(Some(k))) => *k,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "KeyAgreement.init: null key".into(),
-            }
-            .into())
-        }
+        Some(Value::Object(k)) => *k,
+        _ => None,
     };
     let params = match args.get(2) {
         Some(Value::Object(opt)) => Value::Object(*opt),
@@ -260,7 +261,7 @@ fn ka_init_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         spi,
         "engineInit",
         "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
-        &[Value::Object(Some(key)), params, random],
+        &[Value::Object(key), params, random],
     )?;
     Ok(None)
 }
