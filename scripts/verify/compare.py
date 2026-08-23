@@ -32,6 +32,11 @@ PASS_STATUSES = {"PASS", "OK"}
 KNOWN_SHAPES = {
     (2, "\t"): (0, 1, "canonical baseline (class\\tstatus)"),
     (4, ","): (0, 3, "tomcat-style CSV (class,rc,secs,status)"),
+    # Tomcat's runner grew a 5th column (the host's 1-minute load average as
+    # the class finished) on 2026-08-23, so both widths are live: old result
+    # files keep the 4-field shape and are still read. The class and status
+    # indices are the same either way - the column was appended, not inserted.
+    (5, ","): (0, 3, "tomcat-style CSV (class,rc,secs,status,loadavg1)"),
     (9, "\t"): (1, 2, "h2-style TSV (idx,class,status,rc,ms,tests,mode,log,note)"),
 }
 
