@@ -85,6 +85,29 @@ logs 1975   census line present 1972   cells decoded 0   named 0
 The three logs with no census line are the three HANG classes, killed before
 the shutdown trailer -- a blind spot worth stating rather than rounding off.
 
+**The Spring Boot runner now arms it by default** (`-NoCorruptCellCensus` opts
+out), and reads the census back into its own `summary.md` and stdout:
+
+```text
+## Corrupt Value cell census
+- logs scanned: 1975
+- logs carrying the census line: 1972
+- logs with NO census line: 3 (a class killed before the shutdown trailer
+  -- HANG/TIMEOUT -- cannot print it)
+- cells decoded: 0
+- cells named (door or backstop): 0
+```
+
+Reporting "logs carrying the line" separately from "cells decoded" is the whole
+point: those are different claims, and the first armed sweep run for this chase
+had 0 of 1975 carrying it while looking exactly like a clean run. The harness
+caught that same mistake once more on its own first outing -- `0 decoded across
+0 of 24 logs` -- because the binary under test predated the instrument.
+
+`decoded > named` is surfaced rather than smoothed over. A cell decoded by a
+reader with no door, on a thread that exits before its next safepoint, is
+counted and not named; the summary says so instead of implying nothing happened.
+
 **So the cell did not recur, and this page still does not name a producer.**
 What changed is that it no longer needs a person to be looking: the next
 occurrence reports its own door, receiver and Java stack, or -- if it comes
