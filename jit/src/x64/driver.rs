@@ -2378,6 +2378,14 @@ pub fn compile_with_param_slots(
         && compiler
             .safepoint_pcs
             .is_subset(&compiler.mapped_safepoint_pcs);
+    // The SHADOW aggregate, and a different question from the four terms above
+    // — see `CompiledMethod::fully_shadow_covered`. `cm.oop_maps` was assigned
+    // above, so this is the complete set this compilation pushed.
+    cm.fully_shadow_covered = !cm.oop_maps.is_empty()
+        && cm
+            .oop_maps
+            .iter()
+            .all(|m| m.moving_young_coverage_complete);
     // `CRATONVM_DBG_OOPCOV=1` — WHICH of the four terms said no, per method.
     //
     // `moving_young_osr_method_needs_fallback` reports the aggregate as one

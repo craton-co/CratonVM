@@ -2625,6 +2625,27 @@ pub struct CompiledMethod {
     /// it is always safe to leave unset. Only ever consulted on the
     /// gated precise path (`CRATONVM_PRECISE_JIT_MAPS`).
     pub fully_oop_covered: bool,
+    /// Every safepoint of this method claims **shadow** coverage — the method
+    /// has at least one `OopMapEntry` and all of them carry
+    /// `moving_young_coverage_complete`.
+    ///
+    /// A DIFFERENT question from [`Self::fully_oop_covered`], and the
+    /// difference is what
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` ran
+    /// aground on. `fully_oop_covered` asks whether every live oop is named by
+    /// a FRAME SLOT in the map (`safepoint_pcs ⊆ mapped_safepoint_pcs`), which
+    /// a direct JIT→JIT call with a reference argument can never satisfy: the
+    /// argument is marshalled into the outgoing-ABI area, which no frame-slot
+    /// map can name. `fully_shadow_covered` asks whether the shadow push
+    /// published every live oop so a relocation can rewrite it — the property
+    /// `conservative_roots::moving_young_frame_coverage_complete` already
+    /// consults per frame, per safepoint, for every non-OSR frame.
+    ///
+    /// Measured on `TestKillProcessWhileWriting`, 2026-08-23: 439 of the 449
+    /// recorded coverage failures were `staged_arg_unmappable`, i.e. exactly
+    /// the direct-call shape above, and they blocked relocation on 725 of 759
+    /// collections through the OSR fallback's use of `fully_oop_covered`.
+    pub fully_shadow_covered: bool,
     /// deopt-osr scaffolding — `true` only once the deopt finalizer has
     /// proven this method can rebuild a precise interpreter frame at a guard
     /// bci and resume there (instead of the `i64::MIN` whole-method re-run).
@@ -2893,6 +2914,7 @@ impl CompiledMethod {
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
             fully_oop_covered: false,
+            fully_shadow_covered: false,
             // deopt-osr scaffolding: default to the safe re-run path; no
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
@@ -2966,6 +2988,7 @@ impl CompiledMethod {
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
             fully_oop_covered: false,
+            fully_shadow_covered: false,
             // deopt-osr scaffolding: default to the safe re-run path; no
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,

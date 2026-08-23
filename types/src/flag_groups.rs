@@ -1360,6 +1360,13 @@ pub const INVENTORY: &[E] = &[
     // workload with no defragmentation at all. See
     // `vm/src/jit/conservative_roots.rs::xt_jit_coverage_handshake_enabled`.
     E { group: Group::GC, token: "xt-jit-coverage-handshake", on_key: Some("CRATONVM_XT_JIT_COVERAGE_HANDSHAKE"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-23 with the OSR coverage-question correction.
+    // Default-ON, so a KILL SWITCH: `=0` makes the OSR fallback read
+    // `fully_oop_covered` (the frame-slot subset) again instead of
+    // `fully_shadow_covered`, which is what refused relocation on 725 of 759
+    // collections. See
+    // `vm/src/jit/conservative_roots.rs::osr_coverage_uses_shadow_aggregate`.
+    E { group: Group::GC, token: "osr-coverage-shadow", on_key: Some("CRATONVM_OSR_COVERAGE_SHADOW"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-19 with the ZGC read-bounds publish. An OPT-OUT, not an
     // opt-in: ZGC publishing its arena envelope into `JIT_READ_BOUNDS` is the
     // default, and this key is the kill switch that restores helper-only
