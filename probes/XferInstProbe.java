@@ -82,10 +82,10 @@ public class XferInstProbe {
     }
 
     public static void main(String[] args) {
-        int n = args.length > 0 ? Integer.parseInt(args[0]) : 2000000;
+        int requested = args.length > 0 ? Integer.parseInt(args[0]) : 2000000;
         // The megamorphic arm's expected sum is exact only over whole cycles
         // of its four receivers.
-        n -= n % 4;
+        final int n = requested - requested % 4;
         Impl impl = new Impl();
         Adder[] rs = { new Base(), new Impl(), new A2(), new A3() };
 
