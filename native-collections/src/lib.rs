@@ -64668,7 +64668,48 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     let cf = "java/util/concurrent/CompletableFuture";
 
     // --- CompletionStage methods ---
+    //
+    // OVER A REAL JDK THESE SEVEN ARE NOT REGISTERED AT ALL.
+    //
+    // Each one's real-JDK arm is a pure delegation straight back to the method
+    // it shadows — `native_cf_then_compose` is literally
+    //
+    //     if cf_is_real_jdk(ctx, this) {
+    //         return ctx.invoke_special("java/util/concurrent/CompletableFuture",
+    //                                   "uniComposeStage", .., &[this, null, fn]);
+    //     }
+    //
+    // and the real `thenCompose(fn)` is `return uniComposeStage(null, fn)`. So
+    // registering them buys a native dispatch plus a by-name class resolve plus
+    // a nested invoke, to arrive at the bytecode that would otherwise have run.
+    // The synthetic 2-field CF model below each of those branches is what they
+    // exist for, and it is untouched: `real_jdk()` is false in synthetic mode.
+    //
+    // MEASURED 2026-08-22, `apps/hibernate-reactive-suite-runner/HibfixCfBound.java`,
+    // ns/op on an already-completed stage, same binary, same box. `copy()` and
+    // `minimalCompletionStage()` build the SAME `uni*Stage` dependent machinery
+    // in the same interpreter but carry no native, so they price the bytecode
+    // alone:
+    //
+    //   copy()                    708      <- no native
+    //   minimalCompletionStage() 1149      <- no native
+    //   thenApply()              5458      <- native + delegation
+    //   thenCompose()           10256      <- native + delegation
+    //
+    // i.e. roughly 85% of a shadowed call was the shadow. On
+    // `MultithreadedInsertionWithLazyConnectionTest` these account for 4.36M
+    // native invocations and 37% of all profile samples.
+    //
+    // `thenCombine` is deliberately still registered: its native raises its own
+    // NullPointerException for a null other-stage BEFORE reaching the
+    // delegation, so it is not a pure pass-through, and it is not hot on any
+    // workload this was measured against.
+    //
+    // `CRATONVM_CF_DELEGATING_YIELD=0` restores the registrations so one binary
+    // can be A/B'd against its own previous behaviour.
+    let skip_delegating_cf = r.real_jdk() && cf_delegating_yield_enabled();
 
+    if !skip_delegating_cf {
     r.register(
         cf,
         "thenApply",
@@ -64698,6 +64739,9 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
         native_cf_then_compose,
     );
+    }
+
+    // NOT skipped: see the note above — `thenCombine` is not a pure pass-through.
 
     // thenCombine: combine results of two CFs with a BiFunction
     r.register(
@@ -64708,6 +64752,7 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     );
 
     // exceptionally: provide fallback if exception occurred
+    if !skip_delegating_cf {
     r.register(
         cf,
         "exceptionally",
@@ -64730,6 +64775,7 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;",
         native_cf_when_complete,
     );
+    }
 
     // allOf: CompletableFuture[] → CompletableFuture<Void>
     r.register(
@@ -64822,6 +64868,13 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
 
     // Also register CompletionStage interface methods
     let cs = "java/util/concurrent/CompletionStage";
+    // Same argument as the class-level block above, and it matters MORE here:
+    // hibernate-reactive types its whole composition chain as `CompletionStage`,
+    // so these are `invokeinterface` sites. Over a real JDK the interface
+    // declares them abstract, every implementation has its own body, and this
+    // native would delegate to `CompletableFuture` for a receiver that may not
+    // be one.
+    if !skip_delegating_cf {
     r.register(
         cs,
         "thenApply",
@@ -64852,6 +64905,7 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;",
         native_cf_exceptionally,
     );
+    }
 
     // ForkJoinPool.awaitQuiescence is registered by native-builtins after it
     // establishes the real async-worker completion tracker. Keeping a local
@@ -71656,4 +71710,20 @@ mod tests {
              got {r:?}"
         );
     }
+}
+
+/// `CRATONVM_CF_DELEGATING_YIELD` — default ON. `=0` restores the
+/// `CompletableFuture` / `CompletionStage` dependent-stage native registrations
+/// over a real JDK, so the change can be A/B'd on one binary rather than
+/// against a separately built branch. See the note in
+/// `register_concurrent_completeness_natives`.
+fn cf_delegating_yield_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_CF_DELEGATING_YIELD") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }

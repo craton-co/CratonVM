@@ -1411,6 +1411,11 @@ pub const INVENTORY: &[E] = &[
     // so `CRATONVM_LOADER=enforce-native-shadow` could not reach it and no test
     // could arrange it.
     E { group: Group::LOADER, token: "enforce-native-shadow", on_key: Some("CRATONVM_ENFORCE_NATIVE_SHADOW"), off_key: None, off_word: None },
+    // Default ON. `-cf-delegating-yield` keeps the pure-delegation
+    // `CompletableFuture` natives in front of the real JDK bytecode, so the
+    // yield can be A/B'd on one binary. See
+    // `native_override::delegating_native_yields_to_real_bytecode`.
+    E { group: Group::LOADER, token: "cf-delegating-yield", on_key: Some("CRATONVM_CF_DELEGATING_YIELD"), off_key: None, off_word: Some("0") },
     E { group: Group::LOADER, token: "aware-resolution", on_key: Some("CRATONVM_LOADER_AWARE_RESOLUTION"), off_key: None, off_word: None },
     E { group: Group::LOADER, token: "boot-module-registry", on_key: Some("CRATONVM_BOOT_MODULE_REGISTRY"), off_key: None, off_word: Some("off") },
     E { group: Group::LOADER, token: "cl-bootstrap-scoped", on_key: Some("CRATONVM_CL_BOOTSTRAP_SCOPED"), off_key: None, off_word: Some("0") },
