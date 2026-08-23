@@ -1,6 +1,6 @@
 # TechEmpowerTest is not a perf class: with the JIT on it returns a WRONG ANSWER in ~25 s, and it PASSES with `--jit off`
 
-**Status: OPEN CratonVM JIT correctness defect. Bisected to a TWO-COMPONENT interaction: `org/hibernate/reactive/` + array-backed list storage (`java/util/ArrayList` / `Arrays`) -- see §8.** Filed 2026-08-22 on `dev`
+**Status: OPEN CratonVM JIT correctness defect. The reactive LOAD PATH returns `null` for a row that exists (§9, measured directly); compiling `org/hibernate/reactive/` is necessary and a second component (`java/util/ArrayList`, `Arrays`, or `io/vertx/sqlclient/`) acts as a trigger (§8.2, §9.1).** Filed 2026-08-22 on `dev`
 (`b8fa0585e` present — this is NOT that defect, see §4). Reproduces 4/4 with
 the JIT on and 0/3 with it off, on a quiet Azure host, against a HotSpot
 control that passes.
@@ -74,19 +74,19 @@ loopRoot = loopRoot.call( () -> session
         .invoke( worlds::add ) );
 ```
 
-So **something on this path yielded `null` for an id the benchmark guarantees exists** (§8.3 narrows which).
+So **something on this path yielded `null` for an id the benchmark guarantees exists** (§9: it is `find()` itself).
 `Randomizer`/`LocalRandom` draw from `[1, 10000]`
 (`MAX_OF_RANGE = 10000`), and `createData` inserts exactly ids `1..10000`
 (`world.setId( index + 1 )` for `index` in `0..9999`).
 
 ### 2.1 DISCRIMINATED 2026-08-22: the rows are all there, so it is on the READ side
 
-> **Partly revised by §8.3 (2026-08-23).** What this section establishes and
-> keeps: every row exists, so the write path is exonerated. What it states too
-> strongly: that `find()` itself returned `null`. The NPE proves only that a
-> null reached `forEach`; the bisect in §8 makes a compiled-`ArrayList` hole
-> the leading explanation instead. Read §8.3 before building on the wording
-> below.
+> **Questioned by §8.3, then VINDICATED by §9 (2026-08-23).** §8.3 argued this
+> section over-attributed the null to `find()` and that a compiled-`ArrayList`
+> hole was likelier. A direct probe (§9) measured `find()` returning `null`
+> itself, with counts matching exactly. **This section's reading is correct as
+> written**; the §8.3 detour is left in place because the way it went wrong is
+> instructive, not because it stands.
 
 The measurement §2.1 called for was run, and it settles the question in one
 line. A `[COUNT-PROBE]` was added to `TechEmpowerTest` — **the test class, not
@@ -104,8 +104,8 @@ runs that FAILED and the `--jit off` run that passed.** Critically, run 1
 paired `count=10000` with the `NullPointerException` **in the same run**: every
 one of the 10 000 rows was present in the database, ids `1..10000` with no
 gaps at either end, and the collection handed to `forEach` still contained a
-`null` (whether `find()` returned it or the list lost it is settled in §8.3,
-not here).
+`null`. (Whether `find()` returned that null or the list lost it is settled in
+§9: `find()` returned it.)
 
 So:
 
@@ -113,12 +113,10 @@ So:
   and the `loop(0, 10000, …)` / `ArrayLoop` machinery are exonerated. The pull
   toward blaming them (because §8's defect lived there) was a bias worth
   naming, and it was wrong.
-* **Mechanism 2 — something on the read side yields `null` for a row that
-  exists — is CONFIRMED** as the remaining search space. (Narrowed further by
-  §8: the null is more likely a hole left in the `ArrayList` that collects the
-  results than a wrong return from `find()` itself. Both live on the read side,
-  so this section's conclusion stands; only its attribution to `find()` was
-  premature.)
+* **Mechanism 2 — the read path yields `null` for a row that exists — is
+  CONFIRMED**, and §9 pins it precisely: `find()` itself returns the `null`,
+  measured at the moment it is produced, before the collecting list is
+  involved at all.
 
 A caveat recorded rather than hidden: adding the probe shifted the failure
 mode distribution. Before it, 3 of 4 `--jit on` runs took the fast NPE mode;
@@ -140,9 +138,9 @@ reasoning that picked the wrong favourite is worth preserving:
    misses. **REFUTED by §2.1: count=10000, ids 1..10000, no gaps.**
 2. **Something on the read side yields `null` for a row that IS present** —
    produces the identical symptom with no row ever missing. **CONFIRMED by
-   §2.1**, then narrowed by §8: the sufficient partner is compiled
-   `ArrayList`/`Arrays`, so a hole in the collecting list now outranks a wrong
-   return from `find()`.
+   §2.1** and pinned by §9 to `find()` itself. The sufficient partner is compiled
+   `ArrayList`/`Arrays`, but §9 shows that is a TRIGGER, not the source of the
+   wrong value.
 
 The instructive part is that candidate 1 was the more attractive one, because
 `createData`'s `loop(0, 10000, …)` is the same `ArrayLoop` that
@@ -366,3 +364,90 @@ is a far better instrument than the whole-suite run this page started from.
    before assuming one mechanism covers both.
 4. Do not re-chase `CompletableFuture` / Vert.x-core continuation delivery —
    §8.2 exonerated both by direct measurement.
+
+## 9. 2026-08-23 — §8.3's `ArrayList` hypothesis is REFUTED. `find()` really does return `null`, and §2.1 was right all along
+
+§8.5 step 1 asked for one probe: log what `find()` returned immediately before
+`worlds::add`. It was run, and it goes against the hypothesis §8.3 had just
+promoted.
+
+`WorldVerticle` was instrumented with a `FIND_NULL` counter incremented inside
+`.invoke(...)` at the moment `find()` yields a value — i.e. **before** the
+element reaches the list — plus a scan of the collected list immediately before
+`forEach` touches it, both reported on one line so they cannot drift apart:
+
+| run | config | `listNulls` | **`findNullsSoFar`** |
+|---|---|---:|---:|
+| min-1 | ONLY `org/hibernate/reactive/,java/util/ArrayList` | 1 | **1** |
+| min-2 | ONLY `org/hibernate/reactive/,java/util/ArrayList` | 1 | **1** |
+| full-1 | full JIT | 1 | **4** |
+
+```
+[NULLPROBE] listNulls=1 listSize=20 listClass=java.util.ArrayList findNullsSoFar=1
+```
+
+**`find()` returned `null` before the list was ever involved.** In the minimal
+runs the counts match exactly — one null produced, one null present — so the
+`ArrayList` stored faithfully what it was handed. `listSize=20` is the expected
+`queries=20`, with no short or over-long list.
+
+* **§8.3's hypothesis — compiled `ArrayList` leaves a counted-but-unwritten
+  hole — is REFUTED.** `ArrayList` and `Arrays` are exonerated as the *source*
+  of the null.
+* **§2.1's original reading is CONFIRMED** and can be relied on again: something
+  in the reactive **load path** returns `null` for a row that exists. The
+  hedge added to §2.1 and §2.2 by §8.3 can be read as resolved in §2.1's favour.
+
+### 9.1 So what is `java/util/ArrayList` doing in the bisect table?
+
+§8.2 remains factually correct — compiling `org/hibernate/reactive/` together
+with `java/util/ArrayList` (or `Arrays`, or `io/vertx/sqlclient/`) is sufficient
+to make the defect appear, and `HashMap`/`IdentityHashMap`/`LinkedHashMap` are
+not. But §9 shows those partners are **not where the wrong value comes from**.
+
+The consistent reading is that the partner acts as a **catalyst, not a culprit**:
+compiling it perturbs inlining/tiering/timing enough for the *load path's* latent
+defect to fire. That also explains the otherwise-awkward fact that two unrelated
+partners (`java/util/ArrayList` and `io/vertx/sqlclient/`) are each sufficient —
+they need not share a mechanism, only an effect on compilation of the code
+around the load path.
+
+**This is a caution about bisect results generally**, worth carrying beyond this
+page: `CRATONVM_JIT_DENY`/`BISECT_ONLY` identify components whose compilation is
+*necessary or sufficient for the symptom*, which is not the same as the component
+that computes the wrong value. §8 read the table as if it were, and was wrong
+within a day.
+
+### 9.2 A grep artifact that nearly reported the defect as fixed
+
+The instrumented runs scored `NPE=0` under the established
+`grep -c 'because "w" is null'`, which reads exactly like the defect having
+disappeared. It had not. Recompiling `WorldVerticle` changed the JDK helpful-NPE
+message from `because "w" is null` to `because "<local…` — the lambda parameter
+name is not preserved the same way through the ad-hoc `javac` invocation used
+here. The NPE was still thrown, from the same
+`WorldVerticle.lambda$updateWorlds$2`, with the same resulting 500.
+
+Any future instrumentation of this class must re-check the grep pattern against
+the new build rather than reusing the one in this page, or match on something
+stable such as `getRandomNumber()` / `Unhandled exception in router`.
+
+### 9.3 What the next session should do
+
+1. **The target is the reactive load path returning `null` for a present row**,
+   with the partner components treated as triggers rather than suspects. The
+   `ONLY='org/hibernate/reactive/,java/util/ArrayList'` arm remains the right
+   harness because it keeps almost nothing else compiled — but bisect *within*
+   `org/hibernate/reactive/` now needs the deny lever, since §8.1 established
+   that compiling that package alone does not reproduce.
+2. Instrument one level deeper than §9: `find()` here is
+   `Mutiny.Session.find` → the reactive `IdentifierLoadAccess`/load-plan path.
+   Log the id passed in beside the `null` result, then query that id directly —
+   if a specific id or range recurs, that is a far stronger lead than "some
+   find returned null".
+3. `ReactiveDeferredResultSetAccess` is still the most-named class in the
+   teardown traces and has not been directly instrumented.
+4. Do not re-chase `ArrayList`/`Arrays` (§9), `CompletableFuture`/Vert.x core
+   (§8.2), or `createData`/the write path (§2.1). Four components have now been
+   eliminated by direct measurement; the page's value is as much in that list as
+   in the open question.
