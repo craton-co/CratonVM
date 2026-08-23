@@ -1507,8 +1507,8 @@ const _: () = assert!(
     "Value::Double tag must be 3"
 );
 const _: () = assert!(
-    value_tag_word(&Value::Object(None)) == 4,
-    "Value::Object tag must be 4 (x64/objects.rs recognises an Object cell by this literal)"
+    value_tag_word(&Value::Object(None)) == crate::heap_types::FIELD_CELL_TAG_OBJECT,
+    "Value::Object tag must match FIELD_CELL_TAG_OBJECT (x64/objects.rs and the IR backend's inline legacy getfield both recognise an Object cell by it)"
 );
 const _: () = assert!(
     value_tag_word(&Value::ReturnAddress(0)) == 5,
