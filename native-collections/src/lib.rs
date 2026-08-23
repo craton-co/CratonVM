@@ -12075,8 +12075,20 @@ fn ensure_hashtable_load_factor(ctx: &mut dyn NativeContext, this: ObjectRef, cn
 }
 
 /// Keep the real JDK HashMap fail-fast version in sync with native structural
-/// edits. Besides iterator semantics, this is the invalidation generation for
-/// the bounded String-node lookup cache below.
+/// edits.
+///
+/// Besides iterator semantics this is **the** invalidation generation for a
+/// cached map view — see [`view_source_stamp`] and the "Live map views" note.
+/// It used to say it was the generation for "the bounded String-node lookup
+/// cache below"; no cache of that name exists anywhere in this file, and the
+/// `lazy-map-views` plan page flagged the sentence as either stale or naming a
+/// cache that had moved. It was stale: the cache is gone and the claim now has
+/// a real referent again.
+///
+/// STRUCTURAL edits only, which is what makes the view guard sound for a
+/// keySet and unsound for an entrySet: a value-replacing `put` returns from
+/// `native_map_put_evict_pinned` before reaching here, exactly as HotSpot's
+/// `putVal` returns before `++modCount`.
 fn bump_map_mod_count(ctx: &dyn NativeContext, this: ObjectRef) {
     if let Value::Int(current) = ctx.get_field_by_name(this, "modCount") {
         ctx.set_field_by_name(this, "modCount", Value::Int(current.wrapping_add(1)));
@@ -14097,6 +14109,21 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // allocates, so `this` afterwards may be a pre-move address and asking it
     // for its class then would be reading a corpse.
     let sync = wants_synchronized_views(&*ctx, this);
+    // A keySet view is LIVE, so the one this map already minted is still
+    // correct — return it rather than rebuilding a 1000-entry hash map. That is
+    // what HotSpot does with the `keySet` field `java.util.AbstractMap`
+    // declares, and it also makes `map.keySet() == map.keySet()` true, which
+    // this VM used to answer `false` to. What is cached is the object this
+    // accessor RETURNS — for a `Hashtable` that is the synchronized wrapper,
+    // not the carrier inside it, because re-wrapping per call would hand back a
+    // different object every time and lose the identity again;
+    // `cached_map_view` unwraps before validating. See the "Live map views"
+    // module note.
+    if map_view_cache_enabled() {
+        if let Some(cached) = cached_map_view(&*ctx, this, "keySet", VIEW_KIND_KEYSET) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
     let keys = map_collect_keys(ctx, this);
     let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
     let set = if sync {
@@ -14104,6 +14131,18 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     } else {
         set
     };
+    if map_view_cache_enabled() {
+        // `this` is a pre-allocation address by now — every step since read it
+        // through a pin and dropped the pin. Re-derive the source from the
+        // backing the view itself points at, which is the one reference to it
+        // guaranteed live and current.
+        let inner = unwrap_synchronized(&*ctx, set);
+        if let Some(backing) = hs_backing_map(&*ctx, inner) {
+            if let Some(src) = view_backing_source(&*ctx, backing) {
+                try_set_jdk_map_field(ctx, src, "keySet", Value::Object(Some(set)));
+            }
+        }
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -14114,6 +14153,15 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     if is_tree_map_receiver(ctx, this) {
         return native_tm_values(ctx, args);
+    }
+    // Construction half only, exactly as for `entrySet()` — a values view is
+    // kept live by `resync_values_view` on every read, and cannot be
+    // generation-guarded because a value-replacing `put` changes it while
+    // bumping nothing. See `cached_values_view`.
+    if map_view_cache_enabled() {
+        if let Some(cached) = cached_values_view(&*ctx, this) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
     }
     let values = map_collect_values(ctx, this);
     // Build an ArrayList from the values. Reserve one extra trailing slot and
@@ -14149,6 +14197,12 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     } else {
         list
     };
+    if map_view_cache_enabled() {
+        let inner = unwrap_synchronized(&*ctx, list);
+        if let Some(src) = values_view_source(&*ctx, inner) {
+            try_set_jdk_map_field(ctx, src, "values", Value::Object(Some(list)));
+        }
+    }
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -14204,6 +14258,19 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
     // Taken before anything allocates — see `native_map_key_set`.
     let sync = wants_synchronized_views(&*ctx, this);
+    // The CONSTRUCTION half of the map-view fix, and only that half. An
+    // entrySet view is live because `resync_view_set` rebuilds its entries on
+    // every read, so handing back the one this map already minted is correct
+    // for exactly the reason the keySet case is — and unlike keySet it gets NO
+    // generation guard, because a value-replacing `put` changes an entry's
+    // value while bumping nothing (see `view_kind_takes_generation_guard`).
+    // What this removes is the per-call carrier + backing + N `Map$Entry`
+    // allocations, not the resync.
+    if map_view_cache_enabled() {
+        if let Some(cached) = cached_map_view(&*ctx, this, "entrySet", VIEW_KIND_ENTRYSET) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
     // Both allocations below may run a moving young collection. Keep the
     // source and newly created view rooted, then collect entries only after
     // the view is fully wired; otherwise `set_field(set, ...)` can target the
@@ -14302,6 +14369,14 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     } else {
         set
     };
+    if map_view_cache_enabled() {
+        let inner = unwrap_synchronized(&*ctx, set);
+        if let Some(backing) = hs_backing_map(&*ctx, inner) {
+            if let Some(src) = view_backing_source(&*ctx, backing) {
+                try_set_jdk_map_field(ctx, src, "entrySet", Value::Object(Some(set)));
+            }
+        }
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -15003,6 +15078,359 @@ fn view_backing_kind(ctx: &dyn NativeContext, backing: ObjectRef) -> i32 {
     VIEW_KIND_KEYSET
 }
 
+
+// ---------------------------------------------------------------------------
+// Live map views: the two O(n)-per-read terms, and the guard that removes them
+// ---------------------------------------------------------------------------
+//
+// `map.keySet()` is a LIVE view, and both halves of "live" used to be O(n) on
+// every single call:
+//
+//   1. CONSTRUCTION. `native_map_key_set` -> `make_view_set_of` allocates a
+//      carrier, allocates a backing map, and inserts every key through
+//      `native_map_put` — hashing each key through the full `map_hash_key`
+//      triage and probing the bucket chain for duplicates.
+//   2. ITERATION. For a non-STATIC view kind, `resync_view_set` REBUILDS the
+//      whole backing again on every read: a fresh bucket array plus a
+//      re-insertion of every key, from `size()`, `iterator()`, `contains()`,
+//      `toArray()`, `stream()`, `forEach()` and friends — eleven call sites.
+//
+// So Spring's `StringUtils.toStringArray(map.keySet())` (which is what
+// `ConfigurationPropertySources`' `getPropertyNames()` is) rebuilt a
+// 1000-entry hash map TWICE per call, 101 910 times per test run.
+//
+// MEASURED before this change, `probes/KeySetBench` at width=1000, µs per call:
+//
+// ```text
+//   rung        LinkedHashMap   HashMap
+//   viewOnly         1660.5      1643.5     <- construction alone
+//   hoisted          2787.5      3144.0     <- ONE view, resynced per read
+//   perCall          4169.0      4690.5     <- what Spring does
+//   sizeOnly         3020.0      3277.0     <- keySet().size()
+//   mapSize             2.0         3.0     <- control
+// ```
+//
+// `hoisted` is the row that proves iteration is the bigger half: the view is
+// built once and reading through it still costs 2.8 ms, against 2 µs for
+// `map.size()`.
+//
+// # The fix, and what makes it sound
+//
+// Two guards, both keyed on the source map's own modification generation:
+//
+//   A. `keySet()` returns the view CACHED on the source (the `keySet` field
+//      real `java.util.AbstractMap` declares, which is where HotSpot caches
+//      its own). This needs no generation at all — the view is live, so the
+//      same object stays correct forever. It also makes
+//      `map.keySet() == map.keySet()` true, which is what HotSpot answers and
+//      what this VM answered `false` to.
+//   B. `resync_view_set` early-outs when the source has not changed since the
+//      backing was last rebuilt.
+//
+// B is where the soundness argument lives, and it has three parts.
+//
+// **Only keySet views take it.** For a keySet, only STRUCTURAL change matters:
+// a value-replacing `put` cannot change the key set. That is exactly the class
+// of change `modCount` records — and exactly the class it records *completely*,
+// because `modCount` is also the JDK's fail-fast iterator version, so any
+// mutator that failed to bump it would be a visible CME bug today. An
+// entrySet view is NOT eligible: its elements carry a snapshot of the VALUE
+// (`Map$Entry` slot 1), and a value-replacing `put` bumps nothing — see
+// `view_kind_takes_generation_guard`.
+//
+// **The stamp has three terms, not one.** `modCount` is the primary and is
+// sufficient on its own; the source's `size` is there because a mutator that
+// changed cardinality without bumping is the one way the primary term could be
+// incomplete, and catching that costs one field read. (`size` alone would NOT
+// do — `remove(k1); put(k2)` leaves it unchanged — which is why the monotonic
+// counter is the primary and not the other way round.) The third term is the
+// BACKING's own size, and it is what makes the guard safe against edits made
+// through the VIEW: `keySet().remove(k)` deletes from the backing and only
+// then propagates to the source, so between those two writes the source terms
+// alone would still say "in sync". Comparing the backing's cardinality closes
+// that without having to find and annotate every such site.
+//
+// **The stamp is stored +1-encoded.** A view backing is allocated with its
+// slots zeroed, and `0` is a legal `modCount`. Without the encoding a
+// never-stamped backing over a freshly-built map would compare equal to
+// `(0, 0)` and skip its first rebuild. `0` therefore means "never stamped, do
+// not trust", and the guard fails OPEN. This is the same encoding, for the
+// same reason, that the iterator fail-fast work settled on for
+// `expectedModCount`.
+//
+// **The stamp is read BEFORE the rebuild and written after it.** If the source
+// changes while the rebuild runs, the stored stamp is the OLD one, so the next
+// read rebuilds again. Stamping with a generation read afterwards would record
+// a change the rebuild did not see. `make_view_set_of` does not stamp at all,
+// for the same reason: its keys were collected by its caller, before it was
+// entered. With A in place that costs exactly one extra rebuild per map, ever.
+//
+// `CRATONVM_MAP_VIEW_CACHE=0` turns BOTH off, so the whole thing is an A/B
+// inside one binary. `CRATONVM_VERIFY_MAP_VIEW_CACHE=1` takes the fast path,
+// then rebuilds anyway and compares, panicking on divergence — the soundness
+// claim as something measured rather than argued.
+
+/// The state a view backing was last rebuilt against, +1-encoded, three terms:
+/// the source's `modCount`, the source's `size`, and the BACKING's own `size`.
+///
+/// See the module note above for why slots 11-13 are safe: every real
+/// `java/util/HashMap` field resolves at or below slot 7, and the source/kind
+/// markers already sit above these at 14/15.
+const VIEW_BACKING_SYNC_MODCOUNT_SLOT: usize = 13;
+const VIEW_BACKING_SYNC_SRC_SIZE_SLOT: usize = 12;
+const VIEW_BACKING_SYNC_OWN_SIZE_SLOT: usize = 11;
+
+/// `CRATONVM_MAP_VIEW_CACHE=0` — restore the rebuild-on-every-read view
+/// behaviour. Default ON; this is the same-binary A/B for both halves.
+fn map_view_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_MAP_VIEW_CACHE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
+}
+
+/// `CRATONVM_VERIFY_MAP_VIEW_CACHE=1` — every time the generation guard says
+/// "unchanged", rebuild anyway and compare. A divergence panics with both
+/// sides named.
+fn map_view_cache_verify() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_VERIFY_MAP_VIEW_CACHE").is_some()
+    })
+}
+
+/// Is this view kind allowed to skip a resync on an unchanged source?
+///
+/// Only [`VIEW_KIND_KEYSET`]. The two STATIC kinds never reach the guard (they
+/// return through `adopt_fresh_view_backing` first), and
+/// [`VIEW_KIND_ENTRYSET`] is refused on purpose: a resync rebuilds its elements
+/// as fresh 3-field `Map$Entry` objects carrying the VALUE in slot 1, and
+/// `map.put(existingKey, newValue)` changes that value while bumping NOTHING —
+/// `modCount` is the STRUCTURAL generation and a value replacement is not
+/// structural (`native_map_put_evict_pinned` returns before the bump, and
+/// `probes/MapModCountProbe2` reports `put=5 remove=6 replace=6` for every
+/// family, HotSpot included). A guard that cannot see the change would hand
+/// back a stale `getValue()`, so entrySet keeps rebuilding.
+fn view_kind_takes_generation_guard(kind: i32) -> bool {
+    kind == VIEW_KIND_KEYSET
+}
+
+/// The source map's `(modCount, size)`, or `None` when either cannot be read —
+/// in which case the caller must rebuild, because an unreadable generation is
+/// not an unchanged one.
+fn view_source_stamp(ctx: &dyn NativeContext, source: ObjectRef) -> Option<(i32, i32)> {
+    let mod_count = match ctx.get_field_by_name(source, "modCount") {
+        Value::Int(v) => v,
+        _ => return None,
+    };
+    // The same backend split `collect_keys_any` makes: a `LinkedHashMap` keeps
+    // its size in the overlay, not in the bucket state `map_state` reads.
+    let size = if is_lhm_receiver(ctx, source) {
+        lhm_state(ctx, source).1
+    } else {
+        map_state(ctx, source).1
+    };
+    Some((mod_count, size))
+}
+
+/// The `(source modCount, source size, own size)` this backing was last
+/// rebuilt against, or `None` when it has never been stamped (slots still
+/// zero — see the +1 encoding note in the module comment).
+/// Do the four marker slots (11-13 here, plus kind at 14 and source at 15)
+/// really sit above every field a real `java/util/HashMap` declares?
+///
+/// `alloc_view_backing` gives a view backing the REAL `java/util/HashMap`
+/// layout and then writes the kind/source markers at fixed high indices, on the
+/// strength of "loadFactor is the last, <= slot 7". That has been true of every
+/// JDK this VM has run against, and it is unguarded — a layout that grew past
+/// slot 13 would silently type-pun a real field. Resolving the real indices
+/// once and asking is cheap, and it turns that assumption into a switch: on a
+/// layout that does not leave the slots free the stamp is never written, so
+/// every read rebuilds and the fix turns itself off rather than answering
+/// wrongly.
+fn view_backing_marker_slots_are_free(ctx: &dyn NativeContext) -> bool {
+    use std::sync::OnceLock;
+    static FREE: OnceLock<bool> = OnceLock::new();
+    *FREE.get_or_init(|| {
+        let last_real = [
+            "table",
+            "size",
+            "modCount",
+            "threshold",
+            "loadFactor",
+            "entrySet",
+        ]
+        .into_iter()
+        .filter_map(|f| ctx.resolve_field_index("java/util/HashMap", f))
+        .max();
+        match last_real {
+            // No real layout resolvable at all: the fabricated
+            // `cratonvm/util/MapViewBacking` fallback is in use, whose slots
+            // 0..2 are the synthetic `(buckets, size, capacity)` triple.
+            None => true,
+            Some(last) => last < VIEW_BACKING_SYNC_OWN_SIZE_SLOT,
+        }
+    })
+}
+
+fn view_backing_sync_stamp(
+    ctx: &dyn NativeContext,
+    backing: ObjectRef,
+) -> Option<(i32, i32, i32)> {
+    if ctx.object_num_fields(backing) <= VIEW_BACKING_SRC_SLOT
+        || !view_backing_marker_slots_are_free(ctx)
+    {
+        return None;
+    }
+    let read = |slot: usize| match ctx.get_field(backing, slot) {
+        Value::Int(v) if v != 0 => Some(v.wrapping_sub(1)),
+        _ => None,
+    };
+    Some((
+        read(VIEW_BACKING_SYNC_MODCOUNT_SLOT)?,
+        read(VIEW_BACKING_SYNC_SRC_SIZE_SLOT)?,
+        read(VIEW_BACKING_SYNC_OWN_SIZE_SLOT)?,
+    ))
+}
+
+/// Record `(source modCount, source size)` — read BEFORE the rebuild — together
+/// with the backing's own size as it stands now.
+fn set_view_backing_sync_stamp(
+    ctx: &mut dyn NativeContext,
+    backing: ObjectRef,
+    source_stamp: (i32, i32),
+) {
+    if ctx.object_num_fields(backing) <= VIEW_BACKING_SRC_SLOT
+        || !view_backing_marker_slots_are_free(&*ctx)
+    {
+        return;
+    }
+    let own_size = map_state(ctx, backing).1;
+    ctx.set_field(
+        backing,
+        VIEW_BACKING_SYNC_MODCOUNT_SLOT,
+        Value::Int(source_stamp.0.wrapping_add(1)),
+    );
+    ctx.set_field(
+        backing,
+        VIEW_BACKING_SYNC_SRC_SIZE_SLOT,
+        Value::Int(source_stamp.1.wrapping_add(1)),
+    );
+    ctx.set_field(
+        backing,
+        VIEW_BACKING_SYNC_OWN_SIZE_SLOT,
+        Value::Int(own_size.wrapping_add(1)),
+    );
+}
+
+/// `true` when `backing` is provably still in sync with `source`.
+///
+/// The own-size term is what makes this safe against edits made THROUGH the
+/// view. `keySet().remove(k)` deletes from the backing and only then propagates
+/// to the source, and `native_hs_remove_if` / an iterator `remove()` do the
+/// same — so between the two writes the backing is in a state the source stamp
+/// alone would still call "in sync". Comparing the backing's own size closes
+/// that without having to find and annotate every such site: any edit that
+/// changes what the view holds changes its cardinality.
+fn view_backing_is_in_sync(
+    ctx: &dyn NativeContext,
+    backing: ObjectRef,
+    source: ObjectRef,
+) -> bool {
+    let Some((m, s, own)) = view_backing_sync_stamp(ctx, backing) else {
+        return false;
+    };
+    let Some((now_m, now_s)) = view_source_stamp(ctx, source) else {
+        return false;
+    };
+    m == now_m && s == now_s && own == map_state(ctx, backing).1
+}
+
+/// The view `source` has already minted for `kind`, if it is still a usable one.
+///
+/// Every term below is checked because the field is a REAL JDK field that
+/// anything may have written: it must hold a set-view carrier, that carrier
+/// must have a backing, that backing must be a view of the requested kind, and
+/// it must name THIS map as its source.
+fn cached_map_view(
+    ctx: &dyn NativeContext,
+    source: ObjectRef,
+    field_name: &str,
+    kind: i32,
+) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_of_object(source);
+    let slot = ctx.resolve_field_index_by_class_id(class_id, field_name)?;
+    if slot >= ctx.object_num_fields(source) {
+        return None;
+    }
+    let view = match ctx.get_field(source, slot) {
+        Value::Object(Some(v)) => v,
+        _ => return None,
+    };
+    // A `Hashtable`/`Properties` accessor hands back the JDK's
+    // `Collections$SynchronizedSet` in front of the carrier
+    // (`wants_synchronized_views`), so the object stored here is one level out.
+    // Validate the INNER view and return the OUTER object — the wrapper is what
+    // the accessor's contract says it returns, and re-wrapping per call would
+    // give back a different object every time, which is the identity this cache
+    // exists to keep.
+    let inner = unwrap_synchronized(ctx, view);
+    let view_class = ctx.class_id_of_object(inner);
+    match ctx.class_name_arc_of_id(view_class).as_deref() {
+        Some(n) if is_set_view_carrier(n) => {}
+        _ => return None,
+    }
+    let backing = hs_backing_map(ctx, inner)?;
+    if view_backing_kind(ctx, backing) != kind {
+        return None;
+    }
+    match view_backing_source(ctx, backing) {
+        Some(src) if src == source => Some(view),
+        _ => None,
+    }
+}
+
+/// The [`MAP_VIEW_CARRIERS`] twin of [`cached_map_view`], for `values()`.
+///
+/// A values view keeps its state in an `ArrayList`-shaped carrier and its
+/// back-reference in the trailing capacity slot of its element array, not in a
+/// view backing — so it needs its own reader, but the argument is the same one
+/// and only its CONSTRUCTION half applies: `resync_values_view` rebuilds the
+/// element array on every read and is NOT generation-guarded, because a values
+/// view is exactly the shape a value-replacing `put` changes while bumping
+/// nothing (see [`view_kind_takes_generation_guard`]).
+///
+/// The entry carrier is excluded: `TreeMap$EntrySet` is a `MAP_VIEW_CARRIERS`
+/// member whose elements are `Map.Entry`, not values, and it is not what
+/// `values()` returns.
+fn cached_values_view(ctx: &dyn NativeContext, source: ObjectRef) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_of_object(source);
+    let slot = ctx.resolve_field_index_by_class_id(class_id, "values")?;
+    if slot >= ctx.object_num_fields(source) {
+        return None;
+    }
+    let view = match ctx.get_field(source, slot) {
+        Value::Object(Some(v)) => v,
+        _ => return None,
+    };
+    let inner = unwrap_synchronized(ctx, view);
+    match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(inner))
+        .as_deref()
+    {
+        Some(n) if is_map_view_carrier(n) && n != TM_ENTRY_SET_CARRIER => {}
+        _ => return None,
+    }
+    match values_view_source(ctx, inner) {
+        Some(src) if src == source => Some(view),
+        _ => None,
+    }
+}
 /// Remove `key` from `source` by dispatching through the map's own virtual
 /// `remove(Object)` so the correct backend fires (HashMap buckets,
 /// LinkedHashMap overlay, TreeMap tree, ConcurrentHashMap segments).
@@ -15936,6 +16364,23 @@ fn resync_view_set_inner(
     if let Some((method, desc)) = static_view_accessor(kind) {
         return adopt_fresh_view_backing(ctx, set, source, method, desc);
     }
+    // Has anything changed since this backing was last rebuilt? See the
+    // "Live map views" module note for the three-term stamp and why only a
+    // keySet view may take this. Read BEFORE the rebuild and stored after it,
+    // so a source that moves DURING a rebuild is stamped as the older state and
+    // rebuilds again rather than being recorded as caught up.
+    let guarded = map_view_cache_enabled() && view_kind_takes_generation_guard(kind);
+    let stamp_before = view_source_stamp(ctx, source);
+    if guarded && view_backing_is_in_sync(ctx, backing, source) {
+        if !map_view_cache_verify() {
+            return Ok(());
+        }
+        // Verify mode: the guard said "unchanged", so rebuild anyway and prove
+        // it. `verify_view_matches_source` panics on divergence; on agreement
+        // fall through so the rebuild below is the thing that actually runs —
+        // i.e. under verification the fast path is never TAKEN, only tested.
+        verify_view_matches_source(ctx, backing, source)?;
+    }
     // Rebuild the backing map's contents from the live source. Derive the
     // capacity from the current bucket-array length via `map_state` (NOT a raw
     // `get_field(MAP_FIELD_CAPACITY)`): a real-layout view backing keeps its
@@ -16037,7 +16482,67 @@ fn resync_view_set_inner(
             let _ = native_map_put(ctx, &[Value::Object(Some(backing)), k, present_marker(k)]);
         }
     }
+    // Stamp with the generation read BEFORE the rebuild — see the module note.
+    // Only for a kind whose guard is sound; leaving the slots at their
+    // never-stamped `0` is what keeps every other kind rebuilding.
+    let backing = ctx.read_native_pin(roots_base, backing);
+    if guarded {
+        if let Some(stamp) = stamp_before {
+            set_view_backing_sync_stamp(ctx, backing, stamp);
+        }
+    }
     ctx.unpin_native_roots(roots_base);
+    Ok(())
+}
+
+/// The verify-mode check behind `CRATONVM_VERIFY_MAP_VIEW_CACHE=1`: the guard
+/// has just claimed `backing` is still in sync with `source`, so prove it.
+///
+/// Size equality plus one-way containment IS set equality here, because a map
+/// view's backing holds no duplicates. Containment is asked through
+/// `native_map_get_bool_contains`, i.e. the same `equals` route a rebuild would
+/// have used to insert — so this compares what the fast path DELIVERS against
+/// what the slow path WOULD deliver, not two spellings of the same read.
+fn verify_view_matches_source(
+    ctx: &mut dyn NativeContext,
+    backing: ObjectRef,
+    source: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let keys = collect_keys_any(ctx, source);
+    let backing_size = map_state(ctx, backing).1;
+    assert_eq!(
+        backing_size as usize,
+        keys.len(),
+        "CRATONVM_VERIFY_MAP_VIEW_CACHE: the map-view generation guard said \
+         UNCHANGED but the view holds {backing_size} keys and its source holds {}. \
+         The source mutated without moving its modCount/size, so some mutator \
+         does not bump the invalidation generation.",
+        keys.len()
+    );
+    let (base, key_pins) = pin_value_slice(ctx, &keys);
+    let mut missing: Option<String> = None;
+    for (k, key_pin) in keys.into_iter().zip(key_pins) {
+        let k = read_pinned_elem(ctx, key_pin, k);
+        let present = matches!(
+            native_map_contains_key(ctx, &[Value::Object(Some(backing)), k]),
+            Ok(Some(Value::Int(1)))
+        );
+        if !present {
+            missing = Some(format!("{k:?}"));
+            break;
+        }
+    }
+    if base != usize::MAX {
+        ctx.unpin_native_roots(base);
+    }
+    if let Some(k) = missing {
+        panic!(
+            "CRATONVM_VERIFY_MAP_VIEW_CACHE: the map-view generation guard said \
+             UNCHANGED but the source key {k} is absent from the view's backing. \
+             Same conclusion as the size mismatch above: a mutator changed the \
+             key set without moving the generation."
+        );
+    }
     Ok(())
 }
 
@@ -41919,8 +42424,26 @@ fn native_lhm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Live view: the returned set carries `this` as the source map so
     // `keySet().remove` / `iterator().remove` write through (the propagation
     // routes through LinkedHashMap.remove via virtual dispatch).
+    //
+    // Cached on the source exactly as in `native_map_key_set` — a
+    // `LinkedHashMap` inherits `AbstractMap.keySet`, and it is the source type
+    // in the workload this exists for.
+    if map_view_cache_enabled() {
+        if let Some(cached) = cached_map_view(&*ctx, this, "keySet", VIEW_KIND_KEYSET) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
     let keys = lhm_collect_keys(ctx, this);
     let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
+    if map_view_cache_enabled() {
+        // Same re-derivation as `native_map_key_set`: `this` is a
+        // pre-allocation address, the backing's back-reference is not.
+        if let Some(backing) = hs_backing_map(&*ctx, set) {
+            if let Some(src) = view_backing_source(&*ctx, backing) {
+                try_set_jdk_map_field(ctx, src, "keySet", Value::Object(Some(set)));
+            }
+        }
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -41929,9 +42452,19 @@ fn native_lhm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if map_view_cache_enabled() {
+        if let Some(cached) = cached_values_view(&*ctx, this) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
     let vals = lhm_collect_values(ctx, this);
     let carrier = values_carrier_for(&*ctx, this);
     let list = make_view_list_of(ctx, this, &vals, carrier)?;
+    if map_view_cache_enabled() {
+        if let Some(src) = values_view_source(&*ctx, list) {
+            try_set_jdk_map_field(ctx, src, "values", Value::Object(Some(list)));
+        }
+    }
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -41940,6 +42473,13 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Construction half only — see the matching block in `native_map_entry_set`
+    // for why an entrySet view is cached but not generation-guarded.
+    if map_view_cache_enabled() {
+        if let Some(cached) = cached_map_view(&*ctx, this, "entrySet", VIEW_KIND_ENTRYSET) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
     // Collect (key, value) pairs in insertion order.
     let mut pairs = Vec::new();
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
@@ -42050,6 +42590,13 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
     if flat_base != usize::MAX {
         ctx.unpin_native_roots(flat_base);
+    }
+    if map_view_cache_enabled() {
+        if let Some(backing) = hs_backing_map(&*ctx, set) {
+            if let Some(src) = view_backing_source(&*ctx, backing) {
+                try_set_jdk_map_field(ctx, src, "entrySet", Value::Object(Some(set)));
+            }
+        }
     }
     Ok(Some(Value::Object(Some(set))))
 }
