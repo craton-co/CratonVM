@@ -1,6 +1,8 @@
 # One corrupt `Value` cell in `KafkaMetricsAutoConfigurationTests`, seen once and not reproduced
 
-**Status: OPEN — one observation, and that is the whole of the evidence.** Found
+**Status: OPEN — one observation, and that is the whole of the evidence.**
+**2026-08-23: the instrument now covers the doors it missed; the cell has
+not recurred in a further 1975-class armed sweep. See the dated section.** Found
 in a two-arm Spring Boot regression sweep on 2026-08-22 (Windows host, 1975
 classes per arm). Filed because a heap-integrity guard fired and nothing else
 explains it — not because it is understood.
@@ -56,6 +58,39 @@ is a name buffer decoded as a `Value` cell. Different shape, different producer.
 
 So it needs something the suite provides and 36 concurrent re-runs do not, and
 it was not caught with the instrument armed.
+
+
+## 2026-08-23 -- the instrument was widened, and the cell did not come back
+
+`CRATONVM_DBG_CORRUPT_CELL` watched exactly one door when this page was
+written: `NativeContext::get_field`. It now watches the INTERPRETER's own
+`getfield` (where most field reads happen and which was unwatched), three more
+native doors, and a safepoint BACKSTOP for a reader with no door at all -- plus
+an exit census, `[corrupt-cell] decoded=N reported=M`, printed whenever the flag
+is armed so that an absent line and a zero line stop looking alike.
+
+That distinction was not academic. The FIRST armed sweep run for this chase
+printed the census in **zero of 1975 logs** and read exactly like a clean sweep:
+a JUnit runner exits through `System.exit`, and the summary was sitting in
+`vm-cli`'s normal-return arm. Had the census not been the thing being checked,
+that run would have been reported here as "armed, nothing found".
+
+With the census verified present, a full 1975-class Spring Boot sweep on the
+same host, same 12-way parallelism:
+
+```text
+logs 1975   census line present 1972   cells decoded 0   named 0
+```
+
+The three logs with no census line are the three HANG classes, killed before
+the shutdown trailer -- a blind spot worth stating rather than rounding off.
+
+**So the cell did not recur, and this page still does not name a producer.**
+What changed is that it no longer needs a person to be looking: the next
+occurrence reports its own door, receiver and Java stack, or -- if it comes
+through a reader with no door -- its frames at the next safepoint. And a run
+that decodes a cell nobody names now says `decoded=1 reported=0` instead of
+saying nothing.
 
 **It cannot be attributed to the branch that was merged that day**, and it
 cannot be called pre-existing either. The control arm has zero hits in this

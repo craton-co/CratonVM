@@ -1607,10 +1607,45 @@ pub fn symbolize_rvas(_rvas: &[usize]) -> Vec<(usize, Option<String>)> {
 /// registers are too degenerate for the decode to say anything.
 pub(crate) fn decode_indexed_load(regs: &[(&str, u64)], data_addr: usize) -> Option<String> {
     use std::fmt::Write as _;
-    if data_addr == 0 {
+    let mut decoded = String::new();
+    let hits = for_each_indexed_load_match(regs, data_addr, |bname, iname, scale, nth| {
+        if nth < 6 {
+            let _ = write!(decoded, " [{bname}+{iname}*{scale}]");
+        }
+    });
+    if hits == 0 {
         return None;
     }
-    let mut decoded = String::new();
+    Some(format!(
+        "Faulting address decodes as an indexed load:{}{}",
+        decoded,
+        if hits > 6 { " ..." } else { "" }
+    ))
+}
+
+/// The search itself, separated from how the answer is rendered.
+///
+/// Two reporters need it and they cannot share a formatter: the Windows path
+/// builds a `String`, and the Linux path runs inside a signal handler, where
+/// allocating is not allowed. Factoring the loop rather than writing it twice
+/// is what keeps the two reports saying the same thing about the same fault —
+/// Linux carried no decode at all until 2026-08-23, which is why the two
+/// Tomcat SIGSEGVs of 2026-08-22 arrived as bare addresses.
+///
+/// `on_match` is handed the base name, the index name, the scale, and the
+/// 0-based match ordinal; the return value is the TOTAL number of matches,
+/// which can exceed the number the caller chose to render.
+pub(crate) fn for_each_indexed_load_match<F>(
+    regs: &[(&str, u64)],
+    data_addr: usize,
+    mut on_match: F,
+) -> usize
+where
+    F: FnMut(&str, &str, usize, usize),
+{
+    if data_addr == 0 {
+        return 0;
+    }
     let mut hits = 0usize;
     for (bname, bval) in regs {
         let base = *bval as usize;
@@ -1624,22 +1659,13 @@ pub(crate) fn decode_indexed_load(regs: &[(&str, u64)], data_addr: usize) -> Opt
             }
             for scale in [1usize, 2, 4, 8] {
                 if base.wrapping_add(idx.wrapping_mul(scale)) == data_addr {
-                    if hits < 6 {
-                        let _ = write!(decoded, " [{bname}+{iname}*{scale}]");
-                    }
+                    on_match(bname, iname, scale, hits);
                     hits += 1;
                 }
             }
         }
     }
-    if hits == 0 {
-        return None;
-    }
-    Some(format!(
-        "Faulting address decodes as an indexed load:{}{}",
-        decoded,
-        if hits > 6 { " ..." } else { "" }
-    ))
+    hits
 }
 
 #[cfg(test)]
@@ -2135,6 +2161,17 @@ fn install_signal_handlers() {
         } else {
             unsafe { (*info).si_addr() as usize as u64 }
         };
+        // Does `si_addr` mean anything at all? For a hardware fault `si_code`
+        // is one of the small positive per-signal codes (SEGV_MAPERR,
+        // SEGV_ACCERR, BUS_ADRERR, ...) and `si_addr` is the address that
+        // faulted. For a signal someone SENT — `kill`, `tgkill`, `sigqueue` —
+        // `si_code` is <= 0 (SI_USER is 0, SI_QUEUE is -1) and `si_addr` is
+        // not an address, it is whatever that union member happens to hold.
+        // 0x80 is SI_KERNEL, also address-free. Without this the report reads
+        // `addr=0x0` off a `kill -SEGV` and then asserts a NULL-receiver
+        // shape for a fault that never happened.
+        let fault_addr_is_real =
+            !info.is_null() && si_code_means_a_faulting_address(unsafe { (*info).si_code });
         let fault_pc = fault_pc_from_ucontext(ucontext);
         let pc_len = hex_into_buf(&mut pc_buf, fault_pc);
         let addr_len = hex_into_buf(&mut addr_buf, fault_addr);
@@ -2212,6 +2249,143 @@ fn install_signal_handlers() {
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" rbp=0x");
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+
+            // The rest of the general-purpose file, two lines, fixed order.
+            // A crash report is read once, long after the process is gone, so
+            // a register the report omitted is evidence that no longer exists:
+            // the eight hibernate-orm JSON/XML crashes were decoded from `rax`
+            // and `r10` together, and constant `rbx`/`rbp`/`rdi` across all
+            // eight is what ruled out "memory corruption from anywhere".
+            // Reading `gregs` and writing hex allocates nothing.
+            for (label, which) in [
+                (b"#  rax=0x".as_slice(), GREG_RAX),
+                (b" rbx=0x".as_slice(), GREG_RBX),
+                (b" rcx=0x".as_slice(), GREG_RCX),
+                (b" rdx=0x".as_slice(), GREG_RDX),
+                (b" rsi=0x".as_slice(), GREG_RSI),
+                (b" rdi=0x".as_slice(), GREG_RDI),
+            ] {
+                let n = hex_into_buf(&mut rbuf, greg_from_ucontext(ucontext, which));
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, label);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+            }
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+            for (label, which) in [
+                (b"#  r8=0x".as_slice(), GREG_R8),
+                (b" r9=0x".as_slice(), GREG_R9),
+                (b" r12=0x".as_slice(), GREG_R12),
+                (b" r13=0x".as_slice(), GREG_R13),
+                (b" r14=0x".as_slice(), GREG_R14),
+                (b" r15=0x".as_slice(), GREG_R15),
+            ] {
+                let n = hex_into_buf(&mut rbuf, greg_from_ucontext(ucontext, which));
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, label);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+            }
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+
+            // Decode the faulting address as `base + index*scale` over the
+            // registers just printed — the same search the Windows path has
+            // done since 2026-08-22, which Linux did not have. That is not a
+            // hypothetical gap: all eight logs behind
+            // known-issues/hibernate/
+            // hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md
+            // satisfy `fault == r10 + rax*4`, an unchecked jump-table load with
+            // a garbage index, and two sessions read the scattered addresses as
+            // random corruption because nothing said so.
+            //
+            // A `*4`/`*8` hit whose INDEX register holds a large value is the
+            // signature worth acting on: an array index, or an enum
+            // discriminant that should have been small, read out of memory that
+            // did not hold one.
+            //
+            // The Windows reporter formats into a `String`; a signal handler
+            // may not allocate, so both go through `for_each_indexed_load_match`
+            // and only the rendering differs.
+            if fault_addr_is_real {
+                let regs: [(&str, u64); 16] = [
+                    ("rax", greg_from_ucontext(ucontext, GREG_RAX)),
+                    ("rbx", greg_from_ucontext(ucontext, GREG_RBX)),
+                    ("rcx", greg_from_ucontext(ucontext, GREG_RCX)),
+                    ("rdx", greg_from_ucontext(ucontext, GREG_RDX)),
+                    ("rsi", greg_from_ucontext(ucontext, GREG_RSI)),
+                    ("rdi", greg_from_ucontext(ucontext, GREG_RDI)),
+                    ("r8", greg_from_ucontext(ucontext, GREG_R8)),
+                    ("r9", greg_from_ucontext(ucontext, GREG_R9)),
+                    ("r10", r10),
+                    ("r11", greg_from_ucontext(ucontext, GREG_R11)),
+                    ("r12", greg_from_ucontext(ucontext, GREG_R12)),
+                    ("r13", greg_from_ucontext(ucontext, GREG_R13)),
+                    ("r14", greg_from_ucontext(ucontext, GREG_R14)),
+                    ("r15", greg_from_ucontext(ucontext, GREG_R15)),
+                    ("rsp", rsp),
+                    ("rbp", greg_from_ucontext(ucontext, GREG_RBP)),
+                ];
+                let mut wrote_header = false;
+                let hits = for_each_indexed_load_match(
+                    &regs,
+                    fault_addr as usize,
+                    |bname, iname, scale, nth| {
+                        if nth >= 6 {
+                            return;
+                        }
+                        if !wrote_header {
+                            async_signal_safe::write_all(
+                                async_signal_safe::STDERR_FD,
+                                b"#  fault addr decodes as an indexed load:",
+                            );
+                            wrote_header = true;
+                        }
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" [");
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            bname.as_bytes(),
+                        );
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"+");
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            iname.as_bytes(),
+                        );
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"*");
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            match scale {
+                                1 => b"1".as_slice(),
+                                2 => b"2".as_slice(),
+                                4 => b"4".as_slice(),
+                                _ => b"8".as_slice(),
+                            },
+                        );
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"]");
+                    },
+                );
+                if wrote_header {
+                    if hits > 6 {
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" ...");
+                    }
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                }
+
+                // The other shape this tree has seen: an address inside the
+                // first page is a field load off a NULL receiver, where the low
+                // bits are the field offset and not an address. Both Tomcat
+                // SIGSEGVs of 2026-08-22 are this (`addr=0x5`, `addr=0xf`), and
+                // neither decodes as an indexed load — saying so is what keeps
+                // them out of the hibernate family.
+                if fault_addr < 4096 {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#  fault addr is below one page - a NULL receiver plus a field \
+offset, not a stray pointer\n",
+                    );
+                }
+            } else {
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"#  this signal was SENT, not raised by a fault - the addr above is \
+not an address\n",
+                );
+            }
         }
 
         // Which compiled body does the faulting PC (and, for an indirect call
@@ -2556,17 +2730,53 @@ fn install_signal_handlers() {
 
 /// `ucontext_t::uc_mcontext.gregs` indices used by the register dump. Only
 /// meaningful on Linux/x86-64; other platforms report 0.
+///
+/// The whole general-purpose file is here, not just the four the dump started
+/// with, because the analysis this dump exists to feed needs the operands of
+/// the faulting instruction and not only its base. The eight hibernate-orm
+/// JSON/XML crashes were decoded by testing `fault_address == r10 + rax*4` --
+/// which the Linux report could not have answered, because it never printed
+/// `rax` (docs/known-issues/hibernate/
+/// hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md).
 #[cfg(unix)]
-const GREG_R10: usize = 0;
+const GREG_RAX: usize = 0;
 #[cfg(unix)]
-const GREG_R11: usize = 1;
+const GREG_RBX: usize = 1;
 #[cfg(unix)]
-const GREG_RSP: usize = 2;
+const GREG_RCX: usize = 2;
 #[cfg(unix)]
-const GREG_RBP: usize = 3;
+const GREG_RDX: usize = 3;
+#[cfg(unix)]
+const GREG_RSI: usize = 4;
+#[cfg(unix)]
+const GREG_RDI: usize = 5;
+#[cfg(unix)]
+const GREG_R8: usize = 6;
+#[cfg(unix)]
+const GREG_R9: usize = 7;
+#[cfg(unix)]
+const GREG_R10: usize = 8;
+#[cfg(unix)]
+const GREG_R11: usize = 9;
+#[cfg(unix)]
+const GREG_R12: usize = 10;
+#[cfg(unix)]
+const GREG_R13: usize = 11;
+#[cfg(unix)]
+const GREG_R14: usize = 12;
+#[cfg(unix)]
+const GREG_R15: usize = 13;
+#[cfg(unix)]
+const GREG_RSP: usize = 14;
+#[cfg(unix)]
+const GREG_RBP: usize = 15;
 
 /// One general-purpose register out of the signal frame, selected by the
 /// pseudo-indices above. Plain loads only — async-signal-safe.
+///
+/// Every index is spelled out. The earlier `_ => libc::REG_RBP` catch-all was
+/// safe with four callers and would have quietly reported `rbp` under a
+/// fifteenth register's label.
 #[cfg(unix)]
 fn greg_from_ucontext(ucontext: *mut std::ffi::c_void, which: usize) -> u64 {
     if ucontext.is_null() {
@@ -2576,10 +2786,23 @@ fn greg_from_ucontext(ucontext: *mut std::ffi::c_void, which: usize) -> u64 {
     unsafe {
         let uc = ucontext as *const libc::ucontext_t;
         let idx = match which {
+            GREG_RAX => libc::REG_RAX,
+            GREG_RBX => libc::REG_RBX,
+            GREG_RCX => libc::REG_RCX,
+            GREG_RDX => libc::REG_RDX,
+            GREG_RSI => libc::REG_RSI,
+            GREG_RDI => libc::REG_RDI,
+            GREG_R8 => libc::REG_R8,
+            GREG_R9 => libc::REG_R9,
             GREG_R10 => libc::REG_R10,
             GREG_R11 => libc::REG_R11,
+            GREG_R12 => libc::REG_R12,
+            GREG_R13 => libc::REG_R13,
+            GREG_R14 => libc::REG_R14,
+            GREG_R15 => libc::REG_R15,
             GREG_RSP => libc::REG_RSP,
-            _ => libc::REG_RBP,
+            GREG_RBP => libc::REG_RBP,
+            _ => return 0,
         };
         (*uc).uc_mcontext.gregs[idx as usize] as u64
     }
@@ -2588,6 +2811,23 @@ fn greg_from_ucontext(ucontext: *mut std::ffi::c_void, which: usize) -> u64 {
         let _ = (ucontext, which);
         0
     }
+}
+
+/// Does this signal's `si_addr` mean anything?
+///
+/// For a hardware fault `si_code` is one of the small positive per-signal codes
+/// (`SEGV_MAPERR`, `SEGV_ACCERR`, `BUS_ADRERR`, …) and `si_addr` is the address
+/// that faulted. For a signal someone SENT — `kill`, `tgkill`, `sigqueue` —
+/// `si_code` is <= 0 (`SI_USER` is 0, `SI_QUEUE` is -1, `SI_TKILL` is -6) and
+/// `si_addr` is not an address at all, it is whatever that union member happens
+/// to hold. `SI_KERNEL` (0x80) is address-free too.
+///
+/// Without this the report reads `addr=0x0` off a `kill -SEGV` and then decodes
+/// a faulting address that never existed.
+#[cfg(unix)]
+fn si_code_means_a_faulting_address(si_code: i32) -> bool {
+    const SI_KERNEL: i32 = 0x80;
+    si_code > 0 && si_code != SI_KERNEL
 }
 
 /// Faulting instruction pointer out of the signal frame, or 0 where the
@@ -3783,6 +4023,142 @@ mod tests {
         assert!(
             !s.contains("detailed VM info unavailable"),
             "the mode and collector are published lock-free; they are available: {s}"
+        );
+    }
+
+    /// Every pseudo-index reads its OWN machine register, and an index the
+    /// table does not know reports 0 rather than a plausible wrong one.
+    ///
+    /// The accessor used to end in `_ => libc::REG_RBP`. With four callers that
+    /// was harmless. With the whole general-purpose file now printed, one
+    /// mistyped arm would put `rbp`'s value under `r13`'s label — and a crash
+    /// report is read once, long after the process is gone, by someone who
+    /// cannot re-run the fault to check. The mapping is therefore stated twice,
+    /// here and in the accessor, so a typo in either shows up as a mismatch.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn every_gp_register_index_reads_its_own_slot() {
+        let table: [(usize, libc::c_int, &str); 16] = [
+            (GREG_RAX, libc::REG_RAX, "rax"),
+            (GREG_RBX, libc::REG_RBX, "rbx"),
+            (GREG_RCX, libc::REG_RCX, "rcx"),
+            (GREG_RDX, libc::REG_RDX, "rdx"),
+            (GREG_RSI, libc::REG_RSI, "rsi"),
+            (GREG_RDI, libc::REG_RDI, "rdi"),
+            (GREG_R8, libc::REG_R8, "r8"),
+            (GREG_R9, libc::REG_R9, "r9"),
+            (GREG_R10, libc::REG_R10, "r10"),
+            (GREG_R11, libc::REG_R11, "r11"),
+            (GREG_R12, libc::REG_R12, "r12"),
+            (GREG_R13, libc::REG_R13, "r13"),
+            (GREG_R14, libc::REG_R14, "r14"),
+            (GREG_R15, libc::REG_R15, "r15"),
+            (GREG_RSP, libc::REG_RSP, "rsp"),
+            (GREG_RBP, libc::REG_RBP, "rbp"),
+        ];
+
+        let mut uc: libc::ucontext_t = unsafe { std::mem::zeroed() };
+        // A distinct, non-zero value per machine register, written through the
+        // libc index, so nothing the accessor does can produce it by accident.
+        for (i, (_, libc_idx, _)) in table.iter().enumerate() {
+            uc.uc_mcontext.gregs[*libc_idx as usize] = 0x1000 + i as libc::greg_t;
+        }
+        let ucp = (&mut uc as *mut libc::ucontext_t).cast::<std::ffi::c_void>();
+
+        for (i, (pseudo, _, name)) in table.iter().enumerate() {
+            assert_eq!(
+                greg_from_ucontext(ucp, *pseudo),
+                0x1000 + i as u64,
+                "the pseudo-index for {name} read a different register's slot"
+            );
+        }
+
+        // The pseudo-indices are 0..=15; anything past the table is a caller
+        // bug and must report 0, not the last arm's register.
+        assert_eq!(
+            greg_from_ucontext(ucp, table.len()),
+            0,
+            "an unknown pseudo-index must report 0, never a plausible register"
+        );
+        assert_eq!(
+            greg_from_ucontext(std::ptr::null_mut(), GREG_RAX),
+            0,
+            "a null ucontext must report 0"
+        );
+    }
+
+    /// `si_addr` is only an address when `si_code` says a fault produced it.
+    ///
+    /// The signal handler's decode and its NULL-receiver line both hang off
+    /// this. Get it wrong in the permissive direction and a `kill -SEGV` — the
+    /// ordinary way to prod a wedged VM — prints a confident verdict about a
+    /// fault that never happened, in a report whose whole value is that it is
+    /// trustworthy.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_hardware_fault_has_a_faulting_address() {
+        // Per-signal fault codes: SEGV_MAPERR/SEGV_ACCERR/SEGV_BNDERR/
+        // SEGV_PKUERR, and BUS_ADRALN/BUS_ADRERR/BUS_OBJERR, are 1..=4.
+        for code in 1..=4 {
+            assert!(
+                si_code_means_a_faulting_address(code),
+                "si_code {code} is a hardware fault"
+            );
+        }
+        // SI_USER (kill), SI_QUEUE (sigqueue), SI_TKILL (tgkill): sent, so
+        // si_addr is an unrelated union member.
+        for code in [0, -1, -6] {
+            assert!(
+                !si_code_means_a_faulting_address(code),
+                "si_code {code} was SENT, si_addr is not an address"
+            );
+        }
+        // SI_KERNEL is kernel-raised but still carries no faulting address.
+        assert!(!si_code_means_a_faulting_address(0x80));
+    }
+
+    /// The indexed-load search, against the registers a real crash carried, and
+    /// against the two that must NOT match it.
+    ///
+    /// `decode_indexed_load` had its own test for the hibernate row already;
+    /// what is new here is that the search is now shared with the signal
+    /// handler, so this pins the part both callers depend on — including that
+    /// the total hit count is the TOTAL, not the number rendered, since the
+    /// Windows path prints `...` off exactly that difference.
+    #[test]
+    fn the_shared_indexed_load_search_matches_what_the_windows_reporter_reports() {
+        // hs_err_pid3512, g1: fault == r10 + rax*4.
+        let regs = [("rax", 0xEAF8_2DA0u64), ("r10", 0x7FF6_35D7_9014u64)];
+        let mut seen = Vec::new();
+        let hits = for_each_indexed_load_match(&regs, 0x0000_7FF9_E1B8_4694, |b, i, s, n| {
+            seen.push((b.to_string(), i.to_string(), s, n))
+        });
+        assert_eq!(hits, 1, "exactly one pair explains this address");
+        assert_eq!(seen[0].0, "r10");
+        assert_eq!(seen[0].1, "rax");
+        assert_eq!(seen[0].2, 4);
+        // The rendering the Windows path builds on top of the same search.
+        assert!(decode_indexed_load(&regs, 0x0000_7FF9_E1B8_4694)
+            .expect("must decode")
+            .contains("[r10+rax*4]"));
+
+        // The two Tomcat SIGSEGVs of 2026-08-22. Neither is an indexed load,
+        // and that is the point: nothing may attach the hibernate family's
+        // analysis to them.
+        for (addr, r10) in [(0xfusize, 0x708e_467f_6e48u64), (0x5, 0x8000_0000_0000_0000)] {
+            let regs = [("r10", r10), ("rax", 0)];
+            assert_eq!(
+                for_each_indexed_load_match(&regs, addr, |_, _, _, _| {}),
+                0,
+                "addr {addr:#x} must not decode as an indexed load"
+            );
+            assert!(decode_indexed_load(&regs, addr).is_none());
+        }
+
+        // A zero address is not decodable, however degenerate the registers.
+        assert_eq!(
+            for_each_indexed_load_match(&[("rax", 7), ("rbx", 9)], 0, |_, _, _, _| {}),
+            0
         );
     }
 }

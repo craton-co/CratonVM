@@ -441,6 +441,9 @@ pub fn compile_with_param_slots(
     // calls — an optimisation left on the table, never a miscompile.
     elidable_init_pcs: Option<std::collections::HashSet<usize>>,
 ) -> Option<CompiledMethod> {
+    // Cost of a discarded lowering, for the code-buffer bail below. Reading a
+    // monotonic clock once per compile is noise next to the compile itself.
+    let compile_started = std::time::Instant::now();
     // The drift witness for `compile_gate`. Every production door must hold an
     // admission token when it gets here; this counts the entries that do not,
     // which is how a FOURTH door added later announces itself instead of
@@ -2016,6 +2019,7 @@ pub fn compile_with_param_slots(
             compiler.buf.capacity(),
         );
         crate::note_jit_bail_site(crate::CODE_BUFFER_TOO_SMALL_SITE);
+        crate::note_code_buffer_bail_cost(compile_started.elapsed());
         return None;
     }
 

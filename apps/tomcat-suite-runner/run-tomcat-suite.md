@@ -78,7 +78,7 @@ awk -F, '$4!="PASS"{print $1}' \
 
 ```
 $TC_ROOT/.suite/results/<run_name>/shard-<i>/
-  results.csv       class,rc,seconds,status   (append-only, RESUMABLE)
+  results.csv       class,rc,seconds,status,loadavg1   (append-only, RESUMABLE)
   <fqcn>.log        full stdout+stderr, kept only for non-PASS classes
   DONE              marker written when the shard's class list is exhausted
 ```
@@ -86,6 +86,12 @@ $TC_ROOT/.suite/results/<run_name>/shard-<i>/
 Status values: `PASS` (JUnit `OK (n tests)`), `FAIL` (`FAILURES!!!`), `HANG`
 (hit the per-class timeout), `CRASH` (panic/SIGSEGV/SIGABRT fingerprint in the
 log), `NOSUMMARY` (process exited with no JUnit summary at all).
+
+`loadavg1` is the host's 1-minute load average as that class finished. It is
+there because `HANG` is not self-explanatory on a shared box: a class capped at
+`TIMEOUT_SEC` is recorded `HANG` whether it is stuck or merely starved, and the
+two are indistinguishable from the status alone. Read it before reading a
+`HANG` — and before reading a `FAIL` from any class that asserts on timing.
 
 ## 4. Never trust a FAIL/HANG count without a same-fixture HotSpot baseline
 
