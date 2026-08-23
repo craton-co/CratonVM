@@ -2400,7 +2400,7 @@ pub fn compile_with_param_slots(
     // `safepoint_pcs` can hold hundreds of entries and the difference is the
     // whole content of the report.
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOPCOV").is_some()
-        && !cm.fully_oop_covered
+        && !(cm.fully_oop_covered && cm.fully_shadow_covered)
     {
         let mut missing: Vec<u32> = compiler
             .safepoint_pcs
@@ -2409,9 +2409,38 @@ pub fn compile_with_param_slots(
             .collect();
         missing.sort_unstable();
         missing.truncate(16);
+        // The safepoints whose SHADOW claim is false, which is the aggregate
+        // the OSR fallback reads. Listed by `bytecode_pc` so it lines up with
+        // `unmapped_pcs` — the two sets are different questions and, on the
+        // direct-call shape, deliberately disjoint.
+        let mut shadow_missing: Vec<u32> = cm
+            .oop_maps
+            .iter()
+            .filter(|m| !m.moving_young_coverage_complete)
+            .map(|m| m.bytecode_pc)
+            .collect();
+        shadow_missing.sort_unstable();
+        shadow_missing.dedup();
+        shadow_missing.truncate(16);
+        let scauses = crate::x64::safepoint::shadow_incomplete_cause::snapshot();
         let causes = crate::x64::safepoint::map_incomplete_cause::snapshot();
         eprintln!(
-            "[oopcov] uncovered method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
+            "[oopcov] uncovered method={} frameslot={} shadow={} \
+             shadow_missing_pcs={shadow_missing:?} \
+             scauses(gate={} desync={} marks={} scratch={} locals64={} dataflow={} nopush={}) ",
+            compiler.method_key,
+            cm.fully_oop_covered,
+            cm.fully_shadow_covered,
+            scauses[0],
+            scauses[1],
+            scauses[2],
+            scauses[3],
+            scauses[4],
+            scauses[5],
+            scauses[6],
+        );
+        eprintln!(
+            "[oopcov]   frameslot-detail method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
              safepoints={} mapped={} unmapped_pcs={:?} \
              causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={} staged_unmappable={})",
             compiler.method_key,

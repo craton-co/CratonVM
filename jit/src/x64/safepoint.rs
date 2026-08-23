@@ -75,6 +75,50 @@ pub mod map_incomplete_cause {
     }
 }
 
+/// Why a safepoint's SHADOW claim (`OopMapEntry::moving_young_coverage_complete`)
+/// came out false, counted per cause.
+///
+/// The sibling of [`map_incomplete_cause`], for the other of the two coverage
+/// notions. `CompiledMethod::fully_shadow_covered` ANDs this flag over every
+/// safepoint of a method, and the OSR fallback reads that aggregate — so a
+/// single false here refuses relocation for every collection with one of this
+/// method's frames live. Six causes, six different repairs.
+pub mod shadow_incomplete_cause {
+    use std::sync::atomic::AtomicUsize;
+    /// Moving-young is off, or the compile already failed.
+    pub static GATE_OFF_OR_FAILED: AtomicUsize = AtomicUsize::new(0);
+    /// `stack.len() != stack_oop_marks.len()` — the lockstep invariant broke.
+    pub static MARK_VECTOR_DESYNC: AtomicUsize = AtomicUsize::new(0);
+    /// The operand-stack oop marks are not exact at this safepoint (a revived
+    /// dead-code merge reconstructed the stack at a nonzero depth).
+    pub static MARKS_INEXACT: AtomicUsize = AtomicUsize::new(0);
+    /// A marked oop is in a scratch or XMM slot, which the push cannot name.
+    pub static OOP_IN_SCRATCH_OR_XMM: AtomicUsize = AtomicUsize::new(0);
+    /// More than 64 locals, so `color_graph`'s mask cannot describe them all.
+    pub static TOO_MANY_LOCALS: AtomicUsize = AtomicUsize::new(0);
+    /// The forward "must be oop" dataflow never reached this bytecode pc, so
+    /// there is no local oop mask to publish from.
+    pub static LOCAL_OOP_DATAFLOW_UNREACHED: AtomicUsize = AtomicUsize::new(0);
+    /// The push was not emitted at all (shadow gate off, helper unwired, or the
+    /// prologue reserved no thread slot).
+    pub static PUSH_NOT_EMITTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(gate_off, desync, marks_inexact, oop_in_scratch, too_many_locals,
+    /// dataflow_unreached, push_not_emitted)`.
+    pub fn snapshot() -> [usize; 7] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            GATE_OFF_OR_FAILED.load(Relaxed),
+            MARK_VECTOR_DESYNC.load(Relaxed),
+            MARKS_INEXACT.load(Relaxed),
+            OOP_IN_SCRATCH_OR_XMM.load(Relaxed),
+            TOO_MANY_LOCALS.load(Relaxed),
+            LOCAL_OOP_DATAFLOW_UNREACHED.load(Relaxed),
+            PUSH_NOT_EMITTED.load(Relaxed),
+        ]
+    }
+}
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Frame layout, prologue and epilogue
@@ -507,31 +551,42 @@ impl Compiler {
     /// signal to the GC: if this frame is live here, moving-young must divert to
     /// the non-moving sweep for that cycle.
     fn moving_young_safepoint_coverage_complete(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
         if !moving_young_enabled() || self.failed {
+            shadow_incomplete_cause::GATE_OFF_OR_FAILED.fetch_add(1, Relaxed);
             return false;
         }
         if self.stack.len() != self.stack_oop_marks.len() {
+            shadow_incomplete_cause::MARK_VECTOR_DESYNC.fetch_add(1, Relaxed);
             return false;
         }
         if !self.stack.is_empty() && !self.stack_oop_marks_exact {
+            shadow_incomplete_cause::MARKS_INEXACT.fetch_add(1, Relaxed);
             return false;
         }
         for (slot, &is_oop) in self.stack.iter().zip(self.stack_oop_marks.iter()) {
             if is_oop && matches!(slot, StackSlot::Scratch(_) | StackSlot::Xmm(_)) {
+                shadow_incomplete_cause::OOP_IN_SCRATCH_OR_XMM.fetch_add(1, Relaxed);
                 return false;
             }
         }
         if self.num_locals > 64 {
+            shadow_incomplete_cause::TOO_MANY_LOCALS.fetch_add(1, Relaxed);
             return false;
         }
         if self.num_locals == 0 {
             return true;
         }
-        self.local_oop_reached
+        let ok = self
+            .local_oop_reached
             .get(self.cur_bc_pc)
             .copied()
             .unwrap_or(false)
-            && self.local_oop_masks.get(self.cur_bc_pc).is_some()
+            && self.local_oop_masks.get(self.cur_bc_pc).is_some();
+        if !ok {
+            shadow_incomplete_cause::LOCAL_OOP_DATAFLOW_UNREACHED.fetch_add(1, Relaxed);
+        }
+        ok
     }
 
     /// Collect the homes of every live oop at the current safepoint: operand-
@@ -655,6 +710,8 @@ impl Compiler {
             || self.helpers.get_current_thread == 0
             || self.shadow_thread_slot_off == 0
         {
+            shadow_incomplete_cause::PUSH_NOT_EMITTED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.pending_shadow_coverage_complete = false;
             return;
         }
