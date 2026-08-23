@@ -1321,6 +1321,29 @@ pub fn jit_virtual_bytecode_callee() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_SPECIAL_BYTECODE_CALLEE` — the `invokespecial` third of the
+/// interpreted-callee memo (`jit::helpers::try_jit_special_bytecode_callee`).
+///
+/// Last of the four dispatch kinds and the smallest by volume
+/// (`kind_special=5_475_486` against `kind_static=107_874_082` on
+/// `BigEndianHeapByteBufTest`), smaller still because the shared
+/// `site_name_is_special_cased` gate excludes `<init>`/`<clinit>`. It is here
+/// for completeness of `jit-compiled-caller-to-interpreted-callee-costs-1900ns`
+/// rather than for a headline number, and it is switched separately so that is
+/// measurable rather than assumed.
+///
+/// Default ON. `CRATONVM_JIT_SPECIAL_BYTECODE_CALLEE=0` restores the by-name
+/// path.
+#[inline]
+pub fn jit_special_bytecode_callee() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPECIAL_BYTECODE_CALLEE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).

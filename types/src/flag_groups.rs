@@ -1181,6 +1181,9 @@ pub const INVENTORY: &[E] = &[
     // The virtual/interface half of the same memo, same default-ON,
     // opt-out-only shape (`env_cache::jit_virtual_bytecode_callee`).
     E { group: Group::JIT, token: "virtual-bytecode-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
+    // And the invokespecial third, switched separately so its much smaller
+    // eligible population is measurable rather than assumed.
+    E { group: Group::JIT, token: "special-bytecode-callee", on_key: Some("CRATONVM_JIT_SPECIAL_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "statics-index", on_key: None, off_key: Some("CRATONVM_NO_STATICS_INDEX"), off_word: None },
     E { group: Group::JIT, token: "vector-intrinsics", on_key: Some("CRATONVM_VECTOR_INTRINSICS"), off_key: None, off_word: Some("0") },
     // The dispatch-layer half of the same feature, switched separately so the

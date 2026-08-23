@@ -437,8 +437,15 @@ pub mod disp_census {
     /// `out_virt_bc` means the population is ineligible, not that the memo
     /// is thrashing.
     pub const OUT_VIRT_BC_REFUSED: usize = 19;
+    /// The `invokespecial` third of the same memo
+    /// (`try_jit_special_bytecode_callee`), kept as its own row because its
+    /// eligible population is much smaller — `site_name_is_special_cased`
+    /// excludes `<init>`/`<clinit>`, which is most of the invokespecial
+    /// traffic — and folding it into `out_virt_bc` would hide that.
+    pub const OUT_SPECIAL_BC: usize = 20;
+    pub const OUT_SPECIAL_BC_REFUSED: usize = 21;
 
-    const N: usize = 20;
+    const N: usize = 22;
     const NAMES: [&str; N] = [
         "kind_virtual",
         "kind_special",
@@ -460,9 +467,13 @@ pub mod disp_census {
         "out_static_bc_refused",
         "out_virt_bc",
         "out_virt_bc_refused",
+        "out_special_bc",
+        "out_special_bc_refused",
     ];
 
     static COUNTS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -12444,6 +12455,26 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             } else {
                 None
             };
+            // A callee the JIT did not compile: enter it through this site's
+            // cached interpreter frame template. Only when `resolved_owner` is
+            // available — that IS the loader-faithful owner, and this memo has
+            // no by-name fallback on purpose.
+            if let Some(owner) = resolved_owner {
+                if let Some(r) =
+                    try_jit_special_bytecode_callee(vm, thread, info, info_key, owner, &values)
+                {
+                    return match r {
+                        Ok(Some(Value::Int(v))) => v as i64,
+                        Ok(Some(Value::Long(v))) => v,
+                        Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+                        Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+                        Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+                        Ok(Some(Value::Object(None)) | None) => 0,
+                        Ok(_) => 0,
+                        Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
+                    };
+                }
+            }
             let r = match resolved_owner {
                 Some(owner) => crate::vm::invoke_special_shared_on_class(
                     vm,
@@ -12820,6 +12851,106 @@ unsafe fn try_jit_virtual_bytecode_callee(
         return None;
     }
     disp_census::note(disp_census::OUT_VIRT_BC);
+    thread.refill_pools_from_shared(
+        &vm.mem.operand_stack_pool,
+        &vm.mem.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+        cached,
+        values,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    Some(crate::runtime::interpreter::execute_prebuilt_frame(
+        vm, thread, frame,
+    ))
+}
+
+/// The `invokespecial` third of the interpreted-callee memo.
+///
+/// The last of the four dispatch kinds, and the one with the smallest volume
+/// (`kind_special=5_475_486` against `kind_static=107_874_082` on
+/// `BigEndianHeapByteBufTest`) and the largest history: BUG-JIT-INVOKESPECIAL-
+/// LOADER-20260726 and the `AotIntegrationTests` static-owner hang are both
+/// invokespecial resolving a class NAME through the global binary-name map and
+/// binding to another loader's copy.
+///
+/// This path cannot repeat that, because it never sees a name. The kind-1 arm
+/// of [`jit_invoke_dispatch`] has ALREADY resolved the owner through the
+/// CALLER's loader (`resolve_class_loader_aware` on
+/// `JitInvokeInfo::declaring_class_id`) before it dispatches, and the resolved
+/// `ClassId` is what this memo is keyed on and what
+/// `build_lambda_impl_cached` walks from. When that resolution is unavailable
+/// — `declaring_class_id == 0`, the shape that falls back to
+/// `invoke_special_shared`'s own by-name lookup — the caller passes `None` and
+/// this is never reached.
+///
+/// `find_method_recursive` from the resolved owner is exactly what
+/// `invoke_special_shared_impl` does between its native probe and its
+/// `invoke_on_class_shared_no_retarget` call, so the target is the same method
+/// with the same no-retarget semantics: an invokespecial must NOT re-dispatch
+/// onto the receiver's runtime class, and starting the walk at the owner
+/// rather than at the receiver is what guarantees it.
+///
+/// # What it refuses
+///
+/// Everything [`try_jit_virtual_bytecode_callee`] refuses, and constructors
+/// with it: `site_name_is_special_cased` already lists `<init>` and
+/// `<clinit>`, which is most of the invokespecial population and all of the
+/// part whose failure would be hardest to see. That is deliberate on this
+/// pass — the three memos share one gate, and a fourth spelling of it is how
+/// they would come to admit shapes the others refuse.
+///
+/// SAFETY: `values` are the caller's already-decoded arguments with the
+/// receiver at index 0; `thread` is the JIT helper's own borrow.
+unsafe fn try_jit_special_bytecode_callee(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    info_key: JitSiteKey,
+    owner: ClassId,
+    values: &[Value],
+) -> Option<Result<Option<Value>, crate::error::MethodCallFailed>> {
+    if !crate::runtime::env_cache::jit_special_bytecode_callee() {
+        return None;
+    }
+    if info.invoke_kind != 1 || owner == ClassId::new(0) {
+        return None;
+    }
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
+    // Same map as the virtual memo, and the two cannot collide: a call site's
+    // `invoke_kind` is fixed, so one `JitSiteKey` is only ever a kind-1 site or
+    // only ever a kind-0/2 one, and the second half of the key means "resolved
+    // owner" for the first and "receiver class" for the second.
+    let key = (info_key, owner.as_u32());
+    let cached = match VIRTUAL_BYTECODE_CALLEE_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        Some(hit) => hit,
+        None => {
+            let resolved = resolve_virtual_bytecode_callee(vm, info, owner);
+            VIRTUAL_BYTECODE_CALLEE_CACHE.with(|c| {
+                c.borrow_mut().insert(key, resolved.clone());
+            });
+            resolved
+        }
+    };
+    let Some((cached, gate)) = cached else {
+        disp_census::note(disp_census::OUT_SPECIAL_BC_REFUSED);
+        return None;
+    };
+    if gate.is_stale() {
+        VIRTUAL_BYTECODE_CALLEE_CACHE.with(|c| {
+            c.borrow_mut().remove(&key);
+        });
+        return None;
+    }
+    if values.len() != cached.num_params as usize + 1 {
+        return None;
+    }
+    disp_census::note(disp_census::OUT_SPECIAL_BC);
     thread.refill_pools_from_shared(
         &vm.mem.operand_stack_pool,
         &vm.mem.tag_pool,
