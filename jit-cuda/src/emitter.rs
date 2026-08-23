@@ -40,6 +40,10 @@ pub struct PtxModule {
     /// See `KernelSignature::writes_param_mask` for the consumer
     /// (the marshaller in `vm::runtime::offload`).
     pub writes_param_mask: u64,
+    /// Bit-set of params the kernel READS element-wise. Mirror of
+    /// `writes_param_mask`; see `KernelSignature::reads_param_mask` for
+    /// why the chunked writeback needs it.
+    pub reads_param_mask: u64,
 }
 
 impl PtxModule {
@@ -180,6 +184,7 @@ mod tests {
             sm_minor: 5,
             kernels: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
         };
         let s = m.render();
         assert!(s.contains(".version 7.5"));

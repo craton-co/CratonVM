@@ -823,9 +823,52 @@ fn io_err(e: io::Error) -> MethodCallFailed {
 }
 
 /// Convert a "file not found" error for a given path.
+///
+/// **The message is `<path> (<reason>)`, not `<path>`.** HotSpot's
+/// `FileNotFoundException` message is built by the platform layer as the path
+/// followed by `strerror(errno)` in parentheses, and it is the whole content of
+/// the log line an operator reads:
+///
+/// ```text
+///   HotSpot    /definitely/not/here (No such file or directory)
+///   CratonVM   /definitely/not/here                              <- before 2026-08-22
+/// ```
+///
+/// MEASURED with `regression-suite/probes/W4Buffers.java`. A bare path says
+/// only "something went wrong with this file" — it does not distinguish absent
+/// from unreadable from is-a-directory, which is exactly the distinction the
+/// operator is looking for, and the sibling directory case in this file has
+/// carried its `(Is a directory)` suffix all along.
+///
+/// Callers that already have the `io::Error` should use
+/// [`file_not_found_because`] so the reason is the REAL errno rather than the
+/// default assumed here.
 fn file_not_found(path: &str) -> MethodCallFailed {
+    file_not_found_reason(path, "No such file or directory")
+}
+
+/// [`file_not_found`] with the reason taken from the OS error that produced it.
+fn file_not_found_because(path: &str, e: &io::Error) -> MethodCallFailed {
+    let reason = match e.kind() {
+        io::ErrorKind::NotFound => "No such file or directory".to_string(),
+        io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        io::ErrorKind::IsADirectory => "Is a directory".to_string(),
+        // `io::Error`'s Display already reads like `strerror` plus an
+        // `(os error N)` tail; drop the tail, which HotSpot does not print.
+        _ => {
+            let text = e.to_string();
+            match text.split_once(" (os error") {
+                Some((head, _)) => head.to_string(),
+                None => text,
+            }
+        }
+    };
+    file_not_found_reason(path, &reason)
+}
+
+fn file_not_found_reason(path: &str, reason: &str) -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::FileNotFoundException {
-        path: path.to_string(),
+        path: format!("{path} ({reason})"),
     }))
 }
 
@@ -861,7 +904,7 @@ fn file_not_found(path: &str) -> MethodCallFailed {
 /// window can only mis-decide if the path changes kind mid-open.
 pub(crate) fn reject_directory_open(path: &str) -> Result<(), MethodCallFailed> {
     if fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
-        return Err(file_not_found(&format!("{path} (Is a directory)")));
+        return Err(file_not_found_reason(path, "Is a directory"));
     }
     Ok(())
 }
@@ -1814,7 +1857,7 @@ fn fis_open_path(
     let fd = ctx
         .fd_table()
         .open_read(&path)
-        .map_err(|_| file_not_found(&path))?;
+        .map_err(|e| file_not_found_because(&path, &e))?;
     // Defensive real-layout backfill for the SyntheticStub constructor path.
     // The default real-JDK constructor allocates `fd`, `closeLock`, and `path`
     // before calling open0. If a dispatch path accidentally takes the native
@@ -4484,6 +4527,95 @@ fn baos_charset_name_of(ctx: &dyn NativeContext, value: Value) -> String {
     "UTF-8".to_string()
 }
 
+/// `java.io.UnsupportedEncodingException` for a charset NAME the runtime does
+/// not have.
+///
+/// # Why the check asks the JDK instead of consulting our own table
+///
+/// `native-api`'s `canonical_charset_name` knows about forty names; a JDK image
+/// ships around a hundred and seventy. Refusing everything the table does not
+/// list would turn "we have not written this alias down" into an application
+/// error, which is a worse failure than the one being fixed.
+/// `Charset.isSupported(String)` is the authority, it lives in the image, and
+/// it is the same predicate the JDK's own `toString(String)` consults.
+///
+/// If the call itself cannot be made (a mock context, an image mid-boot) the
+/// answer is "supported" and the old decode runs — this must not become a new
+/// way to fail.
+fn charset_name_unsupported(ctx: &mut dyn NativeContext, name: &str) -> bool {
+    let arg = ctx.create_string(name);
+    matches!(
+        ctx.invoke(
+            "java/nio/charset/Charset",
+            "isSupported",
+            "(Ljava/lang/String;)Z",
+            &[Value::Object(Some(arg))],
+        ),
+        Ok(Some(Value::Int(0)))
+    )
+}
+
+/// Build the real `java.io.UnsupportedEncodingException`, whose message is the
+/// charset name and nothing else (measured on HotSpot 25.0.4).
+fn unsupported_encoding_error(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
+    match ctx.new_object("java/io/UnsupportedEncodingException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let msg = ctx.create_string(name);
+            if ctx
+                .invoke(
+                    "java/io/UnsupportedEncodingException",
+                    "<init>",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(exc)), Value::Object(Some(msg))],
+                )
+                .is_ok()
+            {
+                return MethodCallFailed::ExceptionThrown(exc);
+            }
+            RuntimeError::IOException {
+                message: name.to_string(),
+            }
+            .into()
+        }
+        _ => RuntimeError::IOException {
+            message: name.to_string(),
+        }
+        .into(),
+    }
+}
+
+/// `ByteArrayOutputStream.toString(String charsetName)` — the DEPRECATED
+/// overload, which differs from its `Charset` sibling in exactly one way: it
+/// can be handed a name that does not exist, and then it must throw.
+///
+/// MEASURED, `regression-suite/probes/W4Buffers.java`, both modes:
+///
+/// ```text
+///   new ByteArrayOutputStream().toString("no-such-charset")
+///     HotSpot    UnsupportedEncodingException: no-such-charset
+///     CratonVM   ""                                            <- a fabricated success
+/// ```
+///
+/// The empty string is the worst available answer: the caller cannot tell an
+/// unusable charset from an empty buffer. Both descriptors shared
+/// `native_baos_to_string_charset`, whose `baos_charset_name_of` falls back to
+/// the raw name and whose `decode_bytes_lossy` then falls back to a tolerant
+/// byte-oriented decode — so an unknown name decoded as Latin-1 and an empty
+/// buffer decoded as `""`, indistinguishably.
+fn native_baos_to_string_charset_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(name_obj))) = args.get(1) {
+        if let Some(name) = ctx.read_string(*name_obj) {
+            if charset_name_unsupported(ctx, &name) {
+                return Err(unsupported_encoding_error(ctx, &name));
+            }
+        }
+    }
+    native_baos_to_string_charset(ctx, args)
+}
+
 fn native_baos_to_string_charset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -5726,7 +5858,7 @@ fn native_scanner_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let path_str = validated_path(&path_str)?;
     let text = match fs::read_to_string(&path_str) {
         Ok(s) => s,
-        Err(_) => return Err(file_not_found(&path_str)),
+        Err(e) => return Err(file_not_found_because(&path_str, &e)),
     };
     scan_set_source(ctx, this, &text);
     Ok(None)
@@ -7811,11 +7943,15 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_baos_to_string,
     );
+    // The NAME overload gets its own body: it is the only one of the two that
+    // can be handed a charset that does not exist, and it owes an
+    // `UnsupportedEncodingException` when it is. See
+    // `native_baos_to_string_charset_name`.
     registry.register(
         baos,
         "toString",
         "(Ljava/lang/String;)Ljava/lang/String;",
-        native_baos_to_string_charset,
+        native_baos_to_string_charset_name,
     );
     registry.register(
         baos,
@@ -23759,6 +23895,31 @@ fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
 fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path_obj = obj_arg92(args, 0)?;
     let watcher = obj_arg92(args, 1)?;
+    // A CLOSED service refuses REGISTRATION too, not just `poll`/`take`, and it
+    // refuses it with `ClosedWatchServiceException`.
+    //
+    // MEASURED, `regression-suite/probes/W4Watch.java`, Linux/JDK 25.0.4:
+    //
+    //     dir.register(closedWatchService, ENTRY_CREATE)
+    //       HotSpot    java.nio.file.ClosedWatchServiceException
+    //       CratonVM   java.io.IOException
+    //
+    // `ws_require_open` and `closed_watch_service_exception` already existed --
+    // `poll` and `take` both call them, and both matched the oracle in the same
+    // run. This entry point simply never called it, so the closed state was
+    // discovered further down by whichever path check happened to fail and was
+    // reported as an I/O error.
+    //
+    // The comment on `closed_watch_service_exception` says why the TYPE is
+    // load-bearing: a watch loop is written as
+    // `catch (ClosedWatchServiceException ex) { running = false; }`, so any
+    // other type escapes the loop's own shutdown handling. A registration
+    // racing a `close()` on another thread is exactly when that happens.
+    //
+    // Checked FIRST, matching `LinuxWatchService.register`, which runs
+    // `checkOpen()` before it looks at the path at all -- so a closed service
+    // and a missing directory report the closed service, on both VMs.
+    ws_require_open(ctx, watcher)?;
     let kinds_arr = match args.get(2) {
         Some(Value::Object(Some(a))) => *a,
         _ => {
@@ -26185,13 +26346,29 @@ mod io_tests {
     }
 
     #[test]
-    fn file_not_found_contains_path() {
+    fn file_not_found_carries_the_hotspot_reason_suffix() {
+        // The payload IS the Java exception message, and HotSpot renders
+        // `<path> (<strerror>)`. Asserting the bare path is what let the
+        // suffix go missing; `W4Buffers` measured it against the oracle.
         let err = file_not_found("/tmp/missing.txt");
         match err {
             MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::FileNotFoundException { path },
             )) => {
-                assert_eq!(path, "/tmp/missing.txt");
+                assert_eq!(path, "/tmp/missing.txt (No such file or directory)");
+            }
+            other => panic!("expected FileNotFoundException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_not_found_because_uses_the_real_errno() {
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        match file_not_found_because("/tmp/locked", &denied) {
+            MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::FileNotFoundException { path },
+            )) => {
+                assert_eq!(path, "/tmp/locked (Permission denied)");
             }
             other => panic!("expected FileNotFoundException, got {other:?}"),
         }

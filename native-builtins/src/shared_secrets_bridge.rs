@@ -55,7 +55,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use crate::try_alloc_concurrent_synthetic;
+use crate::{obj_arg, try_alloc_concurrent_synthetic};
 
 /// WP1.4 — Re-export of the canonical concrete-class mapping.
 /// Mirrors `vm/src/runtime/shared_secrets.rs::SharedSecretsInterface`
@@ -2443,10 +2443,19 @@ fn register_java_net_uri_access(registry: &mut NativeMethodRegistry) {
 
 // JavaNioAccess ---------------------------------------------------------------
 
+/// `JavaNioAccess.getBufferPool()` — the `"direct"` pool.
+///
+/// It used to be `alloc_singleton(ctx, "java/lang/management/BufferPoolMXBean")`,
+/// i.e. an instance stamped with the INTERFACE, and its four accessors were
+/// stateless lambdas returning 0. Both halves are gone: the receiver is now
+/// [`CRATON_BUFFER_POOL_CLASS`], a concrete class, and the counters are the
+/// direct-memory allocator's own live ones. A pool bean that always reported
+/// zero is worse than none — `DirectBufferCacheProbe` measures "direct buffers
+/// allocated per read" as a difference of two `getCount()` readings, and a
+/// constant zero reports a PERFECT temporary-buffer cache no matter what the
+/// VM is doing.
 fn jnio_get_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Return a synthetic BufferPool whose `getCount` / `getMemoryUsed`
-    // natives are already registered in phases_late.
-    let pool = alloc_singleton(ctx, "java/lang/management/BufferPoolMXBean")?;
+    let pool = alloc_direct_buffer_pool(ctx)?;
     Ok(Some(Value::Object(Some(pool))))
 }
 
@@ -2599,39 +2608,16 @@ fn jnio_page_size(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 /// spec-compatible: the legacy interface only documents the value
 /// shape, not strict per-call accuracy of the counters.
 fn jnio_get_direct_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let pool = try_alloc_concurrent_synthetic(ctx, "jdk/internal/misc/VM$BufferPool", 4)?;
+    let pool = alloc_direct_buffer_pool(ctx)?;
     Ok(Some(Value::Object(Some(pool))))
 }
 
-fn vm_buffer_pool_get_name(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Legacy `jdk.internal.misc.VM$BufferPool.getName()` — the only
-    // direct-buffer pool surface this object covers, so always
-    // "direct".  Real JDK uses the same constant.
-    let s = ctx.create_string("direct");
-    Ok(Some(Value::Object(Some(s))))
-}
-
-fn vm_buffer_pool_get_count(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // No live direct-buffer accounting — return zero so callers that
-    // chart counts see "no pool activity" rather than NPEing.
-    Ok(Some(Value::Long(0)))
-}
-
-fn vm_buffer_pool_get_total_capacity(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Ok(Some(Value::Long(0)))
-}
-
-fn vm_buffer_pool_get_memory_used(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Ok(Some(Value::Long(0)))
-}
-
 fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
+    // The `BufferPoolMXBean` surface. Registered from HERE rather than from
+    // `jmx.rs`, which is gated on the `management` feature: `JavaNioAccess
+    // .getBufferPool` and `VM.getDirectBufferPool` below hand out these beans
+    // on every build, so their methods have to be registered on every build too.
+    register_buffer_pool_mxbean(registry);
     let owner = "java/nio/Buffer$2";
     registry.register(
         owner,
@@ -2752,31 +2738,239 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
         );
     }
 
-    // RKC16N.11: the four `VM$BufferPool` interface methods. The
-    // returned synthetic from `jnio_get_direct_buffer_pool` carries
-    // no instance state, so all four bindings are stateless lambdas
-    // returning safe defaults. Registered on the synthetic class
-    // name (matches the shape used elsewhere in the bridge).
-    let pool_owner = "jdk/internal/misc/VM$BufferPool";
-    registry.register(
-        pool_owner,
-        "getName",
-        "()Ljava/lang/String;",
-        vm_buffer_pool_get_name,
-    );
-    registry.register(pool_owner, "getCount", "()J", vm_buffer_pool_get_count);
-    registry.register(
-        pool_owner,
-        "getTotalCapacity",
-        "()J",
-        vm_buffer_pool_get_total_capacity,
-    );
-    registry.register(
-        pool_owner,
-        "getMemoryUsed",
-        "()J",
-        vm_buffer_pool_get_memory_used,
-    );
+    // RKC16N.11's four `VM$BufferPool` methods USED TO BE FOUR STATELESS
+    // LAMBDAS RETURNING ZERO, registered here. They now live in
+    // [`register_buffer_pool_mxbean`], on all three names a pool receiver
+    // can carry (`jdk/internal/misc/VM$BufferPool` included), backed by the
+    // direct-memory allocator's live counters. Registering them here as well
+    // would be a second answer racing the first on registration order.
+}
+
+// ---------------------------------------------------------------------------
+// java.lang.management.BufferPoolMXBean
+// ---------------------------------------------------------------------------
+
+/// The concrete class CratonVM stamps onto its `BufferPoolMXBean` instances.
+///
+/// Concrete, not the `java/lang/management/BufferPoolMXBean` interface it used
+/// to be: an instance whose class is an interface finds only abstract methods,
+/// and native lookup drops interface-declared instance natives. Same rule, and
+/// the same remedy, as `panama::CRATON_SEGMENT_CLASS` and
+/// `CRATON_SYSTEM_LOGGER_CLASS`; the type relationships are declared in
+/// `vm/src/runtime/interpreter/typecheck.rs`'s `synthetic_implements`.
+pub(crate) const CRATON_BUFFER_POOL_CLASS: &str = "cratonvm/internal/BufferPool";
+/// Slot 0 — the pool's name, as a Java `String`.
+const BUFFER_POOL_SLOT_NAME: usize = 0;
+/// Slot 1 — [`BufferPoolKind`], as an int.
+const BUFFER_POOL_SLOT_KIND: usize = 1;
+const BUFFER_POOL_SLOTS: usize = 2;
+
+/// The pools HotSpot publishes, in the order it publishes them.
+///
+/// MEASURED on Temurin 25.0.3+9 (`scratchpad/PoolNames.java`):
+///
+/// ```text
+/// POOL name=mapped   count=0 used=0 cap=0 objName=java.nio:type=BufferPool,name=mapped
+/// POOL name=direct   count=0 used=0 cap=0 objName=java.nio:type=BufferPool,name=direct
+/// POOL name=mapped - 'non-volatile memory' ...
+/// ```
+///
+/// The order is part of the observable answer — `getPlatformMXBeans` returns a
+/// `List` and callers index it — so it is reproduced rather than sorted.
+const BUFFER_POOL_NAMES: [(&str, i32); 3] = [
+    ("mapped", BUFFER_POOL_KIND_MAPPED),
+    ("direct", BUFFER_POOL_KIND_DIRECT),
+    (
+        "mapped - 'non-volatile memory'",
+        BUFFER_POOL_KIND_NON_VOLATILE,
+    ),
+];
+
+/// Backed by the direct-memory allocator's own live counters.
+const BUFFER_POOL_KIND_DIRECT: i32 = 0;
+/// `FileChannel.map` buffers. CratonVM does not account for them separately, so
+/// this pool reports zeros — which is also what a HotSpot process that has
+/// mapped nothing reports, and is a measured zero rather than a stub: nothing
+/// in this VM increments a mapped-buffer counter, so any other number would be
+/// invented.
+const BUFFER_POOL_KIND_MAPPED: i32 = 1;
+/// The `mapped - 'non-volatile memory'` pool. Non-volatile mapping is an
+/// `ExtendedMapMode` feature CratonVM does not implement at all, so this one is
+/// zero by construction.
+const BUFFER_POOL_KIND_NON_VOLATILE: i32 = 2;
+
+/// Allocate one `BufferPoolMXBean` carrier.
+fn alloc_buffer_pool(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    kind: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let class_id = match ctx.class_id_by_name(CRATON_BUFFER_POOL_CLASS) {
+        Some(id) => id,
+        None => match ctx.try_ensure_synthetic_class(CRATON_BUFFER_POOL_CLASS, BUFFER_POOL_SLOTS) {
+            Ok(id) => id,
+            // Strict mode refused the fabrication. There is no real class to
+            // stand in — `ManagementFactoryHelper.getBufferPoolMXBeans` reaches
+            // its pools through `SharedSecrets`, i.e. back through this file —
+            // so the refusal stands as a catchable throwable rather than a
+            // silently empty list.
+            Err(err) => return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
+        },
+    };
+    let slots = BUFFER_POOL_SLOTS.max(ctx.class_num_total_fields(class_id));
+    let pool = ctx
+        .try_alloc_object_gc_safe(class_id, slots)
+        .unwrap_or_else(|| ctx.alloc_object(class_id, slots));
+    // The name is allocated AFTER the carrier and written straight in, so there
+    // is no window in which a moving young generation can relocate one of the
+    // two behind the other's back.
+    let pool_pin = ctx.pin_native_root(pool);
+    let name_obj = ctx.create_string(name);
+    let pool = ctx.read_native_pin(pool_pin, pool);
+    ctx.unpin_native_roots(pool_pin);
+    ctx.set_field(pool, BUFFER_POOL_SLOT_NAME, Value::Object(Some(name_obj)));
+    ctx.set_field(pool, BUFFER_POOL_SLOT_KIND, Value::Int(kind));
+    Ok(pool)
+}
+
+/// The `"direct"` pool — the one every caller in the JDK's own code asks for by
+/// name (`VM.getDirectBufferPool`, `JavaNioAccess.getBufferPool`).
+pub(crate) fn alloc_direct_buffer_pool(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
+    alloc_buffer_pool(ctx, "direct", BUFFER_POOL_KIND_DIRECT)
+}
+
+/// All three pools, in HotSpot's order — the answer to
+/// `ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)`.
+pub(crate) fn alloc_all_buffer_pools(
+    ctx: &mut dyn NativeContext,
+) -> Result<Vec<ObjectRef>, MethodCallFailed> {
+    let mut pools = Vec::with_capacity(BUFFER_POOL_NAMES.len());
+    for (name, kind) in BUFFER_POOL_NAMES {
+        // Each pool is pinned while the NEXT one is allocated: `alloc_buffer_pool`
+        // allocates twice (the carrier and its name), and a young-generation move
+        // in between would leave every earlier element of this vector stale. This
+        // is the `build_rooted_ref_array` discipline, open-coded because the
+        // caller wants a `Vec`, not a Java array.
+        let pins: Vec<usize> = pools.iter().map(|p| ctx.pin_native_root(*p)).collect();
+        let pool = alloc_buffer_pool(ctx, name, kind);
+        for (slot, pin) in pools.iter_mut().zip(pins.iter()) {
+            *slot = ctx.read_native_pin(*pin, *slot);
+        }
+        if let Some(first) = pins.first() {
+            ctx.unpin_native_roots(*first);
+        }
+        pools.push(pool?);
+    }
+    Ok(pools)
+}
+
+fn buffer_pool_kind(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field(this, BUFFER_POOL_SLOT_KIND) {
+        Value::Int(k) => k,
+        // A receiver from the legacy `jdk/internal/misc/VM$BufferPool` stamp
+        // carries no kind slot. That stamp only ever named the direct pool, so
+        // that is the answer, not a zeroed "mapped".
+        _ => BUFFER_POOL_KIND_DIRECT,
+    }
+}
+
+fn buffer_pool_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Value::Object(Some(name)) = ctx.get_field(this, BUFFER_POOL_SLOT_NAME) {
+        return Ok(Some(Value::Object(Some(name))));
+    }
+    // Legacy stamp, no name slot — see `buffer_pool_kind`.
+    let s = ctx.create_string("direct");
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn buffer_pool_get_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let count = if buffer_pool_kind(ctx, this) == BUFFER_POOL_KIND_DIRECT {
+        cratonvm_native_io::direct_buffer::direct_buffer_pool_stats().0
+    } else {
+        0
+    };
+    Ok(Some(Value::Long(count)))
+}
+
+fn buffer_pool_get_memory_used(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let used = if buffer_pool_kind(ctx, this) == BUFFER_POOL_KIND_DIRECT {
+        cratonvm_native_io::direct_buffer::direct_buffer_pool_stats().1
+    } else {
+        0
+    };
+    Ok(Some(Value::Long(used)))
+}
+
+/// `getTotalCapacity()`. See `direct_buffer_pool_stats` for why this is the
+/// same number as `getMemoryUsed()` rather than a second counter.
+fn buffer_pool_get_total_capacity(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    buffer_pool_get_memory_used(ctx, args)
+}
+
+/// `getObjectName()` — `java.nio:type=BufferPool,name=<pool name>`, the string
+/// HotSpot builds (measured; see [`BUFFER_POOL_NAMES`]).
+///
+/// Answers `null` if `ObjectName` cannot be constructed rather than
+/// propagating: this is the one method on the bean that nothing needs in order
+/// to read a counter, and a JMX failure here would take out
+/// `getPlatformMXBeans` for callers that only wanted `getCount()`.
+fn buffer_pool_get_object_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = match buffer_pool_get_name(ctx, args)? {
+        Some(Value::Object(Some(obj))) => ctx.read_string(obj).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let _ = this;
+    let text = format!("java.nio:type=BufferPool,name={name}");
+    let arg = ctx.create_string(&text);
+    match ctx.invoke(
+        "javax/management/ObjectName",
+        "getInstance",
+        "(Ljava/lang/String;)Ljavax/management/ObjectName;",
+        &[Value::Object(Some(arg))],
+    ) {
+        Ok(Some(value)) => Ok(Some(value)),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// The five `BufferPoolMXBean` methods, on every name a receiver can carry.
+pub(crate) fn register_buffer_pool_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for owner in [
+        CRATON_BUFFER_POOL_CLASS,
+        // The interface, for a call site that resolved against its abstract
+        // declaration, and the two JDK internal spellings a receiver could
+        // still arrive with.
+        "java/lang/management/BufferPoolMXBean",
+        "jdk/internal/misc/VM$BufferPool",
+    ] {
+        r.register(owner, "getName", "()Ljava/lang/String;", buffer_pool_get_name);
+        r.register(owner, "getCount", "()J", buffer_pool_get_count);
+        r.register(owner, "getMemoryUsed", "()J", buffer_pool_get_memory_used);
+        r.register(
+            owner,
+            "getTotalCapacity",
+            "()J",
+            buffer_pool_get_total_capacity,
+        );
+        r.register(
+            owner,
+            "getObjectName",
+            "()Ljavax/management/ObjectName;",
+            buffer_pool_get_object_name,
+        );
+    }
+    r.set_category(__prev_cat);
 }
 
 // JavaSecurityAccess — DELETED 2026-08-13 (F33-1) --------------------------

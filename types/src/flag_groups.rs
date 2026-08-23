@@ -298,6 +298,15 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "census-exact-invocations", on_key: Some("CRATONVM_CENSUS_EXACT_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce", on_key: Some("CRATONVM_DBG_CCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce-bt", on_key: Some("CRATONVM_DBG_CCE_BT"), off_key: None, off_word: None },
+    // Declared 2026-08-22 with the fix it was written for. When a VM-side field
+    // read decodes a `Value` cell with an out-of-range discriminant, name the
+    // RECEIVER and the Java frames that reached it. The collector's own guard
+    // reports the CELL and can report nothing else -- it runs in the collector
+    // crate and cannot see a frame -- which is why the producer behind
+    // `corrupt-value-cell-is-fatal-on-three-of-four-collectors` stayed open for
+    // two days. Costs one relaxed load per `NativeContext::get_field` while
+    // armed and nothing at all while it is not.
+    E { group: Group::DBG, token: "corrupt-cell", on_key: Some("CRATONVM_DBG_CORRUPT_CELL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccecache", on_key: Some("CRATONVM_DBG_CCECACHE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccsprobe", on_key: Some("CRATONVM_DBG_CCSPROBE"), off_key: None, off_word: None },
     // The per-occurrence, backtrace-carrying arm of the descriptor-coercion
@@ -631,6 +640,17 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-seed-collision", on_key: Some("CRATONVM_DBG_OSR_SEED_COLLISION"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-slots", on_key: Some("CRATONVM_DBG_OSR_SLOTS"), off_key: None, off_word: None },
+    // Declared 2026-08-22. `view-kind` reports a map-view carrier whose CLASS
+    // and whose head element disagree about what it holds, and every `vc_route`
+    // rebuild; `view-resync` reports a TreeMap range view's rebuild -- pairs
+    // seen, kept, bounds and the comparison verdict histogram. The pair
+    // separated three defects that all present as one red vector: an entrySet
+    // that came back holding values, a view that came back EMPTY, and a stale
+    // element inside the scan. An empty view that saw no pairs and one whose
+    // every comparison landed out of range are different defects and nothing
+    // else can tell them apart.
+    E { group: Group::DBG, token: "view-kind", on_key: Some("CRATONVM_DBG_VIEWKIND"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "view-resync", on_key: Some("CRATONVM_DBG_VIEWRESYNC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-bt", on_key: Some("CRATONVM_DBG_OVERLAY_BT"), off_key: None, off_word: None },
@@ -775,6 +795,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "ute", on_key: Some("CRATONVM_DBG_UTE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "validate-new", on_key: Some("CRATONVM_DBG_VALIDATE_NEW"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "vdisp", on_key: Some("CRATONVM_DBG_VDISP"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "vector-intrinsics-stats", on_key: Some("CRATONVM_VECTOR_INTRINSICS_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "verify-error", on_key: Some("CRATONVM_DBG_VERIFY_ERROR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "verify-inline-frame-record", on_key: Some("CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "verify-oop-maps", on_key: Some("CRATONVM_DBG_VERIFY_OOP_MAPS"), off_key: None, off_word: None },
@@ -1146,7 +1167,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "stack-bang", on_key: Some("CRATONVM_JIT_STACK_BANG"), off_key: Some("CRATONVM_JIT_NO_STACK_BANG"), off_word: None },
     // Interpreter-side like `trivial-getter`: the lock-free static-field read
     // path in `vm::vm_object`, default-ON with an opt-out-only spelling.
+    E { group: Group::JIT, token: "static-bytecode-callee", on_key: Some("CRATONVM_JIT_STATIC_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "statics-index", on_key: None, off_key: Some("CRATONVM_NO_STATICS_INDEX"), off_word: None },
+    E { group: Group::JIT, token: "vector-intrinsics", on_key: Some("CRATONVM_VECTOR_INTRINSICS"), off_key: None, off_word: Some("0") },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0") },
@@ -1240,6 +1263,8 @@ pub const INVENTORY: &[E] = &[
     // `cuda_bridge::critical` — millisecond budgets, trimmed `u64`, latched in
     // an `AtomicU64` on first read. Value tokens:
     // `CRATONVM_GC=gpu-critical-wait-ms=250`.
+    E { group: Group::GC, token: "gpu-chunk-streams", on_key: Some("CRATONVM_GPU_CHUNK_STREAMS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "gpu-chunks", on_key: Some("CRATONVM_GPU_CHUNKS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "gpu-critical-lease-ms", on_key: Some("CRATONVM_GPU_CRITICAL_LEASE_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "gpu-critical-wait-ms", on_key: Some("CRATONVM_GPU_CRITICAL_WAIT_MS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None },
@@ -1517,6 +1542,7 @@ pub const INVENTORY: &[E] = &[
     // selects is which verifier sees which chain, and at what strength floor.
     E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "map-iterator-failfast", on_key: None, off_key: Some("CRATONVM_NO_MAP_ITERATOR_FAILFAST"), off_word: None },
     E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "jboss-boot-log-file", on_key: Some("CRATONVM_JBOSS_BOOT_LOG_FILE"), off_key: None, off_word: None },

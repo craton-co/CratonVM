@@ -3925,6 +3925,19 @@ pub(crate) fn native_class_is_instance(
             return Ok(Some(Value::Int(1)));
         }
     }
+    // LAST, after every hierarchy answer: the relationships the VM DECLARES for
+    // the concrete stand-in classes it mints itself. This is the same table the
+    // `instanceof` bytecode consults, reached through the same door the
+    // reflective array store uses — see
+    // `NativeContext::synthetic_implements_declared` for why reflection asking a
+    // narrower question than the opcode is a defect and not a conservatism.
+    //
+    // Measured on `probes/FfmVectorSegmentProbe.java`: an FFM segment that a
+    // `checkcast jdk/internal/foreign/AbstractMemorySegmentImpl` had just
+    // admitted answered `isInstance` FALSE for the same class.
+    if ctx.synthetic_implements_declared(target_class_id, &this_name_for_assignability) {
+        return Ok(Some(Value::Int(1)));
+    }
     Ok(Some(Value::Int(0)))
 }
 
@@ -4290,9 +4303,18 @@ pub(crate) fn native_class_is_assignable_from(
                 return Ok(Some(Value::Int(0)));
             }
         };
+        // The last disjunct is the DECLARED relationships of the concrete
+        // stand-in classes the VM mints itself — the same table the `checkcast`
+        // and `instanceof` opcodes consult. See
+        // `NativeContext::synthetic_implements_declared`, and the matching
+        // arm at the tail of `native_class_is_instance`: the two reflective
+        // questions have to agree with each other as well as with the bytecode,
+        // and a `Class.isAssignableFrom` that refuses what `Class.isInstance`
+        // admits is the shape `Class.cast` fails on.
         let result = other_class_id == this_class_id
             || ctx.is_subclass(other_class_id, this_class_id)
-            || loader_aware_reflect_assignable(ctx, other_class_id, this_class_id, &this_name);
+            || loader_aware_reflect_assignable(ctx, other_class_id, this_class_id, &this_name)
+            || ctx.synthetic_implements_declared(other_class_id, &this_name);
         Ok(Some(Value::Int(if result { 1 } else { 0 })))
     })();
     // Restore depth on every exit path (success or error).
@@ -18966,12 +18988,89 @@ fn package_memo_ns_of_class(ctx: &dyn NativeContext, class_id: ClassId) -> u32 {
     }
 }
 
+/// The entry the receiver's OWN `packages` map holds for `package_name`, if
+/// that map is readable and the entry is a real `java.lang.Package`.
+///
+/// **This is a reconciliation, not an optimisation.** `ClassLoader
+/// .definePackage` runs real JDK bytecode against this exact map, and its
+/// contract is `putIfAbsent(name, pkg) != null -> throw
+/// IllegalArgumentException(name)`. A `getDefinedPackage` that cannot see the
+/// map therefore contradicts the very call that populated it. Groovy's
+/// `GroovyClassLoader.definePackageInternal` reads precisely that pair —
+/// `if (getDefinedPackage(p) == null) definePackage(p, ...)` — so a
+/// class-file-only answer kills the SECOND class defined in any one package
+/// with `IllegalArgumentException: <pkg>`. Measured 2026-08-22: that is the
+/// whole 11-class / ~70-method Spring Groovy cluster, and
+/// `probes/DefinedPackageProbe.java` reproduces it with no Groovy present.
+///
+/// Every failure mode falls through to the classpath probe rather than
+/// inventing an answer: a loader we were handed no reference for, an absent or
+/// null `packages` field (the ByteBuddy `JavaDispatcher$DynamicClassLoader`
+/// case this whole override exists for), a lookup that throws, or a stored
+/// value that is not a `Package` (the JDK's lazy `NamedPackage` form, which the
+/// module-taking `definePackage` overload is responsible for converting).
+fn real_defined_package(
+    ctx: &mut dyn NativeContext,
+    loader: Option<ObjectRef>,
+    package_name: &str,
+) -> Option<RealPackageEntry> {
+    let loader = loader?;
+    let map = match ctx.get_field_by_name(loader, "packages") {
+        Value::Object(Some(map)) => map,
+        _ => return None,
+    };
+    let key = ctx.create_string(package_name);
+    let got = ctx
+        .invoke_virtual(
+            map,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(key))],
+        )
+        .ok()??;
+    let entry = match got {
+        Value::Object(Some(entry)) => entry,
+        _ => return None,
+    };
+    // `Package extends NamedPackage`. The eight-arg `definePackage` stores the
+    // full `Package`; defining a CLASS in a package stores only the lazy
+    // `NamedPackage`. BOTH mean the package is defined — the difference is
+    // whether we can hand back the JDK's own object or must supply one.
+    Some(
+        if ctx
+            .class_name_of_id(ctx.class_id_of_object(entry))
+            .is_some_and(|n| n == "java/lang/Package")
+        {
+            RealPackageEntry::Package(entry)
+        } else {
+            RealPackageEntry::Named
+        },
+    )
+}
+
+/// What the receiver's own `packages` map holds for a name.
+enum RealPackageEntry {
+    /// A full `java.lang.Package` — hand back this exact object, so
+    /// `getDefinedPackage(p) == definePackage(p, ...)` as the JDK guarantees.
+    Package(ObjectRef),
+    /// The JDK's lazy `NamedPackage` form. The package IS defined; we supply
+    /// the `Package` object ourselves, memoised for identity stability.
+    Named,
+}
+
 /// `ClassLoader.getDefinedPackage(String name) -> Package`.
 ///
-/// Avoids the real-JDK `ClassLoader.packages` map (it can be uninitialised for
-/// a user-created loader — the original I2/ByteBuddy blocker) and instead
-/// derives the answer from class files visible **to the receiving loader**,
-/// memoising one `Package` identity per (loader namespace, package name).
+/// Answers, in order: the receiver's own real `packages` map (what
+/// `definePackage` actually wrote — see [`real_defined_package`]), then a memo
+/// of packages this VM has synthesised, then class files visible **to the
+/// receiving loader**, memoising one `Package` identity per (loader namespace,
+/// package name).
+///
+/// The real-map step exists because the other two cannot see a loader that
+/// defines classes from bytes rather than from the classpath. The classpath
+/// step exists because a loader's map is not always readable — it can be
+/// uninitialised for a user-created loader, the original I2/ByteBuddy blocker.
+/// Neither is sufficient alone.
 ///
 /// Returning null unconditionally, as this once did, violates the application
 /// loader's contract: Spring Boot's `BeanDefinitionLoader` uses this probe both
@@ -18987,13 +19086,30 @@ pub(crate) fn i2_classloader_get_defined_package(
         Some(Value::Object(Some(name))) => ctx.read_string(*name).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
-    if package_name.is_empty() || package_name.contains('/') {
+    if package_name.contains('/') {
         return Ok(Some(Value::Object(None)));
     }
     let loader = match args.first() {
         Some(Value::Object(Some(l))) => Some(*l),
         _ => None,
     };
+
+    // The loader's own record first: it is the same state `definePackage`
+    // writes, so agreeing with it is the whole contract.
+    let real = real_defined_package(ctx, loader, &package_name);
+    if let Some(RealPackageEntry::Package(pkg)) = real {
+        return Ok(Some(Value::Object(Some(pkg))));
+    }
+    let defined_lazily = matches!(real, Some(RealPackageEntry::Named));
+    // The default package is a package, and a built-in loader that has loaded
+    // a class from it HAS defined it (row C02). A custom loader has not, and
+    // must not inherit the global classpath's answer (row N02).
+    if package_name.is_empty()
+        && !defined_lazily
+        && !loader.is_some_and(|l| crate::classloader::loader_is_builtin(ctx, l))
+    {
+        return Ok(Some(Value::Object(None)));
+    }
     let ns = loader.map_or(0, |l| crate::classloader::loader_namespace_id(ctx, l));
 
     let cached = defined_package_memo()
@@ -19018,9 +19134,11 @@ pub(crate) fn i2_classloader_get_defined_package(
     // packages for arbitrary names or resource-only directories. The probe is
     // scoped to the receiver because `getDefinedPackage` does NOT delegate —
     // see `package_class_files_visible_to_loader`.
-    let class_glob = format!("{}/*.class", package_name.replace('.', "/"));
-    if !crate::classloader::package_class_files_visible_to_loader(ctx, loader, &class_glob) {
-        return Ok(Some(Value::Object(None)));
+    if !defined_lazily {
+        let class_glob = package_class_glob(&package_name);
+        if !crate::classloader::package_class_files_visible_to_loader(ctx, loader, &class_glob) {
+            return Ok(Some(Value::Object(None)));
+        }
     }
     let package = i2_alloc_synthetic_package(ctx, &package_name)?;
     let handle = ctx.add_global_root(package);
@@ -19043,10 +19161,11 @@ pub(crate) fn i2_classloader_get_defined_packages(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let ns = match args.first() {
-        Some(Value::Object(Some(l))) => crate::classloader::loader_namespace_id(ctx, *l),
-        _ => 0,
+    let loader = match args.first() {
+        Some(Value::Object(Some(l))) => Some(*l),
+        _ => None,
     };
+    let ns = loader.map_or(0, |l| crate::classloader::loader_namespace_id(ctx, l));
     let handles: Vec<usize> = defined_package_memo()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -19054,10 +19173,30 @@ pub(crate) fn i2_classloader_get_defined_packages(
         .filter(|((entry_ns, _), _)| *entry_ns == ns)
         .map(|(_, (handle, _rich))| *handle)
         .collect();
-    let packages: Vec<ObjectRef> = handles
+    let mut packages: Vec<ObjectRef> = handles
         .into_iter()
         .filter_map(|h| ctx.resolve_global_root(h))
         .collect();
+
+    // Union with the loader's own map, so the plural method reports every
+    // package the singular one would answer for. Names come from the map;
+    // each is then routed back through `getDefinedPackage` so both methods
+    // hand out the SAME object per package rather than two identities.
+    for name in real_defined_package_names(ctx, loader) {
+        let key = ctx.create_string(&name);
+        let single = i2_classloader_get_defined_package(
+            ctx,
+            &[
+                loader.map_or(Value::Object(None), |l| Value::Object(Some(l))),
+                Value::Object(Some(key)),
+            ],
+        );
+        if let Ok(Some(Value::Object(Some(pkg)))) = single {
+            if !packages.contains(&pkg) {
+                packages.push(pkg);
+            }
+        }
+    }
     // `new_array` can allocate and therefore move; the elements are global
     // roots, so re-resolving is unnecessary, but the array itself must be
     // filled only after it exists.
@@ -19076,6 +19215,66 @@ pub(crate) fn i2_classloader_get_defined_packages(
         ctx.set_array_element(arr, i, Value::Object(Some(pkg)));
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+/// The resource glob matching class files immediately inside `package_name`.
+///
+/// The default package's class files sit at the classpath ROOT, so its glob is
+/// `*.class`. Deriving it uniformly would give `"".replace('.', "/")` +
+/// `"/*.class"` = `/*.class` — an absolute path that matches nothing, which
+/// reads as "the default package has no classes" on every classpath.
+fn package_class_glob(package_name: &str) -> String {
+    if package_name.is_empty() {
+        "*.class".to_string()
+    } else {
+        format!("{}/*.class", package_name.replace('.', "/"))
+    }
+}
+
+/// Every package name in the receiver's own `packages` map.
+///
+/// Empty for a loader whose map is absent, null or unwalkable — the same
+/// fail-soft rule as [`real_defined_package`], for the same reason: this
+/// override exists precisely because that field cannot be relied upon.
+fn real_defined_package_names(
+    ctx: &mut dyn NativeContext,
+    loader: Option<ObjectRef>,
+) -> Vec<String> {
+    let Some(loader) = loader else {
+        return Vec::new();
+    };
+    let map = match ctx.get_field_by_name(loader, "packages") {
+        Value::Object(Some(map)) => map,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let Ok(Some(Value::Object(Some(set)))) =
+        ctx.invoke_virtual(map, "keySet", "()Ljava/util/Set;", &[])
+    else {
+        return out;
+    };
+    let Ok(Some(Value::Object(Some(it)))) =
+        ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[])
+    else {
+        return out;
+    };
+    // Bounded: a runaway iterator must not hang a serviceability call. No real
+    // loader defines anywhere near this many packages.
+    for _ in 0..4096 {
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => break,
+        }
+        let Ok(Some(Value::Object(Some(k)))) =
+            ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])
+        else {
+            break;
+        };
+        if let Some(name) = ctx.read_string(k) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// A `java.lang.Package[]` of `len` elements.
@@ -26671,6 +26870,62 @@ Implementation-Title: opensaml-core-api\r\n\
         match r {
             Some(Value::Object(None)) => {} // null вЂ” correct
             other => panic!("I2: getDefinedPackage MUST return null (was {other:?})",),
+        }
+    }
+
+    #[test]
+    fn package_class_glob_handles_the_default_package() {
+        // `/*.class` is an absolute path and matches nothing, so deriving the
+        // default package's glob uniformly makes every classpath look as if it
+        // had no classes in the default package — which is how
+        // `getDefinedPackage("")` answered null where HotSpot answers non-null.
+        assert_eq!(package_class_glob(""), "*.class");
+        assert_eq!(package_class_glob("java.lang"), "java/lang/*.class");
+        assert_eq!(package_class_glob("a"), "a/*.class");
+        assert_eq!(
+            package_class_glob("org.springframework.context.groovy"),
+            "org/springframework/context/groovy/*.class"
+        );
+    }
+
+    #[test]
+    fn i2_classloader_get_defined_package_rejects_a_resource_path_before_any_lookup() {
+        // A name containing '/' is a caller passing an INTERNAL name, not a
+        // package that could ever have been defined. It must be refused
+        // outright — ahead of the real-`packages` lookup the Groovy fix added,
+        // so that lookup can never be handed a resource path to resolve.
+        let mut ctx = mock_ctx();
+        for bad in &["java/lang", "/", "a/b/C.class"] {
+            let name = ctx.create_string(bad);
+            let r = i2_classloader_get_defined_package(
+                &mut ctx,
+                &[Value::Object(None), Value::Object(Some(name))],
+            )
+            .expect("i2_classloader_get_defined_package must succeed");
+            match r {
+                Some(Value::Object(None)) => {}
+                other => panic!("slash-bearing name {bad:?} MUST be null (was {other:?})"),
+            }
+        }
+    }
+
+    #[test]
+    fn i2_classloader_get_defined_package_is_null_for_the_default_package_without_a_loader() {
+        // The empty name reaches a class-file probe now, but only for a
+        // BUILT-IN loader. With no loader object at all there is nothing whose
+        // definitions we could be reporting, so null stays the answer — the
+        // guard that keeps a custom loader from inheriting the global
+        // classpath's view of the default package (probe row N02).
+        let mut ctx = mock_ctx();
+        let name = ctx.create_string("");
+        let r = i2_classloader_get_defined_package(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(name))],
+        )
+        .expect("i2_classloader_get_defined_package must succeed");
+        match r {
+            Some(Value::Object(None)) => {}
+            other => panic!("default package with no loader MUST be null (was {other:?})"),
         }
     }
 

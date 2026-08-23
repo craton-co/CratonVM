@@ -85,11 +85,41 @@ impl<T> DeviceBufferInner<T> {
         Err(DeviceError::NoDriver)
     }
 
+    /// Stub twin of the sub-range download. No driver, so nothing to copy.
+    pub(crate) fn to_host_range(&self, _dst: &mut [T], _offset: usize) -> Result<()> {
+        Err(DeviceError::NoDriver)
+    }
+
     pub(crate) fn len(&self) -> usize {
         0
     }
 
     pub(crate) fn device_ptr_arg(&self) -> u64 {
         0
+    }
+}
+
+/// Stub twin of the page-locked staging buffer: an ordinary heap
+/// allocation, since there is no driver to pin anything with.
+pub(crate) struct PinnedHostInner<T: Copy> {
+    buf: Vec<T>,
+}
+
+impl<T: Copy + Default> PinnedHostInner<T> {
+    pub(crate) fn new(_ctx: &crate::DeviceContext, len: usize) -> Result<Self> {
+        Ok(Self {
+            buf: vec![T::default(); len],
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// # Safety
+    /// See [`crate::PinnedHostBuffer::as_mut_slice`]. Stub mode queues no
+    /// DMA, so there is nothing to race with.
+    pub(crate) unsafe fn as_mut_slice(&self) -> &mut [T] {
+        std::slice::from_raw_parts_mut(self.buf.as_ptr() as *mut T, self.buf.len())
     }
 }

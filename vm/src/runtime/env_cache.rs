@@ -1211,6 +1211,45 @@ pub fn jit_lambda_capture_adapter() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` — let a compiled caller's
+/// `invokestatic` to a callee the JIT did NOT compile enter that callee through
+/// a per-site cached interpreter frame template, instead of re-resolving it
+/// from its class NAME on every call.
+///
+/// # What it is worth
+///
+/// MEASURED 2026-08-22, `probes/XferProbe.java` — a hot loop calling a one-line
+/// `static int callee(int x) { return x + 1; }`:
+///
+/// | configuration | ns/op |
+/// |---|---:|
+/// | compiled caller -> compiled callee | 22-33 |
+/// | both interpreted (`--nojit`) | 236-385 |
+/// | compiled caller -> INTERPRETED callee | 1242-1902 |
+///
+/// Compiling the caller and not the callee was **5x slower than compiling
+/// neither**. On a real application most callees are never compiled, so that
+/// loss is paid continuously and cancels the JIT's wins — which is exactly the
+/// "JIT 24.6 ms/op vs `--nojit` 25.8 ms/op" wash recorded for
+/// `WebClientIntegrationTests`. `invokestatic` is where it concentrates:
+/// `CRATONVM_DBG=mic-prof` on `probes/ReactorProbe.java` reports
+/// `kind_static=2_986_402` of `disp_calls=3_356_461` — **89%**.
+///
+/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
+///
+/// Default ON. `CRATONVM_JIT_STATIC_BYTECODE_CALLEE=0` restores the by-name
+/// path, which is the A/B a same-binary bisection needs.
+#[inline]
+pub fn jit_static_bytecode_callee() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_STATIC_BYTECODE_CALLEE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).
@@ -1418,6 +1457,13 @@ cached_is_set!(cce_dbg, "CRATONVM_DBG_CCE");
 /// LinkedList$ListItr cursor bug). The hunter logs class + slot + value +
 /// descriptor + native caller so every instance can be enumerated in one run.
 cached_is_set!(overlay_corruption_dbg, "CRATONVM_DBG_OVERLAY");
+/// `CRATONVM_DBG_CORRUPT_CELL` - when a VM-side field read decodes a `Value`
+/// cell with an out-of-range discriminant, name the RECEIVER and the Java frames
+/// that reached it. The collector's own guard reports the cell; only this side
+/// can report who was holding the reference into a swept-then-re-served block.
+/// Costs one relaxed load per `NativeContext::get_field` while armed and nothing
+/// at all while it is not.
+cached_is_set!(corrupt_cell_dbg, "CRATONVM_DBG_CORRUPT_CELL");
 cached_is_set!(lambda_dbg, "CRATONVM_DBG_LAMBDA");
 cached_is_set!(resume_pc_dbg, "CRATONVM_DBG_RESUME_PC");
 /// `CRATONVM_DBG_BADRECV` — on a getfield/putfield/array/invoke receiver whose

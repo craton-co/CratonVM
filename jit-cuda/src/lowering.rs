@@ -215,6 +215,7 @@ fn lower_method_with_pool_impl(
     // D→H copy for read-only array inputs (closing the residual
     // perf gap to TornadoVM left by the Phase 10 #1 residency cache).
     let writes_param_mask = emitter.writes_param_mask;
+    let reads_param_mask = emitter.reads_param_mask;
 
     let reg_decls = emitter.emit_reg_decls();
     let body = emitter.into_body();
@@ -230,6 +231,7 @@ fn lower_method_with_pool_impl(
         sm_minor,
         kernels: vec![kernel],
         writes_param_mask,
+        reads_param_mask,
     })
 }
 
@@ -321,6 +323,22 @@ pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
     out.push(PtxParam {
         name: "failure_flag".to_string(),
         kind: PtxParamKind::U64Ptr,
+    });
+    // The index of the first element this launch is responsible for.
+    //
+    // A whole-array launch passes 0 and nothing changes. A CHUNKED launch
+    // passes the chunk's base, so one kernel can be launched several times
+    // over disjoint slices of the same iteration space while each thread
+    // still computes its GLOBAL index. That is what lets the writeback of
+    // one chunk overlap with the kernel of the next; without it every
+    // launch would start its index space at zero, because CUDA has no
+    // launch offset of its own.
+    //
+    // Costs one `ld.param` and one `add.s32` in the prologue, per thread,
+    // whether or not chunking is in use.
+    out.push(PtxParam {
+        name: "tid_base".to_string(),
+        kind: PtxParamKind::S32,
     });
     out
 }
@@ -441,12 +459,14 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero: false,
         };
         let params = build_param_list(&sig);
-        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag) = 7
-        assert_eq!(params.len(), 7);
+        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag,
+        //  tid_base) = 8
+        assert_eq!(params.len(), 8);
         assert_eq!(params[0].name, "p0_ptr");
         assert_eq!(params[1].name, "p0_len");
         assert_eq!(params[2].name, "p1_ptr");
@@ -454,6 +474,7 @@ mod tests {
         assert_eq!(params[4].name, "ret_ptr");
         assert_eq!(params[5].name, "ret_len");
         assert_eq!(params[6].name, "failure_flag");
+        assert_eq!(params[7].name, "tid_base");
     }
 
     #[test]
@@ -465,14 +486,16 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero: false,
         };
         let params = build_param_list(&sig);
-        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag) = 6
-        assert_eq!(params.len(), 6);
+        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag, tid_base) = 7
+        assert_eq!(params.len(), 7);
         assert_eq!(params[4].name, "ret_ptr");
         assert_eq!(params[5].name, "failure_flag");
+        assert_eq!(params[6].name, "tid_base");
     }
 
     fn lower_i32_remainder_body(allow_div_by_zero: bool) -> String {
@@ -484,6 +507,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero,
         };
@@ -534,6 +558,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero,
         };
@@ -558,6 +583,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero,
         };
@@ -713,6 +739,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero: false,
         };
@@ -950,6 +977,55 @@ mod tests {
         assert!(text.contains("st.global.f32"));
         // Bounds fail
         assert!(text.contains("L_bounds_fail:"));
+    }
+
+    /// `reads_param_mask` must name exactly the params read element-wise.
+    ///
+    /// The chunked writeback commits a chunk into the Java array as its
+    /// event fires — before the bounds-failure flag has been read — so it
+    /// may only do that for an array the kernel does NOT also read. This
+    /// pins the two directions on one kernel: `saxpy(a, x[], y[], out[])`
+    /// reads x and y, writes out, and never reads out.
+    #[test]
+    fn reads_param_mask_names_only_the_arrays_read() {
+        let m = lower_fixture("EligibleSaxpy", "saxpy", "(F[F[F[F)V");
+        // Params: 0 = float a (scalar), 1 = x[], 2 = y[], 3 = out[].
+        let reads = m.reads_param_mask;
+        let writes = m.writes_param_mask;
+        assert_eq!(reads & 1, 0, "a scalar param is never an element read");
+        assert_ne!(reads & (1 << 1), 0, "x[] is read:\nreads={reads:#b}");
+        assert_ne!(reads & (1 << 2), 0, "y[] is read:\nreads={reads:#b}");
+        assert_eq!(
+            reads & (1 << 3),
+            0,
+            "out[] is written but never read; marking it read would refuse \
+             a chunked writeback that is in fact safe\nreads={reads:#b}"
+        );
+        assert_ne!(writes & (1 << 3), 0, "out[] is written:\nwrites={writes:#b}");
+        // The set a chunked dispatch may stream out early.
+        assert_eq!(
+            writes & !reads,
+            1 << 3,
+            "only out[] should be eligible for early commit\n\
+             writes={writes:#b} reads={reads:#b}"
+        );
+    }
+
+    /// An array that is READ AND WRITTEN must not be eligible for early
+    /// commit — `out[i] = out[i] + 1` is the shape that would break.
+    #[test]
+    fn an_array_read_and_written_is_refused_for_early_commit() {
+        let m = lower_fixture("EligibleReadModifyWrite", "bump", "([I)V");
+        let reads = m.reads_param_mask;
+        let writes = m.writes_param_mask;
+        assert_ne!(reads & 1, 0, "a[] is read:\nreads={reads:#b}");
+        assert_ne!(writes & 1, 0, "a[] is written:\nwrites={writes:#b}");
+        assert_eq!(
+            writes & !reads,
+            0,
+            "a read-modify-write array must not be streamed out before the \
+             failure flag is known\nwrites={writes:#b} reads={reads:#b}"
+        );
     }
 
     /// Every float arithmetic instruction must carry an explicit
@@ -1376,18 +1452,22 @@ mod tests {
         let text = m.render();
         assert!(text.contains(".visible .entry NonCanonicalLoops__start5Loop_"));
         // The tid+K fold: an `add.s32` with immediate 5 feeding a fresh
-        // register, right after `emit_tid`'s `mov.b32` reinterpret and
-        // before anything else touches the induction register.
-        assert!(
-            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 5;"),
-            "expected the tid+K fold immediately after tid computation:\n{text}"
-        );
-        // The loop guard must use the folded register (%r1), not the
-        // raw tid (%r0).
+        // register. Register numbers are not asserted — the `tid_base`
+        // add for chunked launches sits between the reinterpret and this
+        // fold and shifts them — so find the fold and then check the guard
+        // uses ITS destination.
+        let folded = text
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with("add.s32") && l.ends_with(", 5;"))
+            .and_then(|l| l.split_whitespace().nth(1).map(|r| r.trim_end_matches(',')))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("expected the tid+K fold:\n{text}"));
+        // The loop guard must use the folded register, not the raw tid.
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains("%r1,")
+                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
@@ -1669,19 +1749,22 @@ mod tests {
         let text = m.render();
         assert!(text.contains(".visible .entry EligibleOffsetLoop__offsetLoop_"));
         // The tid+K fold: an `add.s32` with immediate 4 feeding a fresh
-        // register, right after `emit_tid`'s `mov.b32` reinterpret —
-        // deterministic because both params are arrays (`bind_param_locals`
-        // only touches the U64 pool before `emit_tid` runs), so the tid
-        // register is always %r0 and the folded register is always %r1.
-        assert!(
-            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 4;"),
-            "expected the tid+K fold immediately after tid computation:\n{text}"
-        );
+        // register. It no longer sits immediately after `emit_tid`'s
+        // `mov.b32` reinterpret — the `tid_base` add that makes chunked
+        // launches possible comes between — so this matches the fold
+        // itself rather than its adjacency to the reinterpret.
+        let folded = text
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with("add.s32") && l.ends_with(", 4;"))
+            .and_then(|l| l.split_whitespace().nth(1).map(|r| r.trim_end_matches(',')))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("expected the tid+K fold:\n{text}"));
         // The loop guard must compare the folded register, not raw tid.
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains("%r1,")
+                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
@@ -1726,7 +1809,10 @@ mod tests {
         // constant-pool `Integer` entry rather than merely refusing to
         // reject the loop.
         assert!(
-            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 40000;"),
+            text.lines().any(|l| {
+                let l = l.trim_start();
+                l.starts_with("add.s32") && l.ends_with(", 40000;")
+            }),
             "expected the tid+K fold with the ldc-resolved start value:\n{text}"
         );
     }
@@ -2371,6 +2457,7 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
             is_reduction: false,
             allow_div_by_zero: false,
         };

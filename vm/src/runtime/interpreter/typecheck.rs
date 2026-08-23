@@ -1537,6 +1537,67 @@ pub(super) fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, tar
         return true;
     }
 
+    // Every `MemorySegment` CratonVM mints is a
+    // `cratonvm/internal/foreign/MemorySegmentImpl`
+    // (`native-builtins`' `panama::CRATON_SEGMENT_CLASS`). Same shape as the
+    // logger above and adopted for the same reason — the receiver used to be
+    // stamped with the `java/lang/foreign/MemorySegment` INTERFACE — but here
+    // the missing relationship was not hypothetical: it is the whole defect.
+    //
+    // The JDK does not consume a segment through the interface. Its own
+    // internals cast it down, and `jdk.incubator.vector` does so on EVERY
+    // segment entry point:
+    //
+    //     ShortVector.fromMemorySegment0Template   pc 22: checkcast AbstractMemorySegmentImpl
+    //     IntVector.intoMemorySegment0Template     pc 23: checkcast AbstractMemorySegmentImpl
+    //
+    // `AbstractVector.defaultReinterpret` reaches the second of those for every
+    // `reinterpretAsInts()` — it round-trips the vector through a scratch
+    // `MemorySegment.ofArray(new byte[n])` — so GPULlama3's first `matmul` died
+    // on a segment CratonVM had minted three frames earlier. Nothing about that
+    // is Vector-API-specific: it is every JDK consumer that touches the FFM
+    // internals.
+    //
+    // Two relationships, and both are needed. `MemorySegment` is what user code
+    // casts to; `AbstractMemorySegmentImpl` is what the JDK's own code casts to.
+    // `SegmentAllocator` comes with the second (the abstract class implements
+    // it) and is what `SegmentAllocator.allocate*` call sites check.
+    //
+    // NOT done by giving the class a real superclass in
+    // `class_manager::fabricate_class` — the shape `cratonvm/synthetic/Process`
+    // uses. A fabricated class gets `first_field_index: 0`, so
+    // `AbstractMemorySegmentImpl`'s `length`/`readOnly`/`scope` would alias
+    // slots 0/1/2 of CratonVM's carrier — which hold `ptr`, `size` and `arena` —
+    // and `resolve_field_index_in_hierarchy` would start answering those names
+    // with the wrong values for the three readers in `native-builtins` that ask
+    // by name. See `panama::CRATON_SEGMENT_CLASS` for the full measurement.
+    if obj_name == "cratonvm/internal/foreign/MemorySegmentImpl" {
+        return matches!(
+            target_class_name,
+            "java/lang/foreign/MemorySegment"
+                | "jdk/internal/foreign/AbstractMemorySegmentImpl"
+                | "java/lang/foreign/SegmentAllocator"
+        );
+    }
+
+    // The `BufferPoolMXBean` instances CratonVM hands out
+    // (`native-builtins`' `jmx::CRATON_BUFFER_POOL_CLASS`), same shape and same
+    // reason as the two above: the receiver used to be stamped with the
+    // `java/lang/management/BufferPoolMXBean` interface, so it had no concrete
+    // methods and native lookup drops interface-declared instance natives.
+    //
+    // `PlatformManagedObject` is the supertype `ManagementFactory
+    // .getPlatformMXBeans` is generic over, and the one whose `checkcast` a
+    // caller storing the result in a `PlatformManagedObject` variable emits.
+    if obj_name == "cratonvm/internal/BufferPool" {
+        return matches!(
+            target_class_name,
+            "java/lang/management/BufferPoolMXBean"
+                | "java/lang/management/PlatformManagedObject"
+                | "jdk/internal/misc/VM$BufferPool"
+        );
+    }
+
     // Map.Entry implementations
     if target_class_name == "java/util/Map$Entry" {
         return matches!(

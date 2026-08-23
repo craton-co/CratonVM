@@ -1190,3 +1190,76 @@ mod tests {
         }
     }
 }
+
+/// Copy `src` into `obj`'s payload starting at element `lo`.
+///
+/// The ranged twin of the whole-array `write_back_*`, for the chunked
+/// writeback: each chunk lands in its own slice of the Java array as its
+/// DMA completes, rather than the whole array arriving at once. Same
+/// no-write-barrier argument (primitive arrays never hold references) and
+/// same contiguity fallback.
+macro_rules! write_back_range {
+    ($name:ident, $ty:ty, $elem:expr, $vconv:expr, $what:literal) => {
+        pub fn $name(
+            obj: ObjectRef,
+            heap: &VmHeap,
+            src: &[$ty],
+            lo: usize,
+            _token: &SafepointToken<'_>,
+        ) -> Result<(), String> {
+            let header = heap.get_header(obj);
+            if header.kind() != ObjectKind::Array || header.element_type() != $elem {
+                return Err(concat!(stringify!($name), ": not a ", $what).to_string());
+            }
+            let len = header.array_length() as usize;
+            let end = lo
+                .checked_add(src.len())
+                .ok_or_else(|| format!("{}: lo + len overflows", stringify!($name)))?;
+            if end > len {
+                return Err(format!(
+                    "{}: range [{lo}, {end}) exceeds array length {len}",
+                    stringify!($name)
+                ));
+            }
+            if src.is_empty() {
+                return Ok(());
+            }
+            match heap.array_data_ptr(obj) {
+                Some(dst) => {
+                    // SAFETY: `obj` is a live `$what` of `len` elements
+                    // (kind + element type checked above), the range is
+                    // bounds-checked against it, and GC is paused for the
+                    // duration (token held), so `dst` stays valid. `src` is
+                    // page-locked staging owned by the caller and cannot
+                    // overlap the heap arena.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr() as *const u8,
+                            dst.add(lo * std::mem::size_of::<$ty>()),
+                            std::mem::size_of_val(src),
+                        );
+                    }
+                }
+                // G1 humongous: region-safe per-element store.
+                None => {
+                    for (i, &x) in src.iter().enumerate() {
+                        heap.set_array_element(obj, lo + i, $vconv(x))
+                            .map_err(|_| format!("{}: OOB at {}", stringify!($name), lo + i))?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    };
+}
+
+write_back_range!(write_back_range_i32, i32, ArrayElementType::Int, Value::Int, "int[]");
+write_back_range!(write_back_range_i64, i64, ArrayElementType::Long, Value::Long, "long[]");
+write_back_range!(write_back_range_f32, f32, ArrayElementType::Float, Value::Float, "float[]");
+write_back_range!(
+    write_back_range_f64,
+    f64,
+    ArrayElementType::Double,
+    Value::Double,
+    "double[]"
+);

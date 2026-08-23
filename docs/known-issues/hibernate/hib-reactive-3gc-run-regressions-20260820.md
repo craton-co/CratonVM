@@ -1131,6 +1131,47 @@ caught, and it is repaired by the same change.
 FAIL is either a different defect or environment-dependent; this session has no
 evidence either way and is not claiming it.
 
+### 8.6.1 Full suite, three collectors, MySQL — 2026-08-22
+
+The whole 249-class `testlist.txt` on the fixed binary against **MySQL** in
+Docker (Testcontainers, one container per class), all three collectors, with a
+real-HotSpot control on the same database, list, argfile and shard count. Full
+write-up:
+[`RESULTS-20260822-3gc-mysql-local.md`](../../../apps/hibernate-reactive-suite-runner/RESULTS-20260822-3gc-mysql-local.md).
+
+204 runnable classes per arm (249 minus the 45 no-`@@RESULT` classes):
+
+| GC | PASS | failures HotSpot does NOT share |
+|---|---:|---:|
+| ZGC (default) | 202 | **1** |
+| G1 | 201 | **2** |
+| Generational | 199 | **4** |
+
+Every class in this section's family PASSes on all three collectors:
+`FilterWithPaginationTest`, `CriteriaMutationQueryTest`, `OneToManyTest`,
+`RowIdUpdateAndDeleteTest`, `ReactiveStatelessWithBatchTest`,
+`QuerySpecificationTest`, `MutationDelegateIdentityTest`.
+
+What remains is four classes, none of them this defect:
+`MultithreadedInsertionWithLazyConnectionTest` (all three arms, PASSes on
+HotSpot — the suite's longest-standing item and the obvious next target),
+`techempower.TechEmpowerTest` (G1 + Generational, PASSes on ZGC),
+`MultithreadedIdentityGenerationTest` and `SoftDeleteCollectionTest`
+(Generational only). The last three are single observations and have not been
+repeated.
+
+**One methodology warning from that run, because it nearly produced the wrong
+answer.** The first pass ran the three arms concurrently at 3 shards each — nine
+simultaneous MySQL container boots — and reported 25/22/20 FAIL, *including
+`FilterWithPaginationTest` at `found=35 ok=0 failed=35`*, i.e. this section's own
+witness class failing every test in it. The cause was
+`IllegalStateException: Could not find a valid Docker environment`: the daemon
+was saturated. Re-running the 28-class non-PASS union one arm at a time at 2
+shards — matching the HotSpot control's concurrency — collapsed it to 2/3/5.
+**When a suite's setup depends on a shared external resource, fork count is an
+experimental variable, and an arm run at 9-way against a control run at 2-way is
+not an A/B.**
+
 ### 8.7 What this does NOT settle
 
 Section 7's sweep found 6 of 8 other still-FAIL classes clear under `--jit off`;
@@ -1146,3 +1187,204 @@ unchanged by this fix as far as anything measured says:
 * `techempower.TechEmpowerTest` and the two host-timezone/locale classes
   (`ORMReactivePersistenceTest`, `DatabaseHibernateReactiveTest`) — separate,
   already-documented families.
+
+---
+
+## 9. 2026-08-22 — section 8.7's two open classes, settled on Azure: `ReactiveStatelessProxyUpdateTest` is a SEVENTH class the fix repairs, and its "needs a timeout override" premise was wrong
+
+Section 8 fixed the defect and verified six classes on the Windows box.
+Section 8.7 left two classes explicitly unsettled, both for reasons that
+needed the Azure host rather than more analysis. This section settles both.
+It does not re-derive section 8's mechanism and does not dispute any of it —
+section 8 is the cause of everything measured here.
+
+Binary: `cratonvm-hibfixverify`, built in `/data/cvm-hibreactive-idle-20260820`
+at `5ee7897cf` (current `dev`), `git merge-base --is-ancestor b8fa0585e HEAD`
+confirms section 8's fix is in the tree; `md5sum` matched against the
+`target/release/cratonvm` it was copied from. Azure host, live Postgres via
+Testcontainers, default (ZGC) collector.
+
+**Host caveat, stated up front:** this host was NOT quiet — 1-minute load
+average ranged 23–36 across these runs (8 vCPU), with other sessions building
+and running suites throughout. That is recorded beside each result below. It
+does not weaken a PASS (a class that passes under contention would pass idle),
+and every result here is a PASS, so no conclusion in this section rests on a
+timeout that might have been contention. A HANG under this load would have
+been reported as provisional; none occurred.
+
+### 9.1 `ReactiveStatelessProxyUpdateTest` — PASSES with the JIT on, at the SAME cap where it used to hang
+
+Section 7.2 recorded it as `--jit off` PASS 4/4 in 28.4 s, `--jit on` HANG at
+the flat 120 s cap, and section 8.7 set it aside as needing "its own timeout
+override first" before it could be compared at all.
+
+**The timeout-override premise turns out to be wrong, and the class is simply
+fixed.** On the fixed binary:
+
+| arm | cap | result | wall |
+|---|---|---|---|
+| `--jit on` | 600 s | **PASS 4/4** | 28.8 s |
+| `--jit off` | 600 s | PASS 4/4 | 15.9 s |
+| `--jit on` | **120 s** (the original cap) | **PASS 4/4** | 24.4 s |
+| `--jit on` | **120 s** | **PASS 4/4** | 14.9 s |
+| `--jit on` | **120 s** | **PASS 4/4** | 18.5 s |
+
+Four `--jit on` runs, all PASS, and the three at the ORIGINAL 120 s cap are
+the ones that matter: the class now finishes in 14.9–24.4 s against a cap it
+previously could not reach at all. It never needed a raised budget — the
+"hang" was the section 8 defect, and a raised timeout would only ever have
+converted a hang into a longer hang. Raising the cap to 600 s changed nothing
+(28.8 s, the same neighbourhood).
+
+So `ReactiveStatelessProxyUpdateTest` is a **seventh class repaired by
+`b8fa0585e`**, alongside section 8.6's six, and section 7.2's "plausible but
+unconfirmed" reading of it is now confirmed. It should NOT be given a
+`class-overrides.tsv` entry; nothing about it is slow.
+
+### 9.2 `MutationDelegateIdentityTest` — does not fail on Azure on the fixed binary either
+
+Section 8.6 found it passing on both binaries on the Windows box and
+explicitly declined to claim anything about its Azure FAIL. On Azure, fixed
+binary, `--jit on`, three consecutive runs: **PASS 5/5 every time** (17.1 s,
+14.4 s, 22.9 s; load 23).
+
+Read this narrowly. It confirms the class is healthy on Azure today, but it
+is **not** new evidence that section 8's fix repaired it, because section 5
+already recorded this class among the nine that went PASS on Azure back on
+2026-08-21 — attributed there to the `nio_selector.rs` fix in section 1, on a
+binary that predates `b8fa0585e` entirely. The most defensible statement is
+the one section 8.6 was reaching for: **the original 2026-08-20 3-GC-run FAIL
+for this class does not reproduce on Azure and has not for some time**, and
+nothing in section 8's change altered that. It is not an open item.
+
+### 9.3 Updated tally
+
+Nine classes have now been checked against section 8's fix across the two
+sessions:
+
+| class | status |
+|---|---|
+| `FilterWithPaginationTest` | fixed by `b8fa0585e` (8.6) |
+| `CriteriaMutationQueryTest` | fixed (8.6) |
+| `OneToManyTest` | fixed (8.6) |
+| `ReactiveStatelessWithBatchTest` | fixed (8.6) |
+| `RowIdUpdateAndDeleteTest` | fixed (8.6) |
+| `QuerySpecificationTest` | fixed (8.6) |
+| `ReactiveStatelessProxyUpdateTest` | **fixed (9.1, this section)** |
+| `MutationDelegateIdentityTest` | not failing; unrelated to this fix (9.2) |
+| `techempower.TechEmpowerTest` | still open — separate family, see below |
+| `MultithreadedInsertionWithLazyConnectionTest` | NOT fixed — perf family, measured in 9.5 |
+
+**Seven classes repaired by one change.** The only member of section 7's
+still-FAIL list not accounted for is `techempower.TechEmpowerTest`, which
+sections 7.3 and 8.7 both place in the already-documented
+lambda-dispatch-timeout family (its fixture carries a hardcoded Vert.x
+deadline no runner flag can reach, per
+`residual-seven-after-the-afc-fix-20260817.md` section 2.1). It was NOT
+re-run here: giving it a meaningful verdict needs a quiet host, and this one
+was at load 23–36 throughout — exactly the condition under which a
+timeout-bound class's result would be uninterpretable. Left open deliberately
+rather than measured badly.
+
+### 9.4 A host note worth recording
+
+The first build attempt for this section was **OOM-killed** — `rustc` at
+4.4 GB RSS, `oom-kill … task=rustc` in `dmesg` at 18:32:53, on a 31 GB host
+with no swap that had reached 426 logged-in sessions and a 1-minute load
+average of 150. `nohup` survives `SIGHUP`, not the OOM killer, and the symptom
+is misleading: the build log simply stops mid-crate and the process is gone,
+which reads exactly like "still compiling a big crate" for as long as nobody
+checks. A `pgrep -f 'cargo build …' | wc -l` returning a nonzero count was
+*not* evidence it lived — the pattern matched the checking shell's own
+command line, the self-match trap
+[[feedback_shared_host_blanket_process_kill]] and its sibling note already
+warn about. What settled it was sampling the PID's own CPU time twice, at
+which point `ps -p <pid>` returned nothing at all.
+
+Rebuilding with `nice -n 10` and `-j 2` (fewer concurrent `rustc`, lower peak
+RSS) completed in 17m46s on the same contended host. Anyone building on this
+host while it is busy should do the same, and should watch for process
+*disappearance* rather than only for a completion marker — a watcher that
+waits for `BUILD_DONE` alone waits forever on a killed build.
+
+### 9.5 `MultithreadedInsertionWithLazyConnectionTest` — measured, still the perf family, and the runner's `--timeout` is the WRONG knob for it
+
+Section 7.3 left this class "inconclusive at this run's flat timeout". Measured
+here on the same fixed binary, and the answer is that section 8's fix does not
+change it: it is still exactly what
+[residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md)
+section 2.1 described.
+
+**The first attempt measured the wrong thing, and the way it was wrong is worth
+recording** because it will catch the next reader too. Running with
+`--timeout 900` produced `FAIL 0/2` in 251 s, with both methods throwing
+JUnit's own
+`TimeoutException: … timed out after 120 seconds`. That is **not** the fixture
+deadline and not the runner's cap — it is
+`-Djunit.jupiter.execution.timeout.default=120s`, set in `common.args`. The
+runner's `--timeout` only bounds the forked process's wall clock; it does
+nothing to JUnit's per-test timer, and 2 x 120 s accounts for the 251 s exactly.
+This is the same argfile-ordering hazard residual-seven section 4 documents from
+the other direction: per-class `-D` flags must land AFTER `@common.args` to win,
+which the runner now does.
+
+Re-run with the JUnit timer actually raised — via `HR_CLASS_OVERRIDES` pointing
+at a temporary table (`timeout=900`,
+`-Djunit.jupiter.execution.timeout.default=900s`), so the tracked
+`class-overrides.tsv` was not modified:
+
+| | result |
+|---|---|
+| `found` / `ok` / `failed` | 2 / **1** / 1 |
+| wall | 749 s (12m29s) |
+| failing method | `testIdentityGeneratorWithTransaction` |
+| its exception | Vert.x `TimeoutException: The test execution timed out. Make sure your asynchronous code includes calls to either VertxTestContext#completeNow()…` |
+
+So **one of the two methods passes and the other exceeds the fixture's own
+hardcoded `@Timeout(value = 10, timeUnit = MINUTES)`** — the deadline
+residual-seven section 2.1 already established `io.vertx.junit5` exposes no
+system property for, and which therefore **no runner flag, override row, or
+system property can reach**. Patching an upstream stress test's own budget to
+make the VM look better remains a trade this project has declined to make.
+
+Two caveats, stated rather than buried: the host was at 1-minute load average
+23–27 (8 vCPU) throughout, so this does not prove the second method could not
+finish inside 600 s on a quiet box; and the 749 s here is not comparable to
+residual-seven's 942.9 s, which was a different host under different conditions.
+What it does establish is the **shape** — 1 of 2, second method on the fixture
+deadline — is unchanged by `b8fa0585e`, which is the expected result: section 8
+fixed a double-execution correctness defect, not the functional-interface
+dispatch cost that makes this class slow.
+
+`techempower.TechEmpowerTest` is still not measured (5-minute fixture deadline,
+same family, and section 9.3's reasoning about host load applies to it more
+strongly than to this class).
+
+### 9.6 …and then it WAS measured, and it is not a perf class at all
+
+Measured the same day on a quiet host (load 6.8–14), and the "same family"
+assumption in 9.5 and 9.3 — inherited from
+[residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md)
+section 2.1 — **does not hold**:
+
+| arm | result | wall |
+|---|---|---|
+| real HotSpot | PASS 1/1 | 13.3 s |
+| CratonVM `--jit off` | **PASS 3/3** | 74.9 / 72.2 / 72.6 s |
+| CratonVM `--jit on` | FAIL 4/4 | 31.3 / 22.5 / 21.7 / 305.8 s |
+
+`techempower.TechEmpowerTest` **passes on CratonVM in ~72 s**, well inside its
+own 5-minute fixture deadline, with the JIT off. It never needed a raised
+budget and it is not bound by dispatch cost. With the JIT on it fails — 3 of 4
+times with a fast WRONG ANSWER (a server-side `NullPointerException` because
+`session.find(World.class, id)` returned `null` for an id the benchmark
+guarantees exists, surfacing as HTTP 500 in ~25 s), and 1 of 4 times on the
+fixture deadline. That bimodality is why it was misfiled: the earlier records
+only ever caught the timeout mode.
+
+It is **not** the section 8 defect — the 500 was already present pre-`b8fa0585e`
+(section 7.3) and reproduces on a binary containing it.
+
+Full write-up, evidence, reproducer, and the one query that would split the
+remaining search space:
+[techempower-jit-wrong-answer-20260822.md](../jit/techempower-jit-wrong-answer-20260822.md).

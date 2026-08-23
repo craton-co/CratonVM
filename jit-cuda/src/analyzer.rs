@@ -627,6 +627,12 @@ fn analyze_with_annotations_and_pool_impl(
         // mask precisely here. Leave `0` and let lowering fill it in
         // before `CompiledKernel` caches the signature.
         writes_param_mask: 0,
+        // Same story for the read mask, but the safe default is the
+        // OPPOSITE: an unpopulated `reads_param_mask` must read as "every
+        // param is read" so a chunked dispatch refuses rather than
+        // streams out early on an array the kernel might read. Lowering
+        // overwrites it with the precise set.
+        reads_param_mask: u64::MAX,
         // AUDIT 2026-05-24 (C31): propagate the dot-product reduction
         // flag so the lowering layer emits `atom.global.add.<suffix>`
         // instead of a racing plain `st.global.<suffix>` for the scalar

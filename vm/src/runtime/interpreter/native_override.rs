@@ -8146,22 +8146,31 @@ mod enforcement_dial_door_tests {
     /// TEST rather than something the next lane discovers from a corrupted map.
     #[test]
     fn every_force_native_file_asks_the_dial_or_is_exempt() {
-        // EMPTY IS THE GOAL. A row is a known hole that has been written down,
-        // not an approval — and it must be edited to add one, which is the
-        // difference between this and a comment saying "be careful here".
-        const FORCE_SITES_EXEMPT: &[(&str, &str)] = &[
-            (
-                "dispatch_virtual.rs",
-                "vtable force path; memoizes into a per-entry force_native_cache \
-                 OnceLock, so the dial needs the memo to be dial-aware (the \
-                 2026-08-04 per-call-site drift hazard). Fixed on the handoff \
-                 branch by 089329af7; drop this row when that reaches dev.",
-            ),
+        // (file, permanent?, reason).
+        //
+        // `permanent == false` is a HOLE that has been written down, and the
+        // count of those is what should reach zero. `permanent == true` is a
+        // file where the dial is structurally not applicable — it still calls
+        // the helper, so the scan must account for it, but it is not
+        // outstanding work. Filing both under one heading makes the list read
+        // as twice the remaining problem.
+        const FORCE_SITES_EXEMPT: &[(&str, bool, &str)] = &[
             (
                 "jit_bridge.rs",
-                "JIT direct-bind force path. A compiled site that binds a native \
-                 directly has no interpreter door to report through, so this needs \
-                 the bind to consult the dial, not a counter at a door.",
+                true,
+                "NOT APPLICABLE, verified by reading the bind path rather than \
+                 inferred from the grep that first listed it. Under `--jdk-only`, \
+                 `jit::direct_native_helper` refuses to bind any native whose \
+                 registry kind is not `Intrinsic` (§1.4's reviewed exception) and \
+                 records the refusal. The dial's entire domain is `Bridge` under \
+                 `--jdk-only`, a strict SUBSET of what that already refuses, so \
+                 there is no configuration in which the dial would yield a native \
+                 the JIT would otherwise bind. What this file does with the force \
+                 helper is decide whether to SEAL a caller out of tier-up; missing \
+                 the dial there over-seals an armed run, which costs tier-up in \
+                 the safe direction. Wiring it is a tier-up optimisation, not a \
+                 correctness fix — and `registered_native_will_run`, the natural \
+                 place, also feeds interpreter dispatch, so it is not a free edit.",
             ),
         ];
 
@@ -8207,7 +8216,7 @@ mod enforcement_dial_door_tests {
             checked += 1;
             let asks = src.contains("jdk_only_dial_yields_to_bytecode")
                 || src.contains("enforce_shadow_scope()");
-            let exempt = FORCE_SITES_EXEMPT.iter().any(|(n, _)| *n == name);
+            let exempt = FORCE_SITES_EXEMPT.iter().any(|(n, _, _)| *n == name);
             if !asks && !exempt {
                 offenders.push(name);
             }
@@ -8242,7 +8251,20 @@ mod enforcement_dial_door_tests {
         //
         // With both checked, this list can only shrink: wiring a force site
         // turns the gate red until its row is deleted.
-        for (name, _) in FORCE_SITES_EXEMPT {
+        // ZERO, and held there. Every force site under vm/src now either consults
+        // the dial or is a reasoned `permanent: true` non-hole. A new unwired
+        // site is a red test on its own — nobody has to notice a count creep up.
+        let holes = FORCE_SITES_EXEMPT.iter().filter(|(_, perm, _)| !*perm).count();
+        assert_eq!(
+            holes, 0,
+            "{holes} force site(s) are UNWIRED holes. A `permanent: true` row is a \
+             reasoned non-hole and does not count toward this. If a hole genuinely has \
+             to exist for a while, write the reason and the retiring condition in the \
+             row and raise this bound deliberately — do not flip the flag to true, \
+             which is what turns a to-do into a permanent approval."
+        );
+
+        for (name, _, _) in FORCE_SITES_EXEMPT {
             let found = files
                 .iter()
                 .find(|f| f.file_name().unwrap().to_string_lossy() == *name)

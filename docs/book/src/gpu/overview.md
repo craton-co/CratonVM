@@ -88,9 +88,22 @@ can't move an array a kernel is reading).
 ## Exceptions inside an offloaded method
 
 Array-bounds violations are handled: the kernel flags the failure and returns,
-and the host deopts back to the interpreter, which observes no partial GPU state
-(input arrays aren't written by the failed path, and outputs are separate
-buffers materialized only after a successful kernel).
+and the host deopts back to the interpreter. Input arrays are never written by
+the failed path, so the re-run always starts from the same inputs the original
+call had.
+
+One narrow case can leave part of an *output* array already written when the
+deopt happens. A large enough write-only output is streamed back in chunks, so
+that one chunk's copy overlaps the next chunk's kernel, and each chunk lands in
+the Java array as its own copy completes — which is before the failure flag has
+been read. This is deliberately restricted to an array the kernel **writes and
+never reads**, and it is unobservable: the interpreter re-runs the whole method
+from the first iteration, rewrites every element it would have written, and
+throws at the same index, so the elements an early chunk committed are a subset
+of those plain Java writes before the throw, holding the same values. An array
+the kernel also reads is never streamed this way, precisely because there a
+partial commit would become the re-run's own input. Every other output still
+materializes only after the flag has been checked.
 
 Integer division-by-zero and `INT_MIN`/`LONG_MIN` ÷ `-1` overflow are handled
 the same way, not merely planned. PTX's `div.s32`/`rem.s32` (and the 64-bit

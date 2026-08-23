@@ -2340,24 +2340,106 @@ fn invoke_to_string_opt(
 /// `encode_utf16` their own ASCII text — none of them can produce a
 /// surrogate, so the conversion is exact and the only behavioural difference
 /// is on the two arms that read a Java `String`.
+/// Is `obj` a real `java.lang.String` INSTANCE - not merely something whose
+/// class id says `java/lang/String`?
+///
+/// A reference array has no class of its own in this VM's class store, so it
+/// carries its COMPONENT's class id: `class_id_of_object(new String[2])` answers
+/// `java/lang/String`. Every `class_name == "java/lang/String"` test in the
+/// rendering path therefore matched a `String[]`, and each one then read slot 0
+/// as `String.value` - which is the array's FIRST ELEMENT POINTER, decoded as
+/// the `(tag, payload)` pair of a `Value` cell.
+///
+/// MEASURED (`probes/AppendArrayProbe`), and no GC is involved - the collector's
+/// corrupt-cell guard fires at `collections_now=0`:
+///
+/// ```text
+///   sb.append(new String[]{"y","n"})
+///   String.valueOf((Object) new String[]{"y","n"})
+///   CratonVM   ""  + `gc::guard: corrupt Value cell` + `NullPointerException:
+///                    Cannot read the array length because "this.value" is null`
+///   HotSpot    "[Ljava.lang.String;@<hash>"
+/// ```
+///
+/// This is the producer `corrupt-value-cell-is-fatal-on-three-of-four-collectors`
+/// left open (retired as
+/// `corrupt-value-cell-producer-was-a-string-array-FIXED-20260822`). That record reasoned the reference "is already stale when the
+/// native is entered" because the String fast path has no allocation between
+/// entry and the read. The reference was never stale; the READ was never of a
+/// String. Its Spring Boot witness reaches here through
+/// `ItemMetadata.newProperty(.., new String[]{"y","n"}, ..)` and AssertJ's
+/// `createDescription`, which is a `sb.append(Object)` over that array.
+///
+/// The kind check is the same one the boxed-wrapper fast path in
+/// [`invoke_to_string_units_opt`] has always carried, in its own words: "MUST
+/// exclude arrays: a heap array's num_slots is its LENGTH". Three of the four
+/// String doors did not.
+///
+/// `vm_exec::is_string_object` is the same predicate on the VM side and has
+/// always screened the kind; this is that rule, brought to the natives.
+fn is_plain_string(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> bool {
+    ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array
+        && ctx
+            .class_name_of_id(ctx.class_id_of_object(obj))
+            .as_deref()
+            == Some("java/lang/String")
+}
+
 fn invoke_to_string_units_opt(
     ctx: &mut dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
 ) -> Result<Option<Vec<u16>>, cratonvm_types::error::MethodCallFailed> {
+    // MUST exclude arrays, for the reason the wrapper fast path below says in
+    // its own words -- and this is the site that was missing it.
+    //
+    // A reference array has no class of its own in the class store, so it
+    // carries its COMPONENT's class id: `class_id_of_object(new String[2])`
+    // answers `java/lang/String`, and the name test below matched. This native
+    // then read slot 0 as `String.value`, i.e. it decoded the array's FIRST
+    // ELEMENT POINTER as the `(tag, payload)` pair of a `Value` cell.
+    //
+    // MEASURED (`probes/AppendArrayProbe`, no GC involved -- the guard fires at
+    // `collections_now=0`):
+    //
+    // ```text
+    //   sb.append(new String[]{"y","n"})
+    //   CratonVM   ""            + `gc::guard: corrupt Value cell` + an NPE
+    //                              downstream on the String it minted with a
+    //                              null `value`
+    //   HotSpot    "[Ljava.lang.String;@<hash>"
+    // ```
+    //
+    // That is the whole of the producer
+    // `corrupt-value-cell-is-fatal-on-three-of-four-collectors` was looking for.
+    // Its own reasoning was that the reference must already be stale on entry
+    // because the String fast path has no allocation between entry and the
+    // read; the reference was never stale, and the read was never of a String.
+    // The Spring Boot witness reaches it through
+    // `ItemMetadata.newProperty(.., new String[]{"y","n"}, ..)` and AssertJ's
+    // `createDescription`, which is a `sb.append(Object)` over that array.
+    //
+    // `read_string`'s structural decode is gated with it: it reads the same two
+    // slots, so it has the same hazard and none of the class test's excuse.
+    //
+    // An array falls through to the `invoke_virtual("toString")` at the bottom,
+    // which is `Object.toString()` -- the identity rendering HotSpot gives.
+    let is_array = ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array;
+
     // Fast path: if it's already a String object, read its code units.
     //
     // The class test comes FIRST and `read_string` stays as the fallback: on a
     // class the VM cannot name, `read_string`'s structural decode is still the
     // best answer available, and keeping it means this refactor cannot lose a
-    // route it used to serve.
-    let this_class = ctx
-        .class_name_of_id(ctx.class_id_of_object(obj))
-        .unwrap_or_default();
-    if this_class == "java/lang/String" {
-        return Ok(Some(read_string_chars(&*ctx, obj)));
-    }
-    if let Some(s) = ctx.read_string(obj) {
-        return Ok(Some(s.encode_utf16().collect()));
+    // route it used to serve. `read_string` is gated by the array test too: it
+    // reads the same two slots, so it has the same hazard and none of the class
+    // test's excuse.
+    if !is_array {
+        if is_plain_string(&*ctx, obj) {
+            return Ok(Some(read_string_chars(&*ctx, obj)));
+        }
+        if let Some(s) = ctx.read_string(obj) {
+            return Ok(Some(s.encode_utf16().collect()));
+        }
     }
 
     // Fast path for wrapper types: if the object has exactly 1 field and its
@@ -2652,7 +2734,14 @@ fn charsequence_fast_units(
 ) -> Result<Option<Vec<u16>>, MethodCallFailed> {
     let cid = ctx.class_id_of_object(cs);
     let name = ctx.class_name_of_id(cid).unwrap_or_default();
-    if name == "java/lang/String" {
+    // The array exclusion `invoke_to_string_units_opt` carries, for the same
+    // reason: a reference array answers its COMPONENT's class id, so
+    // `String[]` passes a `name == "java/lang/String"` test and this would read
+    // its first element pointer as `String.value`. Nothing routes an array here
+    // today -- an array is not a `CharSequence` -- but this is the second of
+    // the two doors that read String slots off a class-name test, and the first
+    // one was reached.
+    if is_plain_string(&*ctx, cs) {
         return Ok(Some(read_string_chars(&*ctx, cs)));
     }
     if name == "java/lang/StringBuilder" || name == "java/lang/StringBuffer" {
@@ -3707,7 +3796,8 @@ pub(crate) fn native_sb_insert_charsequence(
     let name = ctx
         .class_name_of_id(ctx.class_id_of_object(cs))
         .unwrap_or_default();
-    if name == "java/lang/String" {
+    // Third door, same array exclusion -- see `is_plain_string`.
+    if is_plain_string(&*ctx, cs) {
         return native_sb_insert_string(ctx, args);
     }
 
@@ -5334,11 +5424,13 @@ pub(crate) fn native_string_value_of_object(
             //
             // The units form was built by `G26` for exactly this reason and
             // this call site never moved to it.
-            if ctx
-                .class_name_of_id(ctx.class_id_of_object(*obj))
-                .as_deref()
-                == Some("java/lang/String")
-            {
+            //
+            // `is_plain_string`, not a bare class-name test: this arm returns
+            // the RECEIVER as the answer, so a `String[]` admitted here is
+            // handed to the caller AS a String and every later `.value` read of
+            // it decodes the array's first element pointer. That is the loudest
+            // of the four doors, because the bad object escapes the native.
+            if is_plain_string(&*ctx, *obj) {
                 return Ok(Some(Value::Object(Some(*obj))));
             }
             match invoke_to_string_units_opt(ctx, *obj)? {
@@ -8144,13 +8236,29 @@ fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: FmtLocale) -> FmtSymbols
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => return None,
         };
+        // GC: the four reads below are `invoke_virtual`s, so each can collect
+        // and relocate `dfs`. A receiver is rooted FOR the call it is passed to
+        // and by nothing between them, so reads two through four were issued
+        // against the address the first one saw. Pin it and re-derive per read.
+        // Same defect, same file, same call as the varargs array the caller
+        // pins -- see
+        // `bug-generational-ntru-unpinned-jit-reference-20260821-FIXED.md`.
+        let dfs_pin = if format_arg_pin_enabled() {
+            Some(ctx.pin_native_root(dfs))
+        } else {
+            None
+        };
         let read = |ctx: &mut dyn NativeContext, name: &str, fallback: char| -> char {
-            match ctx.invoke_virtual(dfs, name, "()C", &[]) {
+            let recv = match dfs_pin {
+                Some(h) => ctx.read_native_pin(h, dfs),
+                None => dfs,
+            };
+            match ctx.invoke_virtual(recv, name, "()C", &[]) {
                 Ok(Some(Value::Int(c))) => char::from_u32(c as u32).unwrap_or(fallback),
                 _ => fallback,
             }
         };
-        Some(FmtSymbols {
+        let syms = FmtSymbols {
             grouping: read(ctx, "getGroupingSeparator", ','),
             decimal: read(ctx, "getDecimalSeparator", '.'),
             zero: read(ctx, "getZeroDigit", '0'),
@@ -8161,7 +8269,11 @@ fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: FmtLocale) -> FmtSymbols
             // its own and is already handed the resolved `FmtSymbols`. 59 of
             // this JDK's 1158 available locales answer U+2212 here.
             minus: read(ctx, "getMinusSign", '-'),
-        })
+        };
+        if let Some(h) = dfs_pin {
+            ctx.unpin_native_roots(h);
+        }
+        Some(syms)
     })();
     FMT_SYMBOLS_RESOLVING.with(|f| f.set(false));
     resolved.unwrap_or_default()

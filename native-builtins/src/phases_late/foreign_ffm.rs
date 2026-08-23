@@ -175,6 +175,94 @@ pub(crate) fn p67_layout_with_name(
     Ok(Some(Value::Object(Some(cloned))))
 }
 
+/// `MemoryLayout.withByteAlignment(long)` — a COPY of the receiver carrying the
+/// requested alignment.
+///
+/// # What this replaces
+///
+/// All nine registrations of this method (three interface names × the
+/// `MemoryLayout`/`ValueLayout`/specific descriptor triple, plus the seven
+/// `ValueLayout$Of*` classes) were `p67_return_this` — the receiver, unchanged.
+/// A layout's alignment is the ONLY thing the method exists to change, so the
+/// answer was wrong for every caller that asked, and wrong quietly: the
+/// returned object is a perfectly good layout of the original alignment.
+///
+/// It is not a corner. `jdk.incubator.vector` builds its element layout as
+///
+/// ```text
+/// IntVector.<clinit>:  ELEMENT_LAYOUT = ValueLayout.JAVA_INT.withByteAlignment(1)
+/// ```
+///
+/// and every `intoMemorySegment` / `fromMemorySegment` store and load goes
+/// through it. With the no-op, `IntVector.memorySegmentSet` asked a `byte[]`-
+/// backed segment for a 4-byte-aligned write and `heap_segment_check_access`
+/// correctly refused:
+///
+/// ```text
+/// IllegalArgumentException: Target offset 0 is incompatible with alignment
+///   constraint 4 for segment MemorySegment{ kind: heap, address: 0x0, byteSize: 16 }
+/// ```
+///
+/// The refusal was right and the layout it was handed was wrong — which is the
+/// worst shape a stub can take, because the error names the innocent half.
+///
+/// # The copy
+///
+/// Same shape as [`p67_layout_with_name`] next door, and for the same reason: a
+/// layout is a value, `withByteAlignment` is `@Override`-free on every JDK
+/// implementation and returns a NEW layout, and mutating the receiver would
+/// change `ValueLayout.JAVA_INT` itself — a static every FFM caller in the VM
+/// shares.
+///
+/// Slot 1 is the alignment on BOTH carriers, which is what lets one body serve
+/// a real-JDK receiver and a CratonVM-minted one: `AbstractLayout` declares
+/// `byteSize` then `byteAlignment`, and CratonVM's fabricated value-layout model
+/// is `(byteSize, byteAlignment, littleEndianFlag, name)`. `p67_layout_size_align`
+/// and `p67_layout_byte_alignment` already read it at that index from both.
+///
+/// # The refusal
+///
+/// `MemoryLayout.withByteAlignment` throws `IllegalArgumentException` for a
+/// `byteAlignment` that is not a positive power of two (JDK 25 javadoc, and
+/// `AbstractLayout`'s constructor enforces it). Answering a layout with a
+/// nonsense alignment instead would push the failure to whichever accessor next
+/// consulted it, which is exactly how the no-op above stayed invisible.
+pub(crate) fn p67_layout_with_byte_alignment(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let alignment = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => i64::from(*v),
+        _ => 0,
+    };
+    if alignment <= 0 || (alignment & (alignment - 1)) != 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Invalid alignment constraint: {alignment}"),
+        }
+        .into());
+    }
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_else(|| "java/lang/foreign/MemoryLayout".to_string());
+    // At least two slots, so a two-slot carrier that has never carried an
+    // explicit alignment gains the slot rather than dropping the write. The
+    // `max` with the receiver's own count is what keeps a real-JDK layout's
+    // `name`/`carrier`/`order` fields (slots 2..4) alive across the copy.
+    let field_count = ctx.object_num_fields(this);
+    let clone_fields = std::cmp::max(field_count, 2);
+    let this_pin = ctx.pin_native_root(this);
+    let cloned = try_alloc_concurrent_synthetic(ctx, &class_name, clone_fields)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    for i in 0..field_count {
+        ctx.set_field(cloned, i, ctx.get_field(this, i));
+    }
+    ctx.unpin_native_roots(this_pin);
+    ctx.set_field(cloned, 1, Value::Long(alignment));
+    Ok(Some(Value::Object(Some(cloned))))
+}
+
 pub(crate) fn p67_address_layout_target_layout(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -682,7 +770,7 @@ pub(crate) fn p67_memory_session(ctx: &mut dyn NativeContext) -> Result<Value, M
 /// `ArenaImpl.session`) — and that field holds one of OUR sessions, because the
 /// `createConfined`/`createShared` factories are force-dispatched here. A
 /// synthetic receiver has no such field; there, a fresh session is all there is.
-fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Result<Value, MethodCallFailed> {
+pub(crate) fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Result<Value, MethodCallFailed> {
     // A real-JDK receiver carries it in a named field.
     for name in ["scope", "session"] {
         if let Value::Object(Some(session)) = ctx.get_field_by_name(receiver, name) {
@@ -788,7 +876,7 @@ fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> Result<ObjectRe
 /// one did.
 fn p67_arena_segment(ctx: &mut dyn NativeContext, arena: ObjectRef, size: i64) -> Result<ObjectRef, MethodCallFailed> {
     let arena_pin = ctx.pin_native_root(arena);
-    let segment = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 3)?;
+    let segment = crate::panama::alloc_segment_carrier(ctx, 3)?;
     let arena = ctx.read_native_pin(arena_pin, arena);
     ctx.unpin_native_roots(arena_pin);
     ctx.set_field(segment, 0, Value::Long(size));
@@ -2814,174 +2902,17 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // MemorySegment = 2-field (byteSize=0 Long, address=1 Long)
-    let ms = "java/lang/foreign/MemorySegment";
-    r.register(ms, "byteSize", "()J", p67_segment_byte_size);
-    r.register(ms, "address", "()J", p67_segment_address);
-    r.register(
-        ms,
-        "copy",
-        "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/ValueLayout;JLjava/lang/Object;II)V",
-        p67_segment_copy_to_array,
-    );
-    r.register(
-        ms,
-        "get",
-        "(Ljava/lang/foreign/ValueLayout$OfByte;J)B",
-        |ctx, args| p67_segment_get_width(ctx, args, 1),
-    );
-    r.register(
-        ms,
-        "get",
-        "(Ljava/lang/foreign/ValueLayout$OfShort;J)S",
-        |ctx, args| p67_segment_get_width(ctx, args, 2),
-    );
-    r.register(
-        ms,
-        "get",
-        "(Ljava/lang/foreign/ValueLayout$OfInt;J)I",
-        |ctx, args| p67_segment_get_width(ctx, args, 4),
-    );
-    r.register(
-        ms,
-        "get",
-        "(Ljava/lang/foreign/ValueLayout$OfLong;J)J",
-        |ctx, args| p67_segment_get_width(ctx, args, 8),
-    );
-    r.register(
-        ms,
-        "set",
-        "(Ljava/lang/foreign/ValueLayout$OfByte;JB)V",
-        |ctx, args| p67_segment_set_width(ctx, args, 1, 3),
-    );
-    r.register(
-        ms,
-        "set",
-        "(Ljava/lang/foreign/ValueLayout$OfShort;JS)V",
-        |ctx, args| p67_segment_set_width(ctx, args, 2, 3),
-    );
-    r.register(
-        ms,
-        "set",
-        "(Ljava/lang/foreign/ValueLayout$OfInt;JI)V",
-        |ctx, args| p67_segment_set_width(ctx, args, 4, 3),
-    );
-    r.register(
-        ms,
-        "set",
-        "(Ljava/lang/foreign/ValueLayout$OfLong;JJ)V",
-        |ctx, args| p67_segment_set_width(ctx, args, 8, 3),
-    );
-    r.register(
-        ms,
-        "asSlice",
-        "(JJ)Ljava/lang/foreign/MemorySegment;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let offset = match args.get(1) {
-                Some(Value::Long(v)) => *v,
-                _ => 0,
-            };
-            let size = match args.get(2) {
-                Some(Value::Long(v)) => *v,
-                _ => 0,
-            };
-            if ctx.object_num_fields(this) >= 6 {
-                let base_ptr = match ctx.get_field(this, 0) {
-                    Value::Long(v) => v,
-                    _ => 0,
-                };
-                let base_off = match ctx.get_field(this, 5) {
-                    Value::Long(v) => v,
-                    _ => 0,
-                };
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
-                ctx.set_field(seg, 0, Value::Long(base_ptr));
-                ctx.set_field(seg, 1, Value::Long(size));
-                ctx.set_field(seg, 2, ctx.get_field(this, 2));
-                ctx.set_field(seg, 3, ctx.get_field(this, 3));
-                ctx.set_field(seg, 4, Value::Int(1));
-                ctx.set_field(seg, 5, Value::Long(base_off + offset));
-                Ok(Some(Value::Object(Some(seg))))
-            } else {
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2)?;
-                ctx.set_field(seg, 0, Value::Long(size));
-                ctx.set_field(seg, 1, Value::Long(offset));
-                Ok(Some(Value::Object(Some(seg))))
-            }
-        },
-    );
-    // SHADOWED: `panama.rs::register_pe_memory_segment` registers this exact
-    // class+method+descriptor too, and its registrar runs AFTER this one on
-    // both paths that reach them (`register_essential_natives`: foreign_ffm at
-    // lib.rs:9736 then panama at :9740; full registry: phase 67 at :22995 then
-    // `register_pe_panama` at :23051). Last-write-wins, so panama's is the live
-    // answer and this one is dead — yet it used to say FALSE where panama said
-    // TRUE, a contradiction that would have bitten whoever changed the
-    // registration order. Panama now answers from the receiver (heap-backed
-    // `ofArray` segments are not native, everything else is); the arena-backed
-    // carriers this file mints are all off-heap, so TRUE is this fallback's
-    // correct value and the two no longer disagree.
-    //
-    // VERIFIED (wave 4): `panama.rs:720` reads `SEG_BACKING_ARRAY_FIELD` off the
-    // receiver and answers `!heap_backed`; both call sites still order
-    // foreign_ffm before panama, so panama's remains live and the two agree.
-    // Left as a constant deliberately — routing it through panama's
-    // receiver-based check would answer FALSE for the synthetic carriers here,
-    // which have no backing-array field at all, i.e. it would introduce the
-    // contradiction this note exists to record.
-    r.register(ms, "isNative", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
-    // STUB-REMOVAL (wave 4): was a flat `false`. The answer is decidable from
-    // the receiver by exactly the same rule the three impl classes use below
-    // (`MappedMemorySegmentImpl` is mapped, nothing else is), so share the
-    // helper rather than restate a constant that could drift away from it.
-    //
-    // The value does not change today: `MemorySegment` is an INTERFACE and this
-    // is a non-static instance method, so per the interface-shadowing rule this
-    // registration only ever reaches the synthetic `java/lang/foreign
-    // /MemorySegment` carriers this file mints — every one of which comes from
-    // `Arena.allocate*`/`asSlice`/`reinterpret`/`NULL`/`ofArray` and is
-    // malloc- or heap-backed, never `FileChannel.map`. It stops being a
-    // constant the moment a mapped carrier is minted.
-    r.register(ms, "isMapped", "()Z", p67_segment_impl_is_mapped);
-    r.register(ms, "isReadOnly", "()Z", p67_segment_is_read_only);
-    // The JDK 22+ spelling of the C-string read. See `p67_segment_get_string`
-    // for why nothing answered it before. The `(long, Charset)` overload is
-    // deliberately NOT registered: this implementation decodes UTF-8, and
-    // answering a caller that asked for another charset with UTF-8 bytes would
-    // be a wrong value where the AbstractMethodError is at least a refusal.
-    r.register(ms, "getString", "(J)Ljava/lang/String;", p67_segment_get_string);
-    // `MemorySegment` does not override `equals` in the JDK — segment equality
-    // IS reference identity. The constant `false` this used to return broke
-    // even reflexivity (`seg.equals(seg)` was false), so a segment could not be
-    // found in any collection it had just been put into, and the
-    // `slice.equals(other)` guards FFM callers write around aliasing all took
-    // the wrong branch.
-    r.register(ms, "equals", "(Ljava/lang/Object;)Z", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let equal = matches!(args.get(1), Some(Value::Object(Some(other))) if *other == this);
-        Ok(Some(Value::Int(i32::from(equal))))
-    });
-    r.register(
-        ms,
-        "scope",
-        "()Ljava/lang/foreign/MemorySegment$Scope;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, this)?))
-        },
-    );
-    r.register(
-        ms,
-        "NULL",
-        "Ljava/lang/foreign/MemorySegment;",
-        |ctx, _args| {
-            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2)?;
-            ctx.set_field(seg, 0, Value::Long(0));
-            ctx.set_field(seg, 1, Value::Long(0));
-            Ok(Some(Value::Object(Some(seg))))
-        },
-    );
+    // The `MemorySegment` surface, once per receiver class. See
+    // `panama::CRATON_SEGMENT_CLASS` for why there are two names and what the
+    // second one is: native dispatch is keyed on the RECEIVER's class, and
+    // since 2026-08-22 a CratonVM-minted segment is stamped with a concrete
+    // class of its own rather than with the interface.
+    for ms in [
+        crate::panama::PE_SEGMENT_INTERFACE,
+        crate::panama::CRATON_SEGMENT_CLASS,
+    ] {
+        register_p67_segment_surface(r, ms);
+    }
     for ms_impl in [
         "jdk/internal/foreign/AbstractMemorySegmentImpl",
         "jdk/internal/foreign/NativeMemorySegmentImpl",
@@ -3188,7 +3119,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             class,
             "withByteAlignment",
             &with_alignment_specific,
-            p67_return_this,
+            p67_layout_with_byte_alignment,
         );
         let with_name_specific = format!("(Ljava/lang/String;){specific_desc}");
         r.register(class, "withName", &with_name_specific, p67_layout_with_name);
@@ -3203,13 +3134,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             class,
             "withByteAlignment",
             "(J)Ljava/lang/foreign/MemoryLayout;",
-            p67_return_this,
+            p67_layout_with_byte_alignment,
         );
         r.register(
             class,
             "withByteAlignment",
             "(J)Ljava/lang/foreign/ValueLayout;",
-            p67_return_this,
+            p67_layout_with_byte_alignment,
         );
         r.register(
             class,
@@ -3249,13 +3180,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "java/lang/foreign/MemoryLayout",
         "withByteAlignment",
         "(J)Ljava/lang/foreign/MemoryLayout;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        p67_layout_with_byte_alignment,
     );
     r.register(
         "java/lang/foreign/ValueLayout",
         "withByteAlignment",
         "(J)Ljava/lang/foreign/ValueLayout;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        p67_layout_with_byte_alignment,
     );
     r.register(
         "java/lang/foreign/ValueLayout",
@@ -3279,7 +3210,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "java/lang/foreign/AddressLayout",
         "withByteAlignment",
         "(J)Ljava/lang/foreign/AddressLayout;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        p67_layout_with_byte_alignment,
     );
     r.register(
         "java/lang/foreign/AddressLayout",
@@ -3342,7 +3273,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             class,
             "withByteAlignment",
             &byte_alignment_specific,
-            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+            p67_layout_with_byte_alignment,
         );
         let with_name_specific = format!("(Ljava/lang/String;){specific_desc}");
         r.register(class, "withName", &with_name_specific, p67_layout_with_name);
@@ -3357,13 +3288,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             class,
             "withByteAlignment",
             "(J)Ljava/lang/foreign/MemoryLayout;",
-            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+            p67_layout_with_byte_alignment,
         );
         r.register(
             class,
             "withByteAlignment",
             "(J)Ljava/lang/foreign/ValueLayout;",
-            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+            p67_layout_with_byte_alignment,
         );
         r.register(
             class,
@@ -4077,82 +4008,90 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "(J)Ljava/lang/foreign/MemorySegment;",
         crate::panama::pe_arena_allocate,
     );
-    r.register(
-        "java/lang/foreign/MemorySegment",
-        "reinterpret",
-        "(J)Ljava/lang/foreign/MemorySegment;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let size = match args.get(1) {
-                Some(Value::Long(size)) => *size,
-                _ => 0,
-            };
-            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
-            ctx.set_field(seg, 0, ctx.get_field(this, 0));
-            ctx.set_field(seg, 1, Value::Long(size));
-            ctx.set_field(seg, 2, ctx.get_field(this, 2));
-            ctx.set_field(seg, 3, ctx.get_field(this, 3));
-            ctx.set_field(seg, 4, Value::Int(1));
-            ctx.set_field(seg, 5, ctx.get_field(this, 5));
-            Ok(Some(Value::Object(Some(seg))))
-        },
-    );
-    r.register(
-        "java/lang/foreign/MemorySegment",
-        "getUtf8String",
-        "(J)Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let offset = match args.get(1) {
-                Some(Value::Long(offset)) if *offset >= 0 => *offset,
-                _ => 0,
-            };
-            let base = match ctx.get_field(this, 0) {
-                Value::Long(address) => address,
-                _ => 0,
-            };
-            let base_offset = match ctx.get_field(this, 5) {
-                Value::Long(offset) => offset,
-                _ => 0,
-            };
-            let remaining = match ctx.get_field(this, 1) {
-                Value::Long(size) if size > offset => size - offset,
-                _ => {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: "getUtf8String requires a non-empty reinterpreted MemorySegment"
-                            .into(),
+    // Both names, for the reason `register_p67_segment_surface` above carries:
+    // native dispatch is keyed on the receiver's class, and a CratonVM-minted
+    // segment is stamped with `panama::CRATON_SEGMENT_CLASS`, not the interface.
+    for ms in [
+        crate::panama::PE_SEGMENT_INTERFACE,
+        crate::panama::CRATON_SEGMENT_CLASS,
+    ] {
+        r.register(
+            ms,
+            "reinterpret",
+            "(J)Ljava/lang/foreign/MemorySegment;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let size = match args.get(1) {
+                    Some(Value::Long(size)) => *size,
+                    _ => 0,
+                };
+                let seg = crate::panama::alloc_segment_carrier(ctx, 6)?;
+                ctx.set_field(seg, 0, ctx.get_field(this, 0));
+                ctx.set_field(seg, 1, Value::Long(size));
+                ctx.set_field(seg, 2, ctx.get_field(this, 2));
+                ctx.set_field(seg, 3, ctx.get_field(this, 3));
+                ctx.set_field(seg, 4, Value::Int(1));
+                ctx.set_field(seg, 5, ctx.get_field(this, 5));
+                Ok(Some(Value::Object(Some(seg))))
+            },
+        );
+        r.register(
+            ms,
+            "getUtf8String",
+            "(J)Ljava/lang/String;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let offset = match args.get(1) {
+                    Some(Value::Long(offset)) if *offset >= 0 => *offset,
+                    _ => 0,
+                };
+                let base = match ctx.get_field(this, 0) {
+                    Value::Long(address) => address,
+                    _ => 0,
+                };
+                let base_offset = match ctx.get_field(this, 5) {
+                    Value::Long(offset) => offset,
+                    _ => 0,
+                };
+                let remaining = match ctx.get_field(this, 1) {
+                    Value::Long(size) if size > offset => size - offset,
+                    _ => {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: "getUtf8String requires a non-empty reinterpreted MemorySegment"
+                                .into(),
+                        }
+                        .into());
                     }
-                    .into());
-                }
-            };
-            let address = (base as u64)
-                .checked_add(base_offset as u64)
-                .and_then(|address| address.checked_add(offset as u64))
-                .ok_or_else(|| -> MethodCallFailed {
-                    RuntimeError::IllegalStateException {
-                        message: "getUtf8String address arithmetic overflow".into(),
-                    }
-                    .into()
-                })? as *const u8;
-            if address.is_null() {
-                return Ok(Some(Value::Object(None)));
-            }
-            let bytes =
-                unsafe { std::slice::from_raw_parts(address, (remaining as usize).min(4096)) };
-            let nul =
-                bytes
-                    .iter()
-                    .position(|byte| *byte == 0)
+                };
+                let address = (base as u64)
+                    .checked_add(base_offset as u64)
+                    .and_then(|address| address.checked_add(offset as u64))
                     .ok_or_else(|| -> MethodCallFailed {
                         RuntimeError::IllegalStateException {
-                            message: "getUtf8String exceeded its bounded scan".into(),
+                            message: "getUtf8String address arithmetic overflow".into(),
                         }
                         .into()
-                    })?;
-            let text = std::str::from_utf8(&bytes[..nul]).unwrap_or("");
-            Ok(Some(Value::Object(Some(ctx.create_string(text)))))
-        },
-    );
+                    })? as *const u8;
+                if address.is_null() {
+                    return Ok(Some(Value::Object(None)));
+                }
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(address, (remaining as usize).min(4096)) };
+                let nul =
+                    bytes
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .ok_or_else(|| -> MethodCallFailed {
+                            RuntimeError::IllegalStateException {
+                                message: "getUtf8String exceeded its bounded scan".into(),
+                            }
+                            .into()
+                        })?;
+                let text = std::str::from_utf8(&bytes[..nul]).unwrap_or("");
+                Ok(Some(Value::Object(Some(ctx.create_string(text)))))
+            },
+        );
+    }
 
     r.register(
         linker,
@@ -4431,7 +4370,7 @@ mod g19_scope_tests {
     /// `[2]` = the segment's own session.
     fn stamped_segment(ctx: &mut dyn NativeContext, session: Value, byte_size: i64) -> ObjectRef {
         let seg =
-            try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 8).unwrap();
+            crate::panama::alloc_segment_carrier(ctx, 8).unwrap();
         ctx.set_field(seg, 0, Value::Long(0));
         ctx.set_field(seg, 1, Value::Long(byte_size));
         ctx.set_field(seg, P67_SEGMENT_ARENA, session);
@@ -4523,4 +4462,183 @@ mod g19_scope_tests {
             "a closed stamped session must refuse; got {err:?}"
         );
     }
+}
+
+/// The `java.lang.foreign.MemorySegment` natives phase 67 owns, registered
+/// under one receiver class.
+///
+/// Extracted from `register_p67_foreign_memory`'s body (2026-08-22) for the
+/// same reason `panama::register_pe_memory_segment_on` was: the set has to be
+/// registered on TWO names now — the interface, for a call site that resolved
+/// against the abstract declaration, and `panama::CRATON_SEGMENT_CLASS`, which
+/// is the runtime class of every segment CratonVM mints. A loop over the two
+/// cannot drift; two hand-maintained copies can.
+fn register_p67_segment_surface(r: &mut NativeMethodRegistry, ms: &str) {
+    // MemorySegment = 2-field (byteSize=0 Long, address=1 Long)
+    r.register(ms, "byteSize", "()J", p67_segment_byte_size);
+    r.register(ms, "address", "()J", p67_segment_address);
+    r.register(
+        ms,
+        "copy",
+        "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/ValueLayout;JLjava/lang/Object;II)V",
+        p67_segment_copy_to_array,
+    );
+    r.register(
+        ms,
+        "get",
+        "(Ljava/lang/foreign/ValueLayout$OfByte;J)B",
+        |ctx, args| p67_segment_get_width(ctx, args, 1),
+    );
+    r.register(
+        ms,
+        "get",
+        "(Ljava/lang/foreign/ValueLayout$OfShort;J)S",
+        |ctx, args| p67_segment_get_width(ctx, args, 2),
+    );
+    r.register(
+        ms,
+        "get",
+        "(Ljava/lang/foreign/ValueLayout$OfInt;J)I",
+        |ctx, args| p67_segment_get_width(ctx, args, 4),
+    );
+    r.register(
+        ms,
+        "get",
+        "(Ljava/lang/foreign/ValueLayout$OfLong;J)J",
+        |ctx, args| p67_segment_get_width(ctx, args, 8),
+    );
+    r.register(
+        ms,
+        "set",
+        "(Ljava/lang/foreign/ValueLayout$OfByte;JB)V",
+        |ctx, args| p67_segment_set_width(ctx, args, 1, 3),
+    );
+    r.register(
+        ms,
+        "set",
+        "(Ljava/lang/foreign/ValueLayout$OfShort;JS)V",
+        |ctx, args| p67_segment_set_width(ctx, args, 2, 3),
+    );
+    r.register(
+        ms,
+        "set",
+        "(Ljava/lang/foreign/ValueLayout$OfInt;JI)V",
+        |ctx, args| p67_segment_set_width(ctx, args, 4, 3),
+    );
+    r.register(
+        ms,
+        "set",
+        "(Ljava/lang/foreign/ValueLayout$OfLong;JJ)V",
+        |ctx, args| p67_segment_set_width(ctx, args, 8, 3),
+    );
+    r.register(
+        ms,
+        "asSlice",
+        "(JJ)Ljava/lang/foreign/MemorySegment;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let offset = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let size = match args.get(2) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            if ctx.object_num_fields(this) >= 6 {
+                let base_ptr = match ctx.get_field(this, 0) {
+                    Value::Long(v) => v,
+                    _ => 0,
+                };
+                let base_off = match ctx.get_field(this, 5) {
+                    Value::Long(v) => v,
+                    _ => 0,
+                };
+                let seg = crate::panama::alloc_segment_carrier(ctx, 6)?;
+                ctx.set_field(seg, 0, Value::Long(base_ptr));
+                ctx.set_field(seg, 1, Value::Long(size));
+                ctx.set_field(seg, 2, ctx.get_field(this, 2));
+                ctx.set_field(seg, 3, ctx.get_field(this, 3));
+                ctx.set_field(seg, 4, Value::Int(1));
+                ctx.set_field(seg, 5, Value::Long(base_off + offset));
+                Ok(Some(Value::Object(Some(seg))))
+            } else {
+                let seg = crate::panama::alloc_segment_carrier(ctx, 2)?;
+                ctx.set_field(seg, 0, Value::Long(size));
+                ctx.set_field(seg, 1, Value::Long(offset));
+                Ok(Some(Value::Object(Some(seg))))
+            }
+        },
+    );
+    // SHADOWED: `panama.rs::register_pe_memory_segment` registers this exact
+    // class+method+descriptor too, and its registrar runs AFTER this one on
+    // both paths that reach them (`register_essential_natives`: foreign_ffm at
+    // lib.rs:9736 then panama at :9740; full registry: phase 67 at :22995 then
+    // `register_pe_panama` at :23051). Last-write-wins, so panama's is the live
+    // answer and this one is dead — yet it used to say FALSE where panama said
+    // TRUE, a contradiction that would have bitten whoever changed the
+    // registration order. Panama now answers from the receiver (heap-backed
+    // `ofArray` segments are not native, everything else is); the arena-backed
+    // carriers this file mints are all off-heap, so TRUE is this fallback's
+    // correct value and the two no longer disagree.
+    //
+    // VERIFIED (wave 4): `panama.rs:720` reads `SEG_BACKING_ARRAY_FIELD` off the
+    // receiver and answers `!heap_backed`; both call sites still order
+    // foreign_ffm before panama, so panama's remains live and the two agree.
+    // Left as a constant deliberately — routing it through panama's
+    // receiver-based check would answer FALSE for the synthetic carriers here,
+    // which have no backing-array field at all, i.e. it would introduce the
+    // contradiction this note exists to record.
+    r.register(ms, "isNative", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    // STUB-REMOVAL (wave 4): was a flat `false`. The answer is decidable from
+    // the receiver by exactly the same rule the three impl classes use below
+    // (`MappedMemorySegmentImpl` is mapped, nothing else is), so share the
+    // helper rather than restate a constant that could drift away from it.
+    //
+    // The value does not change today: `MemorySegment` is an INTERFACE and this
+    // is a non-static instance method, so per the interface-shadowing rule this
+    // registration only ever reaches the synthetic `java/lang/foreign
+    // /MemorySegment` carriers this file mints — every one of which comes from
+    // `Arena.allocate*`/`asSlice`/`reinterpret`/`NULL`/`ofArray` and is
+    // malloc- or heap-backed, never `FileChannel.map`. It stops being a
+    // constant the moment a mapped carrier is minted.
+    r.register(ms, "isMapped", "()Z", p67_segment_impl_is_mapped);
+    r.register(ms, "isReadOnly", "()Z", p67_segment_is_read_only);
+    // The JDK 22+ spelling of the C-string read. See `p67_segment_get_string`
+    // for why nothing answered it before. The `(long, Charset)` overload is
+    // deliberately NOT registered: this implementation decodes UTF-8, and
+    // answering a caller that asked for another charset with UTF-8 bytes would
+    // be a wrong value where the AbstractMethodError is at least a refusal.
+    r.register(ms, "getString", "(J)Ljava/lang/String;", p67_segment_get_string);
+    // `MemorySegment` does not override `equals` in the JDK — segment equality
+    // IS reference identity. The constant `false` this used to return broke
+    // even reflexivity (`seg.equals(seg)` was false), so a segment could not be
+    // found in any collection it had just been put into, and the
+    // `slice.equals(other)` guards FFM callers write around aliasing all took
+    // the wrong branch.
+    r.register(ms, "equals", "(Ljava/lang/Object;)Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let equal = matches!(args.get(1), Some(Value::Object(Some(other))) if *other == this);
+        Ok(Some(Value::Int(i32::from(equal))))
+    });
+    r.register(
+        ms,
+        "scope",
+        "()Ljava/lang/foreign/MemorySegment$Scope;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(p67_receiver_session(ctx, this)?))
+        },
+    );
+    r.register(
+        ms,
+        "NULL",
+        "Ljava/lang/foreign/MemorySegment;",
+        |ctx, _args| {
+            let seg = crate::panama::alloc_segment_carrier(ctx, 2)?;
+            ctx.set_field(seg, 0, Value::Long(0));
+            ctx.set_field(seg, 1, Value::Long(0));
+            Ok(Some(Value::Object(Some(seg))))
+        },
+    );
 }
