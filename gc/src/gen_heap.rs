@@ -9090,9 +9090,20 @@ impl GenerationalHeap {
                     }
                 }
             };
+            // `is_movable_jit_root` is a claim about ONE slot and the pin set is
+            // keyed by OBJECT, so a single rewritable channel naming an address
+            // licensed moving it out from under every OTHER word that also held
+            // it — including a compiled frame's callee-saved register image,
+            // which `band_slot_is_verifiable` refuses to inspect and no channel
+            // rewrites. `is_unrewritable_jit_root` is the veto: the band scan
+            // publishes there when a word in one of those regions resolves to a
+            // live object, and it outranks any movable claim.
             for r in roots.iter() {
                 let a = r.as_ptr() as usize;
-                if is_y(a) && !(honour_movable && crate::gc_quiescence::is_movable_jit_root(a)) {
+                let movable = honour_movable
+                    && crate::gc_quiescence::is_movable_jit_root(a)
+                    && !crate::gc_quiescence::is_unrewritable_jit_root(a);
+                if is_y(a) && !movable {
                     pin_base_of(a, &mut pinned);
                 }
             }

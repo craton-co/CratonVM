@@ -5164,6 +5164,15 @@ fn scan_compiled_frame_bands(
                 return false;
             }
             scan_one_frame(rbp - frame_size, rbp, heap, out);
+            // The band was just read as marking roots, which is what keeps
+            // these objects alive across the pause AND what gets them copied.
+            // Say which of them arrived through a word no channel rewrites, so
+            // the pin decision can veto a movable claim made elsewhere for the
+            // same address. Only reachable with a resolved layout — the foreign
+            // innermost frame above has none, and it already forces the
+            // non-moving sweep through `FOREIGN_INNERMOST_RBP`, so there is no
+            // move to veto there.
+            publish_unrewritable_band_roots(rbp, frame_size, cm, heap);
         }
 
         // `[rbp]` and `[rbp + 8]` hold the saved caller RBP and return PC.
@@ -5307,6 +5316,83 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
         ((aligned_high - aligned_low) / 8) as u64, // Widening: bounded by MAX_SCAN_BYTES
         (out.len() - hits_before) as u64,          // Widening: a Vec length
     );
+}
+
+/// Total addresses published to the unrewritable-root veto this process.
+static UNREWRITABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Addresses published to the unrewritable-root veto since process start.
+///
+/// Diagnostic only. A non-zero count means at least one compiled frame held a
+/// live object in a word `band_slot_is_verifiable` refuses to inspect — i.e.
+/// the pin below is doing work, not just costing a branch.
+pub fn unrewritable_band_root_count() -> usize {
+    UNREWRITABLE_BAND_ROOTS.load(Ordering::Relaxed)
+}
+
+/// Publish every object reachable from one compiled frame's UNVERIFIABLE band
+/// words to the pin veto (`gc_quiescence::add_unrewritable_jit_root`).
+///
+/// `scan_one_frame` has already walked the whole band and pushed these objects
+/// as marking roots — that is what keeps them alive across the pause, and it is
+/// also what gets them COPIED, because a movable claim from any other slot
+/// naming the same address wins at the pin decision. This second, cheap pass
+/// says which of those roots arrived through a word nobody can rewrite, so that
+/// claim can be vetoed.
+///
+/// The two halves must stay the same partition: the words visited here are
+/// exactly the ones `band_slot_is_verifiable` returns `false` for, which is
+/// exactly the set `remap_register_image_words` would otherwise have to
+/// REWRITE. Pinning is the sound half of that choice — see the module comment
+/// on `UNREWRITABLE_JIT_ROOTS` in `gc_quiescence`.
+fn publish_unrewritable_band_roots(
+    rbp: usize,
+    frame_size: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    heap: &VmHeap,
+) {
+    if frame_size == 0 || frame_size > rbp {
+        return;
+    }
+    let live_hi = moving_young_frame_live_hi(rbp, cm);
+    let lo = rbp - frame_size;
+    let mut addr = (lo + 7) & !7usize;
+    // Same clamp as `band_has_unpublished_word_with`: a stale bound must never
+    // walk into unmapped pages. A compiled frame is orders of magnitude
+    // smaller, so this is unreachable in practice.
+    const MAX_SCAN_BYTES: usize = 1024 * 1024;
+    let hi = rbp.min(addr.saturating_add(MAX_SCAN_BYTES));
+    let envelope = heap.conservative_addr_span();
+    let mut published = 0usize;
+    while addr + 8 <= hi {
+        // Cast: a compiled frame is far smaller than i32::MAX bytes.
+        let off = (rbp - addr) as i32;
+        if band_slot_is_verifiable(off, &cm.frame_layout, live_hi) {
+            // Verified storage. An unpublished movable oop here already forces
+            // the non-moving sweep, and a published one is rewritten by
+            // `remap_one_jit_frame`, so it needs no pin and pinning it would
+            // give back the drain this set exists to preserve.
+            addr += 8;
+            continue;
+        }
+        // SAFETY: aligned read inside this thread's own live compiled frame,
+        // bounded by the frame size recorded at compile time — the same
+        // interval `scan_one_frame` has already read.
+        let qword = unsafe { (addr as *const usize).read() };
+        addr += 8;
+        if let Some((elo, ehi)) = envelope {
+            if qword < elo || qword >= ehi {
+                continue;
+            }
+        }
+        if heap.is_object_address(qword).is_some() {
+            cratonvm_gc::gc_quiescence::add_unrewritable_jit_root(qword);
+            published += 1;
+        }
+    }
+    if published > 0 {
+        UNREWRITABLE_BAND_ROOTS.fetch_add(published, Ordering::Relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------
