@@ -26,6 +26,16 @@ use super::*;
 /// come from `SCRATCH_REGS` **or** `LOCAL_REGS`, and `LOCAL_REGS` holds RBX on
 /// every platform and RSI/RDI on Windows. Forcing REX.B on rewrites the ModRM
 /// `r/m` field to `r + 8`, i.e. compares an entirely different register.
+/// The synthetic bytecode pc the METHOD-ENTRY safepoint poll records.
+///
+/// No real method's bytecode is anywhere near 4 GiB, so this can never collide
+/// with a genuine bci in the sp-id-keyed oop-map lookup — which is the whole
+/// reason `emit_safepoint_poll_prologue` uses it instead of the `0` that
+/// `cur_bc_pc` still holds at that point. Named rather than spelled
+/// `u32::MAX as usize` at each site, because `Compiler::local_oop_mask_at_current_pc`
+/// has to recognise it and a bare literal is not a thing a reader can look up.
+pub(super) const ENTRY_POLL_BC_PC: usize = u32::MAX as usize;
+
 pub(super) const fn cmp_r64_imm32_opcode(r: u8) -> [u8; 3] {
     // 0x48 = REX.W; |0x01 adds REX.B, needed only for r8..r15.
     let rex = 0x48 | if r >= 8 { 0x01 } else { 0x00 };
@@ -434,9 +444,51 @@ impl Compiler {
     /// upcoming bytecode loop starts from its expected `0`.
     pub(super) fn emit_safepoint_poll_prologue(&mut self) {
         let saved_pc = self.cur_bc_pc;
-        self.cur_bc_pc = u32::MAX as usize;
+        self.cur_bc_pc = ENTRY_POLL_BC_PC;
         self.emit_safepoint_poll();
         self.cur_bc_pc = saved_pc;
+    }
+
+    /// The live oop LOCALS at the current safepoint, as a bitmask over JVM
+    /// local slots — or `None` when this safepoint's local state is unknown
+    /// and no precise claim may be made about it.
+    ///
+    /// Every reader of `local_oop_masks` / `local_oop_reached` must go through
+    /// here, because the METHOD-ENTRY poll is at `ENTRY_POLL_BC_PC` — a
+    /// synthetic pc chosen (see [`Self::emit_safepoint_poll_prologue`]) so it
+    /// cannot collide with bci 0 in the sp-id-keyed lookup. That choice is
+    /// right, but `local_oop_reached.get(ENTRY_POLL_BC_PC)` is `None`, so the
+    /// entry poll read as "the dataflow never reached here" and its map was
+    /// pushed with `moving_young_coverage_complete: false`.
+    ///
+    /// The consequence was not local to the entry poll. `fully_shadow_covered`
+    /// ANDs that flag over every safepoint of a method, so ONE such entry made
+    /// it false for **every method the fast tier ever compiled**, which through
+    /// the OSR fallback refused relocation on 725 of 759 collections of
+    /// `TestKillProcessWhileWriting` — the
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`
+    /// residual. Measured with `CRATONVM_DBG_OOPCOV=1`: every uncovered method
+    /// reported exactly `shadow_missing_pcs=[4294967295]`.
+    ///
+    /// The entry state is knowable and is not a guess: the prologue has just
+    /// stored every incoming argument to its home (this poll is emitted from
+    /// the END of `emit_prologue`), the operand stack is empty, and the live
+    /// oops are exactly the reference parameters — `param_oop_mask`, the same
+    /// value that seeds the dataflow at bci 0.
+    #[inline]
+    fn local_oop_mask_at_current_pc(&self) -> Option<u64> {
+        if self.cur_bc_pc == ENTRY_POLL_BC_PC {
+            return Some(self.param_oop_mask);
+        }
+        if !self
+            .local_oop_reached
+            .get(self.cur_bc_pc)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        self.local_oop_masks.get(self.cur_bc_pc).copied()
     }
 
     /// A direct self-call may omit the blind all-GPR spill when this method's
@@ -577,12 +629,7 @@ impl Compiler {
         if self.num_locals == 0 {
             return true;
         }
-        let ok = self
-            .local_oop_reached
-            .get(self.cur_bc_pc)
-            .copied()
-            .unwrap_or(false)
-            && self.local_oop_masks.get(self.cur_bc_pc).is_some();
+        let ok = self.local_oop_mask_at_current_pc().is_some();
         if !ok {
             shadow_incomplete_cause::LOCAL_OOP_DATAFLOW_UNREACHED.fetch_add(1, Relaxed);
         }
@@ -645,19 +692,7 @@ impl Compiler {
         // moving coverage: on the non-moving path a register-local is flushed to
         // its frame slot by `emit_pre_safepoint_spill` and found conservatively.
         if complete {
-            let oop_reached = self
-                .local_oop_reached
-                .get(self.cur_bc_pc)
-                .copied()
-                .unwrap_or(false);
-            let oop_mask = if oop_reached {
-                self.local_oop_masks
-                    .get(self.cur_bc_pc)
-                    .copied()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            let oop_mask = self.local_oop_mask_at_current_pc().unwrap_or(0);
             for i in 0..self.num_locals {
                 if i >= 64 || (oop_mask & (1u64 << i)) == 0 {
                     continue;
@@ -726,16 +761,8 @@ impl Compiler {
         self.pending_shadow_coverage_complete = self.moving_young_safepoint_coverage_complete();
         let homes = self.collect_live_oop_homes();
         if !homes.is_empty() && shadow2_diag_enabled(&self.method_label) {
-            let lm = self
-                .local_oop_masks
-                .get(self.cur_bc_pc)
-                .copied()
-                .unwrap_or(0);
-            let reached = self
-                .local_oop_reached
-                .get(self.cur_bc_pc)
-                .copied()
-                .unwrap_or(false);
+            let lm = self.local_oop_mask_at_current_pc().unwrap_or(0);
+            let reached = self.local_oop_mask_at_current_pc().is_some();
             eprintln!(
                 "[SHADOW2] method={} pc={} stack={:?} marks={:?} local_reached={} local_mask={:#x} homes={:?}",
                 self.method_label,
@@ -1205,11 +1232,11 @@ impl Compiler {
         // Sound on the default path regardless of dataflow precision: the
         // consumer re-validates each slot via `heap.is_object_address`.
         if !self.local_oop_masks.is_empty() {
-            let pc = self.cur_bc_pc;
-            if pc < self.local_oop_masks.len()
-                && self.local_oop_reached.get(pc).copied().unwrap_or(false)
-            {
-                let mut mask = self.local_oop_masks[pc];
+            // Via the shared accessor: the METHOD-ENTRY poll must name its
+            // reference parameters here too, or `moving_young_coverage_complete`
+            // (which now claims coverage for it) would be claiming coverage of
+            // a map that names nothing. See `local_oop_mask_at_current_pc`.
+            if let Some(mut mask) = self.local_oop_mask_at_current_pc() {
                 while mask != 0 {
                     // Cast: count/index to usize
                     let k = mask.trailing_zeros() as usize;
@@ -1329,13 +1356,9 @@ impl Compiler {
         if self.failed || self.local_oop_masks.is_empty() {
             return;
         }
-        let pc = self.cur_bc_pc;
-        if pc >= self.local_oop_masks.len()
-            || !self.local_oop_reached.get(pc).copied().unwrap_or(false)
-        {
+        let Some(mut mask) = self.local_oop_mask_at_current_pc() else {
             return;
-        }
-        let mut mask = self.local_oop_masks[pc];
+        };
         while mask != 0 {
             // Cast: count/index to usize
             let k = mask.trailing_zeros() as usize;

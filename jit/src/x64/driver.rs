@@ -1832,6 +1832,10 @@ pub fn compile_with_param_slots(
         compute_local_oop_masks(code, code_len, max_locals, param_oop_mask);
     compiler.local_oop_masks = lo_masks;
     compiler.local_oop_reached = lo_reached;
+    // The entry state, kept alongside the per-pc vectors: the method-entry
+    // safepoint poll is at no bytecode pc, so it has nothing to look up.
+    // See `Compiler::local_oop_mask_at_current_pc`.
+    compiler.param_oop_mask = param_oop_mask;
 
     // deopt-osr P2 — per-local width/type source for the deopt snapshot. Only the
     // (gated) snapshot consumes it, so skip the scan entirely in production.
