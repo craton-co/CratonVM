@@ -6087,6 +6087,24 @@ pub struct NativeMethodRegistry {
     /// and a discriminant compare at the top of `register()`; nothing in
     /// dispatch reads it.
     compatibility_mode: CompatibilityMode,
+    /// Is a REAL JDK class library in use (`--java-home`) rather than the
+    /// synthetic one?
+    ///
+    /// Distinct from [`CompatibilityMode`], which is the strict-vs-compatible
+    /// policy — a run can be `Compatible` on either class library. Registrars
+    /// consult this to skip a native whose only job is to stand in for a class
+    /// the synthetic library fakes. See `native-collections`'
+    /// `CompletableFuture` dependent-stage block: over a real JDK those
+    /// natives detect the real object and delegate straight back to the method
+    /// they shadow, so registering them buys a native dispatch and a by-name
+    /// `invoke_special` and nothing else.
+    ///
+    /// Set **once at VM init, before the `register_*` population pass**, for
+    /// the same reason [`Self::set_compatibility_mode`] must be: it gates
+    /// registration, so flipping it later leaves whatever was already accepted
+    /// in place. Defaults to `false`, so a registry nobody configures behaves
+    /// exactly as it did before this field existed.
+    real_jdk: bool,
     /// Registrations refused by the `JdkOnly` arm of `register()`, in
     /// registration order. Empty in `Compatible` mode. This is the wave-1
     /// deliverable: §10 is "measurement, not deletion" everywhere except class
@@ -6226,6 +6244,7 @@ impl NativeMethodRegistry {
             // behaviour byte-for-byte (§1, "--real-jdk (default) keeps today's
             // behaviour exactly").
             compatibility_mode: CompatibilityMode::Compatible,
+            real_jdk: false,
             refused: Vec::new(),
             drop_real_layout_synthetic: false,
             // PERF: deferred native-ring name index. Sized like the other boot
@@ -6338,6 +6357,20 @@ impl NativeMethodRegistry {
     #[inline]
     pub fn compatibility_mode(&self) -> CompatibilityMode {
         self.compatibility_mode
+    }
+
+    /// Declare that this registry is being populated for a REAL JDK class
+    /// library. See [`Self::real_jdk`]; call once, before the `register_*`
+    /// pass.
+    pub fn set_real_jdk(&mut self, real_jdk: bool) {
+        self.real_jdk = real_jdk;
+    }
+
+    /// Is a real JDK class library in use? Read by registrars deciding whether
+    /// a synthetic-library stand-in is worth registering at all.
+    #[inline]
+    pub fn real_jdk(&self) -> bool {
+        self.real_jdk
     }
 
     /// Registrations refused because of `JdkOnly`, in registration order.

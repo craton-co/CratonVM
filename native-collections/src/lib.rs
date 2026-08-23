@@ -45487,6 +45487,12 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if is_map_key_itr_class(&cn) {
         return native_map_key_itr_next(ctx, args);
     }
+    // Scoped BY CLASS NAME for the same reason the `lastRet` write near the end
+    // of this function is: this native is also the generic `java/util/Iterator`
+    // fallback and runs over shapes whose slot 4 belongs to somebody else.
+    if cn == "java/util/TreeSet$Itr" {
+        ts_itr_check_comod(&*ctx, this)?;
+    }
     // Real-JDK fallback: see `native_snapshot_itr_has_next` doc comment.
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
@@ -47033,7 +47039,76 @@ const TS_ITR_FIELD_DATA: usize = 0;
 const TS_ITR_FIELD_CURSOR: usize = 1;
 const TS_ITR_FIELD_OWNER: usize = 2;
 const TS_ITR_FIELD_LAST_RET: usize = 3;
-const TS_ITR_NUM_FIELDS: usize = 4;
+/// The fail-fast generation this cursor was minted at — the `TreeSet`-carried
+/// twin of the `expectedModCount` the `HashMap$KeyItr` family resolves by name.
+/// A slot rather than a name because `java/util/TreeSet$Itr` is fabricated (no
+/// JDK declares it), so there is no declared field to resolve.
+const TS_ITR_FIELD_EXPECTED_MOD: usize = 4;
+const TS_ITR_NUM_FIELDS: usize = 5;
+
+/// The map a `TreeSet$Itr` is fail-fast against.
+///
+/// `TreeMap.keySet()` mints a `TreeMap$KeySet` whose elements live in the
+/// `ts_array_table` side-table and which stashes its source map in the LAST
+/// capacity slot of the element array — [`ts_view_source`] is the reader, and
+/// it is what already gives this view its write-through. A plain `TreeSet` has
+/// no such marker and answers `None`, which is the no-check case: a set that is
+/// nobody's view has no source generation to watch.
+///
+/// `TreeSet.descendingSet()` puts another `TreeSet` behind the same marker;
+/// that answers `None` from [`map_itr_mod_count`] below (a set keeps no
+/// `modCount`), so it also lands on the no-check path rather than on a wrong
+/// one — the same map-vs-set distinction [`ts_source_remove`] makes.
+fn ts_itr_comod_source(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(itr) <= TS_ITR_FIELD_OWNER {
+        return None;
+    }
+    let owner = match ctx.get_field(itr, TS_ITR_FIELD_OWNER) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    ts_view_source(ctx, owner)
+}
+
+/// `expectedModCount = modCount` for the `TreeSet`-carried cursor.
+fn ts_itr_seed_expected(ctx: &mut dyn NativeContext, itr: ObjectRef) {
+    if !map_itr_failfast_enabled() || ctx.object_num_fields(itr) <= TS_ITR_FIELD_EXPECTED_MOD {
+        return;
+    }
+    let Some(src) = ts_itr_comod_source(&*ctx, itr) else {
+        return;
+    };
+    if let Some(seen) = map_itr_mod_count(&*ctx, src) {
+        ctx.set_field(itr, TS_ITR_FIELD_EXPECTED_MOD, Value::Int(seen));
+    }
+}
+
+/// The comodification test for the `TreeSet`-carried cursor, i.e. the one
+/// `TreeMap.keySet().iterator()` hands out. Fails open on every arm, exactly as
+/// [`map_itr_check_comod`] does: an iterator minted before this slot existed, a
+/// set that is nobody's view, or a source with no generation, all keep the old
+/// never-throw behaviour rather than guessing.
+fn ts_itr_check_comod(
+    ctx: &dyn NativeContext,
+    itr: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if !map_itr_failfast_enabled() || ctx.object_num_fields(itr) <= TS_ITR_FIELD_EXPECTED_MOD {
+        return Ok(());
+    }
+    let expected = match ctx.get_field(itr, TS_ITR_FIELD_EXPECTED_MOD) {
+        Value::Int(v) => v,
+        _ => return Ok(()),
+    };
+    let Some(src) = ts_itr_comod_source(ctx, itr) else {
+        return Ok(());
+    };
+    match map_itr_mod_count(ctx, src) {
+        Some(actual) if actual != expected => {
+            Err(cratonvm_types::error::RuntimeError::ConcurrentModificationException.into())
+        }
+        _ => Ok(()),
+    }
+}
 
 /// Address-keyed TreeSet state side-table. Mirrors `TmArrayState`: in
 /// real-JDK mode `java.util.TreeSet` (and any subclass) has the real JDK
@@ -51635,6 +51710,10 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field(itr, TS_ITR_FIELD_CURSOR, Value::Int(0));
     ctx.set_field(itr, TS_ITR_FIELD_OWNER, Value::Object(Some(this)));
     ctx.set_field(itr, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
+    // After `TS_ITR_FIELD_OWNER`: that is how `ts_itr_comod_source` reaches the
+    // source map whose generation this cursor is fail-fast against. Both mint
+    // sites (`iterator` and `descendingIterator`) hand out this same shape.
+    ts_itr_seed_expected(ctx, itr);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -51705,6 +51784,10 @@ fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if ctx.object_num_fields(this) > TS_ITR_FIELD_LAST_RET {
         ctx.set_field(this, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
     }
+    // The removal above wrote through to the source map and bumped its
+    // generation; adopt it, or the next `next()` trips the check this cursor
+    // installed on itself.
+    ts_itr_seed_expected(ctx, this);
     Ok(None)
 }
 
@@ -52405,6 +52488,10 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ctx.set_field(itr, TS_ITR_FIELD_CURSOR, Value::Int(0));
     ctx.set_field(itr, TS_ITR_FIELD_OWNER, Value::Object(Some(this)));
     ctx.set_field(itr, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
+    // After `TS_ITR_FIELD_OWNER`: that is how `ts_itr_comod_source` reaches the
+    // source map whose generation this cursor is fail-fast against. Both mint
+    // sites (`iterator` and `descendingIterator`) hand out this same shape.
+    ts_itr_seed_expected(ctx, itr);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -65220,7 +65307,48 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     let cf = "java/util/concurrent/CompletableFuture";
 
     // --- CompletionStage methods ---
+    //
+    // OVER A REAL JDK THESE SEVEN ARE NOT REGISTERED AT ALL.
+    //
+    // Each one's real-JDK arm is a pure delegation straight back to the method
+    // it shadows — `native_cf_then_compose` is literally
+    //
+    //     if cf_is_real_jdk(ctx, this) {
+    //         return ctx.invoke_special("java/util/concurrent/CompletableFuture",
+    //                                   "uniComposeStage", .., &[this, null, fn]);
+    //     }
+    //
+    // and the real `thenCompose(fn)` is `return uniComposeStage(null, fn)`. So
+    // registering them buys a native dispatch plus a by-name class resolve plus
+    // a nested invoke, to arrive at the bytecode that would otherwise have run.
+    // The synthetic 2-field CF model below each of those branches is what they
+    // exist for, and it is untouched: `real_jdk()` is false in synthetic mode.
+    //
+    // MEASURED 2026-08-22, `apps/hibernate-reactive-suite-runner/HibfixCfBound.java`,
+    // ns/op on an already-completed stage, same binary, same box. `copy()` and
+    // `minimalCompletionStage()` build the SAME `uni*Stage` dependent machinery
+    // in the same interpreter but carry no native, so they price the bytecode
+    // alone:
+    //
+    //   copy()                    708      <- no native
+    //   minimalCompletionStage() 1149      <- no native
+    //   thenApply()              5458      <- native + delegation
+    //   thenCompose()           10256      <- native + delegation
+    //
+    // i.e. roughly 85% of a shadowed call was the shadow. On
+    // `MultithreadedInsertionWithLazyConnectionTest` these account for 4.36M
+    // native invocations and 37% of all profile samples.
+    //
+    // `thenCombine` is deliberately still registered: its native raises its own
+    // NullPointerException for a null other-stage BEFORE reaching the
+    // delegation, so it is not a pure pass-through, and it is not hot on any
+    // workload this was measured against.
+    //
+    // `CRATONVM_CF_DELEGATING_YIELD=0` restores the registrations so one binary
+    // can be A/B'd against its own previous behaviour.
+    let skip_delegating_cf = r.real_jdk() && cf_delegating_yield_enabled();
 
+    if !skip_delegating_cf {
     r.register(
         cf,
         "thenApply",
@@ -65250,6 +65378,9 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;",
         native_cf_then_compose,
     );
+    }
+
+    // NOT skipped: see the note above — `thenCombine` is not a pure pass-through.
 
     // thenCombine: combine results of two CFs with a BiFunction
     r.register(
@@ -65260,6 +65391,7 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     );
 
     // exceptionally: provide fallback if exception occurred
+    if !skip_delegating_cf {
     r.register(
         cf,
         "exceptionally",
@@ -65282,6 +65414,7 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/BiConsumer;)Ljava/util/concurrent/CompletableFuture;",
         native_cf_when_complete,
     );
+    }
 
     // allOf: CompletableFuture[] → CompletableFuture<Void>
     r.register(
@@ -65374,6 +65507,13 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
 
     // Also register CompletionStage interface methods
     let cs = "java/util/concurrent/CompletionStage";
+    // Same argument as the class-level block above, and it matters MORE here:
+    // hibernate-reactive types its whole composition chain as `CompletionStage`,
+    // so these are `invokeinterface` sites. Over a real JDK the interface
+    // declares them abstract, every implementation has its own body, and this
+    // native would delegate to `CompletableFuture` for a receiver that may not
+    // be one.
+    if !skip_delegating_cf {
     r.register(
         cs,
         "thenApply",
@@ -65404,6 +65544,7 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;",
         native_cf_exceptionally,
     );
+    }
 
     // ForkJoinPool.awaitQuiescence is registered by native-builtins after it
     // establishes the real async-worker completion tracker. Keeping a local
@@ -72208,4 +72349,20 @@ mod tests {
              got {r:?}"
         );
     }
+}
+
+/// `CRATONVM_CF_DELEGATING_YIELD` — default ON. `=0` restores the
+/// `CompletableFuture` / `CompletionStage` dependent-stage native registrations
+/// over a real JDK, so the change can be A/B'd on one binary rather than
+/// against a separately built branch. See the note in
+/// `register_concurrent_completeness_natives`.
+fn cf_delegating_yield_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_CF_DELEGATING_YIELD") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }
