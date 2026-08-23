@@ -12750,7 +12750,12 @@ unsafe fn try_jit_static_bytecode_callee(
 ///   `<clinit>` on the way in, and this path must never become the thing that
 ///   skips it. A live receiver means its own class is initialised, but the
 ///   method may be declared by a superclass or a default-method interface, so
-///   the check is on the DECLARING class rather than on the receiver's.
+///   the check is on the DECLARING class rather than on the receiver's. Like
+///   every refusal here this one is CACHED, so a pair refused for this reason
+///   keeps taking the by-name path even after the class initialises — a
+///   missed optimisation, never a wrong answer, and unreachable in practice
+///   because a live receiver implies its own class and every superclass are
+///   already initialised. Same precedent as the static half.
 ///
 /// Per hit, only what can change is re-tested: the declaring class's
 /// `RedefineGate` and the process-wide `any_class_redefined` latch.

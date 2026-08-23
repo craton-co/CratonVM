@@ -133,7 +133,7 @@ mod stats {
     /// shared bucket would report the same work twice under one name and make
     /// "which layer is answering" unanswerable, which is the only question
     /// worth asking once both layers exist.
-    pub(super) const ENTRY_NAMES: [&str; 13] = [
+    pub(super) const ENTRY_NAMES: [&str; 14] = [
         "binaryOp",
         "unaryOp",
         "ternaryOp",
@@ -147,6 +147,7 @@ mod stats {
         "tmpl:lanewise(Unary)",
         "tmpl:lanewise(Ternary)",
         "tmpl:lanewiseShift",
+        "tmpl:lanewise(scalar)",
     ];
     pub(super) const E_BINARY: usize = 0;
     pub(super) const E_UNARY: usize = 1;
@@ -161,6 +162,7 @@ mod stats {
     pub(super) const E_TMPL_UNARY: usize = 10;
     pub(super) const E_TMPL_TERNARY: usize = 11;
     pub(super) const E_TMPL_SHIFT: usize = 12;
+    pub(super) const E_TMPL_SCALAR: usize = 13;
 
     const N: usize = ENTRY_NAMES.len();
     #[allow(clippy::declare_interior_mutable_const)]
@@ -1425,6 +1427,13 @@ fn templates_engaged() -> bool {
 
 /// to decide whether it must run its special-case cascade. Taken from the
 /// template's own bytecode (`sipush 136`).
+/// `VO_SPECIAL` alone (`sipush 128`) — the bit every operator the templates
+/// special-case by IDENTITY carries: `ZOMO`, `NOT`, `FIRST_NONZERO`,
+/// `AND_NOT`, `DIV`, `BITWISE_BLEND`. One mask test refuses all of them.
+const VO_SPECIAL: i32 = 128;
+/// `VO_SHIFT` alone (`bipush 8`), the bit `lanewise(Binary, scalar)` tests to
+/// route to `lanewiseShift`.
+const VO_SHIFT: i32 = 8;
 const VO_BINARY_SPECIAL: i32 = 136;
 /// `opCode`'s require mask: every `XxxVector.opCode` passes `2048`.
 const VO_OPCODE_VALID: i32 = 2048;
@@ -1771,7 +1780,94 @@ fn vd_lanewise_ternary(
     }
 }
 
-/// One set of four `NativeCallback`s per element type.
+/// `XxxVector.lanewise(VectorOperators$Binary, <lane scalar>)` — the
+/// broadcast-and-combine shape, without the broadcast.
+///
+/// This is the other half of the route, and on `Fp16VectorDotBench` it is the
+/// larger half by call count: the census read `fromBitsCoerced handled=124025`
+/// against `tmpl:lanewise(Binary) handled=185856`, i.e. two thirds of the
+/// binary operations arrive as `v.and(0x7C00)` / `v.add(0x1C000)` rather than
+/// as `v.op(otherVector)`, and each of those first materialises a whole
+/// broadcast vector through `IntSpecies.broadcastBits` and
+/// `VectorSupport.fromBitsCoerced` and then throws it away one operation later.
+///
+/// The JDK body is three branches:
+///
+/// ```text
+/// if (opKind(op, VO_SHIFT))  return lanewiseShift(op, (int) e);
+/// if (op == AND_NOT)         { op = AND; e = ~e; }
+/// return lanewise(op, broadcast(e));
+/// ```
+///
+/// The first is reproduced (it is exactly [`vd_lanewise_shift`]'s arithmetic);
+/// the second refuses on `VO_SPECIAL`, which `AND_NOT` carries; the third is a
+/// per-lane `binary_lane` against the scalar, which is what broadcasting into
+/// a vector and combining lane-wise computes.
+fn vd_lanewise_scalar(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    owner: &str,
+    scalar: char,
+    ret: &str,
+) -> MethodCallResult {
+    let desc = format!("(Ljdk/incubator/vector/VectorOperators$Binary;{scalar}){ret}");
+    let (Some(this), Some(op)) = (obj_at(args, 0), obj_at(args, 1)) else {
+        return template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args);
+    };
+    let handled = (|| -> Option<Vec<i64>> {
+        let (_, elem) = template_owner(ctx, this)?;
+        let op_info = op_info_of(ctx, op)?;
+        // `AND_NOT` rewrites both the operator and the operand and is the only
+        // identity branch here; it is `VO_SPECIAL`, so this refuses it. A
+        // shift op is NOT refused — the branch above it is reproduced below.
+        if (op_info & VO_SPECIAL) != 0 {
+            return None;
+        }
+        let opc = opcode_of(ctx, op, elem, 0)?;
+        // The scalar arrives in its lane type, so the lane BITS depend on the
+        // element type: an integral scalar is sign-narrowed to the lane width
+        // (which is what `broadcast` does), and a floating one is its IEEE-754
+        // bit pattern, because `binary_lane` reads float lanes as bits.
+        let e = match (elem, args.get(2)) {
+            (ELEM_FLOAT, Some(Value::Float(f))) => f.to_bits() as i64,
+            (ELEM_DOUBLE, Some(Value::Double(d))) => d.to_bits() as i64,
+            (ELEM_LONG, Some(Value::Long(v))) => *v,
+            (ELEM_BYTE | ELEM_SHORT | ELEM_INT, Some(Value::Int(v))) => {
+                wrap_integral_lane(elem, i64::from(*v))
+            }
+            _ => return None,
+        };
+        // `opKind(op, VO_SHIFT)` — the first branch, which routes to
+        // `lanewiseShift` and masks the count by the lane width there.
+        let operand = if (op_info & VO_SHIFT) != 0 {
+            i64::from((e as i32) & shift_mask_for(elem))
+        } else {
+            e
+        };
+        let (_, a) = lanes_of(ctx, this)?;
+        if a.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(a.len());
+        for x in a.iter().copied() {
+            out.push(binary_lane(opc, elem, x, operand)?);
+        }
+        Some(out)
+    })();
+    let Some(out) = handled else {
+        return template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args);
+    };
+    let (cid, elem) = match template_owner(ctx, this) {
+        Some(v) => v,
+        None => return template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args),
+    };
+    match build_vector_of(ctx, stats::E_TMPL_SCALAR, cid, elem, &out) {
+        Some(obj) => Ok(Some(Value::Object(Some(obj)))),
+        None => template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args),
+    }
+}
+
+/// One set of five `NativeCallback`s per element type.
 ///
 /// A `NativeCallback` is a plain `fn` pointer with no captured state, so the
 /// owner class — which the fallback needs in order to name the very body it is
@@ -1780,8 +1876,16 @@ fn vd_lanewise_ternary(
 /// class name at run time would put a string operation on the hot path AND
 /// leave the fallback with no name to use when the receiver is the thing that
 /// failed to decode.
+///
+/// `$scalar` is the descriptor character of the element type's OWN scalar
+/// overload — `ByteVector.lanewise(Binary, byte)` is `B`, `FloatVector`'s is
+/// `F`. The `(Binary, long)` overload every type also declares is deliberately
+/// not registered: it is the widening convenience form with its own range
+/// re-check, and it is not what a lane-typed expression like `v.and(0x7C00)`
+/// compiles to.
 macro_rules! vector_templates {
-    ($($fn_bin:ident, $fn_un:ident, $fn_shift:ident, $fn_tern:ident, $owner:literal;)*) => {
+    ($($fn_bin:ident, $fn_un:ident, $fn_shift:ident, $fn_tern:ident, $fn_scalar:ident,
+       $owner:literal, $scalar:literal;)*) => {
         $(
             fn $fn_bin(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 vd_lanewise_binary(ctx, args, $owner, concat!("L", $owner, ";"))
@@ -1795,17 +1899,26 @@ macro_rules! vector_templates {
             fn $fn_tern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 vd_lanewise_ternary(ctx, args, $owner, concat!("L", $owner, ";"))
             }
+            fn $fn_scalar(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                vd_lanewise_scalar(ctx, args, $owner, $scalar, concat!("L", $owner, ";"))
+            }
         )*
     };
 }
 
 vector_templates! {
-    vd_byte_bin,   vd_byte_un,   vd_byte_shift,   vd_byte_tern,   "jdk/incubator/vector/ByteVector";
-    vd_short_bin,  vd_short_un,  vd_short_shift,  vd_short_tern,  "jdk/incubator/vector/ShortVector";
-    vd_int_bin,    vd_int_un,    vd_int_shift,    vd_int_tern,    "jdk/incubator/vector/IntVector";
-    vd_long_bin,   vd_long_un,   vd_long_shift,   vd_long_tern,   "jdk/incubator/vector/LongVector";
-    vd_float_bin,  vd_float_un,  vd_float_shift,  vd_float_tern,  "jdk/incubator/vector/FloatVector";
-    vd_double_bin, vd_double_un, vd_double_shift, vd_double_tern, "jdk/incubator/vector/DoubleVector";
+    vd_byte_bin, vd_byte_un, vd_byte_shift, vd_byte_tern, vd_byte_scalar,
+        "jdk/incubator/vector/ByteVector", 'B';
+    vd_short_bin, vd_short_un, vd_short_shift, vd_short_tern, vd_short_scalar,
+        "jdk/incubator/vector/ShortVector", 'S';
+    vd_int_bin, vd_int_un, vd_int_shift, vd_int_tern, vd_int_scalar,
+        "jdk/incubator/vector/IntVector", 'I';
+    vd_long_bin, vd_long_un, vd_long_shift, vd_long_tern, vd_long_scalar,
+        "jdk/incubator/vector/LongVector", 'J';
+    vd_float_bin, vd_float_un, vd_float_shift, vd_float_tern, vd_float_scalar,
+        "jdk/incubator/vector/FloatVector", 'F';
+    vd_double_bin, vd_double_un, vd_double_shift, vd_double_tern, vd_double_scalar,
+        "jdk/incubator/vector/DoubleVector", 'D';
 }
 
 /// Register the dispatch-layer templates.
@@ -1827,6 +1940,9 @@ fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
         "(Ljdk/incubator/vector/VectorOperators$Binary;Ljdk/incubator/vector/Vector;)";
     const UN_ARGS: &str = "(Ljdk/incubator/vector/VectorOperators$Unary;)";
     const SHIFT_ARGS: &str = "(Ljdk/incubator/vector/VectorOperators$Binary;I)";
+    /// The open paren plus the `Binary` operand, for the scalar overloads
+    /// whose second parameter differs per element type.
+    const BINARY_OP: &str = "(Ljdk/incubator/vector/VectorOperators$Binary;";
     const TERN_ARGS: &str = "(Ljdk/incubator/vector/VectorOperators$Ternary;\
                              Ljdk/incubator/vector/Vector;Ljdk/incubator/vector/Vector;)";
 
@@ -1834,7 +1950,9 @@ fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
                    bin: NativeCallback,
                    un: NativeCallback,
                    shift: Option<NativeCallback>,
-                   tern: NativeCallback| {
+                   tern: NativeCallback,
+                   scalar: NativeCallback,
+                   scalar_desc: char| {
         let ret = format!("L{owner};");
         r.register_with_kind(
             owner,
@@ -1866,6 +1984,16 @@ fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
                 NativeKind::Intrinsic,
             );
         }
+        // The element type's OWN scalar overload, e.g.
+        // `IntVector.lanewise(Binary, int)`. `public final`, not a template,
+        // so it is the outermost frame of the broadcast-and-combine route.
+        r.register_with_kind(
+            owner,
+            "lanewise",
+            &format!("{BINARY_OP}{scalar_desc}){ret}"),
+            scalar,
+            NativeKind::Intrinsic,
+        );
     };
 
     one(
@@ -1874,6 +2002,8 @@ fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
         vd_byte_un,
         Some(vd_byte_shift),
         vd_byte_tern,
+        vd_byte_scalar,
+        'B',
     );
     one(
         "jdk/incubator/vector/ShortVector",
@@ -1881,6 +2011,8 @@ fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
         vd_short_un,
         Some(vd_short_shift),
         vd_short_tern,
+        vd_short_scalar,
+        'S',
     );
     one(
         "jdk/incubator/vector/IntVector",
@@ -1888,6 +2020,8 @@ fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
         vd_int_un,
         Some(vd_int_shift),
         vd_int_tern,
+        vd_int_scalar,
+        'I',
     );
     one(
         "jdk/incubator/vector/LongVector",
@@ -1895,6 +2029,8 @@ fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
         vd_long_un,
         Some(vd_long_shift),
         vd_long_tern,
+        vd_long_scalar,
+        'J',
     );
     one(
         "jdk/incubator/vector/FloatVector",
@@ -1902,6 +2038,8 @@ fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
         vd_float_un,
         None,
         vd_float_tern,
+        vd_float_scalar,
+        'F',
     );
     one(
         "jdk/incubator/vector/DoubleVector",
@@ -1909,6 +2047,8 @@ fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
         vd_double_un,
         None,
         vd_double_tern,
+        vd_double_scalar,
+        'D',
     );
 }
 
