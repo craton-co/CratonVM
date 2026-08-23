@@ -545,7 +545,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-214 tokens.
+215 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -754,6 +754,7 @@ export inherited from a parent shell.
 | `verify-memory-chain` | `CRATONVM_JIT_VERIFY_MEMORY_CHAIN` |
 | `lambda-adapter` | `CRATONVM_JIT_LAMBDA_ADAPTER` |
 | `lambda-capture-adapter` | `CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER` |
+| `lambda-const-probe` | `CRATONVM_JIT_LAMBDA_CONST_PROBE` |
 | `lambda-site` | `CRATONVM_JIT_LAMBDA_SITE` |
 | `lambda-tierup` | `CRATONVM_JIT_LAMBDA_TIERUP` |
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |

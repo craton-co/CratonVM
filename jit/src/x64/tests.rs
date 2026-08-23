@@ -327,15 +327,26 @@ unsafe extern "C" fn stub_invoke_dispatch(
 
 // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
 // and a field index that is bounds-checked within the function body before any dereference.
+//
+// This is a test double for `jit_getfield`, so it has to decode the ARGUMENT the
+// same way: the third parameter is a slot index PLUS the flag bits
+// `GETFIELD_FLAG_BITS` (`GETFIELD_RECEIVER_PROVEN_OOP`, and since 2026-08-23
+// `GETFIELD_EXPECT_REFERENCE`). Stripping them is not optional here. The
+// original stub checked `field_index as u32` against `num_slots` and then
+// indexed with `field_index as usize`: with a flag set, the u32 truncation
+// passed the bounds check and the usize index walked off the object, which
+// aborted the whole test binary the first time a reference load carried a flag.
+// Check and index now use one value.
 unsafe extern "C" fn stub_getfield(_vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
     if obj_ptr == 0 {
         return 0;
     }
+    let field_index = (field_index as u64 & !cratonvm_jit_api::GETFIELD_FLAG_BITS) as i64;
     let base = obj_ptr as *const u8; // Cast: address arithmetic
     let num_slots = read_num_slots(base);
-    if field_index < 0 || field_index as u32 >= num_slots {
+    if field_index < 0 || field_index as u64 >= num_slots as u64 {
         return 0;
-    } // Cast: x86-64 immediate encoding
+    }
     let ptr = base.add(HEADER_SIZE + field_index as usize * SLOT_SIZE); // Cast: address arithmetic
     let val: Value = std::ptr::read(ptr as *const Value); // Cast: address arithmetic
     match val {
@@ -4379,6 +4390,97 @@ fn test_getfield_guarded_inline_fast_and_fallback() {
     // SAFETY: as above.
     let result = unsafe { compiled.try_call(&[0]).expect("jit call") };
     assert_eq!(result, 424242, "null receiver must route to the helper");
+}
+
+/// A REFERENCE field whose 16-byte cell does not hold a reference must not be
+/// read as one by the inline arm.
+///
+/// This is the Tomcat/Derby SIGSEGV of 2026-08-23. The inline legacy `getfield`
+/// loaded the cell's 8-byte payload and handed it on as a pointer without ever
+/// looking at the cell's discriminant. `SQLChar.rawData` is declared `[C`, its
+/// cell did not hold an `Object`, and the payload word — 1 — went straight into
+/// the `arraylength` this arm emits three instructions later
+/// (`MOV r32,[RAX+4]`), so the process died at `addr=0x5`. Three crashes
+/// carried byte-identical registers: the body was deterministic, only its
+/// reachability was racy (3 crashes in 38 runs one hour, 0 in 129 the next).
+///
+/// The checked helper has always looked at the variant, which is why the whole
+/// thing was invisible from the helper's side. The inline arm exists to skip
+/// the helper, so it has to ask the same question and defer when the answer is
+/// no. The marker helper makes that deferral observable.
+#[test]
+fn a_reference_getfield_does_not_read_a_non_reference_cell_as_a_pointer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TEST_BOUNDS: [AtomicUsize; 6] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    /// A value no cell read could produce, so "went to the helper" is visible.
+    unsafe extern "C" fn marker_getfield(_vm: i64, _obj: i64, _idx: i64) -> i64 {
+        424242
+    }
+
+    // aload_0; getfield #1; areturn
+    let code: Vec<u8> = vec![0x2a, 0xb4, 0x00, 0x01, 0xb0, 0, 0];
+    let code_len = 5;
+    // Slot 1, declared `L` — a reference.
+    let field_info = vec![(1usize, 1usize, b'L')];
+    let mut helpers = test_helpers();
+    helpers.getfield = marker_getfield as *const () as usize;
+    helpers.read_bounds_addr = TEST_BOUNDS.as_ptr() as usize;
+    let compiled = compile(
+        &code, code_len, 1, 1, false,
+        Vec::new(), field_info, Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+        Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+        HashMap::new(), HashMap::new(), &helpers,
+        std::collections::HashSet::new(), HashMap::new(), None,
+    )
+    .unwrap();
+
+    use cratonvm_gc::gen_heap::GenerationalHeap;
+    use cratonvm_types::ClassId;
+    let heap = GenerationalHeap::new();
+    let obj = heap.alloc_object(ClassId::new(0), 2);
+    let obj_addr = obj.as_ptr() as usize;
+    TEST_BOUNDS[0].store(obj_addr & !0xFFF, Ordering::Release);
+    TEST_BOUNDS[1].store((obj_addr & !0xFFF) + 0x10000, Ordering::Release);
+
+    // A genuine reference still takes the inline path: the whole sequence
+    // exists to make this case fast, and a "fix" that sent it to the helper
+    // would be a performance regression disguised as a correctness one.
+    let target = heap.alloc_object(ClassId::new(0), 1);
+    heap.set_field(obj, 1, Value::Object(Some(target)));
+    // SAFETY: JIT-compiled code from valid bytecode; executable mmap region.
+    let got = unsafe { compiled.try_call(&[obj_addr as i64]).expect("jit call") };
+    assert_eq!(
+        got,
+        target.as_ptr() as i64,
+        "a real reference must still be read inline"
+    );
+
+    // A PUNNED cell: the same slot now holds a `Long`, whose 8-byte payload
+    // sits at exactly the offset the reference read uses. Pre-fix this
+    // returned 0x1234_5678 — a pointer the caller would dereference. It must
+    // now reach the helper, which owns the decision.
+    heap.set_field(obj, 1, Value::Long(0x1234_5678));
+    // SAFETY: as above.
+    let got = unsafe { compiled.try_call(&[obj_addr as i64]).expect("jit call") };
+    assert_eq!(
+        got, 424242,
+        "a reference load off a non-reference cell returned {got:#x} instead of \
+         deferring — that word is what compiled code dereferences next"
+    );
+
+    // Null is a reference, and must NOT be pushed to the helper: `Object(None)`
+    // is a legitimate inline answer and the common one.
+    heap.set_field(obj, 1, Value::Object(None));
+    // SAFETY: as above.
+    let got = unsafe { compiled.try_call(&[obj_addr as i64]).expect("jit call") };
+    assert_eq!(got, 0, "a null reference must still be read inline as 0");
 }
 
 /// Inline (helper-free) `getstatic`: with a resolver wired, the default `0xb2`

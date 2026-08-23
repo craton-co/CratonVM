@@ -1452,7 +1452,7 @@ impl Compiler {
                         let obj_slot = self.pop_stack();
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
                         crate::metrics::note_getfield_arm(0);
                         self.emit_call_absolute(self.helpers.getfield);
                         // The checked helper returns the `i64::MIN` deopt/NPE

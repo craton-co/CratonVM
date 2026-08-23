@@ -4618,7 +4618,7 @@ impl Compiler {
                         }
                         let obj_slot = self.pop_stack();
                         self.load_slot_to_reg(RAX, obj_slot);
-                        let (slow_patches, null_patch) = if raw_mode {
+                        let (mut slow_patches, null_patch) = if raw_mode {
                             // Null check: TEST RAX,RAX; JZ <null> (result 0).
                             self.emit_test_r64_r64(RAX);
                             (Vec::new(), Some(self.emit_jcc_rel32_patch(0x84))) // JE
@@ -4685,6 +4685,31 @@ impl Compiler {
                         // `legacy_cell + PAYLOAD64`; float is 4 bytes at PAYLOAD32;
                         // int-category is a sign-extended 4-byte load at PAYLOAD32.
                         self.patch_rel32_to_here(legacy_patch);
+                        // Before either reference arm below reads the cell's
+                        // 8-byte payload as a POINTER, check that the cell says
+                        // it holds one. The IR backend's twin of this sequence
+                        // did not, and a `[C` field whose cell held
+                        // `Value::Int(1)` was loaded as the pointer `1` and
+                        // dereferenced by the `arraylength` three instructions
+                        // later -- SIGSEGV at `addr=0x5`, deterministically
+                        // (Tomcat/Derby, 2026-08-23). The checked helper has
+                        // always looked at the variant; this arm exists to skip
+                        // the helper, so it has to ask the same question.
+                        //
+                        // RAW mode is excluded because it has no slow path to
+                        // defer to -- its null arm yields 0 by design. It is an
+                        // explicit opt-in whose own comment calls itself
+                        // "historical semantics"; the guarded path is the
+                        // default and is what the crash was on.
+                        if !raw_mode && (c_is_ref || matches!(type_tag, b'L' | b'[')) {
+                            self.buf.emit(&[0x83, 0xB8]); // CMP DWORD [RAX+disp32], imm8
+                            self.buf.emit(
+                                &(legacy_cell_off + FIELD_CELL_TAG_OFFSET as i32).to_le_bytes(),
+                            );
+                            self.buf
+                                .emit_byte(cratonvm_types::FIELD_CELL_TAG_OBJECT as u8);
+                            slow_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
+                        }
                         if c_is_ref {
                             self.emit_mov_r64_mem_disp32(
                                 RAX,
@@ -4742,7 +4767,7 @@ impl Compiler {
                             }
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
                             crate::metrics::note_getfield_arm(1);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
@@ -4844,6 +4869,26 @@ impl Compiler {
                             self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                             slow_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNZ
                         }
+                        // A REFERENCE read must check the cell's discriminant
+                        // before treating its payload as a pointer. `J`, `D`,
+                        // `L` and `[` all share the 8-byte payload offset, so
+                        // the DESCRIPTOR does not tell you what the cell
+                        // actually holds -- only the tag does. Reading it
+                        // without asking is the Tomcat/Derby SIGSEGV of
+                        // 2026-08-23; see FIELD_CELL_TAG_OBJECT and the twin
+                        // check in the compact arm above.
+                        //
+                        // RAW mode is excluded because it has no slow path to
+                        // defer to; it is an explicit opt-in that documents
+                        // itself as historical semantics.
+                        if !raw_mode && matches!(type_tag, b'L' | b'[') {
+                            self.buf.emit(&[0x83, 0xB8]); // CMP DWORD [RAX+disp32], imm8
+                            self.buf
+                                .emit(&(cell_off + FIELD_CELL_TAG_OFFSET as i32).to_le_bytes());
+                            self.buf
+                                .emit_byte(cratonvm_types::FIELD_CELL_TAG_OBJECT as u8);
+                            slow_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE → helper
+                        }
                         match type_tag {
                             b'J' | b'D' | b'L' | b'[' => {
                                 // 8-byte payload: MOV RAX, [RAX + cell + 8].
@@ -4888,7 +4933,7 @@ impl Compiler {
                             }
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                            self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
                             crate::metrics::note_getfield_arm(2);
                             self.emit_call_absolute(self.helpers.getfield);
                             self.emit_post_invoke_exception_check(type_tag);
@@ -4921,7 +4966,7 @@ impl Compiler {
                         let obj_slot = self.pop_stack();
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+                        self.emit_getfield_index_arg(ARG_REGS[2], field_index, type_tag);
                         crate::metrics::note_getfield_arm(3);
                         self.emit_call_absolute(self.helpers.getfield);
                         // See the inlined-callee getfield site above: the checked
@@ -4946,6 +4991,17 @@ impl Compiler {
                         let obj_slot = self.pop_stack();
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                        // NOT routed through `emit_getfield_index_arg`: that
+                        // encoder needs a type tag, and this arm is the one
+                        // that has none. So `GETFIELD_EXPECT_REFERENCE` cannot
+                        // be set here and the helper keeps its pre-2026-08-23
+                        // behaviour of returning a punned slot's payload. That
+                        // is survivable only because the same missing metadata
+                        // means this arm does not know the value is a reference
+                        // either, so nothing downstream dereferences it on the
+                        // strength of a static type -- but it is a residual,
+                        // and the place to close it is the resolution that
+                        // failed, not here.
                         self.emit_mov_imm32_sx(ARG_REGS[2], 0); // Cast: x86-64 immediate encoding
                         crate::metrics::note_getfield_arm(4);
                         self.emit_call_absolute(self.helpers.getfield);

@@ -2559,6 +2559,33 @@ fn reloc_emit_enabled() -> bool {
         self.patch_rel32_to_here(legacy_patch);
         let legacy_cell_off = (HEADER_SIZE + field_index as usize * SLOT_SIZE) as i32;
         if ref_node {
+            // The cell's DISCRIMINANT decides whether that payload is a
+            // pointer. Reading the payload without asking was the Tomcat/Derby
+            // SIGSEGV of 2026-08-23: `SQLChar.rawData` is declared `[C`, its
+            // cell held `Value::Int(1)`, and this arm loaded the 8-byte payload
+            // word — 1 — and handed it on as a reference. The `arraylength`
+            // three instructions later is `MOV r32,[RAX+4]`, so the process
+            // died at `addr=0x5`, deterministically: three crashes carried
+            // byte-identical registers.
+            //
+            // The helper this arm exists to skip has always looked at the
+            // variant (`read_value_atomic` then `match val`), which is why the
+            // crash was invisible in the helper path and why the fix belongs
+            // here. Deferring to it — rather than degrading to null inline —
+            // keeps ONE place deciding what a punned slot means, and that place
+            // counts it (`getfield reference loads that contained a primitive
+            // slot`).
+            //
+            // Cost is one compare and one not-taken branch on the legacy
+            // reference path; the compact arm above is untouched, and it is the
+            // one this whole inline sequence was written for.
+            self.buf.emit(&[0x83, 0xB8]); // CMP DWORD [RAX + disp32], imm8
+            self.buf
+                .emit(&(legacy_cell_off + cratonvm_types::FIELD_CELL_TAG_OFFSET as i32).to_le_bytes());
+            self.buf
+                .emit_byte(cratonvm_types::FIELD_CELL_TAG_OBJECT as u8);
+            slow.push(self.emit_jcc_rel32(0x85)); // JNE → the checked helper
+
             // A reference descriptor always reads the cell's 64-bit pointer
             // payload — never the 32-bit MOVSXD below, which would
             // sign-extend half a pointer into a bogus non-null receiver.
@@ -2624,12 +2651,20 @@ fn reloc_emit_enabled() -> bool {
         // assertions and an ABI version, all of which exist to keep the layout
         // the JIT bakes frozen. A one-bit argument flag needs none of that, and
         // the index is a small non-negative slot number with 62 spare bits.
+        // The second flag, `GETFIELD_EXPECT_REFERENCE`, tells the helper what
+        // we are going to DO with the answer rather than what we know about the
+        // receiver: the code emitted after this call dereferences the result
+        // for a reference field, while the helper otherwise returns the payload
+        // of whichever `Value` variant it finds in the slot. A type-punned
+        // primitive therefore became a wild pointer — `SQLChar.rawData` is
+        // declared `[C`, read back as `Int(1)`, and the `arraylength` that
+        // followed faulted at `addr=0x5`.
         let base_is_proven_oop = self.graph.nodes[base as usize].ty == IrType::Ref;
-        let arg2 = if ref_node && base_is_proven_oop {
-            field_index as u64 | cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP
-        } else {
-            field_index as u64
-        };
+        let arg2 = cratonvm_jit_api::getfield_index_arg(
+            field_index as u32,
+            ref_node,
+            base_is_proven_oop,
+        );
         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
         self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
         self.emit_mov_reg_imm64(CALL_ARG_REGS[2], arg2);
@@ -4808,7 +4843,18 @@ fn reloc_emit_enabled() -> bool {
                     crate::metrics::note_getfield_arm(5);
                     self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                     self.load_reg_from_frame(CALL_ARG_REGS[1], self.slot_of(base));
-                    self.emit_mov_reg_imm64(CALL_ARG_REGS[2], field_index as i64 as u64);
+                    // Reference loads must carry `GETFIELD_EXPECT_REFERENCE` at
+                    // EVERY arm, not just the one that crashed — this is the
+                    // inline-compact fallback arm. No receiver proof is claimed
+                    // here.
+                    self.emit_mov_reg_imm64(
+                        CALL_ARG_REGS[2],
+                        cratonvm_jit_api::getfield_index_arg(
+                            field_index as u32,
+                            node.ty == IrType::Ref,
+                            false,
+                        ),
+                    );
                     self.emit_mov_reg_imm64(RAX, self.getfield as u64);
                     self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                                                   // The checked `jit_getfield` helper returns the `i64::MIN`
@@ -10997,6 +11043,93 @@ mod tests {
                 tag as char
             );
         }
+    }
+
+    /// A REFERENCE `getfield` must tell the helper that the code after the call
+    /// is going to DEREFERENCE what comes back.
+    ///
+    /// The helper reads a `Value` out of the slot and returns the payload of
+    /// whichever variant it finds, and compiled code checks the returned word
+    /// against `i64::MIN` and nothing else. Without
+    /// `GETFIELD_EXPECT_REFERENCE` a reference field whose slot had been
+    /// type-punned to a primitive therefore came back as that primitive's bits
+    /// and was followed as a pointer: `SQLChar.rawData` (declared `[C`) read
+    /// back as `Int(1)`, and the `arraylength` this arm emits — a plain
+    /// `MOV r32,[reg+4]` — faulted at `addr=0x5`.
+    ///
+    /// This is an EMISSION test on purpose. The miscompiled body was
+    /// deterministic (three crashes, byte-identical registers) but its
+    /// reachability was not — 3 crashes in 38 runs one hour and 0 in 129 the
+    /// next — so running the workload can never distinguish a fix from luck.
+    /// What can be pinned is that the flag is in the argument.
+    #[test]
+    fn a_lowered_reference_getfield_tells_the_helper_it_will_be_dereferenced() {
+        // Any non-`i64::MIN` return reads as an ordinary field value; this test
+        // never executes the code, it only inspects what was emitted.
+        unsafe extern "C" fn stub_getfield(_vm: i64, _obj: i64, _idx: i64) -> i64 {
+            7
+        }
+        let fake_getfield = stub_getfield;
+
+        // aload_0; getfield #2 -> slot 5, `[C`; areturn
+        let code = [0x2a, 0xb4, 0x00, 0x02, 0xb0, 0, 0];
+        let mut b = IrBuilder::new(1, 1);
+        b.set_param_types(&[IrType::Ref]);
+        let mut fi = std::collections::HashMap::new();
+        fi.insert(1usize, (5usize, b'['));
+        b.set_field_info(fi);
+        let graph = b.build(&code, 5).expect("a reference getfield builds");
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.getfield = fake_getfield as *const () as usize;
+        let cm = lower(&graph, &schedule, 1, 1, &helpers).expect("must compile");
+
+        // Two arms can lower this — the main one, which also claims the
+        // receiver proof, and the inline-compact fallback, which does not.
+        // Either is correct; emitting the BARE index is not.
+        //
+        // Built from the CONSTANTS, not by calling `getfield_index_arg`. A
+        // first version of this test computed its expectation with the same
+        // encoder the emitter uses, so disabling the encoder moved both sides
+        // together and the assertion below passed while nothing was flagged —
+        // it only went red on the int case, by accident. An expectation
+        // computed from the thing under test is not an expectation.
+        const EXPECT_REF: u64 = cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE;
+        const PROVEN: u64 = cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP;
+        let proven = (5u64 | EXPECT_REF | PROVEN).to_le_bytes();
+        let unproven = (5u64 | EXPECT_REF).to_le_bytes();
+        //
+        // Accepting either means this pins "the emitted code flags the load",
+        // not "every arm flags it" — measured: patching `ref_node` out of the
+        // main arm alone leaves this green, because the fallback arm still
+        // flags it. Per-arm coverage comes from routing all seven emit sites
+        // in both backends through `getfield_index_arg`, plus the control that
+        // disables that encoder and turns this red.
+        assert!(
+            contains_seq(cm.code_bytes(), &proven)
+                || contains_seq(cm.code_bytes(), &unproven),
+            "no getfield argument in the emitted code carries \
+             GETFIELD_EXPECT_REFERENCE, so the helper will hand this \
+             dereferencing arm whatever primitive the slot happens to hold"
+        );
+
+        // A PRIMITIVE field must not claim it: the flag makes the helper refuse
+        // to return a payload, so setting it on an int load would turn every
+        // such read into a silent zero.
+        let code_i = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
+        let mut b = IrBuilder::new(1, 1);
+        b.set_param_types(&[IrType::Ref]);
+        let mut fi = std::collections::HashMap::new();
+        fi.insert(1usize, (5usize, b'I'));
+        b.set_field_info(fi);
+        let graph = b.build(&code_i, 5).expect("an int getfield builds");
+        let schedule = ir_schedule::schedule(&graph);
+        let cm = lower(&graph, &schedule, 1, 1, &helpers).expect("must compile");
+        assert!(
+            !contains_seq(cm.code_bytes(), &proven)
+                && !contains_seq(cm.code_bytes(), &unproven),
+            "an int field must not claim GETFIELD_EXPECT_REFERENCE"
+        );
     }
 
     fn compile_via_ir_no_opt(
