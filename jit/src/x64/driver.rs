@@ -2325,16 +2325,20 @@ pub fn compile_with_param_slots(
     // install sites in vm/src/jit/helpers.rs) consult this flag so every
     // call to such a method stays on a dispatch helper, whose
     // `try_resume_trapped_callee` resolves the trap precisely in place.
-    // Only sites that actually lower to a trap count. A fully bridged
-    // method (every indy is a StringConcatFactory call) carries no trap, so it
-    // must not be forced onto the dispatch-helper path for its callers.
+    // Only sites that actually lower to a trap count. A fully bridged method
+    // — every indy is a `StringConcatFactory` or `LambdaMetafactory` site the
+    // bridge serves — carries no trap, so it must not be forced onto the
+    // dispatch-helper path for its callers. This predicate is the SAME one
+    // `bytecode_walk`'s 0xba arm uses to decide whether to emit the bridge
+    // call; the two must not drift, or an artifact would advertise a trap it
+    // does not have (or, far worse, hide one it does).
     cm.has_indy_trap = {
-        let concat_entry = crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let bridge_entry = crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
         compiler
             .indy_info
             .iter()
-            .any(|(_pc, _arg_slots, ret_type, _tags, concat_site)| {
-                !(*concat_site != 0 && concat_entry != 0 && matches!(*ret_type, b'L' | b'['))
+            .any(|(_pc, _arg_slots, ret_type, _tags, bridge_site)| {
+                !(*bridge_site != 0 && bridge_entry != 0 && matches!(*ret_type, b'L' | b'['))
             })
     };
     // Stage 3 — the frame offset where this method stores the active

@@ -13975,13 +13975,35 @@ pub fn admit_direct_native_entry(vm: &SharedVm, shadow: DirectNativeShadow) -> O
 ///    the dispatch helper, so the returned sentinel carries properly
 ///    stashed exception state for the caller's post-invoke check.
 ///
-/// Compiled `StringConcatFactory` bridge. Arguments reside in a JIT-owned raw
-/// spill buffer and are decoded by the call site's descriptor before Java code
-/// can run or move the heap.
+/// The compiled `invokedynamic` bridge — the one entry the codegen calls for
+/// every indy site it does NOT lower to an uncommon trap.
+///
+/// Two kinds arrive here and the site metadata says which
+/// (`invokedynamic::jit_indy_site_kind`):
+///
+/// * `StringConcatFactory` — the original bridge, unchanged;
+/// * `LambdaMetafactory` — added 2026-08-23, and the reason methods that
+///   CREATE a lambda can now stay compiled at all. See
+///   [`crate::runtime::invokedynamic::JitIndyGenericSite`] for the 25x that
+///   was worth on `probes/IndyScopeProbe.java`.
+///
+/// Arguments reside in a JIT-owned raw spill buffer and are decoded by the call
+/// site's descriptor before Java code can run or move the heap.
+///
+/// # Failure
+///
+/// The two kinds report differently, and deliberately. The concat bridge
+/// returns `Option` and a `None` becomes `0`, which is what it has always done.
+/// The generic bridge returns `Result`, and an `Err` is routed through
+/// [`handle_jit_dispatch_error`] — the same stash-and-sentinel path a compiled
+/// dispatch failure takes — because a `LambdaMetafactory` bootstrap CAN throw
+/// (a missing implementation method, an incompatible method type) and
+/// swallowing that into a null reference would turn a `BootstrapMethodError`
+/// into an NPE several frames later.
 ///
 /// SAFETY: all pointers are supplied by the generated call sequence for the
 /// current live VM and the site allocation is process-lived.
-pub unsafe extern "C" fn jit_indy_string_concat(
+pub unsafe extern "C" fn jit_indy_bridge(
     vm_ptr: i64,
     site_ptr: i64,
     args_ptr: *const i64,
@@ -13993,15 +14015,54 @@ pub unsafe extern "C" fn jit_indy_string_concat(
         return 0;
     };
     let vm = &*(vm_ptr as *const SharedVm);
-    crate::runtime::invokedynamic::execute_jit_string_concat_raw(
-        vm,
-        thread,
-        site_ptr as usize,
-        args_ptr,
-        arg_count.max(0) as usize,
-    )
-    .map(|obj| obj.as_ptr() as i64)
-    .unwrap_or(0)
+    let count = arg_count.max(0) as usize;
+    match crate::runtime::invokedynamic::jit_indy_site_kind(site_ptr as usize) {
+        crate::runtime::invokedynamic::JIT_INDY_SITE_GENERIC => {
+            match crate::runtime::invokedynamic::execute_jit_indy_generic_raw(
+                vm,
+                thread,
+                site_ptr as usize,
+                args_ptr,
+                count,
+            ) {
+                Ok(Some(obj)) => {
+                    // Object-return handoff root, same contract as every other
+                    // JIT helper that hands a fresh reference back to compiled
+                    // code (see `jit_integer_value_of_direct`): the lambda
+                    // proxy was allocated inside this call and nothing else
+                    // roots it between here and the caller's store.
+                    thread.native_pending_return = Some(obj);
+                    obj.as_ptr() as i64
+                }
+                Ok(None) => 0,
+                Err(error) => {
+                    // `JitInvokeInfo` is what `handle_jit_dispatch_error` uses
+                    // for its diagnostics only; the stash and the sentinel do
+                    // not depend on it. A synthetic one naming the site keeps
+                    // that message readable.
+                    let info = JitInvokeInfo {
+                        class_name: "<jit-indy>",
+                        method_name: "bridge",
+                        descriptor: "()Ljava/lang/Object;",
+                        num_jit_args: 0,
+                        return_type: b'L',
+                        invoke_kind: 3,
+                        declaring_class_id: 0,
+                    };
+                    handle_jit_dispatch_error(vm, thread, error, &info)
+                }
+            }
+        }
+        _ => crate::runtime::invokedynamic::execute_jit_string_concat_raw(
+            vm,
+            thread,
+            site_ptr as usize,
+            args_ptr,
+            count,
+        )
+        .map(|obj| obj.as_ptr() as i64)
+        .unwrap_or(0),
+    }
 }
 
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
@@ -21331,7 +21392,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     // the other two doors must switch to; O1/O2 in the H20-1 record.
     //
     // Deliberately NOT skipped under `JdkOnly`:
-    //  * `set_indy_string_concat_fn` — a `StringConcatFactory` *bootstrap*
+    //  * `set_indy_bridge_fn` — an `invokedynamic` *bootstrap*
     //    bridge, not a native-method dispatch. The interpreter reaches the same
     //    bridge for the same sites, so gating it would move the call without
     //    changing the policy answer, while perturbing
@@ -21339,7 +21400,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     //  * `set_monitor_direct_fns` — VM monitor services, not registered
     //    natives. Not a dispatch site.
     // Both exclusions match `jit/src/lib.rs`'s own JDK-ONLY-NOTE items 5 and 6.
-    cratonvm_jit::set_indy_string_concat_fn(jit_indy_string_concat as *const () as usize);
+    cratonvm_jit::set_indy_bridge_fn(jit_indy_bridge as *const () as usize);
     cratonvm_jit::set_monitor_direct_fns(
         jit_monitor_enter as *const () as usize,
         jit_monitor_exit as *const () as usize,

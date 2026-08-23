@@ -1380,10 +1380,11 @@ pub(super) fn compile_osr_artifact(
                                 let arg_slots = crate::jit::count_param_slots(descriptor);
                                 let ret_type = crate::jit::return_type(descriptor);
                                 let arg_type_tags = crate::jit::indy_arg_type_tags(descriptor);
-                                let concat_site = crate::runtime::invokedynamic::make_jit_string_concat_site_from_parts(
+                                let concat_site = crate::runtime::invokedynamic::make_jit_indy_bridge_site_from_parts(
                                     &class.constant_pool,
                                     &class.bootstrap_methods,
                                     cp_idx,
+                                    class_id,
                                 )
                                 .unwrap_or(0);
                                 indy_info.push((
@@ -1404,10 +1405,17 @@ pub(super) fn compile_osr_artifact(
             // frame at the stale back-edge, silently re-running a loop whose
             // side effects already committed (see
             // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
-            // Admit only sites lowered by the StringConcatFactory bridge, which
-            // emits a direct call and never deopts at the indy bci. `indy_info`
-            // drops sites it cannot resolve, so a length mismatch also means
-            // "not fully bridged" and is refused here.
+            // Admit only BRIDGED sites, which emit a direct call and never
+            // deopt at the indy bci. `indy_info` drops sites it cannot resolve,
+            // so a length mismatch also means "not fully bridged" and is
+            // refused here.
+            //
+            // The bridged set grew on 2026-08-23 from `StringConcatFactory`
+            // alone to `LambdaMetafactory` as well, and this gate is the reason
+            // that matters as much as the whole-method one: `osr-DENY
+            // (unbridged invokedynamic)` is METHOD-WIDE — one lambda creation
+            // anywhere in a method denied OSR to every loop in it, for the life
+            // of the process.
             if indy_info.len() != scan.indy_ops.len()
                 || indy_info.iter().any(|(_, _, ret_type, _, concat_site)| {
                     *concat_site == 0 || !matches!(*ret_type, b'L' | b'[')
@@ -4162,7 +4170,14 @@ pub(super) fn try_jit_upgrade_with_gate(
     // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
     // just its target descriptor (no bootstrap/CallSite resolution needed —
     // the codegen only needs the call site's arg/return stack effect).
-    let indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
+    //
+    // It also returns the BRIDGE SITE for that index (0 when the bootstrap is
+    // one the bridge cannot serve). Folded into this resolver rather than added
+    // as a second callback because `indy_info`'s fifth element has to be filled
+    // in the same loop, and a second `Option<&dyn Fn>` parameter would have had
+    // to be threaded through every `try_compile` caller in the tree — including
+    // twenty test rows that pass `None` for a method with no indy in it.
+    let indy_descriptor_resolver = |cp_idx: u16| -> Option<(String, usize)> {
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         match class.constant_pool.get(cp_idx)? {
@@ -4172,7 +4187,18 @@ pub(super) fn try_jit_upgrade_with_gate(
             } => class
                 .constant_pool
                 .get_name_and_type(*name_and_type_index)
-                .map(|(_name, descriptor)| descriptor.to_string()),
+                .map(|(_name, descriptor)| {
+                    (
+                        descriptor.to_string(),
+                        crate::runtime::invokedynamic::make_jit_indy_bridge_site_from_parts(
+                            &class.constant_pool,
+                            &class.bootstrap_methods,
+                            cp_idx,
+                            class_id,
+                        )
+                        .unwrap_or(0),
+                    )
+                }),
             _ => None,
         }
     };
@@ -4667,7 +4693,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             };
             // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP
             // index to its target descriptor for the callee's constant pool.
-            let c_indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
+            let c_indy_descriptor_resolver = |cp_idx: u16| -> Option<(String, usize)> {
                 let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 match class.constant_pool.get(cp_idx)? {
@@ -4677,7 +4703,18 @@ pub(super) fn try_jit_upgrade_with_gate(
                     } => class
                         .constant_pool
                         .get_name_and_type(*name_and_type_index)
-                        .map(|(_name, descriptor)| descriptor.to_string()),
+                        .map(|(_name, descriptor)| {
+                            (
+                                descriptor.to_string(),
+                                crate::runtime::invokedynamic::make_jit_indy_bridge_site_from_parts(
+                                    &class.constant_pool,
+                                    &class.bootstrap_methods,
+                                    cp_idx,
+                                    callee_cid,
+                                )
+                                .unwrap_or(0),
+                            )
+                        }),
                     _ => None,
                 }
             };
@@ -6007,7 +6044,7 @@ pub(super) fn try_jit_compile_callee_slow(
     };
     // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
     // its target descriptor (no bootstrap/CallSite resolution needed).
-    let indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
+    let indy_descriptor_resolver = |cp_idx: u16| -> Option<(String, usize)> {
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         match class.constant_pool.get(cp_idx)? {
@@ -6017,7 +6054,18 @@ pub(super) fn try_jit_compile_callee_slow(
             } => class
                 .constant_pool
                 .get_name_and_type(*name_and_type_index)
-                .map(|(_name, descriptor)| descriptor.to_string()),
+                .map(|(_name, descriptor)| {
+                    (
+                        descriptor.to_string(),
+                        crate::runtime::invokedynamic::make_jit_indy_bridge_site_from_parts(
+                            &class.constant_pool,
+                            &class.bootstrap_methods,
+                            cp_idx,
+                            cid,
+                        )
+                        .unwrap_or(0),
+                    )
+                }),
             _ => None,
         }
     };

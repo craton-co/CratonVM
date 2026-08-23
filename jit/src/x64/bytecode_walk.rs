@@ -10927,20 +10927,30 @@ impl Compiler {
 
                     self.flush_scratch_registers();
 
-                    // A `StringConcatFactory` site has a resolved,
-                    // process-lifetime bridge, so call it directly instead of
-                    // taking the uncommon trap below. This is what removes
-                    // RBC.7's premise for the common
-                    // `println("..." + x)`-after-a-loop shape: with no trap at
-                    // the indy bci there is nothing for an OSR frame to resume
-                    // imprecisely, so the OSR artifact keeps running. Every
-                    // other bootstrap kind still falls through to the trap.
-                    let concat_entry =
-                        crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
-                    if concat_site != 0 && concat_entry != 0 && matches!(ret_type, b'L' | b'[') {
+                    // A BRIDGED site has a resolved, process-lifetime
+                    // handler, so call it directly instead of taking the
+                    // uncommon trap below. This is what removes RBC.7's premise
+                    // for the common `println("..." + x)`-after-a-loop shape:
+                    // with no trap at the indy bci there is nothing for an OSR
+                    // frame to resume imprecisely, so the OSR artifact keeps
+                    // running.
+                    //
+                    // Two bootstraps are bridged — `StringConcatFactory` and,
+                    // since 2026-08-23, `LambdaMetafactory`. The second is what
+                    // lets a method that CREATES a lambda stay compiled at all:
+                    // before it, such a method took this trap on its first
+                    // execution and was retired with `MakeNotCompilable`, which
+                    // on Reactor/WebFlux assembly means essentially nothing is
+                    // ever compiled. The site pointer is self-describing (its
+                    // `kind` tag), so ONE call sequence and one entry serve
+                    // both. Every other bootstrap kind still falls through to
+                    // the trap.
+                    let bridge_entry =
+                        crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    if concat_site != 0 && bridge_entry != 0 && matches!(ret_type, b'L' | b'[') {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
                             eprintln!(
-                                "[cratonvm-jitc] indy-concat bridge pc={} args={}",
+                                "[cratonvm-jitc] indy bridge pc={} args={}",
                                 pc, arg_slots
                             );
                         }
@@ -10984,7 +10994,7 @@ impl Compiler {
                         }
                         self.emit_mov_imm32_sx(ARG_REGS[3], arg_slots as i32);
                         self.emit_pre_safepoint_spill();
-                        self.emit_call_absolute(concat_entry);
+                        self.emit_call_absolute(bridge_entry);
                         self.emit_oop_map_for_safepoint();
                         self.next_spill_offset = post_pop_spill;
                         self.push_from_rax();

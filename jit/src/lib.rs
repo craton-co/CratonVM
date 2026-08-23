@@ -9364,7 +9364,7 @@ fn direct_native_helper_for_impl(
 //     defect. The shadow check is on the VM side and needs the same
 //     `resolve_dispatch` treatment.
 //
-//  5. `INDY_STRING_CONCAT_FN` (below) is a `StringConcatFactory` *bootstrap*
+//  5. `INDY_BRIDGE_FN` (below) is an `invokedynamic` *bootstrap*
 //     bridge, not a native-method dispatch, and the interpreter reaches the
 //     same bridge for the same sites — so gating it in the JIT would move the
 //     call without changing the policy answer, while perturbing
@@ -9421,16 +9421,22 @@ pub fn set_integer_value_of_direct_fn(addr: usize) {
     INTEGER_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-lifetime bridge for `StringConcatFactory` sites lowered by the
-/// single-pass backend. It stays outside the stable helper-table ABI because
-/// the address is installed once at VM start, not per compiled artifact.
-pub static INDY_STRING_CONCAT_FN: std::sync::atomic::AtomicUsize =
+/// Process-lifetime bridge for `invokedynamic` sites lowered by the
+/// single-pass backend rather than trapped. It stays outside the stable
+/// helper-table ABI because the address is installed once at VM start, not per
+/// compiled artifact.
+///
+/// ONE cell for BOTH bridged kinds — `StringConcatFactory` and, since
+/// 2026-08-23, `LambdaMetafactory`. The site metadata carries a `kind` tag the
+/// VM-side entry reads (`invokedynamic::jit_indy_site_kind`), so the call
+/// sequence and this cell stay single.
+pub static INDY_BRIDGE_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Register the `StringConcatFactory` bridge (called once from the VM's
+/// Register the `invokedynamic` bridge (called once from the VM's
 /// `build_helpers`).
-pub fn set_indy_string_concat_fn(addr: usize) {
-    INDY_STRING_CONCAT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+pub fn set_indy_bridge_fn(addr: usize) {
+    INDY_BRIDGE_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `Integer.intValue()` sibling of [`INTEGER_VALUE_OF_DIRECT_FN`].
@@ -15917,7 +15923,7 @@ pub fn try_compile(
     ir_emit_long: bool,
     ir_emit_virtual_calls: bool,
     ir_emit_fp: bool,
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
 ) -> Option<CompiledMethod> {
     // Thin compatibility wrapper: the overwhelming majority of callers
     // (every `jit` crate test, plus any VM call site that hasn't been
@@ -16081,7 +16087,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // while keeping the compiler's simulated operand stack consistent for
     // whatever bytecode follows. `None` (resolver absent, or it returns `None`
     // for a given site) bails the whole compile — see `try_compile_inner`.
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
     // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
     // identity a guarded speculative inline's receiver class-id check
     // resolved against) to its class name, so a Monomorphic/Bimorphic
@@ -17297,7 +17303,7 @@ fn try_compile_inner(
     // `None` (resolver absent, or it returns `None` for a given id) refuses
     // every speculative virtual/interface inline at that site; static/
     // special DirectBind sites are unaffected (no receiver dependency).
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
     class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
     // PGO-02 R0: the body a receiver of exactly this class id dispatches to.
     // See `try_compile`.
@@ -21629,13 +21635,18 @@ fn try_compile_inner(
             jitc_bail!("cp_invokedynamic_descriptor_resolver")
         };
         for &(pc, cp_idx) in &scan.indy_ops {
-            let Some(descriptor) = resolver(cp_idx) else {
+            let Some((descriptor, bridge_site)) = resolver(cp_idx) else {
                 jitc_bail!("indy_descriptor_resolve")
             };
             let arg_slots = count_param_slots(&descriptor);
             let ret_type = return_type(&descriptor);
             let arg_type_tags = indy_arg_type_tags(&descriptor);
-            indy_info.push((pc, arg_slots, ret_type, arg_type_tags, 0));
+            // `bridge_site` is 0 for every bootstrap the VM cannot bridge,
+            // which is the pre-bridge behaviour: the codegen lowers the site to
+            // an uncommon trap. This used to be an unconditional 0 here, so the
+            // WHOLE-METHOD door trapped even on the `StringConcatFactory` sites
+            // the OSR door had been bridging since that fix landed.
+            indy_info.push((pc, arg_slots, ret_type, arg_type_tags, bridge_site));
         }
     }
 
