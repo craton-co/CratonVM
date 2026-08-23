@@ -23638,7 +23638,24 @@ fn drain_spliterator_to_array_capped(
 /// materialised element array yet), drain the spliterator into slot 0 and clear
 /// the lazy slot. Idempotent; a no-op for ordinary streams. Called at the top of
 /// `stream_elements` so EVERY non-forEach op transparently materialises.
+/// # `stream` is `&mut` — `WORKER-5-NOTE-12` N3 (the depth-2 pass)
+///
+/// Materialising a lazy stream allocates, and the one caller goes straight on
+/// to `ctx.class_id_of_object(stream)`. Same shape as `tm_sync_native_state`;
+/// see `WORKER-5-NOTE-10` §7 for why the receiver is `&mut` rather than a pin
+/// at the call site.
 fn materialize_lazy_stream(
+    ctx: &mut dyn NativeContext,
+    stream_out: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let pin = ctx.pin_native_root(*stream_out);
+    let r = materialize_lazy_stream_inner(ctx, *stream_out);
+    *stream_out = ctx.read_native_pin(pin, *stream_out);
+    ctx.unpin_native_roots(pin);
+    r
+}
+
+fn materialize_lazy_stream_inner(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
 ) -> Result<(), MethodCallFailed> {
@@ -23865,8 +23882,8 @@ fn stream_source_elems(
     this: ObjectRef,
 ) -> Result<Vec<Value>, MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
-    let this_cur = ctx.read_native_pin(this_pin, this);
-    let drained = materialize_lazy_stream(ctx, this_cur);
+    let mut this_cur = ctx.read_native_pin(this_pin, this);
+    let drained = materialize_lazy_stream(ctx, &mut this_cur);
     let this_cur = ctx.read_native_pin(this_pin, this);
     let elems = match ctx.get_field(this_cur, STREAM_FIELD_ELEMENTS) {
         Value::Object(Some(arr)) => {
@@ -25196,7 +25213,7 @@ fn native_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// invokes a lambda and never errors — `?` at call sites is then a no-op.)
 fn stream_elements(
     ctx: &mut dyn NativeContext,
-    stream: ObjectRef,
+    mut stream: ObjectRef,
 ) -> Result<Vec<Value>, MethodCallFailed> {
     // GC-SAFETY: `materialize_lazy_stream`/`stream_apply_chain_full` (and the
     // `toArray()` fallback below) allocate / drive an allocating spliterator
@@ -25249,7 +25266,7 @@ fn stream_elements(
             // false).collect(...)` directly) -- draining it raw here is
             // correct/unavoidable in that case (there is no downstream
             // processing to interleave with `tryAdvance` either way).
-            materialize_lazy_stream(ctx, stream)?;
+            materialize_lazy_stream(ctx, &mut stream)?;
             let stream = ctx.read_native_pin(stream_pin, stream);
             if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
                 let len = ctx.array_length(arr);
@@ -25321,10 +25338,10 @@ fn stream_elements_mut(
 /// result as if it were.
 fn prim_stream_values(
     ctx: &mut dyn NativeContext,
-    stream: ObjectRef,
+    mut stream: ObjectRef,
     toarray_desc: &str,
 ) -> Result<Vec<Value>, MethodCallFailed> {
-    materialize_lazy_stream(ctx, stream)?;
+    materialize_lazy_stream(ctx, &mut stream)?;
     let cn = ctx
         .class_name_of_id(ctx.class_id_of_object(stream))
         .unwrap_or_default();
@@ -55175,28 +55192,28 @@ fn native_chm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// order `chm_reorder_by_virtual_bucket` reconstructs (and which Spring's
 /// `SimpleAliasRegistry.getAliases` depends on) is preserved.
 fn native_chm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     // Refresh the real `table` mirror: this native already walks every entry,
     // so the rebuild is a constant factor and not a change of order. See
     // `chm_refresh_real_table`.
-    chm_refresh_real_table(ctx, this);
+    chm_refresh_real_table(ctx, &mut this);
     // A null mapped value is what makes this view read-only, per the JDK.
     let view = make_key_set_view(ctx, this, Value::Object(None))?;
     Ok(Some(Value::Object(Some(view))))
 }
 
 fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     // Refresh the real `table` mirror: this native already walks every entry,
     // so the rebuild is a constant factor and not a change of order. See
     // `chm_refresh_real_table`.
-    chm_refresh_real_table(ctx, this);
+    chm_refresh_real_table(ctx, &mut this);
     let vals = chm_collect_all_values(ctx, this);
     // Use the layout-aware ArrayList helpers: in real-JDK mode `elementData`
     // and `size` are NOT at slots 0/1 (`AbstractList.modCount` occupies an
@@ -55245,14 +55262,14 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     // Refresh the real `table` mirror: this native already walks every entry,
     // so the rebuild is a constant factor and not a change of order. See
     // `chm_refresh_real_table`.
-    chm_refresh_real_table(ctx, this);
+    chm_refresh_real_table(ctx, &mut this);
     let entries = chm_collect_all_entries(ctx, this);
     // cceres5: pin the snapshot + receiver before the first allocation below.
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
@@ -57071,8 +57088,23 @@ fn chm_real_class(ctx: &mut dyn NativeContext, name: &str) -> Option<ClassId> {
 /// The total-fallback contract is inherited unchanged: any surprise leaves
 /// `table` exactly as it was, so a failed refresh can never be worse than not
 /// refreshing.
-fn chm_refresh_real_table(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    let _ = chm_publish_real_table(ctx, this);
+/// # `this` is `&mut` — `WORKER-5-NOTE-12` N3 (the depth-2 pass)
+///
+/// `chm_publish_real_table` pins `this` for its whole body, but the pin is
+/// released before it returns and the CALLER's copy is never updated — and the
+/// body allocates (class resolution can LOAD a class, as its own comment says).
+/// All three call sites then dereference the receiver immediately
+/// (`make_key_set_view`, `chm_collect_all_values`, `chm_collect_all_entries`).
+///
+/// Found only at `--depth 2`: the allocation is two helper hops down, so the
+/// depth-1 sweep that produced NOTE-12's baseline could not see it. That is
+/// exactly the limit NOTE-12 §5 flagged, and it is why the baseline moved to
+/// depth 2.
+fn chm_refresh_real_table(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
+    let pin = ctx.pin_native_root(*this);
+    let _ = chm_publish_real_table(ctx, *this);
+    *this = ctx.read_native_pin(pin, *this);
+    ctx.unpin_native_roots(pin);
 }
 
 fn chm_publish_real_table(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {

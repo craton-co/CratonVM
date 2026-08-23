@@ -185,7 +185,14 @@ def run(root, depth):
     alloc = allocating(fns, depth)
     cands = candidates(fns, alloc)
     sites = reusing_sites(files, doc, cands, root)
-    return files, fns, alloc, cands, sites
+    # A call site names a FUNCTION and this tool has no module resolution, so
+    # candidates are keyed by NAME. 66 of the tree's 16,347 native fn names are
+    # defined in more than one place; for those the crate label is whichever
+    # definition was indexed last, and the allocation verdict is the UNION over
+    # them. Such rows print `AMBIG` rather than passing as precise -- it is why
+    # a crate's count can move between --depth settings with no code change.
+    defs = collections.Counter(fn.name for fn in fns)
+    return files, fns, alloc, cands, sites, defs
 
 
 def selftest():
@@ -226,7 +233,7 @@ fn caller_only_comments(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // this is mentioned only in prose
 }
 ''')
-        _f, _fns, alloc, cands, sites = run(t, 1)
+        _f, _fns, alloc, cands, sites, _defs = run(t, 1)
         fails = 0
 
         def ck(cond, what):
@@ -270,7 +277,7 @@ def main():
         sys.exit(3 if selftest() else 0)
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    files, fns, alloc, cands, sites = run(root, a.depth)
+    files, fns, alloc, cands, sites, defs = run(root, a.depth)
     total = sum(len(v) for v in sites.values())
     print("STALE-RECEIVER AUDIT (allocation reachability depth <= %d)" % a.depth)
     print("  files %d   fns %d   allocating %d   matching the shape %d"
@@ -282,7 +289,9 @@ def main():
     rows = sorted(sites.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     for name, ss in rows:
         fn, d = cands[name]
-        print("    %-44s %-24s depth=%d sites=%d" % (name, fn.crate, d, len(ss)))
+        amb = "  AMBIG(%d defs)" % defs[name] if defs[name] > 1 else ""
+        print("    %-44s %-24s depth=%d sites=%d%s"
+              % (name, fn.crate, d, len(ss), amb))
         if a.detail:
             for s in ss:
                 print("        %s:%d recv=%s -> first use @%d: %s"

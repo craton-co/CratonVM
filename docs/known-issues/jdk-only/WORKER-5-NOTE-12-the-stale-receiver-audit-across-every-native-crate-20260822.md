@@ -1,7 +1,14 @@
 # WORKER-5 NOTE 12 — the stale-receiver audit across all seven native crates, and the one the tree had already half-fixed
 
-**Status: MEASURED. One fix, one gate, sixteen findings handed over.** Lane
-WORKER-5, 2026-08-22. Answers `WORKER-5-NOTE-11` N2.
+**Status: MEASURED. Three fixes, one gate wired into CI, eighteen findings
+handed over.** Lane WORKER-5, 2026-08-22. Answers `WORKER-5-NOTE-11` N2.
+
+> **§7 is a CORRECTION to this record's own headline.** §3 said
+> "`native-collections` now has ZERO functions of the shape". That was true **at
+> `--depth 1`, which is the only depth this record had measured** — and §5 had
+> flagged depth as a limit in the same breath. At `--depth 2` the crate had two
+> more. Both are now fixed, the baseline has MOVED to depth 2, and the gate is a
+> CI job.
 
 `WORKER-5-NOTE-10` fixed `tm_sync_native_state` and `WORKER-5-NOTE-11` audited
 `native-collections` by hand. N2 asked for the other six crates. This is that
@@ -26,7 +33,7 @@ again.
 **A match is not a defect.** The defect needs a call site that REUSES the
 receiver afterwards, and that is what the gate counts.
 
-## 2. The sweep
+## 2. The sweep — AT DEPTH 1; §7 re-runs it at depth 2 and supersedes these numbers
 
 ```text
 files 253   fns 16,768   allocating 5,147   matching the shape 131
@@ -38,7 +45,7 @@ WITH call sites that reuse the receiver:  17 fn(s), 44 site(s)
 | `native-builtins` | 14 |
 | `native-io` | 2 |
 | `native-awt` | 1 |
-| **`native-collections`** | **0** — clean after §3 |
+| **`native-collections`** | **0** at this depth — but see §7, depth 2 found 2 more |
 | `native-api`, `-crypto`, `-security` | 0 |
 
 The largest are `capture_inheritable_tl_at_construction` (10 sites),
@@ -80,14 +87,16 @@ protected site is retired because the funnel does it. Neither caller can forget
 again.
 
 `native-collections` now has **zero** functions of the shape with reusing call
-sites.
+sites **at depth 1**. §7 is the correction: at depth 2 it had two more, now also
+fixed.
 
 ## 4. The gate
 
 `scripts/stale-receiver-audit.py` — report, `--detail`, `--update`,
 `--selftest`, `--depth`. Baseline at
-`scripts/baselines/stale-receiver-sites.txt` (17 fns / 44 sites). It watches the
-POPULATION; it does not rank it, because ranking needs reproductions and the two
+`scripts/baselines/stale-receiver-sites.txt` — **the committed baseline is the
+DEPTH-2 one, 18 fns / 45 sites** (§7), not the depth-1 figures above. It watches
+the POPULATION; it does not rank it, because ranking needs reproductions and the
 fixed instances disagree (the TreeMap one failed 100%, `resync_view_set` could
 not be made to fail at all).
 
@@ -116,12 +125,13 @@ own first NUL-equivalence proof. Stripping comments cut 21 candidates to 18 and
 
 ## 5. What this does NOT establish
 
-* **No reproduction for any of the 17 remaining.** They match the shape; none
+* **No reproduction for any of the 18 remaining.** They match the shape; none
   is shown to produce a wrong answer. `resync_view_set` (NOTE-11) is the
   standing example of a matching shape that could not be made to fail.
-* **Allocation reachability is depth 1 by default.** A funnel that allocates
-  three helpers deep is invisible at that setting; `--depth 2` widens it and was
-  not used for the baseline, so the baseline is a FLOOR.
+* **Allocation reachability is bounded by `--depth` (2 in the baseline).** A
+  funnel three helpers deep is still invisible, and this is MEASURED rather than
+  theoretical: depth 2 found two real defects depth 1 missed (§7). The baseline
+  is a FLOOR.
 * **`ALLOC0` is a name list.** An allocator spelled a way it does not name is
   missed. It counts `ctx.invoke*` as allocating, which is right (interpreted
   Java allocates) but coarse.
@@ -130,9 +140,57 @@ own first NUL-equivalence proof. Stripping comments cut 21 candidates to 18 and
 * **Only the FIRST post-call use is reported.** A site whose first use is
   harmless but whose second is a deref reads as a hit either way — the count is
   of SITES, not of proven derefs.
-* **`native-collections` being at zero is about this shape only.** It says
-  nothing about receivers passed to functions that take `&mut` already, or about
-  the other GC hazards this directory records.
+* **`native-collections` being at zero is about this shape, AT DEPTH 2, only.**
+  It said "zero" at depth 1 too, and depth 2 found two more (§7). It says nothing
+  about receivers passed to functions that already take `&mut`, or about the
+  other GC hazards this directory records.
+* **Candidates are keyed by function NAME** (§7.1); 66 names are multiply
+  defined and those rows are marked `AMBIG`.
+
+## 7. CORRECTION — "zero" was depth-1, and depth 2 found two more
+
+§5 listed the depth bound as a limitation and then §3 asserted a bare "zero"
+anyway. Running the sweep the way §5 said it should be run:
+
+| | depth 1 | depth 2 |
+|---|---|---|
+| allocating | 5,147 | 6,104 |
+| matching the shape | 131 | 146 |
+| **with reusing call sites** | **17 fn / 44 sites** | **20 fn / 49 sites** |
+
+The three extra are `chm_refresh_real_table` (3 sites),
+`materialize_lazy_stream` (1) — **both `native-collections`** — and
+`populate_format_data_en` (1, `native-builtins`).
+
+`chm_refresh_real_table` is the interesting one and is the same species as
+`tm_migrate_fast_to_array`: `chm_publish_real_table` pins `this` for its whole
+body, **releases the pin before returning, and never tells the caller**, while
+the body allocates (its own comment: *"Class resolution can LOAD a class, which
+allocates"*). All three call sites then dereference immediately —
+`make_key_set_view`, `chm_collect_all_values`, `chm_collect_all_entries`.
+
+Both `native-collections` entries are fixed with the same `&mut` pattern.
+**At depth 2 the crate is now genuinely at zero** — 18 fn / 45 sites remain, all
+in `native-builtins` (16), `native-io` (1) and `native-awt` (1) — and the
+committed baseline is the depth-2 one.
+
+### 7.1 A third limitation, found and now surfaced
+
+Chasing why `native-io` moved from 2 rows to 1 between depths — impossible for a
+superset — exposed that **candidates are keyed by function NAME**, because this
+scan has no module resolution. **66 of the tree's 16,347 native fn names are
+defined in more than one crate**, so those rows merge and the crate label is
+whichever definition was indexed last.
+
+Rather than bury that, the gate now prints `AMBIG(n defs)` on such a row. Of the
+18 in the baseline exactly one is ambiguous (`populate_format_data_en`).
+
+## 8. The gate is a CI job
+
+`.github/workflows/stale-receiver-audit.yml`, modelled on the untyped-alloc
+ratchet: green is the normal state, red means the population grew, no build and
+no JDK. It runs `--selftest` FIRST — check the judge before it judges the tree —
+and then the depth-2 audit.
 
 ## 6. NOMINATIONS
 
@@ -142,11 +200,13 @@ own first NUL-equivalence proof. Stripping comments cut 21 candidates to 18 and
   prints every site with the line that decides it.
 * **N2 — 2 in `native-io`** (`ws_require_open`) **and 1 in `native-awt`**
   (`sync_raster_pixels`).
-* **N3 — run the gate at `--depth 2` once** and decide whether the wider
-  baseline is the one worth freezing. It was left at 1 because depth 2 was not
-  measured, not because 1 is known to be right.
-* **N4 — wire the gate into CI** beside the untyped-alloc ratchet. It needs no
-  build and no JDK, and it runs in about a minute over 253 files.
+* ~~**N3 — run the gate at `--depth 2`.**~~ **DONE — §7.** It found three more,
+  two of them in the crate this record had just called clean. The baseline is
+  now depth 2.
+* ~~**N4 — wire the gate into CI.**~~ **DONE — §8.**
+* **N5 — depth 3 is still unmeasured.** Depth 2 found two real defects that
+  depth 1 could not see, so "the baseline is a floor" is now a measured claim
+  rather than a caveat. Someone should find where it converges.
 
 ---
 

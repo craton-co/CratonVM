@@ -1,0 +1,82 @@
+name: Stale-receiver audit
+
+# Watches for natives that keep using a receiver a moving collector may have
+# relocated inside the call they just made.
+#
+# WHY IT EXISTS
+# -------------
+# `WORKER-5-NOTE-10` traced `RTreeRangeGc`'s compatible-mode failure to one
+# sentence of Rust:
+#
+#     tm_sync_native_state(ctx, this)?;                  // ALLOCATES
+#     let size = tm_get_slot(ctx, this, TM_FIELD_SIZE);  // reads the OLD address
+#
+# The side table is keyed on `widened_obj_key(this)`, which begins with
+# `identity_hash_code(this)`. Off a from-space address that reads a stale
+# header, lands in a different bucket, and mints a FRESH slot — so the lookup
+# finds nothing and answers the DEFAULT. `TreeMap.size()` returned **0** on a
+# view nothing had mutated, and `entrySet()` in the same window threw a
+# `ClassCastException`.
+#
+# **Nothing crashes.** That is the whole argument for a gate: the shape produces
+# a plausible WRONG ANSWER, and it needs a moving collection at one exact
+# instant, so it survives every green suite until an application trips it. Three
+# instances have been found and fixed (`tm_sync_native_state`,
+# `resync_view_set`, `tm_migrate_fast_to_array` + two more at depth 2) and only
+# ONE of them ever had a reproduction.
+#
+# Same shape as `.github/workflows/untyped-alloc-ratchet.yml`: its GREEN state
+# is the normal one, it goes red only when the population GROWS, and it is a
+# source scan — no build, no VM, no JDK, about a minute over 253 files.
+#
+# Re-baselining is one command and is a normal part of a commit that adds a
+# site on purpose:
+#
+#     python3 scripts/stale-receiver-audit.py --depth 2 --update
+#
+# ---------------------------------------------------------------------------
+# WHAT A GREEN RUN HERE DOES NOT MEAN
+# ---------------------------------------------------------------------------
+#
+# A MATCH IS NOT A DEFECT, and the baseline is a FLOOR, not a census:
+#
+#   * allocation reachability is bounded by `--depth` (2 here). A funnel that
+#     allocates three helpers down is invisible at that setting — and that is
+#     not hypothetical: two of the fixed instances were found ONLY when the
+#     depth went from 1 to 2.
+#   * `ALLOC0` is a name list. An allocator spelled a way it does not name is
+#     missed. It counts `ctx.invoke*`, which is right (interpreted Java
+#     allocates) but coarse.
+#   * candidates are keyed by function NAME — this scan has no module
+#     resolution — so the 66 names defined in more than one crate are merged.
+#     Those rows print `AMBIG(n defs)`; do not read their crate label as exact.
+#   * the reuse window ends at the next column-0 `fn`, and only the FIRST
+#     post-call use is reported.
+#
+# `scripts/stale-receiver-audit.py --selftest` runs the detector against a
+# synthetic tree and needs nothing checked out; it covers depth-0 detection, a
+# comment-only mention (which produced three false positives on the first real
+# run), a funnel that RETURNS its receiver, and the three caller shapes that are
+# NOT stale uses — a rebind, a pin re-read, and prose.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  stale-receiver-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scan reads only the checked-out revision; no history needed.
+          fetch-depth: 1
+
+      - name: Selftest the detector
+        # Before the tree is judged, check the judge. This needs no source and
+        # fails loudly if a refactor breaks the matching rules.
+        run: python3 scripts/stale-receiver-audit.py --selftest
+
+      - name: Audit the stale-receiver surface
+        run: python3 scripts/stale-receiver-audit.py --depth 2
