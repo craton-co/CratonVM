@@ -1,4 +1,29 @@
-# The ntru unpinned-JIT-reference failure now reproduces on GENERATIONAL
+# The ntru unpinned-JIT-reference failure on GENERATIONAL
+
+> ## STATUS 2026-08-23: does not reproduce on `dev` — cause of the fix UNKNOWN
+>
+> ```text
+> dev c057a3a78   SIG=0/35
+> old cae49a85c   SIG=19/25   <- positive control, 76%, same harness, interleaved
+> ```
+>
+> Thirty-five runs on the current tip with zero reproductions, while the old
+> commit fires at 76% in the same alternating loop. The control is what makes
+> this readable: without it, "0/35" and "the harness stopped working" are the
+> same output. The residual rate on `dev` is bounded below roughly **8%**
+> (95%), not proven zero.
+>
+> **This branch's fixes are NOT the cause.** At `cae49a85c` + this branch's
+> delta the generational case still failed 3/3, measured twice. Whatever closed
+> it landed on `dev` after `cae49a85c` and has not been identified.
+>
+> **The record stays in `known-issues/` deliberately.** An unexplained
+> disappearance is not a fix. Nobody knows which change removed it, so nothing
+> stops it returning — and this defect has already been observed at 5%, 70% and
+> 76% at different commits, so a low rate is exactly what it looks like on its
+> way in or out. Re-check with the positive control before concluding anything
+> from a quiet run.
+
 
 ## What is failing
 
