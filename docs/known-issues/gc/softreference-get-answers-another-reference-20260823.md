@@ -98,10 +98,12 @@ The same binary, the same subset, the same host:
 |---|---|---|
 | default (ZGC) | `Failures: 0, Errors: 6` | 6 |
 | **`--XX:UseGc G1`** | **`OK (61 tests)`** | **0** |
+| **`--XX:UseGc Generational`** | **`OK (61 tests)`** | **0** |
 
-G1 runs the whole subset clean. That places the defect in the DEFAULT
-collector's reference processing, and it is why `--XX:UseGc G1` is a usable
-workaround for anyone who needs these classes green today.
+Both of the other collectors run the whole subset clean. That places the defect
+squarely in the DEFAULT collector's reference processing, and it is why either
+`--XX:UseGc` spelling is a usable workaround for anyone who needs these classes
+green today.
 
 ## Where to look
 
