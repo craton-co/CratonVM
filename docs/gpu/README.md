@@ -304,11 +304,34 @@ Beyond the original narrow shape, the analyzer now admits:
   — is deliberately excluded: PTX's approximate transcendentals don't
   meet Java's relative-error contract.
 
+- **An outer counted loop whose body contains SEQUENTIAL inner loops.**
+  The outer loop is the parallel dimension — one thread per iteration —
+  and every other back-edge is lowered as a real PTX loop that the
+  thread runs itself. This is what makes a per-row reduction
+  expressible: `out[i] = sum_j w[i*n + j] * x[j]` has a loop-carried
+  accumulator, so its `j` iterations cannot be spread across threads
+  the way the 2-D rectangular mapping spreads `(i, j)` pairs.
+  Recognized by `loop_recog::classify_outer_parallel_loop`, lowered by
+  `Emitter::walk_cfg`; `EligibleRowReduction.java` and
+  `EligibleSplitMatmul.java` are the fixtures.
+- **`Float.float16ToFloat`** → `cvt.f32.f16`, admitted under
+  `AdmissionHint::AllowIntrinsicCalls` like the `Math` table. Exact:
+  widening f16 to f32 has no rounding mode to choose, denormals, NaNs
+  and infinities included.
+- **`Math.exp`** → `ex2.approx.f32` of `x * log2(e)`, and only when
+  `CRATONVM_GPU_APPROX_MATH=1` is set. It is the one entry in the
+  table that is not bit-exact with the JDK (about 2 ULP against
+  `Math.exp`'s 1 ULP in double precision), so it is gated on its own
+  rather than riding on the intrinsic hint — a kernel cannot acquire an
+  approximate answer by accident. Every other transcendental stays
+  rejected.
+
 Still rejected: non-static methods (except `this.field`-only array
 refs), synchronized, native/abstract, non-primitive params, general
 allocation, arbitrary method calls, non-intrinsic field access, type
-checks, `switch`, `throw`, `jsr`/`ret`, reference arrays, general
-branches inside the loop body, nested/2-D loops, `dup2_x1`/`dup2_x2`.
+checks, `switch`, `throw`, `jsr`/`ret`, reference arrays, `break` or
+`return` out of a loop body, irreducible control flow,
+`dup2_x1`/`dup2_x2`.
 
 ### 3. `vm::runtime::gpu_marshal` (`#[cfg(feature = "gpu-offload")]`)
 

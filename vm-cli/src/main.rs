@@ -180,6 +180,20 @@ fn maybe_dump_shutdown_reports() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // Reference loads whose slot did NOT hold a reference, contained by
+        // `GETFIELD_EXPECT_REFERENCE` instead of being handed to compiled code
+        // as a pointer. Printed even when zero, and on the same switch: this
+        // number is the difference between "the crash stopped happening" and
+        // "the crash stopped being reachable this hour" -- the workload it was
+        // found on crashed 3 times in 38 runs one hour and 0 in 129 the next.
+        //
+        // Non-zero is NOT good news. It counts type-punned reference slots this
+        // VM is still producing (the G30-1 species); the guard only stops them
+        // becoming wild pointers in compiled code.
+        eprintln!(
+            "[cratonvm] getfield reference loads that contained a primitive slot: {}",
+            cratonvm_vm::jit::helpers::jit_getfield_primitive_in_ref_slot()
+        );
         // The `validate_code_ptr` memo's engagement, on the same switch and for
         // the same reason as every counter above it. The memo replaced a global
         // `Mutex` taken on EVERY compiled call; a run where `hits` is 0 has the
@@ -6522,6 +6536,11 @@ fn main() {
             // A normal Java-main return never reaches the System.exit hook.
             // Flush controlled-exit diagnostics before rendering the outcome.
             maybe_dump_shutdown_reports();
+            // The corrupt-cell census, on every exit arm. See
+            // `reclaim_guard::corrupt_cell_exit_summary`: a run that tripped the
+            // collector's guard and named nothing must SAY so, because silence
+            // from a diagnostic reads as "clean" and is not.
+            cratonvm_vm::memory::corrupt_cell_exit_summary();
             match result {
                 Ok(()) => {
                     cratonvm_vm::jit::conservative_roots::report_a5_engagement();

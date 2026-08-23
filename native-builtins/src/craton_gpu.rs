@@ -255,6 +255,19 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "(J)Ljava/lang/String;",
         builtin_future_get_error_message,
     );
+    // `GpuFuture.get()` reads a failed submission's reason through
+    // `futureGetError`, not `futureGetErrorMessage`. Registering only
+    // the latter meant the DIAGNOSTIC path for every GPU failure was
+    // itself a failure: a kernel that could not be compiled, marshalled
+    // or launched surfaced as `UnsatisfiedLinkError:
+    // Native.futureGetError` from inside `get()`, hiding the message
+    // the Rust side had already produced. Same body, both names.
+    registry.register(
+        KLASS,
+        "futureGetError",
+        "(J)Ljava/lang/String;",
+        builtin_future_get_error_message,
+    );
 
     registry.register(KLASS, "arrayWrapInt", "([I)J", builtin_array_wrap_int);
     registry.register(KLASS, "arrayWrapLong", "([J)J", builtin_array_wrap_long);
@@ -416,6 +429,25 @@ pub fn array_snapshot(handle: u64) -> Option<(cratonvm_types::ArrayElementType, 
     })
 }
 
+/// Element type and length for an `arrayWrap*`/`arrayAllocate*`
+/// handle, without copying the payload. Returns `None` if the handle
+/// is unknown or has been released.
+///
+/// This is what the dispatch path wants on every submit: it needs the
+/// shape to build the `(ptr, len)` kernel-argument pair, and it needs
+/// the bytes only when the device cache misses. Reading the two apart
+/// is the difference between a resident weight tensor costing one
+/// upload for the life of the process and costing a full `memcpy` of
+/// itself per kernel launch.
+#[cfg(feature = "gpu-offload")]
+pub fn array_shape(handle: u64) -> Option<(cratonvm_types::ArrayElementType, usize)> {
+    state::with(|s| {
+        s.arrays
+            .get(&handle)
+            .map(|e| (e.element_type, e.element_count))
+    })
+}
+
 /// (Phase 6 #3) Replace the host bytes for the array handle. The
 /// `element_count` and `element_type` stay as set by `arrayWrap`;
 /// only the byte payload is overwritten. Called after a kernel
@@ -574,12 +606,28 @@ fn snapshot_java_array(
     let mut bytes = Vec::new();
     match element_type {
         ArrayElementType::Int => {
-            bytes.reserve_exact(length * 4);
-            for i in 0..length {
-                if let Value::Int(v) = ctx.get_array_element(array, i) {
-                    bytes.extend_from_slice(&v.to_ne_bytes());
-                } else {
-                    bytes.extend_from_slice(&0i32.to_ne_bytes());
+            // Bulk, because this is the shape a large resident buffer
+            // arrives in. `read_int_array_into` is one
+            // `copy_nonoverlapping` over the heap arena in the VM's
+            // override; the element-at-a-time loop below it was ~30 ns
+            // per element, which for the 620 million words of a
+            // 1B-parameter half-precision model is most of a minute
+            // spent copying inside `GpuArray.wrap`.
+            let mut words = vec![0i32; length];
+            if ctx.read_int_array_into(array, 0, &mut words) == length {
+                // Reading an `i32` slice AS bytes needs no alignment
+                // beyond the slice's own.
+                bytes.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(words.as_ptr() as *const u8, length * 4)
+                });
+            } else {
+                bytes.reserve_exact(length * 4);
+                for i in 0..length {
+                    if let Value::Int(v) = ctx.get_array_element(array, i) {
+                        bytes.extend_from_slice(&v.to_ne_bytes());
+                    } else {
+                        bytes.extend_from_slice(&0i32.to_ne_bytes());
+                    }
                 }
             }
         }
@@ -1043,6 +1091,11 @@ fn builtin_submit_method(
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let exec = arg_long(args, 0) as u64;
+    let timed = dispatch_timing::enabled();
+    let mut mark = std::time::Instant::now();
+    if timed {
+        dispatch_timing::note_call();
+    }
 
     // Read the three string params. If any is null/unreadable, fail
     // synthetically and let the Java side surface it.
@@ -1068,6 +1121,11 @@ fn builtin_submit_method(
         }
     };
 
+    if timed {
+        dispatch_timing::add(0, mark.elapsed().as_nanos() as u64);
+        mark = std::time::Instant::now();
+    }
+
     // Convert the Object[] argument array into a Vec<Value>. Each
     // slot is read via NativeContext::get_array_element so the JVM
     // layer can unbox / reference-pass as it normally would for a
@@ -1083,6 +1141,11 @@ fn builtin_submit_method(
     let mut java_args: Vec<Value> = Vec::with_capacity(n);
     for i in 0..n {
         java_args.push(ctx.get_array_element(java_args_obj, i));
+    }
+
+    if timed {
+        dispatch_timing::add(1, mark.elapsed().as_nanos() as u64);
+        mark = std::time::Instant::now();
     }
 
     // Dispatch via the NativeContext escape hatch. The VM's impl
@@ -1106,7 +1169,16 @@ fn builtin_submit_method(
         }
     };
 
-    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", submission_handle)
+    if timed {
+        dispatch_timing::add(6, mark.elapsed().as_nanos() as u64);
+        mark = std::time::Instant::now();
+    }
+    let wrapper =
+        instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", submission_handle);
+    if timed {
+        dispatch_timing::add(7, mark.elapsed().as_nanos() as u64);
+    }
+    wrapper
 }
 
 /// gpu-offload-off shim — submitMethod is unreachable in default
@@ -1298,7 +1370,21 @@ fn builtin_future_synchronize(
     // Phase 6 #4 — if the handle is a real submission, block on
     // its event. Otherwise no-op (synthetic Failed futures are
     // immediately observable, no waiting needed).
-    let _ = ctx.gpu_future_synchronize(handle);
+    //
+    // The failure message is REMEMBERED here rather than discarded.
+    // `futureGetErrorMessage` reads the synthetic future store, which a
+    // real dispatch never writes to, so a real submission that failed
+    // reported its reason as `null` and `GpuFuture.get()` threw the
+    // placeholder "kernel failed" — with the actual reason (a bounds
+    // deopt, an unresolvable kernel, a launch error) already computed
+    // and then dropped one frame earlier. Memoising it into the same
+    // store the getter reads keeps both paths on one lookup.
+    if let Some(Err(message)) = ctx.gpu_future_synchronize(handle) {
+        state::with(|s| {
+            s.futures
+                .insert(handle, state::FutureState::Failed { message });
+        });
+    }
     Ok(None)
 }
 
@@ -2390,4 +2476,85 @@ mod tests {
         let host = builtin_array_to_host(&mut ctx, &[Value::Long(handle)]).unwrap();
         assert_eq!(host, Some(Value::Object(None)));
     }
+}
+
+/// Where the time in one `submitMethod` actually goes.
+///
+/// An inference step is hundreds of dispatches, so the per-dispatch
+/// floor is multiplied by hundreds before any kernel runs — and two
+/// rounds of plausible guessing (a pooled failure-flag buffer, a
+/// memoised occupancy query) moved 117 us to 100 us, which is what
+/// guessing usually buys. This exists so the next change is aimed.
+///
+/// Off unless `CRATONVM_GPU_TIME_DISPATCH=1`; the counters are plain
+/// relaxed atomics and the report prints at VM shutdown beside the
+/// other censuses.
+#[cfg(feature = "gpu-offload")]
+pub mod dispatch_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub const PHASES: [&str; 8] = [
+        "read_strings",
+        "read_args",
+        "resolve_method",
+        "lookup_kernel",
+        "marshal_args",
+        "failure_flag",
+        // NESTED: this one spans the whole VM-side dispatch, so it
+        // CONTAINS resolve_method, lookup_kernel, marshal_args and
+        // failure_flag. Read it as the total and those four as its
+        // parts; what it holds beyond their sum is the launch itself.
+        "vm_dispatch_all",
+        "future_object",
+    ];
+
+    static NANOS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("CRATONVM_GPU_TIME_DISPATCH")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn add(phase: usize, nanos: u64) {
+        if phase < NANOS.len() {
+            NANOS[phase].fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    pub fn note_call() {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn report() {
+        let calls = CALLS.load(Ordering::Relaxed);
+        if calls == 0 {
+            return;
+        }
+        let total: u64 = NANOS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
+        eprintln!(
+            "[cratonvm] gpu dispatch: calls={calls} accounted={:.1} us/call",
+            total as f64 / calls as f64 / 1000.0
+        );
+        for (i, name) in PHASES.iter().enumerate() {
+            let n = NANOS[i].load(Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            eprintln!(
+                "[cratonvm] gpu dispatch:   {name:<15} {:>8.2} us/call",
+                n as f64 / calls as f64 / 1000.0
+            );
+        }
+    }
+}
+
+/// Stub so the reporting call site needs no `cfg`.
+#[cfg(not(feature = "gpu-offload"))]
+pub mod dispatch_timing {
+    pub fn report() {}
 }

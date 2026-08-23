@@ -1,6 +1,7 @@
 # WORKER-1-NOTE-2 — `RTreeRangeGc`: dev's loose end closed, the range views confirmed, and a 3-walk repro whose arms do NOT match the vector's
 
-**Status: OPEN — MEASURED.** 2026-08-22, pristine `origin/dev` at `a7c22ddc1`,
+**Status: RESOLVED 2026-08-22 — see the section below the measurements.**
+Originally filed OPEN. 2026-08-22, pristine `origin/dev` at `a7c22ddc1`,
 built on Azure host 2 (Linux, JDK 25). Companion to
 `docs/known-issues/gc/bug-zgc-relocation-unmasks-root-collection-gap-rtreerangegc-20260821.md`,
 which localises the gap to "the range-VIEW machinery" and stops there.
@@ -163,7 +164,8 @@ Same symptom, which is consistent with one defect and proves little on its own.
 
 ### Verdict
 
-**SETTLED — they are TWO defects** (§4c). The default collector's is
+**SETTLED, then SUPERSEDED — see the banner at §4c.** The two symptoms are one
+defect: the publish window. What follows is what was true before that landed. The default collector's is
 `headMap(k,false)` handing back a stale address that decodes as another object;
 generational's is `subMap(k,k)` handing back an EMPTY view on its first walk.
 Different operation, different symptom, different collector, both needing
@@ -175,6 +177,37 @@ parent record's "strict mode is CLEAN" and the localisation built on it.
 **Operationally**: fixing one will not green the vector. Whoever takes the
 empty-view defect has the cheaper target — `1,2,5` on generational, three
 phases, deterministic, no relocation reasoning required.
+
+> **CLOSED 2026-08-22 — `RTreeRangeGc` is green on every arm, and the defect
+> this note localises is FIXED.** `fix/gc-known-issues-20260822` landed four
+> collection-native fixes; the one this note's §4c is about is the publish
+> window in `tm_resync_view_inner`, which allocated the result array, released
+> EVERY pin, and only then wrote the array and the size into the view — so a
+> relocating collection in that window sent both writes to the from-space copy
+> and the live view kept the `SIZE = 0` its constructor had set. That is why the
+> selection loop was never at fault and the spec was never lost, which is what
+> §4c had eliminated but could not explain.
+>
+> **VERIFIED HERE, and this is the part the fixing lane did not publish**: its
+> own record quotes 25/25 on the default collector and 25/25 under
+> `--jdk-only`. The GENERATIONAL arm is the one the parent page called
+> permanently red — *"The generational column never changed"* — and nobody had
+> run it after the fix. On `7be634aab`, `--Xmx 64m`, three runs each:
+>
+> ```text
+> default (ZGC)   pass pass pass      --jdk-only   pass pass pass
+> generational    pass pass pass      --nojit      pass pass pass
+> G1              pass pass pass
+> ```
+>
+> The two-bound `subMap` repro (`WhichBound`) reports **zeros=0 of 40**, three
+> runs, where it reported 1 of 40 before; `TreeVectorShape 1,2,5` is OK 4/4
+> where it failed 2/2; and all sixteen phases pass on both collectors.
+>
+> **So §4c's "fixing either will not green the vector" is WRONG** — it assumed
+> two independent defects where the publish window explains both symptoms. What
+> survives is §4b: `--jdk-only` was never clean, only less sensitive, and the
+> parent page's localisation to the collection substitution had no evidence.
 
 ## 4c. THE GENERATIONAL TRIGGER, FOUND — and it is a SECOND defect
 
@@ -247,6 +280,125 @@ cratonvm --java-home "$JDK" --Xmx 64m -cp probes TreeRepeat sub 8
 `FAILAT walk=3`, 2/2. Three walks instead of a 14,014-check vector, and the
 failing walk ordinal is stable, so a fix is judged on whether the ordinal moves
 rather than on a pass/fail that a 25% flake can supply for free.
+
+## RESOLVED 2026-08-22 -- SAME defect family, and N1 is answered by an A/B
+
+### First, §4c: BOTH symptoms existed, both are fixed, and the collector split does not hold on a second host
+
+§4c is right that the vector carries more than one defect and right that an
+EMPTY view is a different symptom from a stale address -- that empty view is
+the `tm_sync_native_state` defect below, and its signature is exactly the
+`"N entries, expected M"` §4c names. It is fixed.
+
+What does NOT reproduce here is the split BY COLLECTOR. `TreeVectorShape`, this
+lane's Azure host, one `dev` binary and one fixed binary:
+
+```text
+                                    dev            fixed
+generational, phases 1,2,5          4 pass / 0     4 pass / 0
+generational, all 11 phases         0 / 3 FAIL     3 pass / 0
+                                    phase=8, ClassCastException V -> Map$Entry
+default,      all 11 phases         0 / 3 FAIL     3 pass / 0
+                                    phase=6, ClassCastException V -> Map$Entry
+```
+
+On this host generational fails with the SAME `V -> Map$Entry` cast as the
+default collector, two phases later, and the `1,2,5` cell that fails 2/2 there
+passes 4/4 here on a `dev` binary. So "different collector, different symptom"
+is a property of a BINARY AND A HOST -- the framing this record and
+`WORKER-1-NOTE-1` both already converged on -- rather than of the vector. §4c's
+operational conclusion holds regardless and was correct: fixing one would not
+have greened it. It took four.
+
+
+
+`TreeRepeat` is red 6/6 on a `dev` binary and green 6/6 on
+`fix/gc-known-issues-20260822`, on BOTH the arms this note flagged as
+disagreeing. One binary per column, `--Xmx 64m`, `sub 8`:
+
+```text
+              dev (cratonvm-safehandle-20260822)   fixed (cratonvm-strdoor-20260822)
+default       0 pass / 6 fail  FAILAT walk=3       6 pass / 0 fail
+--jdk-only    0 pass / 6 fail  FAILAT walk=3       6 pass / 0 fail
+```
+
+and this note's own per-view table reproduces exactly on the dev binary and is
+uniformly clean on the fixed one, at 40 walks rather than 8:
+
+```text
+view     dev, 40 walks              fixed, 40 walks
+head     FAILAT walk=18   x2        clean x2
+tail     FAILAT walk=18   x2        clean x2
+headF    FAILAT walk=18   x2        clean x2
+sub      FAILAT walk=7    x2        clean x2
+entry    clean            x2        clean x2      <- the whole-map control
+```
+
+**N1 -- same or different: SAME family, three defects.** This note's
+"disagreement" was real and its caution was right; what it could not know is
+that `RTreeRangeGc` is three defects and `TreeRepeat` reaches a different
+subset of them than the vector does. That is exactly why the arms disagreed:
+
+* the vector's compatible-only half is an `entrySet()` view whose KIND was
+  guessed from its head element and defaulted to "values", plus a
+  `tm_sync_native_state` that relocates its own receiver while 34 callers went
+  on using the address they passed in;
+* the vector's strict-only half is six `TreeSet` range natives that read their
+  backing array and bounds before two allocations and pinned nothing;
+* `TreeRepeat` walks `TreeMap` range views only and reaches the second of
+  those in BOTH modes, which is why it fails in both.
+
+So the parent record's *"strict mode is CLEAN, therefore it is the collection
+substitution"* was indeed too narrow, in precisely the way this note suspected:
+strict mode was clean **for the vector**, not for the machinery.
+
+**N2 -- why the two-bound entry points are ~6x more sensitive, not 2x:
+ANSWERED for `subSet`, and it was a
+fourth defect.** For the TreeSet half it is not the allocation rate at all.
+Both two-bound `TreeSet` natives read
+the element ONCE at the top of the scan loop, compared it against the low bound
+-- a full interpreted `compareTo`, which allocates -- and then compared THE SAME
+Rust local against the high bound. The re-read three statements further down,
+before `native_ts_add`, has said exactly this since 2026-07-31; the second
+comparison never got it. The four single-bound natives compare once per element
+and have nothing to go stale between. `TreeMap`s own two-bound rebuild refreshes
+the element before EACH comparison and never had this, so the `subMap` half of
+the 6x is still only the extra dispatch -- unmeasured, and now moot.
+
+It survived the first three fixes as a ~3% residual under `--jdk-only` and was
+found by instrumenting the vector rather than a probe: at the moment
+`native_ts_sub_set` threw, the source set audited **400 / 400 intact** and an
+immediate retry of the same `subSet` answered **200**. Nothing was wrong with
+the set. MEASURED, interleaved on one host, 120 runs each, `--Xmx 64m
+--jdk-only`: **117 pass / 3 fail before, 120 pass / 0 fail after.**
+
+**Section 4b's two findings, both confirmed here:**
+
+* **"`--jdk-only` is not clean; it is less sensitive"** -- right, and the
+  mechanism is now named: strict mode reaches the `TreeSet` half of the defects
+  and not the `TreeMap` half, so its rate is lower at any given heap size and
+  rises as the heap tightens. The fixed binary is 12/12 at each of
+  `--Xmx 64m`, `48m` and `32m`, in BOTH modes -- 72 runs, 0 failures.
+* **"Every construction I could build passes on generational and the vector
+  does not"** -- also right, and not a limit of those probes. The vector's
+  generational failure was the `TreeMap` entrySet-kind defect, which
+  `TreeRepeat` cannot reach because it never asks a view for its `entrySet()`
+  twice. The fixed binary is 12/12 on generational.
+
+**N3 -- the vector's `--jdk-only` PASS.** Withdrawn as load-bearing: it was
+2/2, `WORKER-1-NOTE-1` measured 9 pass / 3 fail over twelve, and this lane
+measured 2 fails in 20 on its own binary. All three are consistent with
+`WORKER-5`'s framing that "flaky" is a property of a BINARY AND A HOST. The
+vector now passes 25/25 in both modes.
+
+Full record: `rtreerangegc-was-four-collection-native-defects-FIXED-20260822`
+(internal). The parent page is retired into it.
+
+**What this note contributed, and it was the load-bearing part:** the
+whole-map-versus-range-view control. "Every range view fails and `entry` is
+clean over 64 walks" is what turned the parent's suspicion into a fact, and the
+`entry` row is the one that stays useful -- it is the negative control that
+tells a future regression here apart from a general iteration defect.
 
 ## NOMINATIONS
 

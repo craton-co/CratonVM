@@ -298,6 +298,23 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "census-exact-invocations", on_key: Some("CRATONVM_CENSUS_EXACT_INVOCATIONS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce", on_key: Some("CRATONVM_DBG_CCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce-bt", on_key: Some("CRATONVM_DBG_CCE_BT"), off_key: None, off_word: None },
+    // Declared 2026-08-22 with the fix it was written for. When a VM-side field
+    // read decodes a `Value` cell with an out-of-range discriminant, name the
+    // RECEIVER and the Java frames that reached it. The collector's own guard
+    // reports the CELL and can report nothing else -- it runs in the collector
+    // crate and cannot see a frame -- which is why the producer behind
+    // `corrupt-value-cell-is-fatal-on-three-of-four-collectors` stayed open for
+    // two days. Costs one relaxed load per `NativeContext::get_field` while
+    // armed and nothing at all while it is not.
+    E { group: Group::DBG, token: "corrupt-cell", on_key: Some("CRATONVM_DBG_CORRUPT_CELL"), off_key: None, off_word: None },
+    // Declared 2026-08-23 with the widening it verifies. Fabricates one
+    // corrupt-cell hit at a site that HAS a read door and one at a site that
+    // does not, so a run can prove the door reporter and the safepoint backstop
+    // both actually speak. A silent diagnostic and a broken one look identical
+    // from the outside, and this instrument was read the wrong way round once
+    // already -- it reported nothing through a Spring Boot sweep that had
+    // tripped the collector's guard, and the silence was taken for "clean".
+    E { group: Group::DBG, token: "corrupt-cell-selftest", on_key: Some("CRATONVM_DBG_CORRUPT_CELL_SELFTEST"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccecache", on_key: Some("CRATONVM_DBG_CCECACHE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccsprobe", on_key: Some("CRATONVM_DBG_CCSPROBE"), off_key: None, off_word: None },
     // The per-occurrence, backtrace-carrying arm of the descriptor-coercion
@@ -415,6 +432,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "hang-sample", on_key: Some("CRATONVM_DBG_HANG_SAMPLE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hangwalk", on_key: Some("CRATONVM_DBG_HANGWALK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "heap-stale", on_key: Some("CRATONVM_DBG_HEAP_STALE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "fmt-wrongtype", on_key: Some("CRATONVM_DBG_FMT_WRONGTYPE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "heap-trace", on_key: Some("CRATONVM_DBG_HEAP_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "heapcopy", on_key: Some("CRATONVM_DBG_HEAPCOPY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "heartbeat", on_key: Some("CRATONVM_DBG_HEARTBEAT"), off_key: None, off_word: None },
@@ -479,6 +497,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-scan-prof", on_key: Some("CRATONVM_DBG_JIT_SCAN_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-rootscan", on_key: Some("CRATONVM_DBG_JIT_ROOTSCAN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-stale-after-remap", on_key: Some("CRATONVM_DBG_JIT_STALE_AFTER_REMAP"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-stale-below-rbp", on_key: Some("CRATONVM_DBG_JIT_STALE_BELOW_RBP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-names", on_key: Some("CRATONVM_DBG_JIT_NAMES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-pin", on_key: Some("CRATONVM_DBG_JIT_PIN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-putfield", on_key: Some("CRATONVM_DBG_JIT_PUTFIELD"), off_key: None, off_word: None },
@@ -628,6 +648,17 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-seed-collision", on_key: Some("CRATONVM_DBG_OSR_SEED_COLLISION"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-slots", on_key: Some("CRATONVM_DBG_OSR_SLOTS"), off_key: None, off_word: None },
+    // Declared 2026-08-22. `view-kind` reports a map-view carrier whose CLASS
+    // and whose head element disagree about what it holds, and every `vc_route`
+    // rebuild; `view-resync` reports a TreeMap range view's rebuild -- pairs
+    // seen, kept, bounds and the comparison verdict histogram. The pair
+    // separated three defects that all present as one red vector: an entrySet
+    // that came back holding values, a view that came back EMPTY, and a stale
+    // element inside the scan. An empty view that saw no pairs and one whose
+    // every comparison landed out of range are different defects and nothing
+    // else can tell them apart.
+    E { group: Group::DBG, token: "view-kind", on_key: Some("CRATONVM_DBG_VIEWKIND"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "view-resync", on_key: Some("CRATONVM_DBG_VIEWRESYNC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-bt", on_key: Some("CRATONVM_DBG_OVERLAY_BT"), off_key: None, off_word: None },
@@ -639,6 +670,7 @@ pub const INVENTORY: &[E] = &[
     // want per-site COUNTS rather than per-site presence.
     E { group: Group::DBG, token: "overlay-nodedup", on_key: Some("CRATONVM_DBG_OVERLAY_NODEDUP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-prune", on_key: Some("CRATONVM_DBG_OVERLAY_PRUNE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "tmview", on_key: Some("CRATONVM_DBG_TMVIEW"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "parklat", on_key: Some("CRATONVM_DBG_PARKLAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pb", on_key: Some("CRATONVM_DBG_PB"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pbe", on_key: Some("CRATONVM_DBG_PBE"), off_key: None, off_word: None },
@@ -1185,6 +1217,7 @@ pub const INVENTORY: &[E] = &[
     // arena-order lanes, and this token still seeds both when neither is set.
     E { group: Group::JIT, token: "lambda-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_ADAPTER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-capture-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "lambda-const-probe", on_key: Some("CRATONVM_JIT_LAMBDA_CONST_PROBE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-site", on_key: Some("CRATONVM_JIT_LAMBDA_SITE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-tierup", on_key: Some("CRATONVM_JIT_LAMBDA_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-schedule", on_key: Some("CRATONVM_JIT_VERIFY_SCHEDULE"), off_key: None, off_word: None },
@@ -1252,6 +1285,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "mirror-pin-young-defer", on_key: None, off_key: Some("CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER"), off_word: None },
     E { group: Group::GC, token: "moving-young", on_key: Some("CRATONVM_MOVING_YOUNG"), off_key: Some("CRATONVM_NO_MOVING_YOUNG"), off_word: None },
     E { group: Group::GC, token: "moving-young-jit-frames", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_JIT"), off_word: None },
+    E { group: Group::GC, token: "format-arg-pin", on_key: None, off_key: Some("CRATONVM_NO_FORMAT_ARG_PIN"), off_word: None },
+    E { group: Group::GC, token: "register-image-remap", on_key: Some("CRATONVM_REGISTER_IMAGE_REMAP"), off_key: None, off_word: None },
     // Resolving the innermost JIT frame's own method from the direct CALL that
     // built it, instead of giving up whenever that method is not the chain
     // entry's. Presence-parsed opt-out, so `=0` still disables it and
@@ -1416,6 +1451,11 @@ pub const INVENTORY: &[E] = &[
     // so `CRATONVM_LOADER=enforce-native-shadow` could not reach it and no test
     // could arrange it.
     E { group: Group::LOADER, token: "enforce-native-shadow", on_key: Some("CRATONVM_ENFORCE_NATIVE_SHADOW"), off_key: None, off_word: None },
+    // Default ON. `-cf-delegating-yield` keeps the pure-delegation
+    // `CompletableFuture` natives in front of the real JDK bytecode, so the
+    // yield can be A/B'd on one binary. See
+    // `native_override::delegating_native_yields_to_real_bytecode`.
+    E { group: Group::LOADER, token: "cf-delegating-yield", on_key: Some("CRATONVM_CF_DELEGATING_YIELD"), off_key: None, off_word: Some("0") },
     E { group: Group::LOADER, token: "aware-resolution", on_key: Some("CRATONVM_LOADER_AWARE_RESOLUTION"), off_key: None, off_word: None },
     E { group: Group::LOADER, token: "boot-module-registry", on_key: Some("CRATONVM_BOOT_MODULE_REGISTRY"), off_key: None, off_word: Some("off") },
     E { group: Group::LOADER, token: "cl-bootstrap-scoped", on_key: Some("CRATONVM_CL_BOOTSTRAP_SCOPED"), off_key: None, off_word: Some("0") },
@@ -1517,6 +1557,7 @@ pub const INVENTORY: &[E] = &[
     // selects is which verifier sees which chain, and at what strength floor.
     E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "map-iterator-failfast", on_key: None, off_key: Some("CRATONVM_NO_MAP_ITERATOR_FAILFAST"), off_word: None },
     E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "jboss-boot-log-file", on_key: Some("CRATONVM_JBOSS_BOOT_LOG_FILE"), off_key: None, off_word: None },

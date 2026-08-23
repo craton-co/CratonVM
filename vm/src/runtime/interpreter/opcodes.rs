@@ -3314,6 +3314,10 @@ pub(super) fn op_putfield(
     frame_idx: usize,
     index: u16,
 ) -> Result<(), MethodCallFailed> {
+    // Self-test only, and deliberately a site with NO watch: `putfield` is a
+    // bytecode every program executes, so if the safepoint BACKSTOP cannot
+    // report a cell injected here it cannot report a real one either.
+    crate::memory::reclaim_guard::corrupt_cell_selftest_inject("putfield");
     // `index` is rebound as a reference so the moved body's `*index`
     // reads unchanged — this is a pure move, not a rewrite.
     let index = &index;
@@ -4157,6 +4161,12 @@ pub(super) fn op_getfield(
             // so subsequent field access hits the live copy. Under
             // stop-the-world GC this is always a no-op fast path.
             let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+            // CRATONVM_DBG_CORRUPT_CELL, the interpreter's own door. The
+            // native funnel was instrumented first and is NOT where most
+            // field reads happen -- this is, and a producer reached only from
+            // bytecode was invisible until now. Off: one cached bool.
+            let corrupt_before = crate::memory::reclaim_guard::corrupt_cell_watch();
+            crate::memory::reclaim_guard::corrupt_cell_selftest_inject("getfield");
             let mut value = if field.is_volatile {
                 shared
                     .mem
@@ -4165,6 +4175,14 @@ pub(super) fn op_getfield(
             } else {
                 shared.mem.heap.get_field(obj_ref, field.field_index)
             };
+            crate::memory::reclaim_guard::corrupt_cell_watch_close(
+                shared,
+                thread,
+                corrupt_before,
+                "interpreter getfield",
+                Some(obj_ref),
+                Some(field.field_index),
+            );
             // K2 (T10.9.E) — J/D direct-CompactValue fast path.
             //
             // For long/double fields, build the CompactValue with the exact

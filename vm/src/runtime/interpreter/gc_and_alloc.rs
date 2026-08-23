@@ -4333,6 +4333,13 @@ pub(super) fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &c
 
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     remap_trace_push(shared, thread, "publish", "");
+    // CRATONVM_DBG_CORRUPT_CELL backstop. Every instrumented door above names
+    // its own receiver; this catches a corrupt cell decoded by a reader that
+    // has NO door -- reflection, `Unsafe`, a class-mirror populator, a
+    // serialization walk -- and reports it with this thread's frames rather
+    // than letting it pass as silence. A one-door instrument cannot tell "no
+    // defect" from "not my door".
+    crate::memory::reclaim_guard::corrupt_cell_backstop(shared, thread);
     // Stamp when this thread last published, so a stale-address report can say
     // how many collections completed since. See `note_root_publish`.
     crate::memory::reclaim_guard::note_root_publish(shared, thread);
@@ -5182,6 +5189,8 @@ pub(crate) fn apply_pointer_map_to_thread(
     // entry chain — sound because we run on the resuming thread itself) and inert
     // unless a precise-map frame is live, so it is a no-op on the default path.
     crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
+    crate::jit::conservative_roots::remap_register_image_words(pointer_map, None);
+    crate::jit::conservative_roots::report_stale_after_remap(pointer_map, None);
     // §4 (multi-thread shadow scan, remap half). Remap THIS thread's shadow-stack
     // precise roots in place, so a worker resuming from the STW barrier sees the
     // relocated addresses in the JIT registers/slots it reloads from its shadow

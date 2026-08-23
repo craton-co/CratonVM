@@ -7748,6 +7748,25 @@ pub(crate) fn loader_owns_complete_resource_view(
 ///    visible, matching HotSpot;
 /// 4. anything else (a custom loader we have no URL view of) — global probe,
 ///    i.e. unchanged from before this function existed.
+/// Is this one of the loaders the VM itself creates (bootstrap / platform /
+/// application), as opposed to a user-defined one?
+///
+/// **This is an identity test, not a claim about visibility.** Being built-in
+/// does NOT mean the loader can see the whole process classpath — that reading
+/// is exactly the bug `aa09d8bd8` fixed below, where the application loader
+/// fabricated a `Package` for `java.lang`. Callers that want visibility must go
+/// through [`package_class_files_visible_to_loader`], which segments it.
+///
+/// The one caller outside this module is `getDefinedPackage`'s DEFAULT-package
+/// arm: a built-in loader that loaded a class from the classpath root has
+/// defined the default package, and a user-defined loader has not.
+pub(crate) fn loader_is_builtin(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(loader))
+        .is_some_and(|n| {
+            n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$")
+        })
+}
+
 ///
 /// # 2026-08-22: step 1 used to be "built-in loaders ARE the global classpath"
 ///
@@ -7778,10 +7797,7 @@ pub(crate) fn package_class_files_visible_to_loader(
         return !ctx.find_all_resource_urls(class_glob).is_empty();
     };
     let loader_class = ctx.class_name_of_id(ctx.class_id_of_object(loader));
-    let is_builtin = loader_class.as_deref().is_some_and(|n| {
-        n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$")
-    });
-    if is_builtin {
+    if loader_is_builtin(ctx, loader) {
         return match builtin_loader_segment(loader_class.as_deref()) {
             Some(segment) => !ctx
                 .find_resource_urls_in_segment(class_glob, segment)

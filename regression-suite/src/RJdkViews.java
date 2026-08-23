@@ -732,8 +732,86 @@ public class RJdkViews {
         System.out.println("CK RJdkViews keyItrExhausted=" + nse);
     }
 
+    // ---- W7-1 residual: an entrySet() view must stay an ENTRY set ----------
+
+    /**
+     * A `MAP_VIEW_CARRIERS` carrier's KIND — entries or values — was inferred
+     * from the class of its head element, and that inference defaulted to
+     * "values" whenever it could not classify one. `TreeMap$EntrySet` is the one
+     * entry-shaped member of that list, so an entrySet the guess could not read
+     * came back holding the map's VALUES: `Map.Entry` elements silently replaced
+     * by `V` objects, which a caller only notices at its first cast.
+     *
+     * Two ordinary ways to reach the unreadable case, one per method below.
+     * Both are asserted on CONTENT, never on `getClass()`: this VM's entries are
+     * `AbstractMap$SimpleEntry` where HotSpot's are `TreeMap$Entry`, which is a
+     * separate (and deliberate) divergence, and a class-name assertion here
+     * would fail the cross-VM diff for the wrong reason.
+     */
+    static void entrySetStaysEntries() {
+        // 1. The view was EMPTY when the carrier was minted, so there was no
+        //    head element to read. No GC, no timing: `entrySet()` held across a
+        //    `put` answered `[1, 2]` where HotSpot answers `[a=1, b=2]`.
+        TreeMap<String, Integer> late = new TreeMap<>();
+        Map<String, Integer> lateMapView = late;
+        java.util.Set<Map.Entry<String, Integer>> es = lateMapView.entrySet();
+        check(es.isEmpty(), "an entrySet of an empty map is empty: " + es);
+        late.put("a", 1);
+        late.put("b", 2);
+        check(es.size() == 2, "the live entrySet tracks the backing map: " + es.size());
+        Iterator<Map.Entry<String, Integer>> lateItr = es.iterator();
+        Object lateHead = lateItr.next();
+        check(lateHead instanceof Map.Entry,
+                "an entrySet taken while the map was EMPTY still yields Map.Entry, not values");
+        // Wildcard cast: the element type is not what is under test here, and an
+        // unchecked cast would be the only warning javac emits for this file.
+        Map.Entry<?, ?> lateEntry = (Map.Entry<?, ?>) lateHead;
+        check(lateEntry.getKey().equals("a") && lateEntry.getValue().equals(1),
+                "and the entry carries its key: " + lateEntry.getKey() + "=" + lateEntry.getValue());
+        check(es.toString().equals("[a=1, b=2]"), "empty-then-populated entrySet: " + es);
+        System.out.println("CK RJdkViews lateEntrySet=" + es);
+
+        // 2. A RANGE view's entrySet. `RTreeRangeGc` reddened here on the
+        //    default collector: `headMap(k, false).entrySet()` handed back the
+        //    view's 300 values and the vector's checkcast to Map.Entry failed.
+        //    The kind must not depend on whether a head element can be read, so
+        //    assert every element rather than the first.
+        TreeMap<String, Integer> src = abcd();
+        NavigableMap<String, Integer> range = src.headMap("c", false);
+        int seen = 0;
+        StringBuilder rendered = new StringBuilder();
+        for (Map.Entry<String, Integer> e : range.entrySet()) {
+            check(e.getKey() != null, "range entrySet element " + seen + " has a key");
+            check(e.getValue() != null, "range entrySet element " + seen + " has a value");
+            if (seen > 0) {
+                rendered.append(',');
+            }
+            rendered.append(e.getKey()).append('=').append(e.getValue());
+            seen++;
+        }
+        check(seen == 2, "headMap(k,false).entrySet() yields both entries: " + seen);
+        check(rendered.toString().equals("a=1,b=2"), "range entrySet content: " + rendered);
+        System.out.println("CK RJdkViews rangeEntrySet=" + rendered);
+
+        // The kind decides equals/hashCode too. `TreeMap$EntrySet`'s real
+        // superclass is AbstractSet, which DOES override both, so two equal maps
+        // have EQUAL entry sets -- where a values view (AbstractCollection,
+        // which overrides neither) compares by identity. Reading the carrier as
+        // a values view got this backwards.
+        TreeMap<String, Integer> twin = abcd();
+        check(src.entrySet().equals(twin.entrySet()),
+                "equal maps have equal entry sets");
+        check(src.entrySet().hashCode() == twin.entrySet().hashCode(),
+                "and equal entry sets hash alike");
+        check(!src.values().equals(twin.values()),
+                "while values() keeps AbstractCollection's identity equality");
+        System.out.println("CK RJdkViews entrySetEquality="
+                + src.entrySet().equals(twin.entrySet()) + "/" + src.values().equals(twin.values()));
+    }
+
     public static void main(String[] args) {
         navigableViews();
+        entrySetStaysEntries();
         iteratorContract();
         failFast();
         formats();

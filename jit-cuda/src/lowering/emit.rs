@@ -23,7 +23,7 @@ use crate::emitter::{LoweringError, RegKind};
 use crate::lowering::loop_recog::{instr_size, CountedLoop, NestedLoop};
 use crate::signature::KernelSignature;
 use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
 /// One slot of typed JVM state.
@@ -48,6 +48,7 @@ pub(crate) struct RegPool {
     pub f32_count: u32,
     pub f64_count: u32,
     pub pred_count: u32,
+    pub b16_count: u32,
 }
 
 impl RegPool {
@@ -60,6 +61,7 @@ impl RegPool {
             RegKind::F32 => (&mut self.f32_count, "f"),
             RegKind::F64 => (&mut self.f64_count, "fd"),
             RegKind::Pred => (&mut self.pred_count, "p"),
+            RegKind::B16 => (&mut self.b16_count, "rs"),
         };
         let n = *count;
         *count += 1;
@@ -658,15 +660,29 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// Lower the acyclic control-flow graph inside one counted-loop body.
+    /// Lower the control-flow graph inside one counted-loop body.
     ///
     /// The surrounding counted loop is still executed once per CUDA thread,
-    /// so its canonical back-edge is deliberately outside `end`.  Interior
-    /// branches must be forward edges: admitting a second loop here would
-    /// change the work mapping and needs a separate iteration-space design.
-    /// Within that boundary this is a real CFG walk, not a pattern matcher:
-    /// it discovers basic blocks, emits PTX labels and predicate branches,
-    /// and reconciles JVM locals/operand-stack values at every join.
+    /// so its canonical back-edge is deliberately outside `end`.  Within that
+    /// boundary this is a real CFG walk, not a pattern matcher: it discovers
+    /// basic blocks, emits PTX labels and predicate branches, and reconciles
+    /// JVM locals/operand-stack values at every join.
+    ///
+    /// **Interior back-edges are lowered as real PTX loops.** A back-edge
+    /// target is a block the walker reaches first through a forward edge, so
+    /// by the time the back-edge is emitted the target's canonical registers
+    /// already exist and its label is already in the body text: the edge is
+    /// then exactly the same "copy the live state into the join's registers,
+    /// then branch" it is for a forward edge, and those registers *are* the
+    /// loop's phis. That is what lets one thread run `out[i] = sum_j ...`
+    /// sequentially while the outer loop still gives one thread per `i`
+    /// ([`crate::lowering::loop_recog::classify_outer_parallel_loop`]).
+    ///
+    /// Two things a back-edge needs that a forward edge does not, both
+    /// enforced below: the target block must actually have been emitted
+    /// (an unreachable block is skipped, and branching to a label that was
+    /// never written is a `ptxas` error rather than a CPU fallback), and the
+    /// state copy must be simultaneous — see [`Self::copy_matching_state`].
     pub fn walk_cfg(
         &mut self,
         start: usize,
@@ -675,6 +691,8 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), LoweringError> {
         let starts = self.cfg_block_starts(start, end, loop_info)?;
         let starts: Vec<usize> = starts.into_iter().collect();
+        let back_targets = self.back_edge_targets(start, end, loop_info)?;
+        let mut emitted = BTreeSet::<usize>::new();
         let mut entries = BTreeMap::<usize, BlockState>::new();
         entries.insert(
             start,
@@ -694,9 +712,14 @@ impl<'a> Emitter<'a> {
             };
             self.stack = entry.stack;
             self.locals = entry.locals;
-            if block_start != start {
+            // The body's first block normally needs no label — control
+            // falls into it from the loop guard.  It needs one as soon as
+            // an interior back-edge targets it, which happens when the
+            // whole outer body *is* the inner loop's header.
+            if block_start != start || back_targets.contains(&block_start) {
                 writeln!(self.body, "L_body_{block_start}:").unwrap();
             }
+            emitted.insert(block_start);
 
             let mut pc = block_start;
             let mut terminated = false;
@@ -712,6 +735,7 @@ impl<'a> Emitter<'a> {
                 match op {
                     0x99..=0xA4 | 0xC6 | 0xC7 => {
                         let target = self.branch_target(pc, op)?;
+                        Self::check_back_edge(pc, target, &emitted, &entries)?;
                         let predicate = self.emit_branch_predicate(op)?;
                         let state = BlockState {
                             stack: self.stack.clone(),
@@ -741,6 +765,7 @@ impl<'a> Emitter<'a> {
                             // back-edge or this thread would repeat work.
                             self.hit_back_branch = true;
                         } else {
+                            Self::check_back_edge(pc, target, &emitted, &entries)?;
                             let state = BlockState {
                                 stack: self.stack.clone(),
                                 locals: self.locals.clone(),
@@ -825,6 +850,62 @@ impl<'a> Emitter<'a> {
         Ok(starts)
     }
 
+    /// Every interior back-edge target inside `start..end`, i.e. the
+    /// header of each sequential loop the CUDA thread will run itself.
+    /// The outer loop's own canonical back-edge is excluded — `walk_cfg`
+    /// is called with `end = back_branch_pc` so it is out of range
+    /// anyway, and its target is the loop header the host guard replaced.
+    fn back_edge_targets(
+        &self,
+        start: usize,
+        end: usize,
+        loop_info: &CountedLoop,
+    ) -> Result<BTreeSet<usize>, LoweringError> {
+        let mut targets = BTreeSet::new();
+        let mut pc = start;
+        while pc < end {
+            let op = self.bytes[pc];
+            let size = instr_size(self.bytes, pc)?;
+            if matches!(op, 0x99..=0xA7 | 0xC6 | 0xC7 | 0xC8) {
+                let target = self.branch_target(pc, op)?;
+                if target <= pc && target != loop_info.header_pc {
+                    targets.insert(target);
+                }
+            }
+            pc += size;
+        }
+        Ok(targets)
+    }
+
+    /// Refuse a back-edge whose target block was never emitted.
+    ///
+    /// The walker visits blocks in ascending PC order and skips any with
+    /// no incoming edge, so a back-edge target that is missing from
+    /// `emitted`/`entries` is a block the admitted subgraph never
+    /// entered forward — an irreducible or unreachable region. Emitting
+    /// `bra L_body_<pc>` for it would produce PTX referencing a label
+    /// that does not exist, which `ptxas` rejects at module load: a hard
+    /// failure instead of the CPU fallback every other refusal here
+    /// produces. Forward edges are unaffected (their target is always
+    /// still ahead, and `copy_state_to_edge` creates its state).
+    fn check_back_edge(
+        source: usize,
+        target: usize,
+        emitted: &BTreeSet<usize>,
+        entries: &BTreeMap<usize, BlockState>,
+    ) -> Result<(), LoweringError> {
+        if target > source {
+            return Ok(());
+        }
+        if !emitted.contains(&target) || !entries.contains_key(&target) {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "back-edge at pc={source} targets pc={target}, a block the walk never \
+                 entered through a forward edge (irreducible or unreachable control flow)"
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_cfg_target(
         &self,
         source: usize,
@@ -844,10 +925,13 @@ impl<'a> Emitter<'a> {
                 "branch at pc={source} targets byte {target}, which is not a JVM instruction boundary"
             )));
         }
-        if target <= source {
+        // A backward interior branch is a sequential loop the thread runs
+        // itself, which `walk_cfg` lowers. A branch to *itself* is not:
+        // it is an unconditional infinite loop with an empty body, and no
+        // iteration-space mapping makes that terminate.
+        if target == source {
             return Err(LoweringError::UnsupportedNode(format!(
-                "backward interior branch at pc={source} → {target} would form a nested loop; \
-                 only the canonical counted-loop back-edge is supported"
+                "branch at pc={source} targets itself — an empty infinite loop"
             )));
         }
         Ok(())
@@ -1134,8 +1218,9 @@ impl<'a> Emitter<'a> {
                 "incompatible JVM state at control-flow join pc={target_pc}"
             )));
         }
+        let mut pairs: Vec<(Reg, Reg)> = Vec::new();
         for (from, to) in source.stack.0.iter().zip(&target.stack.0) {
-            self.copy_reg(from, to, predicate, target_pc)?;
+            pairs.push((from.clone(), to.clone()));
         }
         let local_count = source.locals.0.len().max(target.locals.0.len());
         for index in 0..local_count {
@@ -1143,7 +1228,7 @@ impl<'a> Emitter<'a> {
             let to = target.locals.0.get(index).and_then(Option::as_ref);
             match (from, to) {
                 (None, None) => {}
-                (Some(from), Some(to)) => self.copy_reg(from, to, predicate, target_pc)?,
+                (Some(from), Some(to)) => pairs.push((from.clone(), to.clone())),
                 // A verifier-valid method cannot read a local that is only
                 // initialised on one predecessor.  If it is dead after this
                 // join, preserving neither binding is semantically exact;
@@ -1151,6 +1236,42 @@ impl<'a> Emitter<'a> {
                 // branch-local temporary slots.
                 _ => {}
             }
+        }
+        // A join's copies are a *parallel* assignment: every `to` takes the
+        // value `from` held on entry to the edge. Emitting them one at a
+        // time is only equivalent when no destination is also somebody
+        // else's source. A swap (`a, b = b, a`) is the smallest case that
+        // is not, and a loop back-edge is where it actually shows up —
+        // rotating two accumulators through each other reads the already
+        // overwritten register on the second copy. Sequence through
+        // temporaries when, and only when, the overlap exists, so every
+        // conflict-free join (which is all of them today) emits exactly
+        // the PTX it emitted before this existed.
+        let destinations: HashSet<&str> = pairs
+            .iter()
+            .filter(|(from, to)| from.name != to.name)
+            .map(|(_, to)| to.name.as_str())
+            .collect();
+        let conflict = pairs
+            .iter()
+            .any(|(from, to)| from.name != to.name && destinations.contains(from.name.as_str()));
+        if !conflict {
+            for (from, to) in &pairs {
+                self.copy_reg(from, to, predicate, target_pc)?;
+            }
+            return Ok(());
+        }
+        let mut staged: Vec<(Reg, Reg)> = Vec::new();
+        for (from, to) in &pairs {
+            if from.name == to.name {
+                continue;
+            }
+            let temp = self.regs.fresh_reg_with_wide(from.kind, from.wide);
+            self.copy_reg(from, &temp, predicate, target_pc)?;
+            staged.push((temp, to.clone()));
+        }
+        for (temp, to) in &staged {
+            self.copy_reg(temp, to, predicate, target_pc)?;
         }
         Ok(())
     }
@@ -1195,6 +1316,9 @@ impl<'a> Emitter<'a> {
             RegKind::F32 => "f32",
             RegKind::F64 => "f64",
             RegKind::Pred => "pred",
+            // A B16 is a scratch operand for `cvt.f32.f16` and never
+            // holds a JVM value, so it is never live across an edge.
+            RegKind::B16 => "b16",
         };
         let guard = match predicate {
             Some((name, true)) => format!("@!{name} "),
@@ -1860,12 +1984,97 @@ impl<'a> Emitter<'a> {
             Some(MathIntrinsic::MaxF64) => self.minmax_f64(false),
             Some(MathIntrinsic::FmaF32) => self.fma_f32(),
             Some(MathIntrinsic::FmaF64) => self.fma_f64(),
+            Some(MathIntrinsic::Float16ToFloat) => self.float16_to_float(),
+            Some(MathIntrinsic::ExpF64) => self.exp_approx(),
             None => Err(LoweringError::UnsupportedNode(format!(
                 "invokestatic {class_name}.{method_name}{descriptor} is not a recognised GPU \
                  intrinsic — the analyzer should have rejected this method upstream \
                  (see analyzer::resolve_math_intrinsic)"
             ))),
         }
+    }
+
+    /// `Math.exp(double)`, approximately.
+    ///
+    /// PTX has one exponential, `ex2.approx.f32`, and no f64 form at
+    /// all. `exp(x)` becomes `ex2(x * log2(e))` computed in single
+    /// precision and widened back, which is why this intrinsic is
+    /// admitted only under `CRATONVM_GPU_APPROX_MATH=1` — see
+    /// [`crate::analyzer::MathIntrinsic::ExpF64`] for the contract
+    /// being traded away.
+    ///
+    /// Handles both operand shapes. `(float) Math.exp((double) v)`
+    /// leaves an F32 on the stack when the `f2d` collapsed, and a
+    /// genuine double otherwise; the arithmetic is the same either
+    /// way, only the surrounding conversions differ.
+    fn exp_approx(&mut self) -> Result<(), LoweringError> {
+        // 0x3FB8AA3B is log2(e) rounded to f32.
+        const LOG2_E: &str = "0f3FB8AA3B";
+        let operand = self.stack.pop()?;
+        let x32 = match operand.kind {
+            RegKind::F32 => operand,
+            RegKind::F64 => {
+                let narrowed = self.regs.fresh_reg(RegKind::F32);
+                writeln!(
+                    self.body,
+                    "    cvt.rn.f32.f64 {}, {};",
+                    narrowed.name, operand.name
+                )
+                .unwrap();
+                narrowed
+            }
+            other => {
+                return Err(LoweringError::UnsupportedNode(format!(
+                    "Math.exp expects a floating-point operand, got {other:?}"
+                )))
+            }
+        };
+        let scaled = self.regs.fresh_reg(RegKind::F32);
+        let result = self.regs.fresh_reg(RegKind::F32);
+        writeln!(
+            self.body,
+            "    mul.rn.f32 {}, {}, {LOG2_E};",
+            scaled.name, x32.name
+        )
+        .unwrap();
+        writeln!(self.body, "    ex2.approx.f32 {}, {};", result.name, scaled.name).unwrap();
+        let widened = self.regs.fresh_reg(RegKind::F64);
+        writeln!(
+            self.body,
+            "    cvt.f64.f32 {}, {};",
+            widened.name, result.name
+        )
+        .unwrap();
+        self.stack.push(widened);
+        Ok(())
+    }
+
+    /// `Float.float16ToFloat(short)`.
+    ///
+    /// The operand arrives as a sign-extended `S32` (that is what a
+    /// `short` is on the JVM operand stack, and what `saload` leaves
+    /// behind). PTX `cvt.f32.f16` wants the raw 16 bits in a `.b16`
+    /// register, so the low half is narrowed first; the sign
+    /// extension in the discarded upper half is exactly the bits the
+    /// narrowing drops.
+    ///
+    /// Exact by construction — f16 -> f32 is a widening conversion
+    /// with no rounding mode to get wrong, denormals and NaNs
+    /// included.
+    fn float16_to_float(&mut self) -> Result<(), LoweringError> {
+        let bits = self.stack.pop()?;
+        if bits.kind != RegKind::S32 {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "Float.float16ToFloat expects a short (S32 register), got {:?}",
+                bits.kind
+            )));
+        }
+        let half = self.regs.fresh_reg(RegKind::B16);
+        let out = self.regs.fresh_reg(RegKind::F32);
+        writeln!(self.body, "    cvt.u16.u32 {}, {};", half.name, bits.name).unwrap();
+        writeln!(self.body, "    cvt.f32.f16 {}, {};", out.name, half.name).unwrap();
+        self.stack.push(out);
+        Ok(())
     }
 
     /// `Math.abs(int)` / `StrictMath.abs(int)`.

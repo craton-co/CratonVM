@@ -2343,6 +2343,42 @@ pub(crate) fn p67_segment_copy_to_array(
         _ => 1,
     };
     let little_endian = p67_layout_is_little(ctx, layout);
+    // Bulk fast path: one contiguous run of native-order 4-byte
+    // elements into an `int[]`.
+    //
+    // The loop below resolves the segment — its fields, its scope, its
+    // bounds — once PER ELEMENT and then writes one element through
+    // `set_array_element`. That is correct, and it is also why this
+    // call measured 15 MB/s where HotSpot does 3.0 GB/s: reading a
+    // 2.5 GB weight tensor into the heap would take three minutes.
+    // When the run is contiguous, native-order and four bytes wide,
+    // resolve the whole range ONCE and hand it to the bulk array
+    // write, which the VM implements as a single
+    // `copy_nonoverlapping`.
+    //
+    // Deliberately narrow: a byte, short or long element, a big-endian
+    // layout, a destination that is not an `int[]`, or a range that
+    // does not resolve in one piece all fall through to the
+    // per-element loop unchanged.
+    if width == 4 && little_endian && count > 0 {
+        let span = count as i64 * 4;
+        // `p67_segment_parts` bounds-checks `span` bytes from
+        // `src_offset` itself and answers None when they do not fit, so
+        // reaching here IS the proof that the whole run is in range.
+        if let Some((addr, _size)) = p67_segment_parts(ctx, src, src_offset, span) {
+            {
+                // SAFETY: `p67_segment_parts` bounds-checked `span`
+                // bytes from `addr` against the segment, and
+                // `write_int_array_from` bounds-checks the destination
+                // before it writes anything.
+                let words: &[i32] =
+                    unsafe { std::slice::from_raw_parts(addr as *const i32, count) };
+                if ctx.write_int_array_from(dst, dst_index, words) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
     for i in 0..count {
         let offset = src_offset + (i as i64 * width);
         let Some((addr, _size)) = p67_segment_parts(ctx, src, offset, width) else {

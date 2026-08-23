@@ -1425,6 +1425,14 @@ pub(crate) struct LambdaJitSite {
     /// sends its calls there instead. One latch, never cleared: a body that
     /// deopted once under this call site will do it again.
     direct_disabled: std::cell::Cell<bool>,
+    /// The constant this site's impl body returns unconditionally, if it is
+    /// one of those bodies. Decided once here from the bytecode rather than
+    /// per call, because it is a property of the method.
+    ///
+    /// See [`const_int_return_of`]: a constant body is the one case where a
+    /// wrong answer needs no baseline and no repeat runs, so the FIRST wrong
+    /// call is proof.
+    const_return: Option<i32>,
 }
 
 impl LambdaJitSite {
@@ -1484,6 +1492,20 @@ impl LambdaJitSite {
     /// [`LambdaJitSite::direct_disabled`].
     pub(crate) fn cached_impl(&self) -> &Arc<CachedBytecodeMethod> {
         &self.cached
+    }
+
+    /// The constant this site's impl must return, if its body is a bare
+    /// push-and-return. `None` for every other site, which is nearly all of
+    /// them.
+    pub(crate) fn const_return(&self) -> Option<i32> {
+        self.const_return
+    }
+
+    /// The impl's own name, for the constant-probe report — the SAM name
+    /// (`test`, `apply`) would name the interface rather than the body that
+    /// gave the wrong answer.
+    pub(crate) fn impl_method_name(&self) -> &str {
+        &self.cached.method_name
     }
 
     /// May the direct compiled arm still serve this site? See
@@ -1676,6 +1698,23 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
         // An empty parameter token is malformed metadata, not a shape.
         return SiteVerdict::Never;
     }
+    // Read off the impl BEFORE it is moved into the site: a property of the
+    // method, decided once.
+    let const_return = const_int_return_of(&cached.code, !cached.exception_table.is_empty());
+    if crate::runtime::env_cache::jit_lambda_const_probe() {
+        // One line per SITE, not per call: a handful for a whole run. It is
+        // what tells you whether the impl you care about is even reachable by
+        // this probe -- a `site_const_screened=0` means nothing without it,
+        // because a body this machinery never serves cannot be screened.
+        eprintln!(
+            "[cratonvm-lambda-const] site impl={}.{}{} const_return={const_return:?} \n             code_len={} code={:02x?}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            cached.code.len(),
+            &cached.code[..cached.code.len().min(6)],
+        );
+    }
     SiteVerdict::Eligible(std::rc::Rc::new(LambdaJitSite {
         sam_method_name: Arc::clone(&call_site.sam_method_name),
         sam_descriptor: Arc::clone(&call_site.sam_descriptor),
@@ -1689,6 +1728,7 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
         code_generation: std::cell::Cell::new(u64::MAX),
         adapter_installed: std::cell::Cell::new(false),
         direct_disabled: std::cell::Cell::new(false),
+        const_return,
     }))
 }
 
@@ -1855,10 +1895,13 @@ pub(crate) mod lambda_site_prof {
     }
 
     pub(crate) fn line() -> String {
+        let konst = super::lambda_const_probe_counts();
         format!(
             "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} \
              site_resumed={} site_unresumable={} \
-             site_arity={} site_adapters={} site_cap_adapters={}",
+             site_arity={} site_adapters={} site_cap_adapters={} site_shape_collisions={} \
+             site_const_screened={} site_const_mismatch={} site_const_dirty_high={} \
+             site_const_opaque={}",
             SITE_CALLS.load(Ordering::Relaxed),
             SITE_DIRECT.load(Ordering::Relaxed),
             SITE_NO_CODE.load(Ordering::Relaxed),
@@ -1873,6 +1916,19 @@ pub(crate) mod lambda_site_prof {
             // capturing site falls back to Rust, and a probe reading only the
             // total cannot tell those apart.
             SITE_CAPTURE_ADAPTERS.load(Ordering::Relaxed),
+            // Nonzero means the thunk cache was asked to reuse a thunk across
+            // two different emitted SHAPES and refused. Reported here so the
+            // fix cannot go inert unnoticed: on a workload without the hazard
+            // it reads 0, and 0 is the honest answer rather than a missing one.
+            cratonvm_jit::lambda_adapter::lambda_adapter_shape_collisions(),
+            // The constant-return probe. `screened` is its engagement counter:
+            // a `mismatch=0` beside a `screened=0` says the probe never ran,
+            // not that the answers were right. `opaque` counts the sites whose
+            // calls it structurally cannot see -- see `const_probe_note_opaque`.
+            konst.0,
+            konst.1,
+            konst.2,
+            konst.3,
         )
     }
 }
@@ -2213,6 +2269,7 @@ pub(super) fn try_invoke_cached_lambda_impl(
                 {
                     lambda_jit::bump(&lambda_jit::FAST_RETURNS);
                     lambda_jit::maybe_report();
+                    screen_const_return_value(&cached, value.as_ref(), "interp-oneshot");
                     return Ok(Some(value));
                 }
                 // Declined (ABI limit, or a deopt with no resumable frame):
@@ -2277,6 +2334,16 @@ pub(super) fn try_invoke_cached_lambda_impl(
         }
         lambda_jit::maybe_report();
     }
+    // Taken BEFORE `cached` is moved into the frame, and only when the probe is
+    // on: an unconditional `Arc::clone` here would be a refcount bump on every
+    // interpreted lambda call in the process, for a diagnostic that is off.
+    let const_screen_impl = if crate::runtime::env_cache::jit_lambda_const_probe()
+        && const_int_return_of(&cached.code, !cached.exception_table.is_empty()).is_some()
+    {
+        Some(Arc::clone(&cached))
+    } else {
+        None
+    };
     thread.refill_pools_from_shared(
         &shared.mem.operand_stack_pool,
         &shared.mem.tag_pool,
@@ -2289,7 +2356,14 @@ pub(super) fn try_invoke_cached_lambda_impl(
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
-    execute_prebuilt_frame(shared, thread, frame).map(Some)
+    let out = execute_prebuilt_frame(shared, thread, frame).map(Some);
+    // The INTERPRETED arm, and the one that matters most for a constant body:
+    // a two-byte `iconst_1; ireturn` may never be nominated for compilation at
+    // all, so the two compiled screens above would never see it.
+    if let (Some(impl_method), Ok(Some(value))) = (&const_screen_impl, &out) {
+        screen_const_return_value(impl_method, value.as_ref(), "interp-frame");
+    }
+    out
 }
 
 /// Try to dispatch a method call on a lambda proxy object.
@@ -3413,4 +3487,200 @@ pub(crate) fn try_lambda_dispatch(
             Ok(Some(None))
         }
     }
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The constant an int-category method body returns unconditionally, if it is
+/// one of those bodies.
+///
+/// Only the shapes javac emits for `return <literal>;` — a push and an
+/// `ireturn`, nothing else in the method. `CompletionStages.alwaysTrue` is
+/// `iconst_1; ireturn`, two bytes. Deliberately narrow: the point is a body
+/// whose correct answer is knowable WITHOUT running it, so anything requiring
+/// analysis is not a candidate.
+///
+/// `ireturn` covers the whole int category — `boolean`, `byte`, `char`,
+/// `short`, `int` — which is where the functional interfaces that matter here
+/// (`IntPredicate`, `Predicate`, `BiPredicate`) return.
+pub(crate) fn const_int_return_of(code: &[u8], has_handlers: bool) -> Option<i32> {
+    const IRETURN: u8 = 0xAC;
+    if has_handlers {
+        // A handler can transfer control to a bci past the `ireturn`, so the
+        // prefix below would no longer describe every path through the body.
+        return None;
+    }
+    // A PREFIX match, not an exact-length one: this VM's `code` slice is
+    // zero-padded (`alwaysTrue` arrives as `[04, ac, 00, 00]` — `iconst_1;
+    // ireturn; nop; nop`), and an exact `[push, IRETURN]` pattern silently
+    // matched nothing at all on the very method this probe was written for.
+    //
+    // Sound because the prefix ENDS in an unconditional return and contains no
+    // branch: with no handlers, nothing can reach a later bci, so whatever
+    // follows cannot execute.
+    match *code {
+        // iconst_m1 .. iconst_5
+        [op @ 0x02..=0x08, IRETURN, ..] => Some(i32::from(op) - 0x03),
+        // bipush n
+        [0x10, n, IRETURN, ..] => Some(i32::from(n as i8)),
+        // sipush n
+        [0x11, hi, lo, IRETURN, ..] => Some(i32::from(i16::from_be_bytes([hi, lo]))),
+        _ => None,
+    }
+}
+
+/// Calls screened by the constant-return probe, and what they found.
+///
+/// UNGATED atomics rather than a debug-only structure: a correctness counter
+/// that only exists when a debug variable is set cannot answer "did this ever
+/// happen" after the fact, and the whole value of this probe is that ONE wrong
+/// call is proof.
+static CONST_SCREENED: AtomicU64 = AtomicU64::new(0);
+static CONST_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static CONST_DIRTY_HIGH: AtomicU64 = AtomicU64::new(0);
+static CONST_OPAQUE: AtomicU64 = AtomicU64::new(0);
+
+/// Count one SITE whose calls this probe cannot see — a constant-returning
+/// impl that was given an emitted inline-cache thunk. The thunk tail-jumps to
+/// the impl and returns straight to its compiled caller, so no Rust runs on
+/// that path and every call it serves goes unscreened.
+///
+/// A site count, not a call count: the calls are exactly what cannot be
+/// counted here.
+///
+/// This is the probe's honesty counter. A run with `site_const_mismatch=0` and
+/// a large `site_const_opaque` has not cleared the impl of anything; it has
+/// only failed to look. `CRATONVM_JIT_LAMBDA_CONST_PROBE=strict` refuses those
+/// thunks so the number goes to zero — at the cost of the fast path, and of
+/// changing the very codegen under suspicion.
+pub(crate) fn const_probe_note_opaque() {
+    CONST_OPAQUE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Screen one observed return value against the constant its body must return.
+///
+/// `raw` is the full JIT-ABI register word. The Java value is its low 32 bits,
+/// so that is what decides a MISMATCH; a correct low half carried in a word
+/// with junk above it is counted separately, because a caller that reads the
+/// register at the wrong width would see the junk and not the value.
+pub(crate) fn const_probe_screen(expected: i32, raw: i64, impl_class: &str, impl_name: &str, arm: &str) {
+    CONST_SCREENED.fetch_add(1, Ordering::Relaxed);
+    let observed = raw as i32;
+    if observed != expected {
+        let n = CONST_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            eprintln!(
+                "[cratonvm-lambda-const] WRONG ANSWER from a constant body: \
+                 {impl_class}.{impl_name} must return {expected}, observed {observed} \
+                 (raw={raw:#x}) via {arm}"
+            );
+        }
+        return;
+    }
+    if (raw as u64) >> 32 != 0 {
+        let n = CONST_DIRTY_HIGH.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            eprintln!(
+                "[cratonvm-lambda-const] {impl_class}.{impl_name} returned the right \
+                 int ({expected}) in a word with a dirty upper half (raw={raw:#x}) via {arm}"
+            );
+        }
+    }
+}
+
+/// `(screened, mismatched, dirty-upper-half, opaque)` — the constant-return
+/// probe's counters, for tests and for the census line.
+pub(crate) fn lambda_const_probe_counts() -> (u64, u64, u64, u64) {
+    (
+        CONST_SCREENED.load(Ordering::Relaxed),
+        CONST_MISMATCH.load(Ordering::Relaxed),
+        CONST_DIRTY_HIGH.load(Ordering::Relaxed),
+        CONST_OPAQUE.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+mod const_return_decode_tests {
+    use super::const_int_return_of;
+
+    /// `CompletionStages.alwaysTrue` is these two bytes, and the probe's whole
+    /// premise is recognising them.
+    #[test]
+    fn iconst_1_ireturn_is_the_constant_one() {
+        assert_eq!(const_int_return_of(&[0x04, 0xAC], false), Some(1));
+        assert_eq!(const_int_return_of(&[0x03, 0xAC], false), Some(0));
+        assert_eq!(const_int_return_of(&[0x02, 0xAC], false), Some(-1));
+        assert_eq!(const_int_return_of(&[0x08, 0xAC], false), Some(5));
+    }
+
+    #[test]
+    fn pushed_literals_decode_with_their_sign() {
+        assert_eq!(const_int_return_of(&[0x10, 0xFF, 0xAC], false), Some(-1));
+        assert_eq!(const_int_return_of(&[0x10, 0x7F, 0xAC], false), Some(127));
+        assert_eq!(const_int_return_of(&[0x11, 0xFF, 0x00, 0xAC], false), Some(-256));
+    }
+
+    /// The regression that made the first version of this probe screen NOTHING:
+    /// this VM hands out a zero-padded `code` slice, so `alwaysTrue` arrives as
+    /// four bytes and an exact-length pattern missed the one method the probe
+    /// exists for. `site_const_screened=0` was the only thing that showed it.
+    #[test]
+    fn trailing_padding_does_not_hide_a_constant_body() {
+        assert_eq!(const_int_return_of(&[0x04, 0xAC, 0x00, 0x00], false), Some(1));
+        assert_eq!(const_int_return_of(&[0x10, 0x2A, 0xAC, 0x00], false), Some(42));
+    }
+
+    /// With a handler in the table, a bci past the `ireturn` is reachable, so
+    /// the prefix no longer describes every path and the body is not a
+    /// candidate.
+    #[test]
+    fn a_handler_makes_the_prefix_argument_invalid() {
+        assert_eq!(const_int_return_of(&[0x04, 0xAC, 0x00, 0x00], true), None);
+    }
+
+    /// Anything that is not a push and an `ireturn` is not a candidate: a body
+    /// the probe cannot predict must not be screened against a guess.
+    #[test]
+    fn a_body_that_does_anything_else_is_not_a_constant() {
+        assert_eq!(const_int_return_of(&[0x04], false), None);
+        // iload_0; ireturn — returns an argument, not a constant.
+        assert_eq!(const_int_return_of(&[0x1A, 0xAC], false), None);
+        // iconst_1; areturn — right constant, wrong return category.
+        assert_eq!(const_int_return_of(&[0x04, 0xB0], false), None);
+        assert_eq!(const_int_return_of(&[], false), None);
+    }
+}
+
+/// Screen an interpreted/one-shot SAM result against the constant its body must
+/// return. The `Value`-typed twin of `jit::helpers::screen_const_return`.
+///
+/// A non-int `Value` from a body whose bytecode ends in `ireturn` is itself
+/// wrong, and is reported as such rather than skipped: this arm reconstructs
+/// the return value, so a coercion that lost the type is exactly the kind of
+/// defect worth catching here.
+pub(crate) fn screen_const_return_value(
+    cached: &CachedBytecodeMethod,
+    value: Option<&Value>,
+    arm: &str,
+) {
+    if !crate::runtime::env_cache::jit_lambda_const_probe() {
+        return;
+    }
+    let Some(expected) = const_int_return_of(&cached.code, !cached.exception_table.is_empty()) else {
+        return;
+    };
+    let raw = match value {
+        Some(Value::Int(v)) => i64::from(*v),
+        // Anything else is already a mismatch. `i64::from(expected) ^ 1` can
+        // never equal the expectation, so the screen reports it as the wrong
+        // answer it is instead of silently agreeing.
+        _ => i64::from(expected) ^ 1,
+    };
+    const_probe_screen(
+        expected,
+        raw,
+        &cached.class_name,
+        &cached.method_name,
+        arm,
+    );
 }

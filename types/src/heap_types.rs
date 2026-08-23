@@ -222,6 +222,22 @@ pub const REF_FIELD_SIZE: usize = 8;
 /// Byte offset of the discriminant word within a 16-byte `Value` field cell.
 pub const FIELD_CELL_TAG_OFFSET: usize = 0;
 
+
+/// The discriminant word a 16-byte `Value` field cell carries when it holds a
+/// reference -- i.e. when the 8 bytes at [`FIELD_CELL_PAYLOAD64_OFFSET`] are an
+/// object pointer and not something else.
+///
+/// A JIT arm that reads that payload without comparing against this is reading
+/// a pointer out of a cell that may not hold one. That is not theoretical: the
+/// IR backend's inline legacy `getfield` did exactly that until 2026-08-23, and
+/// a `[C` field whose cell held `Value::Int(1)` became a wild pointer that the
+/// next instruction dereferenced.
+///
+/// Named rather than written as `4` at each site, and const-asserted against
+/// `Value::Object` in `value.rs`, so the enum and the JIT cannot drift apart
+/// silently.
+pub const FIELD_CELL_TAG_OBJECT: u32 = 4;
+
 /// Byte offset of a 4-byte payload (`Int` / `Float`) within a `Value` field cell.
 pub const FIELD_CELL_PAYLOAD32_OFFSET: usize = 4;
 
