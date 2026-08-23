@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-474 tokens.
+477 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -223,6 +223,7 @@ export inherited from a parent shell.
 | `hang-sample` | `CRATONVM_DBG_HANG_SAMPLE` |
 | `hangwalk` | `CRATONVM_DBG_HANGWALK` |
 | `heap-stale` | `CRATONVM_DBG_HEAP_STALE` |
+| `fmt-wrongtype` | `CRATONVM_DBG_FMT_WRONGTYPE` |
 | `heap-trace` | `CRATONVM_DBG_HEAP_TRACE` |
 | `heapcopy` | `CRATONVM_DBG_HEAPCOPY` |
 | `heartbeat` | `CRATONVM_DBG_HEARTBEAT` |
@@ -279,6 +280,8 @@ export inherited from a parent shell.
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
 | `jit-rootscan` | `CRATONVM_DBG_JIT_ROOTSCAN` |
+| `jit-stale-after-remap` | `CRATONVM_DBG_JIT_STALE_AFTER_REMAP` |
+| `jit-stale-below-rbp` | `CRATONVM_DBG_JIT_STALE_BELOW_RBP` |
 | `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
 | `jit-pin` | `CRATONVM_DBG_JIT_PIN` |
 | `jit-putfield` | `CRATONVM_DBG_JIT_PUTFIELD` |
@@ -761,7 +764,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-68 tokens.
+70 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -799,6 +802,8 @@ export inherited from a parent shell.
 | `mirror-pin-young-defer` | `CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER` |
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
+| `format-arg-pin` | `CRATONVM_NO_FORMAT_ARG_PIN` |
+| `register-image-remap` | `CRATONVM_REGISTER_IMAGE_REMAP` |
 | `innermost-callee-resolve` | `CRATONVM_GC_NO_CALLEE_RESOLVE` |
 | `old-interior-pins` | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` |
 | `empty-object-run` | `CRATONVM_GC_NO_EMPTY_OBJECT_RUN` |

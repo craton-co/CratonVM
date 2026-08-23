@@ -937,6 +937,8 @@ pub fn update_all_roots(
     // it is the piece that lets a moving collector run while JIT frames are live
     // (see fixed-suite-bugs/app-jvm-bugs/precise-jit-stack-maps-design.md, Stage 3).
     crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
+    crate::jit::conservative_roots::remap_register_image_words(pointer_map, Some(shared));
+    crate::jit::conservative_roots::report_stale_after_remap(pointer_map, Some(shared));
 
     // Shadow-stack precise remap (CRATONVM_SHADOW_STACK) — the rewritable
     // counterpart to the marking scan in roots.rs. Every pushed slot is a known

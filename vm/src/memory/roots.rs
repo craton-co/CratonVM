@@ -185,7 +185,7 @@ fn dbg_jit_rootscan() -> bool {
 /// cycles the bit is spent, the oracle is not looking.
 ///
 /// This switch exists so the difference costs one binary to measure, not two.
-/// See `docs/known-issues/gc/bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`.
+/// See `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`.
 fn dbg_precise_only_roots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
