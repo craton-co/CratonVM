@@ -152,6 +152,19 @@ path are fixed and gated. Three more read String slots off that test in
 `annotation_value_hash`, `annotation_value_equals`); an annotation member whose
 value is a `String[]` reaches them, and none was measured here. Worth one probe.
 
+**And one observation this page cannot absorb.** The two-arm Spring Boot sweep
+that verified this fix (1975 classes per arm, Windows, 2026-08-22) shows the
+`JsonMarshallerTests` hit GONE — which is this fix working — and one hit in a
+different class, `KafkaMetricsAutoConfigurationTests`, whose `raw0` decodes as
+the ASCII text `"t/Proxy\0"` rather than as two heap pointers. Different shape,
+different producer, and it did not reproduce in 36 targeted runs per binary with
+the instrument armed. It is filed separately and OPEN as
+`known-issues/gc/corrupt-value-cell-one-unreproduced-hit-in-kafkametrics-20260822`.
+Its most actionable line is about the instrument added here: that read did NOT
+come through `NativeContext::get_field`, which is the only door
+`CRATONVM_DBG_CORRUPT_CELL` watches, so widening it to the interpreter's own
+`getfield` is the cheap next step.
+
 ## Reproduce (on a pre-fix binary)
 
 ```bash
