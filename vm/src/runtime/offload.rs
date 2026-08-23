@@ -104,6 +104,16 @@ pub struct CompiledKernel {
     /// Stored explicitly so the launch site doesn't have to reconstruct
     /// it.
     pub kernel_name: String,
+    /// Occupancy-selected block size, memoised after the first launch.
+    /// `0` means "not yet queried".
+    ///
+    /// `cuOccupancyMaxPotentialBlockSize` is a driver round trip and it
+    /// was being paid on EVERY dispatch, for an answer that depends
+    /// only on the kernel — not on how many elements this particular
+    /// launch covers. An inference step is hundreds of small kernels,
+    /// so a per-dispatch driver call is multiplied by hundreds before
+    /// anything else is measured.
+    pub block_size: std::sync::atomic::AtomicU32,
 }
 
 /// Outcome of an [`OffloadCache::lookup_or_compile`] call.
@@ -422,6 +432,7 @@ impl OffloadCache {
             module,
             signature: sig,
             kernel_name,
+            block_size: std::sync::atomic::AtomicU32::new(0),
         });
         self.kernels.write().insert(key, Arc::clone(&kernel));
         LookupOutcome::Hit(kernel)
@@ -1986,9 +1997,22 @@ impl OffloadCache {
         // fixed `DEFAULT_ELEMENTWISE_BLOCK` — falls back to the same
         // 256 default when the query is unavailable (stub mode, or the
         // driver call fails).
-        let cfg = kernel
-            .module
-            .elementwise_for_kernel(ctx, &kernel.kernel_name, work);
+        // Occupancy-tuned block size, queried ONCE per kernel and then
+        // memoised: the driver's answer is a property of the kernel, not
+        // of this launch's element count, and paying for it on every
+        // dispatch is hundreds of driver round trips per inference step.
+        let cfg = match kernel.block_size.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => {
+                let cfg = kernel
+                    .module
+                    .elementwise_for_kernel(ctx, &kernel.kernel_name, work);
+                kernel
+                    .block_size
+                    .store(cfg.block.0, std::sync::atomic::Ordering::Relaxed);
+                cfg
+            }
+            block => cuda_bridge::LaunchConfig::elementwise_with_block(work, block),
+        };
 
         // 3b. Chunked, overlapped writeback.
         //
@@ -2602,6 +2626,8 @@ pub fn dispatch_method_from_native_on_stream(
     // knows whether the compiled PTX declares a trailing `ret_ptr`
     // param (any non-void, non-array return) that needs a matching
     // accumulator buffer pushed ahead of `failure_flag`.
+    let timed = cratonvm_native_builtins::craton_gpu::dispatch_timing::enabled();
+    let mut mark = std::time::Instant::now();
     let (
         class_id,
         method_index,
@@ -2750,6 +2776,14 @@ pub fn dispatch_method_from_native_on_stream(
             }
         }
     };
+
+    if timed {
+        cratonvm_native_builtins::craton_gpu::dispatch_timing::add(
+            3,
+            mark.elapsed().as_nanos() as u64,
+        );
+        mark = std::time::Instant::now();
+    }
 
     // 4. From here on we need a real device context. The Failed-fast
     //    path is identical to dispatch_async's no-device branch.
@@ -3175,8 +3209,21 @@ pub fn dispatch_method_from_native_on_stream(
     //     after `event.synchronize()` and surfaces a non-zero value
     //     as a failure message so the Java side gets a real error
     //     instead of silently corrupt output.
-    let failure_flag_buf = match cuda_bridge::DeviceBuffer::<u64>::zeros(ctx, 1) {
-        Ok(b) => std::sync::Arc::new(b),
+    //     Pooled. A fresh `cuMemAlloc` per dispatch is the single
+    //     most expensive thing on this path — measured at 117 us for a
+    //     kernel that does nothing, against 5.5 ms of ACTUAL device
+    //     work for a whole 453-kernel inference step. The buffer is
+    //     one `u64`; allocating it fresh every time bought nothing.
+    if timed {
+        cratonvm_native_builtins::craton_gpu::dispatch_timing::add(
+            4,
+            mark.elapsed().as_nanos() as u64,
+        );
+        mark = std::time::Instant::now();
+    }
+    let pool_key = ctx as *const cuda_bridge::DeviceContext as usize;
+    let failure_flag_buf = match flag_pool::take(pool_key, ctx) {
+        Ok(b) => b,
         Err(e) => {
             drop(token);
             return record_failed_submission(
@@ -3195,6 +3242,7 @@ pub fn dispatch_method_from_native_on_stream(
     }
     writebacks.push(MarshalWriteback::FailureFlag {
         buf: failure_flag_buf,
+        pool_key,
     });
     // `tid_base` — the index of the first element this launch covers.
     //
@@ -3273,6 +3321,13 @@ pub fn dispatch_method_from_native_on_stream(
     //    handed — no kernel ran, nothing to finalize — same as this
     //    caller used to do explicitly in the `needs_finalize == false`
     //    case.
+    if timed {
+        cratonvm_native_builtins::craton_gpu::dispatch_timing::add(
+            5,
+            mark.elapsed().as_nanos() as u64,
+        );
+        mark = std::time::Instant::now();
+    }
     let submission = cache.dispatch_async(
         stream.clone(),
         class_id,
@@ -3306,10 +3361,28 @@ pub fn finalize_submission(
     shared: &crate::vm::SharedVm,
     submission: &std::sync::Arc<StreamSubmission>,
 ) -> Result<(), String> {
-    // First, take the FinalizeState. If None, finalization has
-    // already run (or this submission was Failed at dispatch) —
-    // fall through to read the terminal status.
-    let pending = submission.finalize.lock().take();
+    // Take the FinalizeState, and HOLD ITS LOCK for the whole
+    // finalization. If None, finalization has already run (or this
+    // submission was Failed at dispatch) — fall through to read the
+    // terminal status.
+    //
+    // The lock has to span the work, not just the take. Two callers
+    // reach here for the same submission — `future.get()` on the Java
+    // thread and the completion reaper woken by the device callback —
+    // and taking-then-releasing let the second one observe the gap:
+    // `FinalizeState` already gone, status not yet stamped, i.e.
+    // `Running` with nothing left to finalize. That is not a logic
+    // error, it is a race, and it surfaced as
+    //
+    //     GpuException: submission handle=35 is Running with no
+    //     FinalizeState
+    //
+    // on roughly a third of a 5-kernel sequence — the kind of flake
+    // that reads like a bad kernel. Holding the lock makes the second
+    // caller wait for the first and then read a terminal status, which
+    // is what it was always assumed to do.
+    let mut finalize_guard = submission.finalize.lock();
+    let pending = finalize_guard.take();
 
     if let Some(FinalizeState {
         writebacks,
@@ -3570,6 +3643,72 @@ pub fn poll_submission_status(shared: &crate::vm::SharedVm, handle: u64) -> Opti
             }
             drop(pending);
             Some(PollOutcome::Failed)
+        }
+    }
+}
+
+/// One-`u64` failure-flag buffers, reused across dispatches.
+///
+/// Every launch needs one, and allocating it fresh meant a `cuMemAlloc`
+/// on a path an inference step walks hundreds of times per token.
+/// Measured on an RTX 2060: 117 us to submit a kernel that does
+/// nothing, against 5.5 ms of real device work for a whole 453-kernel
+/// forward pass — the dispatch floor, not the kernels, was the cost.
+///
+/// Buffers are keyed by the `DeviceContext`'s address so one device's
+/// allocation can never be handed to another. A buffer goes back into
+/// the pool only when it read ZERO, which is what keeps "came from the
+/// pool" and "ready to be a failure flag" the same statement.
+#[cfg(feature = "gpu-offload")]
+pub(crate) mod flag_pool {
+    use cuda_bridge::{DeviceBuffer, DeviceContext};
+    use parking_lot::Mutex;
+    use rustc_hash::FxHashMap;
+    use std::sync::Arc;
+
+    static POOLS: Mutex<Option<FxHashMap<usize, Vec<Arc<DeviceBuffer<u64>>>>>> = Mutex::new(None);
+
+    /// Cap per context. A submission that is never finalized never
+    /// returns its buffer, so this is a reuse cache and not a ledger;
+    /// the cap keeps a pathological caller from growing it without
+    /// bound.
+    const MAX_POOLED: usize = 1024;
+
+    pub(crate) fn take(key: usize, ctx: &DeviceContext) -> Result<Arc<DeviceBuffer<u64>>, String> {
+        let pooled = {
+            let mut guard = POOLS.lock();
+            guard
+                .as_mut()
+                .and_then(|m| m.get_mut(&key))
+                .and_then(|v| v.pop())
+        };
+        if let Some(buf) = pooled {
+            return Ok(buf);
+        }
+        DeviceBuffer::<u64>::zeros(ctx, 1)
+            .map(Arc::new)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Safe to call only from the finalize path: the submission's
+    /// event has already been synchronized there, so no launch can
+    /// still be writing through the pointer the launch closure pinned.
+    pub(crate) fn give(key: usize, buf: &Arc<DeviceBuffer<u64>>) {
+        let buf = Arc::clone(buf);
+        let mut guard = POOLS.lock();
+        let map = guard.get_or_insert_with(FxHashMap::default);
+        let slot = map.entry(key).or_default();
+        if slot.len() < MAX_POOLED {
+            slot.push(buf);
+        }
+    }
+
+    /// Drop every pooled buffer for one context, so the pool never
+    /// outlives the memory it names.
+    #[allow(dead_code)]
+    pub(crate) fn clear(key: usize) {
+        if let Some(map) = POOLS.lock().as_mut() {
+            map.remove(&key);
         }
     }
 }
@@ -4643,6 +4782,11 @@ pub enum MarshalWriteback {
     /// the resident-variant ownership pattern).
     FailureFlag {
         buf: std::sync::Arc<cuda_bridge::DeviceBuffer<u64>>,
+        /// Which device context the buffer came from, so finalize can
+        /// return it to that context's pool and never another's. The
+        /// key is the `DeviceContext`'s address, which is stable for
+        /// the process because the context lives in the `OffloadCache`.
+        pool_key: usize,
     },
     /// Part E — owns the 1-element device buffer a scalar-return
     /// kernel's `ret_ptr` param points at (see
@@ -4790,16 +4934,21 @@ impl MarshalWriteback {
             // If non-zero, the kernel hit a bounds check; report as
             // a writeback error so `finalize_submission` flips the
             // submission to `Failed` and Java sees a `GpuException`.
-            Self::FailureFlag { buf } => {
+            Self::FailureFlag { buf, pool_key } => {
                 let mut cell = [0u64; 1];
-                gpu_marshal::download_into(buf, &mut cell)
+                gpu_marshal::download_into(&buf, &mut cell)
                     .map_err(|e| format!("download_into failure_flag: {e}"))?;
                 if cell[0] != 0 {
+                    // Deliberately NOT returned to the pool: a buffer
+                    // that read non-zero is not zero, and the pool's
+                    // whole contract is that what comes out of it is
+                    // ready to be a fresh failure flag.
                     return Err(format!(
                         "kernel failure flag set (value={}): out-of-range index inside kernel body",
                         cell[0]
                     ));
                 }
+                flag_pool::give(*pool_key, buf);
                 Ok(None)
             }
             // Part E — scalar-return accumulator readback. The device

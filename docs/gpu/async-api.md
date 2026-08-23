@@ -13,11 +13,20 @@ The two paths coexist:
   Methods outside the accepted shape run on the CPU as usual.
 - **Explicit async API** (Phase 3, this document) — `GpuExecutor` lets the
   application *schedule* offloaded work, chain kernels on the same device
-  stream, and read results back as `GpuFuture<T>`. No `--gpu` flag is
-  required; the executor probes the driver itself.
+  stream, and read results back as `GpuFuture<T>`.
 
 Same lowering pipeline, same analyzer, same PTX cache. Different entry
 point.
+
+> **`--gpu` is required for both.** This document used to say the
+> explicit path needs no flag because "the executor probes the driver
+> itself". The executor does acquire its own `DeviceContext` — and that
+> is not the context the dispatch uses. `OffloadCache::new` sets
+> `ctx = None` unless `config.gpu_offload_enabled`, so without `--gpu`
+> every `lookup_or_compile` returns `Skip` and every submission is
+> recorded as failed. What made the wrong claim survive is that
+> `GpuExecutor.open()` still succeeds: the failure appears one call
+> later, at `get()`, as "method not offloadable (Skip)".
 
 ## Quick start
 

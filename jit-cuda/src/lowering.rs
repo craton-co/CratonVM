@@ -1814,6 +1814,169 @@ mod tests {
         assert!(text.contains("L_bounds_fail:"), "{text}");
     }
 
+    /// Every kernel of the GPULlama3 inference path, lowered and run
+    /// through `ptxas`. The application copy lives outside this repo
+    /// (`apps/` is not tracked), so this fixture is its twin: a
+    /// rejection here is a rejection there, found in a second instead
+    /// of after a model load.
+    #[test]
+    fn llama_kernels_all_lower() {
+        let hint = crate::annotations::AdmissionHint::AllowIntrinsicCalls;
+        let cases: &[(&str, &str)] = &[
+            ("transposeF16", "([III[I)V"),
+            ("matmulSplit", "([I[FI[F)V"),
+            ("reducePartials", "([FI[F)V"),
+            ("embedT", "([III[F)V"),
+            ("rmsScale", "([FF[F)V"),
+            ("rmsApply", "([F[F[F[F)V"),
+            ("rope", "([F[F[FII[F)V"),
+            ("copyTo", "([FI[F)V"),
+            ("attScores", "([F[FIIIIIF[F)V"),
+            ("attWeighted", "([F[FIIIII[F)V"),
+            ("addInto", "([F[F)V"),
+            // `softmaxRows` and `siluMul` are deliberately absent: both
+            // call `Math.exp`, which is admitted only under
+            // CRATONVM_GPU_APPROX_MATH=1. Reading that variable here
+            // would make the test depend on the environment it happens
+            // to run in; `llama_exp_kernels_need_the_approx_switch`
+            // asserts the gate itself instead.
+        ];
+        for (name, descriptor) in cases {
+            let m = lower_fixture_with_pool_and_hint(
+                "EligibleLlamaKernels",
+                name,
+                descriptor,
+                hint,
+            );
+            let text = m.render();
+            assert!(
+                text.contains(&format!(".visible .entry EligibleLlamaKernels__{name}_")),
+                "{name} did not lower to a named entry:
+{text}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_llama_kernels() {
+        let hint = crate::annotations::AdmissionHint::AllowIntrinsicCalls;
+        let cases: &[(&str, &str)] = &[
+            ("transposeF16", "([III[I)V"),
+            ("matmulSplit", "([I[FI[F)V"),
+            ("reducePartials", "([FI[F)V"),
+            ("embedT", "([III[F)V"),
+            ("rmsScale", "([FF[F)V"),
+            ("rmsApply", "([F[F[F[F)V"),
+            ("rope", "([F[F[FII[F)V"),
+            ("copyTo", "([FI[F)V"),
+            ("attScores", "([F[FIIIIIF[F)V"),
+            ("attWeighted", "([F[FIIIII[F)V"),
+            ("addInto", "([F[F)V"),
+            // `softmaxRows` and `siluMul` are deliberately absent: both
+            // call `Math.exp`, which is admitted only under
+            // CRATONVM_GPU_APPROX_MATH=1. Reading that variable here
+            // would make the test depend on the environment it happens
+            // to run in; `llama_exp_kernels_need_the_approx_switch`
+            // asserts the gate itself instead.
+        ];
+        for (name, descriptor) in cases {
+            let m = lower_fixture_with_pool_and_hint(
+                "EligibleLlamaKernels",
+                name,
+                descriptor,
+                hint,
+            );
+            ptxas_round_trip(&m.render(), &format!("llama_{name}"));
+        }
+    }
+
+    /// The two kernels that need `Math.exp` are refused unless the
+    /// approximation is explicitly switched on, and admitted when it
+    /// is. Which side this test asserts depends on the environment it
+    /// runs in, so it asserts BOTH sides of the gate against whichever
+    /// state that is — the property under test is the gate, not the
+    /// setting.
+    #[test]
+    fn llama_exp_kernels_follow_the_approx_switch() {
+        let on = std::env::var("CRATONVM_GPU_APPROX_MATH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let hint = crate::annotations::AdmissionHint::AllowIntrinsicCalls;
+        for (name, descriptor) in [
+            ("softmaxRows", "([FII[F)V"),
+            ("siluMul", "([F[F[F)V"),
+        ] {
+            let (method, cp) = crate::analyzer::load_method_with_pool(
+                "EligibleLlamaKernels",
+                name,
+                descriptor,
+            );
+            let annotations = crate::annotations::MethodAnnotations {
+                gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
+                    admit: hint,
+                    ..crate::annotations::GpuKernelAttrs::default()
+                }),
+                ..crate::annotations::MethodAnnotations::default()
+            };
+            let verdict =
+                crate::analyzer::analyze_with_annotations_and_pool(&method, &annotations, &cp);
+            match (on, &verdict) {
+                (true, OffloadVerdict::Eligible(_)) => {}
+                (false, OffloadVerdict::Rejected(crate::analyzer::Reason::Invoke)) => {}
+                _ => panic!(
+                    "{name}: approx_math={on} but the analyzer said {verdict:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn split_matmul_lowers_both_halves() {
+        // The two kernels a decode step actually needs at scale: a
+        // split-K matrix-vector product (one thread per (row, chunk)
+        // pair, so the launch is `chunks` times wider than the row
+        // count) and the per-row reduction of its partials. Both have a
+        // sequential inner loop; the first also divides by a RUNTIME
+        // scalar in both the pre-loop and the body, so it carries two
+        // divisor-zero guards on top of the bounds checks.
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleSplitMatmul",
+            "matmulColSplit",
+            "([I[FI[F)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleSplitMatmul__matmulColSplit_"), "{text}");
+        assert!(text.contains("cvt.f32.f16"), "{text}");
+        assert!(text.contains("bra L_body_"), "{text}");
+
+        let m = lower_fixture("EligibleSplitMatmul", "reducePartials", "([FI[F)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleSplitMatmul__reducePartials_"), "{text}");
+        assert!(text.contains("add.rn.f32"), "{text}");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_split_matmul() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleSplitMatmul",
+            "matmulColSplit",
+            "([I[FI[F)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        ptxas_round_trip(&m.render(), "split_matmul_col_split");
+        let m = lower_fixture("EligibleSplitMatmul", "reducePartials", "([FI[F)V");
+        ptxas_round_trip(&m.render(), "split_matmul_reduce");
+    }
+
     #[test]
     fn row_reduction_with_int_accumulator_lowers() {
         let m = lower_fixture("EligibleRowReduction", "rowSums", "([I[I[I)V");
