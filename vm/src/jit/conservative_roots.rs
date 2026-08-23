@@ -6615,6 +6615,112 @@ mod tests {
         );
     }
 
+    /// The register-image REWRITE covers exactly one of the four regions the
+    /// band verifier refuses, and this test is the partition.
+    ///
+    /// `band_slot_is_verifiable` says "no" to everything at or above
+    /// `callee_saved_lo` — the caller's GPR image, the caller's XMM image, the
+    /// per-safepoint blind GPR spill, and the outgoing-argument / deopt
+    /// reserve above it. Only the FIRST is read by anything (the epilogue pops
+    /// it into the caller's registers) AND capable of holding a reference, and
+    /// widening the write back to the others is what made this repair look
+    /// unsafe enough to ship off. A future edit that re-widens it fails here.
+    #[test]
+    fn only_the_callee_saved_gpr_image_is_rewritten() {
+        let layout = cratonvm_jit::FrameLayout {
+            java_locals_hi: 16,
+            spill_lo: 16,
+            spill_hi: 48,
+            callee_saved_lo: 48,
+            callee_saved_hi: 80,
+            xmm_saved_lo: 80,
+            xmm_saved_hi: 112,
+            reg_spill_lo: 112,
+            reg_spill_hi: 144,
+            frame_size: 176,
+            ..Default::default()
+        };
+        // Verified storage: rewritten by `remap_one_jit_frame`, not here.
+        for off in [8, 16, 40] {
+            assert!(
+                band_slot_is_verifiable(off, &layout, None),
+                "off={off} must be verified storage"
+            );
+            assert!(
+                !is_callee_saved_gpr_image(off, &layout),
+                "off={off} is verified storage and must not be rewritten here"
+            );
+        }
+        // The one region something resumes from.
+        for off in [48, 64, 72] {
+            assert!(
+                !band_slot_is_verifiable(off, &layout, None),
+                "off={off} is a register image, so the verifier must skip it"
+            );
+            assert!(
+                is_callee_saved_gpr_image(off, &layout),
+                "off={off} is the callee-saved GPR image and must be rewritten"
+            );
+        }
+        // Unverifiable AND unread: an XMM never holds a reference, the
+        // per-safepoint spill is write-only, and everything above it is dead.
+        for off in [80, 100, 112, 140, 152] {
+            assert!(
+                !band_slot_is_verifiable(off, &layout, None),
+                "off={off} must be unverifiable"
+            );
+            assert!(
+                !is_callee_saved_gpr_image(off, &layout),
+                "off={off} is region `{}` — nothing resumes from it, so writing \
+                 it can only corrupt",
+                layout.region_name(off),
+            );
+        }
+        // A frame with no save area at all: nothing to rewrite, and the
+        // predicate must not admit an offset by an empty-range accident.
+        let flat = cratonvm_jit::FrameLayout::default();
+        for off in [0, 8, 64] {
+            assert!(!is_callee_saved_gpr_image(off, &flat));
+        }
+    }
+
+    /// The pin veto outranks the movable claim, and only for what it names.
+    ///
+    /// `is_movable_jit_root` is a claim about ONE slot while the pin set is
+    /// keyed by OBJECT, so without the veto a single rewritable channel
+    /// licensed moving an object out from under every unrewritable word that
+    /// also held it. The per-pass clear is the other half: a stale entry would
+    /// over-pin forever.
+    #[test]
+    fn the_unrewritable_veto_outranks_a_movable_claim() {
+        use cratonvm_gc::gc_quiescence as q;
+        q::clear_movable_jit_roots();
+        q::clear_unrewritable_jit_roots();
+        let movable_only = 0x1000usize;
+        let both = 0x2000usize;
+        q::add_movable_jit_root(movable_only);
+        q::add_movable_jit_root(both);
+        q::add_unrewritable_jit_root(both);
+
+        assert!(q::is_movable_jit_root(movable_only));
+        assert!(!q::is_unrewritable_jit_root(movable_only));
+        assert!(q::is_movable_jit_root(both));
+        assert!(
+            q::is_unrewritable_jit_root(both),
+            "an address held in an unrewritable frame word must be vetoed even \
+             though a rewritable channel also names it"
+        );
+        assert_eq!(q::unrewritable_jit_root_count(), 1);
+
+        q::clear_unrewritable_jit_roots();
+        assert!(
+            !q::is_unrewritable_jit_root(both),
+            "the veto is a statement about THIS collection's frames"
+        );
+        assert_eq!(q::unrewritable_jit_root_count(), 0);
+        q::clear_movable_jit_roots();
+    }
+
     #[test]
     fn frame_band_scan_ignores_words_outside_the_young_regions() {
         let band: Vec<usize> = vec![0, 1, u64::MAX as usize, 42, 0x7fff_ffff];
