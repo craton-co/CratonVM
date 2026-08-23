@@ -564,6 +564,7 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
          unjoined={unjoined} trigger={trigger}"
     );
     report_vector_intrinsics();
+    crate::craton_gpu::dispatch_timing::report();
 }
 
 /// The Vector API engagement counters, at exit.

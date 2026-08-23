@@ -80,6 +80,13 @@ pub struct KernelSignature {
     /// this should default it to "all bits set", which refuses chunking.
     pub reads_param_mask: u64,
 
+    /// The kernel's counted-loop trip count, when it is attributable to
+    /// one parameter's length or a literal — see
+    /// [`crate::emitter::WorkBound`]. Populated by `lower_method`; the
+    /// analyzer leaves it `Unknown`, which keeps the launch grid sized
+    /// from the largest array argument.
+    pub work_bound: crate::emitter::WorkBound,
+
     /// AUDIT 2026-05-24 (C31): the analyzer recognised this method as a
     /// dot-product / sum reduction (counted loop, array load, arithmetic
     /// `*add`, scalar return). The lowering layer turns the per-thread
