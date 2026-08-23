@@ -1052,7 +1052,7 @@ impl Compiler {
         // the never-mapped operand-spill slots those runs report. Those are
         // staged invoke-arguments, which were never in this vocabulary to be
         // dropped from. See
-        // `docs/known-issues/gc/bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`. Every `continue`/failed-`if let` below is
+        // `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`. Every `continue`/failed-`if let` below is
         // a silent omission, and until this existed none of them reached
         // `fully_oop_covered`, which tests only that each safepoint produced AN
         // entry (`safepoint_pcs ⊆ mapped_safepoint_pcs`). A safepoint whose map

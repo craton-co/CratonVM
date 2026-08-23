@@ -33,4 +33,9 @@
 # FORMAT — one row per vector, whitespace separated:
 #   <vector>  <observed-rate>  <date>  <record>
 #
-RTreeRangeGc  3/12  2026-08-22  docs/known-issues/jdk-only/WORKER-1-NOTE-1-rtreerangegc-is-two-defects-20260822.md
+# (No rows. `RTreeRangeGc` was quarantined here at 3/12 on 2026-08-22 and
+#  removed the same day: its three defects are fixed and it passes 25/25 on the
+#  default collector and 25/25 under --jdk-only on one binary. Removing a row
+#  cannot move the blast-radius baseline, which is keyed on the SET of FAILING
+#  vectors per prefix -- a vector that passes contributes to no set either way.
+#  See WORKER-1-NOTE-1's RESOLVED section.)

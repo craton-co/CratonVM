@@ -478,8 +478,14 @@ segment per `reinterpretAsInts()`, so a per-allocation regression here is
 multiplied by every lane group in the kernel.
 
 Core regression suite on the fixed binary: **66 of 67 vectors pass**. The one
-failure, `RTreeRangeGc`, is pre-existing and already filed as
-`bug-zgc-relocation-unmasks-root-collection-gap-rtreerangegc-20260821.md`.
+failure, `RTreeRangeGc`, is pre-existing and was filed at the time as a
+root-collection gap. **FIXED 2026-08-22**, and it was not a root-collection
+gap: three defects in the collection natives, retired to
+`rtreerangegc-was-four-collection-native-defects-FIXED-20260822.md`. The guard
+text this paragraph leans on is emitted on EVERY failing `checkcast`, so it was
+never evidence of reclamation -- which does not weaken the argument here, since
+that argument rests on the SAME text appearing on both binaries rather than on
+what the text means.
 That is established rather than assumed: the same vector run 3x on this binary
 and 3x on one built from the merge base fails on both, with identical guard
 text — 3 of 3 here against 2 of 3 there, which is the flake's own rate rather

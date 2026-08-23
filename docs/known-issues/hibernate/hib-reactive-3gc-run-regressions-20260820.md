@@ -1154,7 +1154,11 @@ Every class in this section's family PASSes on all three collectors:
 
 What remains is four classes, none of them this defect:
 `MultithreadedInsertionWithLazyConnectionTest` (all three arms, PASSes on
-HotSpot — the suite's longest-standing item and the obvious next target),
+HotSpot — now diagnosed in its own page,
+[`hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`](hib-reactive-multithreaded-insertion-lazy-connection-20260822.md):
+a ~6x throughput gap on `CompletableFuture` composition crossing the test's own
+10-minute Vert.x budget, plus a separate intermittent duplicated INSERT that is
+NOT this section's defect — `site_unresumable` reads 0 on it),
 `techempower.TechEmpowerTest` (G1 + Generational, PASSes on ZGC),
 `MultithreadedIdentityGenerationTest` and `SoftDeleteCollectionTest`
 (Generational only). The last three are single observations and have not been
@@ -1273,6 +1277,7 @@ sessions:
 | `ReactiveStatelessProxyUpdateTest` | **fixed (9.1, this section)** |
 | `MutationDelegateIdentityTest` | not failing; unrelated to this fix (9.2) |
 | `techempower.TechEmpowerTest` | still open — separate family, see below |
+| `MultithreadedInsertionWithLazyConnectionTest` | NOT fixed — perf family, measured in 9.5 |
 
 **Seven classes repaired by one change.** The only member of section 7's
 still-FAIL list not accounted for is `techempower.TechEmpowerTest`, which
@@ -1305,3 +1310,85 @@ RSS) completed in 17m46s on the same contended host. Anyone building on this
 host while it is busy should do the same, and should watch for process
 *disappearance* rather than only for a completion marker — a watcher that
 waits for `BUILD_DONE` alone waits forever on a killed build.
+
+### 9.5 `MultithreadedInsertionWithLazyConnectionTest` — measured, still the perf family, and the runner's `--timeout` is the WRONG knob for it
+
+Section 7.3 left this class "inconclusive at this run's flat timeout". Measured
+here on the same fixed binary, and the answer is that section 8's fix does not
+change it: it is still exactly what
+[residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md)
+section 2.1 described.
+
+**The first attempt measured the wrong thing, and the way it was wrong is worth
+recording** because it will catch the next reader too. Running with
+`--timeout 900` produced `FAIL 0/2` in 251 s, with both methods throwing
+JUnit's own
+`TimeoutException: … timed out after 120 seconds`. That is **not** the fixture
+deadline and not the runner's cap — it is
+`-Djunit.jupiter.execution.timeout.default=120s`, set in `common.args`. The
+runner's `--timeout` only bounds the forked process's wall clock; it does
+nothing to JUnit's per-test timer, and 2 x 120 s accounts for the 251 s exactly.
+This is the same argfile-ordering hazard residual-seven section 4 documents from
+the other direction: per-class `-D` flags must land AFTER `@common.args` to win,
+which the runner now does.
+
+Re-run with the JUnit timer actually raised — via `HR_CLASS_OVERRIDES` pointing
+at a temporary table (`timeout=900`,
+`-Djunit.jupiter.execution.timeout.default=900s`), so the tracked
+`class-overrides.tsv` was not modified:
+
+| | result |
+|---|---|
+| `found` / `ok` / `failed` | 2 / **1** / 1 |
+| wall | 749 s (12m29s) |
+| failing method | `testIdentityGeneratorWithTransaction` |
+| its exception | Vert.x `TimeoutException: The test execution timed out. Make sure your asynchronous code includes calls to either VertxTestContext#completeNow()…` |
+
+So **one of the two methods passes and the other exceeds the fixture's own
+hardcoded `@Timeout(value = 10, timeUnit = MINUTES)`** — the deadline
+residual-seven section 2.1 already established `io.vertx.junit5` exposes no
+system property for, and which therefore **no runner flag, override row, or
+system property can reach**. Patching an upstream stress test's own budget to
+make the VM look better remains a trade this project has declined to make.
+
+Two caveats, stated rather than buried: the host was at 1-minute load average
+23–27 (8 vCPU) throughout, so this does not prove the second method could not
+finish inside 600 s on a quiet box; and the 749 s here is not comparable to
+residual-seven's 942.9 s, which was a different host under different conditions.
+What it does establish is the **shape** — 1 of 2, second method on the fixture
+deadline — is unchanged by `b8fa0585e`, which is the expected result: section 8
+fixed a double-execution correctness defect, not the functional-interface
+dispatch cost that makes this class slow.
+
+`techempower.TechEmpowerTest` is still not measured (5-minute fixture deadline,
+same family, and section 9.3's reasoning about host load applies to it more
+strongly than to this class).
+
+### 9.6 …and then it WAS measured, and it is not a perf class at all
+
+Measured the same day on a quiet host (load 6.8–14), and the "same family"
+assumption in 9.5 and 9.3 — inherited from
+[residual-seven-after-the-afc-fix-20260817.md](residual-seven-after-the-afc-fix-20260817.md)
+section 2.1 — **does not hold**:
+
+| arm | result | wall |
+|---|---|---|
+| real HotSpot | PASS 1/1 | 13.3 s |
+| CratonVM `--jit off` | **PASS 3/3** | 74.9 / 72.2 / 72.6 s |
+| CratonVM `--jit on` | FAIL 4/4 | 31.3 / 22.5 / 21.7 / 305.8 s |
+
+`techempower.TechEmpowerTest` **passes on CratonVM in ~72 s**, well inside its
+own 5-minute fixture deadline, with the JIT off. It never needed a raised
+budget and it is not bound by dispatch cost. With the JIT on it fails — 3 of 4
+times with a fast WRONG ANSWER (a server-side `NullPointerException` because
+`session.find(World.class, id)` returned `null` for an id the benchmark
+guarantees exists, surfacing as HTTP 500 in ~25 s), and 1 of 4 times on the
+fixture deadline. That bimodality is why it was misfiled: the earlier records
+only ever caught the timeout mode.
+
+It is **not** the section 8 defect — the 500 was already present pre-`b8fa0585e`
+(section 7.3) and reproduces on a binary containing it.
+
+Full write-up, evidence, reproducer, and the one query that would split the
+remaining search space:
+[techempower-jit-wrong-answer-20260822.md](../jit/techempower-jit-wrong-answer-20260822.md).

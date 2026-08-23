@@ -2037,6 +2037,11 @@ impl SharedVm {
         // Config-sourced, not a process global — see the `ClassManager` note
         // above for why (§2).
         native_methods.set_compatibility_mode(config.compatibility_mode);
+        // Which CLASS LIBRARY the registrars below are populating for — a
+        // different question from the compatibility policy above, and one three
+        // of them need. Set here, ahead of every `register_*` arm, because it
+        // gates registration: see `NativeMethodRegistry::real_jdk`.
+        native_methods.set_real_jdk(!config.use_synthetic_jdk);
         #[cfg(feature = "synthetic-jdk")]
         {
             if config.use_synthetic_jdk {

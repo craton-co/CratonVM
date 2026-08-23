@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-472 tokens.
+477 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -118,6 +118,7 @@ export inherited from a parent shell.
 | `census-exact-invocations` | `CRATONVM_CENSUS_EXACT_INVOCATIONS` |
 | `cce` | `CRATONVM_DBG_CCE` |
 | `cce-bt` | `CRATONVM_DBG_CCE_BT` |
+| `corrupt-cell` | `CRATONVM_DBG_CORRUPT_CELL` |
 | `ccecache` | `CRATONVM_DBG_CCECACHE` |
 | `ccsprobe` | `CRATONVM_DBG_CCSPROBE` |
 | `coercion` | `CRATONVM_DBG_COERCION` |
@@ -222,6 +223,7 @@ export inherited from a parent shell.
 | `hang-sample` | `CRATONVM_DBG_HANG_SAMPLE` |
 | `hangwalk` | `CRATONVM_DBG_HANGWALK` |
 | `heap-stale` | `CRATONVM_DBG_HEAP_STALE` |
+| `fmt-wrongtype` | `CRATONVM_DBG_FMT_WRONGTYPE` |
 | `heap-trace` | `CRATONVM_DBG_HEAP_TRACE` |
 | `heapcopy` | `CRATONVM_DBG_HEAPCOPY` |
 | `heartbeat` | `CRATONVM_DBG_HEARTBEAT` |
@@ -278,6 +280,8 @@ export inherited from a parent shell.
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
 | `jit-rootscan` | `CRATONVM_DBG_JIT_ROOTSCAN` |
+| `jit-stale-after-remap` | `CRATONVM_DBG_JIT_STALE_AFTER_REMAP` |
+| `jit-stale-below-rbp` | `CRATONVM_DBG_JIT_STALE_BELOW_RBP` |
 | `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
 | `jit-pin` | `CRATONVM_DBG_JIT_PIN` |
 | `jit-putfield` | `CRATONVM_DBG_JIT_PUTFIELD` |
@@ -385,12 +389,13 @@ export inherited from a parent shell.
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
 | `osr-seed-collision` | `CRATONVM_DBG_OSR_SEED_COLLISION` |
 | `osr-slots` | `CRATONVM_DBG_OSR_SLOTS` |
+| `view-kind` | `CRATONVM_DBG_VIEWKIND` |
+| `view-resync` | `CRATONVM_DBG_VIEWRESYNC` |
 | `overlay` | `CRATONVM_DBG_OVERLAY` |
 | `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
 | `overlay-nodedup` | `CRATONVM_DBG_OVERLAY_NODEDUP` |
 | `overlay-prune` | `CRATONVM_DBG_OVERLAY_PRUNE` |
-| `tmview` | `CRATONVM_DBG_TMVIEW` |
 | `parklat` | `CRATONVM_DBG_PARKLAT` |
 | `pb` | `CRATONVM_DBG_PB` |
 | `pbe` | `CRATONVM_DBG_PBE` |
@@ -759,7 +764,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-68 tokens.
+70 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -797,6 +802,8 @@ export inherited from a parent shell.
 | `mirror-pin-young-defer` | `CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER` |
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
+| `format-arg-pin` | `CRATONVM_NO_FORMAT_ARG_PIN` |
+| `register-image-remap` | `CRATONVM_REGISTER_IMAGE_REMAP` |
 | `innermost-callee-resolve` | `CRATONVM_GC_NO_CALLEE_RESOLVE` |
 | `old-interior-pins` | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` |
 | `empty-object-run` | `CRATONVM_GC_NO_EMPTY_OBJECT_RUN` |
@@ -869,12 +876,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_LOADER`
 
-13 tokens.
+14 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `allow-jsr-ret` | `CRATONVM_ALLOW_JSR_RET` |
 | `enforce-native-shadow` | `CRATONVM_ENFORCE_NATIVE_SHADOW` |
+| `cf-delegating-yield` | `CRATONVM_CF_DELEGATING_YIELD` |
 | `aware-resolution` | `CRATONVM_LOADER_AWARE_RESOLUTION` |
 | `boot-module-registry` | `CRATONVM_BOOT_MODULE_REGISTRY` |
 | `cl-bootstrap-scoped` | `CRATONVM_CL_BOOTSTRAP_SCOPED` |
@@ -952,10 +960,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-13 tokens.
+14 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `map-iterator-failfast` | `CRATONVM_NO_MAP_ITERATOR_FAILFAST` |
 | `eager-streams` | `CRATONVM_EAGER_STREAMS` |
 | `foreign-attach` | `CRATONVM_FOREIGN_ATTACH` |
 | `jboss-boot-log-file` | `CRATONVM_JBOSS_BOOT_LOG_FILE` |

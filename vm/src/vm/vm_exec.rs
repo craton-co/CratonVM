@@ -12169,6 +12169,14 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
         let (obj, obj_validated) = self.shared.mem.heap.load_and_forward_checked(obj);
+        // CRATONVM_DBG_CORRUPT_CELL: remember the collector's corrupt-cell
+        // counter across this read, so a read that trips it can be attributed to
+        // its RECEIVER and its Java frames. See `corrupt_cell_dbg`.
+        let corrupt_before = if crate::runtime::env_cache::corrupt_cell_dbg() {
+            Some(cratonvm_gc::heap::corrupt_cell_hits())
+        } else {
+            None
+        };
         // T10.9.E вЂ” descriptor-aware read path. Resolve (and cache) the
         // declared field descriptor for the receiver's class and route
         // the slot decode through `get_field_as`, so a long-typed field
@@ -12185,7 +12193,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         } else {
             ClassId::new(0)
         };
-        match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
+        let read = match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
             Some(desc) => {
                 let decoded = self.shared.mem.heap.get_field_as(obj, index, desc);
                 // L4 gap 1 — the read half of the overlay hunter. The value
@@ -12209,7 +12217,22 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 decoded
             }
             None => self.shared.mem.heap.get_field(obj, index),
+        };
+        if let Some(before) = corrupt_before {
+            if cratonvm_gc::heap::corrupt_cell_hits() != before {
+                let (slot, raw0, raw1) = cratonvm_gc::heap::corrupt_cell_last();
+                crate::memory::reclaim_guard::report_corrupt_cell_producer(
+                    self.shared,
+                    self.thread,
+                    obj,
+                    index,
+                    slot,
+                    raw0,
+                    raw1,
+                );
+            }
         }
+        read
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {

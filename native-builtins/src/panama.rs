@@ -2077,6 +2077,75 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
                     .into());
                 }
 
+                // A heap segment has no address at all, so the pointer
+                // path below cannot express it: `segment_address` answers
+                // 0 and the `is_null` guard then skipped the copy without
+                // a word — `MemorySegment.copy` into an `ofArray(int[])`
+                // destination wrote NOTHING and reported success. Route
+                // any side that is heap-backed through the array itself.
+                let src_heap = heap_segment_view(ctx, src);
+                let dst_heap = heap_segment_view(ctx, dst);
+                if src_heap.is_some() || dst_heap.is_some() {
+                    let staged = match &src_heap {
+                        Some(view) => heap_read_bytes(ctx, view, src_offset, bytes),
+                        None => {
+                            let addr = (src_ptr as u64).checked_add(src_offset as u64);
+                            addr.filter(|a| *a != 0).map(|a| {
+                                let mut buf = vec![0u8; bytes];
+                                // SAFETY: the source range was bounds-checked
+                                // against the segment size above, and the
+                                // destination is a fresh owned buffer.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        a as *const u8,
+                                        buf.as_mut_ptr(),
+                                        bytes,
+                                    )
+                                };
+                                buf
+                            })
+                        }
+                    };
+                    let Some(staged) = staged else {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: "MemorySegment.copy: source is neither addressable nor \
+                                      array-backed"
+                                .into(),
+                        }
+                        .into());
+                    };
+                    let wrote = match &dst_heap {
+                        Some(view) => heap_write_bytes(ctx, view, dst_offset, &staged),
+                        None => {
+                            let addr = (dst_ptr as u64).checked_add(dst_offset as u64);
+                            match addr.filter(|a| *a != 0) {
+                                Some(a) => {
+                                    // SAFETY: bounds-checked above; `staged`
+                                    // is exactly `bytes` long.
+                                    unsafe {
+                                        std::ptr::copy(
+                                            staged.as_ptr(),
+                                            a as *mut u8,
+                                            bytes,
+                                        )
+                                    };
+                                    true
+                                }
+                                None => false,
+                            }
+                        }
+                    };
+                    if !wrote {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: "MemorySegment.copy: destination is read-only, not \
+                                      addressable, or not array-backed"
+                                .into(),
+                        }
+                        .into());
+                    }
+                    return Ok(None);
+                }
+
                 // Validate address arithmetic doesn't overflow
                 let src_total = (src_ptr as u64).checked_add(src_offset as u64);
                 let dst_total = (dst_ptr as u64).checked_add(dst_offset as u64);
@@ -3727,6 +3796,179 @@ fn heap_element_width(elem: cratonvm_types::ArrayElementType) -> Option<usize> {
         A::Long | A::Double => 8,
         A::Boolean | A::Reference => return None,
     })
+}
+
+/// Read `len` bytes of a heap segment's payload, starting `offset` bytes
+/// into the segment.
+///
+/// A heap segment has no address, so `MemorySegment.copy`'s pointer path
+/// cannot see it at all — which is exactly how a copy INTO one used to
+/// write nothing at all and say nothing about it. The bytes have to come
+/// out of (or go into) the Java array itself.
+///
+/// The `Byte` and `Int` arms go through the bulk array accessors, which
+/// the VM implements as one `copy_nonoverlapping` over the heap arena;
+/// everything else, and any access not aligned to its element width,
+/// falls back to an element-at-a-time loop that is correct for every
+/// width and offset. That fallback is why this returns bytes rather than
+/// borrowing them: an unaligned read spans element boundaries.
+fn heap_read_bytes(
+    ctx: &dyn NativeContext,
+    view: &HeapSegmentView,
+    offset: i64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let start = view.start.checked_add(offset)?;
+    if start < 0 || len == 0 {
+        return if len == 0 { Some(Vec::new()) } else { None };
+    }
+    let start = start as usize;
+    let width = view.elem_width;
+    if width == 1 && view.elem_type == cratonvm_types::ArrayElementType::Byte {
+        let mut out = vec![0u8; len];
+        let got = ctx.read_byte_array_into(view.base, start, &mut out);
+        return (got == len).then_some(out);
+    }
+    if width == 4
+        && view.elem_type == cratonvm_types::ArrayElementType::Int
+        && start % 4 == 0
+        && len % 4 == 0
+    {
+        let mut words = vec![0i32; len / 4];
+        let got = ctx.read_int_array_into(view.base, start / 4, &mut words);
+        if got != words.len() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(len);
+        for w in words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        return Some(out);
+    }
+    // General case: walk the elements the byte range touches and take the
+    // bytes out of each one's little-endian image.
+    let first = start / width;
+    let last = (start + len - 1) / width;
+    let mut staged = Vec::with_capacity((last - first + 1) * width);
+    for index in first..=last {
+        staged.extend_from_slice(&heap_element_le_bytes(ctx, view, index)?);
+    }
+    let skip = start - first * width;
+    Some(staged[skip..skip + len].to_vec())
+}
+
+/// Write `src` into a heap segment's payload at `offset`. Mirror of
+/// [`heap_read_bytes`]; an unaligned or sub-element write reads the
+/// element it lands in, patches the bytes, and writes it back.
+fn heap_write_bytes(
+    ctx: &mut dyn NativeContext,
+    view: &HeapSegmentView,
+    offset: i64,
+    src: &[u8],
+) -> bool {
+    if view.read_only {
+        return false;
+    }
+    let Some(start) = view.start.checked_add(offset) else {
+        return false;
+    };
+    if start < 0 {
+        return false;
+    }
+    if src.is_empty() {
+        return true;
+    }
+    let start = start as usize;
+    let width = view.elem_width;
+    if width == 1 && view.elem_type == cratonvm_types::ArrayElementType::Byte {
+        return ctx.write_byte_array_from(view.base, start, src);
+    }
+    if width == 4
+        && view.elem_type == cratonvm_types::ArrayElementType::Int
+        && start % 4 == 0
+        && src.len() % 4 == 0
+    {
+        let words: Vec<i32> = src
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        return ctx.write_int_array_from(view.base, start / 4, &words);
+    }
+    let first = start / width;
+    let last = (start + src.len() - 1) / width;
+    let mut staged = Vec::with_capacity((last - first + 1) * width);
+    for index in first..=last {
+        match heap_element_le_bytes(ctx, view, index) {
+            Some(bytes) => staged.extend_from_slice(&bytes),
+            None => return false,
+        }
+    }
+    let skip = start - first * width;
+    staged[skip..skip + src.len()].copy_from_slice(src);
+    for (n, index) in (first..=last).enumerate() {
+        let chunk = &staged[n * width..(n + 1) * width];
+        if !heap_element_from_le_bytes(ctx, view, index, chunk) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One array element's little-endian byte image, whatever its width.
+fn heap_element_le_bytes(
+    ctx: &dyn NativeContext,
+    view: &HeapSegmentView,
+    index: usize,
+) -> Option<Vec<u8>> {
+    if index >= ctx.array_length(view.base) {
+        return None;
+    }
+    Some(match ctx.get_array_element(view.base, index) {
+        Value::Int(v) => match view.elem_width {
+            1 => vec![v as u8],
+            2 => (v as u16).to_le_bytes().to_vec(),
+            _ => v.to_le_bytes().to_vec(),
+        },
+        Value::Long(v) => v.to_le_bytes().to_vec(),
+        Value::Float(v) => v.to_bits().to_le_bytes().to_vec(),
+        Value::Double(v) => v.to_bits().to_le_bytes().to_vec(),
+        _ => return None,
+    })
+}
+
+/// Inverse of [`heap_element_le_bytes`].
+fn heap_element_from_le_bytes(
+    ctx: &mut dyn NativeContext,
+    view: &HeapSegmentView,
+    index: usize,
+    bytes: &[u8],
+) -> bool {
+    use cratonvm_types::ArrayElementType as A;
+    if index >= ctx.array_length(view.base) || bytes.len() != view.elem_width {
+        return false;
+    }
+    let value = match view.elem_type {
+        A::Byte => Value::Int(bytes[0] as i8 as i32),
+        A::Short => Value::Int(i16::from_le_bytes([bytes[0], bytes[1]]) as i32),
+        A::Char => Value::Int(u16::from_le_bytes([bytes[0], bytes[1]]) as i32),
+        A::Int => Value::Int(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        A::Float => Value::Float(f32::from_bits(u32::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        A::Long => {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(bytes);
+            Value::Long(i64::from_le_bytes(w))
+        }
+        A::Double => {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(bytes);
+            Value::Double(f64::from_bits(u64::from_le_bytes(w)))
+        }
+        A::Boolean | A::Reference => return false,
+    };
+    ctx.set_array_element(view.base, index, value);
+    true
 }
 
 /// Resolve `seg` if — and only if — it is a heap segment (H1 or H2).
