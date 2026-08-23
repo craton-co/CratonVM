@@ -2563,7 +2563,7 @@ pub mod dispatch_timing {
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| {
-            std::env::var("CRATONVM_GPU_TIME_DISPATCH")
+            cratonvm_types::flags::runtime_var("CRATONVM_GPU_TIME_DISPATCH")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
         })
