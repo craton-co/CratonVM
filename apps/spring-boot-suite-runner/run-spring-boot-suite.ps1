@@ -44,6 +44,14 @@ param(
   [string]$MaxHeap = '2g',
   [string[]]$CratonArgs = @(),
 
+  # The corrupt-`Value`-cell census is ARMED by default on craton runs. It
+  # costs one extra stderr line per class and turns a heap-integrity guard hit
+  # from an event nobody sees into one that names its own door, receiver and
+  # Java stack the FIRST time it happens. A cell was observed once in this
+  # suite on 2026-08-22 and has not been reproduced since; the whole reason it
+  # is unexplained is that nothing was armed when it fired.
+  [switch]$NoCorruptCellCensus,
+
   [switch]$RefreshLists,
   [switch]$RefreshClasspaths,
   [switch]$ListOnly,
@@ -347,6 +355,40 @@ function Select-ClassRange([object[]]$List) {
   $end = $list.Count
   if ($Count -gt 0) { $end = [Math]::Min($list.Count, $from + $Count) }
   return @($list[$from..($end - 1)])
+}
+
+function Get-CorruptCellCensus {
+  <#
+    Read back the `[corrupt-cell] decoded=N reported=M` line every armed
+    cratonvm.exe prints from its shutdown trailer.
+
+    The ARMED count is reported separately from the DECODED count on purpose.
+    An absent line and a zero line are different claims: the first armed sweep
+    run against this suite printed the census in ZERO of 1975 logs -- a JUnit
+    runner exits through System.exit, and the summary was on a path it never
+    took -- and that run looked exactly like a clean one. Counting the logs that
+    actually carried the line is what makes "0 decoded" mean something.
+  #>
+  param([string]$LogDir)
+  $logs = @(Get-ChildItem -Path $LogDir -Filter '*.err.log' -ErrorAction SilentlyContinue)
+  $armed = 0; $decoded = 0; $reported = 0; $classes = @()
+  foreach ($f in $logs) {
+    $m = Select-String -Path $f.FullName -Pattern '\[corrupt-cell\] decoded=(\d+) reported=(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $m) { continue }
+    $armed++
+    $d = [int]$m.Matches[0].Groups[1].Value
+    $r = [int]$m.Matches[0].Groups[2].Value
+    $decoded += $d; $reported += $r
+    if ($d -gt 0) {
+      # `<module>.<fqcn>.err.log` -- keep the class, drop the module and suffix.
+      $stem = $f.Name -replace '\.err\.log$', ''
+      $classes += ("{0}  (decoded={1} named={2})" -f $stem, $d, $r)
+    }
+  }
+  return [pscustomobject]@{
+    Logs = $logs.Count; Armed = $armed; Unarmed = ($logs.Count - $armed)
+    Decoded = $decoded; Reported = $reported; Classes = $classes
+  }
 }
 
 function Resolve-ReferenceFile {
@@ -1238,6 +1280,15 @@ function Invoke-Mode {
     $env:CRATONVM_REAL = 'net-sockets,aqs'
     $env:CRATONVM_THREADS = '-default-watchdog'
     $env:CRATONVM_JIT = 'rootsnap-cache'
+    # Corrupt-`Value`-cell census -- see `-NoCorruptCellCensus`. Armed here so
+    # every child cratonvm.exe inherits it; the per-class cost is one line of
+    # stderr, and `decoded=0` is what makes a quiet run a MEASUREMENT rather
+    # than an absence of one.
+    if ($NoCorruptCellCensus) {
+      $env:CRATONVM_DBG_CORRUPT_CELL = $null
+    } else {
+      $env:CRATONVM_DBG_CORRUPT_CELL = '1'
+    }
   }
 
   $run = $RunName
@@ -1313,6 +1364,27 @@ function Invoke-Mode {
   if ($Vm -eq 'craton') { $summary.Add("- craton exe: $craton") }
   $summary.Add(""); $summary.Add("## Status Counts")
   foreach ($group in $counts) { $summary.Add("- $($group.Name): $($group.Count)") }
+  if ($Vm -eq 'craton' -and -not $NoCorruptCellCensus) {
+    $cc = Get-CorruptCellCensus -LogDir (Join-Path $modeOut 'logs')
+    $summary.Add(""); $summary.Add("## Corrupt Value cell census")
+    $summary.Add("- logs scanned: $($cc.Logs)")
+    $summary.Add("- logs carrying the census line: $($cc.Armed)")
+    $summary.Add("- logs with NO census line: $($cc.Unarmed) (a class killed before the shutdown trailer -- HANG/TIMEOUT -- cannot print it)")
+    $summary.Add("- cells decoded: $($cc.Decoded)")
+    $summary.Add("- cells named (door or backstop): $($cc.Reported)")
+    if ($cc.Classes.Count -gt 0) {
+      $summary.Add(""); $summary.Add("### Classes that decoded a cell")
+      foreach ($c in $cc.Classes) { $summary.Add("- $c") }
+    }
+    # Loud on stdout too: a census buried in a file nobody opens is the same
+    # silence this exists to remove.
+    if ($cc.Decoded -gt 0) {
+      Write-Info "CORRUPT-VALUE-CELL: $($cc.Decoded) decoded, $($cc.Reported) named, in $($cc.Classes.Count) class(es) -- see $summaryPath"
+      foreach ($c in $cc.Classes) { Write-Info "  corrupt-cell: $c" }
+    } else {
+      Write-Info "corrupt-cell census: 0 decoded across $($cc.Armed) of $($cc.Logs) logs (armed)"
+    }
+  }
   $summary.Add(""); $summary.Add("## Files"); $summary.Add("- results: $results"); $summary.Add("- logs: $(Join-Path $modeOut 'logs')")
   $summary | Set-Content -Path $summaryPath -Encoding ascii
 
