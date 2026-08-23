@@ -1793,8 +1793,22 @@ fn register_jit_code_range_inner(
     let registry = jit_code_ranges();
     if let Ok(_writer) = registry.writer.lock() {
         let mut next = (**registry.snapshot.load()).clone();
-        next.push((entry, entry.saturating_add(len), cm_ptr, owner));
-        next.sort_unstable_by_key(|&(start, _, _, _)| start);
+        // INSERT, do not push-then-sort. The snapshot this clone came from is
+        // already sorted by `start` — it is only ever written here and by
+        // `unregister_jit_code_range`, which retains in place — so the whole
+        // ordering work is placing ONE element. `sort_unstable_by_key` cannot
+        // see that: its almost-sorted fast path detects a run, and an element
+        // appended past the end of one is exactly the shape that defeats it, so
+        // every registration paid O(n log n) over the entire registry.
+        //
+        // It matters more than the old cost suggests, because the population is
+        // about to grow: `register_jit_code_range_inner` and its sorts were
+        // ~0.7% of the WebClient exchange profile with 155 compiled methods,
+        // and the whole point of the `invokedynamic` bridge is that far more
+        // methods stay compiled.
+        let range = (entry, entry.saturating_add(len), cm_ptr, owner);
+        let at = next.partition_point(|&(start, _, _, _)| start < entry);
+        next.insert(at, range);
         registry.snapshot.store(std::sync::Arc::new(next));
         // Release: any cached snapshot taken with Acquire after this point must
         // see the push above (ordinary Mutex unlock already provides this, but
