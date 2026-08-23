@@ -62,6 +62,28 @@ public class SubmitOverheadProbe {
             }
             System.out.printf("SUBMIT_NO_GPU   ns=%d%n", (System.nanoTime() - t2) / iters);
 
+            // The fire-and-forget path: no GpuFuture object per call.
+            Object[] fafArgs = new Object[] {a, b};
+            long h = 0;
+            for (int i = 0; i < 20; i++) {
+                h = exec.dispatchNamedHandle("SubmitOverheadProbe", "touch", "([F[F)V", fafArgs);
+            }
+            exec.awaitSubmission(h);
+            long t4 = System.nanoTime();
+            for (int i = 0; i < iters; i++) {
+                h = exec.dispatchNamedHandle("SubmitOverheadProbe", "touch", "([F[F)V", fafArgs);
+            }
+            long queuedFaf = (System.nanoTime() - t4) / iters;
+            exec.awaitSubmission(h);
+            System.out.printf("HANDLE_ONLY     ns=%d%n", queuedFaf);
+
+            long t5 = System.nanoTime();
+            for (int i = 0; i < iters; i++) {
+                exec.awaitSubmission(exec.dispatchNamedHandle(
+                        "SubmitOverheadProbe", "touch", "([F[F)V", fafArgs));
+            }
+            System.out.printf("HANDLE_AND_WAIT ns=%d%n", (System.nanoTime() - t5) / iters);
+
             // And a pure-Java control on the same objects: the cost of
             // CratonVM running the wrapper at all.
             long sink = 0;
