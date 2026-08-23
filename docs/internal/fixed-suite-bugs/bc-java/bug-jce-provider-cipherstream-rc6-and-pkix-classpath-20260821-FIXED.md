@@ -125,6 +125,13 @@ same contended host) — but that is a no-regression check, not the evidence:
 the unmodified binary also passes it sometimes. The ten standalone runs are the
 evidence.
 
+Re-measured after merging 152 commits of `dev` on top: `CipherStreamTest2`
+standalone under Generational passes 3/3, and `jce.provider.test.AllTests` is
+`OK (1 test)` again. The same merge also carries `dev`'s own fixes in this
+family (`String.format reclaimed its own arguments mid-format`, the
+`DecimalFormatSymbols` pinning), which is the same defect shape found
+independently in three places on the same day.
+
 ### The fix
 
 `native-builtins/src/jca/cipher.rs`:
