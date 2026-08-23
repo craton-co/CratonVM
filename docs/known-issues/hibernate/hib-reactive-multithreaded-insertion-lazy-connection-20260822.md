@@ -228,18 +228,98 @@ the one under suspicion, and shadowing it changes what the JIT compiles. The
 verticle-side `ITERS` counter in §5.1 is the instrument that works, because it
 lives in the consumer.
 
-### 5.6 What to try next
+### 5.6 The VM-side constant-return probe
+
+`CRATONVM_JIT_LAMBDA_CONST_PROBE` replaces the statistics of §5.3 for one
+specific shape. `CompletionStages.alwaysTrue` is `return true;` — two bytes of
+bytecode — so its correct answer is knowable WITHOUT running it. That makes a
+wrong answer provable from a single call, with no baseline, no repeat runs and
+no rate to beat.
+
+The probe screens every SAM call whose impl body is a bare push-and-`ireturn`
+(`iconst_<n>` / `bipush` / `sipush`) and reports any call that observes
+something else. `=1` screens; `=strict` additionally refuses the emitted
+inline-cache thunk for such impls — see below.
+
+Counters, in the `CRATONVM_DBG=lambda-jit` census:
+
+| counter | meaning |
+|---|---|
+| `site_const_screened` | calls actually checked — the ENGAGEMENT counter |
+| `site_const_mismatch` | calls that returned the wrong value |
+| `site_const_dirty_high` | right int, in a register with a junk upper half |
+| `site_const_opaque` | sites whose calls the probe structurally cannot see |
+
+**`site_const_opaque` is the honest part.** An emitted thunk tail-jumps to the
+impl and returns straight to its compiled caller, so no Rust runs on that path
+and those calls cannot be screened at all. A `mismatch=0` beside a non-zero
+`opaque` has not cleared anything; it has failed to look. `=strict` drives
+`opaque` to 0 by refusing those thunks — at the cost of changing the very
+codegen under suspicion, which is a diagnostic trade and not a measurement one.
+
+For the thunk that IS installed there is a check that needs no failure at all:
+`const_thunk_self_test` calls the freshly emitted thunk once, at install, and
+compares the result against the constant. A mis-emitted slide, a wrong entry or
+a stale cached thunk is then caught on the first run of the process rather than
+in one run out of ten. It is inside the probe flag today; promoting it to
+always-on is the obvious next step once it has run across a suite.
+
+Measured on this workload (24 threads, N=60, filler rows present):
+
+| mode | `screened` | `mismatch` | `opaque` |
+|---|---:|---:|---:|
+| `=1` | ~500 / run | 0 | 2 |
+| `=strict` | 4319 | 0 | **0** |
+
+and the constant-return site it finds is exactly the one the investigation
+pointed at: `CompletionStages.alwaysTrue(I)Z`.
+
+**The probe has not yet caught anything**: 10 runs at `=1` all passed, so there
+was no failure for it to screen. That is not evidence of correctness — it is
+the base-rate problem of §5.3 again, seen from the other side. What the probe
+changes is that ONE failing run is now enough.
+
+#### The engagement counter earned its keep immediately
+
+The first two builds of this probe read `site_const_screened=0`. Both were
+wrong in ways no amount of running would have revealed:
+
+1. The screens covered only the two COMPILED arms. `alwaysTrue` is two bytes
+   and may never be nominated for compilation, so the interpreted frame path
+   had to be screened too.
+2. This VM hands out a zero-padded `code` slice — `alwaysTrue` arrives as
+   `[04, ac, 00, 00]`, not `[04, ac]` — and an exact-length slice pattern
+   matched nothing. It now matches a PREFIX, which is sound because the prefix
+   ends in an unconditional return and the site gate requires an empty
+   exception table; `a_handler_makes_the_prefix_argument_invalid` and
+   `trailing_padding_does_not_hide_a_constant_body` pin both halves.
+
+A probe reporting `mismatch=0` without `screened` beside it would have passed
+for a clean bill of health twice.
+
+#### Reading it
+
+```bash
+CRATONVM_JIT_LAMBDA_CONST_PROBE=strict CRATONVM_DBG=lambda-jit ./hibfix-dupins-loop.sh hunt /path/to/cratonvm.exe 40
+```
+
+A `[cratonvm-lambda-const] WRONG ANSWER` line names the impl, the expected and
+observed values, the raw register word, and which arm served the call. One such
+line closes this section.
+
+### 5.7 What to try next
 
 1. Re-run the `CRATONVM_JIT_DENY` bisect at **≥40 runs per arm** with
    `hibfix-dupins-loop.sh` and the filler rows in place, control arm interleaved
    with each test arm rather than measured on a different day.
-2. Better: replace the statistics with a direct check. `alwaysTrue` returns a
-   constant, so a VM-side probe on the lambda dispatch path that records any
-   `IntPredicate` SAM call returning `false` for an impl whose body is
-   `iconst_1/ireturn` would catch the wrong answer on the first occurrence,
-   without touching the Java class.
+2. **Run the probe of §5.6 alongside it.** It is built, armed and verified to
+   engage on `alwaysTrue`; it just has not seen a failing run yet. Prefer
+   `=strict` when the goal is coverage and `=1` when the goal is to keep the
+   codegen honest, and read `site_const_screened` before believing any zero.
+   One `WRONG ANSWER` line closes this.
 3. `--nojit` passed 8/8 and JIT 6/8 at the old rate; that comparison also needs
    redoing at the current rate before it is leaned on.
+
 ## 6. What was changed, and why it is not the fix
 
 The `CompletableFuture` / `CompletionStage` dependent-stage natives
