@@ -239,7 +239,7 @@ thread_local! {
     pub(crate) static INLINE_TEST_PUBLISHES_DEOPT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
-mod safepoint;
+pub mod safepoint;
 mod frames;
 mod operand_stack;
 mod emit;

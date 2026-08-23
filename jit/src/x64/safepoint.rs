@@ -32,6 +32,49 @@ pub(super) const fn cmp_r64_imm32_opcode(r: u8) -> [u8; 3] {
     [rex, 0x81, 0xC0 | (7 << 3) | (r & 7)]
 }
 
+/// Why a safepoint's oop map was recorded as INCOMPLETE, counted per cause.
+///
+/// `emit_oop_map_for_safepoint` withholds such a safepoint's pc from
+/// `mapped_safepoint_pcs`, which turns `CompiledMethod::fully_oop_covered`
+/// false for the whole method, which the runtime reports as one
+/// `map_coverage=N` counter on the `[jitroots]` line. That aggregate is where
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` ran out of
+/// road: it names the field, never the reason, and the six ways to get there
+/// want six different repairs.
+///
+/// Process-global relaxed counters — compilation is not on any hot path and
+/// these are read once, at the end of a run, by `CRATONVM_DBG_OOPCOV`.
+pub mod map_incomplete_cause {
+    use std::sync::atomic::AtomicUsize;
+    /// The operand-stack oop mark vector was not exact at this safepoint.
+    pub static MARKS_INEXACT: AtomicUsize = AtomicUsize::new(0);
+    /// A marked operand-stack oop was still register/scratch/xmm resident.
+    pub static OOP_STILL_IN_REGISTER: AtomicUsize = AtomicUsize::new(0);
+    /// An operand-stack frame slot sits further than `i16::MAX` from `rbp`.
+    pub static STACK_OFF_TOO_DEEP: AtomicUsize = AtomicUsize::new(0);
+    /// A local-variable home sits further than `i16::MAX` from `rbp`.
+    pub static LOCAL_OFF_TOO_DEEP: AtomicUsize = AtomicUsize::new(0);
+    /// A staged invoke-argument home sits further than `i16::MAX` from `rbp`.
+    pub static STAGED_ARG_OFF_TOO_DEEP: AtomicUsize = AtomicUsize::new(0);
+    /// A reference was staged somewhere no map can name (native-ABI outgoing
+    /// args, direct-call service slots, inlined-callee parameter locals).
+    pub static STAGED_ARG_UNMAPPABLE: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(marks_inexact, oop_in_register, stack_deep, local_deep, staged_deep,
+    /// staged_unmappable)`.
+    pub fn snapshot() -> [usize; 6] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            MARKS_INEXACT.load(Relaxed),
+            OOP_STILL_IN_REGISTER.load(Relaxed),
+            STACK_OFF_TOO_DEEP.load(Relaxed),
+            LOCAL_OFF_TOO_DEEP.load(Relaxed),
+            STAGED_ARG_OFF_TOO_DEEP.load(Relaxed),
+            STAGED_ARG_UNMAPPABLE.load(Relaxed),
+        ]
+    }
+}
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Frame layout, prologue and epilogue
@@ -1067,6 +1110,9 @@ impl Compiler {
         // classified — sound only because a conservative sweep follows, which is
         // exactly what the coverage claim suppresses.
         let mut map_incomplete = !self.stack.is_empty() && !self.stack_oop_marks_exact;
+        if map_incomplete {
+            map_incomplete_cause::MARKS_INEXACT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let n = self.stack.len();
         for i in 0..n {
             if !self.stack_oop_marks[i] {
@@ -1076,12 +1122,20 @@ impl Compiler {
                 StackSlot::Frame(off) => match i16::try_from(off) {
                     Ok(i16_off) => slots.push(i16_off),
                     // A frame deeper than i16 from `rbp`. Rare, and silent.
-                    Err(_) => map_incomplete = true,
+                    Err(_) => {
+                        map_incomplete = true;
+                        map_incomplete_cause::STACK_OFF_TOO_DEEP
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 },
                 // An oop operand that is still register/scratch/xmm resident at
                 // the safepoint. There was no `else` arm here: the value is live,
                 // the map does not name it, and nothing recorded that.
-                _ => map_incomplete = true,
+                _ => {
+                    map_incomplete = true;
+                    map_incomplete_cause::OOP_STILL_IN_REGISTER
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         // Stage 2 (precise oop maps) — add the canonical frame slots of local
@@ -1110,7 +1164,11 @@ impl Compiler {
                                 slots.push(i16_off);
                             }
                         }
-                        Err(_) => map_incomplete = true,
+                        Err(_) => {
+                            map_incomplete = true;
+                            map_incomplete_cause::LOCAL_OFF_TOO_DEEP
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -1132,7 +1190,11 @@ impl Compiler {
                         slots.push(i16_off);
                     }
                 }
-                Err(_) => map_incomplete = true,
+                Err(_) => {
+                    map_incomplete = true;
+                    map_incomplete_cause::STAGED_ARG_OFF_TOO_DEEP
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         // A reference staged somewhere no map can name it (native-ABI outgoing
@@ -1140,6 +1202,8 @@ impl Compiler {
         // Fail closed.
         if std::mem::take(&mut self.pending_staged_args_unmapped) {
             map_incomplete = true;
+            map_incomplete_cause::STAGED_ARG_UNMAPPABLE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Stage A.2 (precise oop maps, B-K fix) — under the precise gate, record

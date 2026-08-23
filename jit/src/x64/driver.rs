@@ -2401,9 +2401,11 @@ pub fn compile_with_param_slots(
             .collect();
         missing.sort_unstable();
         missing.truncate(16);
+        let causes = crate::x64::safepoint::map_incomplete_cause::snapshot();
         eprintln!(
             "[oopcov] uncovered method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
-             safepoints={} mapped={} unmapped_pcs={:?}",
+             safepoints={} mapped={} unmapped_pcs={:?} \
+             causes(marks_inexact={} oop_in_reg={} stack_deep={} local_deep={} staged_deep={} staged_unmappable={})",
             compiler.method_key,
             compiler.precise_maps,
             compiler.sp_id_slot_off,
@@ -2411,6 +2413,12 @@ pub fn compile_with_param_slots(
             compiler.safepoint_pcs.len(),
             compiler.mapped_safepoint_pcs.len(),
             missing,
+            causes[0],
+            causes[1],
+            causes[2],
+            causes[3],
+            causes[4],
+            causes[5],
         );
     }
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
