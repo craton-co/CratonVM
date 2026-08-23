@@ -2443,22 +2443,6 @@ fn register_java_net_uri_access(registry: &mut NativeMethodRegistry) {
 
 // JavaNioAccess ---------------------------------------------------------------
 
-/// `JavaNioAccess.getBufferPool()` — the `"direct"` pool.
-///
-/// It used to be `alloc_singleton(ctx, "java/lang/management/BufferPoolMXBean")`,
-/// i.e. an instance stamped with the INTERFACE, and its four accessors were
-/// stateless lambdas returning 0. Both halves are gone: the receiver is now
-/// [`CRATON_BUFFER_POOL_CLASS`], a concrete class, and the counters are the
-/// direct-memory allocator's own live ones. A pool bean that always reported
-/// zero is worse than none — `DirectBufferCacheProbe` measures "direct buffers
-/// allocated per read" as a difference of two `getCount()` readings, and a
-/// constant zero reports a PERFECT temporary-buffer cache no matter what the
-/// VM is doing.
-fn jnio_get_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let pool = alloc_direct_buffer_pool(ctx)?;
-    Ok(Some(Value::Object(Some(pool))))
-}
-
 fn jnio_new_direct_byte_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // JavaNioAccess.newDirectByteBuffer(long addr, int cap[, Object att,
     // MemorySegment seg]) -> a DirectByteBuffer wrapping the native address.
@@ -2596,22 +2580,6 @@ fn jnio_page_size(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Int(4096)))
 }
 
-/// RKC16N.11 — return a synthetic `jdk.internal.misc.VM$BufferPool`
-/// instance (rather than the previous null) so that the caller — typically
-/// `ManagementFactoryHelper.getBufferPoolMXBeans` and friends, which
-/// immediately invoke `getName()` / `getCount()` / `getMemoryUsed()` /
-/// `getTotalCapacity()` on the returned reference — does not NPE.
-///
-/// The natives bound to `jdk/internal/misc/VM$BufferPool` (registered
-/// alongside this in `register_java_nio_access`) provide safe defaults:
-/// `"direct"` for the name, zero counters for the rest. That's
-/// spec-compatible: the legacy interface only documents the value
-/// shape, not strict per-call accuracy of the counters.
-fn jnio_get_direct_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let pool = alloc_direct_buffer_pool(ctx)?;
-    Ok(Some(Value::Object(Some(pool))))
-}
-
 fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     // The `BufferPoolMXBean` surface. Registered from HERE rather than from
     // `jmx.rs`, which is gated on the `management` feature: `JavaNioAccess
@@ -2619,12 +2587,6 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     // on every build, so their methods have to be registered on every build too.
     register_buffer_pool_mxbean(registry);
     let owner = "java/nio/Buffer$2";
-    registry.register(
-        owner,
-        "getBufferPool",
-        "()Ljava/lang/management/BufferPoolMXBean;",
-        jnio_get_buffer_pool,
-    );
     // JDK-25 JavaNioAccess overloads: 2-arg `(JI)` (used by the NIO socket
     // read/write path via SocketDispatcher) and 4-arg
     // `(JILjava/lang/Object;Ljava/lang/foreign/MemorySegment;)`.
@@ -2722,21 +2684,20 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     // RKC16N.10 follow-on / RKC16N.11 / TOMCAT0807: legacy SharedSecrets
     // accessor used by JDK 17's `VM$BufferPoolsHolder.<clinit>`.
     // JDK 25 exposes JavaNioAccess as Buffer$2, JDK 17 as Buffer$1, and
-    // CratonVM can also see a synthetic anonymous receiver when real class
-    // metadata is incomplete. Register the method on both known owners and on
-    // the interface so the forced invokeinterface path has a stable target.
-    for direct_owner in [
-        owner,
-        "java/nio/Buffer$1",
-        "jdk/internal/access/JavaNioAccess",
-    ] {
-        registry.register(
-            direct_owner,
-            "getDirectBufferPool",
-            "()Ljdk/internal/misc/VM$BufferPool;",
-            jnio_get_direct_buffer_pool,
-        );
-    }
+    // `getDirectBufferPool` is NOT registered, deliberately. MEASURED with
+    // `javap -p -c` on JDK 25, the real method is two instructions:
+    //
+    //     java.nio.Buffer$2.getDirectBufferPool()
+    //       0: getstatic  java/nio/Bits.BUFFER_POOL
+    //       3: areturn
+    //
+    // — a real object real bytecode already builds, needing no carrier from us.
+    // The native that used to stand here handed back a FABRICATED one, and
+    // under `--jdk-only` that fabrication is refused. Its caller is
+    // `jdk/internal/misc/VM$BufferPoolsHolder.<clinit>`, so the refusal did not
+    // surface as a catchable throwable: it poisoned `jdk.internal.misc.VM` for
+    // the life of the process and took the ENTIRE platform MBeanServer with it,
+    // which is what reddened `RJdkJmx`. See `WORKER-3-NOTE-9` and `-NOTE-10`.
 
     // RKC16N.11's four `VM$BufferPool` methods USED TO BE FOUR STATELESS
     // LAMBDAS RETURNING ZERO, registered here. They now live in
@@ -2835,11 +2796,6 @@ fn alloc_buffer_pool(
 
 /// The `"direct"` pool — the one every caller in the JDK's own code asks for by
 /// name (`VM.getDirectBufferPool`, `JavaNioAccess.getBufferPool`).
-pub(crate) fn alloc_direct_buffer_pool(
-    ctx: &mut dyn NativeContext,
-) -> Result<ObjectRef, MethodCallFailed> {
-    alloc_buffer_pool(ctx, "direct", BUFFER_POOL_KIND_DIRECT)
-}
 
 /// All three pools, in HotSpot's order — the answer to
 /// `ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)`.
