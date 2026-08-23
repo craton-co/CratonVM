@@ -32,6 +32,7 @@ pub mod addr_keyed;
 pub mod gc;
 pub mod native_roots;
 pub mod reclaim_guard;
+pub use reclaim_guard::corrupt_cell_exit_summary;
 pub mod roots;
 pub mod smuggled_longs;
 

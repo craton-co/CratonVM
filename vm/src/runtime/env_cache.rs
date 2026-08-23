@@ -1464,6 +1464,12 @@ cached_is_set!(overlay_corruption_dbg, "CRATONVM_DBG_OVERLAY");
 /// Costs one relaxed load per `NativeContext::get_field` while armed and nothing
 /// at all while it is not.
 cached_is_set!(corrupt_cell_dbg, "CRATONVM_DBG_CORRUPT_CELL");
+/// `CRATONVM_DBG_CORRUPT_CELL_SELFTEST` — fabricate one corrupt-cell hit at the
+/// first interpreter `getfield` and one at the first `set_field`, so a run can
+/// prove the DOOR reporter and the safepoint BACKSTOP both actually speak. A
+/// silent diagnostic and a broken one look identical from the outside, and this
+/// instrument has already been read the wrong way round once.
+cached_is_set!(corrupt_cell_selftest, "CRATONVM_DBG_CORRUPT_CELL_SELFTEST");
 cached_is_set!(lambda_dbg, "CRATONVM_DBG_LAMBDA");
 cached_is_set!(resume_pc_dbg, "CRATONVM_DBG_RESUME_PC");
 /// `CRATONVM_DBG_BADRECV` — on a getfield/putfield/array/invoke receiver whose

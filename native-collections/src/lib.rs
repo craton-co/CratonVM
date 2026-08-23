@@ -15879,7 +15879,40 @@ fn adopt_fresh_view_backing(
 /// views are live. Without this, `map.keySet()` then `map.remove(k)` left the
 /// snapshot reporting `contains(k)==true` (Tomcat `ParameterMap` setUp asserts
 /// the opposite). No-op for an ordinary HashSet (backing carries no source).
-fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> Result<(), MethodCallFailed> {
+/// # `set` is `&mut` for the reason `tm_sync_native_state` is — N4 of `WORKER-5-NOTE-10`
+///
+/// This funnel ALLOCATES (`alloc_ref_array` for the bucket table,
+/// `try_alloc_synthetic` per entry), so a moving collector can relocate the
+/// RECEIVER inside it. It used to take `set` by value and return `()`, which
+/// gave its ten callers no way to learn the new address: each went straight on
+/// to `hs_backing_map(ctx, this)`, and that keys the side table on
+/// `widened_obj_key(this)` — off a from-space address it mints a fresh slot,
+/// finds nothing, and the caller takes its "no backing" branch. That is exactly
+/// how `TreeMap.size()` came to answer 0 on an unmutated view.
+///
+/// **LATENT, not measured.** Unlike the TreeMap case this has no reproduction:
+/// a `HashMap` keySet/entrySet walked under the same `--Xmx 64m --nojit`
+/// pressure answers correctly every time, because the early returns above
+/// usually fire before the allocating path. It is fixed because it is the same
+/// SHAPE, the fix is mechanical, and `&mut` makes the eight unprotected call
+/// sites compile errors rather than a grep somebody has to repeat. Two of the
+/// ten (`native_hs_iterator`, `native_hs_remove_if`) already re-read through a
+/// pin and were never exposed.
+fn resync_view_set(
+    ctx: &mut dyn NativeContext,
+    set: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let pin = ctx.pin_native_root(*set);
+    let r = resync_view_set_inner(ctx, *set);
+    *set = ctx.read_native_pin(pin, *set);
+    ctx.unpin_native_roots(pin);
+    r
+}
+
+fn resync_view_set_inner(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let backing = match hs_backing_map(ctx, set) {
         Some(b) => b,
         None => return Ok(()),
@@ -17749,14 +17782,14 @@ fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if let Some(r) = ksv_route(ctx, args, native_ksv_size) {
         return r;
     }
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     if let Some(b) = unmod_receiver_backing(ctx, this) {
         return native_hs_size(ctx, &[Value::Object(Some(b))]);
     }
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
@@ -17775,11 +17808,11 @@ fn native_hs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(r) = ksv_route(ctx, args, native_ksv_is_empty) {
         return r;
     }
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
@@ -18065,11 +18098,11 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
@@ -18354,7 +18387,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
         return r;
     }
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -18370,7 +18403,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // HashSet before that allocation, otherwise the subsequent backing lookup
     // can read the pre-move receiver and return a null iterator.
     let this_pin = ctx.pin_native_root(this);
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let this = ctx.read_native_pin(this_pin, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
@@ -18477,7 +18510,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             let arr = alloc_ref_array(ctx, 0);
@@ -18495,7 +18528,7 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // natives and reads the backing map directly. Resync here before taking the
     // stream snapshot so a cached view reflects source-map mutations made after
     // the view was obtained (Spring `LinkedCaseInsensitiveMap$KeySet`).
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
 
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
@@ -18522,11 +18555,11 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
@@ -18554,11 +18587,11 @@ fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
@@ -21288,7 +21321,7 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
         return r;
     }
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
@@ -21296,7 +21329,7 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return Ok(None),
@@ -26648,11 +26681,11 @@ fn native_al_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return make_stream(ctx, &[]),
@@ -45126,8 +45159,8 @@ fn native_hs_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this_pin = ctx.pin_native_root(this);
     let pred_pin = ctx.pin_native_root(pred);
     let result = (|| -> MethodCallResult {
-        let this_now = ctx.read_native_pin(this_pin, this);
-        resync_view_set(ctx, this_now)?;
+        let mut this_now = ctx.read_native_pin(this_pin, this);
+        resync_view_set(ctx, &mut this_now)?;
         let this_now = ctx.read_native_pin(this_pin, this);
         let backing = match hs_backing_map(ctx, this_now) {
             Some(m) => m,
@@ -46164,6 +46197,14 @@ fn tm_resync_view(ctx: &mut dyn NativeContext, view: ObjectRef) -> Result<(), Me
     if !TM_VIEW_RESYNC.with(|s| s.borrow_mut().insert(key)) {
         // Already rebuilding this view further up the stack — see the guard's
         // doc comment.
+        //
+        // CRATONVM_DBG_TMVIEW is the instrument that FOUND the stale-receiver
+        // defect, after six theories and the lane's own best lead had all been
+        // eliminated. It is kept because the next bug in this area will present
+        // the same way: a view answering a DEFAULT rather than a wrong value.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TMVIEW").is_some() {
+            eprintln!("[TMVIEW] resync SKIPPED (re-entrant) view={:?}", view.as_ptr());
+        }
         return Ok(());
     }
     let result = tm_resync_view_inner(ctx, view, &spec);

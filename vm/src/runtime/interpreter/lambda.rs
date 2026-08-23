@@ -1858,7 +1858,7 @@ pub(crate) mod lambda_site_prof {
         format!(
             "site_calls={} site_direct={} site_no_code={} site_refused={} site_deopted={} \
              site_resumed={} site_unresumable={} \
-             site_arity={} site_adapters={} site_cap_adapters={}",
+             site_arity={} site_adapters={} site_cap_adapters={} site_shape_collisions={}",
             SITE_CALLS.load(Ordering::Relaxed),
             SITE_DIRECT.load(Ordering::Relaxed),
             SITE_NO_CODE.load(Ordering::Relaxed),
@@ -1873,6 +1873,11 @@ pub(crate) mod lambda_site_prof {
             // capturing site falls back to Rust, and a probe reading only the
             // total cannot tell those apart.
             SITE_CAPTURE_ADAPTERS.load(Ordering::Relaxed),
+            // Nonzero means the thunk cache was asked to reuse a thunk across
+            // two different emitted SHAPES and refused. Reported here so the
+            // fix cannot go inert unnoticed: on a workload without the hazard
+            // it reads 0, and 0 is the honest answer rather than a missing one.
+            cratonvm_jit::lambda_adapter::lambda_adapter_shape_collisions(),
         )
     }
 }

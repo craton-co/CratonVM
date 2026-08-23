@@ -2,92 +2,90 @@
 
 | | |
 |---|---|
-| **Measured** | 2026-08-22, `dev@652956429` + the WebSocket fix (`30b8d5b2e`), Azure Linux, real JDK 25, default collector, `-Xmx2g`, JIT on |
-| **Method** | complete 640-class suite, 4 shards, 300 s cap; then **every non-passed class re-run serially at a 900 s cap** |
-| **Sweep** | 599 PASS / 16 FAIL / 23 HANG / 2 CRASH |
-| **After the serial re-run** | **12 FAIL · 2 stuck** — everything else is the 300 s cap or shard contention |
+| **Measured** | 2026-08-23, `dev@652956429` + the WebSocket fix (`30b8d5b2e`), Azure Linux, real JDK 25, default collector, `-Xmx2g`, JIT on |
+| **Method** | complete 640-class suite, **2 shards, 600 s cap**; then **every non-passed class re-run serially at a 1200 s cap** |
+| **Sweep** | 623 PASS / 15 FAIL / 2 HANG — no CRASH, no NOSUMMARY |
+| **After the serial re-run** | **16 FAIL, nothing stuck** — i.e. **624 of 640** |
 
-The serial re-run is what this page reports, because the sharded numbers conflate
-three different things: a real failure, a class that needs more than 300 s, and a
-class that lost a race with a neighbouring shard. Every row below is one
-observation per class with nothing else of ours running.
+The serial re-run is what this page reports. A sharded number conflates a real
+failure, a class that needs more wall than the cap allows, and a class that lost
+a race for a core; every row below is one observation per class with nothing else
+of ours on the host.
 
-**How large that third category is, measured rather than assumed.** Between the
-two sweeps on this page's two binaries, 15 classes moved into the non-passed set
-that had passed before — including two `rc=139` SIGSEGVs. Every one of them
-**passes when run alone**: the two crashers pass on BOTH binaries, and the other
-13 pass with walls of 148–349 s against a 300 s cap. None was a regression. Do
-not read a sharded non-pass as a defect without re-running it alone.
+## The shard count is part of the measurement
 
-Non-WebSocket rows below were serially confirmed on `652956429`; the two binaries
-differ by one line in the async-socket read path.
+The **same binary** and the same 640 classes scored **599 PASS at 4 shards with a
+300 s cap** and **623 at 2 shards with a 600 s cap**. Nothing about the VM
+differs between those two numbers. The host has 8 cores and is shared; during the
+first sweep roughly 3 of them belonged to other people's builds, so 4 shards
+oversubscribed it and twelve classes whose walls had been 156–275 s all landed on
+exactly 300 — the cap.
 
-## 12 classes are the 300 s cap, not defects
+That first sweep was initially read as a 15-class regression against the
+WebSocket fix, complete with two `rc=139` SIGSEGVs. It was not one. What settled
+it was an **interleaved** serial A/B — one class at a time, arms alternated per
+class so host drift could not line up with one binary:
 
-They PASS when given room. Nothing to investigate; they are listed so the sharded
-`HANG` count is not read as 13 defects.
+| class | pre-fix | post-fix | the same two classes, sharded |
+|---|---:|---:|---|
+| `jasper.tagplugins.jstl.core.TestForEach` | 41 s | **28 s** | 30 → 143 |
+| `jasper.tagplugins.jstl.core.TestOut` | 23 s | 24 s | 43 → 183 |
+| `jasper.runtime.TestJspContextWrapper` | 31 s | 33 s | 55 → 214 |
+| `tomcat.util.descriptor.web.TestWebXml` | 35 s | 62 s | 65 → 221 |
+| `jasper.runtime.TestPageContextImpl` | 41 s | **38 s** | 79 → 246 |
+| `catalina.webresources.TestCachedResource` | 68 s | **67 s** | 149 → 253 (FAIL) |
+| `jasper.compiler.TestCompiler` | 106 s | 124 s | 156 → 300 (HANG) |
+| `naming.TestEnvEntry` | 133 s | 175 s | 184 → 301 (HANG) |
 
-| class | wall | result |
-|---|---:|---|
-| `jasper.compiler.TestGenerator` | 800 s | OK (85 tests) |
-| `jasper.optimizations.TestELInterpreterTagSetters` | 501 s | OK (48 tests) |
-| `catalina.nonblocking.TestNonBlockingAPI` | 403 s | OK (44 tests) |
-| `catalina.startup.TestHostConfigAutomaticDeploymentModification` | 348 s | OK (19 tests) |
-| `el.TestELInJsp` | 283 s | OK (25 tests) |
-| `catalina.startup.TestHostConfigAutomaticDeploymentAddition` | 279 s | OK (19 tests) |
-| `jasper.compiler.TestJspConfig` | 224 s | OK (18 tests) |
-| `jasper.compiler.TestEncodingDetector` | 222 s | OK (22 tests) |
-| `jasper.compiler.TestJspDocumentParser` | 222 s | OK (22 tests) |
-| `catalina.startup.TestHostConfigAutomaticDeploymentUpdateWarOffline` | 196 s | OK (8 tests) |
-| `catalina.manager.TestHostManagerWebapp` | 29 s | OK — FAILed in the sweep, so also flaky |
+All sixteen runs PASS, three of the eight are *faster* on the newer binary, and
+every serial wall is far below both sharded walls. The two SIGSEGVs did not recur
+in either sweep after the first; both classes pass on both binaries when run
+alone. `TestCachedResource` is the shape to remember — it asserts on cache expiry
+timing, so contention makes it **FAIL**, not merely time out, and a wider cap
+would not have saved it.
 
-The wall itself is the embedded-server deployment throughput issue tracked in
-`04-embedded-server-throughput-wall-OPEN.md` — a performance problem, not a
-correctness one.
+`results.csv` therefore carries a 5th column, the host's 1-minute load average as
+each class finished. Read it before reading a `HANG`, and before reading a `FAIL`
+from any class that asserts on timing.
 
-## 1. WebSocket — FIXED 2026-08-22, all 19 now pass
+## Nothing in the suite fails to finish
 
-The largest cluster in the previous revision of this page is gone. `aio_asc_read`
-— the `CompletionHandler` form of `AsynchronousSocketChannel.read` — indexed a
-private slot raw instead of through `aio_base`, so on a real JDK channel object
-it addressed an unrelated field and every frame read failed
-`read: bad fd for tcp clone`. Tomcat's `WsFrameClient` reads that as a dropped
-connection and closed the session immediately after `onOpen`.
+Given 1200 s, every class terminates. `coyote.http2.TestHttp2Section_8_2` — the
+last class this page called stuck — runs **6658 tests in 839 s** and fails one of
+them. It is slow, and it is a real failure, but it is not a hang.
+`jasper.compiler.TestGenerator` is the one class that still needs more than 600 s
+(**868 s**, `OK (85 tests)`); that wall is the embedded-server deployment
+throughput issue in `04-embedded-server-throughput-wall-OPEN.md`, a performance
+problem, not a correctness one.
 
-19 of 19 pass, and the walls collapse with them (`server.TestClassLoader` 902 s
-stuck → 4 s; `TestWsWebSocketContainer` 382 s → 20 s). Record:
-`fixed-suite-bugs/websocket-19-class-cluster-was-one-raw-private-slot-FIXED-20260822.md`
-(plain text — that tree is stripped from public history).
+## The 16, by family
 
-Worth carrying forward: the handler form is NIO2's main read path, so anything
-driving a concrete `AsynchronousSocketChannel` through a `CompletionHandler` hit
-this. Only the WebSocket classes were measured; a NIO2-connector sweep has not
-been done.
+### 1. Tribes group communication — 4
 
-## 2. Tribes group communication — 4 FAIL
-
-`tribes.test.channel.TestDataIntegrity` (2 of 5), `TestMulticastPackages`
-(1 of 5), `TestRemoteProcessException` (1 of 1), `TestUdpPackages` (6 of 6).
+| class | failing |
+|---|---|
+| `tribes.test.channel.TestUdpPackages` | 6 of 6 |
+| `tribes.test.channel.TestDataIntegrity` | 2 of 5 |
+| `tribes.test.channel.TestMulticastPackages` | 1 of 5 |
+| `tribes.test.channel.TestRemoteProcessException` | 1 of 1 |
 
 Multicast on this host is the long-standing environmental gap recorded in
 [tribes-multicast-family-still-environmental.md](tribes-multicast-family-still-environmental.md).
-**Not re-confirmed against HotSpot in this run** — do that before treating any of
-these as a VM defect.
+**Still not re-confirmed against HotSpot** — do that before treating any of these
+as a VM defect. It is the cheapest open item on this page.
 
-## 3. HTTP/2 — 3 FAIL + 1 stuck (the only class left that does not finish)
+### 2. HTTP/2 — 4
 
-| class | result |
+| class | failing |
 |---|---|
-| `coyote.http2.TestFlowControl` | 2 of 2 fail |
-| `coyote.http2.TestHttp2Section_5_1` | 2 of 28 fail |
-| `coyote.http2.TestHttp2Section_6_1` | 4 of 14 fail |
-| `coyote.http2.TestHttp2Section_8_2` | stuck at the 900 s cap |
+| `coyote.http2.TestFlowControl` | 2 of 2 |
+| `coyote.http2.TestHttp2Section_6_1` | 4 of 14 |
+| `coyote.http2.TestHttp2Section_5_1` | 2 of 28 |
+| `coyote.http2.TestHttp2Section_8_2` | 1 of 6658 |
 
-Not diagnosed. `TestHttp2Section_8_2` is now the only class in the suite that
-does not finish given 900 s — `server.TestClassLoader`, previously the other
-one, was the WebSocket defect and passes in 4 s.
+Not diagnosed.
 
-## 4. TLS — 2 FAIL, both accepted limits
+### 3. TLS — 2, both accepted limits
 
 | class | failing test |
 |---|---|
@@ -99,7 +97,7 @@ worth "fixing" as it stands — see
 [ssl-renegotiation-emulation-limits.md](ssl-renegotiation-emulation-limits.md).
 `TestSsl.testPost` additionally flakes under load, documented there.
 
-## 5. Class-loader leak detection — 2 FAIL
+### 4. Class-loader leak detection — 2
 
 `catalina.loader.TestWebappClassLoaderMemoryLeak` and
 `TestWebappClassLoaderExecutorMemoryLeak`, 1 of 1 each. Not diagnosed. Both
@@ -107,17 +105,36 @@ assert that a stopped webapp's class loader becomes unreachable, so they are
 sensitive to any reference this VM retains and HotSpot does not — a GC-rooting
 question, not a Tomcat one.
 
-## 6. Individually undiagnosed — 3 FAIL
+### 5. Individually undiagnosed — 4
 
 | class | failing |
 |---|---|
-| `catalina.connector.TestSendFile` | 1 of 2 |
 | `catalina.core.TestAsyncContextImpl` | 4 of 70 |
+| `catalina.connector.TestSendFile` | 1 of 2 |
 | `catalina.manager.TestManagerWebapp` | 1 of 4 |
+| `catalina.manager.TestHostManagerWebapp` | 1 of 1 — **flaky**: serially `OK` (29 s) on 08-22, `FAILURES` (31 s) on 08-23 |
+
+## WebSocket — FIXED 2026-08-22, all 19 pass
+
+The largest cluster on the previous revision of this page is gone and stayed
+gone across both sweeps. `aio_asc_read` — the `CompletionHandler` form of
+`AsynchronousSocketChannel.read` — indexed a private slot raw instead of through
+`aio_base`, so on a real JDK channel object it addressed an unrelated field and
+every frame read failed `read: bad fd for tcp clone`. Tomcat's `WsFrameClient`
+reads that as a dropped connection and closed the session immediately after
+`onOpen`. Record:
+`fixed-suite-bugs/websocket-19-class-cluster-was-one-raw-private-slot-FIXED-20260822.md`
+(plain text — that tree is stripped from public history).
+
+Worth carrying forward: the handler form is NIO2's main read path, so anything
+driving a concrete `AsynchronousSocketChannel` through a `CompletionHandler` hit
+this. Only the WebSocket classes were measured; **a NIO2-connector sweep has not
+been done.**
 
 ## Reproduction
 
-Whole suite, one shard of four (Linux):
+Whole suite, one shard of two (Linux). Pick the shard count from the cores you
+actually have — see the header comment in the runner:
 
 ```bash
 TC_ROOT=/path/to/apps/tomcat \
@@ -125,8 +142,8 @@ CP_FILE=$TC_ROOT/.suite/cp-linux-fixed.txt \
 JAVA_HOME25=/path/to/jdk-25 \
 CRATONVM_EXE=/path/to/cratonvm \
 HTTPD_PATH=/usr/sbin/apache2 \
-TIMEOUT_SEC=300 \
-apps/tomcat-suite-runner/run-tomcat-suite.sh craton 0 4 <run-name>
+TIMEOUT_SEC=600 \
+apps/tomcat-suite-runner/run-tomcat-suite.sh craton 0 2 <run-name>
 ```
 
 Two cautions that cost real time if ignored:
@@ -136,5 +153,6 @@ Two cautions that cost real time if ignored:
   CratonVM runs of any OCSP class serialise, and the loser scores an `rc=124`
   indistinguishable from a hang. On a shared fixture a neighbouring session is
   enough to cause it.
-* **Do not read a sharded `HANG` as stuck.** Twelve of this run's non-passes did
-  not survive a serial re-run at a wider cap.
+* **Do not read a sharded non-pass as a defect.** Twenty-four of the 4-shard
+  run's non-passes were the harness, and one of them was a `FAIL` rather than a
+  timeout.

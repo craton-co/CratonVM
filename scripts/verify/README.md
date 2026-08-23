@@ -52,7 +52,8 @@ of the runners that exist today, without needing a format flag:
 | Shape | Suite | class col | status col |
 |---|---|---:|---:|
 | 2 fields, tab, no header | canonical `baseline.tsv` | 0 | 1 |
-| 4 fields, comma, no header | Tomcat (`run-tomcat-suite.sh` `results.csv`) | 0 | 3 |
+| 4 fields, comma, no header | Tomcat `results.csv`, runs before 2026-08-23 | 0 | 3 |
+| 5 fields, comma, no header | Tomcat `results.csv` (`class,rc,secs,status,loadavg1`) | 0 | 3 |
 | 9 fields, tab, no header | H2 (`run-h2-suite.sh` `results.tsv`) | 1 | 2 |
 | any width, has a header row naming a `class`/`cls`/`test` and a `status`/`result` column | e.g. Spring Boot's 16-column `results.tsv` | sniffed from header | sniffed from header |
 
