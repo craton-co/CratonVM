@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-478 tokens.
+479 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -397,6 +397,7 @@ export inherited from a parent shell.
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
 | `overlay-nodedup` | `CRATONVM_DBG_OVERLAY_NODEDUP` |
 | `overlay-prune` | `CRATONVM_DBG_OVERLAY_PRUNE` |
+| `tmview` | `CRATONVM_DBG_TMVIEW` |
 | `parklat` | `CRATONVM_DBG_PARKLAT` |
 | `pb` | `CRATONVM_DBG_PB` |
 | `pbe` | `CRATONVM_DBG_PBE` |
@@ -877,12 +878,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_LOADER`
 
-13 tokens.
+14 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `allow-jsr-ret` | `CRATONVM_ALLOW_JSR_RET` |
 | `enforce-native-shadow` | `CRATONVM_ENFORCE_NATIVE_SHADOW` |
+| `cf-delegating-yield` | `CRATONVM_CF_DELEGATING_YIELD` |
 | `aware-resolution` | `CRATONVM_LOADER_AWARE_RESOLUTION` |
 | `boot-module-registry` | `CRATONVM_BOOT_MODULE_REGISTRY` |
 | `cl-bootstrap-scoped` | `CRATONVM_CL_BOOTSTRAP_SCOPED` |

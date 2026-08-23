@@ -673,7 +673,32 @@ fn native_string_init_from_string_builder(
             }
             chars
         }
-        None => Vec::new(),
+        // NOT `Vec::new()`. `sb_state` yields `None` for a builder whose
+        // `value` is the real compact `byte[]` — which is what real
+        // `AbstractStringBuilder` bytecode produces — and an empty vector for
+        // that receiver is a FABRICATION, not a refusal: the caller cannot
+        // tell an empty builder from one whose content this constructor
+        // declined to look at. `sb_read_chars` and `native_sb_to_string`, the
+        // two sibling copies of this read, were both given the layout-aware
+        // fallback; this one was missed, and it is the copy on the live path.
+        //
+        // MEASURED, `--jdk-only` with the builder registrations skipped so
+        // real bytecode owns the object: a builder holding "abcdefgh" reports
+        // `length() == 8` and `toString().length() == 0`, `rc = 0`, no
+        // exception. That is the "every append silently discarded" behaviour
+        // `H22` recorded against `register_string_builder_natives`, produced
+        // here, one class away from anything that registrar names.
+        //
+        // The dispatch that lands a `(AbstractStringBuilder,Void)V` call on
+        // this `(StringBuilder)V` body is a separate defect and is NOT fixed
+        // here — see `WORKER-3-NOTE-6`. This makes the answer right whichever
+        // overload arrives.
+        None => {
+            let mut units = crate::lang_string::sb_value_units(ctx, sb).unwrap_or_default();
+            let n = count.max(0) as usize;
+            units.truncate(n.min(units.len()));
+            units
+        }
     };
     // Write the UTF-16 units STRAIGHT into `this`.
     //

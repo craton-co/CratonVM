@@ -1154,7 +1154,11 @@ Every class in this section's family PASSes on all three collectors:
 
 What remains is four classes, none of them this defect:
 `MultithreadedInsertionWithLazyConnectionTest` (all three arms, PASSes on
-HotSpot — the suite's longest-standing item and the obvious next target),
+HotSpot — now diagnosed in its own page,
+[`hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`](hib-reactive-multithreaded-insertion-lazy-connection-20260822.md):
+a ~6x throughput gap on `CompletableFuture` composition crossing the test's own
+10-minute Vert.x budget, plus a separate intermittent duplicated INSERT that is
+NOT this section's defect — `site_unresumable` reads 0 on it),
 `techempower.TechEmpowerTest` (G1 + Generational, PASSes on ZGC),
 `MultithreadedIdentityGenerationTest` and `SoftDeleteCollectionTest`
 (Generational only). The last three are single observations and have not been

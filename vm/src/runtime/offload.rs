@@ -104,6 +104,16 @@ pub struct CompiledKernel {
     /// Stored explicitly so the launch site doesn't have to reconstruct
     /// it.
     pub kernel_name: String,
+    /// Occupancy-selected block size, memoised after the first launch.
+    /// `0` means "not yet queried".
+    ///
+    /// `cuOccupancyMaxPotentialBlockSize` is a driver round trip and it
+    /// was being paid on EVERY dispatch, for an answer that depends
+    /// only on the kernel — not on how many elements this particular
+    /// launch covers. An inference step is hundreds of small kernels,
+    /// so a per-dispatch driver call is multiplied by hundreds before
+    /// anything else is measured.
+    pub block_size: std::sync::atomic::AtomicU32,
 }
 
 /// Outcome of an [`OffloadCache::lookup_or_compile`] call.
@@ -398,6 +408,10 @@ impl OffloadCache {
         // u64::MAX. `writes & !reads` is what the chunked writeback may
         // stream out before the failure flag is known.
         sig.reads_param_mask = ptx_module.reads_param_mask;
+        // Where the counted loop's trip count comes from, so the launch
+        // grid is sized to the loop rather than to the largest array
+        // argument. See `WorkBound`.
+        sig.work_bound = ptx_module.work_bound;
         let ptx_text = ptx_module.render();
         dump_ptx_if_requested(class_name, &method.name, &ptx_text);
         let ctx = self.ctx.as_ref().expect("ctx presence checked above");
@@ -418,6 +432,7 @@ impl OffloadCache {
             module,
             signature: sig,
             kernel_name,
+            block_size: std::sync::atomic::AtomicU32::new(0),
         });
         self.kernels.write().insert(key, Arc::clone(&kernel));
         LookupOutcome::Hit(kernel)
@@ -1982,9 +1997,22 @@ impl OffloadCache {
         // fixed `DEFAULT_ELEMENTWISE_BLOCK` — falls back to the same
         // 256 default when the query is unavailable (stub mode, or the
         // driver call fails).
-        let cfg = kernel
-            .module
-            .elementwise_for_kernel(ctx, &kernel.kernel_name, work);
+        // Occupancy-tuned block size, queried ONCE per kernel and then
+        // memoised: the driver's answer is a property of the kernel, not
+        // of this launch's element count, and paying for it on every
+        // dispatch is hundreds of driver round trips per inference step.
+        let cfg = match kernel.block_size.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => {
+                let cfg = kernel
+                    .module
+                    .elementwise_for_kernel(ctx, &kernel.kernel_name, work);
+                kernel
+                    .block_size
+                    .store(cfg.block.0, std::sync::atomic::Ordering::Relaxed);
+                cfg
+            }
+            block => cuda_bridge::LaunchConfig::elementwise_with_block(work, block),
+        };
 
         // 3b. Chunked, overlapped writeback.
         //
@@ -2491,6 +2519,12 @@ fn enqueue_completion(
 
 #[cfg(feature = "gpu-offload")]
 fn record_failed_submission(stream: Option<std::sync::Arc<Stream>>, message: String) -> u64 {
+    // Every explicit-dispatch failure ends here, and until this line
+    // existed none of them said anything: the reason was stored on the
+    // submission and only ever surfaced if the Java side successfully
+    // called back for it. `--print-gpu-decisions` turns this on along
+    // with the analyzer verdicts.
+    tracing::warn!("gpu offload: submission failed — {message}");
     let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let sub = std::sync::Arc::new(StreamSubmission {
         handle,
@@ -2592,13 +2626,24 @@ pub fn dispatch_method_from_native_on_stream(
     // knows whether the compiled PTX declares a trailing `ret_ptr`
     // param (any non-void, non-array return) that needs a matching
     // accumulator buffer pushed ahead of `failure_flag`.
-    let (class_id, method_index, is_static, this_field_names, writes_param_mask, return_kind): (
+    let timed = cratonvm_native_builtins::craton_gpu::dispatch_timing::enabled();
+    let mut mark = std::time::Instant::now();
+    let (
+        class_id,
+        method_index,
+        is_static,
+        this_field_names,
+        writes_param_mask,
+        return_kind,
+        work_bound,
+    ): (
         crate::classloading::ClassId,
         u16,
         bool,
         Vec<String>,
         u64,
         ParamKind,
+        jit_cuda::emitter::WorkBound,
     ) = {
         // Phase 9 #1 fix — load the class on demand. The class name
         // arrives as a string from `Native.submitMethod`; the user has
@@ -2710,6 +2755,7 @@ pub fn dispatch_method_from_native_on_stream(
                     names,
                     compiled.signature.writes_param_mask,
                     compiled.signature.return_kind,
+                    compiled.signature.work_bound,
                 )
             }
             LookupOutcome::Skip => {
@@ -2730,6 +2776,14 @@ pub fn dispatch_method_from_native_on_stream(
             }
         }
     };
+
+    if timed {
+        cratonvm_native_builtins::craton_gpu::dispatch_timing::add(
+            3,
+            mark.elapsed().as_nanos() as u64,
+        );
+        mark = std::time::Instant::now();
+    }
 
     // 4. From here on we need a real device context. The Failed-fast
     //    path is identical to dispatch_async's no-device branch.
@@ -2819,6 +2873,11 @@ pub fn dispatch_method_from_native_on_stream(
     let mut kernel_args = KernelArgs::new();
     let mut writebacks: Vec<MarshalWriteback> = Vec::new();
     let mut max_array_len: usize = 0;
+    // Per-declared-parameter array lengths, so `work_bound` can name
+    // the one that is the loop trip count. Only the static path
+    // populates this (the `pthis_*` prelude has no declared index),
+    // which is also the only path `WorkBound::ParamLen` is derived on.
+    let mut param_lens: Vec<Option<usize>> = Vec::new();
     let mut h2d_bytes: usize = 0;
     // Param-index counter for the writes-mask lookup. The non-static
     // `pthis_*` arms come first and consume slots ahead of the
@@ -2995,6 +3054,7 @@ pub fn dispatch_method_from_native_on_stream(
                             if arr_len > max_array_len {
                                 max_array_len = arr_len;
                             }
+                            record_param_len(&mut param_lens, i, arr_len);
                             if let Some(wb) = wb_opt {
                                 writebacks.push(wb);
                             }
@@ -3014,16 +3074,15 @@ pub fn dispatch_method_from_native_on_stream(
                 // the DeviceBuffer in the resident state so this
                 // path skips the H→D copy when the bytes haven't
                 // changed since the previous kernel.
-                if let Some((etype, len, host_bytes, arr_handle)) =
-                    try_gpu_array_snapshot(shared, *obj_ref)
-                {
-                    match marshal_resident_array_arg(ctx, etype, len, host_bytes, arr_handle) {
+                if let Some((etype, len, arr_handle)) = try_gpu_array_shape(shared, *obj_ref) {
+                    match marshal_resident_array_arg(ctx, etype, len, arr_handle) {
                         Ok((args_after, wb)) => {
                             kernel_args = args_after(kernel_args);
                             if let Some(l) = wb.array_len() {
                                 if l > max_array_len {
                                     max_array_len = l;
                                 }
+                                record_param_len(&mut param_lens, i, l);
                             }
                             writebacks.push(wb);
                         }
@@ -3150,8 +3209,21 @@ pub fn dispatch_method_from_native_on_stream(
     //     after `event.synchronize()` and surfaces a non-zero value
     //     as a failure message so the Java side gets a real error
     //     instead of silently corrupt output.
-    let failure_flag_buf = match cuda_bridge::DeviceBuffer::<u64>::zeros(ctx, 1) {
-        Ok(b) => std::sync::Arc::new(b),
+    //     Pooled. A fresh `cuMemAlloc` per dispatch is the single
+    //     most expensive thing on this path — measured at 117 us for a
+    //     kernel that does nothing, against 5.5 ms of ACTUAL device
+    //     work for a whole 453-kernel inference step. The buffer is
+    //     one `u64`; allocating it fresh every time bought nothing.
+    if timed {
+        cratonvm_native_builtins::craton_gpu::dispatch_timing::add(
+            4,
+            mark.elapsed().as_nanos() as u64,
+        );
+        mark = std::time::Instant::now();
+    }
+    let pool_key = ctx as *const cuda_bridge::DeviceContext as usize;
+    let failure_flag_buf = match flag_pool::take(pool_key, ctx) {
+        Ok(b) => b,
         Err(e) => {
             drop(token);
             return record_failed_submission(
@@ -3170,6 +3242,7 @@ pub fn dispatch_method_from_native_on_stream(
     }
     writebacks.push(MarshalWriteback::FailureFlag {
         buf: failure_flag_buf,
+        pool_key,
     });
     // `tid_base` — the index of the first element this launch covers.
     //
@@ -3209,7 +3282,27 @@ pub fn dispatch_method_from_native_on_stream(
             h2d_trace::total(),
         );
     }
-    let runtime_work: u32 = u32::try_from(max_array_len).unwrap_or(u32::MAX);
+    // Size the grid to the loop, not to the biggest array. For an
+    // element-wise kernel these are the same number. For a kernel whose
+    // inputs are larger than its iteration space — a matrix-vector
+    // product is the canonical one — they differ by the matrix's inner
+    // dimension, and the largest-array rule launches that many times too
+    // many threads. Each extra thread does nothing but reach the guard
+    // and exit, but the driver still creates it.
+    //
+    // `Unknown` (anything that is not a single counted loop) and a
+    // parameter whose length we never recorded both fall back to the
+    // old rule, which is over-provisioning and therefore always safe.
+    let work_items: usize = match work_bound {
+        jit_cuda::emitter::WorkBound::ParamLen(idx) => param_lens
+            .get(idx as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(max_array_len),
+        jit_cuda::emitter::WorkBound::Literal(v) if v > 0 => v as usize,
+        _ => max_array_len,
+    };
+    let runtime_work: u32 = u32::try_from(work_items).unwrap_or(u32::MAX);
     // The thread-local SafepointToken's role is over (marshal is
     // done). The cross-thread GcCriticalGuard (moved into
     // `FinalizeState` below) takes over.
@@ -3228,6 +3321,13 @@ pub fn dispatch_method_from_native_on_stream(
     //    handed — no kernel ran, nothing to finalize — same as this
     //    caller used to do explicitly in the `needs_finalize == false`
     //    case.
+    if timed {
+        cratonvm_native_builtins::craton_gpu::dispatch_timing::add(
+            5,
+            mark.elapsed().as_nanos() as u64,
+        );
+        mark = std::time::Instant::now();
+    }
     let submission = cache.dispatch_async(
         stream.clone(),
         class_id,
@@ -3261,10 +3361,28 @@ pub fn finalize_submission(
     shared: &crate::vm::SharedVm,
     submission: &std::sync::Arc<StreamSubmission>,
 ) -> Result<(), String> {
-    // First, take the FinalizeState. If None, finalization has
-    // already run (or this submission was Failed at dispatch) —
-    // fall through to read the terminal status.
-    let pending = submission.finalize.lock().take();
+    // Take the FinalizeState, and HOLD ITS LOCK for the whole
+    // finalization. If None, finalization has already run (or this
+    // submission was Failed at dispatch) — fall through to read the
+    // terminal status.
+    //
+    // The lock has to span the work, not just the take. Two callers
+    // reach here for the same submission — `future.get()` on the Java
+    // thread and the completion reaper woken by the device callback —
+    // and taking-then-releasing let the second one observe the gap:
+    // `FinalizeState` already gone, status not yet stamped, i.e.
+    // `Running` with nothing left to finalize. That is not a logic
+    // error, it is a race, and it surfaced as
+    //
+    //     GpuException: submission handle=35 is Running with no
+    //     FinalizeState
+    //
+    // on roughly a third of a 5-kernel sequence — the kind of flake
+    // that reads like a bad kernel. Holding the lock makes the second
+    // caller wait for the first and then read a terminal status, which
+    // is what it was always assumed to do.
+    let mut finalize_guard = submission.finalize.lock();
+    let pending = finalize_guard.take();
 
     if let Some(FinalizeState {
         writebacks,
@@ -3525,6 +3643,72 @@ pub fn poll_submission_status(shared: &crate::vm::SharedVm, handle: u64) -> Opti
             }
             drop(pending);
             Some(PollOutcome::Failed)
+        }
+    }
+}
+
+/// One-`u64` failure-flag buffers, reused across dispatches.
+///
+/// Every launch needs one, and allocating it fresh meant a `cuMemAlloc`
+/// on a path an inference step walks hundreds of times per token.
+/// Measured on an RTX 2060: 117 us to submit a kernel that does
+/// nothing, against 5.5 ms of real device work for a whole 453-kernel
+/// forward pass — the dispatch floor, not the kernels, was the cost.
+///
+/// Buffers are keyed by the `DeviceContext`'s address so one device's
+/// allocation can never be handed to another. A buffer goes back into
+/// the pool only when it read ZERO, which is what keeps "came from the
+/// pool" and "ready to be a failure flag" the same statement.
+#[cfg(feature = "gpu-offload")]
+pub(crate) mod flag_pool {
+    use cuda_bridge::{DeviceBuffer, DeviceContext};
+    use parking_lot::Mutex;
+    use rustc_hash::FxHashMap;
+    use std::sync::Arc;
+
+    static POOLS: Mutex<Option<FxHashMap<usize, Vec<Arc<DeviceBuffer<u64>>>>>> = Mutex::new(None);
+
+    /// Cap per context. A submission that is never finalized never
+    /// returns its buffer, so this is a reuse cache and not a ledger;
+    /// the cap keeps a pathological caller from growing it without
+    /// bound.
+    const MAX_POOLED: usize = 1024;
+
+    pub(crate) fn take(key: usize, ctx: &DeviceContext) -> Result<Arc<DeviceBuffer<u64>>, String> {
+        let pooled = {
+            let mut guard = POOLS.lock();
+            guard
+                .as_mut()
+                .and_then(|m| m.get_mut(&key))
+                .and_then(|v| v.pop())
+        };
+        if let Some(buf) = pooled {
+            return Ok(buf);
+        }
+        DeviceBuffer::<u64>::zeros(ctx, 1)
+            .map(Arc::new)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Safe to call only from the finalize path: the submission's
+    /// event has already been synchronized there, so no launch can
+    /// still be writing through the pointer the launch closure pinned.
+    pub(crate) fn give(key: usize, buf: &Arc<DeviceBuffer<u64>>) {
+        let buf = Arc::clone(buf);
+        let mut guard = POOLS.lock();
+        let map = guard.get_or_insert_with(FxHashMap::default);
+        let slot = map.entry(key).or_default();
+        if slot.len() < MAX_POOLED {
+            slot.push(buf);
+        }
+    }
+
+    /// Drop every pooled buffer for one context, so the pool never
+    /// outlives the memory it names.
+    #[allow(dead_code)]
+    pub(crate) fn clear(key: usize) {
+        if let Some(map) = POOLS.lock().as_mut() {
+            map.remove(&key);
         }
     }
 }
@@ -4598,6 +4782,11 @@ pub enum MarshalWriteback {
     /// the resident-variant ownership pattern).
     FailureFlag {
         buf: std::sync::Arc<cuda_bridge::DeviceBuffer<u64>>,
+        /// Which device context the buffer came from, so finalize can
+        /// return it to that context's pool and never another's. The
+        /// key is the `DeviceContext`'s address, which is stable for
+        /// the process because the context lives in the `OffloadCache`.
+        pool_key: usize,
     },
     /// Part E — owns the 1-element device buffer a scalar-return
     /// kernel's `ret_ptr` param points at (see
@@ -4745,16 +4934,21 @@ impl MarshalWriteback {
             // If non-zero, the kernel hit a bounds check; report as
             // a writeback error so `finalize_submission` flips the
             // submission to `Failed` and Java sees a `GpuException`.
-            Self::FailureFlag { buf } => {
+            Self::FailureFlag { buf, pool_key } => {
                 let mut cell = [0u64; 1];
-                gpu_marshal::download_into(buf, &mut cell)
+                gpu_marshal::download_into(&buf, &mut cell)
                     .map_err(|e| format!("download_into failure_flag: {e}"))?;
                 if cell[0] != 0 {
+                    // Deliberately NOT returned to the pool: a buffer
+                    // that read non-zero is not zero, and the pool's
+                    // whole contract is that what comes out of it is
+                    // ready to be a fresh failure flag.
                     return Err(format!(
                         "kernel failure flag set (value={}): out-of-range index inside kernel body",
                         cell[0]
                     ));
                 }
+                flag_pool::give(*pool_key, buf);
                 Ok(None)
             }
             // Part E — scalar-return accumulator readback. The device
@@ -4820,19 +5014,29 @@ impl MarshalWriteback {
 }
 
 /// Phase 6 #3: detect a `craton.gpu.GpuArray` Java object and read
-/// its (element_type, length, host bytes, native handle) tuple from
-/// the resident-array store. Returns `None` for any non-GpuArray
-/// object so callers can fall through to other arg shapes.
+/// its (element_type, length, native handle) tuple from the
+/// resident-array store. Returns `None` for any non-GpuArray object so
+/// callers can fall through to other arg shapes.
+///
+/// **Shape only, deliberately.** This used to return the host bytes
+/// too, which meant every submit copied the whole array out of the
+/// resident store — including the overwhelmingly common case where the
+/// buffer was already on the device and the copy was thrown away
+/// unread. For a weight tensor that is resident for the life of the
+/// process (a language model's, say) that is the entire point of
+/// residency undone: gigabytes of `memcpy` per kernel launch. The bytes
+/// are now fetched by `marshal_resident_array_arg` on the cache-miss
+/// path only.
 ///
 /// The GpuArray Java layout (P3-2):
 ///   field 0: `long handle`
 ///   field 1: `Class<?> elementType`  (unused here; type comes from
 ///                                     the resident-store record)
 #[cfg(feature = "gpu-offload")]
-fn try_gpu_array_snapshot(
+fn try_gpu_array_shape(
     shared: &crate::vm::SharedVm,
     obj_ref: cratonvm_types::ObjectRef,
-) -> Option<(cratonvm_types::ArrayElementType, usize, Vec<u8>, u64)> {
+) -> Option<(cratonvm_types::ArrayElementType, usize, u64)> {
     let cid = shared.mem.heap.class_id_of(obj_ref);
     let cm = shared.classes.class_manager.read();
     let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
@@ -4845,8 +5049,20 @@ fn try_gpu_array_snapshot(
         cratonvm_types::Value::Long(h) => h as u64,
         _ => return None,
     };
-    let (etype, len, bytes) = cratonvm_native_builtins::craton_gpu::array_snapshot(handle)?;
-    Some((etype, len, bytes, handle))
+    let (etype, len) = cratonvm_native_builtins::craton_gpu::array_shape(handle)?;
+    Some((etype, len, handle))
+}
+
+/// Remember one declared parameter's array length, growing the vector
+/// as needed. Indexed by the analyzer's declared-parameter index — the
+/// same index `writes_param_mask` is bit-indexed by, and the one
+/// `WorkBound::ParamLen` names.
+#[cfg(feature = "gpu-offload")]
+fn record_param_len(param_lens: &mut Vec<Option<usize>>, index: usize, len: usize) {
+    if param_lens.len() <= index {
+        param_lens.resize(index + 1, None);
+    }
+    param_lens[index] = Some(len);
 }
 
 /// Marshal a resident GpuArray as a kernel arg. The shape of the
@@ -4854,12 +5070,14 @@ fn try_gpu_array_snapshot(
 /// source bytes are the resident-store snapshot rather than a JVM
 /// array — and the writeback target is the resident store (so a
 /// subsequent `GpuArray.toHost()` reads the post-kernel content).
+///
+/// The host bytes are read from the resident store only when the
+/// device cache misses; a hit never touches them.
 #[cfg(feature = "gpu-offload")]
 fn marshal_resident_array_arg(
     ctx: &cuda_bridge::DeviceContext,
     element_type: cratonvm_types::ArrayElementType,
     len: usize,
-    host_bytes: Vec<u8>,
     arr_handle: u64,
 ) -> Result<
     (
@@ -4881,7 +5099,13 @@ fn marshal_resident_array_arg(
             let arc = if let Some(arc) = $cache_get(arr_handle) {
                 arc
             } else {
-                // (b) Miss — upload and install.
+                // (b) Miss — read the host bytes (the only path that
+                // needs them at all), upload and install.
+                let host_bytes = cratonvm_native_builtins::craton_gpu::array_snapshot(arr_handle)
+                    .map(|(_, _, bytes)| bytes)
+                    .ok_or_else(|| {
+                        format!("GpuArray handle {arr_handle} released before its first upload")
+                    })?;
                 let host: &[$ty] = bytemuck::cast_slice(&host_bytes);
                 let buf = gpu_marshal::upload(ctx, host)
                     .map_err(|e| format!("upload {} (GpuArray, len={len}): {e}", $tag))?;
