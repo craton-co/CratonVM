@@ -179,11 +179,83 @@ pub(crate) fn detect_loop(
             let loop_ = classify_counted_loop(bytes, branch_pc, header_pc, cp)?;
             Ok(LoopShape::Counted(loop_))
         }
-        2 => detect_nested_loop(bytes, backs[0], backs[1], cp),
-        _ => Err(LoweringError::UnsupportedNode(
-            "multi-loop or non-canonical control flow".into(),
-        )),
+        2 => match detect_nested_loop(bytes, backs[0], backs[1], cp) {
+            Ok(shape) => Ok(shape),
+            // Not the rectangular `for (i) for (j)` shape the 2-D
+            // mapping needs. It may still be an outer counted loop
+            // whose body happens to contain a sequential inner loop —
+            // `for (i) { s = 0; for (j) s += ...; out[i] = s; }`, the
+            // canonical matmul/dot-per-row kernel. That one parallelises
+            // over `i` only and runs `j` as a real per-thread PTX loop.
+            Err(_) => classify_outer_parallel_loop(bytes, &backs, cp),
+        },
+        _ => classify_outer_parallel_loop(bytes, &backs, cp),
     }
+}
+
+/// Classify a loop nest as "outer counted loop is the parallel
+/// dimension; every other back-edge is a *sequential* loop the CUDA
+/// thread executes itself".
+///
+/// The 2-D mapping in [`detect_nested_loop`] flattens `[0, R*C)` and
+/// gives every `(i, j)` pair its own thread. That is the right shape
+/// for a rectangular elementwise kernel and the wrong one for a
+/// reduction per row: `out[i] = sum_j w[i*n + j] * x[j]` has a
+/// loop-carried accumulator, so its `j` iterations must run in order on
+/// one thread.
+///
+/// This classifier admits exactly that: the outermost back-edge is
+/// validated as the canonical counted loop (all the usual invariants —
+/// stride `+1`, `if_icmpge` exit, non-negative constant start), and
+/// every other back-edge is required to lie strictly inside that loop's
+/// *body* region. The interior edges are not classified at all here;
+/// `Emitter::walk_cfg` lowers them as ordinary PTX control flow, with
+/// the loop header's canonical registers acting as the phi nodes.
+///
+/// The returned shape is a plain [`LoopShape::Counted`] because the
+/// emission path is identical to a single counted loop — one thread per
+/// outer iteration, guard, body CFG, epilogue. The only difference is
+/// that the body CFG is cyclic, which `walk_cfg` handles on its own.
+fn classify_outer_parallel_loop(
+    bytes: &[u8],
+    backs: &[(usize, usize)],
+    cp: Option<&ConstantPool>,
+) -> Result<LoopShape, LoweringError> {
+    let non_canonical =
+        || LoweringError::UnsupportedNode("multi-loop or non-canonical control flow".into());
+    // The outermost back-edge is the one whose span `(header, branch)`
+    // contains every other. Pick the candidate with the lowest header
+    // (ties broken by the highest branch) and then *verify* containment
+    // rather than assuming it — two sequential loops also have a lowest
+    // header, and they must still be rejected.
+    let outer = *backs
+        .iter()
+        .min_by_key(|(branch, header)| (*header, std::cmp::Reverse(*branch)))
+        .ok_or_else(non_canonical)?;
+    let (outer_branch, outer_header) = outer;
+    for &(branch, header) in backs {
+        if (branch, header) == outer {
+            continue;
+        }
+        if header <= outer_header || branch >= outer_branch {
+            return Err(non_canonical());
+        }
+    }
+    let loop_ = classify_counted_loop(bytes, outer_branch, outer_header, cp)?;
+    // `walk_cfg` only ever sees `body_start_pc .. back_branch_pc`. An
+    // interior back-edge outside that window would be silently dropped
+    // (it would sit in the pre-loop or post-loop straight-line walk,
+    // neither of which lowers control flow at all), so require every one
+    // of them to be inside the body the CFG walker actually visits.
+    for &(branch, header) in backs {
+        if (branch, header) == outer {
+            continue;
+        }
+        if header < loop_.body_start_pc || branch >= loop_.back_branch_pc {
+            return Err(non_canonical());
+        }
+    }
+    Ok(LoopShape::Counted(loop_))
 }
 
 /// Given exactly two backward branches, determine whether they form a

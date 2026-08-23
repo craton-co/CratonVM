@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1221;
+const BASELINE_TOTAL_DRIFT: usize = 1218;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1356;
+const BASELINE_TOTAL_PAIRS: usize = 1351;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -825,12 +825,9 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/Double", "toString", "()Ljava/lang/String;"),
             ("java/lang/Float", "toString", "()Ljava/lang/String;"),
             ("java/lang/Integer", "compare", "(II)I"),
-            ("java/lang/Integer", "toBinaryString", "(I)Ljava/lang/String;"),
             ("java/lang/Integer", "toHexString", "(I)Ljava/lang/String;"),
-            ("java/lang/Integer", "toOctalString", "(I)Ljava/lang/String;"),
             ("java/lang/Integer", "toString", "()Ljava/lang/String;"),
             ("java/lang/Long", "compare", "(JJ)I"),
-            ("java/lang/Long", "toHexString", "(J)Ljava/lang/String;"),
             ("java/lang/Long", "toString", "()Ljava/lang/String;"),
             ("java/lang/Short", "toString", "()Ljava/lang/String;"),
             ("java/nio/charset/Charset", "defaultCharset", "()Ljava/nio/charset/Charset;"),
@@ -1614,13 +1611,6 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/util/logging/Logger", "entering", "(Ljava/lang/String;Ljava/lang/String;)V"),
             ("java/util/logging/Logger", "exiting", "(Ljava/lang/String;Ljava/lang/String;)V"),
             ("java/util/logging/Logger", "throwing", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V"),
-        ],
-    ),
-    (
-        "register_p71_wrapper_extras",
-        &[
-            ("java/lang/Integer", "toBinaryString", "(I)Ljava/lang/String;"),
-            ("java/lang/Integer", "toOctalString", "(I)Ljava/lang/String;"),
         ],
     ),
     (

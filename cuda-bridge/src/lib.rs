@@ -82,7 +82,11 @@ impl LaunchConfig {
     /// explicit `block` size. The grid is `ceil(n / block)` (at least
     /// one block). `block` is clamped to at least 1 so a degenerate
     /// `0` never produces a div-by-zero or a zero-thread launch.
-    pub(crate) fn elementwise_with_block(n: u32, block: u32) -> Self {
+    /// Public so a caller that has already paid for the occupancy
+    /// query once can rebuild the config for a different element count
+    /// without paying for it again — the block size a kernel wants does
+    /// not depend on how many elements a particular launch covers.
+    pub fn elementwise_with_block(n: u32, block: u32) -> Self {
         let block = block.max(1);
         let grid = n.div_ceil(block).max(1);
         Self {
