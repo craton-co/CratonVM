@@ -564,6 +564,11 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
          unjoined={unjoined} trigger={trigger}"
     );
     report_vector_intrinsics();
+    // The corrupt-cell census. HERE and not in `vm-cli`, because a JUnit runner
+    // exits through `System.exit` and never reaches `vm-cli`'s normal-return
+    // arm -- which is how a 1975-class sweep produced this line in zero logs
+    // and read as a clean run.
+    cratonvm_types::cell_census::exit_summary();
 }
 
 /// The Vector API engagement counters, at exit.

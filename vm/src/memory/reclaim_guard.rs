@@ -686,40 +686,222 @@ pub(crate) fn audit_thread_frames(shared: &SharedVm, thread: &JvmThread, site: &
 ///
 /// Rate-limited as a whole. Armed by `CRATONVM_DBG_CORRUPT_CELL`; the caller
 /// pays one relaxed load per field read while armed and nothing otherwise.
+/// How many corrupt cells this process decoded, and how many a door or the
+/// backstop actually named — printed once at exit while the flag is armed.
+///
+/// This is the line whose absence cost a day. The instrument reported nothing
+/// through a run that had tripped the collector's guard, and "nothing" was read
+/// as "no producer" when it meant "no door of mine saw it". A count that says
+/// `decoded=1 reported=0` cannot be misread that way.
+pub fn corrupt_cell_exit_summary() {
+    cratonvm_types::cell_census::exit_summary();
+}
+
+/// Fabricate ONE corrupt-cell hit per named site, once per process.
+///
+/// See `heap::corrupt_cell_inject_for_selftest`. `"getfield"` lands inside a
+/// watch, so the DOOR reporter must claim it; `"set_field"` lands where there
+/// is no watch, so only the safepoint BACKSTOP can. A run with
+/// `CRATONVM_DBG_CORRUPT_CELL_SELFTEST` set that prints fewer than both has a
+/// broken instrument, and that is the whole point of having it.
+#[inline]
+pub(crate) fn corrupt_cell_selftest_inject(site: &'static str) {
+    if !crate::runtime::env_cache::corrupt_cell_selftest() {
+        return;
+    }
+    corrupt_cell_selftest_inject_cold(site);
+}
+
+#[cold]
+#[inline(never)]
+fn corrupt_cell_selftest_inject_cold(site: &'static str) {
+    static GETFIELD: std::sync::Once = std::sync::Once::new();
+    static PUTFIELD: std::sync::Once = std::sync::Once::new();
+    let once = if site == "getfield" { &GETFIELD } else { &PUTFIELD };
+    once.call_once(|| {
+        // `raw0` spells "SELFTEST" so the record cannot be mistaken for a real
+        // cell by anyone reading a log later.
+        cratonvm_gc::heap::corrupt_cell_inject_for_selftest(
+            0xdead_0000_0000_0000,
+            u64::from_le_bytes(*b"SELFTEST"),
+            0,
+        );
+    });
+}
+
+/// Arm the corrupt-cell watch around ONE read.
+///
+/// `None` when `CRATONVM_DBG_CORRUPT_CELL` is off, which is the whole cost on
+/// the default path: a cached bool and a branch. See
+/// [`corrupt_cell_watch_close`].
+#[inline]
+pub(crate) fn corrupt_cell_watch() -> Option<u64> {
+    if crate::runtime::env_cache::corrupt_cell_dbg() {
+        Some(cratonvm_gc::heap::corrupt_cell_hits())
+    } else {
+        None
+    }
+}
+
+/// How many corrupt cells this thread has ACCOUNTED FOR — a running count, not
+/// a high-water mark, and the difference is the whole correctness of the
+/// backstop.
+///
+/// MEASURED while building this: with a high-water mark, a door that reports
+/// its own cell also marks every cell outstanding BEFORE its watch opened as
+/// seen, and the backstop then stays silent about them. The self-test caught it
+/// as `decoded=2 reported=1` — one cell injected at a door, one at a site with
+/// none, and only the door's was named. Counting claims instead of stamping a
+/// position is what makes "nobody claimed this one" a question the backstop can
+/// still answer.
+fn corrupt_cell_seen() -> &'static std::thread::LocalKey<std::cell::Cell<u64>> {
+    thread_local! {
+        static SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    &SEEN
+}
+
+/// Close a watch opened by [`corrupt_cell_watch`]: if the collector decoded a
+/// corrupt `Value` cell during the read, name the DOOR it came through, the
+/// receiver when the door has one, and the Java frames.
+///
+/// # Why there are several doors
+///
+/// The first version of this instrument watched exactly one:
+/// `NativeContext::get_field`. That was enough to name the `String[]` producer
+/// (`corrupt-value-cell-producer-was-a-string-array-FIXED-20260822`) and NOT
+/// enough for the next one: a Spring Boot sweep tripped the guard once in
+/// `KafkaMetricsAutoConfigurationTests` and the instrument stayed silent,
+/// which says only that the read came through some OTHER door. A one-door
+/// instrument cannot tell "no defect" from "not my door", and this one was
+/// read as the former for a day.
+pub(crate) fn corrupt_cell_watch_close(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    before: Option<u64>,
+    door: &'static str,
+    recv: Option<cratonvm_types::ObjectRef>,
+    index: Option<usize>,
+) {
+    let Some(before) = before else { return };
+    let now = cratonvm_gc::heap::corrupt_cell_hits();
+    if now == before {
+        return;
+    }
+    // Claim only what happened inside THIS read. Cells that were already
+    // outstanding when the watch opened stay unaccounted, so the backstop can
+    // still speak for them.
+    corrupt_cell_seen().with(|c| c.set(c.get() + (now - before)));
+    report_corrupt_cell_producer(shared, thread, door, recv, index);
+}
+
+/// The backstop: a corrupt cell decoded by THIS thread that no instrumented
+/// read door claimed.
+///
+/// Called from the root-snapshot publish, which every running thread reaches
+/// regularly, so a producer in a VM-internal reader — reflection, `Unsafe`, a
+/// class-mirror populator, a serialization walk — still surfaces with a Java
+/// stack instead of surfacing as silence. The stack is the one at the NEXT
+/// safepoint rather than at the read, and the report says so.
+///
+/// Thread-scoped on purpose. The hit counter is process-GLOBAL, so without the
+/// thread id recorded at the hit this would let one thread report a cell
+/// another decoded — and a Spring Boot test class runs several threads, which
+/// is exactly where that would mislead.
+pub(crate) fn corrupt_cell_backstop(shared: &SharedVm, thread: &JvmThread) {
+    if !crate::runtime::env_cache::corrupt_cell_dbg() {
+        return;
+    }
+    let now = cratonvm_gc::heap::corrupt_cell_hits();
+    if now == 0 || corrupt_cell_seen().with(|c| c.get()) >= now {
+        return;
+    }
+    if cratonvm_gc::heap::corrupt_cell_last_thread() != cratonvm_gc::heap::probe_thread_id() {
+        return;
+    }
+    corrupt_cell_seen().with(|c| c.set(now));
+    report_corrupt_cell_producer(
+        shared,
+        thread,
+        "backstop: no instrumented read door claimed this cell — the frames are \
+         the ones at the NEXT safepoint, not at the read",
+        None,
+        None,
+    );
+}
+
 pub(crate) fn report_corrupt_cell_producer(
     shared: &SharedVm,
     thread: &JvmThread,
-    recv: cratonvm_types::ObjectRef,
-    index: usize,
-    slot: usize,
-    raw0: u64,
-    raw1: u64,
+    door: &'static str,
+    recv: Option<cratonvm_types::ObjectRef>,
+    index: Option<usize>,
 ) {
+    cratonvm_types::cell_census::note_reported();
     static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
         return;
     }
-    let addr = recv.as_ptr() as usize;
-    let cid = shared.mem.heap.class_id_of(recv).as_u32();
-    let name = class_name_of(shared, cid);
-    tracing::error!(
-        target: "cratonvm::gc::guard",
-        obj = format!("{addr:#x}"),
-        slot = format!("{slot:#x}"),
-        slot_index = index,
-        raw0 = format!("{raw0:#018x}"),
-        raw1 = format!("{raw1:#018x}"),
-        receiver_class = %name,
-        receiver_kind = ?shared.mem.heap.kind_of(recv),
-        receiver_fields = shared.mem.heap.num_fields(recv),
-        in_heap = shared.mem.heap.is_heap_addr(addr).is_some(),
-        in_young = shared.mem.heap.is_in_young_addr(addr),
-        collections_now = shared.mem.heap.collection_count(),
-        "the RECEIVER of the read that decoded a corrupt Value cell. Its class \
-         is what re-served the block, not what the holder thinks it is holding.",
-    );
-    report_reclaimed_receiver_forced(shared, addr, "corrupt-cell", &name, cid);
-    report_root_slice_provenance(shared, thread, addr, "corrupt-cell");
+    // The cell's own coordinates come from the collector rather than from the
+    // caller: every door would otherwise have to carry three words it does not
+    // use, and the backstop has no read to carry them from.
+    let (slot, raw0, raw1) = cratonvm_gc::heap::corrupt_cell_last();
+    // The raw words as BYTES as well as hex. The `String[]` producer's `raw0`
+    // was a heap pointer; the `KafkaMetricsAutoConfigurationTests` one is the
+    // ASCII text `"t/Proxy\0"`, and nothing in the record made that visible --
+    // it took decoding the hex by hand to notice. A reader should not have to.
+    let ascii = |w: u64| -> String {
+        w.to_le_bytes()
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect()
+    };
+    match recv {
+        Some(recv) => {
+            let addr = recv.as_ptr() as usize;
+            let cid = shared.mem.heap.class_id_of(recv).as_u32();
+            let name = class_name_of(shared, cid);
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                door = door,
+                obj = format!("{addr:#x}"),
+                slot = format!("{slot:#x}"),
+                slot_index = index,
+                raw0 = format!("{raw0:#018x}"),
+                raw1 = format!("{raw1:#018x}"),
+                raw0_ascii = %ascii(raw0),
+                raw1_ascii = %ascii(raw1),
+                receiver_class = %name,
+                receiver_kind = ?shared.mem.heap.kind_of(recv),
+                receiver_fields = shared.mem.heap.num_fields(recv),
+                in_heap = shared.mem.heap.is_heap_addr(addr).is_some(),
+                in_young = shared.mem.heap.is_in_young_addr(addr),
+                collections_now = shared.mem.heap.collection_count(),
+                "the RECEIVER of the read that decoded a corrupt Value cell. Its \
+                 class is what re-served the block, not what the holder thinks \
+                 it is holding.",
+            );
+            report_reclaimed_receiver_forced(shared, addr, "corrupt-cell", &name, cid);
+            report_root_slice_provenance(shared, thread, addr, "corrupt-cell");
+        }
+        None => {
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                door = door,
+                slot = format!("{slot:#x}"),
+                raw0 = format!("{raw0:#018x}"),
+                raw1 = format!("{raw1:#018x}"),
+                raw0_ascii = %ascii(raw0),
+                raw1_ascii = %ascii(raw1),
+                in_heap = shared.mem.heap.is_heap_addr(slot).is_some(),
+                in_young = shared.mem.heap.is_in_young_addr(slot),
+                collections_now = shared.mem.heap.collection_count(),
+                "a corrupt Value cell with NO receiver to name -- the read did \
+                 not come through an instrumented door. The slot address and \
+                 the frames below are the whole of what is known.",
+            );
+        }
+    }
     let frames: Vec<String> = thread
         .frames
         .iter()
@@ -738,6 +920,7 @@ pub(crate) fn report_corrupt_cell_producer(
     tracing::error!(
         target: "cratonvm::gc::guard",
         site = "corrupt-cell",
+        door = door,
         "...and the Java stack that reached it, top first:\n  {}",
         frames.join("\n  "),
     );
