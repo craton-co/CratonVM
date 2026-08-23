@@ -17,16 +17,21 @@ Superseded documents:
   wrong in every particular — see §6.
 
 **The application now runs its real inference loop and still produces no
-output**, for a reason the open record could not see because it never got
-past the first `matmul`: CratonVM's Vector API runs the JDK's generic Java
-fallback, at ~500,000-850,000x HotSpot on this kernel. That is measured, it
-is a throughput matter and not a correctness one (every value matches the
-oracle bit for bit), and it is `docs/known-issues/perf/
-vector-api-over-memorysegment-is-a-java-fallback-20260822.md`. See §5.2.
+output**, for a reason the open record could not see because it never got past
+the first `matmul`: the Vector API kernel it spends every token in is orders of
+magnitude off HotSpot. That is a throughput matter and not a correctness one —
+every value matches the oracle bit for bit — and it has its own record,
+`docs/known-issues/perf/vector-api-dispatch-depth-20260822.md`. Half of it is
+since FIXED: CratonVM ran the JDK's generic lane-at-a-time Java fallback for
+every Vector API operation, and `VectorSupport`'s intrinsic entry points are
+now whole-vector Rust kernels covering 100% of that kernel's calls. **3.8x**,
+and the gap that remains is the JDK's own dispatch layer above them. See §5.2.
 
-Two residuals are **not** fixed and have been re-homed rather than dropped:
+Two residuals are **not** (fully) fixed and have been re-homed rather than
+dropped:
 
-* the Vector API throughput above, and
+* the Vector API throughput above, now `vector-api-dispatch-depth-20260822.md`,
+  and
 * `FileChannel.read` into a heap buffer at ~8.7x HotSpot, whose stated cause
   in the open record is **refuted** — `docs/known-issues/perf/
   filechannel-heap-read-glue-depth-20260822.md`. See §5.1.
@@ -365,7 +370,32 @@ the canonical NaN and the oracle answers the x86 indefinite one — the known
 `Value::Double` NaN-payload limitation, which predates this work.
 
 Full measurement: `docs/known-issues/perf/
-vector-api-over-memorysegment-is-a-java-fallback-20260822.md`.
+vector-api-dispatch-depth-20260822.md`.
+**UPDATE 2026-08-22, later the same day.** The fallback half of this is fixed.
+`native-builtins/src/vector_support_intrinsics.rs` implements the nine
+`VectorSupport` entry points HotSpot marks `@IntrinsicCandidate` as
+whole-vector Rust kernels, and on this kernel they cover **every call**
+(`fell_back=0`). Measured with a kill switch on ONE binary, arms interleaved:
+**79 713 / 80 479 ns per lane off, 20 813 / 21 276 on — 3.8x**, with the
+`warm=` checksum identical on all four runs and on HotSpot.
+
+It does not make the application produce a token, and the arithmetic in this
+section still holds at the new rate. What it changes is the SHAPE of what is
+left: the 93.7% that was `bOpTemplate` / `uOpTemplate` / `vectorFactory` and
+the per-lane lambdas is gone, and the profile is now the JDK's own route TO
+`VectorSupport` — `lanewiseTemplate`, `convert0`, `ImplCache.find`, `opCode`,
+`sameSpecies` — several dozen ordinary Java calls per vector operation, which
+at CratonVM's ~200 ns per call is the whole remaining cost. That is the general
+call-cost story, not a Vector API defect, and it is the same shape as §5.1.
+
+The rewritten record also corrects two claims this section made. Neither
+`vector_api.rs`'s registrations nor the `Math.fma` one lose a dispatch race:
+both live in registrars reachable only from `register_synthetic_overrides`,
+which does not run in real-JDK mode, so neither had ever been registered there.
+"The native did not win" and "the native was never registered in this mode"
+look identical from the outside; the registrar's call path is the thing to
+check first.
+
 
 ---
 
@@ -448,8 +478,14 @@ segment per `reinterpretAsInts()`, so a per-allocation regression here is
 multiplied by every lane group in the kernel.
 
 Core regression suite on the fixed binary: **66 of 67 vectors pass**. The one
-failure, `RTreeRangeGc`, is pre-existing and already filed as
-`bug-zgc-relocation-unmasks-root-collection-gap-rtreerangegc-20260821.md`.
+failure, `RTreeRangeGc`, is pre-existing and was filed at the time as a
+root-collection gap. **FIXED 2026-08-22**, and it was not a root-collection
+gap: three defects in the collection natives, retired to
+`rtreerangegc-was-four-collection-native-defects-FIXED-20260822.md`. The guard
+text this paragraph leans on is emitted on EVERY failing `checkcast`, so it was
+never evidence of reclamation -- which does not weaken the argument here, since
+that argument rests on the SAME text appearing on both binaries rather than on
+what the text means.
 That is established rather than assumed: the same vector run 3x on this binary
 and 3x on one built from the merge base fails on both, with identical guard
 text — 3 of 3 here against 2 of 3 there, which is the flake's own rate rather

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-470 tokens.
+477 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -118,6 +118,7 @@ export inherited from a parent shell.
 | `census-exact-invocations` | `CRATONVM_CENSUS_EXACT_INVOCATIONS` |
 | `cce` | `CRATONVM_DBG_CCE` |
 | `cce-bt` | `CRATONVM_DBG_CCE_BT` |
+| `corrupt-cell` | `CRATONVM_DBG_CORRUPT_CELL` |
 | `ccecache` | `CRATONVM_DBG_CCECACHE` |
 | `ccsprobe` | `CRATONVM_DBG_CCSPROBE` |
 | `coercion` | `CRATONVM_DBG_COERCION` |
@@ -222,6 +223,7 @@ export inherited from a parent shell.
 | `hang-sample` | `CRATONVM_DBG_HANG_SAMPLE` |
 | `hangwalk` | `CRATONVM_DBG_HANGWALK` |
 | `heap-stale` | `CRATONVM_DBG_HEAP_STALE` |
+| `fmt-wrongtype` | `CRATONVM_DBG_FMT_WRONGTYPE` |
 | `heap-trace` | `CRATONVM_DBG_HEAP_TRACE` |
 | `heapcopy` | `CRATONVM_DBG_HEAPCOPY` |
 | `heartbeat` | `CRATONVM_DBG_HEARTBEAT` |
@@ -278,6 +280,8 @@ export inherited from a parent shell.
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
 | `jit-rootscan` | `CRATONVM_DBG_JIT_ROOTSCAN` |
+| `jit-stale-after-remap` | `CRATONVM_DBG_JIT_STALE_AFTER_REMAP` |
+| `jit-stale-below-rbp` | `CRATONVM_DBG_JIT_STALE_BELOW_RBP` |
 | `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
 | `jit-pin` | `CRATONVM_DBG_JIT_PIN` |
 | `jit-putfield` | `CRATONVM_DBG_JIT_PUTFIELD` |
@@ -385,6 +389,8 @@ export inherited from a parent shell.
 | `osr-meta` | `CRATONVM_DBG_OSR_META` |
 | `osr-seed-collision` | `CRATONVM_DBG_OSR_SEED_COLLISION` |
 | `osr-slots` | `CRATONVM_DBG_OSR_SLOTS` |
+| `view-kind` | `CRATONVM_DBG_VIEWKIND` |
+| `view-resync` | `CRATONVM_DBG_VIEWRESYNC` |
 | `overlay` | `CRATONVM_DBG_OVERLAY` |
 | `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
@@ -513,6 +519,7 @@ export inherited from a parent shell.
 | `ute` | `CRATONVM_DBG_UTE` |
 | `validate-new` | `CRATONVM_DBG_VALIDATE_NEW` |
 | `vdisp` | `CRATONVM_DBG_VDISP` |
+| `vector-intrinsics-stats` | `CRATONVM_VECTOR_INTRINSICS_STATS` |
 | `verify-error` | `CRATONVM_DBG_VERIFY_ERROR` |
 | `verify-inline-frame-record` | `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD` |
 | `verify-oop-maps` | `CRATONVM_DBG_VERIFY_OOP_MAPS` |
@@ -536,7 +543,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-212 tokens.
+214 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -722,7 +729,9 @@ export inherited from a parent shell.
 | `sp-tailcall` | `CRATONVM_JIT_SP_TAILCALL` |
 | `spec-bce` | `CRATONVM_JIT_NO_SPEC_BCE` |
 | `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
+| `static-bytecode-callee` | `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` |
 | `statics-index` | `CRATONVM_NO_STATICS_INDEX` |
+| `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
@@ -755,7 +764,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-66 tokens.
+70 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -783,6 +792,8 @@ export inherited from a parent shell.
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
 | `g1-rset-source-cap` | `CRATONVM_G1_RSET_SOURCE_CAP` |
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |
+| `gpu-chunk-streams` | `CRATONVM_GPU_CHUNK_STREAMS` |
+| `gpu-chunks` | `CRATONVM_GPU_CHUNKS` |
 | `gpu-critical-lease-ms` | `CRATONVM_GPU_CRITICAL_LEASE_MS` |
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
@@ -791,6 +802,8 @@ export inherited from a parent shell.
 | `mirror-pin-young-defer` | `CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER` |
 | `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
 | `moving-young-jit-frames` | `CRATONVM_MOVING_YOUNG_NO_JIT` |
+| `format-arg-pin` | `CRATONVM_NO_FORMAT_ARG_PIN` |
+| `register-image-remap` | `CRATONVM_REGISTER_IMAGE_REMAP` |
 | `innermost-callee-resolve` | `CRATONVM_GC_NO_CALLEE_RESOLVE` |
 | `old-interior-pins` | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` |
 | `empty-object-run` | `CRATONVM_GC_NO_EMPTY_OBJECT_RUN` |
@@ -947,10 +960,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-13 tokens.
+14 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `map-iterator-failfast` | `CRATONVM_NO_MAP_ITERATOR_FAILFAST` |
 | `eager-streams` | `CRATONVM_EAGER_STREAMS` |
 | `foreign-attach` | `CRATONVM_FOREIGN_ATTACH` |
 | `jboss-boot-log-file` | `CRATONVM_JBOSS_BOOT_LOG_FILE` |

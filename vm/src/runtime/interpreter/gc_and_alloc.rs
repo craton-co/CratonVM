@@ -5182,6 +5182,8 @@ pub(crate) fn apply_pointer_map_to_thread(
     // entry chain — sound because we run on the resuming thread itself) and inert
     // unless a precise-map frame is live, so it is a no-op on the default path.
     crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
+    crate::jit::conservative_roots::remap_register_image_words(pointer_map, None);
+    crate::jit::conservative_roots::report_stale_after_remap(pointer_map, None);
     // §4 (multi-thread shadow scan, remap half). Remap THIS thread's shadow-stack
     // precise roots in place, so a worker resuming from the STW barrier sees the
     // relocated addresses in the JIT registers/slots it reloads from its shadow

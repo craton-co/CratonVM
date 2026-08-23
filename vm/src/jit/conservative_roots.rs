@@ -5383,6 +5383,416 @@ mod coverage_oracle_gate_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Post-remap stale-reference detector (`CRATONVM_DBG_JIT_STALE_AFTER_REMAP`)
+// ---------------------------------------------------------------------------
+//
+// `remap_active_jit_frames` rewrites exactly the slots the active oop map
+// names. Everything else in a compiled frame -- the callee-saved GPR/XMM save
+// areas, the per-safepoint blind GPR spill, operand-spill slots above the
+// safepoint's live cursor, the outgoing-argument reserve, and every word of the
+// Rust/interpreter frames the compiled method called INTO -- keeps whatever it
+// held before the move. The conservative scan READS those regions (that is what
+// makes an object there survive), so a moving cycle can copy an object whose
+// only holder is a word nothing rewrites.
+//
+// This walks the same bands the conservative scan reads, AFTER the remap, and
+// reports any word that is still a key of `pointer_map` -- i.e. an address the
+// collection moved away from. It names the method, the frame offset, the
+// `FrameLayout` region and the CLASS of the object at the new address, so the
+// storage class responsible is named rather than guessed at. Diagnostic only;
+// default off.
+fn stale_after_remap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_STALE_AFTER_REMAP").is_some()
+    })
+}
+
+/// `CRATONVM_DBG_JIT_STALE_BELOW_RBP` -- additionally walk the Rust /
+/// interpreter frames beneath the innermost compiled frame. That range is NOT
+/// read by the conservative band scan when the bounded bands are in use, so
+/// most of what it holds is dead stack slop and it drowns out the
+/// compiled-frame findings; separate flag.
+fn stale_below_rbp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_STALE_BELOW_RBP").is_some()
+    })
+}
+
+static STALE_AFTER_REMAP_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Total words found still naming a moved-from address after a remap.
+pub fn stale_after_remap_hits() -> usize {
+    STALE_AFTER_REMAP_HITS.load(Ordering::Relaxed)
+}
+
+/// Name the class of the object now living at `addr`, for diagnostics.
+///
+/// `addr` is a POST-move address (a `pointer_map` value), so the object is
+/// live and its header is intact -- which is the whole reason the report is
+/// taken here rather than at the point of use, where the from-space cell has
+/// already been zeroed and reads back as `java.lang.Object`.
+fn class_name_at(shared: Option<&crate::vm::SharedVm>, addr: usize) -> String {
+    let Some(shared) = shared else {
+        return "?".to_string();
+    };
+    let Some(obj) = shared.mem.heap.is_object_address(addr) else {
+        return "<not-an-object>".to_string();
+    };
+    let cid = shared.mem.heap.class_id_of(obj);
+    shared
+        .classes
+        .class_manager
+        .try_read()
+        .and_then(|cm| cm.get_class(cid).map(|c| c.name.to_string()))
+        .unwrap_or_else(|| format!("class_id={}", cid.as_u32()))
+}
+
+fn report_stale_words_in(
+    lo: usize,
+    hi: usize,
+    cm: Option<&cratonvm_jit::CompiledMethod>,
+    rbp: usize,
+    pointer_map: &cratonvm_types::PointerMap,
+    shared: Option<&crate::vm::SharedVm>,
+    tag: &str,
+) {
+    if hi <= lo {
+        return;
+    }
+    let mut addr = (lo + 7) & !7usize;
+    const MAX_SCAN_BYTES: usize = 1024 * 1024;
+    let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+    while addr + 8 <= hi {
+        // SAFETY: aligned read inside this thread's own live stack interval,
+        // bounded by the caller's frame bounds.
+        let w = unsafe { (addr as *const usize).read() };
+        if let Some(&new) = pointer_map.get(&w) {
+            if new == w {
+                // The map records a no-op relocation for objects the copy left
+                // where they were. Not a stale reference.
+                addr += 8;
+                continue;
+            }
+            let n = STALE_AFTER_REMAP_HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 4000 {
+                let class = class_name_at(shared, new);
+                match cm {
+                    Some(cm) => {
+                        // Cast: a compiled frame is far smaller than i32::MAX.
+                        let off = (rbp - addr) as i32;
+                        eprintln!(
+                            "[jit-stale-after-remap] {tag} method={} off={off} region={} \
+                             verifiable={} class={class} value=0x{w:x} moved_to=0x{new:x}",
+                            cm.method_label,
+                            cm.frame_layout.region_name(off),
+                            band_slot_is_verifiable(
+                                off,
+                                &cm.frame_layout,
+                                moving_young_frame_live_hi(rbp, cm),
+                            ),
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "[jit-stale-after-remap] {tag} depth_below_rbp={} class={class} \
+                             value=0x{w:x} moved_to=0x{new:x}",
+                            rbp.saturating_sub(addr),
+                        );
+                    }
+                }
+            }
+        }
+        addr += 8;
+    }
+}
+
+/// Walk every live compiled frame band after a moving collection has remapped
+/// the oop-map slots and report words that still name a moved-from address.
+///
+/// See [`stale_after_remap_enabled`]. No-op unless the flag is set.
+pub fn report_stale_after_remap(
+    pointer_map: &cratonvm_types::PointerMap,
+    shared: Option<&crate::vm::SharedVm>,
+) {
+    if pointer_map.is_empty() || !stale_after_remap_enabled() {
+        return;
+    }
+    let scanner_sp = current_stack_pointer();
+    JIT_ENTRY_CHAIN.with(|c| {
+        {
+            let mut v = c.borrow_mut();
+            flush_top_rbp_cache_to_chain(v.as_mut_slice());
+        }
+        let chain = c.borrow();
+        for entry in chain.iter() {
+            let Some(info) = entry.precise else { continue };
+            let entry_sp = entry.entry_sp;
+            let mut rbp = info.exact_rbp;
+            if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
+                continue;
+            }
+            if stale_below_rbp_enabled() {
+                report_stale_words_in(
+                    scanner_sp,
+                    rbp,
+                    None,
+                    rbp,
+                    pointer_map,
+                    shared,
+                    "below-innermost-rbp",
+                );
+            }
+            let Some(innermost_cm) = innermost_frame_method(
+                rbp,
+                info.exact_cm_id,
+                entry_sp,
+                scanner_sp,
+                info.compiled_method,
+            ) else {
+                continue;
+            };
+            // SAFETY: same contract as `scan_compiled_frame_bands` -- the chain
+            // entry's CompiledMethod is Arc-owned by the JIT cache while any of
+            // its frames is live.
+            let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
+            let mut frames = 0usize;
+            while frames < 4096 {
+                frames += 1;
+                let frame_size = cm.osr_frame_size;
+                if frame_size <= 0 {
+                    break;
+                }
+                let frame_size = frame_size as usize;
+                const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+                if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+                    break;
+                }
+                report_stale_words_in(
+                    rbp - frame_size,
+                    rbp,
+                    Some(cm),
+                    rbp,
+                    pointer_map,
+                    shared,
+                    "frame-band",
+                );
+                // SAFETY: `rbp` is a validated frame base in this thread's live
+                // JIT stack interval.
+                let parent_rbp = unsafe { (rbp as *const usize).read() };
+                let ret_addr = unsafe { ((rbp + 8) as *const usize).read() };
+                let Some(parent_cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+                    break;
+                };
+                if parent_rbp <= rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp >= entry_sp
+                    || parent_rbp < scanner_sp
+                {
+                    break;
+                }
+                // SAFETY: code ranges retain their CompiledMethod metadata for
+                // the lifetime of an active frame.
+                cm = unsafe { &*(parent_cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                rbp = parent_rbp;
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Register-image remap: the other half of the frame-word partition
+// ---------------------------------------------------------------------------
+//
+// `band_slot_is_verifiable` splits a compiled frame's band in two. Words it
+// inspects are VERIFIED: an unpublished movable oop in one of them makes
+// `moving_young_unpublished_frame_oop_present` report
+// `UNPUBLISHED_FRAME_OOP`, and the cycle diverts to the non-moving sweep.
+// Words it skips were, until now, neither verified NOR rewritten -- the
+// prologue's callee-saved GPR/XMM save areas, the per-safepoint blind GPR
+// spill, the outgoing-argument / deopt-register reserve, and operand-spill
+// slots above the safepoint's live cursor.
+//
+// The justification for skipping them is that they are register IMAGES and
+// dead argument words: "not storage this frame resumes from". That is true of
+// THIS frame and false of its caller. A compiled prologue saves the CALLER's
+// callee-saved GPRs into its own frame, and the epilogue pops them straight
+// back into the caller's registers -- so the caller resumes from exactly the
+// words the verifier declined to look at. `scan_compiled_frame_bands` READS
+// them, which is what keeps the referenced object alive across the pause; the
+// moving young collection then copies it, `remap_active_jit_frames` rewrites
+// only the slots an oop map names, and the saved word is left holding a
+// from-space address.
+//
+// This pass closes the partition: every word of a live compiled frame is now
+// either VERIFIED or REWRITTEN, and none is neither. It rewrites exactly the
+// words `band_slot_is_verifiable` refuses, and only when the word is a KEY of
+// `pointer_map` -- the start address of an object this collection actually
+// moved. That is the same interpretation the conservative scan already
+// committed to when it marked the word as a reference and kept the object
+// alive.
+//
+// SHIPS OPT-IN (`CRATONVM_REGISTER_IMAGE_REMAP=1`). The gap is measured -- see
+// `known-issues/gc/moving-young-leaves-a-callee-saved-register-image-unrewritten-20260822.md`
+// for the observation and the instrument that took it -- but NO failure has
+// been attributed to it, and the repair is a CONSERVATIVE rewrite: it treats a
+// word as a reference on exactly the evidence the marking scan uses, which is
+// sound for marking (over-retention) and not obviously sound for writing (a
+// caller's callee-saved register holding a non-pointer that happens to equal a
+// moved object's from-address would be corrupted). Default off, one flag away,
+// with `CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` as the instrument that says
+// whether it has anything to do on a given workload.
+fn register_image_remap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_REGISTER_IMAGE_REMAP").is_some()
+    })
+}
+
+static REGISTER_IMAGE_REMAP_WORDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Total words rewritten by [`remap_register_image_words`] this process.
+pub fn register_image_remap_words() -> usize {
+    REGISTER_IMAGE_REMAP_WORDS.load(Ordering::Relaxed)
+}
+
+/// Rewrite the moved references held in one frame's unverifiable words.
+fn remap_one_frame_register_images(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    pointer_map: &cratonvm_types::PointerMap,
+    shared: Option<&crate::vm::SharedVm>,
+    dbg: bool,
+) -> usize {
+    let frame_size = cm.osr_frame_size;
+    if frame_size <= 0 {
+        return 0;
+    }
+    let frame_size = frame_size as usize;
+    const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+    if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+        return 0;
+    }
+    let live_hi = moving_young_frame_live_hi(rbp, cm);
+    let lo = rbp - frame_size;
+    let mut addr = (lo + 7) & !7usize;
+    let mut rewritten = 0usize;
+    while addr + 8 <= rbp {
+        // Cast: a compiled frame is far smaller than i32::MAX bytes.
+        let off = (rbp - addr) as i32;
+        if band_slot_is_verifiable(off, &cm.frame_layout, live_hi) {
+            // Verified storage. An unpublished movable oop here has already
+            // forced the non-moving sweep, and a published one was rewritten
+            // by `remap_one_jit_frame`. Rewriting it again here would be a
+            // second, unvalidated interpretation of the same word.
+            addr += 8;
+            continue;
+        }
+        // SAFETY: aligned read inside this thread's own live compiled frame,
+        // bounded by the frame size recorded at compile time.
+        let w = unsafe { (addr as *const usize).read() };
+        if let Some(&new) = pointer_map.get(&w) {
+            if new != w {
+                // SAFETY: same slot, rewriting the relocated reference.
+                unsafe { (addr as *mut usize).write(new) };
+                rewritten += 1;
+                if dbg {
+                    eprintln!(
+                        "[jit-register-image-remap] method={} off={off} region={} class={} \
+                         0x{w:x}->0x{new:x}",
+                        cm.method_label,
+                        cm.frame_layout.region_name(off),
+                        class_name_at(shared, new),
+                    );
+                }
+            }
+        }
+        addr += 8;
+    }
+    rewritten
+}
+
+/// Rewrite moved references held in the register-image / outgoing-argument
+/// words of every live compiled frame on this thread.
+///
+/// Companion to [`remap_active_jit_frames`], which covers the oop-map slots.
+pub fn remap_register_image_words(
+    pointer_map: &cratonvm_types::PointerMap,
+    shared: Option<&crate::vm::SharedVm>,
+) {
+    if pointer_map.is_empty() || !register_image_remap_enabled() {
+        return;
+    }
+    let dbg = stale_after_remap_enabled();
+    let scanner_sp = current_stack_pointer();
+    let mut total = 0usize;
+    JIT_ENTRY_CHAIN.with(|c| {
+        {
+            let mut v = c.borrow_mut();
+            flush_top_rbp_cache_to_chain(v.as_mut_slice());
+        }
+        let chain = c.borrow();
+        for entry in chain.iter() {
+            let Some(info) = entry.precise else { continue };
+            let entry_sp = entry.entry_sp;
+            let mut rbp = info.exact_rbp;
+            if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
+                continue;
+            }
+            // Same resolution rule as `scan_compiled_frame_bands` and
+            // `remap_active_jit_frames`: when nothing describes the frame at
+            // `exact_rbp`, its layout would be read out of the wrong method,
+            // so leave it alone. The coverage refresh reports
+            // `FOREIGN_INNERMOST_RBP` for it, which already forces the
+            // non-moving sweep, so there is no move to repair.
+            let Some(innermost_cm) = innermost_frame_method(
+                rbp,
+                info.exact_cm_id,
+                entry_sp,
+                scanner_sp,
+                info.compiled_method,
+            ) else {
+                continue;
+            };
+            // SAFETY: same contract as `scan_compiled_frame_bands` -- the chain
+            // entry's CompiledMethod is Arc-owned by the JIT cache while any of
+            // its frames is live, and a resolved callee is kept alive by the
+            // live frame whose return address resolved it.
+            let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
+            let mut frames = 0usize;
+            while frames < 4096 {
+                frames += 1;
+                total += remap_one_frame_register_images(rbp, cm, pointer_map, shared, dbg);
+                // SAFETY: `rbp` is a validated frame base in this thread's live
+                // JIT stack interval.
+                let parent_rbp = unsafe { (rbp as *const usize).read() };
+                let ret_addr = unsafe { ((rbp + 8) as *const usize).read() };
+                let Some(parent_cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+                    break;
+                };
+                if parent_rbp <= rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp >= entry_sp
+                    || parent_rbp < scanner_sp
+                {
+                    break;
+                }
+                // SAFETY: code ranges retain their CompiledMethod metadata for
+                // the lifetime of an active frame.
+                cm = unsafe { &*(parent_cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                rbp = parent_rbp;
+            }
+        }
+    });
+    if total > 0 {
+        REGISTER_IMAGE_REMAP_WORDS.fetch_add(total, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

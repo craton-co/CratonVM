@@ -2,7 +2,8 @@
 
 ## Status
 
-**FIXED 2026-08-21** — the suppression this bit licenses is now **opt-in**
+**FIXED 2026-08-21, RETIRED 2026-08-22** -- re-verified on `dev` + 118 further
+commits; see the closing section. **FIXED 2026-08-21** — the suppression this bit licenses is now **opt-in**
 (`CRATONVM_GC_PRECISE_ONLY_ROOTS=1`), because the bit cannot be made sound at a
 price worth paying and it was measured to be worth ~0.1 % of collections. The
 runtime oracle named in the contract now gates the suppression when it is on,
@@ -267,3 +268,68 @@ CRATONVM_DBG_JIT_ROOTSCAN=1 CRATONVM_GC_STRESS=1048576 \
 CRATONVM_GC_PRECISE_ONLY_ROOTS=1 CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE=1 \
 CRATONVM_DBG_JIT_ROOTSCAN=1 CRATONVM_GC_STRESS=16777216 <cratonvm> ...
 ```
+
+## Retirement 2026-08-22: re-verified, and the last open question is answered
+
+Everything above was measured on `dev@ee4cdf528` plus a 220-commit merge. This
+section re-takes the two measurements that decide whether the repair still holds,
+on `dev` + 118 further commits, one binary, and closes the one item this page
+left pointing at another record.
+
+### Engagement and the gate, re-measured
+
+`PolynomialTest`, `-XX:+UseGenerationalGC --Xmx 1g`,
+`CRATONVM_GC_STRESS=16777216`, `CRATONVM_DBG_JIT_ROOTSCAN=1`. Each arm capped at
+420 s of wall clock — the metric is a SHARE, so a truncated workload answers it,
+and the untruncated run writes ~64 MB of `[jitroots]` lines:
+
+| arm | collections | `precise_only=true` | `REFUTED` |
+|---|---:|---:|---:|
+| default (suppression opt-in OFF) | 36 559 | **0** | 0 |
+| `CRATONVM_GC_PRECISE_ONLY_ROOTS=1` | 37 047 | **5** | 0 |
+| `PRECISE_ONLY_ROOTS=1` + `DBG_OOP_ORACLE_FORCE_REFUTE=1` | 27 499 | **0** | **1** |
+
+Three things, all as this page reports them:
+
+* **The default never takes the suppression.** Zero in 36 559 collections, so the
+  conservative JIT backstop runs on every one of them and the soundness argument
+  the bit could not supply is not needed.
+* **The opt-in engagement is still ~0.01 %** — 5 in 37 047, against the 6 in
+  70 066 recorded above. The trade the default flip rests on has not moved.
+* **The gate still fires, and row 2 is still the control that makes row 3 mean
+  something.** Same configuration without the forced refutation takes the branch
+  5 times; with it, 0, and one `COVERAGE_ORACLE_REFUTED`. Row 3's zero is a
+  withdrawn suppression, not an absent one.
+
+### The one referral this page made is now closed
+
+§"The generational failure is NOT this bug" ends: "It belongs to
+`bug-generational-ntru-unpinned-jit-reference-20260821.md`, which reports the
+same signature on pristine `dev` and was already open," and adds "that page calls
+the failure **deterministic** … It is load-sensitive, not deterministic."
+
+Both halves held up. The A/B here — suppression ON and OFF, identical
+distributions — was right that the failure is not the suppression's, and the
+determinism correction was right too. The ntru failure was `String.format`
+reclaiming its own varargs array across `DecimalFormatSymbols.getInstance()`;
+it is fixed, and it is neither a JIT-root nor a relocation defect. See
+`bug-generational-ntru-unpinned-jit-reference-20260821-FIXED.md`.
+
+### What is still open, and where it lives now
+
+The three items under "What this still does not establish" are unchanged and are
+statements of limit rather than work:
+
+* no unmapped oop has ever been found on a suppressed cycle;
+* the oracle's primitive-that-looks-like-an-oop false positive is unchanged, and
+  with the gate armed costs a withdrawn suppression rather than a wrong answer;
+* the three unconditional drops in `emit_oop_map_for_safepoint` still fail closed
+  and have never fired.
+
+One NEW item came out of the same partition while the ntru failure was being
+chased, and it is a separate page rather than a residual here: the words
+`band_slot_is_verifiable` SKIPS are neither verified nor rewritten, and after a
+moving young collection a compiled frame's callee-saved GPR image can still name
+a moved-from address. Measured, no failure attributed, repair available behind
+`CRATONVM_REGISTER_IMAGE_REMAP=1` (default off). See
+`moving-young-leaves-a-callee-saved-register-image-unrewritten-20260822.md`.

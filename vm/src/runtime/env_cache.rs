@@ -1457,6 +1457,13 @@ cached_is_set!(cce_dbg, "CRATONVM_DBG_CCE");
 /// LinkedList$ListItr cursor bug). The hunter logs class + slot + value +
 /// descriptor + native caller so every instance can be enumerated in one run.
 cached_is_set!(overlay_corruption_dbg, "CRATONVM_DBG_OVERLAY");
+/// `CRATONVM_DBG_CORRUPT_CELL` - when a VM-side field read decodes a `Value`
+/// cell with an out-of-range discriminant, name the RECEIVER and the Java frames
+/// that reached it. The collector's own guard reports the cell; only this side
+/// can report who was holding the reference into a swept-then-re-served block.
+/// Costs one relaxed load per `NativeContext::get_field` while armed and nothing
+/// at all while it is not.
+cached_is_set!(corrupt_cell_dbg, "CRATONVM_DBG_CORRUPT_CELL");
 cached_is_set!(lambda_dbg, "CRATONVM_DBG_LAMBDA");
 cached_is_set!(resume_pc_dbg, "CRATONVM_DBG_RESUME_PC");
 /// `CRATONVM_DBG_BADRECV` — on a getfield/putfield/array/invoke receiver whose
