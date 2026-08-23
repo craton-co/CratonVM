@@ -120,9 +120,13 @@ on both binaries.
 ## 7. NOMINATIONS
 
 * **N1 — `RJdkJmx` needs the `jmx.rs` owner** (§5). Control evidence included.
-* **N2 — extend the audit to the other native crates** (§6). The script that
-  produced §2's table is ~60 lines and is not committed; the three properties in
-  §1 are the whole of it.
+* ~~**N2 — extend the audit to the other native crates.**~~ **DONE —
+  `WORKER-5-NOTE-12`.** All seven crates: 131 match the shape, **17 have
+  reusing call sites** (14 `native-builtins`, 2 `native-io`, 1 `native-awt`),
+  handed over unfixed. One more was fixed —
+  `tm_migrate_fast_to_array` — and the script IS committed now, as
+  `scripts/stale-receiver-audit.py` with a baseline and an exercised failure
+  path.
 * **N3 — prefer `&mut ObjectRef` (or a returned `ObjectRef`) for any funnel that
   allocates.** Three of the four correct funnels found here already do, and the
   one that did not is the one that had the bug. That is a convention worth
