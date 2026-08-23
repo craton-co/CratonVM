@@ -164,7 +164,8 @@ Same symptom, which is consistent with one defect and proves little on its own.
 
 ### Verdict
 
-**SETTLED — they are TWO defects** (§4c). The default collector's is
+**SETTLED, then SUPERSEDED — see the banner at §4c.** The two symptoms are one
+defect: the publish window. What follows is what was true before that landed. The default collector's is
 `headMap(k,false)` handing back a stale address that decodes as another object;
 generational's is `subMap(k,k)` handing back an EMPTY view on its first walk.
 Different operation, different symptom, different collector, both needing
@@ -176,6 +177,37 @@ parent record's "strict mode is CLEAN" and the localisation built on it.
 **Operationally**: fixing one will not green the vector. Whoever takes the
 empty-view defect has the cheaper target — `1,2,5` on generational, three
 phases, deterministic, no relocation reasoning required.
+
+> **CLOSED 2026-08-22 — `RTreeRangeGc` is green on every arm, and the defect
+> this note localises is FIXED.** `fix/gc-known-issues-20260822` landed four
+> collection-native fixes; the one this note's §4c is about is the publish
+> window in `tm_resync_view_inner`, which allocated the result array, released
+> EVERY pin, and only then wrote the array and the size into the view — so a
+> relocating collection in that window sent both writes to the from-space copy
+> and the live view kept the `SIZE = 0` its constructor had set. That is why the
+> selection loop was never at fault and the spec was never lost, which is what
+> §4c had eliminated but could not explain.
+>
+> **VERIFIED HERE, and this is the part the fixing lane did not publish**: its
+> own record quotes 25/25 on the default collector and 25/25 under
+> `--jdk-only`. The GENERATIONAL arm is the one the parent page called
+> permanently red — *"The generational column never changed"* — and nobody had
+> run it after the fix. On `7be634aab`, `--Xmx 64m`, three runs each:
+>
+> ```text
+> default (ZGC)   pass pass pass      --jdk-only   pass pass pass
+> generational    pass pass pass      --nojit      pass pass pass
+> G1              pass pass pass
+> ```
+>
+> The two-bound `subMap` repro (`WhichBound`) reports **zeros=0 of 40**, three
+> runs, where it reported 1 of 40 before; `TreeVectorShape 1,2,5` is OK 4/4
+> where it failed 2/2; and all sixteen phases pass on both collectors.
+>
+> **So §4c's "fixing either will not green the vector" is WRONG** — it assumed
+> two independent defects where the publish window explains both symptoms. What
+> survives is §4b: `--jdk-only` was never clean, only less sensitive, and the
+> parent page's localisation to the collection substitution had no evidence.
 
 ## 4c. THE GENERATIONAL TRIGGER, FOUND — and it is a SECOND defect
 
