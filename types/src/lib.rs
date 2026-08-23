@@ -97,7 +97,7 @@ pub use heap_types::{
     element_type_tag_at, kind_tag_at,
     object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
     ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
-    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK,
+    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OBJECT, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK,
     GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
     GC_FLAGS_BYTE_OFFSET, KIND_TAGS_BYTE_OFFSET, KIND_TAG_BYTE_MASK,
     MARK_HASH_MASK, MARK_HASH_SHIFT, MARK_QUARTET_MASK, MARK_QUARTET_SHIFT, MAX_GC_AGE,
@@ -406,3 +406,75 @@ pub fn set_zgc_read_barrier_armed(armed: bool) {
 
 static ZGC_READ_BARRIER_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Corrupt-`Value`-cell census, shared by the three crates that need it.
+///
+/// It lives HERE rather than in the collector or the VM because the only exit
+/// path that every program takes — the shutdown trailer in
+/// `native-builtins::lang_system` — can reach `cratonvm-types` and neither of
+/// the other two. The first version printed its summary from `vm-cli`'s
+/// normal-return arm, and a JUnit runner calls `System.exit`, so a full
+/// 1975-class Spring Boot sweep produced the line in ZERO of 1975 logs while
+/// looking exactly like a clean run.
+///
+/// That is the failure this module exists to make impossible: `decoded=0` is a
+/// measurement, an ABSENT line is not, and the two must not look alike.
+pub mod cell_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DECODED: AtomicU64 = AtomicU64::new(0);
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+
+    /// Count one corrupt cell decoded. Returns the count BEFORE this one, which
+    /// is what a watch compares against.
+    #[inline]
+    pub fn note_decoded() -> u64 {
+        DECODED.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// How many corrupt cells this process has decoded.
+    #[inline]
+    pub fn decoded() -> u64 {
+        DECODED.load(Ordering::Relaxed)
+    }
+
+    /// Count one corrupt cell actually NAMED — by a read door or the backstop.
+    #[inline]
+    pub fn note_reported() {
+        REPORTED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many corrupt cells this process has named.
+    #[inline]
+    pub fn reported() -> u64 {
+        REPORTED.load(Ordering::Relaxed)
+    }
+
+    /// Print the census once, on whichever exit path runs first.
+    ///
+    /// Armed by `CRATONVM_DBG_CORRUPT_CELL`. Prints even when nothing fired —
+    /// that is the point: it turns "the instrument said nothing" into "the
+    /// instrument was armed and counted zero", which are different claims.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        if crate::flags::runtime_var_os("CRATONVM_DBG_CORRUPT_CELL").is_none() {
+            return;
+        }
+        ONCE.call_once(|| {
+            let d = decoded();
+            let r = reported();
+            if d == 0 {
+                eprintln!("[corrupt-cell] decoded=0 reported=0 — armed, and the guard did not fire");
+            } else if r < d {
+                eprintln!(
+                    "[corrupt-cell] decoded={d} reported={r} — {} cell(s) NAMED BY NOBODY: a \
+                     reader with no instrumented door whose thread never reached a safepoint \
+                     afterwards",
+                    d - r
+                );
+            } else {
+                eprintln!("[corrupt-cell] decoded={d} reported={r}");
+            }
+        });
+    }
+}

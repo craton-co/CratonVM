@@ -716,6 +716,70 @@ pub mod npe_action {
 /// unaligned/out-of-range bits are still refused.
 pub const GETFIELD_RECEIVER_PROVEN_OOP: u64 = 1 << 62;
 
+/// Bit the JIT sets in `jit_getfield`'s `field_index` argument to say **"the
+/// value I am about to receive is a REFERENCE, and I will dereference it"**.
+///
+/// Without it the helper cannot know what the caller asked for. It reads a
+/// `Value` out of the slot and returns the payload of whichever variant it
+/// finds, so a reference field whose slot has been type-punned to a primitive
+/// comes back as that primitive's bits — and compiled code, which emitted a
+/// plain `MOV r32,[reg+4]` for the `arraylength` that follows, dereferences an
+/// integer.
+///
+/// That is not hypothetical. `org.apache.derby.iapi.types.SQLChar.rawData` is
+/// declared `[C` and was read back as `Int(1)`; the emitted code went
+///
+/// ```text
+///   call  jit_getfield          ; -> rax = 1
+///   mov   r10, 8000000000000000h
+///   cmp   rax, r10              ; the ONLY value it checks for
+///   je    <deopt>
+///   mov   eax,[rax+4]           ; arraylength  ->  SIGSEGV at addr 0x5
+/// ```
+///
+/// i64::MIN was the only rejected value, so every other primitive payload
+/// became a wild pointer.
+///
+/// With this bit set, a primitive found in a slot the caller will dereference
+/// is degraded to null rather than returned — the same "degrade rather than
+/// hand the JIT bits it will later deref → SIGSEGV" policy
+/// `jit_decode_ref_word` already applies to an implausible POINTER, extended
+/// to the case where the slot does not hold a pointer at all.
+///
+/// Bit 61 for the same reason bit 62 was chosen: a class-file field table is
+/// `u16`-sized, so a real slot index cannot reach either.
+pub const GETFIELD_EXPECT_REFERENCE: u64 = 1 << 61;
+
+/// Every bit in `jit_getfield`'s `field_index` argument that is a flag rather
+/// than part of the index. Masked off in one place so a third flag cannot be
+/// added without the strip site seeing it.
+pub const GETFIELD_FLAG_BITS: u64 = GETFIELD_RECEIVER_PROVEN_OOP | GETFIELD_EXPECT_REFERENCE;
+
+/// Build `jit_getfield`'s third argument.
+///
+/// Seven call sites across the two backends emit this argument, and before
+/// this existed each of them wrote `field_index as u64` by hand. That is how
+/// [`GETFIELD_EXPECT_REFERENCE`] would rot: a site added later, or one whose
+/// author did not know a safety bit had appeared, silently opts out of it and
+/// the hole reopens at exactly one `getfield` arm. One encoder means a new flag
+/// reaches every site by construction.
+pub const fn getfield_index_arg(
+    field_index: u32,
+    is_reference: bool,
+    receiver_proven_oop: bool,
+) -> u64 {
+    let mut arg = field_index as u64;
+    if is_reference {
+        arg |= GETFIELD_EXPECT_REFERENCE;
+        // The receiver proof is only consulted on the reference path, and only
+        // ever as an optimisation — see `GETFIELD_RECEIVER_PROVEN_OOP`.
+        if receiver_proven_oop {
+            arg |= GETFIELD_RECEIVER_PROVEN_OOP;
+        }
+    }
+    arg
+}
+
 
 /// Function pointer table for JIT runtime callbacks.
 ///

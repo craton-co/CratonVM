@@ -307,6 +307,14 @@ pub const INVENTORY: &[E] = &[
     // two days. Costs one relaxed load per `NativeContext::get_field` while
     // armed and nothing at all while it is not.
     E { group: Group::DBG, token: "corrupt-cell", on_key: Some("CRATONVM_DBG_CORRUPT_CELL"), off_key: None, off_word: None },
+    // Declared 2026-08-23 with the widening it verifies. Fabricates one
+    // corrupt-cell hit at a site that HAS a read door and one at a site that
+    // does not, so a run can prove the door reporter and the safepoint backstop
+    // both actually speak. A silent diagnostic and a broken one look identical
+    // from the outside, and this instrument was read the wrong way round once
+    // already -- it reported nothing through a Spring Boot sweep that had
+    // tripped the collector's guard, and the silence was taken for "clean".
+    E { group: Group::DBG, token: "corrupt-cell-selftest", on_key: Some("CRATONVM_DBG_CORRUPT_CELL_SELFTEST"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccecache", on_key: Some("CRATONVM_DBG_CCECACHE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccsprobe", on_key: Some("CRATONVM_DBG_CCSPROBE"), off_key: None, off_word: None },
     // The per-occurrence, backtrace-carrying arm of the descriptor-coercion
@@ -1209,6 +1217,7 @@ pub const INVENTORY: &[E] = &[
     // arena-order lanes, and this token still seeds both when neither is set.
     E { group: Group::JIT, token: "lambda-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_ADAPTER"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-capture-adapter", on_key: Some("CRATONVM_JIT_LAMBDA_CAPTURE_ADAPTER"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "lambda-const-probe", on_key: Some("CRATONVM_JIT_LAMBDA_CONST_PROBE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-site", on_key: Some("CRATONVM_JIT_LAMBDA_SITE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "lambda-tierup", on_key: Some("CRATONVM_JIT_LAMBDA_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "verify-schedule", on_key: Some("CRATONVM_JIT_VERIFY_SCHEDULE"), off_key: None, off_word: None },

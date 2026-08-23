@@ -12156,15 +12156,37 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // Same decode as `get_field`, minus `resolve_field_descriptor_byte_cached`
         // — the caller supplied the answer that lookup would have produced.
         let obj = self.shared.mem.heap.load_and_forward(obj);
-        self.shared.mem.heap.get_field_as(obj, index, descriptor)
+        let corrupt_before = crate::memory::reclaim_guard::corrupt_cell_watch();
+        let read = self.shared.mem.heap.get_field_as(obj, index, descriptor);
+        crate::memory::reclaim_guard::corrupt_cell_watch_close(
+            self.shared,
+            self.thread,
+            corrupt_before,
+            "NativeContext::get_field_typed",
+            Some(obj),
+            Some(index),
+        );
+        read
     }
 
     fn get_fields_typed(&self, obj: ObjectRef, slots: &[(usize, u8)], out: &mut [Value]) {
         // One forwarding read for the whole batch — that is the point.
         let obj = self.shared.mem.heap.load_and_forward(obj);
+        let corrupt_before = crate::memory::reclaim_guard::corrupt_cell_watch();
         for (slot, dst) in slots.iter().zip(out.iter_mut()) {
             *dst = self.shared.mem.heap.get_field_as(obj, slot.0, slot.1);
         }
+        // One watch for the batch: the point of this door is that it does not
+        // pay per slot, and a batch that trips the guard is worth reporting
+        // even if which slot did it needs the `slot=` address to pin down.
+        crate::memory::reclaim_guard::corrupt_cell_watch_close(
+            self.shared,
+            self.thread,
+            corrupt_before,
+            "NativeContext::get_fields_typed",
+            Some(obj),
+            None,
+        );
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
@@ -12172,11 +12194,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // CRATONVM_DBG_CORRUPT_CELL: remember the collector's corrupt-cell
         // counter across this read, so a read that trips it can be attributed to
         // its RECEIVER and its Java frames. See `corrupt_cell_dbg`.
-        let corrupt_before = if crate::runtime::env_cache::corrupt_cell_dbg() {
-            Some(cratonvm_gc::heap::corrupt_cell_hits())
-        } else {
-            None
-        };
+        let corrupt_before = crate::memory::reclaim_guard::corrupt_cell_watch();
         // T10.9.E вЂ” descriptor-aware read path. Resolve (and cache) the
         // declared field descriptor for the receiver's class and route
         // the slot decode through `get_field_as`, so a long-typed field
@@ -12218,20 +12236,14 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             }
             None => self.shared.mem.heap.get_field(obj, index),
         };
-        if let Some(before) = corrupt_before {
-            if cratonvm_gc::heap::corrupt_cell_hits() != before {
-                let (slot, raw0, raw1) = cratonvm_gc::heap::corrupt_cell_last();
-                crate::memory::reclaim_guard::report_corrupt_cell_producer(
-                    self.shared,
-                    self.thread,
-                    obj,
-                    index,
-                    slot,
-                    raw0,
-                    raw1,
-                );
-            }
-        }
+        crate::memory::reclaim_guard::corrupt_cell_watch_close(
+            self.shared,
+            self.thread,
+            corrupt_before,
+            "NativeContext::get_field",
+            Some(obj),
+            Some(index),
+        );
         read
     }
 

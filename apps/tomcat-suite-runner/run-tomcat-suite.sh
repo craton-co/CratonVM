@@ -8,6 +8,18 @@
 # resumable per-shard results.csv (append-only, already-recorded classes are
 # skipped on re-invocation).
 #
+# results.csv columns: class,rc,seconds,status,loadavg1
+#
+# CHOOSING <shard_count>: this is a timing harness, so shard_count is part of
+# the measurement, not just a speed knob. One shard occupies one core for the
+# whole sweep; a class capped at TIMEOUT_SEC is recorded HANG whether it is
+# stuck or merely starved. On a shared box, count the cores you actually have
+# and leave the neighbours theirs. Measured 2026-08-23 on an 8-core host with
+# ~3 cores already busy: 4 shards put twelve healthy classes over a 300 s cap
+# and made one timing-sensitive class FAIL, for a 15-class phantom regression
+# against the same binary. The loadavg1 column exists so that is visible from
+# the results file alone.
+#
 # Prerequisites (not automated here - see run-tomcat-suite.md):
 #   - a Tomcat checkout with compiled test classes under
 #     $TC_ROOT/output/testclasses and a full CATALINA_BASE under
@@ -111,7 +123,7 @@ touch "$RESULTS"
 # Already-recorded classes are skipped (resumable across restarts/timeouts).
 declare -A DONE
 if [ -s "$RESULTS" ]; then
-  while IFS=, read -r cls _rc _secs _status; do
+  while IFS=, read -r cls _rc _secs _status _load; do
     DONE["$cls"]=1
   done < "$RESULTS"
 fi
@@ -233,7 +245,23 @@ while IFS= read -r cls; do
     status=NOSUMMARY
   fi
 
-  echo "$cls,$rc,$secs,$status" >> "$RESULTS"
+  # 5th column: the host's 1-minute load average as the class finished.
+  #
+  # A sharded sweep on a SHARED host is a timing measurement, and rc=124 on its
+  # own cannot tell "this class is stuck" from "this class was capped because
+  # other people's builds had the cores". Measured 2026-08-23: the SAME binary
+  # and the same 640 classes scored 599 PASS at 4 shards on a loaded host, and
+  # twelve classes whose walls had been 156-275 s all landed on exactly 300 -
+  # the cap, not a defect. An interleaved serial A/B put every one of them well
+  # under it. Without this column that sweep reads as a 15-class regression.
+  #
+  # Per class rather than per run: neighbour load moves during a sweep that
+  # takes hours, so a single reading taken at the start would describe the wrong
+  # part of it. NA where there is no /proc (non-Linux).
+  load1=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo NA)
+  [ -n "$load1" ] || load1=NA
+
+  echo "$cls,$rc,$secs,$status,$load1" >> "$RESULTS"
   # keep full logs only for non-PASS classes, to save disk on long runs
   [ "$status" = "PASS" ] && rm -f "$logfile"
 done < "$CLASSLIST"

@@ -1608,9 +1608,14 @@ pub(crate) fn build_third_party_engine(
     let Some(super_id) = ctx.class_id_by_name(required_super) else {
         return Ok(None);
     };
+    // Did the provider hand back the ENGINE class itself, or a bare SPI we had
+    // to wrap? The JDK's answer to that question decides who owns the
+    // algorithm NAME, and it is not the caller — see the write at the end.
+    let mut wrapped_a_bare_spi = false;
     let engine = if ctx.is_subclass(ctx.class_id_of_object(engine), super_id) {
         engine
     } else {
+        wrapped_a_bare_spi = true;
         // The provider registered a BARE SPI. HotSpot wraps one in the engine's
         // package-private `Delegate`, and so do we — it is an ordinary JDK class
         // with a `(Spi, String)` constructor, and building it is what makes the
@@ -1681,11 +1686,44 @@ pub(crate) fn build_third_party_engine(
             }
         }
     };
-    let pin = ctx.pin_native_root(engine);
-    let algo_str = ctx.create_string(algo);
-    let engine = ctx.read_native_pin(pin, engine);
-    ctx.unpin_native_roots(pin);
-    ctx.set_field_by_name(engine, "algorithm", Value::Object(Some(algo_str)));
+    // The algorithm name is the PROVIDER's when the provider's own object is
+    // what we are handing back. Every engine's `getInstance` in the JDK is
+    // written the same way — `MessageDigest`, `KeyPairGenerator`,
+    // `Signature`, `KeyFactory`:
+    //
+    //     if (instance.impl instanceof MessageDigest md) {
+    //         md = messageDigest; md.provider = instance.provider;   // NOT .algorithm
+    //     } else {
+    //         md = Delegate.of((MessageDigestSpi) instance.impl, algorithm, ...);
+    //     }
+    //
+    // Only the WRAPPING arm takes the caller's spelling, and there it goes
+    // through the `Delegate` constructor, which has already run above.
+    // Overwriting it unconditionally destroyed the provider's own canonical
+    // name, and providers publish that name deliberately: BouncyCastle's PQC
+    // generators are constructed as
+    // `super(Strings.toUpperCase(falconParameters.getName()))` and then quote
+    // `getAlgorithm()` back in their own exception text, so
+    // `KeyPairGenerator.getInstance("falcon-512", "BC")` refused a mismatched
+    // spec with `key pair generator locked to falcon-512` where HotSpot says
+    // `FALCON-512` (`pqc.jcajce.provider.test.FalconTest
+    // .testRestrictedKeyPairGen`, which asserts the exact string).
+    //
+    // The fill-in for a null/empty field stays: a provider that never set one
+    // would otherwise leave `getAlgorithm()` answering null, and the caller's
+    // requested name is a better answer than nothing.
+    let needs_algorithm = wrapped_a_bare_spi
+        || match ctx.get_field_by_name(engine, "algorithm") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default().is_empty(),
+            _ => true,
+        };
+    if needs_algorithm {
+        let pin = ctx.pin_native_root(engine);
+        let algo_str = ctx.create_string(algo);
+        let engine = ctx.read_native_pin(pin, engine);
+        ctx.unpin_native_roots(pin);
+        ctx.set_field_by_name(engine, "algorithm", Value::Object(Some(algo_str)));
+    }
     record_requested_provider(ctx, engine, provider);
     Ok(Some(engine))
 }
