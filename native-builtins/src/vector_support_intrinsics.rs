@@ -1405,8 +1405,7 @@ fn vs_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// template's own bytecode (`sipush 136`).
 const VO_BINARY_SPECIAL: i32 = 136;
 /// The same test in `lanewiseTemplate(Unary)` (`sipush 128`), which is
-/// `VO_SPECIAL` alone. The ternary template branches on one operator
-/// (`BITWISE_BLEND`) and that operator is `VO_SPECIAL`, so it reuses this.
+/// `VO_SPECIAL` alone.
 const VO_UNARY_SPECIAL: i32 = 128;
 /// `opCode`'s require mask: every `XxxVector.opCode` passes `2048`.
 const VO_OPCODE_VALID: i32 = 2048;
@@ -1700,9 +1699,12 @@ fn vd_lanewise_ternary(
             return None;
         }
         let (_, elem) = template_owner(ctx, this)?;
-        // `BITWISE_BLEND` is the only operator the JDK body special-cases here,
-        // and it is `VO_SPECIAL` — the same bit `VO_UNARY_SPECIAL` names.
-        let opc = opcode_of(ctx, op, elem, VO_UNARY_SPECIAL)?;
+        // No `opKind` test to reproduce here: the JDK body special-cases ONE
+        // operator by identity (`BITWISE_BLEND`), and the `opc != OP_FMA`
+        // screen below already refuses it and every other ternary operator
+        // these kernels do not compute. Passing a special mask as well would
+        // risk refusing `FMA` itself if it ever carried that bit.
+        let opc = opcode_of(ctx, op, elem, 0)?;
         if opc != OP_FMA {
             return None;
         }
