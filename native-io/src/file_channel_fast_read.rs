@@ -45,6 +45,8 @@
 //!   (no O_DIRECT alignment rules to honour).
 //! * the buffer is a plain heap `ByteBuffer`: `hb != null`, `segment == null`
 //!   (no `MemorySegment` scope to acquire), and for a read, not read-only.
+//! * for a WRITE, the descriptor is not in append mode — `write0` seeks to
+//!   end for one and this path writes at the current position.
 //! * `interruptedTarget` is null and the calling thread's interrupt flag is
 //!   clear, so `begin()` would not have performed an asynchronous close.
 //! * the calling thread is a PLATFORM thread. `VirtualThread.blockedOn`
@@ -647,6 +649,23 @@ fn screen(
     let tf = thread_fields(ctx, ctx.class_id_of_object(thread))?;
 
     let fd_obj = ref_field(ctx, this, cf.fd)?;
+    // An APPEND descriptor is refused, and only the WRITE direction needs it:
+    // `FileDispatcherImpl.write` passes `append` down to `write0`, which on
+    // Windows seeks to end before writing (on Linux the kernel does it from
+    // `O_APPEND`). `FileDescriptorTable::write_bytes` writes at the current
+    // position, so an append channel taking this path would land its bytes
+    // wherever the cursor happened to be — the silent
+    // wrong-bytes-on-every-subsequent-operation failure the parent page named
+    // as the reason not to attempt a fast path at all.
+    //
+    // Absent field: refuse. Assuming `false` is the same bug with an extra
+    // step.
+    if !for_read {
+        match ctx.get_field_by_name(fd_obj, "append") {
+            Value::Int(0) => {}
+            _ => return None,
+        }
+    }
     let fd = fd_from_descriptor(ctx, fd_obj)?;
     let position_lock = ref_field(ctx, this, cf.position_lock)?;
     let interruptor = ctx.get_field(this, cf.interruptor);
