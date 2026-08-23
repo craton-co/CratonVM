@@ -30,7 +30,19 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  * the handful of instructions between `isDone()` and `wait()`, so a
  * thread-per-round harness spends all its time outside the race it is for.
  *
- * Usage: PromiseWaitProbe [rounds] [waiters] [timeoutMs] [maxSpin]
+ * Usage: PromiseWaitProbe [rounds] [waiters] [timeoutMs] [maxSpin] [pressure]
+ *
+ * `pressure` adds the two ingredients the plain race does not have, because the
+ * plain race alone does NOT reproduce (300 000 waits, zero stalls, on both
+ * VMs):
+ *
+ *   `contend`  a third thread taking and releasing `synchronized (p)` in a
+ *              loop, so the promise's monitor is being inflated from OUTSIDE
+ *              while the waiter is entering `wait()` -- the thin/inflated
+ *              handover the page names as the surface still to audit;
+ *   `alloc`    per-round garbage, so a moving collection can land inside the
+ *              window;
+ *   `both`     both. Default: none.
  */
 public class PromiseWaitProbe {
 
@@ -114,12 +126,33 @@ public class PromiseWaitProbe {
     static final AtomicInteger arrived = new AtomicInteger();
     static final AtomicInteger finished = new AtomicInteger();
     static volatile boolean running = true;
+    static Object garbage;
 
     public static void main(String[] args) throws Exception {
         int rounds = args.length > 0 ? Integer.parseInt(args[0]) : 200000;
         int nWaiters = args.length > 1 ? Integer.parseInt(args[1]) : 3;
         long timeoutMs = args.length > 2 ? Long.parseLong(args[2]) : 5000;
         int maxSpin = args.length > 3 ? Integer.parseInt(args[3]) : 64;
+        String pressure = args.length > 4 ? args[4] : "none";
+        boolean contend = pressure.equals("contend") || pressure.equals("both");
+        boolean alloc = pressure.equals("alloc") || pressure.equals("both");
+
+        if (contend) {
+            Thread c = new Thread(() -> {
+                int seen = 0;
+                while (running) {
+                    Promise p = current;
+                    if (p != null) {
+                        synchronized (p) {
+                            seen++;
+                        }
+                    }
+                }
+                garbage = seen;
+            }, "contender");
+            c.setDaemon(true);
+            c.start();
+        }
 
         for (int i = 0; i < nWaiters; i++) {
             Thread w = new Thread(() -> {
@@ -160,6 +193,11 @@ public class PromiseWaitProbe {
             for (int s = 0; s < spin; s++) {
                 Thread.onSpinWait();
             }
+            if (alloc) {
+                for (int a = 0; a < 64; a++) {
+                    garbage = new byte[512];
+                }
+            }
             p.trySuccess("v");
 
             long deadline = System.currentTimeMillis() + timeoutMs;
@@ -196,7 +234,8 @@ public class PromiseWaitProbe {
         }
         running = false;
         seq++;
-        System.out.printf("PROMISE-WAIT rounds=%d waiters=%d stalls=%d%n", rounds, nWaiters, stalls);
+        System.out.printf("PROMISE-WAIT rounds=%d waiters=%d pressure=%s stalls=%d%n",
+                rounds, nWaiters, pressure, stalls);
         System.out.flush();
         Runtime.getRuntime().halt(stalls == 0 ? 0 : 1);
     }

@@ -436,8 +436,13 @@ pub mod disp_census {
     /// That path DECLINED, per call. Read against `out_virtual_bc` the same way
     /// `out_static_bc_refused` is read against `out_static_bc`.
     pub const OUT_VIRTUAL_BC_REFUSED: usize = 19;
+    /// An `invokespecial` to an uncompiled callee served from the call site's
+    /// cached interpreter frame template (`try_jit_special_bytecode_callee`).
+    pub const OUT_SPECIAL_BC: usize = 20;
+    /// That path DECLINED, per call.
+    pub const OUT_SPECIAL_BC_REFUSED: usize = 21;
 
-    const N: usize = 20;
+    const N: usize = 22;
     const NAMES: [&str; N] = [
         "kind_virtual",
         "kind_special",
@@ -459,9 +464,13 @@ pub mod disp_census {
         "out_static_bc_refused",
         "out_virtual_bc",
         "out_virtual_bc_refused",
+        "out_special_bc",
+        "out_special_bc_refused",
     ];
 
     static COUNTS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -2297,6 +2306,7 @@ fn flush_class_identity_dispatch_memos() {
             VIRTUAL_DISPATCH_CACHE.with(|c| c.borrow_mut().clear());
             STATIC_BYTECODE_CALLEE_CACHE.with(|c| c.borrow_mut().clear());
             VIRTUAL_BYTECODE_CALLEE_CACHE.with(|c| c.borrow_mut().clear());
+            SPECIAL_BYTECODE_CALLEE_CACHE.with(|c| c.borrow_mut().clear());
         }
     });
 }
@@ -10996,6 +11006,16 @@ site_keyed_memos! {
     /// per hit — the key IS the guard. Array receivers and `ClassId(0)` never
     /// reach it, for the reason `VIRTUAL_TARGET_CACHE` records.
     VIRTUAL_BYTECODE_CALLEE_CACHE: (JitSiteKey, u32) => Option<(std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>, crate::classloading::resolution::RedefineGate)>;
+    /// `JitSiteKey -> ` the interpreter frame template for an `invokespecial`
+    /// callee the JIT did not compile, or `None` as a cached refusal.
+    ///
+    /// Keyed by the call site ALONE, unlike its virtual twin, and that is the
+    /// definition of `invokespecial`: the target is chosen by the resolved
+    /// constant-pool class, never by the receiver's runtime class. A
+    /// receiver-keyed memo here would be modelling a retarget the opcode
+    /// explicitly does not perform — the one that turns a super-call into a
+    /// self-call and recurses forever (see the `invoke_kind == 1` arm).
+    SPECIAL_BYTECODE_CALLEE_CACHE: JitSiteKey => Option<(std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>, crate::classloading::resolution::RedefineGate)>;
     /// `(JitSiteKey, receiver ClassId) -> CachedDispatchTarget`.
     ///
     /// Keyed exactly like `VIRTUAL_DISPATCH_CACHE`. Array receivers and
@@ -12435,6 +12455,22 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // short-circuits to the global answer whenever no user-defined
             // loader has ever defined a class, so single-loader processes pay
             // one relaxed atomic load.
+            // A callee the JIT did not compile: enter it through this site's
+            // cached interpreter frame template. Same position in the tail as
+            // the static and virtual arms — every compiled-callee probe has
+            // already declined by here.
+            if let Some(r) = try_jit_special_bytecode_callee(vm, thread, info, info_key, &values) {
+                return match r {
+                    Ok(Some(Value::Int(v))) => v as i64,
+                    Ok(Some(Value::Long(v))) => v,
+                    Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+                    Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+                    Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+                    Ok(Some(Value::Object(None)) | None) => 0,
+                    Ok(_) => 0,
+                    Err(error) => handle_jit_dispatch_error(vm, thread, error, info),
+                };
+            }
             let resolved_owner = if info.declaring_class_id != 0 {
                 crate::runtime::interpreter::resolve_class_loader_aware(
                     vm,
@@ -12910,6 +12946,151 @@ fn resolve_virtual_bytecode_callee(
     // `invoke_shared` would run `<clinit>` on the way in. Refuse until it has,
     // rather than becoming the path that skips it. The DECLARING class, not the
     // receiver's: the resolved body may live on a supertype.
+    if !crate::vm::is_class_initialized_via_manager(vm, cached.declaring_class_id) {
+        return None;
+    }
+    Some((cached, gate))
+}
+
+/// The `invokespecial` twin. Same memo, same refusals; what differs is where
+/// the owner comes from and why the key does not carry a receiver class.
+///
+/// `invokespecial` resolves against the constant-pool class and must NOT
+/// virtually retarget onto the receiver's runtime class — the retarget is what
+/// turns `RunLast.execute`'s super-call into a self-call and recurses until the
+/// stack ends (the picocli `StackOverflowError` the `invoke_kind == 1` arm was
+/// written for). `find_method_recursive` walking UP from the CP class is
+/// exactly `invoke_special_shared`'s own "walk the hierarchy from the
+/// CP-resolved class to the declaring class", so this path reproduces that
+/// dispatch rather than approximating it, and the target is a pure function of
+/// the site — hence a site-only key.
+///
+/// The loader question is answered the same way that arm answers it, and it is
+/// the reason the resolver takes a `thread`: `info.class_name` is constant-pool
+/// TEXT, and with two loaders defining that binary name a by-name lookup binds
+/// the call to whichever copy the global map holds
+/// (BUG-JIT-INVOKESPECIAL-LOADER-20260726). This refuses outright unless
+/// `declaring_class_id` is present AND `resolve_class_loader_aware` answers, so
+/// the owner is a `ClassId` resolved through the CALLER's loader or the memo is
+/// never built.
+///
+/// SAFETY: as [`try_jit_virtual_bytecode_callee`].
+unsafe fn try_jit_special_bytecode_callee(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    info_key: JitSiteKey,
+    values: &[Value],
+) -> Option<Result<Option<Value>, crate::error::MethodCallFailed>> {
+    if !crate::runtime::env_cache::jit_virtual_bytecode_callee() {
+        return None;
+    }
+    if info.invoke_kind != 1 {
+        return None;
+    }
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
+    let cached = match SPECIAL_BYTECODE_CALLEE_CACHE.with(|c| c.borrow().get(&info_key).cloned()) {
+        Some(hit) => hit,
+        None => {
+            let resolved = resolve_special_bytecode_callee(vm, thread, info);
+            SPECIAL_BYTECODE_CALLEE_CACHE.with(|c| {
+                c.borrow_mut().insert(info_key, resolved.clone());
+            });
+            resolved
+        }
+    };
+    let Some((cached, gate)) = cached else {
+        disp_census::note(disp_census::OUT_SPECIAL_BC_REFUSED);
+        return None;
+    };
+    if gate.is_stale() {
+        SPECIAL_BYTECODE_CALLEE_CACHE.with(|c| {
+            c.borrow_mut().remove(&info_key);
+        });
+        return None;
+    }
+    // Receiver plus declared parameters, and the receiver must be a live
+    // object: `invokespecial` on null is an NPE the by-name path raises, and
+    // this fast path must not turn it into a frame with a null `this`.
+    if values.len() != cached.num_params as usize + 1 {
+        return None;
+    }
+    if !matches!(values.first(), Some(Value::Object(Some(_)))) {
+        return None;
+    }
+    disp_census::note(disp_census::OUT_SPECIAL_BC);
+    thread.refill_pools_from_shared(
+        &vm.mem.operand_stack_pool,
+        &vm.mem.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+        cached,
+        values,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    Some(crate::runtime::interpreter::execute_prebuilt_frame(
+        vm, thread, frame,
+    ))
+}
+
+/// The once-per-site half of [`try_jit_special_bytecode_callee`].
+fn resolve_special_bytecode_callee(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+) -> Option<(
+    std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>,
+    crate::classloading::resolution::RedefineGate,
+)> {
+    if site_name_is_special_cased(info.method_name) {
+        return None;
+    }
+    // `<init>` and `<clinit>` are refused by name rather than by consequence.
+    // `invoke_on_class_shared_inner` carries explicit carve-outs for both, an
+    // `<init>` is where object initialisation and the VM's own synthetic
+    // layouts meet, and neither is a throughput path worth opening that surface
+    // for.
+    if info.method_name.starts_with('<') {
+        return None;
+    }
+    if vm
+        .natives
+        .native_methods
+        .might_have_method_descriptor(info.method_name, info.descriptor)
+    {
+        return None;
+    }
+    // Loader-faithful owner or nothing — see the doc comment.
+    if info.declaring_class_id == 0 {
+        return None;
+    }
+    let owner = crate::runtime::interpreter::resolve_class_loader_aware(
+        vm,
+        thread,
+        ClassId::new(info.declaring_class_id),
+        info.class_name,
+    )
+    .ok()?;
+    if owner == ClassId::new(0) {
+        return None;
+    }
+    if !crate::vm::is_class_initialized_via_manager(vm, owner) {
+        return None;
+    }
+    let (cached, gate) = crate::runtime::interpreter::build_lambda_impl_cached(
+        vm,
+        owner,
+        info.method_name,
+        info.descriptor,
+    )?;
+    if cached.is_static {
+        return None;
+    }
     if !crate::vm::is_class_initialized_via_manager(vm, cached.declaring_class_id) {
         return None;
     }
@@ -19281,6 +19462,11 @@ mod tests {
         // one class's method body as another's.
         VIRTUAL_BYTECODE_CALLEE_CACHE.with(|c| {
             c.borrow_mut().insert((key, 77), None);
+        });
+
+        // The `invokespecial` twin, site-keyed like the static one.
+        SPECIAL_BYTECODE_CALLEE_CACHE.with(|c| {
+            c.borrow_mut().insert(key, None);
         });
 
         // Every memo non-empty first, or the post-flush sweep proves nothing.

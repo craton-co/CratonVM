@@ -12075,8 +12075,30 @@ fn ensure_hashtable_load_factor(ctx: &mut dyn NativeContext, this: ObjectRef, cn
 }
 
 /// Keep the real JDK HashMap fail-fast version in sync with native structural
-/// edits. Besides iterator semantics, this is the invalidation generation for
-/// the bounded String-node lookup cache below.
+/// edits.
+///
+/// # What reads this generation
+///
+/// The doc here used to claim it was "the invalidation generation for the
+/// bounded String-node lookup cache below". No cache by that name is findable
+/// in this file, and the claim had been stale long enough that the
+/// lazy-map-views plan had to open a blocker on it rather than trust it. The
+/// two live readers, both verified:
+///
+/// * [`map_itr_check_comod`] — the JDK's `HashMap$HashIterator.nextNode()`
+///   comodification test, i.e. `ConcurrentModificationException`;
+/// * [`view_source_generation`] — the keySet-view rebuild elision, which SKIPS
+///   a resync when this counter has not moved since the view's backing was
+///   built.
+///
+/// The second is why a missing bump is now a silently stale collection rather
+/// than only a missing CME, and why every map family's structural mutators
+/// were audited against it: `native_map_put_evict_pinned`,
+/// `native_map_remove_pinned` (x2) and `native_map_clear` for the HashMap
+/// family (which `Hashtable` shares), `lhm_set("size")` and
+/// [`lhm_move_to_tail`] for `LinkedHashMap`, and `tm_set_slot` for `TreeMap`.
+/// `ConcurrentHashMap` bumps its SEGMENT's counter and never its own, which is
+/// exactly why `view_source_generation` refuses a CHM source.
 fn bump_map_mod_count(ctx: &dyn NativeContext, this: ObjectRef) {
     if let Value::Int(current) = ctx.get_field_by_name(this, "modCount") {
         ctx.set_field_by_name(this, "modCount", Value::Int(current.wrapping_add(1)));
@@ -14096,7 +14118,18 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // The wrapper verdict is taken BEFORE the build: `make_view_set_of`
     // allocates, so `this` afterwards may be a pre-move address and asking it
     // for its class then would be reading a corpse.
+    // The view this map already has, if any. A keySet view is LIVE — every read
+    // through it resyncs from the source — so the instance can be reused
+    // indefinitely, which is exactly what HotSpot does and why
+    // `map.keySet() == map.keySet()` holds there. Building a fresh one per call
+    // cost 1609 us on a 1000-entry `LinkedHashMap` (`probes/KeySetBench
+    // viewOnly`), paid on every `getPropertyNames()` in Spring.
+    if let Some(cached) = cached_live_view(ctx, this, VIEW_KIND_KEYSET) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
+    MAP_VIEW_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let sync = wants_synchronized_views(&*ctx, this);
+    let this_pin = ctx.pin_native_root(this);
     let keys = map_collect_keys(ctx, this);
     let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
     let set = if sync {
@@ -14104,6 +14137,12 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     } else {
         set
     };
+    // GC-SAFETY: everything above allocates, so `this` is re-read from its pin
+    // before the store; `set` is the value just returned and has not been
+    // followed by an allocation.
+    let this = ctx.read_native_pin(this_pin, this);
+    store_live_view(ctx, this, VIEW_KIND_KEYSET, set);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -14202,6 +14241,14 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if is_tree_map_receiver(ctx, this) {
         return native_tm_entry_set(ctx, args);
     }
+    // See `native_map_key_set`. An entrySet view is live the same way — every
+    // read resyncs it — so the instance is reusable. Unlike keySet the READ is
+    // not elided (a value-replacing `put` changes an entrySet's contents
+    // without moving `modCount`), so this saves the construction only.
+    if let Some(cached) = cached_live_view(ctx, this, VIEW_KIND_ENTRYSET) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
+    MAP_VIEW_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Taken before anything allocates — see `native_map_key_set`.
     let sync = wants_synchronized_views(&*ctx, this);
     // Both allocations below may run a moving young collection. Keep the
@@ -14294,6 +14341,7 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
 
     let set = ctx.read_native_pin(set_pin, set);
+    let this_now = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(backing_pin);
     ctx.unpin_native_roots(set_pin);
     ctx.unpin_native_roots(this_pin);
@@ -14302,6 +14350,9 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     } else {
         set
     };
+    // `wrap_synchronized_view` allocates, but only on the `sync` arm — which
+    // `store_live_view` refuses anyway, so `this_now` cannot be stale here.
+    store_live_view(ctx, this_now, VIEW_KIND_ENTRYSET, set);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -15065,6 +15116,113 @@ pub(crate) static MAP_VIEW_RESYNC_SKIPPED: std::sync::atomic::AtomicU64 =
 pub(crate) static MAP_VIEW_RESYNC_RAN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The JDK field a live view of `kind` is cached in on its source map, or
+/// `None` for a kind that must not be cached.
+///
+/// The names are the JDK's own: `java.util.AbstractMap` declares `keySet` and
+/// `values`, `java.util.HashMap` declares `entrySet`, and each is exactly the
+/// "return the one instance" slot HotSpot uses (`Set<K> ks = keySet; return ks
+/// != null ? ks : (keySet = new KeySet());`). So caching here does not merely
+/// save work, it restores the identity guarantee `map.keySet() ==
+/// map.keySet()` that this VM did not have.
+///
+/// Both STATIC kinds are refused, and not for the reason the elision refuses
+/// them. A STATIC view resyncs by [`adopt_fresh_view_backing`], which asks the
+/// source for a FRESH view and adopts its backing — if the accessor returned
+/// the cached instance, the view would adopt its own backing and never refresh
+/// again. That is a liveness break, not a slow path.
+fn view_cache_field(kind: i32) -> Option<&'static str> {
+    match kind {
+        VIEW_KIND_KEYSET => Some("keySet"),
+        VIEW_KIND_ENTRYSET => Some("entrySet"),
+        _ => None,
+    }
+}
+
+/// The live view of `kind` already cached on `source`, if there is one and it
+/// still describes this source.
+///
+/// The validation is the point. The field is a REAL JDK slot that other code
+/// may write, and a wrong object here would be handed out as this map's key
+/// set — so the candidate has to prove itself: it must carry a view backing,
+/// that backing's source must be `source` by identity, and its kind must
+/// match. Anything else is ignored and a fresh view is built, which is what
+/// happened before this cache existed.
+///
+/// `unwrap_synchronized` first, because `Hashtable`/`Properties` accessors hand
+/// back a `Collections$Synchronized*` wrapper (see `wrap_synchronized_view`) and
+/// the backing lookup is one level in — the same step
+/// `adopt_fresh_view_backing` needs for the same reason.
+fn cached_live_view(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    kind: i32,
+) -> Option<ObjectRef> {
+    if !map_view_cache_enabled() {
+        return None;
+    }
+    // The `Hashtable`/`Properties` family is refused outright. Its accessors
+    // hand back a `Collections$Synchronized*` wrapper, and `Properties` in
+    // particular keeps half its keys in a Rust side-table that only its own
+    // `keySet()` assembles correctly — so a cached instance there would pin
+    // whatever the field-walking path produced instead of rebuilding it. The
+    // measured workload is a `LinkedHashMap`, so this costs nothing worth
+    // having and removes the whole question.
+    if wants_synchronized_views(&*ctx, source) {
+        return None;
+    }
+    let field = view_cache_field(kind)?;
+    let class_id = ctx.class_id_of_object(source);
+    let slot = ctx.resolve_field_index_by_class_id(class_id, field)?;
+    if slot >= ctx.object_num_fields(source) {
+        return None;
+    }
+    let Value::Object(Some(view)) = ctx.get_field(source, slot) else {
+        return None;
+    };
+    let inner = unwrap_synchronized(ctx, view);
+    let backing = hs_backing_map(&*ctx, inner)?;
+    let cached_source = view_backing_source(&*ctx, backing)?;
+    if !std::ptr::eq(cached_source.as_ptr(), source.as_ptr()) {
+        return None;
+    }
+    if view_backing_kind(&*ctx, backing) != kind {
+        return None;
+    }
+    MAP_VIEW_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(view)
+}
+
+/// Record `view` as this source's live view of `kind`.
+///
+/// A no-op when the receiver's class does not declare the field — a
+/// synthetic-mode map has no `keySet` slot, and `try_set_jdk_map_field`'s own
+/// note explains why resolving the name on the RECEIVER's class rather than on
+/// a hard-coded `java/util/HashMap` is the difference between writing the field
+/// and destroying an unrelated one.
+fn store_live_view(ctx: &mut dyn NativeContext, source: ObjectRef, kind: i32, view: ObjectRef) {
+    if !map_view_cache_enabled() {
+        return;
+    }
+    // Same refusal as the read side, and it has to be here too: a store the
+    // read can never accept is a leak of a live view into a JDK slot for no
+    // benefit at all.
+    if wants_synchronized_views(&*ctx, source) {
+        return;
+    }
+    let Some(field) = view_cache_field(kind) else {
+        return;
+    };
+    try_set_jdk_map_field(ctx, source, field, Value::Object(Some(view)));
+}
+
+/// Views handed back out of the source's own JDK slot rather than rebuilt.
+pub(crate) static MAP_VIEW_REUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Views constructed from scratch.
+pub(crate) static MAP_VIEW_BUILT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Print the rebuild-elision census on `CRATONVM_DBG=map-view-cache`.
 ///
 /// Prints even when every counter is zero — a zero `skipped` is the answer
@@ -15087,7 +15245,9 @@ pub fn report_map_view_cache_at_exit() {
         (skipped as f64) * 100.0 / (total as f64)
     };
     eprintln!(
-        "[MAP-VIEW-CACHE] EXIT resync_skipped={skipped} resync_ran={ran} elided={pct:.1}%          switch={} verify={}",
+        "[MAP-VIEW-CACHE] EXIT resync_skipped={skipped} resync_ran={ran} elided={pct:.1}% view_reused={} view_built={} switch={} verify={}",
+        MAP_VIEW_REUSED.load(std::sync::atomic::Ordering::Relaxed),
+        MAP_VIEW_BUILT.load(std::sync::atomic::Ordering::Relaxed),
         if map_view_cache_enabled() { "ON" } else { "OFF" },
         if verify_map_view_cache() { "ON" } else { "OFF" },
     );
@@ -42179,11 +42339,21 @@ fn native_lhm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // See `native_map_key_set`: a live view can be handed out again rather than
+    // rebuilt, and this is the receiver the workload that motivated it uses.
+    if let Some(cached) = cached_live_view(ctx, this, VIEW_KIND_KEYSET) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
+    MAP_VIEW_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Live view: the returned set carries `this` as the source map so
     // `keySet().remove` / `iterator().remove` write through (the propagation
     // routes through LinkedHashMap.remove via virtual dispatch).
+    let this_pin = ctx.pin_native_root(this);
     let keys = lhm_collect_keys(ctx, this);
     let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    store_live_view(ctx, this, VIEW_KIND_KEYSET, set);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(set))))
 }
 
