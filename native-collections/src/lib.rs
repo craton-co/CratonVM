@@ -15858,7 +15858,40 @@ fn adopt_fresh_view_backing(
 /// views are live. Without this, `map.keySet()` then `map.remove(k)` left the
 /// snapshot reporting `contains(k)==true` (Tomcat `ParameterMap` setUp asserts
 /// the opposite). No-op for an ordinary HashSet (backing carries no source).
-fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> Result<(), MethodCallFailed> {
+/// # `set` is `&mut` for the reason `tm_sync_native_state` is — N4 of `WORKER-5-NOTE-10`
+///
+/// This funnel ALLOCATES (`alloc_ref_array` for the bucket table,
+/// `try_alloc_synthetic` per entry), so a moving collector can relocate the
+/// RECEIVER inside it. It used to take `set` by value and return `()`, which
+/// gave its ten callers no way to learn the new address: each went straight on
+/// to `hs_backing_map(ctx, this)`, and that keys the side table on
+/// `widened_obj_key(this)` — off a from-space address it mints a fresh slot,
+/// finds nothing, and the caller takes its "no backing" branch. That is exactly
+/// how `TreeMap.size()` came to answer 0 on an unmutated view.
+///
+/// **LATENT, not measured.** Unlike the TreeMap case this has no reproduction:
+/// a `HashMap` keySet/entrySet walked under the same `--Xmx 64m --nojit`
+/// pressure answers correctly every time, because the early returns above
+/// usually fire before the allocating path. It is fixed because it is the same
+/// SHAPE, the fix is mechanical, and `&mut` makes the eight unprotected call
+/// sites compile errors rather than a grep somebody has to repeat. Two of the
+/// ten (`native_hs_iterator`, `native_hs_remove_if`) already re-read through a
+/// pin and were never exposed.
+fn resync_view_set(
+    ctx: &mut dyn NativeContext,
+    set: &mut ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let pin = ctx.pin_native_root(*set);
+    let r = resync_view_set_inner(ctx, *set);
+    *set = ctx.read_native_pin(pin, *set);
+    ctx.unpin_native_roots(pin);
+    r
+}
+
+fn resync_view_set_inner(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let backing = match hs_backing_map(ctx, set) {
         Some(b) => b,
         None => return Ok(()),
@@ -17582,14 +17615,14 @@ fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if let Some(r) = ksv_route(ctx, args, native_ksv_size) {
         return r;
     }
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
     if let Some(b) = unmod_receiver_backing(ctx, this) {
         return native_hs_size(ctx, &[Value::Object(Some(b))]);
     }
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
@@ -17608,11 +17641,11 @@ fn native_hs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(r) = ksv_route(ctx, args, native_ksv_is_empty) {
         return r;
     }
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
@@ -17898,11 +17931,11 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
@@ -18187,7 +18220,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
         return r;
     }
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -18203,7 +18236,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // HashSet before that allocation, otherwise the subsequent backing lookup
     // can read the pre-move receiver and return a null iterator.
     let this_pin = ctx.pin_native_root(this);
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let this = ctx.read_native_pin(this_pin, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
@@ -18307,7 +18340,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             let arr = alloc_ref_array(ctx, 0);
@@ -18325,7 +18358,7 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // natives and reads the backing map directly. Resync here before taking the
     // stream snapshot so a cached view reflects source-map mutations made after
     // the view was obtained (Spring `LinkedCaseInsensitiveMap$KeySet`).
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
 
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
@@ -18352,11 +18385,11 @@ fn native_hs_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
@@ -18384,11 +18417,11 @@ fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
@@ -20996,7 +21029,7 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(r) = ksv_route(ctx, args, native_ksv_for_each) {
         return r;
     }
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
@@ -21004,7 +21037,7 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return Ok(None),
@@ -26356,11 +26389,11 @@ fn native_al_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    resync_view_set(ctx, this)?;
+    resync_view_set(ctx, &mut this)?;
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return make_stream(ctx, &[]),
@@ -44772,8 +44805,8 @@ fn native_hs_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this_pin = ctx.pin_native_root(this);
     let pred_pin = ctx.pin_native_root(pred);
     let result = (|| -> MethodCallResult {
-        let this_now = ctx.read_native_pin(this_pin, this);
-        resync_view_set(ctx, this_now)?;
+        let mut this_now = ctx.read_native_pin(this_pin, this);
+        resync_view_set(ctx, &mut this_now)?;
         let this_now = ctx.read_native_pin(this_pin, this);
         let backing = match hs_backing_map(ctx, this_now) {
             Some(m) => m,
@@ -45804,6 +45837,9 @@ fn tm_resync_view(ctx: &mut dyn NativeContext, view: ObjectRef) -> Result<(), Me
     if !TM_VIEW_RESYNC.with(|s| s.borrow_mut().insert(key)) {
         // Already rebuilding this view further up the stack — see the guard's
         // doc comment.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TMVIEW").is_some() {
+            eprintln!("[TMVIEW] resync SKIPPED (re-entrant) view={:?}", view.as_ptr());
+        }
         return Ok(());
     }
     let result = tm_resync_view_inner(ctx, view, &spec);
@@ -45834,11 +45870,14 @@ fn tm_resync_view_inner(
 
     // A view of a view: bring the parent up to date first. Terminates because a
     // view's source always predates it, so the chain is finite and acyclic.
-    if let Err(e) = tm_sync_native_state(ctx, spec.source) {
+    // `spec` is a shared ref, so the refreshed source goes into a local; the
+    // authoritative re-read is the pin below, which this must not contradict.
+    let mut spec_source = spec.source;
+    if let Err(e) = tm_sync_native_state(ctx, &mut spec_source) {
         ctx.unpin_native_roots(view_pin);
         return Err(e);
     }
-    let source = ctx.read_native_pin(src_pin, spec.source);
+    let source = ctx.read_native_pin(src_pin, spec_source);
     let pairs = tm_collect_pairs(ctx, source);
     let source = ctx.read_native_pin(src_pin, source);
 
@@ -45900,6 +45939,22 @@ fn tm_resync_view_inner(
     // creation, never touched here) is already the reversed one, so the array
     // stays consistent with what `tm_binary_search` will assume about it.
     let n = kept.len();
+    // CRATONVM_DBG_TMVIEW: `size()` on a range view intermittently reads 0 on a
+    // view nothing has mutated (MEASURED: five identical calls give
+    // `200 200 0 200 200`). This says whether the zero is produced HERE — an
+    // empty `pairs` or an empty `kept` — or later, by the publish.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TMVIEW").is_some() {
+        eprintln!(
+            "[TMVIEW] resync view={:?} source={:?} pairs={} kept={} lo_b={} hi_b={} desc={}",
+            view.as_ptr(),
+            spec.source.as_ptr(),
+            pinned.len(),
+            n,
+            spec.lo_bounded,
+            spec.hi_bounded,
+            spec.descending,
+        );
+    }
     let buf = alloc_ref_array(ctx, (n * 2).max(TM_DEFAULT_CAPACITY * 2));
     for (out, src_idx) in kept.iter().enumerate() {
         let slot = if spec.descending { n - 1 - out } else { out };
@@ -46025,11 +46080,11 @@ fn tm_new_range_view(
             descending,
         },
     );
-    let view = ctx.read_native_pin(view_pin, view);
+    let mut view = ctx.read_native_pin(view_pin, view);
     // Populate eagerly so the view is correct even for a reader that reaches it
     // without going through `tm_sync_native_state` (nothing does today; the
     // guarantee is cheap and it makes the object self-consistent on return).
-    if let Err(e) = tm_sync_native_state(ctx, view) {
+    if let Err(e) = tm_sync_native_state(ctx, &mut view) {
         ctx.unpin_native_roots(src_pin);
         return Err(e);
     }
@@ -46059,12 +46114,49 @@ fn tm_new_range_view(
 /// Fallible since 2026-08-11: step 1 dispatches the key's real `compareTo` /
 /// `Comparator.compare` to test the range bounds, and a comparator that throws
 /// must surface at the call, not be swallowed into a silently short view.
+/// # Why `this` is `&mut` — the 2026-08-22 `RTreeRangeGc` fix
+///
+/// Both steps ALLOCATE — `tm_resync_view` rebuilds a view's storage (boxing
+/// keys, dispatching `compareTo`, allocating the backing array) and
+/// `tm_materialize_deser_array` allocates an array — so a moving collector can
+/// relocate `this` inside this call. Every caller used to pass a bare
+/// `ObjectRef` and keep using its own copy afterwards:
+///
+/// ```ignore
+/// tm_sync_native_state(ctx, &mut this)?;          // `this` may have MOVED here
+/// let size = tm_get_slot(ctx, this, TM_FIELD_SIZE);   // reads the OLD address
+/// ```
+///
+/// `tm_get_slot`/`tm_collect_pairs` key the side table on
+/// `widened_obj_key(this)`, and that starts with `identity_hash_code(this)` —
+/// off a from-space address it reads a stale header, lands in a different
+/// bucket, and mints a FRESH slot. The lookup then finds no entry and answers
+/// the default, so `TreeMap.size()` returned **0** on a view nothing had
+/// mutated. MEASURED: five identical `size()` calls on one `subMap` gave
+/// `200 200 0 200 200`, and the instrumented resync showed the view's address
+/// changing across exactly the call that answered 0 — with `kept=200` every
+/// time, i.e. the rebuild was always right and only the READ was stale.
+/// `entrySet()` hitting the same window is the `ClassCastException` in
+/// `RTreeRangeGc` (`WORKER-5-NOTE-10`).
+///
+/// So the pin lives HERE, once, and the refreshed reference is written back
+/// through `&mut`. That spelling is deliberate over returning the ref: it makes
+/// every one of the 30+ call sites a COMPILE ERROR until it is converted, where
+/// a returned value could be dropped with `?;` and silently keep the bug.
 fn tm_sync_native_state(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    this: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    tm_resync_view(ctx, this)?;
-    tm_materialize_deser_array(ctx, this);
+    let pin = ctx.pin_native_root(*this);
+    let r = tm_resync_view(ctx, *this);
+    *this = ctx.read_native_pin(pin, *this);
+    if let Err(e) = r {
+        ctx.unpin_native_roots(pin);
+        return Err(e);
+    }
+    tm_materialize_deser_array(ctx, *this);
+    *this = ctx.read_native_pin(pin, *this);
+    ctx.unpin_native_roots(pin);
     Ok(())
 }
 
@@ -48179,7 +48271,7 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
@@ -48356,11 +48448,11 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 }
 
 fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // `TreeMap.getEntry` refuses a null key on a natural-ordering map BEFORE it
     // looks at `root`, so an EMPTY map throws too — which is the shape the probe
@@ -48398,11 +48490,11 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 }
 
 fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // W7-36 residual, and BEFORE the view branch for the reason `native_tm_put`
     // states: a DESCENDING view carries a `Collections.reverseOrder` comparator,
@@ -48475,11 +48567,11 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // W7-36 residual: `TreeMap.containsKey` is `getEntry(key) != null`, and
     // `getEntry` performs the `if (key == null) throw new NullPointerException();`
@@ -48511,11 +48603,11 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         let values: Vec<Value> = tm_fast_with(ctx, this, |bt| bt.values().copied().collect());
@@ -48567,11 +48659,11 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_tm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -48580,11 +48672,11 @@ fn native_tm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 fn native_tm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -48593,7 +48685,7 @@ fn native_tm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
@@ -48603,7 +48695,7 @@ fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // current one, then delete each key through the ordinary view `remove`
     // (which redirects and re-checks the range for us).
     if tm_view_spec(ctx, this).is_some() {
-        tm_sync_native_state(ctx, this)?;
+        tm_sync_native_state(ctx, &mut this)?;
         let pairs = tm_collect_pairs(ctx, this);
         let this_pin = ctx.pin_native_root(this);
         let pinned = PinnedPairs::new(ctx, &pairs);
@@ -48632,7 +48724,7 @@ fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             return Err(
@@ -48643,7 +48735,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             )
         }
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     if tm_is_fast_mode(ctx, this) {
         let first = tm_fast_with(ctx, this, |bt| bt.keys().next().cloned());
         match first {
@@ -48676,7 +48768,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             return Err(
@@ -48687,7 +48779,7 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             )
         }
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     if tm_is_fast_mode(ctx, this) {
         let last = tm_fast_with(ctx, this, |bt| bt.keys().next_back().cloned());
         match last {
@@ -48720,11 +48812,11 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 // ceilingKey: smallest key >= given key
 fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -48761,11 +48853,11 @@ fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 // floorKey: largest key <= given key
 fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -48802,11 +48894,11 @@ fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 // higherKey: smallest key strictly > given key
 fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -48853,11 +48945,11 @@ fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 // lowerKey: largest key strictly < given key
 fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -48962,11 +49054,11 @@ fn tm_array_entry(ctx: &mut dyn NativeContext, data: ObjectRef, i: usize) -> Res
 
 // ceilingEntry: entry for the smallest key >= given key
 fn native_tm_ceiling_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -49006,11 +49098,11 @@ fn native_tm_ceiling_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 // floorEntry: entry for the largest key <= given key
 fn native_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -49050,11 +49142,11 @@ fn native_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 // higherEntry: entry for the smallest key strictly > given key
 fn native_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -49104,11 +49196,11 @@ fn native_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 // lowerEntry: entry for the largest key strictly < given key
 fn native_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -49156,11 +49248,11 @@ fn native_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     if tm_is_fast_mode(ctx, this) {
         let first = tm_fast_with(ctx, this, |bt| {
             bt.iter().next().map(|(k, v)| (k.clone(), *v))
@@ -49187,11 +49279,11 @@ fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     if tm_is_fast_mode(ctx, this) {
         let last = tm_fast_with(ctx, this, |bt| {
             bt.iter().next_back().map(|(k, v)| (k.clone(), *v))
@@ -49219,11 +49311,11 @@ fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     if tm_view_spec(ctx, this).is_some() {
         return tm_view_poll_entry(ctx, this, true);
     }
@@ -49293,11 +49385,11 @@ fn tm_view_poll_entry(
 }
 
 fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     if tm_view_spec(ctx, this).is_some() {
         return tm_view_poll_entry(ctx, this, false);
     }
@@ -49663,11 +49755,11 @@ fn tm_refresh_real_mirrors(ctx: &mut dyn NativeContext, args: &[Value]) {
 
 fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tm_refresh_real_mirrors(ctx, args);
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let pairs = tm_collect_pairs(ctx, this);
     let size = pairs.len() as i32;
     // Family-1 stale-ObjectRef fix (2026-07-31): the two allocations below can
@@ -49833,11 +49925,11 @@ impl PinnedPairs {
 
 fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tm_refresh_real_mirrors(ctx, args);
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     // Live view: the ArrayList stashes the source TreeMap so
     // `values().iterator().remove()` deletes the matching entry from the tree.
     let pairs = tm_collect_pairs(ctx, this);
@@ -49849,11 +49941,11 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tm_refresh_real_mirrors(ctx, args);
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let pairs = tm_collect_pairs(ctx, this);
     // Live view: build Map.Entry objects and stash the source TreeMap so
     // removing an entry through the list (or its iterator) deletes the key.
@@ -49895,7 +49987,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
@@ -49904,7 +49996,7 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // null action must win over anything the sync could raise (it re-enters a
     // user `Comparator`). See `reject_null_functional`.
     reject_null_functional(args.get(1))?;
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let action = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -49932,7 +50024,7 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -49945,7 +50037,7 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let default0 = args.get(2).copied().unwrap_or(Value::Object(None));
     let default_pin = pin_value(ctx, default0);
     let this_pin = ctx.pin_native_root(this);
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let this = ctx.read_native_pin(this_pin, this);
     let key = read_pinned_elem(ctx, key_pin, key0);
     let first_pin = if key_pin == usize::MAX {
@@ -50016,7 +50108,7 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     // W7-1 family 1. Unlike `computeIfAbsent`/`merge` — which already route
@@ -50110,7 +50202,7 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
@@ -50120,7 +50212,7 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let source0 = args.get(1).copied().unwrap_or(Value::Object(None));
     let source_base = pin_value(ctx, source0);
     let this_pin_early = ctx.pin_native_root(this);
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let this = ctx.read_native_pin(this_pin_early, this);
     let source = match read_pinned_elem(ctx, source_base, source0) {
         Value::Object(Some(r)) => r,
@@ -50183,11 +50275,11 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tm_refresh_real_mirrors(ctx, args);
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let pairs = tm_collect_pairs(ctx, this);
     // Family-1 stale-ObjectRef fix (2026-07-31): `obj_to_display_units`
     // dispatches each element's real `toString()`, which allocates — every
@@ -50213,11 +50305,11 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_tm_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     Ok(Some(tm_get_slot(ctx, this, TM_FIELD_COMPARATOR)))
 }
 
@@ -50556,7 +50648,7 @@ fn native_tm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 // TreeMap key iterator: snapshot-based, returns keys in sorted order
 fn native_tm_key_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -50565,7 +50657,7 @@ fn native_tm_key_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // W7-1 family 1: this was the one content native that did NOT open with the
     // state funnel, so a navigable view would have been iterated from whatever
     // its cache last held.
-    tm_sync_native_state(ctx, this)?;
+    tm_sync_native_state(ctx, &mut this)?;
     let pairs = tm_collect_pairs(ctx, this);
     // Family-1 stale-ObjectRef fix (2026-07-31): both allocations below can
     // collect and move the snapshotted keys (and the snapshot array itself).

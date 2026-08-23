@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-471 tokens.
+472 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -390,6 +390,7 @@ export inherited from a parent shell.
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
 | `overlay-nodedup` | `CRATONVM_DBG_OVERLAY_NODEDUP` |
 | `overlay-prune` | `CRATONVM_DBG_OVERLAY_PRUNE` |
+| `tmview` | `CRATONVM_DBG_TMVIEW` |
 | `parklat` | `CRATONVM_DBG_PARKLAT` |
 | `pb` | `CRATONVM_DBG_PB` |
 | `pbe` | `CRATONVM_DBG_PBE` |
