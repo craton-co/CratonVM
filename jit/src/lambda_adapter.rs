@@ -170,7 +170,7 @@ fn emit_tail_jump(out: &mut Vec<u8>, target: usize) {
 /// Three loads cover every Java type, and they are the same three the inline
 /// `getfield` legacy arm emits — deliberately, since both are decoding the same
 /// cell. Anything a descriptor byte cannot be mapped to is not emitted at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CaptureLoad {
     /// The cell's 8-byte payload: a reference, a `long`, or a `double`. The
     /// reference case is the one the read-barrier gate applies to.
@@ -322,15 +322,39 @@ fn emit_adapter(
     out
 }
 
-/// Live thunks, keyed by the (proxy class, impl entry) pair they were built
-/// for. Held strongly: a thunk is reachable from an inline-cache slot that this
-/// map cannot see, so its lifetime is the process's, matching how the JIT
-/// retains compiled code by default.
+/// Everything `emit_adapter` reads. See the note at the `map.get` in
+/// [`lambda_adapter_entry`] for why the arity has to be in here.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AdapterKey {
+    proxy_class_id: u32,
+    impl_entry: usize,
+    leading: usize,
+    sam_args: usize,
+    captures: Vec<CaptureLoad>,
+}
+
+/// Thunk requests refused reuse by the arity/capture terms of [`AdapterKey`] —
+/// i.e. the ones the old `(proxy class, impl entry)` key would have answered
+/// with a thunk emitted for a different shape. Reported by the
+/// `CRATONVM_DBG=lambda-jit` census; UNGATED, because a correctness counter
+/// that only exists when a debug variable is set cannot answer "did this ever
+/// happen" after the fact.
+static SHAPE_COLLISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the shape terms of [`AdapterKey`] refused a stale thunk.
+pub fn lambda_adapter_shape_collisions() -> u64 {
+    SHAPE_COLLISIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Live thunks, keyed by every input their body depends on. Held strongly: a
+/// thunk is reachable from an inline-cache slot that this map cannot see, so
+/// its lifetime is the process's, matching how the JIT retains compiled code
+/// by default.
 fn adapters() -> &'static parking_lot::Mutex<
-    std::collections::HashMap<(u32, usize), Arc<CompiledMethod>>,
+    std::collections::HashMap<AdapterKey, Arc<CompiledMethod>>,
 > {
     static ADAPTERS: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<(u32, usize), Arc<CompiledMethod>>>,
+        parking_lot::Mutex<std::collections::HashMap<AdapterKey, Arc<CompiledMethod>>>,
     > = std::sync::OnceLock::new();
     ADAPTERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
@@ -421,10 +445,37 @@ pub fn lambda_adapter_entry(
     if incoming.max(outgoing) > ARG_REGS.len() {
         return None;
     }
-    let key = (proxy_class_id, impl_entry);
+    // The KEY must name every input the BODY depends on.
+    //
+    // `emit_adapter` is a function of `(leading, captures, sam_args,
+    // impl_entry)`. `leading` and `captures` follow from the impl, but
+    // **`sam_args` does not** — it is the SAM's own arity, a property of the
+    // CALL SITE's functional interface, and the register slide is emitted for
+    // exactly that many arguments. Keying on `(proxy_class_id, impl_entry)`
+    // alone therefore returns a thunk built for a DIFFERENT arity whenever one
+    // impl is reached through two functional interfaces, or whenever two
+    // proxies share a class id. The impl then reads an argument register the
+    // caller never wrote.
+    //
+    // `lambda_adapter_shape_collisions()` counts exactly the reuses the old key
+    // would have made and this one refuses, so the change cannot go silently
+    // inert: it reads 0 on any run that never had the hazard.
+    let key = AdapterKey {
+        proxy_class_id,
+        impl_entry,
+        leading,
+        sam_args,
+        captures: captures.clone(),
+    };
     let mut map = adapters().lock();
     if let Some(existing) = map.get(&key) {
         return Some(existing.entry_ptr() as usize);
+    }
+    if map
+        .keys()
+        .any(|k| k.proxy_class_id == proxy_class_id && k.impl_entry == impl_entry)
+    {
+        SHAPE_COLLISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let code = emit_adapter(leading, &captures, sam_args, impl_entry);
     let mut buffer = ExecutableBuffer::new(code.len().max(64))?;
