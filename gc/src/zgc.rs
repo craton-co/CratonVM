@@ -8025,6 +8025,30 @@ impl ZgcRealHeap {
     /// the header is suspect or the index is out of range. Mirrors the guards
     /// in `g1::get_field` / `gen_heap`.
     fn check_field_index(&self, header: &ObjectHeader, index: usize, op: &'static str) -> Option<usize> {
+        // An ARRAY receiver is never a plain-object field access, and the index
+        // test below cannot see it: `alloc_array` MIRRORS the length into
+        // `num_slots`, so every real element index passes while the byte offset
+        // `get_field`/`set_field` computes (`HEADER_SIZE + index * SLOT_SIZE`)
+        // names neither that element nor, past the first few, any part of the
+        // allocation. See `heap::refuse_array_receiver_field_access`.
+        if header.kind() == ObjectKind::Array {
+            // SAFETY: an `ObjectHeader` sits at offset 0 of its allocation, so
+            // the header reference IS the object base; the caller resolved it
+            // from a live `ObjectRef`.
+            unsafe {
+                crate::heap::refuse_array_receiver_field_access(
+                    header as *const ObjectHeader as usize,
+                    header,
+                    index,
+                    if op == "set" {
+                        "zgc::set_field"
+                    } else {
+                        "zgc::get_field"
+                    },
+                )
+            };
+            return None;
+        }
         let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(target: "zgc", index, num_slots, op, "zgc real: suspect header");

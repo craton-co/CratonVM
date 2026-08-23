@@ -10969,6 +10969,25 @@ impl G1Collector {
         // header or an out-of-layout index must NOT dereference arbitrary
         // memory — return a benign null read instead, matching gen_heap.
         let header = self.get_header(obj);
+        // An ARRAY receiver is never a plain-object field access, and neither
+        // test below can see it: `alloc_array` MIRRORS the length into
+        // `num_slots`, so every real element index is "in bounds" while the
+        // byte offset this accessor computes names neither that element nor,
+        // past the first few, any part of the allocation. See
+        // `heap::refuse_array_receiver_field_access`.
+        if header.kind() == ObjectKind::Array {
+            // SAFETY: `obj` is a live allocation base and `header` is its
+            // header, resolved one line above.
+            unsafe {
+                crate::heap::refuse_array_receiver_field_access(
+                    obj.as_ptr() as usize,
+                    header,
+                    index,
+                    "g1::get_field",
+                )
+            };
+            return Value::Object(None);
+        }
         let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(
@@ -11264,6 +11283,23 @@ impl GarbageCollector for G1Collector {
         // out-of-layout writes rather than corrupting the neighboring object,
         // mirroring `GenerationalHeap::set_field`.
         let header = self.get_header(obj);
+        // Symmetric with `get_field_raw`: a 16-byte `Value` cell stamped over
+        // packed element data corrupts every element sharing those bytes, and
+        // past the first few indices lands outside the allocation. See
+        // `heap::refuse_array_receiver_field_access`.
+        if header.kind() == ObjectKind::Array {
+            // SAFETY: `obj` is a live allocation base and `header` is its
+            // header, resolved one line above.
+            unsafe {
+                crate::heap::refuse_array_receiver_field_access(
+                    obj.as_ptr() as usize,
+                    header,
+                    index,
+                    "g1::set_field",
+                )
+            };
+            return;
+        }
         let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(

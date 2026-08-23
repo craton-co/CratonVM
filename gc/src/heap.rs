@@ -656,6 +656,25 @@ impl Heap {
             index,
             self.get_header(obj_ref).num_slots()
         );
+        // An ARRAY receiver is never a plain-object field access — and the
+        // assertion above does not catch it, because an array mirrors its
+        // LENGTH into `num_slots`. See `refuse_array_receiver_field_access`.
+        {
+            let header = self.get_header(obj_ref);
+            if header.kind() == ObjectKind::Array {
+                // SAFETY: `obj_ref` is a live allocation base and `header` is
+                // its header, read one line above.
+                unsafe {
+                    refuse_array_receiver_field_access(
+                        obj_ref.as_ptr() as usize,
+                        header,
+                        index,
+                        "heap::get_field",
+                    )
+                };
+                return Value::Object(None);
+            }
+        }
         if let Some((offset, storage)) =
             cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
         {
@@ -746,6 +765,25 @@ impl Heap {
             index,
             self.get_header(obj_ref).num_slots()
         );
+        // Symmetric with `get_field`: a 16-byte cell stamped over packed
+        // element data corrupts the elements that share those bytes, and past
+        // the first few indices lands outside the allocation altogether.
+        {
+            let header = self.get_header(obj_ref);
+            if header.kind() == ObjectKind::Array {
+                // SAFETY: `obj_ref` is a live allocation base and `header` is
+                // its header, read one line above.
+                unsafe {
+                    refuse_array_receiver_field_access(
+                        obj_ref.as_ptr() as usize,
+                        header,
+                        index,
+                        "heap::set_field",
+                    )
+                };
+                return;
+            }
+        }
         if let Some((offset, storage)) =
             cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
         {
@@ -2417,6 +2455,127 @@ pub fn corrupt_cell_inject_for_selftest(slot: usize, raw0: u64, raw1: u64) {
     CORRUPT_CELL_RAW1.store(raw1, Ordering::Relaxed);
     CORRUPT_CELL_TID.store(probe_thread_id(), Ordering::Relaxed);
     cratonvm_types::cell_census::note_decoded();
+}
+
+/// How many plain-object field accesses this process has refused because the
+/// RECEIVER was an array. See [`refuse_array_receiver_field_access`].
+static ARRAY_RECEIVER_FIELD_ACCESSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count of array-receiver field accesses refused this process.
+pub fn array_receiver_field_accesses() -> u64 {
+    ARRAY_RECEIVER_FIELD_ACCESSES.load(Ordering::Relaxed)
+}
+
+/// Refuse a plain-object field access whose RECEIVER is an array, and report it
+/// through the corrupt-`Value`-cell chain so the VM names the door.
+///
+/// # Why this is always a defect, and why the index check does not catch it
+///
+/// `get_field`/`set_field` address slot `i` at `HEADER_SIZE + i * SLOT_SIZE` —
+/// a 16-byte tagged `Value` cell. An array's body holds neither: primitive
+/// elements are PACKED at their element width, and reference elements are bare
+/// `REF_ELEMENT_SIZE` (8-byte) pointers. So the read decodes two unrelated
+/// elements (or two halves of one packed run) as a `(tag, payload)` pair, and
+/// the write stamps a 16-byte cell over whatever elements share those bytes.
+///
+/// The bounds check does not stop it because an array MIRRORS ITS LENGTH into
+/// `num_slots` — `alloc_array` writes `ObjectHeader::new(class_id, Array,
+/// element_type, len, len)` on every backend. `index < num_slots` therefore
+/// admits every index a real element has, while the byte offset it computes
+/// runs 2x (reference) to 16x (byte) past the element it names, straight out of
+/// the allocation for anything but the first few indices.
+///
+/// # How a receiver gets here
+///
+/// Two known species, both "a class-id test with no kind check":
+///
+///   * a REFERENCE array carries its COMPONENT's class id (a reference array
+///     has no class of its own in this VM's class store), so
+///     `class_id_of_object(new String[2])` answers `java/lang/String` and a
+///     `class_name == "java/lang/String"` fast path matches. That is
+///     `corrupt-value-cell-producer-was-a-string-array-FIXED-20260822`, fixed
+///     at four named doors with `is_plain_string`.
+///   * a SHAPE probe that screens on `num_fields` rather than on kind — the
+///     `num_fields(obj) < 2` guard in `vm_object::java_string_value_and_coder`
+///     was one, and a `byte[]` of length >= 2 walked straight through it.
+///
+/// Screening at the accessor is what makes the rule one rule instead of one
+/// rule per door: the doors keep their fast-path checks, and a door that
+/// forgets one gets a named refusal rather than a silent stride.
+///
+/// # Why it reports through the corrupt-cell chain
+///
+/// Because it is the same defect, seen one step earlier. The
+/// `cratonvm::gc::guard` corrupt-cell report only fires when the striden bytes
+/// happen to form an out-of-range discriminant; bytes that happen to form a
+/// valid tag are invisible to it, so its count is a FLOOR and not a census.
+/// Routing this through `cratonvm_types::cell_census::note_decoded` and the
+/// `CORRUPT_CELL_*` coordinates means the VM-side producer reporter
+/// (`CRATONVM_DBG_CORRUPT_CELL` — doors plus the safepoint backstop) names the
+/// receiver, the Java frames and the door for every occurrence, not for the
+/// lucky ones. See
+/// `known-issues/gc/corrupt-value-cell-one-unreproduced-hit-in-kafkametrics-20260822.md`.
+///
+/// # Safety
+/// `obj_ptr` must be a live allocation base whose header is `header`. The two
+/// raw words are read ONLY when the cell they name lies inside the array's own
+/// body; past that they are reported as zero rather than read, because the
+/// striding access this refuses is frequently out of the allocation entirely —
+/// which is the other half of what it is fixing.
+pub(crate) unsafe fn refuse_array_receiver_field_access(
+    obj_ptr: usize,
+    header: &ObjectHeader,
+    index: usize,
+    site: &'static str,
+) {
+    let n = cratonvm_types::cell_census::note_decoded();
+    ARRAY_RECEIVER_FIELD_ACCESSES.fetch_add(1, Ordering::Relaxed);
+    let length = header.array_length() as usize;
+    let element_type = header.element_type();
+    let cell_off = HEADER_SIZE + index.saturating_mul(SLOT_SIZE);
+    let body_end = cratonvm_types::array_data_size_checked(length, element_type)
+        .and_then(|d| ARRAY_DATA_OFFSET.checked_add(d));
+    let in_body = matches!(body_end, Some(end) if cell_off.saturating_add(16) <= end);
+    let (raw0, raw1) = if in_body {
+        // SAFETY: the whole 16-byte cell lies inside this array's own body,
+        // which the caller's live allocation covers. Per-word atomic so the
+        // diagnostic cannot tear against a concurrent element store.
+        unsafe {
+            let p = obj_ptr as *const u8;
+            (
+                (*(p.add(cell_off) as *const std::sync::atomic::AtomicU64)).load(Ordering::Relaxed),
+                (*(p.add(cell_off + 8) as *const std::sync::atomic::AtomicU64))
+                    .load(Ordering::Relaxed),
+            )
+        }
+    } else {
+        (0, 0)
+    };
+    CORRUPT_CELL_SLOT.store(obj_ptr.wrapping_add(cell_off), Ordering::Relaxed);
+    CORRUPT_CELL_RAW0.store(raw0, Ordering::Relaxed);
+    CORRUPT_CELL_RAW1.store(raw1, Ordering::Relaxed);
+    CORRUPT_CELL_TID.store(probe_thread_id(), Ordering::Relaxed);
+    if n < 32 || gc_flags().diag_hib32 {
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = ?(obj_ptr as *const u8),
+            index,
+            length,
+            element_type = ?element_type,
+            class_id = ?header.class_id,
+            raw0 = format!("{raw0:#018x}"),
+            raw1 = format!("{raw1:#018x}"),
+            in_body,
+            "{site}: plain-object field access on an ARRAY receiver — refusing \
+             rather than striding packed element data as 16-byte Value cells. \
+             An array mirrors its LENGTH into num_slots, so the index check \
+             admits this; the byte offset it computes does not name the element \
+             it claims to and frequently leaves the allocation. The caller \
+             identified this receiver by class id without a kind check — see \
+             `is_plain_string` for the rule.",
+        );
+    }
 }
 
 pub(crate) unsafe fn read_value_cell_checked(ptr: *const Value, site: &'static str) -> Value {
