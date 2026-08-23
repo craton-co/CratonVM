@@ -5510,9 +5510,19 @@ fn stale_below_rbp_enabled() -> bool {
 static STALE_AFTER_REMAP_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Of those, the ones in a region something RESUMES FROM.
+static STALE_AFTER_REMAP_RESUMED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Total words found still naming a moved-from address after a remap.
 pub fn stale_after_remap_hits() -> usize {
     STALE_AFTER_REMAP_HITS.load(Ordering::Relaxed)
+}
+
+/// Of those, how many sat in a region something resumes from — the
+/// callee-saved GPR image. See [`stale_after_remap_census`].
+pub fn stale_after_remap_resumed_hits() -> usize {
+    STALE_AFTER_REMAP_RESUMED.load(Ordering::Relaxed)
 }
 
 /// Name the class of the object now living at `addr`, for diagnostics.
@@ -5564,6 +5574,18 @@ fn report_stale_words_in(
                 continue;
             }
             let n = STALE_AFTER_REMAP_HITS.fetch_add(1, Ordering::Relaxed);
+            // Split the hit by whether anything RESUMES from the word. The
+            // shared census is what the `System.exit` shutdown trailer prints;
+            // the local counter is what this crate's tests read. See
+            // `cratonvm_types::stale_remap_census`.
+            let resumed_from = cm.is_some_and(|cm| {
+                // Cast: a compiled frame is far smaller than i32::MAX.
+                is_callee_saved_gpr_image((rbp - addr) as i32, &cm.frame_layout)
+            });
+            if resumed_from {
+                STALE_AFTER_REMAP_RESUMED.fetch_add(1, Ordering::Relaxed);
+            }
+            cratonvm_types::stale_remap_census::note(resumed_from);
             if n < 4000 {
                 let class = class_name_at(shared, new);
                 match cm {
@@ -5572,7 +5594,8 @@ fn report_stale_words_in(
                         let off = (rbp - addr) as i32;
                         eprintln!(
                             "[jit-stale-after-remap] {tag} method={} off={off} region={} \
-                             verifiable={} class={class} value=0x{w:x} moved_to=0x{new:x}",
+                             verifiable={} resumed_from={} class={class} value=0x{w:x} \
+                             moved_to=0x{new:x}",
                             cm.method_label,
                             cm.frame_layout.region_name(off),
                             band_slot_is_verifiable(
@@ -5580,6 +5603,7 @@ fn report_stale_words_in(
                                 &cm.frame_layout,
                                 moving_young_frame_live_hi(rbp, cm),
                             ),
+                            is_callee_saved_gpr_image(off, &cm.frame_layout),
                         );
                     }
                     None => {
@@ -5713,28 +5737,65 @@ pub fn report_stale_after_remap(
 // only the slots an oop map names, and the saved word is left holding a
 // from-space address.
 //
-// This pass closes the partition: every word of a live compiled frame is now
-// either VERIFIED or REWRITTEN, and none is neither. It rewrites exactly the
-// words `band_slot_is_verifiable` refuses, and only when the word is a KEY of
-// `pointer_map` -- the start address of an object this collection actually
-// moved. That is the same interpretation the conservative scan already
-// committed to when it marked the word as a reference and kept the object
-// alive.
+// This pass closes the half of that partition that something RESUMES FROM, and
+// it is deliberately narrower than "every word the verifier refuses". The
+// unverifiable regions are not equivalent, and lumping them together is what
+// made the repair look unsafe enough to ship off:
 //
-// SHIPS OPT-IN (`CRATONVM_REGISTER_IMAGE_REMAP=1`). The gap is measured -- see
+//   * `callee-saved-gpr-image` -- the prologue's save area for the CALLER's
+//     callee-saved GPRs, which the epilogue pops straight back into the
+//     caller's registers. This one IS resumed from, and it is the ONLY region
+//     this pass rewrites.
+//   * `callee-saved-xmm-image` -- resumed from as well, but an XMM never holds
+//     an object reference in this VM's calling convention, so a hit there is a
+//     false positive by construction and rewriting it could only corrupt a
+//     double.
+//   * `safepoint-gpr-spill-image` -- write-only. `emit_pre_safepoint_spill`
+//     stores the GPR file purely so the conservative scan can SEE it and says
+//     so in its own words ("no post-call reload is needed"); nothing ever loads
+//     from these slots, so a stale word there is read by no one.
+//   * `outgoing-args-or-deopt-regs`, and operand-spill slots above the
+//     safepoint's live cursor -- dead by definition. The cursor reclaims by
+//     moving, so those slots hold whatever the deepest earlier operand stack
+//     left behind.
+//
+// Restricting to the GPR image is also what makes the write defensible. The
+// dead regions are where a non-pointer that merely LOOKS like an object base is
+// plausible -- they are full of abandoned values nobody screens. A caller's
+// live callee-saved GPR is not: for a hit there to be a false positive, the
+// caller would have to be holding a non-reference whose value is exactly a
+// young object's base address, which `heap.is_object_address` validated against
+// the arena bounds and the object-start bitmap. Loop counters, sizes and PCs do
+// not reach those addresses, and Rust-side pointers are in different mappings.
+//
+// The compiled callers do not actually need this: a compiled frame reloads its
+// live oops from the shadow stack after every safepoint, so its registers are
+// refreshed whatever the image held. What needs it is the OUTERMOST compiled
+// frame, whose caller is the VM's own Rust code at the interpreter->JIT
+// boundary -- which has no reload and resumes from exactly those popped
+// registers. That is the frame every observation on this defect has named.
+//
+// SHIPS ON, with `CRATONVM_REGISTER_IMAGE_REMAP=0` as the kill switch and
+// `CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` as the instrument that says whether it
+// has anything to do on a given workload. See
 // `known-issues/gc/moving-young-leaves-a-callee-saved-register-image-unrewritten-20260822.md`
-// for the observation and the instrument that took it -- but NO failure has
-// been attributed to it, and the repair is a CONSERVATIVE rewrite: it treats a
-// word as a reference on exactly the evidence the marking scan uses, which is
-// sound for marking (over-retention) and not obviously sound for writing (a
-// caller's callee-saved register holding a non-pointer that happens to equal a
-// moved object's from-address would be corrupted). Default off, one flag away,
-// with `CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` as the instrument that says
-// whether it has anything to do on a given workload.
+// for the measurement.
+//
+// The other half of the repair is a PIN rather than a write:
+// `publish_unrewritable_band_roots` publishes every object an unverifiable word
+// holds to `gc_quiescence::add_unrewritable_jit_root`, which vetoes the movable
+// claim at the young sweep's pin decision. That covers the non-moving arm at no
+// risk at all; a Cheney moving young collection has no pin, which is why this
+// write exists for it.
 fn register_image_remap_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_REGISTER_IMAGE_REMAP").is_some()
+        !matches!(
+            cratonvm_types::flags::runtime_var_os("CRATONVM_REGISTER_IMAGE_REMAP")
+                .as_deref()
+                .and_then(|s| s.to_str()),
+            Some("0")
+        )
     })
 }
 
@@ -5746,7 +5807,22 @@ pub fn register_image_remap_words() -> usize {
     REGISTER_IMAGE_REMAP_WORDS.load(Ordering::Relaxed)
 }
 
-/// Rewrite the moved references held in one frame's unverifiable words.
+/// Is `off` inside the prologue's save area for the CALLER's callee-saved GPRs?
+///
+/// The one unverifiable region a frame's CALLER resumes from — the epilogue
+/// pops these words straight back into its registers. `band_slot_is_verifiable`
+/// refuses the whole `off >= callee_saved_lo` tail (GPR image, XMM image,
+/// safepoint spill, outgoing-args/deopt reserve); this narrows it back to the
+/// GPR image alone. See the module comment above for why the other three are
+/// deliberately left stale.
+#[inline]
+fn is_callee_saved_gpr_image(off: i32, layout: &cratonvm_jit::FrameLayout) -> bool {
+    layout.callee_saved_hi > layout.callee_saved_lo
+        && off >= layout.callee_saved_lo
+        && off < layout.callee_saved_hi
+}
+
+/// Rewrite the moved references held in one frame's callee-saved GPR image.
 fn remap_one_frame_register_images(
     rbp: usize,
     cm: &cratonvm_jit::CompiledMethod,
@@ -5770,14 +5846,17 @@ fn remap_one_frame_register_images(
     while addr + 8 <= rbp {
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
-        if band_slot_is_verifiable(off, &cm.frame_layout, live_hi) {
-            // Verified storage. An unpublished movable oop here has already
-            // forced the non-moving sweep, and a published one was rewritten
-            // by `remap_one_jit_frame`. Rewriting it again here would be a
-            // second, unvalidated interpretation of the same word.
+        if !is_callee_saved_gpr_image(off, &cm.frame_layout) {
+            // Everything else is either VERIFIED storage -- where an
+            // unpublished movable oop has already forced the non-moving sweep
+            // and a published one was rewritten by `remap_one_jit_frame` -- or
+            // an unverifiable region nothing resumes from. The module comment
+            // above enumerates the four and says why each is excluded; this is
+            // the line that keeps the write off the dead ones.
             addr += 8;
             continue;
         }
+        let _ = live_hi;
         // SAFETY: aligned read inside this thread's own live compiled frame,
         // bounded by the frame size recorded at compile time.
         let w = unsafe { (addr as *const usize).read() };

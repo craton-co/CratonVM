@@ -570,6 +570,12 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
     // arm -- which is how a 1975-class sweep produced this line in zero logs
     // and read as a clean run.
     cratonvm_types::cell_census::exit_summary();
+    // Same argument, same exit path: the post-remap stale-frame-word detector
+    // splits its hits into words something RESUMES from and words nothing
+    // reads, and `resumed_from=0 dead_region=N` is the REPAIRED state rather
+    // than a quiet one. A detector that only speaks when it finds something
+    // cannot say that.
+    cratonvm_types::stale_remap_census::exit_summary();
 }
 
 /// The Vector API engagement counters, at exit.

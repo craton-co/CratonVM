@@ -2529,7 +2529,14 @@ pub(crate) unsafe fn refuse_array_receiver_field_access(
     index: usize,
     site: &'static str,
 ) {
+    // BOTH counters. `note_decoded` publishes the hit to the VM-side producer
+    // reporter (`CRATONVM_DBG_CORRUPT_CELL` compares the count across a field
+    // read to decide "that read tripped the guard"), so this refusal gets a
+    // door, a receiver and a Java stack for free. `note_array_receiver` keeps
+    // it a distinguishable measurement: `decoded` counts corrupt cells from
+    // every route, and only this one is a count rather than a floor.
     let n = cratonvm_types::cell_census::note_decoded();
+    cratonvm_types::cell_census::note_array_receiver();
     ARRAY_RECEIVER_FIELD_ACCESSES.fetch_add(1, Ordering::Relaxed);
     let length = header.array_length() as usize;
     let element_type = header.element_type();
@@ -3445,6 +3452,75 @@ mod tests {
         assert_eq!(header.element_type(), ArrayElementType::Int);
         assert_eq!(header.array_length(), 5);
         assert_eq!(heap.array_length(arr), 5);
+    }
+
+    /// A plain-object field access on an array receiver is refused, counted,
+    /// and — crucially — leaves the ELEMENTS intact.
+    ///
+    /// The index test cannot catch this on its own: `alloc_array` mirrors the
+    /// length into `num_slots`, so index 2 of a `byte[8]` is "in bounds" while
+    /// the byte offset it names (`16 + 2*16 = 48`) is past the whole 8-byte
+    /// body. Asserting the elements afterwards is what separates "refused" from
+    /// "wrote somewhere harmless".
+    #[test]
+    fn a_field_access_on_an_array_receiver_is_refused_and_counted() {
+        let heap = Heap::new();
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 8);
+        for i in 0..8 {
+            heap.set_array_element(arr, i, Value::Int(i as i32 + 1))
+                .unwrap();
+        }
+        let before = crate::heap::array_receiver_field_accesses();
+
+        // Index 0 lands inside the body; index 2 lands outside it entirely.
+        // Both are "in bounds" by `num_slots` and both must be refused.
+        assert!(heap.get_field(arr, 0).is_null(), "read must answer null");
+        assert!(heap.get_field(arr, 2).is_null(), "read must answer null");
+        heap.set_field(arr, 0, Value::Int(0x7f7f_7f7f));
+        heap.set_field(arr, 2, Value::Int(0x7f7f_7f7f));
+
+        // `>=`, not `==`: the counter is process-global and the test binary
+        // runs its tests on parallel threads.
+        assert!(
+            crate::heap::array_receiver_field_accesses() - before >= 4,
+            "every refused access must be counted, reads and writes alike"
+        );
+        for i in 0..8 {
+            assert_eq!(
+                heap.get_array_element(arr, i).unwrap().as_int(),
+                Some(i as i32 + 1),
+                "element {i} was overwritten by a refused field write"
+            );
+        }
+    }
+
+    /// The same rule for a REFERENCE array, which is the shape that produced
+    /// the original defect: it carries its COMPONENT's class id, so a
+    /// `class_name == "java/lang/String"` fast path matches it, and its
+    /// elements are 8-byte raw pointers — so slot 0 decodes elements 0 and 1
+    /// as a `(tag, payload)` pair.
+    #[test]
+    fn a_field_access_on_a_reference_array_is_refused_too() {
+        let heap = Heap::new();
+        let a = heap.alloc_object(ClassId::new(7), 1);
+        let b = heap.alloc_object(ClassId::new(7), 1);
+        let arr = heap.alloc_array(ClassId::new(3), ArrayElementType::Reference, 2);
+        heap.set_array_element(arr, 0, Value::Object(Some(a))).unwrap();
+        heap.set_array_element(arr, 1, Value::Object(Some(b))).unwrap();
+        let before = crate::heap::array_receiver_field_accesses();
+
+        assert!(heap.get_field(arr, 0).is_null());
+        heap.set_field(arr, 0, Value::Object(None));
+
+        assert!(crate::heap::array_receiver_field_accesses() - before >= 2);
+        assert_eq!(
+            heap.get_array_element(arr, 0).unwrap(),
+            Value::Object(Some(a))
+        );
+        assert_eq!(
+            heap.get_array_element(arr, 1).unwrap(),
+            Value::Object(Some(b))
+        );
     }
 
     #[test]
