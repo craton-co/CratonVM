@@ -10997,6 +10997,20 @@ impl Compiler {
                         self.emit_call_absolute(bridge_entry);
                         self.emit_oop_map_for_safepoint();
                         self.next_spill_offset = post_pop_spill;
+                        // The bridge is FALLIBLE, and the `LambdaMetafactory`
+                        // half is fallible in a way the concat half is not: a
+                        // bootstrap can raise `BootstrapMethodError` /
+                        // `LambdaConversionError`, and the VM-side entry stashes
+                        // that and returns the `i64::MIN` deopt sentinel. Route
+                        // it through the same shared stub every other fallible
+                        // helper call uses; without it the sentinel bits would
+                        // be pushed AS AN OBJECT REFERENCE and dereferenced by
+                        // whatever consumes the result.
+                        //
+                        // Added with the generic bridge rather than before it
+                        // because the concat entry's only failure answer is `0`,
+                        // i.e. a null `String` — wrong, but not a wild pointer.
+                        self.emit_post_invoke_exception_check(b'L');
                         self.push_from_rax();
                         self.mark_top_as_oop();
                         pc += 5;
