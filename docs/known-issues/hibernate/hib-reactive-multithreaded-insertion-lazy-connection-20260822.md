@@ -1,4 +1,4 @@
-# `MultithreadedInsertionWithLazyConnectionTest` — NOT FIXED. A ~6x throughput gap on `CompletableFuture` composition crossing the test's own 10-minute budget, plus a separate CUT LOOP that ends after one iteration
+# `MultithreadedInsertionWithLazyConnectionTest` — NOT FIXED. A ~6x throughput gap on `CompletableFuture` composition crossing the test's own 10-minute budget, plus a separate defect where a stage completes before its transaction does
 
 ## Status
 **OPEN (2026-08-23). Diagnosed, decomposed, not fixed.** One component was
@@ -7,11 +7,14 @@ on this workload. Nothing here is a single defect — closing this test needs th
 reactive composition path to get several times faster.
 
 A second, *separate* finding is recorded in §5, and it is the more interesting
-half: a `CompletionStages.loop` that terminates after ONE iteration instead of
-sixty. That is now measured directly rather than inferred (§5.1), and both the
-duplicated INSERT and HR000090 are downstream of it. It is **not fixed**. §5.3
-is the thing to read before touching it: the failure rate is ~6-12%, which is
-too low for the arm sizes the earlier bisect used. §5.2 records a table-size
+half: verticles whose loop stops short, duplicate INSERTs, and HR000090 "live
+transaction detected while closing". §5.1 places the common cause at a stage
+completing before the work it represents finished — HR000090 precedes the
+first duplicate in 8 failing runs out of 8, and one verticle hit it after
+running all 60 iterations. It is **not fixed**. §5.3 is the thing to read
+before touching it. A 40-run batch put the failure rate at
+**20%**, which makes arms affordable — but the earlier bisect was run at arm
+sizes that were noise at any of these rates. §5.2 records a table-size
 mechanism I claimed and then refuted — it is kept as a worked example of the
 same mistake.
 
@@ -129,39 +132,66 @@ at 153-170 s against HotSpot's 125 s, i.e. ~1.3x and correct. The duplicated
 ids are also not random: they cluster on 52 / 102 / 152, i.e. **50 apart**, the
 pooled optimizer's allocation-block boundary.
 
-### 5.1 What the primary event actually is — measured, not inferred
+### 5.1 The primary event, and what 40 strict runs settled
 
-`InsertEntitiesVerticle` already counts its own `storeEntity` calls
+`InsertEntitiesVerticle` counts its own `storeEntity` calls
 (`sequentialOperation`). Logging that counter in the verticle's `whenComplete`
 handler — the CONSUMER, not the loop — settles what the row count cannot: a
 short loop and a lost insert produce the same number of rows.
 
-On a failing run at `-Dmti.threads=24 -Dmti.n=60`:
+Verticles do stop early. On a failing run at 24 threads x N=60:
 
 ```
-run 6: rows=1328/1440 dup=5 hr90=1 iters=[ITERS 1]
+run 9: rows=56/1440 dup=9 hr90=25
+       iters=[39 27 23 9 35 25 27 21 33 43 31 53 23]
 ```
 
-**One verticle ran the loop body exactly once instead of sixty times.** The
-other 23 reported `ITERS 60`. So the primary event is a `CompletionStages.loop`
-that terminates after one iteration; `session.close()` then runs on a live
-transaction (HR000090), and the duplicate INSERTs follow from the resulting
-rollback/retry traffic — the Duplicate entry lines never appear without a cut
-loop first.
+thirteen of twenty-four verticles ran a fraction of their sixty iterations.
 
-That matches the shape of `ArrayLoop`:
+**But the cut loop is not the primary event.** In the same batch, the FIRST
+HR000090 of run 3 comes from a verticle that had just logged `ITERS 60` — it
+ran every iteration and still hit "live transaction detected while closing".
+Across all eight failing runs of the 40-run batch, HR000090 precedes the first
+`Duplicate entry` every time, by 53 to 217 log lines:
 
-```java
-public CompletionStage<Boolean> next() {
-    current = next( current );                 // skips while !filter.test(index)
-    if ( current < end ) { … return consumer.apply( index ); }
-    return FALSE;                              // loop over
-}
+| run | first HR000090 | first Duplicate |
+|---|---:|---:|
+| 3 | 175 | 242 |
+| 9 | 173 | 261 |
+| 12 | 173 | 226 |
+| 19 | 173 | 243 |
+| 22 | 165 | 327 |
+| 26 | 171 | 270 |
+| 27 | 167 | 228 |
+| 35 | 169 | 382 |
+
+So the common factor is a **stage completing before the work it represents
+finished**. `withTransaction` hands back a completed stage while the
+transaction is still live; the loop advances or ends on that, the session is
+closed under it, and the duplicate INSERTs and the four
+`NonUniqueObjectException`s follow from the resulting inconsistent session
+state. Short loops are a symptom of the same thing, not its cause.
+
+#### The parity, which is the sharpest clue in this page
+
+Across the eight failing runs, the verticles that stopped short did so after an
+**odd** number of `storeEntity` calls, 88 times out of 90:
+
+```
+full (60): 870    short & odd: 88    short & even: 2   (the two are 18 and 24)
 ```
 
-A single wrong `filter.test` answer (the filter is `CompletionStages::alwaysTrue`,
-which is a constant `return true`) sends `next(int)` straight to `end` and ends
-the loop silently, with no exception anywhere.
+`sequentialOperation` is a per-verticle field incremented exactly once per
+`storeEntity`, so this says a dying verticle has almost always made an odd
+number of calls. Under any process that interrupts the loop at a uniformly
+random iteration, 88/90 one-sided is not a coincidence.
+
+It is also directly checkable without any new instrument: `storeEntity` sets
+`entity.name = beforeOperationThread + "__" + localVerticleOperationSequence`,
+so the `name` column IS each verticle's sequence number. Querying `Entity`
+after a failing run for a repeated or skipped sequence per thread answers
+whether an index is processed twice — which is the exact thing this test's
+javadoc says it exists to catch — or simply skipped.
 
 ### 5.2 There is NO table-size variable — that claim was mine, and it is refuted
 
@@ -291,10 +321,38 @@ Measured on this workload (24 threads, N=60):
 and the constant-return site it finds is exactly the one the investigation
 pointed at: `CompletionStages.alwaysTrue(I)Z`.
 
-**The probe has not yet caught anything**: 10 runs at `=1` all passed, so there
-was no failure for it to screen. That is not evidence of correctness — it is
-the base-rate problem of §5.3 again, seen from the other side. What the probe
-changes is that ONE failing run is now enough.
+The probe caught nothing on its first 10 runs at `=1` — none of them failed,
+so there was nothing to screen. The 40-run strict batch below is the real
+answer.
+
+#### The verdict: 40 runs in strict mode, and `alwaysTrue` is EXONERATED
+
+| | |
+|---|---:|
+| runs | 40 |
+| failing runs | **8** (20%) |
+| constant-return calls screened | **156 569** |
+| `site_const_mismatch` | **0** |
+| `site_const_dirty_high` | **0** |
+| `site_const_opaque` | **0** |
+| `WRONG ANSWER` lines | **0** |
+
+Every one of the eight failing runs was individually clean — 1799 to 2821
+calls screened apiece, zero mismatches, and `opaque=0` throughout, so there
+were no unscreened calls to hide behind.
+
+**`CompletionStages.alwaysTrue` never returned a wrong answer.** The
+hypothesis that a bad `filter.test` sends `ArrayLoop.next(int)` skipping to
+`end` is dead, and it is dead on evidence rather than on a clean streak: this
+is a negative result taken WHILE the failure was happening, with full coverage,
+which is exactly what the probe was built to make possible. §5.3's arithmetic
+does not apply to it.
+
+What that removes from suspicion: the `IntPredicate` SAM dispatch, its thunk,
+its inline cache, and the constant body itself. What it leaves: `ArrayLoop`'s
+own `current`/`end` reads and writes, `consumer.apply(index)`'s stage, and
+`asyncWhile` — and, per §5.1, the more likely target is not the loop at all but
+a stage completing before its transaction did.
 
 #### The engagement counter earned its keep immediately
 
@@ -326,16 +384,25 @@ line closes this section.
 
 ### 5.7 What to try next
 
-1. Re-run the `CRATONVM_JIT_DENY` bisect at **≥40 runs per arm** with
-   `hibfix-dupins-loop.sh`, control arm interleaved with each test arm rather
-   than measured on a different day.
-2. **Run the probe of §5.6 alongside it.** It is built, armed and verified to
-   engage on `alwaysTrue`; it just has not seen a failing run yet. Prefer
-   `=strict` when the goal is coverage and `=1` when the goal is to keep the
-   codegen honest, and read `site_const_screened` before believing any zero.
-   One `WRONG ANSWER` line closes this.
-3. `--nojit` passed 8/8 and JIT 6/8 at the old rate; that comparison also needs
-   redoing at the current rate before it is leaned on.
+The 20% failure rate measured over the 40-run batch makes arms affordable
+again: at that rate a 20-run clean arm is p = 0.012. Use
+`hibfix-dupins-loop.sh` and interleave the control with each test arm.
+
+1. **The parity of §5.1, first.** Query `Entity` immediately after a failing
+   run and split `name` on `__` to recover each verticle's sequence numbers.
+   Repeated sequence -> the downstream event fired twice, which is what this
+   test was written to catch. Missing sequence -> the loop skipped an index.
+   Neither -> the count is simply where the verticle died, and the parity is
+   telling us something about the failure's timing instead. This needs no VM
+   change and no new instrument.
+2. **`withTransaction` completing early**, per §5.1: a verticle with
+   `ITERS 60` still hit HR000090, and HR000090 precedes the first duplicate in
+   8 runs out of 8. That points at the transaction's completion stage rather
+   than at the loop.
+3. Re-run the `CRATONVM_JIT_DENY` bisect at ≥20 runs per arm. `ArrayLoop` and
+   `AsyncTrampoline` are still on the list; `alwaysTrue` is **off** it (§5.6).
+4. `--nojit` passed 8/8 and JIT 6/8 at the old rate; redo that comparison at
+   the current rate before leaning on it.
 
 ## 6. What was changed, and why it is not the fix
 
