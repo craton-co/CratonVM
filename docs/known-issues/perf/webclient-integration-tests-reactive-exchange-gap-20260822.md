@@ -103,13 +103,19 @@ Each was measured on this workload, interleaved, on this branch:
    same. (On the whole class the JIT is ~18% ahead, so do not turn it off
    either.)
 
-   **WHY it is a wash was root-caused 2026-08-22 and is a separate page:**
-   `jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`. A
-   compiled caller calling a callee the JIT did NOT compile falls into the
-   fully name-keyed `invoke_or_native` path and costs **1902 ns** against
-   **385 ns** for the same call with the caller left interpreted — so on a
-   partially-compiled call graph the JIT's wins and this loss cancel. That page
-   also explains why reactive code is hit hardest: a method containing an
+   **WHY it is a wash was root-caused 2026-08-22, and the cause is now
+   FIXED for all four invoke kinds (2026-08-23):** a compiled caller calling a
+   callee the JIT did NOT compile fell into the fully name-keyed
+   `invoke_or_native` path and cost **1902 ns** against **385 ns** for the same
+   call with the caller left interpreted — so on a partially-compiled call
+   graph the JIT's wins and this loss cancelled. Each invoke kind now enters an
+   uncompiled callee through the call site's own cached interpreter frame
+   template (`CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` /
+   `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` are the kill switches), at ~420 ns —
+   below the both-interpreted cost. **The exchange has NOT been re-measured
+   against that, and this page's numbers predate it.** What that page also
+   explains, and what is NOT fixed, is why reactive code is hit hardest: a
+   method containing an
    unbridged `invokedynamic` is denied OSR outright and retired with
    `MakeNotCompilable` after its first compiled execution, so every
    lambda-creating method becomes exactly that interpreted callee.

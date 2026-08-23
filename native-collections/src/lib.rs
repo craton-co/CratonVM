@@ -40992,8 +40992,8 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
     // version, and it is also the invalidation generation any cached or lazily
     // materialised map view has to key on — a map whose generation never moves
     // cannot be cached safely, and `LinkedHashMap` is the source type in the
-    // workload that fix exists for (see
-    // `docs/known-issues/perf/lazy-map-views-plan-and-blockers-20260822.md`).
+    // workload that fix exists for (the keySet-view rebuild elision this
+    // generation now gates -- see `view_source_generation`).
     //
     // Bump on a SIZE write only, and here rather than at the three call sites,
     // for the same reason `set_map_size` is the HashMap family's choke point:
