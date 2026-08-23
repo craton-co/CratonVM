@@ -45487,6 +45487,12 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if is_map_key_itr_class(&cn) {
         return native_map_key_itr_next(ctx, args);
     }
+    // Scoped BY CLASS NAME for the same reason the `lastRet` write near the end
+    // of this function is: this native is also the generic `java/util/Iterator`
+    // fallback and runs over shapes whose slot 4 belongs to somebody else.
+    if cn == "java/util/TreeSet$Itr" {
+        ts_itr_check_comod(&*ctx, this)?;
+    }
     // Real-JDK fallback: see `native_snapshot_itr_has_next` doc comment.
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
@@ -47033,7 +47039,76 @@ const TS_ITR_FIELD_DATA: usize = 0;
 const TS_ITR_FIELD_CURSOR: usize = 1;
 const TS_ITR_FIELD_OWNER: usize = 2;
 const TS_ITR_FIELD_LAST_RET: usize = 3;
-const TS_ITR_NUM_FIELDS: usize = 4;
+/// The fail-fast generation this cursor was minted at — the `TreeSet`-carried
+/// twin of the `expectedModCount` the `HashMap$KeyItr` family resolves by name.
+/// A slot rather than a name because `java/util/TreeSet$Itr` is fabricated (no
+/// JDK declares it), so there is no declared field to resolve.
+const TS_ITR_FIELD_EXPECTED_MOD: usize = 4;
+const TS_ITR_NUM_FIELDS: usize = 5;
+
+/// The map a `TreeSet$Itr` is fail-fast against.
+///
+/// `TreeMap.keySet()` mints a `TreeMap$KeySet` whose elements live in the
+/// `ts_array_table` side-table and which stashes its source map in the LAST
+/// capacity slot of the element array — [`ts_view_source`] is the reader, and
+/// it is what already gives this view its write-through. A plain `TreeSet` has
+/// no such marker and answers `None`, which is the no-check case: a set that is
+/// nobody's view has no source generation to watch.
+///
+/// `TreeSet.descendingSet()` puts another `TreeSet` behind the same marker;
+/// that answers `None` from [`map_itr_mod_count`] below (a set keeps no
+/// `modCount`), so it also lands on the no-check path rather than on a wrong
+/// one — the same map-vs-set distinction [`ts_source_remove`] makes.
+fn ts_itr_comod_source(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(itr) <= TS_ITR_FIELD_OWNER {
+        return None;
+    }
+    let owner = match ctx.get_field(itr, TS_ITR_FIELD_OWNER) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    ts_view_source(ctx, owner)
+}
+
+/// `expectedModCount = modCount` for the `TreeSet`-carried cursor.
+fn ts_itr_seed_expected(ctx: &mut dyn NativeContext, itr: ObjectRef) {
+    if !map_itr_failfast_enabled() || ctx.object_num_fields(itr) <= TS_ITR_FIELD_EXPECTED_MOD {
+        return;
+    }
+    let Some(src) = ts_itr_comod_source(&*ctx, itr) else {
+        return;
+    };
+    if let Some(seen) = map_itr_mod_count(&*ctx, src) {
+        ctx.set_field(itr, TS_ITR_FIELD_EXPECTED_MOD, Value::Int(seen));
+    }
+}
+
+/// The comodification test for the `TreeSet`-carried cursor, i.e. the one
+/// `TreeMap.keySet().iterator()` hands out. Fails open on every arm, exactly as
+/// [`map_itr_check_comod`] does: an iterator minted before this slot existed, a
+/// set that is nobody's view, or a source with no generation, all keep the old
+/// never-throw behaviour rather than guessing.
+fn ts_itr_check_comod(
+    ctx: &dyn NativeContext,
+    itr: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if !map_itr_failfast_enabled() || ctx.object_num_fields(itr) <= TS_ITR_FIELD_EXPECTED_MOD {
+        return Ok(());
+    }
+    let expected = match ctx.get_field(itr, TS_ITR_FIELD_EXPECTED_MOD) {
+        Value::Int(v) => v,
+        _ => return Ok(()),
+    };
+    let Some(src) = ts_itr_comod_source(ctx, itr) else {
+        return Ok(());
+    };
+    match map_itr_mod_count(ctx, src) {
+        Some(actual) if actual != expected => {
+            Err(cratonvm_types::error::RuntimeError::ConcurrentModificationException.into())
+        }
+        _ => Ok(()),
+    }
+}
 
 /// Address-keyed TreeSet state side-table. Mirrors `TmArrayState`: in
 /// real-JDK mode `java.util.TreeSet` (and any subclass) has the real JDK
@@ -51635,6 +51710,10 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field(itr, TS_ITR_FIELD_CURSOR, Value::Int(0));
     ctx.set_field(itr, TS_ITR_FIELD_OWNER, Value::Object(Some(this)));
     ctx.set_field(itr, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
+    // After `TS_ITR_FIELD_OWNER`: that is how `ts_itr_comod_source` reaches the
+    // source map whose generation this cursor is fail-fast against. Both mint
+    // sites (`iterator` and `descendingIterator`) hand out this same shape.
+    ts_itr_seed_expected(ctx, itr);
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -51705,6 +51784,10 @@ fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if ctx.object_num_fields(this) > TS_ITR_FIELD_LAST_RET {
         ctx.set_field(this, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
     }
+    // The removal above wrote through to the source map and bumped its
+    // generation; adopt it, or the next `next()` trips the check this cursor
+    // installed on itself.
+    ts_itr_seed_expected(ctx, this);
     Ok(None)
 }
 
@@ -52405,6 +52488,10 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ctx.set_field(itr, TS_ITR_FIELD_CURSOR, Value::Int(0));
     ctx.set_field(itr, TS_ITR_FIELD_OWNER, Value::Object(Some(this)));
     ctx.set_field(itr, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
+    // After `TS_ITR_FIELD_OWNER`: that is how `ts_itr_comod_source` reaches the
+    // source map whose generation this cursor is fail-fast against. Both mint
+    // sites (`iterator` and `descendingIterator`) hand out this same shape.
+    ts_itr_seed_expected(ctx, itr);
     Ok(Some(Value::Object(Some(itr))))
 }
 
