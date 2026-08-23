@@ -192,6 +192,23 @@ failures. The two configurations also show why an absolute verdict was never
 going to work here: the same defect reproduces at ~100 % interpreted and ~65 %
 compiled.
 
+### Independent confirmation on the shipped tip (2026-08-23)
+
+From the other line of work, arrived at without knowing this fix existed —
+cross-commit rather than in-binary, so it corroborates from a different angle:
+
+```text
+dev c057a3a78   SIG 0/35
+old cae49a85c   SIG 19/25   <- positive control, 76 %, interleaved, same loop
+```
+
+Thirty-five clean runs on the tip against a control the harness demonstrably
+still sees. The control is the load-bearing half: without it "0/35" and "the
+harness stopped working" are the same output, and that failure mode had already
+cost three experiments that week. Bounds the residual below ~8 % (95 %) on the
+shipped tip, which is what the `PASS 5/5` row above establishes at a smaller
+sample.
+
 Breadth, same binary, generational, `--Xmx 1g` — the first ten classes of
 `bcjava-pass-list.txt` plus the fixture: **11 classes, 11 PASS**. Three
 collectors on the fixture: G1 3/3, ZGC 3/3, generational as above.

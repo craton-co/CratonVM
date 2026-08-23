@@ -215,6 +215,15 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)Lcraton/gpu/GpuFuture;",
         builtin_submit_method,
     );
+    // Fire-and-forget: the same dispatch, answering the submission
+    // handle rather than a `GpuFuture`. See `builtin_submit_method_handle`
+    // for why the object is worth avoiding.
+    registry.register(
+        KLASS,
+        "submitMethodHandle",
+        "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)J",
+        builtin_submit_method_handle,
+    );
     registry.register(
         KLASS,
         "submitWithArg",
@@ -1086,10 +1095,51 @@ fn builtin_launch(
 /// this is what makes repeated `submitMethod` calls through the same
 /// executor share a real, ordered CUDA stream.
 #[cfg(feature = "gpu-offload")]
+/// `Native.submitMethodHandle(..)` — the same dispatch as
+/// [`builtin_submit_method`], answering the submission handle instead
+/// of a `GpuFuture` object.
+///
+/// Minting the future was measured at 28.8 us of a 63.8 us dispatch —
+/// the largest single item — because `GpuFutureImpl's` constructor
+/// allocates two `AtomicBoolean`s, a `ReentrantReadWriteLock` and a
+/// `Cleaner` registration, and a caller queueing a chain of kernels on
+/// one stream discards all but the last of them. The handle is the same
+/// one a future would have wrapped, so `futureSynchronize` /
+/// `futureStatus` / `futureGetError` all accept it.
+#[cfg(feature = "gpu-offload")]
+fn builtin_submit_method_handle(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let handle = submit_method_dispatch(ctx, args)?;
+    Ok(Some(Value::Long(handle as i64)))
+}
+
+#[cfg(feature = "gpu-offload")]
 fn builtin_submit_method(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
+    let timed = dispatch_timing::enabled();
+    let handle = submit_method_dispatch(ctx, args)?;
+    let mark = std::time::Instant::now();
+    let wrapper =
+        instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", handle);
+    if timed {
+        dispatch_timing::add(7, mark.elapsed().as_nanos() as u64);
+    }
+    wrapper
+}
+
+/// The dispatch itself, shared by both entry points: read the three
+/// string params, convert the `Object[]`, resolve the stream, and hand
+/// the work to the VM. Answers the submission handle; a synthetic
+/// failure handle carries the reason for the Java side to read back.
+#[cfg(feature = "gpu-offload")]
+fn submit_method_dispatch(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> Result<u64, cratonvm_types::error::MethodCallFailed> {
     let exec = arg_long(args, 0) as u64;
     let timed = dispatch_timing::enabled();
     let mut mark = std::time::Instant::now();
@@ -1102,22 +1152,19 @@ fn builtin_submit_method(
     let class_name = match arg_object(args, 1).and_then(|o| ctx.read_string(o)) {
         Some(s) => s,
         None => {
-            let h = record_failed_future_with_message("submitMethod: className was null");
-            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
+            return Ok(record_failed_future_with_message("submitMethod: className was null"));
         }
     };
     let method_name = match arg_object(args, 2).and_then(|o| ctx.read_string(o)) {
         Some(s) => s,
         None => {
-            let h = record_failed_future_with_message("submitMethod: methodName was null");
-            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
+            return Ok(record_failed_future_with_message("submitMethod: methodName was null"));
         }
     };
     let descriptor = match arg_object(args, 3).and_then(|o| ctx.read_string(o)) {
         Some(s) => s,
         None => {
-            let h = record_failed_future_with_message("submitMethod: descriptor was null");
-            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
+            return Ok(record_failed_future_with_message("submitMethod: descriptor was null"));
         }
     };
 
@@ -1133,8 +1180,7 @@ fn builtin_submit_method(
     let java_args_obj = match arg_object(args, 4) {
         Some(o) => o,
         None => {
-            let h = record_failed_future_with_message("submitMethod: args array was null");
-            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
+            return Ok(record_failed_future_with_message("submitMethod: args array was null"));
         }
     };
     let n = ctx.array_length(java_args_obj);
@@ -1171,14 +1217,8 @@ fn builtin_submit_method(
 
     if timed {
         dispatch_timing::add(6, mark.elapsed().as_nanos() as u64);
-        mark = std::time::Instant::now();
     }
-    let wrapper =
-        instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", submission_handle);
-    if timed {
-        dispatch_timing::add(7, mark.elapsed().as_nanos() as u64);
-    }
-    wrapper
+    Ok(submission_handle)
 }
 
 /// gpu-offload-off shim — submitMethod is unreachable in default
@@ -1190,6 +1230,15 @@ fn builtin_submit_method(
     _args: &[cratonvm_types::Value],
 ) -> cratonvm_types::error::MethodCallResult {
     Ok(Some(cratonvm_types::Value::Object(None)))
+}
+
+/// Twin of the shim above for the handle-returning entry point.
+#[cfg(not(feature = "gpu-offload"))]
+fn builtin_submit_method_handle(
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    _args: &[cratonvm_types::Value],
+) -> cratonvm_types::error::MethodCallResult {
+    Ok(Some(cratonvm_types::Value::Long(0)))
 }
 
 #[cfg(feature = "gpu-offload")]
