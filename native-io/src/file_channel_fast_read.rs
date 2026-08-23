@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! `sun.nio.ch.FileChannelImpl.read(ByteBuffer)` / `.write(ByteBuffer)` —
-//! the twenty-frame JDK glue chain, collapsed into one native call.
+//! `sun.nio.ch.FileChannelImpl.read/write(ByteBuffer)`, `position()`,
+//! `position(long)` and `size()` — the JDK glue chain around each, collapsed
+//! into one native call.
 //!
 //! # The measurement this exists for
 //!
@@ -34,9 +35,9 @@
 //! any one wrong silently desynchronises the channel position.
 //!
 //! This file answers that by **refusing** every shape it does not model, and
-//! refusing means calling the channel's own `implRead` / `implWrite` bytecode
-//! with the arguments it was given, so a refusal is bit-for-bit the
-//! un-intercepted VM. The fast path runs only when ALL of these hold:
+//! refusing means re-entering the SAME method as pure bytecode, with the
+//! arguments it was given, so a refusal is bit-for-bit the un-intercepted VM.
+//! The fast path runs only when ALL of these hold:
 //!
 //! * `jfrTracing` is false — otherwise `read(ByteBuffer)`'s own body would
 //!   have taken its `traceImplRead` branch and emitted an event.
@@ -104,6 +105,10 @@ pub mod stats {
     pub static READ_REFUSED: AtomicU64 = AtomicU64::new(0);
     pub static WRITE_FAST: AtomicU64 = AtomicU64::new(0);
     pub static WRITE_REFUSED: AtomicU64 = AtomicU64::new(0);
+    pub static POS_FAST: AtomicU64 = AtomicU64::new(0);
+    pub static POS_REFUSED: AtomicU64 = AtomicU64::new(0);
+    pub static SIZE_FAST: AtomicU64 = AtomicU64::new(0);
+    pub static SIZE_REFUSED: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn bump(c: &AtomicU64) {
         c.fetch_add(1, Ordering::Relaxed);
@@ -112,23 +117,36 @@ pub mod stats {
     /// `true` when anything at all went through this file, so a caller can
     /// decide whether the census is worth printing.
     pub fn touched() -> bool {
-        READ_FAST.load(Ordering::Relaxed)
-            + READ_REFUSED.load(Ordering::Relaxed)
-            + WRITE_FAST.load(Ordering::Relaxed)
-            + WRITE_REFUSED.load(Ordering::Relaxed)
-            != 0
+        ALL.iter().any(|c| c.load(Ordering::Relaxed) != 0)
     }
+
+    /// Every counter, in the order [`report`] prints them.
+    static ALL: [&AtomicU64; 8] = [
+        &READ_FAST,
+        &READ_REFUSED,
+        &WRITE_FAST,
+        &WRITE_REFUSED,
+        &POS_FAST,
+        &POS_REFUSED,
+        &SIZE_FAST,
+        &SIZE_REFUSED,
+    ];
 
     /// The census line. Both halves of every pair are printed, including the
     /// zeros: `fast=N refused=0` and a missing `refused` row are different
     /// claims, and only the first is readable.
     pub fn report() -> String {
         format!(
-            "[cratonvm] filechannel fast I/O: read fast={} refused={}  write fast={} refused={}",
+            "[cratonvm] filechannel fast I/O: read fast={} refused={}  write fast={} refused={}  \
+             pos fast={} refused={}  size fast={} refused={}",
             READ_FAST.load(Ordering::Relaxed),
             READ_REFUSED.load(Ordering::Relaxed),
             WRITE_FAST.load(Ordering::Relaxed),
             WRITE_REFUSED.load(Ordering::Relaxed),
+            POS_FAST.load(Ordering::Relaxed),
+            POS_REFUSED.load(Ordering::Relaxed),
+            SIZE_FAST.load(Ordering::Relaxed),
+            SIZE_REFUSED.load(Ordering::Relaxed),
         )
     }
 }
@@ -339,7 +357,230 @@ fn blocked_on(ctx: &mut dyn NativeContext, thread: ObjectRef, tf: ThreadFields, 
 }
 
 // ---------------------------------------------------------------------------
-// The two entry points
+// position() / position(long) / size()
+// ---------------------------------------------------------------------------
+//
+// `read`/`write` were the headline, but they are not the whole cost of a
+// `DataInput`-shaped reader. `FileChannelHeapReadProbe`'s loop calls
+// `ch.position()` once per iteration, and with the two transfers collapsed the
+// A/B still read 19.6 us against HotSpot's 2.2 — because `position()` walks
+// its own `ensureOpen -> synchronized(positionLock) -> beginBlocking ->
+// threads.add -> nd.seek -> IOStatus.normalize -> threads.remove ->
+// endBlocking` chain. Same skeleton, same refusals, same `end` delegation as
+// the transfers above; the only new question is `append`.
+
+/// The channel state these three need, or `None` meaning "refuse".
+///
+/// Deliberately NOT the transfers' [`screen`]: there is no buffer here, and
+/// the direction flag that matters is neither `readable` nor `writable` —
+/// `position()` is legal on a channel opened for either.
+struct PosState {
+    cf: ChannelFields,
+    tf: ThreadFields,
+    thread: ObjectRef,
+    position_lock: ObjectRef,
+    interruptor: Value,
+    fd: FdId,
+    /// `fdAccess.getAppend(fd)`. `position()` answers `nd.size(fd)` rather
+    /// than `nd.seek(fd, -1)` on an append-mode descriptor, because the OS
+    /// position is not where the next write lands.
+    append: bool,
+}
+
+fn screen_pos(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<PosState> {
+    let channel_class = ctx.class_id_of_object(this);
+    if jfr_tracing(ctx, channel_class) {
+        return None;
+    }
+    let cf = channel_fields(ctx, channel_class)?;
+    if bool_field(ctx, this, cf.closed) || ref_field(ctx, this, cf.interrupted_target).is_some() {
+        return None;
+    }
+    if ctx.is_interrupted(false) {
+        return None;
+    }
+    let thread = ctx.current_thread_object();
+    let tf = thread_fields(ctx, ctx.class_id_of_object(thread))?;
+    let fd_obj = ref_field(ctx, this, cf.fd)?;
+    let fd = fd_from_descriptor(ctx, fd_obj)?;
+    // `FileDescriptor.append` is the field `JavaIOFileDescriptorAccess.getAppend`
+    // reads. Absent on an image that spells it differently: refuse rather than
+    // assume `false`, which would answer an append channel's position with the
+    // OS cursor instead of the file size.
+    let append = match ctx.get_field_by_name(fd_obj, "append") {
+        Value::Int(v) => v != 0,
+        _ => return None,
+    };
+    let position_lock = ref_field(ctx, this, cf.position_lock)?;
+    let interruptor = ctx.get_field(this, cf.interruptor);
+    Some(PosState {
+        cf,
+        tf,
+        thread,
+        position_lock,
+        interruptor,
+        fd,
+        append,
+    })
+}
+
+/// Hand a no-argument `long`-returning channel query back to its own bytecode.
+fn refuse_impl_long(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    let mut full = Vec::with_capacity(args.len() + 1);
+    full.push(Value::Object(Some(this)));
+    full.extend_from_slice(args);
+    ctx.invoke_special_bytecode_only(FCI, name, descriptor, &full)
+}
+
+fn native_fc_position(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(this) = obj_at(args, 0) else {
+        return Err(io_error("FileChannelImpl.position: null receiver"));
+    };
+    let Some(st) = screen_pos(ctx, this) else {
+        stats::bump(&stats::POS_REFUSED);
+        return refuse_impl_long(ctx, this, "position", "()J", &[]);
+    };
+    stats::bump(&stats::POS_FAST);
+
+    ctx.monitor_enter(st.position_lock);
+    blocked_on(ctx, st.thread, st.tf, st.interruptor);
+    if bool_field(ctx, this, st.cf.closed) {
+        blocked_on(ctx, st.thread, st.tf, Value::Object(None));
+        ctx.monitor_exit(st.position_lock);
+        finish(ctx, this, st.cf, false)?;
+        return Ok(Some(Value::Long(0)));
+    }
+    let outcome = if st.append {
+        ctx.fd_table()
+            .file_size(st.fd)
+            .map(|n| n as i64)
+            .map_err(|e| io_error(format!("FileChannelImpl.position: {e}")))
+    } else {
+        ctx.fd_table()
+            .rw_seek(st.fd, std::io::SeekFrom::Current(0))
+            .map(|n| n as i64)
+            .map_err(|e| io_error(format!("FileChannelImpl.position: {e}")))
+    };
+    blocked_on(ctx, st.thread, st.tf, Value::Object(None));
+    ctx.monitor_exit(st.position_lock);
+
+    let p = match outcome {
+        Ok(p) => p,
+        Err(e) => {
+            finish(ctx, this, st.cf, false)?;
+            return Err(e);
+        }
+    };
+    finish(ctx, this, st.cf, p > -1)?;
+    Ok(Some(Value::Long(p)))
+}
+
+fn native_fc_position_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(this) = obj_at(args, 0) else {
+        return Err(io_error("FileChannelImpl.position: null receiver"));
+    };
+    let new_position = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => -1,
+    };
+    // `IllegalArgumentException` for a negative argument, raised by the JDK's
+    // own body with the JDK's own message.
+    if new_position < 0 {
+        stats::bump(&stats::POS_REFUSED);
+        return refuse_impl_long(
+            ctx,
+            this,
+            "position",
+            "(J)Ljava/nio/channels/FileChannel;",
+            &[Value::Long(new_position)],
+        );
+    }
+    let Some(st) = screen_pos(ctx, this) else {
+        stats::bump(&stats::POS_REFUSED);
+        return refuse_impl_long(
+            ctx,
+            this,
+            "position",
+            "(J)Ljava/nio/channels/FileChannel;",
+            &[Value::Long(new_position)],
+        );
+    };
+    stats::bump(&stats::POS_FAST);
+
+    ctx.monitor_enter(st.position_lock);
+    blocked_on(ctx, st.thread, st.tf, st.interruptor);
+    if bool_field(ctx, this, st.cf.closed) {
+        blocked_on(ctx, st.thread, st.tf, Value::Object(None));
+        ctx.monitor_exit(st.position_lock);
+        finish(ctx, this, st.cf, false)?;
+        // The JDK returns `null` from this branch, not `this`.
+        return Ok(Some(Value::Object(None)));
+    }
+    let outcome = ctx
+        .fd_table()
+        .rw_seek(st.fd, std::io::SeekFrom::Start(new_position as u64))
+        .map(|n| n as i64)
+        .map_err(|e| io_error(format!("FileChannelImpl.position: {e}")));
+    blocked_on(ctx, st.thread, st.tf, Value::Object(None));
+    ctx.monitor_exit(st.position_lock);
+
+    let p = match outcome {
+        Ok(p) => p,
+        Err(e) => {
+            finish(ctx, this, st.cf, false)?;
+            return Err(e);
+        }
+    };
+    finish(ctx, this, st.cf, p > -1)?;
+    Ok(Some(Value::Object(Some(this))))
+}
+
+fn native_fc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(this) = obj_at(args, 0) else {
+        return Err(io_error("FileChannelImpl.size: null receiver"));
+    };
+    let Some(st) = screen_pos(ctx, this) else {
+        stats::bump(&stats::SIZE_REFUSED);
+        return refuse_impl_long(ctx, this, "size", "()J", &[]);
+    };
+    stats::bump(&stats::SIZE_FAST);
+
+    ctx.monitor_enter(st.position_lock);
+    blocked_on(ctx, st.thread, st.tf, st.interruptor);
+    if bool_field(ctx, this, st.cf.closed) {
+        blocked_on(ctx, st.thread, st.tf, Value::Object(None));
+        ctx.monitor_exit(st.position_lock);
+        finish(ctx, this, st.cf, false)?;
+        return Ok(Some(Value::Long(-1)));
+    }
+    let outcome = ctx
+        .fd_table()
+        .file_size(st.fd)
+        .map(|n| n as i64)
+        .map_err(|e| io_error(format!("FileChannelImpl.size: {e}")));
+    blocked_on(ctx, st.thread, st.tf, Value::Object(None));
+    ctx.monitor_exit(st.position_lock);
+
+    let s = match outcome {
+        Ok(s) => s,
+        Err(e) => {
+            finish(ctx, this, st.cf, false)?;
+            return Err(e);
+        }
+    };
+    finish(ctx, this, st.cf, s > -1)?;
+    Ok(Some(Value::Long(s)))
+}
+
+// ---------------------------------------------------------------------------
+// read(ByteBuffer) / write(ByteBuffer)
 // ---------------------------------------------------------------------------
 
 /// Everything the fast path needs, or `None` meaning "refuse".
@@ -465,19 +706,23 @@ fn finish(
 
 /// Hand the call back to the channel's own bytecode.
 ///
-/// `read(ByteBuffer)`'s non-JFR body is exactly `implRead(dst)`, so this is
-/// the un-intercepted VM. `implRead`/`implWrite` are private, which is why
-/// this is an `invokespecial`-shaped call against the declaring class rather
-/// than a virtual one.
+/// The target is the SAME method this native is registered for, and that is
+/// not a recursion: `invoke_special_bytecode_only` is the "just run this
+/// bytecode, no native check" primitive (`vm_exec::invoke_special_bytecode_only_shared`
+/// calls `interpreter::execute` directly), which is exactly what it exists
+/// for. Refusing to `implRead` instead would be subtly wrong — it would skip
+/// `read`'s own `if (jfrTracing && FileReadEvent.enabled()) return
+/// traceImplRead(dst);` branch, so a JFR recording would silently lose the
+/// event this path declines to emit.
 fn refuse(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     dst: Value,
-    impl_name: &str,
+    method: &str,
 ) -> MethodCallResult {
     ctx.invoke_special_bytecode_only(
         FCI,
-        impl_name,
+        method,
         "(Ljava/nio/ByteBuffer;)I",
         &[Value::Object(Some(this)), dst],
     )
@@ -490,11 +735,11 @@ fn native_fc_read_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let dst_value = args.get(1).copied().unwrap_or(Value::Object(None));
     let Some(dst) = obj_at(args, 1) else {
         stats::bump(&stats::READ_REFUSED);
-        return refuse(ctx, this, dst_value, "implRead");
+        return refuse(ctx, this, dst_value, "read");
     };
     let Some(st) = screen(ctx, this, dst, true) else {
         stats::bump(&stats::READ_REFUSED);
-        return refuse(ctx, this, dst_value, "implRead");
+        return refuse(ctx, this, dst_value, "read");
     };
     stats::bump(&stats::READ_FAST);
 
@@ -560,11 +805,11 @@ fn native_fc_write_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let src_value = args.get(1).copied().unwrap_or(Value::Object(None));
     let Some(src) = obj_at(args, 1) else {
         stats::bump(&stats::WRITE_REFUSED);
-        return refuse(ctx, this, src_value, "implWrite");
+        return refuse(ctx, this, src_value, "write");
     };
     let Some(st) = screen(ctx, this, src, false) else {
         stats::bump(&stats::WRITE_REFUSED);
-        return refuse(ctx, this, src_value, "implWrite");
+        return refuse(ctx, this, src_value, "write");
     };
     stats::bump(&stats::WRITE_FAST);
 
@@ -637,5 +882,16 @@ pub fn register_file_channel_fast_io(r: &mut NativeMethodRegistry) {
         native_fc_write_bytebuffer,
         NativeKind::Intrinsic,
     );
+    r.register_with_kind(FCI, "position", "()J", native_fc_position, NativeKind::Intrinsic);
+    // The `SeekableByteChannel`-returning overload is javac's bridge and calls
+    // this one, so only the declared shape is registered.
+    r.register_with_kind(
+        FCI,
+        "position",
+        "(J)Ljava/nio/channels/FileChannel;",
+        native_fc_position_set,
+        NativeKind::Intrinsic,
+    );
+    r.register_with_kind(FCI, "size", "()J", native_fc_size, NativeKind::Intrinsic);
     r.set_category(prev);
 }

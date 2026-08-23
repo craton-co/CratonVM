@@ -1294,6 +1294,33 @@ pub fn jit_static_bytecode_callee() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` — the `invokevirtual` /
+/// `invokeinterface` half of the interpreted-callee memo
+/// (`jit::helpers::try_jit_virtual_bytecode_callee`).
+///
+/// Same defect and same shape as [`jit_static_bytecode_callee`] above: a
+/// compiled caller entering a callee the JIT did not compile fell into the
+/// fully name-keyed `invoke_or_native` path and re-derived a constant on every
+/// call. The static half landed first because that is where the volume is on
+/// `probes/ReactorProbe.java` (89% of `jit_invoke_dispatch`'s calls); this is
+/// the rest, and on the SAME probe it is the majority of what is left —
+/// `out_static_bc=98_201` of `out_tail=342_867`, so 71% of the tail is kinds
+/// 0 and 2, plus the 1.95 M `mic_hit_noentry` dispatches that found a receiver
+/// and had no compiled callee to enter.
+///
+/// Default ON. `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0` restores the by-name
+/// path, which is the A/B a same-binary bisection needs.
+#[inline]
+pub fn jit_virtual_bytecode_callee() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).
