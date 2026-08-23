@@ -540,6 +540,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "longroot", on_key: Some("CRATONVM_DBG_LONGROOT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lookup", on_key: Some("CRATONVM_DBG_LOOKUP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "map-miss-audit", on_key: Some("CRATONVM_DBG_MAP_MISS_AUDIT"), off_key: None, off_word: None },
+    // The keySet-view rebuild-elision census, printed at exit by
+    // `native_collections::report_map_view_cache_at_exit`. `resync_skipped` is
+    // the ENGAGEMENT counter for that fast path: a wall-clock number quoted
+    // without it cannot say whether the path ran at all.
+    E { group: Group::DBG, token: "map-view-cache", on_key: Some("CRATONVM_DBG_MAP_VIEW_CACHE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mapper", on_key: Some("CRATONVM_DBG_MAPPER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mcl", on_key: Some("CRATONVM_DBG_MCL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "memwatch", on_key: Some("CRATONVM_DBG_MEMWATCH"), off_key: None, off_word: None },
@@ -1177,6 +1182,9 @@ pub const INVENTORY: &[E] = &[
     // Interpreter-side like `trivial-getter`: the lock-free static-field read
     // path in `vm::vm_object`, default-ON with an opt-out-only spelling.
     E { group: Group::JIT, token: "static-bytecode-callee", on_key: Some("CRATONVM_JIT_STATIC_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
+    // Its invokevirtual/invokeinterface twin. Same shape, same default-ON
+    // opt-out-only spelling; see `env_cache::jit_virtual_bytecode_callee`.
+    E { group: Group::JIT, token: "virtual-bytecode-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "statics-index", on_key: None, off_key: Some("CRATONVM_NO_STATICS_INDEX"), off_word: None },
     E { group: Group::JIT, token: "vector-intrinsics", on_key: Some("CRATONVM_VECTOR_INTRINSICS"), off_key: None, off_word: Some("0") },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
@@ -1559,6 +1567,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "map-iterator-failfast", on_key: None, off_key: Some("CRATONVM_NO_MAP_ITERATOR_FAILFAST"), off_word: None },
+    // The keySet-view rebuild elision, default-ON. `0` restores the
+    // unconditional per-read rebuild, which is the A/B a same-binary
+    // bisection needs.
+    E { group: Group::COMPAT, token: "map-view-cache", on_key: Some("CRATONVM_MAP_VIEW_CACHE"), off_key: None, off_word: Some("0") },
+    // Take the elision decision, then rebuild anyway and compare, panicking
+    // on divergence. Turns the soundness claim into something measured
+    // rather than argued; expensive, so default-OFF.
+    E { group: Group::COMPAT, token: "verify-map-view-cache", on_key: Some("CRATONVM_VERIFY_MAP_VIEW_CACHE"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "jboss-boot-log-file", on_key: Some("CRATONVM_JBOSS_BOOT_LOG_FILE"), off_key: None, off_word: None },
