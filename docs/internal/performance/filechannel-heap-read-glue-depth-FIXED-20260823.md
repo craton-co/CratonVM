@@ -98,6 +98,12 @@ read then the bytes), same binary: **23.44 -> 6.97 µs per string**, HotSpot
 `checksum` is `-540000` in every CratonVM arm and on HotSpot;
 `GgufStringReadProbe`'s is `-53403` in all three.
 
+Confirmed on a second host (Windows 11, same binary, same switch) — noisier,
+so quote the Azure rows above, but the direction and the census are the same:
+`GgufStringReadProbe` **55.13 -> 17.28 µs per string** against HotSpot's 4.93,
+and `FileChannelHeapReadProbe` off/on pairs of 120 346/12 638 and
+42 664/16 159 ns.
+
 The engagement census is what makes those readable —
 `CRATONVM_FC_FAST_IO_STATS=1`, from the "on" arm:
 
@@ -143,5 +149,38 @@ borrows a temporary direct buffer at all, so the pool bean is never touched.
 `per_read=0.0` with `CACHE_WORKING` is the same verdict for a different reason,
 and the `read fast=N` census row is what distinguishes them.
 
-Semantics are pinned by `RChannelInterrupt` and `RFileChannelIsOpen` in the
-regression suite, which the page itself named as the acceptance evidence.
+## The acceptance evidence, and the half of it that did not exist
+
+The open page named `RChannelInterrupt` and `RFileChannelIsOpen` as the
+regression-suite vectors a fast path would have to keep green.
+`RChannelInterrupt` exists and passes. **`RFileChannelIsOpen` does not exist in
+the suite** — `regression-suite/src/` has `RChannelInterrupt`,
+`RSocketChannelInterrupt`, `RJdkNio`, `RJdkAsyncChannel`, `RFileTimes` and
+`RNioNoFollow`, and nothing by that name. An acceptance criterion naming a
+vector nobody wrote reads as satisfied and is not, which is why it is recorded
+here rather than quietly dropped.
+
+`regression-suite/src/RFileChannelFastIo.java` is the vector that half was
+asking for: twelve sections, 40 checks, each asserting an EXACT byte or
+position rather than "no exception" — because the failure this path can have
+is silent. It pins the position advance across SEQUENTIAL reads (a fast path
+that forgot it passes the first read and fails only the second), a
+partially-filled destination, an array-offset sliced destination, an empty
+destination answering `0` and not `-1`, EOF answering `-1` without moving the
+position, `IllegalArgumentException` for a read-only destination, a direct
+destination still working, both direction refusals, an APPEND channel landing
+its bytes at the END, `ClosedChannelException` from all three queries, and a
+`RandomAccessFile` channel sharing the file position.
+
+It reaches BOTH sides, which is what makes it evidence rather than a smoke
+test — its own census reads
+
+```
+read fast=8 refused=4  write fast=2 refused=1  pos fast=18 refused=1  size fast=2 refused=1
+```
+
+and all four `CK` observables are byte-identical on `CRATONVM_FC_FAST_IO=1`,
+on `=0`, and on HotSpot 25.0.3+9.
+
+**Full regression suite on the fixed binary: 69 passed, 0 failed** (70 with
+this vector), `RChannelInterrupt` and `RSocketChannelInterrupt` among them.

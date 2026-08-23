@@ -1350,7 +1350,7 @@ fn vs_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 // # Why this section exists
 //
 // With the nine `VectorSupport` kernels above in place,
-// `docs/known-issues/perf/vector-api-dispatch-depth-20260822.md` measured
+// `performance/vector-api-dispatch-depth-FIXED-20260823.md` measured
 // `fell_back=0` on GPULlama3's inference kernel and a 3.8x wall-clock win — and
 // then recorded that what was LEFT was the JDK's own route to those kernels. A
 // `--nojit --stack-sample-ms 5` profile of the same kernel, 342 samples,

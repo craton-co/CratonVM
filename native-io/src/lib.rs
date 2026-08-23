@@ -91,7 +91,7 @@ pub mod zip_real_jar;
 // WP3.3 + WP3.6 — real FileChannel.map (memmap2) + transferTo (sendfile/TransmitFile).
 pub mod file_channel;
 // `FileChannelImpl.read/write(ByteBuffer)` collapsed into one native call —
-// see `docs/known-issues/perf/filechannel-heap-read-glue-depth-20260822.md`.
+// see `performance/filechannel-heap-read-glue-depth-FIXED-20260823.md`.
 pub mod file_channel_fast_read;
 // WP3.4 — non-blocking SocketChannel / ServerSocketChannel with EAGAIN semantics.
 pub mod socket_channel;
