@@ -10915,7 +10915,7 @@ impl Compiler {
                         .indy_info_idx
                         .get(&pc)
                         .map(|&i| self.indy_info[i].clone());
-                    let Some((_pc, arg_slots, ret_type, arg_type_tags, concat_site)) = info
+                    let Some((_pc, arg_slots, ret_type, arg_type_tags, bridge_site)) = info
                     else {
                         // No resolver, or this site couldn't be resolved at
                         // compile time: fail safe and bail the whole method,
@@ -10947,7 +10947,7 @@ impl Compiler {
                     // the trap.
                     let bridge_entry =
                         crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
-                    if concat_site != 0 && bridge_entry != 0 && matches!(ret_type, b'L' | b'[') {
+                    if bridge_site != 0 && bridge_entry != 0 && matches!(ret_type, b'L' | b'[') {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
                             eprintln!(
                                 "[cratonvm-jitc] indy bridge pc={} args={}",
@@ -10983,7 +10983,7 @@ impl Compiler {
                             }
                         }
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_imm64(ARG_REGS[1], concat_site as i64);
+                        self.emit_mov_imm64(ARG_REGS[1], bridge_site as i64);
                         if arg_slots > 0 {
                             self.emit_lea_frame_slot(
                                 ARG_REGS[2],

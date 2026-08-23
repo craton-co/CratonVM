@@ -1380,7 +1380,7 @@ pub(super) fn compile_osr_artifact(
                                 let arg_slots = crate::jit::count_param_slots(descriptor);
                                 let ret_type = crate::jit::return_type(descriptor);
                                 let arg_type_tags = crate::jit::indy_arg_type_tags(descriptor);
-                                let concat_site = crate::runtime::invokedynamic::make_jit_indy_bridge_site_from_parts(
+                                let bridge_site = crate::runtime::invokedynamic::make_jit_indy_bridge_site_from_parts(
                                     &class.constant_pool,
                                     &class.bootstrap_methods,
                                     cp_idx,
@@ -1392,7 +1392,7 @@ pub(super) fn compile_osr_artifact(
                                     arg_slots,
                                     ret_type,
                                     arg_type_tags,
-                                    concat_site,
+                                    bridge_site,
                                 ));
                             }
                         }
@@ -1417,8 +1417,8 @@ pub(super) fn compile_osr_artifact(
             // anywhere in a method denied OSR to every loop in it, for the life
             // of the process.
             if indy_info.len() != scan.indy_ops.len()
-                || indy_info.iter().any(|(_, _, ret_type, _, concat_site)| {
-                    *concat_site == 0 || !matches!(*ret_type, b'L' | b'[')
+                || indy_info.iter().any(|(_, _, ret_type, _, bridge_site)| {
+                    *bridge_site == 0 || !matches!(*ret_type, b'L' | b'[')
                 })
             {
                 if crate::runtime::env_cache::dbg_jitc() && !scan.indy_ops.is_empty() {
