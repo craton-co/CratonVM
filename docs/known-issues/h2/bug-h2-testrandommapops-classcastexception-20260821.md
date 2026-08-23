@@ -62,6 +62,39 @@ backtrace (`CRATONVM_DBG_COERCION=1`) on the fixed seed before deciding
 whether this is G30-1's family or an unrelated `Map.Entry` handling bug in
 H2's own `MVMap` iteration.
 
+**2026-08-22 update — a second, independent occurrence, and it argues for
+caution rather than confirmation.** Rerunning the 48-class union's still-open
+36-class residual on Azure (fresh `dev` tip) turned up the same ERROR-level
+`in_published_snapshot=...` root-collection-gap line in
+`org.h2.test.unit.TestClassLoaderLeak`'s log, immediately before ITS crash:
+
+```
+ERROR cratonvm::gc::guard: ...in_published_snapshot=false ... published_roots=0
+  last_publish_at_collection=18446744073709551615 collections_now=0
+  top_frame=org/h2/test/unit/TestClassLoaderLeak$TestClassLoader.<init> pc=9
+```
+
+But `TestClassLoaderLeak`'s actual failure is unrelated to this class's
+`Map.Entry` cast:
+`ClassCastException: class jdk.internal.loader.ClassLoaders$AppClassLoader
+cannot be cast to class java.net.URLClassLoader` — a plain JDK9+ fact (the
+system class loader has not been a `URLClassLoader` since JDK 9), true on
+stock HotSpot 25 too, and already covered by this class's "not a CratonVM
+bug" classification in the census and
+`hangs-true-vs-perfcliff-RESOLVED-20260821.md`.
+
+That is a second class where this ERROR line fires **and the crash it
+precedes has nothing to do with GC roots or reference coercion** — the same
+shape the census's §1 already warned about for the WARN-level sibling line
+("appears in all 40 failing logs and in 20 of 20 passing logs... the second
+time this shape has nearly produced a false finding"). One clean corroborating
+occurrence would have strengthened the root-cause hypothesis; a second
+occurrence next to a confirmed-unrelated, confirmed-not-a-CratonVM-bug crash
+weakens it instead. Treat the ERROR line as circumstantial in BOTH directions
+until `CRATONVM_DBG_LAYOUT=1`/`CRATONVM_DBG_COERCION=1` actually resolves what
+it is naming, not as evidence either the `TestRandomMapOps` bug or this line
+share a mechanism.
+
 ## Reproducing
 ```bash
 cd apps/h2database/h2

@@ -563,6 +563,41 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
         "[cratonvm] shutdown hooks: ran={ran} threw={threw} skipped={skipped} \
          unjoined={unjoined} trigger={trigger}"
     );
+    report_vector_intrinsics();
+    crate::craton_gpu::dispatch_timing::report();
+}
+
+/// The Vector API engagement counters, at exit.
+///
+/// Printed when either counter moved, or when
+/// `CRATONVM_VECTOR_INTRINSICS_STATS=1` asks for it explicitly — which is what
+/// makes a printed `handled=0 fell_back=N` a finding rather than a silence. A
+/// speedup quoted for `vector_support_intrinsics` without this line is
+/// unreadable: "the kernels ran" and "every call took the fallback while the
+/// host happened to be quieter" produce the same wall clock.
+///
+/// Silent for the overwhelming majority of programs, which never touch
+/// `jdk.incubator.vector` and would only see noise.
+fn report_vector_intrinsics() {
+    let (handled, fell_back) = crate::vector_support_intrinsics::vector_intrinsic_counts();
+    let asked = cratonvm_types::flags::runtime_var("CRATONVM_VECTOR_INTRINSICS_STATS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if handled == 0 && fell_back == 0 && !asked {
+        return;
+    }
+    eprintln!("[cratonvm] vector intrinsics: handled={handled} fell_back={fell_back}");
+    // The per-entry rows, which SUM to the totals above. Only when asked:
+    // nine lines is the right amount of detail for someone tuning coverage and
+    // the wrong amount for someone reading a test log.
+    if asked {
+        for (name, h, f) in crate::vector_support_intrinsics::vector_intrinsic_census() {
+            if h != 0 || f != 0 {
+                eprintln!("[cratonvm] vector intrinsics:   {name} handled={h} fell_back={f}");
+            }
+        }
+    }
 }
 
 type PreExitHook = fn(code: i32);

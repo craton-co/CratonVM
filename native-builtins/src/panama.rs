@@ -19,6 +19,181 @@ use cratonvm_native_api::ffi::{
     LAYOUT_INT, LAYOUT_LONG, LAYOUT_SHORT,
 };
 
+/// The binary name of the **interface** `java.lang.foreign.MemorySegment`.
+///
+/// Kept as a named constant because it is now two different things in this
+/// file: the class every FFM native is *also* registered on (a real-JDK
+/// receiver arrives stamped with one of the JDK's own impl classes and a
+/// caller resolving through the interface declaration lands here), and — until
+/// 2026-08-22 — the class CratonVM stamped onto the segments it minted itself.
+/// See [`CRATON_SEGMENT_CLASS`] for why that second use is gone.
+pub(crate) const PE_SEGMENT_INTERFACE: &str = "java/lang/foreign/MemorySegment";
+
+/// The concrete class CratonVM stamps onto every `MemorySegment` **it mints**.
+///
+/// # The defect this replaces
+///
+/// Every synthetic segment used to be allocated with the class name
+/// `java/lang/foreign/MemorySegment` — the INTERFACE. Real Java can never have
+/// an instance whose class is an interface, and the JDK's own FFM consumers
+/// rely on that: `jdk.incubator.vector`'s `fromMemorySegment0Template` /
+/// `intoMemorySegment0Template` both open with
+///
+/// ```text
+/// checkcast jdk/internal/foreign/AbstractMemorySegmentImpl
+/// ```
+///
+/// which no interface stamp can satisfy. GPULlama3's first `matmul` died on
+/// exactly that (`AbstractVector.defaultReinterpret` builds a scratch
+/// `MemorySegment.ofArray(new byte[n])` and writes the vector into it), and it
+/// is not specific to the Vector API — it is every JDK path that casts a
+/// segment to its own abstract base.
+///
+/// # Why a class of CratonVM's own, and not a JDK one
+///
+/// Two rejected alternatives, both measured against this tree rather than
+/// reasoned about:
+///
+///  * **Reuse `jdk/internal/foreign/NativeMemorySegmentImpl`.** `fabricate_class`
+///    prefers real bytes for a name that has them, so the stamp would land on
+///    the REAL class — whose declared layout is
+///    `AbstractMemorySegmentImpl{length, readOnly, scope}` then
+///    `NativeMemorySegmentImpl{min}`. This file's carriers put `ptr` in slot 0
+///    and `size` in slot 1, so every inherited accessor would read the pointer
+///    as the byte size.
+///
+///  * **Fabricate a class whose SUPERCLASS is `AbstractMemorySegmentImpl`**
+///    (the shape `cratonvm/synthetic/Process` and `SSLSocketOutputStream` use in
+///    `class_manager::fabricate_class`). That is the "option 1" the bug record
+///    named as the honest one, and it is the one that does not survive contact:
+///    a fabricated class gets `first_field_index: 0`, so the superclass's three
+///    fields alias slots 0/1/2 of THIS layout, and
+///    `resolve_field_index_in_hierarchy` — which `get_field_by_name` and
+///    `resolve_field_index_by_class_id` both go through — would start resolving
+///    `length` to `ptr`, `readOnly` to `size` and `scope` to `arena`. Three live
+///    readers in this tree ask by exactly those names
+///    (`panama::heap_seg_field(_, "readOnly")`,
+///    `foreign_ffm::p67_receiver_session`'s `"scope"`, and
+///    `panama_libffi::is_real_heap_segment`'s sibling `"base"` probe), so
+///    inheriting would have converted the checkcast defect into three silent
+///    wrong-value ones. Superclassing also makes every UNSHADOWED inherited JDK
+///    method a silent misread; with `java/lang/Object` as the super, a method
+///    nobody registered raises `NoSuchMethodError`, which is a refusal rather
+///    than a plausible number.
+///
+/// The relationship to `AbstractMemorySegmentImpl` and to the `MemorySegment`
+/// interface is therefore DECLARED, in
+/// `vm/src/runtime/interpreter/typecheck.rs`'s `synthetic_implements` — the same
+/// place, and for the same reason, as `cratonvm/internal/SystemLogger`'s
+/// relationship to `java.lang.System$Logger`.
+///
+/// # Dispatch
+///
+/// The `cratonvm/internal/` prefix is load-bearing: `vm_exec`'s
+/// `prefer_exact_class_native` checks the exact-class native FIRST for that
+/// namespace, so reflective and native-initiated `invoke_virtual` land on the
+/// registrations below rather than walking to `java/lang/Object`. Every
+/// registration made on [`PE_SEGMENT_INTERFACE`] is made on this name too;
+/// `panama::tests::the_craton_segment_class_mirrors_the_interface` pins that.
+pub(crate) const CRATON_SEGMENT_CLASS: &str = "cratonvm/internal/foreign/MemorySegmentImpl";
+
+/// Allocate a CratonVM-minted `MemorySegment` carrier with `slots` raw slots.
+///
+/// `slots` stays the caller's, exactly as it was when the stamp was the
+/// interface: [`CRATON_SEGMENT_CLASS`] is fabricated declaring **zero**
+/// instance fields, so `try_alloc_concurrent_synthetic`'s
+/// `max(requested, declared)` is `requested` for every one of the 2-, 3-, 6-
+/// and 8-slot shapes this file and `foreign_ffm.rs` mint. That is deliberate:
+/// the shapes are told apart by `object_num_fields` at four live sites
+/// (`heap_segment_view`, `pe_segment_get_impl`, `pe_segment_set_impl`,
+/// `foreign_ffm`'s `asSlice`), and declaring a fixed field count would collapse
+/// them all to the widest.
+///
+/// Falls back to the old interface stamp when the fabrication is REFUSED, which
+/// under `--jdk-only` it is (a `cratonvm/internal/*` name is a
+/// `CompatibilityStub` origin, not `VmInternal`). That mode reaches this
+/// function only where there is no real bytecode to run instead — every FFM
+/// native here is a `Bridge`, and a `Bridge` loses to real bytes under strict
+/// policy — so the fallback is not a new fake, it is the pre-existing one, on a
+/// path strict mode does not otherwise use.
+pub(crate) fn alloc_segment_carrier(
+    ctx: &mut dyn NativeContext,
+    slots: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let Some(class_id) = craton_segment_class_id(ctx) else {
+        return try_alloc_concurrent_synthetic(ctx, PE_SEGMENT_INTERFACE, slots);
+    };
+    // `max` with the declared count is `try_alloc_concurrent_synthetic`'s rule,
+    // kept rather than assumed away: it is what stops an under-request from
+    // producing an object whose header disagrees with its slot count, which the
+    // GC's bounds guard then rejects every field access on. For THIS class the
+    // declared count is 0, so it is the identity — but a class-manager read
+    // lock is ~20 ns against a ~7 µs allocation, and a rule that holds by
+    // construction is still worth asking for rather than assuming.
+    let n = slots.max(ctx.class_num_total_fields(class_id));
+    Ok(ctx
+        .try_alloc_object_gc_safe(class_id, n)
+        .unwrap_or_else(|| ctx.alloc_object(class_id, n)))
+}
+
+/// [`CRATON_SEGMENT_CLASS`]'s `ClassId`, resolved once per VM.
+///
+/// # Why this is not simply a `try_alloc_concurrent_synthetic` call
+///
+/// It was, and that cost 15-40% on every segment CratonVM mints. MEASURED with
+/// `probes/SegmentAllocBench.java`, arms interleaved so both see the same host,
+/// one binary from the merge base and one with the class change:
+///
+/// ```text
+///        ofArray_ns   arena_ns   asSlice_ns
+/// base      7637        6482        6873
+/// v5        9849        7075        8321
+/// base      7420        6087        7109
+/// v5       10679        8693        7756
+/// ```
+///
+/// The shared allocator resolves its class by NAME on every call:
+/// `ensure_class_initialized`, which is a loader-faithful resolution and not a
+/// map hit; then `class_name_of_id`, which clones the name into a fresh
+/// `String` to compare it; then `layout_alias::classify`. That is affordable
+/// for a native reached once per `new URI(..)`. It is not affordable for one
+/// `AbstractVector.defaultReinterpret` reaches on every `reinterpretAsInts()`.
+///
+/// The cost of skipping it is one instrument: `report_layout_alias` no longer
+/// sees these allocations. It was reporting `Undeclared` for every one of them
+/// — this class declares no fields on purpose (see below) — so what is lost is
+/// a constant, not a signal.
+///
+/// # Why the key carries `vm_identity`
+///
+/// The cache is process-global and a `ClassId` is only meaningful within one
+/// VM, so the identity is stored beside it and a mismatch re-resolves. That is
+/// not defensive padding: `native-io`'s direct-memory `Bits` and this file's
+/// `NATIVE_ACCESS_POLICY` are process-global for the same reason, and a second
+/// VM in the same process inheriting the first one's `ClassId` would allocate
+/// every segment against whatever class happened to hold that id.
+///
+/// `None` means the fabrication was REFUSED — see [`alloc_segment_carrier`].
+fn craton_segment_class_id(ctx: &mut dyn NativeContext) -> Option<cratonvm_types::ClassId> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // `vm_identity << 32 | class_id`, or 0 for "not resolved yet". `Relaxed` is
+    // sufficient because the value is self-validating: a reader either sees a
+    // packed pair whose identity half is its own VM's, or re-resolves. A torn
+    // read is impossible — it is one 64-bit atomic.
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    let vm = ctx.vm_identity() as u64 & 0xFFFF_FFFF;
+    let packed = CACHED.load(Ordering::Relaxed);
+    if packed != 0 && (packed >> 32) == vm {
+        return Some(cratonvm_types::ClassId::new((packed & 0xFFFF_FFFF) as u32));
+    }
+    let class_id = match ctx.class_id_by_name(CRATON_SEGMENT_CLASS) {
+        Some(id) => id,
+        None => ctx.try_ensure_synthetic_class(CRATON_SEGMENT_CLASS, 0).ok()?,
+    };
+    CACHED.store((vm << 32) | u64::from(class_id.as_u32()), Ordering::Relaxed);
+    Some(class_id)
+}
+
 /// Maximum number of bytes for a single memory copy/fill operation.
 const MAX_COPY_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 
@@ -687,7 +862,7 @@ fn pe_arena_allocate_impl(
     }
 
     // Create MemorySegment: [0]=ptr, [1]=size, [2]=arena, [3]=ro, [4]=alive, [5]=offset
-    let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+    let seg = alloc_segment_carrier(ctx, 6)?;
     ctx.set_field(seg, 0, Value::Long(ptr as i64));
     ctx.set_field(seg, 1, Value::Long(size));
     ctx.set_field(seg, 2, Value::Object(Some(arena_obj)));
@@ -730,14 +905,321 @@ fn pe_arena_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(None)
 }
 
+/// The `jdk.internal.foreign.AbstractMemorySegmentImpl` surface, on CratonVM's
+/// own segment carrier.
+///
+/// # Why this exists at all
+///
+/// [`CRATON_SEGMENT_CLASS`] is declared assignable to
+/// `jdk/internal/foreign/AbstractMemorySegmentImpl` (see `synthetic_implements`),
+/// which is what lets the JDK's own `checkcast` succeed. A cast that succeeds
+/// is only half an answer: the code on the far side of it then CALLS the
+/// abstract base's methods, and CratonVM's carrier has no superclass to inherit
+/// them from. Measured on the path that motivated this — every Vector API
+/// segment entry point —
+///
+/// ```text
+/// ScopedMemoryAccess.loadFromMemorySegment(.., AbstractMemorySegmentImpl msp, ..)
+///   msp.sessionImpl()                     // then session.checkValidStateRaw()
+///   VectorSupport.load(.., msp.unsafeGetBase(), msp.unsafeGetOffset() + offset, ..)
+/// ```
+///
+/// so `sessionImpl`, `unsafeGetBase` and `unsafeGetOffset` are not optional
+/// extras; they are the three methods without which the cast buys nothing.
+///
+/// # Why the list is longer than three
+///
+/// Everything below either reads `length`, `readOnly` or `scope`, or is
+/// `abstract` on the base. Those are exactly the members a receiver of this
+/// class cannot answer by inheritance, so each one is a `NoSuchMethodError`
+/// waiting for the first consumer that reaches it. `checkAccess` /
+/// `checkBounds` / `checkReadOnly` / `isAlignedForElement` are reached from
+/// `MemorySegment.copy`, `Utils`, the `VarHandle` accessors and
+/// `SegmentBulkOperations`; `maxAlignMask` is reached from
+/// `isAlignedForElement` and from every `asSlice(offset, size, alignment)`.
+///
+/// The set is NOT "every method `AbstractMemorySegmentImpl` declares": the
+/// concrete ones that only compose public API (`fill`, `copyFrom`, `mismatch`,
+/// `toArray`, `getString`, the nine `get`/`set` carrier pairs, `asSlice`,
+/// `asReadOnly`, `asByteBuffer`, `spliterator`, `elements`, `byteSize`,
+/// `isNative`, `isMapped`, `isReadOnly`, `equals`, `scope`) are already
+/// registered by [`register_pe_memory_segment_on`] under both names, and the
+/// private/static ones (`ofBuffer`, `nativeSegment`, `cleanupAction`, the
+/// `lambda$` bodies) are unreachable on a receiver.
+fn register_craton_segment_impl_surface(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Registered on the interface name as well as the craton class: a receiver
+    // minted by the `--jdk-only` fallback in `alloc_segment_carrier` still
+    // carries the interface stamp, and it needs the same methods for the same
+    // reason.
+    for owner in [PE_SEGMENT_INTERFACE, CRATON_SEGMENT_CLASS] {
+        // `unsafeGetBase()` — the heap carrier's backing array, or `null` for an
+        // off-heap one. This is the JDK's `(base, offset)` pair convention: a
+        // null base means `offset` is an absolute machine address.
+        r.register(owner, "unsafeGetBase", "()Ljava/lang/Object;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(match heap_segment_view(ctx, this) {
+                Some(view) => Value::Object(Some(view.base)),
+                None => Value::Object(None),
+            }))
+        });
+        // `unsafeGetOffset()` — the other half of that pair, and NOT the same
+        // number as `address()`. For a heap carrier the JDK returns the
+        // `Unsafe`-style offset, which has `arrayBaseOffset` baked in
+        // (`ofArray(new byte[32])` reports 16, its `asSlice(3)` reports 19),
+        // while `address()` reports 0 and 3. Answering `address()` here would
+        // hand `Unsafe` a pointer 16 bytes before the array data.
+        r.register(owner, "unsafeGetOffset", "()J", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Long(match heap_segment_view(ctx, this) {
+                Some(view) => HEAP_ARRAY_BASE_OFFSET.saturating_add(view.start),
+                None => crate::panama_libffi::segment_address(ctx, this),
+            })))
+        });
+        // `maxAlignMask()` — 0 for a native segment (malloc'd storage carries no
+        // upper bound), and the ELEMENT alignment for a heap one, which is what
+        // caps a `byte[]`-backed segment at 1-byte alignment. Both values are
+        // the JDK's: `NativeMemorySegmentImpl.maxAlignMask()` returns 0 and
+        // `HeapMemorySegmentImpl$Of*` return `ValueLayout.JAVA_*.byteAlignment()`.
+        r.register(owner, "maxAlignMask", "()J", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Long(match heap_segment_view(ctx, this) {
+                Some(view) => view.elem_width as i64,
+                None => 0,
+            })))
+        });
+        // `sessionImpl()` — `final` on the base and a plain `return scope`. It
+        // must NOT answer null: every caller goes straight into
+        // `session.checkValidStateRaw()`, which is an `invokevirtual` and would
+        // raise `NullPointerException` on a null receiver. (That is the one
+        // place this carrier differs from the `Buffer.session()` shim in
+        // `lib.rs`, which CAN answer null because `ScopedMemoryAccess`'s buffer
+        // path tests for it first.)
+        r.register(
+            owner,
+            "sessionImpl",
+            "()Ljdk/internal/foreign/MemorySessionImpl;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(crate::phases_late::foreign_ffm::p67_receiver_session(
+                    ctx, this,
+                )?))
+            },
+        );
+        // The covariant `scope()`. `AbstractMemorySegmentImpl` declares it
+        // returning `MemorySessionImpl` and the `MemorySegment$Scope`-returning
+        // bridge alongside it; the bridge descriptor is already registered by
+        // `register_pe_memory_segment_on`, and a call site that resolved against
+        // the abstract class picks the covariant one.
+        r.register(
+            owner,
+            "scope",
+            "()Ljdk/internal/foreign/MemorySessionImpl;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(crate::phases_late::foreign_ffm::p67_receiver_session(
+                    ctx, this,
+                )?))
+            },
+        );
+        // `checkReadOnly(boolean)` — throws only when a WRITE is attempted on a
+        // read-only segment. The argument is the caller's own read-only-ness,
+        // so `checkReadOnly(true)` never throws.
+        r.register(owner, "checkReadOnly", "(Z)V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let caller_read_only = matches!(args.get(1), Some(Value::Int(n)) if *n != 0);
+            craton_segment_check_read_only(ctx, this, caller_read_only)?;
+            Ok(None)
+        });
+        // `checkBounds(long, long)`. The JDK's body is a bounds test over
+        // `length`; the message shape is the JDK's own
+        // (`AbstractMemorySegmentImpl.outOfBoundException`) so a caller matching
+        // on it is not surprised.
+        r.register(owner, "checkBounds", "(JJ)V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let offset = seg_long_arg(args, 1);
+            let length = seg_long_arg(args, 2);
+            craton_segment_check_bounds(ctx, this, offset, length)
+        });
+        // `checkAccess(long, long, boolean)` = `checkReadOnly` then `checkBounds`,
+        // in that order — a write past the end of a read-only segment reports the
+        // read-only violation, not the bounds one.
+        r.register(owner, "checkAccess", "(JJZ)V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let offset = seg_long_arg(args, 1);
+            let length = seg_long_arg(args, 2);
+            let caller_read_only = matches!(args.get(3), Some(Value::Int(n)) if *n != 0);
+            craton_segment_check_read_only(ctx, this, caller_read_only)?;
+            craton_segment_check_bounds(ctx, this, offset, length)
+        });
+        // `isAlignedForElement(long, long)`:
+        //     ((unsafeGetOffset() + offset) | maxAlignMask()) & (byteAlignment - 1) == 0
+        // verbatim from the base class. The `| maxAlignMask()` term is what makes
+        // a `byte[]`-backed segment refuse every alignment above 1.
+        r.register(owner, "isAlignedForElement", "(JJ)Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let offset = seg_long_arg(args, 1);
+            let byte_alignment = seg_long_arg(args, 2);
+            Ok(Some(Value::Int(i32::from(craton_segment_is_aligned(
+                ctx,
+                this,
+                offset,
+                byte_alignment,
+            )))))
+        });
+        r.register(
+            owner,
+            "isAlignedForElement",
+            "(JLjava/lang/foreign/MemoryLayout;)Z",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let offset = seg_long_arg(args, 1);
+                let layout = obj_arg(args, 2)?;
+                let (_size, align) =
+                    crate::phases_late::foreign_ffm::p67_layout_size_align(ctx, layout);
+                Ok(Some(Value::Int(i32::from(craton_segment_is_aligned(
+                    ctx, this, offset, align,
+                )))))
+            },
+        );
+        // `toString()` — the JDK's shape, `MemorySegment{ address: 0x…, byteSize: N }`.
+        // Not decoration: an unregistered `toString` on this carrier reaches
+        // `java/lang/Object`'s and prints the identity hash, which is what every
+        // FFM diagnostic in the tree would then say.
+        r.register(owner, "toString", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let heap = heap_segment_view(ctx, this).is_some();
+            let address = crate::panama_libffi::segment_address(ctx, this);
+            let size = crate::panama_libffi::segment_byte_size(ctx, this);
+            let text = if heap {
+                format!(
+                    "MemorySegment{{ heapBase: <array>, address: {address:#x}, byteSize: {size} }}"
+                )
+            } else {
+                format!("MemorySegment{{ address: {address:#x}, byteSize: {size} }}")
+            };
+            let s = ctx.create_string(&text);
+            Ok(Some(Value::Object(Some(s))))
+        });
+    }
+    r.set_category(__prev_cat);
+}
+
+/// A `long` argument at `index`, or 0.
+///
+/// The `Value::Int` arm is not defensive padding: a `J` slot can arrive as an
+/// `Int` from a caller that pushed a literal through the operand stack, and
+/// reading that as 0 would be a silent wrong bound rather than a refusal.
+fn seg_long_arg(args: &[Value], index: usize) -> i64 {
+    match args.get(index) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => i64::from(*v),
+        _ => 0,
+    }
+}
+
+/// `AbstractMemorySegmentImpl.checkReadOnly(boolean)`.
+///
+/// The flag is read the way every other read-only reader in this crate reads
+/// it — by NAME first (a real-JDK carrier declares `readOnly`), then slot 3 on
+/// a CratonVM carrier wide enough to have one. Restating the rule rather than
+/// calling `foreign_ffm::p67_segment_is_read_only` would be a second copy of a
+/// decision; calling it means one.
+fn craton_segment_check_read_only(
+    ctx: &mut dyn NativeContext,
+    seg: ObjectRef,
+    caller_read_only: bool,
+) -> Result<(), MethodCallFailed> {
+    let read_only = matches!(
+        crate::phases_late::foreign_ffm::p67_segment_is_read_only(
+            ctx,
+            &[Value::Object(Some(seg))],
+        )?,
+        Some(Value::Int(n)) if n != 0
+    );
+    if !caller_read_only && read_only {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Attempt to write a read-only segment".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// `AbstractMemorySegmentImpl.checkBounds(long offset, long length)`.
+fn craton_segment_check_bounds(
+    ctx: &mut dyn NativeContext,
+    seg: ObjectRef,
+    offset: i64,
+    length: i64,
+) -> MethodCallResult {
+    let size = crate::panama_libffi::segment_byte_size(ctx, seg);
+    let end = offset.checked_add(length);
+    let in_range = offset >= 0 && length >= 0 && matches!(end, Some(end) if end <= size);
+    if !in_range {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!(
+                "Out of bound access on segment MemorySegment{{ byteSize: {size} }}; \
+                 new offset = {offset}; new length = {length}"
+            )),
+        }
+        .into());
+    }
+    Ok(None)
+}
+
+/// `AbstractMemorySegmentImpl.isAlignedForElement`, both overloads.
+fn craton_segment_is_aligned(
+    ctx: &mut dyn NativeContext,
+    seg: ObjectRef,
+    offset: i64,
+    byte_alignment: i64,
+) -> bool {
+    if byte_alignment <= 0 {
+        return false;
+    }
+    let (base_offset, max_align_mask) = match heap_segment_view(ctx, seg) {
+        Some(view) => (
+            HEAP_ARRAY_BASE_OFFSET.saturating_add(view.start),
+            view.elem_width as i64,
+        ),
+        None => (crate::panama_libffi::segment_address(ctx, seg), 0),
+    };
+    ((base_offset.wrapping_add(offset) | max_align_mask) & (byte_alignment - 1)) == 0
+}
+
 // --- MemorySegment: off-heap byte buffer ---
 
+/// Register the whole `MemorySegment` surface, once per receiver class.
+///
+/// TWO names, and both are load-bearing:
+///
+///  * [`PE_SEGMENT_INTERFACE`] — a real-JDK segment arrives stamped with one of
+///    the JDK's own impl classes, and a call site that resolved to the
+///    interface's abstract declaration looks the native up under the DECLARING
+///    class. Removing this name would strand every such call.
+///  * [`CRATON_SEGMENT_CLASS`] — the class CratonVM now stamps onto the
+///    segments it mints itself. Native dispatch is keyed on the RECEIVER class,
+///    so without this pass a craton-minted segment would find nothing.
+///
+/// The pass is a loop rather than two hand-written lists on purpose: a method
+/// added to one and forgotten on the other is exactly the drift that produced
+/// the interface-stamp defect in the first place, and
+/// `tests::the_craton_segment_class_mirrors_the_interface` fails if the two
+/// registration sets ever differ.
 pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
+    for ms in [PE_SEGMENT_INTERFACE, CRATON_SEGMENT_CLASS] {
+        register_pe_memory_segment_on(r, ms);
+    }
+    register_craton_segment_impl_surface(r);
+}
+
+fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
     // Real-JDK callers dispatch these interface methods directly; retain the
     // concrete native bridges when SyntheticStub registrations are filtered.
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let ms = "java/lang/foreign/MemorySegment";
 
     // byteSize() → long
     r.register(ms, "byteSize", "()J", |ctx, args| {
@@ -1191,7 +1673,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+            let seg = alloc_segment_carrier(ctx, 6)?;
             ctx.set_field(seg, 0, Value::Long(addr));
             ctx.set_field(seg, 1, Value::Long(0)); // unknown size
             ctx.set_field(seg, 2, Value::Object(None)); // no arena
@@ -1280,7 +1762,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         }
                     }
                 }
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+                let seg = alloc_segment_carrier(ctx, 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(byte_size));
                 ctx.set_field(seg, 2, Value::Object(None)); // auto-managed
@@ -1322,7 +1804,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         }
                     }
                 }
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+                let seg = alloc_segment_carrier(ctx, 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(byte_size));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -1371,7 +1853,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         *dest = value;
                     }
                 }
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+                let seg = alloc_segment_carrier(ctx, 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(byte_size));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -1411,7 +1893,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         }
                     }
                 }
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+                let seg = alloc_segment_carrier(ctx, 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(byte_size));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -1593,6 +2075,75 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         ),
                     }
                     .into());
+                }
+
+                // A heap segment has no address at all, so the pointer
+                // path below cannot express it: `segment_address` answers
+                // 0 and the `is_null` guard then skipped the copy without
+                // a word — `MemorySegment.copy` into an `ofArray(int[])`
+                // destination wrote NOTHING and reported success. Route
+                // any side that is heap-backed through the array itself.
+                let src_heap = heap_segment_view(ctx, src);
+                let dst_heap = heap_segment_view(ctx, dst);
+                if src_heap.is_some() || dst_heap.is_some() {
+                    let staged = match &src_heap {
+                        Some(view) => heap_read_bytes(ctx, view, src_offset, bytes),
+                        None => {
+                            let addr = (src_ptr as u64).checked_add(src_offset as u64);
+                            addr.filter(|a| *a != 0).map(|a| {
+                                let mut buf = vec![0u8; bytes];
+                                // SAFETY: the source range was bounds-checked
+                                // against the segment size above, and the
+                                // destination is a fresh owned buffer.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        a as *const u8,
+                                        buf.as_mut_ptr(),
+                                        bytes,
+                                    )
+                                };
+                                buf
+                            })
+                        }
+                    };
+                    let Some(staged) = staged else {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: "MemorySegment.copy: source is neither addressable nor \
+                                      array-backed"
+                                .into(),
+                        }
+                        .into());
+                    };
+                    let wrote = match &dst_heap {
+                        Some(view) => heap_write_bytes(ctx, view, dst_offset, &staged),
+                        None => {
+                            let addr = (dst_ptr as u64).checked_add(dst_offset as u64);
+                            match addr.filter(|a| *a != 0) {
+                                Some(a) => {
+                                    // SAFETY: bounds-checked above; `staged`
+                                    // is exactly `bytes` long.
+                                    unsafe {
+                                        std::ptr::copy(
+                                            staged.as_ptr(),
+                                            a as *mut u8,
+                                            bytes,
+                                        )
+                                    };
+                                    true
+                                }
+                                None => false,
+                            }
+                        }
+                    };
+                    if !wrote {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: "MemorySegment.copy: destination is read-only, not \
+                                      addressable, or not array-backed"
+                                .into(),
+                        }
+                        .into());
+                    }
+                    return Ok(None);
                 }
 
                 // Validate address arithmetic doesn't overflow
@@ -2728,11 +3279,7 @@ fn pe_segment_slice(
         // FIRST handle releases both.
         let base_pin = ctx.pin_native_root(view.base);
         let session_pin = parent_session.map(|session| ctx.pin_native_root(session));
-        let slice = try_alloc_concurrent_synthetic(
-            ctx,
-            "java/lang/foreign/MemorySegment",
-            SEG_HEAP_FIELDS,
-        )?;
+        let slice = alloc_segment_carrier(ctx, SEG_HEAP_FIELDS)?;
         let base = ctx.read_native_pin(base_pin, view.base);
         let scope_value = match (parent_session, session_pin) {
             (Some(session), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, session))),
@@ -2788,7 +3335,7 @@ fn pe_segment_slice(
     // saw before.
     let parent_session = pe_segment_session(ctx, this);
     let session_pin = parent_session.map(|session| ctx.pin_native_root(session));
-    let slice = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+    let slice = alloc_segment_carrier(ctx, 6)?;
     // The allocation above can move the session (native stale-local
     // family), so re-read it through the pin before storing it.
     let scope_value = match (parent_session, session_pin) {
@@ -3151,7 +3698,7 @@ fn pe_zero_length_segment(
     ctx: &mut dyn NativeContext,
     addr: i64,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+    let seg = alloc_segment_carrier(ctx, 6)?;
     ctx.set_field(seg, 0, Value::Long(addr));
     ctx.set_field(seg, 1, Value::Long(0));
     ctx.set_field(seg, 2, Value::Object(None));
@@ -3249,6 +3796,179 @@ fn heap_element_width(elem: cratonvm_types::ArrayElementType) -> Option<usize> {
         A::Long | A::Double => 8,
         A::Boolean | A::Reference => return None,
     })
+}
+
+/// Read `len` bytes of a heap segment's payload, starting `offset` bytes
+/// into the segment.
+///
+/// A heap segment has no address, so `MemorySegment.copy`'s pointer path
+/// cannot see it at all — which is exactly how a copy INTO one used to
+/// write nothing at all and say nothing about it. The bytes have to come
+/// out of (or go into) the Java array itself.
+///
+/// The `Byte` and `Int` arms go through the bulk array accessors, which
+/// the VM implements as one `copy_nonoverlapping` over the heap arena;
+/// everything else, and any access not aligned to its element width,
+/// falls back to an element-at-a-time loop that is correct for every
+/// width and offset. That fallback is why this returns bytes rather than
+/// borrowing them: an unaligned read spans element boundaries.
+fn heap_read_bytes(
+    ctx: &dyn NativeContext,
+    view: &HeapSegmentView,
+    offset: i64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let start = view.start.checked_add(offset)?;
+    if start < 0 || len == 0 {
+        return if len == 0 { Some(Vec::new()) } else { None };
+    }
+    let start = start as usize;
+    let width = view.elem_width;
+    if width == 1 && view.elem_type == cratonvm_types::ArrayElementType::Byte {
+        let mut out = vec![0u8; len];
+        let got = ctx.read_byte_array_into(view.base, start, &mut out);
+        return (got == len).then_some(out);
+    }
+    if width == 4
+        && view.elem_type == cratonvm_types::ArrayElementType::Int
+        && start % 4 == 0
+        && len % 4 == 0
+    {
+        let mut words = vec![0i32; len / 4];
+        let got = ctx.read_int_array_into(view.base, start / 4, &mut words);
+        if got != words.len() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(len);
+        for w in words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        return Some(out);
+    }
+    // General case: walk the elements the byte range touches and take the
+    // bytes out of each one's little-endian image.
+    let first = start / width;
+    let last = (start + len - 1) / width;
+    let mut staged = Vec::with_capacity((last - first + 1) * width);
+    for index in first..=last {
+        staged.extend_from_slice(&heap_element_le_bytes(ctx, view, index)?);
+    }
+    let skip = start - first * width;
+    Some(staged[skip..skip + len].to_vec())
+}
+
+/// Write `src` into a heap segment's payload at `offset`. Mirror of
+/// [`heap_read_bytes`]; an unaligned or sub-element write reads the
+/// element it lands in, patches the bytes, and writes it back.
+fn heap_write_bytes(
+    ctx: &mut dyn NativeContext,
+    view: &HeapSegmentView,
+    offset: i64,
+    src: &[u8],
+) -> bool {
+    if view.read_only {
+        return false;
+    }
+    let Some(start) = view.start.checked_add(offset) else {
+        return false;
+    };
+    if start < 0 {
+        return false;
+    }
+    if src.is_empty() {
+        return true;
+    }
+    let start = start as usize;
+    let width = view.elem_width;
+    if width == 1 && view.elem_type == cratonvm_types::ArrayElementType::Byte {
+        return ctx.write_byte_array_from(view.base, start, src);
+    }
+    if width == 4
+        && view.elem_type == cratonvm_types::ArrayElementType::Int
+        && start % 4 == 0
+        && src.len() % 4 == 0
+    {
+        let words: Vec<i32> = src
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        return ctx.write_int_array_from(view.base, start / 4, &words);
+    }
+    let first = start / width;
+    let last = (start + src.len() - 1) / width;
+    let mut staged = Vec::with_capacity((last - first + 1) * width);
+    for index in first..=last {
+        match heap_element_le_bytes(ctx, view, index) {
+            Some(bytes) => staged.extend_from_slice(&bytes),
+            None => return false,
+        }
+    }
+    let skip = start - first * width;
+    staged[skip..skip + src.len()].copy_from_slice(src);
+    for (n, index) in (first..=last).enumerate() {
+        let chunk = &staged[n * width..(n + 1) * width];
+        if !heap_element_from_le_bytes(ctx, view, index, chunk) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One array element's little-endian byte image, whatever its width.
+fn heap_element_le_bytes(
+    ctx: &dyn NativeContext,
+    view: &HeapSegmentView,
+    index: usize,
+) -> Option<Vec<u8>> {
+    if index >= ctx.array_length(view.base) {
+        return None;
+    }
+    Some(match ctx.get_array_element(view.base, index) {
+        Value::Int(v) => match view.elem_width {
+            1 => vec![v as u8],
+            2 => (v as u16).to_le_bytes().to_vec(),
+            _ => v.to_le_bytes().to_vec(),
+        },
+        Value::Long(v) => v.to_le_bytes().to_vec(),
+        Value::Float(v) => v.to_bits().to_le_bytes().to_vec(),
+        Value::Double(v) => v.to_bits().to_le_bytes().to_vec(),
+        _ => return None,
+    })
+}
+
+/// Inverse of [`heap_element_le_bytes`].
+fn heap_element_from_le_bytes(
+    ctx: &mut dyn NativeContext,
+    view: &HeapSegmentView,
+    index: usize,
+    bytes: &[u8],
+) -> bool {
+    use cratonvm_types::ArrayElementType as A;
+    if index >= ctx.array_length(view.base) || bytes.len() != view.elem_width {
+        return false;
+    }
+    let value = match view.elem_type {
+        A::Byte => Value::Int(bytes[0] as i8 as i32),
+        A::Short => Value::Int(i16::from_le_bytes([bytes[0], bytes[1]]) as i32),
+        A::Char => Value::Int(u16::from_le_bytes([bytes[0], bytes[1]]) as i32),
+        A::Int => Value::Int(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        A::Float => Value::Float(f32::from_bits(u32::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        A::Long => {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(bytes);
+            Value::Long(i64::from_le_bytes(w))
+        }
+        A::Double => {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(bytes);
+            Value::Double(f64::from_bits(u64::from_le_bytes(w)))
+        }
+        A::Boolean | A::Reference => return false,
+    };
+    ctx.set_array_element(view.base, index, value);
+    true
 }
 
 /// Resolve `seg` if — and only if — it is a heap segment (H1 or H2).
@@ -3589,11 +4309,7 @@ fn pe_of_array_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let seg = try_alloc_concurrent_synthetic(
-        ctx,
-        "java/lang/foreign/MemorySegment",
-        SEG_HEAP_FIELDS,
-    )?;
+    let seg = alloc_segment_carrier(ctx, SEG_HEAP_FIELDS)?;
     let array = ctx.read_native_pin(array_pin, array);
     let session = match session_obj {
         Some((pin, obj)) => Value::Object(Some(ctx.read_native_pin(pin, obj))),
@@ -4168,7 +4884,7 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
             match ctx.find_native_symbol(lib_index, &sym_name) {
                 Some(addr) => {
                     // Wrap address in MemorySegment and Optional.of()
-                    let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+                    let seg = alloc_segment_carrier(ctx, 6)?;
                     ctx.set_field(seg, 0, Value::Long(addr as i64));
                     ctx.set_field(seg, 1, Value::Long(0)); // function pointer — no byte size
                     ctx.set_field(seg, 2, Value::Object(None));
@@ -5065,7 +5781,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
                     Value::Long(address) => address,
                     _ => 0,
                 };
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+                let seg = alloc_segment_carrier(ctx, 6)?;
                 ctx.set_field(seg, 0, Value::Long(address));
                 ctx.set_field(seg, 1, Value::Long(0));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -5140,7 +5856,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 unsafe {
                     std::ptr::copy_nonoverlapping(ret_slot.as_ptr(), ptr, copy_len);
                 }
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+                let seg = alloc_segment_carrier(ctx, 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(total as i64));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -5831,7 +6547,7 @@ fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     // Wrap the trampoline address in a MemorySegment so Java can pass
     // it to other downcalls expecting a `MemorySegment` function ptr.
-    let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+    let seg = alloc_segment_carrier(ctx, 6)?;
     ctx.set_field(seg, 0, Value::Long(code_ptr as i64));
     ctx.set_field(seg, 1, Value::Long(0));
     ctx.set_field(seg, 2, Value::Object(None));
@@ -5996,7 +6712,12 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
 // --- String marshaling helpers ---
 
 fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
-    let ms = "java/lang/foreign/MemorySegment";
+    for ms in [PE_SEGMENT_INTERFACE, CRATON_SEGMENT_CLASS] {
+        register_pe2_string_marshaling_on(r, ms);
+    }
+}
+
+fn register_pe2_string_marshaling_on(r: &mut NativeMethodRegistry, ms: &str) {
 
     // getUtf8String(long offset) → String
     r.register(ms, "getUtf8String", "(J)Ljava/lang/String;", |ctx, args| {
@@ -6173,7 +6894,7 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
                 _ => ctx.get_field(this, 3),
             };
 
-            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+            let seg = alloc_segment_carrier(ctx, 6)?;
             ctx.set_field(seg, 0, Value::Long(ptr));
             ctx.set_field(seg, 1, Value::Long(new_size));
             ctx.set_field(seg, 2, Value::Object(None));
@@ -6940,7 +7661,7 @@ mod tests {
         let layout_int = make_layout(&mut ctx, LAYOUT_INT);
 
         // Create a segment with null pointer
-        let seg = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
+        let seg = alloc_segment_carrier(&mut ctx, 6).unwrap();
         ctx.set_field(seg, 0, Value::Long(0)); // null ptr
         ctx.set_field(seg, 1, Value::Long(100));
         ctx.set_field(seg, 5, Value::Long(0));
@@ -7143,7 +7864,7 @@ mod tests {
         pe_segment_set_impl(&mut ctx, seg, layout_int, 16, Value::Int(0xCAFE)).unwrap();
 
         // Create a slice starting at offset 16, size 32
-        let slice = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
+        let slice = alloc_segment_carrier(&mut ctx, 6).unwrap();
         let base_ptr = match ctx.get_field(seg, 0) {
             Value::Long(n) => n,
             _ => 0,
@@ -7189,7 +7910,7 @@ mod tests {
 
         // Reinterpret with new size 128
         let reinterpreted =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
+            alloc_segment_carrier(&mut ctx, 6).unwrap();
         ctx.set_field(reinterpreted, 0, Value::Long(orig_ptr));
         ctx.set_field(reinterpreted, 1, Value::Long(128));
         ctx.set_field(reinterpreted, 2, ctx.get_field(seg, 2));
@@ -7975,7 +8696,7 @@ mod tests {
     /// in-bounds accesses are sound while out-of-bounds accesses are caught by
     /// the bounds checks before any dereference.
     fn make_segment(ctx: &mut dyn NativeContext, ptr: i64, size: i64, base_off: i64) -> ObjectRef {
-        let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
+        let seg = alloc_segment_carrier(ctx, 6).unwrap();
         ctx.set_field(seg, 0, Value::Long(ptr));
         ctx.set_field(seg, 1, Value::Long(size));
         ctx.set_field(seg, 2, Value::Object(None));
@@ -8591,7 +9312,7 @@ mod tests {
         read_only: bool,
     ) -> ObjectRef {
         let seg =
-            try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", SEG_HEAP_FIELDS)
+            alloc_segment_carrier(ctx, SEG_HEAP_FIELDS)
                 .unwrap();
         ctx.set_field(seg, 0, Value::Long(0));
         ctx.set_field(seg, 1, Value::Long(size));
@@ -9264,7 +9985,7 @@ mod tests {
     fn a_zero_size_native_segment_is_also_an_index_out_of_bounds() {
         let mut ctx = mock_ctx();
         let seg =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
+            alloc_segment_carrier(&mut ctx, 6).unwrap();
         ctx.set_field(seg, 0, Value::Long(0x1000));
         ctx.set_field(seg, 1, Value::Long(0));
         ctx.set_field(seg, 5, Value::Long(0));
@@ -9740,6 +10461,61 @@ mod tests {
             !native_access_enabled(),
             "the flag-absent refusal must survive, unchanged, for the paths \
              the JDK really does restrict"
+        );
+    }
+
+    /// Every `MemorySegment` triple registered on the interface is registered on
+    /// [`CRATON_SEGMENT_CLASS`] too, and vice versa.
+    ///
+    /// This is the guard on the whole fix, not a tidiness check. Native dispatch
+    /// is keyed on the RECEIVER's class; since 2026-08-22 a CratonVM-minted
+    /// segment's receiver class is `CRATON_SEGMENT_CLASS`, so a method that
+    /// exists only under the interface name is a `NoSuchMethodError` waiting for
+    /// its first caller — and it would be raised from JDK code three frames
+    /// away from the registration that forgot it.
+    ///
+    /// The two names are registered by a loop at each of the three sites
+    /// (`register_pe_memory_segment`, `register_pe2_string_marshaling`,
+    /// `foreign_ffm::register_p67_segment_surface`, plus the two-registration
+    /// block beside `Arena.allocate`), so the sets can only diverge if someone
+    /// adds a fourth site and registers one name. That is precisely the mistake
+    /// this asserts against.
+    #[test]
+    fn the_craton_segment_class_mirrors_the_interface() {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        super::register_pe_memory_segment(&mut registry);
+        super::register_pe2_string_marshaling(&mut registry);
+        crate::phases_late::foreign_ffm::register_p67_foreign_memory(&mut registry);
+
+        let collect = |class: &str| {
+            let mut rows: Vec<(String, String)> = registry
+                .dump_registrations()
+                .into_iter()
+                .filter(|(c, _, _, _)| *c == class)
+                .map(|(_, m, d, _)| (m.to_string(), d.to_string()))
+                .collect();
+            rows.sort();
+            rows.dedup();
+            rows
+        };
+        let iface = collect(super::PE_SEGMENT_INTERFACE);
+        let craton = collect(super::CRATON_SEGMENT_CLASS);
+
+        // A registrar that silently registered nothing would make the equality
+        // below vacuously true; `byteSize` is the cheapest proof that it ran.
+        assert!(
+            iface.iter().any(|(m, d)| m == "byteSize" && d == "()J"),
+            "the interface registrars did not run",
+        );
+        let only_iface: Vec<_> = iface.iter().filter(|r| !craton.contains(r)).collect();
+        let only_craton: Vec<_> = craton.iter().filter(|r| !iface.contains(r)).collect();
+        assert!(
+            only_iface.is_empty() && only_craton.is_empty(),
+            "the segment natives have drifted apart.\n\
+             registered ONLY on {}: {only_iface:#?}\n\
+             registered ONLY on {}: {only_craton:#?}",
+            super::PE_SEGMENT_INTERFACE,
+            super::CRATON_SEGMENT_CLASS,
         );
     }
 }

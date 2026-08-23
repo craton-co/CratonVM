@@ -104,6 +104,16 @@ pub struct CompiledKernel {
     /// Stored explicitly so the launch site doesn't have to reconstruct
     /// it.
     pub kernel_name: String,
+    /// Occupancy-selected block size, memoised after the first launch.
+    /// `0` means "not yet queried".
+    ///
+    /// `cuOccupancyMaxPotentialBlockSize` is a driver round trip and it
+    /// was being paid on EVERY dispatch, for an answer that depends
+    /// only on the kernel — not on how many elements this particular
+    /// launch covers. An inference step is hundreds of small kernels,
+    /// so a per-dispatch driver call is multiplied by hundreds before
+    /// anything else is measured.
+    pub block_size: std::sync::atomic::AtomicU32,
 }
 
 /// Outcome of an [`OffloadCache::lookup_or_compile`] call.
@@ -160,6 +170,24 @@ pub struct OffloadCache {
     /// different Java-visible handle spaces reached through different
     /// `Native.*` entry points, so nothing ever confuses the two).
     next_stream_handle: std::sync::atomic::AtomicU64,
+    /// Internal streams the chunked writeback rotates its per-chunk
+    /// launches over. Created once on first use and reused: a chunked
+    /// dispatch needs several streams so consecutive chunks can run
+    /// concurrently, and these are private to the offload path (the
+    /// `streams` map above holds Java-visible `GpuStream` handles).
+    chunk_streams: RwLock<Vec<std::sync::Arc<Stream>>>,
+    /// Reused page-locked staging slabs for the chunked writeback, one
+    /// per element type. See `staging_slot!` for why they are cached.
+    /// Reused per-chunk completion events. `cuEventCreate` is not free
+    /// and a chunked dispatch needs one per chunk; re-recording a pooled
+    /// event costs nothing. Handed out only when the pool holds the sole
+    /// reference to every event, so a submission still waiting on one
+    /// never has it re-recorded under it.
+    chunk_events: RwLock<Vec<std::sync::Arc<cuda_bridge::Event>>>,
+    chunk_stage_i32: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<i32>>>>,
+    chunk_stage_i64: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<i64>>>>,
+    chunk_stage_f32: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<f32>>>>,
+    chunk_stage_f64: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<f64>>>>,
     /// Compute capability of `ctx`'s device, as `(major, minor)`.
     ///
     /// This is the `sm_XX` every kernel on this cache is lowered for.
@@ -227,6 +255,12 @@ impl OffloadCache {
             print_decisions: config.print_gpu_decisions,
             streams: RwLock::new(FxHashMap::default()),
             next_stream_handle: std::sync::atomic::AtomicU64::new(1),
+            chunk_streams: RwLock::new(Vec::new()),
+            chunk_events: RwLock::new(Vec::new()),
+            chunk_stage_i32: RwLock::new(None),
+            chunk_stage_i64: RwLock::new(None),
+            chunk_stage_f32: RwLock::new(None),
+            chunk_stage_f64: RwLock::new(None),
             sm,
         }
     }
@@ -370,6 +404,14 @@ impl OffloadCache {
         // a post-launch D→H writeback (kernel-written) or not
         // (read-only input — same bytes as already on the device).
         sig.writes_param_mask = ptx_module.writes_param_mask;
+        // The precise read set, replacing the analyzer's conservative
+        // u64::MAX. `writes & !reads` is what the chunked writeback may
+        // stream out before the failure flag is known.
+        sig.reads_param_mask = ptx_module.reads_param_mask;
+        // Where the counted loop's trip count comes from, so the launch
+        // grid is sized to the loop rather than to the largest array
+        // argument. See `WorkBound`.
+        sig.work_bound = ptx_module.work_bound;
         let ptx_text = ptx_module.render();
         dump_ptx_if_requested(class_name, &method.name, &ptx_text);
         let ctx = self.ctx.as_ref().expect("ctx presence checked above");
@@ -390,6 +432,7 @@ impl OffloadCache {
             module,
             signature: sig,
             kernel_name,
+            block_size: std::sync::atomic::AtomicU32::new(0),
         });
         self.kernels.write().insert(key, Arc::clone(&kernel));
         LookupOutcome::Hit(kernel)
@@ -1698,6 +1741,81 @@ impl OffloadCache {
         self.streams.read().get(&handle).cloned()
     }
 
+    /// The per-chunk completion events, reused across dispatches.
+    ///
+    /// Returns an empty vec when the pool cannot be used — either events
+    /// could not be created, or a previous submission still holds one, in
+    /// which case the caller creates its own rather than re-recording an
+    /// event someone is waiting on.
+    #[cfg(feature = "gpu-offload")]
+    fn chunk_event_pool(
+        &self,
+        ctx: &cuda_bridge::DeviceContext,
+        want: usize,
+    ) -> Vec<std::sync::Arc<cuda_bridge::Event>> {
+        {
+            let held = self.chunk_events.read();
+            if held.len() >= want
+                && held
+                    .iter()
+                    .all(|e| std::sync::Arc::strong_count(e) == 1)
+            {
+                return held[..want].to_vec();
+            }
+        }
+        let mut slot = self.chunk_events.write();
+        if slot.len() >= want && slot.iter().all(|e| std::sync::Arc::strong_count(e) == 1) {
+            return slot[..want].to_vec();
+        }
+        let mut made = Vec::with_capacity(want);
+        for _ in 0..want {
+            match cuda_bridge::Event::new(ctx) {
+                Ok(e) => made.push(std::sync::Arc::new(e)),
+                Err(_) => return Vec::new(),
+            }
+        }
+        // Only cache when nothing else is holding the old set; otherwise
+        // hand these out one-shot and leave the pool alone.
+        if slot.iter().all(|e| std::sync::Arc::strong_count(e) == 1) {
+            *slot = made.clone();
+        }
+        made
+    }
+
+    /// The internal stream pool the chunked writeback rotates over,
+    /// created on first use.
+    ///
+    /// Returns an empty vec if streams cannot be created, which the
+    /// caller reads as "do not chunk" and falls back to the single
+    /// whole-array launch.
+    #[cfg(feature = "gpu-offload")]
+    fn chunk_stream_pool(&self, ctx: &cuda_bridge::DeviceContext) -> Vec<std::sync::Arc<Stream>> {
+        {
+            let have = self.chunk_streams.read();
+            if !have.is_empty() {
+                return have.clone();
+            }
+        }
+        let mut slot = self.chunk_streams.write();
+        // Another thread may have filled it while the read lock was down.
+        if !slot.is_empty() {
+            return slot.clone();
+        }
+        let mut made = Vec::with_capacity(chunk_streams_wanted());
+        for _ in 0..chunk_streams_wanted() {
+            match Stream::new(ctx) {
+                Ok(s) => made.push(std::sync::Arc::new(s)),
+                Err(e) => {
+                    tracing::debug!("gpu offload: chunk stream pool unavailable ({e}); \
+                                     falling back to the whole-array writeback");
+                    return Vec::new();
+                }
+            }
+        }
+        *slot = made.clone();
+        made
+    }
+
     /// Asynchronous kernel dispatch on `stream`.
     ///
     /// Returns a [`StreamSubmission`] whose [`handle`](StreamSubmission::handle)
@@ -1804,6 +1922,8 @@ impl OffloadCache {
     /// via `Vm::new`) degrades gracefully: the reaper's `upgrade()`
     /// always fails, and the existing poll-based completion path
     /// (`poll_submission_status`, `get()`) remains fully correct.
+
+    /// (`poll_submission_status`, `get()`) remains fully correct.
     pub fn dispatch_async(
         &self,
         stream: std::sync::Arc<Stream>,
@@ -1877,21 +1997,114 @@ impl OffloadCache {
         // fixed `DEFAULT_ELEMENTWISE_BLOCK` — falls back to the same
         // 256 default when the query is unavailable (stub mode, or the
         // driver call fails).
-        let cfg = kernel
-            .module
-            .elementwise_for_kernel(ctx, &kernel.kernel_name, work);
+        // Occupancy-tuned block size, queried ONCE per kernel and then
+        // memoised: the driver's answer is a property of the kernel, not
+        // of this launch's element count, and paying for it on every
+        // dispatch is hundreds of driver round trips per inference step.
+        let cfg = match kernel.block_size.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => {
+                let cfg = kernel
+                    .module
+                    .elementwise_for_kernel(ctx, &kernel.kernel_name, work);
+                kernel
+                    .block_size
+                    .store(cfg.block.0, std::sync::atomic::Ordering::Relaxed);
+                cfg
+            }
+            block => cuda_bridge::LaunchConfig::elementwise_with_block(work, block),
+        };
+
+        // 3b. Chunked, overlapped writeback.
+        //
+        //     A single whole-array launch cannot overlap anything: the
+        //     device->host copy can only start once the entire kernel has
+        //     finished. Splitting the iteration space lets chunk N's copy
+        //     run while chunk N+1's kernel does, which on the four-sphere
+        //     ray tracer at 2.76M elements is 0.97 ms against 1.62 ms
+        //     serial. `take_chunkable_writeback` decides whether this
+        //     submission qualifies -- crucially, only for an array the
+        //     kernel writes and never reads.
+        //
+        //     Any failure here falls back to the whole-array launch
+        //     below with the writeback put back, so a chunking problem
+        //     costs performance and never correctness.
+        let mut finalize_state = finalize_state;
+        let mut chunked = false;
+        if let Some(fs) = finalize_state.as_mut() {
+            if let Some(plain) =
+                take_chunkable_writeback(&kernel.signature, &mut fs.writebacks, work)
+            {
+                let pool = self.chunk_stream_pool(ctx);
+                if pool.is_empty() {
+                    fs.writebacks.push(plain);
+                } else {
+                    // Cast: `work` is a JVM array length, so it fits usize.
+                    let events = self.chunk_event_pool(ctx, chunk_count_wanted());
+                    match launch_chunked(
+                        self, &events, ctx, &kernel, &args, work as usize, &pool, plain,
+                    ) {
+                        Ok(wb) => {
+                            // Give the submission a completion event that
+                            // really covers every chunk: the user stream
+                            // waits on each chunk event before the
+                            // `record_event` below, so `isDone()` and the
+                            // reaper stay honest even though the work ran
+                            // on the pool streams.
+                            if let MarshalWriteback::Chunked { chunks, .. } = &wb {
+                                for c in chunks {
+                                    if let Err(e) = stream.wait_event(&c.done) {
+                                        return make(SubmissionStatus::Failed {
+                                            message: format!(
+                                                "chunked join wait (lo={}): {e}",
+                                                c.lo
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            // The chunked writeback must drain BEFORE the
+                            // failure flag, so its per-chunk waits overlap
+                            // with the GPU work still outstanding. That is
+                            // the whole point, and it is why chunking is
+                            // gated on a write-only array: see
+                            // `take_chunkable_writeback`.
+                            fs.writebacks.insert(0, wb);
+                            chunked = true;
+                        }
+                        Err(msg) => {
+                            tracing::debug!(
+                                "gpu offload: chunked dispatch unavailable ({msg}); \
+                                 falling back to the whole-array launch"
+                            );
+                            // `launch_chunked` consumed the writeback on the
+                            // error path, so rebuild the submission as failed
+                            // rather than silently dropping the array's
+                            // writeback and returning stale Java state.
+                            return make(SubmissionStatus::Failed {
+                                message: format!("chunked dispatch failed: {msg}"),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let finalize_state = finalize_state;
 
         // 4. Launch on the user-supplied stream. The launch itself is
         //    non-blocking; `stream.synchronize()` below is what makes
         //    this call observably synchronous to the caller.
-        if let Err(e) =
-            kernel
-                .module
-                .launch_on_stream(ctx, &kernel.kernel_name, &cfg, args, &stream)
-        {
-            return make(SubmissionStatus::Failed {
-                message: format!("launch_on_stream({}): {}", kernel.kernel_name, e,),
-            });
+        // Skipped when the chunked path above already launched every
+        // chunk on the pool streams.
+        if !chunked {
+            if let Err(e) =
+                kernel
+                    .module
+                    .launch_on_stream(ctx, &kernel.kernel_name, &cfg, args, &stream)
+            {
+                return make(SubmissionStatus::Failed {
+                    message: format!("launch_on_stream({}): {}", kernel.kernel_name, e,),
+                });
+            }
         }
 
         // 5. Phase 7 #1 — record a completion event and return
@@ -2306,6 +2519,12 @@ fn enqueue_completion(
 
 #[cfg(feature = "gpu-offload")]
 fn record_failed_submission(stream: Option<std::sync::Arc<Stream>>, message: String) -> u64 {
+    // Every explicit-dispatch failure ends here, and until this line
+    // existed none of them said anything: the reason was stored on the
+    // submission and only ever surfaced if the Java side successfully
+    // called back for it. `--print-gpu-decisions` turns this on along
+    // with the analyzer verdicts.
+    tracing::warn!("gpu offload: submission failed — {message}");
     let handle = NEXT_SUBMISSION_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let sub = std::sync::Arc::new(StreamSubmission {
         handle,
@@ -2407,13 +2626,24 @@ pub fn dispatch_method_from_native_on_stream(
     // knows whether the compiled PTX declares a trailing `ret_ptr`
     // param (any non-void, non-array return) that needs a matching
     // accumulator buffer pushed ahead of `failure_flag`.
-    let (class_id, method_index, is_static, this_field_names, writes_param_mask, return_kind): (
+    let timed = cratonvm_native_builtins::craton_gpu::dispatch_timing::enabled();
+    let mut mark = std::time::Instant::now();
+    let (
+        class_id,
+        method_index,
+        is_static,
+        this_field_names,
+        writes_param_mask,
+        return_kind,
+        work_bound,
+    ): (
         crate::classloading::ClassId,
         u16,
         bool,
         Vec<String>,
         u64,
         ParamKind,
+        jit_cuda::emitter::WorkBound,
     ) = {
         // Phase 9 #1 fix — load the class on demand. The class name
         // arrives as a string from `Native.submitMethod`; the user has
@@ -2525,6 +2755,7 @@ pub fn dispatch_method_from_native_on_stream(
                     names,
                     compiled.signature.writes_param_mask,
                     compiled.signature.return_kind,
+                    compiled.signature.work_bound,
                 )
             }
             LookupOutcome::Skip => {
@@ -2545,6 +2776,14 @@ pub fn dispatch_method_from_native_on_stream(
             }
         }
     };
+
+    if timed {
+        cratonvm_native_builtins::craton_gpu::dispatch_timing::add(
+            3,
+            mark.elapsed().as_nanos() as u64,
+        );
+        mark = std::time::Instant::now();
+    }
 
     // 4. From here on we need a real device context. The Failed-fast
     //    path is identical to dispatch_async's no-device branch.
@@ -2634,6 +2873,11 @@ pub fn dispatch_method_from_native_on_stream(
     let mut kernel_args = KernelArgs::new();
     let mut writebacks: Vec<MarshalWriteback> = Vec::new();
     let mut max_array_len: usize = 0;
+    // Per-declared-parameter array lengths, so `work_bound` can name
+    // the one that is the loop trip count. Only the static path
+    // populates this (the `pthis_*` prelude has no declared index),
+    // which is also the only path `WorkBound::ParamLen` is derived on.
+    let mut param_lens: Vec<Option<usize>> = Vec::new();
     let mut h2d_bytes: usize = 0;
     // Param-index counter for the writes-mask lookup. The non-static
     // `pthis_*` arms come first and consume slots ahead of the
@@ -2810,6 +3054,7 @@ pub fn dispatch_method_from_native_on_stream(
                             if arr_len > max_array_len {
                                 max_array_len = arr_len;
                             }
+                            record_param_len(&mut param_lens, i, arr_len);
                             if let Some(wb) = wb_opt {
                                 writebacks.push(wb);
                             }
@@ -2829,16 +3074,15 @@ pub fn dispatch_method_from_native_on_stream(
                 // the DeviceBuffer in the resident state so this
                 // path skips the H→D copy when the bytes haven't
                 // changed since the previous kernel.
-                if let Some((etype, len, host_bytes, arr_handle)) =
-                    try_gpu_array_snapshot(shared, *obj_ref)
-                {
-                    match marshal_resident_array_arg(ctx, etype, len, host_bytes, arr_handle) {
+                if let Some((etype, len, arr_handle)) = try_gpu_array_shape(shared, *obj_ref) {
+                    match marshal_resident_array_arg(ctx, etype, len, arr_handle) {
                         Ok((args_after, wb)) => {
                             kernel_args = args_after(kernel_args);
                             if let Some(l) = wb.array_len() {
                                 if l > max_array_len {
                                     max_array_len = l;
                                 }
+                                record_param_len(&mut param_lens, i, l);
                             }
                             writebacks.push(wb);
                         }
@@ -2965,8 +3209,21 @@ pub fn dispatch_method_from_native_on_stream(
     //     after `event.synchronize()` and surfaces a non-zero value
     //     as a failure message so the Java side gets a real error
     //     instead of silently corrupt output.
-    let failure_flag_buf = match cuda_bridge::DeviceBuffer::<u64>::zeros(ctx, 1) {
-        Ok(b) => std::sync::Arc::new(b),
+    //     Pooled. A fresh `cuMemAlloc` per dispatch is the single
+    //     most expensive thing on this path — measured at 117 us for a
+    //     kernel that does nothing, against 5.5 ms of ACTUAL device
+    //     work for a whole 453-kernel inference step. The buffer is
+    //     one `u64`; allocating it fresh every time bought nothing.
+    if timed {
+        cratonvm_native_builtins::craton_gpu::dispatch_timing::add(
+            4,
+            mark.elapsed().as_nanos() as u64,
+        );
+        mark = std::time::Instant::now();
+    }
+    let pool_key = ctx as *const cuda_bridge::DeviceContext as usize;
+    let failure_flag_buf = match flag_pool::take(pool_key, ctx) {
+        Ok(b) => b,
         Err(e) => {
             drop(token);
             return record_failed_submission(
@@ -2985,7 +3242,18 @@ pub fn dispatch_method_from_native_on_stream(
     }
     writebacks.push(MarshalWriteback::FailureFlag {
         buf: failure_flag_buf,
+        pool_key,
     });
+    // `tid_base` — the index of the first element this launch covers.
+    //
+    // Every lowered kernel takes it (see `lowering::ptx_params`), and a
+    // whole-array launch is base 0. A CHUNKED launch, which is what lets
+    // one chunk's writeback overlap with the next chunk's kernel, passes
+    // that chunk's first index instead. CUDA has no launch offset of its
+    // own, so this parameter is the only way one kernel can cover disjoint
+    // slices of an iteration space while every thread still computes its
+    // global index.
+    kernel_args = kernel_args.push_i32(0);
 
     // 8. Phase 7 #1 — dispatch on the stream. The launch grid's
     //    element count comes from `max_array_len` (0 for a scalar-only
@@ -3014,7 +3282,27 @@ pub fn dispatch_method_from_native_on_stream(
             h2d_trace::total(),
         );
     }
-    let runtime_work: u32 = u32::try_from(max_array_len).unwrap_or(u32::MAX);
+    // Size the grid to the loop, not to the biggest array. For an
+    // element-wise kernel these are the same number. For a kernel whose
+    // inputs are larger than its iteration space — a matrix-vector
+    // product is the canonical one — they differ by the matrix's inner
+    // dimension, and the largest-array rule launches that many times too
+    // many threads. Each extra thread does nothing but reach the guard
+    // and exit, but the driver still creates it.
+    //
+    // `Unknown` (anything that is not a single counted loop) and a
+    // parameter whose length we never recorded both fall back to the
+    // old rule, which is over-provisioning and therefore always safe.
+    let work_items: usize = match work_bound {
+        jit_cuda::emitter::WorkBound::ParamLen(idx) => param_lens
+            .get(idx as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(max_array_len),
+        jit_cuda::emitter::WorkBound::Literal(v) if v > 0 => v as usize,
+        _ => max_array_len,
+    };
+    let runtime_work: u32 = u32::try_from(work_items).unwrap_or(u32::MAX);
     // The thread-local SafepointToken's role is over (marshal is
     // done). The cross-thread GcCriticalGuard (moved into
     // `FinalizeState` below) takes over.
@@ -3033,6 +3321,13 @@ pub fn dispatch_method_from_native_on_stream(
     //    handed — no kernel ran, nothing to finalize — same as this
     //    caller used to do explicitly in the `needs_finalize == false`
     //    case.
+    if timed {
+        cratonvm_native_builtins::craton_gpu::dispatch_timing::add(
+            5,
+            mark.elapsed().as_nanos() as u64,
+        );
+        mark = std::time::Instant::now();
+    }
     let submission = cache.dispatch_async(
         stream.clone(),
         class_id,
@@ -3066,10 +3361,28 @@ pub fn finalize_submission(
     shared: &crate::vm::SharedVm,
     submission: &std::sync::Arc<StreamSubmission>,
 ) -> Result<(), String> {
-    // First, take the FinalizeState. If None, finalization has
-    // already run (or this submission was Failed at dispatch) —
-    // fall through to read the terminal status.
-    let pending = submission.finalize.lock().take();
+    // Take the FinalizeState, and HOLD ITS LOCK for the whole
+    // finalization. If None, finalization has already run (or this
+    // submission was Failed at dispatch) — fall through to read the
+    // terminal status.
+    //
+    // The lock has to span the work, not just the take. Two callers
+    // reach here for the same submission — `future.get()` on the Java
+    // thread and the completion reaper woken by the device callback —
+    // and taking-then-releasing let the second one observe the gap:
+    // `FinalizeState` already gone, status not yet stamped, i.e.
+    // `Running` with nothing left to finalize. That is not a logic
+    // error, it is a race, and it surfaced as
+    //
+    //     GpuException: submission handle=35 is Running with no
+    //     FinalizeState
+    //
+    // on roughly a third of a 5-kernel sequence — the kind of flake
+    // that reads like a bad kernel. Holding the lock makes the second
+    // caller wait for the first and then read a terminal status, which
+    // is what it was always assumed to do.
+    let mut finalize_guard = submission.finalize.lock();
+    let pending = finalize_guard.take();
 
     if let Some(FinalizeState {
         writebacks,
@@ -3077,7 +3390,16 @@ pub fn finalize_submission(
     }) = pending
     {
         // 1. Wait for the kernel to complete via the recorded event.
-        if let Some(event) = &submission.event {
+        //
+        //    Skipped for a chunked submission: its writeback waits each
+        //    chunk event in turn and copies that chunk out, so the host
+        //    memcpy runs under the GPU work still outstanding behind it.
+        //    Waiting here first would drain the whole pipeline and throw
+        //    that overlap away -- the entire point of chunking.
+        let is_chunked = writebacks
+            .iter()
+            .any(|wb| matches!(wb, MarshalWriteback::Chunked { .. }));
+        if let Some(event) = submission.event.as_ref().filter(|_| !is_chunked) {
             if let Err(e) = event.synchronize() {
                 let mut status = submission.status.lock();
                 *status = SubmissionStatus::Failed {
@@ -3122,13 +3444,31 @@ pub fn finalize_submission(
         // sufficient and avoids an extra `is_some()` guard.
         let mut first_err: Option<String> = None;
         let mut scalar_result: Option<SerializedResult> = None;
+        // Order: Chunked, then FailureFlag, then everything else.
+        //
+        // A Chunked writeback goes FIRST, ahead of the flag, and that is
+        // deliberate -- its per-chunk waits are what overlap the host copy
+        // with the GPU work still in flight, and draining the flag first
+        // would require the whole pipeline to finish before any of it.
+        // The consequence is that a chunked array can reach the Java heap
+        // before a bounds failure is known, which is why chunking is only
+        // ever planned for an array the kernel writes and never reads --
+        // see `take_chunkable_writeback` for why that makes the partial
+        // commit unobservable.
+        //
+        // Every other array writeback still drains AFTER the flag, so the
+        // "interpreter observes no partial GPU state" guarantee holds
+        // unchanged for them.
+        let is_chunk = |wb: &&MarshalWriteback| matches!(wb, MarshalWriteback::Chunked { .. });
+        let is_flag = |wb: &&MarshalWriteback| matches!(wb, MarshalWriteback::FailureFlag { .. });
         for wb in writebacks
             .iter()
-            .filter(|wb| matches!(wb, MarshalWriteback::FailureFlag { .. }))
+            .filter(is_chunk)
+            .chain(writebacks.iter().filter(is_flag))
             .chain(
                 writebacks
                     .iter()
-                    .filter(|wb| !matches!(wb, MarshalWriteback::FailureFlag { .. })),
+                    .filter(|wb| !is_chunk(wb) && !is_flag(wb)),
             )
         {
             match wb.writeback(shared, &local_token) {
@@ -3303,6 +3643,72 @@ pub fn poll_submission_status(shared: &crate::vm::SharedVm, handle: u64) -> Opti
             }
             drop(pending);
             Some(PollOutcome::Failed)
+        }
+    }
+}
+
+/// One-`u64` failure-flag buffers, reused across dispatches.
+///
+/// Every launch needs one, and allocating it fresh meant a `cuMemAlloc`
+/// on a path an inference step walks hundreds of times per token.
+/// Measured on an RTX 2060: 117 us to submit a kernel that does
+/// nothing, against 5.5 ms of real device work for a whole 453-kernel
+/// forward pass — the dispatch floor, not the kernels, was the cost.
+///
+/// Buffers are keyed by the `DeviceContext`'s address so one device's
+/// allocation can never be handed to another. A buffer goes back into
+/// the pool only when it read ZERO, which is what keeps "came from the
+/// pool" and "ready to be a failure flag" the same statement.
+#[cfg(feature = "gpu-offload")]
+pub(crate) mod flag_pool {
+    use cuda_bridge::{DeviceBuffer, DeviceContext};
+    use parking_lot::Mutex;
+    use rustc_hash::FxHashMap;
+    use std::sync::Arc;
+
+    static POOLS: Mutex<Option<FxHashMap<usize, Vec<Arc<DeviceBuffer<u64>>>>>> = Mutex::new(None);
+
+    /// Cap per context. A submission that is never finalized never
+    /// returns its buffer, so this is a reuse cache and not a ledger;
+    /// the cap keeps a pathological caller from growing it without
+    /// bound.
+    const MAX_POOLED: usize = 1024;
+
+    pub(crate) fn take(key: usize, ctx: &DeviceContext) -> Result<Arc<DeviceBuffer<u64>>, String> {
+        let pooled = {
+            let mut guard = POOLS.lock();
+            guard
+                .as_mut()
+                .and_then(|m| m.get_mut(&key))
+                .and_then(|v| v.pop())
+        };
+        if let Some(buf) = pooled {
+            return Ok(buf);
+        }
+        DeviceBuffer::<u64>::zeros(ctx, 1)
+            .map(Arc::new)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Safe to call only from the finalize path: the submission's
+    /// event has already been synchronized there, so no launch can
+    /// still be writing through the pointer the launch closure pinned.
+    pub(crate) fn give(key: usize, buf: &Arc<DeviceBuffer<u64>>) {
+        let buf = Arc::clone(buf);
+        let mut guard = POOLS.lock();
+        let map = guard.get_or_insert_with(FxHashMap::default);
+        let slot = map.entry(key).or_default();
+        if slot.len() < MAX_POOLED {
+            slot.push(buf);
+        }
+    }
+
+    /// Drop every pooled buffer for one context, so the pool never
+    /// outlives the memory it names.
+    #[allow(dead_code)]
+    pub(crate) fn clear(key: usize) {
+        if let Some(map) = POOLS.lock().as_mut() {
+            map.remove(&key);
         }
     }
 }
@@ -3909,10 +4315,410 @@ pub(crate) mod input_cache {
     }
 }
 
+
+/// One chunk of a chunked writeback: where it lives in the array, and the
+/// event that fires when its device->staging copy has landed.
+#[cfg(feature = "gpu-offload")]
+pub struct WritebackChunk {
+    /// First element index of this chunk within the array.
+    pub lo: usize,
+    /// Element count.
+    pub len: usize,
+    /// Recorded after this chunk's kernel AND its device->staging copy,
+    /// on the stream both were issued on.
+    pub done: std::sync::Arc<cuda_bridge::Event>,
+}
+
+/// The typed halves of a chunked writeback: the device buffer the kernel
+/// wrote, and the page-locked host staging it is streamed into.
+///
+/// Page-locked is the point. An async device->host copy only overlaps with
+/// kernel execution when its destination is page-locked; measured on an
+/// RTX 2060, 11 MB, 12.9 GB/s into page-locked memory against 8.6 GB/s for
+/// the async form into ordinary pageable memory. The Java heap arena is
+/// pageable, so the chunk lands in staging and is memcpy'd on from there
+/// (~26 GB/s) while later chunks are still on the GPU.
+#[cfg(feature = "gpu-offload")]
+pub enum ChunkedStage {
+    I32 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i32>>,
+        host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<i32>>,
+    },
+    I64 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i64>>,
+        host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<i64>>,
+    },
+    F32 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>,
+        host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<f32>>,
+    },
+    F64 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>,
+        host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<f64>>,
+    },
+}
+
+
+/// How many streams a chunked dispatch rotates its launches over, and how
+/// many chunks it splits the iteration space into.
+///
+/// Both were swept in the VM on an RTX 2060 against the four-sphere ray
+/// tracer at 2.76M elements, on a quiet host (HotSpot control within 2%
+/// of its idle baseline), using `CRATONVM_GPU_CHUNKS=1` as a same-binary
+/// kill switch for the off arm:
+///
+/// ```text
+///   streams  chunks    1(off)      4       8      16      32
+///        2              1.645    1.304   1.127   1.316   1.645
+///        4              1.718    1.283   1.186   1.293   1.683
+///        8              1.643    1.293   1.092   1.291   1.666
+/// ```
+///
+/// Eight chunks is the floor in every row and 32 is no better than not
+/// chunking at all -- per-launch cost grows linearly while the overlap it
+/// buys does not. Stream count matters much less; 8 won a three-repeat
+/// re-measure at 8 chunks (1.092 mean, against 1.149 for four and 1.163
+/// for two) and is cheap because the streams are created once and cached.
+///
+/// 8x8 against the off arm is 1.643 -> 1.092 ms, a 1.51x speedup.
+#[cfg(feature = "gpu-offload")]
+const CHUNK_STREAMS_DEFAULT: usize = 8;
+#[cfg(feature = "gpu-offload")]
+const CHUNK_COUNT_DEFAULT: usize = 8;
+
+/// Streams the chunked dispatch rotates launches over.
+/// Override with `CRATONVM_GPU_CHUNK_STREAMS`.
+#[cfg(feature = "gpu-offload")]
+fn chunk_streams_wanted() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_CHUNK_STREAMS")
+            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+            .filter(|n: &usize| *n >= 1 && *n <= 32)
+            .unwrap_or(CHUNK_STREAMS_DEFAULT)
+    })
+}
+
+/// Chunks the iteration space is split into.
+/// Override with `CRATONVM_GPU_CHUNKS`; 1 disables chunking entirely,
+/// which is the kill switch for A/B-ing this whole path on ONE binary.
+#[cfg(feature = "gpu-offload")]
+fn chunk_count_wanted() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_CHUNKS")
+            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+            .filter(|n: &usize| *n >= 1 && *n <= 256)
+            .unwrap_or(CHUNK_COUNT_DEFAULT)
+    })
+}
+
+/// Below this many elements, chunking costs more in per-launch overhead
+/// than it recovers in overlap.
+///
+/// The overlap can only hide `min(kernel, transfer)`, and both scale with
+/// the element count, while the extra launches are a fixed cost per chunk.
+/// At 307K elements the ray tracer's whole GPU-side cost is already only
+/// ~0.28 ms, of which 16 extra launches would be a visible slice. Kept
+/// deliberately conservative: a workload big enough to care is far above
+/// this line.
+#[cfg(feature = "gpu-offload")]
+const CHUNK_MIN_ELEMS: usize = 1 << 19;
+
+/// Decide whether this submission can use the overlapped chunked
+/// writeback, and if so take the array writeback out of `writebacks` so
+/// the caller can replace it.
+///
+/// # Why this is allowed to break the "no partial GPU state" rule
+///
+/// A chunked writeback commits each chunk into the Java array as that
+/// chunk's event fires, which is BEFORE the bounds-failure flag has been
+/// read. `finalize_submission` normally drains the flag first precisely so
+/// a failed kernel leaves the heap untouched and the CPU re-run starts
+/// clean (docs/book/src/gpu/overview.md, Exceptions).
+///
+/// That rule can be relaxed for an array the kernel writes and never
+/// READS, and only for such an array:
+///
+///   * The values a committed chunk holds are the values the kernel
+///     computed for those iterations, and its threads succeeded — the
+///     flag is set by the failing thread, not by its neighbours, so a
+///     committed chunk never contains garbage.
+///   * On deopt the interpreter re-runs the whole method from iteration
+///     0. It rewrites every element it would have written and throws at
+///     the same index, so the committed elements are a subset of what
+///     plain Java writes before the throw, with the same values. The
+///     observable end state is identical.
+///   * That argument fails the moment the kernel READS the array, because
+///     then the partial commit is the re-run's own input. Hence the
+///     `writes & !reads` gate below rather than `writes` alone.
+///
+/// The remaining conditions are about being able to identify the array at
+/// all: exactly one written param and exactly one array writeback, so the
+/// mask bit and the writeback provably refer to the same array.
+#[cfg(feature = "gpu-offload")]
+fn take_chunkable_writeback(
+    sig: &jit_cuda::signature::KernelSignature,
+    writebacks: &mut Vec<MarshalWriteback>,
+    runtime_work: u32,
+) -> Option<MarshalWriteback> {
+    if (runtime_work as usize) < CHUNK_MIN_ELEMS || chunk_count_wanted() < 2 {
+        return None;
+    }
+    // Exactly one param written, and it is not also read.
+    let streamable = sig.writes_param_mask & !sig.reads_param_mask;
+    if streamable.count_ones() != 1 || sig.writes_param_mask.count_ones() != 1 {
+        return None;
+    }
+    // A reduction writes its accumulator through `ret_ptr` with an atomic;
+    // chunking that would be a different (and racier) problem.
+    if sig.is_reduction {
+        return None;
+    }
+    // Exactly one plain-array writeback, so it must be the streamable one.
+    let idx = {
+        let mut found = None;
+        for (i, wb) in writebacks.iter().enumerate() {
+            let plain = matches!(
+                wb,
+                MarshalWriteback::I32 { .. }
+                    | MarshalWriteback::I64 { .. }
+                    | MarshalWriteback::F32 { .. }
+                    | MarshalWriteback::F64 { .. }
+            );
+            let other_array = wb.array_len().is_some() && !plain;
+            if other_array {
+                // A resident/GpuArray writeback in the mix: bail rather
+                // than reason about which one the mask names.
+                return None;
+            }
+            if plain {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(i);
+            }
+        }
+        found?
+    };
+    // The chunk tiling below assumes the array covers the whole launch.
+    if writebacks[idx].array_len() != Some(runtime_work as usize) {
+        return None;
+    }
+    Some(writebacks.remove(idx))
+}
+
+
+/// Issue a chunked, overlapped dispatch.
+///
+/// Splits `[0, work)` into `chunk_count_wanted()` chunks and, for each, launches
+/// the kernel with that chunk's `tid_base` on one of `chunk_streams_wanted()`
+/// rotating streams and issues the chunk's device->staging copy on the
+/// SAME stream, then records an event. Because each chunk's copy is
+/// ordered behind only its own kernel, chunk N's DMA runs while chunk
+/// N+1's kernel does.
+///
+/// Returns the replacement writeback, or `Err` with a message. On `Err`
+/// the caller must fall back to the whole-array path — nothing has been
+/// committed to the Java heap either way, since that only happens at
+/// finalize.
+#[cfg(feature = "gpu-offload")]
+#[allow(clippy::too_many_arguments)]
+fn launch_chunked(
+    cache: &OffloadCache,
+    events: &[std::sync::Arc<cuda_bridge::Event>],
+    ctx: &cuda_bridge::DeviceContext,
+    kernel: &CompiledKernel,
+    args: &cuda_bridge::KernelArgs,
+    work: usize,
+    streams: &[std::sync::Arc<Stream>],
+    plain: MarshalWriteback,
+) -> Result<MarshalWriteback, String> {
+    // The typed device buffer and a page-locked staging slab the size of
+    // the whole array. One slab, not one per chunk: chunks tile it, so no
+    // chunk's DMA and no chunk's memcpy ever touch the same bytes, and
+    // there is no slot to wait for before reusing.
+    let (obj, stage) = match plain {
+        MarshalWriteback::I32 { obj, buf, len } => (
+            obj,
+            ChunkedStage::I32 {
+                buf,
+                host: cache.staging_i32(ctx, len)?,
+            },
+        ),
+        MarshalWriteback::I64 { obj, buf, len } => (
+            obj,
+            ChunkedStage::I64 {
+                buf,
+                host: cache.staging_i64(ctx, len)?,
+            },
+        ),
+        MarshalWriteback::F32 { obj, buf, len } => (
+            obj,
+            ChunkedStage::F32 {
+                buf,
+                host: cache.staging_f32(ctx, len)?,
+            },
+        ),
+        MarshalWriteback::F64 { obj, buf, len } => (
+            obj,
+            ChunkedStage::F64 {
+                buf,
+                host: cache.staging_f64(ctx, len)?,
+            },
+        ),
+        other => {
+            // `take_chunkable_writeback` only ever hands back the four
+            // plain-array variants; anything else is a bug there.
+            return Err(format!(
+                "launch_chunked given a non-array writeback (len={:?})",
+                other.array_len()
+            ));
+        }
+    };
+
+    let chunk = work.div_ceil(chunk_count_wanted()).max(1);
+    // One occupancy query for the whole dispatch, not one per chunk: it
+    // is a driver round-trip and every chunk but the last is the same
+    // size anyway. The last, shorter chunk just under-fills its final
+    // block, which the kernel guard already handles.
+    // Cast: element count -> u32 grid sizing (JVM array length fits).
+    let cfg = kernel
+        .module
+        .elementwise_for_kernel(ctx, &kernel.kernel_name, chunk as u32);
+    let mut chunks: Vec<WritebackChunk> = Vec::with_capacity(chunk_count_wanted());
+    let mut lo = 0usize;
+    while lo < work {
+        let len = chunk.min(work - lo);
+        let stream = &streams[chunks.len() % streams.len()];
+        // Cast: element index -> i32 launch base. `work` came from a JVM
+        // array length, which is bounded by i32::MAX, so `lo` fits.
+        let base = i32::try_from(lo).map_err(|_| format!("chunk base {lo} exceeds i32"))?;
+        let chunk_args = args
+            .with_tid_base(base)
+            .ok_or_else(|| "kernel args do not end in a tid_base slot".to_string())?;
+        kernel
+            .module
+            .launch_on_stream(ctx, &kernel.kernel_name, &cfg, chunk_args, stream)
+            .map_err(|e| format!("chunked launch (lo={lo} len={len}): {e}"))?;
+
+        // The copy goes on the SAME stream as its launch, so stream order
+        // alone puts it after that chunk's kernel.
+        macro_rules! copy_chunk {
+            ($buf:expr, $host:expr) => {{
+                // SAFETY: `[lo, lo+len)` is this chunk's exclusive slice of
+                // the staging slab -- chunks tile it and none overlaps --
+                // and nothing reads it until this chunk's event fires.
+                let dst = unsafe { &mut $host.as_mut_slice()[lo..lo + len] };
+                // SAFETY: `dst` is page-locked staging that outlives the
+                // submission (it is moved into the returned writeback), and
+                // the CPU does not touch the range until the event below.
+                unsafe { $buf.to_host_async_range_unchecked(dst, lo, stream) }
+                    .map_err(|e| format!("chunked copy (lo={lo} len={len}): {e}"))?;
+            }};
+        }
+        match &stage {
+            ChunkedStage::I32 { buf, host } => copy_chunk!(buf, host),
+            ChunkedStage::I64 { buf, host } => copy_chunk!(buf, host),
+            ChunkedStage::F32 { buf, host } => copy_chunk!(buf, host),
+            ChunkedStage::F64 { buf, host } => copy_chunk!(buf, host),
+        }
+
+        // A pooled event when one is available, else a fresh one.
+        let done = match events.get(chunks.len()) {
+            Some(e) => std::sync::Arc::clone(e),
+            None => std::sync::Arc::new(
+                cuda_bridge::Event::new(ctx)
+                    .map_err(|e| format!("chunk event (lo={lo}): {e}"))?,
+            ),
+        };
+        stream
+            .record_event(&done)
+            .map_err(|e| format!("chunk record_event (lo={lo}): {e}"))?;
+        chunks.push(WritebackChunk { lo, len, done });
+        lo += len;
+    }
+
+    Ok(MarshalWriteback::Chunked { obj, stage, chunks })
+}
+
+
+/// Define an `OffloadCache` accessor for a reusable page-locked staging
+/// slab of one element type.
+///
+/// `cuMemAllocHost` of a frame-sized slab is expensive enough to swamp
+/// the overlap it enables: allocating 11 MB per dispatch made the chunked
+/// writeback 2.8x SLOWER than the whole-array one it replaced. The slab is
+/// therefore kept and reused across dispatches of the same size, which is
+/// the normal case (one kernel called in a loop over one array).
+///
+/// Reuse is refused unless the cache holds the ONLY reference. A
+/// submission that has not finalized yet still owns its slab through the
+/// writeback, and handing that memory to a second concurrent dispatch
+/// would let one chunk's DMA land in another submission's staging.
+#[cfg(feature = "gpu-offload")]
+macro_rules! staging_slot {
+    ($name:ident, $ty:ty, $slot:ident) => {
+        impl OffloadCache {
+            fn $name(
+                &self,
+                ctx: &cuda_bridge::DeviceContext,
+                len: usize,
+            ) -> Result<std::sync::Arc<cuda_bridge::PinnedHostBuffer<$ty>>, String> {
+                {
+                    let held = self.$slot.read();
+                    if let Some(buf) = held.as_ref() {
+                        if buf.len() == len && std::sync::Arc::strong_count(buf) == 1 {
+                            return Ok(std::sync::Arc::clone(buf));
+                        }
+                    }
+                }
+                let fresh = std::sync::Arc::new(
+                    cuda_bridge::PinnedHostBuffer::<$ty>::new(ctx, len).map_err(|e| {
+                        format!("pinned staging {} (len={len}): {e}", stringify!($ty))
+                    })?,
+                );
+                *self.$slot.write() = Some(std::sync::Arc::clone(&fresh));
+                Ok(fresh)
+            }
+        }
+    };
+}
+
+#[cfg(feature = "gpu-offload")]
+staging_slot!(staging_i32, i32, chunk_stage_i32);
+#[cfg(feature = "gpu-offload")]
+staging_slot!(staging_i64, i64, chunk_stage_i64);
+#[cfg(feature = "gpu-offload")]
+staging_slot!(staging_f32, f32, chunk_stage_f32);
+#[cfg(feature = "gpu-offload")]
+staging_slot!(staging_f64, f64, chunk_stage_f64);
+
 // ── Per-type marshalling helpers ────────────────────────────────────
 
 #[cfg(feature = "gpu-offload")]
 pub enum MarshalWriteback {
+    // (Chunked, below, is the overlapped writeback; see its comment.)
+    /// A write-only array streamed back in chunks.
+    ///
+    /// Instead of one device->host copy after the whole kernel, the
+    /// dispatch launched the kernel once per chunk and issued each
+    /// chunk's copy on the same stream, so chunk N's copy runs while
+    /// chunk N+1's kernel does. The drain below waits each chunk's event
+    /// in turn and memcpys it into the Java array, which puts the host
+    /// copy under the GPU work still outstanding behind it.
+    ///
+    /// This is the ONE writeback that may land in the Java heap before
+    /// the bounds-failure flag has been read, and the dispatch only
+    /// builds it for an array in `writes & !reads` — see
+    /// `plan_chunked_writeback` for the full argument.
+    Chunked {
+        obj: cratonvm_types::ObjectRef,
+        stage: ChunkedStage,
+        chunks: Vec<WritebackChunk>,
+    },
     // Plain JVM primitive arrays (Phase 5).
     //
     // Phase 10 #1 (input-residency): the device buffer is held as
@@ -3976,6 +4782,11 @@ pub enum MarshalWriteback {
     /// the resident-variant ownership pattern).
     FailureFlag {
         buf: std::sync::Arc<cuda_bridge::DeviceBuffer<u64>>,
+        /// Which device context the buffer came from, so finalize can
+        /// return it to that context's pool and never another's. The
+        /// key is the `DeviceContext`'s address, which is stable for
+        /// the process because the context lives in the `OffloadCache`.
+        pool_key: usize,
     },
     /// Part E — owns the 1-element device buffer a scalar-return
     /// kernel's `ret_ptr` param points at (see
@@ -4027,6 +4838,45 @@ impl MarshalWriteback {
         match self {
             // Download the kernel-written buffer straight into the JVM heap
             // arena (no staging Vec + write-back) when the array is contiguous.
+            // Chunked: wait each chunk's event in turn and copy that
+            // chunk's page-locked staging into the Java array. Waiting
+            // per chunk rather than for the whole submission is the
+            // point: while this memcpy runs, the chunks behind it are
+            // still transferring.
+            Self::Chunked { obj, stage, chunks } => {
+                macro_rules! drain {
+                    ($host:expr, $write:path, $what:literal) => {{
+                        for chunk in chunks {
+                            chunk.done.synchronize().map_err(|e| {
+                                format!("chunked {} wait (lo={}): {e}", $what, chunk.lo)
+                            })?;
+                            // SAFETY: this chunk's event has fired, so the
+                            // DMA that owned `[lo, lo+len)` in staging is
+                            // complete and the range is ours to read. No
+                            // other chunk covers it.
+                            let src = unsafe { &$host.as_mut_slice()[chunk.lo..chunk.lo + chunk.len] };
+                            $write(*obj, &shared.mem.heap, src, chunk.lo, token).map_err(|e| {
+                                format!("chunked {} write (lo={}): {e}", $what, chunk.lo)
+                            })?;
+                        }
+                    }};
+                }
+                match stage {
+                    ChunkedStage::I32 { host, .. } => {
+                        drain!(host, gpu_marshal::write_back_range_i32, "i32")
+                    }
+                    ChunkedStage::I64 { host, .. } => {
+                        drain!(host, gpu_marshal::write_back_range_i64, "i64")
+                    }
+                    ChunkedStage::F32 { host, .. } => {
+                        drain!(host, gpu_marshal::write_back_range_f32, "f32")
+                    }
+                    ChunkedStage::F64 { host, .. } => {
+                        drain!(host, gpu_marshal::write_back_range_f64, "f64")
+                    }
+                }
+                Ok(None)
+            }
             Self::I32 { obj, buf, .. } => {
                 gpu_marshal::download_obj_i32(buf.as_ref(), *obj, &shared.mem.heap, token)
                     .map_err(|e| format!("download i32: {e}"))?;
@@ -4084,16 +4934,21 @@ impl MarshalWriteback {
             // If non-zero, the kernel hit a bounds check; report as
             // a writeback error so `finalize_submission` flips the
             // submission to `Failed` and Java sees a `GpuException`.
-            Self::FailureFlag { buf } => {
+            Self::FailureFlag { buf, pool_key } => {
                 let mut cell = [0u64; 1];
-                gpu_marshal::download_into(buf, &mut cell)
+                gpu_marshal::download_into(&buf, &mut cell)
                     .map_err(|e| format!("download_into failure_flag: {e}"))?;
                 if cell[0] != 0 {
+                    // Deliberately NOT returned to the pool: a buffer
+                    // that read non-zero is not zero, and the pool's
+                    // whole contract is that what comes out of it is
+                    // ready to be a fresh failure flag.
                     return Err(format!(
                         "kernel failure flag set (value={}): out-of-range index inside kernel body",
                         cell[0]
                     ));
                 }
+                flag_pool::give(*pool_key, buf);
                 Ok(None)
             }
             // Part E — scalar-return accumulator readback. The device
@@ -4136,6 +4991,11 @@ impl MarshalWriteback {
     /// `Scalar*` variants (no array body — just a 1-cell signal).
     pub fn array_len(&self) -> Option<usize> {
         match self {
+            // A chunked writeback covers the whole array; its length is
+            // the sum of the chunks, which by construction tile it.
+            Self::Chunked { chunks, .. } => {
+                Some(chunks.iter().map(|c| c.len).sum())
+            }
             Self::I32 { len, .. }
             | Self::I64 { len, .. }
             | Self::F32 { len, .. }
@@ -4154,19 +5014,29 @@ impl MarshalWriteback {
 }
 
 /// Phase 6 #3: detect a `craton.gpu.GpuArray` Java object and read
-/// its (element_type, length, host bytes, native handle) tuple from
-/// the resident-array store. Returns `None` for any non-GpuArray
-/// object so callers can fall through to other arg shapes.
+/// its (element_type, length, native handle) tuple from the
+/// resident-array store. Returns `None` for any non-GpuArray object so
+/// callers can fall through to other arg shapes.
+///
+/// **Shape only, deliberately.** This used to return the host bytes
+/// too, which meant every submit copied the whole array out of the
+/// resident store — including the overwhelmingly common case where the
+/// buffer was already on the device and the copy was thrown away
+/// unread. For a weight tensor that is resident for the life of the
+/// process (a language model's, say) that is the entire point of
+/// residency undone: gigabytes of `memcpy` per kernel launch. The bytes
+/// are now fetched by `marshal_resident_array_arg` on the cache-miss
+/// path only.
 ///
 /// The GpuArray Java layout (P3-2):
 ///   field 0: `long handle`
 ///   field 1: `Class<?> elementType`  (unused here; type comes from
 ///                                     the resident-store record)
 #[cfg(feature = "gpu-offload")]
-fn try_gpu_array_snapshot(
+fn try_gpu_array_shape(
     shared: &crate::vm::SharedVm,
     obj_ref: cratonvm_types::ObjectRef,
-) -> Option<(cratonvm_types::ArrayElementType, usize, Vec<u8>, u64)> {
+) -> Option<(cratonvm_types::ArrayElementType, usize, u64)> {
     let cid = shared.mem.heap.class_id_of(obj_ref);
     let cm = shared.classes.class_manager.read();
     let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
@@ -4179,8 +5049,20 @@ fn try_gpu_array_snapshot(
         cratonvm_types::Value::Long(h) => h as u64,
         _ => return None,
     };
-    let (etype, len, bytes) = cratonvm_native_builtins::craton_gpu::array_snapshot(handle)?;
-    Some((etype, len, bytes, handle))
+    let (etype, len) = cratonvm_native_builtins::craton_gpu::array_shape(handle)?;
+    Some((etype, len, handle))
+}
+
+/// Remember one declared parameter's array length, growing the vector
+/// as needed. Indexed by the analyzer's declared-parameter index — the
+/// same index `writes_param_mask` is bit-indexed by, and the one
+/// `WorkBound::ParamLen` names.
+#[cfg(feature = "gpu-offload")]
+fn record_param_len(param_lens: &mut Vec<Option<usize>>, index: usize, len: usize) {
+    if param_lens.len() <= index {
+        param_lens.resize(index + 1, None);
+    }
+    param_lens[index] = Some(len);
 }
 
 /// Marshal a resident GpuArray as a kernel arg. The shape of the
@@ -4188,12 +5070,14 @@ fn try_gpu_array_snapshot(
 /// source bytes are the resident-store snapshot rather than a JVM
 /// array — and the writeback target is the resident store (so a
 /// subsequent `GpuArray.toHost()` reads the post-kernel content).
+///
+/// The host bytes are read from the resident store only when the
+/// device cache misses; a hit never touches them.
 #[cfg(feature = "gpu-offload")]
 fn marshal_resident_array_arg(
     ctx: &cuda_bridge::DeviceContext,
     element_type: cratonvm_types::ArrayElementType,
     len: usize,
-    host_bytes: Vec<u8>,
     arr_handle: u64,
 ) -> Result<
     (
@@ -4215,7 +5099,13 @@ fn marshal_resident_array_arg(
             let arc = if let Some(arc) = $cache_get(arr_handle) {
                 arc
             } else {
-                // (b) Miss — upload and install.
+                // (b) Miss — read the host bytes (the only path that
+                // needs them at all), upload and install.
+                let host_bytes = cratonvm_native_builtins::craton_gpu::array_snapshot(arr_handle)
+                    .map(|(_, _, bytes)| bytes)
+                    .ok_or_else(|| {
+                        format!("GpuArray handle {arr_handle} released before its first upload")
+                    })?;
                 let host: &[$ty] = bytemuck::cast_slice(&host_bytes);
                 let buf = gpu_marshal::upload(ctx, host)
                     .map_err(|e| format!("upload {} (GpuArray, len={len}): {e}", $tag))?;

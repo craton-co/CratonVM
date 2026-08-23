@@ -173,6 +173,33 @@ pub enum MathIntrinsic {
     /// `Math.fma(double,double,double)` / `StrictMath.fma(double,double,double)`
     /// → `fma.rn.f64`.
     FmaF64,
+    /// `Float.float16ToFloat(short)` -> `cvt.f32.f16`.
+    ///
+    /// Not a `Math` method, and the only non-`Math` entry in the
+    /// table. It earns its place because half-precision weights are
+    /// the reason a large model fits in device memory at all, and
+    /// because the conversion is EXACT in this direction: every f16
+    /// value, including every denormal, NaN and infinity, is
+    /// representable in f32, so the hardware instruction and the
+    /// JDK method agree bit for bit with no rounding mode to choose.
+    Float16ToFloat,
+    /// `Math.exp(double)` -> `ex2.approx.f32` of `x * log2(e)`.
+    ///
+    /// **The one entry in this table that is not bit-exact with the
+    /// JDK**, and the only one gated behind an environment variable
+    /// (`CRATONVM_GPU_APPROX_MATH=1`) rather than being admitted
+    /// whenever the intrinsic hint is set. `ex2.approx.f32` carries
+    /// about 2 ULP; `Math.exp` promises 1 ULP and semi-monotonicity
+    /// in double precision. Every other transcendental stays
+    /// rejected, and this one is rejected too unless the variable is
+    /// set, so a kernel cannot acquire an approximate answer by
+    /// accident.
+    ///
+    /// It exists because a sigmoid is the one thing a transformer
+    /// feed-forward block needs that cannot be built from the exact
+    /// table, and moving just that step back to the host would put a
+    /// device round trip in the middle of every layer.
+    ExpF64,
 }
 
 /// Resolve a static-method callsite — `class_name` in internal form
@@ -207,11 +234,36 @@ pub enum MathIntrinsic {
 /// overload, but the point stands for any descriptor mismatch) —
 /// returns `None`. The match is exact on all three fields; there is no
 /// fuzzy/partial matching.
+/// Whether `CRATONVM_GPU_APPROX_MATH=1` is set, read once per process.
+///
+/// Off by default, and off is the state in which every admitted
+/// intrinsic is bit-exact with the JDK. Turning it on admits
+/// `Math.exp` and nothing else; see [`MathIntrinsic::ExpF64`].
+fn approx_math_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CRATONVM_GPU_APPROX_MATH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 pub(crate) fn resolve_math_intrinsic(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
 ) -> Option<MathIntrinsic> {
+    if class_name == "java/lang/Float" {
+        // `Float.floatToFloat16` is deliberately absent: the narrowing
+        // direction rounds, and PTX `cvt.rn.f16.f32` would have to be
+        // proven to match `Math.round`-to-nearest-even at every
+        // overflow and denormal boundary before it could be admitted.
+        // Widening has no such question.
+        return match (method_name, descriptor) {
+            ("float16ToFloat", "(S)F") => Some(MathIntrinsic::Float16ToFloat),
+            _ => None,
+        };
+    }
     if class_name != "java/lang/Math" && class_name != "java/lang/StrictMath" {
         return None;
     }
@@ -231,6 +283,7 @@ pub(crate) fn resolve_math_intrinsic(
         ("max", "(DD)D") => MathIntrinsic::MaxF64,
         ("fma", "(FFF)F") => MathIntrinsic::FmaF32,
         ("fma", "(DDD)D") => MathIntrinsic::FmaF64,
+        ("exp", "(D)D") if approx_math_enabled() => MathIntrinsic::ExpF64,
         _ => return None,
     })
 }
@@ -627,6 +680,13 @@ fn analyze_with_annotations_and_pool_impl(
         // mask precisely here. Leave `0` and let lowering fill it in
         // before `CompiledKernel` caches the signature.
         writes_param_mask: 0,
+        // Same story for the read mask, but the safe default is the
+        // OPPOSITE: an unpopulated `reads_param_mask` must read as "every
+        // param is read" so a chunked dispatch refuses rather than
+        // streams out early on an array the kernel might read. Lowering
+        // overwrites it with the precise set.
+        reads_param_mask: u64::MAX,
+        work_bound: crate::emitter::WorkBound::Unknown,
         // AUDIT 2026-05-24 (C31): propagate the dot-product reduction
         // flag so the lowering layer emits `atom.global.add.<suffix>`
         // instead of a racing plain `st.global.<suffix>` for the scalar

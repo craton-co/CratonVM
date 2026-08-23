@@ -104,6 +104,30 @@ pub fn configure_max_direct_memory(bytes: i64) {
     bits().max.store(clamped, Ordering::Relaxed);
 }
 
+/// Live direct buffers, and the bytes they hold — what
+/// `BufferPoolMXBean("direct")` reports as `getCount()` and `getMemoryUsed()`.
+///
+/// These are the SAME two counters `try_reserve`/`release` maintain for the
+/// soft cap, deliberately: a pool bean that counted separately would be a
+/// second answer to a question the allocator already answers, and the
+/// allocator's is the one that is true. `reserved` tracks LIVE memory (a block
+/// is unreserved the moment it is freed and re-reserved when it comes back out
+/// of the bucket pool), so both numbers fall when a buffer is released, exactly
+/// as HotSpot's do.
+///
+/// `getTotalCapacity()` and `getMemoryUsed()` are the same number here. On
+/// HotSpot they differ only by the page-alignment slop `Bits.reserveMemory`
+/// adds for a buffer whose capacity is not page-aligned; CratonVM reserves the
+/// logical size, so there is no slop to report and inventing one would be a
+/// fabricated number rather than a measured one.
+pub fn direct_buffer_pool_stats() -> (i64, i64) {
+    let b = bits();
+    (
+        b.count.load(Ordering::Relaxed).max(0),
+        b.reserved.load(Ordering::Acquire).max(0),
+    )
+}
+
 fn oom(message: impl Into<String>) -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
         message: message.into(),

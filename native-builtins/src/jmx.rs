@@ -2400,6 +2400,14 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 .and_then(|id| ctx.class_name_of_id(id))
                 .unwrap_or_default();
             let beans: Vec<ObjectRef> = match cls_name.as_str() {
+                // Three pools, in HotSpot's own order — see `BUFFER_POOL_NAMES`.
+                // Until 2026-08-22 this fell to the empty-list arm below, so
+                // `getPlatformMXBeans(BufferPoolMXBean.class)` answered a list
+                // with no "direct" pool in it and direct-buffer allocation was
+                // not observable from Java at all.
+                "java/lang/management/BufferPoolMXBean" => {
+                    crate::shared_secrets_bridge::alloc_all_buffer_pools(ctx)?
+                }
                 "java/lang/management/MemoryPoolMXBean" => vec![
                     alloc_memory_pool_impl(ctx, "Eden Space", true)?,
                     alloc_memory_pool_impl(ctx, "Old Gen", true)?,

@@ -115,6 +115,13 @@ fn lower_method_with_pool_impl(
     let mut emitter = Emitter::new(bytes, sig, cp);
     emitter.bind_param_locals()?;
 
+    // The launch grid is sized from this; `Unknown` means "largest
+    // array argument", the pre-existing behaviour. Only the single
+    // counted loop can name its own trip count — the 2-D flattening's
+    // is `R * C`, which is a product of two params rather than one
+    // length, and a straight-line kernel has no loop at all.
+    let mut work_bound = crate::emitter::WorkBound::Unknown;
+
     match shape {
         LoopShape::StraightLine => {
             // Single-thread kernel: every CUDA thread runs the body
@@ -150,13 +157,19 @@ fn lower_method_with_pool_impl(
                     emitter.stack_len()
                 )));
             }
-            // Emit guard.
+            // Emit guard. The same bound is what the host should size
+            // the grid from: the guard makes thread `t` handle iteration
+            // `t + K`, so `bound` threads always cover the loop (`K` of
+            // them redundantly, and `K` is 0 for every loop but the
+            // constant-start form).
             match bound {
                 BoundSource::ParamLen(idx) => {
+                    work_bound = crate::emitter::WorkBound::ParamLen(idx as u32);
                     let bound_reg = emitter.materialise_param_len(idx);
                     emitter.emit_loop_guard(&bound_reg, &li);
                 }
                 BoundSource::Literal(v) => {
+                    work_bound = crate::emitter::WorkBound::Literal(v);
                     let bound_reg = emitter.materialise_literal_s32(v);
                     emitter.emit_loop_guard(&bound_reg, &li);
                 }
@@ -215,6 +228,7 @@ fn lower_method_with_pool_impl(
     // D→H copy for read-only array inputs (closing the residual
     // perf gap to TornadoVM left by the Phase 10 #1 residency cache).
     let writes_param_mask = emitter.writes_param_mask;
+    let reads_param_mask = emitter.reads_param_mask;
 
     let reg_decls = emitter.emit_reg_decls();
     let body = emitter.into_body();
@@ -230,6 +244,8 @@ fn lower_method_with_pool_impl(
         sm_minor,
         kernels: vec![kernel],
         writes_param_mask,
+        reads_param_mask,
+        work_bound,
     })
 }
 
@@ -321,6 +337,22 @@ pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
     out.push(PtxParam {
         name: "failure_flag".to_string(),
         kind: PtxParamKind::U64Ptr,
+    });
+    // The index of the first element this launch is responsible for.
+    //
+    // A whole-array launch passes 0 and nothing changes. A CHUNKED launch
+    // passes the chunk's base, so one kernel can be launched several times
+    // over disjoint slices of the same iteration space while each thread
+    // still computes its GLOBAL index. That is what lets the writeback of
+    // one chunk overlap with the kernel of the next; without it every
+    // launch would start its index space at zero, because CUDA has no
+    // launch offset of its own.
+    //
+    // Costs one `ld.param` and one `add.s32` in the prologue, per thread,
+    // whether or not chunking is in use.
+    out.push(PtxParam {
+        name: "tid_base".to_string(),
+        kind: PtxParamKind::S32,
     });
     out
 }
@@ -416,6 +448,12 @@ impl<'a> Emitter<'a> {
                 count: self.regs.pred_count,
             });
         }
+        if self.regs.b16_count > 0 {
+            out.push(RegDecl {
+                kind: RegKind::B16,
+                count: self.regs.b16_count,
+            });
+        }
         out
     }
 }
@@ -441,12 +479,15 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
+            work_bound: crate::emitter::WorkBound::Unknown,
             is_reduction: false,
             allow_div_by_zero: false,
         };
         let params = build_param_list(&sig);
-        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag) = 7
-        assert_eq!(params.len(), 7);
+        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag,
+        //  tid_base) = 8
+        assert_eq!(params.len(), 8);
         assert_eq!(params[0].name, "p0_ptr");
         assert_eq!(params[1].name, "p0_len");
         assert_eq!(params[2].name, "p1_ptr");
@@ -454,6 +495,7 @@ mod tests {
         assert_eq!(params[4].name, "ret_ptr");
         assert_eq!(params[5].name, "ret_len");
         assert_eq!(params[6].name, "failure_flag");
+        assert_eq!(params[7].name, "tid_base");
     }
 
     #[test]
@@ -465,14 +507,17 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
+            work_bound: crate::emitter::WorkBound::Unknown,
             is_reduction: false,
             allow_div_by_zero: false,
         };
         let params = build_param_list(&sig);
-        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag) = 6
-        assert_eq!(params.len(), 6);
+        // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag, tid_base) = 7
+        assert_eq!(params.len(), 7);
         assert_eq!(params[4].name, "ret_ptr");
         assert_eq!(params[5].name, "failure_flag");
+        assert_eq!(params[6].name, "tid_base");
     }
 
     fn lower_i32_remainder_body(allow_div_by_zero: bool) -> String {
@@ -484,6 +529,8 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
+            work_bound: crate::emitter::WorkBound::Unknown,
             is_reduction: false,
             allow_div_by_zero,
         };
@@ -534,6 +581,8 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
+            work_bound: crate::emitter::WorkBound::Unknown,
             is_reduction: false,
             allow_div_by_zero,
         };
@@ -558,6 +607,8 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
+            work_bound: crate::emitter::WorkBound::Unknown,
             is_reduction: false,
             allow_div_by_zero,
         };
@@ -713,6 +764,8 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
+            work_bound: crate::emitter::WorkBound::Unknown,
             is_reduction: false,
             allow_div_by_zero: false,
         };
@@ -952,6 +1005,55 @@ mod tests {
         assert!(text.contains("L_bounds_fail:"));
     }
 
+    /// `reads_param_mask` must name exactly the params read element-wise.
+    ///
+    /// The chunked writeback commits a chunk into the Java array as its
+    /// event fires — before the bounds-failure flag has been read — so it
+    /// may only do that for an array the kernel does NOT also read. This
+    /// pins the two directions on one kernel: `saxpy(a, x[], y[], out[])`
+    /// reads x and y, writes out, and never reads out.
+    #[test]
+    fn reads_param_mask_names_only_the_arrays_read() {
+        let m = lower_fixture("EligibleSaxpy", "saxpy", "(F[F[F[F)V");
+        // Params: 0 = float a (scalar), 1 = x[], 2 = y[], 3 = out[].
+        let reads = m.reads_param_mask;
+        let writes = m.writes_param_mask;
+        assert_eq!(reads & 1, 0, "a scalar param is never an element read");
+        assert_ne!(reads & (1 << 1), 0, "x[] is read:\nreads={reads:#b}");
+        assert_ne!(reads & (1 << 2), 0, "y[] is read:\nreads={reads:#b}");
+        assert_eq!(
+            reads & (1 << 3),
+            0,
+            "out[] is written but never read; marking it read would refuse \
+             a chunked writeback that is in fact safe\nreads={reads:#b}"
+        );
+        assert_ne!(writes & (1 << 3), 0, "out[] is written:\nwrites={writes:#b}");
+        // The set a chunked dispatch may stream out early.
+        assert_eq!(
+            writes & !reads,
+            1 << 3,
+            "only out[] should be eligible for early commit\n\
+             writes={writes:#b} reads={reads:#b}"
+        );
+    }
+
+    /// An array that is READ AND WRITTEN must not be eligible for early
+    /// commit — `out[i] = out[i] + 1` is the shape that would break.
+    #[test]
+    fn an_array_read_and_written_is_refused_for_early_commit() {
+        let m = lower_fixture("EligibleReadModifyWrite", "bump", "([I)V");
+        let reads = m.reads_param_mask;
+        let writes = m.writes_param_mask;
+        assert_ne!(reads & 1, 0, "a[] is read:\nreads={reads:#b}");
+        assert_ne!(writes & 1, 0, "a[] is written:\nwrites={writes:#b}");
+        assert_eq!(
+            writes & !reads,
+            0,
+            "a read-modify-write array must not be streamed out before the \
+             failure flag is known\nwrites={writes:#b} reads={reads:#b}"
+        );
+    }
+
     /// Every float arithmetic instruction must carry an explicit
     /// rounding modifier.
     ///
@@ -1180,6 +1282,20 @@ mod tests {
         not(feature = "gpu-it"),
         ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
     )]
+    fn ptxas_round_trip_row_reduction() {
+        let m = lower_fixture("EligibleRowReduction", "matmul", "([F[F[F)V");
+        ptxas_round_trip(&m.render(), "row_reduction_matmul");
+        let m = lower_fixture("EligibleRowReduction", "rowSums", "([I[I[I)V");
+        ptxas_round_trip(&m.render(), "row_reduction_row_sums");
+        let m = lower_fixture("EligibleNestedLoop", "trailingCode", "([I[I[I)V");
+        ptxas_round_trip(&m.render(), "outer_parallel_trailing_code");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
     fn ptxas_round_trip_branching_loops() {
         let m = lower_fixture("EligibleBranchingLoop", "absOrIncrement", "([I[I)V");
         ptxas_round_trip(&m.render(), "branching_loop_merge");
@@ -1376,18 +1492,22 @@ mod tests {
         let text = m.render();
         assert!(text.contains(".visible .entry NonCanonicalLoops__start5Loop_"));
         // The tid+K fold: an `add.s32` with immediate 5 feeding a fresh
-        // register, right after `emit_tid`'s `mov.b32` reinterpret and
-        // before anything else touches the induction register.
-        assert!(
-            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 5;"),
-            "expected the tid+K fold immediately after tid computation:\n{text}"
-        );
-        // The loop guard must use the folded register (%r1), not the
-        // raw tid (%r0).
+        // register. Register numbers are not asserted — the `tid_base`
+        // add for chunked launches sits between the reinterpret and this
+        // fold and shifts them — so find the fold and then check the guard
+        // uses ITS destination.
+        let folded = text
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with("add.s32") && l.ends_with(", 5;"))
+            .and_then(|l| l.split_whitespace().nth(1).map(|r| r.trim_end_matches(',')))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("expected the tid+K fold:\n{text}"));
+        // The loop guard must use the folded register, not the raw tid.
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains("%r1,")
+                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
@@ -1612,22 +1732,33 @@ mod tests {
     }
 
     #[test]
-    fn nested_loop_with_trailing_outer_code_is_rejected() {
+    fn nested_loop_with_trailing_outer_code_lowers_as_outer_parallel() {
         // The outer body is `{ inner loop; out[i] = i; }` — more than
-        // just the inner loop. The 2-D lowering never walks that
-        // trailing statement, so it must reject rather than drop it.
-        let method = load_method("EligibleNestedLoop", "trailingCode", "([I[I[I)V");
-        let sig = match analyze(&method) {
-            OffloadVerdict::Eligible(s) => s,
-            v => panic!("expected trailingCode to be analyzer-eligible, got {v:?}"),
-        };
-        let err = lower_method("EligibleNestedLoop", &method, &sig, 7, 5)
-            .expect_err("nested loop with trailing outer-body code must not lower");
-        let msg = format!("{err}");
+        // just the inner loop, so the 2-D flattening (which never walks
+        // that trailing statement) still refuses it. It is now picked up
+        // by the outer-parallel classifier instead: one thread per `i`,
+        // with the `j` loop emitted as a real per-thread PTX loop, and
+        // the trailing store lowered like any other body code.
+        //
+        // Before the outer-parallel path existed this method was a
+        // rejection; the reason it was rejected — "the 2-D lowering
+        // drops the trailing code" — is exactly what the sequential
+        // inner loop does not do.
+        let m = lower_fixture("EligibleNestedLoop", "trailingCode", "([I[I[I)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleNestedLoop__trailingCode_"));
+        // Not the flattened 2-D mapping: no `i = tid / C`, `j = tid % C`.
         assert!(
-            msg.contains("non-canonical nested loop") || msg.contains("multi-loop"),
-            "expected a non-canonical-nesting rejection, got: {msg}"
+            !text.contains("rem.s32"),
+            "outer-parallel lowering must not decompose a flattened index:\n{text}"
         );
+        // A real inner loop: some label is the target of a backward
+        // branch, and the trailing `out[i] = i` store survives.
+        assert!(
+            text.contains("bra L_body_"),
+            "expected an inner-loop back-edge:\n{text}"
+        );
+        assert!(text.matches("st.global.s32").count() >= 2, "{text}");
     }
 
     #[test]
@@ -1651,6 +1782,235 @@ mod tests {
         );
     }
 
+    // ───── Outer-parallel loops with a sequential inner loop ─────────
+    //
+    // `EligibleRowReduction.java` is the fixture for the shape a 2-D
+    // flattening cannot express: `out[i] = sum_j w[i*n + j] * x[j]`.
+    // The accumulator is loop-carried, so the `j` iterations must run in
+    // order on ONE thread while `i` is still the parallel dimension.
+    // `loop_recog::classify_outer_parallel_loop` recognizes it and
+    // `Emitter::walk_cfg` lowers the interior back-edge as a real PTX
+    // loop, with the inner header's canonical registers as its phis.
+
+    #[test]
+    fn row_reduction_lowers_with_a_sequential_inner_loop() {
+        let m = lower_fixture("EligibleRowReduction", "matmul", "([F[F[F)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleRowReduction__matmul_"));
+        // The inner loop header (`javap` pc 23) carries a label and is
+        // the target of a backward branch — a real loop, not unrolled
+        // and not flattened.
+        assert!(text.contains("L_body_23:"), "{text}");
+        assert!(text.contains("bra L_body_23;"), "{text}");
+        // One thread per output row: no flattened-index decomposition.
+        assert!(!text.contains("rem.s32"), "{text}");
+        // The accumulator is an f32 phi: the back-edge writes the
+        // register the header reads.
+        assert!(text.contains("add.rn.f32"), "{text}");
+        assert!(text.contains("mul.rn.f32"), "{text}");
+        assert!(text.contains("st.global.f32"), "{text}");
+        // Every array access inside the sequential loop keeps its bounds
+        // check — the deopt contract does not weaken inside a body loop.
+        assert!(text.contains("L_bounds_fail:"), "{text}");
+    }
+
+    /// Every kernel of the GPULlama3 inference path, lowered and run
+    /// through `ptxas`. The application copy lives outside this repo
+    /// (`apps/` is not tracked), so this fixture is its twin: a
+    /// rejection here is a rejection there, found in a second instead
+    /// of after a model load.
+    #[test]
+    fn llama_kernels_all_lower() {
+        let hint = crate::annotations::AdmissionHint::AllowIntrinsicCalls;
+        let cases: &[(&str, &str)] = &[
+            ("transposeF16", "([III[I)V"),
+            ("matmulSplit", "([I[FI[F)V"),
+            ("reducePartials", "([FI[F)V"),
+            ("embedT", "([III[F)V"),
+            ("rmsScale", "([FF[F)V"),
+            ("rmsApply", "([F[F[F[F)V"),
+            ("rope", "([F[F[FII[F)V"),
+            ("copyTo", "([FI[F)V"),
+            ("attScores", "([F[FIIIIIF[F)V"),
+            ("attWeighted", "([F[FIIIII[F)V"),
+            ("addInto", "([F[F)V"),
+            // `softmaxRows` and `siluMul` are deliberately absent: both
+            // call `Math.exp`, which is admitted only under
+            // CRATONVM_GPU_APPROX_MATH=1. Reading that variable here
+            // would make the test depend on the environment it happens
+            // to run in; `llama_exp_kernels_need_the_approx_switch`
+            // asserts the gate itself instead.
+        ];
+        for (name, descriptor) in cases {
+            let m = lower_fixture_with_pool_and_hint(
+                "EligibleLlamaKernels",
+                name,
+                descriptor,
+                hint,
+            );
+            let text = m.render();
+            assert!(
+                text.contains(&format!(".visible .entry EligibleLlamaKernels__{name}_")),
+                "{name} did not lower to a named entry:
+{text}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_llama_kernels() {
+        let hint = crate::annotations::AdmissionHint::AllowIntrinsicCalls;
+        let cases: &[(&str, &str)] = &[
+            ("transposeF16", "([III[I)V"),
+            ("matmulSplit", "([I[FI[F)V"),
+            ("reducePartials", "([FI[F)V"),
+            ("embedT", "([III[F)V"),
+            ("rmsScale", "([FF[F)V"),
+            ("rmsApply", "([F[F[F[F)V"),
+            ("rope", "([F[F[FII[F)V"),
+            ("copyTo", "([FI[F)V"),
+            ("attScores", "([F[FIIIIIF[F)V"),
+            ("attWeighted", "([F[FIIIII[F)V"),
+            ("addInto", "([F[F)V"),
+            // `softmaxRows` and `siluMul` are deliberately absent: both
+            // call `Math.exp`, which is admitted only under
+            // CRATONVM_GPU_APPROX_MATH=1. Reading that variable here
+            // would make the test depend on the environment it happens
+            // to run in; `llama_exp_kernels_need_the_approx_switch`
+            // asserts the gate itself instead.
+        ];
+        for (name, descriptor) in cases {
+            let m = lower_fixture_with_pool_and_hint(
+                "EligibleLlamaKernels",
+                name,
+                descriptor,
+                hint,
+            );
+            ptxas_round_trip(&m.render(), &format!("llama_{name}"));
+        }
+    }
+
+    /// The two kernels that need `Math.exp` are refused unless the
+    /// approximation is explicitly switched on, and admitted when it
+    /// is. Which side this test asserts depends on the environment it
+    /// runs in, so it asserts BOTH sides of the gate against whichever
+    /// state that is — the property under test is the gate, not the
+    /// setting.
+    #[test]
+    fn llama_exp_kernels_follow_the_approx_switch() {
+        let on = std::env::var("CRATONVM_GPU_APPROX_MATH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let hint = crate::annotations::AdmissionHint::AllowIntrinsicCalls;
+        for (name, descriptor) in [
+            ("softmaxRows", "([FII[F)V"),
+            ("siluMul", "([F[F[F)V"),
+        ] {
+            let (method, cp) = crate::analyzer::load_method_with_pool(
+                "EligibleLlamaKernels",
+                name,
+                descriptor,
+            );
+            let annotations = crate::annotations::MethodAnnotations {
+                gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
+                    admit: hint,
+                    ..crate::annotations::GpuKernelAttrs::default()
+                }),
+                ..crate::annotations::MethodAnnotations::default()
+            };
+            let verdict =
+                crate::analyzer::analyze_with_annotations_and_pool(&method, &annotations, &cp);
+            match (on, &verdict) {
+                (true, OffloadVerdict::Eligible(_)) => {}
+                (false, OffloadVerdict::Rejected(crate::analyzer::Reason::Invoke)) => {}
+                _ => panic!(
+                    "{name}: approx_math={on} but the analyzer said {verdict:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn split_matmul_lowers_both_halves() {
+        // The two kernels a decode step actually needs at scale: a
+        // split-K matrix-vector product (one thread per (row, chunk)
+        // pair, so the launch is `chunks` times wider than the row
+        // count) and the per-row reduction of its partials. Both have a
+        // sequential inner loop; the first also divides by a RUNTIME
+        // scalar in both the pre-loop and the body, so it carries two
+        // divisor-zero guards on top of the bounds checks.
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleSplitMatmul",
+            "matmulColSplit",
+            "([I[FI[F)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleSplitMatmul__matmulColSplit_"), "{text}");
+        assert!(text.contains("cvt.f32.f16"), "{text}");
+        assert!(text.contains("bra L_body_"), "{text}");
+
+        let m = lower_fixture("EligibleSplitMatmul", "reducePartials", "([FI[F)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleSplitMatmul__reducePartials_"), "{text}");
+        assert!(text.contains("add.rn.f32"), "{text}");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_split_matmul() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleSplitMatmul",
+            "matmulColSplit",
+            "([I[FI[F)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        ptxas_round_trip(&m.render(), "split_matmul_col_split");
+        let m = lower_fixture("EligibleSplitMatmul", "reducePartials", "([FI[F)V");
+        ptxas_round_trip(&m.render(), "split_matmul_reduce");
+    }
+
+    #[test]
+    fn row_reduction_with_int_accumulator_lowers() {
+        let m = lower_fixture("EligibleRowReduction", "rowSums", "([I[I[I)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleRowReduction__rowSums_"));
+        assert!(text.contains("bra L_body_"), "{text}");
+        assert!(text.contains("add.s32"), "{text}");
+        assert!(text.contains("st.global.s32"), "{text}");
+    }
+
+    #[test]
+    fn outer_parallel_recognizer_reports_the_outer_loop() {
+        // White-box: two back-edges, and the classifier returns the
+        // OUTER one as a plain `Counted` loop. The inner edge is left
+        // for `walk_cfg` — it is ordinary control flow from here on.
+        let method = load_method("EligibleRowReduction", "matmul", "([F[F[F)V");
+        let code = method.code().expect("matmul has a Code attribute");
+        let shape = super::loop_recog::detect_loop(&code.code, None)
+            .expect("outer-parallel loop must be recognized");
+        match shape {
+            super::loop_recog::LoopShape::Counted(li) => {
+                assert_eq!(li.exit_op, 0xA2);
+                assert_eq!(li.iv_stride, 1);
+                assert_eq!(li.iv_start, 0);
+                // The OUTER loop (`javap`: header 10, back-branch 63),
+                // not the inner one at 23/51.
+                assert_eq!(li.header_pc, 10);
+                assert_eq!(li.back_branch_pc, 63);
+            }
+            other => panic!("expected the outer Counted loop, got {other:?}"),
+        }
+    }
+
+
     // ─── AUDIT 2026-07-11 (constant-start offset): EligibleOffsetLoop ─
     //
     // `EligibleOffsetLoop.java` is the dedicated end-to-end fixture for
@@ -1669,19 +2029,22 @@ mod tests {
         let text = m.render();
         assert!(text.contains(".visible .entry EligibleOffsetLoop__offsetLoop_"));
         // The tid+K fold: an `add.s32` with immediate 4 feeding a fresh
-        // register, right after `emit_tid`'s `mov.b32` reinterpret —
-        // deterministic because both params are arrays (`bind_param_locals`
-        // only touches the U64 pool before `emit_tid` runs), so the tid
-        // register is always %r0 and the folded register is always %r1.
-        assert!(
-            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 4;"),
-            "expected the tid+K fold immediately after tid computation:\n{text}"
-        );
+        // register. It no longer sits immediately after `emit_tid`'s
+        // `mov.b32` reinterpret — the `tid_base` add that makes chunked
+        // launches possible comes between — so this matches the fold
+        // itself rather than its adjacency to the reinterpret.
+        let folded = text
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with("add.s32") && l.ends_with(", 4;"))
+            .and_then(|l| l.split_whitespace().nth(1).map(|r| r.trim_end_matches(',')))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("expected the tid+K fold:\n{text}"));
         // The loop guard must compare the folded register, not raw tid.
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains("%r1,")
+                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
@@ -1726,7 +2089,10 @@ mod tests {
         // constant-pool `Integer` entry rather than merely refusing to
         // reject the loop.
         assert!(
-            text.contains("mov.b32 %r0, %ru3;\n    add.s32 %r1, %r0, 40000;"),
+            text.lines().any(|l| {
+                let l = l.trim_start();
+                l.starts_with("add.s32") && l.ends_with(", 40000;")
+            }),
             "expected the tid+K fold with the ldc-resolved start value:\n{text}"
         );
     }
@@ -2112,6 +2478,48 @@ mod tests {
     // annotation classpath being built in the sandbox).
 
     #[test]
+    fn half_precision_matmul_lowers_to_cvt_f32_f16() {
+        // `Float.float16ToFloat` inside a sequential inner loop: the
+        // two features that let a half-precision weight tensor stay on
+        // the device and still be read at full width in the kernel.
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleHalfPrecisionMatmul",
+            "matmul",
+            "([I[F[F)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        let text = m.render();
+        assert!(text.contains(".visible .entry EligibleHalfPrecisionMatmul__matmul_"));
+        // Two lanes per packed word, so two conversions per iteration.
+        assert_eq!(
+            text.matches("cvt.f32.f16").count(),
+            2,
+            "one conversion per packed half:\n{text}"
+        );
+        // The `.b16` scratch register must be declared, or ptxas
+        // rejects the module.
+        assert!(text.contains(".reg .b16 %rs<"), "{text}");
+        // A real inner loop, and the outer loop still parallelised.
+        assert!(text.contains("bra L_body_"), "{text}");
+        assert!(!text.contains("rem.s32"), "{text}");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_half_precision_matmul() {
+        let m = lower_fixture_with_pool_and_hint(
+            "EligibleHalfPrecisionMatmul",
+            "matmul",
+            "([I[F[F)V",
+            crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+        );
+        ptxas_round_trip(&m.render(), "half_precision_matmul");
+    }
+
+    #[test]
     fn sqrt_abs_fma_lowers_to_exact_ptx() {
         let m = lower_fixture_with_pool_and_hint(
             "EligibleMathKernel",
@@ -2371,6 +2779,8 @@ mod tests {
             needs_d2h_sync: false,
             this_field_cps: vec![],
             writes_param_mask: 0,
+            reads_param_mask: 0,
+            work_bound: crate::emitter::WorkBound::Unknown,
             is_reduction: false,
             allow_div_by_zero: false,
         };

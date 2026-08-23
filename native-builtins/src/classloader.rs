@@ -7738,14 +7738,56 @@ pub(crate) fn loader_owns_complete_resource_view(
 ///
 /// Resolution order, deliberately failing back to the historical global answer
 /// whenever the receiver's own view is not knowable:
-/// 1. built-in loaders (bootstrap/platform/application) — they ARE the global
-///    classpath, so the global probe is the right one;
+/// 1. built-in loaders — see [`builtin_loader_segment`]. The APPLICATION and
+///    PLATFORM loaders are probed against their OWN class-path segment, not the
+///    concatenation; every other built-in (the boot loader) keeps the global
+///    probe, because the boot loader genuinely does define the boot packages;
 /// 2. a loader with its own recorded URLs — probe exactly those (already
 ///    pathing-jar aware via [`loader_local_resource_urls`]);
 /// 3. a loader with a positively-recorded but EMPTY URL set — nothing is
 ///    visible, matching HotSpot;
 /// 4. anything else (a custom loader we have no URL view of) — global probe,
 ///    i.e. unchanged from before this function existed.
+/// Is this one of the loaders the VM itself creates (bootstrap / platform /
+/// application), as opposed to a user-defined one?
+///
+/// **This is an identity test, not a claim about visibility.** Being built-in
+/// does NOT mean the loader can see the whole process classpath — that reading
+/// is exactly the bug `aa09d8bd8` fixed below, where the application loader
+/// fabricated a `Package` for `java.lang`. Callers that want visibility must go
+/// through [`package_class_files_visible_to_loader`], which segments it.
+///
+/// The one caller outside this module is `getDefinedPackage`'s DEFAULT-package
+/// arm: a built-in loader that loaded a class from the classpath root has
+/// defined the default package, and a user-defined loader has not.
+pub(crate) fn loader_is_builtin(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(loader))
+        .is_some_and(|n| {
+            n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$")
+        })
+}
+
+///
+/// # 2026-08-22: step 1 used to be "built-in loaders ARE the global classpath"
+///
+/// It is not true of the application loader, and `RLangPackages` failed its
+/// FIRST check on it (`WORKER-5-NOTE-8`), in BOTH modes:
+///
+/// ```text
+///   appLoader.getDefinedPackage("java.lang")   HotSpot null   CratonVM java.lang
+///   appLoader.getDefinedPackage("java.util")   HotSpot null   CratonVM java.util
+///   platform .getDefinedPackage("java.lang")   HotSpot null   CratonVM java.lang
+///   appLoader.getDefinedPackage("no.such")     HotSpot null   CratonVM null
+/// ```
+///
+/// `java.lang` is defined by the BOOT loader. The global probe concatenates
+/// bootstrap + extension + application, so the application loader found the
+/// boot image's `java/lang/*.class` and fabricated a `Package` — the same
+/// loader-identity error this function was written to fix for URLClassLoader,
+/// left in place for the built-ins by the very branch that skipped them.
+///
+/// The `loader == None` arm above is untouched on purpose: it IS the boot
+/// loader, and answering `true` for `java.lang` there is correct.
 pub(crate) fn package_class_files_visible_to_loader(
     ctx: &mut dyn NativeContext,
     loader: Option<ObjectRef>,
@@ -7754,13 +7796,16 @@ pub(crate) fn package_class_files_visible_to_loader(
     let Some(loader) = loader else {
         return !ctx.find_all_resource_urls(class_glob).is_empty();
     };
-    let is_builtin = ctx
-        .class_name_of_id(ctx.class_id_of_object(loader))
-        .is_some_and(|n| {
-            n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$")
-        });
-    if is_builtin {
-        return !ctx.find_all_resource_urls(class_glob).is_empty();
+    let loader_class = ctx.class_name_of_id(ctx.class_id_of_object(loader));
+    if loader_is_builtin(ctx, loader) {
+        return match builtin_loader_segment(loader_class.as_deref()) {
+            Some(segment) => !ctx
+                .find_resource_urls_in_segment(class_glob, segment)
+                .is_empty(),
+            // The boot loader, or a built-in shape this VM does not recognise:
+            // the historical global probe, unchanged.
+            None => !ctx.find_all_resource_urls(class_glob).is_empty(),
+        };
     }
     if !loader_local_resource_urls(ctx, loader, class_glob).is_empty() {
         return true;
@@ -7769,6 +7814,35 @@ pub(crate) fn package_class_files_visible_to_loader(
         return false;
     }
     !ctx.find_all_resource_urls(class_glob).is_empty()
+}
+
+/// Which class-path segment a built-in loader OWNS, or `None` for the boot
+/// loader (and any built-in shape not listed here).
+///
+/// Segment numbering is `ClassManager::find_resource_urls_in_segment`'s, which
+/// is in turn `next_resource_url_from`'s: 0 bootstrap, 1 extension, 2
+/// application.
+///
+/// `None` is the SAFE answer, not a gap: it selects the historical global
+/// probe, so an unrecognised built-in behaves exactly as it did before this
+/// function existed. Only the two loaders we can name positively are narrowed.
+fn builtin_loader_segment(loader_class: Option<&str>) -> Option<u8> {
+    match loader_class? {
+        // The application loader owns `-cp` and nothing else.
+        "jdk/internal/loader/ClassLoaders$AppClassLoader"
+        | "sun/misc/Launcher$AppClassLoader" => Some(2),
+        // The platform loader owns the extension segment. NOTE: this VM does
+        // not model the JDK's platform MODULE set, so a genuinely
+        // platform-defined package (`java.sql`) answers `null` here where
+        // HotSpot answers non-null. That is a KNOWN residual, recorded in
+        // `WORKER-5-NOTE-8`: it trades a fabricated `Package` for a missing
+        // one, in the direction `getDefinedPackage`'s contract prefers, and no
+        // corpus vector asks the question. Modelling the module set is the
+        // real fix and is a much larger job.
+        "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
+        | "sun/misc/Launcher$ExtClassLoader" => Some(1),
+        _ => None,
+    }
 }
 
 fn loader_local_resource_urls(

@@ -862,6 +862,37 @@ pub trait NativeClassAccess {
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
 
+    /// Does the VM's `checkcast`/`instanceof` admit an instance of `class_id`
+    /// as a `target_class_name` on a relationship that is **declared** rather
+    /// than present in the loaded class hierarchy?
+    ///
+    /// This is the reflection door onto the interpreter's
+    /// `typecheck::synthetic_implements` — the table that says a
+    /// `cratonvm/internal/SystemLogger` is a `System.Logger` and a
+    /// `cratonvm/internal/foreign/MemorySegmentImpl` is both a `MemorySegment`
+    /// and an `AbstractMemorySegmentImpl`. Those classes are concrete stand-ins
+    /// the VM mints itself, so the relationship exists nowhere a hierarchy walk
+    /// can find it.
+    ///
+    /// It exists for the same reason [`aastore_element_assignable`] does: the
+    /// rule was already written once, for the bytecode, and reflection asking a
+    /// SECOND, narrower question is how the two doors come to disagree about
+    /// one object. Measured, before this: `probes/FfmVectorSegmentProbe.java`'s
+    /// IDENTITY section reported `abstractBase=false` for a segment that a
+    /// `checkcast jdk/internal/foreign/AbstractMemorySegmentImpl` three frames
+    /// away had just admitted.
+    ///
+    /// `false` by default: a host with no interpreter behind it (the test
+    /// mocks) has no table to consult, and failing closed leaves the caller's
+    /// own hierarchy checks as the only answer — which is what it had before
+    /// this method existed.
+    ///
+    /// [`aastore_element_assignable`]: Self::aastore_element_assignable
+    fn synthetic_implements_declared(&self, class_id: ClassId, target_class_name: &str) -> bool {
+        let _ = (class_id, target_class_name);
+        false
+    }
+
     /// Get the superclass ClassId. Returns None for java/lang/Object.
     fn superclass_of(&self, class_id: ClassId) -> Option<ClassId>;
 
@@ -1413,6 +1444,20 @@ pub trait NativeClassAccess {
     ) -> Option<(String, u32, u32)> {
         let _ = (name, segment, index);
         None
+    }
+
+    /// [`Self::find_all_resource_urls`] restricted to ONE class-path segment:
+    /// 0 bootstrap, 1 extension, 2 application — the numbering
+    /// [`Self::next_resource_url`] already uses.
+    ///
+    /// Exists for `ClassLoader.getDefinedPackage`, which does NOT delegate: the
+    /// application loader must answer `null` for `java.lang`, which lives on
+    /// segment 0. The default falls back to the unsegmented probe so that an
+    /// implementation which has not overridden it behaves exactly as before
+    /// rather than silently reporting "nothing is visible".
+    fn find_resource_urls_in_segment(&self, name: &str, segment: u8) -> Vec<String> {
+        let _ = segment;
+        self.find_all_resource_urls(name)
     }
 
     /// `true` when [`Self::next_resource_url`] can serve `name` — i.e. the
@@ -6042,6 +6087,24 @@ pub struct NativeMethodRegistry {
     /// and a discriminant compare at the top of `register()`; nothing in
     /// dispatch reads it.
     compatibility_mode: CompatibilityMode,
+    /// Is a REAL JDK class library in use (`--java-home`) rather than the
+    /// synthetic one?
+    ///
+    /// Distinct from [`CompatibilityMode`], which is the strict-vs-compatible
+    /// policy — a run can be `Compatible` on either class library. Registrars
+    /// consult this to skip a native whose only job is to stand in for a class
+    /// the synthetic library fakes. See `native-collections`'
+    /// `CompletableFuture` dependent-stage block: over a real JDK those
+    /// natives detect the real object and delegate straight back to the method
+    /// they shadow, so registering them buys a native dispatch and a by-name
+    /// `invoke_special` and nothing else.
+    ///
+    /// Set **once at VM init, before the `register_*` population pass**, for
+    /// the same reason [`Self::set_compatibility_mode`] must be: it gates
+    /// registration, so flipping it later leaves whatever was already accepted
+    /// in place. Defaults to `false`, so a registry nobody configures behaves
+    /// exactly as it did before this field existed.
+    real_jdk: bool,
     /// Registrations refused by the `JdkOnly` arm of `register()`, in
     /// registration order. Empty in `Compatible` mode. This is the wave-1
     /// deliverable: §10 is "measurement, not deletion" everywhere except class
@@ -6181,6 +6244,7 @@ impl NativeMethodRegistry {
             // behaviour byte-for-byte (§1, "--real-jdk (default) keeps today's
             // behaviour exactly").
             compatibility_mode: CompatibilityMode::Compatible,
+            real_jdk: false,
             refused: Vec::new(),
             drop_real_layout_synthetic: false,
             // PERF: deferred native-ring name index. Sized like the other boot
@@ -6293,6 +6357,20 @@ impl NativeMethodRegistry {
     #[inline]
     pub fn compatibility_mode(&self) -> CompatibilityMode {
         self.compatibility_mode
+    }
+
+    /// Declare that this registry is being populated for a REAL JDK class
+    /// library. See [`Self::real_jdk`]; call once, before the `register_*`
+    /// pass.
+    pub fn set_real_jdk(&mut self, real_jdk: bool) {
+        self.real_jdk = real_jdk;
+    }
+
+    /// Is a real JDK class library in use? Read by registrars deciding whether
+    /// a synthetic-library stand-in is worth registering at all.
+    #[inline]
+    pub fn real_jdk(&self) -> bool {
+        self.real_jdk
     }
 
     /// Registrations refused because of `JdkOnly`, in registration order.

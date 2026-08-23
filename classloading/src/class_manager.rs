@@ -7273,6 +7273,27 @@ impl ClassManager {
         out
     }
 
+    /// [`Self::find_all_resource_urls`] restricted to ONE class-path segment.
+    ///
+    /// `segment` uses the same numbering [`Self::next_resource_url_from`]
+    /// already documents — 0 bootstrap, 1 extension, 2 application — so the
+    /// three segments concatenated in that order reproduce
+    /// `find_all_resource_urls` exactly. Any other value yields nothing.
+    ///
+    /// Added for `ClassLoader.getDefinedPackage`, which is NON-DELEGATING: the
+    /// application loader must not answer for `java.lang` merely because the
+    /// boot image on segment 0 contains it. Before this existed the only probe
+    /// available was the concatenation, so every built-in loader claimed every
+    /// package in the process.
+    pub fn find_resource_urls_in_segment(&self, name: &str, segment: usize) -> Vec<String> {
+        match segment {
+            0 => self.bootstrap.class_path().find_all_resource_urls(name),
+            1 => self.extension.class_path().find_all_resource_urls(name),
+            2 => self.application.class_path().find_all_resource_urls(name),
+            _ => Vec::new(),
+        }
+    }
+
     /// `true` when [`Self::next_resource_url_from`] can serve `name`.
     pub fn resource_name_supports_incremental_scan(name: &str) -> bool {
         crate::class_path::ClassPath::name_supports_incremental_scan(name)

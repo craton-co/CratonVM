@@ -82,7 +82,11 @@ impl LaunchConfig {
     /// explicit `block` size. The grid is `ceil(n / block)` (at least
     /// one block). `block` is clamped to at least 1 so a degenerate
     /// `0` never produces a div-by-zero or a zero-thread launch.
-    pub(crate) fn elementwise_with_block(n: u32, block: u32) -> Self {
+    /// Public so a caller that has already paid for the occupancy
+    /// query once can rebuild the config for a different element count
+    /// without paying for it again — the block size a kernel wants does
+    /// not depend on how many elements a particular launch covers.
+    pub fn elementwise_with_block(n: u32, block: u32) -> Self {
         let block = block.max(1);
         let grid = n.div_ceil(block).max(1);
         Self {
@@ -391,14 +395,37 @@ impl DeviceModule {
 /// Each kernel parameter slot in PTX is a fixed-size scalar (pointer,
 /// `i32`, `i64`, `f32`, `f64`). This builder accumulates aligned bytes
 /// in the order the kernel expects them.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct KernelArgs {
     pub(crate) raw: Vec<KernelArg>,
 }
 
 impl KernelArgs {
+    // (see with_tid_base below for the chunked-launch clone)
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Clone these args with the trailing `tid_base` slot replaced.
+    ///
+    /// Every lowered kernel ends with a `.param .s32 tid_base` (see
+    /// `jit_cuda::lowering::ptx_params`), and a chunked dispatch launches
+    /// the SAME kernel several times over disjoint slices of one iteration
+    /// space, differing only in that value. Cloning is cheap: the device
+    /// pointer args carry an `Arc` keep-alive and a shared `last_write`
+    /// slot, so a clone shares both rather than duplicating anything.
+    ///
+    /// Returns `None` if the last argument is not an `i32`, which would
+    /// mean these args were not built for a `tid_base`-taking kernel.
+    pub fn with_tid_base(&self, base: i32) -> Option<Self> {
+        let mut cloned = self.clone();
+        match cloned.raw.last_mut() {
+            Some(KernelArg::I32(slot)) => {
+                *slot = base;
+                Some(cloned)
+            }
+            _ => None,
+        }
     }
 
     pub fn push_device_ptr<T: Send + Sync + 'static>(mut self, buf: &DeviceBuffer<T>) -> Self {
@@ -481,6 +508,7 @@ impl KernelArgs {
 //
 // In stub mode (no `cuda` feature) the variant degenerates to a bare
 // `u64` since there is no real allocation to guard.
+#[derive(Clone)]
 pub(crate) enum KernelArg {
     #[cfg(feature = "cuda")]
     DevicePtr {
@@ -532,6 +560,54 @@ pub(crate) enum KernelArg {
 ///     with the buffer — `launch_on_stream` updates the slot through the
 ///     `KernelArg`, and the buffer's `to_host_async` reads it back.
 ///   * `Mutex` gives interior mutability through the `&self` API of
+
+/// A page-locked ("pinned") host buffer, for chunked writeback staging.
+///
+/// An async device->host copy only overlaps with kernel execution when its
+/// host destination is page-locked. Measured on this box, 11 MB out of an
+/// RTX 2060: 12.95 GB/s into page-locked memory against 3.98 GB/s for the
+/// async form into ordinary pageable memory. The Java heap arena is
+/// pageable, so a chunked writeback has to land somewhere page-locked and
+/// be memcpy'd on from there — the memcpy runs at ~26 GB/s and overlaps
+/// with the GPU work still queued behind it.
+///
+/// `cuMemHostRegister` on the Java array itself was measured too and
+/// rejected: registering is cheap (0.08 ms for 11 MB) but UNregistering
+/// costs 0.69 ms, which is most of the win, and caching a registration
+/// across calls would have to survive a moving collector.
+///
+/// Allocation is one `cuMemAllocHost` and the buffer is reused across
+/// dispatches, so the cost is paid once per size class rather than per
+/// call. In stub mode this is a plain heap `Vec` and nothing is pinned.
+pub struct PinnedHostBuffer<T: Copy> {
+    inner: backend::PinnedHostInner<T>,
+}
+
+impl<T: Copy + Default> PinnedHostBuffer<T> {
+    /// Allocate `len` page-locked elements.
+    pub fn new(ctx: &DeviceContext, len: usize) -> Result<Self> {
+        backend::PinnedHostInner::new(ctx, len).map(|inner| Self { inner })
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The staging elements as a mutable slice.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not read or write a range that a queued DMA still
+    /// owns. Ordering is the caller's job — wait on the event recorded
+    /// after the copy that filled the range.
+    pub unsafe fn as_mut_slice(&self) -> &mut [T] {
+        self.inner.as_mut_slice()
+    }
+}
 ///     `to_host_async` and the `&KernelArgs` flow of `launch_on_stream`.
 pub struct DeviceBuffer<T> {
     pub(crate) inner: backend::DeviceBufferInner<T>,
@@ -892,6 +968,39 @@ impl<T: DeviceElem> DeviceBuffer<T> {
         Ok(())
     }
 
+    /// Async device->host copy of a SUB-RANGE: `dst.len()` elements
+    /// starting at element `offset` of this buffer.
+    ///
+    /// This is what makes a chunked writeback possible. A whole-buffer
+    /// download cannot overlap with anything, because it can only be
+    /// issued once the entire kernel has finished; splitting the launch
+    /// into chunks and giving each chunk its own slice-sized copy lets
+    /// chunk N's DMA run while chunk N+1's kernel is still executing.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`to_host_async_unchecked`](Self::to_host_async_unchecked):
+    /// `dst` must stay allocated at the same address and unread by the CPU
+    /// until a synchronize or event wait has observed this download. For a
+    /// real overlap `dst` should be page-locked (see [`PinnedHostBuffer`]) —
+    /// an async copy into ordinary pageable memory is staged by the driver
+    /// and does not overlap.
+    pub unsafe fn to_host_async_range_unchecked(
+        &self,
+        dst: &mut [T],
+        offset: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.inner.bind_to_thread()?;
+        let bytes = std::mem::size_of_val(dst);
+        let last_write = self.last_write_event();
+        let wait = last_write.as_ref().map(|ev| ev.cu_event_raw());
+        self.inner
+            .to_host_async_range_raw(dst, offset, stream.raw(), wait)?;
+        stream.record_op(StreamOp::DownloadAsync { bytes });
+        Ok(())
+    }
+
     /// Snapshot the buffer's current `last_write` event, if any.
     ///
     /// Returns a clone of the `Arc<Event>` so the caller can keep the
@@ -1048,6 +1157,43 @@ impl<T: DeviceElem> DeviceBuffer<T> {
             bytes: std::mem::size_of_val(dst),
         });
         self.inner.to_host(dst)
+    }
+
+    /// Stub-mode counterpart of the chunked-writeback download.
+    ///
+    /// # Safety
+    ///
+    /// In real cuda builds the destination slice must outlive the queued
+    /// DMA; in stub mode no DMA is submitted.
+    pub unsafe fn to_host_async_range_unchecked(
+        &self,
+        dst: &mut [T],
+        offset: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let end = offset.checked_add(dst.len()).ok_or_else(|| {
+            DeviceError::Memcpy("to_host_async_range: offset + len overflows".into())
+        })?;
+        if end > self.len() {
+            return Err(DeviceError::Memcpy(format!(
+                "to_host_async_range out of bounds: offset={offset} len={} buffer={}",
+                dst.len(),
+                self.len()
+            )));
+        }
+        if let Some(ev) = self
+            .last_write
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            stream.wait_event(&ev)?;
+        }
+        stream.record_op(StreamOp::DownloadAsync {
+            bytes: std::mem::size_of_val(dst),
+        });
+        self.inner.to_host_range(dst, offset)
     }
 
     pub fn len(&self) -> usize {

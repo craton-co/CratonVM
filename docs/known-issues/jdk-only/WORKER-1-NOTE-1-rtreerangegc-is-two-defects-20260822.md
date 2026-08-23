@@ -84,6 +84,36 @@ cell. The baseline re-runs `unchanged` on all six.
   lane's doc and report changes. They cannot plausibly reach a GC vector, but
   "cannot plausibly" is not a control run and this record does not pretend it is.
 
+## RESOLVED 2026-08-22 — both halves, and this record's central claim held
+
+`RTreeRangeGc` now passes **25/25 on the default collector and 25/25 under
+`--jdk-only`** on one binary (`fix/gc-known-issues-20260822`), and `SUITE=all`
+is 107 passed, 0 failed.
+
+This record's headline claim — that this is **not one flaky vector** but a
+deterministic compatible-mode defect and a separate strict-mode flake, with the
+arm boundary sitting between them — was right, and it was the thing that made
+the fix findable. They were three defects in the collection natives, not one,
+and the split ran exactly where this page put it:
+
+* **compatible mode, deterministic:** an `entrySet()` view whose kind was
+  guessed from its head element and defaulted to "values", and a
+  `tm_sync_native_state` that relocates its own receiver while 34 callers went
+  on using the address they passed in.
+* **`--jdk-only`, the flake:** six `TreeSet` range natives that read their
+  backing array and bounds before two allocations and pinned nothing, so the
+  per-loop pinning below protected an address that was already from-space.
+
+Full record: `rtreerangegc-was-four-collection-native-defects-FIXED-20260822`
+(internal). N2 is done; N3 is moot.
+
+**N1's own guard fires here, in the direction it was written for.** The
+quarantine row is removed from `regression-suite/known-flaky.txt`: 50 runs
+across two arms, zero failures. Removing it cannot move the `25-linux`
+blast-radius baseline, which is keyed on the SET of FAILING vectors per prefix —
+a vector that passes contributes to no set either way. The list is now empty,
+which is what a quarantine list should be between flakes.
+
 ## NOMINATIONS
 
 * **N1 — DONE 2026-08-22.** `regression-suite/known-flaky.txt` is the shared

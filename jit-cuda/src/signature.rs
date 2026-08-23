@@ -70,6 +70,23 @@ pub struct KernelSignature {
     /// conservative writeback behaviour is preserved.
     pub writes_param_mask: u64,
 
+    /// Bit-set of parameter indices the kernel READS element-wise.
+    ///
+    /// Mirror of `writes_param_mask`. The chunked writeback commits each
+    /// chunk into the Java array as its event fires, which is before the
+    /// bounds-failure flag has been read; that is only safe for an array
+    /// the kernel does not also read, so `writes & !reads` is the set a
+    /// chunked dispatch may stream out early. A caller that cannot supply
+    /// this should default it to "all bits set", which refuses chunking.
+    pub reads_param_mask: u64,
+
+    /// The kernel's counted-loop trip count, when it is attributable to
+    /// one parameter's length or a literal — see
+    /// [`crate::emitter::WorkBound`]. Populated by `lower_method`; the
+    /// analyzer leaves it `Unknown`, which keeps the launch grid sized
+    /// from the largest array argument.
+    pub work_bound: crate::emitter::WorkBound,
+
     /// AUDIT 2026-05-24 (C31): the analyzer recognised this method as a
     /// dot-product / sum reduction (counted loop, array load, arithmetic
     /// `*add`, scalar return). The lowering layer turns the per-thread

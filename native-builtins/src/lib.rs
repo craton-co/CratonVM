@@ -453,20 +453,52 @@ fn byte_array_input_stream_skip(
     skipped
 }
 
-fn buffered_input_stream_skip(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    requested: i64,
-) -> Result<i64, MethodCallFailed> {
-    if requested <= 0 {
-        return Ok(0);
-    }
-    let mut skipped = 0i64;
-    while skipped < requested && buffered_input_stream_read_one(ctx, this)? >= 0 {
-        skipped += 1;
-    }
-    Ok(skipped)
-}
+// `buffered_input_stream_skip` was DELETED 2026-08-22 (WORKER 4) with the
+// `java/io/BufferedInputStream.skip(J)J` registration that was its only caller.
+//
+// # It returned the right COUNT and left the stream in the wrong PLACE
+//
+// MEASURED, `regression-suite/probes/W4Buffers.java`, Linux/JDK 25.0.4, both
+// modes. A `BufferedInputStream(bais, 4)` over `"0123456789"`, then
+// `read(); mark(8); read(buf,0,4); reset(); read(); skip(3); readAllBytes()`:
+//
+//     read          48    <- agreed
+//     read(buf,0,4)  4:1234   <- agreed
+//     reset(); read 49    <- agreed
+//     skip(3)        3    <- agreed
+//     readAllBytes  "56789" on HotSpot,  "23489" on CratonVM
+//
+// Every step agreed and the last one returned different BYTES, which is the
+// signature of an accounting error rather than a logic one.
+//
+// # Why: this class was modelled TWICE and the halves did not share state
+//
+// `mark`, `reset`, `read` and `readAllBytes` are NOT registered on
+// `BufferedInputStream` in this build — they run the JDK's own bytecode over
+// the real `buf` / `pos` / `count` / `markpos` fields. `skip` was, and it drove
+// a completely different model: `buffered_input_stream_read_one`, a side table
+// of replayed bytes keyed off the object, falling through to
+// `invoke_virtual(input, "read", "()I")` on the UNDERLYING stream.
+//
+// So `skip(3)` pulled three bytes out of the SOURCE (index 5 -> 8) while the
+// JDK's own `buf` still held `"234"` unread at `pos`. `readAllBytes` then
+// returned the buffer's leftovers followed by the source's new position:
+// `"234"` + `"89"`. The count was right because three bytes really were
+// consumed — from the wrong place.
+//
+// `[native-backed state is invisible to real JDK bytecode]`, in its sharpest
+// form: not a native and bytecode disagreeing about a value, but a native and
+// bytecode maintaining two independent CURSORS over one stream.
+//
+// # Trap 4, checked
+//
+// `BufferedInputStream extends FilterInputStream`, and
+// `java/io/FilterInputStream.skip(J)J` IS registered
+// (`filter_input_stream_skip`), so the superclass walk promotes it. That is
+// deliberate and it is why this deletion is safe: `filter_input_stream_skip`
+// discards through `invoke_virtual(this, "read", "([BII)I")` on the RECEIVER,
+// which is `BufferedInputStream`'s own real `read` over its own real buffer.
+// It cannot desynchronise the two cursors because it only ever moves one.
 
 fn filter_input_stream_skip(
     ctx: &mut dyn NativeContext,
@@ -4255,6 +4287,12 @@ pub mod spring_startup_bootstrap;
 pub mod unsafe_jdk25;
 pub mod unsafe_natives;
 pub mod vector_api;
+// The real-JDK half of the Vector API: `vector_api` is the synthetic
+// implementation and is unreachable when the real `jdk.incubator.vector` is on
+// the module path, because a real receiver is a concrete `Int256Vector`. This
+// one intercepts `jdk.internal.vm.vector.VectorSupport`, which every lane
+// operation funnels through in BOTH modes.
+pub mod vector_support_intrinsics;
 // WP2.3-B — `MethodHandles.Lookup.defineClass` /
 // `defineHiddenClass` / `defineHiddenClassWithClassData` natives.
 // Routes through `NativeContext::define_class_full` with
@@ -7320,6 +7358,10 @@ pub fn register_essential_natives_with_shims(
     // java.base. Keep them in the real-JDK essential path; the broader
     // incubator Vector API shims remain synthetic-only overrides.
     crate::vector_api::register_vector_support_natives(registry);
+    // The `VectorSupport` operations HotSpot intrinsifies. MUST stay in this
+    // registrar, not a `phases_late` one: `register_synthetic_overrides` does
+    // not run in real-JDK mode, which is exactly where these are needed.
+    crate::vector_support_intrinsics::register_vector_support_intrinsics(registry);
     crate::lang_system::register_runtime_natives(registry);
 
     // Synthetic-stream `spliterator()` natives — synthetic stream objects
@@ -9171,15 +9213,6 @@ pub fn register_essential_natives_with_shims(
     // Base64.getEncoder() while running under JBoss Modules; expose the existing
     // Base64 intrinsics in essentials instead of waiting for the full phase table.
     register_base64_natives(registry);
-    registry.register(
-        "java/lang/Integer",
-        "valueOf",
-        "(Ljava/lang/String;)Ljava/lang/Integer;",
-        |ctx, args| match crate::lang_math::native_integer_parse_int(ctx, args)? {
-            Some(Value::Int(v)) => crate::lang_math::native_integer_value_of(ctx, &[Value::Int(v)]),
-            _ => crate::lang_math::native_integer_value_of(ctx, &[Value::Int(0)]),
-        },
-    );
     registry.register("java/util/Arrays", "equals", "([B[B)Z", |ctx, args| {
         let a_ref = match args.first() {
             Some(Value::Object(o)) => *o,
@@ -11345,6 +11378,16 @@ pub fn register_essential_natives_with_shims(
     // `radix_to_string_tests`) so that they are not a landmine if the
     // registration order ever changes, but a fix aimed at the observable
     // behaviour of `Integer.toString(int, int)` has to land in `lang_math.rs`.
+    // The four census-visible rows on the box classes were retired here
+    // (`Integer.valueOf(String)`, `Integer.toOctalString`,
+    // `Integer.toBinaryString`, `Long.toHexString`) -- real JDK 25 bytecode
+    // serves all four. Everything still registered on `Integer`/`Long` is
+    // `NativeKind::Intrinsic` and census-exempt, so those four were the block.
+    //
+    // Do NOT extend this to the classes: `RJdkReflBox` asserts reflective
+    // boxing IDENTITY with `==`, and the intrinsic `valueOf(I)` is what backs
+    // the cache it checks. Retiring `Integer` or `Long` wholesale reddens it.
+    // See `WORKER-3-NOTE-7`.
     registry.register(
         "java/lang/Integer",
         "toHexString",
@@ -11356,34 +11399,6 @@ pub fn register_essential_natives_with_shims(
             };
             Ok(Some(Value::Object(Some(
                 ctx.create_string(&format!("{:x}", val as u32)),
-            ))))
-        },
-    );
-    registry.register(
-        "java/lang/Integer",
-        "toOctalString",
-        "(I)Ljava/lang/String;",
-        |ctx, args| {
-            let val = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            Ok(Some(Value::Object(Some(
-                ctx.create_string(&format!("{:o}", val as u32)),
-            ))))
-        },
-    );
-    registry.register(
-        "java/lang/Integer",
-        "toBinaryString",
-        "(I)Ljava/lang/String;",
-        |ctx, args| {
-            let val = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            Ok(Some(Value::Object(Some(
-                ctx.create_string(&format!("{:b}", val as u32)),
             ))))
         },
     );
@@ -11434,20 +11449,6 @@ pub fn register_essential_natives_with_shims(
             };
             Ok(Some(Value::Object(Some(
                 ctx.create_string(&format_float(v)),
-            ))))
-        },
-    );
-    registry.register(
-        "java/lang/Long",
-        "toHexString",
-        "(J)Ljava/lang/String;",
-        |ctx, args| {
-            let val = match args.first() {
-                Some(Value::Long(v)) => *v,
-                _ => 0,
-            };
-            Ok(Some(Value::Object(Some(
-                ctx.create_string(&format!("{:x}", val as u64)),
             ))))
         },
     );
@@ -18584,21 +18585,10 @@ pub fn register_essential_natives_with_shims(
             Ok(Some(Value::Int(count - pos)))
         },
     );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "skip",
-        "(J)J",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(object))) => *object,
-                _ => return Ok(Some(Value::Long(0))),
-            };
-            let requested = args.get(1).and_then(|value| value.as_long()).unwrap_or(0);
-            Ok(Some(Value::Long(buffered_input_stream_skip(
-                ctx, this, requested,
-            )?)))
-        },
-    );
+    // `java/io/BufferedInputStream.skip(J)J` was registered here and is RETIRED
+    // — see the note where `buffered_input_stream_skip` used to be defined. It
+    // moved the UNDERLYING stream while the JDK's own `buf` still held unread
+    // bytes, so the count was right and the next read returned the wrong ones.
     registry.register(
         "java/io/ByteArrayInputStream",
         "skip",
