@@ -254,13 +254,15 @@ done.
 
 ## Residuals
 
-* **The tokenizer truncates a multi-word prompt.** 11 prompt ids where
-  HotSpot builds 16; the pretokenizer regex agrees on both VMs, so the
-  loss is in BPE aggregation. Pre-existing on dev, upstream of the GPU
-  path, and it affects the CPU path identically.
-  `probes/Llama3PretokenizeProbe.java` and
-  `probes/SpecialTokenSplitProbe.java` rule out the two obvious causes
-  (the regex itself, and `Pattern.quote` + `String.split`).
+* ~~The tokenizer truncates a multi-word prompt.~~ **FIXED 2026-08-23**,
+  and it was not the tokenizer: every COPY of a `Stream.toList()` list
+  kept one element, because the layout probe that reads a foreign
+  collection cannot tell a `boolean` from an `int` and
+  `ImmutableCollections$ListN` is `(E[] elements, boolean allowNulls)`.
+  See `../collections/stream-tolist-copies-kept-one-element-20260823.md`.
+  With it fixed, CratonVM and HotSpot build the same 16 prompt ids, so
+  the one-word prompt this record measures on is no longer a
+  constraint.
 * **`MemorySegment.ofArray(int[])` does not alias its array.** By
   design today — see §1 — but it means `MemorySegment.copy` INTO such a
   segment writes the mirror and leaves the array untouched, silently.

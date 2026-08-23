@@ -44248,6 +44248,38 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
             return Ok(Vec::new());
         }
+        // `java.util.ImmutableCollections$ListN` / `$SetN` — the real-JDK
+        // classes, reached whenever a stream operation falls through to JDK
+        // bytecode instead of one of our `toList` natives. Both hold their
+        // payload in an `elements` array; ListN since JDK 20 also carries a
+        // trailing `boolean allowNulls`, which is exactly the field the
+        // generic (Object[], int size) probe further down used to read AS the
+        // size. The descriptor guard there now refuses that, but reading the
+        // array by NAME here is both correct and direct, so no call site
+        // depends on a `toArray()` fallback.
+        //
+        // The two differ in one respect that matters: a ListN's array IS the
+        // element sequence and may legitimately contain nulls, while a SetN's
+        // is an open-addressed table whose nulls are empty slots.
+        if cls_name == "java/util/ImmutableCollections$ListN"
+            || cls_name == "java/util/ImmutableCollections$SetN"
+        {
+            let keep_nulls = cls_name.ends_with("$ListN");
+            if let Value::Object(Some(arr)) = ctx.get_field_by_name(coll, "elements") {
+                if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                    let len = ctx.array_length(arr);
+                    let mut out = Vec::with_capacity(len);
+                    for i in 0..len {
+                        let v = ctx.get_array_element(arr, i);
+                        if keep_nulls || !matches!(v, Value::Object(None)) {
+                            out.push(v);
+                        }
+                    }
+                    return Ok(out);
+                }
+            }
+            return Ok(Vec::new());
+        }
         if cls_name.starts_with("java/util/Collections$Unmodifiable")
             || cls_name.starts_with("java/util/Collections$Synchronized")
             || cls_name.starts_with("java/util/Collections$Checked")
@@ -44555,6 +44587,32 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // Legacy/synthetic ArrayList layout (field 0 = Object[], field 1 = Int size).
     // Skip entirely when the receiver doesn't even have 2 slots — common for
     // 0-field marker classes (cglib's `MethodInterceptorGenerator`, etc.).
+    //
+    // GUARDED BY THE DECLARED DESCRIPTOR OF SLOT 1, because this shape cannot
+    // otherwise tell a `boolean` from an `int`: CratonVM represents both as
+    // `Value::Int`, so any `(Object[], boolean)` class reads as "an array and
+    // a size", and a `true` reads as size **1**. Every copy of such a
+    // collection then silently keeps its FIRST element and drops the rest —
+    // `addAll`, the copy constructors and `List.copyOf`, into an ArrayList,
+    // LinkedList, Vector or HashSet alike.
+    //
+    // Not hypothetical, and not one class. `kotlin.collections.
+    // ArrayAsCollection` (values, isVarargs) is special-cased by name a few
+    // hundred lines above, having cost Spring's Kotlin resolver tests. The
+    // same shape is `java.util.ImmutableCollections$ListN`, which since JDK 20
+    // carries `(E[] elements, boolean allowNulls)` — and `Stream.toList()`
+    // builds it through `listFromTrustedArrayNullsAllowed`, i.e. with
+    // `allowNulls = true`. So `Arrays.stream(ints).boxed().toList()` produced
+    // a list whose `size()`, `get()`, `iterator()`, `stream()` and `toArray()`
+    // all answered 6 while every COPY of it took 1. In GPULlama3 that
+    // truncated a tokenized prompt from 16 ids to 11: the model answered a
+    // question it had not been asked, and nothing on the path reported
+    // anything.
+    //
+    // Rejecting only on POSITIVE evidence keeps synthetic-JDK mode working —
+    // where the layout is fabricated and carries no field metadata,
+    // `slot_declared_descriptor` answers `None` and this probe behaves exactly
+    // as it did before.
     let f0 = if n_fields >= 1 {
         ctx.get_field(coll, 0)
     } else {
@@ -44565,8 +44623,12 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     } else {
         Value::Object(None)
     };
+    let slot1_is_not_int = matches!(
+        slot_declared_descriptor(ctx, cid, 1).as_deref(),
+        Some(d) if d != "I"
+    );
     if let (Value::Object(Some(arr)), Value::Int(size)) = (f0, f1) {
-        if ctx.heap_kind_of(arr) == ObjectKind::Array {
+        if !slot1_is_not_int && ctx.heap_kind_of(arr) == ObjectKind::Array {
             let len = ctx.array_length(arr);
             if size >= 0 && len >= size as usize {
                 let mut elems = Vec::with_capacity(size as usize);
@@ -72365,4 +72427,46 @@ fn cf_delegating_yield_enabled() -> bool {
             Err(_) => true,
         },
     )
+}
+
+/// The declared descriptor of the instance field at absolute heap slot
+/// `slot` of `class_id`, or `None` when the class carries no field
+/// metadata for it (a fabricated synthetic layout, an unresolvable
+/// class, or a slot past the declared fields).
+///
+/// This exists for one reason: the layout probes in
+/// [`collect_collection_elements`] guess a collection's shape from the
+/// runtime `Value` of a slot, and a `boolean` and an `int` are the same
+/// `Value::Int` here. A class laid out `(Object[], boolean)` is
+/// therefore indistinguishable from `(Object[], int size)` — and reads
+/// as a one-element collection whenever the boolean is `true`. The
+/// declared descriptor is the only thing that separates them.
+///
+/// `declared_fields` allocates a `Vec<FieldMetadata>` of owned `String`s,
+/// and the probe it guards runs on every `addAll` / copy constructor in
+/// the process, so the answer is memoised per `(class, slot)`. Classes
+/// are stable for the life of a `ClassId`, so the memo never needs
+/// invalidating.
+fn slot_declared_descriptor(
+    ctx: &dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    slot: usize,
+) -> Option<String> {
+    use std::cell::RefCell;
+    thread_local! {
+        static MEMO: RefCell<rustc_hash::FxHashMap<(cratonvm_types::ClassId, usize), Option<String>>> =
+            RefCell::new(rustc_hash::FxHashMap::default());
+    }
+    if let Some(hit) = MEMO.with(|m| m.borrow().get(&(class_id, slot)).cloned()) {
+        return hit;
+    }
+    let found = ctx
+        .declared_fields(class_id)
+        .into_iter()
+        .find(|f| !f.is_static && f.slot_index == slot)
+        .map(|f| f.descriptor);
+    MEMO.with(|m| {
+        m.borrow_mut().insert((class_id, slot), found.clone());
+    });
+    found
 }
