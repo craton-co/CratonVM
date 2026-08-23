@@ -12729,6 +12729,16 @@ unsafe fn try_jit_static_bytecode_callee(
     if values.len() != cached.num_params as usize {
         return None;
     }
+    // Count the invocation the ordinary path would have counted, and stand
+    // down if a compiled body now exists — see
+    // `bytecode_callee_compiled_or_nominate`. Without this a callee served
+    // here is never nominated, so it stays interpreted for the life of the
+    // process; and a callee that IS compiled would be run interpreted anyway,
+    // which is a straight loss rather than a missed win.
+    if crate::runtime::interpreter::bytecode_callee_compiled_or_nominate(vm, thread, &cached) {
+        disp_census::note(disp_census::OUT_STATIC_BC_REFUSED);
+        return None;
+    }
     disp_census::note(disp_census::OUT_STATIC_BC);
     thread.refill_pools_from_shared(
         &vm.mem.operand_stack_pool,
@@ -12897,6 +12907,16 @@ unsafe fn try_jit_instance_bytecode_callee(
     // slot 0. A disagreement means the decode and the template describe
     // different methods, which is a refusal, never a guess.
     if values.len() != cached.num_params as usize + 1 {
+        return None;
+    }
+    // Count the invocation, and stand down if a compiled body now exists. On
+    // this path the second half is the one that pays: the MIC's compile probe
+    // runs two arms above, so "the JIT just compiled this callee" is the
+    // COMMON case here, and intercepting it would run the interpreter instead
+    // of the compiled body. See `bytecode_callee_compiled_or_nominate` for the
+    // 15% that cost on `ExchangeProbe` before it was added.
+    if crate::runtime::interpreter::bytecode_callee_compiled_or_nominate(vm, thread, &cached) {
+        disp_census::note(disp_census::OUT_INSTANCE_BC_REFUSED);
         return None;
     }
     disp_census::note(census_slot);

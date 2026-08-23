@@ -2157,6 +2157,117 @@ pub(crate) fn build_lambda_impl_cached(
     Some((c, gate))
 }
 
+/// Give a callee entered through a cached interpreter frame template the
+/// tier-up nomination the ordinary dispatch path would have given it — and say
+/// when the caller must NOT take that template at all, because a compiled body
+/// already exists.
+///
+/// # Why this has to exist separately from the frame builder
+///
+/// `Frame::new_pooled_cached` + `execute_prebuilt_frame` runs a method without
+/// touching `profile_store.increment_invocation` or `jit.jit_cache`, so a
+/// callee reached ONLY that way is never nominated and stays interpreted for
+/// the life of the process. That is the defect
+/// `lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md` records
+/// for lambda SAM bodies, and [`try_invoke_cached_lambda_impl`] answers it
+/// inline. `jit::helpers`' two dispatch templates
+/// (`try_jit_static_bytecode_callee`, `try_jit_instance_bytecode_callee`)
+/// build the same frame from the same `CachedBytecodeMethod` and inherited the
+/// same hole, so the block is factored out here rather than written a third
+/// time.
+///
+/// # Why it also answers "is it already compiled?"
+///
+/// MEASURED 2026-08-23 on `probes/ExchangeProbe.java`: the instance template,
+/// wired in WITHOUT this, cost **15%** across three interleaved rounds
+/// (36.7 / 36.6 / 39.9 ms/op against 31.6 / 30.9 / 35.8). Both halves of that
+/// loss are here. A template that intercepts a callee the JIT HAS compiled
+/// does not merely fail to help — it runs the interpreter instead of the
+/// compiled body, which is a straight loss; and on the MIC path that is the
+/// COMMON case, because the compile probe two arms above has often just
+/// published one. Answering `true` there sends the caller back to
+/// `invoke_or_native`, which knows how to enter compiled code.
+///
+/// The probe is epoch-guarded exactly like its three twins: while this entry's
+/// snapshot of `jit_cache_generation()` is current, nothing has been published
+/// or invalidated since the last miss, so the string-keyed `JitCache::get` is
+/// skipped. The invocation is still COUNTED in that case, or the method could
+/// never reach the threshold that makes re-probing worthwhile.
+pub(crate) fn bytecode_callee_compiled_or_nominate(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+) -> bool {
+    if crate::runtime::env_cache::disable_jit() {
+        return false;
+    }
+    let jit_generation = cratonvm_jit::jit_cache_generation();
+    if !cached.jit_probe_is_current(jit_generation) {
+        let found = shared.jit.jit_cache.read().get(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+            cached.declaring_class_id,
+        );
+        if found.is_some() {
+            return true;
+        }
+        cached.record_jit_probe_miss(jit_generation);
+    }
+    // A virtual thread is excluded from NOMINATION for the same reason the
+    // lambda twin excludes it from compiled ENTRY: compiled code carries none
+    // of the unmount points the interpreter path does.
+    if matches!(thread.kind, crate::threading::ThreadKind::Virtual) {
+        return false;
+    }
+    const JIT_RETRY_STRIDE: u32 = 64;
+    let threshold = crate::runtime::env_cache::jit_invocation_threshold();
+    let cnt = shared
+        .jit
+        .profile_store
+        .increment_invocation(cached.invoc_key());
+    let should_attempt =
+        cnt >= threshold && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
+    if !should_attempt {
+        return false;
+    }
+    if !crate::runtime::env_cache::bg_compile() {
+        // `CRATONVM_BG_COMPILE=0` restores INLINE compilation on the mutator,
+        // and every other nomination site honours it — without this arm the
+        // off-switch would silently stop these callees compiling at all rather
+        // than change how they compile.
+        let gate = RedefineGate::snapshot(
+            shared
+                .classes
+                .class_manager
+                .read()
+                .class_redefine_generation_handle(cached.declaring_class_id),
+        );
+        let _ = try_jit_upgrade_with_gate(shared, cached, gate);
+    } else {
+        ensure_bg_compiler_started(shared);
+        let tiered_key = crate::jit::tiered::MethodKey::new(
+            cached.class_name.as_ref(),
+            cached.method_name.as_ref(),
+            cached.method_descriptor.as_ref(),
+        );
+        // The REAL invocation count, not the stride boundary — see the
+        // invokestatic twin, where stride-boundary `+= 1` counting deflated the
+        // manager's hotness view 64x.
+        let recommended_tier = shared
+            .jit
+            .tiered_manager
+            .on_method_invocation_observed(&tiered_key, cnt as u64);
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] bc-callee-tiered-enqueue {}.{}{} tier={recommended_tier:?} invoc_count={cnt}",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
+    }
+    false
+}
+
 pub(super) fn try_invoke_cached_lambda_impl(
     shared: &SharedVm,
     thread: &mut JvmThread,
