@@ -362,6 +362,13 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     //    case rather than the exotic one.
     let class_manager = shared.classes.class_manager.read();
     let reference_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/Reference");
+    // The referent's CLASS, read from slot 0 on the way past and handed to the
+    // processor below. This is the only point in a collection that holds a
+    // referent and the heap at the same time, and the post-GC restore pass
+    // needs it: that pass writes an object back into slot 0 from an ADDRESS,
+    // and an address is not an identity once a compacting collector has
+    // re-issued it. See `ReferenceProcessor::referent_class_stamps`.
+    let mut referent_classes: Vec<(usize, u32)> = Vec::new();
     for (ref_obj_addr, _referent, stamp) in pairs.into_iter().chain(soft_pairs) {
         // The Reference object is live (or dead-but-not-yet-collected) at this
         // point, so its memory is valid; writing its referent slot is safe.
@@ -406,6 +413,15 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
             }
         }
         if shared.mem.heap.num_fields(ref_obj) >= 2 {
+            // Read the referent out of the slot BEFORE nulling it, and record
+            // its class. The slot is authoritative here in a way the
+            // processor's recorded `referent` address is not: every guard
+            // above has just established that this object IS the Reference
+            // that was discovered, so whatever slot 0 holds right now is its
+            // referent by construction.
+            if let Value::Object(Some(rt)) = shared.mem.heap.get_field(ref_obj, 0) {
+                referent_classes.push((ref_obj_addr, shared.mem.heap.class_id_of(rt).as_u32()));
+            }
             // Slot 0 = REF_FIELD_REFERENT (matches the real JDK Reference layout
             // and the synthetic constant in native-builtins).
             //
@@ -419,6 +435,13 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
                 .mem
                 .heap
                 .set_field_suppress_satb(ref_obj, 0, Value::Object(None));
+        }
+    }
+    drop(class_manager);
+    if !referent_classes.is_empty() {
+        let mut rp = shared.mem.ref_processor.lock();
+        for (ref_obj_addr, class_id) in referent_classes {
+            rp.stamp_referent_class(ref_obj_addr, class_id);
         }
     }
 }
