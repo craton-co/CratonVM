@@ -1211,6 +1211,50 @@ pub fn jit_lambda_capture_adapter() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_LAMBDA_CONST_PROBE` — screen SAM calls whose implementation
+/// body is a CONSTANT (`iconst_<n>/bipush/sipush` then `ireturn`) and report
+/// any call that observes a different value.
+///
+/// This exists for one shape: `CompletionStages::alwaysTrue` is
+/// `return true;`, and `ArrayLoop.next(int)` skips straight to `end` — ending
+/// a hibernate-reactive loop after one iteration, silently and with no
+/// exception — if that predicate ever answers `false`. A constant body is the
+/// one case where a wrong answer needs no baseline, no repeat runs and no
+/// statistics: the correct value is known from the bytecode, so the FIRST
+/// wrong call is proof. See
+/// `docs/known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`
+/// section 5.
+///
+/// Default OFF. `=1` screens; `=strict` (or `=2`) additionally refuses the
+/// emitted inline-cache thunk for such impls, because a thunk tail-jumps and
+/// returns straight to its compiled caller with no Rust on the path — those
+/// calls are INVISIBLE to this probe, which is what
+/// `site_const_opaque` counts.
+#[inline]
+pub fn jit_lambda_const_probe() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LAMBDA_CONST_PROBE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => false,
+        }
+    })
+}
+
+/// Is the constant-return probe in its THUNK-REFUSING mode? See
+/// [`jit_lambda_const_probe`] — this trades the fast path for coverage, and is
+/// a diagnostic setting rather than one to measure performance under.
+#[inline]
+pub fn jit_lambda_const_probe_strict() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LAMBDA_CONST_PROBE") {
+            Ok(v) => v == "2" || v.eq_ignore_ascii_case("strict"),
+            Err(_) => false,
+        }
+    })
+}
+
 /// `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` — let a compiled caller's
 /// `invokestatic` to a callee the JIT did NOT compile enter that callee through
 /// a per-site cached interpreter frame template, instead of re-resolving it

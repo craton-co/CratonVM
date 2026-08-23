@@ -15942,8 +15942,10 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
 unsafe fn install_lambda_inline_cache(
     vm: &SharedVm,
     site: &crate::runtime::interpreter::LambdaJitSite,
+    receiver_ref: ObjectRef,
     receiver_class_id: ClassId,
     code: &cratonvm_jit::RetainedCode,
+    vm_ptr: i64,
     mic_ptr: i64,
     pic_ptr: i64,
 ) {
@@ -15955,6 +15957,17 @@ unsafe fn install_lambda_inline_cache(
     }
     if site.has_checkcasts() || !site.is_static_impl() {
         return;
+    }
+    // A thunk tail-jumps to the impl and returns straight to its compiled
+    // caller, so no Rust runs on that path and the constant-return probe
+    // CANNOT see those calls. Say so -- in strict mode by refusing the thunk,
+    // otherwise by counting what is going unseen, so a clean
+    // `site_const_mismatch` is not mistaken for a clean bill of health.
+    if site.const_return().is_some() && crate::runtime::env_cache::jit_lambda_const_probe() {
+        if crate::runtime::env_cache::jit_lambda_const_probe_strict() {
+            return;
+        }
+        crate::runtime::interpreter::const_probe_note_opaque();
     }
     if !site.claim_adapter_install() {
         return;
@@ -15974,6 +15987,15 @@ unsafe fn install_lambda_inline_cache(
     let class_name = site.impl_class_name();
     let needs_ctx = code.needs_context();
     let jdk_only = crate::vm::dispatch_policy(vm).is_jdk_only();
+    // Run the thunk once before anything dispatches through it. See
+    // `const_thunk_self_test`: for a constant-returning impl the answer is
+    // known from the bytecode, so a wrong thunk is caught deterministically
+    // here rather than statistically later.
+    if crate::runtime::env_cache::jit_lambda_const_probe()
+        && !const_thunk_self_test(site, entry, needs_ctx, vm_ptr, receiver_ref)
+    {
+        return;
+    }
     let mut installed = false;
     if mic_ptr != 0 {
         let mic = &*(mic_ptr as *const JitMICSlot);
@@ -16074,7 +16096,9 @@ unsafe fn try_lambda_site_direct_call(
         return None;
     }
     if let Some((mic_ptr, pic_ptr)) = ic_slots {
-        install_lambda_inline_cache(vm, &site, receiver_class_id, &code, mic_ptr, pic_ptr);
+        install_lambda_inline_cache(
+            vm, &site, receiver_ref, receiver_class_id, &code, vm_ptr, mic_ptr, pic_ptr,
+        );
     }
     let mut jit_args = [0i64; MAX_DIRECT_ARGS];
     crate::runtime::interpreter::lambda_jit_site_capture_args(
@@ -16120,6 +16144,7 @@ unsafe fn try_lambda_site_direct_call(
             // way it was found and hand the value on.
             restash_jit_signals(thread, sig);
             crate::runtime::interpreter::lambda_site_bump_direct();
+            screen_const_return(&site, rc, "jit-direct-minsentinel");
             return Some(rc);
         }
         // A deopt. Its signals describe an attempt that is being abandoned and
@@ -16157,7 +16182,9 @@ unsafe fn try_lambda_site_direct_call(
             ) {
                 Ok(Some(value)) => {
                     crate::runtime::interpreter::lambda_site_bump_resumed();
-                    return Some(jit_abi_bits_of(value));
+                    let bits = jit_abi_bits_of(value);
+                    screen_const_return(&site, bits, "jit-direct-resumed");
+                    return Some(bits);
                 }
                 Ok(None) => {
                     // No resume was possible; the owning method has been
@@ -16182,7 +16209,33 @@ unsafe fn try_lambda_site_direct_call(
         return None;
     }
     crate::runtime::interpreter::lambda_site_bump_direct();
+    screen_const_return(&site, rc, "jit-direct");
     Some(rc)
+}
+
+/// Check a SAM call's result against the constant its impl body must return.
+///
+/// Off unless `CRATONVM_JIT_LAMBDA_CONST_PROBE` is set, and a no-op for the
+/// overwhelming majority of sites, whose bodies are not constants. See
+/// `const_int_return_of`.
+fn screen_const_return(
+    site: &crate::runtime::interpreter::LambdaJitSite,
+    raw: i64,
+    arm: &str,
+) {
+    if !crate::runtime::env_cache::jit_lambda_const_probe() {
+        return;
+    }
+    let Some(expected) = site.const_return() else {
+        return;
+    };
+    crate::runtime::interpreter::const_probe_screen(
+        expected,
+        raw,
+        site.impl_class_name(),
+        site.impl_method_name(),
+        arm,
+    );
 }
 
 /// Encode a resumed frame's return `Value` into the raw JIT-ABI register bit
@@ -22427,4 +22480,53 @@ mod varhandle_read_direct_helper_tables {
             assert!(info.descriptor.starts_with("(Ljava/lang/Object;)"));
         }
     }
+}
+
+/// Call a freshly emitted thunk once and check it against the constant its
+/// impl must return.
+///
+/// This is the part of the probe that does NOT need the failure to reproduce.
+/// Every other arm can only screen calls that happen to occur, and a thunk's
+/// calls are invisible to Rust entirely — but a thunk for a constant-returning
+/// impl is a pure function with a known answer, so it can simply be RUN once,
+/// here, at the moment it is built. A mis-emitted slide, a wrong entry or a
+/// stale cached thunk shows up on the first run of the process rather than in
+/// one run out of ten.
+///
+/// Safe to call with whatever arguments are to hand precisely because the impl
+/// is a constant body: it reads none of them. The receiver is the real proxy,
+/// so a capture load still addresses a live object.
+///
+/// Returns `false` if the thunk gave the wrong answer, in which case the caller
+/// must not install it.
+unsafe fn const_thunk_self_test(
+    site: &crate::runtime::interpreter::LambdaJitSite,
+    entry: usize,
+    needs_ctx: bool,
+    vm_ptr: i64,
+    receiver_ref: ObjectRef,
+) -> bool {
+    let Some(expected) = site.const_return() else {
+        return true;
+    };
+    // `(receiver, samArgs…)` — the shape the emitted cascade would pass.
+    let mut args = [0i64; 8];
+    args[0] = receiver_ref.as_ptr() as i64; // Cast: JIT ABI -- pointer to i64
+    let sam_args = site.total_args() - site.num_captures();
+    let incoming = 1 + sam_args;
+    if incoming > args.len() {
+        return true;
+    }
+    let Some(rc) = try_call_compiled_entry_reentrant(entry, needs_ctx, vm_ptr, &args[..incoming])
+    else {
+        return true;
+    };
+    crate::runtime::interpreter::const_probe_screen(
+        expected,
+        rc,
+        site.impl_class_name(),
+        site.impl_method_name(),
+        "thunk-self-test",
+    );
+    (rc as i32) == expected // Cast: the Java value is the low half
 }
