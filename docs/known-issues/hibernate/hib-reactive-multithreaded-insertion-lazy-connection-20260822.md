@@ -9,10 +9,11 @@ reactive composition path to get several times faster.
 A second, *separate* finding is recorded in §5, and it is the more interesting
 half: a `CompletionStages.loop` that terminates after ONE iteration instead of
 sixty. That is now measured directly rather than inferred (§5.1), and both the
-duplicated INSERT and HR000090 are downstream of it. It is **not fixed**. §5.2
-and §5.3 are the two things to read before touching it: the repro dies if the
-table is truncated, and the failure rate is too low for the arm sizes the
-earlier bisect used.
+duplicated INSERT and HR000090 are downstream of it. It is **not fixed**. §5.3
+is the thing to read before touching it: the failure rate is ~6-12%, which is
+too low for the arm sizes the earlier bisect used. §5.2 records a table-size
+mechanism I claimed and then refuted — it is kept as a worked example of the
+same mistake.
 
 ## Severity
 **MEDIUM.** One class, FAILs on all three collectors, PASSes on HotSpot. It is
@@ -162,24 +163,40 @@ A single wrong `filter.test` answer (the filter is `CompletionStages::alwaysTrue
 which is a constant `return true`) sends `next(int)` straight to `end` and ends
 the loop silently, with no exception anywhere.
 
-### 5.2 The repro depends on TABLE SIZE, and a truncating harness measures nothing
+### 5.2 There is NO table-size variable — that claim was mine, and it is refuted
 
-This is the trap that cost the most here. The `Entity` table is never cleaned by
-the suite, so it accumulates: it held ~140 000 rows when the failure was first
-seen. A loop that truncates it between runs — the obvious way to make the row
-count meaningful — **destroys the repro entirely**:
+An earlier revision of this section reported that the failure needed ~140 000
+accumulated rows in `Entity`, on the evidence of 0 failures in 19 runs against
+a truncated table and failures returning once filler rows were inserted.
 
-| `Entity` rows at run start | runs | failures |
-|---|---:|---:|
-| 0 (truncated each run) | 18, across 3 binaries and both `LAMBDA_ADAPTER` settings | **0** |
-| 141 440 (filler restored) | 6 | 1 (`rows=60/1440`, hr90=25, dup=5) |
-| 361 440 | 8 | 1 (`rows=1388/1440`, hr90=3) |
+**That is wrong, and the mechanism makes it impossible.** `BaseReactiveTest`
+sets `HBM2DDL_AUTO=create`, so Hibernate DROPS AND RECREATES the schema every
+time the SessionFactory is built — once per run. The table is empty at the
+start of every run no matter what was in it before.
 
-`hibfix-dupins-loop.sh` therefore deletes only `id > 0` and keeps negative-id
-filler rows, which can never collide with the sequence. `Entity_SEQ` climbs
-monotonically and is never reset, so leftover rows cannot themselves cause a
-duplicate id — the duplicate is an in-run race, and the table size only widens
-the window.
+The arithmetic in the run log says the same thing. After inserting 140 000
+filler rows and running six times, a second insert of 360 000 left the table at
+**361 440**, not 501 440: the first batch of filler was already gone, wiped by
+the first run's schema creation. The failure in that arm happened on run 4 —
+on an empty table. `Entity_SEQ` tells the same story: it read 2851 before a
+later batch and 2801 after, i.e. it went DOWN, because it too is recreated.
+
+So the two arms were never different. What produced a 19-run clean streak was
+the base rate of §5.3 and nothing else: at the ~6-12% measured here,
+`0.9^19 ≈ 0.14`. **This is exactly the mistake §5.3 exists to warn about, made
+one section earlier**, and it is left in the page rather than quietly deleted
+because the shape of it is the lesson: a clean streak invited a mechanism, and
+the mechanism was invented to fit the streak.
+
+Two practical consequences:
+
+* the repro needs **no** special table state — run it against whatever is
+  there;
+* `hibfix-dupins-loop.sh`'s `delete from Entity where id > 0` is redundant. It
+  is harmless and is kept only so the row count is read against a known start.
+
+Before theorising about a state variable, check what the harness under test
+already resets on its own.
 
 ### 5.3 The base rate is too low for the bisect that was built on it
 
@@ -264,7 +281,7 @@ a stale cached thunk is then caught on the first run of the process rather than
 in one run out of ten. It is inside the probe flag today; promoting it to
 always-on is the obvious next step once it has run across a suite.
 
-Measured on this workload (24 threads, N=60, filler rows present):
+Measured on this workload (24 threads, N=60):
 
 | mode | `screened` | `mismatch` | `opaque` |
 |---|---:|---:|---:|
@@ -310,8 +327,8 @@ line closes this section.
 ### 5.7 What to try next
 
 1. Re-run the `CRATONVM_JIT_DENY` bisect at **≥40 runs per arm** with
-   `hibfix-dupins-loop.sh` and the filler rows in place, control arm interleaved
-   with each test arm rather than measured on a different day.
+   `hibfix-dupins-loop.sh`, control arm interleaved with each test arm rather
+   than measured on a different day.
 2. **Run the probe of §5.6 alongside it.** It is built, armed and verified to
    engage on `alwaysTrue`; it just has not seen a failing run yet. Prefer
    `=strict` when the goal is coverage and `=1` when the goal is to keep the
@@ -358,9 +375,8 @@ the composition, not the CF bytecode and not the native funnel.
 ## 7. What to try next
 
 1. **The cut loop (§5).** A correctness bug beats a throughput one, and it is
-   separable. See §5.6 for the two concrete next steps — and §5.2 before
-   running anything, because a harness that truncates the table reproduces
-   nothing at all.
+   separable. See §5.7 for the concrete next steps, and §5.3 for the arm size
+   any of them needs.
 2. **Lambda/SAM dispatch inside a composition chain**, per §6's closing
    paragraph — that is where the remaining `thenCompose` microseconds are, and
    it is not the native funnel.
@@ -379,8 +395,6 @@ For the cut loop of §5 the repro is a LOOP, not a run — the failure rate is
 ```bash
 cd apps/hibernate-reactive-suite-runner && ./hibfix-dupins-loop.sh ctl /path/to/cratonvm.exe 40
 ```
-
-It needs the negative-id filler rows of §5.2 present in `Entity`.
 
 `hibfix-common-mysql-longto.args` is `common.args` with `-Ddb=PostgreSQL` ->
 `-Ddb=MySQL` and the JUnit default timeout raised to 900 s; the argfile itself
