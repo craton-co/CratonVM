@@ -1294,6 +1294,42 @@ pub fn jit_static_bytecode_callee() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` — the virtual/interface/special half
+/// of the same fix as [`jit_static_bytecode_callee`].
+///
+/// # What it is worth
+///
+/// MEASURED 2026-08-23, `probes/XferProbe2.java`, one binary, three arms per
+/// invoke kind (2 000 000 iterations):
+///
+/// | kind | compiled -> compiled | both interpreted | compiled -> INTERPRETED |
+/// |---|---:|---:|---:|
+/// | `invokestatic` (already fixed) | 42.8 | 571.6 | 571.3 |
+/// | `invokevirtual` | 47.1 | 650.5 | **3177.1** |
+/// | `invokeinterface` | 45.4 | 761.9 | **2587.3** |
+///
+/// i.e. after the `invokestatic` half landed, compiling the caller of an
+/// *interpreted* virtual callee was still **4.9x slower than compiling
+/// neither**, and interface **3.4x**. Real application and reactive code is
+/// overwhelmingly virtual/interface: `out_static_bc=98_201` of
+/// `out_tail=342_867` on `probes/ReactorProbe.java`, i.e. the static fix serves
+/// 29% of that workload's tail and the remaining 71% are kinds 0/1/2.
+///
+/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
+///
+/// Default ON. `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0` restores the by-name
+/// path, which is the A/B a same-binary bisection needs.
+#[inline]
+pub fn jit_virtual_bytecode_callee() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).
