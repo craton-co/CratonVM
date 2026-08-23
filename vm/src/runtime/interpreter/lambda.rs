@@ -2167,10 +2167,10 @@ pub(crate) fn build_lambda_impl_cached(
 /// `Frame::new_pooled_cached` + `execute_prebuilt_frame` runs a method without
 /// touching `profile_store.increment_invocation` or `jit.jit_cache`, so a
 /// callee reached ONLY that way is never nominated and stays interpreted for
-/// the life of the process. That is the defect
-/// `lambda-sam-dispatch-bypasses-the-cached-invoke-path-20260817.md` records
-/// for lambda SAM bodies, and [`try_invoke_cached_lambda_impl`] answers it
-/// inline. `jit::helpers`' two dispatch templates
+/// the life of the process. That is the defect the LAMBDA-JIT-TIERUP block in
+/// [`try_invoke_cached_lambda_impl`] answers inline for lambda SAM bodies —
+/// read its comment for the measurement, which is the same one that applies
+/// here. `jit::helpers`' two dispatch templates
 /// (`try_jit_static_bytecode_callee`, `try_jit_instance_bytecode_callee`)
 /// build the same frame from the same `CachedBytecodeMethod` and inherited the
 /// same hole, so the block is factored out here rather than written a third
