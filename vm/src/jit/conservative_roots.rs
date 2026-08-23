@@ -5778,7 +5778,7 @@ pub fn report_stale_after_remap(
 // SHIPS ON, with `CRATONVM_REGISTER_IMAGE_REMAP=0` as the kill switch and
 // `CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` as the instrument that says whether it
 // has anything to do on a given workload. See
-// `known-issues/gc/moving-young-leaves-a-callee-saved-register-image-unrewritten-20260822.md`
+// `moving-young-left-a-callee-saved-register-image-unrewritten-FIXED-20260823`
 // for the measurement.
 //
 // The other half of the repair is a PIN rather than a write:
@@ -5839,7 +5839,10 @@ fn remap_one_frame_register_images(
     if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
         return 0;
     }
-    let live_hi = moving_young_frame_live_hi(rbp, cm);
+    // No `live_hi` here, deliberately: the safepoint's live cursor bounds the
+    // OPERAND-SPILL region, and this pass no longer touches it. Only the
+    // prologue's callee-saved GPR image is in scope, and its bounds are static
+    // frame geometry.
     let lo = rbp - frame_size;
     let mut addr = (lo + 7) & !7usize;
     let mut rewritten = 0usize;
@@ -5856,7 +5859,6 @@ fn remap_one_frame_register_images(
             addr += 8;
             continue;
         }
-        let _ = live_hi;
         // SAFETY: aligned read inside this thread's own live compiled frame,
         // bounded by the frame size recorded at compile time.
         let w = unsafe { (addr as *const usize).read() };

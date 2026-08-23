@@ -1119,7 +1119,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             // movable set claims. `scan_added>0 unrewritable=0` is a frame
             // whose every live reference sits in verified storage; a non-zero
             // count is the gap
-            // `moving-young-leaves-a-callee-saved-register-image-unrewritten`
+            // `moving-young-left-a-callee-saved-register-image-unrewritten`
             // measured, being closed rather than merely detected.
             unrewritable = cratonvm_gc::gc_quiescence::unrewritable_jit_root_count(),
             is_g1 = shared.mem.heap.is_g1(),

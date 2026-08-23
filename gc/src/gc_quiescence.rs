@@ -1259,7 +1259,7 @@ pub fn movable_jit_root_count() -> usize {
 // writes holds the CALLER's registers, and the epilogue pops them straight back
 // — so the caller resumes from exactly the words the verifier declined to look
 // at. See
-// `known-issues/gc/moving-young-leaves-a-callee-saved-register-image-unrewritten-20260822.md`
+// `moving-young-left-a-callee-saved-register-image-unrewritten-FIXED-20260823`
 // for the detector that measured the gap.
 //
 // This set is the veto. A word in an unverifiable region that resolves to a
