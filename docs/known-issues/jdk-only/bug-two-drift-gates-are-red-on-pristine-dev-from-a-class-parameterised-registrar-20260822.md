@@ -1,4 +1,4 @@
-# THREE drift gates are RED on pristine `dev`, and one refactor causes all of them
+# FOUR gates are RED on pristine `dev` — three from one refactor, one from GPU work
 
 **Status: OPEN, MEASURED, NOT THIS BRANCH'S.** 2026-08-22.
 
@@ -79,6 +79,34 @@ hide inside, and it explains both failures at once:
 `panama.rs` (`git log origin/dev..HEAD -- native-builtins/src/panama.rs` is
 empty), and `register_pe2_string_marshaling_on` arrives with `aecae7e51`
 *fix(ffm): every synthetic MemorySegment carried the INTERFACE as its class*.
+
+## A FOURTH, unrelated: two GPU flags are read but declared nowhere
+
+`cargo test -p cratonvm-types` → `flag_declaration_guard::
+every_cratonvm_literal_is_declared_or_explicitly_exempt`:
+
+```text
+2 CRATONVM_* variable(s) are read by code but declared nowhere.
+  CRATONVM_GPU_APPROX_MATH     first read at jit-cuda/src/analyzer.rs:245
+  CRATONVM_GPU_TIME_DISPATCH   first read at native-builtins/src/craton_gpu.rs:2517
+```
+
+Also dev's, also measured rather than inferred: `CRATONVM_GPU_APPROX_MATH`
+appears three times in `origin/dev:jit-cuda/src/analyzer.rs`, and
+`8b813b8dd` *perf(gpu): GPULlama3 on the GPU at 1.76x HotSpot* is an ancestor
+of `origin/dev`. This branch touches neither file.
+
+**Why it matters beyond a red board**, in the guard's own words: an undeclared
+flag is served by a live `getenv` rather than the latched `VmFlags` snapshot, so
+`CRATONVM_<GROUP>=token` cannot reach it and `with_thread_overrides` cannot
+arrange it in a test — "which is how a flag-dependent test ends up silently
+measuring the developer's ambient environment". Two GPU knobs are currently in
+that state.
+
+Not fixed here for the same reason as the three above: minting a token means
+choosing its group and spelling, which is the GPU lane's semantics, and the
+guard offers three different remedies (declare, reuse an existing token, or
+allowlist as a harness/ABI name) that only that lane can choose between.
 
 ## Do not fix it by raising the ceiling
 
