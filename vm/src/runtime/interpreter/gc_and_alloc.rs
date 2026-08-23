@@ -5090,6 +5090,23 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
             *thread.frame_trace.lock() = trace;
         }
 
+        // Cross-thread JIT coverage handshake, PEER half. This thread is about
+        // to park; the initiator is about to ask whether every live compiled
+        // frame in the process is rewritable, and this thread's chain is the
+        // part of that question only this thread can answer (`JIT_ENTRY_CHAIN`,
+        // the cached top RBP and the shadow window are all thread-local).
+        //
+        // It belongs HERE and not in `update_root_snapshot` above, even though
+        // that function already computes the same proof for the generational
+        // collector: `update_root_snapshot` is also the blocked-region deposit
+        // path, which runs on every blocking native call, and its own comment
+        // records the measurement that made the proof generational-only there
+        // (1.1 M probes reading 35 billion stack words on one 240 s run). A
+        // safepoint park happens once per thread per pause, so the same proof
+        // costs nothing here — and this is the only site where the deposit's
+        // promise holds, because a thread that reaches this line resumes
+        // through `apply_pointer_map_to_thread` and remaps its own frames.
+        crate::jit::conservative_roots::publish_peer_jit_coverage_for_stw();
         // Arrive at barrier and wait for GC to complete. Census-aware (auto):
         // a genuine safepoint arrival is normally counted, but if this pause's
         // census excluded us as blocked (a finding-1(a) window), participating

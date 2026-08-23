@@ -2378,6 +2378,41 @@ pub fn compile_with_param_slots(
         && compiler
             .safepoint_pcs
             .is_subset(&compiler.mapped_safepoint_pcs);
+    // `CRATONVM_DBG_OOPCOV=1` — WHICH of the four terms said no, per method.
+    //
+    // `moving_young_osr_method_needs_fallback` reports the aggregate as one
+    // `map_coverage` counter, and that counter is what
+    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` was left
+    // holding: it names the field, not the term, and not the method. The four
+    // terms fail for completely different reasons (a gate that is off, a slot
+    // the prologue did not reserve, an inlined callee, a safepoint that
+    // flushed without recording), so an aggregate cannot be acted on.
+    //
+    // Only the unmapped PCs are listed, capped: on a large method
+    // `safepoint_pcs` can hold hundreds of entries and the difference is the
+    // whole content of the report.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OOPCOV").is_some()
+        && !cm.fully_oop_covered
+    {
+        let mut missing: Vec<u32> = compiler
+            .safepoint_pcs
+            .difference(&compiler.mapped_safepoint_pcs)
+            .copied()
+            .collect();
+        missing.sort_unstable();
+        missing.truncate(16);
+        eprintln!(
+            "[oopcov] uncovered method={} precise_maps={} sp_id_slot_off={} inline_sites={} \
+             safepoints={} mapped={} unmapped_pcs={:?}",
+            compiler.method_key,
+            compiler.precise_maps,
+            compiler.sp_id_slot_off,
+            compiler.inline_sites.len(),
+            compiler.safepoint_pcs.len(),
+            compiler.mapped_safepoint_pcs.len(),
+            missing,
+        );
+    }
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
     // can replicate the prologue's shadow setup (cache the thread ptr + snapshot
     // the `top` watermark) for OSR-entered frames. All 0 when shadow-stack

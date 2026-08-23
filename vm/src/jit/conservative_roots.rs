@@ -3393,30 +3393,134 @@ pub fn other_thread_in_jit() -> bool {
 /// have machinery: a cooperatively-parked peer publishes its shadow values into
 /// its `root_snapshot` and remaps its own shadow stack on resume, and an
 /// OS-frozen / helper-window peer is scanned conservatively and marks the cycle
-/// incomplete. Neither mechanism, however, gives the *initiator* a positive
-/// proof at the moment it decides whether to relocate — a peer whose deposit is
-/// stale, or which entered JIT after its last deposit, is simply not
-/// represented. Since a peer's JIT registers and frame slots are not rewritable
-/// by this collection, "cannot prove" must mean "do not move".
+/// incomplete.
 ///
-/// So: when any peer is in JIT, this cycle is treated as unproven. That is
-/// deliberately conservative — it means moving-young engages only on cycles
-/// where the initiator is the sole thread in compiled code — and it is the
-/// honest state of the proof until a cross-thread coverage handshake exists
-/// (specified in `arch-2026-07-26/moving-young-precise-roots.md`).
+/// Until 2026-08-23 neither mechanism gave the *initiator* a positive proof at
+/// the moment it decides whether to relocate, so the rule was: **any** peer in
+/// JIT makes the cycle unproven. That is the
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` residual —
+/// on a many-threaded workload it fires on nearly every cycle, and on ZGC,
+/// where relocation is the only defragmentation there is, the consequence is an
+/// `OutOfMemoryError` on a heap that is 97 % free.
+///
+/// [`publish_peer_jit_coverage_for_stw`] is the handshake that replaces it. A
+/// peer proves its OWN frames rewritable, on its own thread, at its own park,
+/// and deposits the proven depth; this function accepts the cycle only when the
+/// deposits account for **every** peer JIT entry in the process. The
+/// accounting is a depth comparison rather than a thread count because
+/// `GLOBAL_JIT_DEPTH` is the only process-wide view available and it is a
+/// depth: `peer = global - mine`, and `proven >= peer` is the acceptance test.
+/// Everything the handshake cannot see — an OS-frozen peer, a peer blocked in a
+/// native with compiled frames below it, a peer whose own proof failed —
+/// deposits nothing, so the shortfall refuses the cycle exactly as before.
+///
+/// `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` restores the blanket refusal on the
+/// same binary, which is what makes this an A/B rather than a rebuild.
 /// Over-diverting costs compaction; under-diverting costs the heap.
 pub fn refresh_moving_young_coverage_for_collection() -> bool {
     if !moving_young_enabled() {
         return true;
     }
     let mut complete = refresh_moving_young_coverage_for_current_thread();
-    if other_thread_in_jit() {
-        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
-            cratonvm_gc::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER,
-        );
-        complete = false;
+    let peer_depth = peer_jit_depth();
+    if peer_depth > 0 {
+        let proven = cratonvm_gc::gc_quiescence::peer_proven_jit_depth();
+        let accounted = xt_jit_coverage_handshake_enabled() && proven >= peer_depth;
+        cratonvm_gc::gc_quiescence::note_peer_coverage_verdict(accounted);
+        if xt_coverage_dbg() {
+            eprintln!(
+                "[xt-coverage] peer_depth={peer_depth} proven={proven} accounted={accounted}"
+            );
+        }
+        if !accounted {
+            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                cratonvm_gc::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER,
+            );
+            complete = false;
+        }
     }
     complete
+}
+
+/// JIT entries held by threads OTHER than this one, right now.
+///
+/// `saturating_sub` and not a plain subtraction: `GLOBAL_JIT_DEPTH` is a
+/// striped counter and this thread's own chain is a thread-local, so a torn
+/// read across the stripes can momentarily make the global look smaller than
+/// the local. Zero is the safe reading of that — it means "no peer depth to
+/// account for", and the caller's other obligations still stand.
+#[inline]
+fn peer_jit_depth() -> usize {
+    GLOBAL_JIT_DEPTH
+        .get()
+        .saturating_sub(current_thread_jit_depth())
+}
+
+/// May the cross-thread coverage handshake discharge `CROSS_THREAD_JIT_PEER`?
+///
+/// Default ON, so a KILL SWITCH: `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` (or
+/// `off`/`false`/`no`) restores the blanket "any peer in JIT means unproven"
+/// refusal. Default-off would leave the many-threaded case exactly where the
+/// H2 page found it, which is the defect and not a conservative posture.
+///
+/// Read per cycle rather than latched: it is consulted once per collection, and
+/// a `OnceLock` would let the first test to touch it decide the answer for
+/// every later test in the binary.
+fn xt_jit_coverage_handshake_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_XT_JIT_COVERAGE_HANDSHAKE") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
+fn xt_coverage_dbg() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_COVERAGE").is_some()
+}
+
+/// A peer thread's half of the cross-thread JIT coverage handshake.
+///
+/// Called by a mutator that is about to park at the STW barrier, immediately
+/// before `arrive_and_wait`. It runs THIS thread's own per-thread coverage
+/// proof — the only place in the process where that proof can be run for this
+/// thread, because `JIT_ENTRY_CHAIN`, the cached top RBP and the shadow window
+/// are all thread-local — and, if it holds, deposits this thread's JIT depth
+/// into the pause's ledger.
+///
+/// Why a deposit here is a promise the thread can keep: a cooperatively-parked
+/// peer resumes through `apply_pointer_map_to_thread`, which runs
+/// `remap_active_jit_frames`, `remap_register_image_words` and
+/// `shadow_stack.remap` over exactly the chain this proof just walked. The
+/// proof says every live oop of those frames is reachable from a channel the
+/// remap rewrites; the resume applies the rewrite. Nothing else in the process
+/// has to touch the peer's registers.
+///
+/// Cheap when it cannot matter: a thread with no JIT entries contributes
+/// nothing to the initiator's `peer_depth` arithmetic, so it returns before
+/// paying for `refresh_moving_young_coverage_for_current_thread` (whose
+/// `native_stack_has_jit_frame` band walk is the expensive part). That is the
+/// overwhelmingly common shape at a safepoint park.
+pub fn publish_peer_jit_coverage_for_stw() {
+    if !moving_young_enabled() || !xt_jit_coverage_handshake_enabled() {
+        return;
+    }
+    // Pruning inside the proof can only SHRINK the chain, so an already-empty
+    // chain stays empty and this early-out cannot skip a nonzero deposit.
+    if current_thread_jit_depth() == 0 {
+        return;
+    }
+    let proven = refresh_moving_young_coverage_for_current_thread();
+    // Read the depth AFTER the proof: it prunes returned entries, and the
+    // deposit must not claim more than the proof covered.
+    let depth = current_thread_jit_depth();
+    if proven && depth > 0 {
+        cratonvm_gc::gc_quiescence::add_peer_proven_jit_depth(depth);
+    }
+    if xt_coverage_dbg() {
+        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth}");
+    }
 }
 
 /// Returns true if any thread anywhere in the process is currently inside a

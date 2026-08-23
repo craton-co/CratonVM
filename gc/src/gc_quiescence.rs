@@ -345,6 +345,171 @@ fn unrewritable_peer_state_set(v: bool) {
     UNREWRITABLE_PEER_STATE.store(v, Ordering::Release);
 }
 
+// ---- The cross-thread JIT coverage handshake ledger -----------------------
+//
+// `incomplete_reason::CROSS_THREAD_JIT_PEER` used to be an unconditional
+// refusal: *any* peer inside compiled code made the cycle unprovable, because
+// the initiator cannot walk a peer's `JIT_ENTRY_CHAIN` (it is a thread-local)
+// and cannot rewrite a peer's registers. On a many-threaded workload that is
+// nearly every cycle, which is how
+// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` ends with an
+// `OutOfMemoryError` on a heap that is 97 % free.
+//
+// The missing half was never the REWRITE. A peer that parks COOPERATIVELY at
+// the STW barrier runs `apply_pointer_map_to_thread` on resume, and that is
+// `remap_active_jit_frames` + `remap_register_image_words` +
+// `shadow_stack.remap` over its OWN chain — precisely the rewrite the
+// initiator cannot perform on its behalf. The missing half was the PROOF: the
+// initiator had no way to learn that those frames were rewritable.
+//
+// So the peer proves it for itself, on its own thread, at its own park, and
+// deposits the answer here. The ledger is a DEPTH rather than a thread count
+// because `GLOBAL_JIT_DEPTH` — the only process-wide view of how much compiled
+// code is live — is a depth too, and comparing like with like is what makes
+// the accounting airtight: the initiator accepts a cycle only when the proven
+// depth accounts for EVERY peer JIT entry in the process. Anything it cannot
+// account for (an OS-frozen peer, a peer blocked in a native with compiled
+// frames below it, a peer whose own proof failed) never lands here, and the
+// shortfall refuses the cycle.
+//
+// Reset at the two points that OPEN a pause — `begin_moving_young_coverage_cycle`
+// and the barrier's own `request_stw` — never at the end of one. A stale
+// nonzero value is the only unsound state this ledger has, so it is cleared on
+// the way in, by whichever of the two runs first, rather than trusted to a
+// path that may not run at all.
+#[cfg(not(test))]
+static PEER_PROVEN_JIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(test))]
+static PEER_COVERAGE_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(test))]
+static PEER_COVERAGE_REFUSED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(test))]
+static PEER_COVERAGE_DEPOSITS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static PEER_PROVEN_JIT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PEER_COVERAGE_ACCEPTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PEER_COVERAGE_REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PEER_COVERAGE_DEPOSITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(test))]
+#[inline]
+fn peer_proven_depth_reset_inner() {
+    PEER_PROVEN_JIT_DEPTH.store(0, Ordering::Release);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn peer_proven_depth_add_inner(n: usize) {
+    PEER_PROVEN_JIT_DEPTH.fetch_add(n, Ordering::AcqRel);
+    PEER_COVERAGE_DEPOSITS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn peer_proven_depth_get_inner() -> usize {
+    PEER_PROVEN_JIT_DEPTH.load(Ordering::Acquire)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn peer_coverage_bump(accepted: bool) {
+    if accepted {
+        PEER_COVERAGE_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PEER_COVERAGE_REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(test))]
+fn peer_coverage_counters_inner() -> (usize, usize, usize) {
+    (
+        PEER_COVERAGE_ACCEPTED.load(Ordering::Relaxed),
+        PEER_COVERAGE_REFUSED.load(Ordering::Relaxed),
+        PEER_COVERAGE_DEPOSITS.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+#[inline]
+fn peer_proven_depth_reset_inner() {
+    PEER_PROVEN_JIT_DEPTH.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+#[inline]
+fn peer_proven_depth_add_inner(n: usize) {
+    PEER_PROVEN_JIT_DEPTH.with(|c| c.set(c.get() + n));
+    PEER_COVERAGE_DEPOSITS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+#[inline]
+fn peer_proven_depth_get_inner() -> usize {
+    PEER_PROVEN_JIT_DEPTH.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[inline]
+fn peer_coverage_bump(accepted: bool) {
+    if accepted {
+        PEER_COVERAGE_ACCEPTED.with(|c| c.set(c.get() + 1));
+    } else {
+        PEER_COVERAGE_REFUSED.with(|c| c.set(c.get() + 1));
+    }
+}
+
+#[cfg(test)]
+fn peer_coverage_counters_inner() -> (usize, usize, usize) {
+    (
+        PEER_COVERAGE_ACCEPTED.with(std::cell::Cell::get),
+        PEER_COVERAGE_REFUSED.with(std::cell::Cell::get),
+        PEER_COVERAGE_DEPOSITS.with(std::cell::Cell::get),
+    )
+}
+
+/// Clear the cross-thread coverage ledger for a pause that is about to open.
+///
+/// Called from [`begin_moving_young_coverage_cycle`] and from the VM's
+/// `GcBarrier::request_stw` — both run strictly BEFORE any peer can park and
+/// deposit, and a pause that reaches only one of them is still cleared.
+pub fn reset_peer_proven_jit_depth() {
+    peer_proven_depth_reset_inner();
+}
+
+/// A cooperatively-parking peer deposits `depth` JIT entries it has just PROVEN
+/// rewritable for this pause.
+///
+/// `depth` must be the depositing thread's own `JIT_ENTRY_CHAIN` length read
+/// AFTER its per-thread coverage proof returned `true`: the proof prunes
+/// returned entries, and a length read before it can be too LARGE — which is
+/// the unsound direction here, since the initiator's test is a comparison
+/// against the process-wide depth.
+pub fn add_peer_proven_jit_depth(depth: usize) {
+    if depth != 0 {
+        peer_proven_depth_add_inner(depth);
+    }
+}
+
+/// Total peer JIT depth proven rewritable for this pause.
+pub fn peer_proven_jit_depth() -> usize {
+    peer_proven_depth_get_inner()
+}
+
+/// Record whether a cycle's cross-thread obligation was discharged by the
+/// handshake (`accepted`) or fell back to the blanket refusal.
+pub fn note_peer_coverage_verdict(accepted: bool) {
+    peer_coverage_bump(accepted);
+}
+
+/// `(cycles accepted, cycles refused, peer deposits)` for the handshake — the
+/// engagement counter that has to sit beside any claim made about it.
+pub fn peer_coverage_counters() -> (usize, usize, usize) {
+    peer_coverage_counters_inner()
+}
+
 #[cfg(test)]
 #[inline]
 fn coverage_incomplete_get() -> bool {
@@ -654,6 +819,12 @@ pub fn begin_moving_young_coverage_cycle() {
     coverage_incomplete_set(false);
     incomplete_reason_clear();
     unrewritable_peer_state_set(false);
+    // The cross-thread handshake ledger is per-PAUSE and only ever read as
+    // "does this account for every peer JIT entry?", so a value carried over
+    // from the previous pause would be an over-count — the one direction that
+    // could license a relocation nobody proved. Clear it here and again in the
+    // barrier's `request_stw`; see `reset_peer_proven_jit_depth`.
+    peer_proven_depth_reset_inner();
 }
 
 /// Whether this cycle's root scan touched state belonging to a peer thread that

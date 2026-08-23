@@ -497,6 +497,15 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-scan-prof", on_key: Some("CRATONVM_DBG_JIT_SCAN_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-rootscan", on_key: Some("CRATONVM_DBG_JIT_ROOTSCAN"), off_key: None, off_word: None },
+    // Declared 2026-08-23. `jit-rootscan` reports the moving-young coverage
+    // verdict as an aggregate `map_coverage=N` counter, which names neither the
+    // METHOD nor WHICH of `fully_oop_covered`'s four terms said no. `oopcov`
+    // prints both, per compile. See `jit/src/x64/driver.rs`.
+    E { group: Group::DBG, token: "oopcov", on_key: Some("CRATONVM_DBG_OOPCOV"), off_key: None, off_word: None },
+    // Declared 2026-08-23 with the cross-thread JIT coverage handshake: the
+    // per-cycle `peer_depth`/`proven` arithmetic and each peer's deposit. See
+    // `vm/src/jit/conservative_roots.rs::publish_peer_jit_coverage_for_stw`.
+    E { group: Group::DBG, token: "xt-coverage", on_key: Some("CRATONVM_DBG_XT_COVERAGE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-stale-after-remap", on_key: Some("CRATONVM_DBG_JIT_STALE_AFTER_REMAP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-stale-below-rbp", on_key: Some("CRATONVM_DBG_JIT_STALE_BELOW_RBP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-names", on_key: Some("CRATONVM_DBG_JIT_NAMES"), off_key: None, off_word: None },
@@ -1344,6 +1353,13 @@ pub const INVENTORY: &[E] = &[
     // compiled frame -- which is why the default configuration never
     // defragmented. See `gc/src/zgc.rs::zgc_relocate_under_proven_jit`.
     E { group: Group::GC, token: "zgc-relocate-proven-jit", on_key: Some("CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT"), off_key: None, off_word: Some("0") },
+    // Declared 2026-08-23 with the cross-thread JIT coverage handshake.
+    // Default-ON, so a KILL SWITCH, with the same `off_word: Some("0")` as its
+    // neighbours: `=0` restores the blanket "any peer inside compiled code
+    // makes this cycle unprovable" refusal, which is what left a many-threaded
+    // workload with no defragmentation at all. See
+    // `vm/src/jit/conservative_roots.rs::xt_jit_coverage_handshake_enabled`.
+    E { group: Group::GC, token: "xt-jit-coverage-handshake", on_key: Some("CRATONVM_XT_JIT_COVERAGE_HANDSHAKE"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-19 with the ZGC read-bounds publish. An OPT-OUT, not an
     // opt-in: ZGC publishing its arena envelope into `JIT_READ_BOUNDS` is the
     // default, and this key is the kill switch that restores helper-only
