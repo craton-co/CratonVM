@@ -1294,6 +1294,45 @@ pub fn jit_static_bytecode_callee() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_INSTANCE_BYTECODE_CALLEE` — the same idea as
+/// [`jit_static_bytecode_callee`], for the three INSTANCE invoke kinds:
+/// `invokevirtual`, `invokeinterface` and `invokespecial`.
+///
+/// # Why it is a separate switch
+///
+/// The static half went first because it has no receiver, hence no virtual
+/// retarget, no interface rules and no receiver guard. The instance half has
+/// all three, so its memo is keyed by `(call site, DISPATCH class id)` rather
+/// than by the site alone — the dispatch class being the receiver's runtime
+/// class for kinds 0/2 and the CP-resolved owner for kind 1. Two switches let
+/// a bisection say which half a regression came from, on ONE binary.
+///
+/// # What is left for it to buy
+///
+/// `invokestatic` was 89% of `jit_invoke_dispatch`'s tail on
+/// `probes/ReactorProbe.java`, but the tail is not where the instance volume
+/// is: those calls arrive at `jit_invoke_virtual_mic` instead, whose
+/// `CRATONVM_DBG=mic-prof` census read `mic_calls=9_437_184` with
+/// `hit_noentry=1_954_260` — 1.95 M dispatches that found their receiver, had
+/// no compiled callee to enter, and fell through to the by-name
+/// `invoke_or_native`, i.e. exactly the 1900 ns transition the static fix
+/// removed for its own kind.
+///
+/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
+///
+/// Default ON. `CRATONVM_JIT_INSTANCE_BYTECODE_CALLEE=0` restores the by-name
+/// path, which is the A/B a same-binary bisection needs.
+#[inline]
+pub fn jit_instance_bytecode_callee() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INSTANCE_BYTECODE_CALLEE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).

@@ -732,6 +732,7 @@ export inherited from a parent shell.
 | `spec-bce` | `CRATONVM_JIT_NO_SPEC_BCE` |
 | `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
 | `static-bytecode-callee` | `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` |
+| `instance-bytecode-callee` | `CRATONVM_JIT_INSTANCE_BYTECODE_CALLEE` |
 | `statics-index` | `CRATONVM_NO_STATICS_INDEX` |
 | `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |

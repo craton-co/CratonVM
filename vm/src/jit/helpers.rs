@@ -427,8 +427,25 @@ pub mod disp_census {
     /// number here against a small `out_static_bc` means the population is
     /// genuinely ineligible rather than the cache thrashing.
     pub const OUT_STATIC_BC_REFUSED: usize = 17;
+    /// An `invokevirtual` / `invokeinterface` / `invokespecial` to an
+    /// uncompiled callee served from the call site's cached interpreter frame
+    /// template (`try_jit_instance_bytecode_callee`).
+    ///
+    /// Split from [`OUT_STATIC_BC`] rather than folded into it because the two
+    /// have different populations and different refusal reasons, and a single
+    /// combined number could not say which half a change moved.
+    pub const OUT_INSTANCE_BC: usize = 18;
+    /// That path DECLINED, per call — same reading as
+    /// [`OUT_STATIC_BC_REFUSED`].
+    pub const OUT_INSTANCE_BC_REFUSED: usize = 19;
+    /// `jit_invoke_virtual_mic`'s entryless hit served by the instance
+    /// template, counted separately from [`OUT_INSTANCE_BC`] because it is a
+    /// DIFFERENT entry point with its own volume (`mic_calls` vs
+    /// `disp_calls`), and the whole point of the instance half is that the MIC
+    /// is where its volume lives.
+    pub const MIC_INSTANCE_BC: usize = 20;
 
-    const N: usize = 18;
+    const N: usize = 21;
     const NAMES: [&str; N] = [
         "kind_virtual",
         "kind_special",
@@ -448,9 +465,15 @@ pub mod disp_census {
         "mic_pic",
         "out_static_bc",
         "out_static_bc_refused",
+        "out_instance_bc",
+        "out_instance_bc_refused",
+        "mic_instance_bc",
     ];
 
     static COUNTS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -2265,6 +2288,14 @@ macro_rules! site_keyed_memos {
 /// tier signals, so without this line the site would keep entering the first
 /// loader's body forever.
 ///
+/// `INSTANCE_BYTECODE_CALLEE_CACHE` joins them. Its own key is a `ClassId`, not
+/// a name, so the second-loader hazard the static memo has does not reach it —
+/// but its `invokespecial` arm RESOLVES that `ClassId` through
+/// `resolve_class_loader_aware(info.class_name)`, and a class definition is
+/// exactly what can change that answer. Listing it costs one `clear()` per
+/// definition epoch and removes the need to argue the distinction on every
+/// future read.
+///
 /// `any_class_redefined` is folded in as cheap insurance. None of the other
 /// memoized fields can actually move under redefinition (a `ClassId`'s name
 /// and `ACC_INTERFACE` are fixed at definition, and redefinition rewrites
@@ -2283,6 +2314,7 @@ fn flush_class_identity_dispatch_memos() {
             DISPATCH_CACHE.with(|c| c.borrow_mut().clear());
             VIRTUAL_DISPATCH_CACHE.with(|c| c.borrow_mut().clear());
             STATIC_BYTECODE_CALLEE_CACHE.with(|c| c.borrow_mut().clear());
+            INSTANCE_BYTECODE_CALLEE_CACHE.with(|c| c.borrow_mut().clear());
         }
     });
 }
@@ -10971,6 +11003,19 @@ site_keyed_memos! {
     /// member is what makes it safe — the same generation and class-identity
     /// flushes that drop every other dispatch memo drop this one too.
     STATIC_BYTECODE_CALLEE_CACHE: JitSiteKey => Option<(std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>, crate::classloading::resolution::RedefineGate)>;
+    /// `(JitSiteKey, DISPATCH ClassId) -> ` the interpreter frame template for
+    /// an `invokevirtual` / `invokeinterface` / `invokespecial` callee the JIT
+    /// did not compile, or `None` as a cached refusal.
+    ///
+    /// The second key component is the class the resolution WALKED FROM, not
+    /// the call site's CP owner: the receiver's runtime class for kinds 0/2
+    /// (so an override is found, and a site that goes polymorphic simply gets
+    /// a second entry rather than serving the first receiver's body to the
+    /// second), and the CP-resolved owner for kind 1 (where a super-call must
+    /// NOT retarget onto the receiver). Keying by the site alone — which is
+    /// what the static half does, correctly, because a static call has no
+    /// receiver — would be the miscompile this cache exists to avoid.
+    INSTANCE_BYTECODE_CALLEE_CACHE: (JitSiteKey, u32) => Option<(std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>, crate::classloading::resolution::RedefineGate)>;
     /// `(JitSiteKey, receiver ClassId) -> CachedDispatchTarget`.
     ///
     /// Keyed exactly like `VIRTUAL_DISPATCH_CACHE`. Array receivers and
@@ -12282,8 +12327,38 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // `virtual_dispatch_target_for_receiver` preserves the real receiver
             // class when available and otherwise supplies the CP-resolved class;
             // `invoke_or_native` then applies the VM's interface/abstract retarget.
-            let dispatch_class =
-                virtual_dispatch_target_for_receiver(vm, receiver_ref, info).class_name;
+            let dispatch_target = virtual_dispatch_target_for_receiver(vm, receiver_ref, info);
+            // A callee the JIT did not compile: enter it through this
+            // (site, receiver class) pair's cached interpreter frame template
+            // rather than re-resolving it from a class NAME on every call.
+            // Only for a `cacheable_receiver`, which is what makes the
+            // receiver's class id a sound key — see
+            // `try_jit_instance_bytecode_callee`.
+            if dispatch_target.cacheable_receiver {
+                if let Some(r) = try_jit_instance_bytecode_callee(
+                    vm,
+                    thread,
+                    info,
+                    info_key,
+                    vm.mem.heap.class_id_of(receiver_ref).as_u32(),
+                    &values,
+                    disp_census::OUT_INSTANCE_BC,
+                ) {
+                    match r {
+                        Ok(v) => return match v {
+                            Some(Value::Int(x)) => x as i64,
+                            Some(Value::Long(x)) => x,
+                            Some(Value::Float(f)) => f.to_bits() as i64,
+                            Some(Value::Double(d)) => d.to_bits() as i64,
+                            Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
+                            Some(Value::Object(None)) | None => 0,
+                            Some(_) => 0,
+                        },
+                        Err(e) => return handle_jit_dispatch_error(vm, thread, e, info),
+                    }
+                }
+            }
+            let dispatch_class = dispatch_target.class_name;
             let virt_result = crate::vm::invoke_or_native(
                 vm,
                 thread,
@@ -12393,6 +12468,38 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             } else {
                 None
             };
+            // An uncompiled super-call callee: same template memo as the
+            // virtual arm, but keyed on the CP-RESOLVED OWNER rather than the
+            // receiver's class, because invokespecial must not retarget. Only
+            // taken when the loader-aware resolution above produced that owner
+            // — the `None` arm below falls back to a by-name
+            // `invoke_special_shared`, and reproducing that choice here would
+            // be reproducing the very question this memo is meant to have
+            // answered once.
+            if let Some(owner) = resolved_owner {
+                if let Some(r) = try_jit_instance_bytecode_callee(
+                    vm,
+                    thread,
+                    info,
+                    info_key,
+                    owner.as_u32(),
+                    &values,
+                    disp_census::OUT_INSTANCE_BC,
+                ) {
+                    match r {
+                        Ok(v) => return match v {
+                            Some(Value::Int(x)) => x as i64,
+                            Some(Value::Long(x)) => x,
+                            Some(Value::Float(f)) => f.to_bits() as i64,
+                            Some(Value::Double(d)) => d.to_bits() as i64,
+                            Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
+                            Some(Value::Object(None)) | None => 0,
+                            Some(_) => 0,
+                        },
+                        Err(e) => return handle_jit_dispatch_error(vm, thread, e, info),
+                    }
+                }
+            }
             let r = match resolved_owner {
                 Some(owner) => crate::vm::invoke_special_shared_on_class(
                     vm,
@@ -12682,6 +12789,182 @@ fn resolve_static_bytecode_callee(
         info.descriptor,
     )?;
     if !cached.is_static {
+        return None;
+    }
+    Some((cached, gate))
+}
+
+/// A compiled caller's `invokevirtual` / `invokeinterface` / `invokespecial`
+/// to a callee the JIT did NOT compile — the instance half of
+/// [`try_jit_static_bytecode_callee`].
+///
+/// # The cost this removes, and where it actually is
+///
+/// Identical in kind to the static half: without it the call lands in
+/// `crate::vm::invoke_or_native`, which re-resolves the dispatch class from a
+/// STRING, re-runs the native-override arbitration, re-clones the
+/// `CodeAttribute` and re-pads the bytecode on every call — 1902 ns against
+/// the interpreter's own 385 ns for the same call.
+///
+/// It is NOT in the same place, though, and that is why this is a second
+/// function rather than a relaxed `invoke_kind` test on the first. An instance
+/// call from compiled code normally arrives at [`jit_invoke_virtual_mic`], not
+/// at `jit_invoke_dispatch`'s tail, so the static half's own census
+/// (`out_tail`) could not see it: `CRATONVM_DBG=mic-prof` on
+/// `probes/ReactorProbe.java` read `mic_calls=9_437_184` with
+/// `hit_noentry=1_954_260`, i.e. 1.95 M dispatches that found their receiver,
+/// had no compiled callee to enter, and fell through to `invoke_or_native`.
+/// This path is therefore wired into BOTH entry points, and counted separately
+/// in each ([`disp_census::MIC_INSTANCE_BC`] vs
+/// [`disp_census::OUT_INSTANCE_BC`]) so "it fires" and "it fires where the
+/// volume is" stay distinguishable.
+///
+/// # Why it is safe to take instead of `invoke_or_native`
+///
+/// Every gate the static half discharges once at resolution, this discharges
+/// too (see [`resolve_instance_bytecode_callee`]); what it adds is the three
+/// obligations a receiver creates:
+///
+/// * **the retarget is performed, not skipped.** The memo's second key
+///   component is the class the resolution walked from, and
+///   `build_lambda_impl_cached` walks it with `find_method_recursive` — the
+///   superclass chain first, then the interface-default closure. For kinds 0/2
+///   that class is the RECEIVER's runtime class, so an override is found
+///   exactly as `invoke_on_class_shared_inner`'s retarget would find it; for
+///   kind 1 it is the CP-resolved owner, so a super-call is NOT retargeted
+///   onto the receiver (the unbounded-recursion defect the `invoke_kind == 1`
+///   arm's own comment records).
+/// * **a site that goes polymorphic cannot serve the wrong body.** The
+///   receiver class is part of the KEY, not a guard tested after a lookup, so
+///   a second receiver class misses and resolves its own entry instead of
+///   hitting the first one's.
+/// * **only a plain, class-identified receiver qualifies.** Callers pass the
+///   dispatch class id only when `virtual_dispatch_target_cached` reported
+///   `cacheable_receiver`, which is false for an array receiver (whose header
+///   carries its COMPONENT class id, so `(site, class id)` does not identify
+///   it), false for `ClassId(0)` synthetics, and false for the
+///   interface-or-bare-`Object` receiver shape that must resolve through the
+///   CP class.
+///
+/// Per hit, only what can change is re-tested: the declaring class's
+/// `RedefineGate`, the process-wide `any_class_redefined` latch, and the arity.
+///
+/// SAFETY: `values` are the caller's already-decoded arguments, receiver
+/// first; `thread` is the JIT helper's own borrow.
+unsafe fn try_jit_instance_bytecode_callee(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    info_key: JitSiteKey,
+    dispatch_class_id: u32,
+    values: &[Value],
+    census_slot: usize,
+) -> Option<Result<Option<Value>, crate::error::MethodCallFailed>> {
+    if !crate::runtime::env_cache::jit_instance_bytecode_callee() {
+        return None;
+    }
+    if dispatch_class_id == 0 {
+        return None;
+    }
+    // A redefine can swap a body for a native (or the reverse) anywhere in the
+    // process; the cached template predates it. Same cheap global latch the
+    // static half opens with.
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
+    let key = (info_key, dispatch_class_id);
+    let cached = match INSTANCE_BYTECODE_CALLEE_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        Some(hit) => hit,
+        None => {
+            let resolved = resolve_instance_bytecode_callee(vm, info, dispatch_class_id);
+            INSTANCE_BYTECODE_CALLEE_CACHE.with(|c| {
+                c.borrow_mut().insert(key, resolved.clone());
+            });
+            resolved
+        }
+    };
+    let Some((cached, gate)) = cached else {
+        disp_census::note(disp_census::OUT_INSTANCE_BC_REFUSED);
+        return None;
+    };
+    if gate.is_stale() {
+        INSTANCE_BYTECODE_CALLEE_CACHE.with(|c| {
+            c.borrow_mut().remove(&key);
+        });
+        return None;
+    }
+    // An instance callee takes its declared parameters PLUS the receiver in
+    // slot 0. A disagreement means the decode and the template describe
+    // different methods, which is a refusal, never a guess.
+    if values.len() != cached.num_params as usize + 1 {
+        return None;
+    }
+    disp_census::note(census_slot);
+    thread.refill_pools_from_shared(
+        &vm.mem.operand_stack_pool,
+        &vm.mem.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let frame = crate::runtime::frame::Frame::new_pooled_cached(
+        cached,
+        values,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    Some(crate::runtime::interpreter::execute_prebuilt_frame(vm, thread, frame))
+}
+
+/// The once-per-`(site, dispatch class)` half of
+/// [`try_jit_instance_bytecode_callee`]. Every refusal is cached as `None`, so
+/// an ineligible pair asks these questions once.
+fn resolve_instance_bytecode_callee(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    dispatch_class_id: u32,
+) -> Option<(
+    std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>,
+    crate::classloading::resolution::RedefineGate,
+)> {
+    if site_name_is_special_cased(info.method_name) {
+        return None;
+    }
+    // No native may be in play for this triple, by either route. Same refusal,
+    // and for the same reason, as the static half: it removes the
+    // native-override, `SyntheticStub`-yield and redefine-shadow questions
+    // rather than reproducing them.
+    if vm
+        .natives
+        .native_methods
+        .might_have_method_descriptor(info.method_name, info.descriptor)
+    {
+        return None;
+    }
+    let owner = ClassId::new(dispatch_class_id);
+    // A lambda proxy's SAM call is not an ordinary virtual call: resolving it
+    // against the proxy's own class runs the functional interface's method
+    // instead of the lambda body (`try_lambda_proxy_sam_dispatch`). Those
+    // arms run before this one at both entry points, but a proxy that reached
+    // here anyway must decline rather than be dispatched by walk.
+    if vm.classes.lambda_proxies.read().contains_key(&owner) {
+        return None;
+    }
+    // `invoke_shared` would run `<clinit>` on the way in. For a receiver whose
+    // class is already instantiated this is all but guaranteed, but the check
+    // is once per pair and initialisation is monotone, so it costs a resolution
+    // and buys the same guarantee the static half has.
+    if !crate::vm::is_class_initialized_via_manager(vm, owner) {
+        return None;
+    }
+    let (cached, gate) = crate::runtime::interpreter::build_lambda_impl_cached(
+        vm,
+        owner,
+        info.method_name,
+        info.descriptor,
+    )?;
+    // A `static` body reached through an instance call site is a disagreement
+    // between the decode and the template, not a target.
+    if cached.is_static {
         return None;
     }
     Some((cached, gate))
@@ -17350,6 +17633,36 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             }
         }
 
+        // THE entryless-hit tail, and the one the instance template memo was
+        // built for: `hit_noentry=1_954_260` of `mic_calls=9_437_184` on
+        // `probes/ReactorProbe.java` reach exactly this `invoke_or_native`,
+        // having already established the receiver and failed to find a
+        // compiled callee to enter. Serving it from the site's cached frame
+        // template is the same 1900 -> 259 ns transition the static half
+        // measured, on 8x the population.
+        if cacheable_receiver {
+            if let Some(r) = try_jit_instance_bytecode_callee(
+                vm,
+                thread,
+                info,
+                jit_site_key(vm.vm_identity, info_ptr as usize),
+                receiver_cid,
+                &full_args,
+                disp_census::MIC_INSTANCE_BC,
+            ) {
+                return match r {
+                    Ok(Some(Value::Int(v))) => v as i64,
+                    Ok(Some(Value::Long(v))) => v,
+                    Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+                    Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+                    Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+                    Ok(Some(Value::Object(None)) | None) => 0,
+                    Ok(_) => 0,
+                    Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
+                };
+            }
+        }
+
         let invoke_res = {
             let _g = mic_prof::CycGuard::new(&mic_prof::CYC_INVOKE);
             crate::vm::invoke_or_native(
@@ -17546,6 +17859,34 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // See the matching note in the cache-hit branch — `decode_values` already
     // yields the `[receiver, args...]` vector `invoke_or_native` expects.
     let full_args = decode_values();
+
+    // Same template memo as the entryless-hit branch above. A miss reaches
+    // here on a site's first call with a given receiver class and on every
+    // call of a megamorphic one; the memo is keyed by `(site, receiver class)`
+    // so the megamorphic case simply keeps one entry per class it actually
+    // sees, and a class it never sees again costs one resolution.
+    if cacheable_receiver {
+        if let Some(r) = try_jit_instance_bytecode_callee(
+            vm,
+            thread,
+            info,
+            jit_site_key(vm.vm_identity, info_ptr as usize),
+            receiver_cid,
+            &full_args,
+            disp_census::MIC_INSTANCE_BC,
+        ) {
+            return match r {
+                Ok(Some(Value::Int(v))) => v as i64,
+                Ok(Some(Value::Long(v))) => v,
+                Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+                Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+                Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+                Ok(Some(Value::Object(None)) | None) => 0,
+                Ok(_) => 0,
+                Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
+            };
+        }
+    }
 
     let invoke_res = {
         let _g = mic_prof::CycGuard::new(&mic_prof::CYC_INVOKE);
@@ -18989,6 +19330,13 @@ mod tests {
         // deny the new site the fast path forever.
         STATIC_BYTECODE_CALLEE_CACHE.with(|c| {
             c.borrow_mut().insert(key, None);
+        });
+
+        // The instance half of the same memo. Keyed by `(site, dispatch class)`
+        // like `VIRTUAL_DISPATCH_CACHE`, and a cached refusal is again a real
+        // entry.
+        INSTANCE_BYTECODE_CALLEE_CACHE.with(|c| {
+            c.borrow_mut().insert((key, 77), None);
         });
 
         // Every memo non-empty first, or the post-flush sweep proves nothing.

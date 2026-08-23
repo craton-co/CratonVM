@@ -1276,6 +1276,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_SP_TAILCALL` | JIT | `CRATONVM_JIT=sp-tailcall` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_STACK_BANG` | JIT | `CRATONVM_JIT=stack-bang` | both | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` | JIT | `CRATONVM_JIT=static-bytecode-callee` | default-on | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_INSTANCE_BYTECODE_CALLEE` | JIT | `CRATONVM_JIT=instance-bytecode-callee` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` | JIT | `CRATONVM_JIT=strict-callee-roots` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` | JIT | `CRATONVM_JIT=strict-install-epoch` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_SYNC_METHODS` | JIT | `CRATONVM_JIT=sync-methods` | opt-in | off | behaviour | snapshot | vm |
