@@ -1183,6 +1183,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "virtual-bytecode-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "statics-index", on_key: None, off_key: Some("CRATONVM_NO_STATICS_INDEX"), off_word: None },
     E { group: Group::JIT, token: "vector-intrinsics", on_key: Some("CRATONVM_VECTOR_INTRINSICS"), off_key: None, off_word: Some("0") },
+    // The dispatch-layer half of the same feature, switched separately so the
+    // templates can be priced against the kernels they sit on rather than only
+    // against an un-intercepted VM.
+    E { group: Group::JIT, token: "vector-templates", on_key: Some("CRATONVM_VECTOR_TEMPLATES"), off_key: None, off_word: Some("0") },
     // `FileChannelImpl.read/write(ByteBuffer)` as one native call instead of
     // twenty JDK frames (`native-io::file_channel_fast_read`). Default-ON,
     // opt-out-only, same shape as `vector-intrinsics` above: the switch gates

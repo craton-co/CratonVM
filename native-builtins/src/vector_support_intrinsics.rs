@@ -1401,12 +1401,31 @@ fn vs_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 // forms, and any opcode the lane kernels do not implement.
 
 /// `VO_SPECIAL | VO_SHIFT` — the mask `lanewiseTemplate(Binary, Vector)` tests
+/// Are the dispatch-layer TEMPLATES registered?
+///
+/// A second switch beside `CRATONVM_VECTOR_INTRINSICS`, and it exists for one
+/// reason: the two layers answer the SAME operations, so a single switch can
+/// only compare "all of it" against "none of it" and cannot price the
+/// templates against the kernels they sit on top of. With this one,
+/// `CRATONVM_VECTOR_TEMPLATES=0` leaves the nine kernels registered and the
+/// route to them interpreted, which is exactly the arm the parent page
+/// measured before this section existed.
+///
+/// Gates REGISTRATION, like its sibling — so the off arm is a VM that never
+/// answers a template natively, not one that answers and discards.
+fn templates_engaged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_VECTOR_TEMPLATES")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
 /// to decide whether it must run its special-case cascade. Taken from the
 /// template's own bytecode (`sipush 136`).
 const VO_BINARY_SPECIAL: i32 = 136;
-/// The same test in `lanewiseTemplate(Unary)` (`sipush 128`), which is
-/// `VO_SPECIAL` alone.
-const VO_UNARY_SPECIAL: i32 = 128;
 /// `opCode`'s require mask: every `XxxVector.opCode` passes `2048`.
 const VO_OPCODE_VALID: i32 = 2048;
 /// `opCode`'s forbid mask. `256` for the two floating-point element types and
@@ -1600,7 +1619,16 @@ fn vd_lanewise_unary(
     };
     let handled = (|| -> Option<Vec<i64>> {
         let (_, elem) = template_owner(ctx, this)?;
-        let opc = opcode_of(ctx, op, elem, VO_UNARY_SPECIAL)?;
+        // No special mask. `lanewiseTemplate(Unary)` branches on exactly two
+        // operators by IDENTITY — `ZOMO` and `NOT` — and both are expansions
+        // with no `VectorSupport` opcode of their own, so `VO_OPCODE_VALID`
+        // is clear on them and `opcode_of` refuses them anyway. Passing
+        // `VO_SPECIAL` as well refused EVERY unary: the census read
+        // `tmpl:lanewise(Unary) handled=0 fell_back=30976` while the kernel
+        // below it answered all 30 976, i.e. the mask cost the whole win and
+        // bought nothing. Anything the lane kernel does not compute still
+        // takes the fallback through `unary_lane`.
+        let opc = opcode_of(ctx, op, elem, 0)?;
         let (_, a) = lanes_of(ctx, this)?;
         if a.is_empty() {
             return None;
@@ -1792,6 +1820,9 @@ vector_templates! {
 /// shift — and registering a triple no class declares would be an entry that
 /// can never fire.
 fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
+    if !templates_engaged() {
+        return;
+    }
     const BIN_ARGS: &str =
         "(Ljdk/incubator/vector/VectorOperators$Binary;Ljdk/incubator/vector/Vector;)";
     const UN_ARGS: &str = "(Ljdk/incubator/vector/VectorOperators$Unary;)";

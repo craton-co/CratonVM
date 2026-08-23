@@ -47,6 +47,11 @@
 //!   (no `MemorySegment` scope to acquire), and for a read, not read-only.
 //! * `interruptedTarget` is null and the calling thread's interrupt flag is
 //!   clear, so `begin()` would not have performed an asynchronous close.
+//! * the calling thread is a PLATFORM thread. `VirtualThread.blockedOn`
+//!   wraps its superclass body in `disableSuspendAndPreempt` /
+//!   `enableSuspendAndPreempt`, and a fast path that published the blocker
+//!   without them would leave a virtual thread preemptable between the
+//!   publication and the I/O.
 //!
 //! Everything else is reproduced exactly rather than skipped:
 //!
@@ -396,7 +401,7 @@ fn screen_pos(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<PosState> 
     if bool_field(ctx, this, cf.closed) || ref_field(ctx, this, cf.interrupted_target).is_some() {
         return None;
     }
-    if ctx.is_interrupted(false) {
+    if ctx.is_interrupted(false) || ctx.is_current_virtual() {
         return None;
     }
     let thread = ctx.current_thread_object();
@@ -635,7 +640,7 @@ fn screen(
         return None;
     }
 
-    if ctx.is_interrupted(false) {
+    if ctx.is_interrupted(false) || ctx.is_current_virtual() {
         return None;
     }
     let thread = ctx.current_thread_object();

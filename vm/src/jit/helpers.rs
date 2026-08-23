@@ -11002,7 +11002,7 @@ site_keyed_memos! {
     /// out of the way (a plain miss) the moment the site sees a second class,
     /// exactly as `VIRTUAL_DISPATCH_CACHE` does for a compiled callee.
     ///
-    /// Resolution goes through the receiver`s ClassId, never through a class
+    /// Resolution goes through the receiver's ClassId, never through a class
     /// NAME, so the by-name loader-identity hazard that
     /// `STATIC_BYTECODE_CALLEE_CACHE` needs the identity flush for cannot
     /// arise here. It is flushed with the others anyway: a ClassId is reused
