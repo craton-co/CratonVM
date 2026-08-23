@@ -328,6 +328,29 @@ pub struct ReferenceProcessor {
     /// "refuse" would silently stop reference processing there.
     identity_stamps: FxHashMap<usize, i32>,
 
+    /// The CLASS of each entry's referent, keyed by the same `reference_obj`
+    /// address as [`Self::identity_stamps`].
+    ///
+    /// The identity stamp above proves the REFERENCE object is the one that
+    /// was discovered. Nothing proved the same about the REFERENT, and the
+    /// post-GC restore pass writes it into slot 0 — so an address that was
+    /// freed and handed to a different object made that pass install a
+    /// stranger as somebody's referent. Under a compacting collector that is
+    /// not exotic: survivors slide DOWN into the space dead objects vacated,
+    /// so a dead referent's base is very often a live object's new base, and
+    /// ZGC's `is_object_address` answers "yes, an object lives here" for it.
+    /// Measured: `SoftReference.get()` returning a `java.io.ClassCache$CacheRef`
+    /// where `MethodTypeForm.cachedLambdaForm` expects a `LambdaForm`.
+    ///
+    /// A class id is a header READ — unlike an identity hash it mints
+    /// nothing, which matters because the only place with the referent in hand
+    /// is the pre-GC null pass, and minting into a mark word the collector is
+    /// about to use is not a trade worth making.
+    ///
+    /// `0` and a missing key both mean UNSTAMPED, and unstamped admits — same
+    /// convention as the identity stamps, and for the same reason.
+    referent_class_stamps: FxHashMap<usize, u32>,
+
     soft_pre_nulled: FxHashSet<usize>,
 
     stats: ReferenceProcessingStats,
@@ -352,6 +375,7 @@ impl ReferenceProcessor {
             soft_ref_addr_index: FxHashMap::default(),
             last_observed_clock_ms: 0,
             identity_stamps: FxHashMap::default(),
+            referent_class_stamps: FxHashMap::default(),
             soft_pre_nulled: FxHashSet::default(),
             stats: ReferenceProcessingStats::default(),
         }
@@ -1113,6 +1137,23 @@ impl ReferenceProcessor {
             self.identity_stamps = moved;
         }
 
+        // Same treatment, same reason, for the referent-class table: its keys
+        // are `reference_obj` addresses and a slide moves them.
+        if !self.referent_class_stamps.is_empty() {
+            let mut moved: FxHashMap<usize, u32> = FxHashMap::with_capacity_and_hasher(
+                self.referent_class_stamps.len(),
+                Default::default(),
+            );
+            for (addr, cid) in self.referent_class_stamps.iter() {
+                let now = match pointer_map.get(addr) {
+                    Some(&new) if new != 0 => new,
+                    _ => *addr,
+                };
+                moved.insert(now, *cid);
+            }
+            self.referent_class_stamps = moved;
+        }
+
         // Relocate finalization queue entries
         for addr in &mut self.finalization_queue {
             if let Some(&new_addr) = pointer_map.get(addr) {
@@ -1170,6 +1211,24 @@ impl ReferenceProcessor {
         if identity_hash != 0 {
             self.identity_stamps.insert(reference_obj, identity_hash);
         }
+    }
+
+    /// Record the CLASS of the referent this entry currently points at, so the
+    /// post-GC restore pass can refuse to install a stranger. See
+    /// [`Self::referent_class_stamps`].
+    ///
+    /// Called by the VM from the pre-GC null pass, which is the one place that
+    /// holds the referent and the heap at the same time.
+    pub fn stamp_referent_class(&mut self, reference_obj: usize, class_id: u32) {
+        if class_id != 0 {
+            self.referent_class_stamps.insert(reference_obj, class_id);
+        }
+    }
+
+    /// A copy of the referent-class table, for the same reason
+    /// [`Self::identity_stamps_snapshot`] exists.
+    pub fn referent_class_stamps_snapshot(&self) -> FxHashMap<usize, u32> {
+        self.referent_class_stamps.clone()
     }
 
     /// The stamp for `reference_obj`, or `None` when it was never stamped.
@@ -1237,7 +1296,7 @@ impl ReferenceProcessor {
 
     /// Keep only the stamps of entries this processor still holds.
     fn prune_identity_stamps(&mut self) {
-        if self.identity_stamps.is_empty() {
+        if self.identity_stamps.is_empty() && self.referent_class_stamps.is_empty() {
             return;
         }
         let mut live: FxHashSet<usize> = FxHashSet::default();
@@ -1252,6 +1311,8 @@ impl ReferenceProcessor {
             live.insert(e.reference_obj);
         }
         self.identity_stamps.retain(|addr, _| live.contains(addr));
+        self.referent_class_stamps
+            .retain(|addr, _| live.contains(addr));
     }
 
     /// Retire the registry's bookkeeping entry for a `Reference` the
