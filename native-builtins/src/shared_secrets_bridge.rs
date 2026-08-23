@@ -2846,6 +2846,24 @@ pub(crate) fn alloc_direct_buffer_pool(
 pub(crate) fn alloc_all_buffer_pools(
     ctx: &mut dyn NativeContext,
 ) -> Result<Vec<ObjectRef>, MethodCallFailed> {
+    // A refused fabrication must NOT propagate from here. `alloc_buffer_pool`
+    // deliberately turns the refusal into a throwable, and for
+    // `JavaNioAccess.getBufferPool()` that is right. This is the LIST, and it
+    // answers `ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)`
+    // during platform-server init -- so a throw here takes out every platform
+    // MXBean, not just the pools. MEASURED: that is what reddened `RJdkJmx`,
+    // whose checks are almost entirely about other beans.
+    //
+    // Empty is what this list answered before the pools became real, and it is
+    // what HotSpot's own contract permits (the list is not specified to be
+    // non-empty). The pools are still real everywhere the carrier CAN be built.
+    if ctx.class_id_by_name(CRATON_BUFFER_POOL_CLASS).is_none()
+        && ctx
+            .try_ensure_synthetic_class(CRATON_BUFFER_POOL_CLASS, BUFFER_POOL_SLOTS)
+            .is_err()
+    {
+        return Ok(Vec::new());
+    }
     let mut pools = Vec::with_capacity(BUFFER_POOL_NAMES.len());
     for (name, kind) in BUFFER_POOL_NAMES {
         // Each pool is pinned while the NEXT one is allocated: `alloc_buffer_pool`
