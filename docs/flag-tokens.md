@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-477 tokens.
+479 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -119,6 +119,7 @@ export inherited from a parent shell.
 | `cce` | `CRATONVM_DBG_CCE` |
 | `cce-bt` | `CRATONVM_DBG_CCE_BT` |
 | `corrupt-cell` | `CRATONVM_DBG_CORRUPT_CELL` |
+| `corrupt-cell-selftest` | `CRATONVM_DBG_CORRUPT_CELL_SELFTEST` |
 | `ccecache` | `CRATONVM_DBG_CCECACHE` |
 | `ccsprobe` | `CRATONVM_DBG_CCSPROBE` |
 | `coercion` | `CRATONVM_DBG_COERCION` |
@@ -396,6 +397,7 @@ export inherited from a parent shell.
 | `overlay-bt` | `CRATONVM_DBG_OVERLAY_BT` |
 | `overlay-nodedup` | `CRATONVM_DBG_OVERLAY_NODEDUP` |
 | `overlay-prune` | `CRATONVM_DBG_OVERLAY_PRUNE` |
+| `tmview` | `CRATONVM_DBG_TMVIEW` |
 | `parklat` | `CRATONVM_DBG_PARKLAT` |
 | `pb` | `CRATONVM_DBG_PB` |
 | `pbe` | `CRATONVM_DBG_PBE` |

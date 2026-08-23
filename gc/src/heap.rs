@@ -2355,17 +2355,16 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
 /// Relaxed throughout: this is a diagnostic on an already-failed path, and the
 /// only ordering that matters - the counter moving before the reader re-reads it
 /// - comes from the read being sequenced between the two loads on one thread.
-pub(crate) static CORRUPT_CELL_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 static CORRUPT_CELL_SLOT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static CORRUPT_CELL_RAW0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CORRUPT_CELL_RAW1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CORRUPT_CELL_TID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many corrupt `Value` cells this process has decoded. See
 /// [`CORRUPT_CELL_HITS`].
 pub fn corrupt_cell_hits() -> u64 {
-    CORRUPT_CELL_HITS.load(Ordering::Relaxed)
+    cratonvm_types::cell_census::decoded()
 }
 
 /// `(slot address, raw word 0, raw word 1)` of the last corrupt cell decoded.
@@ -2378,11 +2377,53 @@ pub fn corrupt_cell_last() -> (usize, u64, u64) {
     )
 }
 
+/// A process-local id for the calling thread, cheap and stable.
+///
+/// `std::thread::ThreadId` has no stable numeric form, and the corrupt-cell
+/// counter is process-GLOBAL: without this, a backstop on thread B would report
+/// a cell thread A decoded, and on a Spring Boot test class -- which runs
+/// several threads -- that is the difference between naming a producer and
+/// naming a bystander. The reporter compares this against the id recorded AT
+/// the hit and stays silent when they differ.
+pub fn probe_thread_id() -> u64 {
+    thread_local! {
+        static TID: u64 = {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        };
+    }
+    TID.with(|t| *t)
+}
+
+/// The [`probe_thread_id`] of the thread that decoded the last corrupt cell.
+pub fn corrupt_cell_last_thread() -> u64 {
+    CORRUPT_CELL_TID.load(Ordering::Relaxed)
+}
+
+/// Fabricate one corrupt-cell hit so the VM can prove its reporting chain works.
+///
+/// A diagnostic that only ever produces silence is indistinguishable from a
+/// broken one, and that is not hypothetical here: the first version of this
+/// instrument watched a single door, stayed quiet through a guard hit it could
+/// not see, and the quiet was read as "nothing to see". The VM arms this from
+/// `CRATONVM_DBG_CORRUPT_CELL_SELFTEST` and checks that both the door reporter
+/// and the safepoint backstop actually speak.
+///
+/// Diagnostic-only: nothing calls it unless that flag is set, and it touches
+/// only this module's own telemetry statics — never the heap.
+pub fn corrupt_cell_inject_for_selftest(slot: usize, raw0: u64, raw1: u64) {
+    CORRUPT_CELL_SLOT.store(slot, Ordering::Relaxed);
+    CORRUPT_CELL_RAW0.store(raw0, Ordering::Relaxed);
+    CORRUPT_CELL_RAW1.store(raw1, Ordering::Relaxed);
+    CORRUPT_CELL_TID.store(probe_thread_id(), Ordering::Relaxed);
+    cratonvm_types::cell_census::note_decoded();
+}
+
 pub(crate) unsafe fn read_value_cell_checked(ptr: *const Value, site: &'static str) -> Value {
     match cratonvm_types::read_value_checked_atomic(ptr) {
         Some(v) => v,
         None => {
-            let n = CORRUPT_CELL_HITS.fetch_add(1, Ordering::Relaxed);
+            let n = cratonvm_types::cell_census::note_decoded();
             // SAFETY: caller contract - 16 readable, 8-byte-aligned bytes.
             CORRUPT_CELL_SLOT.store(ptr as usize, Ordering::Relaxed);
             CORRUPT_CELL_RAW0.store(
@@ -2394,6 +2435,7 @@ pub(crate) unsafe fn read_value_cell_checked(ptr: *const Value, site: &'static s
                     .load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+            CORRUPT_CELL_TID.store(probe_thread_id(), Ordering::Relaxed);
             if n < 32 || gc_flags().diag_hib32 {
                 // SAFETY: caller contract — 16 readable, 8-byte-aligned bytes.
                 // Read atomically per word so the diagnostic itself cannot tear
