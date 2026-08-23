@@ -97,7 +97,11 @@ public class ArrayReceiverProbe {
             row("hashCode==identityHashCode " + name(r),
                     () -> r.hashCode() == System.identityHashCode(r));
             row("equals(self) " + name(r), () -> r.equals(r));
-            row("equals(copy-of-self) " + name(r), () -> r.equals(r.clone()));
+            // An array's `equals` is reference identity, so a copy must NOT be
+            // equal. A door that decoded the body instead would be free to say
+            // otherwise.
+            row("equals(copy) " + name(r), () -> r.equals(java.lang.reflect.Array.newInstance(
+                    r.getClass().getComponentType(), java.lang.reflect.Array.getLength(r))));
         }
 
         System.out.println("== collection doors ==");
