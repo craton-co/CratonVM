@@ -8236,13 +8236,29 @@ fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: FmtLocale) -> FmtSymbols
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => return None,
         };
+        // GC: the four reads below are `invoke_virtual`s, so each can collect
+        // and relocate `dfs`. A receiver is rooted FOR the call it is passed to
+        // and by nothing between them, so reads two through four were issued
+        // against the address the first one saw. Pin it and re-derive per read.
+        // Same defect, same file, same call as the varargs array the caller
+        // pins -- see
+        // `bug-generational-ntru-unpinned-jit-reference-20260821-FIXED.md`.
+        let dfs_pin = if format_arg_pin_enabled() {
+            Some(ctx.pin_native_root(dfs))
+        } else {
+            None
+        };
         let read = |ctx: &mut dyn NativeContext, name: &str, fallback: char| -> char {
-            match ctx.invoke_virtual(dfs, name, "()C", &[]) {
+            let recv = match dfs_pin {
+                Some(h) => ctx.read_native_pin(h, dfs),
+                None => dfs,
+            };
+            match ctx.invoke_virtual(recv, name, "()C", &[]) {
                 Ok(Some(Value::Int(c))) => char::from_u32(c as u32).unwrap_or(fallback),
                 _ => fallback,
             }
         };
-        Some(FmtSymbols {
+        let syms = FmtSymbols {
             grouping: read(ctx, "getGroupingSeparator", ','),
             decimal: read(ctx, "getDecimalSeparator", '.'),
             zero: read(ctx, "getZeroDigit", '0'),
@@ -8253,7 +8269,11 @@ fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: FmtLocale) -> FmtSymbols
             // its own and is already handed the resolved `FmtSymbols`. 59 of
             // this JDK's 1158 available locales answer U+2212 here.
             minus: read(ctx, "getMinusSign", '-'),
-        })
+        };
+        if let Some(h) = dfs_pin {
+            ctx.unpin_native_roots(h);
+        }
+        Some(syms)
     })();
     FMT_SYMBOLS_RESOLVING.with(|f| f.set(false));
     resolved.unwrap_or_default()
@@ -8501,10 +8521,67 @@ pub(crate) fn native_string_format(
 /// `String.format(Locale.ROOT, "%s", x)` pays nothing for a locale it never
 /// consults — and, since the fix above, neither does the no-`Locale` overload,
 /// which is the same laziness doing the same job on a hotter path.
+/// `CRATONVM_NO_FORMAT_ARG_PIN=1` restores the unpinned formatter, so the two
+/// arms are one binary apart.
+fn format_arg_pin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_FORMAT_ARG_PIN").is_none()
+    })
+}
+
 fn format_impl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     locale: FmtLocale,
+) -> MethodCallResult {
+    // GC. `format_impl_pinned` RUNS BYTECODE: every numeric conversion resolves
+    // `FmtSymbols` through `DecimalFormatSymbols.getInstance()`, which allocates
+    // and can trigger a young collection, and `format_arg_full` dispatches
+    // `hashCode`/`toString` on the argument. The format string and the varargs
+    // array arrive as raw `ObjectRef`s in `args` and were held across all of it
+    // with nothing rooting them, so a collection mid-format reclaimed the array
+    // together with every box still inside it. The next conversion then read an
+    // all-zero header at the argument's address -- `ClassId(0)`, which the class
+    // manager names `java.lang.Object` -- and the formatter refused it as
+    // `IllegalFormatConversionException: d != java.lang.Object`. See
+    // `bug-generational-ntru-unpinned-jit-reference-20260821.md`: the signature
+    // reads like a lost JIT root and is neither JIT- nor relocation-related.
+    //
+    // Pin both for the duration, and re-derive the array from its handle before
+    // every element read so a moving collection's new address is used. Same
+    // idiom as `fmt_format_to` further up this file; `pin_base` is the FIRST
+    // handle, so one `unpin_native_roots(pin_base)` releases the batch on every
+    // return path -- which is why the body is a separate function rather than
+    // an early-returning block.
+    if format_arg_pin_enabled() {
+        let fmt_obj = match args.first() {
+            Some(Value::Object(Some(obj))) => *obj,
+            _ => {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("String.format: format is null".to_string()),
+                }
+                .into())
+            }
+        };
+        let arr_obj = match args.get(1) {
+            Some(Value::Object(Some(obj))) => Some(*obj),
+            _ => None,
+        };
+        let pin_base = ctx.pin_native_root(fmt_obj);
+        let arr_pin = arr_obj.map(|a| ctx.pin_native_root(a));
+        let out = format_impl_pinned(ctx, args, locale, arr_pin);
+        ctx.unpin_native_roots(pin_base);
+        return out;
+    }
+    format_impl_pinned(ctx, args, locale, None)
+}
+
+fn format_impl_pinned(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    locale: FmtLocale,
+    arr_pin: Option<usize>,
 ) -> MethodCallResult {
     // Static: args[0] = format String, args[1] = Object[] array
     let fmt_obj = match args.first() {
@@ -8837,6 +8914,20 @@ fn format_impl(
                         } else {
                             FmtSymbols::default()
                         };
+                        // `fmt_symbols_for` above may have run
+                        // `DecimalFormatSymbols.getInstance()` -- real bytecode,
+                        // real allocation, so a collection can have happened
+                        // since `arg` was read. The array is pinned, so the
+                        // element is still LIVE; re-read it through the handle
+                        // so a moving collection's new address is used rather
+                        // than the copy taken before the call.
+                        let arg = match (arr_ref, arr_pin) {
+                            (Some(a), Some(h)) if use_idx < arr_len => {
+                                let a = ctx.read_native_pin(h, a);
+                                ctx.get_array_element(a, use_idx)
+                            }
+                            _ => arg,
+                        };
                         let text = format_arg_full(
                             ctx, &arg, spec, &flags, width, precision, sym, locale,
                         )?;
@@ -9002,6 +9093,17 @@ fn format_impl(
                                     s
                                 }
                             }
+                        };
+                        // Same re-derivation as the general-conversion arm: the
+                        // symbols lookup above can run `DecimalFormatSymbols`
+                        // bytecode, so `elem` may name a pre-collection address.
+                        // The array is pinned, so the element is still live.
+                        let elem = match (arr_ref, arr_pin) {
+                            (Some(a), Some(h)) if use_idx < arr_len => {
+                                let a = ctx.read_native_pin(h, a);
+                                ctx.get_array_element(a, use_idx)
+                            }
+                            _ => elem,
                         };
                         let text = format_temporal_field(
                             ctx, &elem, field, &flags, width, sym, locale, uppercase,
@@ -11927,6 +12029,33 @@ pub(crate) fn format_arg(
                     _ => true,
                 };
                 if !applicable {
+                    // DIAGNOSTIC (`CRATONVM_DBG_FMT_WRONGTYPE`): this is the
+                    // exact site that produces
+                    // `IllegalFormatConversionException: d != java.lang.Object`.
+                    // The message names only the class, which cannot separate a
+                    // reclaimed cell (all-zero header), a stale reference to a
+                    // moved object (forwarded header), and an argument that
+                    // really is of the wrong class. Dump the header so the run
+                    // says which.
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FMT_WRONGTYPE")
+                        .is_some()
+                    {
+                        let a = obj.as_ptr() as usize;
+                        // SAFETY: diagnostic-only aligned read of the header
+                        // words of an argument object the formatter was just
+                        // handed, so the address is mapped.
+                        let w = unsafe { std::slice::from_raw_parts(a as *const u64, 4) };
+                        eprintln!(
+                            "[fmt-wrongtype] spec={spec} obj=0x{a:x} cid={} cname={cname:?} \
+                             kind={:?} w0=0x{:x} w1=0x{:x} w2=0x{:x} w3=0x{:x}",
+                            class_id.as_u32(),
+                            ctx.heap_kind_of(*obj),
+                            w[0],
+                            w[1],
+                            w[2],
+                            w[3],
+                        );
+                    }
                     // The conversion character the exception carries is the
                     // LOWER-case one. `FormatSpecifier.conversion(char)` folds
                     // every upper-case conversion down —

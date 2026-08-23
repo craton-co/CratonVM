@@ -153,7 +153,7 @@ it stands now"):
    would report incomplete for ZGC, and the refusal would behave exactly as it
    does now.
 
-`known-issues/gc/bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`
+`bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`
 reaches the same conclusion from the other end, and records that
 `precise_only_true` is **0 on ZGC** on every workload it measured.
 
