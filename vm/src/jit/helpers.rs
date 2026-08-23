@@ -6945,8 +6945,30 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     if proven_oop {
         JIT_GETFIELD_TRUSTED_REF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let field_index = (raw & !cratonvm_jit_api::GETFIELD_RECEIVER_PROVEN_OOP) as i64;
-    jit_getfield_impl(vm_ptr, obj_ptr, field_index, !proven_oop)
+    // `GETFIELD_EXPECT_REFERENCE` says the caller will DEREFERENCE what it gets
+    // back. See that constant: without it the helper hands compiled code the
+    // payload of whatever `Value` variant the slot holds, and a reference field
+    // punned to a primitive becomes a wild pointer.
+    let expect_ref = raw & cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE != 0;
+    let field_index = (raw & !cratonvm_jit_api::GETFIELD_FLAG_BITS) as i64;
+    jit_getfield_impl(vm_ptr, obj_ptr, field_index, !proven_oop, expect_ref)
+}
+
+/// Reference loads whose slot did not hold a reference, degraded to null by
+/// [`GETFIELD_EXPECT_REFERENCE`](cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE)
+/// instead of being handed to compiled code as a pointer.
+///
+/// An engagement counter, printed beside the fix rather than trusted: a zero
+/// here on a workload that used to crash means the crash came from somewhere
+/// else, and a non-zero one is a live count of type-punned reference slots this
+/// VM is still producing (the G30-1 species). It counts a REAL defect being
+/// contained, not one being fixed — see `jit_getfield_impl`.
+pub static JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT`].
+pub fn jit_getfield_primitive_in_ref_slot() -> u64 {
+    JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Calls that arrived with `GETFIELD_RECEIVER_PROVEN_OOP` set — the engagement
@@ -6962,16 +6984,23 @@ pub fn jit_getfield_trusted_ref_calls() -> u64 {
 
 /// Shared body of [`jit_getfield`] and [`jit_getfield_trusted_ref`].
 ///
-/// `validate_membership` is the ONLY difference between them. Kept as one
-/// function so the two entry points cannot drift in the read, the layout
-/// split or the NPE contract — the drift this repository has been bitten by
-/// every time a "fast" copy of a helper was maintained separately.
+/// `validate_membership` and `expect_ref` are the only parameters that differ
+/// between them. Kept as one function so the two entry points cannot drift in
+/// the read, the layout split or the NPE contract — the drift this repository
+/// has been bitten by every time a "fast" copy of a helper was maintained
+/// separately.
+///
+/// `expect_ref` is a SAFETY input, not an optimisation one: it says the caller
+/// will dereference the returned word. Every path that would otherwise return a
+/// primitive payload has to refuse under it, because compiled code has already
+/// emitted the dereference and checks only for the `i64::MIN` sentinel.
 #[inline]
 unsafe fn jit_getfield_impl(
     vm_ptr: i64,
     obj_ptr: i64,
     field_index: i64,
     validate_membership: bool,
+    expect_ref: bool,
 ) -> i64 {
     // ENGAGEMENT COUNTER for the guarded inline `getfield` fast path.
     //
@@ -7080,6 +7109,14 @@ unsafe fn jit_getfield_impl(
         // #3 for the interpreter-side counterpart of this same gap.
         let val: Value =
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed);
+        // The caller will dereference this, and the compact layout says the
+        // slot is NOT a reference — the two disagree about the field. Refuse
+        // rather than hand over a primitive payload; see the legacy arm below
+        // for the full argument and the crash it comes from.
+        if expect_ref {
+            JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return 0;
+        }
         return match val {
             Value::Int(i) => i as i64,
             Value::Long(l) => l,
@@ -7115,6 +7152,29 @@ unsafe fn jit_getfield_impl(
     // compact-layout branch above -- was `std::ptr::read(ptr as *const
     // Value)`, non-atomic, tearable against a concurrent plain putfield.
     let val: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
+    // A REFERENCE load whose slot does not hold a reference.
+    //
+    // The legacy 16-byte slot carries its own discriminant, so unlike the
+    // compact layout there is no `FieldStorageKind` to consult and this
+    // function has, until now, simply returned the payload of whatever variant
+    // it found. For a caller that is going to dereference the answer that turns
+    // a type-punned slot straight into a wild pointer:
+    // `org.apache.derby.iapi.types.SQLChar.rawData` is declared `[C`, held
+    // `Int(1)`, and the compiled `arraylength` after this call faulted at
+    // `addr=0x5` (= 1 + ARRAY_LENGTH_OFFSET). Compiled code checks the returned
+    // word against `i64::MIN` and nothing else, so every other primitive
+    // payload was a pointer it would follow.
+    //
+    // Degrading to null is the policy `jit_decode_ref_word` already applies
+    // twice in this function to an IMPLAUSIBLE pointer; this is the same
+    // policy for a slot that holds no pointer at all. It is containment, not a
+    // cure — whatever wrote a primitive into a reference slot (the G30-1
+    // species, `known-issues/.../G30-1-the-silent-reference-slot-coercion`)
+    // is still doing it, and the counter says how often.
+    if expect_ref && !matches!(val, Value::Object(_)) {
+        JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return 0;
+    }
     let result = match val {
         Value::Int(i) => i as i64,
         Value::Long(l) => l,
@@ -19638,6 +19698,134 @@ mod tests {
             !take_jit_pending_npe(),
             "an in-range receiver with an OOB slot must not raise NPE"
         );
+    }
+
+    /// A reference load must never hand compiled code a primitive payload.
+    ///
+    /// This is the Tomcat/Derby SIGSEGV of 2026-08-23, reproduced at the helper
+    /// instead of waited for. `org.apache.derby.iapi.types.SQLChar.rawData` is
+    /// declared `[C` and was read back as `Int(1)`; the emitted code was
+    ///
+    /// ```text
+    ///   call  jit_getfield          ; -> rax = 1
+    ///   mov   r10, 8000000000000000h
+    ///   cmp   rax, r10              ; the ONLY value it checks for
+    ///   je    <deopt>
+    ///   mov   eax,[rax+4]           ; arraylength -> SIGSEGV at addr 0x5
+    /// ```
+    ///
+    /// so `i64::MIN` was the only rejected word and every other primitive
+    /// payload became a pointer compiled code would follow. Three crashes
+    /// carried byte-identical registers (`rax=1`, `addr=0x5`), which is what
+    /// showed the miscompiled body was deterministic and only its REACHABILITY
+    /// was racy — 3 crashes in 38 runs one hour, 0 in 129 the next. An
+    /// end-to-end test could not tell a fix from luck; this can.
+    ///
+    /// Exercises the LEGACY 16-byte slot arm, which is the one that crashed:
+    /// a `ClassId` with no registered compact layout takes it.
+    #[test]
+    fn a_reference_getfield_refuses_a_primitive_found_in_the_slot() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let _ = take_jit_pending_npe();
+        let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = (&*vm_box as *const SharedVm) as i64;
+        let obj = vm_box.mem.heap.alloc_object(ClassId::new(0), 2);
+        let obj_ptr = obj.as_ptr() as i64;
+        // Slot 1 punned: an int where a reference belongs. That is the G30-1
+        // species this VM still produces; the point here is what the JIT helper
+        // does when handed one, not how it got there.
+        vm_box.mem.heap.set_field(obj, 1, Value::Int(1));
+
+        let before = jit_getfield_primitive_in_ref_slot();
+
+        // A caller that will NOT dereference still gets the payload — that arm
+        // is what makes this helper usable for primitive fields at all, and
+        // breaking it would be a far larger bug than the one being fixed.
+        let as_primitive = unsafe { jit_getfield(vm_ptr, obj_ptr, 1) };
+        assert_eq!(as_primitive, 1, "a primitive load still returns its payload");
+
+        // A caller that WILL dereference gets null.
+        let ref_arg = cratonvm_jit_api::getfield_index_arg(1, true, false) as i64;
+        let as_reference = unsafe { jit_getfield(vm_ptr, obj_ptr, ref_arg) };
+        assert_eq!(
+            as_reference, 0,
+            "a reference load returned {as_primitive}, which compiled code \
+             dereferences at {:#x}",
+            as_primitive + 4
+        );
+        assert_eq!(
+            jit_getfield_primitive_in_ref_slot() - before,
+            1,
+            "the containment counter must move, or the fix is invisible in a run"
+        );
+
+        // The flag must not disturb the case it exists to protect: a real
+        // reference still comes back as its own pointer, and null as 0.
+        let other = vm_box.mem.heap.alloc_object(ClassId::new(0), 1);
+        vm_box.mem.heap.set_field(obj, 0, Value::Object(Some(other)));
+        let arg0 = cratonvm_jit_api::getfield_index_arg(0, true, false) as i64;
+        assert_eq!(
+            unsafe { jit_getfield(vm_ptr, obj_ptr, arg0) },
+            other.as_ptr() as i64,
+            "a genuine reference must pass through the new guard untouched"
+        );
+        vm_box.mem.heap.set_field(obj, 0, Value::Object(None));
+        assert_eq!(
+            unsafe { jit_getfield(vm_ptr, obj_ptr, arg0) },
+            0,
+            "null must still read back as 0, not as a refusal"
+        );
+        assert!(
+            !take_jit_pending_npe(),
+            "containing a punned slot is not an NPE — the receiver was fine"
+        );
+    }
+
+    /// The flag bits must not be mistaken for part of the slot index.
+    ///
+    /// `field_index` is masked with `GETFIELD_FLAG_BITS`, and the bounds check
+    /// that stops an out-of-range slot reading into the neighbouring object
+    /// runs on the masked value. A mask that missed the new bit would turn
+    /// every reference load into an enormous index — caught by the bounds
+    /// check as `0`, i.e. every reference field in the VM silently reading
+    /// null. That is a quiet catastrophe rather than a loud one, so it is
+    /// asserted directly.
+    #[test]
+    fn the_getfield_flag_bits_are_stripped_before_the_slot_index_is_used() {
+        use cratonvm_jit_api::{
+            getfield_index_arg, GETFIELD_EXPECT_REFERENCE, GETFIELD_FLAG_BITS,
+            GETFIELD_RECEIVER_PROVEN_OOP,
+        };
+        assert_eq!(
+            GETFIELD_FLAG_BITS,
+            GETFIELD_EXPECT_REFERENCE | GETFIELD_RECEIVER_PROVEN_OOP,
+            "every flag must be in the strip mask"
+        );
+        for (index, is_ref, proven) in [
+            (0u32, false, false),
+            (1, true, false),
+            (7, true, true),
+            (u16::MAX as u32, true, true),
+        ] {
+            let arg = getfield_index_arg(index, is_ref, proven);
+            assert_eq!(
+                arg & !GETFIELD_FLAG_BITS,
+                index as u64,
+                "the index must survive the flags"
+            );
+            assert_eq!(
+                arg & GETFIELD_EXPECT_REFERENCE != 0,
+                is_ref,
+                "EXPECT_REFERENCE must ride on exactly the reference loads"
+            );
+            assert_eq!(
+                arg & GETFIELD_RECEIVER_PROVEN_OOP != 0,
+                is_ref && proven,
+                "the receiver proof is only claimed on the reference path"
+            );
+        }
     }
 
     #[test]

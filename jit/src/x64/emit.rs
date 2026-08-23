@@ -373,6 +373,26 @@ impl Compiler {
         self.buf.emit(&imm.to_le_bytes());
     }
 
+    /// MOV `reg`, `jit_getfield`'s third argument for this field.
+    ///
+    /// The argument is a slot index plus flag bits, and one of those flags —
+    /// [`GETFIELD_EXPECT_REFERENCE`](cratonvm_jit_api::GETFIELD_EXPECT_REFERENCE)
+    /// — is a safety contract, not an optimisation: without it the helper
+    /// returns the payload of whichever `Value` variant the slot holds, and
+    /// compiled code, which has already emitted the dereference, follows a
+    /// type-punned primitive as a pointer.
+    ///
+    /// Every `getfield` helper call site in this backend goes through here, so
+    /// the flag cannot be forgotten at one arm. `emit_mov_imm64` still picks
+    /// the short imm32 encoding when no flag is set, so primitive loads emit
+    /// exactly the bytes they emitted before.
+    pub(super) fn emit_getfield_index_arg(&mut self, reg: u8, field_index: usize, type_tag: u8) {
+        let is_ref = type_tag == b'L' || type_tag == b'[';
+        let arg = cratonvm_jit_api::getfield_index_arg(field_index as u32, is_ref, false);
+        // Cast: the flag bits sit at 61/62, so the value stays positive in i64.
+        self.emit_mov_imm64(reg, arg as i64);
+    }
+
     /// MOV reg, imm32 (sign-extended to 64-bit). Uses XOR for zero.
     pub(super) fn emit_mov_imm32_sx(&mut self, reg: u8, imm: i32) {
         if imm == 0 {
