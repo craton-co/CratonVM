@@ -1,10 +1,52 @@
 # `ParameterizedSslHandlerTest` — a completed promise whose waiter is never woken
 
-**Status: ROOT CAUSE LOCALISED. The awaited promise is ALREADY COMPLETE and the
-waiter IS registered, yet the thread stays parked in `Object.wait()` forever.
-This is a memory-ordering defect around CratonVM's monitor, not a netty, TLS or
-selector problem.** The remaining work is to decide which of two reads went
-stale and to fix it.
+**Status: OPEN. The awaited promise is ALREADY COMPLETE and the waiter IS
+registered, yet the thread stays parked in `Object.wait()` forever.**
+
+**2026-08-23 — the "not the monitor / not the JIT" narrowing is WEAKER than
+this page claimed, and one of its two refutations has been withdrawn.** Three
+things changed:
+
+1. **`CRATONVM_JIT_DENY` does not do what the "The JIT is REFUTED" section
+   assumes**, and the refutation is withdrawn. The lever is documented as "a
+   matching method is force-interpreted (never JIT-compiled)"; until this date
+   it was consulted only by `compile_gate::admit`, i.e. by the three COMPILE
+   doors, and **the inline planner never asked**. A denied method could still
+   be `inline-planned` and spliced into a compiled caller's body — so a run
+   with the lever set could have the denied code executing compiled anyway.
+   Worse, whether it does is a **compile-order coin toss**: measured on
+   `probes/XferProbe2.java`'s new `special1` arm, the SAME denied
+   configuration read 5463.9, 444.9, 44.3 and 41.8 ns/op across four runs of
+   three binaries, against ~48 ns/op undenied. Engaged in two of them, inert in
+   the other two. The page's engagement proof (`still-interpreted` 20 → 32,
+   `42036 invocations compile-failed DefaultPromise.isDone0`) cannot tell those
+   apart, because it counts COMPILES and the thing that leaks is a SPLICE.
+
+   The planner now consults the lever
+   (`InlineRefusal::ForceInterpreted`). **The 50-run
+   `CRATONVM_JIT_DENY=DefaultPromise` arm has to be re-run on a binary that has
+   it** before "the defect is tier-independent" can be asserted again.
+
+2. **The monitor now reports whether a `notifyAll()` ever reached it**, which
+   is the measurement that partitions the two surviving explanations. See
+   "The partitioning instrument" below. It has NOT yet been run against a
+   stall — the Azure host was unreachable for the whole of the session that
+   added it.
+
+3. **The plain wait/notify handshake does NOT reproduce in isolation.**
+   `probes/PromiseWaitProbe.java` is `DefaultPromise`'s handshake reduced to
+   the three fields that carry it. Roughly **1.2 million waits** across five
+   configurations — plain, `contend` (a third thread taking `synchronized (p)`
+   in a loop, so the monitor inflates from outside while the waiter enters
+   `wait()`), `alloc` (per-round garbage under `--Xmx 256m`), `both`, and the
+   synthetic-JDK vs real-JDK (`--java-home`, `-XX:+UseG1GC`) paths — produced
+   **zero stalls**, on this tree and on HotSpot. That is a real negative: the
+   race between `isDone()`, `incWaiters()`, `wait()` and a `synchronized`
+   completer is not sufficient on its own, so the stall needs an ingredient
+   that probe does not have.
+
+The selector-registry leak recorded at the bottom of this page is **FIXED**
+independently, on its own merits, and is still not shown to cause this stall.
 
 ## The measurement that settles it
 
@@ -117,14 +159,26 @@ Either is a happens-before failure across `monitorenter`/`monitorexit`.
 
 ~5–7.5%.
 
-**The JIT is REFUTED.** The first deny arm (0/10) proved nothing — 10 runs at a
-6% rate expects 0.6 — so it was re-run toward 50 with the lever's engagement
-proven first (below). It stalled at **run 4**, which settled it without needing
-50 — 50 runs were only ever required to demonstrate *absence*, and one stall
-demonstrates *presence*. The arm was left to finish anyway and ended
-**4 stalls in 50 (8%)**, statistically indistinguishable from the 6.25%
-baseline (5/80): the lever moves the rate not at all. The stalled run carries the identical signature, with
-`DefaultPromise` force-interpreted:
+**~~The JIT is REFUTED.~~ WITHDRAWN 2026-08-23 — see the status block.** The
+argument below is reproduced as it stood, because the DATA is still good and
+only the interpretation of the lever has changed. The first deny arm (0/10)
+proved nothing — 10 runs at a 6% rate expects 0.6 — so it was re-run toward 50
+with the lever's engagement proven first (below). It stalled at **run 4**,
+which settled it without needing 50 — 50 runs were only ever required to
+demonstrate *absence*, and one stall demonstrates *presence*. The arm was left
+to finish anyway and ended **4 stalls in 50 (8%)**, statistically
+indistinguishable from the 6.25% baseline (5/80): the lever moves the rate not
+at all.
+
+**What that no longer licenses.** "The lever moves the rate not at all" is
+consistent with two different worlds: the JIT is irrelevant, OR the lever did
+not force-interpret anything. Until 2026-08-23 the second world was not
+excluded, because the inline planner ignored the lever and could splice the
+denied bodies into their callers anyway — non-deterministically, run to run.
+The arm has to be re-run on a binary whose planner consults it.
+
+The stalled run carries the identical signature, with `DefaultPromise`
+nominally force-interpreted:
 
 ```
 [WAIT-OBJECT] class=io/netty/util/concurrent/DefaultPromise
@@ -132,23 +186,25 @@ baseline (5/80): the lever moves the rate not at all. The stalled run carries th
 orphan hits: 0
 ```
 
-So the stale read is **not** in `DefaultPromise`'s compiled code, and a compiled
-`monitorenter`/`monitorexit` missing a fence is no longer the candidate. **The
-defect is tier-independent — it is in the VM's monitor implementation itself**
-(the interpreter path included), or in the `Object.wait`/`notifyAll`
-bookkeeping around it.
+~~So the stale read is **not** in `DefaultPromise`'s compiled code, and a
+compiled `monitorenter`/`monitorexit` missing a fence is no longer the
+candidate. **The defect is tier-independent.**~~ Both sentences depended on the
+lever having engaged. Neither is established today.
 
-Engagement was proven before trusting either arm: with the lever set,
-`still-interpreted` rises 20 → 32 and the hot-but-stuck list names the denied
-methods outright —
+Engagement was *thought* to have been proven before trusting either arm: with
+the lever set, `still-interpreted` rises 20 → 32 and the hot-but-stuck list
+names the denied methods outright —
 
 ```
 42036 invocations  compile-failed  DefaultPromise.isDone0(Ljava/lang/Object;)Z
 29492 invocations  compile-failed  DefaultPromise.isDone()Z
 ```
 
-`isDone`/`isDone0` are precisely the volatile `result` read at BCI 20, i.e. the
-arm did test candidate (1) directly.
+`isDone`/`isDone0` are precisely the volatile `result` read at BCI 20. But both
+lines say a standalone COMPILE was refused, which is not the same claim as "no
+compiled copy of this body ran": an inline splice into a compiled caller
+produces neither line. That is the gap the 2026-08-23 planner fix closes, and
+the reason this proof has to be re-taken rather than reused.
 
 ## Instruments added (all default-OFF or watchdog-only)
 
@@ -165,17 +221,80 @@ arm did test candidate (1) directly.
 * the orphan check, and `dump_wait_object_state` (the `[WAIT-OBJECT]` line
   above) — **both unsound under a moving collector; see the caveat box.**
 
+### The partitioning instrument (added 2026-08-23, not yet run against a stall)
+
+`Monitor` now counts the `notify()` / `notifyAll()` calls it SERVES, and
+`Object.wait()` snapshots that total under the state lock a notifier must also
+hold — so the snapshot cannot straddle one. The watchdog dump prints the
+DELTA:
+
+```
+[WAIT-OBJECT] notifies_since_wait=N interrupt_wakes_since_wait=M
+              (monitor totals: notify=… interrupt=…)
+```
+
+At a stall, with `result != null` and `waiters == 1` already established, that
+one number separates the two surviving explanations, which need OPPOSITE
+fixes:
+
+* **`N == 0`** — no `notifyAll()` ever reached this monitor after the waiter
+  registered. The defect is then ABOVE the monitor: `checkNotifyWaiters` read a
+  stale `waiters == 0`, or `setValue0`'s `RESULT_UPDATER.compareAndSet` wrote
+  the field without reporting the success, so the branch containing the call
+  was never taken at all. (That third possibility is worth naming: netty's
+  `setValue0` is `if (CAS(null→v) || CAS(UNCANCELLABLE→v)) { checkNotifyWaiters(); }`,
+  so a CAS that writes and returns `false` produces EXACTLY the observed state
+  — `result` set, no notify — and `trySuccess` would then return `false`, which
+  netty logs as "Failed to mark a promise as success". **Grepping a stall log
+  for that string is free and has not been done.**)
+* **`N >= 1`** — a notification WAS delivered to this monitor and the waiter did
+  not observe it. The defect is then the condvar handshake in `monitor.rs`.
+
+It costs one relaxed add under a lock the notifier already holds, and it needs
+ONE stall rather than a rate. `wake_all_for_interrupt` is counted separately,
+because it is the VM answering `Thread.interrupt()` rather than Java code
+signalling a condition, and folding the two together would let an unrelated
+interrupt masquerade as the missing `notifyAll`.
+
+### `probes/PromiseWaitProbe.java` — the isolated handshake, which does NOT stall
+
+`DefaultPromise`'s `result` / `waiters` / `notifyAll` handshake with nothing
+else attached, driven by a REUSED waiter pool spinning on a sequence number
+(thread creation is ~1 ms and the window being hunted is the handful of
+instructions between `isDone()` and `wait()`, so a thread-per-round harness
+spends all its time outside the race). Its STALL line reports `cas`, `result`,
+`notified`, the `waiters` the completer saw and the `waiters` now, so each
+candidate mechanism has a distinct fingerprint.
+
+~1.2 M waits, five pressure configurations, both JDK paths: **zero stalls.**
+Recorded as a negative rather than dropped — it says the monitor primitive is
+not the whole story, and it is the harness the next ingredient should be added
+to rather than rebuilt.
+
 **Do not read `CRATONVM_WAIT_SPURIOUS_MS` as a fix.** It converts a permanent
 hang into an `n`-second delay by papering over a lost wakeup; at 100 ms it also
 cost 69% wall (72.5 s → 122.8 s), so it is a diagnostic, not a mitigation.
 
-## Also found: the selector registry never shrinks
+## Also found: the selector registry never shrinks — **FIXED 2026-08-23**
 
 1056 selectors in one run of one class, 1040 of them closed. `selector_close`
-sets `open = false` and nothing removes the map entry, so
-`deregister_fd_everywhere` — called on **every channel close** — locks ~1000
-dead mutexes by the end of the class. A real defect on its own merits;
-explicitly **not** shown to cause this stall.
+sets `open = false` and nothing removes the map entry — it cannot, because
+other threads hold `MutexGuard`s derived from it and the registry's values are
+stored inline — so `deregister_fd_everywhere`, called on **every channel
+close**, locked ~1000 dead mutexes by the end of the class purely to read a
+`bool` out of each and find nothing. Three other registry-wide walks
+(`deregister_channel_everywhere`, `slot_of_key_obj`, `selector_refresh_udp`)
+had the same shape.
+
+The entry now carries a lock-free mirror of its `open` flag beside the mutex
+(`SelectorSlot`), and every registry-wide walk skips a closed entry without
+locking it. `SelectorState::open` stays authoritative — every correctness
+decision still reads it under the lock — and the mirror is only ever used to
+SKIP. `open` is monotone (open once, closed forever), so a skip cannot race a
+re-open: there is no such transition.
+
+A real defect on its own merits; still explicitly **not** shown to cause this
+stall, and fixed on those terms rather than offered as the stall's fix.
 
 ## Next
 
@@ -212,11 +331,23 @@ explicitly **not** shown to cause this stall.
    earlier revision of this page asserted "nothing publishes them"; that was
    wrong. Audit instead the **inflation transition** and the
    thin→inflated handover, where the two orderings meet.
-2. Cheapest confirmation: log `waiters` as the completer reads it, next to the
-   value the waiter wrote — through a GC-safe handle per step 0. A 0-vs-1
-   disagreement names the failing edge directly and needs one stall, not a rate.
-3. Fix the ordering; re-measure the rate over ≥40 runs.
-4. Fix the selector-registry leak independently.
+2. ~~Cheapest confirmation: log `waiters` as the completer reads it~~ —
+   **SUPERSEDED and DONE differently.** Counting the notifies the MONITOR
+   served is strictly stronger than logging what the completer read: it
+   distinguishes "the completer never called `notifyAll()`" from "it did and
+   the waiter missed it", which is the branch point, whereas a `waiters` log
+   only covers the first. See "The partitioning instrument". **Still needs one
+   stall to be read.**
+3. **RE-RUN the `CRATONVM_JIT_DENY=DefaultPromise` arm** on a binary whose
+   inline planner consults the lever. Until that is done the JIT is not
+   refuted, and "the defect is tier-independent" is not a finding.
+4. Grep an existing stall log for netty's own
+   `"Failed to mark a promise as success"` warning. If it is there, `setValue0`
+   returned `false` after writing `result`, and the defect is in
+   `AtomicReferenceFieldUpdater.compareAndSet` rather than in the monitor at
+   all — which no instrument on this page would have shown. Free to check.
+5. Fix whatever 2/3/4 name; re-measure the rate over ≥40 runs.
+6. ~~Fix the selector-registry leak independently~~ — **DONE 2026-08-23.**
 
 ## Repro
 

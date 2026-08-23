@@ -5,7 +5,8 @@
  * is overwhelmingly virtual/interface, so this splits the three kinds so a fix
  * scoped to one of them can be shown to move the right one.
  *
- * Usage: XferProbe2 <iters> <arm>   arm = static | virtual | iface | iface2 | special
+ * Usage: XferProbe2 <iters> <arm>
+ *   arm = static | virtual | iface | iface2 | special | special1
  *
  * Deny the callee with the class the body actually lives on, e.g.
  * `CRATONVM_JIT_DENY=XferProbe2$Impl.calleeVirtual` for `virtual` and
@@ -113,6 +114,22 @@ public class XferProbe2 {
         @Override int calleeSpecial(int x) { return super.calleeSpecial(x); }
     }
 
+    /**
+     * The ONE-LINE super-callee, kept as the lever's own witness.
+     *
+     * `CRATONVM_JIT_DENY=XferProbe2$Base1.calleeSpecial1` on this arm is the
+     * test of whether the deny lever means what its doc says. Before
+     * 2026-08-23 the planner did not consult it, so `CRATONVM_DBG=jitc`
+     * printed `inline-planned XferProbe2$Base1.calleeSpecial1 @pc=2` and the
+     * arm read the SAME ns/op denied and undenied -- the tell that the lever
+     * was not engaged, and the reason the `special` arm above needed a callee
+     * the inliner refuses on size.
+     */
+    static class Base1 { int calleeSpecial1(int x) { return x + 1; } }
+    static class Sub1 extends Base1 {
+        @Override int calleeSpecial1(int x) { return super.calleeSpecial1(x); }
+    }
+
     static class Impl implements Op, Op2 {
         public int apply(int x) { return calleeIface(x); }
         public int compute(int x) { return x + 1; }
@@ -137,17 +154,22 @@ public class XferProbe2 {
     static void loopSpecial(int n, Sub s) {
         for (int i = 0; i < n; i++) sink += s.calleeSpecial(i);
     }
+    static void loopSpecial1(int n, Sub1 s) {
+        for (int i = 0; i < n; i++) sink += s.calleeSpecial1(i);
+    }
 
     public static void main(String[] args) {
         int n = args.length > 0 ? Integer.parseInt(args[0]) : 2000000;
         String arm = args.length > 1 ? args[1] : "static";
         Impl o = new Impl();
         Sub s = new Sub();
+        Sub1 s1 = new Sub1();
         switch (arm) {
             case "virtual": loopVirtual(50000, o); break;
             case "iface":   loopIface(50000, o);   break;
             case "iface2":  loopIface2(50000, o);  break;
             case "special": loopSpecial(50000, s);  break;
+            case "special1": loopSpecial1(50000, s1); break;
             default:        loopStatic(50000);     break;
         }
         long t0 = System.nanoTime();
@@ -156,6 +178,7 @@ public class XferProbe2 {
             case "iface":   loopIface(n, o);   break;
             case "iface2":  loopIface2(n, o);  break;
             case "special": loopSpecial(n, s);  break;
+            case "special1": loopSpecial1(n, s1); break;
             default:        loopStatic(n);     break;
         }
         long d = System.nanoTime() - t0;

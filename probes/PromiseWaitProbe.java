@@ -42,7 +42,12 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  *              handover the page names as the surface still to audit;
  *   `alloc`    per-round garbage, so a moving collection can land inside the
  *              window;
- *   `both`     both. Default: none.
+ *   `intr`     a thread interrupting the waiters, which is the one path in
+ *              `Monitor::wait` that FORWARDS a notification it may have
+ *              consumed (`if !result.timed_out() { notify_one() }`) -- and
+ *              netty's `awaitUninterruptibly` swallows the exception and
+ *              re-loops, so an interrupt there is invisible in the test output;
+ *   `all`      contend + alloc + intr. Default: none.
  */
 public class PromiseWaitProbe {
 
@@ -134,8 +139,11 @@ public class PromiseWaitProbe {
         long timeoutMs = args.length > 2 ? Long.parseLong(args[2]) : 5000;
         int maxSpin = args.length > 3 ? Integer.parseInt(args[3]) : 64;
         String pressure = args.length > 4 ? args[4] : "none";
-        boolean contend = pressure.equals("contend") || pressure.equals("both");
-        boolean alloc = pressure.equals("alloc") || pressure.equals("both");
+        boolean contend = pressure.equals("contend") || pressure.equals("both")
+                || pressure.equals("all");
+        boolean alloc = pressure.equals("alloc") || pressure.equals("both")
+                || pressure.equals("all");
+        boolean intr = pressure.equals("intr") || pressure.equals("all");
 
         if (contend) {
             Thread c = new Thread(() -> {
@@ -152,6 +160,21 @@ public class PromiseWaitProbe {
             }, "contender");
             c.setDaemon(true);
             c.start();
+        }
+
+        final Thread[] pool = new Thread[nWaiters];
+        if (intr) {
+            Thread ir = new Thread(() -> {
+                int i = 0;
+                while (running) {
+                    Thread t = pool[i++ % pool.length];
+                    if (t != null) {
+                        t.interrupt();
+                    }
+                }
+            }, "interrupter");
+            ir.setDaemon(true);
+            ir.start();
         }
 
         for (int i = 0; i < nWaiters; i++) {
@@ -174,6 +197,7 @@ public class PromiseWaitProbe {
                 }
             }, "waiter-" + i);
             w.setDaemon(true);
+            pool[i] = w;
             w.start();
         }
 
