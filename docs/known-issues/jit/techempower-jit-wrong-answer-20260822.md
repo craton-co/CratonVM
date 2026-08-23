@@ -1,6 +1,6 @@
 # TechEmpowerTest is not a perf class: with the JIT on it returns a WRONG ANSWER in ~25 s, and it PASSES with `--jit off`
 
-**Status: OPEN CratonVM JIT correctness defect.** Filed 2026-08-22 on `dev`
+**Status: OPEN CratonVM JIT correctness defect, narrowed to the reactive READ path (§2.1).** Filed 2026-08-22 on `dev`
 (`b8fa0585e` present — this is NOT that defect, see §4). Reproduces 4/4 with
 the JIT on and 0/3 with it off, on a quiet Azure host, against a HotSpot
 control that passes.
@@ -79,32 +79,65 @@ So **`find()` handed back `null` for an id the benchmark guarantees exists.**
 (`MAX_OF_RANGE = 10000`), and `createData` inserts exactly ids `1..10000`
 (`world.setId( index + 1 )` for `index` in `0..9999`).
 
-### 2.1 Two candidate mechanisms, NOT yet discriminated
+### 2.1 DISCRIMINATED 2026-08-22: the rows are all there. It is the READ path.
 
-This page deliberately stops before naming one, because the evidence so far
-is equally consistent with both:
+The measurement §2.1 called for was run, and it settles the question in one
+line. A `[COUNT-PROBE]` was added to `TechEmpowerTest` — **the test class, not
+`WorldVerticle`**, deliberately, because `createData` holds the suspect
+`ArrayLoop` and §8.2 of the hibernate-reactive page showed that instrumenting
+a suspect body can hide the defect. It runs after `/createData` has returned
+and before `/updates` begins:
 
-1. **`createData` under-inserted.** It runs
-   `CompletionStages.loop( 0, 10000, index -> session.persist(...) )` — the
-   `ArrayLoop` machinery — with `setBatchSize(1000).flush()`. If the compiled
-   loop drops an iteration, or a batch flush silently loses rows, the missing
-   ids are exactly what `find()` would later miss.
-2. **`find()` is wrong for a row that IS present.** The reactive load path
-   returning `null` for an existing row would produce the identical symptom
-   without any row ever being missing.
+```
+[COUNT-PROBE] after createData: count=10000 minId=1 maxId=10000 (expected 10000/1/10000)
+```
 
-**The discriminating measurement is one query**: after `/createData` returns
-200 and before `/updates` runs, `SELECT count(*) FROM World` (or select the
-missing id directly once the failing id is logged). 10 000 means the defect is
-in the read path; fewer means it is in the write/loop path. That is the
-honest first step for whoever takes this, and it is cheap.
+**That line appeared, identically, in all four runs — the three `--jit on`
+runs that FAILED and the `--jit off` run that passed.** Critically, run 1
+paired `count=10000` with the `NullPointerException` **in the same run**: every
+one of the 10 000 rows was present in the database, ids `1..10000` with no
+gaps at either end, and `session.find( World.class, id )` still handed back
+`null`.
 
-Note the pull toward mechanism 1: `createData`'s `loop(0, 10000, …)` is the
-same `ArrayLoop` that
+So:
+
+* **Mechanism 1 — `createData` under-inserted — is REFUTED.** The write path
+  and the `loop(0, 10000, …)` / `ArrayLoop` machinery are exonerated. The pull
+  toward blaming them (because §8's defect lived there) was a bias worth
+  naming, and it was wrong.
+* **Mechanism 2 — the reactive read path returns `null` for a row that
+  exists — is CONFIRMED**, and is now the whole of the remaining search space.
+
+A caveat recorded rather than hidden: adding the probe shifted the failure
+mode distribution. Before it, 3 of 4 `--jit on` runs took the fast NPE mode;
+with it, 1 of 3 did (runs 2 and 3 hit the 300 s fixture deadline instead).
+The probe therefore perturbs timing somewhat — but it did **not** mask the
+defect (4/4 still fail with the JIT on), and the decisive datum comes from a
+run that reproduced the NPE with the probe active, so the conclusion does not
+rest on the perturbed runs.
+
+### 2.2 The original two candidates, retained for the record
+
+These were the two candidates before §2.1's measurement. Kept because the
+reasoning that picked the wrong favourite is worth preserving:
+
+1. **`createData` under-inserted** — it runs
+   `CompletionStages.loop( 0, 10000, index -> session.persist(...) )`, the
+   `ArrayLoop` machinery, with `setBatchSize(1000).flush()`. A dropped
+   iteration or a lost batch would leave exactly the gaps `find()` later
+   misses. **REFUTED by §2.1: count=10000, ids 1..10000, no gaps.**
+2. **`find()` is wrong for a row that IS present** — the reactive load path
+   returning `null` for an existing row produces the identical symptom with no
+   row ever missing. **CONFIRMED by §2.1.**
+
+The instructive part is that candidate 1 was the more attractive one, because
+`createData`'s `loop(0, 10000, …)` is the same `ArrayLoop` that
 [hib-reactive-3gc-run-regressions-20260820.md](../hibernate/hib-reactive-3gc-run-regressions-20260820.md)
-§8 found miscompiled. **That is a reason to check it first, not a reason to
-believe it** — §8's defect is fixed and present in this binary, and §4 below
-shows this failure predates and survives that fix.
+§8 found miscompiled — a known-bad component sitting directly in the suspect
+path. It was still the wrong answer. Proximity to a previously-broken
+component is a reason to test something first, never a reason to believe it;
+one `SELECT count(*)` was enough to settle what argument would have kept
+circling.
 
 ## 3. The failure mode is bimodal, which is why this was misfiled for so long
 
@@ -171,15 +204,30 @@ filing implied was available.
 
 ## 7. What the next session should do
 
-1. **Run the discriminating query in §2.1 first.** It splits the search space
-   in half for the cost of one `SELECT count(*)`, and every other step depends
-   on which half.
-2. If it is the write path, the `ArrayLoop`/`loop(0, 10000, …)` compiled body
-   is the obvious suspect and `CRATONVM_JIT_DENY` can bisect it by class the
-   way §8.1 did (`CompletionStages$ArrayLoop` was the single class that
-   mattered there).
-3. If it is the read path, this is unrelated to the loop machinery and needs
-   its own bisect; `CRATONVM_JIT_LAMBDA_SITE=0` and the other twelve switches
-   §8.3 enumerated are the cheapest first sweep, since one of them cleared the
-   §8 defect in a single run.
-4. Do NOT re-file this as a perf/timeout issue without re-reading §1 and §3.
+The discriminating query has been run (§2.1): the rows are all present, so
+this is the **reactive read path**, and the loop/write machinery is out of
+scope. What remains:
+
+1. **Bisect by class with `CRATONVM_JIT_DENY`**, the way the hibernate-reactive
+   page's §8.1 did — that technique took its defect from "somewhere in the
+   JIT" to a single class in one table of runs. Start with the read-path
+   classes this workload actually goes through: `ReactiveDeferredResultSetAccess`
+   (already named in the teardown traces), the reactive `find`/load
+   plan classes, and `Mutiny`/`Uni` glue. `CompletionStages$ArrayLoop` should
+   NOT be the starting point any more — §2.1 exonerated it.
+2. **Sweep the JIT feature switches**, cheapest first: §8.3 of the
+   hibernate-reactive page lists twelve that were tried there, of which
+   `CRATONVM_JIT_LAMBDA_SITE=0` cleared that defect in a single run. Whether
+   any of them clears THIS one is unknown and one run each answers it.
+3. **Get the failing id.** The probe proves rows `1..10000` all exist; the next
+   refinement is to log which id `find()` was called with when it returned
+   `null`, then query that row directly. If a specific id or a narrow range
+   recurs, that is a much stronger lead than "some find returned null" — and it
+   distinguishes a genuinely wrong query result from a lost/misrouted
+   continuation delivering someone else's (empty) result.
+4. Note the read path here is **concurrent**: 500 in-flight requests across 10
+   verticles, each doing 20 sequential `find`s on a shared `Mutiny.SessionFactory`.
+   A result being delivered to the wrong pending continuation would present
+   exactly as `null` for one caller, and would explain why the defect needs
+   the JIT and load to show. That is a hypothesis, not a finding.
+5. Do NOT re-file this as a perf/timeout issue without re-reading §1 and §3.
