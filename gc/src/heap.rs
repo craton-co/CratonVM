@@ -3471,6 +3471,11 @@ mod tests {
                 .unwrap();
         }
         let before = crate::heap::array_receiver_field_accesses();
+        // The census the Spring Boot runner reads back at exit is a SECOND
+        // counter, in `types`, and a refusal that moved only the local one
+        // would report `array_receiver=0` on a sweep that found producers.
+        let census_before = cratonvm_types::cell_census::array_receiver();
+        let decoded_before = cratonvm_types::cell_census::decoded();
 
         // Index 0 lands inside the body; index 2 lands outside it entirely.
         // Both are "in bounds" by `num_slots` and both must be refused.
@@ -3492,6 +3497,14 @@ mod tests {
                 "element {i} was overwritten by a refused field write"
             );
         }
+        assert!(
+            cratonvm_types::cell_census::array_receiver() - census_before >= 4,
+            "the exit census must see the refusals too, or a sweep reports zero"
+        );
+        assert!(
+            cratonvm_types::cell_census::decoded() - decoded_before >= 4,
+            "and `decoded` must move as well: that is what makes the VM-side              producer reporter name the door, the receiver and the Java frames"
+        );
     }
 
     /// The same rule for a REFERENCE array, which is the shape that produced
