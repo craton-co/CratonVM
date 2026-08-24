@@ -708,6 +708,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "promo-seed", on_key: Some("CRATONVM_DBG_PROMO_SEED"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "proxy", on_key: Some("CRATONVM_DBG_PROXY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "prune", on_key: None, off_key: Some("CRATONVM_DBG_NO_PRUNE"), off_word: None },
+    // The named-writer arm of the punned-reference counter: on a NON-ZERO
+    // payload word under a non-`Object` tag, print the class and field so the
+    // writer can be found rather than inferred. Diagnostic only -- the counter
+    // itself is unconditional; this names what it counted.
+    E { group: Group::DBG, token: "punned-ref", on_key: Some("CRATONVM_DBG_PUNNED_REF"), off_key: None, off_word: None },
     // Was the bare `CRATONVM_DBG`, which is now the group variable itself. It
     // gated exactly one call site (`quarkus_staticinit.rs`), so it becomes an
     // ordinary topic. `CRATONVM_DBG=1` no longer enables it — that spelling now
