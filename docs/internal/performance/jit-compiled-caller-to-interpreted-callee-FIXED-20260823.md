@@ -250,7 +250,7 @@ quote them as a suite number**. The population question is the one to ask next,
 and `CRATONVM_DBG=mic-prof` answers it in one run on any host that can boot the
 workload.
 
-Related: `known-issues/perf/webclient-integration-tests-reactive-exchange-gap-20260822.md`,
+Related: `internal/performance/webclient-integration-tests-reactive-exchange-gap-RETIRED-20260823.md`,
 [[jit-entries-per-call-cost-is-the-call-dense-wall]].
 
 ## Reproducing

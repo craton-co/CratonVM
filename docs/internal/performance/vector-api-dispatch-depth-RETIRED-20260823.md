@@ -2,21 +2,64 @@
 
 ## Status
 
-**PARTIALLY FIXED 2026-08-22.** The defect this page opened on — CratonVM
-running the JDK's generic, lane-at-a-time Java fallback for every Vector API
-operation — is fixed. `VectorSupport`'s intrinsic entry points are now whole-
-vector kernels in Rust (`native-builtins/src/vector_support_intrinsics.rs`),
-and on GPULlama3's inference kernel they cover **100%** of calls
-(`fell_back=0`, from the engagement census below).
+**RETIRED 2026-08-23.** The page opened on CratonVM running the JDK's generic,
+lane-at-a-time Java fallback for every Vector API operation. That was fixed on
+2026-08-22 with whole-vector Rust kernels at `VectorSupport`
+(`native-builtins/src/vector_support_intrinsics.rs`), and the page was kept
+OPEN for the layer ABOVE them — `lanewiseTemplate`, `convert0`,
+`ImplCache.find`, `opCode`, `sameSpecies` — which is ordinary interpreted Java,
+tens of frames per lane group.
 
-What remains is a different thing with a different cause, and the page is kept
-OPEN for it: the JDK's own dispatch layer ABOVE `VectorSupport` —
-`lanewiseTemplate`, `convert0`, `ImplCache.find`, `opCode`, `sameSpecies`,
-`broadcastBits` — is ordinary interpreted Java, and there are tens of those
-frames per lane group.
+It closes here because that layer's own diagnosis turned out to be right and to
+have a general fix. The page said, of the remaining cost: **"This is the
+general interpreter/JIT call-cost story, not a Vector API defect."** Two pieces
+of general call-cost work then landed, and the claim is now measured rather
+than asserted:
 
-Opened out of
-`gpullama3-model-load-and-ffm-segment-class-identity-RESOLVED-20260822.md`.
+* the interpreted-callee frame templates for all four invoke kinds
+  (`internal/performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`);
+* the compiled `invokedynamic` bridge, which is what lets a method that CREATES
+  a lambda stay compiled at all — and the JDK's own
+  `IntVector.fromMemorySegment0Template` is exactly such a method.
+
+`probes/Fp16VectorDotBench.java`, ONE binary, `CRATONVM_JIT_INDY_BRIDGE=0|1`,
+six interleaved pairs on a quiet host, `checksum` byte-identical on every run:
+
+| arm | ns per lane |
+|---|---:|
+| bridge OFF | 11 765 - 19 120 |
+| bridge ON | **6 830 - 10 630** |
+
+**1.7x on the median (11 800 -> 6 899), 1.72x on the minima.** Against the
+16 165 - 19 219 this page's own probe read on `dev` `3ed73bf89` the same day,
+the two changes together are **~2.4x** — from work that names no Vector API
+class anywhere.
+
+## What is NOT done, and why it is not a residual of this page
+
+Intercepting HIGHER — at `IntVector.lanewiseTemplate` and its siblings — was
+this page's suggested next step, and the investigation that closed the page
+also closed that question, in the negative and for a concrete reason rather
+than a size estimate:
+
+**A template native has nothing to hand the call back to.** The nine
+`VectorSupport` entry points can REFUSE per call — that is what makes their
+partial coverage safe, and it is only possible because the JDK passes each one
+a `defaultImpl` lambda as an argument. `lanewiseTemplate` has no such
+parameter. CratonVM's native ABI (`MethodCallResult = Result<Option<Value>,
+MethodCallFailed>`) has no "decline, run the bytecode instead" answer either;
+the one yield-to-bytecode mechanism in the tree
+(`synthetic_stub_should_yield_to_real_bytecode`) is resolution-time, and the
+opcode a template must decide on is a RUNTIME value. So a template native would
+have to be TOTAL over every `VectorOperators` opcode for every element type,
+and a gap would be a wrong answer rather than a fallback — against a surface
+where `probes/VectorApiProbe.java`'s 320 rows already caught two real bugs in a
+much smaller one.
+
+That is the argument for stopping, and it does not depend on the throughput
+number: the remaining cost is per-call cost, the per-call work is being
+attacked generally, and the Vector-API-specific version of it cannot be made
+safe by the same means the `VectorSupport` kernels were.
 
 ## Severity
 

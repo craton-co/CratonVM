@@ -205,7 +205,7 @@ pub struct JitStringConcatSite {
 ///
 /// 25x, for moving one `->` across a method boundary. Reactor and WebFlux
 /// assembly is nothing but methods that create lambdas, which is why
-/// `known-issues/perf/webclient-integration-tests-reactive-exchange-gap-20260822.md`
+/// `internal/performance/webclient-integration-tests-reactive-exchange-gap-RETIRED-20260823.md`
 /// reads as a flat profile with no single lever: the lever is that none of it
 /// is compiled.
 ///

@@ -1,17 +1,96 @@
 # `WebClientIntegrationTests` — one WebClient exchange costs 30 ms of CPU against HotSpot's 3.8 ms
 
-**Status: OPEN — characterised 2026-08-22 on `dev` `651fa3256` (Azure Linux
-host 2). Throughput, not correctness: the class scores `169/170 succ, 0 fail,
-1 skip`, same as HotSpot, and finishes. The gap is 7.7x on CPU per exchange and
-it is FLAT — no single symbol is above 3% of a profile. This page exists so the
-next reader does not re-derive the seven things that are already ruled out, and
-does not repeat the two measurements that lie.**
+**Status: RETIRED 2026-08-23. Every mechanism this page named as unfixed is now
+fixed and measured; the gap it characterises is not closed, and the reason is
+recorded below rather than left open.** Throughput, not correctness: the class
+scores `169/170 succ, 0 fail, 1 skip`, same as HotSpot, and finishes. The gap
+was 7.7x on CPU per exchange and it was FLAT — no single symbol above 3% of a
+profile. The page exists so the next reader does not re-derive the seven things
+already ruled out, and does not repeat the two measurements that lie.
 
-The one defect this investigation did find and fix is a different bug and did
-not move this class:
-`internal/fixed-suite-bugs/registered-native-that-always-yields-cost-the-jit-and-the-inline-cache-FIXED-20260822.md`.
+## What was fixed out of this page, and what it was worth
+
+Two mechanisms, both named in "Ruled out" item 1 as the reason the JIT is a
+wash here.
+
+**1. The compiled-caller-to-interpreted-callee transition, all four invoke
+kinds.** Retired separately as
+`internal/performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`.
+
+**2. The `invokedynamic` denial — this page's own "and what is NOT fixed".**
+A method containing an unbridged `invokedynamic` was denied OSR outright and
+METHOD-WIDE, and retired with `MakeNotCompilable` after its first compiled
+execution, so every lambda-creating method ran interpreted for the life of the
+process. Compiled code now EXECUTES such a site through a runtime bridge
+(`CRATONVM_JIT_INDY_BRIDGE`, default ON) covering every bootstrap whose
+implementation reaches the frame only through its operand stack and its class
+id — `LambdaMetafactory`, `SwitchBootstraps`, `ObjectMethods`, alongside the
+`StringConcatFactory` bridge that already existed.
+
+MEASURED on ONE binary, both arms of that switch, interleaved on a quiet host:
+
+| probe / arm | bridge OFF | bridge ON |
+|---|---:|---:|
+| `IndyScopeProbe` loop whose method creates the lambda | 651-1043 ns/op | **23.7-34.4 ns/op** |
+| `IndyScopeProbe` same loop, lambda hoisted out (control) | 23.6-34.2 | 23.8-34.4 |
+| `IndyScopeProbe` a fresh lambda per call | 891-1179 ns/op | **430-560 ns/op** |
+| `Fp16VectorDotBench` (`checksum` identical) | 11 765-19 120 ns/lane | **6 830-10 630 ns/lane** |
+| `ReactorProbe` assemble-only, least-contended | 9248 ns/op | **6896 ns/op** |
+| `ReactorProbe` assemble+run, least-contended | 64 120 ns/op | **56 279 ns/op** |
+| **`ExchangeProbe` — THIS page's workload** | 31.42-34.64 ms/op | 31.27-44.50 ms/op |
+
+The first row is the headline: **~28x**, and it lands exactly on its own
+control, so the penalty for putting a `->` inside a loop's own method is gone
+rather than reduced.
+
+## Why the last row is a wash, and why that retires the page rather than keeping it open
+
+The exchange does not move, and this page already said why in "Ruled out" item
+3: **a request-path method is called ~60 times in this probe and ~170 times in
+the class, so most never qualify for compilation at all.** The page's own
+profile puts it plainly — **this workload is ~98% interpreted**, with `[JIT]
+tid …` at 1.66% of samples.
+
+Every fix above makes COMPILED code better: it removes the tax a compiled
+caller pays to reach an uncompiled callee, and it removes the reason a
+lambda-creating method could never be compiled. On a workload where almost
+nothing is compiled, better compiled code buys almost nothing. That is not a
+missing lever; it is the same statement as "98% interpreted", read forward.
+
+So what is left of this page is the general interpreter throughput wall, which
+has its own pages ([[jit-entries-per-call-cost-is-the-call-dense-wall]],
+[[profile-before-calling-it-the-interpreter-throughput-wall]]) and is not a
+WebClient question. Keeping a WebClient-titled page open for it would send the
+next reader to re-derive the seven ruled-out items above in order to arrive at
+a conclusion this paragraph already states.
+
+## The residual list, settled
+
+Of the named items in "What is actually left":
+
+* `register_jit_code_range_inner` + its sorts — **fixed**. The snapshot it
+  clones is already sorted, so the whole ordering job is placing one element;
+  `sort_unstable_by_key` could not see that (an element appended past the end
+  of a sorted run defeats its almost-sorted path), so every registration paid
+  O(n log n) over the entire registry. Now a `partition_point` + `insert`.
+* `resolve_field_ref_loader_aware`'s "the hit path still clones
+  `ResolvedField`" — **not a defect.** `ResolvedField` is a `ClassId`, a
+  `usize`, three `bool`s and a `u8`; the clone is a ~24-byte memcpy with no
+  refcount and no allocation. The 1.98% is the function, not the clone, and
+  the hit path is already an array index plus two relaxed loads.
+* `CachedInvokeTarget::clone` — real (it holds `Arc`s) and deliberately not
+  taken: the cache is a thread-local `RefCell` and the borrow must be released
+  before the callee runs, because the callee re-enters it. Returning a
+  reference means restructuring that re-entrancy, which is a larger change than
+  0.77% justifies.
+* `InvokeCache::get`, `resolve_method_metadata`,
+  `native_stack_has_jit_frame`, `intern_arc` — left as measured. None is above
+  2.65% and the profile has no lever above them; see the flat-profile table
+  below.
 
 ## The number
+
+
 
 `apps/spring-suite-runner`, `KRunT` (per-test timing launcher), Azure host 2,
 ABBA-interleaved because a same-config wall time on this box swings 50%:

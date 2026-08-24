@@ -6,7 +6,7 @@
 # one request + close. `ExchangeProbe` is that shape without JUnit and
 # reproduces the whole gap; `ExchangePhases` splits it; `ShadowProbe2` is the
 # per-call arm set. See
-# docs/known-issues/perf/webclient-integration-tests-reactive-exchange-gap-20260822.md
+# internal/performance/webclient-integration-tests-reactive-exchange-gap-RETIRED-20260823.md
 #
 # Usage:
 #   CRATONVM_BIN=<bin> ./wcit-exchange-ab.sh run   <hs|cv> <MainClass> [args...]

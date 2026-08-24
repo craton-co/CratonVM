@@ -10,7 +10,7 @@ the arbitration to the real JDK body at every dispatch site, so nothing was
 being protected and the method, its callers and its call sites all paid.
 
 Found while characterising
-`known-issues/perf/webclient-integration-tests-reactive-exchange-gap-20260822.md`.
+`internal/performance/webclient-integration-tests-reactive-exchange-gap-RETIRED-20260823.md`.
 It is **not** that page's cause — see "What this did not fix" below, which is
 the part worth reading before spending time here again.
 
