@@ -1,0 +1,162 @@
+# HotSpot oracle transcript for probes/ArrayReceiverProbe.java
+# openjdk 25.0.3 2026-04-21 LTS (Temurin-25.0.3+9-LTS), win32.
+# Captured 2026-08-24. Record:
+#   corrupt-value-cell-array-receiver-species-CLOSED-20260823
+#
+# Columns: what<TAB>answer. Every array rendering is reduced to its SHAPE (the
+# text up to and including `@`), so no row depends on an identity hash and the
+# transcript is host-independent. A row reading `[B@` is the identity rendering
+# `Object.toString()` gives; a row reading anything else for an array receiver
+# is a door that decoded the BODY.
+#
+# Regenerate with:
+#   javac -d <dir> probes/ArrayReceiverProbe.java && java -cp <dir> ArrayReceiverProbe
+== rendering doors ==
+String.valueOf(Object) [B	[B@
+sb.append(Object) [B	[B@
+sb.append(CharSequence?) [B	[B@
+sb.insert(0,Object) [B	[B@
+Objects.toString [B	[B@
+String.concat-via-+ [B	[B@
+r.toString() [B	[B@
+String.valueOf(Object) [C	[C@
+sb.append(Object) [C	[C@
+sb.append(CharSequence?) [C	[C@
+sb.insert(0,Object) [C	[C@
+Objects.toString [C	[C@
+String.concat-via-+ [C	[C@
+r.toString() [C	[C@
+String.valueOf(Object) [Ljava.lang.String;	[Ljava.lang.String;@
+sb.append(Object) [Ljava.lang.String;	[Ljava.lang.String;@
+sb.append(CharSequence?) [Ljava.lang.String;	[Ljava.lang.String;@
+sb.insert(0,Object) [Ljava.lang.String;	[Ljava.lang.String;@
+Objects.toString [Ljava.lang.String;	[Ljava.lang.String;@
+String.concat-via-+ [Ljava.lang.String;	[Ljava.lang.String;@
+r.toString() [Ljava.lang.String;	[Ljava.lang.String;@
+String.valueOf(Object) [Ljava.lang.Object;	[Ljava.lang.Object;@
+sb.append(Object) [Ljava.lang.Object;	[Ljava.lang.Object;@
+sb.append(CharSequence?) [Ljava.lang.Object;	[Ljava.lang.Object;@
+sb.insert(0,Object) [Ljava.lang.Object;	[Ljava.lang.Object;@
+Objects.toString [Ljava.lang.Object;	[Ljava.lang.Object;@
+String.concat-via-+ [Ljava.lang.Object;	[Ljava.lang.Object;@
+r.toString() [Ljava.lang.Object;	[Ljava.lang.Object;@
+String.valueOf(Object) [I	[I@
+sb.append(Object) [I	[I@
+sb.append(CharSequence?) [I	[I@
+sb.insert(0,Object) [I	[I@
+Objects.toString [I	[I@
+String.concat-via-+ [I	[I@
+r.toString() [I	[I@
+String.valueOf(Object) [[Ljava.lang.String;	[[Ljava.lang.String;@
+sb.append(Object) [[Ljava.lang.String;	[[Ljava.lang.String;@
+sb.append(CharSequence?) [[Ljava.lang.String;	[[Ljava.lang.String;@
+sb.insert(0,Object) [[Ljava.lang.String;	[[Ljava.lang.String;@
+Objects.toString [[Ljava.lang.String;	[[Ljava.lang.String;@
+String.concat-via-+ [[Ljava.lang.String;	[[Ljava.lang.String;@
+r.toString() [[Ljava.lang.String;	[[Ljava.lang.String;@
+String.valueOf(Object) [B	[B@
+sb.append(Object) [B	[B@
+sb.append(CharSequence?) [B	[B@
+sb.insert(0,Object) [B	[B@
+Objects.toString [B	[B@
+String.concat-via-+ [B	[B@
+r.toString() [B	[B@
+String.valueOf(Object) [B	[B@
+sb.append(Object) [B	[B@
+sb.append(CharSequence?) [B	[B@
+sb.insert(0,Object) [B	[B@
+Objects.toString [B	[B@
+String.concat-via-+ [B	[B@
+r.toString() [B	[B@
+== identity doors ==
+hashCode==identityHashCode [B	true
+equals(self) [B	true
+equals(copy) [B	false
+hashCode==identityHashCode [C	true
+equals(self) [C	true
+equals(copy) [C	false
+hashCode==identityHashCode [Ljava.lang.String;	true
+equals(self) [Ljava.lang.String;	true
+equals(copy) [Ljava.lang.String;	false
+hashCode==identityHashCode [Ljava.lang.Object;	true
+equals(self) [Ljava.lang.Object;	true
+equals(copy) [Ljava.lang.Object;	false
+hashCode==identityHashCode [I	true
+equals(self) [I	true
+equals(copy) [I	false
+hashCode==identityHashCode [[Ljava.lang.String;	true
+equals(self) [[Ljava.lang.String;	true
+equals(copy) [[Ljava.lang.String;	false
+hashCode==identityHashCode [B	true
+equals(self) [B	true
+equals(copy) [B	false
+hashCode==identityHashCode [B	true
+equals(self) [B	true
+equals(copy) [B	false
+== collection doors ==
+HashMap.put/get [B	v
+LinkedHashMap.put/get [B	v
+IdentityHashMap.put/get [B	v
+HashSet.add/contains [B	true
+List.indexOf [B	0
+TreeMap.put(String key, array value) [B	[B@
+HashMap.put/get [C	v
+LinkedHashMap.put/get [C	v
+IdentityHashMap.put/get [C	v
+HashSet.add/contains [C	true
+List.indexOf [C	0
+TreeMap.put(String key, array value) [C	[C@
+HashMap.put/get [Ljava.lang.String;	v
+LinkedHashMap.put/get [Ljava.lang.String;	v
+IdentityHashMap.put/get [Ljava.lang.String;	v
+HashSet.add/contains [Ljava.lang.String;	true
+List.indexOf [Ljava.lang.String;	0
+TreeMap.put(String key, array value) [Ljava.lang.String;	[Ljava.lang.String;@
+HashMap.put/get [Ljava.lang.Object;	v
+LinkedHashMap.put/get [Ljava.lang.Object;	v
+IdentityHashMap.put/get [Ljava.lang.Object;	v
+HashSet.add/contains [Ljava.lang.Object;	true
+List.indexOf [Ljava.lang.Object;	0
+TreeMap.put(String key, array value) [Ljava.lang.Object;	[Ljava.lang.Object;@
+HashMap.put/get [I	v
+LinkedHashMap.put/get [I	v
+IdentityHashMap.put/get [I	v
+HashSet.add/contains [I	true
+List.indexOf [I	0
+TreeMap.put(String key, array value) [I	[I@
+HashMap.put/get [[Ljava.lang.String;	v
+LinkedHashMap.put/get [[Ljava.lang.String;	v
+IdentityHashMap.put/get [[Ljava.lang.String;	v
+HashSet.add/contains [[Ljava.lang.String;	true
+List.indexOf [[Ljava.lang.String;	0
+TreeMap.put(String key, array value) [[Ljava.lang.String;	[[Ljava.lang.String;@
+HashMap.put/get [B	v
+LinkedHashMap.put/get [B	v
+IdentityHashMap.put/get [B	v
+HashSet.add/contains [B	true
+List.indexOf [B	0
+TreeMap.put(String key, array value) [B	[B@
+HashMap.put/get [B	v
+LinkedHashMap.put/get [B	v
+IdentityHashMap.put/get [B	v
+HashSet.add/contains [B	true
+List.indexOf [B	0
+TreeMap.put(String key, array value) [B	[B@
+== Arrays helpers ==
+Arrays.toString(byte[])	[106, 97, 118, 97, 47, 108, 97, 110, 103, 47, 114, 101, 102, 108, 101, 99, 116, 47, 80, 114, 111, 120, 121]
+Arrays.toString(String[])	[y, n]
+Arrays.deepToString(String[][])	[[a], [b]]
+Arrays.asList(String[]).toString	[y, n]
+Arrays.hashCode(byte[])	-1515625977
+Arrays.equals(byte[],copy)	true
+new String(byte[])	java/lang/reflect/Proxy
+new String(char[])	java/lang/reflect/Proxy
+== the two recorded producers, directly ==
+valueOf==append	true
+valueOf shape	[Ljava.lang.String;@
+componentClassName	[Ljava.lang.String;
+proxyName decoded	java/lang/reflect/Proxy
+proxyName rendered	[B@
+proxyName length	23
+byte[16]	t
+tail	t/Proxy

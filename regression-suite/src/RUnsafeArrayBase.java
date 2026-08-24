@@ -141,6 +141,36 @@ public class RUnsafeArrayBase {
         eq("Object[] via Unsafe read", u.getObject(oa, obase + 2 * oscale), "v");
         eq("Object[] untouched neighbour", oa[3], null);
 
+        // ---- byte-ADDRESSED round trips over a byte[] ---------------------
+        //
+        // This is the half a "did not corrupt anything" assertion cannot see.
+        // `Unsafe.putFloat(byte[], off, v)` writes FOUR bytes at that offset,
+        // not one truncated element, and `Bits.writeIntL([BII)` — one frame
+        // below Hazelcast's probe in the stack that found this defect — is
+        // exactly that idiom. Routing the array base to `set_array_element`
+        // alone stops the out-of-bounds write and still gives the wrong answer.
+        byte[] buf = new byte[(int) base + 32];
+        byte[] bufGuardBefore = guardArray(64, 55);
+        byte[] bufGuardAfter = guardArray(64, 99);
+        u.putFloat(buf, base, 1.5f);
+        u.putDouble(buf, base + 8, 2.75d);
+        u.putInt(buf, base + 16, 0x01020304);
+        u.putLong(buf, base + 24, 0x0102030405060708L);
+        eq("byte[] getFloat round trip", u.getFloat(buf, base), 1.5f);
+        eq("byte[] getDouble round trip", u.getDouble(buf, base + 8), 2.75d);
+        eq("byte[] getInt round trip", u.getInt(buf, base + 16), 0x01020304);
+        eq("byte[] getLong round trip", u.getLong(buf, base + 24), 0x0102030405060708L);
+        // The FOUR bytes must actually be four bytes: read them back as
+        // elements and rebuild the value the way the JDK's own Bits does.
+        int rebuilt = (buf[0] & 0xff) | ((buf[1] & 0xff) << 8)
+                | ((buf[2] & 0xff) << 16) | ((buf[3] & 0xff) << 24);
+        eq("byte[] float landed as 4 elements", Float.intBitsToFloat(rebuilt), 1.5f);
+        ck("byte[] float did not land as one truncated element",
+                !(buf[1] == 0 && buf[2] == 0 && buf[3] == 0),
+                "bytes 1..3 are all zero — the write was one element wide");
+        checkGuard("byte[] neighbour before", bufGuardBefore, 55);
+        checkGuard("byte[] neighbour after", bufGuardAfter, 99);
+
         // ---- an OUT-OF-RANGE offset must not write anything ---------------
         //
         // Past the end of the element range there is no element to name. It
