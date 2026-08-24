@@ -12934,6 +12934,50 @@ unsafe fn try_jit_virtual_bytecode_callee(
     ))
 }
 
+/// [`site_name_is_special_cased`], minus `apply`.
+///
+/// That list is a NAME-only filter shared with the leaf-native path, and it is
+/// deliberately over-broad there: a leaf native resolves to a callback and
+/// cannot afford to reason about which of `invoke_or_native`'s special cases
+/// might apply. Deferring to it here cost the single most common interface
+/// method in Java. MEASURED, `probes/XferProbe2.java` with
+/// `CRATONVM_DBG=mic-prof`, before this narrowing:
+///
+/// ```text
+/// virtual  out_virtual_bc=1048575  out_virtual_bc_refused=0          <- 100% served
+/// iface    out_virtual_bc=0        out_virtual_bc_refused=1048575    <- 100% refused
+/// ```
+///
+/// `apply` is the SAM of `java.util.function.Function`, i.e. every reactive
+/// operator that is a CLASS rather than a lambda, which is exactly the
+/// population the interpreted-callee page exists for. It earns its place on the
+/// shared list through ONE rescue: `invoke_or_native` redirects
+/// `apply(Ljava/lang/Object;)Ljava/lang/Object;` to
+/// `applyAsInt`/`applyAsLong`/`applyAsDouble` when the dispatch class is
+/// `java/util/function/To{Int,Long,Double}Function`, because those interfaces
+/// declare no `apply` at all and naive dispatch raises `NoSuchMethodError`
+/// (Spring/Eureka).
+///
+/// Narrowed to that rescue's own triple. Two independent things already make it
+/// unreachable from here, and the explicit test is so a later change to either
+/// does not quietly re-open it: an interface that declares no `apply` has no
+/// `Code` for it, so `build_lambda_impl_cached` refuses; and a receiver whose
+/// class is an interface DIFFERENT from the call site's never reaches
+/// resolution at all, because `virtual_dispatch_target_cached` answers
+/// `cacheable_receiver = false` for it.
+fn virtual_site_name_is_special_cased(info: &JitInvokeInfo) -> bool {
+    if info.method_name == "apply" {
+        return info.descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;"
+            && matches!(
+                info.class_name,
+                "java/util/function/ToIntFunction"
+                    | "java/util/function/ToLongFunction"
+                    | "java/util/function/ToDoubleFunction"
+            );
+    }
+    site_name_is_special_cased(info.method_name)
+}
+
 /// The once-per-(site, receiver class) half of
 /// [`try_jit_virtual_bytecode_callee`]. Every refusal is cached as `None`, so
 /// an ineligible pair asks these questions once.
@@ -12945,7 +12989,7 @@ fn resolve_virtual_bytecode_callee(
     std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>,
     crate::classloading::resolution::RedefineGate,
 )> {
-    if site_name_is_special_cased(info.method_name) {
+    if virtual_site_name_is_special_cased(info) {
         return None;
     }
     // No native may be in play for this triple, by either route.

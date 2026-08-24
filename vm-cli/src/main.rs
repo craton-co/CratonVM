@@ -164,6 +164,13 @@ fn maybe_dump_shutdown_reports() {
     // ran at all.
     cratonvm_vm::report_map_view_cache_at_exit();
 
+    // The notification-credit census, on `CRATONVM_DBG=monitor-notify`.
+    // `credits_consumed` is the engagement counter for the `Object.wait()`
+    // lost-wakeup fix: a run with no stalls says nothing about whether the
+    // condition path was exercised, and this is what tells that apart from
+    // the switch having been off.
+    cratonvm_vm::threading::monitor::report_monitor_notify_census_at_exit();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
@@ -6547,6 +6554,10 @@ fn main() {
             // collector's guard and named nothing must SAY so, because silence
             // from a diagnostic reads as "clean" and is not.
             cratonvm_vm::memory::corrupt_cell_exit_summary();
+            // Same reasoning for the post-remap stale-frame-word detector: its
+            // `System.exit` printer sits in the shutdown trailer, and this is
+            // the arm a program that returns from `main` takes instead.
+            cratonvm_types::stale_remap_census::exit_summary();
             match result {
                 Ok(()) => {
                     cratonvm_vm::jit::conservative_roots::report_a5_engagement();

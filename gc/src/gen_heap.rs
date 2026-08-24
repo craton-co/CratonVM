@@ -3835,6 +3835,25 @@ impl GenerationalHeap {
         // is accessed through a Reflection path that resolved a
         // larger-than-actual layout.
         let header = self.get_header(obj_ref);
+        // An ARRAY receiver is never a plain-object field access, and neither
+        // test below can see it: `alloc_array` MIRRORS the length into
+        // `num_slots`, so every real element index is "in bounds" while the
+        // byte offset this accessor computes names neither that element nor,
+        // past the first few, any part of the allocation. See
+        // `heap::refuse_array_receiver_field_access`.
+        if header.kind() == ObjectKind::Array {
+            // SAFETY: `obj_ref` is a live allocation base and `header` is its
+            // header, resolved one line above.
+            unsafe {
+                crate::heap::refuse_array_receiver_field_access(
+                    obj_ref.as_ptr() as usize,
+                    header,
+                    index,
+                    "gen_heap::get_field",
+                )
+            };
+            return Value::Object(None);
+        }
         let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(
@@ -4210,6 +4229,24 @@ impl GenerationalHeap {
         // overflowing into the neighboring object.  Still panic on
         // clearly-corrupt headers.
         let header = self.get_header(obj_ref);
+        // Symmetric with `get_field`: a 16-byte `Value` cell stamped over
+        // packed element data corrupts every element sharing those bytes, and
+        // past the first few indices lands outside the allocation. The bounds
+        // test below admits it because an array mirrors its LENGTH into
+        // `num_slots`. See `heap::refuse_array_receiver_field_access`.
+        if header.kind() == ObjectKind::Array {
+            // SAFETY: `obj_ref` is a live allocation base and `header` is its
+            // header, resolved one line above.
+            unsafe {
+                crate::heap::refuse_array_receiver_field_access(
+                    obj_ref.as_ptr() as usize,
+                    header,
+                    index,
+                    "gen_heap::set_field",
+                )
+            };
+            return;
+        }
         let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(
@@ -9090,9 +9127,20 @@ impl GenerationalHeap {
                     }
                 }
             };
+            // `is_movable_jit_root` is a claim about ONE slot and the pin set is
+            // keyed by OBJECT, so a single rewritable channel naming an address
+            // licensed moving it out from under every OTHER word that also held
+            // it — including a compiled frame's callee-saved register image,
+            // which `band_slot_is_verifiable` refuses to inspect and no channel
+            // rewrites. `is_unrewritable_jit_root` is the veto: the band scan
+            // publishes there when a word in one of those regions resolves to a
+            // live object, and it outranks any movable claim.
             for r in roots.iter() {
                 let a = r.as_ptr() as usize;
-                if is_y(a) && !(honour_movable && crate::gc_quiescence::is_movable_jit_root(a)) {
+                let movable = honour_movable
+                    && crate::gc_quiescence::is_movable_jit_root(a)
+                    && !crate::gc_quiescence::is_unrewritable_jit_root(a);
+                if is_y(a) && !movable {
                     pin_base_of(a, &mut pinned);
                 }
             }

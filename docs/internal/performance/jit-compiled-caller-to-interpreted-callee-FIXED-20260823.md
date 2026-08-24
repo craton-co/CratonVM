@@ -154,6 +154,27 @@ and both failures read like results:
   `ToIntFunction.apply` SAM bridges). Correct behaviour, but a name-wide
   refusal reading like a kind-wide one. The new `iface2` arm names its SAM
   `compute`, and running both is what tells the two apart.
+
+  **That refusal was then removed rather than worked around** (second pass,
+  same day). `apply` is the SAM of `java.util.function.Function` — every
+  reactive operator that is a CLASS rather than a lambda — so refusing it by
+  name gave up exactly the population this page exists for, and the `iface2`
+  arm proved the KIND worked while the shipped VM still served none of the real
+  sites. `virtual_site_name_is_special_cased` narrows the refusal to the
+  rescue's own triple: `apply(Ljava/lang/Object;)Ljava/lang/Object;` on
+  `java/util/function/To{Int,Long,Double}Function`, which is the only thing
+  `invoke_or_native` actually redirects.
+
+  Two independent things already make that triple unreachable from this path,
+  and the explicit test is so a later change to either does not quietly
+  re-open it: an interface that declares no `apply` has no `Code` for it, so
+  `build_lambda_impl_cached` refuses; and a receiver whose class is an
+  interface DIFFERENT from the call site's never reaches resolution, because
+  `virtual_dispatch_target_cached` answers `cacheable_receiver = false`.
+
+  All three arms now read `out_virtual_bc=1048575 out_virtual_bc_refused=0`.
+  `iface` and `iface2` are kept as a REGRESSION GATE on that: `iface` going
+  back to a refusal means the narrowing was lost.
 * **the `special` arm's callee was being INLINED.** A one-line
   `super.calleeSpecial` was `inline-planned … cost=4 budget_left=750` and
   spliced outright, so `CRATONVM_JIT_DENY` on it was a no-op — 24.2 ns denied
@@ -174,7 +195,7 @@ nothing, which is the failure mode this census exists for.
 three kinds — verified to reproduce the pre-fix binary's numbers within its
 noise, which is what makes the A/B a one-binary A/B.
 
-## §3 — why this landed on reactive code hardest (FIXED 2026-08-23, separately)
+## §3 — why this landed on reactive code hardest (CLOSED 2026-08-23, separately)
 
 A method containing an unbridged `invokedynamic` cannot run compiled, so it
 becomes exactly the interpreted callee above. Two mechanisms, both named by the
@@ -195,25 +216,40 @@ VM itself under `CRATONVM_DBG=jitc`:
 once the calling method is compiled); what was broken is that a method
 *containing* an `invokedynamic` never stayed compiled.
 
-**That was a separate item, and it is now CLOSED — by a bridge, not by this
-page.** Compiled code EXECUTES such a site through a runtime helper
+**That was a separate item, and it is CLOSED — by a bridge, not by this page.**
+Compiled code now EXECUTES such a site through a runtime helper
 (`CRATONVM_JIT_INDY_BRIDGE`, default ON), which removes both mechanisms above
 at once: with no trap at the indy bci there is nothing for an OSR frame to
-resume imprecisely, so the OSR denial lifts, and nothing takes the reason-8
-stub, so nothing is retired. Both bullets above therefore describe the OFF arm
-of that switch.
+resume imprecisely, so the method-wide OSR denial lifts, and nothing takes the
+reason-8 stub, so nothing is retired. **Both bullets above now describe the OFF
+arm of that switch.** The bridged set is every bootstrap whose implementation
+reaches the frame only through its operand stack and its class id —
+`LambdaMetafactory`, `SwitchBootstraps`, `ObjectMethods` — beside the
+`StringConcatFactory` bridge the first bullet already named.
 
-MEASURED on ONE binary, both arms, interleaved on a quiet host:
+ONE binary, both arms, ABBA-interleaved on Azure host 2 at load 3-4:
 
-| `IndyScopeProbe` arm | bridge OFF | bridge ON |
-|---|---:|---:|
-| loop whose method creates the lambda | 698-757 ns/op | **22.4-24.2 ns/op** |
-| same loop, lambda hoisted out (control) | 22.4-24.1 | 22.4-24.8 |
-| a fresh lambda per call | 881-936 ns/op | **267-287 ns/op** |
+| `IndyScopeProbe` arm | HotSpot | bridge OFF | bridge ON |
+|---|---:|---:|---:|
+| loop whose method creates the lambda | 1.4 ns | 698-757 ns/op | **22.4-24.2 ns/op** |
+| same loop, lambda hoisted out — CONTROL | 2.5 ns | 22.4-24.1 | 22.4-24.8 |
+| a fresh lambda per call | 2.7 ns | 881-936 ns/op | **267-287 ns/op** |
 
-~30x, and the first row lands exactly on its own control. What THIS page closes
-remains the cost of CALLING an uncompiled method, which was 1900-3700 ns and is
-now ~420.
+~30x, and the first row lands exactly on its control.
+
+Two things that took four builds to find are worth carrying forward, because
+both are about flags that predate an `invokedynamic` which CALLS anything:
+`has_dispatch` and `needs_heap` are computed from `invoke_info`, `direct_calls`
+and the field/new tables, and a bridged indy is in none of them. A method whose
+only inter-method work was one indy therefore compiled with both false, took
+the entry path that "skips catch_unwind + thread-local overhead", and the
+bridge found a null `JIT_THREAD` and answered a NULL REFERENCE — no exception,
+no crash. `probes/MinIndyProbe.java` exists because every arm of
+`probes/IndyBridgeProbe.java` is a LOOP, and a loop has something else in it
+that already forces both flags.
+
+What this page closes remains the cost of CALLING an uncompiled method, which
+was 1900–3700 ns and is now ~420.
 
 ## What this is NOT
 
@@ -258,17 +294,52 @@ synthetic layouts meet.
 Naming which gate refuses would take one counter per refusal reason, and is the
 cheapest next instrument here.
 
-## What is left
+## The suite-level population — ASKED above, ANSWERED here (2026-08-23)
 
-**The suite-level population is not measured here.** `probes/ReactorProbe.java`
-and the WebClient exchange need reactor on the classpath, which this session's
-host does not have, so the `out_virtual_bc` share of a real reactive workload's
-tail is unmeasured. The isolated per-call numbers above are real; **do not
-quote them as a suite number**. The population question is the one to ask next,
-and `CRATONVM_DBG=mic-prof` answers it in one run on any host that can boot the
-workload.
+The section this replaces closed by naming the next question: *"the
+`out_virtual_bc` share of a real reactive workload's tail is unmeasured …
+`CRATONVM_DBG=mic-prof` answers it in one run on any host that can boot the
+workload."* It was run, on the Azure host that does have spring-webflux's test
+classpath, over **300 `ExchangeProbe` exchanges** — the unit of work
+`webclient-integration-tests-reactive-exchange-gap` is built from:
 
-Related: `internal/performance/webclient-integration-tests-reactive-exchange-gap-RETIRED-20260823.md`,
+```
+disp_calls=10232   mic_calls=4270   hit_entry=0   hit_noentry=3280
+out_virt_bc=44     out_virt_bc_refused=3298
+out_special_bc=0   out_special_bc_refused=0
+```
+
+(Verbatim from the run, which was taken on the branch binary before the merge
+that kept dev's spelling: the slot dev ships is `out_virtual_bc`, and it is the
+same counter. Grep for that one.)
+
+**Ten thousand `jit_invoke_dispatch` calls for three hundred exchanges, and
+`hit_entry=0`** — not one inline-cache dispatch found a compiled callee to
+enter. The transition this page is about is reached about **11 times per
+exchange**. At the ~1 600 ns it now saves per transition, that is **~18 µs
+against ~30 000 µs of CPU per exchange: 0.06%.**
+
+So the population answer for the workload this page was opened to explain is
+"almost none", for the same reason `RJitGc`'s was: the fast arms and the
+interpreter between them serve nearly everything, and **a reactive workload
+barely enters compiled code at all**. The isolated per-call numbers are real
+and the workload-level silence is real, and they do not contradict each other.
+
+That also settles a measurement that would otherwise be re-run indefinitely.
+Three ABBA rounds of the memo A/B on the exchange gave 33.3 / 33.0 / 46.3 /
+49.6 / 34.1 ms per exchange with the memos ON against 31.3 / 45.3 / 39.4 / 30.8
+with them OFF, and the startup-free `perf stat -e task-clock` marginal form was
+no better (31.8-61.6 ON, 1.3-49.4 OFF, the 1.3 being a run that failed
+outright). **The spread inside one arm exceeds any difference between arms**;
+the census does not have that problem, and it is what a future reader should
+reach for. **Do not re-open this page because a reactive workload did not
+move — read `disp_calls` and `hit_entry` first.**
+
+Still unmeasured: `probes/ReactorProbe.java`'s own tail split, which needs
+reactor compiled against the probe rather than against the suite classpath.
+
+Related:
+`performance/webclient-integration-tests-reactive-exchange-gap-RETIRED-20260823.md`,
 [[jit-entries-per-call-cost-is-the-call-dense-wall]].
 
 ## Reproducing

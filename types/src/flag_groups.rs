@@ -387,6 +387,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "exit", on_key: Some("CRATONVM_DBG_EXIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fbcglib", on_key: Some("CRATONVM_DBG_FBCGLIB"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fbref", on_key: Some("CRATONVM_DBG_FBREF"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "fc-fast-io-stats", on_key: Some("CRATONVM_FC_FAST_IO_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-get", on_key: Some("CRATONVM_DBG_FIELD_GET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-watch", on_key: Some("CRATONVM_DBG_FIELD_WATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fieldaddr", on_key: Some("CRATONVM_DBG_FIELDADDR"), off_key: None, off_word: None },
@@ -554,6 +555,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "mh-dispatch", on_key: Some("CRATONVM_DBG_MH_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mh-stack", on_key: Some("CRATONVM_DBG_MH_STACK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mic-prof", on_key: Some("CRATONVM_DBG_MIC_PROF"), off_key: None, off_word: None },
+    // The notification-credit census -- how much of this VM's Object.wait()
+    // waking actually came from the CONDITION rather than from the condvar
+    // signal. `credits_consumed` is the engagement counter for the netty
+    // lost-wakeup fix.
+    E { group: Group::DBG, token: "monitor-notify", on_key: Some("CRATONVM_DBG_MONITOR_NOTIFY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mic-method", on_key: Some("CRATONVM_DBG_MIC_METHOD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mark-why-class", on_key: Some("CRATONVM_DBG_MARK_WHY_CLASS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mirrorpin-why", on_key: Some("CRATONVM_DBG_MIRRORPIN_WHY"), off_key: None, off_word: None },
@@ -1190,6 +1196,15 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "virtual-bytecode-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "statics-index", on_key: None, off_key: Some("CRATONVM_NO_STATICS_INDEX"), off_word: None },
     E { group: Group::JIT, token: "vector-intrinsics", on_key: Some("CRATONVM_VECTOR_INTRINSICS"), off_key: None, off_word: Some("0") },
+    // The dispatch-layer half of the same feature, switched separately so the
+    // templates can be priced against the kernels they sit on rather than only
+    // against an un-intercepted VM.
+    E { group: Group::JIT, token: "vector-templates", on_key: Some("CRATONVM_VECTOR_TEMPLATES"), off_key: None, off_word: Some("0") },
+    // `FileChannelImpl.read/write(ByteBuffer)` as one native call instead of
+    // twenty JDK frames (`native-io::file_channel_fast_read`). Default-ON,
+    // opt-out-only, same shape as `vector-intrinsics` above: the switch gates
+    // REGISTRATION so the off arm is the un-intercepted VM.
+    E { group: Group::JIT, token: "fc-fast-io", on_key: Some("CRATONVM_FC_FAST_IO"), off_key: None, off_word: Some("0") },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0") },
@@ -1530,6 +1545,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::THREADS, token: "striped-counters", on_key: None, off_key: Some("CRATONVM_STRIPED_COUNTERS_OFF"), off_word: None },
     E { group: Group::THREADS, token: "thread-start-grace-ms", on_key: Some("CRATONVM_THREAD_START_GRACE_MS"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "wait-spurious-ms", on_key: Some("CRATONVM_WAIT_SPURIOUS_MS"), off_key: None, off_word: None },
+    // The condition half of `Object.wait()` -- `MonitorState::pending_notifies`.
+    // Default ON; `0` restores the condvar-only wait that lost a delivered
+    // `notifyAll()`, so the fix can be interleaved against itself on ONE binary.
+    E { group: Group::THREADS, token: "monitor-pending-notify", on_key: Some("CRATONVM_MONITOR_PENDING_NOTIFY"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "aot-hmac-key", on_key: Some("CRATONVM_AOT_HMAC_KEY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "jca-lenient-getinstance", on_key: Some("CRATONVM_JCA_LENIENT_GETINSTANCE"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "block-private-nets", on_key: Some("CRATONVM_BLOCK_PRIVATE_NETS"), off_key: None, off_word: None },

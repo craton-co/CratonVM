@@ -159,7 +159,9 @@ different class, `KafkaMetricsAutoConfigurationTests`, whose `raw0` decodes as
 the ASCII text `"t/Proxy\0"` rather than as two heap pointers. Different shape,
 different producer, and it did not reproduce in 36 targeted runs per binary with
 the instrument armed. It is filed separately and OPEN as
-`known-issues/gc/corrupt-value-cell-one-unreproduced-hit-in-kafkametrics-20260822`.
+`corrupt-value-cell-array-receiver-species-CLOSED-20260823` (the SPECIES was
+closed 2026-08-23 at the heap accessors; the sighting itself is still
+unreproduced).
 Its most actionable line is about the instrument added here: that read did NOT
 come through `NativeContext::get_field`, which is the only door
 `CRATONVM_DBG_CORRUPT_CELL` watches, so widening it to the interpreter's own

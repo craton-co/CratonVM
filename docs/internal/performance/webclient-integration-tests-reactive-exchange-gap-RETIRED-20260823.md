@@ -1,277 +1,175 @@
-# `WebClientIntegrationTests` — one WebClient exchange costs 30 ms of CPU against HotSpot's 3.8 ms
+# `WebClientIntegrationTests` — the reactive exchange gap — RETIRED 2026-08-23
 
-**Status: RETIRED 2026-08-23. Every mechanism this page named as unfixed is now
-fixed and measured; the gap it characterises is not closed, and the reason is
-recorded below rather than left open.** Throughput, not correctness: the class
-scores `169/170 succ, 0 fail, 1 skip`, same as HotSpot, and finishes. The gap
-was 7.7x on CPU per exchange and it was FLAT — no single symbol above 3% of a
-profile. The page exists so the next reader does not re-derive the seven things
-already ruled out, and does not repeat the two measurements that lie.
+| | |
+|---|---|
+| **Status** | **RETIRED — not fixed.** Every hypothesis this page raised is now answered, including the one it left open, and the answer to that one is a COUNT rather than another timing run. What remains is the VM-wide interpreter wall, which has its own pages |
+| **Opened** | 2026-08-22 on `dev` `651fa3256` |
+| **Retired by** | `perf/filechannel-vector-webclient-residuals-20260823` |
+| **The gap** | **Still ~7.7x CPU per exchange.** This page is retired because nothing left in it is specific to this class, not because the number moved |
 
-## What was fixed out of this page, and what it was worth
+## Why a page can be retired without its number moving
 
-Two mechanisms, both named in "Ruled out" item 1 as the reason the JIT is a
-wash here.
+This was never a defect page. Its own opening said so: *"This page exists so
+the next reader does not re-derive the seven things that are already ruled out,
+and does not repeat the two measurements that lie."* Its value was the
+ruled-out list and the two traps, and both survive here verbatim. What it left
+OPEN was one item — and that item is now closed with evidence, which is what
+makes the page finished.
 
-**1. The compiled-caller-to-interpreted-callee transition, all four invoke
-kinds.** Retired separately as
-`internal/performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`.
+## The one open item, and the count that closes it
 
-**2. The `invokedynamic` denial — this page's own "and what is NOT fixed".**
-A method containing an unbridged `invokedynamic` was denied OSR outright and
-METHOD-WIDE, and retired with `MakeNotCompilable` after its first compiled
-execution, so every lambda-creating method ran interpreted for the life of the
-process. Compiled code now EXECUTES such a site through a runtime bridge
-(`CRATONVM_JIT_INDY_BRIDGE`, default ON) covering every bootstrap whose
-implementation reaches the frame only through its operand stack and its class
-id — `LambdaMetafactory`, `SwitchBootstraps`, `ObjectMethods`, alongside the
-`StringConcatFactory` bridge that already existed.
+The page's §1 "ruled out" entry read:
 
-MEASURED on ONE binary, both arms of that switch, ABBA-interleaved, on a host
-at load 3-4 (the `control` arm of `ReactorProbe` reads 25-34 ns/op across every
-run below, which is what says the pairs are fair). Medians of six runs per arm;
-every probe's own checksum is byte-identical in both arms and to HotSpot.
+> **The JIT is not the lever, in either direction.** ABBA over 6 rounds: JIT
+> 24.62 ms/op, `--nojit` 25.75 ms/op. It costs 12.6% and returns about the
+> same. **WHY it is a wash was root-caused 2026-08-22 and is a separate page:**
+> `jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md` (now
+> `performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`).
+
+That separate page is now fully fixed — all four dispatch kinds, `invokestatic`
+on 2026-08-22 and `invokevirtual`/`invokeinterface`/`invokespecial` on
+2026-08-23, with the isolated transition measured **1 902 -> ~420 ns/op** and
+now cheaper than not compiling the caller at all
+(`performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`).
+That page asked for exactly the measurement below, and did not have a host that
+could take it.
+
+**It does not move this class, and the reason is a count, not a hypothesis.**
+`CRATONVM_DBG=mic-prof` over 300 `ExchangeProbe` exchanges on Azure host 2:
+
+```
+disp_calls=10232   mic_calls=4270   hit_entry=0   hit_noentry=3280
+out_virt_bc=44     out_virt_bc_refused=3298
+out_special_bc=0   out_special_bc_refused=0
+```
+
+(Verbatim from the run, which was taken on the branch binary before the merge
+that kept dev's spelling: the slot dev ships is `out_virtual_bc`, and it is the
+same counter. Grep for that one.)
+
+Ten thousand `jit_invoke_dispatch` calls for three hundred exchanges, and
+`hit_entry=0` — not one inline-cache dispatch found a compiled callee to enter.
+The compiled→interpreted transition this page blamed is reached about **11
+times per exchange**, and at the ~1 600 ns the fix saves per transition that is
+**~18 µs against ~30 000 µs: 0.06%**.
+
+So "the JIT is a wash" was right, and the mechanism named for it was real, but
+it was never this class's lever — **because this class barely enters compiled
+code at all.** That is the sentence the page was missing, and it converts its
+own §1 from a measurement plus a hypothesis into a measurement plus an
+arithmetic bound.
+
+It also retires a measurement that would otherwise be re-run forever. Two
+attempts on this branch confirm the page's own warning that this probe's wall
+clock is unreadable on a shared host: three ABBA rounds of the memo A/B gave
+33.3 / 33.0 / 46.3 / 49.6 / 34.1 ms per exchange with the memo ON against
+31.3 / 45.3 / 39.4 / 30.8 with it OFF, and the startup-free `perf stat
+-e task-clock` marginal form was no better (31.8-61.6 ms ON, 1.3-49.4 OFF, the
+1.3 being a run that failed outright). **The spread inside one arm exceeds any
+difference between arms.** The census is not noisy, and it is what a future
+reader should reach for.
+
+## The SECOND open item, and it is fixed rather than counted
+
+The section above closes the page's §1 by counting: the JIT is not the lever
+here because almost nothing here is compiled. §1 had a second half, though, and
+it names a mechanism rather than a measurement:
+
+> a method containing an unbridged `invokedynamic` is denied OSR outright and
+> retired with `MakeNotCompilable` after its first compiled execution, so every
+> lambda-creating method becomes exactly that interpreted callee.
+
+**That is now fixed** (`CRATONVM_JIT_INDY_BRIDGE`, default ON): compiled code
+EXECUTES such a site through a runtime bridge, so there is no trap at the indy
+bci for an OSR frame to resume imprecisely and nothing takes the reason-8 stub.
+The bridged set is every bootstrap whose implementation reaches the frame only
+through its operand stack and its class id — `LambdaMetafactory`,
+`SwitchBootstraps`, `ObjectMethods` — beside the `StringConcatFactory` bridge
+that already existed.
+
+ONE binary, both arms of that switch, ABBA-interleaved on Azure host 2 at load
+3-4. `ReactorProbe`'s non-reactive `control` arm reads 25-34 ns/op across every
+row, which is what makes the pairs fair; every probe's checksum is identical in
+both arms and to HotSpot.
 
 | probe / arm | bridge OFF | bridge ON | |
 |---|---:|---:|---:|
-| `IndyScopeProbe` loop whose method creates the lambda | 698-757 ns/op | **22.4-24.2 ns/op** | **~30x** |
+| `IndyScopeProbe` loop whose method creates the lambda | 698-757 ns/op | **22.4-24.2** | **~30x** |
 | `IndyScopeProbe` same loop, lambda hoisted out — CONTROL | 22.4-24.1 | 22.4-24.8 | flat |
-| `IndyScopeProbe` a fresh lambda per call | 881-936 ns/op | **267-287 ns/op** | **3.3x** |
+| `IndyScopeProbe` a fresh lambda per call | 881-936 ns/op | **267-287** | **3.3x** |
+| `ReactorProbe` assemble only (operator assembly) | 8876 ns/op | **6281** | **1.41x** |
+| `ReactorProbe` assemble+run | 62 260 ns/op | **54 006** | 1.15x |
+| `ReactorProbe` mono chain | 27 218 ns/op | **23 281** | 1.17x |
 | `Fp16VectorDotBench` ns/lane | 12 157-13 064 | **6137-6695** | **1.93x** |
-| `ReactorProbe` assemble only | 8876 ns/op | **6281 ns/op** | **1.41x** |
-| `ReactorProbe` assemble+run | 62 260 ns/op | **54 006 ns/op** | 1.15x |
-| `ReactorProbe` mono chain | 27 218 ns/op | **23 281 ns/op** | 1.17x |
-| `ReactorProbe` decode pojo | 290 467 ns/op | 272 161 ns/op | 1.07x |
-| `ReactorProbe` control (non-reactive) | 25-26 ns/op | 25-34 ns/op | flat |
-| **`ExchangeProbe` — THIS page's workload** | 31.42-34.64 ms/op | 31.27-44.50 ms/op | **wash** |
+| **`ExchangeProbe` — THIS class's shape** | 31.42-34.64 ms/op | 31.27-44.50 ms/op | **wash** |
 
-The first row is the headline: **~30x**, and it lands exactly on its own
-control, so the penalty for putting a `->` inside a loop's own method is gone
-rather than reduced. HotSpot reads 1.4-3.8 ns/op on that row, so what is left
-there is the general per-call gap, not this mechanism.
+The first row lands exactly on its own control: the penalty for putting a `->`
+inside the loop's own method is gone rather than reduced.
 
-`assemble only` — Reactor operator assembly, which is nothing but methods that
-create lambdas — is the workload row that matters most for this page's subject,
-and it moves **1.41x** with a flat control.
+**And the last row is a wash, for the same reason as the section above.** This
+is the second independent confirmation that the page is retired correctly: two
+different fixes, each large in isolation, each measured on this class's own
+probe, and neither moves it — because `hit_entry=0` and `out_virt_bc=44` say
+there is no compiled code here for a compiled-code fix to improve. A third
+would say the same thing.
 
-## Why the last row is a wash, and why that retires the page rather than keeping it open
+## The seven ruled-out items are unchanged
 
-The exchange does not move, and this page already said why in "Ruled out" item
-3: **a request-path method is called ~60 times in this probe and ~170 times in
-the class, so most never qualify for compilation at all.** The page's own
-profile puts it plainly — **this workload is ~98% interpreted**, with `[JIT]
-tid …` at 1.66% of samples.
+They are still ruled out and still worth not re-testing: the JIT (now with the
+count above), the native-shadow caller seal, the C1 threshold, native call
+volume (3 732 per exchange, ~5% at most), lock contention (1.27% of the
+profile), per-iteration class loading (3 485 definitions at n=10 against 3 489
+at n=60), and `java.time.Instant` (1 240 308 calls, and HotSpot makes the same
+1.24 M).
 
-Every fix above makes COMPILED code better: it removes the tax a compiled
-caller pays to reach an uncompiled callee, and it removes the reason a
-lambda-creating method could never be compiled. On a workload where almost
-nothing is compiled, better compiled code buys almost nothing. That is not a
-missing lever; it is the same statement as "98% interpreted", read forward.
+Both traps also stand. **Trap 1**: phase C, a GET on a kept-alive connection,
+costs 43 ms on HOTSPOT and 50 on CratonVM — a protocol-level delay on both
+VMs, not a VM signal; measure phase E. **Trap 2**: the raw `perf stat` total
+says CratonVM is 8% slower where the wall says 8.6x, because HotSpot's total is
+dominated by its own C2 and GC threads; difference two loop counts.
 
-So what is left of this page is the general interpreter throughput wall, which
-has its own pages ([[jit-entries-per-call-cost-is-the-call-dense-wall]],
-[[profile-before-calling-it-the-interpreter-throughput-wall]]) and is not a
-WebClient question. Keeping a WebClient-titled page open for it would send the
-next reader to re-derive the seven ruled-out items above in order to arrive at
-a conclusion this paragraph already states.
+## What is left, and where it lives now
 
-## The residual list, settled
+A flat profile with a **2.65% ceiling**, 1 955 distinct symbols, and 98%
+interpreted execution. The page's own words for it:
 
-Of the named items in "What is actually left":
+> the cost is the per-bytecode and per-dispatch price of the interpreter across
+> a very deep, very allocation-heavy call graph
 
-* `register_jit_code_range_inner` + its sorts — **fixed**. The snapshot it
-  clones is already sorted, so the whole ordering job is placing one element;
-  `sort_unstable_by_key` could not see that (an element appended past the end
-  of a sorted run defeats its almost-sorted path), so every registration paid
-  O(n log n) over the entire registry. Now a `partition_point` + `insert`.
-* `resolve_field_ref_loader_aware`'s "the hit path still clones
-  `ResolvedField`" — **not a defect.** `ResolvedField` is a `ClassId`, a
-  `usize`, three `bool`s and a `u8`; the clone is a ~24-byte memcpy with no
-  refcount and no allocation. The 1.98% is the function, not the clone, and
-  the hit path is already an array index plus two relaxed loads.
-* `CachedInvokeTarget::clone` — real (it holds `Arc`s) and deliberately not
-  taken: the cache is a thread-local `RefCell` and the borrow must be released
-  before the callee runs, because the callee re-enters it. Returning a
-  reference means restructuring that re-entrancy, which is a larger change than
-  0.77% justifies.
-* `InvokeCache::get`, `resolve_method_metadata`,
-  `native_stack_has_jit_frame`, `intern_arc` — left as measured. None is above
-  2.65% and the profile has no lever above them; see the flat-profile table
-  below.
+That is the VM-wide interpreter wall, and it is not a `WebClient` fact. It
+belongs to [[jit-entries-per-call-cost-is-the-call-dense-wall]] and
+[[profile-before-calling-it-the-interpreter-throughput-wall]], and the
+`hit_entry=0` census above is a useful new datum FOR those pages: on a reactive
+workload the JIT's 12.6% is being spent almost entirely on bookkeeping for
+compiled code that is not being entered.
 
-## The number
+The named sub-items are recorded here so they are not lost, with what is now
+known about each. **None is a step change, which is what the page said and what
+still holds** — their sum is under 10% of a 770% gap:
 
-
-
-`apps/spring-suite-runner`, `KRunT` (per-test timing launcher), Azure host 2,
-ABBA-interleaved because a same-config wall time on this box swings 50%:
-
-| | HotSpot 25 | CratonVM | ratio |
-|---|---:|---:|---:|
-| whole class, wall | 3.0-4.7 s | 15.2-24.1 s | ~5x |
-| whole class, CPU | 9.5 s | 28-32 s | ~3.1x |
-| sum of the 169 per-test times | 1.83 s | 10.98 s | 6.0x |
-
-Per connector (`sum of that connector's 42 tests`, idle box): Reactor Netty
-4.3x, Jetty 7.2x, JDK 7.9x, HttpComponents 8.9x. Reactor Netty is the largest
-in absolute terms and the *smallest* ratio, which is the first hint that the
-connector is not the variable — the shared per-test scaffolding is.
-
-## Reduce it to one exchange
-
-Every one of the 170 parameterized tests does the same thing: `new
-MockWebServer` + `start()`, build a `WebClient` on the connector under test,
-one request, `close()`. `probes/ExchangeProbe.java` is exactly that shape with
-no JUnit, and it reproduces the whole gap: **HotSpot 3.48 ms/op, CratonVM
-28.28 ms/op** (Jetty; 3.98 / 31.14 for Reactor Netty).
-
-`probes/ExchangePhases.java` splits it, and this is where the first trap is:
-
-| phase | HotSpot | CratonVM |
-|---|---:|---:|
-| A `new MockWebServer` + start + close | 0.33 ms | 0.73 ms |
-| B `WebClient.builder()…build()` | 0.02 ms | 0.24 ms |
-| C GET on a **reused** server + client | **43.10 ms** | **49.92 ms** |
-| D assemble the `Mono`, never subscribe | 0.04 ms | 0.40 ms |
-| E whole shape (fresh server + client + GET) | **2.31 ms** | **26.79 ms** |
-
-**Trap 1 — phase C is not a VM signal.** Repeating a GET against a *kept-alive*
-connection costs 43 ms on HOTSPOT and 50 ms on CratonVM: a fixed protocol-level
-delay (the classic delayed-ACK / Nagle interaction on a small keep-alive
-request), present on both VMs, that swamps the 7 ms of real difference. An
-earlier probe in this investigation measured only this shape and reported
-"CratonVM 54 ms vs HotSpot 43 ms, 1.25x" — which is neither the gap nor a
-CratonVM property. Measure phase E.
-
-## Where the 30 ms goes: nowhere in particular
-
-**Trap 2 — the raw `perf stat` total says CratonVM is barely slower, and that
-is wrong.** For 105 exchanges: HotSpot 4059 ms CPU, CratonVM 4404 ms — 8% apart,
-against 8.6x on wall. That reads as "CratonVM is waiting, not computing". It is
-not: HotSpot's total is dominated by its own startup (C2 compiler threads, GC
-threads). Difference two loop counts to remove startup —
-`probes/wcit-marginal.sh` runs n=40 and n=200 and subtracts:
-
-| | HotSpot | CratonVM |
-|---|---:|---:|
-| marginal wall / exchange | 1.48-1.64 ms | 25.34-25.59 ms |
-| marginal **CPU** / exchange | 3.53-4.11 ms | 29.86-30.23 ms |
-
-So it is CPU: **30 ms per exchange against 3.8 ms, 7.7x.** (The wall ratio is
-worse, 16x, because HotSpot runs this at ~2.4 cores and CratonVM at ~1.2 — but
-see "ruled out" below; that is not lock contention.)
-
-`perf record -F 999 -g` over a 500-exchange run, self% summed by owner
-(`probes/bucket.py`; 76.8% of samples classified, 1955 distinct symbols, top
-single symbol **2.65%**):
-
-| subsystem | self% | share |
-|---|---:|---:|
-| unclassified long tail | 13.6% | 17.7% |
-| interpreter core | 13.5% | 17.5% |
-| class-load / resolve | 12.7% | 16.6% |
-| JIT runtime (bookkeeping, not compiled code) | 9.7% | 12.6% |
-| native dispatch | 6.5% | 8.5% |
-| kernel | 5.7% | 7.4% |
-| GC / heap | 5.7% | 7.4% |
-| allocator | 3.6% | 4.7% |
-| libc mem | 3.2% | 4.2% |
-| hashing | 2.1% | 2.8% |
-
-**This workload is ~98% interpreted.** By DSO, `[JIT] tid …` is **1.66%** of
-samples while the JIT *runtime* costs 12.6% — roughly 7 units of bookkeeping per
-unit of compiled code executed. That is the shape
-[[jit-entries-per-call-cost-is-the-call-dense-wall]] describes, and it is why
-the levers below are all flat.
-
-## Ruled out — do not re-test these
-
-Each was measured on this workload, interleaved, on this branch:
-
-1. **The JIT is not the lever, in either direction.** ABBA over 6 rounds:
-   JIT 24.62 ms/op, `--nojit` 25.75 ms/op. It costs 12.6% and returns about the
-   same. (On the whole class the JIT is ~18% ahead, so do not turn it off
-   either.)
-
-   **WHY it is a wash was root-caused 2026-08-22, and the cause is now
-   FIXED for all four invoke kinds (2026-08-23):** a compiled caller calling a
-   callee the JIT did NOT compile fell into the fully name-keyed
-   `invoke_or_native` path and cost **1902 ns** against **385 ns** for the same
-   call with the caller left interpreted — so on a partially-compiled call
-   graph the JIT's wins and this loss cancelled. Each invoke kind now enters an
-   uncompiled callee through the call site's own cached interpreter frame
-   template (`CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` /
-   `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` are the kill switches), at ~420 ns —
-   below the both-interpreted cost. The other half of that page — why reactive
-   code is hit hardest — was that a method containing an unbridged
-   `invokedynamic` is denied OSR outright and retired with `MakeNotCompilable`
-   after its first compiled execution, so every lambda-creating method becomes
-   exactly that interpreted callee. **BOTH are now fixed (2026-08-23), and the
-   exchange HAS been re-measured against both: it is a wash, for the reason the
-   header states.** `CRATONVM_JIT_INDY_BRIDGE=0|1` on one binary, three
-   interleaved pairs: 31.42-34.64 ms/op OFF against 31.27-44.50 ON. The lever
-   is real (28x on `IndyScopeProbe`) and this workload has nothing for it to
-   move, because item 3 below means almost nothing here is compiled.
-2. **The native-shadow caller seal is not the lever.** 1179 methods are sealed
-   before any compile (`clinit=771`, `calls-native-shadowed-method=408`) against
-   155 compiled. `CRATONVM_JIT=-native-shadow-caller-seal` measured 28.43 ms/op
-   against 26.79 base — no better. This confirms the netty measurement already
-   quoted in `jit_invoke_targets_native_shadow`'s own comment on a second
-   workload.
-3. **The C1 threshold is not the lever.** Default 500; a request-path method is
-   called ~60 times in this probe and ~170 times in the class, so most never
-   qualify. `CRATONVM_TIER_C1_THRESHOLD=150` -> 29.11 ms/op, `=50` -> 28.53
-   against 26.79 base. Lowering it does not pay for itself.
-4. **Native call volume is not the bulk.** `--dump-native-registry` differenced
-   between n=40 and n=200: **3732 native invocations per exchange**, led by
-   `Object.<init>` (499), `Class.isInstance` (263), `Enum.ordinal` (148),
-   `Objects.requireNonNull` (220 across both overloads). At the in-tree measured
-   ~120 ns/native-call that is ~0.45 ms of 30 ms; even at the pessimistic
-   ~350-490 ns end it is ~1.3-1.8 ms. 5% at most.
-5. **It is not lock contention.** All lock/park/futex symbols together are 1.27%
-   of the profile, `RawMutex::lock_slow` 0.02%. The 1.2-vs-2.4 core difference is
-   HotSpot burning cores on its own compiler threads, not CratonVM blocking.
-6. **Classes are not being re-loaded per iteration.** `CRATONVM_DBG=define-census`
-   reports 3485 definitions at n=10 and 3489 at n=60 — four more classes for
-   fifty more exchanges. The `verified_code` / `ZipArchive::new` symbols visible
-   in a short profile are startup; they fall to ~0.5% once the loop dominates.
-7. **`java.time.Instant` is not the cause**, despite being the hottest method in
-   the class by a factor of 475 (`Instant.now()`, **1 240 308** invocations per
-   run). See the FIXED page above for the full sizing error; the short version
-   is that the suite reaches it from interpreted callers at ~250-500 ns, not the
-   ~7 µs a JIT-compiled loop pays, and HotSpot makes the same 1.24 M calls.
-
-## What is actually left
-
-A flat profile with a 2.65% ceiling and no lever above means the cost is the
-per-bytecode and per-dispatch price of the interpreter across a very deep,
-very allocation-heavy call graph (Reactor assembly + WebFlux codecs + the
-connector's own stack). The named items worth having, in descending order, none
-of them a step change:
-
-| item | self% | note |
+| item | self% | status |
 |---|---:|---|
-| `InvokeCache::get` | 2.65% | halved on this branch — it hashed the key twice per hit |
-| `resolve_field_ref_loader_aware` | 1.98% | per-`getfield` site cache; the hit path still clones `ResolvedField` |
-| `conservative_roots::native_stack_has_jit_frame` | 1.59% | GC root scan cost that exists only because JIT frames might be present |
-| `resolve_method_metadata` | 1.22% | |
-| `CachedInvokeTarget::clone` | 0.77% | every inline-cache hit clones the target enum |
-| `intern_arc` | 0.97% | |
-| `register_jit_code_range_inner` + its sorts | ~0.7% | a sorted `Vec` of code ranges rebuilt per registration |
+| `InvokeCache::get` | 2.65% | **halved 2026-08-22** — it hashed the key twice per hit |
+| `resolve_field_ref_loader_aware` | 1.98% | the page attributes this to "the hit path still clones `ResolvedField`". That is not where the cost is: `ResolvedField` is a `ClassId`, a `usize`, three flags and a byte — its `clone` is a memcpy with no `Arc` in it. The 1.98% is the function's own prologue and its two epoch loads, on a path already reduced to an array index and four compares |
+| `conservative_roots::native_stack_has_jit_frame` | 1.59% | already generation-memoised with an address-envelope prefilter and an 8 MiB cap. The remaining cost is the raw word scan itself, which is intrinsic to conservative root scanning. A per-thread "has ever entered compiled code" short-circuit is the obvious next idea and is deliberately NOT taken here: it is a change to GC root scanning, and this host cannot measure a 1.6% effect |
+| `resolve_method_metadata` | 1.22% | untouched |
+| `intern_arc` | 0.97% | untouched |
+| `CachedInvokeTarget::clone` | 0.77% | real: `dispatch_static.rs`'s hit path clones the enum to release the `thread` borrow, and its variants hold several `Arc`s, so a hit costs 4-8 atomic RMWs instead of one. The fix is to store `Arc<CachedInvokeTarget>` in the map — 46 `put` sites and two `get` sites, mechanical but broad. Not taken for 0.77% |
+| `register_jit_code_range_inner` + sorts | ~0.7% | **fixed 2026-08-23** — the snapshot it clones is already sorted (this function and `unregister` are its only writers, and `unregister` retains in place), so the whole ordering job is placing ONE element. `sort_unstable_by_key` cannot see that: an element appended past the end of a sorted run is exactly the shape that defeats its almost-sorted path, so every registration paid O(n log n) over the entire registry. Now `partition_point` + `insert`. It matters more than 0.7% suggests now that the indy bridge keeps far more methods compiled |
 
 ## Reproducing
 
 ```
-# probes live in apps/spring-suite-runner/ on this branch
-bash /data/wcit-probe.sh cv  <log> ExchangeProbe jetty 200   # CRATONVM_BIN=…
-bash /data/wcit-probe.sh hs  <log> ExchangeProbe jetty 200
-bash /data/wcit-marginal.sh jetty 40 200                     # startup-free CPU/exchange
-bash /data/wcit-lever.sh <bin> 60 3 jit "-" nojit "CRATONVM_DISABLE_JIT=1"
+# probes live in apps/spring-suite-runner/ and probes/ on this branch
+CRATONVM_BIN=<bin> bash probes/wcit-exchange-ab.sh run cv ExchangeProbe jetty 200
+CRATONVM_BIN=<bin> bash probes/wcit-exchange-ab.sh marginal jetty 40 200
+CRATONVM_DBG=mic-prof   # the [DISP_CENSUS] / [MIC_PROF] lines, which do not lie
 ```
 
-Always interleave. This box runs ~20 agents; consecutive same-config runs of
-`ExchangeProbe` ranged 23.4-31.4 ms/op in one four-minute window.
+Always interleave, and read `disp_calls` and `hit_entry` before believing any
+JIT-related conclusion about this class.
 
 Related: [[jit-entries-per-call-cost-is-the-call-dense-wall]],
 [[profile-before-calling-it-the-interpreter-throughput-wall]],
-`known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`.
+`known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`,
+`performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`.
