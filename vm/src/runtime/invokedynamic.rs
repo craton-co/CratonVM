@@ -112,6 +112,15 @@ cached_env_flag!(dbg_indy_all, "CRATONVM_DBG_INDY_ALL");
 cached_env_flag!(dbg_indy_generic, "CRATONVM_DBG_INDY_GENERIC");
 cached_env_flag!(dbg_lambda_dispatch, "CRATONVM_DBG_LAMBDA_DISPATCH");
 
+/// `CRATONVM_DBG_INDY_GENERIC`, re-exported for the compiled bridge's own
+/// tracing. Public because `jit::helpers::jit_indy_bridge` is the other half of
+/// that trace and lives in a different module: a wrong result from a bridged
+/// site raises exactly one question — which SIDE lost the value — and only a
+/// line from each can answer it.
+pub fn dbg_indy_generic_enabled() -> bool {
+    dbg_indy_generic()
+}
+
 /// Groovy call-site name for a coercion (`cast:(Object)Z`, `cast:(Object)I`, …).
 const GROOVY_CAST: &str = "cast";
 
@@ -557,7 +566,10 @@ pub unsafe fn execute_jit_indy_generic_raw(
     // arms mirror `jit_invoke_dispatch`'s return encoding one for one.
     Ok(match (site.return_type, popped) {
         (b'L' | b'[', Some(Value::Object(Some(obj)))) => (obj.as_ptr() as i64, Some(obj)),
-        (b'L' | b'[', Some(Value::Object(None)) | None) => (0, None),
+        // A genuine null. NOT folded together with an EMPTY stack below: those
+        // two look identical from the call site and mean opposite things — one
+        // is the answer, the other is the answer having gone missing.
+        (b'L' | b'[', Some(Value::Object(None))) => (0, None),
         (b'J', Some(Value::Long(v))) => (v, None),
         (b'F', Some(Value::Float(f))) => (f.to_bits() as i64, None),
         (b'D', Some(Value::Double(d))) => (d.to_bits() as i64, None),

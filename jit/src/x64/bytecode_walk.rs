@@ -10961,11 +10961,19 @@ impl Compiler {
                             );
                         }
                         let pre_pop_spill = self.next_spill_offset;
-                        let mut arg_slots_vec = Vec::with_capacity(arg_slots);
-                        for _ in 0..arg_slots {
-                            arg_slots_vec.push(self.pop_stack());
-                        }
-                        arg_slots_vec.reverse();
+                        // `pop_invoke_args`, not a bare `pop_stack` loop: it
+                        // also hands back the per-argument OOP MARKS, and the
+                        // staged buffer below is the only thing holding those
+                        // references across a call that runs a bootstrap and
+                        // allocates. Without `pending_staged_arg_oops` the
+                        // safepoint map does not name them, which for a
+                        // capturing lambda means every captured object is
+                        // invisible to a collection that happens inside its own
+                        // creation. The concat bridge this arm grew out of had
+                        // the same gap and never showed it, because a
+                        // `StringConcatFactory` argument is read into a Rust
+                        // `String` before anything can allocate.
+                        let (arg_slots_vec, arg_oops) = self.pop_invoke_args(arg_slots);
                         let post_pop_spill = self.next_spill_offset;
                         if arg_slots > 0 {
                             let Some(args_end) =
@@ -10986,6 +10994,9 @@ impl Compiler {
                                 let offset = pre_pop_spill + ((arg_slots - 1 - i) as i32) * 8;
                                 self.load_slot_to_reg(RAX, *slot);
                                 self.emit_store_local(offset, RAX);
+                                if arg_oops[i] {
+                                    self.pending_staged_arg_oops.push(offset);
+                                }
                             }
                         }
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);

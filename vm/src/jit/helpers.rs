@@ -14016,6 +14016,20 @@ pub unsafe extern "C" fn jit_indy_bridge(
     };
     let vm = &*(vm_ptr as *const SharedVm);
     let count = arg_count.max(0) as usize;
+    // `CRATONVM_DBG=indy-generic` — what the bridge was handed and what it
+    // answered. The one question a wrong result here poses is which SIDE lost
+    // the value, and nothing else can tell them apart: a helper that returns a
+    // good pointer into a call sequence that drops it looks exactly like a
+    // helper that returned 0.
+    let dbg = crate::runtime::invokedynamic::dbg_indy_generic_enabled();
+    if dbg {
+        eprintln!(
+            "[indy-bridge] kind={} args={} args_ptr={:?}",
+            crate::runtime::invokedynamic::jit_indy_site_kind(site_ptr as usize),
+            count,
+            args_ptr
+        );
+    }
     match crate::runtime::invokedynamic::jit_indy_site_kind(site_ptr as usize) {
         crate::runtime::invokedynamic::JIT_INDY_SITE_GENERIC => {
             match crate::runtime::invokedynamic::execute_jit_indy_generic_raw(
@@ -14025,6 +14039,13 @@ pub unsafe extern "C" fn jit_indy_bridge(
                 args_ptr,
                 count,
             ) {
+                Ok((bits, obj_opt)) if dbg => {
+                    eprintln!("[indy-bridge] generic -> 0x{:x}", bits);
+                    if let Some(obj) = obj_opt {
+                        thread.native_pending_return = Some(obj);
+                    }
+                    bits
+                }
                 Ok((bits, Some(obj))) => {
                     // Object-return handoff root, same contract as every other
                     // JIT helper that hands a fresh reference back to compiled
@@ -14053,15 +14074,21 @@ pub unsafe extern "C" fn jit_indy_bridge(
                 }
             }
         }
-        _ => crate::runtime::invokedynamic::execute_jit_string_concat_raw(
-            vm,
-            thread,
-            site_ptr as usize,
-            args_ptr,
-            count,
-        )
-        .map(|obj| obj.as_ptr() as i64)
-        .unwrap_or(0),
+        _ => {
+            let r = crate::runtime::invokedynamic::execute_jit_string_concat_raw(
+                vm,
+                thread,
+                site_ptr as usize,
+                args_ptr,
+                count,
+            )
+            .map(|obj| obj.as_ptr() as i64)
+            .unwrap_or(0);
+            if dbg {
+                eprintln!("[indy-bridge] concat -> 0x{:x}", r);
+            }
+            r
+        }
     }
 }
 
