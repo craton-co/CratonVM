@@ -14141,6 +14141,11 @@ impl DirectNativeShadow {
 
     /// The Rust item name, so a refusal and the source witness can both name
     /// the same symbol the ladders name.
+    /// Test-only: every caller is in this file's `#[cfg(test)]` module, where
+    /// it names the `extern "C"` item each shadow is supposed to point at so
+    /// the string and the item cannot drift apart. Nothing in production asks
+    /// a shadow for its symbol NAME -- the doors take `entry_addr()`.
+    #[cfg(test)]
     pub const fn helper_symbol(self) -> &'static str {
         match self {
             DirectNativeShadow::ThreadCurrentThread => "jit_thread_current_thread_direct",
