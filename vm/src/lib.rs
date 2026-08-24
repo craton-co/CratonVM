@@ -57,6 +57,11 @@ pub use error::{MethodCallFailed, MethodCallResult, VmError};
 pub use threading::{JvmThread, ThreadId};
 pub use vm::{SharedVm, StackTraceFrame, Vm};
 
+/// The map-view rebuild-elision census (`CRATONVM_DBG=map-view-cache`),
+/// re-exported so the CLI can print it at exit without taking a direct
+/// dependency on `cratonvm-native-collections`.
+pub use cratonvm_native_collections::report_map_view_cache_at_exit;
+
 // ---------------------------------------------------------------------------
 // T17.E.2 — Windows test-harness teardown shim
 // ---------------------------------------------------------------------------

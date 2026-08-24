@@ -1,15 +1,18 @@
 # `ConfigurationPropertySourcesTests` is 245× HotSpot — decomposed
 
-**Status: OPEN — Term 1 CLOSED 2026-08-23, Terms 2 and 3 open.** Rewritten from the 2026-08-21 first cut, which
+**Status: OPEN — 2026-08-22.** Rewritten from the 2026-08-21 first cut, which
 called this "the native-collections floor, no leaf over ~8%, no dominant term
 to attack" and left it there. That reading was **wrong in the way that matters**:
 a flat profile does not mean a flat cause. Decomposed properly, the gap is three
 named things, two of which are algorithmic divergences from the JDK rather than
 constant-factor overhead.
 
-Still open — nothing here is fixed. What follows is the decomposition, the
-measurements that pin each term, and the two fixes with their predicted
-payoffs, so the next session starts from arithmetic instead of from a profile.
+**Term 1 was FIXED on 2026-08-23** — see "The two fixes, in value order"
+below. Terms 2 and 3 are untouched, and **this page's end-to-end number has NOT
+been re-measured against the fix**, so 245x still stands as the last thing that
+was actually observed. What follows is the decomposition, the measurements that
+pin each term, and the two fixes with their predicted payoffs, so the next
+session starts from arithmetic instead of from a profile.
 
 ## The workload, exactly
 
@@ -70,9 +73,9 @@ And plain compiled Java is fine — a hand-written loop over the same two arrays
 **~5× on ordinary compiled Java, 40–400× on anything that touches the native
 collections.** That is the whole story, and it is where the first cut stopped.
 
-## Term 1 — `keySet()` was O(n) per call; the JDK's is O(1) — **CLOSED 2026-08-23**
+## Term 1 — `keySet()` is O(n) per call; the JDK's is O(1)
 
-`native_lhm_key_set` (and the `HashMap` twin) called `lhm_collect_keys` and then
+`native_lhm_key_set` (and the `HashMap` twin) calls `lhm_collect_keys` and then
 `make_view_set_of`, which allocates a carrier, allocates a backing map, and
 **inserts every key through `native_map_put`** — hashing each key and probing
 for duplicates. Per call. The JDK returns a cached live view and touches
@@ -80,33 +83,15 @@ nothing.
 
 Measured on a 1000-entry map (`KeySetBench`), µs per call:
 
-| rung | HotSpot | CratonVM (2026-08-21) |
+| rung | HotSpot | CratonVM |
 |---|---|---|
 | `map.size()` | 0.4 | 1.8 |
 | **`map.keySet()` and nothing else** | **~0** | **2619** |
 | iterate a *hoisted* view | 10.8 | 4434 |
 | `keySet()` + iterate | 10.0 | 6151 |
 
-`HashMap` behaved the same as `LinkedHashMap` (2852 µs). Spring calls this
+`HashMap` behaves the same as `LinkedHashMap` (2852 µs). Spring calls this
 101 910 times per test run.
-
-**Fixed by `internal/performance/lazy-map-views-FIXED-20260823.md`**: a
-`keySet()`/`values()`/`entrySet()` view is now cached on the source in the
-field `java.util.AbstractMap` declares for it, exactly as HotSpot does, and
-`resync_view_set` early-outs on a three-term generation stamp. Same probe, same
-machine, one binary A/B'd by `CRATONVM_MAP_VIEW_CACHE`:
-
-| rung | HotSpot | CV before | CV after | ratio to HotSpot, before -> after |
-|---|---:|---:|---:|---|
-| `viewOnly` (LHM) | ~0 | 1284.0 | **1.5** | — |
-| `sizeOnly` (LHM) | ~0 | 3132.0 | **5.0** | — |
-| `perCall` (LHM) | 9.0 | 5206.5 | **1192.5** | 578x -> **132x** |
-| `hoisted` (LHM) | 9.5 | 2974.5 | **1217.5** | 313x -> **128x** |
-| `perCall` (HM) | 15.5 | 5506.0 | **1246.5** | 355x -> **80x** |
-| `hoisted` (HM) | 14.5 | 3079.5 | **1197.5** | 212x -> **83x** |
-
-Term 1 is gone outright. Term 2 is what is left, and it is now visible without
-the rebuild sitting on top of it — see below.
 
 ## Term 2 — the per-element constant is ~2 µs, and it is linear
 
@@ -121,10 +106,7 @@ elements fixed and scaling the map width:
 | 2000 | 1.88 | 2.24 |
 
 Flat. Both are clean **O(n) with a ~2 µs per-element constant** — against
-HotSpot's ~10 ns. (Those two rows were measured with the per-read rebuild still
-in them. With Term 1 closed the `iterate hoisted` constant is **1.2 µs/elem**
-against HotSpot's 9.5 ns — still ~128x, and now the whole of the remaining gap
-rather than part of it.) That constant is the floor, and profiling the isolated
+HotSpot's ~10 ns. That constant is the floor, and profiling the isolated
 `keySet()` rung (no Spring, 13 s of pure view construction) shows what it is
 made of:
 
@@ -189,36 +171,41 @@ that one. The change was reverted rather than shipped inert.
 
 Per test run, against the ~475 s (JIT, loaded host) arm:
 
-| term | est. cost | note | 2026-08-23 |
-|---|---|---|---|
-| `keySet()` view construction | ~190 s | 101 910 calls × 1000 elem × ~1.9 µs | **~0 — CLOSED** |
-| iterating those views | ~230 s | 100M steps × ~2.3 µs | **~120 s** (1.2 µs/elem) |
-| `Objects.equals` via `Arrays.equals` | ~21 s | 100M calls × ~215 ns | unchanged |
+| term | est. cost | note |
+|---|---|---|
+| `keySet()` view construction | ~190 s | 101 910 calls × 1000 elem × ~1.9 µs |
+| iterating those views | ~230 s | 100M steps × ~2.3 µs |
+| `Objects.equals` via `Arrays.equals` | ~21 s | 100M calls × ~215 ns |
 
-Terms 1 and 2 were ~90 % of it. **`Objects.equals` is only ~4 %** — worth
-fixing for the whole VM, but it is not this test's problem.
-
-**The ~475 s figure and every estimate in this table predate the map-view fix.**
-The arithmetic above predicts ~140 s; that prediction has NOT been measured
-end to end (the Azure host was unreachable when the fix landed), so re-run the
-class before quoting a new wall. What HAS been measured is the isolated probe,
-above.
+Terms 1 and 2 are ~90 % of it. **`Objects.equals` is only ~4 %** — worth fixing
+for the whole VM, but it is not this test's problem.
 
 ## The two fixes, in value order
 
-1. ~~**Make map views lazy/live**~~ — **DONE 2026-08-23**, though not the way
-   this entry proposed. Delegating `size()`/`contains()`/`iterator()`/
-   `toArray()` to the source is design B of the plan page, and it is blocked by
-   the view backing being readable from JDK bytecode
-   (`keySet().spliterator()` does `getfield map.table`). What landed is design
-   A: cache the view on the source in the JDK's own field, and guard the
-   per-read rebuild on a `(source modCount, source size, backing size)` stamp.
-   Kill switch `CRATONVM_MAP_VIEW_CACHE=0`, verify mode
-   `CRATONVM_VERIFY_MAP_VIEW_CACHE=1`, and a 138-row behavioural probe
-   (`probes/MapViewCacheProbe`) byte-identical to HotSpot.
+1. **Make map views lazy/live** (`keySet`/`values`/`entrySet`) — **DONE
+   2026-08-23**, for `keySet` and `entrySet`, by a route this page did not
+   anticipate. Rather than delegating reads to the source, the view's backing
+   now carries the source's modification generation and a resync whose source
+   has not moved returns immediately; and `keySet()`/`entrySet()` hand back the
+   instance the map already has instead of building a new one, which is also
+   what HotSpot does and restores `map.keySet() == map.keySet()`.
 
-2. **Cut the per-element constant** (Term 2) — now the WHOLE of the remaining
-   gap on this workload, at 1.2 µs/elem against HotSpot's 9.5 ns. The natives read and write the
+   MEASURED on `probes/KeySetBench`, `LinkedHashMap` of 1000 entries, one
+   binary with `CRATONVM_MAP_VIEW_CACHE` as the A/B: `keySet()` alone
+   1674.5 → **2.5 µs/call**; `keySet().size()` — the shape
+   `StringUtils.toStringArray(map.keySet())` uses — 3125 → **4.5 µs/call**;
+   `keySet()` + iterate 5949.5 → **1489.5 µs/call**.
+
+   `values()` did NOT get it: its carrier is a list with a different backing
+   scheme. Neither did entrySet READS — only their construction — because an
+   entrySet's contents include values and a value-replacing `put` deliberately
+   does not move `modCount`.
+
+   Kill switch `CRATONVM_MAP_VIEW_CACHE=0`, verify mode
+   `CRATONVM_VERIFY_MAP_VIEW_CACHE=1`, engagement census
+   `CRATONVM_DBG=map-view-cache`.
+
+2. **Cut the per-element constant** (Term 2). The natives read and write the
    nodes *they themselves allocated*, with a known layout, through the generic
    validated accessor. A trusted-access path for that case is where the 17 % +
    29 % lives. This is a change at the native/GC boundary and needs to be
@@ -228,7 +215,9 @@ A cheaper partial for Term 1, if a lazy view is too big a step: build the view's
 backing directly from the source's `(hash, key)` node pairs — the hash is
 already stored in `NODE_FIELD_HASH` and the keys are already unique, so both
 `map_hash_key` and the duplicate probe are pure waste. Constant-factor only; it
-does not remove the O(n)-per-call.
+does not remove the O(n)-per-call. **Still worth doing** — the 2026-08-23 fix
+removes the repeated builds but not the cost of the first one, so this is what
+is left of Term 1 for a map whose key set really does keep changing.
 
 ## Reproducing
 

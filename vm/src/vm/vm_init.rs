@@ -8107,12 +8107,117 @@ pub fn dump_wait_object_state(shared: &SharedVm, obj: ObjectRef) {
         drop(cm);
         Some(shared.mem.heap.get_field(obj, idx))
     };
+    // WHAT `result` ACTUALLY IS, not just whether it is non-null.
+    //
+    // `result != null` is NOT the same claim as "the promise completed", and
+    // reading it as one is the single largest risk this dump carries.
+    // `io.netty.util.concurrent.DefaultPromise` holds THREE kinds of value in
+    // that one field:
+    //
+    // ```java
+    // private static final Object SUCCESS = new Object();
+    // private static final Object UNCANCELLABLE = new Object();
+    // private static boolean isDone0(Object result) {
+    //     return result != null && result != UNCANCELLABLE;
+    // }
+    // public boolean setUncancellable() {
+    //     if (RESULT_UPDATER.compareAndSet(this, null, UNCANCELLABLE)) return true;
+    //     …
+    // }
+    // ```
+    //
+    // `setUncancellable()` — which the channel register and bind paths call as
+    // a matter of course — publishes a NON-NULL `result` and deliberately does
+    // NOT notify, because the promise is still pending. A waiter's
+    // `while (!isDone())` correctly parks, and `checkNotifyWaiters` is
+    // correctly never called. So `result != null` + `waiters == 1` + no
+    // notification is EXACTLY what a promise that was made uncancellable and
+    // then never completed looks like — with no memory-ordering defect
+    // anywhere, and with the defect living upstream in whatever should have
+    // completed it.
+    //
+    // Distinguishing the two is a pointer comparison against the class's own
+    // statics, so the dump does it rather than leaving the reader to assume.
+    let result = field("result");
+    let verdict = classify_promise_result(shared, cid, &result);
     eprintln!(
-        "[WAIT-OBJECT] obj={:p} class={name} result={:?} waiters={:?}",
+        "[WAIT-OBJECT] obj={:p} class={name} result={:?} result_is={verdict} waiters={:?}",
         obj.as_ptr(),
-        field("result"),
+        result,
         field("waiters"),
     );
+}
+
+/// Name a `DefaultPromise.result` value against that class's own `SUCCESS` /
+/// `UNCANCELLABLE` sentinels — see the note in [`dump_wait_object_state`] for
+/// why the distinction decides the netty stall.
+///
+/// `unknown` means the statics could not be resolved on this receiver's
+/// hierarchy, and it is printed rather than swallowed: a silent fallback to
+/// "not uncancellable" is precisely the reading that would repeat the original
+/// mistake.
+fn classify_promise_result(
+    shared: &SharedVm,
+    cid: ClassId,
+    result: &Option<cratonvm_types::Value>,
+) -> String {
+    let Some(cratonvm_types::Value::Object(slot)) = result else {
+        return "not-a-reference-slot".to_string();
+    };
+    let Some(r) = slot else {
+        return "null(PENDING)".to_string();
+    };
+    // The sentinels are `private static final` on `DefaultPromise` itself, so
+    // walk from the receiver's class up until a class declares the name — the
+    // receiver is usually a subclass (`DefaultChannelPromise`,
+    // `AbstractBootstrap$PendingRegistrationPromise`).
+    let sentinel = |fname: &str| -> Option<ObjectRef> {
+        let cm = shared.classes.class_manager.read();
+        let mut cur = Some(cid);
+        while let Some(c) = cur {
+            let class = cm.get_class(c)?;
+            let mut static_idx = 0usize;
+            for f in &class.fields {
+                if f.is_static() {
+                    if &*f.name == fname {
+                        let owner = c;
+                        drop(cm);
+                        return match crate::vm::vm_object::get_static_shared(
+                            shared, owner, static_idx,
+                        ) {
+                            cratonvm_types::Value::Object(Some(o)) => Some(o),
+                            _ => None,
+                        };
+                    }
+                    static_idx += 1;
+                }
+            }
+            cur = class.superclass;
+        }
+        None
+    };
+    let same = |o: Option<ObjectRef>| o.is_some_and(|o| std::ptr::eq(o.as_ptr(), r.as_ptr()));
+    let unc = sentinel("UNCANCELLABLE");
+    let suc = sentinel("SUCCESS");
+    if unc.is_none() && suc.is_none() {
+        return "unknown(sentinels-unresolved)".to_string();
+    }
+    if same(unc) {
+        return "UNCANCELLABLE--STILL-PENDING".to_string();
+    }
+    if same(suc) {
+        return "SUCCESS".to_string();
+    }
+    let rcid = shared.mem.heap.class_id_of(*r);
+    let rname = shared
+        .classes
+        .class_manager
+        .read()
+        .class_store
+        .get(rcid)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| format!("<class_id {rcid:?}>"));
+    format!("other({rname})")
 }
 
 impl SharedVm {

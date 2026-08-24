@@ -103,24 +103,22 @@ Each was measured on this workload, interleaved, on this branch:
    same. (On the whole class the JIT is ~18% ahead, so do not turn it off
    either.)
 
-   **WHY it was a wash was root-caused 2026-08-22 and FIXED 2026-08-23:**
-   `internal/performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`.
-   A compiled caller calling a callee the JIT did NOT compile fell into the
-   fully name-keyed `invoke_or_native` path and cost **1902 ns** against
-   **385 ns** for the same call with the caller left interpreted — so on a
-   partially-compiled call graph the JIT's wins and this loss cancelled. All
-   four invoke kinds now enter such a callee through the call site's own cached
-   interpreter frame template and every one is BELOW its both-interpreted
-   control (virtual 1705-2012 -> 275-285 ns/op, interface 2148-2733 ->
-   440-493).
-
-   **The ABBA numbers above therefore predate the fix and are not a current
-   measurement of this workload** — re-take them before drawing any conclusion
-   from them. What that page does NOT change is why reactive code is hit
-   hardest: a method containing an unbridged `invokedynamic` is still denied
-   OSR outright and still retired with `MakeNotCompilable` after its first
-   compiled execution, so every lambda-creating method is still an interpreted
-   callee. Only the PRICE of calling one moved.
+   **WHY it is a wash was root-caused 2026-08-22, and the cause is now
+   FIXED for all four invoke kinds (2026-08-23):** a compiled caller calling a
+   callee the JIT did NOT compile fell into the fully name-keyed
+   `invoke_or_native` path and cost **1902 ns** against **385 ns** for the same
+   call with the caller left interpreted — so on a partially-compiled call
+   graph the JIT's wins and this loss cancelled. Each invoke kind now enters an
+   uncompiled callee through the call site's own cached interpreter frame
+   template (`CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` /
+   `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` are the kill switches), at ~420 ns —
+   below the both-interpreted cost. **The exchange has NOT been re-measured
+   against that, and this page's numbers predate it.** What that page also
+   explains, and what is NOT fixed, is why reactive code is hit hardest: a
+   method containing an
+   unbridged `invokedynamic` is denied OSR outright and retired with
+   `MakeNotCompilable` after its first compiled execution, so every
+   lambda-creating method becomes exactly that interpreted callee.
 2. **The native-shadow caller seal is not the lever.** 1179 methods are sealed
    before any compile (`clinit=771`, `calls-native-shadowed-method=408`) against
    155 compiled. `CRATONVM_JIT=-native-shadow-caller-seal` measured 28.43 ms/op

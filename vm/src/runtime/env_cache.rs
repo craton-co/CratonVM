@@ -1279,7 +1279,8 @@ pub fn jit_lambda_const_probe_strict() -> bool {
 /// `CRATONVM_DBG=mic-prof` on `probes/ReactorProbe.java` reports
 /// `kind_static=2_986_402` of `disp_calls=3_356_461` — **89%**.
 ///
-/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
+/// The virtual/interface/special half followed on 2026-08-23; see
+/// [`jit_virtual_bytecode_callee`].
 ///
 /// Default ON. `CRATONVM_JIT_STATIC_BYTECODE_CALLEE=0` restores the by-name
 /// path, which is the A/B a same-binary bisection needs.
@@ -1294,31 +1295,28 @@ pub fn jit_static_bytecode_callee() -> bool {
     })
 }
 
-/// `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` — the virtual/interface/special half
-/// of the same fix as [`jit_static_bytecode_callee`].
+/// `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` — the invokevirtual / invokeinterface
+/// twin of [`jit_static_bytecode_callee`].
+///
+/// The static half left 71% of a reactive workload's dispatch tail on the
+/// by-name path, because real application code is overwhelmingly virtual and
+/// interface. This is that half.
 ///
 /// # What it is worth
 ///
-/// MEASURED 2026-08-23, `probes/XferProbe2.java`, one binary, three arms per
-/// invoke kind (2 000 000 iterations):
+/// MEASURED 2026-08-23 on this tree, `probes/XferProbe2.java`, one binary:
 ///
-/// | kind | compiled -> compiled | both interpreted | compiled -> INTERPRETED |
+/// | arm | compiled -> compiled | compiled -> INTERPRETED | both interpreted |
 /// |---|---:|---:|---:|
-/// | `invokestatic` (already fixed) | 42.8 | 571.6 | 571.3 |
-/// | `invokevirtual` | 47.1 | 650.5 | **3177.1** |
-/// | `invokeinterface` | 45.4 | 761.9 | **2587.3** |
+/// | `invokevirtual` | 33.4 ns | **2031.4 ns** | 535.4 ns |
+/// | `invokeinterface` | 36.0 ns | **2298.9 ns** | 839.8 ns |
 ///
-/// i.e. after the `invokestatic` half landed, compiling the caller of an
-/// *interpreted* virtual callee was still **4.9x slower than compiling
-/// neither**, and interface **3.4x**. Real application and reactive code is
-/// overwhelmingly virtual/interface: `out_static_bc=98_201` of
-/// `out_tail=342_867` on `probes/ReactorProbe.java`, i.e. the static fix serves
-/// 29% of that workload's tail and the remaining 71% are kinds 0/1/2.
+/// i.e. compiling the caller and not the callee was 3.8x (virtual) and 2.7x
+/// (interface) SLOWER than compiling neither — the same shape the static half
+/// was fixed for, at the invoke kinds where the volume actually is.
 ///
-/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
-///
-/// Default ON. `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0` restores the by-name
-/// path, which is the A/B a same-binary bisection needs.
+/// Default ON. Set to `0` to restore the by-name `invoke_or_native` tail, which
+/// is the A/B a same-binary bisection needs.
 #[inline]
 pub fn jit_virtual_bytecode_callee() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();

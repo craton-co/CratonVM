@@ -1,269 +1,275 @@
-# A compiled caller calling an INTERPRETED callee cost 1900 ns — 5x more than never compiling the caller at all
+# A compiled caller calling an INTERPRETED callee — FIXED for all four invoke kinds
 
-**Status: FIXED 2026-08-23. All four invoke kinds now enter an uncompiled
-callee through the call site's own cached interpreter frame template.
-`invokestatic` landed 2026-08-22 (1310 -> 259 ns/op);
-`invokevirtual` / `invokeinterface` / `invokespecial` landed here.
-Measured on one binary with the kill switch as the A/B, four interleaved
-rounds, 2 000 000 iterations, `probes/XferProbe2.java`:**
-
-| kind | compiled -> compiled | both interpreted (`--nojit`) | compiled -> INTERPRETED, memo OFF | memo ON | ratio |
-|---|---:|---:|---:|---:|---:|
-| `invokestatic` | 25 | 283 | 238 | 240 | (landed 08-22) |
-| `invokevirtual` | 25 | 333-384 | **1705-2012** | **275-285** | **6.3-7.1x** |
-| `invokeinterface` | 27 | 501-572 | **2148-2733** | **440-493** | **4.9-5.5x** |
-| `invokespecial` | — | 634-639 | **2643** | **458** | **5.8x** |
-
-Re-measured on the final binary, three further interleaved rounds on a busier
-window (absolute values inflated on BOTH arms, ratios unchanged): virtual
-2724-4058 -> 319-521, interface 3815-5408 -> 587-706.
-
-**Every kind is now BELOW its both-interpreted control, so compiling the caller
-is no longer a pessimisation for any of them.** That is the number that
-mattered: before this, compiling the caller and not the callee was 4.9x slower
-(virtual) and 3.4x slower (interface) than compiling neither.
+**Status: FIXED 2026-08-23.** `invokestatic` was closed on 2026-08-22
+(1310 → 259 ns/op). `invokevirtual`, `invokeinterface` and `invokespecial` are
+closed here, each by the same mechanism: the call site's own cached interpreter
+frame template, entered instead of the fully name-keyed generic dispatch. All
+three are now BELOW the both-interpreted cost, so compiling the caller is no
+longer a pessimisation at any invoke kind.
 
 This was never a lambda bug, a reactive bug or a `java.time` bug: it was the
-JIT's interpreter-fallback path, and it applied to EVERY compiled method
-calling a callee the JIT did not compile — which, on any real application, is
+JIT's interpreter-fallback path, and it applied to EVERY compiled method that
+called a callee the JIT did not compile — which, on any real application, is
 most callees.
 
 ## The measurement
 
-`probes/XferProbe2.java` — a hot loop calling a one-line callee, one arm per
-invoke kind, with `CRATONVM_JIT_DENY` keeping the callee interpreted while the
-caller stays compiled. Three configurations per arm, same binary:
+`probes/XferProbe2.java`, one binary, `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` as
+the A/B, `CRATONVM_JIT_DENY` naming the callee so it stays interpreted while
+the caller is still compiled. Three interleaved rounds, medians:
 
-```
-CRATONVM_JIT_DENY=.calleeVirtual  <bin> -cp . XferProbe2 2000000 virtual
-CRATONVM_JIT_DENY=.calleeVirtual  CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0 \
-                                  <bin> -cp . XferProbe2 2000000 virtual
-                                  <bin> --nojit -cp . XferProbe2 2000000 virtual
-```
+| arm | compiled → compiled | compiled → INTERPRETED, **before** | compiled → INTERPRETED, **after** | both interpreted (`--nojit`) |
+|---|---:|---:|---:|---:|
+| `invokevirtual` | 38.6 | **3698** | **420** | 536 |
+| `invokeinterface` | 37.3 | **3488** | **417** | 466 |
+| `invokespecial` | 50.2 | **3035** | **429** | 940 |
 
-**Two traps in that command line, both of which silently measure the wrong
-thing:**
+8.8x / 8.4x / 7.1x, and `sink` bit-identical in every arm.
 
-* `CRATONVM_JIT_DENY` is a SUBSTRING match on `Class.method`, and the
-  virtual/interface callees live on `XferProbe2$Impl`, not on `XferProbe2`.
-  The probe's own header used to suggest `CRATONVM_JIT_DENY=XferProbe2.calleeVirtual`,
-  which matches nothing — the arm then measures the UNDENIED configuration and
-  reads ~25 ns/op, i.e. it looks like there is no problem at all.
-* A denied callee can still be INLINED into the compiled caller: the deny stops
-  a separate compile, not a splice. The `special` arm is bimodal for exactly
-  this reason — 24 ns/op in the rounds where `Base.calleeSpecial` was spliced,
-  ~2600 (OFF) / ~460 (ON) in the rounds where it dispatched. Only rounds in
-  which BOTH arms dispatch are comparable, and `CRATONVM_JIT_INLINE_CALLS=0`
-  is what makes that reproducible.
+**Read the RATIO, not the absolute.** This host's wall clock is not stable
+across a day — a second interleaved session the same evening read
+1682 / 1645 / 2311 for the same OFF arms and 247 / 251 / 360 for the same ON
+arms, i.e. 6.4–6.8x for the identical binaries. The by-name arm is the noisy
+one (2255–10787 ns/op observed across sessions) because it allocates and takes
+a global `Mutex` on every call; the memo arm is tight (295–636) because it does
+neither. What is invariant across every session run: **ON is below the
+`--nojit` control in all three kinds**, which is the property that matters —
+the JIT was actively losing to the interpreter it replaced.
 
-## Why it cost what it did
+The `--nojit` row is the control that makes the point. Before the fix,
+compiling the caller and not the callee was 6.9x (virtual), 7.5x (interface)
+and 3.2x (special) slower than compiling *neither*.
 
-`perf` on the denied arm, steady state. A compiled caller's call to an
-uncompiled callee fell out of `jit_invoke_dispatch`'s fast arms into
-`crate::vm::invoke_or_native`, i.e. the **fully name-keyed generic dispatch**:
+## Why it was slow
 
-| symbol | self% |
-|---|---:|
-| `vm_exec::invoke_on_class_shared_inner` | 14.72% |
-| `interpreter::execute` | 8.04% |
-| `RawEntryBuilder<(ClassLoaderId, Arc<str>)>::search` (class lookup BY NAME) | 3.41% |
-| `__memcmp_evex_movbe` | 3.04% |
-| `jit::helpers::jit_invoke_dispatch` | 3.06% |
-| `vm_exec::invoke_or_native` | 2.43% |
-| `native_override::should_force_registered_native_over_bytecode` | 1.93% |
-| `Arc<[u8]>::drop_slow` + `frame::padded_bytecode_for_method` + `CodeAttribute::clone` | 4.50% |
-| mimalloc (`_mi_page_malloc_zero`, `mi_free`, `mi_malloc_aligned`, VecPool) | ~11% |
+A compiled caller's call to an uncompiled callee fell out of
+`jit_invoke_dispatch`'s fast arms into `crate::vm::invoke_or_native`, the fully
+name-keyed generic dispatch: class lookup BY NAME, native-override arbitration,
+a `CodeAttribute` clone, bytecode re-padding behind a global `Mutex` with a
+full-body `memcmp`, and ~11% mimalloc. Every one of those is re-derivation of a
+constant — the call site is monomorphic and the callee never changes.
 
-Every one of those is *re-derivation of a constant*. The call site is
-monomorphic and the callee never changes, yet each call re-resolved the class
-by name, re-ran the native-override arbitration, re-cloned the `CodeAttribute`
-and re-padded the bytecode.
-
-The interpreter does none of this: its call sites hold a
+The interpreter does none of it: its call sites hold a
 `CachedInvokeTarget::Bytecode` with a prebuilt `Arc<CachedBytecodeMethod>`.
-**The JIT's dispatch helper had a cache for a COMPILED callee (`DISPATCH_CACHE`,
-`VIRTUAL_DISPATCH_CACHE`) and none at all for an interpreted one.**
+**The JIT's dispatch helper had a cache for a COMPILED callee
+(`DISPATCH_CACHE`, `VIRTUAL_DISPATCH_CACHE`) and no cache at all for an
+interpreted one.**
 
-## The fix
+## The three new memos
 
-Two functions, one per shape, both giving the dispatch tail the cache the
-interpreter always had — a site-keyed `(Arc<CachedBytecodeMethod>,
-RedefineGate)` memo entered with the same frame template
-`lambda.rs::try_invoke_cached_lambda_impl` uses:
+All three enter the callee through `Frame::new_pooled_cached` +
+`execute_prebuilt_frame`, the same shape `lambda.rs::try_invoke_cached_lambda_impl`
+uses, and all three are `site_keyed_memos!` members, so the generation and
+class-identity flushes that drop every other dispatch memo drop them too.
 
-* `jit::helpers::try_jit_static_bytecode_callee` — `invokestatic`, keyed by the
-  call site alone (a static call has no receiver, so the target is a pure
-  function of the site). Landed 2026-08-22.
-* `jit::helpers::try_jit_virtual_bytecode_callee` — `invokevirtual` /
-  `invokeinterface` / `invokespecial`, keyed by **`(call site, receiver
-  ClassId)`**. That extra key term is the whole difference: a virtual target is
-  not a function of the site, and the receiver's runtime class is what selects
-  the override. Making it part of the KEY rather than a per-hit guard lets a
-  bimorphic site keep both templates instead of evicting one on every
-  alternation, and removes the guard from the hot path entirely — a hit IS a
-  proof that the receiver's class is the one the template was resolved against.
+### `try_jit_virtual_bytecode_callee` — kinds 0 and 2
 
-Both are default-ON with a kill switch (`CRATONVM_JIT_STATIC_BYTECODE_CALLEE=0`,
-`CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0`), so the A/B is inside one binary.
+Keyed on **`(JitSiteKey, receiver ClassId)`**. The static half had no receiver,
+hence no dispatch retarget, no interface rules and no receiver guard; all three
+come back here and each is discharged rather than approximated:
 
-### What the virtual resolution refuses, and why each refusal is the point
+* **The retarget IS the resolution.** `build_lambda_impl_cached` resolves
+  through `find_method_recursive` starting at the RECEIVER'S OWN class id — the
+  same walk `invoke_on_class_shared` performs after its retarget, and the same
+  one the MIC's compile probe uses. A callee it cannot land on (an abstract
+  declaration, an interface method with no implementation on this receiver) has
+  no `Code` attribute and is refused rather than guessed at.
+* **The receiver guard IS the key.** A hit is by construction an answer
+  resolved for exactly this receiver class, so a site that goes polymorphic
+  gets one entry per class instead of serving the wrong body.
+* **Loader identity is not in play at all**, and this is the one place this path
+  is STRICTLY safer than its static sibling. That one resolves its owner
+  through `get_loaded_class_id(info.class_name)` — a class NAME, which two
+  loaders can both define — and had to join
+  `flush_class_identity_dispatch_memos` for it. Here the owner comes from the
+  receiver's header. The memo joins that flush anyway, because a `ClassId` is
+  reissued when a class is unloaded.
 
-Every obligation is discharged ONCE, at resolution; a site that cannot
-discharge them caches a refusal and never asks again.
+Array receivers are refused (`ObjectKind::Object` only): an array header carries
+its COMPONENT class id, so `(site, class id)` does not identify one — the same
+invariant `VIRTUAL_TARGET_CACHE` and the KC26 `array.clone()` note turn on.
 
-* **`cacheable_receiver && globally_named`.** This pair is the entire
-  loader-identity surface of a virtual dispatch: `cacheable` means the dispatch
-  class IS the receiver's runtime class (not an array, not `ClassId(0)`, not an
-  interface/bare-`Object` fallback to the CP class), and `globally_named` means
-  that name resolves back to that same class id. It is the virtual counterpart
-  of the static twin's `jit_static_owner_override` refusal, and the same term
-  `publish_mic_rust_cached_entry` and the by-name compile probe already gate on
-  — see the `ApplicationContextAotGeneratorTests` note at those sites for what
-  eight copies of one class name does without it.
+### `try_jit_special_bytecode_callee` — kind 1
+
+Keyed on **the call site alone**, and that is the definition of the opcode: the
+target is chosen by the resolved constant-pool class, never by the receiver's
+runtime class. A receiver-keyed memo here would be modelling a retarget
+`invokespecial` explicitly does not perform — the one that turns a super-call
+into a self-call and recurses until the stack ends (the picocli
+`StackOverflowError` the kind-1 arm was written for).
+
+It refuses unless `declaring_class_id` is present AND
+`resolve_class_loader_aware` answers, so the owner is always a `ClassId`
+resolved through the CALLER's loader
+(BUG-JIT-INVOKESPECIAL-LOADER-20260726). It refuses `<init>` / `<clinit>` by
+name rather than by consequence: `invoke_on_class_shared_inner` carries explicit
+carve-outs for both, an `<init>` is where object initialisation and this VM's
+synthetic layouts meet, and neither is a throughput path worth opening that
+surface for.
+
+### Shared refusals
+
+Every one is the static half's, verbatim and for the same reason:
+
 * **no native anywhere has this `(name, descriptor)`**
-  (`might_have_method_descriptor`), which removes the native-override,
-  `SyntheticStub`-yield and redefine-shadow questions rather than reproducing
-  them, and subsumes `force_native_over_real_jdk_bytecode` (whose triples all
-  name a REGISTERED native).
-* **the receiver's class is not a lambda proxy.** Every caller already routes
-  proxies away above this point; the resolver refuses them anyway, because a
-  memo that is correct only because of where it is called from is one move away
-  from being wrong.
-* **the declaring class is already initialised.** `invoke_shared` would run
-  `<clinit>` on the way in. Unlike every other refusal this one is NOT cached —
-  it is the single condition that becomes true on its own, and a cached refusal
-  would deny a site its fast path for the life of the process over a race with
-  class initialisation.
-* **`build_lambda_impl_cached` accepts the method found by walking UP from the
-  receiver's own class**: not native, not `synchronized`, not abstract (an
-  abstract method has no `Code`), no native shadow on the declaring class.
-  Rooting the walk at the receiver is what makes this override-correct rather
-  than a call to the call site's static type — the `Object.equals` /
-  `Long.equals` defect the MIC's own "VIRTUAL DISPATCH FIX" comment records.
+  (`might_have_method_descriptor`) — which removes the native-override,
+  `SyntheticStub`-yield, redefine-shadow and
+  `force_native_over_real_jdk_bytecode` questions rather than reproducing them;
+* the DECLARING class is already initialised — `invoke_shared` would run
+  `<clinit>` on the way in, and this path must never be the thing that skips it;
+* `site_name_is_special_cased`;
+* the resolved method is not `static`, and the decoded argument count matches
+  `receiver + declared parameters`.
 
-`invokespecial` differs in one term: its resolution root is the loader-resolved
-CP owner (`resolve_class_loader_aware`), not the receiver, because
-invokespecial must NOT re-target onto the receiver's runtime class — that turns
-a super-call into a self-call and recurses forever (the picocli
-`AbstractParseResultHandler.execute` `StackOverflowError`).
+Per hit only what can change is re-tested: the declaring class's `RedefineGate`
+and the process-wide `any_class_redefined` latch.
 
-Per hit, only what can change is re-tested: the declaring class's
-`RedefineGate`, the process-wide `any_class_redefined` latch, the arity, and
-the template's own `(name, descriptor)` against the site's.
+## Where they are spliced in, and the one gate that is not obvious
 
-### `apply` — the name that made the interface half read zero
+Three call sites: the generic dispatcher's 0/2 arm and its 1 arm — both of
+which are the TAIL, i.e. `OUT_TAIL` is already counted and every
+compiled-callee probe (`DISPATCH_CACHE`, `VIRTUAL_DISPATCH_CACHE`, `JitCache`,
+the tier-up arm) has already declined — and both of
+`jit_invoke_virtual_mic`'s resolving arms.
 
-The first cut of the virtual memo deferred to `site_name_is_special_cased`, the
-name-only list the leaf-native path uses. `apply` is on it, and `apply` is the
-SAM of `java.util.function.Function` — the single most common interface method
-in reactive code. `CRATONVM_DBG=mic-prof` said so exactly:
+The MIC arms carry an extra gate: **the memo is taken only when the compile
+probe produced no entry** (`callee_has_compiled_code` / `entry_ptr == 0`). The
+by-name `invoke_or_native` below them WOULD have entered compiled code if the
+callee had any, so an ungated memo could divert a compiled callee into the
+interpreter. That is the one way this change could have made something slower,
+and it is closed by a boolean.
 
-```
-virtual  out_virt_bc=1048575 out_virt_bc_refused=0          <- 100% served
-iface    out_virt_bc=0       out_virt_bc_refused=1048575    <- 100% refused
-```
+## What the probe had to be fixed to measure
 
-`apply` earns its place on that list through ONE rescue: `invoke_or_native`
-redirects `apply(Ljava/lang/Object;)Ljava/lang/Object;` to
-`applyAsInt`/`applyAsLong`/`applyAsDouble` when the dispatch class is
-`java/util/function/To{Int,Long,Double}Function`, because those interfaces
-declare no `apply` at all and naive dispatch raises `NoSuchMethodError`
-(Spring/Eureka). `virtual_site_name_is_special_cased` narrows the refusal to
-that triple. Two independent things already make it unreachable from this path
-— an interface that declares no `apply` has no `Code` for it, and a receiver
-whose class is an interface different from the call site's fails
-`cacheable_receiver` — and the explicit test is there so a later change to
-either does not quietly re-open it. After the narrowing the interface arm reads
-`out_virt_bc=1048575 out_virt_bc_refused=0`.
+`probes/XferProbe2.java` as it stood could not measure two of the three kinds,
+and both failures read like results:
 
-**A finding worth keeping from the same probe:** `iface` and `iface2` differ
-only in the SAM's NAME (`apply` vs `step`) and take completely different
-routes. `step` is devirtualized and INLINED outright — the arm reads ~23 ns/op
-even with all of `XferProbe2$Impl` denied, and the dispatch helper is never
-entered (no `[DISP_CENSUS]` line at all). `apply` is not inlined. Both arms are
-kept in the probe because the pair is the evidence that the name, not the
-shape, decides.
+* **the `iface` arm was measuring `invokestatic`.** Its suggested
+  `CRATONVM_JIT_DENY=XferProbe2.calleeIface` denies a STATIC method that the
+  interface body calls, not the interface call. Denying the interface body
+  itself (`XferProbe2$Impl.apply`) then produced `out_virtual_bc=0
+  out_virtual_bc_refused=1048575` — a refusal on every call — because `apply`
+  is on `site_name_is_special_cased`'s deliberately over-broad list (it is one
+  of the names `invoke_or_native`'s opening cascade can claim, via the
+  `ToIntFunction.apply` SAM bridges). Correct behaviour, but a name-wide
+  refusal reading like a kind-wide one. The new `iface2` arm names its SAM
+  `compute`, and running both is what tells the two apart.
+* **the `special` arm's callee was being INLINED.** A one-line
+  `super.calleeSpecial` was `inline-planned … cost=4 budget_left=750` and
+  spliced outright, so `CRATONVM_JIT_DENY` on it was a no-op — 24.2 ns denied
+  against 25.8 ns undenied, which is the tell that the lever was not engaged.
+  The callee is now a 64-arm `tableswitch`: far past the inline budget, still
+  O(1) to execute, and every arm returns the same value so `sink` stays
+  bit-identical across all arms — which is the check that the switch costs a
+  dispatch and not a body.
 
-## Correctness
+## Instruments
 
-* `cargo test -p cratonvm-vm --lib`: **2600 passed, 0 failed**, including
-  `a_jit_generation_change_clears_every_site_keyed_memo`.
-* `regression-suite/run.sh`: **69 of 69 scheduled vectors passed, 0 failed.**
+`CRATONVM_DBG=mic-prof` reports `out_virtual_bc` / `out_virtual_bc_refused` and
+`out_special_bc` / `out_special_bc_refused` beside the static pair. A version of
+any of these that never fires is indistinguishable from one that fires and buys
+nothing, which is the failure mode this census exists for.
 
+`CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0` restores the by-name path for all
+three kinds — verified to reproduce the pre-fix binary's numbers within its
+noise, which is what makes the A/B a one-binary A/B.
 
-* The memo joins `site_keyed_memos!`, so the JIT-generation and
-  class-identity flushes drop it like every other dispatch memo, and
-  `a_jit_generation_change_clears_every_site_keyed_memo` fails if a new memo is
-  added without a population line — which is what forced the static twin into
-  `flush_class_identity_dispatch_memos` when it was first written.
-* It re-tests the template's `(name, descriptor)` against the site's on every
-  hit. `flush_raw_entry_dispatch_caches` is the mechanism that closes
-  `JitInvokeInfo` address reuse, and it runs before every consult; the extra
-  test is kept because this memo is also consulted from
-  `jit_invoke_virtual_mic`, where a site key has already been observed once to
-  name a different site (the `OffsetDateTimeTest` discovery crash).
-* It does not starve tier-up. In `jit_invoke_dispatch` the invocation counter
-  and compile attempt run BEFORE `out_tail`, i.e. before this hook; in
-  `jit_invoke_virtual_mic` the `try_jit_compile_callee` probe runs before it in
-  both the entryless-hit and the miss arm. A callee that becomes hot is still
-  nominated and still tiers up — it simply stops paying a by-name resolution
-  while it waits.
+## §3 — why this landed on reactive code hardest (unchanged, and still true)
 
-## Hooked at four sites
+A method containing an unbridged `invokedynamic` cannot run compiled, so it
+becomes exactly the interpreted callee above. Two mechanisms, both named by the
+VM itself under `CRATONVM_DBG=jitc`:
 
-`jit_invoke_dispatch`'s `0 | 2` arm and its `1` arm, and
-`jit_invoke_virtual_mic`'s entryless-hit and cache-miss arms. The MIC is where
-the volume for virtual/interface lives: `mic_calls=9_437_184` with
-`hit_entry=879_584` and `hit_noentry=1_954_260`, i.e. 1.95 M dispatches that
-found the receiver and had no compiled callee to enter.
+* **OSR is refused outright and permanently** — `osr-DENY (unbridged
+  invokedynamic)`, then the method is OSR-denied for the rest of the process.
+  The guard admits only `StringConcatFactory` sites, because every other
+  bootstrap lowers to an unconditional frame-deopt and an OSR frame cannot take
+  that trap safely. It is method-wide: one indy anywhere denies every loop in
+  the method.
+* **Whole-method compiles are undone at runtime** — the method compiles,
+  executes the indy, hits the reason-8 stub, and
+  `DeoptimizationController::deoptimize` with `action=MakeNotCompilable`
+  retires it permanently.
 
-The `0 | 2` arm also switched from `virtual_dispatch_target_for_receiver` to
-`virtual_dispatch_target_cached` — same class-name answer by the same
-conditions, plus the `globally_named` round-trip the memo gates on, and
-`flush_class_identity_dispatch_memos` has already run for that call.
+`probes/IndyScopeProbe.java` isolates it. The SAM call itself is fine (32–35 ns
+once the calling method is compiled); what is broken is that a method
+*containing* an `invokedynamic` never stays compiled. **That is a separate open
+item and is NOT closed by this page** — what this page closes is the cost of
+calling such a method, which was 1900–3700 ns and is now ~420.
 
 ## What this is NOT
 
-* Not lambda *dispatch*. `[LAMBDA-PROF]` and `[LAMBDA-JIT]` both show the lambda
-  machinery working: `compiled_hits=1017675`, `declines=0`.
+* Not lambda *dispatch*. `[LAMBDA-PROF]` / `[LAMBDA-JIT]` show
+  `compiled_hits=1017675 declines=0`.
 * Not tier-up thresholds: `CRATONVM_JIT_LAMBDA_TIERUP=0` moves the lambda arm 4%.
 * Not the field-site cache. Its hit rate on the WebClient exchange is 83.9% at
-  the default 1024 slots and saturates at 92.6% by 32768 — but buying those
-  95 000 misses back moved neither the exchange (30.2 -> 30.2 ms/op) nor
-  `ReactorProbe` (118k -> 115k ns/op, inside noise). Sized and rejected.
+  1024 slots and saturates at 92.6% by 32768, and buying those 95 000 misses
+  back moved neither the exchange (30.2 → 30.2 ms/op) nor `ReactorProbe`
+  (118k → 115k ns/op, inside noise). Sized and rejected.
 
-## What stays open, and where
+## The one population number that WAS taken, and what it says
 
-Two things this page carried that are NOT this defect and do not close with it:
+`CRATONVM_DBG=mic-prof` on `regression-suite`'s `RJitGc` — a GC-stress class,
+not a microbenchmark:
 
-* **`invokedynamic` keeps a method from staying compiled.** A method containing
-  an unbridged indy is permanently denied OSR (`jit_bridge.rs`, the "RBC.7
-  (relaxed)" guard admits only `StringConcatFactory` sites), and a whole-method
-  compile that does succeed is retired at runtime by
-  `DeoptimizationController::deoptimize` with `action=MakeNotCompilable` when
-  the reason-8 stub fires. That is why reactive assembly is hit hardest: it is
-  nothing but methods that create lambdas. **This page's fix changes the PRICE
-  of that, not the fact** — such a method is still interpreted, but calling it
-  now costs ~285-490 ns instead of ~1900-3200. The indy rule itself is tracked
-  in the JIT notes, not here.
-* **`known-issues/perf/webclient-integration-tests-reactive-exchange-gap-20260822.md`**
-  is its own page and stays open on its own terms.
+```
+kind_special=1_769_271  out_tail=1040
+out_special_bc=0  out_special_bc_refused=1040
+```
+
+Two things follow, and the second is uncomfortable enough to state plainly:
+
+* the fast arms already serve 99.94% of that class's `invokespecial` calls, so
+  the tail this page is about is a thin slice of the total. A per-call
+  multiplier on the tail is not a workload multiplier — see
+  `a-multiplier-and-a-population-are-different-measurements`;
+* **every one of the 1040 tail calls was REFUSED.** The most likely reason is
+  the `<init>` / `<clinit>` refusal — a GC-stress class's `invokespecial` tail
+  is overwhelmingly constructors — but that attribution is **not verified**:
+  the census counts refusals without naming which gate took them, and
+  `might_have_method_descriptor` would look identical here.
+
+So the `invokespecial` half is proven on `probes/XferProbe2`'s `special` arm
+(3035 → 429 ns/op) and has **zero measured population on the one real class
+censused**. If it turns out `<init>` is where the volume is, admitting it is
+the next piece of work — and it is deliberately the piece this pass did not
+open, because `invoke_on_class_shared_inner` carries explicit carve-outs for
+both names and an `<init>` is where object initialisation and this VM's
+synthetic layouts meet.
+
+Naming which gate refuses would take one counter per refusal reason, and is the
+cheapest next instrument here.
+
+## What is left
+
+**The suite-level population is not measured here.** `probes/ReactorProbe.java`
+and the WebClient exchange need reactor on the classpath, which this session's
+host does not have, so the `out_virtual_bc` share of a real reactive workload's
+tail is unmeasured. The isolated per-call numbers above are real; **do not
+quote them as a suite number**. The population question is the one to ask next,
+and `CRATONVM_DBG=mic-prof` answers it in one run on any host that can boot the
+workload.
+
+Related: `known-issues/perf/webclient-integration-tests-reactive-exchange-gap-20260822.md`,
+[[jit-entries-per-call-cost-is-the-call-dense-wall]].
 
 ## Reproducing
 
-```
-CRATONVM_BIN=<bin> bash probes/wcit-exchange-ab.sh run cv XferProbe2 2000000 virtual
+```bash
+CV=<bin>
+for arm in virtual iface2 special; do
+  case $arm in
+    virtual) D='XferProbe2$Impl.calleeVirtual' ;;
+    iface2)  D='XferProbe2$Impl.compute' ;;
+    special) D='XferProbe2$Base.calleeSpecial' ;;
+  esac
+  $CV --cp <probes> XferProbe2 2000000 $arm                                   # compiled -> compiled
+  CRATONVM_JIT_DENY=$D $CV --cp <probes> XferProbe2 2000000 $arm              # ON
+  CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0 CRATONVM_JIT_DENY=$D \
+    $CV --cp <probes> XferProbe2 2000000 $arm                                 # OFF
+  $CV --nojit --cp <probes> XferProbe2 2000000 $arm                           # both interpreted
+done
 ```
 
-or directly, which is what the numbers above were taken with:
-
-```
-<bin> -cp <probes> XferProbe2 2000000 <static|virtual|iface|iface2|special>
-```
-
-`XferProbe2` / `IndyScopeProbe` / `ReactorProbe` / `IndyProbe` /
-`HoistedLambdaProbe` are pure CPU with no sockets, so unlike the WebClient
-exchange probe they are stable on a loaded shared host.
-
-Related: [[jit-entries-per-call-cost-is-the-call-dense-wall]],
-`known-issues/perf/webclient-integration-tests-reactive-exchange-gap-20260822.md`.
+Interleave the arms. All are pure CPU with no sockets, but this host's absolute
+wall clock still moves by 2x across a session — see the note under the table.
