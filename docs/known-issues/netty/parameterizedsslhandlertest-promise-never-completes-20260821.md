@@ -22,10 +22,13 @@ things changed:
    `42036 invocations compile-failed DefaultPromise.isDone0`) cannot tell those
    apart, because it counts COMPILES and the thing that leaks is a SPLICE.
 
-   The planner now consults the lever
-   (`InlineRefusal::ForceInterpreted`). **The 50-run
-   `CRATONVM_JIT_DENY=DefaultPromise` arm has to be re-run on a binary that has
-   it** before "the defect is tier-independent" can be asserted again.
+   The planner now consults the lever (`InlineRefusal::ForceInterpreted`), and
+   the same arm is deterministic on a binary that has it — 384.3 / 387.1 /
+   408.2 ns/op denied against 38.8 / 42.7 / 43.5 undenied over three
+   interleaved pairs, with `CRATONVM_DBG=jitc` printing no `inline-planned`
+   line for the denied callee at all. **The 50-run
+   `CRATONVM_JIT_DENY=DefaultPromise` arm has to be re-run on that binary**
+   before "the defect is tier-independent" can be asserted again.
 
 2. **The monitor now reports whether a `notifyAll()` ever reached it**, which
    is the measurement that partitions the two surviving explanations. See
@@ -339,8 +342,20 @@ stall, and fixed on those terms rather than offered as the stall's fix.
    only covers the first. See "The partitioning instrument". **Still needs one
    stall to be read.**
 3. **RE-RUN the `CRATONVM_JIT_DENY=DefaultPromise` arm** on a binary whose
-   inline planner consults the lever. Until that is done the JIT is not
-   refuted, and "the defect is tier-independent" is not a finding.
+   inline planner consults the lever (any build from `a36caa907` on). Until
+   that is done the JIT is not refuted, and "the defect is tier-independent" is
+   not a finding.
+
+   Read it with the `result_is=` tag from step 2b, not just the stall count: if
+   the promise is `UNCANCELLABLE` the deny arm is answering a question about a
+   defect that is not there.
+
+2b. **Read `result_is=` on the next stall before anything else.** The dump now
+   names `UNCANCELLABLE` (see "Also: `result != null` does not mean completed"
+   above). If it reads `UNCANCELLABLE--STILL-PENDING`, every "the promise has
+   completed" conclusion on this page collapses, the monitor is exonerated
+   outright, and the question becomes what failed to complete the promise —
+   which is a different investigation with a different suspect list.
 4. Grep an existing stall log for netty's own
    `"Failed to mark a promise as success"` warning. If it is there, `setValue0`
    returned `false` after writing `result`, and the defect is in
