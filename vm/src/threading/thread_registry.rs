@@ -1493,6 +1493,51 @@ impl ThreadRegistry {
         monitor
     }
 
+    /// EVERY registered thread that is currently parked in `Object.wait()`,
+    /// with the object each one is parked on.
+    ///
+    /// # Why a census, and not the one thread the watchdog reaches
+    ///
+    /// The wait-site dump reports the FIRST parked thread it finds, which on
+    /// the netty `ParameterizedSslHandlerTest` stalls was always the test thread
+    /// — and the test thread is parked on a promise that something *else* was
+    /// supposed to complete. A dump that names only that thread cannot tell
+    /// "nothing ever completed this promise" from "the thread that would have
+    /// completed it is itself parked somewhere", and those two need opposite
+    /// investigations. One line per waiter settles it inside the stall that is
+    /// already happening, with no second run.
+    ///
+    /// Rows are `(tid, name, alive, waited_on, waited_ms)`, sorted by tid.
+    /// `waited_ms` is `0` when the wait-start stamp is missing, so a caller
+    /// never has to unwrap it. The `ObjectRef` comes from the same
+    /// `jmx_waiting_monitor` slot [`Self::peek_jmx_waiting_monitor`] reads —
+    /// a scanned root that `update_thread_objs_after_gc` forwards — so it is
+    /// sound to dereference under a moving collector, unlike `Monitor::wait`'s
+    /// own entry-time local.
+    pub fn waiting_monitor_census(&self) -> Vec<(u64, String, bool, ObjectRef, u64)> {
+        let threads = self.threads.read();
+        let mut out: Vec<(u64, String, bool, ObjectRef, u64)> = Vec::new();
+        for (tid, entry) in threads.iter() {
+            let waiting = *entry.jmx_waiting_monitor.lock();
+            let Some(obj) = waiting else {
+                continue;
+            };
+            let started = *entry.jmx_wait_started.lock();
+            let waited_ms = started
+                .map(|t| t.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0);
+            out.push((
+                tid.0,
+                entry.name.clone(),
+                entry.alive.load(Ordering::Acquire),
+                obj,
+                waited_ms,
+            ));
+        }
+        out.sort_by_key(|r| r.0);
+        out
+    }
+
     pub fn take_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
         let threads = self.threads.read();
         let entry = threads.get(&thread_id)?;
@@ -4515,6 +4560,55 @@ mod tests {
         assert_eq!(
             b.take_async_exception(tid).map(|o| o.as_ptr()),
             Some(throwable.as_ptr())
+        );
+    }
+
+    /// The census reports EVERY thread parked in `Object.wait()`, not the one
+    /// the watchdog happened to reach first.
+    ///
+    /// This is the property
+    /// `known-issues/netty/parameterizedsslhandlertest-residual-stalls` was
+    /// blocked on: with one waiter reported, "nothing completed this promise"
+    /// and "the thread that would have completed it is itself parked" are
+    /// indistinguishable. A thread that has LEFT the wait must not appear, or
+    /// the census would manufacture the second reading.
+    #[test]
+    fn waiting_monitor_census_lists_every_waiter_and_only_waiters() {
+        let registry = ThreadRegistry::new();
+        let mut b1 = [0u64; 2];
+        let mut b2 = [0u64; 2];
+        let mut b3 = [0u64; 2];
+        let (m1, m2, m3) = (
+            dummy_aligned_objref(&mut b1),
+            dummy_aligned_objref(&mut b2),
+            dummy_aligned_objref(&mut b3),
+        );
+        for (i, name) in ["main", "reactor-1", "reactor-2"].iter().enumerate() {
+            registry.register(ThreadId(i as u64), name, None);
+        }
+        assert!(
+            registry.waiting_monitor_census().is_empty(),
+            "nobody is waiting yet"
+        );
+
+        registry.set_jmx_waiting_monitor(ThreadId(0), m1);
+        registry.set_jmx_waiting_monitor(ThreadId(2), m3);
+        let rows = registry.waiting_monitor_census();
+        assert_eq!(rows.len(), 2, "both waiters, and only them: {rows:?}");
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1, "main");
+        assert!(std::ptr::eq(rows[0].3.as_ptr(), m1.as_ptr()));
+        assert_eq!(rows[1].0, 2);
+        assert!(std::ptr::eq(rows[1].3.as_ptr(), m3.as_ptr()));
+
+        // A thread that leaves the wait drops out; one that enters appears.
+        registry.take_jmx_waiting_monitor(ThreadId(0));
+        registry.set_jmx_waiting_monitor(ThreadId(1), m2);
+        let rows = registry.waiting_monitor_census();
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the census must track the slot, not a high-water mark"
         );
     }
 
