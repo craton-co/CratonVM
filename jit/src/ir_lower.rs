@@ -3532,6 +3532,35 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x4D, 0x8B, 0x5A, disp]); // MOV R11, [R10+disp8]
         }
         self.buf.emit(&[0x41, 0xFF, 0xD3]); // CALL R11
+        // The callee is COMPILED JAVA, so its prologue published ITS (rbp,
+        // compile id) into the innermost-frame mirror and nothing on the return
+        // path of a raw JIT->JIT call restores this frame's. Both inline-cache
+        // arms in this tier went without it until 2026-08-24, so after any
+        // monomorphic or polymorphic hit the mirror named a frame that had
+        // already returned -- measured on H2 `TestMVStoreTool`, where ONE rbp
+        // with ONE saved return address inside `TestMVStoreTool.testCompact`
+        // was claimed across collections by four different methods, one of them
+        // `RootReference.isLocked` with `maps=0`, which emits no safepoint and
+        // therefore cannot be the frame at a collection at all.
+        //
+        // `moving_young_frame_coverage_complete` then reads
+        // `[stale_rbp - stale_method.sp_id_slot_off]`, finds a word matching no
+        // map, and refuses the whole cycle (`ACTIVE_FRAME_MAP`,
+        // `frame_cov=(no_map=N incomplete=0)`), which is what kept ZGC from
+        // compacting on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free`.
+        // The single-pass backend republishes at both of its equivalent arms,
+        // and the shared hashed/vtable stub below is handed `self.frame_record`
+        // for exactly this -- these two arms were the gap.
+        //
+        // It lives INSIDE this helper rather than at the two call sites so a
+        // third arm cannot be added without it. RAX (the callee's Java return
+        // value) is preserved by both forms of the republish, and the security
+        // invariant above is about the MOV/CALL pair, which nothing here comes
+        // between.
+        if !ic_frame_republish_disabled() {
+            self.emit_post_call_frame_record();
+            IC_FRAME_REPUBLISH_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// IR inline-cache lowering — serve a virtual / interface `Op::Call` from a
@@ -11182,7 +11211,102 @@ mod tests {
     /// end-to-end execution coverage for IR call lowering lives in
     /// `jit/tests/ir_vs_singlepass.rs` (see the doc for the cases to add
     /// there — that file is outside this change's ownership).
+
+    /// Every inline-cache hit in this tier restores the innermost-frame mirror
+    /// before it does anything else.
+    ///
+    /// A compiled callee's prologue publishes ITS `(rbp, compile id)` there, and
+    /// nothing on the return path of a raw JIT->JIT call restores the caller's.
+    /// Until 2026-08-24 neither of this tier's two inline-cache arms — the
+    /// monomorphic MIC hit and each rung of the polymorphic PIC cascade — did,
+    /// so after any hit the mirror named a frame that had already returned.
+    /// `moving_young_frame_coverage_complete` then read
+    /// `[stale_rbp - stale_method.sp_id_slot_off]`, matched no map, and refused
+    /// the whole collection (`ACTIVE_FRAME_MAP`). Measured on H2
+    /// `TestMVStoreTool`: one rbp with ONE saved return address claimed across
+    /// collections by four different methods, one of them `RootReference.isLocked`
+    /// with `maps=0` — a method that emits no safepoint and therefore cannot be
+    /// the frame at a collection at all.
+    ///
+    /// The single-pass backend republishes at both of its equivalent arms and
+    /// the shared hashed/vtable stub is handed `frame_record` for the same
+    /// reason; these two were the gap.
+    ///
+    /// Asserted as "the byte right after the CALL", because that placement is
+    /// the property: anything emitted between the return and the republish runs
+    /// under a mirror naming a dead frame. The zero-`frame_record` arm is the
+    /// control — it proves the assertion can FAIL, so a future edit that drops
+    /// the republish cannot leave this test passing vacuously.
+    #[test]
+    fn every_inline_cache_hit_restores_the_frame_record_before_anything_else() {
+        crate::x64::set_moving_young_override(Some(false));
+        const MIC: usize = 0x7fff_0000_0000_1000;
+        const PIC: usize = 0x7fff_0000_0000_2000;
+        const FRAME_RECORD: usize = 0x7fff_0000_0000_3000;
+        let mut ic = HashMap::new();
+        ic.insert(2usize, (MIC, PIC));
+
+        // `CALL R11` — the cached-entry indirect call, and the ONLY way this
+        // tier reaches a compiled Java callee from an inline cache.
+        const CALL_R11: [u8; 3] = [0x41, 0xFF, 0xD3];
+        let seg = crate::x64::inline_rbp_tls_segment_prefix();
+
+        let sites = |code: &[u8]| -> Vec<usize> {
+            (0..code.len().saturating_sub(3))
+                .filter(|&i| code[i..i + 3] == CALL_R11)
+                .collect()
+        };
+
+        let with = lower_virtual_call_with_ic_fr(&ic, FRAME_RECORD);
+        let without = lower_virtual_call_with_ic_fr(&ic, 0);
+
+        let with_sites = sites(&with);
+        // One MIC arm plus one rung per PIC entry. If this is ever zero the
+        // test below is vacuous, which is the failure mode worth naming.
+        assert!(
+            with_sites.len() >= 1 + crate::JIT_PIC_ENTRIES,
+            "expected at least {} cached-entry calls, found {} — the probe cannot fire",
+            1 + crate::JIT_PIC_ENTRIES,
+            with_sites.len()
+        );
+
+        for at in &with_sites {
+            let next = with[at + 3];
+            // Inline form: `MOV <seg>:[disp32], RBP` opens with the segment
+            // prefix. Helper form (no probed TLS displacement): `PUSH RAX`
+            // preserves the callee's Java return value first.
+            assert!(
+                next == seg || next == 0x50,
+                "cached-entry CALL at {at} is followed by {next:#04x}, not the \
+                 frame-record republish ({seg:#04x} inline / 0x50 helper form)"
+            );
+        }
+
+        // The control. With no frame-record helper the republish is switched
+        // off wholesale, so NONE of the sites may carry it — which is what
+        // makes the assertion above discriminating rather than decorative.
+        for at in sites(&without) {
+            let next = without[at + 3];
+            assert!(
+                next != seg && next != 0x50,
+                "frame_record=0 must emit no republish, but the call at {at} is \
+                 followed by {next:#04x}"
+            );
+        }
+    }
+
     fn lower_virtual_call_with_ic(ic: &HashMap<usize, (usize, usize)>) -> Vec<u8> {
+        lower_virtual_call_with_ic_fr(ic, 0)
+    }
+
+    /// As [`lower_virtual_call_with_ic`], with the frame-record helper
+    /// pointer set. Zero is what `no_helpers()` gives, and zero switches the
+    /// whole frame record off, so a test about the record has to pass a live
+    /// one or it is asking a question the emitter never reaches.
+    fn lower_virtual_call_with_ic_fr(
+        ic: &HashMap<usize, (usize, usize)>,
+        frame_record: usize,
+    ) -> Vec<u8> {
         // aload_0; iload_1; invokevirtual #2; ireturn
         let code = [0x2a, 0x1b, 0xb6, 0x00, 0x02, 0xac, 0x00, 0x00];
         // A live `JitInvokeInfo` for the site. Leaked deliberately: `Op::Call`
@@ -11213,6 +11337,7 @@ mod tests {
         helpers.invoke_dispatch = 0x1111_2222_3333_4440;
         helpers.invoke_virtual_mic = 0x1111_2222_3333_4441;
         helpers.dispatch_threw = 0x1111_2222_3333_4442;
+        helpers.frame_record = frame_record;
 
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
@@ -16288,4 +16413,35 @@ mod tests {
             "…but it must still cover the largest call-free compile measured"
         );
     }
+}
+
+/// `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH=1` — stop republishing the
+/// innermost-frame mirror after an optimizing-tier inline-cache hit.
+///
+/// The bisect lever for the republish folded into `emit_call_cached_entry`,
+/// which is default-ON. Latched: read once, because a codegen decision must not
+/// change under a running process. With it set, one binary reproduces the
+/// stale-mirror `ACTIVE_FRAME_MAP` refusals this fixed.
+fn ic_frame_republish_disabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH").is_some()
+    })
+}
+
+/// How many optimizing-tier inline-cache call sites were compiled WITH the
+/// frame-record republish.
+///
+/// Bumped at COMPILE time, not per call, so it costs a workload nothing. It is
+/// the engagement counter for that repair: a claim that the republish did or
+/// did not move a workload is worth nothing while this reads zero, because a
+/// zero means the optimizing tier never lowered an inline cache in that run and
+/// the arms differed only by noise. Printed on the `[jitroots]` line beside the
+/// verdict it is supposed to explain.
+pub static IC_FRAME_REPUBLISH_SITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Read [`IC_FRAME_REPUBLISH_SITES`].
+pub fn ic_frame_republish_sites() -> usize {
+    IC_FRAME_REPUBLISH_SITES.load(std::sync::atomic::Ordering::Relaxed)
 }
