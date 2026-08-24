@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-485 tokens.
+487 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -417,6 +417,8 @@ export inherited from a parent shell.
 | `promo-seed` | `CRATONVM_DBG_PROMO_SEED` |
 | `proxy` | `CRATONVM_DBG_PROXY` |
 | `prune` | `CRATONVM_DBG_NO_PRUNE` |
+| `punned-ref` | `CRATONVM_DBG_PUNNED_REF` |
+| `view-comod` | `CRATONVM_DBG_VIEW_COMOD` |
 | `quarkus-staticinit` | `CRATONVM_DBG_QUARKUS_STATICINIT` |
 | `quicken-stats` | `CRATONVM_QUICKEN_STATS` |
 | `quiet-env-fallback` | `CRATONVM_QUIET_ENV_FALLBACK` |
