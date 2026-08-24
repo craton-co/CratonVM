@@ -676,6 +676,51 @@ pub struct Monitor {
 
 /// The mutable state protected by a monitor's mutex.
 struct MonitorState {
+    /// Threads currently parked in `Object.wait()` on this monitor.
+    ///
+    /// Incremented under the state lock immediately before a waiter parks and
+    /// decremented immediately after it leaves the wait loop, so it is exact
+    /// for anyone holding that lock. `notify_all` uses it to decide how many
+    /// notifications to make available; `notify` uses it to avoid stockpiling
+    /// notifications nobody is waiting for.
+    parked_waiters: u32,
+    /// Notifications delivered to this monitor that no waiter has consumed yet.
+    ///
+    /// **This is the fix for the netty `ParameterizedSslHandlerTest` stall, and
+    /// the reason it existed.** `Object.wait()` here used to depend on the
+    /// CONDVAR ALONE: park on `wait_condvar`, and treat a signalled return as
+    /// the notification. A condvar is a signalling primitive, not a state one —
+    /// a notification that is delivered while the waiter is between a
+    /// `wait_for` timeout and its next park, or that is consumed by
+    /// `parking_lot`'s requeue-to-mutex and then reported as a timeout because
+    /// the 5 ms poll deadline passed before the waiter could re-acquire, is
+    /// simply gone. The standard discipline is to pair the condvar with a
+    /// CONDITION protected by the same mutex and re-test it on every wakeup,
+    /// and that is what this counter is.
+    ///
+    /// MEASURED, one stall, on the instrumented binary:
+    ///
+    /// ```text
+    /// [WAIT-OBJECT] class=…AbstractBootstrap$PendingRegistrationPromise
+    ///               result_is=SUCCESS  waiters=Some(Int(1))
+    /// [WAIT-OBJECT] notifies_since_wait=1 interrupt_wakes_since_wait=0
+    ///               polls=78025 signalled=0 waited_ms=397123
+    ///               (monitor totals: notify=1 interrupt=0)
+    /// ```
+    ///
+    /// 397 123 ms over 78 025 polls is 5.09 ms each — the loop was spinning
+    /// perfectly healthily — and **not one of those 78 025 `wait_for` returns
+    /// was a signalled return**, while the monitor served a `notifyAll()`
+    /// during that window. No `[WAIT-REACQUIRE]`, so the thread never left the
+    /// wait loop; no `[MONITOR-ORPHAN]`, so the object still pointed at this
+    /// monitor. The notification reached the exact condvar the thread was
+    /// parked in and the thread never observed it.
+    ///
+    /// Consuming a notification is a decrement, not a flag, so `notify()` still
+    /// releases exactly one waiter and `notifyAll()` exactly the ones parked
+    /// when it ran — the JLS semantics, rather than the "wake everybody and let
+    /// them re-check" approximation a bare generation counter would give.
+    pending_notifies: u32,
     /// The thread that currently owns this monitor, or `None` if unlocked.
     owner: Option<ThreadId>,
     /// Re-entry count. Incremented on each `monitorenter`, decremented on
@@ -711,6 +756,8 @@ impl Monitor {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(MonitorState {
+                parked_waiters: 0,
+                pending_notifies: 0,
                 owner: None,
                 entry_count: 0,
                 jfr_enter_recorded: false,
@@ -1092,6 +1139,14 @@ impl Monitor {
         // `Monitor::notify_calls`.
         let (notifies_at_entry, interrupt_wakes_at_entry) = self.notify_totals();
 
+        // ENROL as a waiter, under the same lock a notifier must take. From
+        // here until the decrement below, a `notify` / `notifyAll` on this
+        // monitor will leave a `pending_notifies` credit this thread can
+        // consume, whether or not the condvar signal itself is observed. See
+        // `MonitorState::pending_notifies` for the stall that made this
+        // necessary.
+        state.parked_waiters = state.parked_waiters.saturating_add(1);
+
         // Block on wait_condvar with periodic interrupt checks.
         // We use short timed waits so that Thread.interrupt() (which only sets
         // a flag) can wake us within a bounded interval.
@@ -1125,6 +1180,12 @@ impl Monitor {
                     }
                     let wait_time = remaining.min(poll_interval);
                     let result = self.wait_condvar.wait_for(&mut state, wait_time);
+                    // The CONDITION, re-tested under the mutex on every wakeup
+                    // — the thing a condvar-only wait was missing.
+                    if state.pending_notifies > 0 {
+                        state.pending_notifies -= 1;
+                        break;
+                    }
                     if let Some(flag) = interrupted {
                         if flag.load(std::sync::atomic::Ordering::Acquire) {
                             was_interrupted = true;
@@ -1218,11 +1279,22 @@ impl Monitor {
                     // condvar.
                     let mut polls: u64 = 0;
                     let mut signalled: u64 = 0;
+                    let mut consumed: u64 = 0;
                     loop {
                         let result = self.wait_condvar.wait_for(&mut state, poll_interval);
                         polls = polls.wrapping_add(1);
                         if !result.timed_out() {
                             signalled = signalled.wrapping_add(1);
+                        }
+                        // The CONDITION, re-tested under the mutex on every
+                        // wakeup. `signalled` deliberately counts only the
+                        // condvar's own signal, so the two stay separable in
+                        // the dump: a run with `consumed=1 signalled=0` is a
+                        // notification this loop would have MISSED before.
+                        if state.pending_notifies > 0 {
+                            state.pending_notifies -= 1;
+                            consumed = consumed.wrapping_add(1);
+                            break;
                         }
                         if let Some(ms) = spurious_after {
                             if started.elapsed() >= std::time::Duration::from_millis(ms) {
@@ -1324,7 +1396,7 @@ impl Monitor {
                             let (notifies_now, interrupt_wakes_now) = self.notify_totals();
                             eprintln!(
                                 "[WAIT-OBJECT] notifies_since_wait={} interrupt_wakes_since_wait={} \
-                                 polls={polls} signalled={signalled} waited_ms={} \
+                                 polls={polls} signalled={signalled} consumed={consumed} waited_ms={} \
                                  (monitor totals: notify={notifies_now} interrupt={interrupt_wakes_now})",
                                 notifies_now.wrapping_sub(notifies_at_entry),
                                 interrupt_wakes_now.wrapping_sub(interrupt_wakes_at_entry),
@@ -1366,11 +1438,25 @@ impl Monitor {
                         }
                     }
                 } else {
-                    // No interrupt flag — use a real untimed wait (for unit tests etc.)
-                    self.wait_condvar.wait(&mut state);
+                    // No interrupt flag — a real untimed wait (unit tests etc.).
+                    // Still condition-driven: a notification that arrived
+                    // between the enrol above and this park is already a
+                    // `pending_notifies` credit, and taking it without parking
+                    // is the whole point of pairing the condvar with state.
+                    loop {
+                        if state.pending_notifies > 0 {
+                            state.pending_notifies -= 1;
+                            break;
+                        }
+                        self.wait_condvar.wait(&mut state);
+                    }
                 }
             }
         }
+
+        // LEAVE the waiter set. After this point a `notifyAll()` must not
+        // count this thread, and a `notify()` must not leave a credit for it.
+        state.parked_waiters = state.parked_waiters.saturating_sub(1);
 
         // Re-acquire: wait until monitor is unowned or owned by us.
         //
@@ -1426,6 +1512,16 @@ impl Monitor {
         }
         self.notify_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Make ONE notification available, but never more than there are
+        // waiters to consume it: a notification stockpiled for a waiter that
+        // does not exist would be consumed by a FUTURE `wait()` that no
+        // `notify` was ever aimed at, which is a spurious return the JLS
+        // permits but which would also mask a real lost wakeup from this
+        // counter. See `MonitorState::pending_notifies`.
+        let mut state = state;
+        if state.pending_notifies < state.parked_waiters {
+            state.pending_notifies += 1;
+        }
         self.wait_condvar.notify_one();
         Ok(())
     }
@@ -1440,6 +1536,12 @@ impl Monitor {
         }
         self.notify_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Exactly the waiters parked RIGHT NOW, which is what
+        // `Object.notifyAll()` promises — a thread that starts waiting after
+        // this point is not one of them and must not consume a notification
+        // meant for the current set.
+        let mut state = state;
+        state.pending_notifies = state.parked_waiters;
         self.wait_condvar.notify_all();
         Ok(())
     }
