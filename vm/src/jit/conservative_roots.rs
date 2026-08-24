@@ -2542,13 +2542,54 @@ fn returned_from_direct_self_call(ret_addr: usize, entry_ptr: usize) -> bool {
     entry_ptr != 0 && direct_call_target(ret_addr, entry_ptr) == Some(entry_ptr)
 }
 
+/// Why [`moving_young_frame_coverage_complete`] said no, counted per cause.
+///
+/// `ACTIVE_FRAME_MAP` / `PARENT_FRAME_MAP` are one reason code each and this
+/// predicate has four ways to produce them — a method with no sp-id slot, a
+/// misaligned slot, a stored id no map matches, and a matched map that does
+/// not claim coverage. They are four different repairs, and after the
+/// 2026-08-23 OSR fix these two codes are what
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s remaining
+/// classes (`TestMVStoreTool`, 5 of 8 collections) refuse on, so the split is
+/// the next question rather than a nicety.
+pub mod frame_coverage_reason {
+    use std::sync::atomic::AtomicUsize;
+    /// The compilation reserved no safepoint-id slot, so no map can be located.
+    pub static NO_SP_ID_SLOT: AtomicUsize = AtomicUsize::new(0);
+    /// The safepoint-id slot address is misaligned — the frame base is wrong.
+    pub static MISALIGNED_SLOT: AtomicUsize = AtomicUsize::new(0);
+    /// The stored id matches no `OopMapEntry` of this method. The frame has not
+    /// reached a safepoint yet (its slot holds prologue-era stack residue), or
+    /// the method standing at this rbp is not the one being consulted.
+    pub static NO_MAP_FOR_STORED_ID: AtomicUsize = AtomicUsize::new(0);
+    /// A map matched and does NOT claim shadow coverage — the honest refusal.
+    pub static MAP_NOT_COMPLETE: AtomicUsize = AtomicUsize::new(0);
+    /// It said yes.
+    pub static COMPLETE: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(no_slot, misaligned, no_map_for_id, map_incomplete, complete)`.
+    pub fn snapshot() -> (usize, usize, usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            NO_SP_ID_SLOT.load(Relaxed),
+            MISALIGNED_SLOT.load(Relaxed),
+            NO_MAP_FOR_STORED_ID.load(Relaxed),
+            MAP_NOT_COMPLETE.load(Relaxed),
+            COMPLETE.load(Relaxed),
+        )
+    }
+}
+
 fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
     let sp_id_off = cm.sp_id_slot_off;
     if sp_id_off == 0 {
+        frame_coverage_reason::NO_SP_ID_SLOT.fetch_add(1, Relaxed);
         return false;
     }
     let id_addr = rbp.wrapping_sub(sp_id_off as usize);
     if id_addr & 0x7 != 0 {
+        frame_coverage_reason::MISALIGNED_SLOT.fetch_add(1, Relaxed);
         return false;
     }
     // SAFETY: aligned safepoint-id slot in a live JIT frame on this thread.
@@ -2557,8 +2598,14 @@ fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledM
     for map in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
         found = true;
         if !map.moving_young_coverage_complete {
+            frame_coverage_reason::MAP_NOT_COMPLETE.fetch_add(1, Relaxed);
             return false;
         }
+    }
+    if found {
+        frame_coverage_reason::COMPLETE.fetch_add(1, Relaxed);
+    } else {
+        frame_coverage_reason::NO_MAP_FOR_STORED_ID.fetch_add(1, Relaxed);
     }
     found
 }
