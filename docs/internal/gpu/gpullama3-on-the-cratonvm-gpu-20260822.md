@@ -13,6 +13,37 @@ hours per token. This record is the other route: not making the CPU
 path fast, but putting the forward pass on the GPU that was already
 there.
 
+## Update, 2026-08-23: TornadoVM, and the dispatch floor
+
+Two things landed after this record was first written. The tokenizer
+defect in §Residuals is fixed, so the comparison no longer needs a
+one-word prompt; and the fire-and-forget dispatch named in §What is
+left is done.
+
+Three arms interleaved, full prompt, 128 tokens, greedy:
+
+| round | HotSpot CPU | CratonVM GPU | TornadoVM GPU |
+|---|---|---|---|
+| 1 | 8.68 | 16.56 | 17.82 |
+| 2 | 8.71 | 17.10 | 17.75 |
+| 3 | 8.47 | 17.19 | 17.63 |
+
+**TornadoVM produces garbage output** — `stillinghaminghamingham...`,
+in six runs across both models and both sampling settings. TornadoVM
+itself is healthy here (the repo's validated vector-add fixture computes
+the right checksum on the GPU), so this is GPULlama3's TornadoVM path.
+Its throughput is therefore NOT a like-for-like baseline: a computation
+that produces the wrong answer may also be doing less work. CratonVM's
+output is byte-identical to HotSpot's over 128 tokens.
+
+The two systems have opposite bottlenecks, which is visible in how they
+respond to host CPU state. Across a window where this machine's CPU
+dropped off boost, TornadoVM moved 15.0 -> 18.4 while CratonVM went
+19.2 -> 10.5; `drain_ms` stayed at 5-6 ms throughout. TornadoVM is
+GPU-bound, CratonVM is host-dispatch-bound. An absolute number from
+this machine is only meaningful beside the other arms measured in the
+same window, which is why every table here is interleaved.
+
 ## The measurement
 
 `Llama-3.2-1B-Instruct-F16.gguf`, greedy decode (temperature 0), RTX
@@ -244,13 +275,26 @@ future that 452 of the 453 callers immediately discard. The remaining
 ~25 us is the launch itself (`Event::new`, `launch_on_stream`, the host
 callback, submission registration).
 
-So the named next lever is a fire-and-forget submission that returns a
-handle instead of a future object, plus an event pool. If the floor
-went to 10 us the forward pass would be about 13 ms per token rather
-than 48 — roughly 75 tok/s, against the 5.5 ms the device actually
-spends. That is a change to the `craton-gpu-java` API surface rather
-than to CratonVM, which is why it is written down here rather than
-done.
+**DONE 2026-08-23.** `Native.submitMethodHandle` /
+`GpuExecutor.dispatchNamedHandle` submit and answer the submission
+handle, with no future object; `awaitSubmission(long)` waits on one.
+Ordering carries the correctness: kernels on one stream run in
+submission order, so awaiting the last handle awaits the chain. What is
+given up is per-kernel observability, so `dispatchNamed` stays for any
+kernel whose outcome is needed individually, and
+`-Dllama.craton.syncEach=true` still keeps a future per kernel so a
+bisecting run names the kernel that failed rather than the last one.
+
+Measured: the dispatch floor 85 us -> 49 us, per-token `submit_ms`
+92 ms -> 41 ms on one host state, `drain_ms` unchanged (this touched
+only the host side), and the application 13.1 -> 17.0 tok/s. Output
+stays byte-identical to HotSpot over 128 tokens.
+
+What is left is still host-side and still most of the time: 41 ms of
+submission against 6 ms of device work, with the launch path itself
+(`Event::new` per submission, `launch_on_stream`, the host callback,
+submission registration) now the largest item at ~29 us. An event pool
+is the next lever and, unlike the future object, it is inside CratonVM.
 
 ## Residuals
 

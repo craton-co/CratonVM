@@ -53,7 +53,7 @@
 //! That is what makes partial coverage safe, and it is why the table below can
 //! grow one opcode at a time.
 
-use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
+use cratonvm_native_api::{NativeCallback, NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
@@ -127,7 +127,13 @@ mod stats {
     /// One bucket per entry point. The rows SUM to the totals above, which is
     /// what makes the census readable: "45% fell back" is not actionable, "45%
     /// fell back and every one was `load`" names the next thing to implement.
-    pub(super) const ENTRY_NAMES: [&str; 9] = [
+    /// The last four are the DISPATCH-LAYER templates, kept as their own rows
+    /// rather than folded into the four kernel rows above. A template hit does
+    /// not go on to call its kernel — it answers the whole operation — so one
+    /// shared bucket would report the same work twice under one name and make
+    /// "which layer is answering" unanswerable, which is the only question
+    /// worth asking once both layers exist.
+    pub(super) const ENTRY_NAMES: [&str; 14] = [
         "binaryOp",
         "unaryOp",
         "ternaryOp",
@@ -137,6 +143,11 @@ mod stats {
         "fromBitsCoerced",
         "load",
         "store",
+        "tmpl:lanewise(Binary)",
+        "tmpl:lanewise(Unary)",
+        "tmpl:lanewise(Ternary)",
+        "tmpl:lanewiseShift",
+        "tmpl:lanewise(scalar)",
     ];
     pub(super) const E_BINARY: usize = 0;
     pub(super) const E_UNARY: usize = 1;
@@ -147,6 +158,11 @@ mod stats {
     pub(super) const E_FROM_BITS: usize = 6;
     pub(super) const E_LOAD: usize = 7;
     pub(super) const E_STORE: usize = 8;
+    pub(super) const E_TMPL_BINARY: usize = 9;
+    pub(super) const E_TMPL_UNARY: usize = 10;
+    pub(super) const E_TMPL_TERNARY: usize = 11;
+    pub(super) const E_TMPL_SHIFT: usize = 12;
+    pub(super) const E_TMPL_SCALAR: usize = 13;
 
     const N: usize = ENTRY_NAMES.len();
     #[allow(clippy::declare_interior_mutable_const)]
@@ -1327,6 +1343,715 @@ fn vs_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// `--jdk-only` as well. The claim it makes is exactly the one HotSpot makes for
 /// the same methods: the compiled form and the Java fallback compute the same
 /// answer, and `probes/VectorApiProbe.java` is the evidence.
+// ---------------------------------------------------------------------------
+// The dispatch layer ABOVE `VectorSupport`
+// ---------------------------------------------------------------------------
+//
+// # Why this section exists
+//
+// With the nine `VectorSupport` kernels above in place,
+// `performance/vector-api-dispatch-depth-FIXED-20260823.md` measured
+// `fell_back=0` on GPULlama3's inference kernel and a 3.8x wall-clock win — and
+// then recorded that what was LEFT was the JDK's own route to those kernels. A
+// `--nojit --stack-sample-ms 5` profile of the same kernel, 342 samples,
+// deepest frame per sample:
+//
+// ```text
+//  48  IntVector.lanewiseTemplate          13  AbstractVector.sameSpecies
+//  44  AbstractVector.convert0             11  VectorOperators$OperatorImpl.opKind
+//  19  IntVector.lanewiseShiftTemplate     11  VectorOperators$OperatorImpl.opCode
+//  18  IntVector$IntSpecies.broadcastBits   9  VectorOperators$ImplCache.find
+// ```
+//
+// Every one of those is the SAME operation this file already computes, arriving
+// through several dozen interpreted Java calls. `lanewiseTemplate` is where the
+// route converges: `IntVector.add`, `.and`, `.or`, `.lanewise` and their
+// siblings on all five shapes funnel into it, and its body is a special-case
+// cascade, an `opCode` field read, an `ImplCache.find` and the
+// `VectorSupport.binaryOp` call this file already answers.
+//
+// So this section registers on the TEMPLATE, not on the kernel — six classes
+// (`ByteVector` … `DoubleVector`), not the thirty per-shape concrete ones the
+// parent page worried about, because `Int256Vector.lanewise` is one line:
+// `return (Int256Vector) super.lanewiseTemplate(op, v);`
+//
+// # How an operator is decoded, and why it is a field read rather than a table
+//
+// `VectorOperators$OperatorImpl` carries ONE int, `opInfo`, and the JDK's own
+// accessors are pure functions of it (`javap -c`, Temurin 25.0.3+9):
+//
+// ```text
+// opCodeRaw()   = opInfo >> 12
+// opKind(mask)  = (opInfo & mask) != 0
+// opCode(req,forbid): opCodeRaw(), throwing unless (opInfo & req) == req
+//                     and (forbid == 0 || (opInfo & forbid) != forbid)
+// ```
+//
+// Reading `opInfo` and applying those three lines is therefore not a re-derived
+// table that could drift from the JDK's — it is the JDK's own arithmetic on the
+// JDK's own field. The masks below are the literals the templates pass, taken
+// from their bytecode rather than from the source constants' names, because the
+// bytecode is what runs.
+//
+// # Refusing is still always available
+//
+// Every entry point here ends in a call to its own bytecode
+// (`invoke_special_bytecode_only`, the "run this body, no native check"
+// primitive), so a refusal is bit-for-bit the un-intercepted VM — including
+// every special-case branch this code deliberately does not model: `AND_NOT`,
+// `DIV`-by-zero, `FIRST_NONZERO`, `ZOMO`, `NOT`, `BITWISE_BLEND`, the masked
+// forms, and any opcode the lane kernels do not implement.
+
+/// `VO_SPECIAL | VO_SHIFT` — the mask `lanewiseTemplate(Binary, Vector)` tests
+/// Are the dispatch-layer TEMPLATES registered?
+///
+/// A second switch beside `CRATONVM_VECTOR_INTRINSICS`, and it exists for one
+/// reason: the two layers answer the SAME operations, so a single switch can
+/// only compare "all of it" against "none of it" and cannot price the
+/// templates against the kernels they sit on top of. With this one,
+/// `CRATONVM_VECTOR_TEMPLATES=0` leaves the nine kernels registered and the
+/// route to them interpreted, which is exactly the arm the parent page
+/// measured before this section existed.
+///
+/// Gates REGISTRATION, like its sibling — so the off arm is a VM that never
+/// answers a template natively, not one that answers and discards.
+fn templates_engaged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_VECTOR_TEMPLATES")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
+/// to decide whether it must run its special-case cascade. Taken from the
+/// template's own bytecode (`sipush 136`).
+/// `VO_SPECIAL` alone (`sipush 128`) — the bit every operator the templates
+/// special-case by IDENTITY carries: `ZOMO`, `NOT`, `FIRST_NONZERO`,
+/// `AND_NOT`, `DIV`, `BITWISE_BLEND`. One mask test refuses all of them.
+const VO_SPECIAL: i32 = 128;
+/// `VO_SHIFT` alone (`bipush 8`), the bit `lanewise(Binary, scalar)` tests to
+/// route to `lanewiseShift`.
+const VO_SHIFT: i32 = 8;
+const VO_BINARY_SPECIAL: i32 = 136;
+/// `opCode`'s require mask: every `XxxVector.opCode` passes `2048`.
+const VO_OPCODE_VALID: i32 = 2048;
+/// `opCode`'s forbid mask. `256` for the two floating-point element types and
+/// `512` for the four integral ones — the per-class literals in
+/// `FloatVector.opCode` / `IntVector.opCode` and their siblings.
+const VO_FORBID_FP: i32 = 256;
+const VO_FORBID_INTEGRAL: i32 = 512;
+
+/// The lane count a shift's scalar operand is masked by, per element type.
+/// `IntVector.lanewiseShiftTemplate` does `e &= 31`; the other widths use their
+/// own `bits - 1`.
+fn shift_mask_for(elem: u8) -> i32 {
+    match elem {
+        ELEM_LONG => 63,
+        ELEM_INT => 31,
+        ELEM_SHORT => 15,
+        _ => 7,
+    }
+}
+
+thread_local! {
+    /// One-entry memo for `OperatorImpl.opInfo`'s slot index, keyed by the
+    /// operator's concrete class. Every operator of one arity is the same
+    /// class, so a kernel that uses `AND`, `OR` and `LSHL` still hits this on
+    /// every call after the first.
+    static OP_INFO_SLOT: std::cell::Cell<Option<(ClassId, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `((OperatorImpl) op).opInfo`, memoised by the operator's class.
+fn op_info_of(ctx: &dyn NativeContext, op: ObjectRef) -> Option<i32> {
+    let cid = ctx.class_id_of_object(op);
+    let slot = match OP_INFO_SLOT.with(|c| c.get()) {
+        Some((cached, slot)) if cached == cid => slot,
+        _ => {
+            let slot = ctx.resolve_field_index_by_class_id(cid, "opInfo")?;
+            OP_INFO_SLOT.with(|c| c.set(Some((cid, slot))));
+            slot
+        }
+    };
+    match ctx.get_field(op, slot) {
+        Value::Int(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Decode an operator to its `VectorSupport` opcode, or `None` when the
+/// template's own `opCode` would have thrown or its special cascade would have
+/// run.
+///
+/// `special_mask` is the template's own `opKind` test; a hit there means the
+/// JDK body branches before ever reaching `VectorSupport`, so this file must
+/// hand the call back rather than skip the branch.
+fn opcode_of(ctx: &dyn NativeContext, op: ObjectRef, elem: u8, special_mask: i32) -> Option<i32> {
+    let op_info = op_info_of(ctx, op)?;
+    if special_mask != 0 && (op_info & special_mask) != 0 {
+        return None;
+    }
+    if (op_info & VO_OPCODE_VALID) != VO_OPCODE_VALID {
+        return None;
+    }
+    let forbid = if elem == ELEM_FLOAT || elem == ELEM_DOUBLE {
+        VO_FORBID_FP
+    } else {
+        VO_FORBID_INTEGRAL
+    };
+    if (op_info & forbid) == forbid {
+        return None;
+    }
+    Some(op_info >> 12)
+}
+
+/// Build a vector of `class_id` whose payload holds `lanes`.
+///
+/// [`build_vector`]'s sibling for the callers that already hold the receiver's
+/// `ClassId` — every entry point in this section does, because the result of a
+/// `lanewiseTemplate` is always the receiver's OWN concrete class (`getClass()`
+/// in the template's own bytecode). Same allocation order and same pin as
+/// `build_vector`; see its comment for why the array is pinned across the
+/// object allocation.
+fn build_vector_of(
+    ctx: &mut dyn NativeContext,
+    entry: usize,
+    class_id: ClassId,
+    elem: u8,
+    lanes: &[i64],
+) -> Option<ObjectRef> {
+    let arr0 = ctx.new_array(array_type_of(elem), lanes.len());
+    let pin = ctx.pin_native_root(arr0);
+    let slots = ctx.class_num_total_fields(class_id).max(1);
+    let obj = ctx
+        .try_alloc_object_gc_safe(class_id, slots)
+        .unwrap_or_else(|| ctx.alloc_object(class_id, slots));
+    let arr = ctx.read_native_pin(pin, arr0);
+    for (i, bits) in lanes.iter().copied().enumerate() {
+        ctx.set_array_element(arr, i, lane_bits_to_value(elem, bits));
+    }
+    let slot = payload_slot(ctx, class_id);
+    ctx.set_field(obj, slot, Value::Object(Some(arr)));
+    ctx.unpin_native_roots(pin);
+    stats::handled(entry);
+    Some(obj)
+}
+
+/// Hand a template call back to its own bytecode.
+///
+/// `invoke_special_bytecode_only` is the "just run this body, no native check"
+/// primitive (`vm_exec::invoke_special_bytecode_only_shared` calls
+/// `interpreter::execute` directly), so naming the same method this native is
+/// registered for is not a recursion — it is the un-intercepted VM.
+fn template_fallback(
+    ctx: &mut dyn NativeContext,
+    entry: usize,
+    owner: &str,
+    method: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    stats::fell_back(entry);
+    ctx.invoke_special_bytecode_only(owner, method, descriptor, args)
+}
+
+/// The receiver's concrete `ClassId` and element type — the two things every
+/// entry point below needs.
+fn template_owner(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ClassId, u8)> {
+    let cid = ctx.class_id_of_object(this);
+    let arr = payload_of(ctx, this)?;
+    let elem = elem_code_of(ctx, arr)?;
+    Some((cid, elem))
+}
+
+/// `XxxVector.lanewiseTemplate(VectorOperators$Binary, Vector)`
+fn vd_lanewise_binary(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    owner: &str,
+    ret: &str,
+) -> MethodCallResult {
+    let desc =
+        format!("(Ljdk/incubator/vector/VectorOperators$Binary;Ljdk/incubator/vector/Vector;){ret}");
+    let (Some(this), Some(op), Some(that)) = (obj_at(args, 0), obj_at(args, 1), obj_at(args, 2))
+    else {
+        return template_fallback(ctx, stats::E_TMPL_BINARY, owner, "lanewiseTemplate", &desc, args);
+    };
+    let handled = (|| -> Option<Vec<i64>> {
+        // `check(that)` in the template asserts the two share a species and
+        // throws `IllegalArgumentException` otherwise. Identical concrete
+        // classes is a STRONGER test than identical species, and needs no
+        // species object.
+        if ctx.class_id_of_object(that) != ctx.class_id_of_object(this) {
+            return None;
+        }
+        let (_, elem) = template_owner(ctx, this)?;
+        let opc = opcode_of(ctx, op, elem, VO_BINARY_SPECIAL)?;
+        let (_, a) = lanes_of(ctx, this)?;
+        let (_, b) = lanes_of(ctx, that)?;
+        if a.len() != b.len() || a.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(a.len());
+        for (x, y) in a.iter().copied().zip(b.iter().copied()) {
+            out.push(binary_lane(opc, elem, x, y)?);
+        }
+        Some(out)
+    })();
+    let Some(out) = handled else {
+        return template_fallback(ctx, stats::E_TMPL_BINARY, owner, "lanewiseTemplate", &desc, args);
+    };
+    let (cid, elem) = match template_owner(ctx, this) {
+        Some(v) => v,
+        None => {
+            return template_fallback(ctx, stats::E_TMPL_BINARY, owner, "lanewiseTemplate", &desc, args)
+        }
+    };
+    match build_vector_of(ctx, stats::E_TMPL_BINARY, cid, elem, &out) {
+        Some(obj) => Ok(Some(Value::Object(Some(obj)))),
+        None => template_fallback(ctx, stats::E_TMPL_BINARY, owner, "lanewiseTemplate", &desc, args),
+    }
+}
+
+/// `XxxVector.lanewiseTemplate(VectorOperators$Unary)`
+fn vd_lanewise_unary(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    owner: &str,
+    ret: &str,
+) -> MethodCallResult {
+    let desc = format!("(Ljdk/incubator/vector/VectorOperators$Unary;){ret}");
+    let (Some(this), Some(op)) = (obj_at(args, 0), obj_at(args, 1)) else {
+        return template_fallback(ctx, stats::E_TMPL_UNARY, owner, "lanewiseTemplate", &desc, args);
+    };
+    let handled = (|| -> Option<Vec<i64>> {
+        let (_, elem) = template_owner(ctx, this)?;
+        // No special mask. `lanewiseTemplate(Unary)` branches on exactly two
+        // operators by IDENTITY — `ZOMO` and `NOT` — and both are expansions
+        // with no `VectorSupport` opcode of their own, so `VO_OPCODE_VALID`
+        // is clear on them and `opcode_of` refuses them anyway. Passing
+        // `VO_SPECIAL` as well refused EVERY unary: the census read
+        // `tmpl:lanewise(Unary) handled=0 fell_back=30976` while the kernel
+        // below it answered all 30 976, i.e. the mask cost the whole win and
+        // bought nothing. Anything the lane kernel does not compute still
+        // takes the fallback through `unary_lane`.
+        let opc = opcode_of(ctx, op, elem, 0)?;
+        let (_, a) = lanes_of(ctx, this)?;
+        if a.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(a.len());
+        for x in a.iter().copied() {
+            out.push(unary_lane(opc, elem, x)?);
+        }
+        Some(out)
+    })();
+    let Some(out) = handled else {
+        return template_fallback(ctx, stats::E_TMPL_UNARY, owner, "lanewiseTemplate", &desc, args);
+    };
+    let (cid, elem) = match template_owner(ctx, this) {
+        Some(v) => v,
+        None => {
+            return template_fallback(ctx, stats::E_TMPL_UNARY, owner, "lanewiseTemplate", &desc, args)
+        }
+    };
+    match build_vector_of(ctx, stats::E_TMPL_UNARY, cid, elem, &out) {
+        Some(obj) => Ok(Some(Value::Object(Some(obj)))),
+        None => template_fallback(ctx, stats::E_TMPL_UNARY, owner, "lanewiseTemplate", &desc, args),
+    }
+}
+
+/// `XxxVector.lanewiseShiftTemplate(VectorOperators$Binary, int)`
+///
+/// No special cascade at all in the JDK body — only an assertion that the
+/// operator IS a shift, the `e &= bits-1` mask, and `broadcastInt`.
+fn vd_lanewise_shift(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    owner: &str,
+    ret: &str,
+) -> MethodCallResult {
+    let desc = format!("(Ljdk/incubator/vector/VectorOperators$Binary;I){ret}");
+    let fb = "lanewiseShiftTemplate";
+    let (Some(this), Some(op)) = (obj_at(args, 0), obj_at(args, 1)) else {
+        return template_fallback(ctx, stats::E_TMPL_SHIFT, owner, fb, &desc, args);
+    };
+    let e_raw = int_at(args, 2);
+    let handled = (|| -> Option<Vec<i64>> {
+        let (_, elem) = template_owner(ctx, this)?;
+        // The shift template has no `opKind` branch to reproduce, so no special
+        // mask — but `opCode`'s require/forbid still apply.
+        let opc = opcode_of(ctx, op, elem, 0)?;
+        let e = i64::from(e_raw & shift_mask_for(elem));
+        let (_, a) = lanes_of(ctx, this)?;
+        if a.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(a.len());
+        for x in a.iter().copied() {
+            out.push(binary_lane(opc, elem, x, e)?);
+        }
+        Some(out)
+    })();
+    let Some(out) = handled else {
+        return template_fallback(ctx, stats::E_TMPL_SHIFT, owner, fb, &desc, args);
+    };
+    let (cid, elem) = match template_owner(ctx, this) {
+        Some(v) => v,
+        None => return template_fallback(ctx, stats::E_TMPL_SHIFT, owner, fb, &desc, args),
+    };
+    match build_vector_of(ctx, stats::E_TMPL_SHIFT, cid, elem, &out) {
+        Some(obj) => Ok(Some(Value::Object(Some(obj)))),
+        None => template_fallback(ctx, stats::E_TMPL_SHIFT, owner, fb, &desc, args),
+    }
+}
+
+/// `XxxVector.lanewiseTemplate(VectorOperators$Ternary, Vector, Vector)`
+///
+/// Only `FMA` is computed here, matching [`vs_ternary_op`]; `BITWISE_BLEND` has
+/// its own three-`lanewise` expansion in the JDK body and is handed back.
+fn vd_lanewise_ternary(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    owner: &str,
+    ret: &str,
+) -> MethodCallResult {
+    let desc = format!(
+        "(Ljdk/incubator/vector/VectorOperators$Ternary;Ljdk/incubator/vector/Vector;\
+         Ljdk/incubator/vector/Vector;){ret}"
+    );
+    let (Some(this), Some(op), Some(v2), Some(v3)) = (
+        obj_at(args, 0),
+        obj_at(args, 1),
+        obj_at(args, 2),
+        obj_at(args, 3),
+    ) else {
+        return template_fallback(ctx, stats::E_TMPL_TERNARY, owner, "lanewiseTemplate", &desc, args);
+    };
+    let handled = (|| -> Option<Vec<i64>> {
+        let cid = ctx.class_id_of_object(this);
+        if ctx.class_id_of_object(v2) != cid || ctx.class_id_of_object(v3) != cid {
+            return None;
+        }
+        let (_, elem) = template_owner(ctx, this)?;
+        // No `opKind` test to reproduce here: the JDK body special-cases ONE
+        // operator by identity (`BITWISE_BLEND`), and the `opc != OP_FMA`
+        // screen below already refuses it and every other ternary operator
+        // these kernels do not compute. Passing a special mask as well would
+        // risk refusing `FMA` itself if it ever carried that bit.
+        let opc = opcode_of(ctx, op, elem, 0)?;
+        if opc != OP_FMA {
+            return None;
+        }
+        let (_, a) = lanes_of(ctx, this)?;
+        let (_, b) = lanes_of(ctx, v2)?;
+        let (_, c) = lanes_of(ctx, v3)?;
+        if a.len() != b.len() || a.len() != c.len() || a.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(a.len());
+        for i in 0..a.len() {
+            out.push(match elem {
+                ELEM_FLOAT => f32::from_bits(a[i] as u32)
+                    .mul_add(f32::from_bits(b[i] as u32), f32::from_bits(c[i] as u32))
+                    .to_bits() as i64,
+                ELEM_DOUBLE => f64::from_bits(a[i] as u64)
+                    .mul_add(f64::from_bits(b[i] as u64), f64::from_bits(c[i] as u64))
+                    .to_bits() as i64,
+                _ => return None,
+            });
+        }
+        Some(out)
+    })();
+    let Some(out) = handled else {
+        return template_fallback(ctx, stats::E_TMPL_TERNARY, owner, "lanewiseTemplate", &desc, args);
+    };
+    let (cid, elem) = match template_owner(ctx, this) {
+        Some(v) => v,
+        None => {
+            return template_fallback(ctx, stats::E_TMPL_TERNARY, owner, "lanewiseTemplate", &desc, args)
+        }
+    };
+    match build_vector_of(ctx, stats::E_TMPL_TERNARY, cid, elem, &out) {
+        Some(obj) => Ok(Some(Value::Object(Some(obj)))),
+        None => template_fallback(ctx, stats::E_TMPL_TERNARY, owner, "lanewiseTemplate", &desc, args),
+    }
+}
+
+/// `XxxVector.lanewise(VectorOperators$Binary, <lane scalar>)` — the
+/// broadcast-and-combine shape, without the broadcast.
+///
+/// This is the other half of the route, and on `Fp16VectorDotBench` it is the
+/// larger half by call count: the census read `fromBitsCoerced handled=124025`
+/// against `tmpl:lanewise(Binary) handled=185856`, i.e. two thirds of the
+/// binary operations arrive as `v.and(0x7C00)` / `v.add(0x1C000)` rather than
+/// as `v.op(otherVector)`, and each of those first materialises a whole
+/// broadcast vector through `IntSpecies.broadcastBits` and
+/// `VectorSupport.fromBitsCoerced` and then throws it away one operation later.
+///
+/// The JDK body is three branches:
+///
+/// ```text
+/// if (opKind(op, VO_SHIFT))  return lanewiseShift(op, (int) e);
+/// if (op == AND_NOT)         { op = AND; e = ~e; }
+/// return lanewise(op, broadcast(e));
+/// ```
+///
+/// The first is reproduced (it is exactly [`vd_lanewise_shift`]'s arithmetic);
+/// the second refuses on `VO_SPECIAL`, which `AND_NOT` carries; the third is a
+/// per-lane `binary_lane` against the scalar, which is what broadcasting into
+/// a vector and combining lane-wise computes.
+fn vd_lanewise_scalar(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    owner: &str,
+    scalar: char,
+    ret: &str,
+) -> MethodCallResult {
+    let desc = format!("(Ljdk/incubator/vector/VectorOperators$Binary;{scalar}){ret}");
+    let (Some(this), Some(op)) = (obj_at(args, 0), obj_at(args, 1)) else {
+        return template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args);
+    };
+    let handled = (|| -> Option<Vec<i64>> {
+        let (_, elem) = template_owner(ctx, this)?;
+        let op_info = op_info_of(ctx, op)?;
+        // `AND_NOT` rewrites both the operator and the operand and is the only
+        // identity branch here; it is `VO_SPECIAL`, so this refuses it. A
+        // shift op is NOT refused — the branch above it is reproduced below.
+        if (op_info & VO_SPECIAL) != 0 {
+            return None;
+        }
+        let opc = opcode_of(ctx, op, elem, 0)?;
+        // The scalar arrives in its lane type, so the lane BITS depend on the
+        // element type: an integral scalar is sign-narrowed to the lane width
+        // (which is what `broadcast` does), and a floating one is its IEEE-754
+        // bit pattern, because `binary_lane` reads float lanes as bits.
+        let e = match (elem, args.get(2)) {
+            (ELEM_FLOAT, Some(Value::Float(f))) => f.to_bits() as i64,
+            (ELEM_DOUBLE, Some(Value::Double(d))) => d.to_bits() as i64,
+            (ELEM_LONG, Some(Value::Long(v))) => *v,
+            (ELEM_BYTE | ELEM_SHORT | ELEM_INT, Some(Value::Int(v))) => {
+                wrap_integral_lane(elem, i64::from(*v))
+            }
+            _ => return None,
+        };
+        // `opKind(op, VO_SHIFT)` — the first branch, which routes to
+        // `lanewiseShift` and masks the count by the lane width there.
+        let operand = if (op_info & VO_SHIFT) != 0 {
+            i64::from((e as i32) & shift_mask_for(elem))
+        } else {
+            e
+        };
+        let (_, a) = lanes_of(ctx, this)?;
+        if a.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(a.len());
+        for x in a.iter().copied() {
+            out.push(binary_lane(opc, elem, x, operand)?);
+        }
+        Some(out)
+    })();
+    let Some(out) = handled else {
+        return template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args);
+    };
+    let (cid, elem) = match template_owner(ctx, this) {
+        Some(v) => v,
+        None => return template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args),
+    };
+    match build_vector_of(ctx, stats::E_TMPL_SCALAR, cid, elem, &out) {
+        Some(obj) => Ok(Some(Value::Object(Some(obj)))),
+        None => template_fallback(ctx, stats::E_TMPL_SCALAR, owner, "lanewise", &desc, args),
+    }
+}
+
+/// One set of five `NativeCallback`s per element type.
+///
+/// A `NativeCallback` is a plain `fn` pointer with no captured state, so the
+/// owner class — which the fallback needs in order to name the very body it is
+/// handing the call back to — has to come from somewhere. A macro that stamps
+/// out six named functions is that somewhere; deriving it from the receiver's
+/// class name at run time would put a string operation on the hot path AND
+/// leave the fallback with no name to use when the receiver is the thing that
+/// failed to decode.
+///
+/// `$scalar` is the descriptor character of the element type's OWN scalar
+/// overload — `ByteVector.lanewise(Binary, byte)` is `B`, `FloatVector`'s is
+/// `F`. The `(Binary, long)` overload every type also declares is deliberately
+/// not registered: it is the widening convenience form with its own range
+/// re-check, and it is not what a lane-typed expression like `v.and(0x7C00)`
+/// compiles to.
+macro_rules! vector_templates {
+    ($($fn_bin:ident, $fn_un:ident, $fn_shift:ident, $fn_tern:ident, $fn_scalar:ident,
+       $owner:literal, $scalar:literal;)*) => {
+        $(
+            fn $fn_bin(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                vd_lanewise_binary(ctx, args, $owner, concat!("L", $owner, ";"))
+            }
+            fn $fn_un(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                vd_lanewise_unary(ctx, args, $owner, concat!("L", $owner, ";"))
+            }
+            fn $fn_shift(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                vd_lanewise_shift(ctx, args, $owner, concat!("L", $owner, ";"))
+            }
+            fn $fn_tern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                vd_lanewise_ternary(ctx, args, $owner, concat!("L", $owner, ";"))
+            }
+            fn $fn_scalar(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                vd_lanewise_scalar(ctx, args, $owner, $scalar, concat!("L", $owner, ";"))
+            }
+        )*
+    };
+}
+
+vector_templates! {
+    vd_byte_bin, vd_byte_un, vd_byte_shift, vd_byte_tern, vd_byte_scalar,
+        "jdk/incubator/vector/ByteVector", 'B';
+    vd_short_bin, vd_short_un, vd_short_shift, vd_short_tern, vd_short_scalar,
+        "jdk/incubator/vector/ShortVector", 'S';
+    vd_int_bin, vd_int_un, vd_int_shift, vd_int_tern, vd_int_scalar,
+        "jdk/incubator/vector/IntVector", 'I';
+    vd_long_bin, vd_long_un, vd_long_shift, vd_long_tern, vd_long_scalar,
+        "jdk/incubator/vector/LongVector", 'J';
+    vd_float_bin, vd_float_un, vd_float_shift, vd_float_tern, vd_float_scalar,
+        "jdk/incubator/vector/FloatVector", 'F';
+    vd_double_bin, vd_double_un, vd_double_shift, vd_double_tern, vd_double_scalar,
+        "jdk/incubator/vector/DoubleVector", 'D';
+}
+
+/// Register the dispatch-layer templates.
+///
+/// Called from [`register_vector_support_intrinsics`] under the same kill
+/// switch, because the two halves are one feature: with the kernels off, a
+/// template intercept would be answering an operation the "off" arm is supposed
+/// to leave entirely to the JDK.
+///
+/// `lanewiseShiftTemplate` is registered only for the four integral element
+/// types. `FloatVector` and `DoubleVector` do not declare it — a float has no
+/// shift — and registering a triple no class declares would be an entry that
+/// can never fire.
+fn register_vector_dispatch_templates(r: &mut NativeMethodRegistry) {
+    if !templates_engaged() {
+        return;
+    }
+    const BIN_ARGS: &str =
+        "(Ljdk/incubator/vector/VectorOperators$Binary;Ljdk/incubator/vector/Vector;)";
+    const UN_ARGS: &str = "(Ljdk/incubator/vector/VectorOperators$Unary;)";
+    const SHIFT_ARGS: &str = "(Ljdk/incubator/vector/VectorOperators$Binary;I)";
+    /// The open paren plus the `Binary` operand, for the scalar overloads
+    /// whose second parameter differs per element type.
+    const BINARY_OP: &str = "(Ljdk/incubator/vector/VectorOperators$Binary;";
+    const TERN_ARGS: &str = "(Ljdk/incubator/vector/VectorOperators$Ternary;\
+                             Ljdk/incubator/vector/Vector;Ljdk/incubator/vector/Vector;)";
+
+    let mut one = |owner: &str,
+                   bin: NativeCallback,
+                   un: NativeCallback,
+                   shift: Option<NativeCallback>,
+                   tern: NativeCallback,
+                   scalar: NativeCallback,
+                   scalar_desc: char| {
+        let ret = format!("L{owner};");
+        r.register_with_kind(
+            owner,
+            "lanewiseTemplate",
+            &format!("{BIN_ARGS}{ret}"),
+            bin,
+            NativeKind::Intrinsic,
+        );
+        r.register_with_kind(
+            owner,
+            "lanewiseTemplate",
+            &format!("{UN_ARGS}{ret}"),
+            un,
+            NativeKind::Intrinsic,
+        );
+        r.register_with_kind(
+            owner,
+            "lanewiseTemplate",
+            &format!("{TERN_ARGS}{ret}"),
+            tern,
+            NativeKind::Intrinsic,
+        );
+        if let Some(shift) = shift {
+            r.register_with_kind(
+                owner,
+                "lanewiseShiftTemplate",
+                &format!("{SHIFT_ARGS}{ret}"),
+                shift,
+                NativeKind::Intrinsic,
+            );
+        }
+        // The element type's OWN scalar overload, e.g.
+        // `IntVector.lanewise(Binary, int)`. `public final`, not a template,
+        // so it is the outermost frame of the broadcast-and-combine route.
+        r.register_with_kind(
+            owner,
+            "lanewise",
+            &format!("{BINARY_OP}{scalar_desc}){ret}"),
+            scalar,
+            NativeKind::Intrinsic,
+        );
+    };
+
+    one(
+        "jdk/incubator/vector/ByteVector",
+        vd_byte_bin,
+        vd_byte_un,
+        Some(vd_byte_shift),
+        vd_byte_tern,
+        vd_byte_scalar,
+        'B',
+    );
+    one(
+        "jdk/incubator/vector/ShortVector",
+        vd_short_bin,
+        vd_short_un,
+        Some(vd_short_shift),
+        vd_short_tern,
+        vd_short_scalar,
+        'S',
+    );
+    one(
+        "jdk/incubator/vector/IntVector",
+        vd_int_bin,
+        vd_int_un,
+        Some(vd_int_shift),
+        vd_int_tern,
+        vd_int_scalar,
+        'I',
+    );
+    one(
+        "jdk/incubator/vector/LongVector",
+        vd_long_bin,
+        vd_long_un,
+        Some(vd_long_shift),
+        vd_long_tern,
+        vd_long_scalar,
+        'J',
+    );
+    one(
+        "jdk/incubator/vector/FloatVector",
+        vd_float_bin,
+        vd_float_un,
+        None,
+        vd_float_tern,
+        vd_float_scalar,
+        'F',
+    );
+    one(
+        "jdk/incubator/vector/DoubleVector",
+        vd_double_bin,
+        vd_double_un,
+        None,
+        vd_double_tern,
+        vd_double_scalar,
+        'D',
+    );
+}
+
 pub(crate) fn register_vector_support_intrinsics(r: &mut NativeMethodRegistry) {
     // The kill switch gates REGISTRATION, not each call: with the natives
     // absent the "off" arm is bit-for-bit the un-intercepted VM, which a
@@ -1437,6 +2162,11 @@ pub(crate) fn register_vector_support_intrinsics(r: &mut NativeMethodRegistry) {
         vs_store,
         NativeKind::Intrinsic,
     );
+
+    // The JDK`s own route to the nine kernels above — see the section comment
+    // on `register_vector_dispatch_templates`. Under the SAME kill switch,
+    // because the two halves are one feature.
+    register_vector_dispatch_templates(r);
 
     r.set_category(__prev_cat);
 }

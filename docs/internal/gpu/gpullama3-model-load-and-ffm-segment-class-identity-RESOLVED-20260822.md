@@ -21,7 +21,7 @@ output**, for a reason the open record could not see because it never got past
 the first `matmul`: the Vector API kernel it spends every token in is orders of
 magnitude off HotSpot. That is a throughput matter and not a correctness one —
 every value matches the oracle bit for bit — and it has its own record,
-`docs/known-issues/perf/vector-api-dispatch-depth-20260822.md`. Half of it is
+`docs/internal/performance/vector-api-dispatch-depth-FIXED-20260823.md`. Half of it is
 since FIXED: CratonVM ran the JDK's generic lane-at-a-time Java fallback for
 every Vector API operation, and `VectorSupport`'s intrinsic entry points are
 now whole-vector Rust kernels covering 100% of that kernel's calls. **3.8x**,
@@ -30,11 +30,11 @@ and the gap that remains is the JDK's own dispatch layer above them. See §5.2.
 Two residuals are **not** (fully) fixed and have been re-homed rather than
 dropped:
 
-* the Vector API throughput above, now `vector-api-dispatch-depth-20260822.md`,
+* the Vector API throughput above, now `internal/performance/vector-api-dispatch-depth-FIXED-20260823.md`,
   and
 * `FileChannel.read` into a heap buffer at ~8.7x HotSpot, whose stated cause
   in the open record is **refuted** — `docs/known-issues/perf/
-  filechannel-heap-read-glue-depth-20260822.md`. See §5.1.
+  internal/performance/filechannel-heap-read-glue-depth-FIXED-20260823.md`. See §5.1.
 
 ---
 
@@ -299,7 +299,7 @@ recorded. Both numbers are `FileChannelHeapReadProbe 20000 24`.
 
 This is a general NIO performance characteristic, not a GGUF or an FFM
 defect, so retiring this record must not retire it. It is now
-`docs/known-issues/perf/filechannel-heap-read-glue-depth-20260822.md`, with
+`docs/internal/performance/filechannel-heap-read-glue-depth-FIXED-20260823.md`, with
 the profile, the refuted hypothesis, and the shape of the fix that was
 considered and not taken.
 
@@ -370,7 +370,7 @@ the canonical NaN and the oracle answers the x86 indefinite one — the known
 `Value::Double` NaN-payload limitation, which predates this work.
 
 Full measurement: `docs/known-issues/perf/
-vector-api-dispatch-depth-20260822.md`.
+internal/performance/vector-api-dispatch-depth-FIXED-20260823.md`.
 **UPDATE 2026-08-22, later the same day.** The fallback half of this is fixed.
 `native-builtins/src/vector_support_intrinsics.rs` implements the nine
 `VectorSupport` entry points HotSpot marks `@IntrinsicCandidate` as

@@ -1236,6 +1236,78 @@ pub fn movable_jit_root_count() -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Unrewritable JIT roots — the VETO over the movable set above
+// ---------------------------------------------------------------------------
+//
+// "Movable" above is a claim about a SLOT: this frame word sits in a precise,
+// rewritable channel (an oop map entry, a shadow-stack cell), so the collector
+// may evacuate what it points at and fix the word up afterwards. The pin set is
+// keyed by OBJECT ADDRESS, so one such claim licenses moving the object — for
+// every word in the process, including words nobody can rewrite.
+//
+// A compiled frame has such words. `conservative_roots::band_slot_is_verifiable`
+// splits a frame's band in two: the half it inspects is verified and rewritten,
+// and the half it skips — the prologue's callee-saved GPR/XMM save areas, the
+// per-safepoint blind GPR spill, the outgoing-argument / deopt reserve, and
+// operand-spill slots above the safepoint's live cursor — is neither. The
+// conservative band scan READS those words (that is what keeps the object
+// alive), so the object is a root; if the SAME object is also named by an oop
+// map or a shadow-stack cell it is published movable, gets evacuated, and the
+// unrewritable word is left holding a from-space address.
+//
+// That is not hypothetical: the callee-saved GPR image a compiled prologue
+// writes holds the CALLER's registers, and the epilogue pops them straight back
+// — so the caller resumes from exactly the words the verifier declined to look
+// at. See
+// `moving-young-left-a-callee-saved-register-image-unrewritten-FIXED-20260823`
+// for the detector that measured the gap.
+//
+// This set is the veto. A word in an unverifiable region that resolves to a
+// live object publishes that object's address here, and the young sweep's pin
+// decision reads it as "pin regardless of any movable claim". The cost is
+// exactly the conservative cost the band scan already pays on the MARKING side
+// — an `i64` that happens to equal an object address defers that object's
+// promotion by one cycle — and it can never dangle. Rewriting the word instead
+// would be the opposite trade: a caller's callee-saved register holding a
+// non-pointer equal to a moved object's from-address would be CORRUPTED.
+//
+// Thread-local for the same reason `MOVABLE_JIT_ROOTS` is: it exists only to
+// veto that set, and a root another thread never published as movable is
+// already pinned. A missed publication leaves the legacy behaviour; a stale
+// entry would only over-pin, and the per-pass clear prevents even that.
+
+thread_local! {
+    static UNREWRITABLE_JIT_ROOTS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Clear the unrewritable-JIT-root set. Called by the VM's root gatherer at the
+/// start of every collection, beside [`clear_movable_jit_roots`].
+pub fn clear_unrewritable_jit_roots() {
+    UNREWRITABLE_JIT_ROOTS.with(|s| s.borrow_mut().clear());
+}
+
+/// Record `addr` as reachable from a compiled-frame word no channel can
+/// rewrite, so it must be pinned this cycle whatever else claims it is movable.
+pub fn add_unrewritable_jit_root(addr: usize) {
+    UNREWRITABLE_JIT_ROOTS.with(|s| {
+        s.borrow_mut().insert(addr);
+    });
+}
+
+/// True if `addr` was published as unrewritable this cycle. Vetoes
+/// [`is_movable_jit_root`] at the pin decision.
+#[inline]
+pub fn is_unrewritable_jit_root(addr: usize) -> bool {
+    UNREWRITABLE_JIT_ROOTS.with(|s| s.borrow().contains(&addr))
+}
+
+/// Count of unrewritable roots published this cycle (diagnostics).
+pub fn unrewritable_jit_root_count() -> usize {
+    UNREWRITABLE_JIT_ROOTS.with(|s| s.borrow().len())
+}
+
+// ---------------------------------------------------------------------------
 // Conservative (non-movable) JIT roots — G1 region pinning
 // ---------------------------------------------------------------------------
 //

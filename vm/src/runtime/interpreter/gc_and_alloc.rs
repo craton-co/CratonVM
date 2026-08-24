@@ -2528,13 +2528,30 @@ pub(super) fn process_references_after_gc(
     // `None` (the class not loaded) means no Reference object can exist yet, so
     // the guard has nothing to judge and admits — it must never be the thing
     // that silently stops reference processing on a stripped image.
+    //
+    // Both guards screen the KIND first, and the `num_fields >= 2` test above
+    // them is why: an array MIRRORS ITS LENGTH into `num_slots`, so a
+    // `Reference[2]` reports two "fields" and — because a reference array
+    // carries its COMPONENT's class id — also answers `is_subclass_of(
+    // java/lang/ref/Reference)`. It would pass both tests and reach the
+    // positional `get_field(obj, 0)` / `get_field(obj, 1)` reads below, which
+    // stride packed 8-byte elements as 16-byte `Value` cells. Same species as
+    // `corrupt-value-cell-producer-was-a-string-array-FIXED-20260822`; the heap
+    // accessors refuse it now, but a door that can answer "not a Reference"
+    // for free should not make the heap say it.
     let is_reference_shaped = |obj: ObjectRef| -> bool {
+        if shared.mem.heap.kind_of(obj) == crate::memory::heap::ObjectKind::Array {
+            return false;
+        }
         match reference_cid {
             Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
             None => true,
         }
     };
     let is_queue_shaped = |obj: ObjectRef| -> bool {
+        if shared.mem.heap.kind_of(obj) == crate::memory::heap::ObjectKind::Array {
+            return false;
+        }
         match queue_cid {
             Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
             None => true,
@@ -2563,6 +2580,14 @@ pub(super) fn process_references_after_gc(
     // the processor (`take_newly_cleared`, `remove_collected`), so a live
     // borrow of it here would not compile.
     let identity_stamps = ref_proc.identity_stamps_snapshot();
+    // The referent side of the same question the identity stamps answer for
+    // the Reference side. See the refusal at the restore write below.
+    let referent_class_stamps = ref_proc.referent_class_stamps_snapshot();
+    // Every address a survivor RELOCATED INTO this cycle. A pre-collection
+    // address that appears here is not the address it used to be: the object
+    // that lived there is gone and a slid survivor now owns the base.
+    let relocation_targets: std::collections::HashSet<usize> =
+        pointer_map.values().copied().collect();
     let identity_matches = |pre_gc_addr: usize, obj: ObjectRef| -> bool {
         match identity_stamps.get(&pre_gc_addr) {
             Some(&stamp) if stamp != 0 => {
@@ -2877,8 +2902,12 @@ pub(super) fn process_references_after_gc(
             // The referent survived (this entry was not cleared/enqueued): find
             // its post-collection address (relocated → pointer map; old-gen
             // in place → live).
+            let mut referent_moved = false;
             let referent_new = match pointer_map.get(&referent_old) {
-                Some(&a) => a,
+                Some(&a) => {
+                    referent_moved = true;
+                    a
+                }
                 None if shared
                     .mem
                     .heap
@@ -2925,6 +2954,67 @@ pub(super) fn process_references_after_gc(
                 }
                 continue;
             }
+            // AND THE SAME QUESTION ABOUT THE REFERENT, which nothing asked.
+            //
+            // Every guard above proves `ro` is the Reference that was
+            // discovered. `rt` had no guard at all, and this line writes it
+            // into somebody's `referent` slot. The address it came from is a
+            // PRE-collection one, and an address is not an identity once a
+            // compacting collector has re-issued it: survivors slide DOWN into
+            // the space dead objects vacated, so a dead referent's base is very
+            // often a live object's new base. `watched_pre_gc_addr_survived`
+            // then answers `true` through ZGC's `is_object_address`, which
+            // proves an object lives there and NOT that it is this one.
+            //
+            // Measured: `SoftReference.get()` returning a
+            // `java.io.ClassCache$CacheRef` where
+            // `java.lang.invoke.MethodTypeForm.cachedLambdaForm` casts to
+            // `LambdaForm`, and the `ObjectStreamClass` twin of it, both on the
+            // default collector only — G1 and Generational never took this
+            // arm (`is_addr_live` is exact for the first, and the second emits
+            // identity pointer-map entries for every watched address).
+            //
+            // Two screens, in increasing cost:
+            //
+            //  * a pre-collection address that is a relocation TARGET this
+            //    cycle is definitively somebody else's now, unless the map
+            //    itself is what sent us there;
+            //  * otherwise the referent's CLASS, recorded from slot 0 by the
+            //    pre-GC null pass, must still be the class of whatever lives
+            //    at the address.
+            //
+            // A refusal leaves the slot NULL, which reads as a cleared
+            // reference. That is a legal answer for a soft reference and an
+            // early one for a weak reference; installing a stranger is neither.
+            let screen_on = !cratonvm_types::flags().gc.no_referent_identity_screen;
+            if screen_on && !referent_moved && relocation_targets.contains(&referent_old) {
+                note_referent_restore_refused();
+                if straystack_enabled() || dbg_weakref() {
+                    eprintln!(
+                        "[refproc] REFUSE weak/phantom RESTORE ref @0x{ref_obj_new:x}: \
+                         referent @0x{referent_old:x} is a relocation TARGET this cycle \
+                         (total refused={})",
+                        referent_restore_refusals()
+                    );
+                }
+                continue;
+            }
+            if let Some(&want_class) = referent_class_stamps.get(&ref_obj_old).filter(|_| screen_on)
+            {
+                let have_class = shared.mem.heap.class_id_of(rt).as_u32();
+                if want_class != 0 && have_class != want_class {
+                    note_referent_restore_refused();
+                    if straystack_enabled() || dbg_weakref() {
+                        eprintln!(
+                            "[refproc] REFUSE weak/phantom RESTORE ref @0x{ref_obj_new:x}: \
+                             referent @0x{referent_new:x} is class {have_class}, recorded \
+                             {want_class} (total refused={})",
+                            referent_restore_refusals()
+                        );
+                    }
+                    continue;
+                }
+            }
             // Slot 0 = REF_FIELD_REFERENT. `set_field` fires the write barrier,
             // so a young referent restored into a promoted (old-gen) Reference
             // re-marks the old→young card.
@@ -2963,6 +3053,22 @@ pub(super) fn process_references_after_gc(
 
     // Relocate all addresses in the ref processor to match the new heap layout
     ref_proc.update_after_gc(pointer_map);
+}
+
+/// Restores the post-GC referent pass refused because it could not prove the
+/// object at the recorded address is still the referent. Non-zero means this
+/// VM would have installed a stranger in a `Reference`'s slot 0.
+static REFERENT_RESTORE_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn note_referent_restore_refused() {
+    REFERENT_RESTORE_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many restores have been refused so far. Printed beside each refusal and
+/// available to a test.
+pub fn referent_restore_refusals() -> u64 {
+    REFERENT_RESTORE_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Try to allocate an object, running GC and retrying on failure.
@@ -6022,13 +6128,30 @@ pub(super) fn g1_remark_process_references(
     let class_manager = shared.classes.class_manager.read();
     let reference_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/Reference");
     let queue_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/ReferenceQueue");
+    //
+    // Both guards screen the KIND first, and the `num_fields >= 2` test above
+    // them is why: an array MIRRORS ITS LENGTH into `num_slots`, so a
+    // `Reference[2]` reports two "fields" and — because a reference array
+    // carries its COMPONENT's class id — also answers `is_subclass_of(
+    // java/lang/ref/Reference)`. It would pass both tests and reach the
+    // positional `get_field(obj, 0)` / `get_field(obj, 1)` reads below, which
+    // stride packed 8-byte elements as 16-byte `Value` cells. Same species as
+    // `corrupt-value-cell-producer-was-a-string-array-FIXED-20260822`; the heap
+    // accessors refuse it now, but a door that can answer "not a Reference"
+    // for free should not make the heap say it.
     let is_reference_shaped = |obj: ObjectRef| -> bool {
+        if shared.mem.heap.kind_of(obj) == crate::memory::heap::ObjectKind::Array {
+            return false;
+        }
         match reference_cid {
             Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
             None => true,
         }
     };
     let is_queue_shaped = |obj: ObjectRef| -> bool {
+        if shared.mem.heap.kind_of(obj) == crate::memory::heap::ObjectKind::Array {
+            return false;
+        }
         match queue_cid {
             Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
             None => true,

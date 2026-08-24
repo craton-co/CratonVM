@@ -7,9 +7,12 @@ a flat profile does not mean a flat cause. Decomposed properly, the gap is three
 named things, two of which are algorithmic divergences from the JDK rather than
 constant-factor overhead.
 
-Still open — nothing here is fixed. What follows is the decomposition, the
-measurements that pin each term, and the two fixes with their predicted
-payoffs, so the next session starts from arithmetic instead of from a profile.
+**Term 1 was FIXED on 2026-08-23** — see "The two fixes, in value order"
+below. Terms 2 and 3 are untouched, and **this page's end-to-end number has NOT
+been re-measured against the fix**, so 245x still stands as the last thing that
+was actually observed. What follows is the decomposition, the measurements that
+pin each term, and the two fixes with their predicted payoffs, so the next
+session starts from arithmetic instead of from a profile.
 
 ## The workload, exactly
 
@@ -179,15 +182,28 @@ for the whole VM, but it is not this test's problem.
 
 ## The two fixes, in value order
 
-1. **Make map views lazy/live** (`keySet`/`values`/`entrySet`). The view already
-   carries a back-reference to its source map (`store_set_view_backref`, used
-   for write-through), so `size()`, `contains()`, `iterator()` and `toArray()`
-   can delegate to the source instead of to an eagerly-built backing. That
-   deletes Term 1 outright (~190 s here) and makes the view *more*
-   JDK-faithful — today's snapshot is already the wrong semantics for a live
-   view. This is the fix; it is also a change to the VM's most load-bearing
-   data structure and wants its own session, a kill switch, and the
-   142 `native-collections` unit tests plus a Spring Boot arm as the gate.
+1. **Make map views lazy/live** (`keySet`/`values`/`entrySet`) — **DONE
+   2026-08-23**, for `keySet` and `entrySet`, by a route this page did not
+   anticipate. Rather than delegating reads to the source, the view's backing
+   now carries the source's modification generation and a resync whose source
+   has not moved returns immediately; and `keySet()`/`entrySet()` hand back the
+   instance the map already has instead of building a new one, which is also
+   what HotSpot does and restores `map.keySet() == map.keySet()`.
+
+   MEASURED on `probes/KeySetBench`, `LinkedHashMap` of 1000 entries, one
+   binary with `CRATONVM_MAP_VIEW_CACHE` as the A/B: `keySet()` alone
+   1674.5 → **2.5 µs/call**; `keySet().size()` — the shape
+   `StringUtils.toStringArray(map.keySet())` uses — 3125 → **4.5 µs/call**;
+   `keySet()` + iterate 5949.5 → **1489.5 µs/call**.
+
+   `values()` did NOT get it: its carrier is a list with a different backing
+   scheme. Neither did entrySet READS — only their construction — because an
+   entrySet's contents include values and a value-replacing `put` deliberately
+   does not move `modCount`.
+
+   Kill switch `CRATONVM_MAP_VIEW_CACHE=0`, verify mode
+   `CRATONVM_VERIFY_MAP_VIEW_CACHE=1`, engagement census
+   `CRATONVM_DBG=map-view-cache`.
 
 2. **Cut the per-element constant** (Term 2). The natives read and write the
    nodes *they themselves allocated*, with a known layout, through the generic
@@ -199,7 +215,9 @@ A cheaper partial for Term 1, if a lazy view is too big a step: build the view's
 backing directly from the source's `(hash, key)` node pairs — the hash is
 already stored in `NODE_FIELD_HASH` and the keys are already unique, so both
 `map_hash_key` and the duplicate probe are pure waste. Constant-factor only; it
-does not remove the O(n)-per-call.
+does not remove the O(n)-per-call. **Still worth doing** — the 2026-08-23 fix
+removes the repeated builds but not the cost of the first one, so this is what
+is left of Term 1 for a map whose key set really does keep changing.
 
 ## Reproducing
 
