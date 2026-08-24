@@ -194,6 +194,24 @@ Feature gates, all green:
   cargo test -p cratonvm-native-builtins --lib --features synthetic-jdk  rc=0
 ```
 
+## 4b. The MERGED state, which neither lane had run
+
+`WORKER-3` landed its `RJdkJmx` fix (`61a1647aa`, the P0 this lane filed in
+NOTE-11 §5) while this work was in flight, and it touches
+`native-builtins/src/lib.rs` — the same file as the 24-funnel migration. Two
+fixes that merge cleanly are still an untested combination, so the merge was
+built and run rather than assumed:
+
+```text
+  SUITE=all CRATONVM_ARGS=--jdk-only    107 / 107      <- was 106/107
+  SUITE=all                             107 / 107
+  SUITE=core                             67 /  67
+  stale-receiver audit (depth 6)        0 fn / 0 sites  --selftest rc=0
+```
+
+**Strict is fully green for the first time in this lane's records.** The audit
+was re-run on the merge too: WORKER-3's new code adds no funnel of this shape.
+
 ## 5. What this does NOT establish
 
 * **Still no reproduction for any of the 24.** They match the shape; not one is
@@ -228,8 +246,10 @@ Feature gates, all green:
   converted — is the cheapest route from "shape" to "reproduction", and would
   retire the caveat at the top of §5. It needs a pristine control binary, and
   the default collector is ZGC, so it needs `-XX:+UseGenerationalGC` too.
-* **N3 — `RJdkJmx`** still needs the `jmx.rs` owner; control evidence in
-  `WORKER-5-NOTE-11` §5.
+* ~~**N3 — `RJdkJmx`** needs the `jmx.rs` owner.~~ **CLOSED by WORKER-3**
+  (`61a1647aa`, `WORKER-3-NOTE-10`) — it retired `getDirectBufferPool` so real
+  `java.nio` bytecode builds the pool. Verified here on the merge: strict is
+  107/107 (§4b).
 
 ---
 
