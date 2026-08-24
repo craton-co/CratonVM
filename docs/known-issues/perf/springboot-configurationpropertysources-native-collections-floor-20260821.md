@@ -205,13 +205,84 @@ why "the per-element constant" reads as one flat number and why no
 whole-subsystem switch moved it: two effects of comparable size cancelling.
 Each door has to be armed on its own evidence.
 
-**Next, precisely scoped:** give `ArrayList.get` the Term 3 treatment — yield
-to real bytecode under the default policy, with the five-term predicate as the
-safety and `CRATONVM_DBG_STUB_YIELD` as the engagement counter. It is worth
-~6× on indexed list access VM-wide. Do NOT extend it to the iterator family on
-the same reasoning; the number above says it would be a pessimisation, and it
-needs its own investigation into why `ArrayList$Itr` bytecode is slow (the
-first question being whether it is compiled at all).
+### The Term 3 treatment was ATTEMPTED for `ArrayList.get` and REVERTED
+
+It is behaviourally viable and mechanically inert, and it broke something else.
+All three parts matter to whoever picks this up.
+
+**Behaviourally it is fine.** `probes/ListYieldProbe` (new, 44 rows) covers the
+receivers that are ArrayList-SHAPED but are not plain ArrayLists, which is where
+real JDK bytecode reading `elementData`/`size` straight through would diverge: a
+live `values()` view across put and remove, `subList` (whose indices are offset
+from the backing) including write-through, `Collections.unmodifiableList`
+refusing writes, `Arrays.asList` allowing `set` but refusing `add`, iterator
+order, fail-fast, bounds and null. **44/44 byte-identical to HotSpot 25.0.3+9
+both on the default policy and under `--jdk-only` with the dial scoped to
+`java/util/ArrayList`** — so the real bytecode does drive CratonVM's ArrayList
+correctly.
+
+**Mechanically it did not engage.** Registering `size`/`isEmpty`/`get` as
+`SyntheticStub` and adding `java/util/ArrayList` to
+`real_protected_stub_class_common` — exactly the Term 3 change, one class over —
+produced `CRATONVM_DBG_STUB_YIELD` counts of **zero**, with and without
+`--nojit`. The static path and the virtual path do not arbitrate the same way,
+and the piece that works for `java.util.Objects` does not reach an instance
+accessor. Whatever the next attempt is, it starts by finding which predicate the
+virtual path actually consults for a `SyntheticStub` instance method — not by
+assuming this one.
+
+**And it silently disabled the Objects yield.** Same run, same binary:
+
+| rung | dev | dev + the ArrayList attempt |
+|---|---:|---:|
+| `Objects.equals` | 50.6 ns | **155.6 ns** |
+| `Objects.isNull` | 28.0 ns | **117.0 ns** |
+| `myEquals` (control) | 59.2 ns | 56.0 ns |
+| `myIsNull` (control) | 33.0 ns | 26.8 ns |
+
+The controls do not move, so this is the Term 3 fix being switched off, not a
+slower VM. The mechanism is not identified — adding one arm to a `matches!`
+cannot remove another — so the two halves (the `SyntheticStub` retag and the
+allow-list entry) need bisecting SEPARATELY before either is trusted. **Reverted
+rather than shipped**; only the probe is kept.
+
+**The engagement counter is what caught both.** The timings alone said "no
+faster", which reads as a null result and invites shipping it as harmless; the
+counter said "never ran", and the control rungs said the Objects regression was
+real. This is the second time on this page that a fix attempt measured nothing —
+the first was the original Term 3 attempt — and both times the counter was the
+difference between a null result and a wrong one.
+
+**Still open, unchanged:** ~6× is available on indexed list access if the
+engagement problem is solved. Do NOT extend it to the iterator family on the
+same reasoning; the number above says that would be a pessimisation, and it
+needs its own investigation into why `ArrayList$Itr` bytecode is slow (the first
+question being whether it is compiled at all).
+
+### The leaf fast path is engaged and is not the lever
+
+`native-collections` registers nothing as leaf, so the obvious next idea is to
+mark the pure accessors leaf and drop the funnel's pinning, STW probe,
+transitions and unwind bookkeeping. The numbers say do not bother.
+`probes/NativeFunnelFloorProbe`, this host, from compiled code:
+
+```text
+control: plain Java call         10.8 ns
+LEAF   AtomicInteger.get        383-417 ns
+FUNNEL AtomicInteger.CAS            482 ns
+FUNNEL MessageDigest.update         156 ns
+FUNNEL identityHashCode             127 ns
+FUNNEL System.nanoTime               90 ns
+```
+
+`CRATONVM_DBG=intrinsic-stats` confirms engagement — `compiled leaf-native
+dispatches: 3918000`, so the leaf arm is running, not skipped. Yet the LEAF rung
+costs 2.5-4× the full-funnel rungs beneath it. Leafness buys ~100 ns against its
+own non-leaf twin (383 vs 482, same receiver and call-site shape) and that is
+real, but it lands nowhere near `System.nanoTime`'s 90 ns. So the funnel is not
+what makes `AtomicInteger.get` expensive, and marking collection accessors leaf
+would not close a 37× gap. **Why a leaf native costs 4× a full-funnel one is its
+own question**, and a better one than anything on this page.
 
 ## Term 2 (ORIGINAL 2026-08-22 reading) — the per-element constant is ~2 µs, and it is linear
 
