@@ -60,6 +60,13 @@
 //! * `positionLock` is held across the whole operation, so a concurrent
 //!   `position()`/`read`/`write` on the same channel serialises as it does
 //!   under the JDK's `synchronized (positionLock)`.
+//!   Reading `this`/`dst`/`hb` after that acquire is safe for the reason the
+//!   other ~80 native `monitor_enter` sites rely on and `monitor_enter_gc_safe`
+//!   spells out: the plain contended path leaves the caller counted in an
+//!   in-flight STW barrier's `expected` set rather than being excused from it,
+//!   so no moving collection completes while this thread waits. A future
+//!   change that switched this file to the GC-safe variant would have to
+//!   pin-and-refresh every one of those references.
 //! * `blockedOn(interruptor)` is published on the calling thread before the
 //!   I/O and cleared after, so another thread's `Thread.interrupt()` during
 //!   the call still reaches `AbstractInterruptibleChannel$1.interrupt` and
