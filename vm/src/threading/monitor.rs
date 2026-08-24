@@ -4415,6 +4415,110 @@ mod tests {
     /// the mark word (the object is already inflated before either thread
     /// starts, so no inflation happens on either side).
     #[test]
+    /// A NOTIFICATION SURVIVES A CONDVAR SIGNAL THAT IS NEVER OBSERVED.
+    ///
+    /// This is the invariant the netty `ParameterizedSslHandlerTest` stall cost
+    /// 420 s a run to find, and it is white-box on purpose: the black-box
+    /// version ("notify, then assert the waiter woke") passes on the BROKEN
+    /// code too, because there the condvar signal normally does arrive. What
+    /// broke was the case where it does not, and only the state can be asked
+    /// about that.
+    ///
+    /// The measured failure was `polls=78025 signalled=0` with
+    /// `notifies_since_wait=1` — 78 025 five-millisecond waits, not one of them
+    /// a signalled return, against a `notifyAll()` the monitor really did
+    /// serve. The fix is that the notification is now a CREDIT in
+    /// `MonitorState`, taken under the same mutex a notifier must hold, so the
+    /// condvar signal is an optimisation rather than the mechanism.
+    ///
+    /// What this test pins, with no condvar involved at all:
+    ///
+    /// * `notifyAll()` leaves exactly one credit per waiter parked AT THAT
+    ///   MOMENT — not more (a later waiter must not consume one) and not fewer;
+    /// * `notify()` leaves exactly one, and never stockpiles credits for
+    ///   waiters that do not exist;
+    /// * a credit is CONSUMED by a decrement, which is what keeps `notify()`
+    ///   from behaving like `notifyAll()`.
+    #[test]
+    fn a_notification_is_a_credit_in_monitor_state_not_only_a_condvar_signal() {
+        let m = Monitor::new();
+        let owner = ThreadId(7);
+
+        // Pretend three threads are parked, without actually parking any.
+        {
+            let mut s = m.state.lock();
+            s.owner = Some(owner);
+            s.entry_count = 1;
+            s.parked_waiters = 3;
+        }
+
+        // `notify()` leaves ONE credit, however many times a notifier could
+        // race — and never more than there are waiters.
+        m.notify(owner).unwrap();
+        assert_eq!(m.state.lock().pending_notifies, 1);
+        m.notify(owner).unwrap();
+        m.notify(owner).unwrap();
+        assert_eq!(m.state.lock().pending_notifies, 3);
+        m.notify(owner).unwrap();
+        assert_eq!(
+            m.state.lock().pending_notifies,
+            3,
+            "a notify with no waiter left to take it must not stockpile a credit \
+             that a FUTURE wait would consume as a spurious wakeup"
+        );
+
+        // `notifyAll()` is exactly the waiters parked right now.
+        {
+            let mut s = m.state.lock();
+            s.pending_notifies = 0;
+            s.parked_waiters = 2;
+        }
+        m.notify_all(owner).unwrap();
+        assert_eq!(m.state.lock().pending_notifies, 2);
+
+        // A waiter that arrives AFTER the notifyAll must not be able to take
+        // one of those credits and count itself notified.
+        {
+            let mut s = m.state.lock();
+            s.parked_waiters += 1;
+        }
+        assert_eq!(
+            m.state.lock().pending_notifies,
+            2,
+            "notifyAll() promises the set parked when it ran, not a standing offer"
+        );
+
+        // Consuming is a DECREMENT: two waiters take one each and the third
+        // finds nothing, which is what stops `notify()` from waking everyone.
+        for expected in [1u32, 0] {
+            let mut s = m.state.lock();
+            assert!(s.pending_notifies > 0);
+            s.pending_notifies -= 1;
+            assert_eq!(s.pending_notifies, expected);
+        }
+        assert_eq!(m.state.lock().pending_notifies, 0);
+    }
+
+    /// `notify` / `notifyAll` on a monitor this thread does not own must still
+    /// be an `IllegalMonitorStateException` and must leave NO credit behind —
+    /// the credit is only reachable past the ownership check, and a refused
+    /// notification that still armed a waiter would be a spurious wakeup with
+    /// no notifier.
+    #[test]
+    fn a_refused_notify_leaves_no_credit() {
+        let m = Monitor::new();
+        {
+            let mut s = m.state.lock();
+            s.owner = Some(ThreadId(1));
+            s.entry_count = 1;
+            s.parked_waiters = 2;
+        }
+        assert!(m.notify(ThreadId(2)).is_err());
+        assert!(m.notify_all(ThreadId(2)).is_err());
+        assert_eq!(m.state.lock().pending_notifies, 0);
+    }
+
+    #[test]
     fn wait_notify_round_trip_on_a_mark_word_reachable_monitor() {
         let table = Arc::new(MonitorTable::new());
         let obj = leaked_heap().alloc_object(ClassId::new(0), 0);
