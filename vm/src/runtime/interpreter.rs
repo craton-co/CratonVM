@@ -2974,10 +2974,11 @@ pub fn execute(
                                         let ret_type = crate::jit::return_type(descriptor);
                                         let arg_type_tags =
                                             crate::jit::indy_arg_type_tags(descriptor);
-                                        let concat_site = crate::runtime::invokedynamic::make_jit_string_concat_site_from_parts(
+                                        let bridge_site = crate::runtime::invokedynamic::make_jit_indy_bridge_site_from_parts(
                                             &class.constant_pool,
                                             &class.bootstrap_methods,
                                             cp_idx,
+                                            class_id,
                                         )
                                         .unwrap_or(0);
                                         indy_info.push((
@@ -2985,7 +2986,7 @@ pub fn execute(
                                             arg_slots,
                                             ret_type,
                                             arg_type_tags,
-                                            concat_site,
+                                            bridge_site,
                                         ));
                                     }
                                 }
@@ -3219,7 +3220,17 @@ pub fn execute(
                         code_len,
                         param_slots,
                         code_attr.max_locals as usize, // Widening: u16 to usize
-                        scan.needs_heap,
+                        // A BRIDGED indy site calls a helper, which loads the
+                        // hidden `SharedVm` pointer from the frame slot
+                        // `heap_local_offset` names — and that slot only EXISTS
+                        // when `needs_heap` is set. `scan.needs_heap` does not
+                        // know about it, because an `invokedynamic` used to
+                        // lower to a trap that calls nothing. See the same
+                        // one-line remedy at the other two compile doors.
+                        scan.needs_heap
+                            || indy_info
+                                .iter()
+                                .any(|&(_, _, _, _, bridge_site)| bridge_site != 0),
                         mna_info,
                         field_info,
                         typecheck_info,

@@ -1,18 +1,55 @@
-# `ConfigurationPropertySourcesTests` is 245× HotSpot — decomposed
+# `ConfigurationPropertySourcesTests` — decomposed, Term 1 fixed, ~23× HotSpot
 
-**Status: OPEN — 2026-08-22.** Rewritten from the 2026-08-21 first cut, which
-called this "the native-collections floor, no leaf over ~8%, no dominant term
-to attack" and left it there. That reading was **wrong in the way that matters**:
-a flat profile does not mean a flat cause. Decomposed properly, the gap is three
-named things, two of which are algorithmic divergences from the JDK rather than
-constant-factor overhead.
+**Status: OPEN — Term 1 CLOSED and RE-MEASURED 2026-08-24; Terms 2 and 3 open.**
+Rewritten from the 2026-08-21 first cut, which called this "the
+native-collections floor, no leaf over ~8%, no dominant term to attack" and left
+it there. That reading was **wrong in the way that matters**: a flat profile does
+not mean a flat cause. Decomposed properly, the gap is three named things, two of
+which are algorithmic divergences from the JDK rather than constant-factor
+overhead.
 
-**Term 1 was FIXED on 2026-08-23** — see "The two fixes, in value order"
-below. Terms 2 and 3 are untouched, and **this page's end-to-end number has NOT
-been re-measured against the fix**, so 245x still stands as the last thing that
-was actually observed. What follows is the decomposition, the measurements that
-pin each term, and the two fixes with their predicted payoffs, so the next
-session starts from arithmetic instead of from a profile.
+## The end-to-end number, measured
+
+Term 1 (the map-view rebuild) was fixed on 2026-08-23 and this class was
+re-measured on 2026-08-24. **One binary, `CRATONVM_MAP_VIEW_CACHE` as the A/B,
+three interleaved rounds, reported in CPU time:**
+
+| round | HotSpot | cache OFF | cache ON | OFF/ON |
+|---|---:|---:|---:|---:|
+| 1 | 8.3 s | 1291.0 s | 186.2 s | 6.93× |
+| 2 | 6.6 s | 1274.9 s | 187.3 s | 6.81× |
+| 3 | 8.4 s | 1304.3 s | 191.2 s | 6.82× |
+
+**6.8× end to end**, and the class moves from ~156× HotSpot to **~23×**. All
+three rounds pass 11/11 tests on both arms (one test is `@Disabled`, "for manual
+testing", on both VMs).
+
+**Why CPU time and not wall clock.** The box is shared and ran at load 17–37
+with ten other `cratonvm` processes throughout. Wall clock there measures the
+neighbours: one HotSpot run read 2.7 s idle and 15.4 s at load 35, a 5.7×
+excursion on an unchanged binary. CPU time moved 1.5× over the same range, and
+across the three rounds the OFF arm spans 2.3% and the ON arm 2.7% — the ON arm
+also read 184.3 s at load 5, so it is flat from load 5 to 24. A first attempt at
+this measurement in wall clock was discarded, not adjusted.
+
+**The engagement counter, identical on all three ON runs** (deterministic):
+
+```text
+[MAP-VIEW-CACHE] EXIT resync_skipped=300132 resync_ran=66 elided=100.0%
+                      view_reused=299758 view_built=415 switch=ON verify=OFF
+```
+
+300 132 rebuilds skipped against 66 run, and 299 758 view reuses against 415
+builds — which is what says the fix is engaged on THIS workload rather than
+merely present in the binary.
+
+**The 245× in this page's old title was wall clock on a loaded host and is not
+comparable to the numbers above.** The ~156× OFF figure here is the same
+pre-fix behaviour priced the new way, on the same host, in the same window as
+its own ON control.
+
+What follows is the decomposition, the measurements that pin each term, and the
+fixes, so the next session starts from arithmetic instead of from a profile.
 
 ## The workload, exactly
 
@@ -169,16 +206,26 @@ that one. The change was reverted rather than shipped inert.
 
 ## Where the time actually goes
 
-Per test run, against the ~475 s (JIT, loaded host) arm:
+Per test run, against the ~475 s (JIT, loaded host, WALL CLOCK) arm this was
+decomposed on. See "The end-to-end number, measured" at the top for what the
+class costs now and why that section prices it in CPU time instead:
 
-| term | est. cost | note |
-|---|---|---|
-| `keySet()` view construction | ~190 s | 101 910 calls × 1000 elem × ~1.9 µs |
-| iterating those views | ~230 s | 100M steps × ~2.3 µs |
-| `Objects.equals` via `Arrays.equals` | ~21 s | 100M calls × ~215 ns |
+| term | est. cost | note | after Term 1 |
+|---|---|---|---|
+| `keySet()` view construction | ~190 s | 101 910 calls × 1000 elem × ~1.9 µs | **gone** |
+| iterating those views | ~230 s | 100M steps × ~2.3 µs | **reduced** |
+| `Objects.equals` via `Arrays.equals` | ~21 s | 100M calls × ~215 ns | unchanged |
 
-Terms 1 and 2 are ~90 % of it. **`Objects.equals` is only ~4 %** — worth fixing
-for the whole VM, but it is not this test's problem.
+Terms 1 and 2 were ~90 % of it. **`Objects.equals` is only ~4 %** — worth
+fixing for the whole VM, but it is not this test's problem.
+
+**Checked against the measurement rather than left as arithmetic.** The
+estimates above predicted ~140 s remaining; the measured ON arm is 186-191 s
+CPU. The estimate was low, and the residue is Term 2: what the elision removes
+is the per-READ rebuild, not the per-element cost of walking a view once it is
+built. `Objects.equals` (~21 s) and the ~66 rebuilds that still run are the rest.
+Term 2 is now the whole of the remaining gap on this workload rather than part
+of it, which is the useful thing the re-measurement establishes.
 
 ## The two fixes, in value order
 

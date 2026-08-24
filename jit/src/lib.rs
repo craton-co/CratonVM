@@ -1793,8 +1793,22 @@ fn register_jit_code_range_inner(
     let registry = jit_code_ranges();
     if let Ok(_writer) = registry.writer.lock() {
         let mut next = (**registry.snapshot.load()).clone();
-        next.push((entry, entry.saturating_add(len), cm_ptr, owner));
-        next.sort_unstable_by_key(|&(start, _, _, _)| start);
+        // INSERT, do not push-then-sort. The snapshot this clone came from is
+        // already sorted by `start` — it is only ever written here and by
+        // `unregister_jit_code_range`, which retains in place — so the whole
+        // ordering work is placing ONE element. `sort_unstable_by_key` cannot
+        // see that: its almost-sorted fast path detects a run, and an element
+        // appended past the end of one is exactly the shape that defeats it, so
+        // every registration paid O(n log n) over the entire registry.
+        //
+        // It matters more than the old cost suggests, because the population is
+        // about to grow: `register_jit_code_range_inner` and its sorts were
+        // ~0.7% of the WebClient exchange profile with 155 compiled methods,
+        // and the whole point of the `invokedynamic` bridge is that far more
+        // methods stay compiled.
+        let range = (entry, entry.saturating_add(len), cm_ptr, owner);
+        let at = next.partition_point(|&(start, _, _, _)| start < entry);
+        next.insert(at, range);
         registry.snapshot.store(std::sync::Arc::new(next));
         // Release: any cached snapshot taken with Acquire after this point must
         // see the push above (ordinary Mutex unlock already provides this, but
@@ -2625,6 +2639,27 @@ pub struct CompiledMethod {
     /// it is always safe to leave unset. Only ever consulted on the
     /// gated precise path (`CRATONVM_PRECISE_JIT_MAPS`).
     pub fully_oop_covered: bool,
+    /// Every safepoint of this method claims **shadow** coverage — the method
+    /// has at least one `OopMapEntry` and all of them carry
+    /// `moving_young_coverage_complete`.
+    ///
+    /// A DIFFERENT question from [`Self::fully_oop_covered`], and the
+    /// difference is what
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` ran
+    /// aground on. `fully_oop_covered` asks whether every live oop is named by
+    /// a FRAME SLOT in the map (`safepoint_pcs ⊆ mapped_safepoint_pcs`), which
+    /// a direct JIT→JIT call with a reference argument can never satisfy: the
+    /// argument is marshalled into the outgoing-ABI area, which no frame-slot
+    /// map can name. `fully_shadow_covered` asks whether the shadow push
+    /// published every live oop so a relocation can rewrite it — the property
+    /// `conservative_roots::moving_young_frame_coverage_complete` already
+    /// consults per frame, per safepoint, for every non-OSR frame.
+    ///
+    /// Measured on `TestKillProcessWhileWriting`, 2026-08-23: 439 of the 449
+    /// recorded coverage failures were `staged_arg_unmappable`, i.e. exactly
+    /// the direct-call shape above, and they blocked relocation on 725 of 759
+    /// collections through the OSR fallback's use of `fully_oop_covered`.
+    pub fully_shadow_covered: bool,
     /// deopt-osr scaffolding — `true` only once the deopt finalizer has
     /// proven this method can rebuild a precise interpreter frame at a guard
     /// bci and resume there (instead of the `i64::MIN` whole-method re-run).
@@ -2893,6 +2928,7 @@ impl CompiledMethod {
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
             fully_oop_covered: false,
+            fully_shadow_covered: false,
             // deopt-osr scaffolding: default to the safe re-run path; no
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
@@ -2966,6 +3002,7 @@ impl CompiledMethod {
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
             fully_oop_covered: false,
+            fully_shadow_covered: false,
             // deopt-osr scaffolding: default to the safe re-run path; no
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
@@ -9385,7 +9422,7 @@ fn direct_native_helper_for_impl(
 //     defect. The shadow check is on the VM side and needs the same
 //     `resolve_dispatch` treatment.
 //
-//  5. `INDY_STRING_CONCAT_FN` (below) is a `StringConcatFactory` *bootstrap*
+//  5. `INDY_BRIDGE_FN` (below) is an `invokedynamic` *bootstrap*
 //     bridge, not a native-method dispatch, and the interpreter reaches the
 //     same bridge for the same sites — so gating it in the JIT would move the
 //     call without changing the policy answer, while perturbing
@@ -9442,16 +9479,22 @@ pub fn set_integer_value_of_direct_fn(addr: usize) {
     INTEGER_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-lifetime bridge for `StringConcatFactory` sites lowered by the
-/// single-pass backend. It stays outside the stable helper-table ABI because
-/// the address is installed once at VM start, not per compiled artifact.
-pub static INDY_STRING_CONCAT_FN: std::sync::atomic::AtomicUsize =
+/// Process-lifetime bridge for `invokedynamic` sites lowered by the
+/// single-pass backend rather than trapped. It stays outside the stable
+/// helper-table ABI because the address is installed once at VM start, not per
+/// compiled artifact.
+///
+/// ONE cell for BOTH bridged kinds — `StringConcatFactory` and, since
+/// 2026-08-23, `LambdaMetafactory`. The site metadata carries a `kind` tag the
+/// VM-side entry reads (`invokedynamic::jit_indy_site_kind`), so the call
+/// sequence and this cell stay single.
+pub static INDY_BRIDGE_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Register the `StringConcatFactory` bridge (called once from the VM's
+/// Register the `invokedynamic` bridge (called once from the VM's
 /// `build_helpers`).
-pub fn set_indy_string_concat_fn(addr: usize) {
-    INDY_STRING_CONCAT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+pub fn set_indy_bridge_fn(addr: usize) {
+    INDY_BRIDGE_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `Integer.intValue()` sibling of [`INTEGER_VALUE_OF_DIRECT_FN`].
@@ -15938,7 +15981,7 @@ pub fn try_compile(
     ir_emit_long: bool,
     ir_emit_virtual_calls: bool,
     ir_emit_fp: bool,
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
 ) -> Option<CompiledMethod> {
     // Thin compatibility wrapper: the overwhelming majority of callers
     // (every `jit` crate test, plus any VM call site that hasn't been
@@ -16102,7 +16145,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // while keeping the compiler's simulated operand stack consistent for
     // whatever bytecode follows. `None` (resolver absent, or it returns `None`
     // for a given site) bails the whole compile — see `try_compile_inner`.
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
     // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
     // identity a guarded speculative inline's receiver class-id check
     // resolved against) to its class name, so a Monomorphic/Bimorphic
@@ -17318,7 +17361,7 @@ fn try_compile_inner(
     // `None` (resolver absent, or it returns `None` for a given id) refuses
     // every speculative virtual/interface inline at that site; static/
     // special DirectBind sites are unaffected (no receiver dependency).
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
     class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
     // PGO-02 R0: the body a receiver of exactly this class id dispatches to.
     // See `try_compile`.
@@ -21662,13 +21705,40 @@ fn try_compile_inner(
             jitc_bail!("cp_invokedynamic_descriptor_resolver")
         };
         for &(pc, cp_idx) in &scan.indy_ops {
-            let Some(descriptor) = resolver(cp_idx) else {
+            let Some((descriptor, bridge_site)) = resolver(cp_idx) else {
                 jitc_bail!("indy_descriptor_resolve")
             };
             let arg_slots = count_param_slots(&descriptor);
             let ret_type = return_type(&descriptor);
             let arg_type_tags = indy_arg_type_tags(&descriptor);
-            indy_info.push((pc, arg_slots, ret_type, arg_type_tags, 0));
+            // `bridge_site` is 0 for every bootstrap the VM cannot bridge,
+            // which is the pre-bridge behaviour: the codegen lowers the site to
+            // an uncommon trap. This used to be an unconditional 0 here, so the
+            // WHOLE-METHOD door trapped even on the `StringConcatFactory` sites
+            // the OSR door had been bridging since that fix landed.
+            //
+            // A BRIDGED site CALLS A HELPER, and every helper call in this
+            // backend loads the hidden `SharedVm` pointer out of the frame slot
+            // `heap_local_offset` names — a slot that only EXISTS when
+            // `needs_heap` is set. Nothing else in a method like
+            //
+            //     static String f(int i) { return "v=" + i; }
+            //
+            // asks for it: there is no `new`, no field access, no ordinary
+            // invoke, and the indy used to lower to a trap that calls nothing.
+            // So `heap_local_offset` stayed 0, the bridge call loaded `[rbp-0]`
+            // — the saved RBP — as its VM pointer, and the helper answered
+            // with a null String from a garbage `SharedVm`.
+            //
+            // It reproduced ONLY through the whole-method door: an OSR compile
+            // sets `needs_heap` for its own entry stub, which is why the concat
+            // bridge ran correctly for the months it was OSR-only, and why
+            // `probes/IndyBridgeProbe.java`'s loop-shaped arms all passed while
+            // a three-instruction method returned null.
+            if bridge_site != 0 {
+                needs_heap = true;
+            }
+            indy_info.push((pc, arg_slots, ret_type, arg_type_tags, bridge_site));
         }
     }
 

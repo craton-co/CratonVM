@@ -195,7 +195,7 @@ it is the class this branch's siblings have been chasing: **10 of 10 at 63/63**,
 76–85 s. That is consistent with its known ~1-in-14 stall rate being unchanged
 and is **not** evidence that it improved — ten clean runs is what an unchanged
 1-in-14 usually looks like. See
-`known-issues/netty/parameterizedsslhandlertest-promise-never-completes-20260820.md`.
+`fixed-suite-bugs/netty/parameterizedsslhandlertest-object-wait-lost-a-delivered-notify-FIXED-20260824.md`.
 
 ## Repro
 

@@ -192,6 +192,57 @@ failures. The two configurations also show why an absolute verdict was never
 going to work here: the same defect reproduces at ~100 % interpreted and ~65 %
 compiled.
 
+### The EXPOSURE question is answered, and item 2 above needs correcting (2026-08-24)
+
+This page says the regression is real and that it does not explain it. It is
+explained: **moving young collections are what expose the defect, and the window
+reduced how often the collector declines to move.**
+
+Fallback counts (a fallback IS the collector declining to move) are perfectly
+deterministic and separate perfectly with outcome:
+
+```text
+cae49a85c   5 fallbacks/run   SIG  6/6
+684f37e14   7 fallbacks/run   PASS 6/6
+```
+
+Two collections that stayed non-moving on the good endpoint stopped doing so on
+the bad one. Forcing the decline back on, in the bad binary, 10 reps interleaved
+against its own control:
+
+```text
+default                      SIG 8/10   (6 fallbacks)
+CRATONVM_MOVING_YOUNG_NO_JIT=1   SIG 0/10   (8 fallbacks)
+```
+
+At an 80 % baseline, 0/10 is ~1e-7. The lever raises the decline count and the
+failure disappears with it.
+
+**Item 2's dismissal of this same lever is wrong, and the reasoning is the
+instructive part.** It reads `--nojit` as "the same never-move policy" and takes
+its 4/4 failure as a refutation. But `--nojit` does not force never-move — it
+removes JIT frames, and it is the PRESENCE of a JIT frame that makes this
+collector decline to move. With no JIT frames the young collector is *free* to
+move, so `--nojit` is the MOVING arm. Its 4/4 failure is evidence FOR
+"moving exposes it", not against, and every measurement now agrees:
+
+| arm | moves? | result |
+|---|---|---|
+| `--nojit` (no JIT frames) | yes, freely | SIG 4/4 |
+| default, JIT on | sometimes (5-6 declines) | SIG 8/10 |
+| `MOVING_YOUNG_NO_JIT=1` | no (8 declines) | **SIG 0/10** |
+
+The original 6/6 was also not noise: at these rates it is well under 1 %. It was
+discarded for a stated reason that does not hold, which is a harder failure to
+catch than a coincidence — see
+`a-guard-scoped-by-a-stated-premise-is-only-as-good-as-the-premise`.
+
+None of this changes the FIX, which is correct and is the right layer: pinning
+`format_impl`'s locals makes the defect immune to whether the collector moves.
+It changes the open question at the bottom of this page from "why did exposure
+change" to "which commit in the window reduced the decline count" — a much
+narrower search, over a deterministic 7-to-5 signal rather than a 70 % coin.
+
 ### Independent confirmation on the shipped tip (2026-08-23)
 
 From the other line of work, arrived at without knowing this fix existed —

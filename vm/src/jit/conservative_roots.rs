@@ -615,6 +615,25 @@ pub mod osr_fallback_reason {
     }
 }
 
+/// Does the OSR coverage check read the SHADOW aggregate
+/// (`CompiledMethod::fully_shadow_covered`) rather than the frame-slot subset
+/// (`fully_oop_covered`)?
+///
+/// Default ON, so a KILL SWITCH: `CRATONVM_OSR_COVERAGE_SHADOW=0` (or
+/// `off`/`false`/`no`) restores the frame-slot reading, which is the bisect for
+/// anything that appears with this on. Read per call rather than latched, so a
+/// test can set it without deciding the answer for every later test in the
+/// binary; the call site runs once per live chain entry per collection.
+fn osr_coverage_uses_shadow_aggregate() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_OSR_COVERAGE_SHADOW") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
 fn moving_young_osr_method_needs_fallback(
     cm: &cratonvm_jit::CompiledMethod,
     exact_rbp: usize,
@@ -626,7 +645,51 @@ fn moving_young_osr_method_needs_fallback(
     let shadow_layout_ok = cm.shadow_thread_slot_off != 0
         && cm.shadow_savetop_slot_off != 0
         && cm.shadow_off_in_thread != 0;
-    let precise_map_ok = !cm.has_precise_oop_maps() || (cm.fully_oop_covered && exact_rbp != 0);
+    // THE SHADOW AGGREGATE, NOT THE FRAME-SLOT SUBSET (2026-08-23).
+    //
+    // This function is `moving_young_osr_shadow_fallback_needed`'s per-method
+    // half and its whole subject is whether an OSR artifact can prove
+    // **rewritable shadow coverage**. It asked `fully_oop_covered`, which on
+    // the fast tier — the only tier that produces OSR artifacts, since
+    // `ir_lower` publishes no `osr_pc_to_native` — is a different question:
+    // `safepoint_pcs ⊆ mapped_safepoint_pcs`, i.e. "every live oop is named by
+    // a FRAME SLOT".
+    //
+    // A direct JIT→JIT call with a reference argument can never satisfy that.
+    // The argument is popped off the operand stack and marshalled into the
+    // outgoing-ABI area, which no frame-slot map can name, so all three direct
+    // -call arms raise `pending_staged_args_unmapped` and the safepoint's pc is
+    // withheld from `mapped_safepoint_pcs` — permanently, for the whole method.
+    // Measured on `TestKillProcessWhileWriting` with `CRATONVM_DBG_OOPCOV=1`:
+    // 439 of 449 coverage failures are that one shape, and through this term
+    // they refused relocation on 725 of 759 collections. That is the
+    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` residual,
+    // and the page's own guess (a cross-thread peer) was measured at 0 of 759.
+    //
+    // The staged argument is not the caller's live value any more — it is the
+    // CALLEE's parameter, covered by the callee's own locals map, and the
+    // caller never re-reads the outgoing area after the call. Nothing the
+    // moving cycle must rewrite is lost by not naming it, which is why the
+    // per-safepoint SHADOW verdict is the honest question here.
+    //
+    // Narrowing this term does not weaken the proof, because it does not stand
+    // alone: `refresh_moving_young_coverage_for_collection` — which the OSR
+    // fallback SHORT-CIRCUITS PAST when it fires — then runs
+    // `moving_young_frame_coverage_complete` on the active frame and every
+    // parent (the same `moving_young_coverage_complete` flag, resolved through
+    // the live safepoint id, so per-frame rather than per-method) and the band
+    // verifier's empirical walk for young-resident unpublished words. Those are
+    // strictly sharper than a method-wide bit; the effect of this change is
+    // that they get to run.
+    //
+    // `CRATONVM_OSR_COVERAGE_SHADOW=0` restores `fully_oop_covered` on the same
+    // binary.
+    let covered = if osr_coverage_uses_shadow_aggregate() {
+        cm.fully_shadow_covered
+    } else {
+        cm.fully_oop_covered
+    };
+    let precise_map_ok = !cm.has_precise_oop_maps() || (covered && exact_rbp != 0);
     use std::sync::atomic::Ordering::Relaxed;
     if !shadow_layout_ok {
         osr_fallback_reason::BAD_SHADOW_LAYOUT.fetch_add(1, Relaxed);
@@ -637,7 +700,7 @@ fn moving_young_osr_method_needs_fallback(
         return true;
     }
     if !precise_map_ok {
-        if cm.has_precise_oop_maps() && !cm.fully_oop_covered {
+        if cm.has_precise_oop_maps() && !covered {
             osr_fallback_reason::BAD_MAP_COVERAGE.fetch_add(1, Relaxed);
         } else {
             osr_fallback_reason::MISSING_EXACT_RBP.fetch_add(1, Relaxed);
@@ -2479,13 +2542,74 @@ fn returned_from_direct_self_call(ret_addr: usize, entry_ptr: usize) -> bool {
     entry_ptr != 0 && direct_call_target(ret_addr, entry_ptr) == Some(entry_ptr)
 }
 
+/// Why [`moving_young_frame_coverage_complete`] said no, counted per cause.
+///
+/// `ACTIVE_FRAME_MAP` / `PARENT_FRAME_MAP` are one reason code each and this
+/// predicate has four ways to produce them — a method with no sp-id slot, a
+/// misaligned slot, a stored id no map matches, and a matched map that does
+/// not claim coverage. They are four different repairs, and after the
+/// 2026-08-23 OSR fix these two codes are what
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s remaining
+/// classes (`TestMVStoreTool`, 5 of 8 collections) refuse on, so the split is
+/// the next question rather than a nicety.
+pub mod frame_coverage_reason {
+    use std::sync::atomic::AtomicUsize;
+    /// The compilation reserved no safepoint-id slot, so no map can be located.
+    pub static NO_SP_ID_SLOT: AtomicUsize = AtomicUsize::new(0);
+    /// The safepoint-id slot address is misaligned — the frame base is wrong.
+    pub static MISALIGNED_SLOT: AtomicUsize = AtomicUsize::new(0);
+    /// The stored id matches no `OopMapEntry` of this method. The frame has not
+    /// reached a safepoint yet (its slot holds prologue-era stack residue), or
+    /// the method standing at this rbp is not the one being consulted.
+    pub static NO_MAP_FOR_STORED_ID: AtomicUsize = AtomicUsize::new(0);
+    /// A map matched and does NOT claim shadow coverage — the honest refusal.
+    pub static MAP_NOT_COMPLETE: AtomicUsize = AtomicUsize::new(0);
+    /// It said yes.
+    pub static COMPLETE: AtomicUsize = AtomicUsize::new(0);
+
+    /// `(no_slot, misaligned, no_map_for_id, map_incomplete, complete)`.
+    pub fn snapshot() -> (usize, usize, usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            NO_SP_ID_SLOT.load(Relaxed),
+            MISALIGNED_SLOT.load(Relaxed),
+            NO_MAP_FOR_STORED_ID.load(Relaxed),
+            MAP_NOT_COMPLETE.load(Relaxed),
+            COMPLETE.load(Relaxed),
+        )
+    }
+}
+
 fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> bool {
+    moving_young_frame_coverage_complete_at(rbp, cm, None)
+}
+
+/// As [`moving_young_frame_coverage_complete`], plus the return address the
+/// rbp-chain walk resolved `cm` from — `None` for the innermost frame, whose
+/// method comes from the chain entry rather than from a return address.
+///
+/// The extra argument exists only for the `no_map` diagnostic: the walk's
+/// "is this a JIT frame" test is `lookup_jit_code_range(ret_addr).is_some()`,
+/// which the A5 probe's own comment says is not sufficient — "cached function
+/// pointers and JIT helper arguments that happen to point inside generated code
+/// read as return PCs and fabricate a frame". `is_plausible_return_pc` is the
+/// sharper test that already exists for exactly that, and reporting it here
+/// says whether a `no_map` frame is a real frame at an unmapped call site or a
+/// fabricated one, which are opposite repairs.
+fn moving_young_frame_coverage_complete_at(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    ret_addr: Option<usize>,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
     let sp_id_off = cm.sp_id_slot_off;
     if sp_id_off == 0 {
+        frame_coverage_reason::NO_SP_ID_SLOT.fetch_add(1, Relaxed);
         return false;
     }
     let id_addr = rbp.wrapping_sub(sp_id_off as usize);
     if id_addr & 0x7 != 0 {
+        frame_coverage_reason::MISALIGNED_SLOT.fetch_add(1, Relaxed);
         return false;
     }
     // SAFETY: aligned safepoint-id slot in a live JIT frame on this thread.
@@ -2494,7 +2618,86 @@ fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledM
     for map in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
         found = true;
         if !map.moving_young_coverage_complete {
+            frame_coverage_reason::MAP_NOT_COMPLETE.fetch_add(1, Relaxed);
             return false;
+        }
+    }
+    if found {
+        frame_coverage_reason::COMPLETE.fetch_add(1, Relaxed);
+    } else {
+        frame_coverage_reason::NO_MAP_FOR_STORED_ID.fetch_add(1, Relaxed);
+        // WHICH frame, and what id was standing in its slot. This is the last
+        // obligation blocking `TestMVStoreTool`
+        // (`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`):
+        // `no_map=9 incomplete=0 ok=46`, so no map ever refuses on its own
+        // claim — nine frames simply cannot be located. A count cannot say
+        // whether that is a frame that has not reached a safepoint yet, a call
+        // site that recorded no map, or a method mis-resolved from a return
+        // address, and those are three different repairs.
+        //
+        // Rate-limited to the first 32: it fires per frame per collection.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some() {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if N.fetch_add(1, Relaxed) < 32 {
+                // For the INNERMOST frame the walk hands no return address, so
+                // read the frame's own saved one here (`[rbp + 8]`). Who the
+                // CALLER is settles the remaining question: if the frame at
+                // `rbp` really is `cm`'s, its return address lands inside a
+                // method that calls `cm`. If the (rbp, compile-id) mirror is
+                // STALE — published by a callee's prologue and not restored on
+                // its return, since `emit_post_call_rbp_republish` has only six
+                // call sites — the two will not correspond, and
+                // `own_ret_ok=false` says the word is not a return address at
+                // all.
+                let own_ret = if rbp != 0 && rbp & 0x7 == 0 {
+                    // SAFETY: the same aligned in-band read the chain walk makes
+                    // a few lines further on, on this thread's own stack.
+                    Some(unsafe { ((rbp + 8) as *const usize).read() })
+                } else {
+                    None
+                };
+                let own_caller_cm = own_ret.and_then(cratonvm_jit::lookup_jit_code_range);
+                let own_caller = own_caller_cm.map(|p| {
+                    // SAFETY: a resolved range is Arc-owned by the JIT cache
+                    // for as long as any of its frames is live.
+                    let c: &cratonvm_jit::CompiledMethod =
+                        unsafe { &*(p as *const cratonvm_jit::CompiledMethod) };
+                    c.method_label.clone()
+                });
+                // THE DISCRIMINATOR. `innermost_frame_method` prefers the
+                // compile-id MIRROR (`published_innermost_method`), which
+                // generated code writes in its prologue and restores after a
+                // JIT->JIT call. Decoding the caller's `E8 rel32` instead
+                // answers the same question from the STACK, which cannot go
+                // stale. If the two disagree, the mirror is naming a frame that
+                // has already returned; if they agree, these are real frames
+                // live at a call site that recorded no map — opposite repairs.
+                let decoded = match (own_ret, own_caller_cm) {
+                    (Some(r), Some(c)) => direct_call_callee(r, c).map(|p| {
+                        // SAFETY: as above.
+                        let m: &cratonvm_jit::CompiledMethod = unsafe { &*p };
+                        m.method_label.clone()
+                    }),
+                    _ => None,
+                };
+                eprintln!(
+                    "[frame-cov] no map for stored id: sp_id={sp_id} (0x{sp_id:x}) \
+                     method={} maps={} ids={:?} sp_id_slot_off={sp_id_off} rbp=0x{rbp:x} \
+                     walk_ret={:?} walk_ret_ok={:?} own_ret={:?} own_ret_ok={:?} \
+                     own_caller={own_caller:?} decoded_callee={decoded:?}",
+                    cm.method_label,
+                    cm.oop_maps.len(),
+                    cm.oop_maps
+                        .iter()
+                        .map(|m| m.bytecode_pc)
+                        .take(24)
+                        .collect::<Vec<_>>(),
+                    ret_addr.map(|r| format!("0x{r:x}")),
+                    ret_addr.map(is_plausible_return_pc),
+                    own_ret.map(|r| format!("0x{r:x}")),
+                    own_ret.map(is_plausible_return_pc),
+                );
+            }
         }
     }
     found
@@ -3180,7 +3383,7 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 };
                 let cm: &cratonvm_jit::CompiledMethod =
                     unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
-                if !moving_young_frame_coverage_complete(parent_rbp, cm) {
+                if !moving_young_frame_coverage_complete_at(parent_rbp, cm, Some(ret_addr)) {
                     if dbg {
                         eprintln!(
                             "[moving-young-coverage] incomplete: parent frame map at rbp=0x{:x}",
@@ -3393,30 +3596,150 @@ pub fn other_thread_in_jit() -> bool {
 /// have machinery: a cooperatively-parked peer publishes its shadow values into
 /// its `root_snapshot` and remaps its own shadow stack on resume, and an
 /// OS-frozen / helper-window peer is scanned conservatively and marks the cycle
-/// incomplete. Neither mechanism, however, gives the *initiator* a positive
-/// proof at the moment it decides whether to relocate — a peer whose deposit is
-/// stale, or which entered JIT after its last deposit, is simply not
-/// represented. Since a peer's JIT registers and frame slots are not rewritable
-/// by this collection, "cannot prove" must mean "do not move".
+/// incomplete.
 ///
-/// So: when any peer is in JIT, this cycle is treated as unproven. That is
-/// deliberately conservative — it means moving-young engages only on cycles
-/// where the initiator is the sole thread in compiled code — and it is the
-/// honest state of the proof until a cross-thread coverage handshake exists
-/// (specified in `arch-2026-07-26/moving-young-precise-roots.md`).
+/// Until 2026-08-23 neither mechanism gave the *initiator* a positive proof at
+/// the moment it decides whether to relocate, so the rule was: **any** peer in
+/// JIT makes the cycle unproven. That is the
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` residual —
+/// on a many-threaded workload it fires on nearly every cycle, and on ZGC,
+/// where relocation is the only defragmentation there is, the consequence is an
+/// `OutOfMemoryError` on a heap that is 97 % free.
+///
+/// [`publish_peer_jit_coverage_for_stw`] is the handshake that replaces it. A
+/// peer proves its OWN frames rewritable, on its own thread, at its own park,
+/// and deposits the proven depth; this function accepts the cycle only when the
+/// deposits account for **every** peer JIT entry in the process. The
+/// accounting is a depth comparison rather than a thread count because
+/// `GLOBAL_JIT_DEPTH` is the only process-wide view available and it is a
+/// depth: `peer = global - mine`, and `proven >= peer` is the acceptance test.
+/// Everything the handshake cannot see — an OS-frozen peer, a peer blocked in a
+/// native with compiled frames below it, a peer whose own proof failed —
+/// deposits nothing, so the shortfall refuses the cycle exactly as before.
+///
+/// `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` restores the blanket refusal on the
+/// same binary, which is what makes this an A/B rather than a rebuild.
 /// Over-diverting costs compaction; under-diverting costs the heap.
 pub fn refresh_moving_young_coverage_for_collection() -> bool {
     if !moving_young_enabled() {
         return true;
     }
     let mut complete = refresh_moving_young_coverage_for_current_thread();
-    if other_thread_in_jit() {
-        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
-            cratonvm_gc::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER,
-        );
-        complete = false;
+    let peer_depth = peer_jit_depth();
+    if peer_depth > 0 {
+        let proven = cratonvm_gc::gc_quiescence::peer_proven_jit_depth();
+        let accounted =
+            xt_jit_coverage_handshake_enabled() && peer_coverage_accounted(peer_depth, proven);
+        cratonvm_gc::gc_quiescence::note_peer_coverage_verdict(accounted);
+        if xt_coverage_dbg() {
+            eprintln!(
+                "[xt-coverage] peer_depth={peer_depth} proven={proven} accounted={accounted}"
+            );
+        }
+        if !accounted {
+            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                cratonvm_gc::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER,
+            );
+            complete = false;
+        }
     }
     complete
+}
+
+/// The handshake's acceptance test, split out so it is testable without racing
+/// the process-global counters.
+///
+/// `>=` and not `==`: the ledger is a sum of per-thread deposits taken at each
+/// peer's park, and a peer that returned from a JIT frame between its deposit
+/// and this read lowers `peer_depth` without lowering `proven`. That direction
+/// is safe — the frames it proved are a superset of the frames still live. The
+/// unsafe direction is `proven` running ahead of what was actually proven this
+/// pause, which is why the ledger is cleared by `request_stw` and by
+/// `begin_moving_young_coverage_cycle` rather than after use.
+#[inline]
+const fn peer_coverage_accounted(peer_depth: usize, proven_depth: usize) -> bool {
+    proven_depth >= peer_depth
+}
+
+/// JIT entries held by threads OTHER than this one, right now.
+///
+/// `saturating_sub` and not a plain subtraction: `GLOBAL_JIT_DEPTH` is a
+/// striped counter and this thread's own chain is a thread-local, so a torn
+/// read across the stripes can momentarily make the global look smaller than
+/// the local. Zero is the safe reading of that — it means "no peer depth to
+/// account for", and the caller's other obligations still stand.
+#[inline]
+fn peer_jit_depth() -> usize {
+    GLOBAL_JIT_DEPTH
+        .get()
+        .saturating_sub(current_thread_jit_depth())
+}
+
+/// May the cross-thread coverage handshake discharge `CROSS_THREAD_JIT_PEER`?
+///
+/// Default ON, so a KILL SWITCH: `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` (or
+/// `off`/`false`/`no`) restores the blanket "any peer in JIT means unproven"
+/// refusal. Default-off would leave the many-threaded case exactly where the
+/// H2 page found it, which is the defect and not a conservative posture.
+///
+/// Read per cycle rather than latched: it is consulted once per collection, and
+/// a `OnceLock` would let the first test to touch it decide the answer for
+/// every later test in the binary.
+fn xt_jit_coverage_handshake_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_XT_JIT_COVERAGE_HANDSHAKE") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
+fn xt_coverage_dbg() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_COVERAGE").is_some()
+}
+
+/// A peer thread's half of the cross-thread JIT coverage handshake.
+///
+/// Called by a mutator that is about to park at the STW barrier, immediately
+/// before `arrive_and_wait`. It runs THIS thread's own per-thread coverage
+/// proof — the only place in the process where that proof can be run for this
+/// thread, because `JIT_ENTRY_CHAIN`, the cached top RBP and the shadow window
+/// are all thread-local — and, if it holds, deposits this thread's JIT depth
+/// into the pause's ledger.
+///
+/// Why a deposit here is a promise the thread can keep: a cooperatively-parked
+/// peer resumes through `apply_pointer_map_to_thread`, which runs
+/// `remap_active_jit_frames`, `remap_register_image_words` and
+/// `shadow_stack.remap` over exactly the chain this proof just walked. The
+/// proof says every live oop of those frames is reachable from a channel the
+/// remap rewrites; the resume applies the rewrite. Nothing else in the process
+/// has to touch the peer's registers.
+///
+/// Cheap when it cannot matter: a thread with no JIT entries contributes
+/// nothing to the initiator's `peer_depth` arithmetic, so it returns before
+/// paying for `refresh_moving_young_coverage_for_current_thread` (whose
+/// `native_stack_has_jit_frame` band walk is the expensive part). That is the
+/// overwhelmingly common shape at a safepoint park.
+pub fn publish_peer_jit_coverage_for_stw() {
+    if !moving_young_enabled() || !xt_jit_coverage_handshake_enabled() {
+        return;
+    }
+    // Pruning inside the proof can only SHRINK the chain, so an already-empty
+    // chain stays empty and this early-out cannot skip a nonzero deposit.
+    if current_thread_jit_depth() == 0 {
+        return;
+    }
+    let proven = refresh_moving_young_coverage_for_current_thread();
+    // Read the depth AFTER the proof: it prunes returned entries, and the
+    // deposit must not claim more than the proof covered.
+    let depth = current_thread_jit_depth();
+    if proven && depth > 0 {
+        cratonvm_gc::gc_quiescence::add_peer_proven_jit_depth(depth);
+    }
+    if xt_coverage_dbg() {
+        eprintln!("[xt-coverage] peer deposit proven={proven} depth={depth}");
+    }
 }
 
 /// Returns true if any thread anywhere in the process is currently inside a
@@ -6463,6 +6786,68 @@ mod tests {
         assert!(peer_jit_frames_present(1, 0), "a peer while we are quiescent");
     }
 
+    /// The cross-thread handshake's arithmetic. The whole soundness argument is
+    /// "accept only when the deposits account for EVERY peer JIT entry", so the
+    /// shortfall case is the one that matters and it is asserted in both the
+    /// one-short and the nothing-deposited shapes.
+    #[test]
+    fn peer_coverage_is_accepted_only_when_every_peer_entry_is_accounted_for() {
+        assert!(
+            peer_coverage_accounted(0, 0),
+            "no peer depth to account for",
+        );
+        assert!(
+            peer_coverage_accounted(3, 3),
+            "three peer entries, three proven",
+        );
+        assert!(
+            !peer_coverage_accounted(3, 2),
+            "one peer entry unaccounted for must refuse the cycle — an OS-frozen \
+             peer, or one blocked in a native with compiled frames below it, \
+             deposits nothing and is exactly this shortfall",
+        );
+        assert!(
+            !peer_coverage_accounted(1, 0),
+            "a peer in JIT that deposited nothing must refuse",
+        );
+        assert!(
+            peer_coverage_accounted(2, 5),
+            "a peer that returned from JIT after depositing lowers peer_depth \
+             without lowering the ledger; the proven set is then a superset",
+        );
+    }
+
+    /// The ledger is cleared on the way IN to a pause, and a stale carry-over
+    /// is the one state that could license a relocation nobody proved.
+    #[test]
+    fn beginning_a_coverage_cycle_clears_the_peer_ledger() {
+        cratonvm_gc::gc_quiescence::add_peer_proven_jit_depth(7);
+        assert_eq!(
+            cratonvm_gc::gc_quiescence::peer_proven_jit_depth(),
+            7,
+            "the deposit did not land, so the clear below would prove nothing",
+        );
+        cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
+        assert_eq!(cratonvm_gc::gc_quiescence::peer_proven_jit_depth(), 0);
+        // And the dedicated entry point the barrier calls, on its own.
+        cratonvm_gc::gc_quiescence::add_peer_proven_jit_depth(4);
+        assert_eq!(cratonvm_gc::gc_quiescence::peer_proven_jit_depth(), 4);
+        cratonvm_gc::gc_quiescence::reset_peer_proven_jit_depth();
+        assert_eq!(cratonvm_gc::gc_quiescence::peer_proven_jit_depth(), 0);
+    }
+
+    /// A thread with no JIT entries contributes nothing to `peer_depth`, so the
+    /// peer half must return without paying for the band walk — and, more to
+    /// the point, without depositing anything. A deposit from a chain-less
+    /// thread would be a claim about frames that do not exist.
+    #[test]
+    fn a_thread_with_no_jit_frames_deposits_nothing() {
+        assert_eq!(current_thread_jit_depth(), 0, "test precondition");
+        cratonvm_gc::gc_quiescence::reset_peer_proven_jit_depth();
+        publish_peer_jit_coverage_for_stw();
+        assert_eq!(cratonvm_gc::gc_quiescence::peer_proven_jit_depth(), 0);
+    }
+
     fn dummy_compiled_method() -> cratonvm_jit::CompiledMethod {
         cratonvm_jit::CompiledMethod::new(
             cratonvm_jit::ExecutableBuffer::new(64)
@@ -7171,13 +7556,83 @@ mod tests {
             native_pc_offset: 0,
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
-            moving_young_coverage_complete: false,
+            moving_young_coverage_complete: true,
             live_frame_hi: 0,
         });
         cm.fully_oop_covered = true;
+        cm.fully_shadow_covered = true;
 
         assert!(moving_young_osr_method_needs_fallback(&cm, 0, false));
         assert!(!moving_young_osr_method_needs_fallback(&cm, 0x1000, false));
+    }
+
+    /// The 2026-08-23 correction, as a pair that fails in BOTH directions if
+    /// the predicate reads the wrong field.
+    ///
+    /// The fixture is the shape the fast tier actually emits for an OSR method
+    /// containing a direct JIT→JIT call with a reference argument: every
+    /// safepoint publishes complete SHADOW coverage, and `fully_oop_covered` is
+    /// false because the marshalled argument sits in the outgoing-ABI area,
+    /// which no frame-slot map can name (`pending_staged_args_unmapped`).
+    /// Measured on `TestKillProcessWhileWriting`, that shape was 439 of 449
+    /// coverage failures and refused relocation on 725 of 759 collections.
+    ///
+    /// Non-vacuous in both arms: the kill switch flips the answer on the SAME
+    /// fixture, so this pins which field is being read rather than riding on a
+    /// fixture that would pass either way.
+    #[test]
+    fn the_osr_coverage_check_reads_the_shadow_aggregate_not_the_frame_slot_subset() {
+        let mut cm = dummy_compiled_method();
+        add_shadow_osr_layout(&mut cm);
+        cm.push_oop_map(cratonvm_jit::OopMapEntry {
+            native_pc_offset: 0,
+            bytecode_pc: 0,
+            frame_slot_offsets: vec![-16],
+            moving_young_coverage_complete: true,
+            live_frame_hi: 0,
+        });
+        // The direct-call shape: shadow complete, frame-slot subset incomplete.
+        cm.fully_shadow_covered = true;
+        cm.fully_oop_covered = false;
+
+        assert!(
+            !moving_young_osr_method_needs_fallback(&cm, 0x1000, false),
+            "a frame whose every safepoint published complete shadow coverage must not \
+             force the OSR fallback merely because a marshalled argument has no frame slot"
+        );
+
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_OSR_COVERAGE_SHADOW", Some("0"))],
+            || {
+                assert!(
+                    moving_young_osr_method_needs_fallback(&cm, 0x1000, false),
+                    "the kill switch must restore the frame-slot reading on the SAME \
+                     fixture, or it is not a bisect"
+                );
+            },
+        );
+    }
+
+    /// The other half: the shadow aggregate is not a rubber stamp. A method
+    /// with one incomplete safepoint map still forces the fallback.
+    #[test]
+    fn the_osr_coverage_check_still_refuses_an_incomplete_shadow_claim() {
+        let mut cm = dummy_compiled_method();
+        add_shadow_osr_layout(&mut cm);
+        cm.push_oop_map(cratonvm_jit::OopMapEntry {
+            native_pc_offset: 0,
+            bytecode_pc: 0,
+            frame_slot_offsets: vec![-16],
+            moving_young_coverage_complete: false,
+            live_frame_hi: 0,
+        });
+        cm.fully_shadow_covered = false;
+        // `fully_oop_covered` true and shadow false is the inverse of the pair
+        // above: if the predicate were still reading the old field this would
+        // pass the check, so the assertion pins the direction.
+        cm.fully_oop_covered = true;
+
+        assert!(moving_young_osr_method_needs_fallback(&cm, 0x1000, false));
     }
 
     #[test]

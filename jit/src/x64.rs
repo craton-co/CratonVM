@@ -239,7 +239,7 @@ thread_local! {
     pub(crate) static INLINE_TEST_PUBLISHES_DEOPT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
-mod safepoint;
+pub mod safepoint;
 mod frames;
 mod operand_stack;
 mod emit;
@@ -954,6 +954,18 @@ struct Compiler {
     /// Stage 2 — companion to `local_oop_masks`: whether the forward local-oop
     /// dataflow reached each PC. Only `reached` PCs get precise local entries.
     local_oop_reached: Vec<bool>,
+    /// The forward dataflow's ENTRY state: bit `k` set ⇒ JVM local slot `k`
+    /// holds a reference parameter on method entry (`compute_param_oop_mask`).
+    /// It is what seeds `local_oop_masks[0]`, and it is kept separately
+    /// because the METHOD-ENTRY safepoint poll
+    /// (`Compiler::emit_safepoint_poll_prologue`) sits at no bytecode pc at
+    /// all — see `Compiler::local_oop_mask_at_current_pc`.
+    ///
+    /// Deliberately NOT read back out of `local_oop_masks[0]`: when bci 0 is
+    /// also a branch target that entry has been intersected with the back
+    /// edge's state, which is a SUBSET of the entry state, and publishing a
+    /// subset while claiming complete coverage is the unsound direction.
+    param_oop_mask: u64,
     /// deopt-osr P2 — per-local JVM value kind (`classify_local_kinds`), the
     /// width/type source for the deopt snapshot so a `long`/`double`/`float`
     /// local emits a precisely-typed `FrameValue` rather than a truncating
@@ -2554,6 +2566,7 @@ impl Compiler {
             inline_walk_at: (usize::MAX, 0),
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
+            param_oop_mask: 0,
             cur_bc_pc: 0,
             slot_mirror: None,
             kernel_operand_cache: kernel_reg_homes_active,
