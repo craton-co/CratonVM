@@ -3615,11 +3615,10 @@ mod tests {
                 "create",
                 "(Ljava/lang/String;Ljava/lang/String;)Ljava/net/URI;",
             ),
-            (
-                "java/nio/Buffer$2",
-                "getBufferPool",
-                "()Ljava/lang/management/BufferPoolMXBean;",
-            ),
+            // `java/nio/Buffer$2.getBufferPool()` was HERE and is retired
+            // (`61a1647aa`). `javap -p` says NO supported JDK 25 image
+            // declares it, so the registration could never be dispatched and
+            // this row asserted the presence of a dead one.
             (
                 "cratonvm/internal/ss/JavaUtilJarAccess$1",
                 "jarFileHasClassPathAttribute",
@@ -3646,7 +3645,7 @@ mod tests {
                 "(Ljava/util/ResourceBundle;Ljava/util/ResourceBundle;)V",
             ),
         ];
-        assert_eq!(expected.len(), 14);
+        assert_eq!(expected.len(), 13);
         for (owner, method, desc) in expected {
             assert!(
                 r.find(owner, method, desc).is_some(),
@@ -3666,14 +3665,29 @@ mod tests {
         register_wp1_4_shared_secrets(&mut r);
         let descriptor = "()Ljdk/internal/misc/VM$BufferPool;";
 
+        // RETIRED 2026-08-24 (`61a1647aa`), and the assertion is INVERTED
+        // rather than deleted, because the absence is the property now.
+        //
+        // `javap` decided it: `java.nio.Buffer$2.getDirectBufferPool()` is
+        //
+        //     0: getstatic  java/nio/Bits.BUFFER_POOL
+        //     3: areturn
+        //
+        // two instructions returning an object real bytecode already builds.
+        // The native in front of it existed only to hand back a FABRICATED
+        // carrier, and under `--jdk-only` that fabrication is refused from
+        // inside `VM$BufferPoolsHolder.<clinit>` — where a refusal is not
+        // catchable, poisons `jdk.internal.misc.VM` for the process, and takes
+        // the whole platform MBeanServer with it. The interception was strictly
+        // worse than nothing, so re-adding it must fail this test.
         for owner in [
             "java/nio/Buffer$1",
             "java/nio/Buffer$2",
             "jdk/internal/access/JavaNioAccess",
         ] {
             assert!(
-                r.find(owner, "getDirectBufferPool", descriptor).is_some(),
-                "JavaNioAccess.getDirectBufferPool missing on {owner}"
+                r.find(owner, "getDirectBufferPool", descriptor).is_none(),
+                "{owner}.getDirectBufferPool is registered again — the real                  `Bits.BUFFER_POOL` bytecode must serve it, or strict mode                  loses the platform MBeanServer out of a <clinit>"
             );
         }
 
