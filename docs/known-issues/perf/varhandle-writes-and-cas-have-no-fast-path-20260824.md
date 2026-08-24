@@ -1,11 +1,12 @@
 # `VarHandle` writes and CAS have no fast path — 35-303x, and it is most of `java.util.concurrent`
 
 ## Status
-**OPEN (2026-08-24). Measured, localised, not fixed.** The defect is a gap in
-an existing optimisation rather than a bug: `VARHANDLE_READ_DIRECT_FNS` binds
-`VarHandle` READS of PRIMITIVE fields to a direct helper, and nothing else.
-Every write, every CAS, and every reference-typed access falls through to the
-generic native dispatch funnel.
+**PARTIALLY FIXED (2026-08-24).** `set` is bound and verified — 698 000 native
+dispatches eliminated, 246.5 ns -> 64.8 ns (see below). `compareAndSet` and
+reference READS are still on the generic funnel, and the downstream
+composition workload is CAS-dominated so it has barely moved. The defect was a
+gap in an existing optimisation rather than a bug: `VARHANDLE_READ_DIRECT_FNS`
+bound READS of PRIMITIVE fields and nothing else.
 
 ## Severity
 **HIGH, and broad.** `VarHandle` is the primitive under `CompletableFuture`,
@@ -74,18 +75,79 @@ is **uncontended and succeeds on the first attempt** — a third of the time in
 an uncontended CAS is the primitive, not the algorithm. `ForkJoinTask.casStatus`
 and `compareAndSetForkJoinTaskTag` appear lower down for the same reason.
 
-## The fix, in the shape the existing code already has
+## Step 1 landed: `set` is bound (2026-08-24)
 
-Extend the direct-bind table the way it was extended for reads:
+The write modes now have the bind the read modes have had:
+`VARHANDLE_WRITE_DIRECT_FNS`, 36 slots over
+`["set", "setVolatile", "setRelease", "setOpaque"]` x
+`[Z B C S I J F D L]`, recognised at BOTH the single-pass and the OSR door.
 
-1. add the write and read-modify-write modes — `set`, `setVolatile`,
-   `setRelease`, `setOpaque`, `compareAndSet`, `compareAndExchange`,
-   `weakCompareAndSet`, `getAndSet`, `getAndAdd`;
-2. add the reference kinds `L` and `[`, which need the store barrier the
-   primitive path does not — that is why they were left out, and it is the
-   real work here;
-3. keep the same site-keyed bind so the funnel is skipped, not merely
-   shortened.
+**References are in scope here, and that is not an oversight in the read
+table's direction.** The read bind excludes `L`/`[` because a reference RETURN
+must be published as a handoff root before the caller can store it, and the
+direct arm takes no thread borrow to publish one with. A write has no return:
+the reference travels INWARD, in a register the compiled caller's own frame
+already describes, so there is no window to root across. The store itself goes
+through `set_field_volatile_as`, which routes to the collector's own inherent
+write barrier rather than an open-coded one — so this arm and the interpreter's
+`putfield` tell the GC the same story.
+
+Measured on ONE binary with `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS`:
+
+| | bind off | bind on |
+|---|---:|---:|
+| `VarHandle.set` NATIVE dispatches (census) | **698 000** | **0** |
+| `VarHandle.set` reference | 246.5 ns | **64.8 ns** |
+| `VarHandle.CAS int` (control, unbound) | 233.8 ns | 239.5 ns |
+| `VarHandle.get` natives (control) | 500 000 | 500 000 |
+| `compareAndSet` natives (control) | 1 396 000 | 1 396 000 |
+
+The controls are what make it a bind and not a coincidence: every unbound
+operation is unchanged, and the probe's self-check values are identical in both
+arms. 2097 jit tests, 2610 vm tests and 71/71 regression vectors pass.
+
+### The census is what caught the first version being inert
+
+Bound in the single-pass ladder ALONE, the numbers were: 698 000 native
+dispatches with the bind on, 698 000 with it off. Identical. The site counter
+said "bound"; the census said "moved nothing". The probe's stores are in a
+`main` loop, and **a loop body is an OSR compilation** — which the read bind's
+own comment says in as many words about its OSR twin. A timing A/B alone would
+have read as noise and been believed.
+
+(A second mistake the same day, for the same file: the OSR block first spliced
+INSIDE the read bind's `if let`, immediately after its `continue;` —
+unreachable, and it compiled cleanly because the two closing braces landed on
+the far side of it. `cargo check` passing proved nothing; reading the nesting
+did.)
+
+### What step 1 does NOT buy
+
+`HibfixComposeProbe2` moved **2.5%** (139.8 s -> 136.4 s), and that is the
+honest headline for the downstream workload. `tryPushStack` is `NEXT.set(c, h)`
+**and** `STACK.compareAndSet(this, h, c)`; only the first is bound, and the CAS
+is the more expensive half (489 ns against 303 ns), with more CAS behind it in
+`UniCompose.tryFire` and `completeRelay`. Composition is CAS-dominated, so it
+stays slow until step 2.
+
+The remaining 64.8 ns is also still 65x HotSpot's 1.0 ns. Two costs are left in
+the helper itself, and the second is the bigger prize:
+
+## Steps 2 and 3, in priority order
+
+2. **Bind `compareAndSet`.** This is where the downstream win is. The helper is
+   `(vm_ptr, vh, receiver, expected, new)` — five words against Windows' four
+   `ARG_REGS`, so unlike `set` it needs the stack-argument setup
+   (`emit_stack_arg_setup`, which the direct-call path already has). The store
+   half can reuse `vm_exec::compare_and_swap_field`'s logic, which already does
+   the hardware CAS with the SATB pre-barrier on `expected` and the post
+   `write_barrier` on success.
+3. **Stop taking a global mutex per operation.**
+   `varhandle_instance_field_plan` locks `vh_meta_table` on EVERY call, on the
+   read path as well as this one, and at 24 threads that is a contention point
+   before it is a cost. A per-handle memo keyed the way the site key already is
+   would take the remaining ~65 ns down and speed the existing read bind up for
+   free.
 
 ## Repro
 

@@ -1297,6 +1297,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_UNREG_MEMO_HIWATER` | JIT | `CRATONVM_JIT=unreg-memo-hiwater` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_UNROLL` | JIT | `CRATONVM_JIT=unroll` | both | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` | JIT | `CRATONVM_JIT=varhandle-read-direct-helpers` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS` | JIT | `CRATONVM_JIT=varhandle-write-direct-helpers` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_VECTORIZE` | JIT | `CRATONVM_JIT=vectorize` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_VERIFY_ARENA_ORDER` | JIT | `CRATONVM_JIT=verify-arena-order` | opt-in | off | behaviour | snapshot | jit, types |
 | `CRATONVM_JIT_VERIFY_FRAME_STATES` | JIT | `CRATONVM_JIT=verify-frame-states` | opt-in | off | behaviour | snapshot | jit, types |
