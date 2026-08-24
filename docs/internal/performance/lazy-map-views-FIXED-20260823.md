@@ -108,6 +108,12 @@ wall-clock figure quoted without them cannot say whether the fast path ran:
 | `hoisted` — `keySet()` once, iterate inside the loop | 2939.5 | **1152.0** | 2.6x | `resync_skipped=2000` |
 | `mapSize` — `map.size()`, the control | 2.5 | 2.5 | — | — |
 
+**Re-verified on the merged tree (2026-08-24)**, after another session's
+follow-up added `values()` and `LinkedHashMap.entrySet()` caching on top:
+`viewOnly` 1809.0 -> **3.0**, `sizeOnly` 3166.0 -> **5.5**, `perCall`
+4535.5 -> **1473.0**, `hoisted` 3005.0 -> **1442.0** µs/call. Regression suite
+**71 passed, 0 failed** on that binary.
+
 `sizeOnly` is the Spring shape and it is the one that collapses.
 `hoisted`'s residual 1152 µs is the ITERATION cost of 1000 elements
 (~1.15 µs/element) and is not this fix's to remove — see "What is left" below.

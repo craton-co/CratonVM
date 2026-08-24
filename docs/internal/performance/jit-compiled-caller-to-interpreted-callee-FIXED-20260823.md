@@ -36,6 +36,19 @@ neither. What is invariant across every session run: **ON is below the
 `--nojit` control in all three kinds**, which is the property that matters —
 the JIT was actively losing to the interpreter it replaced.
 
+**Re-verified on the merged tree (2026-08-24), quiet host, two interleaved
+rounds** — after another session's follow-up landed `Function.apply` through
+the same memo:
+
+| arm | ON | OFF | ratio |
+|---|---:|---:|---:|
+| `invokevirtual` | 334.3 / 342.5 | 1875.5 / 1846.1 | 5.5x |
+| `invokeinterface` | 345.2 / 345.8 | 1884.6 / 1855.0 | 5.4x |
+| `invokespecial` | 430.9 / 432.9 | 1974.3 / 1957.1 | 4.6x |
+
+`sink` bit-identical in all twelve runs. The ON arm is tight to within 3% while
+the OFF arm still spreads — the same asymmetry the note above describes.
+
 The `--nojit` row is the control that makes the point. Before the fix,
 compiling the caller and not the callee was 6.9x (virtual), 7.5x (interface)
 and 3.2x (special) slower than compiling *neither*.
