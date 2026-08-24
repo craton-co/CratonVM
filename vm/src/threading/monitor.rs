@@ -1338,9 +1338,43 @@ impl Monitor {
             }
         }
 
-        // Re-acquire: wait until monitor is unowned or owned by us
+        // Re-acquire: wait until monitor is unowned or owned by us.
+        //
+        // POLLED, and reported. This used to be a bare
+        // `entry_condvar.wait(&mut state)` — untimed, with no poll and no
+        // diagnostic — which made it the one place in this function a thread
+        // could be stuck WITHOUT the watchdog being able to say so. The
+        // `[WAIT-OBJECT]` dump lives in the `wait_condvar` loop above, so a
+        // thread that was notified, broke out, and then blocked HERE produced
+        // exactly the signature the netty page could not explain: a delivered
+        // `notifyAll()` (`notifies_since_wait=1`) and a thread still parked.
+        //
+        // The poll is not only an instrument. `Monitor::exit` releases with
+        // `entry_condvar.notify_one()`, so a release wakes exactly one of the
+        // threads queued here and in `enter_labeled`; any path that releases
+        // this monitor WITHOUT going through `Monitor::exit` — a deflation back
+        // to a thin lock, a `force_release_if_owned_by` race — leaves a waiter
+        // here with nothing left to wake it. Re-testing the condition on a
+        // timer is sound for a lock acquire in a way it would NOT be for
+        // `Object.wait` (which owes Java a notification), so this costs one
+        // wakeup per 5 ms per contended re-acquire and removes a whole class of
+        // permanent stall.
+        let mut reacquire_reported = false;
         while state.owner.is_some() && state.owner != Some(thread_id) {
-            self.entry_condvar.wait(&mut state);
+            let _ = self.entry_condvar.wait_for(&mut state, poll_interval);
+            if !reacquire_reported && stack_dump_wait_flag().load(Ordering::Acquire) {
+                reacquire_reported = true;
+                let (notifies_now, interrupt_now) = self.notify_totals();
+                eprintln!(
+                    "[WAIT-REACQUIRE] thread {thread_id:?} was NOTIFIED and is now stuck \
+                     RE-ACQUIRING the monitor, not waiting on it — owner={:?} entry_count={} \
+                     saved_count={saved_count} notifies_since_wait={} interrupt_wakes_since_wait={}",
+                    state.owner,
+                    state.entry_count,
+                    notifies_now.wrapping_sub(notifies_at_entry),
+                    interrupt_now.wrapping_sub(interrupt_wakes_at_entry),
+                );
+            }
         }
         state.owner = Some(thread_id);
         state.entry_count = saved_count;
