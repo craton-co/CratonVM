@@ -2656,20 +2656,35 @@ fn moving_young_frame_coverage_complete_at(
                 } else {
                     None
                 };
-                let own_caller = own_ret
-                    .and_then(cratonvm_jit::lookup_jit_code_range)
-                    .map(|p| {
-                        // SAFETY: a resolved range is Arc-owned by the JIT cache
-                        // for as long as any of its frames is live.
-                        let c: &cratonvm_jit::CompiledMethod =
-                            unsafe { &*(p as *const cratonvm_jit::CompiledMethod) };
-                        c.method_label.clone()
-                    });
+                let own_caller_cm = own_ret.and_then(cratonvm_jit::lookup_jit_code_range);
+                let own_caller = own_caller_cm.map(|p| {
+                    // SAFETY: a resolved range is Arc-owned by the JIT cache
+                    // for as long as any of its frames is live.
+                    let c: &cratonvm_jit::CompiledMethod =
+                        unsafe { &*(p as *const cratonvm_jit::CompiledMethod) };
+                    c.method_label.clone()
+                });
+                // THE DISCRIMINATOR. `innermost_frame_method` prefers the
+                // compile-id MIRROR (`published_innermost_method`), which
+                // generated code writes in its prologue and restores after a
+                // JIT->JIT call. Decoding the caller's `E8 rel32` instead
+                // answers the same question from the STACK, which cannot go
+                // stale. If the two disagree, the mirror is naming a frame that
+                // has already returned; if they agree, these are real frames
+                // live at a call site that recorded no map — opposite repairs.
+                let decoded = match (own_ret, own_caller_cm) {
+                    (Some(r), Some(c)) => direct_call_callee(r, c).map(|p| {
+                        // SAFETY: as above.
+                        let m: &cratonvm_jit::CompiledMethod = unsafe { &*p };
+                        m.method_label.clone()
+                    }),
+                    _ => None,
+                };
                 eprintln!(
                     "[frame-cov] no map for stored id: sp_id={sp_id} (0x{sp_id:x}) \
                      method={} maps={} ids={:?} sp_id_slot_off={sp_id_off} rbp=0x{rbp:x} \
                      walk_ret={:?} walk_ret_ok={:?} own_ret={:?} own_ret_ok={:?} \
-                     own_caller={own_caller:?}",
+                     own_caller={own_caller:?} decoded_callee={decoded:?}",
                     cm.method_label,
                     cm.oop_maps.len(),
                     cm.oop_maps
