@@ -427,6 +427,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gocbf", on_key: Some("CRATONVM_DBG_GOCBF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-dump-ptx", on_key: Some("CRATONVM_GPU_DUMP_PTX"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-trace-bytes", on_key: Some("CRATONVM_GPU_TRACE_BYTES"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "gpu-time-dispatch", on_key: Some("CRATONVM_GPU_TIME_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gse", on_key: Some("CRATONVM_DBG_GSE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "h2parserread", on_key: Some("CRATONVM_DBG_H2PARSERREAD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "h2trace", on_key: Some("CRATONVM_DBG_H2TRACE"), off_key: None, off_word: None },
@@ -829,6 +830,7 @@ pub const INVENTORY: &[E] = &[
     // `sp-inline-*` knobs are the single-pass inline-cache bisection surface;
     // three are DEFAULT-ON and read `=0` to disable, so they carry `on_key`
     // and the "0" off-word rather than an `off_key`.
+    E { group: Group::JIT, token: "gpu-approx-math", on_key: Some("CRATONVM_GPU_APPROX_MATH"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deopt-check", on_key: Some("CRATONVM_JIT_SP_IC_DEOPT_CHECK"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-only", on_key: Some("CRATONVM_JIT_SP_IC_ONLY"), off_key: None, off_word: None },

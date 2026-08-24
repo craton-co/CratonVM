@@ -242,7 +242,7 @@ pub enum MathIntrinsic {
 fn approx_math_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CRATONVM_GPU_APPROX_MATH")
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_APPROX_MATH")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
