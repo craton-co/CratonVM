@@ -454,7 +454,7 @@ them without further work:
 One Java thread waiting on a `DefaultChannelPromise` while five event loops sit
 in `NioIoHandler.select` is a completion that never arrives, not a lock. It is
 filed as
-`known-issues/netty/parameterizedsslhandlertest-promise-never-completes-20260820.md`,
+`fixed-suite-bugs/netty/parameterizedsslhandlertest-object-wait-lost-a-delivered-notify-FIXED-20260824.md`,
 with what it would take to close it.
 
 **The second observation has since arrived, and it moved that page's
@@ -657,5 +657,5 @@ told apart from a ticket that was never issued.
 - the retired `sslcontext-natives-ignore-a-third-party-spi` write-up — closed
   in the same branch; it is the reason `gen-openssl-args.sh` grew a `--bc18`
   mode.
-- `known-issues/netty/parameterizedsslhandlertest-promise-never-completes-20260820.md`
+- `fixed-suite-bugs/netty/parameterizedsslhandlertest-object-wait-lost-a-delivered-notify-FIXED-20260824.md`
   — what is left of §D once the deadlock is gone, and a much narrower thing.

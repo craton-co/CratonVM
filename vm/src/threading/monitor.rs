@@ -724,7 +724,8 @@ pub struct Monitor {
     ///
     /// This is the counter that partitions the netty
     /// `ParameterizedSslHandlerTest` stall (see
-    /// `known-issues/netty/parameterizedsslhandlertest-promise-never-completes-*`).
+    /// the netty `ParameterizedSslHandlerTest` stall, closed 2026-08-24 by
+    /// `MonitorState::pending_notifies`).
     /// At the stall the promise is complete and the waiter is registered
     /// (`result != null`, `waiters == 1`), and the two remaining explanations
     /// need opposite fixes:

@@ -1,8 +1,14 @@
-# `ParameterizedSslHandlerTest` — a completed promise whose waiter is never woken
+# `Object.wait()` lost a DELIVERED `notifyAll()` — the `ParameterizedSslHandlerTest` stall
 
-**Status: ROOT CAUSE FOUND AND FIXED 2026-08-23, rate re-measured — 0 stalls
-in 25 against 5 in 25 for the same binary with the fix switched off. TWO OTHER
-STALLS remain under this title and this page stays OPEN for them.** `Object.wait()` depended on the CONDVAR ALONE — it parked on
+**Status: FIXED 2026-08-24.** Rate re-measured: **0 stalls in 25 against 5 in
+25** for the same binary with the fix switched off, interleaved run-by-run.
+
+Two OTHER stalls surfaced in the same test class on the way here and are NOT
+this defect; they moved to their own page,
+`known-issues/netty/parameterizedsslhandlertest-residual-stalls-20260824.md`.
+This page is the record of the one that is closed.
+
+`Object.wait()` depended on the CONDVAR ALONE — it parked on
 `wait_condvar` and treated a signalled return as the notification, with no
 condition under the mutex to re-check. A `notifyAll()` that is delivered while
 the waiter sits between a `wait_for` timeout and its next park, or that is
@@ -64,11 +70,13 @@ thousands of healthy 5 ms polls, not one signalled return. `consumed=0` is what
 the OFF arm must read, so the switch really was off and the arms differ in the
 one thing they are supposed to.
 
-**The fifth is not, and it is left open.** `result_is=null(PENDING)` with
-`notifies_since_wait=0` is a promise that was never completed and never had a
-notification due — nothing was lost, so nothing here can fix it. With run 8's
-`Int(0)` in a `private volatile Object` slot, that is **two** further stalls
-under this page's title that the monitor fix does not touch.
+**The fifth is not, and it moved to its own page.** `result_is=null(PENDING)`
+with `notifies_since_wait=0` is a promise that was never completed and never
+had a notification due — nothing was lost, so nothing here can fix it. With
+run 8's `Int(0)` in a `private volatile Object` slot, that is two further
+stalls in this test class that the monitor fix does not touch; both are
+recorded in
+`known-issues/netty/parameterizedsslhandlertest-residual-stalls-20260824.md`.
 
 ### Engagement: the credit path RUNS, and the rescue is rare
 
