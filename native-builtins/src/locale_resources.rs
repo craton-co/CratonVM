@@ -99,7 +99,22 @@ fn put_str(ctx: &mut dyn NativeContext, map_pin: usize, map: ObjectRef, key: &st
     ctx.unpin_native_roots(k_pin);
 }
 
-fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
+/// Pins `map` across [`populate_format_data_en_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `map` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn populate_format_data_en(ctx: &mut dyn NativeContext, map: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*map);
+    let w5_out = populate_format_data_en_body(ctx, *map);
+    *map = ctx.read_native_pin(w5_pin, *map);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
+fn populate_format_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // cceres5: every put below allocates; one entry pin, read per call.
     let map_pin = ctx.pin_native_root(map);
     // 13-slot month arrays (12 months + empty trailing slot for lunar
@@ -333,7 +348,22 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     ctx.unpin_native_roots(map_pin);
 }
 
-fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
+/// Pins `map` across [`populate_locale_names_en_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `map` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*map);
+    let w5_out = populate_locale_names_en_body(ctx, *map);
+    *map = ctx.read_native_pin(w5_pin, *map);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
+fn populate_locale_names_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // cceres5: every put below allocates; one entry pin, read per call.
     let map_pin = ctx.pin_native_root(map);
     let langs: &[(&str, &str)] = &[
@@ -382,7 +412,22 @@ fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     ctx.unpin_native_roots(map_pin);
 }
 
-fn populate_calendar_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
+/// Pins `map` across [`populate_calendar_data_en_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `map` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn populate_calendar_data_en(ctx: &mut dyn NativeContext, map: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*map);
+    let w5_out = populate_calendar_data_en_body(ctx, *map);
+    *map = ctx.read_native_pin(w5_pin, *map);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
+fn populate_calendar_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // cceres5: every put below allocates; one entry pin, read per call.
     let map_pin = ctx.pin_native_root(map);
     put_str(ctx, map_pin, map, "firstDayOfWeek", "1"); // Sunday
@@ -1108,19 +1153,19 @@ fn build_bundle(
             || bundle_name.starts_with("sun.text.resources.cldr.FormatData")
             || bundle_name.starts_with("sun.text.resources.ext.FormatData")
         {
-            let map_now = ctx.read_native_pin(map_pin, map);
-            populate_format_data_en(ctx, map_now);
+            let mut map_now = ctx.read_native_pin(map_pin, map);
+            populate_format_data_en(ctx, &mut map_now);
         } else if bundle_name.starts_with("sun.util.resources.LocaleNames")
             || bundle_name.starts_with("sun.util.resources.cldr.LocaleNames")
             || bundle_name.starts_with("sun.util.resources.ext.LocaleNames")
         {
-            let map_now = ctx.read_native_pin(map_pin, map);
-            populate_locale_names_en(ctx, map_now);
+            let mut map_now = ctx.read_native_pin(map_pin, map);
+            populate_locale_names_en(ctx, &mut map_now);
         } else if bundle_name.starts_with("sun.util.resources.CalendarData")
             || bundle_name.starts_with("sun.util.resources.cldr.CalendarData")
         {
-            let map_now = ctx.read_native_pin(map_pin, map);
-            populate_calendar_data_en(ctx, map_now);
+            let mut map_now = ctx.read_native_pin(map_pin, map);
+            populate_calendar_data_en(ctx, &mut map_now);
         } else if bundle_name.starts_with("sun.util.resources.CurrencyNames")
             || bundle_name.starts_with("sun.util.resources.cldr.CurrencyNames")
         {

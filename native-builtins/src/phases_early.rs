@@ -22086,9 +22086,9 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(huc, "connect", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 {
-            p54_huc_do_request(ctx, this)?;
+            p54_huc_do_request(ctx, &mut this)?;
         }
         Ok(None)
     });
@@ -22097,10 +22097,10 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         "getInputStream",
         "()Ljava/io/InputStream;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             // Auto-connect
             if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 {
-                p54_huc_do_request(ctx, this)?;
+                p54_huc_do_request(ctx, &mut this)?;
             }
             // Return ByteArrayInputStream wrapping response body
             let body_arr = match ctx.get_field(this, 6) {
@@ -22135,9 +22135,9 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         "getHeaderField",
         "(Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 {
-                p54_huc_do_request(ctx, this)?;
+                p54_huc_do_request(ctx, &mut this)?;
             }
             let key_ref = obj_arg(args, 1)?;
             let key = ctx.read_string(key_ref).unwrap_or_default().to_lowercase();
@@ -22160,9 +22160,9 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(huc, "getContentLength", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 {
-            p54_huc_do_request(ctx, this)?;
+            p54_huc_do_request(ctx, &mut this)?;
         }
         match ctx.get_field(this, 6) {
             Value::Object(Some(a)) => Ok(Some(Value::Int(ctx.array_length(a) as i32))),
@@ -22170,9 +22170,9 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         }
     });
     r.register(huc, "getContentLengthLong", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 {
-            p54_huc_do_request(ctx, this)?;
+            p54_huc_do_request(ctx, &mut this)?;
         }
         match ctx.get_field(this, 6) {
             Value::Object(Some(a)) => Ok(Some(Value::Long(ctx.array_length(a) as i64))),
@@ -22184,9 +22184,9 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         "getContentType",
         "()Ljava/lang/String;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 {
-                p54_huc_do_request(ctx, this)?;
+                p54_huc_do_request(ctx, &mut this)?;
             }
             // Search response headers for Content-Type
             if let Value::Object(Some(hdr_arr)) = ctx.get_field(this, 5) {
@@ -22274,9 +22274,9 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         "getResponseMessage",
         "()Ljava/lang/String;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 {
-                p54_huc_do_request(ctx, this)?;
+                p54_huc_do_request(ctx, &mut this)?;
             }
             let code = ctx.get_field(this, 2).as_int().unwrap_or(0);
             let msg = match code {
@@ -22629,9 +22629,24 @@ fn p54_huc_set_chunked_streaming_mode(
     Ok(None)
 }
 
+/// Pins `this` across [`p54_huc_do_request_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `this` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn p54_huc_do_request(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+    let w5_pin = ctx.pin_native_root(*this);
+    let w5_out = p54_huc_do_request_body(ctx, *this);
+    *this = ctx.read_native_pin(w5_pin, *this);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Perform a real HTTP/1.1 request for HttpURLConnection.
 /// Connects via fd_table TCP, sends request, reads and parses the full response.
-fn p54_huc_do_request(
+fn p54_huc_do_request_body(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<(), MethodCallFailed> {

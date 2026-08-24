@@ -1285,6 +1285,104 @@ fn synthetic_by_file() -> Vec<(String, usize)> {
 /// ratchet asks that. It does not say anybody adjudicated a row; `kind_stated`
 /// and `scripts/jdk-only-kind-map.py` ask that. It says only that the *default*
 /// decides nothing any more, which is the specific property step 3 names.
+/// INTRINSIC RATCHET — the census cannot see this population, so a gate must.
+///
+/// `WORKER-3-NOTE-5` (2026-08-22) measured what the `Intrinsic` tag costs the
+/// contract. `vm/src/vm/vm_exec.rs` skips it at **all three** sites that can
+/// record a `native-shadows-bytecode` row:
+///
+/// ```text
+/// if policy.is_jdk_only() && bytecode_available && kind != NativeKind::Intrinsic {
+///     record_native_shadows_bytecode(class_name, method_name, descriptor, kind);
+/// }
+/// ```
+///
+/// and `resolve_step1_native` returns `DispatchDecision::Intrinsic` at step 2,
+/// before the step-3 arm that records. So the census population is `Bridge` +
+/// `SyntheticStub` only, by construction.
+///
+/// MEASURED on one `--jdk-only --dump-native-registry` run: **629** intrinsic
+/// registrations, **595** owning their slot, and **398** of those standing where
+/// the real JDK 25 class declares the method WITH CODE — shadows by §1.4's own
+/// definition, uncountable. That is +29% on the published 1387, and 305 of the
+/// 398 are `java/lang`.
+///
+/// **This is why the tag needs a ratchet and the header's "kept forever" needs
+/// reading twice.** Re-tagging a row `Intrinsic` removes it from the census
+/// *without changing behaviour*, and it would score as progress. The exemption
+/// is also not uniformly benign: `String.<init>(AbstractStringBuilder,Void)V` is
+/// `kind=intrinsic`, `owns_slot: true`, over real bytecode, and returned an
+/// empty String for any builder on the real `byte[]` layout until
+/// `WORKER-3-NOTE-6` fixed the body it reaches.
+///
+/// `Math`/`StrictMath` are 138 of the 398 and are what an intrinsic exemption is
+/// for. The other 260 have no cited review, which is the work this gate holds
+/// still while somebody does it.
+///
+/// Like the stub ratchet: a change that ADDS an intrinsic fails; REMOVING one is
+/// welcome and only needs the baseline lowered. Raising it is allowed too — but
+/// deliberately, in a commit that says which row and why, which is the whole
+/// point.
+#[test]
+fn intrinsic_count_does_not_regress() {
+    let rows = census_rows();
+    let intrinsic = rows
+        .iter()
+        .filter(|(_, _, _, kind)| *kind == NativeKind::Intrinsic)
+        .count();
+
+    println!(
+        "intrinsic-ratchet [{MEASURED_CONFIG}]: {intrinsic} Intrinsic registrations \
+         out of {} total (baseline {BASELINE_INTRINSICS})",
+        rows.len()
+    );
+    println!("intrinsic-ratchet: const BASELINE_INTRINSICS: usize = {intrinsic};");
+
+    // WHERE it lives, on every run — a flat count says the population moved and
+    // never which subsystem moved it, which is the whole cost of acting on a red
+    // ratchet (the lesson `synthetic_by_file` was added for).
+    for (file, n) in intrinsic_by_file() {
+        println!("  intrinsic-ratchet: {n:>4}  {file}");
+    }
+
+    assert!(
+        intrinsic <= BASELINE_INTRINSICS,
+        "INTRINSIC RATCHET: {intrinsic} `Intrinsic` registrations, above the \
+         baseline of {BASELINE_INTRINSICS}.\n\
+         \n\
+         `Intrinsic` is EXEMPT from the jdk-only `native-shadows-bytecode` \
+         census (`vm_exec.rs`, all three recorder sites), so a row that gains \
+         this tag leaves the defect population without its behaviour \
+         changing. If the new rows are genuine hot-path intrinsics, raise the \
+         baseline in a commit that names them and says why. If they were \
+         re-tagged to quiet a census, that is the thing this gate exists to \
+         stop. See `WORKER-3-NOTE-5`."
+    );
+}
+
+/// The intrinsic census grouped by the SOURCE FILE that registered each row —
+/// the `synthetic_by_file` shape, for the reason given there.
+fn intrinsic_by_file() -> Vec<(String, usize)> {
+    let mut registry = NativeMethodRegistry::new();
+    register_boot_path(&mut registry);
+    let mut per_file: std::collections::BTreeMap<String, usize> = Default::default();
+    for r in registry.census() {
+        if r.kind != NativeKind::Intrinsic {
+            continue;
+        }
+        let at = r.registered_by.as_deref().unwrap_or("<unknown>");
+        let file = at.replace('\\', "/");
+        let file = file.rsplit_once(':').map_or(file.as_str(), |(f, _)| f).to_string();
+        *per_file.entry(file).or_default() += 1;
+    }
+    let mut out: Vec<_> = per_file.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// Frozen by the run that added the gate; see `intrinsic_count_does_not_regress`.
+const BASELINE_INTRINSICS: usize = 1365;
+
 #[test]
 fn no_registration_runs_on_the_ambient_default() {
     let mut registry = NativeMethodRegistry::new();
