@@ -194,6 +194,30 @@ pub fn signal_stack_dump_to_waiters() {
 /// Read once and cached so the per-enter check is a single relaxed load.
 /// `CRATONVM_WAIT_SPURIOUS_MS=<n>` — see the call site in `Monitor::wait`.
 /// Diagnostic only; `None` (unset) leaves the wait loop unchanged.
+/// `CRATONVM_MONITOR_PENDING_NOTIFY=0` — restore the condvar-only
+/// `Object.wait()`, i.e. the behaviour that lost a delivered `notifyAll()`.
+///
+/// Default ON. It exists so the fix can be A/B'd INSIDE ONE BINARY: this
+/// stall's rate is load-sensitive (4/20 at load 12-84, 1/23 at load 6-10), so
+/// a before-binary/after-binary comparison across two sessions measures the
+/// host, not the change. With this switch the two arms can be interleaved
+/// run-by-run and see the same load distribution.
+///
+/// OFF does NOT stop `parked_waiters` being maintained — that costs two
+/// saturating adds under a lock already held and keeps the two arms differing
+/// in exactly one thing: whether the condition is consulted.
+fn monitor_pending_notify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_MONITOR_PENDING_NOTIFY")
+                .ok()
+                .as_deref(),
+            Some("0")
+        )
+    })
+}
+
 fn wait_spurious_ms() -> Option<u64> {
     static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1519,7 +1543,7 @@ impl Monitor {
         // permits but which would also mask a real lost wakeup from this
         // counter. See `MonitorState::pending_notifies`.
         let mut state = state;
-        if state.pending_notifies < state.parked_waiters {
+        if monitor_pending_notify() && state.pending_notifies < state.parked_waiters {
             state.pending_notifies += 1;
         }
         self.wait_condvar.notify_one();
@@ -1541,7 +1565,9 @@ impl Monitor {
         // this point is not one of them and must not consume a notification
         // meant for the current set.
         let mut state = state;
-        state.pending_notifies = state.parked_waiters;
+        if monitor_pending_notify() {
+            state.pending_notifies = state.parked_waiters;
+        }
         self.wait_condvar.notify_all();
         Ok(())
     }
