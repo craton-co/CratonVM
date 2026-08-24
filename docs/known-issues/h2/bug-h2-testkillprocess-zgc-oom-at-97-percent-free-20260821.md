@@ -69,7 +69,17 @@ frame cannot be *located*, not disbelieved. See §"Still open".
 > gap` says its author was already looking at that gap. Not patched here: it is
 > another session's live feature, and the fix belongs with it.
 >
-> **A second, smaller contributor is unaccounted for.** With the indy bridge
+> **Later that day, one more real defect on this path, which changed nothing
+> here.** The optimizing tier's inline caches never restored the innermost-frame
+> mirror — a genuine gap every sibling path closes, now fixed and pinned by a
+> discriminating test — and on this class it moves the `no_map` rate not at all
+> (5.06/5.33/5.09 % on against 5.57/5.18 % off, engagement counter 3 695–3 730
+> against 0). See §"Follow-up 2026-08-24 (second)". The same section records
+> that this class has become FLAKY on `dev` — `rc=0` once and `rc=1` five times
+> from one binary on one config — which is the first thing any future arm here
+> has to be scored against.
+>
+> > **A second, smaller contributor is unaccounted for.** With the indy bridge
 > off, `active-safepoint-map-incomplete` is still 56 per 76 cycles against 46
 > before the merge, and proven cycles are 13 against 24 — so the class still
 > fails. None of the five switches covers it. That is the same
@@ -767,6 +777,115 @@ Two hypotheses were tested and **both failed**, which is the useful part:
   the negative result is recorded here so the next attempt starts after it
   rather than before it.
 
+
+## Follow-up 2026-08-24 (second): a real frame-record gap, and what it did NOT fix
+
+Taking on §7's residual — `ACTIVE_FRAME_MAP` / `frame_cov=(… no_map=N …)`, the
+innermost compiled frame that cannot be LOCATED.
+
+### The defect, found by reading and pinned by a test
+
+The optimizing tier reaches a compiled Java callee from an inline cache through
+one helper, `ir_lower::emit_call_cached_entry` (`MOV R11,[R10+d] ; CALL R11`),
+used by the monomorphic MIC arm and by every rung of the polymorphic PIC
+cascade. **Neither restored the innermost-frame mirror afterwards.** Every
+sibling path does: the single-pass backend republishes at both of its
+equivalent arms, the shared hashed/vtable stub is handed `frame_record` for
+exactly this, the Rust dispatch path brackets it in `try_call_compiled_entry`,
+and `ir_lower`'s other three call sites call `emit_post_call_frame_record` —
+a function this tier already had, already RAX-safe, simply never called here.
+
+So after any inline-cache hit in that tier the mirror named the callee's frame,
+which had already returned.
+
+Fixed by folding the republish INTO `emit_call_cached_entry`, so a third arm
+cannot be added without it. `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH=1` is the
+same-binary A/B.
+
+`every_inline_cache_hit_restores_the_frame_record_before_anything_else` asserts
+the byte immediately after each cached-entry `CALL R11`, because the PLACEMENT
+is the property — anything emitted between the return and the republish runs
+under a mirror naming a dead frame. **It discriminates**: with the kill switch
+set it fails with `cached-entry CALL at 197 is followed by 0xe9`, `0xE9` being
+the `JMP rel32` to `.done` that used to follow the call directly. A second
+control (`frame_record = 0`, which switches the whole record off) asserts that
+NO site carries the republish, so the test cannot pass vacuously.
+
+### It is heavily engaged — and it changes nothing here
+
+`ic_fr_sites` on the `[jitroots]` line is the compile-time count of
+optimizing-tier inline-cache sites that received the republish. It is **3 585 –
+7 700 per run** on these H2 classes, and **0** with the kill switch set, so this
+is a working engagement control rather than an inert probe.
+
+`TestKillProcessWhileWriting`, current `dev` + this fix, one binary, arms
+interleaved, `--Xmx 1g`:
+
+| arm | `ic_fr_sites` | `no_map` / (`no_map` + `ok`) | compactions | cycles | rc |
+|---|---:|---:|---:|---:|---|
+| on | 3 725 | 137 / 2 708 = **5.06 %** | 12 | 216 | 1 |
+| off | 0 | 175 / 3 144 = **5.57 %** | 10 | 268 | 1 |
+| on | 3 730 | 402 / 7 539 = **5.33 %** | 11 | 582 | 1 |
+| off | 0 | 427 / 8 248 = **5.18 %** | 8 | 636 | 1 |
+| on | 3 695 | 174 / 3 419 = **5.09 %** | 9 | 270 | 1 |
+
+The rates are indistinguishable, and every arm fails with the same 4
+`OutOfMemoryError`. **The optimizing tier's inline caches are not what produces
+`no_map` on these classes.** The fix is kept on its own correctness merits —
+the gap is real, every sibling path closes it, and the test proves the
+placement — but it is not this page's repair, and nobody should read it as one.
+
+Two calibrations that come with that table, both of which say a workload verdict
+is not available on this host today:
+
+* **The class is flaky on current `dev`.** The same binary and the same flags
+  produced `rc=0 oom=0` (11 compactions, 67 cycles) in one run and `rc=1 oom=4`
+  in the five above. Score any future arm against that, not against a
+  remembered deterministic failure.
+* **Wall clock swings 5×.** `TestMVStoreTool` ranges 89 s – 1 500 s at host load
+  45 – 65, and its `no_map` share has fallen from 16 % (9 of 57) on the
+  2026-08-23 tree to ~1 %. An arm taken here cannot separate a repair from the
+  host.
+
+### The census, re-taken, and what is now ruled out
+
+The signature §7 describes still holds on current `dev` — several unrelated
+methods claiming ONE rbp with one saved return address, all
+`decoded_callee=None` because the calls are indirect:
+
+```
+MVMap.put            maps=6 sp_id_slot_off=40 rbp=0x…3a00 own_ret=0x…2bfb
+MVStore.openMap      maps=3 sp_id_slot_off=32 rbp=0x…3a00 own_ret=0x…2bfb
+MVStore$Builder.autoCommitDisabled maps=3 sp_id_slot_off=24 rbp=0x…3a00 own_ret=0x…2bfb
+DataUtils.getPageMaxLength maps=1 sp_id_slot_off=40 rbp=0x…2bf0
+```
+
+At most one of the three at `0x…3a00` can be right, so the mirror IS naming a
+frame that has returned. What no longer explains it:
+
+1. **Not the spliced-call path** — identical shape with
+   `CRATONVM_JIT_INLINE_CALLS` / `_NEST` / `_SPLICE_DEVIRT` all `0`.
+2. **Not a missing publish at the safepoint** — publishing the mirror at every
+   GC-capable safepoint was implemented, confirmed engaged, moved nothing, and
+   was reverted (§7).
+3. **Not the optimizing tier's inline caches** — the table above.
+
+Every JIT→JIT return path now republishes, and the Rust dispatch bracket covers
+both directions, so the next candidate is a path that returns WITHOUT running
+any of them. Worth checking in this order: the OSR trampoline's exit, the deopt
+/ callee-deopt service bail, and any exception unwind that leaves a compiled
+frame without passing its call site's republish.
+
+### Also measured
+
+* `TestCachedQueryResults` shows `incomplete=5` — the FIRST occurrence anywhere
+  of a map refusing on its own claim, alongside `no_map=2477 ok=35503` over
+  4 991 collections and 9 962 `OutOfMemoryError`. That is a different obligation
+  from `no_map` and has never been looked at.
+* `UNPUBLISHED_FRAME_OOP` (the `CRATONVM_JIT_INDY_BRIDGE` blocker bisected in
+  §Status) is present in every arm above — 67, 81, 166, 195, 85 refusals — so it
+  remains a second, independent reason these collections decline.
+* 2 096 jit + 581 types + 1 687 gc + 2 610 vm unit tests pass with the fix.
 ## Still open
 
 Ordered by what a next session should pick up first.
@@ -785,13 +904,21 @@ Ordered by what a next session should pick up first.
   proven cycles 13 against 24. None of the five switches covers it. Almost
   certainly the same question as the `no_map` residual below.
 * **`TestMVStoreTool` and `TestCachedQueryResults` — the innermost frame cannot
-  be LOCATED.** Fully characterised in §"Follow-up 2026-08-24" §7, with two
-  hypotheses already ruled out by measurement. The lever is
-  `frame_cov=(… no_map=N …)` on the `[jitroots]` line and the `[frame-cov]`
-  lines under `CRATONVM_DBG_JIT_ROOTSCAN=1`; the question is why one `rbp` with
-  one saved return address is claimed by four different methods across
-  collections, when the calls are indirect and the stack cannot decide. This is
-  a frame-record defect, not a coverage one, and it deserves its own page.
+  be LOCATED, and THREE hypotheses are now dead.** Read §"Follow-up 2026-08-24
+  (second)" before picking this up: the spliced-call path, a missing publish at
+  the safepoint, and the optimizing tier's inline caches have each been tested
+  and each changed nothing, the last of them against a working engagement
+  counter (`ic_fr_sites` 3 695–3 730 vs 0). Every JIT->JIT return path now
+  republishes and the Rust dispatch bracket covers both directions, so what is
+  left is a path that returns WITHOUT passing any of them — the OSR trampoline's
+  exit, the deopt / callee-deopt service bail, or an exception unwind. Note also
+  that this class is now FLAKY on `dev` (`rc=0` once, `rc=1` five times, same
+  binary, same flags) and that its wall clock swings 5x at host load 45–65, so
+  the next arm needs a measured base rate before it means anything.
+* **`TestCachedQueryResults` shows `incomplete=5`** — the first time anywhere
+  that a map refuses on its OWN claim rather than being unlocatable. Different
+  obligation from `no_map`, never investigated, and it sits alongside 9 962
+  `OutOfMemoryError` over 4 991 collections.
 * **`TestOpenClose`: `Exception in thread "main" java/lang/Object`, no captured
   frames.** Now the ONLY thing failing this class — the fragmentation OOM is
   gone. Already confirmed pre-existing and unrelated by the kill-switch
