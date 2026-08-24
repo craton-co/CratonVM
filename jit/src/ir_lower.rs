@@ -3532,6 +3532,34 @@ fn reloc_emit_enabled() -> bool {
             self.buf.emit(&[0x4D, 0x8B, 0x5A, disp]); // MOV R11, [R10+disp8]
         }
         self.buf.emit(&[0x41, 0xFF, 0xD3]); // CALL R11
+        // The callee is COMPILED JAVA, so its prologue published ITS (rbp,
+        // compile id) into the innermost-frame mirror and nothing on the return
+        // path of a raw JIT->JIT call restores this frame's. Both inline-cache
+        // arms in this tier went without it until 2026-08-24, so after any
+        // monomorphic or polymorphic hit the mirror named a frame that had
+        // already returned -- measured on H2 `TestMVStoreTool`, where ONE rbp
+        // with ONE saved return address inside `TestMVStoreTool.testCompact`
+        // was claimed across collections by four different methods, one of them
+        // `RootReference.isLocked` with `maps=0`, which emits no safepoint and
+        // therefore cannot be the frame at a collection at all.
+        //
+        // `moving_young_frame_coverage_complete` then reads
+        // `[stale_rbp - stale_method.sp_id_slot_off]`, finds a word matching no
+        // map, and refuses the whole cycle (`ACTIVE_FRAME_MAP`,
+        // `frame_cov=(no_map=N incomplete=0)`), which is what kept ZGC from
+        // compacting on `bug-h2-testkillprocess-zgc-oom-at-97-percent-free`.
+        // The single-pass backend republishes at both of its equivalent arms,
+        // and the shared hashed/vtable stub below is handed `self.frame_record`
+        // for exactly this -- these two arms were the gap.
+        //
+        // It lives INSIDE this helper rather than at the two call sites so a
+        // third arm cannot be added without it. RAX (the callee's Java return
+        // value) is preserved by both forms of the republish, and the security
+        // invariant above is about the MOV/CALL pair, which nothing here comes
+        // between.
+        if !ic_frame_republish_disabled() {
+            self.emit_post_call_frame_record();
+        }
     }
 
     /// IR inline-cache lowering — serve a virtual / interface `Op::Call` from a
@@ -16288,4 +16316,18 @@ mod tests {
             "…but it must still cover the largest call-free compile measured"
         );
     }
+}
+
+/// `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH=1` — stop republishing the
+/// innermost-frame mirror after an optimizing-tier inline-cache hit.
+///
+/// The bisect lever for the republish folded into `emit_call_cached_entry`,
+/// which is default-ON. Latched: read once, because a codegen decision must not
+/// change under a running process. With it set, one binary reproduces the
+/// stale-mirror `ACTIVE_FRAME_MAP` refusals this fixed.
+fn ic_frame_republish_disabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH").is_some()
+    })
 }
