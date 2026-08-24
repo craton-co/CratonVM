@@ -186,6 +186,144 @@ fn is_class_mirror(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) 
         .is_some_and(|n| n == "java/lang/Class")
 }
 
+// PERF (2026-08-24, `quartz-stackwalker-walk-is-38x-hotspot`): `populate_sfi`
+// resolved FIVE field names on `java/lang/StackFrameInfo` for every frame it
+// materialised, and every `resolve_field_index` takes the class-manager
+// `RwLock`, hashes the class name, `memcmp`s it against the loaded-class table
+// and then walks the field list comparing names. At the Quartz stack depth
+// (~53) that is ~265 name resolutions per `StackWalker.walk`, and Mockito runs
+// one walk per mock invocation.
+//
+// The layout of `java.lang.StackFrameInfo` is fixed for the life of a VM once
+// the class is loaded, so it is resolved once and read from a thread-local
+// afterwards. The two rules the sibling bignum layout memo states keep this
+// honest, and are repeated here because they are the whole correctness
+// argument:
+//
+//   * scoped by `vm_identity()` -- Rust tests build several independent `Vm`s in
+//     one process and a synthetic-JDK VM has no such layout at all, so an entry
+//     from another VM is never returned;
+//   * only a COMPLETE, successful resolve is stored. Before the class is loaded
+//     the resolve legitimately answers `None`, and caching that would pin every
+//     later call to the by-name fallback for the life of the process.
+//
+// `classOrMemberName` and `flags` are declared on the SUPERCLASS
+// (`ClassFrameInfo`), so each name is looked up on the subclass first and on
+// the superclass second -- the same two-step `getDeclaringClass` already
+// performs.
+#[derive(Clone, Copy)]
+struct SfiLayout {
+    class_or_member_name: usize,
+    flags: usize,
+    name: usize,
+    bci: usize,
+    ste: usize,
+}
+
+thread_local! {
+    static SFI_LAYOUT_TLS: std::cell::Cell<Option<(usize, SfiLayout)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn sfi_field_index(ctx: &dyn NativeContext, field: &str) -> Option<usize> {
+    ctx.resolve_field_index("java/lang/StackFrameInfo", field)
+        .or_else(|| ctx.resolve_field_index("java/lang/ClassFrameInfo", field))
+}
+
+/// The memoized `StackFrameInfo` field layout, or `None` when the real class is
+/// not loaded (synthetic-JDK mode, or before first load) -- callers then fall
+/// back to `set_field_by_name`, which is exactly what they did before this memo.
+fn sfi_layout(ctx: &dyn NativeContext) -> Option<SfiLayout> {
+    let vm = ctx.vm_identity();
+    if let Some((cached_vm, layout)) = SFI_LAYOUT_TLS.with(std::cell::Cell::get) {
+        if cached_vm == vm {
+            return Some(layout);
+        }
+    }
+    let layout = SfiLayout {
+        class_or_member_name: sfi_field_index(ctx, "classOrMemberName")?,
+        flags: sfi_field_index(ctx, "flags")?,
+        name: sfi_field_index(ctx, "name")?,
+        bci: sfi_field_index(ctx, "bci")?,
+        ste: sfi_field_index(ctx, "ste")?,
+    };
+    SFI_LAYOUT_TLS.with(|c| c.set(Some((vm, layout))));
+    Some(layout)
+}
+
+/// Write one `StackFrameInfo` field through the memoized index when there is
+/// one, and by name when there is not.
+fn sfi_set(
+    ctx: &mut dyn NativeContext,
+    sf: cratonvm_types::ObjectRef,
+    field: &str,
+    idx: Option<usize>,
+    value: Value,
+) {
+    match idx {
+        Some(i) => ctx.set_field(sf, i, value),
+        None => ctx.set_field_by_name(sf, field, value),
+    }
+}
+
+/// The real-JDK `java.lang.StackTraceElement` field layout, memoized on the
+/// same two rules as [`sfi_layout`] (scoped by `vm_identity`, only a COMPLETE
+/// successful resolve is stored).
+///
+/// `populate_sfi` used to write this carrier by RAW SLOT `0..3`, which is the
+/// SYNTHETIC stub's layout (`[class, method, file, line]`). Real JDK 25 declares
+///
+/// ```text
+/// String classLoaderName; String moduleName; String moduleVersion;
+/// String declaringClass;  String methodName; String fileName; int lineNumber;
+/// Class<?> declaringClassObject; ...
+/// ```
+///
+/// so slot 0 is `classLoaderName` and slot 3 is `declaringClass` — every write
+/// landed one field-group early. `getClassName()` read a null loader name,
+/// `getLineNumber()` read a String slot, and `StackFrameInfo.toString()` NPE'd
+/// inside `StackTraceElement.computeFormat()` on a null `declaringClass`. It
+/// went unnoticed because `p59_sw_walk` intercepted `StackWalker.walk` before
+/// the JDK's own `callStackWalk` — the only producer of these carriers — could
+/// run.
+///
+/// `declaringClassObject` is part of the layout because `computeFormat()` calls
+/// `declaringClassObject.getClassLoader0()` with NO null guard (JDK 25), so a
+/// carrier without it turns any `toString()` into an NPE — the same trap
+/// `lang_misc::fill_stack_trace_element` documents.
+#[derive(Clone, Copy)]
+struct SteLayout {
+    declaring_class: usize,
+    method_name: usize,
+    file_name: usize,
+    line_number: usize,
+    declaring_class_object: usize,
+}
+
+thread_local! {
+    static STE_LAYOUT_TLS: std::cell::Cell<Option<(usize, SteLayout)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn ste_layout(ctx: &dyn NativeContext) -> Option<SteLayout> {
+    let vm = ctx.vm_identity();
+    if let Some((cached_vm, layout)) = STE_LAYOUT_TLS.with(std::cell::Cell::get) {
+        if cached_vm == vm {
+            return Some(layout);
+        }
+    }
+    let idx = |field: &str| ctx.resolve_field_index("java/lang/StackTraceElement", field);
+    let layout = SteLayout {
+        declaring_class: idx("declaringClass")?,
+        method_name: idx("methodName")?,
+        file_name: idx("fileName")?,
+        line_number: idx("lineNumber")?,
+        declaring_class_object: idx("declaringClassObject")?,
+    };
+    STE_LAYOUT_TLS.with(|c| c.set(Some((vm, layout))));
+    Some(layout)
+}
+
 fn populate_sfi(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
@@ -241,6 +379,23 @@ fn populate_sfi(
         }
         None => (None, None),
     };
+    // A SECOND mirror, for the `StackTraceElement`'s `declaringClassObject`
+    // only. It falls back to `java/lang/Object` when the frame's own class
+    // cannot be resolved, because `computeFormat()` dereferences this field
+    // with no null guard and one null element NPEs the whole `toString()`.
+    // `classOrMemberName` above deliberately does NOT take that fallback: a
+    // wrong declaring class is worse than a missing one.
+    let (mut ste_mirror, h_ste_mirror) = match class_mirror {
+        Some(m) => (Some(m), None),
+        None => match ctx.class_id_by_name("java/lang/Object") {
+            Some(c) => {
+                let m = ctx.get_class_mirror(c);
+                let h = ctx.pin_native_root(m);
+                (Some(m), Some(h))
+            }
+            None => (None, None),
+        },
+    };
     let mut sf =
         try_alloc_concurrent_synthetic(ctx, "java/lang/StackFrameInfo", STACK_FRAME_INFO_FIELDS)?;
     let h_sf = ctx.pin_native_root(sf);
@@ -258,6 +413,13 @@ fn populate_sfi(
     if let (Some(m), Some(h)) = (class_mirror, h_mirror) {
         class_mirror = Some(ctx.read_native_pin(h, m));
     }
+    ste_mirror = match (ste_mirror, h_ste_mirror) {
+        // Its own pin (the `class_mirror` was null and we fell back to Object).
+        (Some(m), Some(h)) => Some(ctx.read_native_pin(h, m)),
+        // Same object as `class_mirror`, already re-read through `h_mirror`.
+        (Some(_), None) => class_mirror,
+        _ => None,
+    };
     sf = ctx.read_native_pin(h_sf, sf);
     ste = ctx.read_native_pin(h_ste, ste);
 
@@ -294,35 +456,70 @@ fn populate_sfi(
         Some(m) => Value::Object(Some(m)),
         None => Value::Object(None),
     };
-    ctx.set_field_by_name(sf, "classOrMemberName", class_mirror_val);
+    // One memoized layout read instead of five name resolutions per frame; see
+    // `sfi_layout`. `None` (synthetic-JDK, or the class not yet loaded) keeps
+    // the by-name writes this replaced.
+    let layout = sfi_layout(ctx);
+    sfi_set(
+        ctx,
+        sf,
+        "classOrMemberName",
+        layout.map(|l| l.class_or_member_name),
+        class_mirror_val,
+    );
     // `flags` mirrors ClassFrameInfo's: bit 0 is RETAIN_CLASS_REF (copied from
     // the walker), the `Modifier` bits above it are read by `isNativeMethod` /
     // `getLineNumber` / `getByteCodeIndex`. We do not (yet) know a frame's
     // method modifiers here, so only the retain bit is set.
-    ctx.set_field_by_name(
+    sfi_set(
+        ctx,
         sf,
         "flags",
+        layout.map(|l| l.flags),
         Value::Int(if retain_class_ref {
             SF_FLAG_RETAIN_CLASS_REF
         } else {
             0
         }),
     );
-    ctx.set_field_by_name(sf, "name", Value::Object(Some(meth_str)));
-    ctx.set_field_by_name(sf, "bci", Value::Int(entry.byte_code_index));
+    sfi_set(
+        ctx,
+        sf,
+        "name",
+        layout.map(|l| l.name),
+        Value::Object(Some(meth_str)),
+    );
+    sfi_set(
+        ctx,
+        sf,
+        "bci",
+        layout.map(|l| l.bci),
+        Value::Int(entry.byte_code_index),
+    );
 
     // Pre-cache `ste` so real JDK `toStackTraceElement()` / `getFileName()` /
     // `getLineNumber()` paths see a populated element without running
     // `StackTraceElement.of`.
-    ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
-    ctx.set_field(ste, 1, Value::Object(Some(meth_str)));
-    ctx.set_field(
-        ste,
-        2,
-        file_str.map_or(Value::Object(None), |s| Value::Object(Some(s))),
-    );
-    ctx.set_field(ste, 3, Value::Int(entry.line_number));
-    ctx.set_field_by_name(sf, "ste", Value::Object(Some(ste)));
+    let file_val = file_str.map_or(Value::Object(None), |s| Value::Object(Some(s)));
+    match ste_layout(ctx) {
+        Some(l) => {
+            ctx.set_field(ste, l.declaring_class, Value::Object(Some(cls_str)));
+            ctx.set_field(ste, l.method_name, Value::Object(Some(meth_str)));
+            ctx.set_field(ste, l.file_name, file_val);
+            ctx.set_field(ste, l.line_number, Value::Int(entry.line_number));
+            if let Some(m) = ste_mirror {
+                ctx.set_field(ste, l.declaring_class_object, Value::Object(Some(m)));
+            }
+        }
+        // Synthetic-stub layout: `[class, method, file, line]`, no mirror slot.
+        None => {
+            ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
+            ctx.set_field(ste, 1, Value::Object(Some(meth_str)));
+            ctx.set_field(ste, 2, file_val);
+            ctx.set_field(ste, 3, Value::Int(entry.line_number));
+        }
+    }
+    sfi_set(ctx, sf, "ste", layout.map(|l| l.ste), Value::Object(Some(ste)));
 
     // `declaring_class_native` fast-path reads `SF_DECL_INTERNAL` — on the
     // real class this aliases `contScope` (slot 5); we stash the '/'-form
@@ -790,7 +987,14 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
-            return Ok(Some(ctx.get_field(ste, 0)));
+            // Layout-aware: slot 0 is `classLoaderName` on a real JDK 25
+            // `StackTraceElement`, not the class name. See `SteLayout`.
+            return Ok(Some(crate::lang_misc::ste_read_field(
+                ctx,
+                ste,
+                "declaringClass",
+                0,
+            )));
         }
         Ok(Some(ctx.get_field(this, SF_CLASSNAME)))
     });
@@ -811,7 +1015,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
-            return Ok(Some(ctx.get_field(ste, 2)));
+            return Ok(Some(crate::lang_misc::ste_read_field(ctx, ste, "fileName", 2)));
         }
         Ok(Some(ctx.get_field(this, SF_FILENAME)))
     });
@@ -828,7 +1032,12 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(-2)));
         }
         if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
-            return Ok(Some(ctx.get_field(ste, 3)));
+            return Ok(Some(crate::lang_misc::ste_read_field(
+                ctx,
+                ste,
+                "lineNumber",
+                3,
+            )));
         }
         Ok(Some(ctx.get_field(this, SF_LINENUMBER)))
     });
@@ -1110,16 +1319,32 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        // Keep the package-private bridge aligned with the public accessor:
-        // callers that arrive through ClassFrameInfo must not bypass the
-        // RETAIN_CLASS_REFERENCE contract either.
-        if matches!(class_frame_retains_class_ref(ctx, this), Some(false)) {
-            return Err(MethodCallFailed::from(
-                RuntimeError::UnsupportedOperationException {
-                    message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-                },
-            ));
-        }
+        // NO RETAIN_CLASS_REFERENCE CHECK HERE, deliberately, and it is not an
+        // oversight -- `java.lang.ClassFrameInfo` says so in a comment on the
+        // declaration itself:
+        //
+        //     // package-private called by StackStreamFactory to skip
+        //     // the capability check
+        //     Class<?> declaringClass() { return (Class<?>) classOrMemberName; }
+        //
+        // and its own `getClassName()` is `declaringClass().getName()`. The
+        // capability check belongs to the PUBLIC `getDeclaringClass()`
+        // (`ensureRetainClassRefEnabled(); return declaringClass();`), which
+        // `get_declaring_class_native` below still enforces.
+        //
+        // This guard used to be here, on the argument that "callers that arrive
+        // through ClassFrameInfo must not bypass the contract either". The
+        // caller it actually blocked is
+        // `StackStreamFactory$StackFrameBuffer.at(int)` -- the same call site
+        // the comment above this function names as the reason the override
+        // exists at all -- which the JDK runs for EVERY populated frame inside
+        // `setBatch()`. With the guard, a plain `StackWalker.getInstance()`
+        // walk (no RETAIN_CLASS_REFERENCE) threw
+        // `UnsupportedOperationException` out of its first batch, so nothing
+        // driving the walk through the JDK's own `callStackWalk` /
+        // `fetchStackFrames` path could complete. It went unnoticed only
+        // because `p59_sw_walk` intercepted `walk` before the JDK bytecode
+        // ever ran.
         // The mirror `populate_sfi` already resolved wins, and it is read
         // BY NAME off this carrier rather than through a `resolve_field_index`
         // on `java/lang/ClassFrameInfo` (which needs that class to be loaded
@@ -1162,6 +1387,16 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(m))));
                 }
             }
+            // Slot 6 is LAZY since the carrier stopped resolving a mirror per
+            // frame; slot 8 holds the same guaranteed-valid `ClassId` the eager
+            // resolve used. Reading it here keeps this arm answering for a
+            // carrier whose mirror has not been materialised yet, which is the
+            // normal state for every frame a walk did not inspect.
+            if let Some(cid) =
+                crate::phases_late::reflect_invoke::p59_frame_class_id(ctx, this)
+            {
+                return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+            }
         }
         // Only then the internal-name slot, resolved by name.
         if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
@@ -1197,6 +1432,25 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(None)))
     }
+    /// The PUBLIC `StackFrame.getDeclaringClass()`, which is
+    /// `ensureRetainClassRefEnabled(); return declaringClass();` in the JDK.
+    /// Split out of `declaring_class_native` when that one stopped enforcing
+    /// the capability -- see the long comment inside it for why the
+    /// package-private bridge must not.
+    fn get_declaring_class_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        if matches!(class_frame_retains_class_ref(ctx, this), Some(false)) {
+            return Err(MethodCallFailed::from(
+                RuntimeError::UnsupportedOperationException {
+                    message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+                },
+            ));
+        }
+        declaring_class_native(ctx, args)
+    }
     registry.register(
         sfi,
         "declaringClass",
@@ -1213,7 +1467,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         "java/lang/ClassFrameInfo",
         "getDeclaringClass",
         "()Ljava/lang/Class;",
-        declaring_class_native,
+        get_declaring_class_native,
     );
     registry.register(
         "java/lang/ClassFrameInfo",

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-483 tokens.
+485 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -283,6 +283,8 @@ export inherited from a parent shell.
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
 | `jit-rootscan` | `CRATONVM_DBG_JIT_ROOTSCAN` |
+| `oopcov` | `CRATONVM_DBG_OOPCOV` |
+| `xt-coverage` | `CRATONVM_DBG_XT_COVERAGE` |
 | `jit-stale-after-remap` | `CRATONVM_DBG_JIT_STALE_AFTER_REMAP` |
 | `jit-stale-below-rbp` | `CRATONVM_DBG_JIT_STALE_BELOW_RBP` |
 | `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
@@ -549,7 +551,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-219 tokens.
+220 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -776,7 +778,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-71 tokens.
+74 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -837,6 +839,8 @@ export inherited from a parent shell.
 | `zgc-parmark` | `CRATONVM_ZGC_PARMARK` |
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
 | `zgc-relocate-proven-jit` | `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` |
+| `xt-jit-coverage-handshake` | `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE` |
+| `osr-coverage-shadow` | `CRATONVM_OSR_COVERAGE_SHADOW` |
 | `zgc-jit-read-bounds` | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
@@ -851,6 +855,7 @@ export inherited from a parent shell.
 | `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
 | `validate-once` | `CRATONVM_GC_NO_VALIDATE_ONCE` |
+| `stream-refresh-each` | `CRATONVM_GC_STREAM_REFRESH_EACH` |
 
 ## `CRATONVM_REAL`
 
@@ -974,7 +979,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-16 tokens.
+17 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -991,6 +996,7 @@ export inherited from a parent shell.
 | `lazy-streams` | `CRATONVM_LAZY_STREAMS` |
 | `mh-strict-invokeexact` | `CRATONVM_MH_STRICT_INVOKEEXACT` |
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
+| `stackwalker-jdk-walk` | `CRATONVM_SW_JDK_WALK` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
 | `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
