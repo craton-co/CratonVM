@@ -2085,6 +2085,21 @@ pub fn compile_with_param_slots(
     // `Character.getType` returned UNASSIGNED for every Latin-1 letter once
     // JIT-compiled.
     let has_dispatch = !compiler.invoke_info.is_empty()
+        // A BRIDGED `invokedynamic` CALLS `jit_indy_bridge`, and that helper's
+        // first act is `jit_thread_mut()` — it has to push the synthetic frame
+        // the bootstrap runs on. A method whose only inter-method work is one
+        // indy has an EMPTY `invoke_info`: an `invokedynamic` used to lower to
+        // an uncommon trap, which calls nothing, so nothing on this list ever
+        // saw it. `static String f(int i) { return "v=" + i; }` compiled with
+        // `has_dispatch=false`, took the TLS-free fast entry, and the bridge
+        // answered every call with a NULL STRING — the identical shape as the
+        // `Character.getType` and `<clinit>`-gap entries above, and found the
+        // same way, by a method small enough to have nothing else in it
+        // (`probes/MinIndyProbe.java`).
+        || compiler
+            .indy_info
+            .iter()
+            .any(|&(_, _, _, _, bridge_site)| bridge_site != 0)
         || !compiler.direct_calls.is_empty()
         || !compiler.bounds_check_stubs.is_empty()
         || !compiler.null_check_store_stubs.is_empty()
