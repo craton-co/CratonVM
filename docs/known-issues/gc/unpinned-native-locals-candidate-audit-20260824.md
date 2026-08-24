@@ -109,6 +109,44 @@ The fix, when one is confirmed, is the two-line idiom already used everywhere
 else — `ctx.pin_native_root(obj)` before the call, `ctx.read_native_pin(h, obj)`
 to re-derive after it.
 
+## Two blind spots this search has, both with a measured instance behind them
+
+A confirmed defect of exactly this shape was found and fixed on 2026-08-24 —
+`collect_collection_elements_or_real` dispatched `toArray()` on a receiver that
+G1 had evacuated and recycled during the `size()` call one line above, and it
+surfaced as the canonical `java.lang.Object` face:
+
+```
+NoSuchMethodError: 'java.lang.Object[] java.lang.Object.toArray()'
+    from new ArrayList<>(map.keySet())
+```
+
+**It is not in the 32.** Two independent reasons, and each is worth a line here
+because each is cheap to close:
+
+1. **The search covers `native-builtins/src` only.** That defect is in
+   `native-collections/src/lib.rs`, which holds its own several-thousand
+   `ctx.invoke_*` sites and the whole collection-copy family. Re-running the
+   same script over that crate is free.
+2. **An unpinned PARAMETER is invisible to the heuristic.** The rule is "an
+   object-typed local *bound* before a GC-capable call"; `coll` there is a
+   function parameter, never re-bound, used across two `invoke_virtual` calls.
+   A parameter is exactly as unrooted as a local and is arguably the more
+   common shape, because a helper that takes a receiver and drives its Java is
+   the normal way this code is factored.
+
+A narrower complementary heuristic caught it in one pass and is worth running
+alongside this one: **two or more `ctx.invoke_*` calls on the SAME receiver
+identifier within one function, with no `read_native_pin` between them.** Over
+`native-collections/src/lib.rs` that yields 13 candidates rather than hundreds,
+because it does not care whether the body pins anything — only whether the
+receiver is re-derived between the calls that can move it.
+
+One caution learned from fixing that instance, on this page's own subject:
+`report_reclaimed_receiver` said nothing throughout. It asks the FREE LIST, and
+a whole evacuated G1 region is not a free-list block. So a quiet reclaim guard
+does not clear a candidate off this list.
+
 ## Reproducing the audit
 
 The script is `scratchpad/pinaudit.py` in the session that produced this page;
