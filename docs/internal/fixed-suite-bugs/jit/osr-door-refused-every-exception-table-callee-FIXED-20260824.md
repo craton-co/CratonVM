@@ -120,6 +120,21 @@ shared and loaded; the ON/OFF pairs either side of it are consistent.
 Both counters move, and the refusal reason appears only in the ban arm. That is
 the engagement statement the previous page asked for and could not get.
 
+And on a real workload rather than a probe — one
+`org.hibernate.reactive.techempower.TechEmpowerTest` run, same binary:
+
+```
+direct callee binds: 4662 bound, 2703 left on the dispatch helper
+  of which the OSR door: 39 bound, 19 left on the dispatch helper
+  bind refused, callee-not-yet-compiled: 18
+```
+
+The same run on `dev` prints the first line with almost identical totals
+(4671 / 2724) and **no OSR line at all**, and no `callee-not-yet-compiled`
+row — those 18 are the OSR ladder's own misses, tallied for the first time.
+The door was doing this work all along and contributing nothing to the census
+that was used to reason about it.
+
 ## 5. The oracle could not have caught what came next
 
 `probes/ExcTableDirectCallOracle.java` pins the CALLEE's own handler — its
