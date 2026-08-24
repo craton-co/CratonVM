@@ -159,13 +159,29 @@ under all three collectors, with `array_receiver=0`.
 **Sweep**: the full Spring Boot suite on Windows, the same corpus and harness
 the sighting came from, census armed:
 
+**Before** the `Unsafe` fix of §6a (shards 1-2 only, the run that found it):
+
 ```text
 shard 1 (classes    1- 500)  0 decoded, 0 array-receiver refusals, 499 of 500 logs armed
 shard 2 (classes  501-1000)  2 decoded, 2 array-receiver refusals, in ONE class -- §6a
 ```
 
-(Unarmed logs are HANG classes killed before their shutdown trailer, which
-cannot print it — a blind spot worth stating rather than rounding off.)
+**After**, the whole suite, same harness, census armed:
+
+```text
+shard 1 (   1- 500)  0 decoded, 0 array-receiver refusals, 500 of 500 armed
+shard 2 ( 501-1000)  0 decoded, 0 array-receiver refusals, 500 of 500 armed
+shard 3 (1001-1500)  0 decoded, 0 array-receiver refusals, 500 of 500 armed
+shard 4 (1501-1975)  0 decoded, 0 array-receiver refusals, 474 of 475 armed
+                                                          ----------------
+                                            1975 classes, 1974 of 1975 armed
+```
+
+1920 PASS, 8 FAIL, 1 HANG, 43 EMPTY, 3 ENV-GATED. The non-PASS set on shard 1 is
+IDENTICAL to the pre-fix run's, minus its one HANG — the screen and the refusals
+changed no verdict. The one unarmed log is that HANG, killed before its shutdown
+trailer, which cannot print the census: a blind spot worth stating rather than
+rounding off.
 
 ## 6a. What the screen found on its first sweep
 

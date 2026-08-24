@@ -115,12 +115,20 @@ round 1  on         6          0 0 0 0 0 0
          off        5          3 0 1 3 0
 round 2  on         5          0 0 0 0 0
          off        5          1 1 2 0 0
+round 3  on         5          0 0 0 0 0        (on the dev merge)
+         off        5          0 0 0 1 1
 ```
 
-`OK (14 tests)` on every completed run. **11 ON runs, zero stale words; 10 OFF
-runs, 11 stale words across 6 of them.** The two runs missing from round 2 hit
+`OK (14 tests)` on every completed run. **16 ON runs, zero stale words; 15 OFF
+runs, 13 stale words across 8 of them.** The two runs missing from round 2 hit
 the harness's 900 s cap while the host was at load 100+; they are environment,
 not results, and are counted out rather than in.
+
+The OFF arm is the base rate and it is not high — the gap needs a moving young
+cycle, which is roughly one collection in six on this fixture, so a clean OFF
+run says nothing on its own. Round 3's first three pairs were 0/0 and would have
+been an empty measurement if the round had stopped there. What carries the
+result is the ON arm's 16 for 16 against an OFF arm that fires in 8 of 15.
 
 `dead_region=0` in EVERY one of those runs — on this fixture the narrowing costs
 nothing, because every stale word the detector found was in the region the
