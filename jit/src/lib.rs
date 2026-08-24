@@ -33042,3 +33042,6 @@ pub fn jit_gate_pass_census() -> (u64, u64) {
         JIT_GATE_PASS_FILLS.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
+
+/// See [`ir_lower::ic_frame_republish_sites`].
+pub use ir_lower::ic_frame_republish_sites;

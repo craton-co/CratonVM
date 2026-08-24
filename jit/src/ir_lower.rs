@@ -3559,6 +3559,7 @@ fn reloc_emit_enabled() -> bool {
         // between.
         if !ic_frame_republish_disabled() {
             self.emit_post_call_frame_record();
+            IC_FRAME_REPUBLISH_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -16426,4 +16427,21 @@ fn ic_frame_republish_disabled() -> bool {
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH").is_some()
     })
+}
+
+/// How many optimizing-tier inline-cache call sites were compiled WITH the
+/// frame-record republish.
+///
+/// Bumped at COMPILE time, not per call, so it costs a workload nothing. It is
+/// the engagement counter for that repair: a claim that the republish did or
+/// did not move a workload is worth nothing while this reads zero, because a
+/// zero means the optimizing tier never lowered an inline cache in that run and
+/// the arms differed only by noise. Printed on the `[jitroots]` line beside the
+/// verdict it is supposed to explain.
+pub static IC_FRAME_REPUBLISH_SITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Read [`IC_FRAME_REPUBLISH_SITES`].
+pub fn ic_frame_republish_sites() -> usize {
+    IC_FRAME_REPUBLISH_SITES.load(std::sync::atomic::Ordering::Relaxed)
 }
