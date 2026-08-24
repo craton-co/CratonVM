@@ -48,12 +48,33 @@ frame cannot be *located*, not disbelieved. See §"Still open".
 > repair that landed in the same window) leaves it at `unpub=264/855` and
 > `unpub=149/515`, still failing.
 >
-> 91 commits landed on `dev` in that window, including a generic
-> `invokedynamic` bridge, an `UNREWRITABLE_JIT_ROOTS` veto, array-receiver
-> screens at the reference-processing shape guards, and several changes to what
-> a compiled frame holds live. Which of them raised `UNPUBLISHED_FRAME_OOP` is
-> the next question, and the counter to bisect it with is on the `[jitroots]`
-> line.
+> **Bisected to the `invokedynamic` bridge**, on one binary, using dev's own
+> kill switches — no rebuild, five arms, `UNPUBLISHED_FRAME_OOP` counted over
+> the first 76 collections of each:
+>
+> | arm | `compiled-frame-oop-not-published` | `none` (proven) |
+> |---|---:|---:|
+> | none off (the merged default) | 28 | 9 |
+> | `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0` | 25 | 11 |
+> | `CRATONVM_MAP_VIEW_CACHE=0` | 23 | 10 |
+> | `CRATONVM_VECTOR_TEMPLATES=0` | 21 | 12 |
+> | **`CRATONVM_JIT_INDY_BRIDGE=0`** | **5** | 13 |
+> | all four + `CRATONVM_REGISTER_IMAGE_REMAP=0` | 3 | 12 |
+>
+> One switch accounts for essentially all of it, and 5 is the pre-merge level
+> (6). `2cc02f7d3 feat(jit): bridge every frame-stack-only invokedynamic
+> bootstrap` compiles a call shape whose live oops the shadow stack does not
+> publish — which is the same family as §"Follow-up 2026-08-24" §2, and
+> `a51077342 wip: instrument the indy bridge and close its staged-arg oop-map
+> gap` says its author was already looking at that gap. Not patched here: it is
+> another session's live feature, and the fix belongs with it.
+>
+> **A second, smaller contributor is unaccounted for.** With the indy bridge
+> off, `active-safepoint-map-incomplete` is still 56 per 76 cycles against 46
+> before the merge, and proven cycles are 13 against 24 — so the class still
+> fails. None of the five switches covers it. That is the same
+> `ACTIVE_FRAME_MAP` obligation §7 characterises for `TestMVStoreTool`, and the
+> two are probably one question.
 ## Symptom
 
 `org.h2.test.store.TestKillProcessWhileWriting`, default configuration
@@ -750,15 +771,19 @@ Two hypotheses were tested and **both failed**, which is the useful part:
 
 Ordered by what a next session should pick up first.
 
-* **`UNPUBLISHED_FRAME_OOP` became the dominant refusal on the 2026-08-24 `dev`
-  tip.** See the box under §Status: 24 proven cycles in 76 before the merge, 9
-  in 76 after, with `compiled-frame-oop-not-published` going 6 → 28 over the
-  same window. `CRATONVM_REGISTER_IMAGE_REMAP=0` does not restore it, so it is
-  not the register-image repair that landed in the same window. This is the
-  first thing to bisect — the 91-commit range is `3ed73bf89..d2db39944`, the
-  counter is on the `[jitroots]` line, and each arm is one 4-minute run of this
-  class. Until it is found, this class fails on `dev` for a reason that has
-  nothing to do with the coverage proof.
+* **The `invokedynamic` bridge's compiled frames do not publish their live oops
+  to the shadow stack.** Bisected to `CRATONVM_JIT_INDY_BRIDGE=0` on one binary
+  — see the table under §Status: it takes `compiled-frame-oop-not-published`
+  from 28 back to 5 per 76 collections, where none of the other four 2026-08-24
+  switches moves it below 21. The feature is `2cc02f7d3` and its own WIP commit
+  `a51077342` names "the indy bridge's staged-arg oop-map gap", so this is
+  most likely already known to its author. Left for them; recorded here because
+  it is what makes this class fail on `dev` today, and because the counter that
+  found it is now on the `[jitroots]` line for anyone else.
+* **A second, unidentified contributor to `ACTIVE_FRAME_MAP`.** With the indy
+  bridge off, that reason is 56 per 76 cycles against 46 before the merge, and
+  proven cycles 13 against 24. None of the five switches covers it. Almost
+  certainly the same question as the `no_map` residual below.
 * **`TestMVStoreTool` and `TestCachedQueryResults` — the innermost frame cannot
   be LOCATED.** Fully characterised in §"Follow-up 2026-08-24" §7, with two
   hypotheses already ruled out by measurement. The lever is
