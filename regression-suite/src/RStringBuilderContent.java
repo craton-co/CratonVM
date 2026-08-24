@@ -175,6 +175,48 @@ public class RStringBuilderContent {
         eq("insert(int, CharSequence) over a real String",
                 new StringBuilder("ac").insert(1, (CharSequence) "b").toString(), "abc");
 
+        // ---- and neither is a PRIMITIVE array, whatever its length says ----
+        //
+        // The rows above are about a class-id test with no kind check. This
+        // group is about the OTHER half of the same species: a SHAPE probe that
+        // screens on `num_fields` instead. An array mirrors its LENGTH into
+        // `num_slots`, so `new byte[23]` reports twenty-three "fields" and walks
+        // straight through a `num_fields(obj) < 2` guard into a positional
+        // slot-0 / slot-1 read — which addresses 16-byte tagged cells while the
+        // body holds packed bytes, and past index 1 leaves the allocation.
+        //
+        // `java/lang/reflect/Proxy` is not decoration. The one unreproduced
+        // corrupt-cell hit this group exists to keep closed decoded its `raw0`
+        // as the ASCII text "t/Proxy " — bytes 16..24 of exactly this name,
+        // i.e. slot 1 of a 16-byte stride over this array's body.
+        byte[] proxyName = "java/lang/reflect/Proxy".getBytes();
+        eqi("byte[] length is not a field count", proxyName.length, 23);
+        eq("byte[] decodes as its own text", new String(proxyName), "java/lang/reflect/Proxy");
+        eq("byte[] tail at the strided offset", new String(proxyName, 16, 7), "t/Proxy");
+        arrayIdentity("byte[]", proxyName, "[B@");
+        arrayIdentity("byte[0]", new byte[0], "[B@");
+        arrayIdentity("byte[1]", new byte[] { 7 }, "[B@");
+        arrayIdentity("long[]", new long[] { 1L, 2L }, "[J@");
+
+        // An array's identity must survive being used as a KEY, which is the
+        // door that reaches the shape probe: the map asks the receiver for a
+        // hash and an equality, and a reader that decoded the BODY would answer
+        // from the bytes rather than from the identity.
+        java.util.Map<Object, Object> byIdentity = new java.util.HashMap<>();
+        byIdentity.put(proxyName, "v");
+        eq("byte[] survives a HashMap round trip", String.valueOf(byIdentity.get(proxyName)), "v");
+        ck("byte[] hashCode is its identity hash",
+                proxyName.hashCode() == System.identityHashCode(proxyName),
+                "an array's hashCode is Object's, not a content hash");
+        ck("two equal-content byte[] are NOT equal",
+                !proxyName.equals("java/lang/reflect/Proxy".getBytes()),
+                "an array's equals is reference identity");
+        eq("a content-equal byte[] misses in the map",
+                String.valueOf(byIdentity.get("java/lang/reflect/Proxy".getBytes())), "null");
+        java.util.Set<Object> set = new java.util.HashSet<>();
+        set.add(proxyName);
+        ck("byte[] is found in a HashSet by identity", set.contains(proxyName), "lost its key");
+
         System.out.println("PASS RStringBuilderContent (" + checks + " checks)");
     }
 }

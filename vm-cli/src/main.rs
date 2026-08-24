@@ -6547,6 +6547,10 @@ fn main() {
             // collector's guard and named nothing must SAY so, because silence
             // from a diagnostic reads as "clean" and is not.
             cratonvm_vm::memory::corrupt_cell_exit_summary();
+            // Same reasoning for the post-remap stale-frame-word detector: its
+            // `System.exit` printer sits in the shutdown trailer, and this is
+            // the arm a program that returns from `main` takes instead.
+            cratonvm_types::stale_remap_census::exit_summary();
             match result {
                 Ok(()) => {
                     cratonvm_vm::jit::conservative_roots::report_a5_engagement();

@@ -1,0 +1,159 @@
+import java.lang.reflect.Field;
+
+/**
+ * {@code sun.misc.Unsafe.{get,put}X(Object base, long offset, …)} with an ARRAY
+ * base, at every primitive width.
+ *
+ * <p>An array base is an ELEMENT access. CratonVM's int, long, byte, short and
+ * object natives have always screened the receiver kind and routed an array to
+ * {@code get/set_array_element}; the four FLOAT and DOUBLE natives did not, and
+ * passed the byte offset straight to the plain-object field accessor as if it
+ * were a slot index.
+ *
+ * <p>That is not a type error the accessor can catch, because an array MIRRORS
+ * ITS LENGTH into {@code num_slots}: {@code new byte[32]} reports thirty-two
+ * "fields", so every offset up to 31 is "in bounds" while the byte offset the
+ * accessor computes is {@code HEADER_SIZE + offset * 16}. For the shape below —
+ * which is exactly Hazelcast's {@code UnsafeUtil.checkUnsafeInstance}, run on
+ * every Spring Boot cache autoconfiguration test — {@code putFloat(buf, 16, 3f)}
+ * addressed byte 272 of a 32-byte body: a silent 240-byte out-of-bounds WRITE,
+ * twice per run, that no guard could see because the striden bytes happened to
+ * form a valid discriminant.
+ *
+ * <p>Every assertion here is a HotSpot-observable round trip, so the vector
+ * says what the platform says rather than what this VM happens to do. The
+ * out-of-bounds write is caught by the NEIGHBOUR arrays: they are allocated
+ * around the target, filled with a known pattern, and checked afterwards. A
+ * write that lands past the target has to land on one of them.
+ */
+public class RUnsafeArrayBase {
+    static int checks = 0;
+
+    static void eq(String what, Object got, Object want) {
+        checks++;
+        if (!String.valueOf(want).equals(String.valueOf(got))) {
+            throw new AssertionError(what + ": expected [" + want + "] got [" + got + "]");
+        }
+    }
+
+    static void ck(String what, boolean ok, String detail) {
+        checks++;
+        if (!ok) {
+            throw new AssertionError(what + ": " + detail);
+        }
+    }
+
+    static sun.misc.Unsafe unsafe() throws Exception {
+        Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+        f.setAccessible(true);
+        return (sun.misc.Unsafe) f.get(null);
+    }
+
+    /** Fill with a distinctive pattern so ANY foreign write is visible. */
+    static byte[] guardArray(int len, int seed) {
+        byte[] a = new byte[len];
+        for (int i = 0; i < len; i++) {
+            a[i] = (byte) (seed + i);
+        }
+        return a;
+    }
+
+    static void checkGuard(String what, byte[] a, int seed) {
+        for (int i = 0; i < a.length; i++) {
+            ck(what + "[" + i + "]", a[i] == (byte) (seed + i),
+                    "neighbour byte " + i + " was overwritten: expected "
+                            + (byte) (seed + i) + " got " + a[i]);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        sun.misc.Unsafe u = unsafe();
+
+        long base = u.arrayBaseOffset(byte[].class);
+        ck("arrayBaseOffset(byte[]) is positive", base > 0, "got " + base);
+
+        // Hazelcast's own shape, verbatim in structure: a byte[] sized
+        // base + 2*8, written at every primitive width.
+        byte[] before = guardArray(64, 11);
+        byte[] buffer = new byte[(int) base + 16];
+        byte[] after = guardArray(64, 77);
+
+        u.putByte(buffer, base, (byte) 0x00);
+        u.putBoolean(buffer, base, false);
+        u.putChar(buffer, base + 2, '0');
+        u.putShort(buffer, base + 2, (short) 1);
+        u.putInt(buffer, base + 4, 2);
+        u.putFloat(buffer, base + 4, 3f);
+        u.putLong(buffer, base + 8, 4L);
+        u.putDouble(buffer, base + 8, 5d);
+
+        // NOTHING may have landed outside `buffer`.
+        checkGuard("neighbour before", before, 11);
+        checkGuard("neighbour after", after, 77);
+
+        // And the target must still be its own length, readable end to end.
+        eq("buffer.length", buffer.length, (int) base + 16);
+        int sum = 0;
+        for (byte b : buffer) {
+            sum += b & 0xff;
+        }
+        ck("buffer is readable end to end", sum >= 0, "sum=" + sum);
+
+        // ---- round trips at each width, on a typed array of that width -----
+        //
+        // A typed array is where the ELEMENT interpretation is unambiguous, so
+        // these are exact-value assertions rather than "did not corrupt".
+        float[] fa = new float[4];
+        long fbase = u.arrayBaseOffset(float[].class);
+        long fscale = u.arrayIndexScale(float[].class);
+        u.putFloat(fa, fbase + 2 * fscale, 2.5f);
+        eq("float[] via Unsafe round trip", fa[2], 2.5f);
+        eq("float[] via Unsafe read", u.getFloat(fa, fbase + 2 * fscale), 2.5f);
+        eq("float[] untouched neighbour", fa[3], 0.0f);
+
+        double[] da = new double[4];
+        long dbase = u.arrayBaseOffset(double[].class);
+        long dscale = u.arrayIndexScale(double[].class);
+        u.putDouble(da, dbase + 1 * dscale, 6.25d);
+        eq("double[] via Unsafe round trip", da[1], 6.25d);
+        eq("double[] via Unsafe read", u.getDouble(da, dbase + 1 * dscale), 6.25d);
+        eq("double[] untouched neighbour", da[2], 0.0d);
+
+        int[] ia = new int[4];
+        long ibase = u.arrayBaseOffset(int[].class);
+        long iscale = u.arrayIndexScale(int[].class);
+        u.putInt(ia, ibase + 3 * iscale, 99);
+        eq("int[] via Unsafe round trip", ia[3], 99);
+        eq("int[] via Unsafe read", u.getInt(ia, ibase + 3 * iscale), 99);
+
+        long[] la = new long[4];
+        long lbase = u.arrayBaseOffset(long[].class);
+        long lscale = u.arrayIndexScale(long[].class);
+        u.putLong(la, lbase + 1 * lscale, 1234567890123L);
+        eq("long[] via Unsafe round trip", la[1], 1234567890123L);
+        eq("long[] via Unsafe read", u.getLong(la, lbase + 1 * lscale), 1234567890123L);
+
+        Object[] oa = new Object[4];
+        long obase = u.arrayBaseOffset(Object[].class);
+        long oscale = u.arrayIndexScale(Object[].class);
+        u.putObject(oa, obase + 2 * oscale, "v");
+        eq("Object[] via Unsafe round trip", oa[2], "v");
+        eq("Object[] via Unsafe read", u.getObject(oa, obase + 2 * oscale), "v");
+        eq("Object[] untouched neighbour", oa[3], null);
+
+        // ---- an OUT-OF-RANGE offset must not write anything ---------------
+        //
+        // Past the end of the element range there is no element to name. It
+        // must be a no-op, not a stride into the next allocation — which is
+        // what the float/double path did.
+        float[] small = new float[2];
+        byte[] sentinel = guardArray(64, 33);
+        u.putFloat(small, fbase + 64 * fscale, 9f);
+        u.putDouble(new double[2], dbase + 64 * dscale, 9d);
+        checkGuard("sentinel after an out-of-range Unsafe write", sentinel, 33);
+        eq("small[0] untouched", small[0], 0.0f);
+        eq("small[1] untouched", small[1], 0.0f);
+
+        System.out.println("PASS RUnsafeArrayBase (" + checks + " checks)");
+    }
+}

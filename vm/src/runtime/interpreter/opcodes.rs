@@ -3748,6 +3748,16 @@ pub(super) fn op_putfield(
                     }
                 }
             }
+            // CRATONVM_DBG_CORRUPT_CELL, the interpreter's own WRITE door.
+            // The read doors were instrumented first, and a producer that only
+            // ever WRITES was invisible to every one of them: the first
+            // array-receiver refusal this instrument caught on a real workload
+            // (`CacheAutoConfigurationTests`, 2026-08-23) was a `set_field`,
+            // and only the safepoint BACKSTOP saw it -- two minutes later, with
+            // the frames of whatever that thread was doing by then, which is
+            // exactly the caveat the backstop prints about itself. A write door
+            // names it at the store. Off: one cached bool.
+            let corrupt_before = crate::memory::reclaim_guard::corrupt_cell_watch();
             if field.is_volatile {
                 // CRATONVM_DBG_AQS_TRACE (2026-07-21): ledger entry for the
                 // synchronizer family's plain volatile state writes
@@ -3780,6 +3790,14 @@ pub(super) fn op_putfield(
             } else {
                 shared.mem.heap.set_field(obj_ref, field.field_index, value);
             }
+            crate::memory::reclaim_guard::corrupt_cell_watch_close(
+                shared,
+                thread,
+                corrupt_before,
+                "interpreter putfield",
+                Some(obj_ref),
+                Some(field.field_index),
+            );
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): when a *valid* reference is
             // stored into an EC object's reference field, arm a software
             // watchpoint on the field's payload so the later raw `0x4` overwrite
