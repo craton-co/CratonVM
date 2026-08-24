@@ -69,7 +69,10 @@ things changed:
      ever completed the promise. Whether the `Int(0)` is the cause or a
      mis-resolved field index in the dump is **not established**.
 
-   Three stalls in ten is well above the 6.25% this page recorded (5/80), and
+   The loop was stopped at 20 runs to free the host for the A/B below, with
+   **4 stalls in 20 (20%)**.
+
+   Four stalls in twenty is well above the 6.25% this page recorded (5/80), and
    the binary that produced them also carries this session's two perf changes.
    **That rate is not yet attributable** — `/tmp/mjnab.sh` interleaves
    `CRATONVM_MAP_VIEW_CACHE=0 CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0` against
