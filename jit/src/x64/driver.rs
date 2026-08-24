@@ -299,6 +299,42 @@ pub(super) fn gc_inert_selfrec_candidate(
 /// counted as 2). These let the prologue place long/double parameters in the
 /// slots the body actually reads. Pass `&[]` / `0` for the legacy
 /// "arg index == slot" behavior (see the [`compile`] wrapper).
+/// Total callee bytecode one splice emits, INCLUDING every body it splices in
+/// turn.
+///
+/// [`crate::InlineSite::nested_sites`] holds full recursive `InlineSite`s, and
+/// the emitter splices those bodies into the same code buffer as the body that
+/// contains them. Anything that sizes a reservation from a site must therefore
+/// walk the whole tree, not just its root — see the two call sites in
+/// [`compile_with_param_slots`] for what under-counting cost.
+pub(super) fn spliced_bytecode_len(site: &crate::InlineSite) -> usize {
+    site.nested_sites
+        .iter()
+        .map(|n| spliced_bytecode_len(&n.site))
+        .fold(site.callee_code_len, |a, b| a.saturating_add(b))
+}
+
+/// Spill slots one splice needs, INCLUDING every nested body.
+///
+/// Same tree walk as [`spliced_bytecode_len`], against the per-site formula the
+/// enclosing reservation has always used: `max(callee_max_locals, param_span)`
+/// for the body's own frame, plus `callee_code_len` to bound its operand depth.
+/// A nested body gets its own locals and its own operand stack on top of the
+/// body that splices it, so the reserves add.
+pub(super) fn spliced_stack_reserve(site: &crate::InlineSite) -> usize {
+    let (_, param_span) =
+        crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
+    site.nested_sites
+        .iter()
+        .map(|n| spliced_stack_reserve(&n.site))
+        .fold(
+            site.callee_max_locals
+                .max(param_span)
+                .saturating_add(site.callee_code_len),
+            |a, b| a.saturating_add(b),
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compile_with_param_slots(
     // ── The admission gate, enforced by the type system ───────────────
@@ -792,10 +828,21 @@ pub fn compile_with_param_slots(
             .values()
             .flat_map(|variants| variants.iter().skip(1).map(|(_, s)| s))
     };
+    // NESTED bodies count too. `InlineSite::nested_sites` is a recursive
+    // `InlineSite`, and `emit_inline_body` splices those bodies into the SAME
+    // buffer as the body that contains them — so a site's real footprint is its
+    // own bytecode PLUS every body it inlines in turn, transitively. Sizing
+    // from `callee_code_len` alone reserved the outer body's bytes and none of
+    // the nested ones, which is exactly how a method whose callees are all tiny
+    // (`VolumeOps.grad`: 273 invokes of 5-15 byte getters that each splice a
+    // constructor and three field loads) overran an estimate by 8% and stopped
+    // being compiled at all. The per-method inline BUDGET was already
+    // nested-aware (`inline_site_expansion_cost_tiered` folds
+    // `nested_expansion`); only the two sizing sites here were not.
     let inline_extra: usize = inline_sites
         .values()
         .chain(extra_guard_bodies())
-        .map(|s| s.callee_code_len.saturating_mul(64))
+        .map(|s| spliced_bytecode_len(s).saturating_mul(64))
         .sum();
     let estimated_size = code_len
         .saturating_mul(96)
@@ -849,12 +896,7 @@ pub fn compile_with_param_slots(
     let inline_stack_reserve: usize = inline_sites
         .values()
         .chain(extra_guard_bodies())
-        .map(|s| {
-            let (_, param_span) = crate::compute_param_jvm_slots(&s.descriptor, s.callee_is_static);
-            s.callee_max_locals
-                .max(param_span)
-                .saturating_add(s.callee_code_len)
-        })
+        .map(spliced_stack_reserve)
         .sum();
     let max_stack = max_stack
         .saturating_add(max_invoke_args)
