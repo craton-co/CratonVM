@@ -35,11 +35,37 @@ things changed:
    `CRATONVM_JIT_DENY=DefaultPromise` arm has to be re-run on that binary**
    before "the defect is tier-independent" can be asserted again.
 
-2. **The monitor now reports whether a `notifyAll()` ever reached it**, which
-   is the measurement that partitions the two surviving explanations. See
-   "The partitioning instrument" below. It has NOT yet been run against a
-   stall — the Azure host was unreachable for the whole of the session that
-   added it.
+2. **The monitor now reports whether a `notifyAll()` ever reached it, and it
+   has been RUN — the answer is that there are TWO different stalls under this
+   page's one title.** In ten runs of the instrumented binary, three stalled,
+   and no two of them look alike:
+
+   ```
+   run  8  DefaultChannelPromise   result=Some(Int(0))   result_is=not-a-reference-slot
+           notifies_since_wait=0   (monitor totals: notify=0)   orphan 0
+   run  9  DefaultPromise          result_is=other(DefaultPromise$CauseHolder)
+           notifies_since_wait=1   (monitor totals: notify=1)   orphan 0   waiters=1
+   run 10  rc=124 — the watchdog never fired, so no dump at all
+   ```
+
+   * **Run 9 is the branch the counter was added to find.** The promise
+     genuinely completed (a `CauseHolder`, i.e. a failure — NOT the
+     `UNCANCELLABLE` case), a `notifyAll()` DID reach this monitor after the
+     waiter registered, and the waiter is still parked. The defect is below
+     Java, in the handshake — see "Where a NOTIFIED thread can still be stuck".
+   * **Run 8 is something else entirely.** `DefaultPromise.result` is
+     `private volatile Object`, and the slot holds `Int(0)` — a PRIMITIVE in a
+     reference slot, the `G30-1-the-silent-reference-slot-coercion` family, with
+     34 `primitive-into-reference` guard hits in that run's log. No `notifyAll`
+     was ever served on that monitor (`notify=0`), which is consistent: nothing
+     ever completed the promise. Whether the `Int(0)` is the cause or a
+     mis-resolved field index in the dump is **not established**.
+
+   Three stalls in ten is well above the 6.25% this page recorded (5/80), and
+   the binary that produced them also carries this session's two perf changes.
+   **That rate is not yet attributable** — `/tmp/mjnab.sh` interleaves
+   `CRATONVM_MAP_VIEW_CACHE=0 CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0` against
+   both-on, ON ONE BINARY, which is the only comparison that can answer it.
 
 3. **The plain wait/notify handshake does NOT reproduce in isolation.**
    `probes/PromiseWaitProbe.java` is `DefaultPromise`'s handshake reduced to
@@ -328,6 +354,43 @@ ONE stall rather than a rate. `wake_all_for_interrupt` is counted separately,
 because it is the VM answering `Thread.interrupt()` rather than Java code
 signalling a condition, and folding the two together would let an unrelated
 interrupt masquerade as the missing `notifyAll`.
+
+### Where a NOTIFIED thread can still be stuck: the RE-ACQUIRE
+
+`Monitor::wait` has two places a thread can block, and until 2026-08-23 only
+one of them could ever be reported.
+
+After the `wait_condvar` loop breaks — which is what a delivered notification
+makes it do — the thread must RE-ACQUIRE the monitor before returning to Java.
+That was a bare `entry_condvar.wait(&mut state)`: untimed, unpolled, and
+invisible to the watchdog, whose `[WAIT-OBJECT]` dump lives in the loop above
+it. **A thread that was notified, broke out, and then blocked there produces
+exactly run 9's signature** — `notifies_since_wait=1` and a thread still
+parked — and nothing on this page could tell that apart from a notification
+that was never delivered to the waiter at all.
+
+The re-acquire now polls on the same 5 ms cadence and reports once:
+
+```
+[WAIT-REACQUIRE] thread … was NOTIFIED and is now stuck RE-ACQUIRING the
+                 monitor, not waiting on it — owner=… entry_count=… …
+```
+
+`Monitor::exit` releases with `entry_condvar.notify_one()`, so a release wakes
+exactly one of the threads queued there and in `enter_labeled`; any path that
+releases the monitor WITHOUT going through `Monitor::exit` leaves a waiter
+there with nothing to wake it. Re-testing the condition on a timer is sound for
+a lock ACQUIRE in a way it would not be for `Object.wait` (which owes Java a
+real notification), so the poll is both the instrument and a removal of that
+class of permanent stall. `enter_labeled`'s own contended loop is deliberately
+left alone — hot `monitorenter` path, documented as byte-for-byte unchanged,
+and `CRATONVM_DBG_MONENTER` already makes it pollable when someone is looking.
+
+**The next stall on a binary with this either prints `[WAIT-REACQUIRE]` — in
+which case run 9 is a lock-handover defect and not a lost notification — or it
+does not, in which case the notification really was delivered into a
+`wait_condvar` the waiter was parked on and did not observe.** One stall
+decides it.
 
 ### `probes/PromiseWaitProbe.java` — the isolated handshake, which does NOT stall
 
