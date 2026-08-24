@@ -114,6 +114,20 @@ wall-clock figure quoted without them cannot say whether the fast path ran:
 
 ## How it is known to be right
 
+`probes/MapViewCacheProbe` is the behavioural gate this cache added: 150 rows
+over `HashMap`, `LinkedHashMap` and `Hashtable`, printed as `name=value` so the
+output diffs against HotSpot's verbatim. It covers view IDENTITY, liveness of a
+hoisted view across every mutator shape (put of a new key, a value-replacing
+put, remove, clear, and a size-invariant `remove`+`put` pair), `toArray` /
+`stream` / `iterator` / `isEmpty`, write-through by `remove` and by
+`iterator().remove()`, entrySet value freshness and `setValue` write-through,
+values liveness, a view taken from an EMPTY map and read after a put, and the
+copy-constructor / `toArray` / `addAll` door that blocker 3 hides behind — which
+is the row set that caught the stale values read. Three `ht.ident.*` rows are
+expected to differ (see "What is left"); everything else must match exactly,
+and does, on the cache both ON and OFF and under ZGC, G1 and Generational at
+`--Xmx 64m`.
+
 * **`CRATONVM_VERIFY_MAP_VIEW_CACHE=1`** takes the elision decision, then
   rebuilds anyway and compares, panicking on divergence. The comparison is over
   sorted IDENTITY HASHES, not addresses: the rebuild allocates, so under a
@@ -181,9 +195,48 @@ apply to design A, which needs no lazy materialisation and so needs no
 
 * **Design B** (lazy backing + source-delegating reads) is still the better end
   state and is unblocked by nothing here. Its precondition remains blocker 3.
-* **`values()` views** get neither half: their carrier is a list with a
-  different backing scheme. `probes/KeySetBench` has no `values` rung, so there
-  is no number for what that costs.
+* ~~**`values()` views** get neither half~~ — **the construction half landed
+  2026-08-23**, in a second pass, along with the `LinkedHashMap` entrySet mint
+  site the first pass missed. A values carrier is a list with a different
+  backing scheme, so it needs its own `cached_live_values_view` /
+  `store_live_values_view` pair rather than a `VIEW_KIND_*`; it gets the
+  construction half only, for the same reason entrySet does. `KeySetBench` now
+  has `valuesOnly` and `entryOnly` rungs, and they are what says what it was
+  worth (LinkedHashMap, width 1000, µs/call, interleaved):
+
+  ```text
+    valuesOnly   OFF 68.5-76.5   ON 1.0        ~70x
+    entryOnly    OFF 804-850     ON 1.5-2.0   ~470x
+    viewOnly     OFF 1095-1147   ON 1.5       ~740x   (for scale)
+  ```
+
+  `values()` construction was ~15x cheaper than `keySet()`'s to begin with —
+  an array copy, no hashing — which is why it is the smallest of the three.
+
+  **Caching values is what exposed blocker 3 as a live defect rather than a
+  design-B precondition**, and that is the part worth keeping:
+  `collect_collection_elements` — the helper behind `new ArrayList<>(c)`,
+  `new HashSet<>(c)`, `addAll` and `toArray` on an arbitrary collection —
+  probes the receiver for an ArrayList layout and reads `elementData`/`size`
+  DIRECTLY. A values view is ArrayList-SHAPED, so the probe matched it and read
+  a stale array. The read was harmless only for as long as every `values()`
+  call minted a FRESH view; a fresh view is never stale, and caching removed
+  that accident. MEASURED while the cache was briefly allowed on the
+  `Hashtable` family:
+
+  ```text
+    ht.values.copyList   HotSpot 1   cache OFF 1   cache ON 2
+    ht  v2.size=1   v2.toString=[b]   v2.toArray.len=2
+  ```
+
+  `size()` and `toString()` on the very same object were right; only
+  `toArray()` was wrong. The asymmetry IS the diagnosis: a `Hashtable` view
+  arrives inside a `Collections$SynchronizedCollection`, which that helper
+  unwraps and RECURSES into, landing at the layout probe where nothing
+  resyncs — while a bare `HashMap$Values` receiver reaches
+  `native_al_to_array` instead and resyncs there. The family is refused by
+  `cached_live_values_view` anyway, so one resync at the top of that helper
+  closes the SHAPE rather than the instance.
 * **entrySet READS still rebuild.** Only the construction is elided for them.
   Closing that needs a second generation that moves on a value-replacing `put`
   as well as on a structural change — which is another mutator audit, of the
@@ -191,6 +244,11 @@ apply to design A, which needs no lazy materialisation and so needs no
   doing until something measures the entrySet read path as a wall.
 * **Map-view ITERATION is ~1.15 µs/element** (`hoisted`, above). That is a
   separate wall from this one and this fix does not touch it.
+* **The `Hashtable`/`Properties` family is refused outright**, so
+  `hashtable.keySet() == hashtable.keySet()` is still `false` where HotSpot says
+  `true`. Three rows of `probes/MapViewCacheProbe` record it as a deliberate
+  boundary rather than a defect — every OTHER row on that family, liveness and
+  write-through and the copy constructors, matches HotSpot exactly.
 
 ## Reproducing
 
