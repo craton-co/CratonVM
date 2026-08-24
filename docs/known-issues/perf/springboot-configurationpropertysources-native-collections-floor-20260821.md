@@ -1,7 +1,8 @@
 # `ConfigurationPropertySourcesTests` — decomposed, Term 1 fixed, ~23× HotSpot
 
 **Status: OPEN — Terms 1 and 3 CLOSED, Term 2 RE-TAKEN and re-scoped, all on
-2026-08-24.** What is left is one precisely-named next step (`ArrayList.get`,
+2026-08-24. Term 3's fix is real but measured NOT to move this class**, so what
+is left of the gap here is Term 2 alone. What is left is one precisely-named next step (`ArrayList.get`,
 worth ~6×) and one open question (why `ArrayList$Itr` bytecode is SLOWER than
 its native), both in Term 2 below.
 Rewritten from the 2026-08-21 first cut, which called this "the
@@ -279,6 +280,33 @@ move. `CRATONVM_DBG_STUB_YIELD` prints `yield=true — real bytecode wins` on th
 fix and nothing on the base; `CRATONVM_DBG_JIT_COMPILED` counts 0
 `java/util/Objects` entries before and 6 after — which is the engagement
 evidence this page asked the next session to get before trusting any flag.
+
+**AND IT DOES NOT MOVE THIS CLASS.** Measured end to end after landing it, same
+harness and same CPU-time instrument as the Term 1 measurement at the top:
+
+| | HotSpot | CratonVM |
+|---|---:|---:|
+| Term 1 only (earlier window) | 8.3 / 6.6 / 8.4 s | 186.2 / 187.3 / **191.2** s |
+| Term 1 + Term 3 | 10.0 / 8.3 / 8.4 s | 201.2 / 189.9 / **189.4** s |
+
+189.9 against 187.3, with each arm's own spread being 186-191 and 189-201. That
+is a null result, and the HotSpot control is what licenses reading the two
+windows against each other at all: its median is 8.4 s here and 8.3 s there, so
+the windows cost the same in CPU terms even though the box was at load 33-51 for
+one and 17-37 for the other. (It is still a CROSS-BINARY comparison — Term 3 is
+a registration KIND and has no kill switch — so it is weaker than the
+one-binary A/B above it, and is quoted only to bound the effect, not to price
+it.)
+
+**So the term table below is wrong about this term.** It priced
+`Objects.equals` at ~21 s of ~475 s and called it "~4%". Making those methods
+3.4x faster should then have been worth ~8% of the post-Term-1 187 s, and
+nothing of the kind shows up. Either `Objects` is not a meaningful share of what
+remains after Term 1, or the ~215 ns/call the estimate was built on was measuring
+the pre-Term-1 profile's `Arrays.equals` path rather than these statics. The
+useful conclusion is the general one: **Term 3 is a real VM-wide win and a
+correctness fix, and it is NOT a fix for this class.** `requireNonNull` being
+among the most-called methods in the JDK is what justifies it, not this page.
 
 **It also fixed three wrong answers.** `probes/ObjectsYieldProbe` (50 rows,
 diffed against HotSpot 25.0.3+9) is byte-identical after the fix; before it, the
