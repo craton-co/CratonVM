@@ -476,7 +476,7 @@ impl Compiler {
     /// oops are exactly the reference parameters — `param_oop_mask`, the same
     /// value that seeds the dataflow at bci 0.
     #[inline]
-    fn local_oop_mask_at_current_pc(&self) -> Option<u64> {
+    pub(super) fn local_oop_mask_at_current_pc(&self) -> Option<u64> {
         if self.cur_bc_pc == ENTRY_POLL_BC_PC {
             return Some(self.param_oop_mask);
         }
