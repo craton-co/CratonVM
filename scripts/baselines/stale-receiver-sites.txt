@@ -1,22 +1,4 @@
 # stale-receiver audit baseline — scripts/stale-receiver-audit.py
 # fn <sites-that-reuse-the-receiver>. See the script header for the
 # shape and for why a match is not automatically a defect.
-depth=2
-attach_minimal_jboss_logger_node 2
-capture_huc_key_managers_ctx_key 1
-capture_inheritable_tl_at_construction 10
-capture_throwable_trace 1
-https_ensure_exchanged 3
-iis_fill 2
-init_runtime_mxbean_fields 1
-lucene_buffered_checksum_flush 1
-p54_huc_do_request 6
-populate_boot_layer_modules 1
-populate_format_data_en 1
-register_rsa_priv_sign_material 3
-register_rsa_pub_verify_material 2
-seed_coder_error_actions 2
-sync_raster_pixels 1
-ws_require_open 4
-zo_finalize_current_entry 3
-zo_write_zip 1
+depth=6

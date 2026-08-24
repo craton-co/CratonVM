@@ -13641,11 +13641,11 @@ pub fn register_essential_natives_with_shims(
         },
     );
     registry.register("java/lang/Thread", "<init>", "()V", |ctx, args| {
-        let this = match args.first() {
+        let mut this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+        crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
         let name = Value::Object(Some(thread_default_name(ctx)));
         if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
             populate_real_thread_holder(ctx, this, Value::Object(None), Value::Object(None), name);
@@ -13660,11 +13660,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/Runnable;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name = Value::Object(Some(thread_default_name(ctx)));
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
@@ -13682,11 +13682,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/String;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let name = match args.get(1).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
                 _ => Value::Object(Some(thread_default_name(ctx))),
@@ -13711,11 +13711,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/Runnable;Ljava/lang/String;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
@@ -13736,11 +13736,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = Value::Object(Some(thread_default_name(ctx)));
@@ -13760,11 +13760,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
@@ -13785,11 +13785,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 // Real-JDK Thread: this native intercepts the real Java
                 // constructor, so we must populate the `holder:FieldHolder`
@@ -13821,11 +13821,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;J)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 let group = args.get(1).cloned().unwrap_or(Value::Object(None));
                 let target = args.get(2).cloned().unwrap_or(Value::Object(None));
@@ -13854,7 +13854,7 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;JZ)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
@@ -13885,7 +13885,7 @@ pub fn register_essential_natives_with_shims(
                 let child_hash = ctx.identity_hash_code(this);
                 crate::phases_early::queue_inherited_tl_for_child(child_hash, Default::default());
             } else {
-                crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+                crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             }
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 let group = args.get(1).cloned().unwrap_or(Value::Object(None));
@@ -40265,13 +40265,16 @@ fn native_exception_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         // with "Can't overwrite cause", and serializing such a throwable emits
         // a null `cause` where HotSpot emits the self back-reference.
         crate::lang_misc::write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
-        crate::lang_misc::capture_throwable_trace(ctx, *this);
+        // `this` borrows `args`; take a local so the funnel's refreshed
+        // reference is what any later statement in this block sees.
+        let mut this = *this;
+        crate::lang_misc::capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
 
 fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -40359,7 +40362,7 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // returned 0 frames for every one of those subclasses thrown from bytecode.
     // Route through the shared capture helper so they match HotSpot (and the
     // base Throwable/RuntimeException classes, which these lists omit).
-    crate::lang_misc::capture_throwable_trace(ctx, this);
+    crate::lang_misc::capture_throwable_trace(ctx, &mut this);
     Ok(None)
 }
 
@@ -47046,7 +47049,12 @@ mod g23_nomination_witnesses {
              way the per-body check below would be checking the wrong population",
             bodies.len()
         );
-        let call = format!("capture_inheritable_tl_at_{}(ctx, this)", "construction");
+        // `&mut this` since `WORKER-5-NOTE-13`: the funnel allocates, so it
+        // hands the refreshed receiver back rather than stranding the caller
+        // with a pre-move address. Kept EXACT rather than loosened to a name
+        // match -- the point of this witness is that each body passes its own
+        // `this`, and a prefix match would stop checking that.
+        let call = format!("capture_inheritable_tl_at_{}(ctx, &mut this)", "construction");
         let queue = format!("queue_inherited_tl_for_{}(child_hash", "child");
         for (n, body) in bodies.iter().enumerate() {
             assert!(

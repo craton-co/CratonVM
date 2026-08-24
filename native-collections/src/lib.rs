@@ -10460,12 +10460,25 @@ impl Drop for ChmResizeLockGuard {
 /// resize lock-free (HashMap is not thread-safe). CHM segment callers
 /// take the write lock so concurrent CHM lock-free readers in
 /// `chm_seg_get` serialize against the in-place NEXT mutations below.
-fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
+///
+/// The receiver is `&mut` because a resize ALLOCATES: `map_resize_inner` pins
+/// `this`, re-reads it across `new_ref_array` and again across the rehash, and
+/// then dropped that refreshed value at its own closing brace -- so every
+/// caller was left holding a pre-move address (`WORKER-5-NOTE-12` §7; the same
+/// species as `chm_publish_real_table`). Of the three call sites exactly one
+/// re-read through its own pin and two did not. Taking `&mut` makes forgetting
+/// a COMPILE ERROR rather than something the next audit has to find again.
+fn map_resize(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
     let is_concurrent = CHM_RESIZE_LOCK_NEEDED.with(|c| c.get());
-    map_resize_inner(ctx, this, is_concurrent);
+    *this = map_resize_inner(ctx, *this, is_concurrent);
 }
 
-fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent: bool) {
+/// Returns the receiver, refreshed across every collection this can complete.
+fn map_resize_inner(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    is_concurrent: bool,
+) -> ObjectRef {
     // Bug 1+2+5 (CRIT/HIGH) round-10 fix: only take the resize lock when
     // resizing a CHM segment. Plain `java/util/HashMap.put` is single-
     // threaded; serializing its resize through the striped lock array
@@ -10491,7 +10504,7 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
 
     let (old_buckets0, size, old_cap) = map_state(ctx, this);
     if old_cap >= MAP_MAX_CAPACITY {
-        return; // cannot grow further
+        return this; // cannot grow further -- above the pin, so unmoved
     }
     // `native_map_put` also routes here to MATERIALISE a table for a map that
     // has none (a JDK-bytecode constructor that leaves `table` null, or any
@@ -10900,6 +10913,7 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
         }
     }
     ctx.unpin_native_roots(this_pin); // gcstress residual face-1 fix
+    this
 }
 
 /// Collect all keys from a HashMap into a Vec.
@@ -12360,8 +12374,7 @@ fn native_map_put_evict_pinned(
     // deep in Spring's bean factory).
     let (initial_buckets, size, cap) = map_state(ctx, this);
     if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
-        map_resize(ctx, this);
-        this = ctx.read_native_pin(put_pin_base, this);
+        map_resize(ctx, &mut this);
     }
 
     let (buckets, size, cap) = map_state(ctx, this);
@@ -14258,7 +14271,7 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
         // Add to the set's backing map
         let hash = ctx.identity_hash_code(entry_obj);
-        let backing_map = ctx.read_native_pin(backing_pin, backing_map);
+        let mut backing_map = ctx.read_native_pin(backing_pin, backing_map);
         let (b, size, c) = map_state(ctx, backing_map);
         // Materialise instead of unwrapping. These builders run over a backing
         // map this crate allocated, and `alloc_view_backing` still allocates its
@@ -14269,7 +14282,7 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let b = match b {
             Some(b) => b,
             None => {
-                map_resize(ctx, backing_map);
+                map_resize(ctx, &mut backing_map);
                 let (b2, _, _) = map_state(ctx, backing_map);
                 match b2 {
                     Some(b2) => b2,
@@ -41739,7 +41752,7 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let b = match b {
             Some(b) => b,
             None => {
-                map_resize(ctx, backing_map);
+                map_resize(ctx, &mut backing_map);
                 let (b2, _, _) = map_state(ctx, backing_map);
                 match b2 {
                     Some(b2) => b2,

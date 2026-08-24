@@ -2461,6 +2461,42 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// `gc/src/stale_objref_debug.rs` and
     /// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     ///
+    /// # A funnel that allocates takes its receiver by `&mut ObjectRef`
+    ///
+    /// Pinning protects the code that does it. It does NOT protect a CALLER
+    /// that passed the receiver in by value: the callee's refreshed reference
+    /// dies at its closing brace and the caller keeps the pre-move address.
+    /// That is a whole defect family rather than a one-off —
+    /// `WORKER-5-NOTE-10` traced `TreeMap.size()` answering **0** on a view
+    /// nothing had mutated to exactly this, and `WORKER-5-NOTE-13` converted
+    /// 23 more funnels across all seven native crates.
+    ///
+    /// So the convention is:
+    ///
+    /// > **A helper that (a) takes a receiver `ObjectRef`, (b) can allocate,
+    /// > and (c) returns no reference MUST take that receiver as
+    /// > `&mut ObjectRef` and write the refreshed value back.**
+    ///
+    /// ```ignore
+    /// fn refresh_the_thing(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
+    ///     let pin = ctx.pin_native_root(*this);
+    ///     let out = refresh_the_thing_body(ctx, *this);
+    ///     *this = ctx.read_native_pin(pin, *this);   // hand the caller the new address
+    ///     ctx.unpin_native_roots(pin);
+    ///     out
+    /// }
+    /// ```
+    ///
+    /// `&mut` is the point, not the pin: it turns every unconverted caller
+    /// into a COMPILE ERROR. Returning the reference instead is equally sound
+    /// but weaker — a plain `-> ObjectRef` can be dropped in silence. Pinning
+    /// at each call site is weakest of all: it is what the next audit has to
+    /// find again, and of the call sites `WORKER-5-NOTE-12`/`-13` examined,
+    /// the ones that had been protected by hand were consistently outnumbered
+    /// by the ones beside them that had not.
+    ///
+    /// `scripts/stale-receiver-audit.py` is the gate; its baseline is empty.
+    ///
     /// Default impl is a no-op (handle 0) for test mocks with no moving GC.
     fn pin_native_root(&mut self, _obj: ObjectRef) -> usize {
         0

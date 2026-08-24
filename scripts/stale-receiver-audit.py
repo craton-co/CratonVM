@@ -56,7 +56,8 @@ Usage:
     scripts/stale-receiver-audit.py --update        # re-baseline
     scripts/stale-receiver-audit.py --detail        # every site, with first use
     scripts/stale-receiver-audit.py --selftest      # no tree needed
-    scripts/stale-receiver-audit.py --depth 2       # widen reachability
+    scripts/stale-receiver-audit.py --depth 1       # narrow reachability
+                                                    # (default 6 = the fixpoint)
 
 Exit: 0 ok · 1 the population GREW · 2 no baseline · 3 the gate is broken
 """
@@ -80,6 +81,8 @@ ALLOC0 = re.compile(
     r"|\bctx\.ensure_class_initialized\b|\bctx\.intern\b|\bctx\.box_")
 FNDEF = re.compile(r"^(pub(\([a-z ]+\))? )?(async )?(unsafe )?fn ([a-z_][a-z_0-9]*)")
 CALL = re.compile(r"(?<![a-z_0-9.])([a-z_][a-z_0-9]*)\(\s*ctx\s*,\s*([a-z_][a-z_0-9]*)\s*\)")
+# Every `name(` that is not a method call -- the callee edge of the call graph.
+CALLEE = re.compile(r"(?<![a-z_0-9.])([a-z_][a-z_0-9]*)\s*\(")
 RECV = re.compile(r"\b([a-z_][a-z_0-9]*): ObjectRef\b")
 
 Fn = collections.namedtuple("Fn", "name file line sig code crate")
@@ -119,14 +122,22 @@ def index(root, crates):
 
 
 def allocating(fns, depth):
-    """{fn name: the depth at which allocation was reached}."""
+    """{fn name: the depth at which allocation was reached}.
+
+    The callee names of each body are tokenised ONCE and reachability is a set
+    intersection. The obvious spelling -- one `a|b|c|...` alternation per round
+    over every body -- is quadratic in the frontier, and at `--depth 3` (a
+    6,000-name frontier) it did not finish in ten minutes. `CALLEE` is the same
+    pattern that alternation used, so the two agree; `--selftest` and the
+    committed depth-1/depth-2 numbers are what hold them to that.
+    """
     alloc = {fn.name: 0 for fn in fns if ALLOC0.search(fn.code)}
+    callees = [(fn.name, set(CALLEE.findall(fn.code))) for fn in fns]
     for d in range(1, depth + 1):
         known = set(alloc)
         if not known:
             break
-        pat = re.compile(r"(?<![a-z_0-9.])(" + "|".join(map(re.escape, known)) + r")\s*\(")
-        add = {fn.name: d for fn in fns if fn.name not in alloc and pat.search(fn.code)}
+        add = {n: d for (n, cs) in callees if n not in alloc and not cs.isdisjoint(known)}
         if not add:
             break
         alloc.update(add)
@@ -265,7 +276,11 @@ fn caller_only_comments(ctx: &mut dyn NativeContext, this: ObjectRef) {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--depth", type=int, default=1)
+    # 6 is the FIXPOINT: `allocating` stops growing there (5147 at depth 1,
+    # 6104 at 2, 6348 at 3, 6476 at 4, 6538 at 5, 6538 at 6 and at 12), so
+    # the default is a converged answer rather than an arbitrary cut. It is
+    # not a slow one -- the whole scan is ~9s.
+    ap.add_argument("--depth", type=int, default=6)
     ap.add_argument("--update", action="store_true")
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--selftest", action="store_true")

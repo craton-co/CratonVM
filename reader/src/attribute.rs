@@ -2706,7 +2706,7 @@ mod tests {
     #[test]
     fn element_value_all_const_tags() {
         // All valid constant tags: B, C, D, F, I, J, S, Z, s
-        for tag in [b'B', b'C', b'D', b'F', b'I', b'J', b'S', b'Z', b's'] {
+        for tag in *b"BCDFIJSZs" {
             let ev = ElementValue::Const {
                 tag,
                 const_value_index: 1,

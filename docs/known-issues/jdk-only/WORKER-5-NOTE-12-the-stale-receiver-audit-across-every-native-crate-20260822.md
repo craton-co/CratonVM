@@ -3,6 +3,13 @@
 **Status: MEASURED. Three fixes, one gate wired into CI, eighteen findings
 handed over.** Lane WORKER-5, 2026-08-22. Answers `WORKER-5-NOTE-11` N2.
 
+> **SUPERSEDED IN PART by `WORKER-5-NOTE-13` (2026-08-23).** The eighteen
+> handed over in §2/§6 are **fixed**, the baseline is **empty**, and the depth
+> this record settled on (2) was still short: the fixpoint is **6**, and depth
+> 5 exposed three more — one of them in `native-collections`, which §7 below
+> had just called *genuinely* clean. Read §7 as the second of three such
+> corrections, not the last.
+
 > **§7 is a CORRECTION to this record's own headline.** §3 said
 > "`native-collections` now has ZERO functions of the shape". That was true **at
 > `--depth 1`, which is the only depth this record had measured** — and §5 had
@@ -194,19 +201,23 @@ and then the depth-2 audit.
 
 ## 6. NOMINATIONS
 
-* **N1 — the 14 `native-builtins` sites want their owner.** Start with
+* ~~**N1 — the 14 `native-builtins` sites want their owner.**~~ **DONE —
+  `WORKER-5-NOTE-13` §2**, along with N2. All converted to `&mut ObjectRef`;
+  the compiler found the callers. Original text:
+  Start with
   `capture_inheritable_tl_at_construction` (10) and `p54_huc_do_request` (6);
   §2 verified both reach allocation. `scripts/stale-receiver-audit.py --detail`
   prints every site with the line that decides it.
-* **N2 — 2 in `native-io`** (`ws_require_open`) **and 1 in `native-awt`**
-  (`sync_raster_pixels`).
+* ~~**N2 — 2 in `native-io`** (`ws_require_open`) **and 1 in `native-awt`**
+  (`sync_raster_pixels`).~~ **DONE — `WORKER-5-NOTE-13` §2.**
 * ~~**N3 — run the gate at `--depth 2`.**~~ **DONE — §7.** It found three more,
   two of them in the crate this record had just called clean. The baseline is
   now depth 2.
 * ~~**N4 — wire the gate into CI.**~~ **DONE — §8.**
-* **N5 — depth 3 is still unmeasured.** Depth 2 found two real defects that
-  depth 1 could not see, so "the baseline is a floor" is now a measured claim
-  rather than a caveat. Someone should find where it converges.
+* ~~**N5 — depth 3 is still unmeasured.**~~ **DONE — `WORKER-5-NOTE-13` §1.**
+  It converges at **6**, not 3: depths 3 and 4 return the same 18/45 as depth 2
+  and look like convergence, and depth 5 then adds three more. The tool could
+  not answer this at all until its reachability was rewritten.
 
 ---
 

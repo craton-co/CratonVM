@@ -1505,7 +1505,12 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_SIGN));
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
-        let mut kid = extract_key_id_from_key(ctx, *k);
+        // `k` borrows `args`. Take a local: the register_* funnel below
+        // allocates, and both the `extract_key_id_from_key` re-read and
+        // the SIG_OFF_KEYOBJ store after it must use the POST-move ref --
+        // that field is GC-scanned, so a stale ref there is durable.
+        let mut k = *k;
+        let mut kid = extract_key_id_from_key(ctx, k);
         let alg = get_sig_algo(ctx, this).unwrap_or(-1);
         if needs_registered_rsa_key(alg) && !crypto_impl::rsa_key_registered(kid) {
             // A key this VM did not mint. Import it from the standard
@@ -1521,8 +1526,8 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             // usable accessors, so a genuinely OPAQUE key still lands on the
             // refusal below — which is the behaviour netty's provider search
             // depends on.
-            crate::jca::key_factory::register_rsa_priv_sign_material(ctx, *k);
-            kid = extract_key_id_from_key(ctx, *k);
+            crate::jca::key_factory::register_rsa_priv_sign_material(ctx, &mut k);
+            kid = extract_key_id_from_key(ctx, k);
             if !crypto_impl::rsa_key_registered(kid) {
                 return Err(refuse_unusable_key(ctx, alg));
             }
@@ -1531,7 +1536,7 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
         // Stash the real key object for the SunEC ECDSA drive path (slot is
         // GC-scanned, so the ref survives init→update→sign relocations).
-        ctx.set_field(this, base + SIG_OFF_KEYOBJ, Value::Object(Some(*k)));
+        ctx.set_field(this, base + SIG_OFF_KEYOBJ, Value::Object(Some(k)));
     }
     clear_data(ctx, this);
     Ok(None)
@@ -1560,7 +1565,12 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_VERIFY));
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
-        let mut kid = extract_key_id_from_key(ctx, *k);
+        // `k` borrows `args`. Take a local: the register_* funnel below
+        // allocates, and both the `extract_key_id_from_key` re-read and
+        // the SIG_OFF_KEYOBJ store after it must use the POST-move ref --
+        // that field is GC-scanned, so a stale ref there is durable.
+        let mut k = *k;
+        let mut kid = extract_key_id_from_key(ctx, k);
         let alg = get_sig_algo(ctx, this).unwrap_or(-1);
         if needs_registered_rsa_key(alg) && !crypto_impl::rsa_key_registered(kid) {
             // A key this VM did not mint. Import it from the standard
@@ -1576,8 +1586,8 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             // usable accessors, so a genuinely OPAQUE key still lands on the
             // refusal below — which is the behaviour netty's provider search
             // depends on.
-            crate::jca::key_factory::register_rsa_pub_verify_material(ctx, *k);
-            kid = extract_key_id_from_key(ctx, *k);
+            crate::jca::key_factory::register_rsa_pub_verify_material(ctx, &mut k);
+            kid = extract_key_id_from_key(ctx, k);
             if !crypto_impl::rsa_key_registered(kid) {
                 return Err(refuse_unusable_key(ctx, alg));
             }
@@ -1586,7 +1596,7 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
         // Stash the real key object for the SunEC ECDSA drive path (slot is
         // GC-scanned, so the ref survives init→update→sign relocations).
-        ctx.set_field(this, base + SIG_OFF_KEYOBJ, Value::Object(Some(*k)));
+        ctx.set_field(this, base + SIG_OFF_KEYOBJ, Value::Object(Some(k)));
     }
     clear_data(ctx, this);
     Ok(None)

@@ -20,38 +20,41 @@ name: Stale-receiver audit
 #
 # **Nothing crashes.** That is the whole argument for a gate: the shape produces
 # a plausible WRONG ANSWER, and it needs a moving collection at one exact
-# instant, so it survives every green suite until an application trips it. Three
-# instances have been found and fixed (`tm_sync_native_state`,
-# `resync_view_set`, `tm_migrate_fast_to_array` + two more at depth 2) and only
-# ONE of them ever had a reproduction.
+# instant, so it survives every green suite until an application trips it. Only
+# one of the instances found so far ever had a reproduction.
 #
 # Same shape as `.github/workflows/untyped-alloc-ratchet.yml`: its GREEN state
 # is the normal one, it goes red only when the population GROWS, and it is a
-# source scan — no build, no VM, no JDK, about a minute over 253 files.
+# source scan — no build, no VM, no JDK, about nine seconds over 253 files.
 #
-# Re-baselining is one command and is a normal part of a commit that adds a
-# site on purpose:
+# THE BASELINE IS EMPTY (`WORKER-5-NOTE-13`). Every funnel of this shape now
+# takes `&mut ObjectRef`, so an unconverted caller is a COMPILE error and a
+# newly written one is a red job here. Re-baselining is one command and is a
+# normal part of a commit that adds a site on purpose:
 #
-#     python3 scripts/stale-receiver-audit.py --depth 2 --update
+#     python3 scripts/stale-receiver-audit.py --update
 #
 # ---------------------------------------------------------------------------
 # WHAT A GREEN RUN HERE DOES NOT MEAN
 # ---------------------------------------------------------------------------
 #
-# A MATCH IS NOT A DEFECT, and the baseline is a FLOOR, not a census:
+# A MATCH IS NOT A DEFECT, and a zero is a floor, not a proof:
 #
-#   * allocation reachability is bounded by `--depth` (2 here). A funnel that
-#     allocates three helpers down is invisible at that setting — and that is
-#     not hypothetical: two of the fixed instances were found ONLY when the
-#     depth went from 1 to 2.
+#   * the depth default (6) is the FIXPOINT of allocation reachability, not a
+#     guess — `allocating` stops growing there. But reachability is computed
+#     over an intra-crate call graph keyed by NAME, so a call through a trait
+#     object or a function pointer is invisible at any depth.
 #   * `ALLOC0` is a name list. An allocator spelled a way it does not name is
 #     missed. It counts `ctx.invoke*`, which is right (interpreted Java
 #     allocates) but coarse.
 #   * candidates are keyed by function NAME — this scan has no module
-#     resolution — so the 66 names defined in more than one crate are merged.
-#     Those rows print `AMBIG(n defs)`; do not read their crate label as exact.
+#     resolution — so names defined in more than one crate are merged. Those
+#     rows print `AMBIG(n defs)`; do not read their crate label as exact.
 #   * the reuse window ends at the next column-0 `fn`, and only the FIRST
 #     post-call use is reported.
+#   * it says nothing about a receiver held across a call that already takes
+#     `&mut`, nor about NON-receiver locals held across an allocating call —
+#     `WORKER-5-NOTE-13` §5 nominates that second family and it is unmeasured.
 #
 # `scripts/stale-receiver-audit.py --selftest` runs the detector against a
 # synthetic tree and needs nothing checked out; it covers depth-0 detection, a
@@ -74,9 +77,10 @@ jobs:
           fetch-depth: 1
 
       - name: Selftest the detector
-        # Before the tree is judged, check the judge. This needs no source and
-        # fails loudly if a refactor breaks the matching rules.
+        # Before the tree is judged, check the judge. This matters more now the
+        # baseline is EMPTY: a detector that has silently stopped matching
+        # anything reports exactly the same clean run as a clean tree.
         run: python3 scripts/stale-receiver-audit.py --selftest
 
       - name: Audit the stale-receiver surface
-        run: python3 scripts/stale-receiver-audit.py --depth 2
+        run: python3 scripts/stale-receiver-audit.py
