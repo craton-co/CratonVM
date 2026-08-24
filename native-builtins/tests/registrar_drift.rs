@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1214;
+const BASELINE_TOTAL_DRIFT: usize = 1237;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1347;
+const BASELINE_TOTAL_PAIRS: usize = 1370;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -1252,6 +1252,14 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/management/RuntimeMXBean", "getUptime", "()J"),
             ("java/lang/management/RuntimeMXBean", "getVmName", "()Ljava/lang/String;"),
             ("java/lang/management/RuntimeMXBean", "getVmVersion", "()Ljava/lang/String;"),
+            ("java/lang/management/ThreadMXBean", "getAllThreadIds", "()[J"),
+            ("java/lang/management/ThreadMXBean", "getDaemonThreadCount", "()I"),
+            ("java/lang/management/ThreadMXBean", "getPeakThreadCount", "()I"),
+            ("java/lang/management/ThreadMXBean", "getThreadCount", "()I"),
+            ("java/lang/management/ThreadMXBean", "getTotalStartedThreadCount", "()J"),
+            ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringEnabled", "()Z"),
+            ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringSupported", "()Z"),
+            ("java/lang/management/ThreadMXBean", "isThreadCpuTimeSupported", "()Z"),
         ],
     ),
     (
@@ -1645,6 +1653,15 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
         ],
     ),
     (
+        "register_pe2_string_marshaling_on",
+        &[
+            ("cratonvm/internal/foreign/MemorySegmentImpl", "getUtf8String", "(J)Ljava/lang/String;"),
+            ("cratonvm/internal/foreign/MemorySegmentImpl", "reinterpret", "(J)Ljava/lang/foreign/MemorySegment;"),
+            ("java/lang/foreign/MemorySegment", "getUtf8String", "(J)Ljava/lang/String;"),
+            ("java/lang/foreign/MemorySegment", "reinterpret", "(J)Ljava/lang/foreign/MemorySegment;"),
+        ],
+    ),
+    (
         "register_pe_arena",
         &[
             ("java/lang/foreign/Arena", "allocate", "(J)Ljava/lang/foreign/MemorySegment;"),
@@ -1871,10 +1888,21 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/net/HttpURLConnection", "connect", "()V"),
             ("java/net/HttpURLConnection", "disconnect", "()V"),
             ("java/net/HttpURLConnection", "getContentLength", "()I"),
+            ("java/net/HttpURLConnection", "getContentLengthLong", "()J"),
+            ("java/net/HttpURLConnection", "getErrorStream", "()Ljava/io/InputStream;"),
             ("java/net/HttpURLConnection", "getHeaderField", "(Ljava/lang/String;)Ljava/lang/String;"),
             ("java/net/HttpURLConnection", "getInputStream", "()Ljava/io/InputStream;"),
+            ("java/net/HttpURLConnection", "getInstanceFollowRedirects", "()Z"),
+            ("java/net/HttpURLConnection", "getOutputStream", "()Ljava/io/OutputStream;"),
+            ("java/net/HttpURLConnection", "getResponseMessage", "()Ljava/lang/String;"),
+            ("java/net/HttpURLConnection", "setChunkedStreamingMode", "(I)V"),
+            ("java/net/HttpURLConnection", "setConnectTimeout", "(I)V"),
             ("java/net/HttpURLConnection", "setDoInput", "(Z)V"),
             ("java/net/HttpURLConnection", "setDoOutput", "(Z)V"),
+            ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(I)V"),
+            ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(J)V"),
+            ("java/net/HttpURLConnection", "setInstanceFollowRedirects", "(Z)V"),
+            ("java/net/HttpURLConnection", "setReadTimeout", "(I)V"),
             ("java/net/InetAddress", "getHostAddress", "()Ljava/lang/String;"),
             ("java/net/InetAddress", "getHostName", "()Ljava/lang/String;"),
             ("java/net/InetAddress", "toString", "()Ljava/lang/String;"),
@@ -3040,6 +3068,9 @@ struct Analysis {
     resolved_sites: usize,
     loop_expanded_sites: usize,
     unresolved: BTreeMap<String, usize>,
+    /// `reason|file|enclosing-fn` -> count, so the blind region can NAME
+    /// the registrars to teach the resolver about next.
+    unresolved_where: BTreeMap<String, usize>,
     triples: usize,
     shipping: usize,
     synthetic_only: BTreeSet<String>,
@@ -3743,6 +3774,7 @@ fn build_analysis() -> Analysis {
     let mut resolved_sites = 0usize;
     let mut loop_expanded_sites = 0usize;
 let mut param_bound_sites = 0usize;
+    let mut unresolved_where: BTreeMap<String, usize> = BTreeMap::new();
     let bump = |m: &mut BTreeMap<String, usize>, k: &str| {
         *m.entry(k.to_string()).or_insert(0) += 1;
     };
@@ -3799,7 +3831,19 @@ let mut param_bound_sites = 0usize;
                 }
                 let name = String::from_utf8_lossy(&t[j..k]).into_owned();
                 let paren = skip_ws(t, k);
-                if paren < n && t[paren] == b'(' && name.starts_with("register") {
+                // NOT the definition. `fn name(r: &mut .., c: &str)` matches
+                // `name(` just as a call does, and its "arguments" are the
+                // PARAMETER LIST, which never resolves — so including it made
+                // the all-sites-must-resolve rule refuse every real binding.
+                // Measured: this alone was 41 sites on
+                // `register_al_sublist_natives_on` and 41 more on
+                // `register_pe_memory_segment_on`.
+                let mut b = j;
+                while b > 0 && (t[b - 1] == b' ' || t[b - 1] == b'\t') {
+                    b -= 1;
+                }
+                let is_def = b >= 2 && &t[b - 2..b] == b"fn";
+                if paren < n && t[paren] == b'(' && !is_def && name.starts_with("register") {
                     let cend = match_paren(t, paren);
                     if cend > paren + 1 {
                         let a = split_args(&t[paren + 1..cend - 1], &nc[paren + 1..cend - 1]);
@@ -4060,6 +4104,13 @@ let mut param_bound_sites = 0usize;
                 resolved_sites += 1;
             } else {
                 bump(&mut unresolved, &why);
+                // WHERE, not just how many. The category alone says a form is
+                // unresolvable; it does not say which registrar to teach the
+                // resolver about next, and this gate's remedy is explicitly to
+                // teach a form rather than to raise the ceiling.
+                *unresolved_where
+                    .entry(format!("{why}|{}|{}", f.rel, fns[encl].name))
+                    .or_insert(0usize) += 1;
             }
         }
     }
@@ -4087,6 +4138,7 @@ let mut param_bound_sites = 0usize;
         resolved_sites,
         loop_expanded_sites,
         unresolved,
+        unresolved_where,
         triples: registrants.len(),
         shipping: shipping.len(),
         synthetic_only,
@@ -4275,8 +4327,31 @@ fn the_drift_scanner_is_not_vacuous() {
          INVISIBLE to `no_new_mode_drift`. This assertion cannot see that drift either; \
          all it says is that the region where it could hide has not grown. If a change \
          needs to grow it, the honest move is to teach the resolver the new form, not to \
-         raise this number.",
-        a.unresolved
+         raise this number.
+
+\n         WHERE THE BLIND REGION IS, worst first -- the registrars to teach it \n         about next:
+{}",
+        a.unresolved,
+        {
+            let mut v: Vec<(&String, &usize)> = a
+                .unresolved_where
+                .iter()
+                .filter(|(k, _)| !k.starts_with("arity<4|"))
+                .collect();
+            v.sort_by(|x, y| y.1.cmp(x.1).then(x.0.cmp(y.0)));
+            v.into_iter()
+                .take(15)
+                .map(|(k, n)| {
+                    let mut it = k.split('|');
+                    let why = it.next().unwrap_or("");
+                    let file = it.next().unwrap_or("");
+                    let f = it.next().unwrap_or("");
+                    format!("           {n:>5}  {why:<20} {f}  ({file})")
+                })
+                .collect::<Vec<_>>()
+                .join("
+")
+        }
     );
 
     // --- the analysis's own two views of drift must agree ------------------
