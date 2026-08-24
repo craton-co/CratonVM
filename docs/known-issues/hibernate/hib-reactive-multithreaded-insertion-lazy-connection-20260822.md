@@ -587,6 +587,59 @@ Every link is CORRECT. And the composition links are **95x** and **64x**
 slower than HotSpot on precisely the shape `nextHiValue` retries through — far
 worse than the ~2.5x engine floor of the table in "Where the time goes".
 
+#### The 95x was under-measured, and the cause is `VarHandle`
+
+`HibfixComposeProbe`'s own profile showed ~45% of its time in the
+`ScheduledThreadPoolExecutor` it used to complete the inner stage — AQS,
+`ReentrantLock`, `DelayedWorkQueue` — against ~24% in `CompletableFuture`. Its
+95x was a real ratio for a mixed workload but NOT a measurement of composition.
+
+`HibfixComposeProbe2` removes the scheduler entirely: each thread owns its
+futures, the gates are completed after composition so every relay still takes
+the not-yet-complete path, and there is not a lock in it.
+
+| | HotSpot | CratonVM | ratio |
+|---|---:|---:|---:|
+| 4 800 000 compose chains | **412 ms** | **359 197 ms** | **~872x** |
+
+The scheduler had been DILUTING the cost, not inflating it. `wrong=0` over 4.8
+million chains, so this is purely cost.
+
+Profiling that clean run:
+
+| frame | share |
+|---|---:|
+| `CompletableFuture.tryPushStack` | **34.0%** |
+| `CompletableFuture$UniCompose.tryFire` | 21.4% |
+| `CompletableFuture.completeRelay` | 12.4% |
+| `CompletableFuture.uniComposeStage` | 8.0% |
+
+`tryPushStack` is `NEXT.set(c, h)` then `STACK.compareAndSet(this, h, c)` — two
+`VarHandle` operations on a reference field, **uncontended** here because each
+thread owns its futures.
+
+That led to
+[`../perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md`](../perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md):
+
+| operation | HotSpot | CratonVM | ratio |
+|---|---:|---:|---:|
+| `VarHandle.compareAndSet` reference | 9.2 ns | 488.9 ns | 53x |
+| `VarHandle.set` reference | 1.0 ns | 303.4 ns | **303x** |
+| `VarHandle.compareAndSet` int | 8.6 ns | 300.2 ns | 35x |
+| `AtomicInteger.incrementAndGet` | 5.0 ns | 6.2 ns | **1.2x** |
+
+`AtomicInteger` at parity is what makes it conclusive: this is `VarHandle`
+specifically, not atomics and not the box. The VM's `VARHANDLE_READ_DIRECT_FNS`
+binds READS of PRIMITIVE fields only — its own doc says `L` and `[` "are absent
+on purpose" — so every write and every CAS still pays the generic dispatch
+funnel.
+
+**This is the composition cost, and it is a far better lead than anything else
+on this page**: it is deterministic, needs no database and no failing run, and
+it is the plausible enabling condition for the correctness failure here — a
+sequence race HotSpot settles in microseconds run through machinery two orders
+of magnitude slower.
+
 #### What that buys, and what it does not
 
 It explains the SHAPE of the failure without yet naming the defect. A
@@ -614,21 +667,21 @@ which is the method to keep: reproduce the exact shape, run it hot, count.
 The rate drifts between 0% and 25% with no code change, so size arms by §5.3
 and **discard any arm whose control did not fail**.
 
-1. **Test the variance hypothesis of §5.9 directly.** It predicts that
+1. **Fix the `VarHandle` funnel** — `../perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md`. It is
+   deterministic, needs no failing run, and is 872x on composition. Everything
+   else on this list is downstream of it.
+2. **Test the variance hypothesis of §5.9 directly.** It predicts that
    anything reducing JIT timing variance reduces the failure, while anything
    reducing mean speed does not. `CRATONVM_BG_COMPILE=0` (synchronous
    compilation) and a pinned tier are the two levers that change variance
    without changing the code path. Interleave with a control.
-2. **Attack the 95x.** `HibfixComposeProbe` is a standalone, deterministic,
-   3.8s-vs-361s reproducer of the composition cost on the recursive-retry
-   shape — no database, no flake, no statistics. Whatever is slow there is
-   also what widens the CAS window. Profile it (`--stack-sample-ms`) and the
-   answer is a perf fix that may close the correctness bug as a side effect.
-3. **Find the event before `HR000089`.** It is the first error that reaches
+3. **Done — the 95x is now the 872x of §5.9, and profiled.** `HibfixComposeProbe2`
+   is the reproducer: 412 ms against 359 s, no database, no flake.
+4. **Find the event before `HR000089`.** It is the first error that reaches
    the test's own hooks, but those hooks only wrap `withTransaction` and
    `persist`. Something aborts an iteration before that; wrapping the loop
    body's returned stage would catch it.
-4. Do NOT re-run, all measured and negative: the `alwaysTrue` screen (§5.6),
+5. Do NOT re-run, all measured and negative: the `alwaysTrue` screen (§5.6),
    thread identity, pool comparison, guard comparison (§5.8), `thenCompose`
    relaying, and the Vert.x bridge (§5.9).
 
@@ -703,3 +756,49 @@ is generated and machine-local, so it is not committed.
 - `jit/src/lambda_adapter.rs` — the `AdapterKey` of §5.4 and its `site_shape_collisions` counter
 - [`hib-reactive-3gc-run-regressions-20260820.md`](hib-reactive-3gc-run-regressions-20260820.md) §8
 - [`batchtest-mysql-jdbc-batching-slow-20260822.md`](batchtest-mysql-jdbc-batching-slow-20260822.md) — the same "trivial JDK primitive served by a native" shape, and the same conclusion that the funnel's aggregate is small
+
+---
+
+## 8. 2026-08-24 — the `invokedynamic` bridge does NOT retire this class (checked, negative)
+
+Recorded because the obvious question after
+`fixed-suite-bugs/jit/techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md`
+is whether the same merge helps here. `TechEmpowerTest` was retired by
+`730d3e0d9` (compiled code can now EXECUTE an `invokedynamic`), and this class
+sits in the same reactive-dispatch cost family, so it is a reasonable thing to
+hope for. **It does not.**
+
+Local Windows box, live Postgres via Testcontainers, binary built from `dev`
+`b70870c36` (indy merge confirmed present by `merge-base --is-ancestor`), JUnit's
+own per-test timer raised to 900 s through `HR_CLASS_OVERRIDES` so the fixture's
+hardcoded `@Timeout(10, MINUTES)` is what binds:
+
+| arm | `ok` / 2 | wall |
+|---|---:|---|
+| default (indy bridge on) | 1 | 674 s |
+| `CRATONVM_JIT_INDY_BRIDGE=0` | 0 | 666 s |
+| `CRATONVM_JIT_INDY_BRIDGE=0` | 1 | 97 s |
+| `CRATONVM_JIT_INDY_BRIDGE=0` | 1 | 669 s |
+
+**Status on today's `dev` is unchanged from this page's own:** 1 of 2, with
+`testIdentityGeneratorWithTransaction` still exceeding the fixture's own
+deadline. The indy work does not close it, and nobody should re-run this
+expecting otherwise.
+
+### 8.1 A claim this section deliberately does NOT make
+
+The first `INDY_BRIDGE=0` run had `testIdentityGenerator` (the *non*-transactional
+method, which §Status records as passing) fail with
+`ConstraintViolationException: duplicate key value violates unique constraint
+"entity_pkey"`. On one run that reads like "the indy bridge is what keeps this
+method correct" — the same wrong-answer shape the TechEmpower page pins on that
+trap.
+
+Two further runs of the same arm did not reproduce it: **1 of 3**. So the event
+is intermittent and is NOT attributable to the flag on this evidence; it is at
+least as consistent with the duplicate-INSERT behaviour §5 already treats as
+downstream. Establishing a real rate difference here needs the kind of run count
+§5 used (40), not three.
+
+It is written down only so the next reader who sees one duplicate-key failure
+under that flag knows it has been seen, and knows it did not survive repetition.

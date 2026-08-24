@@ -246,8 +246,10 @@ restructured into SLAMBench2 (kfusion is now a separately-cloned `.so` module
 with no standalone dataset tooling), `pamela-project/kfusion` does not have it,
 `GerhardR/kfusion` is a live-camera CUDA demo, and no tag or branch preserves
 the pre-2017 layout the script was written against. Building the SLAMBench C++
-framework to check was a multi-hour GCC15/CMake4 exercise and produced no
-converter.
+framework to check was a multi-hour GCC15/CMake4 exercise (opencv 3.4.3, eigen3,
+suitesparse, cvd, flann, pangolin, pcl, sophus and the kfusion module all
+patched to build clean — see git history around 2026-08-23/24 for the exact
+patch sequence if this ever needs repeating) and produced no converter.
 
 Replacement: `scene2raw.py` (numpy + Pillow) reads the ICL-NUIM
 `living_room_traj2_loop.tgz` members directly, converts the ASCII `.depth`

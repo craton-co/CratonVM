@@ -205,13 +205,117 @@ why "the per-element constant" reads as one flat number and why no
 whole-subsystem switch moved it: two effects of comparable size cancelling.
 Each door has to be armed on its own evidence.
 
-**Next, precisely scoped:** give `ArrayList.get` the Term 3 treatment — yield
-to real bytecode under the default policy, with the five-term predicate as the
-safety and `CRATONVM_DBG_STUB_YIELD` as the engagement counter. It is worth
-~6× on indexed list access VM-wide. Do NOT extend it to the iterator family on
-the same reasoning; the number above says it would be a pessimisation, and it
-needs its own investigation into why `ArrayList$Itr` bytecode is slow (the
-first question being whether it is compiled at all).
+### The Term 3 treatment was ATTEMPTED for `ArrayList.get` and REVERTED
+
+It is behaviourally viable and mechanically inert, and it broke something else.
+All three parts matter to whoever picks this up.
+
+**Behaviourally it is fine.** `probes/ListYieldProbe` (new, 44 rows) covers the
+receivers that are ArrayList-SHAPED but are not plain ArrayLists, which is where
+real JDK bytecode reading `elementData`/`size` straight through would diverge: a
+live `values()` view across put and remove, `subList` (whose indices are offset
+from the backing) including write-through, `Collections.unmodifiableList`
+refusing writes, `Arrays.asList` allowing `set` but refusing `add`, iterator
+order, fail-fast, bounds and null. **44/44 byte-identical to HotSpot 25.0.3+9
+both on the default policy and under `--jdk-only` with the dial scoped to
+`java/util/ArrayList`** — so the real bytecode does drive CratonVM's ArrayList
+correctly.
+
+**Mechanically it did not engage, and the retag half was a no-op from the
+start.** The census says `java/util/ArrayList.get` is **ALREADY**
+`kind: synthetic-stub` on plain dev, with `kind_stated: true` — even though
+`register_arraylist_natives` sets an ambient `set_category(Bridge)` around it.
+`NativeMethodRegistry::register` adjudicates the kind itself (its "two drop arms
+and the `keep_real_*` heuristics"), so **the ambient category is not what
+lands**, and reading the registrar to learn a triple's kind is unreliable. Use
+the census.
+
+So the only effective half was the allow-list entry, and with it in place every
+precondition is satisfied and it STILL does not yield:
+
+* `kind` is `synthetic-stub` ✓
+* `real_protected_stub_class("java/util/ArrayList")` ✓ (arms C and D)
+* all five terms of the yield predicate ✓ — the census's own
+  `real_declaring_method` block reads
+  `{loaded: true, declared: true, acc_native: false, has_code: true}`
+
+and `invocations` stays at 127 in every arm and every mode. The refusal is
+therefore in the **dispatch path**, not in the registration, the allow-list or
+the predicate — and not in the JIT, since `--nojit` refuses identically.
+
+**The next probe is named:** `dispatch_virtual` has three doors that could serve
+`ArrayList.get` — `execute_invokevirtual_vtable_fast`'s
+`registered_native_will_run` (line ~150), the population filter on
+`resolve_cached_native_registration` (line ~3261), and `revalidate_cached_native`
+on cache hits. All three spell the same three-term test. Put one trace line in
+each, run `probes/ListYieldProbe`, and the door that never prints is the answer.
+Do not add another allow-list entry before doing that; two attempts have now
+been spent assuming the arbitration is reached.
+
+**~~And it silently disabled the Objects yield.~~ RETRACTED 2026-08-24 — that
+claim was wrong.** It was published off one paired reading (`Objects.equals`
+50.6 → 155.6 ns, `isNull` 28.0 → 117.0, with two local-twin controls flat) and
+it does not reproduce. Bisected properly, four binaries from the same commit:
+
+| arm | change | `Objects.equals` invocations | `ArrayList.get` invocations |
+|---|---|---:|---:|
+| A | dev, control | 0 | 127 |
+| B | the `SyntheticStub` retag only | 0 | 127 |
+| C | the allow-list entry only | 0 | 127 |
+| D | **both** — exactly the reverted attempt | 0 | 127 |
+
+Timings agree: `Objects.equals` reads 56.8-66.8 ns on D against 57.0-60.2 on A,
+i.e. noise. **No arm regresses anything.** The controls being flat is what made
+the original reading persuasive, and it should not have been — two rungs moving
+3× with two controls flat is a coincidence, not a mechanism, and "adding one arm
+to a `matches!` cannot remove another" was reason enough to withhold the claim
+until it was bisected. What the original reading actually was is not known; it
+was taken against a binary built at an earlier dev commit, which was not
+re-tested.
+
+**`invocations` is the instrument that settles this, not ns/call.**
+`--dump-native-registry` writes a row per registered triple carrying
+`invocations`, `kind`, `owns_slot`, `registered_by`, `overwrote` and a
+`real_declaring_method` block. `java/util/Objects.equals` reading
+**`invocations: 0`** is a far better proof that Term 3 works than any timing:
+the native is never entered at all. Every question on this page that is really
+"did the native run?" should be asked this way.
+
+**What DID survive the bisect is the engagement failure**, and it is sharper
+than first stated. `ArrayList.get` runs its native 127 times in all four arms,
+under `--nojit` as well as compiled — so it is not the JIT site cache, and the
+interpreter refuses it too.
+
+**Still open, unchanged:** ~6× is available on indexed list access if the
+engagement problem is solved. Do NOT extend it to the iterator family on the
+same reasoning; the number above says that would be a pessimisation, and it
+needs its own investigation into why `ArrayList$Itr` bytecode is slow (the first
+question being whether it is compiled at all).
+
+### The leaf fast path is engaged and is not the lever
+
+`native-collections` registers nothing as leaf, so the obvious next idea is to
+mark the pure accessors leaf and drop the funnel's pinning, STW probe,
+transitions and unwind bookkeeping. The numbers say do not bother.
+`probes/NativeFunnelFloorProbe`, this host, from compiled code:
+
+```text
+control: plain Java call         10.8 ns
+LEAF   AtomicInteger.get        383-417 ns
+FUNNEL AtomicInteger.CAS            482 ns
+FUNNEL MessageDigest.update         156 ns
+FUNNEL identityHashCode             127 ns
+FUNNEL System.nanoTime               90 ns
+```
+
+`CRATONVM_DBG=intrinsic-stats` confirms engagement — `compiled leaf-native
+dispatches: 3918000`, so the leaf arm is running, not skipped. Yet the LEAF rung
+costs 2.5-4× the full-funnel rungs beneath it. Leafness buys ~100 ns against its
+own non-leaf twin (383 vs 482, same receiver and call-site shape) and that is
+real, but it lands nowhere near `System.nanoTime`'s 90 ns. So the funnel is not
+what makes `AtomicInteger.get` expensive, and marking collection accessors leaf
+would not close a 37× gap. **Why a leaf native costs 4× a full-funnel one is its
+own question**, and a better one than anything on this page.
 
 ## Term 2 (ORIGINAL 2026-08-22 reading) — the per-element constant is ~2 µs, and it is linear
 
