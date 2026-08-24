@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-480 tokens.
+483 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -182,6 +182,7 @@ export inherited from a parent shell.
 | `exit` | `CRATONVM_DBG_EXIT` |
 | `fbcglib` | `CRATONVM_DBG_FBCGLIB` |
 | `fbref` | `CRATONVM_DBG_FBREF` |
+| `fc-fast-io-stats` | `CRATONVM_FC_FAST_IO_STATS` |
 | `field-get` | `CRATONVM_DBG_FIELD_GET` |
 | `field-watch` | `CRATONVM_DBG_FIELD_WATCH` |
 | `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
@@ -316,6 +317,7 @@ export inherited from a parent shell.
 | `longroot` | `CRATONVM_DBG_LONGROOT` |
 | `lookup` | `CRATONVM_DBG_LOOKUP` |
 | `map-miss-audit` | `CRATONVM_DBG_MAP_MISS_AUDIT` |
+| `map-view-cache` | `CRATONVM_DBG_MAP_VIEW_CACHE` |
 | `mapper` | `CRATONVM_DBG_MAPPER` |
 | `mcl` | `CRATONVM_DBG_MCL` |
 | `memwatch` | `CRATONVM_DBG_MEMWATCH` |
@@ -324,6 +326,7 @@ export inherited from a parent shell.
 | `mh-dispatch` | `CRATONVM_DBG_MH_DISPATCH` |
 | `mh-stack` | `CRATONVM_DBG_MH_STACK` |
 | `mic-prof` | `CRATONVM_DBG_MIC_PROF` |
+| `monitor-notify` | `CRATONVM_DBG_MONITOR_NOTIFY` |
 | `mic-method` | `CRATONVM_DBG_MIC_METHOD` |
 | `mark-why-class` | `CRATONVM_DBG_MARK_WHY_CLASS` |
 | `mirrorpin-why` | `CRATONVM_DBG_MIRRORPIN_WHY` |
@@ -546,7 +549,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-216 tokens.
+219 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -734,8 +737,11 @@ export inherited from a parent shell.
 | `spec-bce` | `CRATONVM_JIT_NO_SPEC_BCE` |
 | `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
 | `static-bytecode-callee` | `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` |
+| `virtual-bytecode-callee` | `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` |
 | `statics-index` | `CRATONVM_NO_STATICS_INDEX` |
 | `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
+| `vector-templates` | `CRATONVM_VECTOR_TEMPLATES` |
+| `fc-fast-io` | `CRATONVM_FC_FAST_IO` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
@@ -919,7 +925,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-19 tokens.
+20 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -942,6 +948,7 @@ export inherited from a parent shell.
 | `striped-counters` | `CRATONVM_STRIPED_COUNTERS_OFF` |
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
 | `wait-spurious-ms` | `CRATONVM_WAIT_SPURIOUS_MS` |
+| `monitor-pending-notify` | `CRATONVM_MONITOR_PENDING_NOTIFY` |
 
 ## `CRATONVM_SECURITY`
 
@@ -966,11 +973,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-14 tokens.
+16 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `map-iterator-failfast` | `CRATONVM_NO_MAP_ITERATOR_FAILFAST` |
+| `map-view-cache` | `CRATONVM_MAP_VIEW_CACHE` |
+| `verify-map-view-cache` | `CRATONVM_VERIFY_MAP_VIEW_CACHE` |
 | `eager-streams` | `CRATONVM_EAGER_STREAMS` |
 | `foreign-attach` | `CRATONVM_FOREIGN_ATTACH` |
 | `jboss-boot-log-file` | `CRATONVM_JBOSS_BOOT_LOG_FILE` |

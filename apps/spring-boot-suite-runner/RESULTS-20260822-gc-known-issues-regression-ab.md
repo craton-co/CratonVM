@@ -62,7 +62,7 @@ gc::guard ERROR, all kinds    35 cls / 62      35 cls / 63
   pointers), it did not reproduce in 6 isolated + 36 parallel runs per binary
   with the instrument armed, and it cannot be attributed to this branch or
   called pre-existing on one observation. Filed OPEN as
-  `docs/known-issues/gc/corrupt-value-cell-one-unreproduced-hit-in-kafkametrics-20260822.md`.
+  `docs/corrupt-value-cell-array-receiver-species-CLOSED-20260823.md`.
 
 ## Also measured on this host
 

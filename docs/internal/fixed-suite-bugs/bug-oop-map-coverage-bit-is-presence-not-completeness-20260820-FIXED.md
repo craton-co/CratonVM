@@ -332,4 +332,5 @@ chased, and it is a separate page rather than a residual here: the words
 moving young collection a compiled frame's callee-saved GPR image can still name
 a moved-from address. Measured, no failure attributed, repair available behind
 `CRATONVM_REGISTER_IMAGE_REMAP=1` (default off). See
-`moving-young-leaves-a-callee-saved-register-image-unrewritten-20260822.md`.
+`moving-young-left-a-callee-saved-register-image-unrewritten-FIXED-20260823.md`
+(fixed 2026-08-23; that page superseded the open one cited here).

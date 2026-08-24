@@ -287,7 +287,8 @@ correlated with a failing run once, which is how it survived as a hypothesis;
 the correlation did not hold, and closing it
 (`CRATONVM_REGISTER_IMAGE_REMAP=1`, default off) does not change the failure
 rate — 4 SIG / 8 with it on against 5 SIG / 8 with it off. Written up in
-`moving-young-leaves-a-callee-saved-register-image-unrewritten-20260822.md`.
+`moving-young-left-a-callee-saved-register-image-unrewritten-FIXED-20260823.md`
+(fixed 2026-08-23; that page superseded the open one cited here).
 
 ## Residuals
 

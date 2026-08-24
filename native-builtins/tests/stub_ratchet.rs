@@ -1381,7 +1381,49 @@ fn intrinsic_by_file() -> Vec<(String, usize)> {
 }
 
 /// Frozen by the run that added the gate; see `intrinsic_count_does_not_regress`.
-const BASELINE_INTRINSICS: usize = 1365;
+///
+/// # 1365 -> 1398, 2026-08-24 — +33, and BOTH movements are hot-path kernels
+/// HotSpot intrinsifies too
+///
+/// The gate asks for the new rows to be NAMED, so they were measured rather
+/// than argued: the per-file breakdown was taken at `2f8367356` (the commit
+/// that set 1365) and at this tip, and diffed.
+///
+/// ```text
+/// native-builtins/src/vector_support_intrinsics.rs   10 -> 38   +28
+/// native-io/src/file_channel_fast_read.rs           (new) -> 5   +5
+/// every other file                                      identical
+///                                                                ---
+///                                                                +33
+/// ```
+///
+/// **The second column classifies it.** Totals moved 13365 -> 13398, i.e. UP by
+/// EXACTLY the intrinsic delta, so every registration added in this window is
+/// one of these 33 and nothing was re-tagged out of the shadow census — which is
+/// the failure this gate exists for.
+///
+/// **+28 `VectorSupport`** (`9a117f991`). Nine entry points that HotSpot itself
+/// marks `@IntrinsicCandidate` and C2 replaces with SIMD; the Java fallback an
+/// interpreter runs is a lambda per operation plus a lambda per LANE, and it was
+/// **93.7% of a 3500-sample profile** of GPULlama3's inference kernel. Measured
+/// 3.8x (79713 -> 20813 ns/lane), one binary, kill switch
+/// `CRATONVM_VECTOR_INTRINSICS=0|1` gating REGISTRATION so the off arm is
+/// bit-for-bit un-intercepted, arms interleaved, checksum identical on all four
+/// runs and on HotSpot. `fell_back=0` PRINTED, not claimed — and that counter
+/// earned itself immediately, naming a defect (`class_id_from_mirror` not
+/// resolving a primitive mirror) that a wall-clock win would have hidden.
+///
+/// **+5 `FileChannelImpl`**. `FileChannel.read` into a HEAP buffer measured
+/// **~8.7x HotSpot** over 20 000 reads. The cause is not allocation and not the
+/// temporary-direct-buffer cache — both were measured and REFUTED — it is ~20
+/// JDK frames of glue per read that C2 inlines to a handful of instructions
+/// around one syscall, with nothing in the profile above 11%. A distribution
+/// like that only moves by removing the chain.
+///
+/// So both are `Intrinsic` by §1.4's own standard: a reviewed exception of the
+/// kind every JVM makes for `Math.sqrt`. Neither is a row that gained the tag to
+/// leave the census.
+const BASELINE_INTRINSICS: usize = 1398;
 
 #[test]
 fn no_registration_runs_on_the_ambient_default() {

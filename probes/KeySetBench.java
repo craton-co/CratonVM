@@ -9,6 +9,8 @@ import java.util.Map;
  *   hoisted    keySet() ONCE, iterate inside the loop — the same reads, no rebuild
  *   perCall    keySet() inside the loop, then iterate — what Spring does
  *   sizeOnly   keySet().size() inside the loop
+ *   valuesOnly map.values() and nothing else        — the values construction term
+ *   entryOnly  map.entrySet() and nothing else      — the entrySet construction term
  *
  * If viewOnly ~= perCall and hoisted is fast, the cost is building the view, not
  * reading through it.
@@ -38,6 +40,8 @@ public class KeySetBench {
                 case "hoisted"  -> { for (String s : hoistedKeys) { if (s != null) { sink++; } } }
                 case "perCall"  -> { for (String s : map.keySet()) { if (s != null) { sink++; } } }
                 case "sizeOnly" -> { sink += map.keySet().size(); }
+                case "valuesOnly" -> { osink = map.values(); }
+                case "entryOnly" -> { osink = map.entrySet(); }
                 case "mapSize"  -> { sink += map.size(); }
                 default -> throw new IllegalArgumentException(rung);
             }
