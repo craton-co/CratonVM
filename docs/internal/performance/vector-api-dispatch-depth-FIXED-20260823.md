@@ -5,7 +5,7 @@
 | **Status** | **FIXED.** The JDK's route to `VectorSupport` is native for the whole `lanewise` family. What is left is `convert0` and the VM-wide per-call cost, and the page itself already said which of those is a Vector API defect: neither |
 | **Opened** | 2026-08-22, as the residual of the lane-at-a-time fallback fixed the same day |
 | **Closed by** | `perf/filechannel-vector-webclient-residuals-20260823` |
-| **Measured effect** | `Fp16VectorDotBench` **15 863 -> 9 212 ns per lane**, **1.7x**, one binary, `CRATONVM_VECTOR_TEMPLATES=0\|1`, three interleaved rounds on a quiet host. `probes/VectorApiProbe.java`: **322 of 322 rows identical** to Temurin 25.0.3+9 in all three arms |
+| **Measured effect** | `Fp16VectorDotBench` **~1.8x** (Windows 15 863 -> 9 212, Azure 12 696 -> 6 843 ns per lane), one binary, `CRATONVM_VECTOR_TEMPLATES=0\|1`, three interleaved rounds on each of two quiet hosts. `probes/VectorApiProbe.java`: **322 of 322 rows identical** to Temurin 25.0.3+9 in all three arms |
 
 ## What the page left open
 
@@ -115,8 +115,19 @@ than left as a preference: the load landed on the OFF arm, so the contended
 run flatters the change. A ratio taken on a busy host is only trustworthy when
 it is the WORSE of the two available readings.
 
-`checksum=1098616832` and `warm=1061765120` on every row of both arms, and
-`warm` matches HotSpot's. HotSpot itself is 0.265 ns per lane.
+Confirmed on a second host — **Azure Linux host 2 at load average 7**, same
+tree, same switch, three interleaved rounds:
+
+| | round 1 | round 2 | round 3 |
+|---|---:|---:|---:|
+| templates **off** | 12 526 | 12 696 | 13 261 |
+| templates **on** | **6 592** | **6 843** | **7 597** |
+
+**1.85x**, 6% spread. The two hosts disagree on the absolutes by ~30% and
+agree on the ratio to within 8% — call it **~1.8x**.
+
+`checksum=1098616832` and `warm=1061765120` on every row of every arm on both
+hosts, and `warm` matches HotSpot's. HotSpot itself is 0.265 ns per lane.
 
 The engagement census is what makes that readable, and it says more than the
 wall clock does — templates ON:
@@ -183,11 +194,14 @@ the traffic with `fell_back=0`, the dispatch layer is not what is being
 measured.
 
 The arithmetic the parent page insisted on stating still holds and is still
-worth stating: at ~10 µs per lane a Llama-3.2-1B forward pass of ~1.2e9 lane
-multiply-adds is on the order of **3 hours per token**, against ~7 hours before
-this change and ~40 hours before the kernels. A speedup that does not cross a
-usefulness threshold is still a speedup, and reporting one without the
-threshold would be the more misleading of the two.
+worth stating: at the ~7 µs per lane these hosts now measure, a Llama-3.2-1B
+forward pass of ~1.2e9 lane multiply-adds is on the order of **2 hours per
+token**, against ~4 hours before this change and ~40 hours before the kernels.
+A speedup that does not cross a usefulness threshold is still a speedup, and
+reporting one without the threshold would be the more misleading of the two.
+**The Vector API is not a usable CratonVM surface for inference, and this
+change does not make it one** — it removes the last part of the gap that was
+Vector-API-shaped.
 
 ## Repro
 

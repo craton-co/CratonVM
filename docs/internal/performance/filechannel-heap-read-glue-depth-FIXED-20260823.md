@@ -5,7 +5,7 @@
 | **Status** | **FIXED.** The twenty-frame JDK glue chain is one native call; the page's own probes moved 3.4-3.6x and the residual is a different, named page |
 | **Opened** | 2026-08-22, re-homed out of the GPULlama3 record |
 | **Closed by** | `perf/filechannel-vector-webclient-residuals-20260823` |
-| **Measured effect** | `FileChannelHeapReadProbe` **39.9 -> 10.4 µs** per read pair (**3.8x**); `GgufStringReadProbe` **23.4 -> 7.0 µs** per string (**3.4x**). Gap to HotSpot: **19.6x -> 5.1x** |
+| **Measured effect** | `FileChannelHeapReadProbe` **25.0 -> 7.5 µs** per read pair (**3.3x**); `GgufStringReadProbe` **25.9 -> 7.2 µs** per string (**3.6x**). Gap to HotSpot **15.4x -> 4.6x**. Two hosts, both quiet, on the merged `dev` tip |
 
 ## What the page said, and what was done about it
 
@@ -81,26 +81,23 @@ The position advance is the OS handle's, on both platforms.
 
 ## The numbers
 
-Azure Linux host 2, one binary, `CRATONVM_FC_FAST_IO=0|1` interleaved, three
-rounds, Temurin 25.0.3+9 as the oracle on the same file:
+Taken on the **merged `dev` tip**, on **two hosts**, both quiet, one binary per
+host with `CRATONVM_FC_FAST_IO=0|1` interleaved three rounds, Temurin 25.0.3+9
+as the oracle on the same file.
+
+**Azure Linux host 2**, load average 7 — ns per read pair:
 
 | | round 1 | round 2 | round 3 |
 |---|---:|---:|---:|
-| `FileChannelHeapReadProbe`, ns per read pair | | | |
-| fast I/O **off** | 41 867 | 35 784 | 42 109 |
-| fast I/O **on** | **11 006** | **11 346** | **9 961** |
-| HotSpot | 2 202 | 1 961 | 1 937 |
+| fast I/O **off** | 25 428 | 25 042 | 24 832 |
+| fast I/O **on** | 11 054 | **7 471** | **7 503** |
+| HotSpot | 2 210 | 1 631 | 1 574 |
 
-`GgufStringReadProbe`, the shape GGUF's `readString` uses (an 8-byte length
-read then the bytes), same binary: **23.44 -> 6.97 µs per string**, HotSpot
-1.52.
+The off-arm spread is 2%. Round 1's on-arm is the outlier of the set and is
+left in rather than dropped; rounds 2 and 3 agree to 0.4%. **3.3x**, and the
+gap to HotSpot goes **15.4x -> 4.6x**.
 
-`checksum` is `-540000` in every CratonVM arm and on HotSpot;
-`GgufStringReadProbe`'s is `-53403` in all three.
-
-Confirmed on a second host, and on the MERGED tree rather than the branch tip.
-Windows 11, quiet, same binary, same switch, three interleaved rounds — a
-tighter spread than either of the runs above:
+**Windows 11**, same tree, same switch:
 
 | | round 1 | round 2 | round 3 |
 |---|---:|---:|---:|
@@ -108,11 +105,23 @@ tighter spread than either of the runs above:
 | fast I/O **on** | **10 423** | **10 623** | **10 543** |
 | HotSpot | 3 082 | 3 157 | 3 548 |
 
-The on-arm spread is 2%. **3.1x**, and the gap to HotSpot goes 10.2x -> 3.2x.
-The census is identical on every one of those rounds
-(`read fast=120000 refused=0  pos fast=60000 refused=0`), and
-`GgufStringReadProbe` on the same host reads 55.13 -> 17.28 µs per string
-against HotSpot's 4.93.
+2% on-arm spread. **3.1x**, gap **10.2x -> 3.2x**.
+
+`GgufStringReadProbe` — the shape GGUF's `readString` uses, an 8-byte length
+read then the bytes — on Azure: **25.86 -> 7.21 µs per string** (3.6x) against
+HotSpot's 1.63, so its gap goes 15.9x -> 4.4x. On Windows: 55.13 -> 17.28
+against 4.93.
+
+`checksum` is `-540000` in every CratonVM arm and on HotSpot on both hosts;
+`GgufStringReadProbe`'s is `-53403` in all six runs.
+
+The two hosts disagree on the ABSOLUTE numbers by 30-40% and agree on the
+ratio to within 7%. That is the reading to trust, and the census below is
+identical on all twelve runs.
+
+(An earlier interleaved set on the branch tip, on Azure while it was busier,
+read 41 867 / 35 784 / 42 109 off against 11 006 / 11 346 / 9 961 on. Same
+direction, looser spread, and superseded by the rows above.)
 
 The engagement census is what makes those readable —
 `CRATONVM_FC_FAST_IO_STATS=1`, from the "on" arm:
@@ -129,7 +138,7 @@ the same wall clock.
 
 ## What is left, and why it is not this page
 
-The gap to HotSpot is **5.1x**, down from 19.6x. What remains is not
+The gap to HotSpot is **4.6x**, down from 15.4x. What remains is not
 `FileChannel`-shaped: per read pair the fast path makes three native calls
 (~200 ns each at this VM's measured per-call cost) against a probe loop that
 also allocates a `byte[]`, constructs a `HeapByteBuffer` through
