@@ -126,7 +126,7 @@ also allocates a `byte[]`, constructs a `HeapByteBuffer` through
 `ByteBuffer.wrap`, and runs `clear()`/`get(0)`/array reads — all interpreted.
 That is the general per-call and per-bytecode price, which
 [[jit-entries-per-call-cost-is-the-call-dense-wall]] owns and which
-`known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`
+`performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`
 is the live half of.
 
 **Do not reopen this page for that.** The distinguishing test is the census: if

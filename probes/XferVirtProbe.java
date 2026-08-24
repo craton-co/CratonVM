@@ -4,7 +4,7 @@
 /**
  * Prices the compiled-caller -> INTERPRETED-callee transition for an
  * `invokevirtual` / `invokeinterface` callee — the half
- * `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`
+ * `performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`
  * left open after its `invokestatic` fix.
  *
  * `probes/XferProbe.java` is the static counterpart and cannot answer this:

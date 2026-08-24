@@ -12726,7 +12726,7 @@ unsafe fn try_jit_static_bytecode_callee(
 ///
 /// # What it is for
 ///
-/// `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`
+/// `performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`
 /// measured a compiled caller entering an UNCOMPILED callee at **1902 ns/op**
 /// against **385 ns** for the same call with the caller left interpreted — the
 /// JIT actively losing to the interpreter it replaced, because the compiled

@@ -166,7 +166,7 @@ concluded in its own words:
 
 That story has its own pages —
 [[jit-entries-per-call-cost-is-the-call-dense-wall]] and
-`known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`
+`performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`
 — and it is where the remaining distance to HotSpot lives. **Do not reopen this
 page for it.** The distinguishing test is the census: if the `tmpl:` rows carry
 the traffic with `fell_back=0`, the dispatch layer is not what is being

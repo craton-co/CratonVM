@@ -1279,7 +1279,7 @@ pub fn jit_lambda_const_probe_strict() -> bool {
 /// `CRATONVM_DBG=mic-prof` on `probes/ReactorProbe.java` reports
 /// `kind_static=2_986_402` of `disp_calls=3_356_461` — **89%**.
 ///
-/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
+/// See `performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`.
 ///
 /// Default ON. `CRATONVM_JIT_STATIC_BYTECODE_CALLEE=0` restores the by-name
 /// path, which is the A/B a same-binary bisection needs.
