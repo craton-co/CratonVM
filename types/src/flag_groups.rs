@@ -1069,12 +1069,6 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },
-    // Declared 2026-08-24. An OPT-OUT: publishing the innermost-frame mirror at
-    // every GC-capable safepoint is the default, and this key restores the
-    // entry-plus-republish discipline that let the mirror name a frame which
-    // had already returned. See
-    // `jit/src/x64/safepoint.rs::emit_frame_record_at_safepoint`.
-    E { group: Group::JIT, token: "safepoint-frame-record", on_key: None, off_key: Some("CRATONVM_JIT_NO_SAFEPOINT_FRAME_RECORD"), off_word: None },
     E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-call-dispatch", on_key: Some("CRATONVM_JIT_INLINE_CALL_DISPATCH"), off_key: None, off_word: None },
