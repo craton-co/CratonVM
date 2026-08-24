@@ -14154,6 +14154,15 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if is_tree_map_receiver(ctx, this) {
         return native_tm_values(ctx, args);
     }
+    // The CONSTRUCTION half only, and it is the same argument as `keySet()`'s:
+    // a values view is live because `resync_values_view` rebuilds its element
+    // array on every read, so the instance never goes stale and can simply be
+    // handed out again. What it does NOT get is the rebuild elision -- a
+    // value-replacing `put` changes what this view must answer while moving no
+    // structural counter. See `cached_live_values_view`.
+    if let Some(cached) = cached_live_values_view(ctx, this) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
     let values = map_collect_values(ctx, this);
     // Build an ArrayList from the values. Reserve one extra trailing slot and
     // stash the source map there so `values().iterator().remove()` /
@@ -14188,6 +14197,12 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     } else {
         list
     };
+    // `this` is a pre-allocation address by now. Re-derive the source from the
+    // view's own back-reference, which is the one pointer to it guaranteed
+    // live and current.
+    if let Some(src) = values_view_source(&*ctx, list) {
+        store_live_values_view(ctx, src, list);
+    }
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -15191,6 +15206,57 @@ fn cached_live_view(
     }
     MAP_VIEW_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(view)
+}
+
+/// The [`MAP_VIEW_CARRIERS`] twin of [`cached_live_view`], for `values()`.
+///
+/// A values view is not a set view: it keeps its state in an `ArrayList`-shaped
+/// carrier and its back-reference in the trailing capacity slot of its element
+/// array, not in a view backing carrying a `VIEW_KIND_*`. So it needs its own
+/// reader and its own validation, and it gets only the CONSTRUCTION half of the
+/// fix — `resync_values_view` still rebuilds the element array on every read,
+/// and must, because a values view is exactly the shape a value-replacing `put`
+/// changes while moving no structural counter.
+///
+/// Same refusal of the `Hashtable`/`Properties` family as the set twin, for the
+/// same reasons.
+///
+/// The entry carrier is excluded by name: `TreeMap$EntrySet` is a
+/// `MAP_VIEW_CARRIERS` member whose elements are `Map.Entry`, not values, and
+/// it is not what `values()` returns.
+fn cached_live_values_view(ctx: &mut dyn NativeContext, source: ObjectRef) -> Option<ObjectRef> {
+    if !map_view_cache_enabled() || wants_synchronized_views(&*ctx, source) {
+        return None;
+    }
+    let class_id = ctx.class_id_of_object(source);
+    let slot = ctx.resolve_field_index_by_class_id(class_id, "values")?;
+    if slot >= ctx.object_num_fields(source) {
+        return None;
+    }
+    let Value::Object(Some(view)) = ctx.get_field(source, slot) else {
+        return None;
+    };
+    match ctx
+        .class_name_arc_of_id(ctx.class_id_of_object(view))
+        .as_deref()
+    {
+        Some(n) if is_map_view_carrier(n) && n != TM_ENTRY_SET_CARRIER => {}
+        _ => return None,
+    }
+    let cached_source = values_view_source(&*ctx, view)?;
+    if !std::ptr::eq(cached_source.as_ptr(), source.as_ptr()) {
+        return None;
+    }
+    MAP_VIEW_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(view)
+}
+
+/// Record `view` as this source's live `values()` view.
+fn store_live_values_view(ctx: &mut dyn NativeContext, source: ObjectRef, view: ObjectRef) {
+    if !map_view_cache_enabled() || wants_synchronized_views(&*ctx, source) {
+        return;
+    }
+    try_set_jdk_map_field(ctx, source, "values", Value::Object(Some(view)));
 }
 
 /// Record `view` as this source's live view of `kind`.
@@ -42362,9 +42428,15 @@ fn native_lhm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Some(cached) = cached_live_values_view(ctx, this) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
     let vals = lhm_collect_values(ctx, this);
     let carrier = values_carrier_for(&*ctx, this);
     let list = make_view_list_of(ctx, this, &vals, carrier)?;
+    if let Some(src) = values_view_source(&*ctx, list) {
+        store_live_values_view(ctx, src, list);
+    }
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -42373,6 +42445,16 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `LinkedHashMap` has its OWN entrySet native, so the cache the HashMap
+    // twin got does not reach it -- the same fourth-mint-site asymmetry the
+    // `store_set_view_backref` note below records, and the reason it is worth
+    // repeating: `probes/MapViewCacheProbe` read `lhm.ident.entrySet=false`
+    // against HotSpot's `true` while every other family answered `true`. A
+    // LinkedHashMap is the source type in the workload this cache exists for,
+    // and each miss allocates one `Map$Entry` per entry.
+    if let Some(cached) = cached_live_view(ctx, this, VIEW_KIND_ENTRYSET) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
     // Collect (key, value) pairs in insertion order.
     let mut pairs = Vec::new();
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
@@ -42484,6 +42566,8 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if flat_base != usize::MAX {
         ctx.unpin_native_roots(flat_base);
     }
+    // `this` was carried through `rooted_across` above, so it is current here.
+    store_live_view(ctx, this, VIEW_KIND_ENTRYSET, set);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -45022,6 +45106,35 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // each probe returns a benign null, and a downstream invariant eventually
     // segfaults the VM.  We compute `n_fields` once and use it to short-circuit
     // any layout probe whose required slot is past the receiver's actual layout.
+    // A `values()` view is ArrayList-SHAPED, and the layout probe below reads
+    // its `elementData`/`size` slots DIRECTLY. That is the site the
+    // lazy-map-views plan page named as "the accessor is nearly, but not quite,
+    // a chokepoint", and it was harmless only for as long as every `values()`
+    // call minted a FRESH view -- a fresh view is never stale. Caching the view
+    // on the source removes that accident, so the read has to go through the
+    // funnel like every other reader.
+    //
+    // MEASURED as a real divergence while the cache was briefly allowed on the
+    // `Hashtable` family: `new ArrayList<>(hashtable.values())` after two
+    // removals answered 2 where HotSpot answers 1
+    // (`probes/MapViewCacheProbe` `ht.values.copyList`), while `size()` and
+    // `toString()` on the very same object were right -- only `toArray()` was
+    // wrong. A `Hashtable` view arrives inside a
+    // `Collections$SynchronizedCollection`, which this function unwraps and
+    // RECURSES into, landing here; a bare `HashMap$Values` receiver reaches
+    // `native_al_to_array` instead and resyncs there. The family is refused by
+    // `cached_live_values_view` now, so that exact route is closed twice over
+    // -- this closes the SHAPE rather than the instance.
+    //
+    // The keySet/entrySet carriers need nothing here: their branch below hands
+    // the BACKING to `collect_view_snapshot_ordered`, which reads the SOURCE
+    // map and is live whatever the backing happens to hold.
+    let coll = match ctx.class_name_arc_of_id(cid).as_deref() {
+        Some(n) if is_map_view_carrier(n) && values_view_source(ctx, coll).is_some() => {
+            resync_values_view(ctx, coll)?
+        }
+        _ => coll,
+    };
     let n_fields = ctx.object_num_fields(coll);
     // S111r-bug-fix (peaceful-sammet): Try ArrayList layout via the
     // field-index resolver so we honour the real-JDK layout

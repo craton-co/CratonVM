@@ -14,13 +14,19 @@
  * `XferProbe2.calleeIface` denies a STATIC method and re-measures the
  * `invokestatic` kind, which is why that spelling is not the one to use.
  *
- * `iface` and `iface2` differ ONLY in the SAM's name. `apply` is on
+ * `iface` and `iface2` differ ONLY in the SAM's name, and that pair is now a
+ * REGRESSION GATE rather than a workaround. `apply` is on
  * `site_name_is_special_cased`'s deliberately over-broad list (it is one of the
  * names `invoke_or_native`'s opening cascade can claim, via the
- * `ToIntFunction.apply` SAM bridges), so the interpreted-callee memo refuses
- * that site by name -- correctly. `iface2` is the arm that measures the
- * `invokeinterface` KIND rather than that one name, and running both is what
- * tells a kind-wide refusal apart from a name-wide one.
+ * `ToIntFunction.apply` SAM bridges), and deferring to that list made the memo
+ * refuse every `apply` site: `out_virtual_bc=0 out_virtual_bc_refused=1048575`
+ * on this arm against `1048575 / 0` on `virtual`. Since `apply` is the SAM of
+ * `java.util.function.Function` -- every reactive operator that is a CLASS
+ * rather than a lambda -- that was a name-wide refusal over exactly the
+ * population the fix exists for, so `virtual_site_name_is_special_cased`
+ * narrowed it to the rescue's own triple. BOTH arms should now read
+ * `out_virtual_bc_refused=0`; `iface` going back to a refusal means the
+ * narrowing was lost.
  */
 public class XferProbe2 {
     static long sink;

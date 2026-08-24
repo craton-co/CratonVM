@@ -154,6 +154,27 @@ and both failures read like results:
   `ToIntFunction.apply` SAM bridges). Correct behaviour, but a name-wide
   refusal reading like a kind-wide one. The new `iface2` arm names its SAM
   `compute`, and running both is what tells the two apart.
+
+  **That refusal was then removed rather than worked around** (second pass,
+  same day). `apply` is the SAM of `java.util.function.Function` — every
+  reactive operator that is a CLASS rather than a lambda — so refusing it by
+  name gave up exactly the population this page exists for, and the `iface2`
+  arm proved the KIND worked while the shipped VM still served none of the real
+  sites. `virtual_site_name_is_special_cased` narrows the refusal to the
+  rescue's own triple: `apply(Ljava/lang/Object;)Ljava/lang/Object;` on
+  `java/util/function/To{Int,Long,Double}Function`, which is the only thing
+  `invoke_or_native` actually redirects.
+
+  Two independent things already make that triple unreachable from this path,
+  and the explicit test is so a later change to either does not quietly
+  re-open it: an interface that declares no `apply` has no `Code` for it, so
+  `build_lambda_impl_cached` refuses; and a receiver whose class is an
+  interface DIFFERENT from the call site's never reaches resolution, because
+  `virtual_dispatch_target_cached` answers `cacheable_receiver = false`.
+
+  All three arms now read `out_virtual_bc=1048575 out_virtual_bc_refused=0`.
+  `iface` and `iface2` are kept as a REGRESSION GATE on that: `iface` going
+  back to a refusal means the narrowing was lost.
 * **the `special` arm's callee was being INLINED.** A one-line
   `super.calleeSpecial` was `inline-planned … cost=4 budget_left=750` and
   spliced outright, so `CRATONVM_JIT_DENY` on it was a no-op — 24.2 ns denied

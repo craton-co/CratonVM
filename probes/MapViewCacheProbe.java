@@ -25,6 +25,23 @@ import java.util.*;
  * `evalue.*` is the row that says why an entrySet view is NOT
  * generation-guarded: a value-replacing `put` changes what `getValue()` must
  * answer while moving no structural counter.
+ *
+ * THREE ROWS ARE EXPECTED TO DIFFER FROM HOTSPOT, and they are a scope
+ * boundary rather than a defect:
+ *
+ *     ht.ident.keySet     ht.ident.entrySet     ht.ident.values
+ *
+ * The view cache refuses the `Hashtable`/`Properties` family outright
+ * (`cached_live_view`'s `wants_synchronized_views` gate). Those accessors hand
+ * back a `Collections$Synchronized*` wrapper, and `Properties` in particular
+ * keeps half its keys in a Rust side-table that only its own `keySet()`
+ * assembles correctly, so a cached instance there would pin whatever the
+ * field-walking path produced. Every OTHER row on `ht` — liveness,
+ * write-through, the copy constructors — must still match HotSpot exactly, and
+ * does; only the identity guarantee is given up.
+ *
+ * Everything else is a hard gate: diff against HotSpot and expect those three
+ * rows and nothing else.
  */
 public class MapViewCacheProbe {
 
