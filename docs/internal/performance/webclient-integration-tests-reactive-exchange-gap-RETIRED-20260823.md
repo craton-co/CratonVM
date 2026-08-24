@@ -191,13 +191,16 @@ Each was measured on this workload, interleaved, on this branch:
    uncompiled callee through the call site's own cached interpreter frame
    template (`CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` /
    `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` are the kill switches), at ~420 ns —
-   below the both-interpreted cost. **The exchange has NOT been re-measured
-   against that, and this page's numbers predate it.** What that page also
-   explains, and what is NOT fixed, is why reactive code is hit hardest: a
-   method containing an
-   unbridged `invokedynamic` is denied OSR outright and retired with
-   `MakeNotCompilable` after its first compiled execution, so every
-   lambda-creating method becomes exactly that interpreted callee.
+   below the both-interpreted cost. The other half of that page — why reactive
+   code is hit hardest — was that a method containing an unbridged
+   `invokedynamic` is denied OSR outright and retired with `MakeNotCompilable`
+   after its first compiled execution, so every lambda-creating method becomes
+   exactly that interpreted callee. **BOTH are now fixed (2026-08-23), and the
+   exchange HAS been re-measured against both: it is a wash, for the reason the
+   header states.** `CRATONVM_JIT_INDY_BRIDGE=0|1` on one binary, three
+   interleaved pairs: 31.42-34.64 ms/op OFF against 31.27-44.50 ON. The lever
+   is real (28x on `IndyScopeProbe`) and this workload has nothing for it to
+   move, because item 3 below means almost nothing here is compiled.
 2. **The native-shadow caller seal is not the lever.** 1179 methods are sealed
    before any compile (`clinit=771`, `calls-native-shadowed-method=408`) against
    155 compiled. `CRATONVM_JIT=-native-shadow-caller-seal` measured 28.43 ms/op

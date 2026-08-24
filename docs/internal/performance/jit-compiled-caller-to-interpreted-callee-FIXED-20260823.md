@@ -174,7 +174,7 @@ nothing, which is the failure mode this census exists for.
 three kinds — verified to reproduce the pre-fix binary's numbers within its
 noise, which is what makes the A/B a one-binary A/B.
 
-## §3 — why this landed on reactive code hardest (unchanged, and still true)
+## §3 — why this landed on reactive code hardest (FIXED 2026-08-23, separately)
 
 A method containing an unbridged `invokedynamic` cannot run compiled, so it
 becomes exactly the interpreted callee above. Two mechanisms, both named by the
@@ -192,10 +192,28 @@ VM itself under `CRATONVM_DBG=jitc`:
   retires it permanently.
 
 `probes/IndyScopeProbe.java` isolates it. The SAM call itself is fine (32–35 ns
-once the calling method is compiled); what is broken is that a method
-*containing* an `invokedynamic` never stays compiled. **That is a separate open
-item and is NOT closed by this page** — what this page closes is the cost of
-calling such a method, which was 1900–3700 ns and is now ~420.
+once the calling method is compiled); what was broken is that a method
+*containing* an `invokedynamic` never stayed compiled.
+
+**That was a separate item, and it is now CLOSED — by a bridge, not by this
+page.** Compiled code EXECUTES such a site through a runtime helper
+(`CRATONVM_JIT_INDY_BRIDGE`, default ON), which removes both mechanisms above
+at once: with no trap at the indy bci there is nothing for an OSR frame to
+resume imprecisely, so the OSR denial lifts, and nothing takes the reason-8
+stub, so nothing is retired. Both bullets above therefore describe the OFF arm
+of that switch.
+
+MEASURED on ONE binary, both arms, interleaved on a quiet host:
+
+| `IndyScopeProbe` arm | bridge OFF | bridge ON |
+|---|---:|---:|
+| loop whose method creates the lambda | 651-1043 ns/op | **23.7-34.4 ns/op** |
+| same loop, lambda hoisted out (control) | 23.6-34.2 | 23.8-34.4 |
+| a fresh lambda per call | 891-1179 ns/op | **430-560 ns/op** |
+
+~28x, and the first row lands exactly on its own control. What THIS page closes
+remains the cost of CALLING an uncompiled method, which was 1900-3700 ns and is
+now ~420.
 
 ## What this is NOT
 
