@@ -107,15 +107,24 @@ object-start bitmap. Loop counters, sizes and PCs do not reach those addresses,
 and Rust-side pointers are in different mappings.
 
 **Measured, ABBA-interleaved, one binary, `CRATONVM_REGISTER_IMAGE_REMAP` as the
-only difference:**
+only difference. Two rounds, on two builds of this branch:**
 
 ```text
-arm   runs   stale words in resumed-from regions
-on      6    0  0  0  0  0  0
-off     5    3  0  1  3  0
+              runs completed   stale words in resumed-from regions
+round 1  on         6          0 0 0 0 0 0
+         off        5          3 0 1 3 0
+round 2  on         5          0 0 0 0 0
+         off        5          1 1 2 0 0
 ```
 
-`OK (14 tests)` on all eleven runs.
+`OK (14 tests)` on every completed run. **11 ON runs, zero stale words; 10 OFF
+runs, 11 stale words across 6 of them.** The two runs missing from round 2 hit
+the harness's 900 s cap while the host was at load 100+; they are environment,
+not results, and are counted out rather than in.
+
+`dead_region=0` in EVERY one of those runs — on this fixture the narrowing costs
+nothing, because every stale word the detector found was in the region the
+repair rewrites.
 
 ## 5. The other half: a PIN, where pinning is possible
 
