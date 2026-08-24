@@ -129,6 +129,29 @@ ZipContentTests                             tests=29  failed=0   --             
 — the SAME names in both arms, so they are pre-existing and untouched by this
 door. Zero `ConcurrentModificationException` anywhere.
 
+## Re-verified after merging dev
+
+`dev` moves hourly and a result verified on a pre-merge tree does not carry, so
+the whole gate was re-run on the merged binary (`c72da3611`, origin/dev
+`2e9286dde`): sixteen cells CME, twelve back to `NONE` with the switch off,
+**zero `UNSEEDED`** lines, `MapViewBehaviourProbe` 194/194 identical to HotSpot,
+collections 243/0, the Java regression suite **71/71**, and the same six Spring
+Boot classes at 486 tests with the same three pre-existing failures and zero
+`ConcurrentModificationException`.
+
+Two red results seen along the way that are NOT this change, checked rather than
+assumed:
+
+* `registrar_drift`'s `the_drift_scanner_is_not_vacuous` and
+  `the_two_gates_agree_on_the_synthetic_only_population` fail on clean `dev`
+  too. Same numbers on both trees once compared against the SAME base —
+  **1017** unresolved register sites (ceiling 1000) and
+  `register_pe2_string_marshaling_on`, which entered via `aecae7e51`, an
+  ancestor of this branch. An earlier reading of 1018 came from comparing across
+  two different `dev` bases, not from this diff, which adds no register site.
+* One `cargo test` run died with `rustc-LLVM ERROR: no space on device`. The
+  volume was at 100%; that is the full-disk shape, not a code failure.
+
 ## One environment note, so it is not rediscovered
 
 `CacheAutoConfigurationTests` cannot be launched on Windows through the ordinary
