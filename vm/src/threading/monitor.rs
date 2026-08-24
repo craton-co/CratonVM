@@ -1190,8 +1190,40 @@ impl Monitor {
                     // Default OFF: unset leaves the loop byte-for-byte as it was.
                     let spurious_after = wait_spurious_ms();
                     let started = std::time::Instant::now();
+                    // IS THIS THREAD EVEN POLLING?
+                    //
+                    // The dump below reports `notifies_since_wait`, and two
+                    // stalls have now shown it as 1 — a `notifyAll()` reached
+                    // this monitor while this thread was inside the loop, and
+                    // the thread is still here. Two very different things
+                    // produce that, and nothing so far tells them apart:
+                    //
+                    //   * the loop IS spinning (one 5 ms `wait_for` after
+                    //     another, `polls` in the tens of thousands) and simply
+                    //     never observed a signalled return — the notification
+                    //     was lost between `Condvar::notify_all` and this
+                    //     parked thread;
+                    //   * the loop is NOT spinning (`polls` small and frozen) —
+                    //     the thread is stuck INSIDE one `wait_for`, i.e. below
+                    //     `parking_lot`, and the 5 ms timeout is not firing at
+                    //     all. A GC-blocked or safepoint-parked thread looks
+                    //     like this.
+                    //
+                    // `signalled` separates a notification this loop SAW from
+                    // one the monitor merely served: a `wait_for` that returns
+                    // `!timed_out()` breaks out one line below, so any value
+                    // above zero here means the loop re-entered after a
+                    // signalled return — which it can only do by NOT breaking,
+                    // and that would be a bug in this loop rather than in the
+                    // condvar.
+                    let mut polls: u64 = 0;
+                    let mut signalled: u64 = 0;
                     loop {
                         let result = self.wait_condvar.wait_for(&mut state, poll_interval);
+                        polls = polls.wrapping_add(1);
+                        if !result.timed_out() {
+                            signalled = signalled.wrapping_add(1);
+                        }
                         if let Some(ms) = spurious_after {
                             if started.elapsed() >= std::time::Duration::from_millis(ms) {
                                 break;
@@ -1292,9 +1324,11 @@ impl Monitor {
                             let (notifies_now, interrupt_wakes_now) = self.notify_totals();
                             eprintln!(
                                 "[WAIT-OBJECT] notifies_since_wait={} interrupt_wakes_since_wait={} \
+                                 polls={polls} signalled={signalled} waited_ms={} \
                                  (monitor totals: notify={notifies_now} interrupt={interrupt_wakes_now})",
                                 notifies_now.wrapping_sub(notifies_at_entry),
                                 interrupt_wakes_now.wrapping_sub(interrupt_wakes_at_entry),
+                                started.elapsed().as_millis(),
                             );
                             // ORPHAN CHECK. If the object's mark word stops
                             // pointing at `self`, a later `notifyAll()` inflates
