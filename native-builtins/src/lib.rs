@@ -32046,6 +32046,15 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
     // Interface method dispatch resolves through the receiver's concrete
     // class — `System$1` above — but belt-and-suspenders: register on the
     // interface as well so any direct invocation path hits the forwarder.
+    // `layers` on the concrete receiver class, for the same reason
+    // `currentCarrierThread` is registered there: `invokeinterface` dispatches
+    // through `System$1`.
+    registry.register(
+        sys1,
+        "layers",
+        "(Ljava/lang/ClassLoader;)Ljava/util/stream/Stream;",
+        native_jla_layers,
+    );
     let jla = "jdk/internal/access/JavaLangAccess";
     registry.register(
         jla,
@@ -32053,7 +32062,40 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Thread;",
         native_jla_current_carrier_thread,
     );
+    registry.register(
+        jla,
+        "layers",
+        "(Ljava/lang/ClassLoader;)Ljava/util/stream/Stream;",
+        native_jla_layers,
+    );
     registry.set_category(__prev_cat);
+}
+
+/// `JavaLangAccess.layers(ClassLoader)` — the module layers with at least one
+/// module defined to `loader`.
+///
+/// `java.util.ServiceLoader$ModuleServicesLookupIterator.iteratorFor` calls
+/// this for any loader that is neither null nor the platform loader, then walks
+/// the result collecting module-declared service providers. Without it
+/// `ManagementFactory.getPlatformMBeanServer()` dies with `NoSuchMethodError`
+/// the moment strict mode runs its real bytecode.
+fn native_jla_layers(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // EMPTY, and measured rather than assumed. The alternative,
+    // `Stream.of(ModuleLayer.boot())`, was built and run: it reaches the next
+    // unimplemented `JavaLangAccess` method
+    // (`getServicesCatalog(Ljava/lang/ModuleLayer;)`) and dies there instead.
+    // Empty is also the honest answer for this VM -- it defines no NAMED
+    // modules to the application class loader, which is the only loader for
+    // which `iteratorFor` consults this method at all.
+    ctx.invoke(
+        "java/util/stream/Stream",
+        "empty",
+        "()Ljava/util/stream/Stream;",
+        &[],
+    )
 }
 
 pub(crate) fn build_synthetic_module_descriptor(
