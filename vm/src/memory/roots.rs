@@ -1089,10 +1089,23 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         // bucket means.
         let (osr_bad_shadow, osr_debug_disabled, osr_bad_map, osr_missing_rbp) =
             crate::jit::conservative_roots::osr_fallback_reason::snapshot();
+        // Same treatment for the ACTIVE_FRAME_MAP / PARENT_FRAME_MAP pair: one
+        // reason code each, four ways to earn it. Cumulative, like the OSR
+        // buckets above — read the growth between two lines.
+        let (fc_no_slot, fc_misaligned, fc_no_map, fc_incomplete, fc_ok) =
+            crate::jit::conservative_roots::frame_coverage_reason::snapshot();
+        // Engagement counter for the cross-thread coverage handshake, printed
+        // beside the verdict it produces so any claim about it carries the
+        // number of cycles it actually decided.
+        let (xt_accepted, xt_refused, xt_deposits) =
+            cratonvm_gc::gc_quiescence::peer_coverage_counters();
         eprintln!(
             "[jitroots] precise_only={precise_only} proven={proven} moving_young={moving_young} \
              osr_fb={osr_fb} osr_reason=(shadow={osr_bad_shadow} debug={osr_debug_disabled} \
              map_coverage={osr_bad_map} exact_rbp={osr_missing_rbp}) \
+             frame_cov=(no_slot={fc_no_slot} misaligned={fc_misaligned} no_map={fc_no_map} \
+             incomplete={fc_incomplete} ok={fc_ok}) \
+             xt_cov=(accepted={xt_accepted} refused={xt_refused} deposits={xt_deposits}) \
              incomplete={incomplete} reason={reason} chain={chain} \
              any_jit={any_jit} \
              scan_added={added} unrewritable={unrewritable} is_g1={is_g1} \

@@ -285,6 +285,18 @@ impl GcBarrier {
         // frame pointers at pre-GC (relocated) addresses. The map is overwritten
         // wholesale by the matching `complete_gc`, so a stale map never leaks
         // into the wrong generation.
+        //
+        // DO clear the cross-thread JIT coverage ledger, and do it here rather
+        // than only in `begin_moving_young_coverage_cycle`. Every peer deposit
+        // happens inside the window this store opens (a peer parks because it
+        // observed `stw_requested`), so this is the one place in the process
+        // that is guaranteed to run before the first deposit of a pause and
+        // after the last deposit of the previous one — and it runs under the
+        // same lock that publishes `expected`, so no peer can be mid-deposit
+        // across it. `begin_moving_young_coverage_cycle` also clears it; the
+        // duplication is deliberate, because only SOME collection paths call
+        // that one and an over-count is the ledger's only unsound state.
+        cratonvm_gc::gc_quiescence::reset_peer_proven_jit_depth();
         self.stw_requested.store(true, Ordering::Release);
         true
     }
