@@ -255,6 +255,10 @@ out_virt_bc=44     out_virt_bc_refused=3298
 out_special_bc=0   out_special_bc_refused=0
 ```
 
+(Verbatim from the run, which was taken on the branch binary before the merge
+that kept dev's spelling: the slot dev ships is `out_virtual_bc`, and it is the
+same counter. Grep for that one.)
+
 **Ten thousand `jit_invoke_dispatch` calls for three hundred exchanges, and
 `hit_entry=0`** — not one inline-cache dispatch found a compiled callee to
 enter. The transition this page is about is reached about **11 times per
