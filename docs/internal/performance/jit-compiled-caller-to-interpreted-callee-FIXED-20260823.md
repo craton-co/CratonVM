@@ -207,6 +207,39 @@ calling such a method, which was 1900–3700 ns and is now ~420.
   back moved neither the exchange (30.2 → 30.2 ms/op) nor `ReactorProbe`
   (118k → 115k ns/op, inside noise). Sized and rejected.
 
+## The one population number that WAS taken, and what it says
+
+`CRATONVM_DBG=mic-prof` on `regression-suite`'s `RJitGc` — a GC-stress class,
+not a microbenchmark:
+
+```
+kind_special=1_769_271  out_tail=1040
+out_special_bc=0  out_special_bc_refused=1040
+```
+
+Two things follow, and the second is uncomfortable enough to state plainly:
+
+* the fast arms already serve 99.94% of that class's `invokespecial` calls, so
+  the tail this page is about is a thin slice of the total. A per-call
+  multiplier on the tail is not a workload multiplier — see
+  `a-multiplier-and-a-population-are-different-measurements`;
+* **every one of the 1040 tail calls was REFUSED.** The most likely reason is
+  the `<init>` / `<clinit>` refusal — a GC-stress class's `invokespecial` tail
+  is overwhelmingly constructors — but that attribution is **not verified**:
+  the census counts refusals without naming which gate took them, and
+  `might_have_method_descriptor` would look identical here.
+
+So the `invokespecial` half is proven on `probes/XferProbe2`'s `special` arm
+(3035 → 429 ns/op) and has **zero measured population on the one real class
+censused**. If it turns out `<init>` is where the volume is, admitting it is
+the next piece of work — and it is deliberately the piece this pass did not
+open, because `invoke_on_class_shared_inner` carries explicit carve-outs for
+both names and an `<init>` is where object initialisation and this VM's
+synthetic layouts meet.
+
+Naming which gate refuses would take one counter per refusal reason, and is the
+cheapest next instrument here.
+
 ## What is left
 
 **The suite-level population is not measured here.** `probes/ReactorProbe.java`
