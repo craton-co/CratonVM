@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-482 tokens.
+483 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -326,6 +326,7 @@ export inherited from a parent shell.
 | `mh-dispatch` | `CRATONVM_DBG_MH_DISPATCH` |
 | `mh-stack` | `CRATONVM_DBG_MH_STACK` |
 | `mic-prof` | `CRATONVM_DBG_MIC_PROF` |
+| `monitor-notify` | `CRATONVM_DBG_MONITOR_NOTIFY` |
 | `mic-method` | `CRATONVM_DBG_MIC_METHOD` |
 | `mark-why-class` | `CRATONVM_DBG_MARK_WHY_CLASS` |
 | `mirrorpin-why` | `CRATONVM_DBG_MIRRORPIN_WHY` |

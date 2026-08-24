@@ -218,6 +218,46 @@ fn monitor_pending_notify() -> bool {
     })
 }
 
+/// Process-wide totals for the notification CREDIT, so the fast path can be
+/// shown to RUN rather than merely to exist.
+///
+/// The stall dump reports `consumed=` per waiter, but it only prints at a
+/// stall — so a run that never stalls says nothing about whether the credit
+/// path was exercised at all, and "no stalls" would then be
+/// indistinguishable from "the switch was off". These are the denominator.
+///
+/// `condvar_signalled` counts `wait_for` returns that were NOT timeouts, i.e.
+/// the condvar delivering under its own steam. Read beside `consumed`, the two
+/// say how much of the waking this VM does actually depends on the signal:
+/// `consumed` far above `condvar_signalled` would mean the condvar was
+/// carrying almost none of it.
+static NOTIFY_CREDITS_CREATED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NOTIFY_CREDITS_CONSUMED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CONDVAR_SIGNALLED_RETURNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Print the notification-credit census on `CRATONVM_DBG=monitor-notify`.
+///
+/// Prints even when every counter is zero: a zero line is the answer "nothing
+/// reached this path", and it is worth nothing unless it can be told apart
+/// from the switch having been off — which the absence of a line cannot.
+pub fn report_monitor_notify_census_at_exit() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MONITOR_NOTIFY").is_none() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    eprintln!(
+        "[MONITOR-NOTIFY] EXIT credits_created={} credits_consumed={} \
+         condvar_signalled={} switch={}",
+        NOTIFY_CREDITS_CREATED.load(Relaxed),
+        NOTIFY_CREDITS_CONSUMED.load(Relaxed),
+        CONDVAR_SIGNALLED_RETURNS.load(Relaxed),
+        if monitor_pending_notify() { "ON" } else { "OFF" },
+    );
+}
+
 fn wait_spurious_ms() -> Option<u64> {
     static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1208,6 +1248,7 @@ impl Monitor {
                     // — the thing a condvar-only wait was missing.
                     if state.pending_notifies > 0 {
                         state.pending_notifies -= 1;
+                        NOTIFY_CREDITS_CONSUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                     if let Some(flag) = interrupted {
@@ -1309,6 +1350,8 @@ impl Monitor {
                         polls = polls.wrapping_add(1);
                         if !result.timed_out() {
                             signalled = signalled.wrapping_add(1);
+                            CONDVAR_SIGNALLED_RETURNS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         // The CONDITION, re-tested under the mutex on every
                         // wakeup. `signalled` deliberately counts only the
@@ -1318,6 +1361,8 @@ impl Monitor {
                         if state.pending_notifies > 0 {
                             state.pending_notifies -= 1;
                             consumed = consumed.wrapping_add(1);
+                            NOTIFY_CREDITS_CONSUMED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
                         if let Some(ms) = spurious_after {
@@ -1470,6 +1515,8 @@ impl Monitor {
                     loop {
                         if state.pending_notifies > 0 {
                             state.pending_notifies -= 1;
+                            NOTIFY_CREDITS_CONSUMED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
                         self.wait_condvar.wait(&mut state);
@@ -1545,6 +1592,7 @@ impl Monitor {
         let mut state = state;
         if monitor_pending_notify() && state.pending_notifies < state.parked_waiters {
             state.pending_notifies += 1;
+            NOTIFY_CREDITS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.wait_condvar.notify_one();
         Ok(())
@@ -1566,6 +1614,10 @@ impl Monitor {
         // meant for the current set.
         let mut state = state;
         if monitor_pending_notify() {
+            NOTIFY_CREDITS_CREATED.fetch_add(
+                u64::from(state.parked_waiters.saturating_sub(state.pending_notifies)),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             state.pending_notifies = state.parked_waiters;
         }
         self.wait_condvar.notify_all();
