@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-481 tokens.
+482 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -182,6 +182,7 @@ export inherited from a parent shell.
 | `exit` | `CRATONVM_DBG_EXIT` |
 | `fbcglib` | `CRATONVM_DBG_FBCGLIB` |
 | `fbref` | `CRATONVM_DBG_FBREF` |
+| `fc-fast-io-stats` | `CRATONVM_FC_FAST_IO_STATS` |
 | `field-get` | `CRATONVM_DBG_FIELD_GET` |
 | `field-watch` | `CRATONVM_DBG_FIELD_WATCH` |
 | `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
@@ -547,7 +548,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-217 tokens.
+219 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -738,6 +739,8 @@ export inherited from a parent shell.
 | `virtual-bytecode-callee` | `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` |
 | `statics-index` | `CRATONVM_NO_STATICS_INDEX` |
 | `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
+| `vector-templates` | `CRATONVM_VECTOR_TEMPLATES` |
+| `fc-fast-io` | `CRATONVM_FC_FAST_IO` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |

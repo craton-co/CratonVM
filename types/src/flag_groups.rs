@@ -387,6 +387,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "exit", on_key: Some("CRATONVM_DBG_EXIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fbcglib", on_key: Some("CRATONVM_DBG_FBCGLIB"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fbref", on_key: Some("CRATONVM_DBG_FBREF"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "fc-fast-io-stats", on_key: Some("CRATONVM_FC_FAST_IO_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-get", on_key: Some("CRATONVM_DBG_FIELD_GET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-watch", on_key: Some("CRATONVM_DBG_FIELD_WATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fieldaddr", on_key: Some("CRATONVM_DBG_FIELDADDR"), off_key: None, off_word: None },
@@ -1189,6 +1190,15 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "virtual-bytecode-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "statics-index", on_key: None, off_key: Some("CRATONVM_NO_STATICS_INDEX"), off_word: None },
     E { group: Group::JIT, token: "vector-intrinsics", on_key: Some("CRATONVM_VECTOR_INTRINSICS"), off_key: None, off_word: Some("0") },
+    // The dispatch-layer half of the same feature, switched separately so the
+    // templates can be priced against the kernels they sit on rather than only
+    // against an un-intercepted VM.
+    E { group: Group::JIT, token: "vector-templates", on_key: Some("CRATONVM_VECTOR_TEMPLATES"), off_key: None, off_word: Some("0") },
+    // `FileChannelImpl.read/write(ByteBuffer)` as one native call instead of
+    // twenty JDK frames (`native-io::file_channel_fast_read`). Default-ON,
+    // opt-out-only, same shape as `vector-intrinsics` above: the switch gates
+    // REGISTRATION so the off arm is the un-intercepted VM.
+    E { group: Group::JIT, token: "fc-fast-io", on_key: Some("CRATONVM_FC_FAST_IO"), off_key: None, off_word: Some("0") },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0") },

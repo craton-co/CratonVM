@@ -261,17 +261,52 @@ synthetic layouts meet.
 Naming which gate refuses would take one counter per refusal reason, and is the
 cheapest next instrument here.
 
-## What is left
+## The suite-level population — ASKED above, ANSWERED here (2026-08-23)
 
-**The suite-level population is not measured here.** `probes/ReactorProbe.java`
-and the WebClient exchange need reactor on the classpath, which this session's
-host does not have, so the `out_virtual_bc` share of a real reactive workload's
-tail is unmeasured. The isolated per-call numbers above are real; **do not
-quote them as a suite number**. The population question is the one to ask next,
-and `CRATONVM_DBG=mic-prof` answers it in one run on any host that can boot the
-workload.
+The section this replaces closed by naming the next question: *"the
+`out_virtual_bc` share of a real reactive workload's tail is unmeasured …
+`CRATONVM_DBG=mic-prof` answers it in one run on any host that can boot the
+workload."* It was run, on the Azure host that does have spring-webflux's test
+classpath, over **300 `ExchangeProbe` exchanges** — the unit of work
+`webclient-integration-tests-reactive-exchange-gap` is built from:
 
-Related: `known-issues/perf/webclient-integration-tests-reactive-exchange-gap-20260822.md`,
+```
+disp_calls=10232   mic_calls=4270   hit_entry=0   hit_noentry=3280
+out_virt_bc=44     out_virt_bc_refused=3298
+out_special_bc=0   out_special_bc_refused=0
+```
+
+(Verbatim from the run, which was taken on the branch binary before the merge
+that kept dev's spelling: the slot dev ships is `out_virtual_bc`, and it is the
+same counter. Grep for that one.)
+
+**Ten thousand `jit_invoke_dispatch` calls for three hundred exchanges, and
+`hit_entry=0`** — not one inline-cache dispatch found a compiled callee to
+enter. The transition this page is about is reached about **11 times per
+exchange**. At the ~1 600 ns it now saves per transition, that is **~18 µs
+against ~30 000 µs of CPU per exchange: 0.06%.**
+
+So the population answer for the workload this page was opened to explain is
+"almost none", for the same reason `RJitGc`'s was: the fast arms and the
+interpreter between them serve nearly everything, and **a reactive workload
+barely enters compiled code at all**. The isolated per-call numbers are real
+and the workload-level silence is real, and they do not contradict each other.
+
+That also settles a measurement that would otherwise be re-run indefinitely.
+Three ABBA rounds of the memo A/B on the exchange gave 33.3 / 33.0 / 46.3 /
+49.6 / 34.1 ms per exchange with the memos ON against 31.3 / 45.3 / 39.4 / 30.8
+with them OFF, and the startup-free `perf stat -e task-clock` marginal form was
+no better (31.8-61.6 ON, 1.3-49.4 OFF, the 1.3 being a run that failed
+outright). **The spread inside one arm exceeds any difference between arms**;
+the census does not have that problem, and it is what a future reader should
+reach for. **Do not re-open this page because a reactive workload did not
+move — read `disp_calls` and `hit_entry` first.**
+
+Still unmeasured: `probes/ReactorProbe.java`'s own tail split, which needs
+reactor compiled against the probe rather than against the suite classpath.
+
+Related:
+`performance/webclient-integration-tests-reactive-exchange-gap-RETIRED-20260823.md`,
 [[jit-entries-per-call-cost-is-the-call-dense-wall]].
 
 ## Reproducing
