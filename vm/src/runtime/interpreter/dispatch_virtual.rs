@@ -2124,7 +2124,7 @@ pub(super) fn execute_invokevirtual_cached(
                         // `try_jit_upgrade_with_gate` already refuses these,
                         // and so do the MIC/PIC and OSR direct-call sites
                         // (`mic_callee_has_exception_table`,
-                        // `osr_callee_declares_handlers`). This route was the
+                        // `osr_callee_bars_direct_call`). This route was the
                         // gap: under `bg_compile` — the DEFAULT — the worker
                         // publishes and the `jit_cache` probe below promotes
                         // the site without consulting the gate, which is the
