@@ -564,6 +564,7 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
          unjoined={unjoined} trigger={trigger}"
     );
     report_vector_intrinsics();
+    report_filechannel_fast_io();
     crate::craton_gpu::dispatch_timing::report();
     // The corrupt-cell census. HERE and not in `vm-cli`, because a JUnit runner
     // exits through `System.exit` and never reaches `vm-cli`'s normal-return
@@ -609,6 +610,26 @@ fn report_vector_intrinsics() {
             }
         }
     }
+}
+
+/// The `FileChannelImpl.read/write(ByteBuffer)` fast-path engagement counters,
+/// at exit.
+///
+/// Same rule as `report_vector_intrinsics` above, and for the same reason: a
+/// `FileChannel` speedup quoted without this line cannot distinguish "the
+/// native ran on every read" from "every read refused and the host was
+/// quieter". Printed when the path was touched at all, or when
+/// `CRATONVM_FC_FAST_IO_STATS=1` asks — so a run that PRINTS
+/// `read fast=0 refused=N` is a finding rather than a silence.
+fn report_filechannel_fast_io() {
+    let asked = cratonvm_types::flags::runtime_var("CRATONVM_FC_FAST_IO_STATS")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if !asked && !cratonvm_native_io::file_channel_fast_read::stats::touched() {
+        return;
+    }
+    eprintln!("{}", cratonvm_native_io::file_channel_fast_read::stats::report());
 }
 
 type PreExitHook = fn(code: i32);

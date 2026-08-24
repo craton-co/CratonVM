@@ -90,6 +90,9 @@ pub mod zip_real_jar;
 // Wave 3 — NIO / async I/O.
 // WP3.3 + WP3.6 — real FileChannel.map (memmap2) + transferTo (sendfile/TransmitFile).
 pub mod file_channel;
+// `FileChannelImpl.read/write(ByteBuffer)` collapsed into one native call —
+// see `performance/filechannel-heap-read-glue-depth-FIXED-20260823.md`.
+pub mod file_channel_fast_read;
 // WP3.4 — non-blocking SocketChannel / ServerSocketChannel with EAGAIN semantics.
 pub mod socket_channel;
 // Real non-blocking TCP connect with a pollable OS fd (ES-HANG-02 residual 1).
@@ -6914,6 +6917,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `native_fc_transfer_to0` / `native_fc_max_direct_transfer_size0`
     // stubs in `nio_native.rs:317-345`.
     file_channel::register_file_channel_real(registry);
+    // `FileChannelImpl.read/write(ByteBuffer)` as one native call instead of
+    // twenty JDK frames. Registered AFTER `register_file_channel_real` so a
+    // future overlap there is decided by this file, and gated by
+    // `CRATONVM_FC_FAST_IO=0` — see `file_channel_fast_read`.
+    file_channel_fast_read::register_file_channel_fast_io(registry);
     // WP3.4 — non-blocking SocketChannel / ServerSocketChannel.
     socket_channel::register_socket_channel_real(registry);
     // WP3.2 — AIO socket channels + AsynchronousChannelGroup. Supersedes
