@@ -10278,6 +10278,16 @@ pub(crate) fn lower_inner_with_scopes(
     // is what actually gates the fast tier's OR-branch on "no maps at all," so a
     // vacuous true here never overrides that check.
     cm.fully_oop_covered = cm.oop_maps.iter().all(|m| m.moving_young_coverage_complete);
+    // The same aggregate under the name that says what it measures — see
+    // `CompiledMethod::fully_shadow_covered`. The two coincide on THIS backend
+    // and deliberately differ on the fast tier, where `fully_oop_covered` is
+    // the frame-slot subset test; the OSR fallback reads `fully_shadow_covered`
+    // so it gets the same question from both.
+    cm.fully_shadow_covered = !cm.oop_maps.is_empty()
+        && cm
+            .oop_maps
+            .iter()
+            .all(|m| m.moving_young_coverage_complete);
     cm.osr_frame_size = frame_size;
     // OSR and the save area, stated where the artifact is published.
     //

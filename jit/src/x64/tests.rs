@@ -15640,3 +15640,94 @@ fn scan_admitted_opcodes_are_lowered_or_declared() {
         );
     }
 }
+
+/// The METHOD-ENTRY safepoint poll must not read as "the local-oop dataflow
+/// never reached here".
+///
+/// `emit_safepoint_poll_prologue` deliberately stamps `cur_bc_pc` with
+/// `ENTRY_POLL_BC_PC` so its map cannot collide with a genuine bci-0 safepoint
+/// in the sp-id-keyed lookup. That is right, and it had a consequence nobody
+/// costed: `local_oop_reached.get(ENTRY_POLL_BC_PC)` is `None`, so
+/// `moving_young_safepoint_coverage_complete` reported the entry poll as
+/// unprovable and its `OopMapEntry` was pushed with
+/// `moving_young_coverage_complete: false`.
+///
+/// `CompiledMethod::fully_shadow_covered` ANDs that flag over every safepoint
+/// of a method, so ONE such entry made it false for **every method the fast
+/// tier ever compiled** — and through the OSR fallback that refused relocation
+/// on 725 of 759 collections of `TestKillProcessWhileWriting`. Measured with
+/// `CRATONVM_DBG_OOPCOV=1`, every uncovered method reported exactly
+/// `shadow_missing_pcs=[4294967295]`.
+///
+/// Non-vacuous in three directions: the entry pc answers with the SEEDED mask
+/// (not zero, not `local_oop_masks[0]`), a reached bci answers with its own
+/// mask, and an unreached bci still answers `None` — so the fix cannot be
+/// mistaken for "everything is covered now".
+#[test]
+fn the_method_entry_poll_knows_its_own_live_oop_locals() {
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut compiler = Compiler::new(
+        "entry-poll-oop-mask-test".to_string(),
+        ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    // Entry state: locals 0 and 2 are reference parameters. bci 0's own entry
+    // is deliberately DIFFERENT (a back edge to bci 0 would have intersected
+    // it), so reading the mask out of `local_oop_masks[0]` cannot pass this.
+    compiler.param_oop_mask = 0b101;
+    compiler.local_oop_masks = vec![0b001, 0b010, 0];
+    compiler.local_oop_reached = vec![true, true, false];
+
+    compiler.cur_bc_pc = crate::x64::safepoint::ENTRY_POLL_BC_PC;
+    assert_eq!(
+        compiler.local_oop_mask_at_current_pc(),
+        Some(0b101),
+        "the entry poll must answer with the dataflow's SEEDED entry state — \
+         `None` here is the defect, and `Some(0b001)` would mean it read \
+         `local_oop_masks[0]`, which a back edge can have narrowed",
+    );
+
+    compiler.cur_bc_pc = 1;
+    assert_eq!(compiler.local_oop_mask_at_current_pc(), Some(0b010));
+
+    compiler.cur_bc_pc = 2;
+    assert_eq!(
+        compiler.local_oop_mask_at_current_pc(),
+        None,
+        "a pc the forward dataflow never reached (an exception-handler-only \
+         entry) must still refuse to make a precise claim",
+    );
+
+    compiler.cur_bc_pc = 99;
+    assert_eq!(
+        compiler.local_oop_mask_at_current_pc(),
+        None,
+        "and so must a pc past the end of the vectors",
+    );
+}
