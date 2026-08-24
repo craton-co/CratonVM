@@ -26,6 +26,19 @@ use super::*;
 /// come from `SCRATCH_REGS` **or** `LOCAL_REGS`, and `LOCAL_REGS` holds RBX on
 /// every platform and RSI/RDI on Windows. Forcing REX.B on rewrites the ModRM
 /// `r/m` field to `r + 8`, i.e. compares an entirely different register.
+/// `CRATONVM_JIT_NO_SAFEPOINT_FRAME_RECORD=1` — go back to publishing the
+/// innermost-frame mirror only on method entry and after a JIT→JIT call.
+///
+/// The bisect lever for [`Compiler::emit_frame_record_at_safepoint`], which is
+/// default-ON. Latched: it is read once per emitted safepoint, and codegen
+/// decisions must not change under a running process.
+fn safepoint_frame_record_disabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_SAFEPOINT_FRAME_RECORD").is_some()
+    })
+}
+
 /// The synthetic bytecode pc the METHOD-ENTRY safepoint poll records.
 ///
 /// No real method's bytecode is anywhere near 4 GiB, so this can never collide
@@ -279,6 +292,8 @@ impl Compiler {
             }
             self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32); // Cast: bytecode PC fits i32
             self.emit_store_local(self.sp_id_slot_off, RAX);
+            // Re-publish the frame record HERE, where the GC will read it.
+            self.emit_frame_record_at_safepoint();
             // Stage A.2 — this is a GC-capable safepoint that flushed its
             // register-locals and stored an sp-id; record it so finalize can
             // require a matching oop map (coverage = spilled ⊆ mapped).
@@ -369,7 +384,59 @@ impl Compiler {
             }
             self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32);
             self.emit_store_local(self.sp_id_slot_off, RAX);
+            self.emit_frame_record_at_safepoint();
             self.safepoint_pcs.insert(self.cur_bc_pc as u32);
+        }
+    }
+
+    /// Publish this frame's `(RBP, compile id)` into the innermost-frame mirror
+    /// at a GC-capable safepoint, right beside the sp-id store.
+    ///
+    /// **The mirror is written where it is READ.** Until 2026-08-24 it was
+    /// written only on method ENTRY and restored by
+    /// `emit_post_call_rbp_republish` after a JIT→JIT call — a contract spread
+    /// over the prologue, six call sites and a Rust-side bracket
+    /// (`try_call_compiled_entry`), and one that has to hold at *every* return
+    /// path for the pair to be trustworthy. Measured on `TestMVStoreTool`, it
+    /// does not: one rbp (`0x…3a00`) with ONE saved return address inside
+    /// `TestMVStoreTool.testCompact` was claimed by FOUR different methods
+    /// across collections — `RootReference.isLocked` (which has zero oop maps
+    /// and so can never be the frame at a safepoint), `MVMap.getRoot`,
+    /// `MVMap$DecisionMaker.decide` and `MVMap.replacePage`. At most one can be
+    /// right. `moving_young_frame_coverage_complete` then reads
+    /// `[stale_rbp - stale_method.sp_id_slot_off]`, finds a word that matches no
+    /// map, and refuses the cycle: `frame_cov=(no_map=7 incomplete=0 ok=48)`,
+    /// which is the whole of that class's remaining
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` residual.
+    ///
+    /// A safepoint is the only place a collection can observe this thread, and
+    /// it is a place the frame that owns the mirror is provably live. Writing
+    /// the pair here makes it correct BY CONSTRUCTION rather than by a
+    /// save/restore discipline maintained at every call site: the reader can
+    /// only ever run against a pair published by the frame it is standing in.
+    /// The entry publish and the post-call republish are kept — they are what
+    /// keeps the pair sane between safepoints, which the conservative scan and
+    /// `remap_active_jit_frames` still read.
+    ///
+    /// Two segment-relative `mov`s, on a path that has just spilled the whole
+    /// register file and is about to make a call. Gated exactly as the prologue
+    /// publish is (`precise_maps && frame_record != 0`), so a context without a
+    /// wired helper — the JIT unit tests — stays byte-golden.
+    /// `CRATONVM_JIT_NO_SAFEPOINT_FRAME_RECORD=1` restores the entry-only
+    /// discipline on the same binary.
+    fn emit_frame_record_at_safepoint(&mut self) {
+        if !self.precise_maps
+            || self.helpers.frame_record == 0
+            || self.inline_rbp_tls_disp == 0
+            || safepoint_frame_record_disabled()
+        {
+            return;
+        }
+        self.emit_mov_tls_disp32_rbp(self.inline_rbp_tls_disp as u32);
+        // Both halves or neither — the pair must never name two frames. See
+        // `conservative_roots::top_cm_id_mirror_read`.
+        if self.inline_cm_tls_disp != 0 {
+            self.emit_mov_tls_disp32_imm32(self.inline_cm_tls_disp as u32, self.compile_id);
         }
     }
 
