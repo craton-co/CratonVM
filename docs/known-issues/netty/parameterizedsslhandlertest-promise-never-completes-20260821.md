@@ -1,12 +1,56 @@
 # `ParameterizedSslHandlerTest` — a completed promise whose waiter is never woken
 
-**Status: OPEN. A thread stays parked in `Object.wait()` forever on a promise
-whose `result` field is non-null and whose `waiters` count is 1.**
+**Status: ROOT CAUSE FOUND AND FIXED 2026-08-23; the RATE is not yet
+re-measured.** `Object.wait()` depended on the CONDVAR ALONE — it parked on
+`wait_condvar` and treated a signalled return as the notification, with no
+condition under the mutex to re-check. A `notifyAll()` that is delivered while
+the waiter sits between a `wait_for` timeout and its next park, or that is
+consumed by `parking_lot`'s requeue-to-mutex and then reported as a timeout
+because the 5 ms poll deadline passed before the waiter could re-acquire, is
+simply gone.
 
-**Read that sentence and not the old one.** This page said "the awaited promise
-is ALREADY COMPLETE", and that is an inference, not the observation — see the
-UNCANCELLABLE section below, which is the leading hypothesis as of 2026-08-23
-and would make the observation entirely benign.
+**The measurement that says so**, one stall, on the instrumented binary:
+
+```
+[WAIT-OBJECT] class=io/netty/bootstrap/AbstractBootstrap$PendingRegistrationPromise
+              result_is=SUCCESS  waiters=Some(Int(1))
+[WAIT-OBJECT] notifies_since_wait=1 interrupt_wakes_since_wait=0
+              polls=78025 signalled=0 waited_ms=397123
+              (monitor totals: notify=1 interrupt=0)
+```
+
+397 123 ms over 78 025 polls is **5.09 ms each** — the wait loop was spinning
+perfectly healthily for the whole 420 s. **Not one of those 78 025 `wait_for`
+returns was a signalled return**, and the monitor served a `notifyAll()` during
+that window. No `[WAIT-REACQUIRE]`, so the thread never left the wait loop; no
+`[MONITOR-ORPHAN]`, so the object still pointed at this monitor;
+`result_is=SUCCESS`, so the promise genuinely completed and this is not the
+`UNCANCELLABLE` case below. The notification reached the exact condvar the
+thread was parked in and the thread never observed it.
+
+`MonitorState` now carries the condition: `parked_waiters` (exact under the
+state lock) and `pending_notifies` (delivered, not yet consumed). `notify()`
+adds one and never more than there are waiters to take it; `notifyAll()` sets
+it to exactly the waiters parked RIGHT NOW; every wakeup path re-tests it under
+the mutex and CONSUMES one. Consuming is a decrement rather than clearing a
+flag, so `notify()` still releases exactly one waiter — a bare generation
+counter would have turned every `notify()` into a `notifyAll()`. The condvar
+signal is now an optimisation rather than the mechanism.
+
+**What is NOT done: the rate.** `CRATONVM_MONITOR_PENDING_NOTIFY=0` restores the
+old behaviour so the fix can be interleaved against itself on ONE binary, which
+is the only comparison this host supports — the rate moved from 4/20 at load
+12–84 to 1/23 at load 6–10 within one session, so any two-session
+before/after would be measuring the machine. A stall line reading
+`consumed=1 signalled=0` is the engagement proof: it names a notification this
+loop would have MISSED before.
+
+**And there is a SECOND stall under this title that the fix does not address**
+— see run 8 below, where `DefaultPromise.result` (a `private volatile Object`)
+holds `Int(0)`.
+
+The rest of this page is kept as it stood, including the two claims withdrawn
+on the way here.
 
 **2026-08-23 — the "not the monitor / not the JIT" narrowing is WEAKER than
 this page claimed, and one of its two refutations has been withdrawn.** Three
@@ -397,11 +441,11 @@ class of permanent stall. `enter_labeled`'s own contended loop is deliberately
 left alone — hot `monitorenter` path, documented as byte-for-byte unchanged,
 and `CRATONVM_DBG_MONENTER` already makes it pollable when someone is looking.
 
-**The next stall on a binary with this either prints `[WAIT-REACQUIRE]` — in
-which case run 9 is a lock-handover defect and not a lost notification — or it
-does not, in which case the notification really was delivered into a
-`wait_condvar` the waiter was parked on and did not observe.** One stall
-decides it.
+**ANSWERED, 2026-08-23, in one stall.** No `[WAIT-REACQUIRE]` line, and
+`polls=78025 signalled=0` — the thread never left the wait loop, and never saw
+a signalled return in 78 025 attempts. So it is the second branch: the
+notification really was delivered into a `wait_condvar` the waiter was parked
+on and never observed. See the status block at the top for the fix.
 
 ### `probes/PromiseWaitProbe.java` — the isolated handshake, which does NOT stall
 
