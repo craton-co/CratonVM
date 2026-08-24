@@ -1793,8 +1793,22 @@ fn register_jit_code_range_inner(
     let registry = jit_code_ranges();
     if let Ok(_writer) = registry.writer.lock() {
         let mut next = (**registry.snapshot.load()).clone();
-        next.push((entry, entry.saturating_add(len), cm_ptr, owner));
-        next.sort_unstable_by_key(|&(start, _, _, _)| start);
+        // INSERT, do not push-then-sort. The snapshot this clone came from is
+        // already sorted by `start` — it is only ever written here and by
+        // `unregister_jit_code_range`, which retains in place — so the whole
+        // ordering work is placing ONE element. `sort_unstable_by_key` cannot
+        // see that: its almost-sorted fast path detects a run, and an element
+        // appended past the end of one is exactly the shape that defeats it, so
+        // every registration paid O(n log n) over the entire registry.
+        //
+        // It matters more than the old cost suggests, because the population is
+        // about to grow: `register_jit_code_range_inner` and its sorts were
+        // ~0.7% of the WebClient exchange profile with 155 compiled methods,
+        // and the whole point of the `invokedynamic` bridge is that far more
+        // methods stay compiled.
+        let range = (entry, entry.saturating_add(len), cm_ptr, owner);
+        let at = next.partition_point(|&(start, _, _, _)| start < entry);
+        next.insert(at, range);
         registry.snapshot.store(std::sync::Arc::new(next));
         // Release: any cached snapshot taken with Acquire after this point must
         // see the push above (ordinary Mutex unlock already provides this, but
@@ -6389,6 +6403,26 @@ pub enum InlineRefusal {
     BudgetAlreadySpent,
     /// The receiver profile has saturated ([`ReceiverShape::Saturated`]).
     SaturatedProfile { observations: u32 },
+    /// The callee is force-interpreted by `CRATONVM_JIT_DENY` /
+    /// `CRATONVM_JIT_BISECT_ONLY`.
+    ///
+    /// Those levers are documented as "a matching method is force-interpreted
+    /// (never JIT-compiled)", and until 2026-08-23 they were consulted ONLY by
+    /// `compile_gate::admit` — i.e. by the three COMPILE doors. The inline
+    /// planner never asked, so a denied callee was still `inline-planned` and
+    /// spliced into a compiled caller's body. MEASURED on
+    /// `probes/XferProbe2.java`: with
+    /// `CRATONVM_JIT_DENY=XferProbe2$Base.calleeSpecial` set,
+    /// `CRATONVM_DBG=jitc` printed `inline-planned
+    /// XferProbe2$Base.calleeSpecial(I)I @pc=2` and the arm read 24.2 ns/op
+    /// against 25.8 undenied — the lever moved nothing because the callee was
+    /// still running as compiled code, just not as its own artifact.
+    ///
+    /// That is not untidiness: it silently invalidates any bisect built on the
+    /// lever. A conclusion of the form "the arm stalled with X force-
+    /// interpreted, therefore X's compiled code is not the cause" is only
+    /// sound if X really was interpreted.
+    ForceInterpreted,
 }
 
 impl InlineRefusal {
@@ -6414,6 +6448,7 @@ impl InlineRefusal {
             InlineRefusal::CalleeUnresolved { .. } => "callee-unresolved",
             InlineRefusal::BudgetAlreadySpent => "budget-already-spent",
             InlineRefusal::SaturatedProfile { .. } => "saturated-profile",
+            InlineRefusal::ForceInterpreted => "force-interpreted",
         }
     }
 }
@@ -9387,7 +9422,7 @@ fn direct_native_helper_for_impl(
 //     defect. The shadow check is on the VM side and needs the same
 //     `resolve_dispatch` treatment.
 //
-//  5. `INDY_STRING_CONCAT_FN` (below) is a `StringConcatFactory` *bootstrap*
+//  5. `INDY_BRIDGE_FN` (below) is an `invokedynamic` *bootstrap*
 //     bridge, not a native-method dispatch, and the interpreter reaches the
 //     same bridge for the same sites — so gating it in the JIT would move the
 //     call without changing the policy answer, while perturbing
@@ -9444,16 +9479,22 @@ pub fn set_integer_value_of_direct_fn(addr: usize) {
     INTEGER_VALUE_OF_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-lifetime bridge for `StringConcatFactory` sites lowered by the
-/// single-pass backend. It stays outside the stable helper-table ABI because
-/// the address is installed once at VM start, not per compiled artifact.
-pub static INDY_STRING_CONCAT_FN: std::sync::atomic::AtomicUsize =
+/// Process-lifetime bridge for `invokedynamic` sites lowered by the
+/// single-pass backend rather than trapped. It stays outside the stable
+/// helper-table ABI because the address is installed once at VM start, not per
+/// compiled artifact.
+///
+/// ONE cell for BOTH bridged kinds — `StringConcatFactory` and, since
+/// 2026-08-23, `LambdaMetafactory`. The site metadata carries a `kind` tag the
+/// VM-side entry reads (`invokedynamic::jit_indy_site_kind`), so the call
+/// sequence and this cell stay single.
+pub static INDY_BRIDGE_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Register the `StringConcatFactory` bridge (called once from the VM's
+/// Register the `invokedynamic` bridge (called once from the VM's
 /// `build_helpers`).
-pub fn set_indy_string_concat_fn(addr: usize) {
-    INDY_STRING_CONCAT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+pub fn set_indy_bridge_fn(addr: usize) {
+    INDY_BRIDGE_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `Integer.intValue()` sibling of [`INTEGER_VALUE_OF_DIRECT_FN`].
@@ -15940,7 +15981,7 @@ pub fn try_compile(
     ir_emit_long: bool,
     ir_emit_virtual_calls: bool,
     ir_emit_fp: bool,
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
 ) -> Option<CompiledMethod> {
     // Thin compatibility wrapper: the overwhelming majority of callers
     // (every `jit` crate test, plus any VM call site that hasn't been
@@ -16104,7 +16145,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // while keeping the compiler's simulated operand stack consistent for
     // whatever bytecode follows. `None` (resolver absent, or it returns `None`
     // for a given site) bails the whole compile — see `try_compile_inner`.
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
     // PGO-02: maps a receiver CLASS ID (not a CP index - the runtime
     // identity a guarded speculative inline's receiver class-id check
     // resolved against) to its class name, so a Monomorphic/Bimorphic
@@ -17320,7 +17361,7 @@ fn try_compile_inner(
     // `None` (resolver absent, or it returns `None` for a given id) refuses
     // every speculative virtual/interface inline at that site; static/
     // special DirectBind sites are unaffected (no receiver dependency).
-    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<(String, usize)>>,
     class_id_name_resolver: Option<&dyn Fn(u32) -> Option<String>>,
     // PGO-02 R0: the body a receiver of exactly this class id dispatches to.
     // See `try_compile`.
@@ -20293,7 +20334,19 @@ fn try_compile_inner(
                         f(receiver_class_id, &class_name, &method_name, &descriptor)
                     })
                 };
-                if inline_budget_remaining == 0 {
+                // The bisect levers apply HERE too — see
+                // `InlineRefusal::ForceInterpreted` for what it cost that they
+                // did not. Checked against the CONSTANT-POOL name, which is the
+                // callee for the statically bound kinds (3 | 1) this planner
+                // actually admits by default; guarded virtual/interface
+                // speculation resolves its body per receiver class and is
+                // default-OFF (`CRATONVM_JIT_GUARDED_VIRTUAL_INLINE`), so a
+                // deny aimed at a speculated receiver's own class name is NOT
+                // covered by this and would need the receiver's name, which
+                // this site does not have.
+                if jit_force_interpret(&class_name, &method_name) {
+                    inline_tally.record_refusal(&InlineRefusal::ForceInterpreted);
+                } else if inline_budget_remaining == 0 {
                     inline_tally.record_refusal(&InlineRefusal::BudgetAlreadySpent);
                 } else {
                     // A guarded site's callee is NOT the constant-pool callee
@@ -21652,13 +21705,40 @@ fn try_compile_inner(
             jitc_bail!("cp_invokedynamic_descriptor_resolver")
         };
         for &(pc, cp_idx) in &scan.indy_ops {
-            let Some(descriptor) = resolver(cp_idx) else {
+            let Some((descriptor, bridge_site)) = resolver(cp_idx) else {
                 jitc_bail!("indy_descriptor_resolve")
             };
             let arg_slots = count_param_slots(&descriptor);
             let ret_type = return_type(&descriptor);
             let arg_type_tags = indy_arg_type_tags(&descriptor);
-            indy_info.push((pc, arg_slots, ret_type, arg_type_tags, 0));
+            // `bridge_site` is 0 for every bootstrap the VM cannot bridge,
+            // which is the pre-bridge behaviour: the codegen lowers the site to
+            // an uncommon trap. This used to be an unconditional 0 here, so the
+            // WHOLE-METHOD door trapped even on the `StringConcatFactory` sites
+            // the OSR door had been bridging since that fix landed.
+            //
+            // A BRIDGED site CALLS A HELPER, and every helper call in this
+            // backend loads the hidden `SharedVm` pointer out of the frame slot
+            // `heap_local_offset` names — a slot that only EXISTS when
+            // `needs_heap` is set. Nothing else in a method like
+            //
+            //     static String f(int i) { return "v=" + i; }
+            //
+            // asks for it: there is no `new`, no field access, no ordinary
+            // invoke, and the indy used to lower to a trap that calls nothing.
+            // So `heap_local_offset` stayed 0, the bridge call loaded `[rbp-0]`
+            // — the saved RBP — as its VM pointer, and the helper answered
+            // with a null String from a garbage `SharedVm`.
+            //
+            // It reproduced ONLY through the whole-method door: an OSR compile
+            // sets `needs_heap` for its own entry stub, which is why the concat
+            // bridge ran correctly for the months it was OSR-only, and why
+            // `probes/IndyBridgeProbe.java`'s loop-shaped arms all passed while
+            // a three-instruction method returned null.
+            if bridge_site != 0 {
+                needs_heap = true;
+            }
+            indy_info.push((pc, arg_slots, ret_type, arg_type_tags, bridge_site));
         }
     }
 

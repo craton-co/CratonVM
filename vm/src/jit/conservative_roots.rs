@@ -5487,6 +5487,15 @@ fn scan_compiled_frame_bands(
                 return false;
             }
             scan_one_frame(rbp - frame_size, rbp, heap, out);
+            // The band was just read as marking roots, which is what keeps
+            // these objects alive across the pause AND what gets them copied.
+            // Say which of them arrived through a word no channel rewrites, so
+            // the pin decision can veto a movable claim made elsewhere for the
+            // same address. Only reachable with a resolved layout — the foreign
+            // innermost frame above has none, and it already forces the
+            // non-moving sweep through `FOREIGN_INNERMOST_RBP`, so there is no
+            // move to veto there.
+            publish_unrewritable_band_roots(rbp, frame_size, cm, heap);
         }
 
         // `[rbp]` and `[rbp + 8]` hold the saved caller RBP and return PC.
@@ -5632,6 +5641,83 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
     );
 }
 
+/// Total addresses published to the unrewritable-root veto this process.
+static UNREWRITABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Addresses published to the unrewritable-root veto since process start.
+///
+/// Diagnostic only. A non-zero count means at least one compiled frame held a
+/// live object in a word `band_slot_is_verifiable` refuses to inspect — i.e.
+/// the pin below is doing work, not just costing a branch.
+pub fn unrewritable_band_root_count() -> usize {
+    UNREWRITABLE_BAND_ROOTS.load(Ordering::Relaxed)
+}
+
+/// Publish every object reachable from one compiled frame's UNVERIFIABLE band
+/// words to the pin veto (`gc_quiescence::add_unrewritable_jit_root`).
+///
+/// `scan_one_frame` has already walked the whole band and pushed these objects
+/// as marking roots — that is what keeps them alive across the pause, and it is
+/// also what gets them COPIED, because a movable claim from any other slot
+/// naming the same address wins at the pin decision. This second, cheap pass
+/// says which of those roots arrived through a word nobody can rewrite, so that
+/// claim can be vetoed.
+///
+/// The two halves must stay the same partition: the words visited here are
+/// exactly the ones `band_slot_is_verifiable` returns `false` for, which is
+/// exactly the set `remap_register_image_words` would otherwise have to
+/// REWRITE. Pinning is the sound half of that choice — see the module comment
+/// on `UNREWRITABLE_JIT_ROOTS` in `gc_quiescence`.
+fn publish_unrewritable_band_roots(
+    rbp: usize,
+    frame_size: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    heap: &VmHeap,
+) {
+    if frame_size == 0 || frame_size > rbp {
+        return;
+    }
+    let live_hi = moving_young_frame_live_hi(rbp, cm);
+    let lo = rbp - frame_size;
+    let mut addr = (lo + 7) & !7usize;
+    // Same clamp as `band_has_unpublished_word_with`: a stale bound must never
+    // walk into unmapped pages. A compiled frame is orders of magnitude
+    // smaller, so this is unreachable in practice.
+    const MAX_SCAN_BYTES: usize = 1024 * 1024;
+    let hi = rbp.min(addr.saturating_add(MAX_SCAN_BYTES));
+    let envelope = heap.conservative_addr_span();
+    let mut published = 0usize;
+    while addr + 8 <= hi {
+        // Cast: a compiled frame is far smaller than i32::MAX bytes.
+        let off = (rbp - addr) as i32;
+        if band_slot_is_verifiable(off, &cm.frame_layout, live_hi) {
+            // Verified storage. An unpublished movable oop here already forces
+            // the non-moving sweep, and a published one is rewritten by
+            // `remap_one_jit_frame`, so it needs no pin and pinning it would
+            // give back the drain this set exists to preserve.
+            addr += 8;
+            continue;
+        }
+        // SAFETY: aligned read inside this thread's own live compiled frame,
+        // bounded by the frame size recorded at compile time — the same
+        // interval `scan_one_frame` has already read.
+        let qword = unsafe { (addr as *const usize).read() };
+        addr += 8;
+        if let Some((elo, ehi)) = envelope {
+            if qword < elo || qword >= ehi {
+                continue;
+            }
+        }
+        if heap.is_object_address(qword).is_some() {
+            cratonvm_gc::gc_quiescence::add_unrewritable_jit_root(qword);
+            published += 1;
+        }
+    }
+    if published > 0 {
+        UNREWRITABLE_BAND_ROOTS.fetch_add(published, Ordering::Relaxed);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5747,9 +5833,19 @@ fn stale_below_rbp_enabled() -> bool {
 static STALE_AFTER_REMAP_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Of those, the ones in a region something RESUMES FROM.
+static STALE_AFTER_REMAP_RESUMED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Total words found still naming a moved-from address after a remap.
 pub fn stale_after_remap_hits() -> usize {
     STALE_AFTER_REMAP_HITS.load(Ordering::Relaxed)
+}
+
+/// Of those, how many sat in a region something resumes from — the
+/// callee-saved GPR image. See [`stale_after_remap_census`].
+pub fn stale_after_remap_resumed_hits() -> usize {
+    STALE_AFTER_REMAP_RESUMED.load(Ordering::Relaxed)
 }
 
 /// Name the class of the object now living at `addr`, for diagnostics.
@@ -5801,6 +5897,18 @@ fn report_stale_words_in(
                 continue;
             }
             let n = STALE_AFTER_REMAP_HITS.fetch_add(1, Ordering::Relaxed);
+            // Split the hit by whether anything RESUMES from the word. The
+            // shared census is what the `System.exit` shutdown trailer prints;
+            // the local counter is what this crate's tests read. See
+            // `cratonvm_types::stale_remap_census`.
+            let resumed_from = cm.is_some_and(|cm| {
+                // Cast: a compiled frame is far smaller than i32::MAX.
+                is_callee_saved_gpr_image((rbp - addr) as i32, &cm.frame_layout)
+            });
+            if resumed_from {
+                STALE_AFTER_REMAP_RESUMED.fetch_add(1, Ordering::Relaxed);
+            }
+            cratonvm_types::stale_remap_census::note(resumed_from);
             if n < 4000 {
                 let class = class_name_at(shared, new);
                 match cm {
@@ -5809,7 +5917,8 @@ fn report_stale_words_in(
                         let off = (rbp - addr) as i32;
                         eprintln!(
                             "[jit-stale-after-remap] {tag} method={} off={off} region={} \
-                             verifiable={} class={class} value=0x{w:x} moved_to=0x{new:x}",
+                             verifiable={} resumed_from={} class={class} value=0x{w:x} \
+                             moved_to=0x{new:x}",
                             cm.method_label,
                             cm.frame_layout.region_name(off),
                             band_slot_is_verifiable(
@@ -5817,6 +5926,7 @@ fn report_stale_words_in(
                                 &cm.frame_layout,
                                 moving_young_frame_live_hi(rbp, cm),
                             ),
+                            is_callee_saved_gpr_image(off, &cm.frame_layout),
                         );
                     }
                     None => {
@@ -5950,28 +6060,65 @@ pub fn report_stale_after_remap(
 // only the slots an oop map names, and the saved word is left holding a
 // from-space address.
 //
-// This pass closes the partition: every word of a live compiled frame is now
-// either VERIFIED or REWRITTEN, and none is neither. It rewrites exactly the
-// words `band_slot_is_verifiable` refuses, and only when the word is a KEY of
-// `pointer_map` -- the start address of an object this collection actually
-// moved. That is the same interpretation the conservative scan already
-// committed to when it marked the word as a reference and kept the object
-// alive.
+// This pass closes the half of that partition that something RESUMES FROM, and
+// it is deliberately narrower than "every word the verifier refuses". The
+// unverifiable regions are not equivalent, and lumping them together is what
+// made the repair look unsafe enough to ship off:
 //
-// SHIPS OPT-IN (`CRATONVM_REGISTER_IMAGE_REMAP=1`). The gap is measured -- see
-// `known-issues/gc/moving-young-leaves-a-callee-saved-register-image-unrewritten-20260822.md`
-// for the observation and the instrument that took it -- but NO failure has
-// been attributed to it, and the repair is a CONSERVATIVE rewrite: it treats a
-// word as a reference on exactly the evidence the marking scan uses, which is
-// sound for marking (over-retention) and not obviously sound for writing (a
-// caller's callee-saved register holding a non-pointer that happens to equal a
-// moved object's from-address would be corrupted). Default off, one flag away,
-// with `CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` as the instrument that says
-// whether it has anything to do on a given workload.
+//   * `callee-saved-gpr-image` -- the prologue's save area for the CALLER's
+//     callee-saved GPRs, which the epilogue pops straight back into the
+//     caller's registers. This one IS resumed from, and it is the ONLY region
+//     this pass rewrites.
+//   * `callee-saved-xmm-image` -- resumed from as well, but an XMM never holds
+//     an object reference in this VM's calling convention, so a hit there is a
+//     false positive by construction and rewriting it could only corrupt a
+//     double.
+//   * `safepoint-gpr-spill-image` -- write-only. `emit_pre_safepoint_spill`
+//     stores the GPR file purely so the conservative scan can SEE it and says
+//     so in its own words ("no post-call reload is needed"); nothing ever loads
+//     from these slots, so a stale word there is read by no one.
+//   * `outgoing-args-or-deopt-regs`, and operand-spill slots above the
+//     safepoint's live cursor -- dead by definition. The cursor reclaims by
+//     moving, so those slots hold whatever the deepest earlier operand stack
+//     left behind.
+//
+// Restricting to the GPR image is also what makes the write defensible. The
+// dead regions are where a non-pointer that merely LOOKS like an object base is
+// plausible -- they are full of abandoned values nobody screens. A caller's
+// live callee-saved GPR is not: for a hit there to be a false positive, the
+// caller would have to be holding a non-reference whose value is exactly a
+// young object's base address, which `heap.is_object_address` validated against
+// the arena bounds and the object-start bitmap. Loop counters, sizes and PCs do
+// not reach those addresses, and Rust-side pointers are in different mappings.
+//
+// The compiled callers do not actually need this: a compiled frame reloads its
+// live oops from the shadow stack after every safepoint, so its registers are
+// refreshed whatever the image held. What needs it is the OUTERMOST compiled
+// frame, whose caller is the VM's own Rust code at the interpreter->JIT
+// boundary -- which has no reload and resumes from exactly those popped
+// registers. That is the frame every observation on this defect has named.
+//
+// SHIPS ON, with `CRATONVM_REGISTER_IMAGE_REMAP=0` as the kill switch and
+// `CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` as the instrument that says whether it
+// has anything to do on a given workload. See
+// `moving-young-left-a-callee-saved-register-image-unrewritten-FIXED-20260823`
+// for the measurement.
+//
+// The other half of the repair is a PIN rather than a write:
+// `publish_unrewritable_band_roots` publishes every object an unverifiable word
+// holds to `gc_quiescence::add_unrewritable_jit_root`, which vetoes the movable
+// claim at the young sweep's pin decision. That covers the non-moving arm at no
+// risk at all; a Cheney moving young collection has no pin, which is why this
+// write exists for it.
 fn register_image_remap_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_REGISTER_IMAGE_REMAP").is_some()
+        !matches!(
+            cratonvm_types::flags::runtime_var_os("CRATONVM_REGISTER_IMAGE_REMAP")
+                .as_deref()
+                .and_then(|s| s.to_str()),
+            Some("0")
+        )
     })
 }
 
@@ -5983,7 +6130,22 @@ pub fn register_image_remap_words() -> usize {
     REGISTER_IMAGE_REMAP_WORDS.load(Ordering::Relaxed)
 }
 
-/// Rewrite the moved references held in one frame's unverifiable words.
+/// Is `off` inside the prologue's save area for the CALLER's callee-saved GPRs?
+///
+/// The one unverifiable region a frame's CALLER resumes from — the epilogue
+/// pops these words straight back into its registers. `band_slot_is_verifiable`
+/// refuses the whole `off >= callee_saved_lo` tail (GPR image, XMM image,
+/// safepoint spill, outgoing-args/deopt reserve); this narrows it back to the
+/// GPR image alone. See the module comment above for why the other three are
+/// deliberately left stale.
+#[inline]
+fn is_callee_saved_gpr_image(off: i32, layout: &cratonvm_jit::FrameLayout) -> bool {
+    layout.callee_saved_hi > layout.callee_saved_lo
+        && off >= layout.callee_saved_lo
+        && off < layout.callee_saved_hi
+}
+
+/// Rewrite the moved references held in one frame's callee-saved GPR image.
 fn remap_one_frame_register_images(
     rbp: usize,
     cm: &cratonvm_jit::CompiledMethod,
@@ -6000,18 +6162,23 @@ fn remap_one_frame_register_images(
     if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
         return 0;
     }
-    let live_hi = moving_young_frame_live_hi(rbp, cm);
+    // No `live_hi` here, deliberately: the safepoint's live cursor bounds the
+    // OPERAND-SPILL region, and this pass no longer touches it. Only the
+    // prologue's callee-saved GPR image is in scope, and its bounds are static
+    // frame geometry.
     let lo = rbp - frame_size;
     let mut addr = (lo + 7) & !7usize;
     let mut rewritten = 0usize;
     while addr + 8 <= rbp {
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
-        if band_slot_is_verifiable(off, &cm.frame_layout, live_hi) {
-            // Verified storage. An unpublished movable oop here has already
-            // forced the non-moving sweep, and a published one was rewritten
-            // by `remap_one_jit_frame`. Rewriting it again here would be a
-            // second, unvalidated interpretation of the same word.
+        if !is_callee_saved_gpr_image(off, &cm.frame_layout) {
+            // Everything else is either VERIFIED storage -- where an
+            // unpublished movable oop has already forced the non-moving sweep
+            // and a published one was rewritten by `remap_one_jit_frame` -- or
+            // an unverifiable region nothing resumes from. The module comment
+            // above enumerates the four and says why each is excluded; this is
+            // the line that keeps the write off the dead ones.
             addr += 8;
             continue;
         }
@@ -6831,6 +6998,112 @@ mod tests {
             band_has_unpublished_word_with(hi, hi - lo, &layout, None, &published, &relocatable),
             "an unknown cursor must fall back to scanning the whole region",
         );
+    }
+
+    /// The register-image REWRITE covers exactly one of the four regions the
+    /// band verifier refuses, and this test is the partition.
+    ///
+    /// `band_slot_is_verifiable` says "no" to everything at or above
+    /// `callee_saved_lo` — the caller's GPR image, the caller's XMM image, the
+    /// per-safepoint blind GPR spill, and the outgoing-argument / deopt
+    /// reserve above it. Only the FIRST is read by anything (the epilogue pops
+    /// it into the caller's registers) AND capable of holding a reference, and
+    /// widening the write back to the others is what made this repair look
+    /// unsafe enough to ship off. A future edit that re-widens it fails here.
+    #[test]
+    fn only_the_callee_saved_gpr_image_is_rewritten() {
+        let layout = cratonvm_jit::FrameLayout {
+            java_locals_hi: 16,
+            spill_lo: 16,
+            spill_hi: 48,
+            callee_saved_lo: 48,
+            callee_saved_hi: 80,
+            xmm_saved_lo: 80,
+            xmm_saved_hi: 112,
+            reg_spill_lo: 112,
+            reg_spill_hi: 144,
+            frame_size: 176,
+            ..Default::default()
+        };
+        // Verified storage: rewritten by `remap_one_jit_frame`, not here.
+        for off in [8, 16, 40] {
+            assert!(
+                band_slot_is_verifiable(off, &layout, None),
+                "off={off} must be verified storage"
+            );
+            assert!(
+                !is_callee_saved_gpr_image(off, &layout),
+                "off={off} is verified storage and must not be rewritten here"
+            );
+        }
+        // The one region something resumes from.
+        for off in [48, 64, 72] {
+            assert!(
+                !band_slot_is_verifiable(off, &layout, None),
+                "off={off} is a register image, so the verifier must skip it"
+            );
+            assert!(
+                is_callee_saved_gpr_image(off, &layout),
+                "off={off} is the callee-saved GPR image and must be rewritten"
+            );
+        }
+        // Unverifiable AND unread: an XMM never holds a reference, the
+        // per-safepoint spill is write-only, and everything above it is dead.
+        for off in [80, 100, 112, 140, 152] {
+            assert!(
+                !band_slot_is_verifiable(off, &layout, None),
+                "off={off} must be unverifiable"
+            );
+            assert!(
+                !is_callee_saved_gpr_image(off, &layout),
+                "off={off} is region `{}` — nothing resumes from it, so writing \
+                 it can only corrupt",
+                layout.region_name(off),
+            );
+        }
+        // A frame with no save area at all: nothing to rewrite, and the
+        // predicate must not admit an offset by an empty-range accident.
+        let flat = cratonvm_jit::FrameLayout::default();
+        for off in [0, 8, 64] {
+            assert!(!is_callee_saved_gpr_image(off, &flat));
+        }
+    }
+
+    /// The pin veto outranks the movable claim, and only for what it names.
+    ///
+    /// `is_movable_jit_root` is a claim about ONE slot while the pin set is
+    /// keyed by OBJECT, so without the veto a single rewritable channel
+    /// licensed moving an object out from under every unrewritable word that
+    /// also held it. The per-pass clear is the other half: a stale entry would
+    /// over-pin forever.
+    #[test]
+    fn the_unrewritable_veto_outranks_a_movable_claim() {
+        use cratonvm_gc::gc_quiescence as q;
+        q::clear_movable_jit_roots();
+        q::clear_unrewritable_jit_roots();
+        let movable_only = 0x1000usize;
+        let both = 0x2000usize;
+        q::add_movable_jit_root(movable_only);
+        q::add_movable_jit_root(both);
+        q::add_unrewritable_jit_root(both);
+
+        assert!(q::is_movable_jit_root(movable_only));
+        assert!(!q::is_unrewritable_jit_root(movable_only));
+        assert!(q::is_movable_jit_root(both));
+        assert!(
+            q::is_unrewritable_jit_root(both),
+            "an address held in an unrewritable frame word must be vetoed even \
+             though a rewritable channel also names it"
+        );
+        assert_eq!(q::unrewritable_jit_root_count(), 1);
+
+        q::clear_unrewritable_jit_roots();
+        assert!(
+            !q::is_unrewritable_jit_root(both),
+            "the veto is a statement about THIS collection's frames"
+        );
+        assert_eq!(q::unrewritable_jit_root_count(), 0);
+        q::clear_movable_jit_roots();
     }
 
     #[test]

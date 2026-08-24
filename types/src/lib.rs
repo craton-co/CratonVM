@@ -419,11 +419,65 @@ static ZGC_READ_BARRIER_ARMED: std::sync::atomic::AtomicBool =
 ///
 /// That is the failure this module exists to make impossible: `decoded=0` is a
 /// measurement, an ABSENT line is not, and the two must not look alike.
+/// Post-remap stale-frame-word census, printed at exit while the detector is
+/// armed (`CRATONVM_DBG_JIT_STALE_AFTER_REMAP`).
+///
+/// Lives here for the same reason `cell_census` does: the shutdown trailer that
+/// a `System.exit`ing program actually reaches is in `native-builtins`, which
+/// cannot call into `vm` where the detector lives. The counters are fed by
+/// `vm::jit::conservative_roots::report_stale_words_in`.
+///
+/// The SPLIT is the measurement. `resumed_from` counts words in a compiled
+/// frame's callee-saved GPR image — the save area whose epilogue pops it
+/// straight back into the CALLER's registers, so the caller resumes from
+/// exactly those words. `dead_region` counts the rest of what the frame-band
+/// verifier skips (the XMM image, the write-only per-safepoint GPR spill, the
+/// outgoing-argument / deopt reserve, operand slots above the live cursor);
+/// nothing loads from those, so a stale word there is read by no one and is
+/// deliberately left alone. A run reporting `resumed_from=0 dead_region=N` is
+/// the repaired state, not a quiet one.
+pub mod stale_remap_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static RESUMED: AtomicU64 = AtomicU64::new(0);
+    static DEAD: AtomicU64 = AtomicU64::new(0);
+
+    /// Count one stale word. `resumed_from` says whether anything reads it.
+    #[inline]
+    pub fn note(resumed_from: bool) {
+        if resumed_from {
+            RESUMED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DEAD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(resumed_from, dead_region)` totals for this process.
+    #[inline]
+    pub fn totals() -> (u64, u64) {
+        (RESUMED.load(Ordering::Relaxed), DEAD.load(Ordering::Relaxed))
+    }
+
+    /// Print the census once, on whichever exit path runs first. Zeros
+    /// included — see the module comment.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        if crate::flags::runtime_var_os("CRATONVM_DBG_JIT_STALE_AFTER_REMAP").is_none() {
+            return;
+        }
+        ONCE.call_once(|| {
+            let (r, d) = totals();
+            eprintln!("[jit-stale-after-remap] census: resumed_from={r} dead_region={d}");
+        });
+    }
+}
+
 pub mod cell_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static DECODED: AtomicU64 = AtomicU64::new(0);
     static REPORTED: AtomicU64 = AtomicU64::new(0);
+    static ARRAY_RECEIVER: AtomicU64 = AtomicU64::new(0);
 
     /// Count one corrupt cell decoded. Returns the count BEFORE this one, which
     /// is what a watch compares against.
@@ -450,6 +504,25 @@ pub mod cell_census {
         REPORTED.load(Ordering::Relaxed)
     }
 
+    /// Count one plain-object field access refused because the RECEIVER was an
+    /// array — the same defect one step EARLIER than a corrupt cell.
+    ///
+    /// Counted separately because it is a different measurement. The corrupt
+    /// cell is what you see when the striden element bytes happen to form an
+    /// out-of-range discriminant; this is what you see EVERY time, which is why
+    /// `decoded` was a floor and this is a count. See
+    /// `gc::heap::refuse_array_receiver_field_access`.
+    #[inline]
+    pub fn note_array_receiver() {
+        ARRAY_RECEIVER.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many array-receiver field accesses this process has refused.
+    #[inline]
+    pub fn array_receiver() -> u64 {
+        ARRAY_RECEIVER.load(Ordering::Relaxed)
+    }
+
     /// Print the census once, on whichever exit path runs first.
     ///
     /// Armed by `CRATONVM_DBG_CORRUPT_CELL`. Prints even when nothing fired —
@@ -463,6 +536,15 @@ pub mod cell_census {
         ONCE.call_once(|| {
             let d = decoded();
             let r = reported();
+            let a = array_receiver();
+            // Always printed, `0` included, and always beside `decoded`: these
+            // are the same defect at two removes, and a run with `decoded=0
+            // array_receiver=7` has found seven producers the corrupt-cell
+            // guard could not see. `decoded` counts these too — the refusal
+            // publishes the cell coordinates so the producer reporter names the
+            // door — so `decoded - array_receiver` is the number of cells that
+            // came through some OTHER route.
+            eprintln!("[corrupt-cell] array_receiver={a}");
             if d == 0 {
                 eprintln!("[corrupt-cell] decoded=0 reported=0 — armed, and the guard did not fire");
             } else if r < d {

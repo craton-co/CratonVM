@@ -387,6 +387,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "exit", on_key: Some("CRATONVM_DBG_EXIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fbcglib", on_key: Some("CRATONVM_DBG_FBCGLIB"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fbref", on_key: Some("CRATONVM_DBG_FBREF"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "fc-fast-io-stats", on_key: Some("CRATONVM_FC_FAST_IO_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-get", on_key: Some("CRATONVM_DBG_FIELD_GET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-watch", on_key: Some("CRATONVM_DBG_FIELD_WATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fieldaddr", on_key: Some("CRATONVM_DBG_FIELDADDR"), off_key: None, off_word: None },
@@ -426,6 +427,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gocbf", on_key: Some("CRATONVM_DBG_GOCBF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-dump-ptx", on_key: Some("CRATONVM_GPU_DUMP_PTX"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gpu-trace-bytes", on_key: Some("CRATONVM_GPU_TRACE_BYTES"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "gpu-time-dispatch", on_key: Some("CRATONVM_GPU_TIME_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gse", on_key: Some("CRATONVM_DBG_GSE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "h2parserread", on_key: Some("CRATONVM_DBG_H2PARSERREAD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "h2trace", on_key: Some("CRATONVM_DBG_H2TRACE"), off_key: None, off_word: None },
@@ -549,6 +551,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "longroot", on_key: Some("CRATONVM_DBG_LONGROOT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lookup", on_key: Some("CRATONVM_DBG_LOOKUP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "map-miss-audit", on_key: Some("CRATONVM_DBG_MAP_MISS_AUDIT"), off_key: None, off_word: None },
+    // The keySet-view rebuild-elision census, printed at exit by
+    // `native_collections::report_map_view_cache_at_exit`. `resync_skipped` is
+    // the ENGAGEMENT counter for that fast path: a wall-clock number quoted
+    // without it cannot say whether the path ran at all.
+    E { group: Group::DBG, token: "map-view-cache", on_key: Some("CRATONVM_DBG_MAP_VIEW_CACHE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mapper", on_key: Some("CRATONVM_DBG_MAPPER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mcl", on_key: Some("CRATONVM_DBG_MCL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "memwatch", on_key: Some("CRATONVM_DBG_MEMWATCH"), off_key: None, off_word: None },
@@ -557,6 +564,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "mh-dispatch", on_key: Some("CRATONVM_DBG_MH_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mh-stack", on_key: Some("CRATONVM_DBG_MH_STACK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mic-prof", on_key: Some("CRATONVM_DBG_MIC_PROF"), off_key: None, off_word: None },
+    // The notification-credit census -- how much of this VM's Object.wait()
+    // waking actually came from the CONDITION rather than from the condvar
+    // signal. `credits_consumed` is the engagement counter for the netty
+    // lost-wakeup fix.
+    E { group: Group::DBG, token: "monitor-notify", on_key: Some("CRATONVM_DBG_MONITOR_NOTIFY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mic-method", on_key: Some("CRATONVM_DBG_MIC_METHOD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mark-why-class", on_key: Some("CRATONVM_DBG_MARK_WHY_CLASS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mirrorpin-why", on_key: Some("CRATONVM_DBG_MIRRORPIN_WHY"), off_key: None, off_word: None },
@@ -837,6 +849,7 @@ pub const INVENTORY: &[E] = &[
     // `sp-inline-*` knobs are the single-pass inline-cache bisection surface;
     // three are DEFAULT-ON and read `=0` to disable, so they carry `on_key`
     // and the "0" off-word rather than an `off_key`.
+    E { group: Group::JIT, token: "gpu-approx-math", on_key: Some("CRATONVM_GPU_APPROX_MATH"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-deopt-check", on_key: Some("CRATONVM_JIT_SP_IC_DEOPT_CHECK"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "sp-ic-only", on_key: Some("CRATONVM_JIT_SP_IC_ONLY"), off_key: None, off_word: None },
@@ -1186,8 +1199,21 @@ pub const INVENTORY: &[E] = &[
     // Interpreter-side like `trivial-getter`: the lock-free static-field read
     // path in `vm::vm_object`, default-ON with an opt-out-only spelling.
     E { group: Group::JIT, token: "static-bytecode-callee", on_key: Some("CRATONVM_JIT_STATIC_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "indy-bridge", on_key: Some("CRATONVM_JIT_INDY_BRIDGE"), off_key: None, off_word: Some("0") },
+    // Its invokevirtual/invokeinterface twin. Same shape, same default-ON
+    // opt-out-only spelling; see `env_cache::jit_virtual_bytecode_callee`.
+    E { group: Group::JIT, token: "virtual-bytecode-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "statics-index", on_key: None, off_key: Some("CRATONVM_NO_STATICS_INDEX"), off_word: None },
     E { group: Group::JIT, token: "vector-intrinsics", on_key: Some("CRATONVM_VECTOR_INTRINSICS"), off_key: None, off_word: Some("0") },
+    // The dispatch-layer half of the same feature, switched separately so the
+    // templates can be priced against the kernels they sit on rather than only
+    // against an un-intercepted VM.
+    E { group: Group::JIT, token: "vector-templates", on_key: Some("CRATONVM_VECTOR_TEMPLATES"), off_key: None, off_word: Some("0") },
+    // `FileChannelImpl.read/write(ByteBuffer)` as one native call instead of
+    // twenty JDK frames (`native-io::file_channel_fast_read`). Default-ON,
+    // opt-out-only, same shape as `vector-intrinsics` above: the switch gates
+    // REGISTRATION so the off arm is the un-intercepted VM.
+    E { group: Group::JIT, token: "fc-fast-io", on_key: Some("CRATONVM_FC_FAST_IO"), off_key: None, off_word: Some("0") },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0") },
@@ -1542,6 +1568,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::THREADS, token: "striped-counters", on_key: None, off_key: Some("CRATONVM_STRIPED_COUNTERS_OFF"), off_word: None },
     E { group: Group::THREADS, token: "thread-start-grace-ms", on_key: Some("CRATONVM_THREAD_START_GRACE_MS"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "wait-spurious-ms", on_key: Some("CRATONVM_WAIT_SPURIOUS_MS"), off_key: None, off_word: None },
+    // The condition half of `Object.wait()` -- `MonitorState::pending_notifies`.
+    // Default ON; `0` restores the condvar-only wait that lost a delivered
+    // `notifyAll()`, so the fix can be interleaved against itself on ONE binary.
+    E { group: Group::THREADS, token: "monitor-pending-notify", on_key: Some("CRATONVM_MONITOR_PENDING_NOTIFY"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "aot-hmac-key", on_key: Some("CRATONVM_AOT_HMAC_KEY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "jca-lenient-getinstance", on_key: Some("CRATONVM_JCA_LENIENT_GETINSTANCE"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "block-private-nets", on_key: Some("CRATONVM_BLOCK_PRIVATE_NETS"), off_key: None, off_word: None },
@@ -1582,6 +1612,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::SECURITY, token: "tls-openssl-client", on_key: Some("CRATONVM_TLS_OPENSSL_CLIENT"), off_key: None, off_word: Some("0") },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "map-iterator-failfast", on_key: None, off_key: Some("CRATONVM_NO_MAP_ITERATOR_FAILFAST"), off_word: None },
+    // The keySet-view rebuild elision, default-ON. `0` restores the
+    // unconditional per-read rebuild, which is the A/B a same-binary
+    // bisection needs.
+    E { group: Group::COMPAT, token: "map-view-cache", on_key: Some("CRATONVM_MAP_VIEW_CACHE"), off_key: None, off_word: Some("0") },
+    // Take the elision decision, then rebuild anyway and compare, panicking
+    // on divergence. Turns the soundness claim into something measured
+    // rather than argued; expensive, so default-OFF.
+    E { group: Group::COMPAT, token: "verify-map-view-cache", on_key: Some("CRATONVM_VERIFY_MAP_VIEW_CACHE"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "jboss-boot-log-file", on_key: Some("CRATONVM_JBOSS_BOOT_LOG_FILE"), off_key: None, off_word: None },

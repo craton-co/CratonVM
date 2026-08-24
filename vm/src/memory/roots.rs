@@ -223,6 +223,12 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // collector then excludes them from the pin set. No-op unless precise
     // relocation is engaged (the set stays empty on the default path).
     cratonvm_gc::gc_quiescence::clear_movable_jit_roots();
+    // Its veto, cleared on the same schedule and for the same reason: the set
+    // is a statement about THIS collection's compiled frames. The band scan
+    // below republishes an entry for every object held in a frame word
+    // `band_slot_is_verifiable` refuses to inspect, and the young sweep pins
+    // those whatever the movable set says.
+    cratonvm_gc::gc_quiescence::clear_unrewritable_jit_roots();
     // G1 pin-in-place: reset the conservative-JIT-root pin set too, so it
     // reflects only THIS collection's stack (republished by the JIT-frame scan
     // below, under G1). See that scan site and `G1Collector::young_collection`.
@@ -1102,7 +1108,8 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
              xt_cov=(accepted={xt_accepted} refused={xt_refused} deposits={xt_deposits}) \
              incomplete={incomplete} reason={reason} chain={chain} \
              any_jit={any_jit} \
-             scan_added={added} is_g1={is_g1} ybounds={ybounds} frames={labels:?}",
+             scan_added={added} unrewritable={unrewritable} is_g1={is_g1} \
+             ybounds={ybounds} frames={labels:?}",
             precise_only = moving_young_precise_only,
             proven = coverage_proven,
             osr_fb = moving_young_osr_fallback,
@@ -1120,6 +1127,14 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             chain = crate::jit::conservative_roots::current_thread_jit_depth(),
             any_jit = crate::jit::conservative_roots::any_thread_in_jit(),
             added = roots.len() - jit_scan_start,
+            // How many of this cycle's band roots came through a word no
+            // channel can rewrite, and are therefore pinned whatever the
+            // movable set claims. `scan_added>0 unrewritable=0` is a frame
+            // whose every live reference sits in verified storage; a non-zero
+            // count is the gap
+            // `moving-young-left-a-callee-saved-register-image-unrewritten`
+            // measured, being closed rather than merely detected.
+            unrewritable = cratonvm_gc::gc_quiescence::unrewritable_jit_root_count(),
             is_g1 = shared.mem.heap.is_g1(),
             // Whether `gen_heap::JIT_REGION_BOUNDS` carries a young pair at
             // all. It is what the moving-young frame-band verifier's residency

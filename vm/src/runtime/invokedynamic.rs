@@ -112,6 +112,15 @@ cached_env_flag!(dbg_indy_all, "CRATONVM_DBG_INDY_ALL");
 cached_env_flag!(dbg_indy_generic, "CRATONVM_DBG_INDY_GENERIC");
 cached_env_flag!(dbg_lambda_dispatch, "CRATONVM_DBG_LAMBDA_DISPATCH");
 
+/// `CRATONVM_DBG_INDY_GENERIC`, re-exported for the compiled bridge's own
+/// tracing. Public because `jit::helpers::jit_indy_bridge` is the other half of
+/// that trace and lives in a different module: a wrong result from a bridged
+/// site raises exactly one question — which SIDE lost the value — and only a
+/// line from each can answer it.
+pub fn dbg_indy_generic_enabled() -> bool {
+    dbg_indy_generic()
+}
+
 /// Groovy call-site name for a coercion (`cast:(Object)Z`, `cast:(Object)I`, …).
 const GROOVY_CAST: &str = "cast";
 
@@ -145,12 +154,119 @@ struct IndyInfo {
     bootstrap_arg_indices: Vec<u16>,
 }
 
+/// A compiled `invokedynamic` bridge site is a BRIDGE of one of two kinds, and
+/// this is the tag that says which.
+///
+/// The codegen carries exactly one `usize` per indy site (the fifth element of
+/// `indy_info`) and calls exactly one entry (`cratonvm_jit::INDY_BRIDGE_FN`),
+/// so the discriminator has to live in the pointed-to metadata rather than in
+/// the call sequence. Both site structs are `#[repr(C)]` with this `u32` as
+/// their first field, and [`jit_indy_site_kind`] is the only reader.
+///
+/// A tag rather than a second helper cell and a sixth `indy_info` element: the
+/// tuple appears in fifteen places across two crates and every one of them
+/// would have had to grow a field it does not use, for a fact the metadata
+/// already knows.
+pub const JIT_INDY_SITE_CONCAT: u32 = 1;
+/// A site whose bootstrap is `LambdaMetafactory` — see [`JitIndyGenericSite`].
+pub const JIT_INDY_SITE_GENERIC: u32 = 2;
+
 /// Immutable metadata owned for the lifetime of generated code which directly
 /// invokes a `StringConcatFactory` call site.
+#[repr(C)]
 pub struct JitStringConcatSite {
+    /// [`JIT_INDY_SITE_CONCAT`]. FIRST FIELD, and `#[repr(C)]`, so
+    /// [`jit_indy_site_kind`] can read it through either site type's pointer.
+    kind: u32,
     recipe: Arc<[u16]>,
     constant_args: Vec<Arc<[u16]>>,
     target_descriptor: Arc<str>,
+}
+
+/// Immutable metadata for a compiled `invokedynamic` site whose bootstrap is
+/// `LambdaMetafactory` — the shape that makes reactive code slow.
+///
+/// # Why this exists
+///
+/// Before it, a method containing ANY non-concat `invokedynamic` could not stay
+/// compiled: the codegen lowered the site to an unconditional reason-8 uncommon
+/// trap, the first execution took it, and `DeoptimizationController` retired the
+/// method with `MakeNotCompilable`. OSR was refused outright for the same
+/// reason. So every method that CREATES a lambda ran interpreted for the life
+/// of the process, and every compiled caller of one paid the
+/// compiled-to-interpreted transition on top.
+///
+/// MEASURED 2026-08-23, `probes/IndyScopeProbe.java`, one binary:
+///
+/// | arm | HotSpot | CratonVM |
+/// |---|---:|---:|
+/// | loop whose method creates the lambda | 1.6 ns | **1055.8 ns** |
+/// | identical loop, lambda hoisted out | 4.0 ns | 42.2 ns |
+///
+/// 25x, for moving one `->` across a method boundary. Reactor and WebFlux
+/// assembly is nothing but methods that create lambdas, which is why
+/// `internal/performance/webclient-integration-tests-reactive-exchange-gap-RETIRED-20260823.md`
+/// reads as a flat profile with no single lever: the lever is that none of it
+/// is compiled.
+///
+/// # Why `LambdaMetafactory` and not every bootstrap
+///
+/// The bridge below hands the site to `execute_invokedynamic`, i.e. to the
+/// interpreter's own implementation, so nothing about the bootstrap is
+/// reimplemented and any bootstrap would in principle work. The admission is
+/// narrow anyway because the RETURN VALUE has to fit the bridge's `i64` ABI as
+/// an object reference, and because a bootstrap that can throw at a point the
+/// compiled caller cannot resume is a different question from this one. Every
+/// other bootstrap keeps the trap it has today.
+#[repr(C)]
+pub struct JitIndyGenericSite {
+    /// [`JIT_INDY_SITE_GENERIC`]. FIRST FIELD — see [`JIT_INDY_SITE_CONCAT`].
+    kind: u32,
+    /// The class whose constant pool holds `cp_index`. The bridge pushes a
+    /// synthetic frame carrying it, because `execute_invokedynamic` reads the
+    /// caller class from `thread.frames[frame_idx].class_id` and keys the
+    /// resolved-call-site cache on `(that class, cp_index)` — so the compiled
+    /// site and the interpreted one share ONE cache entry and one bootstrap.
+    class_id: ClassId,
+    cp_index: u16,
+    target_descriptor: Arc<str>,
+    /// The site's argument type tags, parsed ONCE.
+    ///
+    /// `parse_descriptor_args` walks a `String` and allocates a `Vec` — per
+    /// call, on a path whose whole reason to exist is that the interpreter's
+    /// version re-derives constants. Everything below is here for the same
+    /// reason: the synthetic frame is built with [`Frame::new_from_arcs`],
+    /// which takes pre-built `Arc`s, rather than with `Frame::new`, whose
+    /// `padded_bytecode_for_method` takes a GLOBAL MUTEX and verifies its memo
+    /// with a body compare — on every single bridged call.
+    arg_types: Arc<[u8]>,
+    frame_class_name: Arc<str>,
+    frame_method_name: Arc<str>,
+    /// Padded empty bytecode. The frame decodes no instruction, but the
+    /// interpreter's dispatch loop reads two bytes past the last opcode
+    /// unconditionally, so the two-byte tail is a precondition rather than a
+    /// courtesy — see `Frame::new_from_arcs`.
+    frame_code: Arc<[u8]>,
+    frame_exception_table: Arc<[cratonvm_reader::attribute::ExceptionTableEntry]>,
+    frame_max_stack: u16,
+    /// First byte of the site's RETURN descriptor. The bridge hands compiled
+    /// code one `i64`, and this is what says how the `Value` was encoded into
+    /// it — the same encoding `jit_invoke_dispatch` uses for an ordinary
+    /// invoke's return, so the call site pushes it with the same three-way
+    /// (`xmm0` / plain / oop-marked) choice.
+    return_type: u8,
+}
+
+/// The bridge kind of a site pointer handed to compiled code, or `0` for null.
+///
+/// SAFETY: `site_ptr` is either 0 or a pointer returned by
+/// [`make_jit_indy_bridge_site_from_parts`], whose allocations are
+/// process-lived.
+pub unsafe fn jit_indy_site_kind(site_ptr: usize) -> u32 {
+    if site_ptr == 0 {
+        return 0;
+    }
+    *(site_ptr as *const u32)
 }
 
 /// Return a stable metadata pointer for a StringConcatFactory site, or `None`
@@ -195,9 +311,114 @@ pub fn make_jit_string_concat_site_from_parts(
         return None;
     };
     Some(Box::into_raw(Box::new(JitStringConcatSite {
+        kind: JIT_INDY_SITE_CONCAT,
         recipe,
         constant_args,
         target_descriptor: Arc::from(descriptor),
+    })) as usize)
+}
+
+/// Return a stable metadata pointer for ANY `invokedynamic` site the compiled
+/// bridge can serve, or `None` for one it cannot.
+///
+/// This is the resolver both compile doors call. It answers
+/// [`make_jit_string_concat_site_from_parts`] first, so a `StringConcatFactory`
+/// site keeps the direct concat bridge it has had since that fix; otherwise it
+/// admits a `LambdaMetafactory` site (see [`JitIndyGenericSite`] for what that
+/// is worth and why the list stops there).
+///
+/// The allocation is intentionally process-lived: generated code embeds the
+/// pointer and no individual compiled artifact owns it — same contract as the
+/// concat site.
+///
+/// A `None` here is not a compile failure. It means "this site keeps its
+/// uncommon trap", which is the behaviour every indy site had before any bridge
+/// existed.
+pub fn make_jit_indy_bridge_site_from_parts(
+    pool: &ConstantPool,
+    bootstraps: &[BootstrapMethod],
+    cp_index: u16,
+    class_id: ClassId,
+) -> Option<usize> {
+    if let Some(concat) = make_jit_string_concat_site_from_parts(pool, bootstraps, cp_index) {
+        return Some(concat);
+    }
+    let (bsm_index, nat_index) = match pool.get(cp_index)? {
+        ConstantPoolEntry::InvokeDynamic {
+            bootstrap_method_attr_index,
+            name_and_type_index,
+        } => (*bootstrap_method_attr_index, *name_and_type_index),
+        _ => return None,
+    };
+    // The generic half's kill switch. It gates SITE CONSTRUCTION, not each
+    // call, so the "off" arm is the VM as it was before this bridge existed:
+    // with no site the codegen lowers the indy to its uncommon trap, and
+    // `has_dispatch` / `needs_heap` never see it either. A switch that only
+    // silenced the bridge while still claiming the site would be measuring a
+    // third thing that ships nowhere.
+    //
+    // The `StringConcatFactory` half above is deliberately NOT gated: it
+    // predates this switch and is not what a bisection here is asking about.
+    if !crate::runtime::env_cache::jit_indy_bridge() {
+        return None;
+    }
+    let (_, descriptor) = pool.get_name_and_type(nat_index)?;
+    // A `void` site has no stack effect for the codegen's typed push to model
+    // and does not occur in practice, so it keeps the trap rather than being
+    // guessed at. Every other return kind is served: the bridge hands back one
+    // `i64` and the call site pushes it by the descriptor, exactly as an
+    // ordinary invoke's return is pushed.
+    let ret = descriptor.rsplit(')').next()?.as_bytes().first().copied()?;
+    if ret == b'V' {
+        return None;
+    }
+    let bsm = bootstraps.get(bsm_index as usize)?;
+    let handle = resolve_method_handle_full(pool, bsm.bootstrap_method_ref).ok()?;
+    // The admitted set is exactly the bootstraps whose implementation in
+    // `execute_invokedynamic` touches the frame ONLY through its operand stack
+    // and its `class_id` — which is all the synthetic frame this bridge builds
+    // can offer. Between them they cover every shape that makes a whole method
+    // permanently uncompilable in ordinary Java:
+    //
+    //   `LambdaMetafactory`  every lambda and method reference;
+    //   `SwitchBootstraps`   a pattern-matching `switch`;
+    //   `ObjectMethods`      a record's `equals`/`hashCode`/`toString`.
+    //
+    // Deliberately NOT admitted: Groovy's `IndyInterface`, and the generic
+    // MethodHandle fallback below it. Those build adapter chains whose
+    // behaviour this tree already documents as caller-sensitive (see the
+    // `groovy_cast_to_boolean` arm), and a bridge is the wrong place to
+    // discover that. They keep the trap they have today.
+    let admitted = match handle.class_name.as_ref() {
+        LAMBDA_METAFACTORY => {
+            matches!(handle.member_name.as_ref(), METAFACTORY | ALT_METAFACTORY)
+        }
+        SWITCH_BOOTSTRAPS => matches!(handle.member_name.as_ref(), TYPE_SWITCH | ENUM_SWITCH),
+        OBJECT_METHODS => handle.member_name.as_ref() == BOOTSTRAP,
+        _ => false,
+    };
+    if !admitted {
+        return None;
+    }
+    let arg_types: Vec<u8> = parse_descriptor_args(descriptor)
+        .into_iter()
+        .map(|c| c as u8)
+        .collect();
+    let frame_max_stack = u16::try_from(arg_types.len()).unwrap_or(u16::MAX).saturating_add(1);
+    Some(Box::into_raw(Box::new(JitIndyGenericSite {
+        kind: JIT_INDY_SITE_GENERIC,
+        class_id,
+        cp_index,
+        target_descriptor: Arc::from(descriptor),
+        arg_types: Arc::from(arg_types.as_slice()),
+        frame_class_name: Arc::from("<jit-indy>"),
+        frame_method_name: Arc::from("bridge"),
+        frame_code: crate::runtime::frame::padded_bytecode(&[]),
+        frame_exception_table: Arc::from(
+            Vec::<cratonvm_reader::attribute::ExceptionTableEntry>::new().into_boxed_slice(),
+        ),
+        frame_max_stack,
+        return_type: ret,
     })) as usize)
 }
 
@@ -270,6 +491,147 @@ pub unsafe fn execute_jit_string_concat_raw(
         });
     thread.frames.pop();
     result
+}
+
+/// Execute a compiled `LambdaMetafactory` site — the generic half of the
+/// bridge.
+///
+/// # How little it reimplements
+///
+/// Nothing. It builds the same synthetic frame the concat bridge builds, pushes
+/// the descriptor-typed arguments onto it, and calls [`execute_invokedynamic`]
+/// — the interpreter's own implementation, including its resolved-call-site
+/// cache. The frame carries the SITE's `class_id`, which is what makes the
+/// compiled site and the interpreted one share a cache entry rather than
+/// bootstrap twice.
+///
+/// # The return value
+///
+/// `Ok((bits, Some(obj)))` for a reference result — the second half is the
+/// object the caller must root through `native_pending_return` before it hands
+/// the pointer to compiled code. `Ok((bits, None))` for a primitive (or a null
+/// reference), where `bits` is encoded exactly as `jit_invoke_dispatch` encodes
+/// an ordinary invoke's return: sign-extended for the integral kinds, raw
+/// `to_bits()` for `F`/`D`.
+///
+/// # Errors
+///
+/// `Err` on anything the bootstrap or the call site raises. The caller
+/// (`jit::helpers::jit_indy_bridge`) routes it through the same
+/// stash-and-return-sentinel path a compiled dispatch failure takes, so an
+/// exception thrown out of a bridged site reaches the compiled caller's
+/// post-call check rather than being swallowed into a `0`.
+///
+/// SAFETY: `site_ptr` is a pointer from [`make_jit_indy_bridge_site_from_parts`]
+/// whose `kind` is [`JIT_INDY_SITE_GENERIC`]; `args_ptr` is the JIT caller's own
+/// spill buffer, live and unmoved for the duration of this call.
+pub unsafe fn execute_jit_indy_generic_raw(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    site_ptr: usize,
+    args_ptr: *const i64,
+    arg_count: usize,
+) -> Result<(i64, Option<ObjectRef>), MethodCallFailed> {
+    let Some(site) = (site_ptr as *const JitIndyGenericSite).as_ref() else {
+        return Err(VmError::Internal {
+            message: "jit indy bridge: null site".to_owned(),
+        }
+        .into());
+    };
+    let arg_types = &site.arg_types;
+    if arg_types.len() != arg_count || (arg_count != 0 && args_ptr.is_null()) {
+        // A disagreement between the descriptor and what the call sequence
+        // pushed is a miscompile, not a value to guess at.
+        return Err(VmError::Internal {
+            message: format!(
+                "jit indy bridge: {} args for descriptor {}",
+                arg_count, site.target_descriptor
+            ),
+        }
+        .into());
+    }
+    let raw_args = std::slice::from_raw_parts(args_ptr, arg_count);
+    let mut values = Vec::with_capacity(arg_count);
+    for (&raw, ty) in raw_args.iter().zip(arg_types.iter()) {
+        // Descriptor-typed, never bits-typed: a category-2 value must not be
+        // reclassified from its payload (the same rule the concat bridge
+        // states).
+        values.push(match *ty {
+            b'J' => Value::Long(raw),
+            b'D' => Value::Double(f64::from_bits(raw as u64)),
+            b'F' => Value::Float(f32::from_bits(raw as u32)),
+            b'L' | b'[' => {
+                if raw == 0 {
+                    Value::Object(None)
+                } else {
+                    Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+                }
+            }
+            _ => Value::Int(raw as i32),
+        });
+    }
+    let frame_idx = thread.frames.len();
+    // `new_from_arcs`, not `new`: every part is precomputed on the site, so
+    // this costs refcount bumps instead of a global-mutex memo probe with a
+    // body compare (`padded_bytecode_for_method`) plus three `String`
+    // allocations, on every bridged call.
+    thread.frames.push(Frame::new_from_arcs(
+        site.class_id,
+        Arc::clone(&site.frame_class_name),
+        Arc::clone(&site.frame_method_name),
+        Arc::clone(&site.target_descriptor),
+        None,
+        Arc::clone(&site.frame_code),
+        Arc::clone(&site.frame_exception_table),
+        site.frame_max_stack,
+        0,
+        &[],
+    ));
+    for value in values {
+        if thread.frames[frame_idx].stack.push(value).is_err() {
+            thread.frames.pop();
+            return Err(VmError::Internal {
+                message: "jit indy bridge: operand stack overflow".to_owned(),
+            }
+            .into());
+        }
+    }
+    let executed = execute_invokedynamic(shared, thread, frame_idx, site.cp_index);
+    let popped = match executed {
+        Ok(()) => thread.frames[frame_idx].stack.pop().ok(),
+        Err(error) => {
+            // The frame this bridge owns must come off the stack whatever
+            // happened on it — an abandoned synthetic frame would be visible to
+            // every stack walk and to the collector's root scan from here on.
+            thread.frames.pop();
+            return Err(error);
+        }
+    };
+    thread.frames.pop();
+    // Encoded by the SITE's descriptor, not by the `Value`'s own shape: a
+    // bootstrap that answered with a differently-tagged value than its
+    // descriptor promises is a defect to surface, not one to re-interpret. The
+    // arms mirror `jit_invoke_dispatch`'s return encoding one for one.
+    Ok(match (site.return_type, popped) {
+        (b'L' | b'[', Some(Value::Object(Some(obj)))) => (obj.as_ptr() as i64, Some(obj)),
+        // A genuine null. NOT folded together with an EMPTY stack below: those
+        // two look identical from the call site and mean opposite things — one
+        // is the answer, the other is the answer having gone missing.
+        (b'L' | b'[', Some(Value::Object(None))) => (0, None),
+        (b'J', Some(Value::Long(v))) => (v, None),
+        (b'F', Some(Value::Float(f))) => (f.to_bits() as i64, None),
+        (b'D', Some(Value::Double(d))) => (d.to_bits() as i64, None),
+        (_, Some(Value::Int(v))) => (v as i64, None),
+        (_, other) => {
+            return Err(VmError::Internal {
+                message: format!(
+                    "jit indy bridge: {} returned {:?} for descriptor {}",
+                    site.cp_index, other, site.target_descriptor
+                ),
+            }
+            .into());
+        }
+    })
 }
 
 /// Execute an invokedynamic instruction.

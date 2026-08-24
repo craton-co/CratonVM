@@ -2528,13 +2528,30 @@ pub(super) fn process_references_after_gc(
     // `None` (the class not loaded) means no Reference object can exist yet, so
     // the guard has nothing to judge and admits — it must never be the thing
     // that silently stops reference processing on a stripped image.
+    //
+    // Both guards screen the KIND first, and the `num_fields >= 2` test above
+    // them is why: an array MIRRORS ITS LENGTH into `num_slots`, so a
+    // `Reference[2]` reports two "fields" and — because a reference array
+    // carries its COMPONENT's class id — also answers `is_subclass_of(
+    // java/lang/ref/Reference)`. It would pass both tests and reach the
+    // positional `get_field(obj, 0)` / `get_field(obj, 1)` reads below, which
+    // stride packed 8-byte elements as 16-byte `Value` cells. Same species as
+    // `corrupt-value-cell-producer-was-a-string-array-FIXED-20260822`; the heap
+    // accessors refuse it now, but a door that can answer "not a Reference"
+    // for free should not make the heap say it.
     let is_reference_shaped = |obj: ObjectRef| -> bool {
+        if shared.mem.heap.kind_of(obj) == crate::memory::heap::ObjectKind::Array {
+            return false;
+        }
         match reference_cid {
             Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
             None => true,
         }
     };
     let is_queue_shaped = |obj: ObjectRef| -> bool {
+        if shared.mem.heap.kind_of(obj) == crate::memory::heap::ObjectKind::Array {
+            return false;
+        }
         match queue_cid {
             Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
             None => true,
@@ -6128,13 +6145,30 @@ pub(super) fn g1_remark_process_references(
     let class_manager = shared.classes.class_manager.read();
     let reference_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/Reference");
     let queue_cid = class_manager.find_bootstrap_class_by_name("java/lang/ref/ReferenceQueue");
+    //
+    // Both guards screen the KIND first, and the `num_fields >= 2` test above
+    // them is why: an array MIRRORS ITS LENGTH into `num_slots`, so a
+    // `Reference[2]` reports two "fields" and — because a reference array
+    // carries its COMPONENT's class id — also answers `is_subclass_of(
+    // java/lang/ref/Reference)`. It would pass both tests and reach the
+    // positional `get_field(obj, 0)` / `get_field(obj, 1)` reads below, which
+    // stride packed 8-byte elements as 16-byte `Value` cells. Same species as
+    // `corrupt-value-cell-producer-was-a-string-array-FIXED-20260822`; the heap
+    // accessors refuse it now, but a door that can answer "not a Reference"
+    // for free should not make the heap say it.
     let is_reference_shaped = |obj: ObjectRef| -> bool {
+        if shared.mem.heap.kind_of(obj) == crate::memory::heap::ObjectKind::Array {
+            return false;
+        }
         match reference_cid {
             Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
             None => true,
         }
     };
     let is_queue_shaped = |obj: ObjectRef| -> bool {
+        if shared.mem.heap.kind_of(obj) == crate::memory::heap::ObjectKind::Array {
+            return false;
+        }
         match queue_cid {
             Some(cid) => class_manager.is_subclass_of(shared.mem.heap.class_id_of(obj), cid),
             None => true,

@@ -809,6 +809,23 @@ fn java_string_value_and_coder(heap: &VmHeap, obj_ref: ObjectRef) -> Option<(Obj
     // out-of-bounds-read diagnostic for every probe. A String always has
     // at least 2 slots (value + coder), so anything smaller cannot be a
     // String and the right answer is `None`.
+    //
+    // That test is NOT an array screen, which is what it reads like. An array
+    // MIRRORS ITS LENGTH into `num_slots`, so `num_fields(new byte[23])` is 23
+    // and every `byte[]` / `char[]` / `Object[]` of length >= 2 walks straight
+    // through it into the positional `get_field(obj, 0)` / `get_field(obj, 1)`
+    // reads below — which stride packed element data as 16-byte `Value` cells
+    // and, past the first couple of indices, leave the allocation. Same species
+    // as the `String[]` producer closed by `is_plain_string`
+    // (`corrupt-value-cell-producer-was-a-string-array-FIXED-20260822`),
+    // reached through a SHAPE probe instead of a class-name fast path.
+    //
+    // The kind test belongs here as well as at the accessor: this reader is
+    // deliberately speculative, so the right answer for an array is "not a
+    // String", not "ask the heap to refuse the read".
+    if heap.kind_of(obj_ref) == crate::memory::heap::ObjectKind::Array {
+        return None;
+    }
     if heap.num_fields(obj_ref) < 2 {
         return None;
     }

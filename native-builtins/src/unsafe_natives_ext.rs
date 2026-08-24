@@ -3471,7 +3471,28 @@ pub(crate) fn native_unsafe_get_float(
             _ => Value::Float(0.0),
         }));
     }
-    let val = ctx.get_field(obj, offset);
+    // An ARRAY base is an ELEMENT access, not a field access — the same screen
+    // `native_unsafe_put_int` / `native_unsafe_get_long` have always carried,
+    // and the four float/double natives were the only ones without it.
+    //
+    // `Unsafe.{get,put}{Float,Double}(Object, long, …)` over an array reached
+    // `ctx.{get,set}_field(obj, offset)` with the BYTE OFFSET as a slot index.
+    // An array mirrors its LENGTH into `num_slots`, so the index check admits
+    // it, and the accessor then addresses a 16-byte `Value` cell at
+    // `HEADER_SIZE + offset * 16` — for Hazelcast's
+    // `UnsafeUtil.checkUnsafeInstance`, a `putFloat(new byte[32], 16, 3f)` that
+    // computed byte 272 of a 32-byte body, i.e. 240 bytes past the allocation.
+    // Found 2026-08-23 by the array-receiver screen at the heap accessors
+    // (`corrupt-value-cell-array-receiver-species-CLOSED-20260823`), which is
+    // what turned a silent out-of-bounds write into a named producer.
+    let val = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+        match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(idx) => ctx.get_array_element(obj, idx),
+            None => Value::Float(0.0),
+        }
+    } else {
+        ctx.get_field(obj, offset)
+    };
     match val {
         Value::Float(_) => Ok(Some(val)),
         Value::Int(bits) => Ok(Some(Value::Float(f32::from_bits(bits as u32)))),
@@ -3496,7 +3517,29 @@ pub(crate) fn native_unsafe_put_float(
         synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
-    ctx.set_field(obj, offset, val);
+    // An ARRAY base is an ELEMENT access, not a field access — the same screen
+    // `native_unsafe_put_int` / `native_unsafe_get_long` have always carried,
+    // and the four float/double natives were the only ones without it.
+    //
+    // `Unsafe.{get,put}{Float,Double}(Object, long, …)` over an array reached
+    // `ctx.{get,set}_field(obj, offset)` with the BYTE OFFSET as a slot index.
+    // An array mirrors its LENGTH into `num_slots`, so the index check admits
+    // it, and the accessor then addresses a 16-byte `Value` cell at
+    // `HEADER_SIZE + offset * 16` — for Hazelcast's
+    // `UnsafeUtil.checkUnsafeInstance`, a `putFloat(new byte[32], 16, 3f)` that
+    // computed byte 272 of a 32-byte body, i.e. 240 bytes past the allocation.
+    // Found 2026-08-23 by the array-receiver screen at the heap accessors
+    // (`corrupt-value-cell-array-receiver-species-CLOSED-20260823`), which is
+    // what turned a silent out-of-bounds write into a named producer.
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+        if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
+            ctx.set_array_element(obj, idx, val);
+        }
+        // An out-of-range offset is a no-op, matching the int/long siblings:
+        // never reaches the host accessor.
+    } else {
+        ctx.set_field(obj, offset, val);
+    }
     Ok(None)
 }
 
@@ -3523,7 +3566,28 @@ pub(crate) fn native_unsafe_get_double(
             _ => Value::Double(0.0),
         }));
     }
-    let val = ctx.get_field(obj, offset);
+    // An ARRAY base is an ELEMENT access, not a field access — the same screen
+    // `native_unsafe_put_int` / `native_unsafe_get_long` have always carried,
+    // and the four float/double natives were the only ones without it.
+    //
+    // `Unsafe.{get,put}{Float,Double}(Object, long, …)` over an array reached
+    // `ctx.{get,set}_field(obj, offset)` with the BYTE OFFSET as a slot index.
+    // An array mirrors its LENGTH into `num_slots`, so the index check admits
+    // it, and the accessor then addresses a 16-byte `Value` cell at
+    // `HEADER_SIZE + offset * 16` — for Hazelcast's
+    // `UnsafeUtil.checkUnsafeInstance`, a `putFloat(new byte[32], 16, 3f)` that
+    // computed byte 272 of a 32-byte body, i.e. 240 bytes past the allocation.
+    // Found 2026-08-23 by the array-receiver screen at the heap accessors
+    // (`corrupt-value-cell-array-receiver-species-CLOSED-20260823`), which is
+    // what turned a silent out-of-bounds write into a named producer.
+    let val = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+        match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(idx) => ctx.get_array_element(obj, idx),
+            None => Value::Double(0.0),
+        }
+    } else {
+        ctx.get_field(obj, offset)
+    };
     match val {
         Value::Double(_) => Ok(Some(val)),
         Value::Long(bits) => Ok(Some(Value::Double(f64::from_bits(bits as u64)))),
@@ -3548,7 +3612,29 @@ pub(crate) fn native_unsafe_put_double(
         synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
-    ctx.set_field(obj, offset, val);
+    // An ARRAY base is an ELEMENT access, not a field access — the same screen
+    // `native_unsafe_put_int` / `native_unsafe_get_long` have always carried,
+    // and the four float/double natives were the only ones without it.
+    //
+    // `Unsafe.{get,put}{Float,Double}(Object, long, …)` over an array reached
+    // `ctx.{get,set}_field(obj, offset)` with the BYTE OFFSET as a slot index.
+    // An array mirrors its LENGTH into `num_slots`, so the index check admits
+    // it, and the accessor then addresses a 16-byte `Value` cell at
+    // `HEADER_SIZE + offset * 16` — for Hazelcast's
+    // `UnsafeUtil.checkUnsafeInstance`, a `putFloat(new byte[32], 16, 3f)` that
+    // computed byte 272 of a 32-byte body, i.e. 240 bytes past the allocation.
+    // Found 2026-08-23 by the array-receiver screen at the heap accessors
+    // (`corrupt-value-cell-array-receiver-species-CLOSED-20260823`), which is
+    // what turned a silent out-of-bounds write into a named producer.
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+        if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
+            ctx.set_array_element(obj, idx, val);
+        }
+        // An out-of-range offset is a no-op, matching the int/long siblings:
+        // never reaches the host accessor.
+    } else {
+        ctx.set_field(obj, offset, val);
+    }
     Ok(None)
 }
 

@@ -12250,6 +12250,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
         let (obj, obj_validated) = self.shared.mem.heap.load_and_forward_checked(obj);
         let value = forward_boundary_value(&self.shared.mem.heap, value);
+        let corrupt_before = crate::memory::reclaim_guard::corrupt_cell_watch();
         // DIAGNOSTIC-ONLY (cce0079 tree-key tail): decisive probe - capture
         // the minor-GC epoch at entry and compare at exit. A delta proves a
         // GC completed INSIDE a plain ref store (and names the stack);
@@ -12372,6 +12373,20 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             }
             None => self.shared.mem.heap.set_field(obj, index, value),
         }
+        // CRATONVM_DBG_CORRUPT_CELL, the native WRITE door -- the twin of the
+        // read watch in `get_field` above. Every door instrumented before
+        // 2026-08-23 was a READ door, so a producer that only ever writes had
+        // nothing to name it; the first array-receiver refusal caught on a real
+        // workload was a `set_field`, and only the safepoint backstop reported
+        // it, two minutes after the fact.
+        crate::memory::reclaim_guard::corrupt_cell_watch_close(
+            self.shared,
+            self.thread,
+            corrupt_before,
+            "NativeContext::set_field",
+            Some(obj),
+            Some(index),
+        );
         // write_barrier fires automatically inside set_field / set_field_as
     }
 

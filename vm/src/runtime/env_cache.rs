@@ -1279,7 +1279,8 @@ pub fn jit_lambda_const_probe_strict() -> bool {
 /// `CRATONVM_DBG=mic-prof` on `probes/ReactorProbe.java` reports
 /// `kind_static=2_986_402` of `disp_calls=3_356_461` — **89%**.
 ///
-/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
+/// The virtual/interface/special half followed on 2026-08-23; see
+/// [`jit_virtual_bytecode_callee`].
 ///
 /// Default ON. `CRATONVM_JIT_STATIC_BYTECODE_CALLEE=0` restores the by-name
 /// path, which is the A/B a same-binary bisection needs.
@@ -1288,6 +1289,91 @@ pub fn jit_static_bytecode_callee() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
         match cratonvm_types::flags::runtime_var("CRATONVM_JIT_STATIC_BYTECODE_CALLEE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` — the invokevirtual / invokeinterface
+/// twin of [`jit_static_bytecode_callee`].
+///
+/// The static half left 71% of a reactive workload's dispatch tail on the
+/// by-name path, because real application code is overwhelmingly virtual and
+/// interface. This is that half.
+///
+/// # What it is worth
+///
+/// MEASURED 2026-08-23 on this tree, `probes/XferProbe2.java`, one binary:
+///
+/// | arm | compiled -> compiled | compiled -> INTERPRETED | both interpreted |
+/// |---|---:|---:|---:|
+/// | `invokevirtual` | 33.4 ns | **2031.4 ns** | 535.4 ns |
+/// | `invokeinterface` | 36.0 ns | **2298.9 ns** | 839.8 ns |
+///
+/// i.e. compiling the caller and not the callee was 3.8x (virtual) and 2.7x
+/// (interface) SLOWER than compiling neither — the same shape the static half
+/// was fixed for, at the invoke kinds where the volume actually is.
+///
+/// Default ON. Set to `0` to restore the by-name `invoke_or_native` tail, which
+/// is the A/B a same-binary bisection needs.
+#[inline]
+pub fn jit_virtual_bytecode_callee() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_INDY_BRIDGE` — let a compiled method EXECUTE an
+/// `invokedynamic` through a runtime bridge instead of lowering it to an
+/// uncommon trap.
+///
+/// # What it decides
+///
+/// Without the bridge, a method containing any non-`StringConcatFactory` indy
+/// takes an unconditional reason-8 trap on its first compiled execution and is
+/// retired with `MakeNotCompilable`; OSR is refused for it outright, and
+/// method-wide. So every method that CREATES a lambda runs interpreted for the
+/// life of the process. MEASURED on `probes/IndyScopeProbe.java`, current
+/// `dev` against this branch, four interleaved pairs on a quiet host:
+///
+/// | arm | HotSpot | bridge OFF | bridge ON |
+/// |---|---:|---:|---:|
+/// | loop whose method creates the lambda | 1.4 ns | 698-757 ns | **22.4-24.2 ns** |
+/// | identical loop, lambda hoisted out | 2.5 ns | 22.4-24.1 ns | 22.4-24.8 ns |
+/// | a fresh lambda per call | 2.7 ns | 881-936 ns | **267-287 ns** |
+///
+/// ~30x, and the first row lands exactly on the second — the penalty for
+/// putting a `->` inside the loop's own method is gone rather than reduced.
+///
+/// On the workloads, same binary and same switch, medians of six interleaved
+/// runs with `ReactorProbe`'s non-reactive `control` arm flat at 25-34 ns/op:
+/// `Fp16VectorDotBench` **1.93x** (12 157-13 064 -> 6137-6695 ns/lane),
+/// `ReactorProbe` operator assembly **1.41x** (8876 -> 6281 ns/op),
+/// assemble+run 1.15x, `mono chain` 1.17x. `ExchangeProbe` is a WASH, and that
+/// is not a contradiction: its request-path methods are called ~60 times, below
+/// the C1 threshold, so ~98% of it never compiles and there is nothing for a
+/// compiled-code fix to move.
+///
+/// # Why it is a switch and not a constant
+///
+/// Because the trade is not one-signed. Bridging makes the METHOD compilable,
+/// which is a large win wherever the indy is a small part of a hot method; it
+/// also makes the indy ITSELF more expensive than the interpreter's own path,
+/// because the bridge builds a synthetic frame per call. On a workload whose
+/// hot methods are mostly lambda creation the second term can dominate. This
+/// switch is what lets that be measured on ONE binary instead of two.
+///
+/// Default ON. `CRATONVM_JIT_INDY_BRIDGE=0` restores the trap.
+#[inline]
+pub fn jit_indy_bridge() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INDY_BRIDGE") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
         }

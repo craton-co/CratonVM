@@ -371,7 +371,7 @@ function Get-CorruptCellCensus {
   #>
   param([string]$LogDir)
   $logs = @(Get-ChildItem -Path $LogDir -Filter '*.err.log' -ErrorAction SilentlyContinue)
-  $armed = 0; $decoded = 0; $reported = 0; $classes = @()
+  $armed = 0; $decoded = 0; $reported = 0; $arrayRecv = 0; $classes = @()
   foreach ($f in $logs) {
     $m = Select-String -Path $f.FullName -Pattern '\[corrupt-cell\] decoded=(\d+) reported=(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $m) { continue }
@@ -379,15 +379,24 @@ function Get-CorruptCellCensus {
     $d = [int]$m.Matches[0].Groups[1].Value
     $r = [int]$m.Matches[0].Groups[2].Value
     $decoded += $d; $reported += $r
-    if ($d -gt 0) {
+    # `array_receiver` is the SAME defect one step earlier: a plain-object field
+    # access whose receiver is an array, refused at the heap accessor. It is a
+    # COUNT where `decoded` is a floor -- the corrupt-cell guard only fires when
+    # the striden element bytes happen to form an out-of-range discriminant --
+    # so a sweep with `decoded=0 array_receiver=N` has found N producers the
+    # guard could not see. Reported separately for that reason.
+    $a = Select-String -Path $f.FullName -Pattern '\[corrupt-cell\] array_receiver=(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $av = 0
+    if ($a) { $av = [int]$a.Matches[0].Groups[1].Value; $arrayRecv += $av }
+    if ($d -gt 0 -or $av -gt 0) {
       # `<module>.<fqcn>.err.log` -- keep the class, drop the module and suffix.
       $stem = $f.Name -replace '\.err\.log$', ''
-      $classes += ("{0}  (decoded={1} named={2})" -f $stem, $d, $r)
+      $classes += ("{0}  (decoded={1} named={2} array_receiver={3})" -f $stem, $d, $r, $av)
     }
   }
   return [pscustomobject]@{
     Logs = $logs.Count; Armed = $armed; Unarmed = ($logs.Count - $armed)
-    Decoded = $decoded; Reported = $reported; Classes = $classes
+    Decoded = $decoded; Reported = $reported; ArrayReceiver = $arrayRecv; Classes = $classes
   }
 }
 
@@ -1372,17 +1381,18 @@ function Invoke-Mode {
     $summary.Add("- logs with NO census line: $($cc.Unarmed) (a class killed before the shutdown trailer -- HANG/TIMEOUT -- cannot print it)")
     $summary.Add("- cells decoded: $($cc.Decoded)")
     $summary.Add("- cells named (door or backstop): $($cc.Reported)")
+    $summary.Add("- array-receiver field accesses refused: $($cc.ArrayReceiver) (a plain-object field read whose receiver was an ARRAY -- the same defect one step earlier, and a COUNT where `cells decoded` is a floor)")
     if ($cc.Classes.Count -gt 0) {
-      $summary.Add(""); $summary.Add("### Classes that decoded a cell")
+      $summary.Add(""); $summary.Add("### Classes that decoded a cell or strided an array")
       foreach ($c in $cc.Classes) { $summary.Add("- $c") }
     }
     # Loud on stdout too: a census buried in a file nobody opens is the same
     # silence this exists to remove.
-    if ($cc.Decoded -gt 0) {
-      Write-Info "CORRUPT-VALUE-CELL: $($cc.Decoded) decoded, $($cc.Reported) named, in $($cc.Classes.Count) class(es) -- see $summaryPath"
+    if ($cc.Decoded -gt 0 -or $cc.ArrayReceiver -gt 0) {
+      Write-Info "CORRUPT-VALUE-CELL: $($cc.Decoded) decoded, $($cc.Reported) named, $($cc.ArrayReceiver) array-receiver refusals, in $($cc.Classes.Count) class(es) -- see $summaryPath"
       foreach ($c in $cc.Classes) { Write-Info "  corrupt-cell: $c" }
     } else {
-      Write-Info "corrupt-cell census: 0 decoded across $($cc.Armed) of $($cc.Logs) logs (armed)"
+      Write-Info "corrupt-cell census: 0 decoded, 0 array-receiver refusals across $($cc.Armed) of $($cc.Logs) logs (armed)"
     }
   }
   $summary.Add(""); $summary.Add("## Files"); $summary.Add("- results: $results"); $summary.Add("- logs: $(Join-Path $modeOut 'logs')")
