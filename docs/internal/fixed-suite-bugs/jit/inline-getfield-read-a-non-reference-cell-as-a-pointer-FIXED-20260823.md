@@ -157,6 +157,26 @@ arms:
 `jasper.compiler.TestGenerator` is the known 868 s class and needs a cap above
 600 s; it is not a defect. The rest are the census's standing set.
 
+
+### Correction, 2026-08-24: what that counter actually counts
+
+The commit that landed this called the counter "a live count of type-punned
+reference slots this VM is still producing". **That was wrong**, and it is
+corrected here rather than quietly.
+
+Split into "payload word zero" and "payload word non-zero" and re-measured on
+the same two classes: **20 190 hits across two solo runs, ZERO of them
+non-zero**. The total is dominated by reference fields of freshly allocated
+objects — a zero-filled cell decodes as `Int(0)`, and the old inline read
+returned the correct null from it by accident. That is not corruption and must
+not be reported as it.
+
+The number worth quoting is `JIT_GETFIELD_PUNNED_REF_NONZERO`: the cells whose
+payload word was non-zero, i.e. the ones the inline arm would genuinely have
+handed to compiled code as a pointer. `SQLChar.rawData` with `payload64=1` is
+one of those, and it is rare — which is consistent with the crash being rare,
+and inconsistent with the "8 500 per run" reading.
+
 ## Residuals, stated
 
 * **A cell tagged `Object` whose pointer is garbage still passes the inline

@@ -400,7 +400,7 @@ const FAMILY_DRIFT_EXPOSURE: &[(&str, usize)] = &[
     ("register_crypto_impl_natives", 2),
     ("register_enterprise_final_natives", 118),
     ("register_enterprise_natives", 0),
-    ("register_enum_natives", 4),
+    ("register_enum_natives", 0),
     ("register_functional_completion_natives", 0),
     ("register_functional_extras_natives", 0),
     ("register_graalvm_compat_natives", 0),

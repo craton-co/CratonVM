@@ -56,7 +56,8 @@ Usage:
     scripts/stale-receiver-audit.py --update        # re-baseline
     scripts/stale-receiver-audit.py --detail        # every site, with first use
     scripts/stale-receiver-audit.py --selftest      # no tree needed
-    scripts/stale-receiver-audit.py --depth 2       # widen reachability
+    scripts/stale-receiver-audit.py --depth 1       # narrow reachability
+                                                    # (default 6 = the fixpoint)
 
 Exit: 0 ok · 1 the population GREW · 2 no baseline · 3 the gate is broken
 """
@@ -80,6 +81,8 @@ ALLOC0 = re.compile(
     r"|\bctx\.ensure_class_initialized\b|\bctx\.intern\b|\bctx\.box_")
 FNDEF = re.compile(r"^(pub(\([a-z ]+\))? )?(async )?(unsafe )?fn ([a-z_][a-z_0-9]*)")
 CALL = re.compile(r"(?<![a-z_0-9.])([a-z_][a-z_0-9]*)\(\s*ctx\s*,\s*([a-z_][a-z_0-9]*)\s*\)")
+# Every `name(` that is not a method call -- the callee edge of the call graph.
+CALLEE = re.compile(r"(?<![a-z_0-9.])([a-z_][a-z_0-9]*)\s*\(")
 RECV = re.compile(r"\b([a-z_][a-z_0-9]*): ObjectRef\b")
 
 Fn = collections.namedtuple("Fn", "name file line sig code crate")
@@ -119,14 +122,22 @@ def index(root, crates):
 
 
 def allocating(fns, depth):
-    """{fn name: the depth at which allocation was reached}."""
+    """{fn name: the depth at which allocation was reached}.
+
+    The callee names of each body are tokenised ONCE and reachability is a set
+    intersection. The obvious spelling -- one `a|b|c|...` alternation per round
+    over every body -- is quadratic in the frontier, and at `--depth 3` (a
+    6,000-name frontier) it did not finish in ten minutes. `CALLEE` is the same
+    pattern that alternation used, so the two agree; `--selftest` and the
+    committed depth-1/depth-2 numbers are what hold them to that.
+    """
     alloc = {fn.name: 0 for fn in fns if ALLOC0.search(fn.code)}
+    callees = [(fn.name, set(CALLEE.findall(fn.code))) for fn in fns]
     for d in range(1, depth + 1):
         known = set(alloc)
         if not known:
             break
-        pat = re.compile(r"(?<![a-z_0-9.])(" + "|".join(map(re.escape, known)) + r")\s*\(")
-        add = {fn.name: d for fn in fns if fn.name not in alloc and pat.search(fn.code)}
+        add = {n: d for (n, cs) in callees if n not in alloc and not cs.isdisjoint(known)}
         if not add:
             break
         alloc.update(add)
@@ -185,7 +196,14 @@ def run(root, depth):
     alloc = allocating(fns, depth)
     cands = candidates(fns, alloc)
     sites = reusing_sites(files, doc, cands, root)
-    return files, fns, alloc, cands, sites
+    # A call site names a FUNCTION and this tool has no module resolution, so
+    # candidates are keyed by NAME. 66 of the tree's 16,347 native fn names are
+    # defined in more than one place; for those the crate label is whichever
+    # definition was indexed last, and the allocation verdict is the UNION over
+    # them. Such rows print `AMBIG` rather than passing as precise -- it is why
+    # a crate's count can move between --depth settings with no code change.
+    defs = collections.Counter(fn.name for fn in fns)
+    return files, fns, alloc, cands, sites, defs
 
 
 def selftest():
@@ -226,7 +244,7 @@ fn caller_only_comments(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // this is mentioned only in prose
 }
 ''')
-        _f, _fns, alloc, cands, sites = run(t, 1)
+        _f, _fns, alloc, cands, sites, _defs = run(t, 1)
         fails = 0
 
         def ck(cond, what):
@@ -258,7 +276,11 @@ fn caller_only_comments(ctx: &mut dyn NativeContext, this: ObjectRef) {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--depth", type=int, default=1)
+    # 6 is the FIXPOINT: `allocating` stops growing there (5147 at depth 1,
+    # 6104 at 2, 6348 at 3, 6476 at 4, 6538 at 5, 6538 at 6 and at 12), so
+    # the default is a converged answer rather than an arbitrary cut. It is
+    # not a slow one -- the whole scan is ~9s.
+    ap.add_argument("--depth", type=int, default=6)
     ap.add_argument("--update", action="store_true")
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--selftest", action="store_true")
@@ -270,7 +292,7 @@ def main():
         sys.exit(3 if selftest() else 0)
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    files, fns, alloc, cands, sites = run(root, a.depth)
+    files, fns, alloc, cands, sites, defs = run(root, a.depth)
     total = sum(len(v) for v in sites.values())
     print("STALE-RECEIVER AUDIT (allocation reachability depth <= %d)" % a.depth)
     print("  files %d   fns %d   allocating %d   matching the shape %d"
@@ -282,7 +304,9 @@ def main():
     rows = sorted(sites.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     for name, ss in rows:
         fn, d = cands[name]
-        print("    %-44s %-24s depth=%d sites=%d" % (name, fn.crate, d, len(ss)))
+        amb = "  AMBIG(%d defs)" % defs[name] if defs[name] > 1 else ""
+        print("    %-44s %-24s depth=%d sites=%d%s"
+              % (name, fn.crate, d, len(ss), amb))
         if a.detail:
             for s in ss:
                 print("        %s:%d recv=%s -> first use @%d: %s"

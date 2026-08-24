@@ -23840,9 +23840,24 @@ fn closed_watch_service_exception(ctx: &mut dyn NativeContext) -> MethodCallFail
     }
 }
 
+/// Pins `this` across [`ws_require_open_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `this` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn ws_require_open(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+    let w5_pin = ctx.pin_native_root(*this);
+    let w5_out = ws_require_open_body(ctx, *this);
+    *this = ctx.read_native_pin(w5_pin, *this);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// `Ok(())` while the service is open; the JDK's `ClosedWatchServiceException`
 /// once `close()` has run.
-fn ws_require_open(
+fn ws_require_open_body(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<(), MethodCallFailed> {
@@ -23902,7 +23917,7 @@ fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
 
 fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path_obj = obj_arg92(args, 0)?;
-    let watcher = obj_arg92(args, 1)?;
+    let mut watcher = obj_arg92(args, 1)?;
     // A CLOSED service refuses REGISTRATION too, not just `poll`/`take`, and it
     // refuses it with `ClosedWatchServiceException`.
     //
@@ -23927,7 +23942,7 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Checked FIRST, matching `LinuxWatchService.register`, which runs
     // `checkOpen()` before it looks at the path at all -- so a closed service
     // and a missing directory report the closed service, on both VMs.
-    ws_require_open(ctx, watcher)?;
+    ws_require_open(ctx, &mut watcher)?;
     let kinds_arr = match args.get(2) {
         Some(Value::Object(Some(a))) => *a,
         _ => {
@@ -24224,8 +24239,8 @@ fn ws_signalled_key(
 }
 
 fn native_ws_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    ws_require_open(ctx, this)?;
+    let mut this = obj_arg92(args, 0)?;
+    ws_require_open(ctx, &mut this)?;
     match ws_signalled_key(ctx, this)? {
         Some(wk) => Ok(Some(Value::Object(Some(wk)))),
         None => Ok(Some(Value::Object(None))),
@@ -24255,7 +24270,7 @@ fn native_ws_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
 
     let result = loop {
-        if let Err(e) = ws_require_open(ctx, this) {
+        if let Err(e) = ws_require_open(ctx, &mut this) {
             break Err(e);
         }
         match ws_signalled_key(ctx, this) {
@@ -24292,7 +24307,7 @@ fn native_ws_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let this_pin = ctx.pin_native_root(this);
     let mut this = this;
     let result = loop {
-        if let Err(e) = ws_require_open(ctx, this) {
+        if let Err(e) = ws_require_open(ctx, &mut this) {
             break Err(e);
         }
         // Drain whatever the OS has delivered so far, then try to return a key.

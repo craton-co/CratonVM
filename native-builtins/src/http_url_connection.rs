@@ -379,6 +379,21 @@ fn https_recycle_carrier_by_key(
     crate::net_phase_e::forget_https_carrier_session_by_key(ctx, carrier_key);
 }
 
+/// Pins `this` across [`https_ensure_exchanged_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `this` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn https_ensure_exchanged(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*this);
+    let w5_out = https_ensure_exchanged_body(ctx, *this);
+    *this = ctx.read_native_pin(w5_pin, *this);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Make sure the exchange that produces the handshake info has actually run.
 ///
 /// `HttpsURLConnection.getServerCertificates()` and friends are defined to
@@ -402,7 +417,7 @@ fn https_recycle_carrier_by_key(
 /// row — remove it and this function would drive a second HTTPS exchange on the
 /// next accessor call, repopulate the table, and answer as if the connection
 /// had never been torn down.
-fn https_ensure_exchanged(ctx: &mut dyn NativeContext, this: ObjectRef) {
+fn https_ensure_exchanged_body(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // Key before the guard — see `record_https_peer_info`.
     let key = ctx.identity_hash_code(this) as u32 as u64;
     if https_peer_info().lock().unwrap().contains_key(&key) {
@@ -477,8 +492,8 @@ fn https_not_yet_open(ctx: &mut dyn NativeContext) -> MethodCallFailed {
 /// once happened, which is not the question — the question is whether this
 /// CONNECTION is open now, and after [`https_recycle_carrier`] it is not. See
 /// that function for HotSpot's measured post-`disconnect()` transcript.
-fn https_has_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
-    https_ensure_exchanged(ctx, this);
+fn https_has_session(ctx: &mut dyn NativeContext, mut this: ObjectRef) -> bool {
+    https_ensure_exchanged(ctx, &mut this);
     let key = ctx.identity_hash_code(this) as u32 as u64;
     https_peer_info()
         .lock()
@@ -492,9 +507,9 @@ fn https_has_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
 /// `SSLPeerUnverifiedException` when one was and it carried no chain.
 fn https_peer_chain_or_throw(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    mut this: ObjectRef,
 ) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
-    https_ensure_exchanged(ctx, this);
+    https_ensure_exchanged(ctx, &mut this);
     let key = ctx.identity_hash_code(this) as u32 as u64;
     // A recycled entry is filtered out here rather than matched below, so it
     // lands on the `None` arm — `IllegalStateException: connection not yet
@@ -633,8 +648,8 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
         },
     );
     r.register(cls, "getCipherSuite", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        https_ensure_exchanged(ctx, this);
+        let mut this = obj_arg(args, 0)?;
+        https_ensure_exchanged(ctx, &mut this);
         let key = ctx.identity_hash_code(this) as u32 as u64;
         // `filter` before `map`: a recycled connection has no cipher suite to
         // report, and falls through to the refusal below. See
@@ -6032,15 +6047,18 @@ mod http_url_connection_tests {
         let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
         let fn_start = lines
             .iter()
-            .position(|l| l.starts_with("fn https_ensure_exchanged("))
-            .expect("https_ensure_exchanged must still exist");
+            // `_body` since `WORKER-5-NOTE-13`: `https_ensure_exchanged` is now
+            // the `&mut ObjectRef` wrapper and the guard this witness is about
+            // lives in the body half. `expect` keeps a further rename loud.
+            .position(|l| l.starts_with("fn https_ensure_exchanged_body("))
+            .expect("https_ensure_exchanged_body must still exist");
         let fn_end = lines
             .iter()
             .enumerate()
             .skip(fn_start)
             .find(|(_, l)| **l == "}")
             .map(|(i, _)| i)
-            .expect("https_ensure_exchanged must be terminated");
+            .expect("https_ensure_exchanged_body must be terminated");
         let body = &lines[fn_start..fn_end];
 
         assert!(

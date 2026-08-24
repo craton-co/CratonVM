@@ -638,7 +638,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         "putNextEntry",
         "(Ljava/util/zip/ZipEntry;)V",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             if !zo_real_fast_active(ctx, this) {
                 let Some(entry) = args.get(1).and_then(Value::as_object) else {
                     return ctx.invoke_virtual_bytecode_only(
@@ -661,7 +661,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             // begins the next one.  Keeping that transition in the compact
             // side state lets the Java closeEntry bytecode remain a cheap
             // no-op (its real `current` field was never populated).
-            zo_finalize_current_entry(ctx, this);
+            zo_finalize_current_entry(ctx, &mut this);
             // Read entry name from ZipEntry (field 0)
             let entry_name = match args.get(1) {
                 Some(Value::Object(Some(ze))) => ctx
@@ -759,31 +759,31 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(zo, "closeEntry", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
             return Ok(ctx.invoke_virtual_bytecode_only(this, "closeEntry", "()V", &[])?);
         }
-        zo_finalize_current_entry(ctx, this);
+        zo_finalize_current_entry(ctx, &mut this);
         Ok(None)
     });
     r.register(zo, "finish", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
             return Ok(ctx.invoke_virtual_bytecode_only(this, "finish", "()V", &[])?);
         }
         // Finalize any open entry
-        zo_finalize_current_entry(ctx, this);
+        zo_finalize_current_entry(ctx, &mut this);
         // Build zip and write to underlying stream
-        zo_write_zip(ctx, this)?;
+        zo_write_zip(ctx, &mut this)?;
         Ok(None)
     });
     r.register(zo, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
             return Ok(ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[])?);
         }
-        zo_finalize_current_entry(ctx, this);
-        zo_write_zip(ctx, this)?;
+        zo_finalize_current_entry(ctx, &mut this);
+        zo_write_zip(ctx, &mut this)?;
         // `ZipOutputStream.close()` is `super.close()` =
         // `DeflaterOutputStream.close()`, whose `finally` ends in a bare
         // `out.close()` under `throws IOException`. Nothing catches, so the
@@ -2171,7 +2171,22 @@ pub(crate) fn zo_append_entry_data(ctx: &mut dyn NativeContext, this: ObjectRef,
     bufs.entry(key).or_default().extend_from_slice(bytes);
 }
 
-pub(crate) fn zo_finalize_current_entry(ctx: &mut dyn NativeContext, this: ObjectRef) {
+/// Pins `this` across [`zo_finalize_current_entry_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `this` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn zo_finalize_current_entry(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*this);
+    let w5_out = zo_finalize_current_entry_body(ctx, *this);
+    *this = ctx.read_native_pin(w5_pin, *this);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
+pub(crate) fn zo_finalize_current_entry_body(ctx: &mut dyn NativeContext, this: ObjectRef) {
     if let Some(state) = zo_real_fast_state(ctx, this) {
         let mut state = state.lock().unwrap();
         if let Some(name) = state.current_name.take() {
@@ -2386,7 +2401,22 @@ fn zo_write_compact_zip(entries: Vec<ZoCompactEntry>) -> Vec<u8> {
     out
 }
 
-pub(crate) fn zo_write_zip(
+/// Pins `this` across [`zo_write_zip_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `this` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn zo_write_zip(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+    let w5_pin = ctx.pin_native_root(*this);
+    let w5_out = zo_write_zip_body(ctx, *this);
+    *this = ctx.read_native_pin(w5_pin, *this);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
+pub(crate) fn zo_write_zip_body(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<(), MethodCallFailed> {
@@ -2568,11 +2598,26 @@ fn iis_is_bomb(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::InvalidData && e.to_string().contains("compression bomb")
 }
 
+/// Pins `this` across [`iis_fill_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `this` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn iis_fill(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+    let w5_pin = ctx.pin_native_root(*this);
+    let w5_out = iis_fill_body(ctx, *this);
+    *this = ctx.read_native_pin(w5_pin, *this);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Inflate the wrapped stream once, memoized under this object's identity
 /// hash. Identity hashing (rather than the raw pointer) is required for the
 /// same reason `zo_buf_key` documents: the drain below re-enters Java and a
 /// moving young GC can relocate `this` mid-flight.
-fn iis_fill(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
+fn iis_fill_body(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
     let key = zo_buf_key(ctx, this);
     if iis_state()
         .lock()
@@ -2632,8 +2677,8 @@ fn iis_fill(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCa
 }
 
 pub(crate) fn iis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    iis_fill(ctx, this)?;
+    let mut this = obj_arg(args, 0)?;
+    iis_fill(ctx, &mut this)?;
     let key = zo_buf_key(ctx, this);
     let mut states = iis_state().lock().unwrap_or_else(|e| e.into_inner());
     let Some(st) = states.get_mut(&key) else {
@@ -2648,7 +2693,7 @@ pub(crate) fn iis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 pub(crate) fn iis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let dst = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Int(-1))),
@@ -2670,7 +2715,7 @@ pub(crate) fn iis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     if len == 0 {
         return Ok(Some(Value::Int(0)));
     }
-    iis_fill(ctx, this)?;
+    iis_fill(ctx, &mut this)?;
     let key = zo_buf_key(ctx, this);
     let chunk = {
         let mut states = iis_state().lock().unwrap_or_else(|e| e.into_inner());

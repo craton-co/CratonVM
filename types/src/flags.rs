@@ -2769,7 +2769,7 @@ fn capped_var_verdict(
         return (default, None);
     }
     match trimmed.parse::<usize>() {
-        Ok(n) if n == 0 => (
+        Ok(0) => (
             default,
             Some(format!(
                 "[cratonvm] warning: {name}=0 is not a usable {what} cap — a cap of zero \

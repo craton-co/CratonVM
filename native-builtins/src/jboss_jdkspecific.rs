@@ -308,7 +308,7 @@ fn build_boot_layer(
     ctx.set_field_by_name(layer, "nameToModule", Value::Object(Some(name_to_module)));
 
     let modules = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "layer modules")?;
-    let layer = ctx.read_native_pin(layer_pin, layer);
+    let mut layer = ctx.read_native_pin(layer_pin, layer);
     ctx.set_field_by_name(layer, "modules", Value::Object(Some(modules)));
 
     ctx.unpin_native_roots(layer_pin);
@@ -328,8 +328,23 @@ fn build_boot_layer(
         memo.insert(vm, handle);
     }
     drop(memo);
-    populate_boot_layer_modules(ctx, layer)?;
+    populate_boot_layer_modules(ctx, &mut layer)?;
     Ok(layer)
+}
+
+/// Pins `layer` across [`populate_boot_layer_modules_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `layer` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn populate_boot_layer_modules(ctx: &mut dyn NativeContext, layer: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+    let w5_pin = ctx.pin_native_root(*layer);
+    let w5_out = populate_boot_layer_modules_body(ctx, *layer);
+    *layer = ctx.read_native_pin(w5_pin, *layer);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
 }
 
 /// Insert every registered module into the boot layer's `nameToModule` map and
@@ -383,7 +398,7 @@ fn build_boot_layer(
 /// nor the system loader's `ServicesCatalog` on HotSpot, and putting them in
 /// either here handed `ServiceLoader` the same provider twice. The gate is at
 /// the top of the loop with the measurement that motivated it.
-fn populate_boot_layer_modules(
+fn populate_boot_layer_modules_body(
     ctx: &mut dyn NativeContext,
     layer: ObjectRef,
 ) -> Result<(), MethodCallFailed> {

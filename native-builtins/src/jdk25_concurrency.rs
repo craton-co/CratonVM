@@ -869,7 +869,7 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
     // Build a Thread whose Thread.run() dispatches to the runner, then start it
     // via the VM's real thread machinery. The worker is reaped by join().
-    let worker = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", THREAD_SYNTHETIC_NUM_FIELDS)?;
+    let mut worker = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", THREAD_SYNTHETIC_NUM_FIELDS)?;
     let name = ctx.create_string("StsFork");
     // Choose the field-set strategy by the object's actual layout. A synthetic
     // 5-slot Thread (num_fields <= 8, matching the VM's
@@ -956,7 +956,7 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // Placed after BOTH layout arms, because the real-JDK arm's
     // `Thread.<init>` invoke can allocate and the identity the queue is keyed
     // by must be the finished object's.
-    crate::lang_system::capture_inheritable_tl_at_construction(ctx, worker);
+    crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut worker);
 
     // Record the (subtask, worker) pair BEFORE starting so a racing fast worker
     // is already tracked when join() runs.

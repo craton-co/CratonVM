@@ -7020,11 +7020,33 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
 ///
 /// An engagement counter, printed beside the fix rather than trusted: a zero
 /// here on a workload that used to crash means the crash came from somewhere
-/// else, and a non-zero one is a live count of type-punned reference slots this
-/// VM is still producing (the G30-1 species). It counts a REAL defect being
-/// contained, not one being fixed — see `jit_getfield_impl`.
+/// else.
+///
+/// **It is NOT a defect count, and the first version of this comment said it
+/// was.** Measured 2026-08-24 on the two Tomcat classes it was written for:
+/// 20 190 hits across two solo runs, of which **zero** carried a non-zero
+/// payload word. The total is dominated by reference fields of freshly
+/// allocated objects, whose cells are still zero-filled and therefore decode as
+/// `Int(0)` — the inline read this defers from returned the correct null from
+/// them by accident. Quote [`JIT_GETFIELD_PUNNED_REF_NONZERO`] instead: that is
+/// the subset that would actually have been dereferenced.
 pub static JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Of [`JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT`], the subset whose cell payload
+/// word was NON-ZERO — i.e. the ones the inline arm would have handed to
+/// compiled code as a pointer to follow.
+///
+/// The total is dominated by zero-filled cells of freshly allocated objects,
+/// where the old inline read produced the correct null by accident. This
+/// counter is the one that measures danger, and it is the number to quote.
+pub static JIT_GETFIELD_PUNNED_REF_NONZERO: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`JIT_GETFIELD_PUNNED_REF_NONZERO`].
+pub fn jit_getfield_punned_ref_nonzero() -> u64 {
+    JIT_GETFIELD_PUNNED_REF_NONZERO.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Snapshot of [`JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT`].
 pub fn jit_getfield_primitive_in_ref_slot() -> u64 {
@@ -7233,6 +7255,58 @@ unsafe fn jit_getfield_impl(
     // is still doing it, and the counter says how often.
     if expect_ref && !matches!(val, Value::Object(_)) {
         JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SPLIT THE COUNT, because the total does not mean what it looks like.
+        //
+        // The inline arm this defers from read the cell's 8-byte payload word
+        // and used it as a pointer. For the overwhelmingly common case — a
+        // reference field of a freshly allocated object, whose cell is still
+        // zero-filled and so decodes as `Int(0)` — that word is 0, i.e. the
+        // correct null, by accident. Those are not corruption, and counting
+        // them together made a benign number read as a defect number.
+        //
+        // What is dangerous is a NON-ZERO payload word under a non-`Object`
+        // tag: that is what the inline arm would have handed to compiled code
+        // as a pointer, and it is the shape that killed
+        // `SQLChar.readExternalFromArray` with `addr=0x5`. Counted separately,
+        // and under `CRATONVM_DBG_PUNNED_REF` it names the class and field so
+        // the WRITER can be found rather than inferred.
+        //
+        // SAFETY: `ptr` is the cell base of an in-bounds slot of a live object
+        // (both checked above), so the 8 bytes at FIELD_CELL_PAYLOAD64_OFFSET
+        // inside that cell are within the allocation.
+        let payload64 = std::ptr::read_unaligned(
+            ptr.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET) as *const u64,
+        );
+        if payload64 != 0 {
+            let n = JIT_GETFIELD_PUNNED_REF_NONZERO
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 32
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PUNNED_REF").is_some()
+            {
+                let hdr = &*(obj_ptr as *const cratonvm_types::ObjectHeader);
+                // The whole cell, not just the word that would have been
+                // dereferenced. `Value::Int` keeps its payload at
+                // FIELD_CELL_PAYLOAD32_OFFSET, so a non-zero payload64 under an
+                // Int tag is either a writer that used the WRONG offset or
+                // padding left by the cell's previous occupant — and the two
+                // want completely different searches. Printing tag+p32+p64
+                // separates them in one run instead of by argument.
+                let tag = std::ptr::read_unaligned(
+                    ptr.add(cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u32,
+                );
+                let payload32 = std::ptr::read_unaligned(
+                    ptr.add(cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET) as *const u32,
+                );
+                eprintln!(
+                    "[punned-ref] class_id={} num_slots={} field_index={field_index} \
+                     tag={tag} payload32={payload32:#x} payload64={payload64:#x} \
+                     decoded={val:?} (payload64 is the word that would have been \
+                     dereferenced)",
+                    hdr.class_id,
+                    hdr.num_slots(),
+                );
+            }
+        }
         return 0;
     }
     let result = match val {

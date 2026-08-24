@@ -429,7 +429,7 @@ fn write_field(buf: &mut Vec<u8>, value: &EventValue, declared: FieldKind) {
         }
         (FieldKind::Boolean, EventValue::Boolean(v)) => buf.push(u8::from(*v)),
         (FieldKind::String, _) => match value.as_str_bytes() {
-            Some(bytes) if bytes.is_empty() => buf.push(STRING_EMPTY),
+            Some([]) => buf.push(STRING_EMPTY),
             Some(bytes) => {
                 buf.push(STRING_UTF8);
                 write_varint(buf, bytes.len() as u64);
