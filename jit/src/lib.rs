@@ -17111,6 +17111,57 @@ fn ir_unresumable_trap_declines(
     true
 }
 
+/// What makes a whole-method replay observably wrong: a store the JVM can see
+/// from outside this frame, a call, or a monitor action. A pure computation can
+/// be re-run.
+///
+/// Shared deliberately with the consumer of the refusal this predicate feeds.
+/// [`ir_unresumable_protected_trap`] admits the optimizing tier for a protected
+/// range whose trap is unresumable ON THE STATED GROUND that "a read-only
+/// `try { return a[i]; } catch (...)` replays harmlessly, so the refusal would
+/// buy nothing and cost the compile" — and the interpreter's tier-up sink then
+/// refused EVERY whole-method replay with a hard `InternalError`, harmless or
+/// not. The compiler's narrowing rested on a behaviour the consumer did not
+/// have. One predicate, asked at both ends, is what stops that from drifting
+/// again; see [`bytecode_commits_side_effect`].
+pub fn opcode_commits_side_effect(op: u8) -> bool {
+    matches!(
+        op,
+        0x4f..=0x56 // array stores
+            | 0xb3 | 0xb5 // putstatic / putfield
+            | 0xb6..=0xba // the invokes
+            | 0xc2 | 0xc3 // monitorenter / monitorexit
+    )
+}
+
+/// Does this method body commit any side effect a re-run from entry would
+/// duplicate?
+///
+/// `false` means a whole-method replay is observably equivalent to the
+/// abandoned compiled attempt: the locals are rebuilt from the same arguments,
+/// nothing outside the frame was written, and no call was made. That is the
+/// exact condition under which the interpreter's deopt sink may replay instead
+/// of raising `InternalError: precise deoptimization unavailable`.
+///
+/// Conservative on anything it cannot read: a walk that loses instruction sync
+/// answers `true`, because it has not proved anything about the rest of the
+/// method.
+pub fn bytecode_commits_side_effect(code: &[u8], code_len: usize) -> bool {
+    let mut pc = 0;
+    while pc < code_len {
+        let op = code[pc];
+        if opcode_commits_side_effect(op) {
+            return true;
+        }
+        let len = x64::bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return true;
+        }
+        pc += len;
+    }
+    false
+}
+
 fn ir_unresumable_protected_trap(
     code: &[u8],
     code_len: usize,
@@ -17139,17 +17190,7 @@ fn ir_unresumable_protected_trap(
                 | 0xbe // arraylength
         )
     };
-    // What makes a replay observably wrong. Stores and calls only — a pure
-    // computation can be re-run.
-    let side_effecting = |op: u8| {
-        matches!(
-            op,
-            0x4f..=0x56 // array stores
-                | 0xb3 | 0xb5 // putstatic / putfield
-                | 0xb6..=0xba // the invokes
-                | 0xc2 | 0xc3 // monitorenter / monitorexit
-        )
-    };
+    let side_effecting = opcode_commits_side_effect;
 
     let mut trap: Option<(usize, u8)> = None;
     let mut has_side_effect = false;
