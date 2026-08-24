@@ -1,11 +1,14 @@
 # The unreproduced KafkaMetrics corrupt cell: the species is closed at the accessor
 
-**Status: CLOSED 2026-08-23 — the SPECIES, not the sighting.** The one cell that
-page recorded is still unreproduced, and this page does not claim otherwise.
-What changed is that the shape it had can no longer be produced: a plain-object
-field access whose receiver is an ARRAY is refused at all four heap accessors
-and reported through the corrupt-cell chain, so a door that makes that mistake
-now names itself the first time instead of once in 1975 classes.
+**Status: CLOSED 2026-08-23 — the SPECIES, and one live producer it found.**
+The one cell the open page recorded is still unreproduced, and this page does
+not claim otherwise. What changed is that the shape it had can no longer be
+produced — a plain-object field access whose receiver is an ARRAY is refused at
+all four heap accessors and reported through the corrupt-cell chain — and that
+the screen immediately found a REAL one the corrupt-cell guard could never have
+seen: `Unsafe.putFloat`/`putDouble` over a `byte[]` base, writing 240 bytes past
+the allocation, twice per run, on every Spring Boot cache autoconfiguration
+test. See §6a.
 
 Supersedes
 `known-issues/gc/corrupt-value-cell-one-unreproduced-hit-in-kafkametrics-20260822.md`.
@@ -139,10 +142,14 @@ be a field count, its bytes 16..24 are asserted to be `"t/Proxy"`, and it is
 carried through the rendering doors, a `HashMap` round trip, a `HashSet`, and
 the identity-vs-content `equals`/`hashCode` contract.
 
-**Both new gate groups PASS on the pre-fix `dev` binary as well.** They are a
-forward gate, not a reproduction, and saying so is the point: nothing in the
-in-tree corpus reaches the un-screened path today, which is consistent with a
-cell seen once in 1975 classes and never again.
+**Both new `RStringBuilderContent` groups PASS on the pre-fix `dev` binary as
+well.** They are a forward gate, not a reproduction, and saying so is the point:
+nothing in the in-tree corpus reached those doors' un-screened paths.
+
+**`regression-suite/RUnsafeArrayBase` is the one that does reproduce** — see
+§6a. It FAILS on pre-fix `dev` and PASSES on the fix, at every primitive width,
+with neighbour arrays around the target so an out-of-bounds write has somewhere
+to be seen. 70 of 70 regression vectors pass on the fix.
 
 **Probe** (`probes/ArrayReceiverProbe`): every shape-probing door — rendering,
 identity, five collection shapes, the `Arrays` helpers — over eight array
@@ -153,18 +160,78 @@ under all three collectors, with `array_receiver=0`.
 the sighting came from, census armed:
 
 ```text
-shard 1 (classes 1-500)     0 decoded, 0 array-receiver refusals, 499 of 500 logs armed
+shard 1 (classes    1- 500)  0 decoded, 0 array-receiver refusals, 499 of 500 logs armed
+shard 2 (classes  501-1000)  2 decoded, 2 array-receiver refusals, in ONE class -- §6a
 ```
 
-(The one unarmed log is a HANG killed before its shutdown trailer — a blind spot
-worth stating rather than rounding off.)
+(Unarmed logs are HANG classes killed before their shutdown trailer, which
+cannot print it — a blind spot worth stating rather than rounding off.)
+
+## 6a. What the screen found on its first sweep
+
+The point of screening at the accessor rather than at a door is that it catches
+producers nobody has thought of. It took one shard to find one.
+
+`module/spring-boot-cache … CacheAutoConfigurationTests`, deterministic, every
+run:
+
+```text
+[corrupt-cell] array_receiver=2  decoded=2 reported=2
+zgc::set_field: plain-object field access on an ARRAY receiver
+  obj=0x249f987f5d0 index=16 length=32 element_type=Byte in_body=false
+```
+
+`index=16` on a 32-element `byte[]` computes byte `16 + 16*16 = 272` of a
+32-byte body. **`in_body=false`: the write was 240 bytes outside the
+allocation.** Twice.
+
+Naming it needed one more thing, and its absence is worth recording. Every door
+instrumented before this was a READ door, so the first report came from the
+safepoint BACKSTOP — two minutes after the fact, with the frames of whatever
+the thread was doing by then, which is exactly the caveat the backstop prints
+about itself. With `interpreter putfield` and `NativeContext::set_field`
+instrumented as WRITE doors, the same run reports `decoded=2 reported=2` and
+names it at the store:
+
+```text
+door=NativeContext::set_field  slot_index=16
+receiver_class=java/lang/Object  receiver_kind=Array  receiver_fields=32
+top_frame=com/hazelcast/internal/memory/impl/UnsafeUtil.checkUnsafeInstance pc=76
+  … UnsafeUtil.<clinit> → AlignmentUtil.<clinit> → GlobalMemoryAccessorRegistry.<clinit>
+  … Hazelcast.newHazelcastInstance ← HazelcastServerConfiguration.getHazelcastInstance
+```
+
+`UnsafeUtil.checkUnsafeInstance` is Hazelcast's availability probe: it allocates
+`new byte[arrayBaseOffset + 16]` and writes it at every primitive width through
+`Unsafe.put*(Object, long, …)`.
+
+**The defect is in four natives.** `native_unsafe_put_int`, `..._put_long`,
+`..._put_byte_mb`, `..._put_object` and their readers have always screened the
+receiver kind and routed an array base to `get/set_array_element`. The four
+FLOAT and DOUBLE natives did not — they passed the byte OFFSET to
+`ctx.{get,set}_field` as a slot index. `putFloat` and `putDouble` are called
+exactly once each by that probe, which is why the count was exactly two.
+
+Two shapes, one bug, and `RUnsafeArrayBase` asserts both:
+
+| receiver | `num_slots` | offset 24 | before the fix |
+| --- | --- | --- | --- |
+| `float[4]` | 4 | out of range | write DROPPED — `expected [2.5] got [0.0]`, a wrong ANSWER |
+| `byte[32]` | 32 (the LENGTH) | "in bounds" | write lands 240 bytes past the allocation |
+
+The vector FAILS on pre-fix `dev` (`zgc real: field index OOB index=24
+num_slots=4 op="set"`, then the assertion) and PASSES on the fix, and the
+`CacheAutoConfigurationTests` census goes `array_receiver=2` → `0`.
 
 ## 7. What is and is not claimed
 
-* **Claimed:** a `byte[]` body can no longer be read as a `Value` cell, whatever
-  door asks — which is the exact shape the sighting had. The class-id species
-  and the shape-probe species are both screened, at the accessor and at the
-  doors, and any recurrence is counted rather than caught by luck.
+* **Claimed:** a `byte[]` body can no longer be read or WRITTEN as a `Value`
+  cell, whatever door asks — which is the exact shape the sighting had. The
+  class-id species and the shape-probe species are both screened, at the
+  accessor and at the doors, and any recurrence is counted rather than caught by
+  luck. One live producer of the species is fixed (§6a), and it is one the
+  corrupt-cell guard could never have reported: its striden bytes formed a valid
+  discriminant every time.
 * **Not claimed:** that the KafkaMetrics cell has been reproduced, or that its
   particular door has been named. It has not. A second reading of the same
   evidence remains open — that the receiver was not an array at all but an
