@@ -7,13 +7,13 @@ on this workload. Nothing here is a single defect — closing this test needs th
 reactive composition path to get several times faster.
 
 A second, *separate* finding is recorded in §5, and it is the more interesting
-half: INSERTs are silently LOST. On one failing run 1200 inserts were
-attempted and 93 landed, with only 19 of the 1107 losses producing any error.
-No sequence number is ever committed twice (§5.1), so the downstream event is
-being DROPPED rather than duplicated. The cause looks to be a stage that
-completes before its COMMIT does: HR000090 precedes the first duplicate in 8
-failing runs out of 8, and a verticle that ran all 60 iterations still hit it.
-It is **not fixed**. §5.3 is the thing to read
+half: INSERTs are silently LOST, and the loss carries a SUCCESS signal —
+959 transactions reported committed against 56 rows on the table (§5.8). No
+sequence number is ever committed twice (§5.1), so the event is DROPPED rather
+than duplicated. The first error in a failing run is `HR000089: Connection is
+closed` raised inside the ID GENERATOR's CAS retry, meaning a retry outlived
+its session; the thread-safety assertion is a late symptom. It is **not
+fixed**. §5.3 is the thing to read
 before touching it. A 40-run batch put the failure rate at
 **20%**, which makes arms affordable — but the earlier bisect was run at arm
 sizes that were noise at any of these rates. §5.2 records a table-size
@@ -433,26 +433,141 @@ A `[cratonvm-lambda-const] WRONG ANSWER` line names the impl, the expected and
 observed values, the raw register word, and which arm served the call. One such
 line closes this section.
 
-### 5.7 What to try next
+### 5.8 Where the data actually goes, and the four hypotheses that died finding out
 
-Failure rates measured here: 8/40 in the strict batch, 1/45 with an older dev
-binary in the same session. The rate is not stable across conditions, so
-interleave the control with every test arm and read §5.3 before sizing one.
+#### The loss is silent and it carries a SUCCESS signal
 
-1. **`withTransaction`'s completion stage.** This is now the main suspect and
-   it is specific: 1200 inserts attempted, 93 landed, 1107 gone with no error,
-   23 verticles hitting HR000090 at close. Find where the reactive transaction
-   signals completion relative to the actual COMMIT, and whether the stage can
-   be completed by the connection's own callback before the commit response
-   arrives. The `--nojit` control matters most here.
-2. **The parity of §5.1.** 96 short loops out of 100 ended on an odd count,
-   across two binaries and two probe settings, and nothing found so far
-   explains it. Logging the thread name beside `ITERS` and the loop index at
-   the point the verticle dies would turn it from a statistic into a trace.
-3. Re-run the `CRATONVM_JIT_DENY` bisect. `ArrayLoop` and `AsyncTrampoline`
-   are still on the list; `alwaysTrue` is **off** it (§5.6).
-4. `--nojit` passed 8/8 and JIT 6/8 at the old rate; redo that comparison at a
-   freshly measured rate before leaning on it.
+Instrumenting the test's own two lambdas — `WT` counts entries to
+`(s, entity) -> s.withTransaction(...)`, `PERSIST` counts entries to the
+`t -> s.persist(entity)` work lambda — plus a `whenComplete` on each stage:
+
+| | |
+|---|---:|
+| `withTransaction` work lambdas invoked | 1016 |
+| `persist` stages completing successfully | 965 |
+| `withTransaction` stages reporting **success** | **959** |
+| rows in the table | **56** |
+
+**`WT == PERSIST` exactly**, so `withTransaction` always runs the work it is
+given — it does not short-circuit. And 959 transactions reported success while
+903 of those rows do not exist.
+
+Server-side, from MySQL's own general log (`hibfix-commitcheck.sh`):
+
+| stage | count |
+|---|---:|
+| `storeEntity` calls attempted | 1093 |
+| INSERTs that reached MySQL | 134 |
+| BEGINs | 86 |
+| COMMITs | 62 |
+| ROLLBACKs | 24 |
+
+`86 = 62 + 24` on every connection, so the transactions that DO run are
+well-formed. The work never reaches the database at all.
+
+#### The first error is the ID GENERATOR on a closed connection
+
+Ordering the errors of a failing run by line number rather than by which looked
+most interesting:
+
+| event | first at line |
+|---|---:|
+| **`HR000089: Connection is closed`** | **113** |
+| `HR000090: Live transaction on close` | 133 |
+| `NonUniqueObjectException` | 137 |
+| `Duplicate entry` | 163 |
+| `AssertionFailure: non-threadsafe access` | 372 |
+
+The thread-safety assertion is a LATE symptom, not the root. The first error's
+stack names the id generator's optimistic-CAS retry:
+
+```
+HR000089: Connection is closed
+  at SqlClientPool$ProxyConnection.connection(:274)
+  at SqlClientPool$ProxyConnection.selectIdentifier(:402)
+  at TableReactiveIdentifierGenerator.nextHiValue(:112)
+  at TableReactiveIdentifierGenerator.checkValue(:149)
+  at TableReactiveIdentifierGenerator.lambda$nextHiValue$1(:140)
+```
+
+`checkValue` retries `nextHiValue` whenever the CAS `update Entity_SEQ set
+next_val=NEW where next_val=OLD` affects 0 rows. Reaching a CLOSED connection
+there means **a retry outlived the session that owned it**.
+
+#### The CAS degenerates into a retry storm — direction of causation UNKNOWN
+
+`hibfix-seqrace.sh` reads the CAS traffic off the server:
+
+| run | total UPDATEs | distinct | attempts per block |
+|---|---:|---:|---:|
+| HotSpot, passing | 57 | 53 | **1.1** |
+| CratonVM, passing | 56 | 52 | **1.1** |
+| CratonVM, FAILING | 97 | **8** | ~12, one UPDATE tried **30x** |
+
+A healthy run has essentially no contention on the sequence row. A failing run
+piles 30 racers onto a single `101 -> 151` and only ever allocates 8 blocks.
+
+**This is not yet a cause.** The storm is equally consistent with being an
+EFFECT: once inserts stop happening (134 of 1093), the verticles stop waiting
+on I/O and spin through iterations, which is exactly what would pile them onto
+the id generator. Establishing the order needs the general log's `event_time`
+correlated against the first `HR000089` on a run that is kept — the first
+attempt at this lost its data when the control run truncated
+`mysql.general_log`.
+
+#### Four hypotheses killed, three of them without any statistics
+
+* **`alwaysTrue` returning a wrong `false`** — 156 569 constant-return calls
+  screened across 8 failing runs, 0 mismatches, 0 opaque (§5.6).
+* **`Thread.currentThread()` identity under JIT** — `EventLoopExecutor.inThread()`
+  reduces to netty's `Thread.currentThread() == this.thread`, so a wrong TRUE
+  there would run a continuation on a foreign event loop.
+  `HibfixThreadIdentityProbe` reproduces exactly that shape: **48 000 000
+  checks on 24 threads, 0 wrong answers**, matching HotSpot.
+* **Connection-pool sharing** — the ~2 INSERTs per BEGIN seen in failing runs
+  suggested two sessions per physical connection. On PASSING runs both runtimes
+  are byte-identical: 6 connections, 1440 begins, 1448 inserts, 1440 commits.
+  Pool usage is not the defect.
+* **The `gc::guard` "descriptor-aware field access DESTROYED the value"
+  warning** — with the ANSI escapes stripped, passing and failing runs carry
+  the identical five shapes (`class_id` 12/64/158/1602, ~28 lines each). Noise.
+
+#### What IS established
+
+The failure is JIT-dependent. Interleaved on one binary, alternating arms:
+**JIT 2/8 failures, `--nojit` 0/8**, and the failing JIT run finished in 15 s
+against ~35 s healthy because it did almost no work.
+
+#### The one structural fact worth carrying forward
+
+The continuation in every one of these traces is resumed from
+`FutureBase$EmitResultTask.run` called by netty's `runAllTasks` — i.e. it was
+SCHEDULED as a task, not run inline. Whatever goes wrong, it goes wrong in what
+the future's context was when the task was posted, not in the inline-vs-schedule
+decision itself.
+
+### 5.9 What to try next
+
+The failure rate drifts between 0% and 25% with no code change, so size arms by
+§5.3 and **discard any arm whose control did not fail**.
+
+1. **Settle the direction of §5.8's CAS storm.** Keep the general log from a
+   failing run (do NOT truncate it with a control run afterwards) and correlate
+   `event_time` of the first retry burst against the first `HR000089`. If the
+   storm starts BEFORE inserts stop, it is the cause; if after, it is an
+   effect and the search moves upstream of the id generator.
+2. **Why does a retry outlive its session?** `checkValue` -> `nextHiValue`
+   re-enters through `session.getReactiveConnection()`, and reaching a closed
+   `ProxyConnection` means the session finished while the retry was in flight.
+   That is a concrete, small chain to walk: who completed the outer stage while
+   `nextHiValue` was still retrying.
+3. **`ReactiveEntityRegularInsertAction.lambda$reactiveExecute$1`** is where the
+   late thread assertion fires; it is reached from
+   `Future.lambda$toCompletionStage$5`. Both are capturing lambdas on the
+   suspect path, and both are JIT-compiled.
+4. Do NOT re-run: the thread-identity probe, the pool comparison, the guard
+   comparison, or the `alwaysTrue` screen. All four are measured and negative
+   (§5.8, §5.6).
 
 ## 6. What was changed, and why it is not the fix
 
@@ -491,9 +606,9 @@ the composition, not the CF bytecode and not the native funnel.
 
 ## 7. What to try next
 
-1. **The cut loop (§5).** A correctness bug beats a throughput one, and it is
-   separable. See §5.7 for the concrete next steps, and §5.3 for the arm size
-   any of them needs.
+1. **The silent insert loss (§5).** A correctness bug beats a throughput one,
+   and it is separable. See §5.9 for the concrete next steps, §5.8 for what is
+   already measured and negative, and §5.3 for the arm size any of them needs.
 2. **Lambda/SAM dispatch inside a composition chain**, per §6's closing
    paragraph — that is where the remaining `thenCompose` microseconds are, and
    it is not the native funnel.
@@ -520,7 +635,7 @@ is generated and machine-local, so it is not committed.
 ## Related files
 
 - `apps/hibernate-reactive/hibernate-reactive-core/src/test/java/org/hibernate/reactive/MultithreadedInsertionWithLazyConnectionTest.java`
-- `apps/hibernate-reactive-suite-runner/HibfixCfProbe.java`, `HibfixCfBound.java`, `hibfix-mtins-run.sh`, `hibfix-dupins-loop.sh`, `hibfix-seqcheck.sh`
+- `apps/hibernate-reactive-suite-runner/HibfixCfProbe.java`, `HibfixCfBound.java`, `hibfix-mtins-run.sh`, `hibfix-dupins-loop.sh`, `hibfix-seqcheck.sh`, `hibfix-commitcheck.sh`, `hibfix-wtcheck.sh`, `hibfix-arms.sh`, `hibfix-jitab.sh`, `hibfix-seqrace.sh`, `HibfixThreadIdentityProbe.java`
 - `jit/src/lambda_adapter.rs` — the `AdapterKey` of §5.4 and its `site_shape_collisions` counter
 - [`hib-reactive-3gc-run-regressions-20260820.md`](hib-reactive-3gc-run-regressions-20260820.md) §8
 - [`batchtest-mysql-jdbc-batching-slow-20260822.md`](batchtest-mysql-jdbc-batching-slow-20260822.md) — the same "trivial JDK primitive served by a native" shape, and the same conclusion that the funnel's aggregate is small
