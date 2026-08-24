@@ -18858,6 +18858,93 @@ fn real_ht_view_enumerator(
     }
 }
 
+/// A snapshot iterator for a `CopyOnWriteArraySet` receiver, or `None` if this
+/// receiver is not one.
+///
+/// The copy-on-write contract is that an iterator reflects the collection as it
+/// stood when the iterator was created, never throws
+/// `ConcurrentModificationException`, and refuses `remove()`. The set family
+/// here is backed by a live `LinkedHashMap`, so the shared cursor gives the
+/// opposite of all three.
+///
+/// Rather than re-derive the contract, this mints a real
+/// `java/util/concurrent/CopyOnWriteArrayList` over the snapshot and returns
+/// ITS iterator — the same structure the JDK uses (`CopyOnWriteArraySet` holds a
+/// `CopyOnWriteArrayList` and returns `al.iterator()`), and the same code path
+/// `probes/CowSnapshotProbe.java` rows L01-L04 already show to be correct on
+/// this VM. If the delegate ever regresses, the set regresses with it, which is
+/// the intended coupling.
+///
+/// Returns `None` — falling through to the live cursor — for any receiver that
+/// is not a `CopyOnWriteArraySet`, and for the two shapes that would otherwise
+/// be guesses: no resolvable COWAL `array` field, or an allocation that fails.
+fn cow_set_snapshot_iterator(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    backing: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let cows_cid = match ctx.class_id_by_name("java/util/concurrent/CopyOnWriteArraySet") {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    if !ctx.is_subclass(ctx.class_id_of_object(this), cows_cid) {
+        return Ok(None);
+    }
+    // Read the elements BEFORE allocating anything: every allocation below can
+    // collect. `collect_view_snapshot_ordered` on the resolved backing map is
+    // what the rest of this Set surface uses (`toArray`); the generic
+    // `collect_collection_elements` does NOT read a map-backed Set and returns
+    // an empty vector, which reads downstream as "the set is empty" rather than
+    // as a failure.
+    let elems = collect_view_snapshot_ordered(ctx, backing)?;
+    let (elem_pin_base, elem_handles) = pin_value_slice(ctx, &elems);
+    let backing = alloc_ref_array(ctx, elems.len());
+    let backing_pin = ctx.pin_native_root(backing);
+    for (i, v) in elems.iter().enumerate() {
+        let backing = ctx.read_native_pin(backing_pin, backing);
+        let v = read_pinned_elem(ctx, elem_handles[i], *v);
+        ctx.set_array_element(backing, i, v);
+    }
+    let backing = ctx.read_native_pin(backing_pin, backing);
+
+    let delegate = match ctx.new_object("java/util/concurrent/CopyOnWriteArrayList")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            if elem_pin_base != usize::MAX {
+                ctx.unpin_native_roots(elem_pin_base);
+            } else {
+                ctx.unpin_native_roots(backing_pin);
+            }
+            return Ok(None);
+        }
+    };
+    let delegate_pin = ctx.pin_native_root(delegate);
+    let backing = ctx.read_native_pin(backing_pin, backing);
+    let arr_slot = ctx.resolve_field_index("java/util/concurrent/CopyOnWriteArrayList", "array");
+    let itr = match arr_slot {
+        Some(slot) => {
+            let delegate = ctx.read_native_pin(delegate_pin, delegate);
+            ctx.set_field(delegate, slot, Value::Object(Some(backing)));
+            let delegate = ctx.read_native_pin(delegate_pin, delegate);
+            match ctx.invoke_virtual(delegate, "iterator", "()Ljava/util/Iterator;", &[])? {
+                Some(Value::Object(Some(it))) => Some(it),
+                _ => None,
+            }
+        }
+        // No `array` field to write means this VM is not modelling COWAL the
+        // way the delegate path expects. Decline rather than hand back an
+        // iterator over an empty list, which would read as "the set is empty".
+        None => None,
+    };
+    let unpin = if elem_pin_base != usize::MAX {
+        elem_pin_base.min(backing_pin).min(delegate_pin)
+    } else {
+        backing_pin.min(delegate_pin)
+    };
+    ctx.unpin_native_roots(unpin);
+    Ok(itr)
+}
+
 fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_iterator) {
         return r;
@@ -18893,6 +18980,13 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return Ok(Some(Value::Object(None)));
         }
     };
+    // Copy-on-write is decided HERE, once `backing` is resolved and before any
+    // live cursor is built: this family shares the HashSet surface but has the
+    // opposite iterator contract.
+    if let Some(itr) = cow_set_snapshot_iterator(ctx, this, backing)? {
+        ctx.unpin_native_roots(this_pin);
+        return Ok(Some(Value::Object(Some(itr))));
+    }
     // `H4-1` section 3, closed. See [`real_ht_view_enumerator`]: the Hashtable
     // family gets java.base's OWN cursor rather than a snapshot under a
     // borrowed class name. Placed here because it needs `backing` — the view
