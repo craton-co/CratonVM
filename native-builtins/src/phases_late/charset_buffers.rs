@@ -312,6 +312,21 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
 // CharsetDecoder = 3-field (charset=0, avgCharsPerByte=1 Float, maxCharsPerByte=2 Float)
 // =============================================================================
 
+/// Pins `coder` across [`seed_coder_error_actions_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `coder` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn seed_coder_error_actions(ctx: &mut dyn NativeContext, coder: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*coder);
+    let w5_out = seed_coder_error_actions_body(ctx, *coder);
+    *coder = ctx.read_native_pin(w5_pin, *coder);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Seed a freshly-built synthetic `CharsetEncoder`/`CharsetDecoder` with the
 /// JDK-default coding-error actions (`CodingErrorAction.REPORT`) for the
 /// `malformedInputAction` / `unmappableCharacterAction` fields.
@@ -327,7 +342,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
 /// the fields so the JDK bytecode sees the same defaults HotSpot would.
 /// `set_field_by_name` is a no-op when the field is absent (synthetic-JDK
 /// mode), so this is safe in both modes.
-pub(crate) fn seed_coder_error_actions(ctx: &mut dyn NativeContext, coder: ObjectRef) {
+pub(crate) fn seed_coder_error_actions_body(ctx: &mut dyn NativeContext, coder: ObjectRef) {
     let report = match ctx.ensure_class_initialized("java/nio/charset/CodingErrorAction") {
         Ok(cid) => match ctx.static_field_index_by_name(cid, "REPORT") {
             Some(idx) => ctx.get_static_field(cid, idx),
@@ -526,11 +541,11 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             };
             let avg = cratonvm_native_api::charset::average_bytes_per_char(&name);
             let max = cratonvm_native_api::charset::max_bytes_per_char(&name);
-            let enc_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 6)?;
+            let mut enc_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 6)?;
             ctx.set_field(enc_obj, 0, Value::Object(Some(this)));
             ctx.set_field(enc_obj, 1, Value::Float(avg));
             ctx.set_field(enc_obj, 2, Value::Float(max));
-            seed_coder_error_actions(ctx, enc_obj);
+            seed_coder_error_actions(ctx, &mut enc_obj);
             Ok(Some(Value::Object(Some(enc_obj))))
         },
     );
@@ -546,13 +561,13 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             };
             let avg = cratonvm_native_api::charset::average_chars_per_byte(&name);
             let max = cratonvm_native_api::charset::max_chars_per_byte(&name);
-            let dec_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 6)?;
+            let mut dec_obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 6)?;
             ctx.set_field(dec_obj, 0, Value::Object(Some(this)));
             ctx.set_field(dec_obj, 1, Value::Float(avg));
             ctx.set_field(dec_obj, 2, Value::Float(max));
             let replacement = ctx.create_string("\u{fffd}");
             ctx.set_field_by_name(dec_obj, "replacement", Value::Object(Some(replacement)));
-            seed_coder_error_actions(ctx, dec_obj);
+            seed_coder_error_actions(ctx, &mut dec_obj);
             Ok(Some(Value::Object(Some(dec_obj))))
         },
     );

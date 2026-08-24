@@ -13641,11 +13641,11 @@ pub fn register_essential_natives_with_shims(
         },
     );
     registry.register("java/lang/Thread", "<init>", "()V", |ctx, args| {
-        let this = match args.first() {
+        let mut this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+        crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
         let name = Value::Object(Some(thread_default_name(ctx)));
         if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
             populate_real_thread_holder(ctx, this, Value::Object(None), Value::Object(None), name);
@@ -13660,11 +13660,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/Runnable;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name = Value::Object(Some(thread_default_name(ctx)));
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
@@ -13682,11 +13682,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/String;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let name = match args.get(1).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
                 _ => Value::Object(Some(thread_default_name(ctx))),
@@ -13711,11 +13711,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/Runnable;Ljava/lang/String;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
@@ -13736,11 +13736,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = Value::Object(Some(thread_default_name(ctx)));
@@ -13760,11 +13760,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
@@ -13785,11 +13785,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 // Real-JDK Thread: this native intercepts the real Java
                 // constructor, so we must populate the `holder:FieldHolder`
@@ -13821,11 +13821,11 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;J)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+            crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 let group = args.get(1).cloned().unwrap_or(Value::Object(None));
                 let target = args.get(2).cloned().unwrap_or(Value::Object(None));
@@ -13854,7 +13854,7 @@ pub fn register_essential_natives_with_shims(
         "<init>",
         "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;JZ)V",
         |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
@@ -13885,7 +13885,7 @@ pub fn register_essential_natives_with_shims(
                 let child_hash = ctx.identity_hash_code(this);
                 crate::phases_early::queue_inherited_tl_for_child(child_hash, Default::default());
             } else {
-                crate::lang_system::capture_inheritable_tl_at_construction(ctx, this);
+                crate::lang_system::capture_inheritable_tl_at_construction(ctx, &mut this);
             }
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 let group = args.get(1).cloned().unwrap_or(Value::Object(None));
@@ -16460,170 +16460,6 @@ pub fn register_essential_natives_with_shims(
     // shadow and corrupt `Enum.name()` → `Enum.valueOf("CLASSIC")` fails
     // with `IllegalArgumentException: No enum constant ... CLASSIC`,
     // which blocks `KafkaConfig.<init>` at bci=970.
-    registry.register(
-        "java/lang/Enum",
-        "<init>",
-        "(Ljava/lang/String;I)V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let name = args.get(1).copied().unwrap_or(Value::Object(None));
-            let ord = args.get(2).copied().unwrap_or(Value::Int(0));
-            if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "name") {
-                ctx.set_field(this, slot, name);
-            } else {
-                ctx.set_field_by_name(this, "name", name);
-            }
-            if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "ordinal") {
-                ctx.set_field(this, slot, ord);
-            } else {
-                ctx.set_field_by_name(this, "ordinal", ord);
-            }
-            Ok(None)
-        },
-    );
-    registry.register("java/lang/Enum", "ordinal", "()I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        if let Some(slot) = ctx.resolve_field_index("java/lang/Enum", "ordinal") {
-            return Ok(Some(ctx.get_field(this, slot)));
-        }
-        Ok(Some(ctx.get_field_by_name(this, "ordinal")))
-    });
-    registry.register(
-        "java/lang/Enum",
-        "name",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // Scoped to `java/lang/Enum`, exactly like the `ordinal` native
-            // above — NEVER to the receiver's class. `ref_field` does the
-            // latter, and `resolve_field_index_by_class_id` returns the
-            // MOST-DERIVED declaration, so an enum that declares its own field
-            // called `name` got that one instead: Spring Boot's
-            // `WebEndpointTest.Infrastructure` (`JERSEY("Jersey")`) made
-            // `name()` answer "Jersey" rather than "JERSEY". See
-            // `lang_misc::enum_constant_name` for the full trail. The
-            // primitive-tag degrade the descriptor-safety pass added is kept.
-            // `java.time.temporal.ChronoUnit` is a second witness with the same
-            // shape: it declares its own `name` holding the DISPLAY form, so a
-            // receiver-scoped read answered "Seconds" and
-            // `Enum.valueOf(ChronoUnit.class, "SECONDS")` matched nothing —
-            // which fell all the way through to every
-            // LocalDevToolsAutoConfigurationTests failing on
-            // `@DurationUnit(ChronoUnit.SECONDS)`.
-            // `probes/EnumShadowedNameFieldProbe.java` pins it, with
-            // `java.util.concurrent.TimeUnit` (no shadowing field) as control.
-            Ok(Some(lang_misc::enum_constant_name(ctx, this)))
-        },
-    );
-    registry.register(
-        "java/lang/Enum",
-        "toString",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // See `Enum.name` immediately above: same descriptor, same hazard.
-            Ok(Some(lang_misc::enum_constant_name(ctx, this)))
-        },
-    );
-    registry.register(
-        "java/lang/Enum",
-        "valueOf",
-        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
-        |ctx, args| {
-            let enum_class = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("Enum.valueOf: enumClass is null".into()),
-                    }
-                    .into())
-                }
-            };
-            let wanted = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("Name is null".into()),
-                    }
-                    .into())
-                }
-            };
-            let constants = match lang_class::native_class_get_enum_constants(
-                ctx,
-                &[Value::Object(Some(enum_class))],
-            )? {
-                Some(Value::Object(Some(arr))) => arr,
-                _ => {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: "Enum.valueOf: class is not an enum".into(),
-                    }
-                    .into())
-                }
-            };
-            // Cross-call GC-safety (2026-08-04): `invoke_virtual` runs
-            // `Enum.name()` — Java, and therefore a possible moving young
-            // collection — with `constants` and `candidate` held as bare
-            // `ObjectRef` locals. After one relocation the array walk reads a
-            // vacated from-space array, matches nothing, and this throws
-            // `No enum constant <NAME>` for a constant that exists. Root the
-            // array once and re-read it (and each element) per iteration; the
-            // MATCHED candidate is also re-read through its own root, because
-            // the `name()` call that identified it may itself have moved it.
-            // Companion fix to `native_class_get_enum_constants`, which had the
-            // same defect one call deeper.
-            let mut scope = NativeHandleScope::new(ctx);
-            // The enum's own mirror is rooted for the same reason the array is:
-            // the refusal path below reads its canonical name AFTER the
-            // `name()` calls in the loop, any one of which can move it.
-            let enum_class_h = scope.root(enum_class);
-            let constants_h = scope.root(constants);
-            let constants_cur = scope.get(&constants_h);
-            let len = scope.array_length(constants_cur);
-            for i in 0..len {
-                let constants_cur = scope.get(&constants_h);
-                let candidate = match scope.get_array_element(constants_cur, i) {
-                    Value::Object(Some(o)) => o,
-                    _ => continue,
-                };
-                let candidate_h = scope.root(candidate);
-                let candidate_cur = scope.get(&candidate_h);
-                let name_val =
-                    scope.invoke_virtual(candidate_cur, "name", "()Ljava/lang/String;", &[])?;
-                let name_obj = match name_val {
-                    Some(Value::Object(Some(s))) => s,
-                    _ => continue,
-                };
-                if scope.read_string(name_obj).as_deref() == Some(wanted.as_str()) {
-                    return Ok(Some(Value::Object(Some(scope.get(&candidate_h)))));
-                }
-            }
-            // HotSpot: `"No enum constant " + enumType.getCanonicalName() + "."
-            // + name`. This used to omit the type entirely (`No enum constant
-            // MAUVE`), which is both a divergence and a message that never
-            // names the enum that refused. `enum_class` is the mirror this
-            // native was handed, so the type is always in hand here — no call
-            // site has to guess.
-            let enum_class_cur = scope.get(&enum_class_h);
-            let message = lang_class::no_enum_constant_message_for_mirror(
-                &mut *scope,
-                enum_class_cur,
-                &wanted,
-            );
-            Err(RuntimeError::IllegalArgumentException { message }.into())
-        },
-    );
     // Spring Boot 2 launcher: avoid ctor-side ClassCastException in
     // MainMethodRunner.<init> by wiring fields directly.
     registry.register(
@@ -32210,6 +32046,15 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
     // Interface method dispatch resolves through the receiver's concrete
     // class — `System$1` above — but belt-and-suspenders: register on the
     // interface as well so any direct invocation path hits the forwarder.
+    // `layers` on the concrete receiver class, for the same reason
+    // `currentCarrierThread` is registered there: `invokeinterface` dispatches
+    // through `System$1`.
+    registry.register(
+        sys1,
+        "layers",
+        "(Ljava/lang/ClassLoader;)Ljava/util/stream/Stream;",
+        native_jla_layers,
+    );
     let jla = "jdk/internal/access/JavaLangAccess";
     registry.register(
         jla,
@@ -32217,7 +32062,40 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Thread;",
         native_jla_current_carrier_thread,
     );
+    registry.register(
+        jla,
+        "layers",
+        "(Ljava/lang/ClassLoader;)Ljava/util/stream/Stream;",
+        native_jla_layers,
+    );
     registry.set_category(__prev_cat);
+}
+
+/// `JavaLangAccess.layers(ClassLoader)` — the module layers with at least one
+/// module defined to `loader`.
+///
+/// `java.util.ServiceLoader$ModuleServicesLookupIterator.iteratorFor` calls
+/// this for any loader that is neither null nor the platform loader, then walks
+/// the result collecting module-declared service providers. Without it
+/// `ManagementFactory.getPlatformMBeanServer()` dies with `NoSuchMethodError`
+/// the moment strict mode runs its real bytecode.
+fn native_jla_layers(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // EMPTY, and measured rather than assumed. The alternative,
+    // `Stream.of(ModuleLayer.boot())`, was built and run: it reaches the next
+    // unimplemented `JavaLangAccess` method
+    // (`getServicesCatalog(Ljava/lang/ModuleLayer;)`) and dies there instead.
+    // Empty is also the honest answer for this VM -- it defines no NAMED
+    // modules to the application class loader, which is the only loader for
+    // which `iteratorFor` consults this method at all.
+    ctx.invoke(
+        "java/util/stream/Stream",
+        "empty",
+        "()Ljava/util/stream/Stream;",
+        &[],
+    )
 }
 
 pub(crate) fn build_synthetic_module_descriptor(
@@ -40429,13 +40307,16 @@ fn native_exception_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         // with "Can't overwrite cause", and serializing such a throwable emits
         // a null `cause` where HotSpot emits the self back-reference.
         crate::lang_misc::write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
-        crate::lang_misc::capture_throwable_trace(ctx, *this);
+        // `this` borrows `args`; take a local so the funnel's refreshed
+        // reference is what any later statement in this block sees.
+        let mut this = *this;
+        crate::lang_misc::capture_throwable_trace(ctx, &mut this);
     }
     Ok(None)
 }
 
 fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -40523,7 +40404,7 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // returned 0 frames for every one of those subclasses thrown from bytecode.
     // Route through the shared capture helper so they match HotSpot (and the
     // base Throwable/RuntimeException classes, which these lists omit).
-    crate::lang_misc::capture_throwable_trace(ctx, this);
+    crate::lang_misc::capture_throwable_trace(ctx, &mut this);
     Ok(None)
 }
 
@@ -47210,7 +47091,12 @@ mod g23_nomination_witnesses {
              way the per-body check below would be checking the wrong population",
             bodies.len()
         );
-        let call = format!("capture_inheritable_tl_at_{}(ctx, this)", "construction");
+        // `&mut this` since `WORKER-5-NOTE-13`: the funnel allocates, so it
+        // hands the refreshed receiver back rather than stranding the caller
+        // with a pre-move address. Kept EXACT rather than loosened to a name
+        // match -- the point of this witness is that each body passes its own
+        // `this`, and a prefix match would stop checking that.
+        let call = format!("capture_inheritable_tl_at_{}(ctx, &mut this)", "construction");
         let queue = format!("queue_inherited_tl_for_{}(child_hash", "child");
         for (n, body) in bodies.iter().enumerate() {
             assert!(

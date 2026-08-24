@@ -2223,12 +2223,27 @@ fn attach_real_raster(ctx: &mut dyn NativeContext, this: ObjectRef, w: i32, h: i
     ctx.set_field_by_name(this, "colorModel", Value::Object(Some(cm)));
 }
 
+/// Pins `this` across [`sync_raster_pixels_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `this` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn sync_raster_pixels(ctx: &mut dyn NativeContext, this: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*this);
+    let w5_out = sync_raster_pixels_body(ctx, *this);
+    *this = ctx.read_native_pin(w5_pin, *this);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Copy the rasterizer's pixels into the real `DataBufferInt` behind `this`'s
 /// raster, so a raster handed to Java reflects what has been drawn.
 ///
 /// Called at the points where a raster (or its data) leaves for Java. See the
 /// SNAPSHOT limit in the block comment above.
-fn sync_raster_pixels(ctx: &mut dyn NativeContext, this: ObjectRef) {
+fn sync_raster_pixels_body(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let Some(id) = buffered_image_id(ctx, this) else {
         return;
     };
@@ -2312,8 +2327,8 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         "getRaster",
         "()Ljava/awt/image/WritableRaster;",
         |ctx, args| {
-            if let Some(this) = get_obj(args, 0) {
-                sync_raster_pixels(ctx, this);
+            if let Some(mut this) = get_obj(args, 0) {
+                sync_raster_pixels(ctx, &mut this);
                 return Ok(Some(ctx.get_field_by_name(this, "raster")));
             }
             null_ok()
