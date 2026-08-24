@@ -1,4 +1,4 @@
-# `MultithreadedInsertionWithLazyConnectionTest` — NOT FIXED. A ~6x throughput gap on `CompletableFuture` composition crossing the test's own 10-minute budget, plus a separate defect where a stage completes before its transaction does
+# `MultithreadedInsertionWithLazyConnectionTest` — NOT FIXED. A ~6x throughput gap on `CompletableFuture` composition crossing the test's own 10-minute budget, plus a separate defect that silently DROPS inserts — 1200 attempted, 93 landed
 
 ## Status
 **OPEN (2026-08-23). Diagnosed, decomposed, not fixed.** One component was
@@ -7,11 +7,13 @@ on this workload. Nothing here is a single defect — closing this test needs th
 reactive composition path to get several times faster.
 
 A second, *separate* finding is recorded in §5, and it is the more interesting
-half: verticles whose loop stops short, duplicate INSERTs, and HR000090 "live
-transaction detected while closing". §5.1 places the common cause at a stage
-completing before the work it represents finished — HR000090 precedes the
-first duplicate in 8 failing runs out of 8, and one verticle hit it after
-running all 60 iterations. It is **not fixed**. §5.3 is the thing to read
+half: INSERTs are silently LOST. On one failing run 1200 inserts were
+attempted and 93 landed, with only 19 of the 1107 losses producing any error.
+No sequence number is ever committed twice (§5.1), so the downstream event is
+being DROPPED rather than duplicated. The cause looks to be a stage that
+completes before its COMMIT does: HR000090 precedes the first duplicate in 8
+failing runs out of 8, and a verticle that ran all 60 iterations still hit it.
+It is **not fixed**. §5.3 is the thing to read
 before touching it. A 40-run batch put the failure rate at
 **20%**, which makes arms affordable — but the earlier bisect was run at arm
 sizes that were noise at any of these rates. §5.2 records a table-size
@@ -172,26 +174,75 @@ closed under it, and the duplicate INSERTs and the four
 `NonUniqueObjectException`s follow from the resulting inconsistent session
 state. Short loops are a symptom of the same thing, not its cause.
 
-#### The parity, which is the sharpest clue in this page
+#### The `name` column answers it: the event is DROPPED, not duplicated
 
-Across the eight failing runs, the verticles that stopped short did so after an
-**odd** number of `storeEntity` calls, 88 times out of 90:
+`storeEntity` sets `entity.name = <thread>__<localVerticleOperationSequence>`,
+so the rows ARE each verticle's sequence log and need no new instrument.
+`hibfix-seqcheck.sh` runs until a failure and queries before the next run drops
+the table.
+
+Control, on a passing run: 1440 rows, 1440 distinct names, every thread
+complete over `0..59`.
+
+On a failing run (24 threads, N=60, 26th attempt):
+
+| | |
+|---|---:|
+| `storeEntity` calls made (sum of `ITERS`) | **1200** |
+| rows that landed | **93** |
+| distinct names among them | **93** |
+| repeated `(thread, seq)` pairs | **0** |
+| `Duplicate entry` errors | 19 (14 distinct ids) |
+| HR000090 | 23 |
+
+**No sequence number is ever committed twice.** The test's javadoc worries
+about a downstream event "being processed twice (or more) concurrently"; what
+this measures is the other half of the same sentence — events being
+**dropped**. 1200 inserts were attempted and 1107 vanished, while only 19 of
+them produced any error at all. The rest failed silently.
+
+The surviving rows show the shape. Gaps are scattered, not a truncated tail:
 
 ```
-full (60): 870    short & odd: 88    short & even: 2   (the two are 18 and 24)
+thread-13: 3,4,5,6,7,8, _ ,10,…,16, _ ,18,…,28     (0,1,2 never landed; 9 and 17 missing)
+thread-16: 1,…,11, _ ,13,…,16                      (0 never landed; 12 missing)
+thread-14: 0,…,8                                    (complete)
 ```
+
+so individual iterations disappear mid-stream while the verticle carries on —
+and fourteen verticles reported `ITERS 60`, a full loop, yet no thread landed
+more than 24 rows.
+
+That is the mechanism §5.1 describes, now with numbers behind it:
+`s.withTransaction(...)` hands back a stage that completes before the COMMIT
+does. The loop advances on it, the verticle finishes, and at `session.close()`
+the transaction is still live — HR000090, "it will be roll backed" — so
+everything that had not really committed is discarded. The 19 duplicate-key
+errors are a smaller, secondary effect of two verticles racing on the id
+sequence; they cannot account for 1107 missing rows.
+
+**Caveat on scope.** A rolled-back row is not in the table, so this rules out
+double-COMMIT rather than double-EXECUTION. It does not prove nothing ran
+twice — it proves nothing landed twice, and that the dominant effect is loss.
+
+#### The parity, still unexplained
+
+Verticles that stop short do so after an **odd** number of `storeEntity`
+calls, 96 times out of 100 across every failing run measured — 88 of 90 in the
+40-run strict batch, and 8 of 10 in the independent `hibfix-seqcheck.sh` run
+above, which used a different binary and no probe at all. The four exceptions
+are 18, 24, 18 and 30.
 
 `sequentialOperation` is a per-verticle field incremented exactly once per
 `storeEntity`, so this says a dying verticle has almost always made an odd
 number of calls. Under any process that interrupts the loop at a uniformly
-random iteration, 88/90 one-sided is not a coincidence.
+random iteration, 96/100 one-sided is not a coincidence.
 
-It is also directly checkable without any new instrument: `storeEntity` sets
-`entity.name = beforeOperationThread + "__" + localVerticleOperationSequence`,
-so the `name` column IS each verticle's sequence number. Querying `Entity`
-after a failing run for a repeated or skipped sequence per thread answers
-whether an index is processed twice — which is the exact thing this test's
-javadoc says it exists to catch — or simply skipped.
+The sequence query above did NOT explain it: no index is committed twice, and
+the gaps are scattered rather than clustered at the end. So the parity is not
+"one extra call after an even number of successes". It survives a change of
+binary and of probe setting, which rules out the probe as its cause, and it is
+the one signal in this page with no candidate mechanism attached.
 
 ### 5.2 There is NO table-size variable — that claim was mine, and it is refuted
 
@@ -384,25 +435,24 @@ line closes this section.
 
 ### 5.7 What to try next
 
-The 20% failure rate measured over the 40-run batch makes arms affordable
-again: at that rate a 20-run clean arm is p = 0.012. Use
-`hibfix-dupins-loop.sh` and interleave the control with each test arm.
+Failure rates measured here: 8/40 in the strict batch, 1/45 with an older dev
+binary in the same session. The rate is not stable across conditions, so
+interleave the control with every test arm and read §5.3 before sizing one.
 
-1. **The parity of §5.1, first.** Query `Entity` immediately after a failing
-   run and split `name` on `__` to recover each verticle's sequence numbers.
-   Repeated sequence -> the downstream event fired twice, which is what this
-   test was written to catch. Missing sequence -> the loop skipped an index.
-   Neither -> the count is simply where the verticle died, and the parity is
-   telling us something about the failure's timing instead. This needs no VM
-   change and no new instrument.
-2. **`withTransaction` completing early**, per §5.1: a verticle with
-   `ITERS 60` still hit HR000090, and HR000090 precedes the first duplicate in
-   8 runs out of 8. That points at the transaction's completion stage rather
-   than at the loop.
-3. Re-run the `CRATONVM_JIT_DENY` bisect at ≥20 runs per arm. `ArrayLoop` and
-   `AsyncTrampoline` are still on the list; `alwaysTrue` is **off** it (§5.6).
-4. `--nojit` passed 8/8 and JIT 6/8 at the old rate; redo that comparison at
-   the current rate before leaning on it.
+1. **`withTransaction`'s completion stage.** This is now the main suspect and
+   it is specific: 1200 inserts attempted, 93 landed, 1107 gone with no error,
+   23 verticles hitting HR000090 at close. Find where the reactive transaction
+   signals completion relative to the actual COMMIT, and whether the stage can
+   be completed by the connection's own callback before the commit response
+   arrives. The `--nojit` control matters most here.
+2. **The parity of §5.1.** 96 short loops out of 100 ended on an odd count,
+   across two binaries and two probe settings, and nothing found so far
+   explains it. Logging the thread name beside `ITERS` and the loop index at
+   the point the verticle dies would turn it from a statistic into a trace.
+3. Re-run the `CRATONVM_JIT_DENY` bisect. `ArrayLoop` and `AsyncTrampoline`
+   are still on the list; `alwaysTrue` is **off** it (§5.6).
+4. `--nojit` passed 8/8 and JIT 6/8 at the old rate; redo that comparison at a
+   freshly measured rate before leaning on it.
 
 ## 6. What was changed, and why it is not the fix
 
@@ -470,7 +520,7 @@ is generated and machine-local, so it is not committed.
 ## Related files
 
 - `apps/hibernate-reactive/hibernate-reactive-core/src/test/java/org/hibernate/reactive/MultithreadedInsertionWithLazyConnectionTest.java`
-- `apps/hibernate-reactive-suite-runner/HibfixCfProbe.java`, `HibfixCfBound.java`, `hibfix-mtins-run.sh`, `hibfix-dupins-loop.sh`
+- `apps/hibernate-reactive-suite-runner/HibfixCfProbe.java`, `HibfixCfBound.java`, `hibfix-mtins-run.sh`, `hibfix-dupins-loop.sh`, `hibfix-seqcheck.sh`
 - `jit/src/lambda_adapter.rs` — the `AdapterKey` of §5.4 and its `site_shape_collisions` counter
 - [`hib-reactive-3gc-run-regressions-20260820.md`](hib-reactive-3gc-run-regressions-20260820.md) §8
 - [`batchtest-mysql-jdbc-batching-slow-20260822.md`](batchtest-mysql-jdbc-batching-slow-20260822.md) — the same "trivial JDK primitive served by a native" shape, and the same conclusion that the funnel's aggregate is small

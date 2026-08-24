@@ -1257,6 +1257,7 @@ pub const INVENTORY: &[E] = &[
     // A/B isolation, which is exactly why they belong inside the declared
     // surface rather than behind a live `getenv` nobody can enumerate.
     E { group: Group::GC, token: "exact-refproc-survival", on_key: None, off_key: Some("CRATONVM_NO_EXACT_REFPROC_SURVIVAL"), off_word: None },
+    E { group: Group::GC, token: "referent-identity-screen", on_key: None, off_key: Some("CRATONVM_NO_REFERENT_IDENTITY_SCREEN"), off_word: None },
     E { group: Group::GC, token: "g1-coverage-pin", on_key: Some("CRATONVM_G1_COVERAGE_PIN"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-pin-empty-publication", on_key: Some("CRATONVM_G1_PIN_EMPTY_PUBLICATION"), off_key: None, off_word: None },
     E { group: Group::GC, token: "g1-precise-only-roots", on_key: Some("CRATONVM_G1_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None },

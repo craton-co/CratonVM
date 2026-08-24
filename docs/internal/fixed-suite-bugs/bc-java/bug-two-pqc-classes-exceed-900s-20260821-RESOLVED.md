@@ -51,10 +51,11 @@ With all of them applied, and after merging 152 commits of `dev` on top:
 
 Both counts are HotSpot's own for the same suites.
 
-**046's green is not unconditional, and the reason is a defect `dev` already
-has.** An earlier run of the fixed binary came back `Failures: 13, Errors: 24`,
-all of them one pre-existing fault that surfaces on some runs and not others. A
-four-class subset (`XMSSTest`, `XMSSMTTest`, `SLHDSATest`, `FalconTest`; 61 tests), run on
+**046—s green was not unconditional at first, and the reason was a defect `dev`
+already had — FIXED 2026-08-23, one day after this page.** An earlier run of the
+fixed binary came back `Failures: 13, Errors: 24`, all of them that one
+pre-existing fault, which surfaced on some runs and not others. A four-class
+subset (`XMSSTest`, `XMSSMTTest`, `SLHDSATest`, `FalconTest`; 61 tests), run on
 both binaries within the same hour on the same host:
 
 | | result | `ClassCache$CacheRef` lines |
@@ -62,13 +63,17 @@ both binaries within the same hour on the same host:
 | unmodified `dev` | `Failures: 2, Errors: 12` | **21** |
 | with these fixes | **`Failures: 0, Errors: 6`** | **21** |
 
-The six that survive are all one pre-existing defect — `SoftReference.get()`
+The six that survived at the time were all one pre-existing defect — `SoftReference.get()`
 answering a `java.io.ClassCache$CacheRef` where the referent belongs, which
 `java.lang.invoke.MethodTypeForm.cachedLambdaForm` then fails to cast — and its
 count is IDENTICAL on both arms. It is the DEFAULT collector's alone: the same
 subset on the same binary is `OK (61 tests)` under `--XX:UseGc G1` and under
 `--XX:UseGc Generational`, with zero occurrences. It has its own page,
-`softreference-get-answers-another-reference`.
+`softreference-get-answers-another-reference`, and it is now fixed: the post-GC
+referent restore had no identity guard on the referent, so under a compacting
+collector it installed whatever object had slid into that address. With that
+fix, **046 is `OK (316 tests)` on the default collector** — the first time it has
+been.
 
 How often it fires is a property of the RUN, not of the build: across five
 full-suite runs of 046 the count was 0, 1, 24, 45 and 104, on binaries whose only
