@@ -116,7 +116,7 @@ So the expensive thing about these methods is not which backend compiles them.
 It is having an exception table at all.
 
 **ROOT-CAUSED 2026-08-21 — and it was NOT inlining.** See
-`static-exception-table-callee-pays-the-funnel-20260821.md`. Both callees are
+`osr-door-refused-every-exception-table-callee-FIXED-20260824.md`. Both callees are
 compiled and NEITHER is inlined (an OSR body passes an empty `inline_sites`
 map), so the inlining hypothesis recorded here was wrong. What actually happens
 is that a statically-bound callee declaring an exception table is barred from a

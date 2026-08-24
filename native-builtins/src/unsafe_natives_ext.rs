@@ -3486,9 +3486,23 @@ pub(crate) fn native_unsafe_get_float(
     // (`corrupt-value-cell-array-receiver-species-CLOSED-20260823`), which is
     // what turned a silent out-of-bounds write into a named producer.
     let val = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        match unsafe_checked_array_index(ctx, obj, offset) {
-            Some(idx) => ctx.get_array_element(obj, idx),
-            None => Value::Float(0.0),
+        // The read half of `native_unsafe_put_float`'s byte-addressed write.
+        // Restricted to `byte[]`/`boolean[]` on purpose: for a typed array the
+        // element accessor is the authority on how that element is stored, and
+        // re-assembling it from bytes would be a second, unvalidated decoding.
+        if matches!(
+            ctx.heap_element_type_of(obj),
+            cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean
+        ) {
+            match unsafe_read_bytes_from_array(ctx, obj, offset, 4) {
+                Some(b) => Value::Float(f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                None => Value::Float(0.0),
+            }
+        } else {
+            match unsafe_checked_array_index(ctx, obj, offset) {
+                Some(idx) => ctx.get_array_element(obj, idx),
+                None => Value::Float(0.0),
+            }
         }
     } else {
         ctx.get_field(obj, offset)
@@ -3532,6 +3546,22 @@ pub(crate) fn native_unsafe_put_float(
     // (`corrupt-value-cell-array-receiver-species-CLOSED-20260823`), which is
     // what turned a silent out-of-bounds write into a named producer.
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+        // A `byte[]` base is a BYTE-ADDRESSED write of the full 4-byte value,
+        // not a one-element store. `unsafe_multibyte_put!` says the same thing
+        // for short/char/int/long; float and double were not wired to it, and
+        // routing them to `set_array_element` alone would truncate a float to
+        // one byte -- no longer an out-of-bounds write, but still not HotSpot's
+        // answer. This is the idiom `Bits.writeIntL([BII)` (one frame below
+        // Hazelcast's probe in the stack that found this) depends on.
+        let bits = match val {
+            Value::Float(f) => f.to_bits(),
+            Value::Int(i) => i as u32,
+            _ => 0,
+        };
+        if unsafe_write_bytes_to_byte_array(ctx, obj, offset, &bits.to_le_bytes()) {
+            return Ok(None);
+        }
+        // Any other primitive array: the offset names one typed element.
         if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
             ctx.set_array_element(obj, idx, val);
         }
@@ -3581,9 +3611,22 @@ pub(crate) fn native_unsafe_get_double(
     // (`corrupt-value-cell-array-receiver-species-CLOSED-20260823`), which is
     // what turned a silent out-of-bounds write into a named producer.
     let val = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        match unsafe_checked_array_index(ctx, obj, offset) {
-            Some(idx) => ctx.get_array_element(obj, idx),
-            None => Value::Double(0.0),
+        // Byte-addressed over a `byte[]` only — see `native_unsafe_get_float`.
+        if matches!(
+            ctx.heap_element_type_of(obj),
+            cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean
+        ) {
+            match unsafe_read_bytes_from_array(ctx, obj, offset, 8) {
+                Some(b) => Value::Double(f64::from_le_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ])),
+                None => Value::Double(0.0),
+            }
+        } else {
+            match unsafe_checked_array_index(ctx, obj, offset) {
+                Some(idx) => ctx.get_array_element(obj, idx),
+                None => Value::Double(0.0),
+            }
         }
     } else {
         ctx.get_field(obj, offset)
@@ -3627,11 +3670,19 @@ pub(crate) fn native_unsafe_put_double(
     // (`corrupt-value-cell-array-receiver-species-CLOSED-20260823`), which is
     // what turned a silent out-of-bounds write into a named producer.
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+        // Byte-addressed over a `byte[]`, one typed element otherwise — see
+        // `native_unsafe_put_float`.
+        let bits = match val {
+            Value::Double(d) => d.to_bits(),
+            Value::Long(l) => l as u64,
+            _ => 0,
+        };
+        if unsafe_write_bytes_to_byte_array(ctx, obj, offset, &bits.to_le_bytes()) {
+            return Ok(None);
+        }
         if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
             ctx.set_array_element(obj, idx, val);
         }
-        // An out-of-range offset is a no-op, matching the int/long siblings:
-        // never reaches the host accessor.
     } else {
         ctx.set_field(obj, offset, val);
     }

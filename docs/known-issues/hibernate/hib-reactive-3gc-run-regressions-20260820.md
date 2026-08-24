@@ -1391,4 +1391,6 @@ It is **not** the section 8 defect — the 500 was already present pre-`b8fa0585
 
 Full write-up, evidence, reproducer, and the one query that would split the
 remaining search space:
-[techempower-jit-wrong-answer-20260822.md](../jit/techempower-jit-wrong-answer-20260822.md).
+`techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md` (retired to
+docs/internal 2026-08-24: the wrong answer was the pre-bridge `invokedynamic`
+trap, and `CRATONVM_JIT_INDY_BRIDGE=0` puts it back on any current binary).
