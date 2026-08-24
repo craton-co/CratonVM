@@ -974,7 +974,19 @@ impl ConcurrentMarker {
                 // stripe lock, so the atomic read is what makes *that* pairing
                 // well-defined (see `read_value_atomic` / `write_value_atomic`).
                 // SAFETY: slot_ptr points to a valid, aligned Value slot.
-                let value = unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) };
+                // Screen the discriminant before the bytes become a `Value`.
+                // `read_value_atomic` transmutes two words unconditionally, so a
+                // cell holding two heap pointers (a swept-and-reused slot) became
+                // a `Value` with an out-of-range tag — UB the moment it exists,
+                // and a garbage `ObjectRef` we would push onto the mark queue and
+                // later dereference as an `ObjectHeader`. `heap::read_slot`,
+                // `g1::get_field` and `zgc::get_field` were moved onto this guard
+                // for exactly that reason; the marker was not, and it is a
+                // G1/ZGC-only path, which is where the JSON/XML SIGSEGV pattern
+                // lives. Corrupt cells decode to `Value::Object(None)`, which this
+                // loop skips, and are counted by the cell census.
+                let value =
+                    unsafe { crate::heap::read_value_cell_checked(slot_ptr as *const Value, "concurrent_mark::scan_object") };
                 std::sync::atomic::fence(Ordering::SeqCst);
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();
