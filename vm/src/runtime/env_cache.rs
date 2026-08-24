@@ -1279,7 +1279,8 @@ pub fn jit_lambda_const_probe_strict() -> bool {
 /// `CRATONVM_DBG=mic-prof` on `probes/ReactorProbe.java` reports
 /// `kind_static=2_986_402` of `disp_calls=3_356_461` — **89%**.
 ///
-/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
+/// The virtual/interface/special half followed on 2026-08-23; see
+/// [`jit_virtual_bytecode_callee`].
 ///
 /// Default ON. `CRATONVM_JIT_STATIC_BYTECODE_CALLEE=0` restores the by-name
 /// path, which is the A/B a same-binary bisection needs.
@@ -1294,39 +1295,33 @@ pub fn jit_static_bytecode_callee() -> bool {
     })
 }
 
-/// `CRATONVM_JIT_INSTANCE_BYTECODE_CALLEE` — the same idea as
-/// [`jit_static_bytecode_callee`], for the three INSTANCE invoke kinds:
-/// `invokevirtual`, `invokeinterface` and `invokespecial`.
+/// `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` — the invokevirtual / invokeinterface
+/// twin of [`jit_static_bytecode_callee`].
 ///
-/// # Why it is a separate switch
+/// The static half left 71% of a reactive workload's dispatch tail on the
+/// by-name path, because real application code is overwhelmingly virtual and
+/// interface. This is that half.
 ///
-/// The static half went first because it has no receiver, hence no virtual
-/// retarget, no interface rules and no receiver guard. The instance half has
-/// all three, so its memo is keyed by `(call site, DISPATCH class id)` rather
-/// than by the site alone — the dispatch class being the receiver's runtime
-/// class for kinds 0/2 and the CP-resolved owner for kind 1. Two switches let
-/// a bisection say which half a regression came from, on ONE binary.
+/// # What it is worth
 ///
-/// # What is left for it to buy
+/// MEASURED 2026-08-23 on this tree, `probes/XferProbe2.java`, one binary:
 ///
-/// `invokestatic` was 89% of `jit_invoke_dispatch`'s tail on
-/// `probes/ReactorProbe.java`, but the tail is not where the instance volume
-/// is: those calls arrive at `jit_invoke_virtual_mic` instead, whose
-/// `CRATONVM_DBG=mic-prof` census read `mic_calls=9_437_184` with
-/// `hit_noentry=1_954_260` — 1.95 M dispatches that found their receiver, had
-/// no compiled callee to enter, and fell through to the by-name
-/// `invoke_or_native`, i.e. exactly the 1900 ns transition the static fix
-/// removed for its own kind.
+/// | arm | compiled -> compiled | compiled -> INTERPRETED | both interpreted |
+/// |---|---:|---:|---:|
+/// | `invokevirtual` | 33.4 ns | **2031.4 ns** | 535.4 ns |
+/// | `invokeinterface` | 36.0 ns | **2298.9 ns** | 839.8 ns |
 ///
-/// See `known-issues/perf/jit-compiled-caller-to-interpreted-callee-costs-1900ns-20260822.md`.
+/// i.e. compiling the caller and not the callee was 3.8x (virtual) and 2.7x
+/// (interface) SLOWER than compiling neither — the same shape the static half
+/// was fixed for, at the invoke kinds where the volume actually is.
 ///
-/// Default ON. `CRATONVM_JIT_INSTANCE_BYTECODE_CALLEE=0` restores the by-name
-/// path, which is the A/B a same-binary bisection needs.
+/// Default ON. Set to `0` to restore the by-name `invoke_or_native` tail, which
+/// is the A/B a same-binary bisection needs.
 #[inline]
-pub fn jit_instance_bytecode_callee() -> bool {
+pub fn jit_virtual_bytecode_callee() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INSTANCE_BYTECODE_CALLEE") {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
         }

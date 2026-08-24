@@ -1,6 +1,6 @@
 # TechEmpowerTest is not a perf class: with the JIT on it returns a WRONG ANSWER in ~25 s, and it PASSES with `--jit off`
 
-**Status: OPEN CratonVM JIT correctness defect. The reactive LOAD PATH returns `null` for a row that exists (§9, measured directly); compiling `org/hibernate/reactive/` is necessary and a second component (`java/util/ArrayList`, `Arrays`, or `io/vertx/sqlclient/`) acts as a trigger (§8.2, §9.1).** Filed 2026-08-22 on `dev`
+**Status: OPEN CratonVM JIT correctness defect. The reactive LOAD PATH returns `null` for a row that exists (§9, measured directly); compiling `org/hibernate/reactive/` is necessary and a second component (`java/util/ArrayList`, `Arrays`, or `io/vertx/sqlclient/`) acts as a trigger (§8.2, §9.1). The failing id is RANDOM every time, so it is a RACE, not a bad row (§10).** Filed 2026-08-22 on `dev`
 (`b8fa0585e` present — this is NOT that defect, see §4). Reproduces 4/4 with
 the JIT on and 0/3 with it off, on a quiet Azure host, against a HotSpot
 control that passes.
@@ -451,3 +451,95 @@ stable such as `getRandomNumber()` / `Unhandled exception in router`.
    (§8.2), or `createData`/the write path (§2.1). Four components have now been
    eliminated by direct measurement; the page's value is as much in that list as
    in the open question.
+
+## 10. 2026-08-23 — the failing id is RANDOM every time, so this is a race, not a bad row
+
+§9.3 step 2 asked for the id passed to the failing `find()`. The pristine code
+passes `localRandom.getNextRandom()` inline, so the id is unrecoverable at the
+point the null is seen; `randomWorldsForWrite` was restructured minimally to
+bind it (`final Integer probeId`) and print on null:
+
+```
+[IDPROBE] find returned NULL for id=3022 nullNo=1
+```
+
+Nine runs of the minimal two-component repro
+(`ONLY='org/hibernate/reactive/,java/util/ArrayList'`), five of which failed:
+
+| run | result | ids that returned `null` |
+|---|---|---|
+| 1 | PASS | — |
+| 2 | FAIL | 3022 |
+| 3 | PASS | — |
+| 4 | FAIL | **4176, 5472** |
+| 5 | PASS | — |
+| 6 | FAIL | 9836 |
+| 7 | FAIL | 3140 |
+| 8 | FAIL | **7669, 1521** |
+| 9 | PASS | — |
+
+**Seven ids, all distinct: 1521, 3022, 3140, 4176, 5472, 7669, 9836.**
+
+No id repeats across runs. They are spread across the whole `[1, 10000]` space
+with no clustering, no boundary values (never 1 or 10000), and no relation to
+`createData`'s `setBatchSize(1000)` — none is at or adjacent to a multiple of
+1000. Every one of them is provably present in the database: §2.1 established
+`count=10000, minId=1, maxId=10000` with no gaps.
+
+### 10.1 What this rules out
+
+* **Not a specific bad row**, and not a row that failed to persist — the ids
+  differ every time and all exist.
+* **Not a boundary/off-by-one** in id handling — no extreme or near-extreme id
+  ever appears.
+* **Not a batching artifact** from the write side — no alignment with the 1000-row
+  batch size.
+* **Not deterministic on input at all**: the same workload, same binary, same
+  configuration produces a different id each time, and often none.
+
+What is left is a **race**: under 500 concurrent `/updates?queries=20` requests
+across 10 verticles, an arbitrary in-flight `find()` occasionally resolves to
+`null` for a row that exists. Two runs produced *two* nulls, so it is not a
+once-per-process event either.
+
+This is the first evidence that positively characterises the defect's *nature*
+rather than its location, and it narrows the remaining hypotheses considerably:
+a load-plan/session-state race, or a result being resolved against the wrong
+in-flight request, both fit; a wrong constant, a bad row, and an id-arithmetic
+error do not.
+
+### 10.2 The probe suppresses the defect, and the numbers say by how much
+
+With this instrument the failure rate drops to **5 of 9** runs, against **4 of 4**
+on the uninstrumented binary (§1). The restructuring is the likely cause — binding
+`probeId` and replacing the `worlds::add` method reference with a lambda changes
+what that hot body compiles to.
+
+The passing runs are also markedly slower (57–109 s) than the failing ones
+(27–51 s), which is consistent with the whole class of observations on this page:
+the configurations that avoid the wrong answer are the slower ones, and the race
+needs the fast path to lose.
+
+Anyone tightening this further should expect the instrument to fight them, and
+should keep a same-binary uninstrumented control alongside — the pattern §8.2 of
+the hibernate-reactive page established, and which held again here.
+
+### 10.3 What the next session should do
+
+1. **Treat it as a concurrency defect from here.** The remaining question is
+   which shared state is being raced, not which row or which id.
+2. The cheapest next discriminator is **concurrency scaling**: the fixture's
+   `REQUEST_NUMBER = 500` and `VERTICLE_INSTANCES = 10` are plain constants in
+   `TechEmpowerTest`/`WorldVerticle`. Dropping the concurrency toward 1 and
+   seeing where the failure rate goes to zero would say whether the race is
+   between requests, between verticles, or within a single session's own
+   pipeline — and a configuration that still fails at low concurrency would be a
+   far easier target to debug than 500 in-flight requests.
+3. `ReactiveDeferredResultSetAccess` remains the most-named class in the traces
+   and still has not been instrumented; a per-request identity on the result-set
+   access path would show directly whether one request is being handed another's
+   (empty) result.
+4. Everything eliminated so far, in one place, so it is not re-tried: the write
+   path (§2.1), `ArrayList`/`Arrays` as the source (§9), `CompletableFuture` and
+   Vert.x core (§8.2), ORM core and Mutiny (§8.2), and now data-dependence of any
+   kind (§10.1).

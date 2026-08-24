@@ -644,6 +644,34 @@ pub struct Monitor {
     /// `0` means "none displaced": either the object was never hashed before it
     /// inflated, or it has not been hashed at all yet.
     displaced_hash: std::sync::atomic::AtomicI32,
+    /// How many `Object.notify()` / `Object.notifyAll()` calls this monitor has
+    /// SERVED, ever. Diagnostic only; carries no semantics.
+    ///
+    /// This is the counter that partitions the netty
+    /// `ParameterizedSslHandlerTest` stall (see
+    /// `known-issues/netty/parameterizedsslhandlertest-promise-never-completes-*`).
+    /// At the stall the promise is complete and the waiter is registered
+    /// (`result != null`, `waiters == 1`), and the two remaining explanations
+    /// need opposite fixes:
+    ///
+    /// * **zero notifies since the wait began** — the completer never called
+    ///   `notifyAll()`. The defect is then above the monitor: either
+    ///   `checkNotifyWaiters` read a stale `waiters == 0`, or `setValue0`'s
+    ///   `compareAndSet` never reported the success it performed, so the branch
+    ///   containing the call was not taken at all.
+    /// * **one or more** — the notification WAS delivered to this monitor and
+    ///   the waiter did not observe it. The defect is then the condvar
+    ///   handshake in this file.
+    ///
+    /// One relaxed add under a lock the notifier already holds, and it answers
+    /// that in ONE stall instead of a rate. `wake_all_for_interrupt` is counted
+    /// separately (`interrupt_wakes`) because it is the VM answering
+    /// `Thread.interrupt()`, not Java code signalling a condition — folding the
+    /// two together would let an unrelated interrupt masquerade as the missing
+    /// `notifyAll`.
+    notify_calls: std::sync::atomic::AtomicU64,
+    /// `wake_all_for_interrupt` calls — see [`Self::notify_calls`].
+    interrupt_wakes: std::sync::atomic::AtomicU64,
 }
 
 /// The mutable state protected by a monitor's mutex.
@@ -691,7 +719,19 @@ impl Monitor {
             wait_condvar: Condvar::new(),
             mark_ref: std::sync::atomic::AtomicBool::new(false),
             displaced_hash: std::sync::atomic::AtomicI32::new(0),
+            notify_calls: std::sync::atomic::AtomicU64::new(0),
+            interrupt_wakes: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The `(notify + notifyAll, interrupt-wake)` totals this monitor has
+    /// served. Diagnostic only — see [`Self::notify_calls`].
+    #[inline]
+    pub(crate) fn notify_totals(&self) -> (u64, u64) {
+        (
+            self.notify_calls.load(Ordering::Relaxed),
+            self.interrupt_wakes.load(Ordering::Relaxed),
+        )
     }
 
     /// The identity hash displaced into this monitor, or `0` if none.
@@ -1043,6 +1083,15 @@ impl Monitor {
         state.entry_count = 0;
         self.entry_condvar.notify_one();
 
+        // The notify/interrupt-wake totals AS OF THE MOMENT THIS WAIT BEGAN.
+        // Taken under the state lock that a notifier must also hold, so the
+        // snapshot cannot straddle one. The watchdog dump below reports the
+        // DELTA, which is the whole question at a stall: a delta of 0 means no
+        // `notifyAll()` ever reached this monitor after the waiter registered,
+        // and a non-zero delta means one did and was not observed. See
+        // `Monitor::notify_calls`.
+        let (notifies_at_entry, interrupt_wakes_at_entry) = self.notify_totals();
+
         // Block on wait_condvar with periodic interrupt checks.
         // We use short timed waits so that Thread.interrupt() (which only sets
         // a flag) can wake us within a bounded interval.
@@ -1231,6 +1280,22 @@ impl Monitor {
                                 eprintln!("[WAIT-OBJECT] handle={src} obj={:p}", obj.as_ptr());
                                 emit_wait_object_state(obj);
                             }
+                            // THE PARTITIONING LINE. `notifies_since_wait=0`
+                            // with a completed promise and `waiters == 1` says
+                            // the completer never called `notifyAll()` on this
+                            // monitor — so the defect is in the Java-level
+                            // bookkeeping above it (a stale `waiters` read, or
+                            // a `compareAndSet` that wrote without reporting
+                            // success), NOT in the condvar handshake. Any
+                            // non-zero value says the reverse. It needs one
+                            // stall, not a rate.
+                            let (notifies_now, interrupt_wakes_now) = self.notify_totals();
+                            eprintln!(
+                                "[WAIT-OBJECT] notifies_since_wait={} interrupt_wakes_since_wait={} \
+                                 (monitor totals: notify={notifies_now} interrupt={interrupt_wakes_now})",
+                                notifies_now.wrapping_sub(notifies_at_entry),
+                                interrupt_wakes_now.wrapping_sub(interrupt_wakes_at_entry),
+                            );
                             // ORPHAN CHECK. If the object's mark word stops
                             // pointing at `self`, a later `notifyAll()` inflates
                             // a DIFFERENT monitor and can never reach this
@@ -1291,6 +1356,8 @@ impl Monitor {
         if state.owner != Some(thread_id) {
             return Err(MonitorError::NotOwner);
         }
+        self.notify_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.wait_condvar.notify_one();
         Ok(())
     }
@@ -1303,6 +1370,8 @@ impl Monitor {
         if state.owner != Some(thread_id) {
             return Err(MonitorError::NotOwner);
         }
+        self.notify_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.wait_condvar.notify_all();
         Ok(())
     }
@@ -1329,6 +1398,8 @@ impl Monitor {
     /// Taken under the monitor state lock, exactly like `notify`/`notify_all`.
     pub(crate) fn wake_all_for_interrupt(&self) {
         let _state = self.state.lock();
+        self.interrupt_wakes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.wait_condvar.notify_all();
     }
 }

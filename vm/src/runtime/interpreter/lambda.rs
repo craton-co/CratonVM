@@ -2170,11 +2170,11 @@ pub(crate) fn build_lambda_impl_cached(
 /// the life of the process. That is the defect the LAMBDA-JIT-TIERUP block in
 /// [`try_invoke_cached_lambda_impl`] answers inline for lambda SAM bodies —
 /// read its comment for the measurement, which is the same one that applies
-/// here. `jit::helpers`' two dispatch templates
-/// (`try_jit_static_bytecode_callee`, `try_jit_instance_bytecode_callee`)
-/// build the same frame from the same `CachedBytecodeMethod` and inherited the
-/// same hole, so the block is factored out here rather than written a third
-/// time.
+/// here. `jit::helpers`' three dispatch templates
+/// (`try_jit_static_bytecode_callee`, `try_jit_virtual_bytecode_callee`,
+/// `try_jit_special_bytecode_callee`) build the same frame from the same
+/// `CachedBytecodeMethod` and inherited the same hole, so the block is
+/// factored out here rather than written a fourth time.
 ///
 /// # Why it also answers "is it already compiled?"
 ///

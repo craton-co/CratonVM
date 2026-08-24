@@ -560,14 +560,65 @@ impl Drop for SelectorState {
     }
 }
 
+/// One registry entry: the selector's state, plus a copy of its `open` flag
+/// that can be read WITHOUT taking the state mutex.
+///
+/// The duplicate flag exists because [`selector_close`] cannot remove the
+/// entry — other threads hold `MutexGuard`s derived from it, and the registry
+/// is a `HashMap` whose values are stored inline — so a long-lived process
+/// accumulates dead entries. One run of ONE netty test class left **1056
+/// selectors, 1040 of them closed**, and `deregister_fd_everywhere` runs on
+/// EVERY channel close: without this flag it locked and unlocked ~1000 dead
+/// mutexes each time, purely to read a `bool` and find nothing.
+///
+/// It is a mirror, not the source of truth: `SelectorState::open` stays
+/// authoritative and every correctness decision still reads it under the lock.
+/// This copy is only ever used to SKIP an entry that has already been closed,
+/// and `open` is monotone (open once, closed forever), so a skip cannot race a
+/// re-open — there is no such transition.
+struct SelectorSlot {
+    /// Lock-free mirror of `SelectorState::open`. Monotone true -> false.
+    open: std::sync::atomic::AtomicBool,
+    state: Mutex<SelectorState>,
+}
+
+impl SelectorSlot {
+    fn new() -> Self {
+        Self {
+            open: std::sync::atomic::AtomicBool::new(true),
+            state: Mutex::new(SelectorState::new()),
+        }
+    }
+
+    /// Take the state lock. Named `lock` so every `regs.get(&id)` call site
+    /// reads exactly as it did when the value WAS the mutex.
+    #[inline]
+    fn lock(&self) -> parking_lot::MutexGuard<'_, SelectorState> {
+        self.state.lock()
+    }
+
+    /// Take the state lock if it is uncontended. Same delegation as
+    /// [`Self::lock`], for the diagnostic dumps that must never block.
+    #[inline]
+    fn try_lock(&self) -> Option<parking_lot::MutexGuard<'_, SelectorState>> {
+        self.state.try_lock()
+    }
+
+    /// Has this selector been closed? Answers without touching the mutex.
+    #[inline]
+    fn is_open(&self) -> bool {
+        self.open.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Process-wide selector registry. Keyed by an integer id we allocate at
 /// `Selector.open()`.
 ///
 /// **Do not call `.read()` on this directly — use [`selectors_read`].** See its
 /// doc comment for the deadlock that rule exists to stop; the one legitimate
 /// `.write()` is [`selectors_open_write`].
-fn selectors() -> &'static RwLock<HashMap<i32, Mutex<SelectorState>>> {
-    static REG: OnceLock<RwLock<HashMap<i32, Mutex<SelectorState>>>> = OnceLock::new();
+fn selectors() -> &'static RwLock<HashMap<i32, SelectorSlot>> {
+    static REG: OnceLock<RwLock<HashMap<i32, SelectorSlot>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -608,11 +659,11 @@ thread_local! {
 /// as well as debug. A `#[cfg(debug_assertions)]` check would have said nothing
 /// about the release binary the suites actually run.
 struct SelectorsRead {
-    guard: parking_lot::RwLockReadGuard<'static, HashMap<i32, Mutex<SelectorState>>>,
+    guard: parking_lot::RwLockReadGuard<'static, HashMap<i32, SelectorSlot>>,
 }
 
 impl std::ops::Deref for SelectorsRead {
-    type Target = HashMap<i32, Mutex<SelectorState>>;
+    type Target = HashMap<i32, SelectorSlot>;
     fn deref(&self) -> &Self::Target {
         &self.guard
     }
@@ -655,7 +706,7 @@ fn selectors_read_depth() -> u32 {
 /// place), so it is asserted rather than left to be discovered by a stuck
 /// process. There is exactly one caller and it holds nothing.
 fn selectors_open_write(
-) -> parking_lot::RwLockWriteGuard<'static, HashMap<i32, Mutex<SelectorState>>> {
+) -> parking_lot::RwLockWriteGuard<'static, HashMap<i32, SelectorSlot>> {
     debug_assert_eq!(
         selectors_read_depth(),
         0,
@@ -729,7 +780,7 @@ fn closed_selector_typed(ctx: &mut dyn NativeContext) -> MethodCallFailed {
 /// tests and for `sun.nio.ch.SelectorProvider.openSelector0()` callers.
 pub fn selector_open() -> i32 {
     let id = next_selector_id();
-    selectors_open_write().insert(id, Mutex::new(SelectorState::new()));
+    selectors_open_write().insert(id, SelectorSlot::new());
     id
 }
 
@@ -748,6 +799,12 @@ pub fn selector_close(id: i32) {
             return;
         }
         st.open = false;
+        // Publish the close to the lock-free mirror so the registry-wide walks
+        // can skip this entry without locking it. Under the state lock, so the
+        // two can never disagree in the direction that matters (mirror says
+        // open, state says closed) — see `SelectorSlot::open`.
+        s.open
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // An in-flight epoll_wait must be woken before its self-pipe and
         // epoll fd can be released. In particular, closing an epoll fd from a
         // different thread is not a portable wakeup primitive. Keep those
@@ -845,6 +902,9 @@ pub fn selector_refresh_udp(net_fd: i32, fresh: &UdpSocket) {
         let regs = selectors_read();
         regs.iter()
             .filter(|(_, s)| {
+                if !s.is_open() {
+                    return false;
+                }
                 let st = s.lock();
                 st.open && st.keys.get(&net_fd).is_some_and(|k| !k.cancelled)
             })
@@ -1020,6 +1080,9 @@ pub fn selector_register(
 fn slot_of_key_obj(key_obj: ObjectRef) -> Option<(i32, i32)> {
     let regs = selectors_read();
     for (sel_id, sel) in regs.iter() {
+        if !sel.is_open() {
+            continue;
+        }
         let st = sel.lock();
         if let Some(fd) = st
             .keys
@@ -1183,6 +1246,14 @@ pub fn selector_cancel(id: i32, net_fd: i32) {
 pub fn deregister_fd_everywhere(net_fd: i32) {
     let regs = selectors_read();
     for (_sel_id, sel) in regs.iter() {
+        // A closed selector cleared `keys` in `selector_close` and can never
+        // gain another registration, so there is nothing here to remove. The
+        // skip is the point: this function runs on EVERY channel close and the
+        // registry is append-only, so without it a netty test class ends up
+        // taking ~1000 dead mutexes per close. See `SelectorSlot::open`.
+        if !sel.is_open() {
+            continue;
+        }
         let mut st = sel.lock();
         st.keys.remove(&net_fd);
     }
@@ -1204,6 +1275,7 @@ pub fn deregister_channel_everywhere(ctx: &mut dyn NativeContext, channel: Objec
     let candidates: Vec<(i32, ObjectRef)> = {
         let regs = selectors_read();
         regs.iter()
+            .filter(|(_, sel)| sel.is_open())
             .flat_map(|(sel_id, sel)| {
                 let st = sel.lock();
                 st.keys

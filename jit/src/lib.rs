@@ -6380,6 +6380,26 @@ pub enum InlineRefusal {
     BudgetAlreadySpent,
     /// The receiver profile has saturated ([`ReceiverShape::Saturated`]).
     SaturatedProfile { observations: u32 },
+    /// The callee is force-interpreted by `CRATONVM_JIT_DENY` /
+    /// `CRATONVM_JIT_BISECT_ONLY`.
+    ///
+    /// Those levers are documented as "a matching method is force-interpreted
+    /// (never JIT-compiled)", and until 2026-08-23 they were consulted ONLY by
+    /// `compile_gate::admit` — i.e. by the three COMPILE doors. The inline
+    /// planner never asked, so a denied callee was still `inline-planned` and
+    /// spliced into a compiled caller's body. MEASURED on
+    /// `probes/XferProbe2.java`: with
+    /// `CRATONVM_JIT_DENY=XferProbe2$Base.calleeSpecial` set,
+    /// `CRATONVM_DBG=jitc` printed `inline-planned
+    /// XferProbe2$Base.calleeSpecial(I)I @pc=2` and the arm read 24.2 ns/op
+    /// against 25.8 undenied — the lever moved nothing because the callee was
+    /// still running as compiled code, just not as its own artifact.
+    ///
+    /// That is not untidiness: it silently invalidates any bisect built on the
+    /// lever. A conclusion of the form "the arm stalled with X force-
+    /// interpreted, therefore X's compiled code is not the cause" is only
+    /// sound if X really was interpreted.
+    ForceInterpreted,
 }
 
 impl InlineRefusal {
@@ -6405,6 +6425,7 @@ impl InlineRefusal {
             InlineRefusal::CalleeUnresolved { .. } => "callee-unresolved",
             InlineRefusal::BudgetAlreadySpent => "budget-already-spent",
             InlineRefusal::SaturatedProfile { .. } => "saturated-profile",
+            InlineRefusal::ForceInterpreted => "force-interpreted",
         }
     }
 }
@@ -20290,7 +20311,19 @@ fn try_compile_inner(
                         f(receiver_class_id, &class_name, &method_name, &descriptor)
                     })
                 };
-                if inline_budget_remaining == 0 {
+                // The bisect levers apply HERE too — see
+                // `InlineRefusal::ForceInterpreted` for what it cost that they
+                // did not. Checked against the CONSTANT-POOL name, which is the
+                // callee for the statically bound kinds (3 | 1) this planner
+                // actually admits by default; guarded virtual/interface
+                // speculation resolves its body per receiver class and is
+                // default-OFF (`CRATONVM_JIT_GUARDED_VIRTUAL_INLINE`), so a
+                // deny aimed at a speculated receiver's own class name is NOT
+                // covered by this and would need the receiver's name, which
+                // this site does not have.
+                if jit_force_interpret(&class_name, &method_name) {
+                    inline_tally.record_refusal(&InlineRefusal::ForceInterpreted);
+                } else if inline_budget_remaining == 0 {
                     inline_tally.record_refusal(&InlineRefusal::BudgetAlreadySpent);
                 } else {
                     // A guarded site's callee is NOT the constant-pool callee
