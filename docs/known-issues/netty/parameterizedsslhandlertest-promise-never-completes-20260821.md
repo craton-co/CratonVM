@@ -1,7 +1,12 @@
 # `ParameterizedSslHandlerTest` — a completed promise whose waiter is never woken
 
-**Status: OPEN. The awaited promise is ALREADY COMPLETE and the waiter IS
-registered, yet the thread stays parked in `Object.wait()` forever.**
+**Status: OPEN. A thread stays parked in `Object.wait()` forever on a promise
+whose `result` field is non-null and whose `waiters` count is 1.**
+
+**Read that sentence and not the old one.** This page said "the awaited promise
+is ALREADY COMPLETE", and that is an inference, not the observation — see the
+UNCANCELLABLE section below, which is the leading hypothesis as of 2026-08-23
+and would make the observation entirely benign.
 
 **2026-08-23 — the "not the monitor / not the JIT" narrowing is WEAKER than
 this page claimed, and one of its two refutations has been withdrawn.** Three
@@ -51,6 +56,67 @@ things changed:
 The selector-registry leak recorded at the bottom of this page is **FIXED**
 independently, on its own merits, and is still not shown to cause this stall.
 
+## Also: `result != null` does not mean the promise completed — and every stalled promise is a channel-op promise
+
+`io.netty.util.concurrent.DefaultPromise` keeps three kinds of value in one
+field:
+
+```java
+private static final Object SUCCESS = new Object();
+private static final Object UNCANCELLABLE = new Object();
+private static boolean isDone0(Object result) {
+    return result != null && result != UNCANCELLABLE;
+}
+public boolean setUncancellable() {
+    if (RESULT_UPDATER.compareAndSet(this, null, UNCANCELLABLE)) return true;
+    …
+}
+```
+
+`UNCANCELLABLE` is a **non-null marker for a promise that is still PENDING**.
+`setUncancellable()` publishes it and correctly does not notify. A waiter's
+`while (!isDone())` correctly parks. `checkNotifyWaiters` is correctly never
+called. So `result != null` + `waiters == 1` + no notification + parked forever
+is EXACTLY what a promise that was made uncancellable and never completed looks
+like — with no memory-ordering defect anywhere.
+
+**And netty makes every channel-operation promise uncancellable on the way
+in.** `AbstractChannel$AbstractUnsafe` opens `bind`, `register0`, `connect` and
+`close` with `if (!promise.setUncancellable() …) return;`. The two promise
+classes this page has ever observed —
+`AbstractBootstrap$PendingRegistrationPromise` and `DefaultChannelPromise` —
+are precisely those promises. So the state this page calls unreachable is the
+ORDINARY state of a pending channel operation.
+
+The dump could not tell the two apart: it printed
+`result=Some(Object(Some(ObjectRef{..})))` for both. It now compares the value
+against the receiver's own `UNCANCELLABLE` / `SUCCESS` statics and prints
+`result_is=UNCANCELLABLE--STILL-PENDING` / `SUCCESS` / `other(<class>)` /
+`null(PENDING)`, and `unknown(sentinels-unresolved)` when it cannot resolve
+them rather than silently falling back to "not uncancellable".
+
+### The `CRATONVM_WAIT_SPURIOUS_MS` A/B does not survive this either
+
+That A/B is the page's stated foundation — "it is what establishes the promise
+was already complete". It does not establish that. The switch makes **every**
+untimed `Object.wait()` in the process return after `n` ms, not just this one.
+A run that completes under it therefore shows only that SOME untimed wait
+somewhere was stuck; if the stuck one belongs to an event-loop or task-queue
+thread, waking THAT thread lets the channel operation finish and the observed
+promise complete normally — which is indistinguishable, at the level of "did
+the run pass", from waking the observed waiter.
+
+That reading is also simpler, and it fits everything: the watchdog dumps the
+first parked thread it reaches, which is the TEST thread; the test thread is
+parked on a pending promise because the thread that would complete it is itself
+parked somewhere else. **This is reasoning, not a measurement.** What would
+settle it, in one stall each:
+
+* `result_is=` on the observed promise (instrument added, not yet run);
+* **every** thread parked in `Object.wait()` at stall time and what each is
+  parked on, rather than just the first. The stall logs already carry
+  `N thread(s) dumped`, so the raw material may already be on disk.
+
 ## The measurement that settles it
 
 At stall time, with the watchdog dumping the state of the object the thread is
@@ -65,10 +131,12 @@ parked on:
 
 Both halves matter:
 
-* **`result != null`** — the promise **has completed**. Nothing is outstanding;
-  the reactor did its job.
+* ~~**`result != null`** — the promise **has completed**.~~ **WITHDRAWN
+  2026-08-23** — see the UNCANCELLABLE section above. `result != null` is
+  consistent with a promise that is still pending, and for a channel-operation
+  promise it is the EXPECTED state.
 * **`waiters == 1`** — the parked thread **did** register itself
-  (`incWaiters()`) before calling `wait()`.
+  (`incWaiters()`) before calling `wait()`. This half stands.
 
 > ### ⚠ This dump is UNSOUND under a moving collector — read the caveat
 >
@@ -129,7 +197,9 @@ synchronized (this) {                    // DefaultPromise.await*, BCI 18
 
 Both blocks synchronize on the same object, and the orphan check (below) proves
 they resolve the same monitor. With correct `synchronized` semantics the
-observed state is unreachable. Exactly one of these reads must have been stale:
+observed state is unreachable **IF the promise really completed** — which the
+UNCANCELLABLE section above puts in doubt. On that assumption, exactly one of
+these reads must have been stale:
 
 1. **the waiter's volatile read of `result` at BCI 20** — if it saw `null` after
    the completer had already published a non-null `result` and run
@@ -356,11 +426,22 @@ stall, and fixed on those terms rather than offered as the stall's fix.
    completed" conclusion on this page collapses, the monitor is exonerated
    outright, and the question becomes what failed to complete the promise —
    which is a different investigation with a different suspect list.
+3b. **Dump EVERY thread parked in `Object.wait()` at stall time**, not the
+   first one. If the test thread is parked on a pending promise because the
+   thread that would complete it is itself parked, the current dump names the
+   symptom and never the cause. The existing logs report `N thread(s) dumped`,
+   so this may be answerable from disk without a new run.
 4. Grep an existing stall log for netty's own
    `"Failed to mark a promise as success"` warning. If it is there, `setValue0`
    returned `false` after writing `result`, and the defect is in
    `AtomicReferenceFieldUpdater.compareAndSet` rather than in the monitor at
    all — which no instrument on this page would have shown. Free to check.
+   **DONE 2026-08-23 — REFUTED.** No `/tmp/sslloop/*/run-*.log` on the Azure
+   host contains that string, nor an `IllegalStateException` / "complete
+   already" from the throwing `setSuccess` sibling; the only match anywhere is
+   the unrelated "Failed to mark a promise as failure because it has failed
+   already". So whenever `result` holds a real completion, `setValue0` returned
+   true and `checkNotifyWaiters()` did run.
 5. Fix whatever 2/3/4 name; re-measure the rate over ≥40 runs.
 6. ~~Fix the selector-registry leak independently~~ — **DONE 2026-08-23.**
 
