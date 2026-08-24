@@ -769,7 +769,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-70 tokens.
+71 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -783,6 +783,7 @@ export inherited from a parent shell.
 | `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
 | `defrag-promote` | `CRATONVM_NO_DEFRAG_PROMOTE` |
 | `exact-refproc-survival` | `CRATONVM_NO_EXACT_REFPROC_SURVIVAL` |
+| `referent-identity-screen` | `CRATONVM_NO_REFERENT_IDENTITY_SCREEN` |
 | `g1-coverage-pin` | `CRATONVM_G1_COVERAGE_PIN` |
 | `g1-pin-empty-publication` | `CRATONVM_G1_PIN_EMPTY_PUBLICATION` |
 | `g1-precise-only-roots` | `CRATONVM_G1_PRECISE_ONLY_ROOTS` |
