@@ -25,9 +25,17 @@ import java.util.function.*;
  *                          body at all.
  *   serializable           `altMetafactory`, whose bootstrap takes extra
  *                          static arguments.
- *   concat-and-lambda      BOTH bridged bootstraps in one method, which is the
+ *   concat-and-lambda      BOTH bridged site kinds in one method, which is the
  *                          case that proves the site pointer's `kind` tag is
  *                          read rather than assumed.
+ *   record-methods         `ObjectMethods.bootstrap` — a record's
+ *                          equals/hashCode/toString, whose indy returns `Z`,
+ *                          `I` and `Ljava/lang/String;`. The two primitive
+ *                          returns are what exercise the descriptor-typed push
+ *                          rather than the reference one.
+ *   pattern-switch         `SwitchBootstraps.typeSwitch`, an indy returning
+ *                          `I`, over four receiver kinds including the
+ *                          `default` arm.
  *   throwing               an exception raised INSIDE a bridged lambda's body,
  *                          caught by the caller. The bridge's failure edge
  *                          returns the `i64::MIN` deopt sentinel; a compiled
@@ -117,6 +125,39 @@ public class IndyBridgeProbe {
         return s;
     }
 
+    // `ObjectMethods.bootstrap` — a record's equals/hashCode/toString are each
+    // ONE `invokedynamic`, with `Z`, `I` and `Ljava/lang/String;` returns. Those
+    // three methods were permanently uncompilable before the bridge learned a
+    // non-reference return, and they are on the hot path of anything that puts
+    // records in a collection.
+    static long recordObjectMethods(int n) {
+        long s = 0;
+        Box a = new Box(3);
+        for (int i = 0; i < n; i++) {
+            Box b = new Box(i & 7);
+            s += b.hashCode();
+            s += a.equals(b) ? 1 : 0;
+            s += b.toString().length();
+        }
+        return s;
+    }
+
+    // `SwitchBootstraps.typeSwitch` — a pattern-matching switch is one
+    // `invokedynamic` returning `I`.
+    static long patternSwitch(Object[] xs, int n) {
+        long s = 0;
+        for (int i = 0; i < n; i++) {
+            Object o = xs[i & 3];
+            s += switch (o) {
+                case Integer x -> x + 1;
+                case String x -> x.length() + 2;
+                case Box x -> x.v() + 3;
+                default -> 4;
+            };
+        }
+        return s;
+    }
+
     static long throwingLambda(int n) {
         long s = 0;
         for (int i = 0; i < n; i++) {
@@ -147,6 +188,8 @@ public class IndyBridgeProbe {
             fold(boundRef(n));
             fold(serializableLambda(n));
             fold(concatAndLambda(n));
+            fold(recordObjectMethods(n));
+            fold(patternSwitch(new Object[] { 5, "seven", new Box(9), 1.5 }, n));
             fold(throwingLambda(n));
             System.out.println("pass " + pass + " checksum=" + checksum);
         }

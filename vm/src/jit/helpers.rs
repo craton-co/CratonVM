@@ -14025,16 +14025,16 @@ pub unsafe extern "C" fn jit_indy_bridge(
                 args_ptr,
                 count,
             ) {
-                Ok(Some(obj)) => {
+                Ok((bits, Some(obj))) => {
                     // Object-return handoff root, same contract as every other
                     // JIT helper that hands a fresh reference back to compiled
                     // code (see `jit_integer_value_of_direct`): the lambda
                     // proxy was allocated inside this call and nothing else
                     // roots it between here and the caller's store.
                     thread.native_pending_return = Some(obj);
-                    obj.as_ptr() as i64
+                    bits
                 }
-                Ok(None) => 0,
+                Ok((bits, None)) => bits,
                 Err(error) => {
                     // `JitInvokeInfo` is what `handle_jit_dispatch_error` uses
                     // for its diagnostics only; the stash and the sentinel do

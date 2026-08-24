@@ -221,6 +221,12 @@ pub struct JitIndyGenericSite {
     class_id: ClassId,
     cp_index: u16,
     target_descriptor: Arc<str>,
+    /// First byte of the site's RETURN descriptor. The bridge hands compiled
+    /// code one `i64`, and this is what says how the `Value` was encoded into
+    /// it — the same encoding `jit_invoke_dispatch` uses for an ordinary
+    /// invoke's return, so the call site pushes it with the same three-way
+    /// (`xmm0` / plain / oop-marked) choice.
+    return_type: u8,
 }
 
 /// The bridge kind of a site pointer handed to compiled code, or `0` for null.
@@ -317,23 +323,41 @@ pub fn make_jit_indy_bridge_site_from_parts(
         _ => return None,
     };
     let (_, descriptor) = pool.get_name_and_type(nat_index)?;
-    // The bridge's ABI returns one `i64` that the codegen pushes as an object
-    // reference. A site returning a primitive would need a different push kind
-    // and a different null convention, so it is refused rather than guessed —
-    // and `LambdaMetafactory` always returns the functional interface instance,
-    // so this costs the shape it is for nothing.
-    if !descriptor.rsplit(')').next().is_some_and(|ret| {
-        ret.starts_with('L') || ret.starts_with('[')
-    }) {
+    // A `void` site has no stack effect for the codegen's typed push to model
+    // and does not occur in practice, so it keeps the trap rather than being
+    // guessed at. Every other return kind is served: the bridge hands back one
+    // `i64` and the call site pushes it by the descriptor, exactly as an
+    // ordinary invoke's return is pushed.
+    let ret = descriptor.rsplit(')').next()?.as_bytes().first().copied()?;
+    if ret == b'V' {
         return None;
     }
     let bsm = bootstraps.get(bsm_index as usize)?;
     let handle = resolve_method_handle_full(pool, bsm.bootstrap_method_ref).ok()?;
-    if handle.class_name.as_ref() != LAMBDA_METAFACTORY {
-        return None;
-    }
-    if handle.member_name.as_ref() != METAFACTORY && handle.member_name.as_ref() != ALT_METAFACTORY
-    {
+    // The admitted set is exactly the bootstraps whose implementation in
+    // `execute_invokedynamic` touches the frame ONLY through its operand stack
+    // and its `class_id` — which is all the synthetic frame this bridge builds
+    // can offer. Between them they cover every shape that makes a whole method
+    // permanently uncompilable in ordinary Java:
+    //
+    //   `LambdaMetafactory`  every lambda and method reference;
+    //   `SwitchBootstraps`   a pattern-matching `switch`;
+    //   `ObjectMethods`      a record's `equals`/`hashCode`/`toString`.
+    //
+    // Deliberately NOT admitted: Groovy's `IndyInterface`, and the generic
+    // MethodHandle fallback below it. Those build adapter chains whose
+    // behaviour this tree already documents as caller-sensitive (see the
+    // `groovy_cast_to_boolean` arm), and a bridge is the wrong place to
+    // discover that. They keep the trap they have today.
+    let admitted = match handle.class_name.as_ref() {
+        LAMBDA_METAFACTORY => {
+            matches!(handle.member_name.as_ref(), METAFACTORY | ALT_METAFACTORY)
+        }
+        SWITCH_BOOTSTRAPS => matches!(handle.member_name.as_ref(), TYPE_SWITCH | ENUM_SWITCH),
+        OBJECT_METHODS => handle.member_name.as_ref() == BOOTSTRAP,
+        _ => false,
+    };
+    if !admitted {
         return None;
     }
     Some(Box::into_raw(Box::new(JitIndyGenericSite {
@@ -341,6 +365,7 @@ pub fn make_jit_indy_bridge_site_from_parts(
         class_id,
         cp_index,
         target_descriptor: Arc::from(descriptor),
+        return_type: ret,
     })) as usize)
 }
 
@@ -427,6 +452,15 @@ pub unsafe fn execute_jit_string_concat_raw(
 /// compiled site and the interpreted one share a cache entry rather than
 /// bootstrap twice.
 ///
+/// # The return value
+///
+/// `Ok((bits, Some(obj)))` for a reference result — the second half is the
+/// object the caller must root through `native_pending_return` before it hands
+/// the pointer to compiled code. `Ok((bits, None))` for a primitive (or a null
+/// reference), where `bits` is encoded exactly as `jit_invoke_dispatch` encodes
+/// an ordinary invoke's return: sign-extended for the integral kinds, raw
+/// `to_bits()` for `F`/`D`.
+///
 /// # Errors
 ///
 /// `Err` on anything the bootstrap or the call site raises. The caller
@@ -444,7 +478,7 @@ pub unsafe fn execute_jit_indy_generic_raw(
     site_ptr: usize,
     args_ptr: *const i64,
     arg_count: usize,
-) -> Result<Option<ObjectRef>, MethodCallFailed> {
+) -> Result<(i64, Option<ObjectRef>), MethodCallFailed> {
     let Some(site) = (site_ptr as *const JitIndyGenericSite).as_ref() else {
         return Err(VmError::Internal {
             message: "jit indy bridge: null site".to_owned(),
@@ -517,11 +551,26 @@ pub unsafe fn execute_jit_indy_generic_raw(
         }
     };
     thread.frames.pop();
-    Ok(match popped {
-        Some(Value::Object(obj)) => obj,
-        // A non-reference result cannot reach here: the site admission refuses
-        // any descriptor whose return is not `L`/`[`.
-        _ => None,
+    // Encoded by the SITE's descriptor, not by the `Value`'s own shape: a
+    // bootstrap that answered with a differently-tagged value than its
+    // descriptor promises is a defect to surface, not one to re-interpret. The
+    // arms mirror `jit_invoke_dispatch`'s return encoding one for one.
+    Ok(match (site.return_type, popped) {
+        (b'L' | b'[', Some(Value::Object(Some(obj)))) => (obj.as_ptr() as i64, Some(obj)),
+        (b'L' | b'[', Some(Value::Object(None)) | None) => (0, None),
+        (b'J', Some(Value::Long(v))) => (v, None),
+        (b'F', Some(Value::Float(f))) => (f.to_bits() as i64, None),
+        (b'D', Some(Value::Double(d))) => (d.to_bits() as i64, None),
+        (_, Some(Value::Int(v))) => (v as i64, None),
+        (_, other) => {
+            return Err(VmError::Internal {
+                message: format!(
+                    "jit indy bridge: {} returned {:?} for descriptor {}",
+                    site.cp_index, other, site.target_descriptor
+                ),
+            }
+            .into());
+        }
     })
 }
 

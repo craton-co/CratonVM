@@ -10935,8 +10935,14 @@ impl Compiler {
                     // frame to resume imprecisely, so the OSR artifact keeps
                     // running.
                     //
-                    // Two bootstraps are bridged — `StringConcatFactory` and,
-                    // since 2026-08-23, `LambdaMetafactory`. The second is what
+                    // The bridged set is `StringConcatFactory` and, since
+                    // 2026-08-23, `LambdaMetafactory`, `SwitchBootstraps` and
+                    // `ObjectMethods` — every bootstrap whose implementation
+                    // reaches the frame only through its operand stack and its
+                    // class id, which is all a bridge can offer. Between them
+                    // they cover a lambda or method reference, a
+                    // pattern-matching `switch`, and a record's
+                    // `equals`/`hashCode`/`toString`. The lambda one is what
                     // lets a method that CREATES a lambda stay compiled at all:
                     // before it, such a method took this trap on its first
                     // execution and was retired with `MakeNotCompilable`, which
@@ -10947,7 +10953,7 @@ impl Compiler {
                     // the trap.
                     let bridge_entry =
                         crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
-                    if bridge_site != 0 && bridge_entry != 0 && matches!(ret_type, b'L' | b'[') {
+                    if bridge_site != 0 && bridge_entry != 0 && ret_type != b'V' {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
                             eprintln!(
                                 "[cratonvm-jitc] indy bridge pc={} args={}",
@@ -10969,7 +10975,7 @@ impl Compiler {
                                     .is_some()
                                 {
                                     eprintln!(
-                                        "[cratonvm-jitc] indy-concat bridge spill overflow pc={} base={} args={}",
+                                        "[cratonvm-jitc] indy bridge spill overflow pc={} base={} args={}",
                                         pc, pre_pop_spill, arg_slots
                                     );
                                 }
@@ -11010,9 +11016,21 @@ impl Compiler {
                         // Added with the generic bridge rather than before it
                         // because the concat entry's only failure answer is `0`,
                         // i.e. a null `String` — wrong, but not a wild pointer.
-                        self.emit_post_invoke_exception_check(b'L');
-                        self.push_from_rax();
-                        self.mark_top_as_oop();
+                        self.emit_post_invoke_exception_check(ret_type);
+                        // Pushed by the DESCRIPTOR, the same three-way choice
+                        // the invoke lowering above makes: `xmm0` for `D`/`F`,
+                        // a plain slot otherwise, oop-marked for `L`/`[`. A
+                        // `V` site never reaches here — it is refused at
+                        // admission, because a void bridge has no push for
+                        // this to model.
+                        if matches!(ret_type, b'D' | b'F') {
+                            self.push_from_rax_as_xmm0();
+                        } else {
+                            self.push_from_rax();
+                        }
+                        if matches!(ret_type, b'L' | b'[') {
+                            self.mark_top_as_oop();
+                        }
                         pc += 5;
                         continue;
                     }

@@ -2338,7 +2338,7 @@ pub fn compile_with_param_slots(
             .indy_info
             .iter()
             .any(|(_pc, _arg_slots, ret_type, _tags, bridge_site)| {
-                !(*bridge_site != 0 && bridge_entry != 0 && matches!(*ret_type, b'L' | b'['))
+                !(*bridge_site != 0 && bridge_entry != 0 && *ret_type != b'V')
             })
     };
     // Stage 3 — the frame offset where this method stores the active

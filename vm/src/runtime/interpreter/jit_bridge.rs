@@ -1418,7 +1418,7 @@ pub(super) fn compile_osr_artifact(
             // of the process.
             if indy_info.len() != scan.indy_ops.len()
                 || indy_info.iter().any(|(_, _, ret_type, _, bridge_site)| {
-                    *bridge_site == 0 || !matches!(*ret_type, b'L' | b'[')
+                    *bridge_site == 0 || *ret_type == b'V'
                 })
             {
                 if crate::runtime::env_cache::dbg_jitc() && !scan.indy_ops.is_empty() {
