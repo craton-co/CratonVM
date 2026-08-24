@@ -2606,6 +2606,32 @@ fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledM
         frame_coverage_reason::COMPLETE.fetch_add(1, Relaxed);
     } else {
         frame_coverage_reason::NO_MAP_FOR_STORED_ID.fetch_add(1, Relaxed);
+        // WHICH frame, and what id was standing in its slot. This is the last
+        // obligation blocking `TestMVStoreTool`
+        // (`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`):
+        // `no_map=9 incomplete=0 ok=46`, so no map ever refuses on its own
+        // claim — nine frames simply cannot be located. A count cannot say
+        // whether that is a frame that has not reached a safepoint yet, a call
+        // site that recorded no map, or a method mis-resolved from a return
+        // address, and those are three different repairs.
+        //
+        // Rate-limited to the first 32: it fires per frame per collection.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some() {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if N.fetch_add(1, Relaxed) < 32 {
+                eprintln!(
+                    "[frame-cov] no map for stored id: sp_id={sp_id} (0x{sp_id:x}) \
+                     method={} maps={} ids={:?} sp_id_slot_off={sp_id_off} rbp=0x{rbp:x}",
+                    cm.method_label,
+                    cm.oop_maps.len(),
+                    cm.oop_maps
+                        .iter()
+                        .map(|m| m.bytecode_pc)
+                        .take(24)
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
     }
     found
 }
