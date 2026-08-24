@@ -587,6 +587,59 @@ Every link is CORRECT. And the composition links are **95x** and **64x**
 slower than HotSpot on precisely the shape `nextHiValue` retries through — far
 worse than the ~2.5x engine floor of the table in "Where the time goes".
 
+#### The 95x was under-measured, and the cause is `VarHandle`
+
+`HibfixComposeProbe`'s own profile showed ~45% of its time in the
+`ScheduledThreadPoolExecutor` it used to complete the inner stage — AQS,
+`ReentrantLock`, `DelayedWorkQueue` — against ~24% in `CompletableFuture`. Its
+95x was a real ratio for a mixed workload but NOT a measurement of composition.
+
+`HibfixComposeProbe2` removes the scheduler entirely: each thread owns its
+futures, the gates are completed after composition so every relay still takes
+the not-yet-complete path, and there is not a lock in it.
+
+| | HotSpot | CratonVM | ratio |
+|---|---:|---:|---:|
+| 4 800 000 compose chains | **412 ms** | **359 197 ms** | **~872x** |
+
+The scheduler had been DILUTING the cost, not inflating it. `wrong=0` over 4.8
+million chains, so this is purely cost.
+
+Profiling that clean run:
+
+| frame | share |
+|---|---:|
+| `CompletableFuture.tryPushStack` | **34.0%** |
+| `CompletableFuture$UniCompose.tryFire` | 21.4% |
+| `CompletableFuture.completeRelay` | 12.4% |
+| `CompletableFuture.uniComposeStage` | 8.0% |
+
+`tryPushStack` is `NEXT.set(c, h)` then `STACK.compareAndSet(this, h, c)` — two
+`VarHandle` operations on a reference field, **uncontended** here because each
+thread owns its futures.
+
+That led to
+[`../perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md`](../perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md):
+
+| operation | HotSpot | CratonVM | ratio |
+|---|---:|---:|---:|
+| `VarHandle.compareAndSet` reference | 9.2 ns | 488.9 ns | 53x |
+| `VarHandle.set` reference | 1.0 ns | 303.4 ns | **303x** |
+| `VarHandle.compareAndSet` int | 8.6 ns | 300.2 ns | 35x |
+| `AtomicInteger.incrementAndGet` | 5.0 ns | 6.2 ns | **1.2x** |
+
+`AtomicInteger` at parity is what makes it conclusive: this is `VarHandle`
+specifically, not atomics and not the box. The VM's `VARHANDLE_READ_DIRECT_FNS`
+binds READS of PRIMITIVE fields only — its own doc says `L` and `[` "are absent
+on purpose" — so every write and every CAS still pays the generic dispatch
+funnel.
+
+**This is the composition cost, and it is a far better lead than anything else
+on this page**: it is deterministic, needs no database and no failing run, and
+it is the plausible enabling condition for the correctness failure here — a
+sequence race HotSpot settles in microseconds run through machinery two orders
+of magnitude slower.
+
 #### What that buys, and what it does not
 
 It explains the SHAPE of the failure without yet naming the defect. A
@@ -614,21 +667,21 @@ which is the method to keep: reproduce the exact shape, run it hot, count.
 The rate drifts between 0% and 25% with no code change, so size arms by §5.3
 and **discard any arm whose control did not fail**.
 
-1. **Test the variance hypothesis of §5.9 directly.** It predicts that
+1. **Fix the `VarHandle` funnel** — `../perf/varhandle-writes-and-cas-have-no-fast-path-20260824.md`. It is
+   deterministic, needs no failing run, and is 872x on composition. Everything
+   else on this list is downstream of it.
+2. **Test the variance hypothesis of §5.9 directly.** It predicts that
    anything reducing JIT timing variance reduces the failure, while anything
    reducing mean speed does not. `CRATONVM_BG_COMPILE=0` (synchronous
    compilation) and a pinned tier are the two levers that change variance
    without changing the code path. Interleave with a control.
-2. **Attack the 95x.** `HibfixComposeProbe` is a standalone, deterministic,
-   3.8s-vs-361s reproducer of the composition cost on the recursive-retry
-   shape — no database, no flake, no statistics. Whatever is slow there is
-   also what widens the CAS window. Profile it (`--stack-sample-ms`) and the
-   answer is a perf fix that may close the correctness bug as a side effect.
-3. **Find the event before `HR000089`.** It is the first error that reaches
+3. **Done — the 95x is now the 872x of §5.9, and profiled.** `HibfixComposeProbe2`
+   is the reproducer: 412 ms against 359 s, no database, no flake.
+4. **Find the event before `HR000089`.** It is the first error that reaches
    the test's own hooks, but those hooks only wrap `withTransaction` and
    `persist`. Something aborts an iteration before that; wrapping the loop
    body's returned stage would catch it.
-4. Do NOT re-run, all measured and negative: the `alwaysTrue` screen (§5.6),
+5. Do NOT re-run, all measured and negative: the `alwaysTrue` screen (§5.6),
    thread identity, pool comparison, guard comparison (§5.8), `thenCompose`
    relaying, and the Vert.x bridge (§5.9).
 
