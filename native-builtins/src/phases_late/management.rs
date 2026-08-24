@@ -435,78 +435,26 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 3)))
     });
 
-    // ThreadMXBean = 0-field synthetic — wire to real VM thread stats
-    let tmx = "java/lang/management/ThreadMXBean";
-    r.register(tmx, "getThreadCount", "()I", |ctx, _args| {
-        Ok(Some(Value::Int(ctx.active_thread_count() as i32)))
-    });
-    // REAL: a monotone high-water mark (see `peak_thread_count`), not the
-    // instantaneous live count the previous body returned — which could go
-    // DOWN and left `resetPeakThreadCount()` with nothing to reset.
-    r.register(tmx, "getPeakThreadCount", "()I", |ctx, _args| {
-        Ok(Some(Value::Int(peak_thread_count(ctx))))
-    });
-    r.register(tmx, "getTotalStartedThreadCount", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(ctx.active_thread_count().max(1) as i64)))
-    });
-    // REAL: count the live threads carrying `Thread.holder.daemon` — the same
-    // flag the VM's own shutdown logic reads. The hard-coded 0 made every JVM
-    // look like it ran no daemon threads at all. Shares `jmx.rs`'s helper so
-    // both registrations of this triple agree.
-    r.register(tmx, "getDaemonThreadCount", "()I", |ctx, _args| {
-        Ok(Some(Value::Int(daemon_thread_count(ctx))))
-    });
-    // REAL thread ids. The previous body allocated one slot per live thread
-    // but then filled them with the loop INDEX (`i + 1`) rather than the
-    // thread's id, so the array's contents were fabricated even though its
-    // length was real — and `getThreadInfo(long)` resolves threads by matching
-    // `Thread.tid`, so those ids did not round-trip. Read the real `tid`.
-    r.register(tmx, "getAllThreadIds", "()[J", |ctx, _args| {
-        // Ids are collected as plain i64 first: `new_array` can GC, and the
-        // thread references behind them are not pinned.
-        let ids = live_thread_ids(ctx);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, ids.len());
-        for (i, id) in ids.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Long(*id));
-        }
-        Ok(Some(Value::Object(Some(arr))))
-    });
-    // REAL, in lock-step with the winning `jmx.rs` registration. The accessor
-    // the previous escalation asked for now exists
-    // (`NativeContext::thread_os_tid`), so this is no longer a constant: it
-    // resolves the caller's own mirror to an OS tid and reads that tid through
-    // the same platform path `getThreadCpuTime(long)` takes for a foreign id,
-    // and reports whatever that actually returns. `false` survives as the
-    // honest answer on a platform we do not read.
-    r.register(tmx, "isThreadCpuTimeSupported", "()Z", |ctx, _args| {
-        Ok(Some(Value::Int(i32::from(
-            arbitrary_thread_cpu_time_supported(ctx),
-        ))))
-    });
-    // KEEP: false is the measurement — contention monitoring needs per-thread
-    // blocked/waiting DURATIONS, which nothing in the VM records (unlike lock
-    // OWNERSHIP, which the registry does model), so
-    // `getThreadInfo(..).getBlockedTime()` has no source at all and the spec's
-    // answer for an unsupported optional feature is exactly `false`.
-    // ES-FAIL-05 — `HotThreads.initializeRuntimeMonitoring()` (ESTestCase.<clinit>)
-    // calls isThreadContentionMonitoringSupported(); unregistered → AbstractMethodError
-    // blocking ~every server test. Report false (HotThreads then no-ops).
-    r.register(
-        tmx,
-        "isThreadContentionMonitoringSupported",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    // KEEP: false is the measurement, and it is forced by the line above — a
-    // `false` from `...Supported()` makes `setThreadContentionMonitoringEnabled`
-    // throw `UnsupportedOperationException` from JDK bytecode, so "enabled" can
-    // never become true. "Not enabled" is also the state a HotSpot boots in.
-    r.register(
-        tmx,
-        "isThreadContentionMonitoringEnabled",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
+    // THE ThreadMXBean BLOCK WAS REMOVED HERE 2026-08-24. All 8 triples it
+    // registered also come from `jmx.rs::register_thread_mxbean_for`, which a
+    // shipping binary reaches and this pass is not -- so the two modes ran
+    // different code for every one of them, and this side won only under
+    // `--features synthetic-jdk`. The shipping pass registers all 8 on a
+    // SUPERSET of the class names (it also covers `com/sun/management/
+    // ThreadMXBean`), so nothing here was load-bearing.
+    //
+    // Three of the 8 were better on THIS side and the fix went the other way:
+    // `getThreadCount` / `getTotalStartedThreadCount` / `getDaemonThreadCount`
+    // read live counts here and frozen `<init>` slots there. Those three are
+    // now live in `jmx.rs` too.
+    //
+    // Two were WORSE on this side, which is why reading both bodies mattered:
+    // this block answered `isThreadContentionMonitoringSupported()` false, on
+    // the stated premise that nothing in the VM records blocked/waited
+    // durations. That premise expired -- `ThreadJmxSnapshot::blocked_time_ms`
+    // and `waited_time_ms` are real, filled by `vm_exec.rs` from the registry
+    // and read back into `ThreadInfo.blockedTime`. The shipping `true` is
+    // correct, so synthetic-JDK mode had been denying a capability this VM has.
 
     // RuntimeMXBean = 0-field synthetic — wire to real uptime
     let rmx = "java/lang/management/RuntimeMXBean";
