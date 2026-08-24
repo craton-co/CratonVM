@@ -88,9 +88,38 @@ use std::path::{Path, PathBuf};
 /// `ResolvedTarget`, `ResolvedField`, `cache_field`, `method_count`,
 /// `field_count`) are masked by the cross-crate collision documented above.
 ///
+/// **Re-measured 2026-08-24 after fixing the scanner, and this number is not
+/// comparable to the 319 before it.** `split_regions` cleared its `pending`
+/// flag only on a `{`, so a `#[cfg(test)]` on a BRACE-LESS item latched it for
+/// the rest of the file. Seven such sites in `vm/src` were swallowing **7 732
+/// production lines** -- `vm/src/memory/gc.rs` entire, from a
+/// `#[cfg(test)] use crate::types::Value;` on line 16, and
+/// `vm/src/runtime/resolve/mod.rs` from line 88. Over that tail the gate was
+/// vacuous in both directions: a `pub` declared there could never be reported,
+/// and a genuine production call there counted as a test reference.
+///
+/// With the scanner fixed the same two trees read 317 at `f0709247f` (where the
+/// old scanner said 319) and 320 on `dev` at `e645a7349` (where it said 324) --
+/// so of the five items that appeared to push the gate over, only THREE were
+/// real. `frame_trace_wanted` and `publish_peer_jit_coverage_for_stw` are both
+/// called from `safepoint_check`, ~130 lines past a
+/// `#[cfg(test)] mod root_snapshot_cache_tests;`, and were never offenders.
+///
+/// Of the three real ones, two are fixed in this change (`helper_symbol` and
+/// `other_thread_in_jit`, both now `#[cfg(test)]`), which is 320 - 2 = 318.
+///
+/// The third, `admit_direct_native_entry`, is deliberately LEFT. It is not dead
+/// code: it is the destination of an in-flight migration, and
+/// `the_two_direct_doors_take_exactly_the_addresses_h12_measured` in
+/// `vm/src/jit/helpers.rs` exists precisely because the two compile doors still
+/// take 7 + 2 raw helper addresses without asking it. Deleting it to buy one
+/// point on this ratchet would delete the thing those doors are supposed to
+/// migrate ONTO and destroy the H12 record. When O1/O2 land, that call appears,
+/// this item stops being an offender, and the baseline drops to 317 with it.
+///
 /// Zero slack, matching `stub_ratchet`'s contract: this is the observed count,
 /// not a rounded-up allowance.
-const BASELINE_OFFENDERS: usize = 319;
+const BASELINE_OFFENDERS: usize = 318;
 
 /// Minimum number of declarations the scan must find before its result means
 /// anything.
@@ -182,6 +211,33 @@ fn split_regions(src: &str) -> (Vec<&str>, Vec<&str>) {
                 depth = 0;
             } else if depth > 0 {
                 pending = false;
+            } else if !is_comment && code_part(line).contains(';') {
+                // A BRACE-LESS gated item: `use x;`, `mod y;`, `const Z: T = v;`.
+                // It ends on this line, and without this arm `pending` latches
+                // FOREVER -- every remaining line in the file is then filed as
+                // test, which makes the gate vacuous over the tail of that file
+                // in both directions: a `pub` declared there is never seen (so it
+                // can never be an offender) and a genuine production CALL there is
+                // counted as a test reference (so the callee it keeps alive reads
+                // as test-only).
+                //
+                // Measured on 2026-08-24: seven such sites in `vm/src` were
+                // swallowing 7 732 production lines, `vm/src/memory/gc.rs` entire
+                // (a `#[cfg(test)] use crate::types::Value;` on line 16) and
+                // `vm/src/runtime/resolve/mod.rs` from line 88. Three of the five
+                // offenders that pushed this gate over its baseline were artifacts
+                // of exactly this -- `frame_trace_wanted` and
+                // `publish_peer_jit_coverage_for_stw` are both called from
+                // `safepoint_check`, 130 lines past a `#[cfg(test)] mod
+                // root_snapshot_cache_tests;`.
+                //
+                // An attribute line (`#[allow(..)]`) carries no `;` and keeps
+                // `pending` raised, which is what a multi-attribute item needs; a
+                // comment line is excluded because a prose `;` inside the doc
+                // block between the attribute and its item would end the region
+                // early.
+                pending = false;
+                depth = 0;
             }
             continue;
         }
@@ -196,6 +252,21 @@ fn split_regions(src: &str) -> (Vec<&str>, Vec<&str>) {
         prod.push(line);
     }
     (prod, test)
+}
+
+/// The line with any trailing `//` comment removed.
+///
+/// The semicolon arm of [`split_regions`] must look at CODE only. Written
+/// without this, `#[allow(deprecated)] // prose; with a semicolon` ended the
+/// pending region on the attribute line and let the whole
+/// `mod tests { .. }` body that followed leak into production --- caught by
+/// `a_braced_cfg_test_block_still_swallows_its_body`, which is the entire
+/// reason that test exists.
+fn code_part(line: &str) -> &str {
+    match line.find("//") {
+        Some(i) => &line[..i],
+        None => line,
+    }
 }
 
 fn brace_delta(line: &str) -> i32 {
@@ -410,4 +481,90 @@ fn no_new_test_only_public_api() {
         BASELINE_OFFENDERS,
         offenders.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The scanner's own tests.
+//
+// This file's header says it in as many words: "A scanner nobody has watched
+// fail is a scanner that passes vacuously." It had no self-tests, and it was
+// wrong -- for long enough that 7 732 lines of `vm/src` were invisible to it.
+// These pin the region split against the shapes that broke it.
+// ---------------------------------------------------------------------------
+
+/// A `#[cfg(test)]` on a BRACE-LESS item must end at that item's `;`.
+///
+/// The bug this pins: `pending` was cleared only by a `{`, so `#[cfg(test)] use
+/// x;` / `#[cfg(test)] mod y;` latched it forever and every remaining line in
+/// the file was filed as test. `vm/src/memory/gc.rs` has such a `use` on line
+/// 16 -- the whole file was invisible. Both directions matter: a `pub` in the
+/// swallowed tail can never be reported (the gate goes quiet), and a genuine
+/// production call there is counted as a test reference (a live item reads as
+/// test-only).
+#[test]
+fn a_braceless_cfg_test_item_ends_at_its_semicolon() {
+    for item in ["use crate::types::Value;", "mod guard;", "pub mod guard;"] {
+        let src = format!("use std::foo;\n#[cfg(test)]\n{item}\npub fn live() {{}}\nlive();\n");
+        let (prod, test) = split_regions(&src);
+        assert!(
+            prod.iter().any(|l| l.contains("pub fn live")),
+            "the declaration after `{item}` was swallowed into the test region"
+        );
+        assert!(
+            prod.iter().any(|l| l.trim() == "live();"),
+            "a production CALL after `{item}` was counted as a test reference"
+        );
+        assert!(
+            test.iter().any(|l| l.contains(item)),
+            "the gated item itself belongs to the test region"
+        );
+        assert_eq!(
+            test.len(),
+            2,
+            "only the attribute and its own item are test lines, got {test:?}"
+        );
+    }
+}
+
+/// A `#[cfg(test)] mod tests { .. }` still swallows its whole block, and
+/// attributes and doc comments may sit between the attribute and the item.
+///
+/// `vm/src/threading/varhandle.rs` has exactly this shape, with a `;` inside
+/// the prose of the comment between `#[allow(deprecated)]` and `mod tests {` --
+/// which is why the semicolon arm above must skip comment lines.
+#[test]
+fn a_braced_cfg_test_block_still_swallows_its_body() {
+    let src = "pub fn live() {}\n\
+               #[cfg(test)]\n\
+               #[allow(deprecated)] // prose; with a semicolon in it\n\
+               mod tests {\n\
+               fn helper() {}\n\
+               }\n\
+               pub fn also_live() {}\n";
+    let (prod, test) = split_regions(src);
+    assert!(prod.iter().any(|l| l.contains("pub fn live")));
+    assert!(
+        prod.iter().any(|l| l.contains("pub fn also_live")),
+        "the block closed, so what follows it is production again"
+    );
+    assert!(
+        test.iter().any(|l| l.contains("fn helper")),
+        "the block body is test"
+    );
+    assert!(
+        !prod.iter().any(|l| l.contains("fn helper")),
+        "the block body must not leak into production"
+    );
+}
+
+/// A `#[cfg(test)]` mentioned inside a comment is not an attribute.
+///
+/// The header records this as a lesson learned "the expensive way" in a sibling
+/// scanner; it was never pinned here.
+#[test]
+fn a_cfg_test_inside_a_comment_opens_no_region() {
+    let src = "// #[cfg(test)] is discussed here\npub fn live() {}\n";
+    let (prod, test) = split_regions(src);
+    assert!(prod.iter().any(|l| l.contains("pub fn live")));
+    assert!(test.is_empty(), "no region should have opened, got {test:?}");
 }

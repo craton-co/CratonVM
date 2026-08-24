@@ -1,7 +1,8 @@
 # `ConfigurationPropertySourcesTests` — decomposed, Term 1 fixed, ~23× HotSpot
 
 **Status: OPEN — Terms 1 and 3 CLOSED, Term 2 RE-TAKEN and re-scoped, all on
-2026-08-24.** What is left is one precisely-named next step (`ArrayList.get`,
+2026-08-24. Term 3's fix is real but measured NOT to move this class**, so what
+is left of the gap here is Term 2 alone. What is left is one precisely-named next step (`ArrayList.get`,
 worth ~6×) and one open question (why `ArrayList$Itr` bytecode is SLOWER than
 its native), both in Term 2 below.
 Rewritten from the 2026-08-21 first cut, which called this "the
@@ -204,13 +205,84 @@ why "the per-element constant" reads as one flat number and why no
 whole-subsystem switch moved it: two effects of comparable size cancelling.
 Each door has to be armed on its own evidence.
 
-**Next, precisely scoped:** give `ArrayList.get` the Term 3 treatment — yield
-to real bytecode under the default policy, with the five-term predicate as the
-safety and `CRATONVM_DBG_STUB_YIELD` as the engagement counter. It is worth
-~6× on indexed list access VM-wide. Do NOT extend it to the iterator family on
-the same reasoning; the number above says it would be a pessimisation, and it
-needs its own investigation into why `ArrayList$Itr` bytecode is slow (the
-first question being whether it is compiled at all).
+### The Term 3 treatment was ATTEMPTED for `ArrayList.get` and REVERTED
+
+It is behaviourally viable and mechanically inert, and it broke something else.
+All three parts matter to whoever picks this up.
+
+**Behaviourally it is fine.** `probes/ListYieldProbe` (new, 44 rows) covers the
+receivers that are ArrayList-SHAPED but are not plain ArrayLists, which is where
+real JDK bytecode reading `elementData`/`size` straight through would diverge: a
+live `values()` view across put and remove, `subList` (whose indices are offset
+from the backing) including write-through, `Collections.unmodifiableList`
+refusing writes, `Arrays.asList` allowing `set` but refusing `add`, iterator
+order, fail-fast, bounds and null. **44/44 byte-identical to HotSpot 25.0.3+9
+both on the default policy and under `--jdk-only` with the dial scoped to
+`java/util/ArrayList`** — so the real bytecode does drive CratonVM's ArrayList
+correctly.
+
+**Mechanically it did not engage.** Registering `size`/`isEmpty`/`get` as
+`SyntheticStub` and adding `java/util/ArrayList` to
+`real_protected_stub_class_common` — exactly the Term 3 change, one class over —
+produced `CRATONVM_DBG_STUB_YIELD` counts of **zero**, with and without
+`--nojit`. The static path and the virtual path do not arbitrate the same way,
+and the piece that works for `java.util.Objects` does not reach an instance
+accessor. Whatever the next attempt is, it starts by finding which predicate the
+virtual path actually consults for a `SyntheticStub` instance method — not by
+assuming this one.
+
+**And it silently disabled the Objects yield.** Same run, same binary:
+
+| rung | dev | dev + the ArrayList attempt |
+|---|---:|---:|
+| `Objects.equals` | 50.6 ns | **155.6 ns** |
+| `Objects.isNull` | 28.0 ns | **117.0 ns** |
+| `myEquals` (control) | 59.2 ns | 56.0 ns |
+| `myIsNull` (control) | 33.0 ns | 26.8 ns |
+
+The controls do not move, so this is the Term 3 fix being switched off, not a
+slower VM. The mechanism is not identified — adding one arm to a `matches!`
+cannot remove another — so the two halves (the `SyntheticStub` retag and the
+allow-list entry) need bisecting SEPARATELY before either is trusted. **Reverted
+rather than shipped**; only the probe is kept.
+
+**The engagement counter is what caught both.** The timings alone said "no
+faster", which reads as a null result and invites shipping it as harmless; the
+counter said "never ran", and the control rungs said the Objects regression was
+real. This is the second time on this page that a fix attempt measured nothing —
+the first was the original Term 3 attempt — and both times the counter was the
+difference between a null result and a wrong one.
+
+**Still open, unchanged:** ~6× is available on indexed list access if the
+engagement problem is solved. Do NOT extend it to the iterator family on the
+same reasoning; the number above says that would be a pessimisation, and it
+needs its own investigation into why `ArrayList$Itr` bytecode is slow (the first
+question being whether it is compiled at all).
+
+### The leaf fast path is engaged and is not the lever
+
+`native-collections` registers nothing as leaf, so the obvious next idea is to
+mark the pure accessors leaf and drop the funnel's pinning, STW probe,
+transitions and unwind bookkeeping. The numbers say do not bother.
+`probes/NativeFunnelFloorProbe`, this host, from compiled code:
+
+```text
+control: plain Java call         10.8 ns
+LEAF   AtomicInteger.get        383-417 ns
+FUNNEL AtomicInteger.CAS            482 ns
+FUNNEL MessageDigest.update         156 ns
+FUNNEL identityHashCode             127 ns
+FUNNEL System.nanoTime               90 ns
+```
+
+`CRATONVM_DBG=intrinsic-stats` confirms engagement — `compiled leaf-native
+dispatches: 3918000`, so the leaf arm is running, not skipped. Yet the LEAF rung
+costs 2.5-4× the full-funnel rungs beneath it. Leafness buys ~100 ns against its
+own non-leaf twin (383 vs 482, same receiver and call-site shape) and that is
+real, but it lands nowhere near `System.nanoTime`'s 90 ns. So the funnel is not
+what makes `AtomicInteger.get` expensive, and marking collection accessors leaf
+would not close a 37× gap. **Why a leaf native costs 4× a full-funnel one is its
+own question**, and a better one than anything on this page.
 
 ## Term 2 (ORIGINAL 2026-08-22 reading) — the per-element constant is ~2 µs, and it is linear
 
@@ -279,6 +351,33 @@ move. `CRATONVM_DBG_STUB_YIELD` prints `yield=true — real bytecode wins` on th
 fix and nothing on the base; `CRATONVM_DBG_JIT_COMPILED` counts 0
 `java/util/Objects` entries before and 6 after — which is the engagement
 evidence this page asked the next session to get before trusting any flag.
+
+**AND IT DOES NOT MOVE THIS CLASS.** Measured end to end after landing it, same
+harness and same CPU-time instrument as the Term 1 measurement at the top:
+
+| | HotSpot | CratonVM |
+|---|---:|---:|
+| Term 1 only (earlier window) | 8.3 / 6.6 / 8.4 s | 186.2 / 187.3 / **191.2** s |
+| Term 1 + Term 3 | 10.0 / 8.3 / 8.4 s | 201.2 / 189.9 / **189.4** s |
+
+189.9 against 187.3, with each arm's own spread being 186-191 and 189-201. That
+is a null result, and the HotSpot control is what licenses reading the two
+windows against each other at all: its median is 8.4 s here and 8.3 s there, so
+the windows cost the same in CPU terms even though the box was at load 33-51 for
+one and 17-37 for the other. (It is still a CROSS-BINARY comparison — Term 3 is
+a registration KIND and has no kill switch — so it is weaker than the
+one-binary A/B above it, and is quoted only to bound the effect, not to price
+it.)
+
+**So the term table below is wrong about this term.** It priced
+`Objects.equals` at ~21 s of ~475 s and called it "~4%". Making those methods
+3.4x faster should then have been worth ~8% of the post-Term-1 187 s, and
+nothing of the kind shows up. Either `Objects` is not a meaningful share of what
+remains after Term 1, or the ~215 ns/call the estimate was built on was measuring
+the pre-Term-1 profile's `Arrays.equals` path rather than these statics. The
+useful conclusion is the general one: **Term 3 is a real VM-wide win and a
+correctness fix, and it is NOT a fix for this class.** `requireNonNull` being
+among the most-called methods in the JDK is what justifies it, not this page.
 
 **It also fixed three wrong answers.** `probes/ObjectsYieldProbe` (50 rows,
 diffed against HotSpot 25.0.3+9) is byte-identical after the fix; before it, the
