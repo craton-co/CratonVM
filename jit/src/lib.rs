@@ -23721,6 +23721,19 @@ mod tests {
             None,
             "a side-effect-free protected trap must still compile"
         );
+        // ...and the OTHER half of that narrowing term, which for a long time
+        // was only an assumption: the consumer must actually be willing to
+        // replay this body. `bytecode_commits_side_effect` is what the
+        // interpreter's deopt sink asks before it raises `InternalError:
+        // precise deoptimization unavailable`, and it must agree with the
+        // admission above on exactly this shape. If these two ever disagree,
+        // the population admitted BECAUSE the replay is harmless is the
+        // population that dies.
+        assert!(
+            !bytecode_commits_side_effect(&read_only, read_only.len()),
+            "the shape admitted because its replay is harmless must read as \
+             side-effect-free at the consumer too"
+        );
 
         // A protected range whose only throwing site is an invoke: those exit
         // through the sentinel + exception routing, which needs no resume.
@@ -23735,6 +23748,10 @@ mod tests {
         // Side effect present but no deopt-guarded trap: putstatic only.
         //   0: iconst_0, 1: putstatic #4, 4: return
         let store_only = [0x03, 0xb3, 0x00, 0x04, 0xb1];
+        assert!(
+            bytecode_commits_side_effect(&store_only, store_only.len()),
+            "a putstatic is a side effect a replay would duplicate"
+        );
         assert_eq!(
             ir_unresumable_protected_trap(&store_only, store_only.len(), &range(0, 4)),
             None,
