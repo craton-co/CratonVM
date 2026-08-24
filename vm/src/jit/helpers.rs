@@ -14149,21 +14149,30 @@ pub unsafe extern "C" fn jit_indy_bridge(
 ) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
-    let Some((thread, _guard)) = jit_thread_mut() else {
-        return 0;
-    };
-    let vm = &*(vm_ptr as *const SharedVm);
-    let count = arg_count.max(0) as usize;
-    // `CRATONVM_DBG_INDY_GENERIC` — what the bridge was handed and what it
-    // answered. A wrong result from a bridged site poses exactly one question,
-    // which SIDE lost the value, and nothing else can tell the two apart: a
-    // helper that returns a good pointer into a call sequence that drops it
-    // looks identical to a helper that returned 0.
-    let dbg = crate::runtime::invokedynamic::dbg_indy_generic_enabled();
+    // `CRATONVM_DBG_JITC=1` — what the bridge was handed and what it answered.
+    // A wrong result from a bridged site poses exactly one question, which SIDE
+    // lost the value, and nothing else can tell the two apart: a helper that
+    // returns a good pointer into a call sequence that drops it looks identical
+    // to a helper that returned 0. Rides on the same variable the codegen's own
+    // `indy bridge pc=` line uses, so one run shows the emission and the
+    // execution together.
+    let dbg = crate::runtime::env_cache::dbg_jitc();
     let kind = crate::runtime::invokedynamic::jit_indy_site_kind(site_ptr as usize);
+    let count = arg_count.max(0) as usize;
     if dbg {
         eprintln!("[indy-bridge] kind={kind} args={count} args_ptr={args_ptr:?}");
     }
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        // UNCONDITIONAL. This is a should-never-happen that answers with a
+        // NULL REFERENCE, which is the worst shape a helper can have: no
+        // exception, no crash, a wrong value that surfaces frames later. It is
+        // inherited from the concat bridge, where it has always been silent.
+        eprintln!(
+            "[indy-bridge] NO JIT THREAD - returning a null result for a bridged invokedynamic (kind={kind}, args={count}). This is a bug, not a condition; the site's answer is now wrong."
+        );
+        return 0;
+    };
+    let vm = &*(vm_ptr as *const SharedVm);
     match kind {
         crate::runtime::invokedynamic::JIT_INDY_SITE_GENERIC => {
             match crate::runtime::invokedynamic::execute_jit_indy_generic_raw(
