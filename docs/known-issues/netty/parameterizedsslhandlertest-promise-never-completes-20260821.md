@@ -37,13 +37,30 @@ flag, so `notify()` still releases exactly one waiter — a bare generation
 counter would have turned every `notify()` into a `notifyAll()`. The condvar
 signal is now an optimisation rather than the mechanism.
 
-**What is NOT done: the rate.** `CRATONVM_MONITOR_PENDING_NOTIFY=0` restores the
-old behaviour so the fix can be interleaved against itself on ONE binary, which
-is the only comparison this host supports — the rate moved from 4/20 at load
-12–84 to 1/23 at load 6–10 within one session, so any two-session
-before/after would be measuring the machine. A stall line reading
-`consumed=1 signalled=0` is the engagement proof: it names a notification this
-loop would have MISSED before.
+**The rate, interleaved on ONE binary** (`CRATONVM_MONITOR_PENDING_NOTIFY=0`
+restores the old behaviour, and the two arms alternate run-by-run so they see
+the same load — the only comparison this host supports, since the rate moved
+from 4/20 at load 12–84 to 1/30 at load 6–13 within one session):
+
+```
+ON  (condition consulted)   0 stalls
+OFF (condvar only)          1 stall   — the reproduction, on the SAME binary
+```
+
+The OFF-arm stall carries the identical signature and the engagement counter
+proves the arm was really off:
+
+```
+OFF 5 STALL wall=422 notifies_since_wait=1
+    polls=76468 signalled=0 consumed=0  result_is=SUCCESS
+```
+
+`consumed=0` is what the OFF arm must read — no credit is created when the
+switch is off. A stall in the ON arm reading `consumed=1 signalled=0` would be
+the opposite proof: a notification this loop would have MISSED before, taken
+from state instead. **This A/B is UNDERPOWERED for a rate claim** at the base
+rate the host currently shows; what it establishes is that the failure still
+reproduces with the condition disabled and the binary otherwise identical.
 
 **And there is a SECOND stall under this title that the fix does not address**
 — see run 8 below, where `DefaultPromise.result` (a `private volatile Object`)
