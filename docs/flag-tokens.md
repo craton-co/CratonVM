@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-485 tokens.
+487 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -417,6 +417,8 @@ export inherited from a parent shell.
 | `promo-seed` | `CRATONVM_DBG_PROMO_SEED` |
 | `proxy` | `CRATONVM_DBG_PROXY` |
 | `prune` | `CRATONVM_DBG_NO_PRUNE` |
+| `punned-ref` | `CRATONVM_DBG_PUNNED_REF` |
+| `view-comod` | `CRATONVM_DBG_VIEW_COMOD` |
 | `quarkus-staticinit` | `CRATONVM_DBG_QUARKUS_STATICINIT` |
 | `quicken-stats` | `CRATONVM_QUICKEN_STATS` |
 | `quiet-env-fallback` | `CRATONVM_QUIET_ENV_FALLBACK` |
@@ -551,7 +553,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-220 tokens.
+222 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -651,6 +653,7 @@ export inherited from a parent shell.
 | `long-intrinsics` | `CRATONVM_JIT_NO_LONG_INTRINSICS` |
 | `long-box-direct-helpers` | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` |
 | `varhandle-read-direct-helpers` | `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` |
+| `varhandle-write-direct-helpers` | `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
 | `main-inline` | `CRATONVM_JIT_MAIN_INLINE` |
 | `matrix-dot` | `CRATONVM_JIT_MATRIX_DOT` |
@@ -677,6 +680,7 @@ export inherited from a parent shell.
 | `osr-dead-mask-blanket` | `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET` |
 | `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
+| `ic-frame-republish` | `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH` |
 | `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
 | `inline-call-dispatch` | `CRATONVM_JIT_INLINE_CALL_DISPATCH` |

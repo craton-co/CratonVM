@@ -198,17 +198,37 @@ This page says the regression is real and that it does not explain it. It is
 explained: **moving young collections are what expose the defect, and the window
 reduced how often the collector declines to move.**
 
-Fallback counts (a fallback IS the collector declining to move) are perfectly
-deterministic and separate perfectly with outcome:
+> **CORRECTION (2026-08-24).** The paragraph below called the fallback counts
+> "perfectly deterministic". **They are not**, and the claim is withdrawn. A
+> third bisect keyed on that count named `ad6e3969c`; confirming it against its
+> parent at 10 reps each destroyed both halves:
+>
+> ```text
+> ad6e3969c   SIG=6/10   fallbacks 7x1 8x2 9x6 10x1
+> 9b60ddbee   SIG=7/10   fallbacks 8x4 9x6
+> ```
+>
+> Same failure rate on both sides, so it is not a boundary; and the count
+> ranges 7-10 where the bisect had read a stable 5. The count is stable WITHIN
+> a measurement batch and varies ACROSS batches — the same batch-correlation
+> that produced the earlier "the rate tracks when the run happened" error in
+> this file's sibling record. Reading batch stability as commit-determinism is
+> now the third bisect this defect has voided.
+>
+> What survives is the LEVER result below, which does not depend on any
+> per-commit signal: it is an in-binary A/B with its own control.
+
+Fallback counts (a fallback IS the collector declining to move) appeared to
+separate with outcome in one interleaved measurement:
 
 ```text
 cae49a85c   5 fallbacks/run   SIG  6/6
 684f37e14   7 fallbacks/run   PASS 6/6
 ```
 
-Two collections that stayed non-moving on the good endpoint stopped doing so on
-the bad one. Forcing the decline back on, in the bad binary, 10 reps interleaved
-against its own control:
+That reading is now suspect for the reason above and should not be built on.
+The lever, by contrast — forcing the decline back on in the bad binary, 10 reps
+interleaved against its own control:
 
 ```text
 default                      SIG 8/10   (6 fallbacks)

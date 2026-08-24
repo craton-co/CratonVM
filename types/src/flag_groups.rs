@@ -708,6 +708,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "promo-seed", on_key: Some("CRATONVM_DBG_PROMO_SEED"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "proxy", on_key: Some("CRATONVM_DBG_PROXY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "prune", on_key: None, off_key: Some("CRATONVM_DBG_NO_PRUNE"), off_word: None },
+    // The named-writer arm of the punned-reference counter: on a NON-ZERO
+    // payload word under a non-`Object` tag, print the class and field so the
+    // writer can be found rather than inferred. Diagnostic only -- the counter
+    // itself is unconditional; this names what it counted.
+    E { group: Group::DBG, token: "punned-ref", on_key: Some("CRATONVM_DBG_PUNNED_REF"), off_key: None, off_word: None },
+    // Per-event trace of the map/set VIEW comodification door: which check
+    // fired, and whether the modCount stamp behind it is live or dead. A
+    // pass/fail cell cannot tell a working door from a dead stamp, which is
+    // what this exists to distinguish.
+    E { group: Group::DBG, token: "view-comod", on_key: Some("CRATONVM_DBG_VIEW_COMOD"), off_key: None, off_word: None },
     // Was the bare `CRATONVM_DBG`, which is now the group variable itself. It
     // gated exactly one call site (`quarkus_staticinit.rs`), so it becomes an
     // ordinary topic. `CRATONVM_DBG=1` no longer enables it — that spelling now
@@ -1025,6 +1035,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "long-intrinsics", on_key: None, off_key: Some("CRATONVM_JIT_NO_LONG_INTRINSICS"), off_word: None },
     E { group: Group::JIT, token: "long-box-direct-helpers", on_key: Some("CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "varhandle-read-direct-helpers", on_key: Some("CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "varhandle-write-direct-helpers", on_key: Some("CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "longroot-strict", on_key: Some("CRATONVM_LONGROOT_STRICT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "main-inline", on_key: Some("CRATONVM_JIT_MAIN_INLINE"), off_key: None, off_word: None },
     // Default-ON kill switch for the `int[][]` matrix-dot emitter.
@@ -1082,6 +1093,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-dead-mask-blanket", on_key: Some("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-newarray", on_key: Some("CRATONVM_OSR_NEWARRAY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "osr-exc-table", on_key: Some("CRATONVM_JIT_OSR_EXC_TABLE"), off_key: None, off_word: None },
+    // Declared 2026-08-24. An OPT-OUT: the optimizing tier republishes the
+    // innermost-frame mirror after an inline-cache hit by default, and this key
+    // restores the stale-mirror behaviour so one binary has both arms. See
+    // `ir_lower::emit_call_cached_entry`.
+    E { group: Group::JIT, token: "ic-frame-republish", on_key: None, off_key: Some("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"), off_word: None },
     E { group: Group::JIT, token: "inline-calls", on_key: Some("CRATONVM_JIT_INLINE_CALLS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-nest", on_key: Some("CRATONVM_JIT_INLINE_NEST"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "inline-call-dispatch", on_key: Some("CRATONVM_JIT_INLINE_CALL_DISPATCH"), off_key: None, off_word: None },

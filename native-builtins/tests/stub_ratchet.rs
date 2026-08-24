@@ -1064,7 +1064,55 @@ use cratonvm_types::compat::CompatibilityMode;
 /// rows alongside it. The two-column rule adjudicates that correctly as long as
 /// both numbers are read, which is why the second column is re-measured here
 /// rather than carried.
-const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1573;
+
+/// **RE-FROZEN 2026-08-24: 1573 -> 1584 (management), 1562 -> 1573 (default).
+/// +11 in BOTH arms, and the +11 is a RETIREMENT, not a regression.**
+///
+/// `register_objects_natives` became kind-parameterised
+/// (`native-builtins/src/lib.rs`). It is called twice, and the same eleven
+/// bodies mean two different things:
+///
+///   * from `register_synthetic_overrides` -> `Intrinsic`, unchanged. On a
+///     synthetic-JDK image there is no `java/util/Objects` bytecode at all,
+///     so these ARE the implementation and must win.
+///   * from `register_annotation_overrides`, i.e. the REAL-JDK path ->
+///     `SyntheticStub`, which is new. There they exist only so
+///     `requireNonNull` and friends still link when java.base is partial, and
+///     when the real class IS loaded they must yield -- exactly like the
+///     `StringJoiner` / `EnumSet` / `Instant` stubs beside them.
+///
+/// So eleven registrations that used to win unconditionally over real JDK
+/// bytecode now stand aside for it. That is the direction this whole ratchet
+/// exists to encourage, and it is billed here because `SyntheticStub` is the
+/// tag that makes `--jdk-only` refuse them.
+///
+/// **The +11 is exhaustively accounted, and by the OTHER ratchet rather than
+/// by arithmetic on this one.** `register_objects_natives` contains exactly 11
+/// `r.register(` calls; stubs moved +11 in the management arm AND +11 in the
+/// default arm; and `BASELINE_INTRINSICS` moved **1398 -> 1387, exactly -11**,
+/// measured with `--nocapture` rather than derived. Same eleven rows, one tag
+/// to another.
+///
+/// That makes this case ONE of the three classified on
+/// [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`] -- *total unchanged, stubs up ->
+/// existing fakes were relabelled, welcome* -- and NOT case two, which says do
+/// not re-freeze. The distinction is the whole reason to read both columns:
+/// `register_annotation_overrides` ALREADY called `register_objects_natives`
+/// before this merge, so no call site was added and no registration is new.
+/// Only the kind it passes changed.
+///
+/// The intrinsic ratchet is a CEILING (`intrinsic <= BASELINE_INTRINSICS`), so
+/// this -11 would have passed in silence and left 11 intrinsics free to come
+/// back unnoticed. It is re-frozen to 1387 in the same edit.
+///
+/// Measured on the merge of `origin/dev` `b70870c36`
+/// (perf/static-native-over-bytecode-20260824), which is where the change
+/// arrives. Its own commit gives the number that motivated it: `Objects.equals`
+/// 203.5 ns as an unconditional-win native against 47.2 ns for a byte-identical
+/// local static, over 10M calls, because `dispatch_static` arbitrates on
+/// `NativeKind` alone and an `Intrinsic` was never letting the method be
+/// JIT-compiled.
+const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1584;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars
 /// short of the shipping registry, and 10 stub rows lighter. See
@@ -1079,9 +1127,22 @@ const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1573;
 /// the delta is the same −7 in both — but measure it, do not derive it: this
 /// constant's own history has a case of one derived from the other sitting six
 /// above the truth for a week.
-const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1562;
+const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1573;
 
 /// The TOTAL registration count each baseline above was measured beside.
+///
+/// **REFRESHED 2026-08-24: 13753 -> 13766 (management), 13385 -> 13398
+/// (default).** Both were stale by 13 in BOTH arms, and the 13 is NOT the
+/// 2026-08-24 `java/util/Objects` relabel that prompted the visit -- that
+/// movement changes no total at all, which is exactly how it was classified as
+/// case one. The 13 is non-stub registrations that landed on `dev` across
+/// earlier windows while these constants were not re-measured beside their own
+/// stub baselines. The same equal-in-both-arms drift this doc comment already
+/// records twice.
+///
+/// Stated rather than folded in, because a stale total silently disarms the
+/// three-case classification below: it is the only thing that tells a relabel
+/// from a new fake, and it cannot do that while it is 13 behind.
 ///
 /// Not asserted — a new `Bridge` legitimately raises it, so a gate here would
 /// fire on correct work. It exists so a failure can be CLASSIFIED: compare the
@@ -1109,13 +1170,13 @@ const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1562;
 /// [`BASELINE_SYNTHETIC_STUBS_MANAGEMENT`]; the run prints
 /// `... out of {total} total`, and `{total}` is this number.
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13753;
+const MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT: usize = 13766;
 /// See [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].
 ///
 /// **H3-1 REBASELINE — SUPERSEDED. Predicted 12785; MEASURED 12857 (+65),
 /// for the reason given on [`MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT`].**
 #[allow(dead_code)]
-const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13385;
+const MEASURED_TOTAL_REGISTRATIONS_NO_MANAGEMENT: usize = 13398;
 
 #[cfg(feature = "management")]
 const MEASURED_TOTAL_REGISTRATIONS: usize = MEASURED_TOTAL_REGISTRATIONS_MANAGEMENT;
@@ -1423,7 +1484,7 @@ fn intrinsic_by_file() -> Vec<(String, usize)> {
 /// So both are `Intrinsic` by §1.4's own standard: a reviewed exception of the
 /// kind every JVM makes for `Math.sqrt`. Neither is a row that gained the tag to
 /// leave the census.
-const BASELINE_INTRINSICS: usize = 1398;
+const BASELINE_INTRINSICS: usize = 1387;
 
 #[test]
 fn no_registration_runs_on_the_ambient_default() {
