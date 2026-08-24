@@ -2085,6 +2085,21 @@ pub fn compile_with_param_slots(
     // `Character.getType` returned UNASSIGNED for every Latin-1 letter once
     // JIT-compiled.
     let has_dispatch = !compiler.invoke_info.is_empty()
+        // A BRIDGED `invokedynamic` CALLS `jit_indy_bridge`, and that helper's
+        // first act is `jit_thread_mut()` — it has to push the synthetic frame
+        // the bootstrap runs on. A method whose only inter-method work is one
+        // indy has an EMPTY `invoke_info`: an `invokedynamic` used to lower to
+        // an uncommon trap, which calls nothing, so nothing on this list ever
+        // saw it. `static String f(int i) { return "v=" + i; }` compiled with
+        // `has_dispatch=false`, took the TLS-free fast entry, and the bridge
+        // answered every call with a NULL STRING — the identical shape as the
+        // `Character.getType` and `<clinit>`-gap entries above, and found the
+        // same way, by a method small enough to have nothing else in it
+        // (`probes/MinIndyProbe.java`).
+        || compiler
+            .indy_info
+            .iter()
+            .any(|&(_, _, _, _, bridge_site)| bridge_site != 0)
         || !compiler.direct_calls.is_empty()
         || !compiler.bounds_check_stubs.is_empty()
         || !compiler.null_check_store_stubs.is_empty()
@@ -2325,16 +2340,20 @@ pub fn compile_with_param_slots(
     // install sites in vm/src/jit/helpers.rs) consult this flag so every
     // call to such a method stays on a dispatch helper, whose
     // `try_resume_trapped_callee` resolves the trap precisely in place.
-    // Only sites that actually lower to a trap count. A fully bridged
-    // method (every indy is a StringConcatFactory call) carries no trap, so it
-    // must not be forced onto the dispatch-helper path for its callers.
+    // Only sites that actually lower to a trap count. A fully bridged method
+    // — every indy is a `StringConcatFactory` or `LambdaMetafactory` site the
+    // bridge serves — carries no trap, so it must not be forced onto the
+    // dispatch-helper path for its callers. This predicate is the SAME one
+    // `bytecode_walk`'s 0xba arm uses to decide whether to emit the bridge
+    // call; the two must not drift, or an artifact would advertise a trap it
+    // does not have (or, far worse, hide one it does).
     cm.has_indy_trap = {
-        let concat_entry = crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
+        let bridge_entry = crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
         compiler
             .indy_info
             .iter()
-            .any(|(_pc, _arg_slots, ret_type, _tags, concat_site)| {
-                !(*concat_site != 0 && concat_entry != 0 && matches!(*ret_type, b'L' | b'['))
+            .any(|(_pc, _arg_slots, ret_type, _tags, bridge_site)| {
+                !(*bridge_site != 0 && bridge_entry != 0 && *ret_type != b'V')
             })
     };
     // Stage 3 — the frame offset where this method stores the active

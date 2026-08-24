@@ -193,6 +193,27 @@ page for it.** The distinguishing test is the census: if the `tmpl:` rows carry
 the traffic with `fell_back=0`, the dispatch layer is not what is being
 measured.
 
+**And that story has since paid out on this very bench, which is the strongest
+evidence the classification above was right.** The `invokedynamic` bridge
+(`CRATONVM_JIT_INDY_BRIDGE`, landed the same day, on a branch that did not have
+the templates above) lets a method that CREATES a lambda stay compiled at all —
+and `IntVector.fromMemorySegment0Template`, on the read side of this very
+kernel, is exactly such a method. ONE binary, both arms, six ABBA-interleaved
+pairs on Azure host 2 at load 3.4, `checksum` byte-identical on all twelve
+runs:
+
+| arm | ns per lane |
+|---|---:|
+| indy bridge OFF | 12 157 - 13 064 |
+| indy bridge ON | **6137 - 6695** |
+
+**1.93x**, with no overlap between the arms. That is a Vector API number
+produced by work naming no Vector API class anywhere, which is what "not a
+Vector API defect" means when it is true.
+
+The two changes have NOT been measured together — each ratio above is against
+its own arm on its own tree — so do not multiply them.
+
 The arithmetic the parent page insisted on stating still holds and is still
 worth stating: at the ~7 µs per lane these hosts now measure, a Llama-3.2-1B
 forward pass of ~1.2e9 lane multiply-adds is on the order of **2 hours per

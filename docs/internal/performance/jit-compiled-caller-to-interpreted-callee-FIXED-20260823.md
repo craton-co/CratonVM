@@ -195,7 +195,7 @@ nothing, which is the failure mode this census exists for.
 three kinds — verified to reproduce the pre-fix binary's numbers within its
 noise, which is what makes the A/B a one-binary A/B.
 
-## §3 — why this landed on reactive code hardest (unchanged, and still true)
+## §3 — why this landed on reactive code hardest (CLOSED 2026-08-23, separately)
 
 A method containing an unbridged `invokedynamic` cannot run compiled, so it
 becomes exactly the interpreted callee above. Two mechanisms, both named by the
@@ -213,10 +213,43 @@ VM itself under `CRATONVM_DBG=jitc`:
   retires it permanently.
 
 `probes/IndyScopeProbe.java` isolates it. The SAM call itself is fine (32–35 ns
-once the calling method is compiled); what is broken is that a method
-*containing* an `invokedynamic` never stays compiled. **That is a separate open
-item and is NOT closed by this page** — what this page closes is the cost of
-calling such a method, which was 1900–3700 ns and is now ~420.
+once the calling method is compiled); what was broken is that a method
+*containing* an `invokedynamic` never stayed compiled.
+
+**That was a separate item, and it is CLOSED — by a bridge, not by this page.**
+Compiled code now EXECUTES such a site through a runtime helper
+(`CRATONVM_JIT_INDY_BRIDGE`, default ON), which removes both mechanisms above
+at once: with no trap at the indy bci there is nothing for an OSR frame to
+resume imprecisely, so the method-wide OSR denial lifts, and nothing takes the
+reason-8 stub, so nothing is retired. **Both bullets above now describe the OFF
+arm of that switch.** The bridged set is every bootstrap whose implementation
+reaches the frame only through its operand stack and its class id —
+`LambdaMetafactory`, `SwitchBootstraps`, `ObjectMethods` — beside the
+`StringConcatFactory` bridge the first bullet already named.
+
+ONE binary, both arms, ABBA-interleaved on Azure host 2 at load 3-4:
+
+| `IndyScopeProbe` arm | HotSpot | bridge OFF | bridge ON |
+|---|---:|---:|---:|
+| loop whose method creates the lambda | 1.4 ns | 698-757 ns/op | **22.4-24.2 ns/op** |
+| same loop, lambda hoisted out — CONTROL | 2.5 ns | 22.4-24.1 | 22.4-24.8 |
+| a fresh lambda per call | 2.7 ns | 881-936 ns/op | **267-287 ns/op** |
+
+~30x, and the first row lands exactly on its control.
+
+Two things that took four builds to find are worth carrying forward, because
+both are about flags that predate an `invokedynamic` which CALLS anything:
+`has_dispatch` and `needs_heap` are computed from `invoke_info`, `direct_calls`
+and the field/new tables, and a bridged indy is in none of them. A method whose
+only inter-method work was one indy therefore compiled with both false, took
+the entry path that "skips catch_unwind + thread-local overhead", and the
+bridge found a null `JIT_THREAD` and answered a NULL REFERENCE — no exception,
+no crash. `probes/MinIndyProbe.java` exists because every arm of
+`probes/IndyBridgeProbe.java` is a LOOP, and a loop has something else in it
+that already forces both flags.
+
+What this page closes remains the cost of CALLING an uncompiled method, which
+was 1900–3700 ns and is now ~420.
 
 ## What this is NOT
 

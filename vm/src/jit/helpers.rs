@@ -12711,6 +12711,17 @@ unsafe fn try_jit_static_bytecode_callee(
     if values.len() != cached.num_params as usize {
         return None;
     }
+    // Count the invocation the ordinary path would have counted, and stand
+    // down if a compiled body now exists — see
+    // `bytecode_callee_compiled_or_nominate`. Without this a callee served here
+    // is never nominated, so it stays interpreted for the life of the process;
+    // and a callee that IS compiled would be run interpreted anyway, which is a
+    // straight loss rather than a missed win. MEASURED at 15% on
+    // `probes/ExchangeProbe.java` before it was added.
+    if crate::runtime::interpreter::bytecode_callee_compiled_or_nominate(vm, thread, &cached) {
+        disp_census::note(disp_census::OUT_STATIC_BC_REFUSED);
+        return None;
+    }
     disp_census::note(disp_census::OUT_STATIC_BC);
     thread.refill_pools_from_shared(
         &vm.mem.operand_stack_pool,
@@ -12894,6 +12905,17 @@ unsafe fn try_jit_virtual_bytecode_callee(
     if values.len() != cached.num_params as usize + 1 {
         return None;
     }
+    // Count the invocation the ordinary path would have counted, and stand
+    // down if a compiled body now exists — see
+    // `bytecode_callee_compiled_or_nominate`. Without this a callee served here
+    // is never nominated, so it stays interpreted for the life of the process;
+    // and a callee that IS compiled would be run interpreted anyway, which is a
+    // straight loss rather than a missed win. MEASURED at 15% on
+    // `probes/ExchangeProbe.java` before it was added.
+    if crate::runtime::interpreter::bytecode_callee_compiled_or_nominate(vm, thread, &cached) {
+        disp_census::note(disp_census::OUT_VIRTUAL_BC_REFUSED);
+        return None;
+    }
     disp_census::note(disp_census::OUT_VIRTUAL_BC);
     thread.refill_pools_from_shared(
         &vm.mem.operand_stack_pool,
@@ -13062,6 +13084,17 @@ unsafe fn try_jit_special_bytecode_callee(
         return None;
     }
     if !matches!(values.first(), Some(Value::Object(Some(_)))) {
+        return None;
+    }
+    // Count the invocation the ordinary path would have counted, and stand
+    // down if a compiled body now exists — see
+    // `bytecode_callee_compiled_or_nominate`. Without this a callee served here
+    // is never nominated, so it stays interpreted for the life of the process;
+    // and a callee that IS compiled would be run interpreted anyway, which is a
+    // straight loss rather than a missed win. MEASURED at 15% on
+    // `probes/ExchangeProbe.java` before it was added.
+    if crate::runtime::interpreter::bytecode_callee_compiled_or_nominate(vm, thread, &cached) {
+        disp_census::note(disp_census::OUT_SPECIAL_BC_REFUSED);
         return None;
     }
     disp_census::note(disp_census::OUT_SPECIAL_BC);
@@ -14126,13 +14159,33 @@ pub fn admit_direct_native_entry(vm: &SharedVm, shadow: DirectNativeShadow) -> O
 ///    the dispatch helper, so the returned sentinel carries properly
 ///    stashed exception state for the caller's post-invoke check.
 ///
-/// Compiled `StringConcatFactory` bridge. Arguments reside in a JIT-owned raw
-/// spill buffer and are decoded by the call site's descriptor before Java code
-/// can run or move the heap.
+/// The compiled `invokedynamic` bridge — the one entry the codegen calls for
+/// every indy site it does NOT lower to an uncommon trap.
+///
+/// The site metadata carries a `kind` tag
+/// (`invokedynamic::jit_indy_site_kind`) saying which bootstrap family it is:
+/// `StringConcatFactory`, or (since 2026-08-23) any of the bootstraps whose
+/// implementation reaches the frame only through its operand stack and its
+/// class id — `LambdaMetafactory`, `SwitchBootstraps`, `ObjectMethods`. The
+/// second family is why a method that CREATES a lambda can stay compiled at
+/// all; see `crate::runtime::invokedynamic::JitIndyGenericSite`.
+///
+/// Arguments reside in a JIT-owned raw spill buffer and are decoded by the call
+/// site's descriptor before Java code can run or move the heap.
+///
+/// # Failure
+///
+/// The two kinds report differently, and deliberately. The concat bridge
+/// returns `Option` and a `None` becomes `0`, which is what it has always done.
+/// The generic bridge returns `Result`, and an `Err` is routed through
+/// [`handle_jit_dispatch_error`] — the same stash-and-sentinel path a compiled
+/// dispatch failure takes — because a bootstrap CAN throw
+/// (`BootstrapMethodError`, `LambdaConversionError`) and swallowing that into a
+/// null reference would surface it as an NPE several frames later.
 ///
 /// SAFETY: all pointers are supplied by the generated call sequence for the
 /// current live VM and the site allocation is process-lived.
-pub unsafe extern "C" fn jit_indy_string_concat(
+pub unsafe extern "C" fn jit_indy_bridge(
     vm_ptr: i64,
     site_ptr: i64,
     args_ptr: *const i64,
@@ -14140,19 +14193,87 @@ pub unsafe extern "C" fn jit_indy_string_concat(
 ) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
+    // `CRATONVM_DBG_JITC=1` — what the bridge was handed and what it answered.
+    // A wrong result from a bridged site poses exactly one question, which SIDE
+    // lost the value, and nothing else can tell the two apart: a helper that
+    // returns a good pointer into a call sequence that drops it looks identical
+    // to a helper that returned 0. Rides on the same variable the codegen's own
+    // `indy bridge pc=` line uses, so one run shows the emission and the
+    // execution together.
+    let dbg = crate::runtime::env_cache::dbg_jitc();
+    let kind = crate::runtime::invokedynamic::jit_indy_site_kind(site_ptr as usize);
+    let count = arg_count.max(0) as usize;
+    if dbg {
+        eprintln!("[indy-bridge] kind={kind} args={count} args_ptr={args_ptr:?}");
+    }
     let Some((thread, _guard)) = jit_thread_mut() else {
+        // UNCONDITIONAL. This is a should-never-happen that answers with a
+        // NULL REFERENCE, which is the worst shape a helper can have: no
+        // exception, no crash, a wrong value that surfaces frames later. It is
+        // inherited from the concat bridge, where it has always been silent.
+        eprintln!(
+            "[indy-bridge] NO JIT THREAD - returning a null result for a bridged invokedynamic (kind={kind}, args={count}). This is a bug, not a condition; the site's answer is now wrong."
+        );
         return 0;
     };
     let vm = &*(vm_ptr as *const SharedVm);
-    crate::runtime::invokedynamic::execute_jit_string_concat_raw(
-        vm,
-        thread,
-        site_ptr as usize,
-        args_ptr,
-        arg_count.max(0) as usize,
-    )
-    .map(|obj| obj.as_ptr() as i64)
-    .unwrap_or(0)
+    match kind {
+        crate::runtime::invokedynamic::JIT_INDY_SITE_GENERIC => {
+            match crate::runtime::invokedynamic::execute_jit_indy_generic_raw(
+                vm,
+                thread,
+                site_ptr as usize,
+                args_ptr,
+                count,
+            ) {
+                Ok((bits, obj_opt)) => {
+                    if dbg {
+                        eprintln!("[indy-bridge] generic -> 0x{bits:x}");
+                    }
+                    if let Some(obj) = obj_opt {
+                        // Object-return handoff root, same contract as every
+                        // other JIT helper that hands a fresh reference back to
+                        // compiled code (see `jit_integer_value_of_direct`):
+                        // the value was allocated inside this call and nothing
+                        // else roots it between here and the caller's store.
+                        thread.native_pending_return = Some(obj);
+                    }
+                    bits
+                }
+                Err(error) => {
+                    // `JitInvokeInfo` is only what `handle_jit_dispatch_error`
+                    // uses for its diagnostics; the stash and the sentinel do
+                    // not depend on it. A synthetic one keeps that message
+                    // readable.
+                    let info = JitInvokeInfo {
+                        class_name: "<jit-indy>",
+                        method_name: "bridge",
+                        descriptor: "()Ljava/lang/Object;",
+                        num_jit_args: 0,
+                        return_type: b'L',
+                        invoke_kind: 3,
+                        declaring_class_id: 0,
+                    };
+                    handle_jit_dispatch_error(vm, thread, error, &info)
+                }
+            }
+        }
+        _ => {
+            let r = crate::runtime::invokedynamic::execute_jit_string_concat_raw(
+                vm,
+                thread,
+                site_ptr as usize,
+                args_ptr,
+                count,
+            )
+            .map(|obj| obj.as_ptr() as i64)
+            .unwrap_or(0);
+            if dbg {
+                eprintln!("[indy-bridge] concat -> 0x{r:x}");
+            }
+            r
+        }
+    }
 }
 
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
@@ -21485,7 +21606,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     // the other two doors must switch to; O1/O2 in the H20-1 record.
     //
     // Deliberately NOT skipped under `JdkOnly`:
-    //  * `set_indy_string_concat_fn` — a `StringConcatFactory` *bootstrap*
+    //  * `set_indy_bridge_fn` — an `invokedynamic` *bootstrap*
     //    bridge, not a native-method dispatch. The interpreter reaches the same
     //    bridge for the same sites, so gating it would move the call without
     //    changing the policy answer, while perturbing
@@ -21493,7 +21614,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     //  * `set_monitor_direct_fns` — VM monitor services, not registered
     //    natives. Not a dispatch site.
     // Both exclusions match `jit/src/lib.rs`'s own JDK-ONLY-NOTE items 5 and 6.
-    cratonvm_jit::set_indy_string_concat_fn(jit_indy_string_concat as *const () as usize);
+    cratonvm_jit::set_indy_bridge_fn(jit_indy_bridge as *const () as usize);
     cratonvm_jit::set_monitor_direct_fns(
         jit_monitor_enter as *const () as usize,
         jit_monitor_exit as *const () as usize,

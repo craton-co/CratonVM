@@ -10915,7 +10915,7 @@ impl Compiler {
                         .indy_info_idx
                         .get(&pc)
                         .map(|&i| self.indy_info[i].clone());
-                    let Some((_pc, arg_slots, ret_type, arg_type_tags, concat_site)) = info
+                    let Some((_pc, arg_slots, ret_type, arg_type_tags, bridge_site)) = info
                     else {
                         // No resolver, or this site couldn't be resolved at
                         // compile time: fail safe and bail the whole method,
@@ -10927,29 +10927,53 @@ impl Compiler {
 
                     self.flush_scratch_registers();
 
-                    // A `StringConcatFactory` site has a resolved,
-                    // process-lifetime bridge, so call it directly instead of
-                    // taking the uncommon trap below. This is what removes
-                    // RBC.7's premise for the common
-                    // `println("..." + x)`-after-a-loop shape: with no trap at
-                    // the indy bci there is nothing for an OSR frame to resume
-                    // imprecisely, so the OSR artifact keeps running. Every
-                    // other bootstrap kind still falls through to the trap.
-                    let concat_entry =
-                        crate::INDY_STRING_CONCAT_FN.load(std::sync::atomic::Ordering::Relaxed);
-                    if concat_site != 0 && concat_entry != 0 && matches!(ret_type, b'L' | b'[') {
+                    // A BRIDGED site has a resolved, process-lifetime
+                    // handler, so call it directly instead of taking the
+                    // uncommon trap below. This is what removes RBC.7's premise
+                    // for the common `println("..." + x)`-after-a-loop shape:
+                    // with no trap at the indy bci there is nothing for an OSR
+                    // frame to resume imprecisely, so the OSR artifact keeps
+                    // running.
+                    //
+                    // The bridged set is `StringConcatFactory` and, since
+                    // 2026-08-23, `LambdaMetafactory`, `SwitchBootstraps` and
+                    // `ObjectMethods` — every bootstrap whose implementation
+                    // reaches the frame only through its operand stack and its
+                    // class id, which is all a bridge can offer. Between them
+                    // they cover a lambda or method reference, a
+                    // pattern-matching `switch`, and a record's
+                    // `equals`/`hashCode`/`toString`. The lambda one is what
+                    // lets a method that CREATES a lambda stay compiled at all:
+                    // before it, such a method took this trap on its first
+                    // execution and was retired with `MakeNotCompilable`, which
+                    // on Reactor/WebFlux assembly means essentially nothing is
+                    // ever compiled. The site pointer is self-describing (its
+                    // `kind` tag), so ONE call sequence and one entry serve
+                    // both. Every other bootstrap kind still falls through to
+                    // the trap.
+                    let bridge_entry =
+                        crate::INDY_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
+                    if bridge_site != 0 && bridge_entry != 0 && ret_type != b'V' {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
                             eprintln!(
-                                "[cratonvm-jitc] indy-concat bridge pc={} args={}",
+                                "[cratonvm-jitc] indy bridge pc={} args={}",
                                 pc, arg_slots
                             );
                         }
                         let pre_pop_spill = self.next_spill_offset;
-                        let mut arg_slots_vec = Vec::with_capacity(arg_slots);
-                        for _ in 0..arg_slots {
-                            arg_slots_vec.push(self.pop_stack());
-                        }
-                        arg_slots_vec.reverse();
+                        // `pop_invoke_args`, not a bare `pop_stack` loop: it
+                        // also hands back the per-argument OOP MARKS, and the
+                        // staged buffer below is the only thing holding those
+                        // references across a call that runs a bootstrap and
+                        // allocates. Without `pending_staged_arg_oops` the
+                        // safepoint map does not name them, which for a
+                        // capturing lambda means every captured object is
+                        // invisible to a collection that happens inside its own
+                        // creation. The concat bridge this arm grew out of had
+                        // the same gap and never showed it, because a
+                        // `StringConcatFactory` argument is read into a Rust
+                        // `String` before anything can allocate.
+                        let (arg_slots_vec, arg_oops) = self.pop_invoke_args(arg_slots);
                         let post_pop_spill = self.next_spill_offset;
                         if arg_slots > 0 {
                             let Some(args_end) =
@@ -10959,7 +10983,7 @@ impl Compiler {
                                     .is_some()
                                 {
                                     eprintln!(
-                                        "[cratonvm-jitc] indy-concat bridge spill overflow pc={} base={} args={}",
+                                        "[cratonvm-jitc] indy bridge spill overflow pc={} base={} args={}",
                                         pc, pre_pop_spill, arg_slots
                                     );
                                 }
@@ -10970,10 +10994,13 @@ impl Compiler {
                                 let offset = pre_pop_spill + ((arg_slots - 1 - i) as i32) * 8;
                                 self.load_slot_to_reg(RAX, *slot);
                                 self.emit_store_local(offset, RAX);
+                                if arg_oops[i] {
+                                    self.pending_staged_arg_oops.push(offset);
+                                }
                             }
                         }
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_imm64(ARG_REGS[1], concat_site as i64);
+                        self.emit_mov_imm64(ARG_REGS[1], bridge_site as i64);
                         if arg_slots > 0 {
                             self.emit_lea_frame_slot(
                                 ARG_REGS[2],
@@ -10984,11 +11011,37 @@ impl Compiler {
                         }
                         self.emit_mov_imm32_sx(ARG_REGS[3], arg_slots as i32);
                         self.emit_pre_safepoint_spill();
-                        self.emit_call_absolute(concat_entry);
+                        self.emit_call_absolute(bridge_entry);
                         self.emit_oop_map_for_safepoint();
                         self.next_spill_offset = post_pop_spill;
-                        self.push_from_rax();
-                        self.mark_top_as_oop();
+                        // The bridge is FALLIBLE, and the `LambdaMetafactory`
+                        // half is fallible in a way the concat half is not: a
+                        // bootstrap can raise `BootstrapMethodError` /
+                        // `LambdaConversionError`, and the VM-side entry stashes
+                        // that and returns the `i64::MIN` deopt sentinel. Route
+                        // it through the same shared stub every other fallible
+                        // helper call uses; without it the sentinel bits would
+                        // be pushed AS AN OBJECT REFERENCE and dereferenced by
+                        // whatever consumes the result.
+                        //
+                        // Added with the generic bridge rather than before it
+                        // because the concat entry's only failure answer is `0`,
+                        // i.e. a null `String` — wrong, but not a wild pointer.
+                        self.emit_post_invoke_exception_check(ret_type);
+                        // Pushed by the DESCRIPTOR, the same three-way choice
+                        // the invoke lowering above makes: `xmm0` for `D`/`F`,
+                        // a plain slot otherwise, oop-marked for `L`/`[`. A
+                        // `V` site never reaches here — it is refused at
+                        // admission, because a void bridge has no push for
+                        // this to model.
+                        if matches!(ret_type, b'D' | b'F') {
+                            self.push_from_rax_as_xmm0();
+                        } else {
+                            self.push_from_rax();
+                        }
+                        if matches!(ret_type, b'L' | b'[') {
+                            self.mark_top_as_oop();
+                        }
                         pc += 5;
                         continue;
                     }

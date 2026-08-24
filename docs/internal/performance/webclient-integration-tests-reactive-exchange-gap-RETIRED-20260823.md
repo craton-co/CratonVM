@@ -69,6 +69,50 @@ clock is unreadable on a shared host: three ABBA rounds of the memo A/B gave
 difference between arms.** The census is not noisy, and it is what a future
 reader should reach for.
 
+## The SECOND open item, and it is fixed rather than counted
+
+The section above closes the page's §1 by counting: the JIT is not the lever
+here because almost nothing here is compiled. §1 had a second half, though, and
+it names a mechanism rather than a measurement:
+
+> a method containing an unbridged `invokedynamic` is denied OSR outright and
+> retired with `MakeNotCompilable` after its first compiled execution, so every
+> lambda-creating method becomes exactly that interpreted callee.
+
+**That is now fixed** (`CRATONVM_JIT_INDY_BRIDGE`, default ON): compiled code
+EXECUTES such a site through a runtime bridge, so there is no trap at the indy
+bci for an OSR frame to resume imprecisely and nothing takes the reason-8 stub.
+The bridged set is every bootstrap whose implementation reaches the frame only
+through its operand stack and its class id — `LambdaMetafactory`,
+`SwitchBootstraps`, `ObjectMethods` — beside the `StringConcatFactory` bridge
+that already existed.
+
+ONE binary, both arms of that switch, ABBA-interleaved on Azure host 2 at load
+3-4. `ReactorProbe`'s non-reactive `control` arm reads 25-34 ns/op across every
+row, which is what makes the pairs fair; every probe's checksum is identical in
+both arms and to HotSpot.
+
+| probe / arm | bridge OFF | bridge ON | |
+|---|---:|---:|---:|
+| `IndyScopeProbe` loop whose method creates the lambda | 698-757 ns/op | **22.4-24.2** | **~30x** |
+| `IndyScopeProbe` same loop, lambda hoisted out — CONTROL | 22.4-24.1 | 22.4-24.8 | flat |
+| `IndyScopeProbe` a fresh lambda per call | 881-936 ns/op | **267-287** | **3.3x** |
+| `ReactorProbe` assemble only (operator assembly) | 8876 ns/op | **6281** | **1.41x** |
+| `ReactorProbe` assemble+run | 62 260 ns/op | **54 006** | 1.15x |
+| `ReactorProbe` mono chain | 27 218 ns/op | **23 281** | 1.17x |
+| `Fp16VectorDotBench` ns/lane | 12 157-13 064 | **6137-6695** | **1.93x** |
+| **`ExchangeProbe` — THIS class's shape** | 31.42-34.64 ms/op | 31.27-44.50 ms/op | **wash** |
+
+The first row lands exactly on its own control: the penalty for putting a `->`
+inside the loop's own method is gone rather than reduced.
+
+**And the last row is a wash, for the same reason as the section above.** This
+is the second independent confirmation that the page is retired correctly: two
+different fixes, each large in isolation, each measured on this class's own
+probe, and neither moves it — because `hit_entry=0` and `out_virt_bc=44` say
+there is no compiled code here for a compiled-code fix to improve. A third
+would say the same thing.
+
 ## The seven ruled-out items are unchanged
 
 They are still ruled out and still worth not re-testing: the JIT (now with the
@@ -111,7 +155,7 @@ still holds** — their sum is under 10% of a 770% gap:
 | `resolve_method_metadata` | 1.22% | untouched |
 | `intern_arc` | 0.97% | untouched |
 | `CachedInvokeTarget::clone` | 0.77% | real: `dispatch_static.rs`'s hit path clones the enum to release the `thread` borrow, and its variants hold several `Arc`s, so a hit costs 4-8 atomic RMWs instead of one. The fix is to store `Arc<CachedInvokeTarget>` in the map — 46 `put` sites and two `get` sites, mechanical but broad. Not taken for 0.77% |
-| `register_jit_code_range_inner` + sorts | ~0.7% | untouched |
+| `register_jit_code_range_inner` + sorts | ~0.7% | **fixed 2026-08-23** — the snapshot it clones is already sorted (this function and `unregister` are its only writers, and `unregister` retains in place), so the whole ordering job is placing ONE element. `sort_unstable_by_key` cannot see that: an element appended past the end of a sorted run is exactly the shape that defeats its almost-sorted path, so every registration paid O(n log n) over the entire registry. Now `partition_point` + `insert`. It matters more than 0.7% suggests now that the indy bridge keeps far more methods compiled |
 
 ## Reproducing
 
