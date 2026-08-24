@@ -756,3 +756,49 @@ is generated and machine-local, so it is not committed.
 - `jit/src/lambda_adapter.rs` — the `AdapterKey` of §5.4 and its `site_shape_collisions` counter
 - [`hib-reactive-3gc-run-regressions-20260820.md`](hib-reactive-3gc-run-regressions-20260820.md) §8
 - [`batchtest-mysql-jdbc-batching-slow-20260822.md`](batchtest-mysql-jdbc-batching-slow-20260822.md) — the same "trivial JDK primitive served by a native" shape, and the same conclusion that the funnel's aggregate is small
+
+---
+
+## 8. 2026-08-24 — the `invokedynamic` bridge does NOT retire this class (checked, negative)
+
+Recorded because the obvious question after
+[`techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md`](../../internal/fixed-suite-bugs/jit/techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md)
+is whether the same merge helps here. `TechEmpowerTest` was retired by
+`730d3e0d9` (compiled code can now EXECUTE an `invokedynamic`), and this class
+sits in the same reactive-dispatch cost family, so it is a reasonable thing to
+hope for. **It does not.**
+
+Local Windows box, live Postgres via Testcontainers, binary built from `dev`
+`b70870c36` (indy merge confirmed present by `merge-base --is-ancestor`), JUnit's
+own per-test timer raised to 900 s through `HR_CLASS_OVERRIDES` so the fixture's
+hardcoded `@Timeout(10, MINUTES)` is what binds:
+
+| arm | `ok` / 2 | wall |
+|---|---:|---|
+| default (indy bridge on) | 1 | 674 s |
+| `CRATONVM_JIT_INDY_BRIDGE=0` | 0 | 666 s |
+| `CRATONVM_JIT_INDY_BRIDGE=0` | 1 | 97 s |
+| `CRATONVM_JIT_INDY_BRIDGE=0` | 1 | 669 s |
+
+**Status on today's `dev` is unchanged from this page's own:** 1 of 2, with
+`testIdentityGeneratorWithTransaction` still exceeding the fixture's own
+deadline. The indy work does not close it, and nobody should re-run this
+expecting otherwise.
+
+### 8.1 A claim this section deliberately does NOT make
+
+The first `INDY_BRIDGE=0` run had `testIdentityGenerator` (the *non*-transactional
+method, which §Status records as passing) fail with
+`ConstraintViolationException: duplicate key value violates unique constraint
+"entity_pkey"`. On one run that reads like "the indy bridge is what keeps this
+method correct" — the same wrong-answer shape the TechEmpower page pins on that
+trap.
+
+Two further runs of the same arm did not reproduce it: **1 of 3**. So the event
+is intermittent and is NOT attributable to the flag on this evidence; it is at
+least as consistent with the duplicate-INSERT behaviour §5 already treats as
+downstream. Establishing a real rate difference here needs the kind of run count
+§5 used (40), not three.
+
+It is written down only so the next reader who sees one duplicate-key failure
+under that flag knows it has been seen, and knows it did not survive repetition.
