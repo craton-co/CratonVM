@@ -1343,12 +1343,21 @@ pub fn jit_virtual_bytecode_callee() -> bool {
 ///
 /// | arm | HotSpot | bridge OFF | bridge ON |
 /// |---|---:|---:|---:|
-/// | loop whose method creates the lambda | 1.4 ns | 660-885 ns | **23.7-25.5 ns** |
-/// | identical loop, lambda hoisted out | 2.5 ns | 23.6-33.5 ns | 23.7-25.4 ns |
-/// | a fresh lambda per call | 2.7 ns | 889-1044 ns | **427-474 ns** |
+/// | loop whose method creates the lambda | 1.4 ns | 698-757 ns | **22.4-24.2 ns** |
+/// | identical loop, lambda hoisted out | 2.5 ns | 22.4-24.1 ns | 22.4-24.8 ns |
+/// | a fresh lambda per call | 2.7 ns | 881-936 ns | **267-287 ns** |
 ///
 /// ~30x, and the first row lands exactly on the second — the penalty for
 /// putting a `->` inside the loop's own method is gone rather than reduced.
+///
+/// On the workloads, same binary and same switch, medians of six interleaved
+/// runs with `ReactorProbe`'s non-reactive `control` arm flat at 25-34 ns/op:
+/// `Fp16VectorDotBench` **1.93x** (12 157-13 064 -> 6137-6695 ns/lane),
+/// `ReactorProbe` operator assembly **1.41x** (8876 -> 6281 ns/op),
+/// assemble+run 1.15x, `mono chain` 1.17x. `ExchangeProbe` is a WASH, and that
+/// is not a contradiction: its request-path methods are called ~60 times, below
+/// the C1 threshold, so ~98% of it never compiles and there is nothing for a
+/// compiled-code fix to move.
 ///
 /// # Why it is a switch and not a constant
 ///

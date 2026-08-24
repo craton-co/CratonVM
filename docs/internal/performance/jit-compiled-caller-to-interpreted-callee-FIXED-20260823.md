@@ -207,11 +207,11 @@ MEASURED on ONE binary, both arms, interleaved on a quiet host:
 
 | `IndyScopeProbe` arm | bridge OFF | bridge ON |
 |---|---:|---:|
-| loop whose method creates the lambda | 651-1043 ns/op | **23.7-34.4 ns/op** |
-| same loop, lambda hoisted out (control) | 23.6-34.2 | 23.8-34.4 |
-| a fresh lambda per call | 891-1179 ns/op | **430-560 ns/op** |
+| loop whose method creates the lambda | 698-757 ns/op | **22.4-24.2 ns/op** |
+| same loop, lambda hoisted out (control) | 22.4-24.1 | 22.4-24.8 |
+| a fresh lambda per call | 881-936 ns/op | **267-287 ns/op** |
 
-~28x, and the first row lands exactly on its own control. What THIS page closes
+~30x, and the first row lands exactly on its own control. What THIS page closes
 remains the cost of CALLING an uncompiled method, which was 1900-3700 ns and is
 now ~420.
 

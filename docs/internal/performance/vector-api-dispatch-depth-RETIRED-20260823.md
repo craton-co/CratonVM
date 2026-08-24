@@ -23,17 +23,21 @@ than asserted:
   `IntVector.fromMemorySegment0Template` is exactly such a method.
 
 `probes/Fp16VectorDotBench.java`, ONE binary, `CRATONVM_JIT_INDY_BRIDGE=0|1`,
-six interleaved pairs on a quiet host, `checksum` byte-identical on every run:
+six ABBA-interleaved pairs on a host at load 3.4, `checksum` byte-identical on
+all twelve runs:
 
 | arm | ns per lane |
 |---|---:|
-| bridge OFF | 11 765 - 19 120 |
-| bridge ON | **6 830 - 10 630** |
+| bridge OFF | 12 157 - 13 064 |
+| bridge ON | **6137 - 6695** |
 
-**1.7x on the median (11 800 -> 6 899), 1.72x on the minima.** Against the
-16 165 - 19 219 this page's own probe read on `dev` `3ed73bf89` the same day,
-the two changes together are **~2.4x** — from work that names no Vector API
-class anywhere.
+**1.93x**, with no overlap between the arms in either direction.
+
+Against the 16 165 - 19 219 this page's own probe read on `dev` `3ed73bf89` the
+same day, the two changes together are **~2.7x** — from work that names no
+Vector API class anywhere. HotSpot reads 0.13 ns/lane, so this is not a
+usefulness threshold being crossed; it is the page's own diagnosis being
+confirmed.
 
 ## What is NOT done, and why it is not a residual of this page
 

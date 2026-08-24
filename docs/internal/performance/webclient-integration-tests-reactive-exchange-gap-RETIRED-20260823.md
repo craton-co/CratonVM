@@ -27,21 +27,32 @@ implementation reaches the frame only through its operand stack and its class
 id — `LambdaMetafactory`, `SwitchBootstraps`, `ObjectMethods`, alongside the
 `StringConcatFactory` bridge that already existed.
 
-MEASURED on ONE binary, both arms of that switch, interleaved on a quiet host:
+MEASURED on ONE binary, both arms of that switch, ABBA-interleaved, on a host
+at load 3-4 (the `control` arm of `ReactorProbe` reads 25-34 ns/op across every
+run below, which is what says the pairs are fair). Medians of six runs per arm;
+every probe's own checksum is byte-identical in both arms and to HotSpot.
 
-| probe / arm | bridge OFF | bridge ON |
-|---|---:|---:|
-| `IndyScopeProbe` loop whose method creates the lambda | 651-1043 ns/op | **23.7-34.4 ns/op** |
-| `IndyScopeProbe` same loop, lambda hoisted out (control) | 23.6-34.2 | 23.8-34.4 |
-| `IndyScopeProbe` a fresh lambda per call | 891-1179 ns/op | **430-560 ns/op** |
-| `Fp16VectorDotBench` (`checksum` identical) | 11 765-19 120 ns/lane | **6 830-10 630 ns/lane** |
-| `ReactorProbe` assemble-only, least-contended | 9248 ns/op | **6896 ns/op** |
-| `ReactorProbe` assemble+run, least-contended | 64 120 ns/op | **56 279 ns/op** |
-| **`ExchangeProbe` — THIS page's workload** | 31.42-34.64 ms/op | 31.27-44.50 ms/op |
+| probe / arm | bridge OFF | bridge ON | |
+|---|---:|---:|---:|
+| `IndyScopeProbe` loop whose method creates the lambda | 698-757 ns/op | **22.4-24.2 ns/op** | **~30x** |
+| `IndyScopeProbe` same loop, lambda hoisted out — CONTROL | 22.4-24.1 | 22.4-24.8 | flat |
+| `IndyScopeProbe` a fresh lambda per call | 881-936 ns/op | **267-287 ns/op** | **3.3x** |
+| `Fp16VectorDotBench` ns/lane | 12 157-13 064 | **6137-6695** | **1.93x** |
+| `ReactorProbe` assemble only | 8876 ns/op | **6281 ns/op** | **1.41x** |
+| `ReactorProbe` assemble+run | 62 260 ns/op | **54 006 ns/op** | 1.15x |
+| `ReactorProbe` mono chain | 27 218 ns/op | **23 281 ns/op** | 1.17x |
+| `ReactorProbe` decode pojo | 290 467 ns/op | 272 161 ns/op | 1.07x |
+| `ReactorProbe` control (non-reactive) | 25-26 ns/op | 25-34 ns/op | flat |
+| **`ExchangeProbe` — THIS page's workload** | 31.42-34.64 ms/op | 31.27-44.50 ms/op | **wash** |
 
-The first row is the headline: **~28x**, and it lands exactly on its own
+The first row is the headline: **~30x**, and it lands exactly on its own
 control, so the penalty for putting a `->` inside a loop's own method is gone
-rather than reduced.
+rather than reduced. HotSpot reads 1.4-3.8 ns/op on that row, so what is left
+there is the general per-call gap, not this mechanism.
+
+`assemble only` — Reactor operator assembly, which is nothing but methods that
+create lambdas — is the workload row that matters most for this page's subject,
+and it moves **1.41x** with a flat control.
 
 ## Why the last row is a wash, and why that retires the page rather than keeping it open
 
