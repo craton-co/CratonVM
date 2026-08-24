@@ -98,11 +98,21 @@ read then the bytes), same binary: **23.44 -> 6.97 µs per string**, HotSpot
 `checksum` is `-540000` in every CratonVM arm and on HotSpot;
 `GgufStringReadProbe`'s is `-53403` in all three.
 
-Confirmed on a second host (Windows 11, same binary, same switch) — noisier,
-so quote the Azure rows above, but the direction and the census are the same:
-`GgufStringReadProbe` **55.13 -> 17.28 µs per string** against HotSpot's 4.93,
-and `FileChannelHeapReadProbe` off/on pairs of 120 346/12 638 and
-42 664/16 159 ns.
+Confirmed on a second host, and on the MERGED tree rather than the branch tip.
+Windows 11, quiet, same binary, same switch, three interleaved rounds — a
+tighter spread than either of the runs above:
+
+| | round 1 | round 2 | round 3 |
+|---|---:|---:|---:|
+| fast I/O **off** | 33 584 | 32 328 | 31 074 |
+| fast I/O **on** | **10 423** | **10 623** | **10 543** |
+| HotSpot | 3 082 | 3 157 | 3 548 |
+
+The on-arm spread is 2%. **3.1x**, and the gap to HotSpot goes 10.2x -> 3.2x.
+The census is identical on every one of those rounds
+(`read fast=120000 refused=0  pos fast=60000 refused=0`), and
+`GgufStringReadProbe` on the same host reads 55.13 -> 17.28 µs per string
+against HotSpot's 4.93.
 
 The engagement census is what makes those readable —
 `CRATONVM_FC_FAST_IO_STATS=1`, from the "on" arm:

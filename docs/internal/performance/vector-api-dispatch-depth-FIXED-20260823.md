@@ -5,7 +5,7 @@
 | **Status** | **FIXED.** The JDK's route to `VectorSupport` is native for the whole `lanewise` family. What is left is `convert0` and the VM-wide per-call cost, and the page itself already said which of those is a Vector API defect: neither |
 | **Opened** | 2026-08-22, as the residual of the lane-at-a-time fallback fixed the same day |
 | **Closed by** | `perf/filechannel-vector-webclient-residuals-20260823` |
-| **Measured effect** | `Fp16VectorDotBench` **22 093 -> 9 874 ns per lane**, 2.2x, one binary, `CRATONVM_VECTOR_TEMPLATES=0\|1`, three interleaved rounds. `probes/VectorApiProbe.java`: **322 of 322 rows identical** to Temurin 25.0.3+9 in all three arms |
+| **Measured effect** | `Fp16VectorDotBench` **15 863 -> 9 212 ns per lane**, **1.7x**, one binary, `CRATONVM_VECTOR_TEMPLATES=0\|1`, three interleaved rounds on a quiet host. `probes/VectorApiProbe.java`: **322 of 322 rows identical** to Temurin 25.0.3+9 in all three arms |
 
 ## What the page left open
 
@@ -98,12 +98,22 @@ per-entry census separates them.
 ## The numbers
 
 Windows 11, one binary, `CRATONVM_VECTOR_TEMPLATES=0|1`, three interleaved
-rounds of `probes/Fp16VectorDotBench.java 20 2048`:
+rounds of `probes/Fp16VectorDotBench.java 20 2048`, taken on the MERGED tree
+and on a quiet host:
 
 | | round 1 | round 2 | round 3 |
 |---|---:|---:|---:|
-| templates **off** (kernels only) | 30 363 | 21 945 | 22 093 |
-| templates **on** | **9 405** | **9 874** | **12 280** |
+| templates **off** (kernels only) | 17 177 | 15 580 | 15 863 |
+| templates **on** | **8 901** | **9 368** | **9 212** |
+
+**1.7x**, with a 5% spread inside each arm.
+
+An earlier run of the same A/B on the same host — while it was compiling — read
+30 363 / 21 945 / 22 093 against 9 405 / 9 874 / 12 280, a nominal **2.2x**.
+The quiet rows are the ones to quote, and the reason is worth naming rather
+than left as a preference: the load landed on the OFF arm, so the contended
+run flatters the change. A ratio taken on a busy host is only trustworthy when
+it is the WORSE of the two available readings.
 
 `checksum=1098616832` and `warm=1061765120` on every row of both arms, and
 `warm` matches HotSpot's. HotSpot itself is 0.265 ns per lane.
