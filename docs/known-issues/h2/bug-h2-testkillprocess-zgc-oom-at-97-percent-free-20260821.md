@@ -73,7 +73,8 @@ frame cannot be *located*, not disbelieved. See §"Still open".
 > here.** The optimizing tier's inline caches never restored the innermost-frame
 > mirror — a genuine gap every sibling path closes, now fixed and pinned by a
 > discriminating test — and on this class it moves the `no_map` rate not at all
-> (5.06/5.33/5.09 % on against 5.57/5.18 % off, engagement counter 3 695–3 730
+> (5.06/5.33/5.09 % on against 5.57/5.18/5.14 % off, 6/6 failing, engagement
+> counter 3 695–3 730
 > against 0). See §"Follow-up 2026-08-24 (second)". The same section records
 > that this class has become FLAKY on `dev` — `rc=0` once and `rc=1` five times
 > from one binary on one config — which is the first thing any future arm here
@@ -828,8 +829,9 @@ interleaved, `--Xmx 1g`:
 | on | 3 730 | 402 / 7 539 = **5.33 %** | 11 | 582 | 1 |
 | off | 0 | 427 / 8 248 = **5.18 %** | 8 | 636 | 1 |
 | on | 3 695 | 174 / 3 419 = **5.09 %** | 9 | 270 | 1 |
+| off | 0 | 216 / 4 200 = **5.14 %** | 9 | 329 | 1 |
 
-The rates are indistinguishable, and every arm fails with the same 4
+Three reps per arm: **5.06 / 5.33 / 5.09 %** on against **5.57 / 5.18 / 5.14 %** off. Indistinguishable, and all six fail with the same 4
 `OutOfMemoryError`. **The optimizing tier's inline caches are not what produces
 `no_map` on these classes.** The fix is kept on its own correctness merits —
 the gap is real, every sibling path closes it, and the test proves the
