@@ -2,28 +2,106 @@
 
 ## Status
 
-**OPEN 2026-08-24, but not on the signature this page was filed for.** The
+**OPEN 2026-08-24 — one of the two live failures is now FIXED, the other is
+not, and neither is the signature this page was filed for.** The
 `ClassCastException: String cannot be cast to Map$Entry` did not occur once in
 **eleven runs** of this class across seven configurations and roughly two and a
 half hours of runtime, on the 2026-08-23 `dev` tip. The seed the page records
 as the reproducer passes on CratonVM *and* on stock HotSpot 25.
 
-What the same runs did find is two other failures, both reproducible, neither
-of which this page describes:
+| failure | state |
+|---|---|
+| `-XX:+UseG1GC`: `NoSuchMethodError: 'java.lang.Object[] java.lang.Object.toArray()'` | **FIXED** — an unpinned receiver across a GC point; see below |
+| `--Xmx 256m`: a stale receiver inside `assertEquals`, ~823–845 s | **OPEN**, and it has now shown TWO different faces |
+| the recorded `ClassCastException` | **not reproduced**, retired as a starting point |
 
-* **`-XX:+UseG1GC`: `NoSuchMethodError: 'java.lang.Object[]
-  java.lang.Object.toArray()'` in 41–67 s, 5 of 5 runs.** A receiver whose
-  class reads as `java.lang.Object` — the same *family* as the recorded cast
-  failure (a reference whose class is wrong), reproducible in a minute instead
-  of not at all.
-* **`--Xmx 256m`: `NullPointerException: Cannot read the array length because
-  "d" is null`** inside MVStore, at 823 s, `seed:-6324998873221791827 op:2093`.
+The page stays open on the second row.
 
-Both are on the **default `dev` binary**; neither is introduced by the
-2026-08-24 ZGC/JIT relocation work (the G1 arm was A/B'd against it explicitly
-— see below). The page stays open because the class fails; the recorded
-signature is retired as a starting point, because chasing it costs runs and
-produces nothing.
+## The G1 failure: an unpinned receiver across a GC point — FIXED
+
+`new ArrayList<>(map.keySet())` reaches `native_al_init_from_collection` →
+`collect_collection_elements_or_real`, which asks the receiver's own `size()`
+and then its `toArray()`:
+
+```rust
+let real_size = ctx.invoke_virtual(coll, "size", "()I", &[]);   // GC point
+let arr       = ctx.invoke_virtual(coll, "toArray", ...);       // stale `coll`
+```
+
+`invoke_virtual` re-enters Java, so it is a GC point, and `coll` was a bare
+Rust local that nothing rooted. G1 evacuated `coll`'s region during `size()`
+and **recycled** it; `toArray()` then dispatched against the freed region's base
+address. An all-zero header reads as `ClassId(0)`, which **is**
+`java.lang.Object` — the first class this VM loads — so a use-after-move
+surfaced as a missing method on a class nobody called.
+
+**`--nojit` is the control that matters.** This page filed the failure as "a
+receiver whose class reads as `java.lang.Object` — the same *family* as the
+recorded cast failure", which points at a lost JIT root. It is not one:
+
+| arm | result |
+|---|---|
+| G1, `--Xmx 1g` | 3 of 3 FAIL, 155–178 s |
+| G1, `--Xmx 1g`, **`--nojit`** | FAILS — so not a JIT root defect |
+| G1, **`--Xmx 8g`** | clean past 500 s — so it needs a collection |
+| ZGC / generational, `--Xmx 1g` | clean past 420 s — so it needs an EVACUATING collector |
+| G1, `--Xmx 1g`, **fixed binary** | **3 of 3 clean past 500 s** |
+
+**`report_reclaimed_receiver` stayed silent the whole time**, which is worth
+recording because that guard exists to answer exactly this question: it asks the
+FREE LIST, and a whole evacuated G1 region is not a free-list block. A quiet
+reclaim guard is not a clean one.
+
+**The fix is measured, not inferred.** `CRATONVM_DBG_COLL_REFRESH=1` counts
+every time the re-read finds the receiver has actually moved — 46 and 42 per
+run, **all** of them at `between size() and toArray()`, with stale addresses
+that are region bases:
+
+```text
+[COLL-REFRESH] between size() and toArray(): 0x251689f0060 -> 0x25167df0060
+[COLL-REFRESH] between size() and toArray(): 0x251689f0000 -> 0x251683c4840
+```
+
+So the old code used a stale pointer dozens of times per run and raised the
+error only on the occasions when the region had also been recycled. That
+counter is the difference between "the fix works" and "the symptom did not
+happen this time", which a timing-dependent defect can fake on any single run.
+
+### The same shape elsewhere, audited rather than assumed
+
+Scanning `native-collections/src/lib.rs` for two or more `invoke_virtual` calls
+on one unpinned receiver finds **13 candidate sites**. The four on this call
+path are pinned by the same change, each with its own counter label: the
+Hibernate `size()`→`toArray()`, the two Jetty `size()`→`get(i)` loops and the
+`Path` `getNameCount()`→`getName(i)` loop in `collect_collection_elements`.
+**On this workload only the proven site ever fires** — the per-site counter says
+so. The rest are in unrelated natives (`Optional.orElseGet`, the stream
+mappers, `COWAL.addAll`); they are listed here rather than patched blind,
+because nothing measured reaches them and an unmeasured fix to nine sites is
+nine chances to break something.
+
+## The `--Xmx 256m` failure is still open, and has two faces
+
+On the **fixed** binary, `--Xmx 256m` (default collector) still fails at
+**845 s** — close to the 823 s this page recorded, but with a different
+message:
+
+```
+NoSuchMethodError: 'boolean <unknown class 2460030832>.equals(java.lang.Object)'
+  at org/h2/test/store/TestRandomMapOps.assertEquals(TestRandomMapOps.java)
+  at org/h2/test/store/TestRandomMapOps.testOps(TestRandomMapOps.java:162)
+```
+
+Same family as the G1 one — a receiver read at an address that no longer holds
+the object it was — but a **different site and a different face**: a garbage
+class id rather than `ClassId(0)`, which is what a recycled address looks like
+once something else has been allocated over it. `CRATONVM_DBG_COLL_REFRESH`
+reports **zero** engagements on that run, so the path fixed above is not
+involved at all.
+
+Two faces (`NullPointerException: "d" is null` at 823 s, this one at 845 s) at
+nearly the same point is itself the finding: the recorded message is not the
+lever, the same way the recorded seed was not.
 
 ## The recorded signature, and why it is not a reproducer
 
@@ -116,6 +194,20 @@ as background until something resolves what they name — which is still
 
 ## Reproducing
 
+**It reproduces locally on Windows, in minutes, with no Azure host.** The H2
+tree under `apps/h2database/h2` is already compiled into `temp/` and
+`cp_abs.txt` is the classpath; the G1 arm failed at 155-178 s on this laptop.
+The host commands below still work, but nothing here needs them:
+
+```bash
+cd apps/h2database/h2
+<cratonvm-bin> --java-home "<jdk-25>" --Xmx 1g -XX:+UseG1GC     -c "$(cat cp_abs.txt)" org.h2.test.store.TestRandomMapOps
+```
+
+`CRATONVM_DBG_COLL_REFRESH=1` prints every receiver move the pinning absorbs,
+and `CRATONVM_DBG_CCE_BT=1` dumps the offending receiver's shape, frame stack
+and move history at the dispatch miss -- the two instruments that settled this.
+
 The class itself:
 
 ```bash
@@ -123,7 +215,7 @@ source /data/toolchain/env.sh
 cd /data/cratonvm/apps/h2database/h2
 CP="target/classes:target/test-classes:$(cat craton-testcp.txt)"
 
-# the reproducible G1 failure -- 41-67 s
+# the G1 failure, FIXED 2026-08-24 -- this arm used to die in 41-155 s
 <cratonvm-bin> --java-home /data/toolchain/jdk-25 --Xmx 1g -XX:+UseG1GC \
     -c "$CP" org.h2.test.store.TestRandomMapOps
 ```
