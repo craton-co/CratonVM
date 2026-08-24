@@ -237,6 +237,16 @@ static NOTIFY_CREDITS_CONSUMED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static CONDVAR_SIGNALLED_RETURNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Credits taken on a wakeup the condvar did NOT signal — the waiter's
+/// `wait_for` TIMED OUT and the notification was found in state instead.
+///
+/// **This is the money number.** Every one of these is a notification the
+/// condvar-only wait would have had to pick up on some later poll, and a stall
+/// is what happens when there is no later poll that ever sees it.
+/// `credits_consumed - this` is the ordinary case, where the signal and the
+/// credit arrived together.
+static NOTIFY_CREDITS_TAKEN_UNSIGNALLED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Print the notification-credit census on `CRATONVM_DBG=monitor-notify`.
 ///
@@ -250,9 +260,10 @@ pub fn report_monitor_notify_census_at_exit() {
     use std::sync::atomic::Ordering::Relaxed;
     eprintln!(
         "[MONITOR-NOTIFY] EXIT credits_created={} credits_consumed={} \
-         condvar_signalled={} switch={}",
+         taken_unsignalled={} condvar_signalled={} switch={}",
         NOTIFY_CREDITS_CREATED.load(Relaxed),
         NOTIFY_CREDITS_CONSUMED.load(Relaxed),
+        NOTIFY_CREDITS_TAKEN_UNSIGNALLED.load(Relaxed),
         CONDVAR_SIGNALLED_RETURNS.load(Relaxed),
         if monitor_pending_notify() { "ON" } else { "OFF" },
     );
@@ -1363,6 +1374,13 @@ impl Monitor {
                             consumed = consumed.wrapping_add(1);
                             NOTIFY_CREDITS_CONSUMED
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if result.timed_out() {
+                                // The condvar did NOT signal this wakeup; the
+                                // notification was found in state. See
+                                // `NOTIFY_CREDITS_TAKEN_UNSIGNALLED`.
+                                NOTIFY_CREDITS_TAKEN_UNSIGNALLED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             break;
                         }
                         if let Some(ms) = spurious_after {
