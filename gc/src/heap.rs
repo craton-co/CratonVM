@@ -2515,7 +2515,7 @@ pub fn array_receiver_field_accesses() -> u64 {
 /// (`CRATONVM_DBG_CORRUPT_CELL` — doors plus the safepoint backstop) names the
 /// receiver, the Java frames and the door for every occurrence, not for the
 /// lucky ones. See
-/// `known-issues/gc/corrupt-value-cell-one-unreproduced-hit-in-kafkametrics-20260822.md`.
+/// `corrupt-value-cell-array-receiver-species-CLOSED-20260823`.
 ///
 /// # Safety
 /// `obj_ptr` must be a live allocation base whose header is `header`. The two
