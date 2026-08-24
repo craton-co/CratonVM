@@ -230,6 +230,25 @@ pub struct JitIndyGenericSite {
     class_id: ClassId,
     cp_index: u16,
     target_descriptor: Arc<str>,
+    /// The site's argument type tags, parsed ONCE.
+    ///
+    /// `parse_descriptor_args` walks a `String` and allocates a `Vec` — per
+    /// call, on a path whose whole reason to exist is that the interpreter's
+    /// version re-derives constants. Everything below is here for the same
+    /// reason: the synthetic frame is built with [`Frame::new_from_arcs`],
+    /// which takes pre-built `Arc`s, rather than with `Frame::new`, whose
+    /// `padded_bytecode_for_method` takes a GLOBAL MUTEX and verifies its memo
+    /// with a body compare — on every single bridged call.
+    arg_types: Arc<[u8]>,
+    frame_class_name: Arc<str>,
+    frame_method_name: Arc<str>,
+    /// Padded empty bytecode. The frame decodes no instruction, but the
+    /// interpreter's dispatch loop reads two bytes past the last opcode
+    /// unconditionally, so the two-byte tail is a precondition rather than a
+    /// courtesy — see `Frame::new_from_arcs`.
+    frame_code: Arc<[u8]>,
+    frame_exception_table: Arc<[cratonvm_reader::attribute::ExceptionTableEntry]>,
+    frame_max_stack: u16,
     /// First byte of the site's RETURN descriptor. The bridge hands compiled
     /// code one `i64`, and this is what says how the `Value` was encoded into
     /// it — the same encoding `jit_invoke_dispatch` uses for an ordinary
@@ -381,11 +400,24 @@ pub fn make_jit_indy_bridge_site_from_parts(
     if !admitted {
         return None;
     }
+    let arg_types: Vec<u8> = parse_descriptor_args(descriptor)
+        .into_iter()
+        .map(|c| c as u8)
+        .collect();
+    let frame_max_stack = u16::try_from(arg_types.len()).unwrap_or(u16::MAX).saturating_add(1);
     Some(Box::into_raw(Box::new(JitIndyGenericSite {
         kind: JIT_INDY_SITE_GENERIC,
         class_id,
         cp_index,
         target_descriptor: Arc::from(descriptor),
+        arg_types: Arc::from(arg_types.as_slice()),
+        frame_class_name: Arc::from("<jit-indy>"),
+        frame_method_name: Arc::from("bridge"),
+        frame_code: crate::runtime::frame::padded_bytecode(&[]),
+        frame_exception_table: Arc::from(
+            Vec::<cratonvm_reader::attribute::ExceptionTableEntry>::new().into_boxed_slice(),
+        ),
+        frame_max_stack,
         return_type: ret,
     })) as usize)
 }
@@ -506,7 +538,7 @@ pub unsafe fn execute_jit_indy_generic_raw(
         }
         .into());
     };
-    let arg_types = parse_descriptor_args(&site.target_descriptor);
+    let arg_types = &site.arg_types;
     if arg_types.len() != arg_count || (arg_count != 0 && args_ptr.is_null()) {
         // A disagreement between the descriptor and what the call sequence
         // pushed is a miscompile, not a value to guess at.
@@ -524,11 +556,11 @@ pub unsafe fn execute_jit_indy_generic_raw(
         // Descriptor-typed, never bits-typed: a category-2 value must not be
         // reclassified from its payload (the same rule the concat bridge
         // states).
-        values.push(match ty {
-            'J' => Value::Long(raw),
-            'D' => Value::Double(f64::from_bits(raw as u64)),
-            'F' => Value::Float(f32::from_bits(raw as u32)),
-            'L' | '[' => {
+        values.push(match *ty {
+            b'J' => Value::Long(raw),
+            b'D' => Value::Double(f64::from_bits(raw as u64)),
+            b'F' => Value::Float(f32::from_bits(raw as u32)),
+            b'L' | b'[' => {
                 if raw == 0 {
                     Value::Object(None)
                 } else {
@@ -539,15 +571,19 @@ pub unsafe fn execute_jit_indy_generic_raw(
         });
     }
     let frame_idx = thread.frames.len();
-    thread.frames.push(Frame::new(
+    // `new_from_arcs`, not `new`: every part is precomputed on the site, so
+    // this costs refcount bumps instead of a global-mutex memo probe with a
+    // body compare (`padded_bytecode_for_method`) plus three `String`
+    // allocations, on every bridged call.
+    thread.frames.push(Frame::new_from_arcs(
         site.class_id,
-        "<jit-indy>".to_owned(),
-        "bridge".to_owned(),
-        site.target_descriptor.to_string(),
+        Arc::clone(&site.frame_class_name),
+        Arc::clone(&site.frame_method_name),
+        Arc::clone(&site.target_descriptor),
         None,
-        vec![],
-        vec![],
-        (arg_count as u16).saturating_add(1),
+        Arc::clone(&site.frame_code),
+        Arc::clone(&site.frame_exception_table),
+        site.frame_max_stack,
         0,
         &[],
     ));
