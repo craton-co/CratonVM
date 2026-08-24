@@ -46,7 +46,15 @@ things changed:
    run  9  DefaultPromise          result_is=other(DefaultPromise$CauseHolder)
            notifies_since_wait=1   (monitor totals: notify=1)   orphan 0   waiters=1
    run 10  rc=124 — the watchdog never fired, so no dump at all
+   run 11  PendingRegistrationPromise                     result_is=SUCCESS
+           notifies_since_wait=1   (monitor totals: notify=1)   waiters=1
    ```
+
+   Run 11 repeats run 9's signature on a DIFFERENT promise class and a
+   DIFFERENT completion value — one failed (`CauseHolder`), one succeeded
+   (`SUCCESS`) — so "the promise completed, the `notifyAll()` was delivered to
+   this monitor, and the waiter is still parked" is the reproducible shape, not
+   a one-off.
 
    * **Run 9 is the branch the counter was added to find.** The promise
      genuinely completed (a `CauseHolder`, i.e. a failure — NOT the
