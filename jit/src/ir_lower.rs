@@ -11210,7 +11210,102 @@ mod tests {
     /// end-to-end execution coverage for IR call lowering lives in
     /// `jit/tests/ir_vs_singlepass.rs` (see the doc for the cases to add
     /// there — that file is outside this change's ownership).
+
+    /// Every inline-cache hit in this tier restores the innermost-frame mirror
+    /// before it does anything else.
+    ///
+    /// A compiled callee's prologue publishes ITS `(rbp, compile id)` there, and
+    /// nothing on the return path of a raw JIT->JIT call restores the caller's.
+    /// Until 2026-08-24 neither of this tier's two inline-cache arms — the
+    /// monomorphic MIC hit and each rung of the polymorphic PIC cascade — did,
+    /// so after any hit the mirror named a frame that had already returned.
+    /// `moving_young_frame_coverage_complete` then read
+    /// `[stale_rbp - stale_method.sp_id_slot_off]`, matched no map, and refused
+    /// the whole collection (`ACTIVE_FRAME_MAP`). Measured on H2
+    /// `TestMVStoreTool`: one rbp with ONE saved return address claimed across
+    /// collections by four different methods, one of them `RootReference.isLocked`
+    /// with `maps=0` — a method that emits no safepoint and therefore cannot be
+    /// the frame at a collection at all.
+    ///
+    /// The single-pass backend republishes at both of its equivalent arms and
+    /// the shared hashed/vtable stub is handed `frame_record` for the same
+    /// reason; these two were the gap.
+    ///
+    /// Asserted as "the byte right after the CALL", because that placement is
+    /// the property: anything emitted between the return and the republish runs
+    /// under a mirror naming a dead frame. The zero-`frame_record` arm is the
+    /// control — it proves the assertion can FAIL, so a future edit that drops
+    /// the republish cannot leave this test passing vacuously.
+    #[test]
+    fn every_inline_cache_hit_restores_the_frame_record_before_anything_else() {
+        crate::x64::set_moving_young_override(Some(false));
+        const MIC: usize = 0x7fff_0000_0000_1000;
+        const PIC: usize = 0x7fff_0000_0000_2000;
+        const FRAME_RECORD: usize = 0x7fff_0000_0000_3000;
+        let mut ic = HashMap::new();
+        ic.insert(2usize, (MIC, PIC));
+
+        // `CALL R11` — the cached-entry indirect call, and the ONLY way this
+        // tier reaches a compiled Java callee from an inline cache.
+        const CALL_R11: [u8; 3] = [0x41, 0xFF, 0xD3];
+        let seg = crate::x64::inline_rbp_tls_segment_prefix();
+
+        let sites = |code: &[u8]| -> Vec<usize> {
+            (0..code.len().saturating_sub(3))
+                .filter(|&i| code[i..i + 3] == CALL_R11)
+                .collect()
+        };
+
+        let with = lower_virtual_call_with_ic_fr(&ic, FRAME_RECORD);
+        let without = lower_virtual_call_with_ic_fr(&ic, 0);
+
+        let with_sites = sites(&with);
+        // One MIC arm plus one rung per PIC entry. If this is ever zero the
+        // test below is vacuous, which is the failure mode worth naming.
+        assert!(
+            with_sites.len() >= 1 + crate::JIT_PIC_ENTRIES,
+            "expected at least {} cached-entry calls, found {} — the probe cannot fire",
+            1 + crate::JIT_PIC_ENTRIES,
+            with_sites.len()
+        );
+
+        for at in &with_sites {
+            let next = with[at + 3];
+            // Inline form: `MOV <seg>:[disp32], RBP` opens with the segment
+            // prefix. Helper form (no probed TLS displacement): `PUSH RAX`
+            // preserves the callee's Java return value first.
+            assert!(
+                next == seg || next == 0x50,
+                "cached-entry CALL at {at} is followed by {next:#04x}, not the \
+                 frame-record republish ({seg:#04x} inline / 0x50 helper form)"
+            );
+        }
+
+        // The control. With no frame-record helper the republish is switched
+        // off wholesale, so NONE of the sites may carry it — which is what
+        // makes the assertion above discriminating rather than decorative.
+        for at in sites(&without) {
+            let next = without[at + 3];
+            assert!(
+                next != seg && next != 0x50,
+                "frame_record=0 must emit no republish, but the call at {at} is \
+                 followed by {next:#04x}"
+            );
+        }
+    }
+
     fn lower_virtual_call_with_ic(ic: &HashMap<usize, (usize, usize)>) -> Vec<u8> {
+        lower_virtual_call_with_ic_fr(ic, 0)
+    }
+
+    /// As [`lower_virtual_call_with_ic`], with the frame-record helper
+    /// pointer set. Zero is what `no_helpers()` gives, and zero switches the
+    /// whole frame record off, so a test about the record has to pass a live
+    /// one or it is asking a question the emitter never reaches.
+    fn lower_virtual_call_with_ic_fr(
+        ic: &HashMap<usize, (usize, usize)>,
+        frame_record: usize,
+    ) -> Vec<u8> {
         // aload_0; iload_1; invokevirtual #2; ireturn
         let code = [0x2a, 0x1b, 0xb6, 0x00, 0x02, 0xac, 0x00, 0x00];
         // A live `JitInvokeInfo` for the site. Leaked deliberately: `Op::Call`
@@ -11241,6 +11336,7 @@ mod tests {
         helpers.invoke_dispatch = 0x1111_2222_3333_4440;
         helpers.invoke_virtual_mic = 0x1111_2222_3333_4441;
         helpers.dispatch_threw = 0x1111_2222_3333_4442;
+        helpers.frame_record = frame_record;
 
         let empty_hints: HashMap<usize, bool> = HashMap::new();
         let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
