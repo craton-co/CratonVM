@@ -1184,6 +1184,7 @@ pub const INVENTORY: &[E] = &[
     // Interpreter-side like `trivial-getter`: the lock-free static-field read
     // path in `vm::vm_object`, default-ON with an opt-out-only spelling.
     E { group: Group::JIT, token: "static-bytecode-callee", on_key: Some("CRATONVM_JIT_STATIC_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },
+    E { group: Group::JIT, token: "indy-bridge", on_key: Some("CRATONVM_JIT_INDY_BRIDGE"), off_key: None, off_word: Some("0") },
     // Its invokevirtual/invokeinterface twin. Same shape, same default-ON
     // opt-out-only spelling; see `env_cache::jit_virtual_bytecode_callee`.
     E { group: Group::JIT, token: "virtual-bytecode-callee", on_key: Some("CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE"), off_key: None, off_word: Some("0") },

@@ -1328,6 +1328,49 @@ pub fn jit_virtual_bytecode_callee() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_INDY_BRIDGE` — let a compiled method EXECUTE an
+/// `invokedynamic` through a runtime bridge instead of lowering it to an
+/// uncommon trap.
+///
+/// # What it decides
+///
+/// Without the bridge, a method containing any non-`StringConcatFactory` indy
+/// takes an unconditional reason-8 trap on its first compiled execution and is
+/// retired with `MakeNotCompilable`; OSR is refused for it outright, and
+/// method-wide. So every method that CREATES a lambda runs interpreted for the
+/// life of the process. MEASURED on `probes/IndyScopeProbe.java`, current
+/// `dev` against this branch, four interleaved pairs on a quiet host:
+///
+/// | arm | HotSpot | bridge OFF | bridge ON |
+/// |---|---:|---:|---:|
+/// | loop whose method creates the lambda | 1.4 ns | 660-885 ns | **23.7-25.5 ns** |
+/// | identical loop, lambda hoisted out | 2.5 ns | 23.6-33.5 ns | 23.7-25.4 ns |
+/// | a fresh lambda per call | 2.7 ns | 889-1044 ns | **427-474 ns** |
+///
+/// ~30x, and the first row lands exactly on the second — the penalty for
+/// putting a `->` inside the loop's own method is gone rather than reduced.
+///
+/// # Why it is a switch and not a constant
+///
+/// Because the trade is not one-signed. Bridging makes the METHOD compilable,
+/// which is a large win wherever the indy is a small part of a hot method; it
+/// also makes the indy ITSELF more expensive than the interpreter's own path,
+/// because the bridge builds a synthetic frame per call. On a workload whose
+/// hot methods are mostly lambda creation the second term can dominate. This
+/// switch is what lets that be measured on ONE binary instead of two.
+///
+/// Default ON. `CRATONVM_JIT_INDY_BRIDGE=0` restores the trap.
+#[inline]
+pub fn jit_indy_bridge() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INDY_BRIDGE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).

@@ -331,6 +331,18 @@ pub fn make_jit_indy_bridge_site_from_parts(
         } => (*bootstrap_method_attr_index, *name_and_type_index),
         _ => return None,
     };
+    // The generic half's kill switch. It gates SITE CONSTRUCTION, not each
+    // call, so the "off" arm is the VM as it was before this bridge existed:
+    // with no site the codegen lowers the indy to its uncommon trap, and
+    // `has_dispatch` / `needs_heap` never see it either. A switch that only
+    // silenced the bridge while still claiming the site would be measuring a
+    // third thing that ships nowhere.
+    //
+    // The `StringConcatFactory` half above is deliberately NOT gated: it
+    // predates this switch and is not what a bisection here is asking about.
+    if !crate::runtime::env_cache::jit_indy_bridge() {
+        return None;
+    }
     let (_, descriptor) = pool.get_name_and_type(nat_index)?;
     // A `void` site has no stack effect for the codegen's typed push to model
     // and does not occur in practice, so it keeps the trap rather than being
