@@ -32,6 +32,32 @@ StringUtils.toStringArray(map.keySet())   // getPropertyNames()
 rebuilt a 1000-entry hash map twice per call, 101 910 times per run of
 `ConfigurationPropertySourcesTests`.
 
+**End to end on that class, measured 2026-08-24** — one binary,
+`CRATONVM_MAP_VIEW_CACHE` as the A/B, three interleaved rounds, CPU time
+(the host is shared and ran at load 17-37 throughout, so wall clock there
+measures the neighbours; a first attempt in wall clock was discarded rather
+than adjusted):
+
+| round | HotSpot | cache OFF | cache ON | OFF/ON |
+|---|---:|---:|---:|---:|
+| 1 | 8.3 s | 1291.0 s | 186.2 s | 6.93x |
+| 2 | 6.6 s | 1274.9 s | 187.3 s | 6.81x |
+| 3 | 8.4 s | 1304.3 s | 191.2 s | 6.82x |
+
+**6.8x**, and the class moves from ~156x HotSpot to ~23x. 11/11 tests pass on
+both arms. The OFF arm spans 2.3% across the three rounds and the ON arm 2.7%,
+and the ON arm also read 184.3 s at load 5 — flat from load 5 to 24, which is
+what makes CPU time the usable instrument on this box. The engagement counter
+was byte-identical on all three ON runs:
+
+```text
+[MAP-VIEW-CACHE] EXIT resync_skipped=300132 resync_ran=66 elided=100.0%
+                      view_reused=299758 view_built=415 switch=ON verify=OFF
+```
+
+i.e. 300 132 rebuilds skipped against 66 run, and 299 758 view reuses against
+415 builds, on the workload the fix was written for.
+
 The design intent was right — a non-STATIC view is meant to be *live*, and
 resyncing is how it stays live. It was the implementation of "live" that was
 O(n)-per-read instead of O(1).

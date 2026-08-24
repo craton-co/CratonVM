@@ -8401,6 +8401,17 @@ impl ZgcRealHeap {
                 // (the ledger keeps one cycle only) or the address was never a
                 // relocation source -- which would make this a different bug
                 // and is worth distinguishing rather than assuming.
+                //
+                // `in_registry=true` settles which, and it is the case the
+                // Tomcat `num_slots=0` signature actually hits (2026-08-24):
+                // the address is a LIVE REGISTERED object that has no slots,
+                // not a corpse at all. The report used to stop one field short
+                // of a diagnosis -- "some live object has zero slots" names no
+                // suspect. A corpse's header is zeroed by `compact_low_to`, but
+                // a live object's is not, so its class id is still readable and
+                // is the only thing that can point at the allocation site.
+                let live = self.registry.contains(addr);
+                let class_id = if live { header.class_id.as_u32() } else { u32::MAX };
                 tracing::error!(
                     target: "cratonvm::gc::guard",
                     read_addr = addr,
@@ -8409,7 +8420,10 @@ impl ZgcRealHeap {
                         .unwrap_or("<none: not handed to the marker as a root>"),
                     slides_so_far = self.corpse_cycle.load(Ordering::Relaxed),
                     op,
-                    in_registry = self.registry.contains(addr),
+                    in_registry = live,
+                    class_id,
+                    class = %crate::collector::class_name_for_diagnostics(class_id),
+                    header_num_slots = header.num_slots(),
                     %backtrace,
                     "zgc corpse read: OOB read at an address the LAST slide did not                      vacate -- older cycle, or never a relocation source"
                 );

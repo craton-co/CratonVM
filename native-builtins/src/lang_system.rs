@@ -364,6 +364,21 @@ pub(crate) fn thread_already_started(ctx: &mut dyn NativeContext, thread: Object
     }
 }
 
+/// Pins `child` across [`capture_inheritable_tl_at_construction_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `child` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn capture_inheritable_tl_at_construction(ctx: &mut dyn NativeContext, child: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*child);
+    let w5_out = capture_inheritable_tl_at_construction_body(ctx, *child);
+    *child = ctx.read_native_pin(w5_pin, *child);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Capture the constructing thread's `InheritableThreadLocal` values against
 /// `child`, at CONSTRUCTION time — the moment HotSpot captures them.
 ///
@@ -399,7 +414,7 @@ pub(crate) fn thread_already_started(ctx: &mut dyn NativeContext, thread: Object
 /// `docs/known-issues/jdk-only/G5-1-inheritable-threadlocal-captures-at-
 /// construction-20260816.md` §6, and read that record BEFORE assuming the
 /// `new Thread` timing divergence is closed. It is not.
-pub(crate) fn capture_inheritable_tl_at_construction(
+pub(crate) fn capture_inheritable_tl_at_construction_body(
     ctx: &mut dyn NativeContext,
     child: ObjectRef,
 ) {

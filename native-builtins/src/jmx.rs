@@ -4003,9 +4003,24 @@ fn register_platform_managed_object_names(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 10)?;
-    init_runtime_mxbean_fields(ctx, obj)?;
+    let mut obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 10)?;
+    init_runtime_mxbean_fields(ctx, &mut obj)?;
     Ok(obj)
+}
+
+/// Pins `obj` across [`init_runtime_mxbean_fields_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `obj` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+    let w5_pin = ctx.pin_native_root(*obj);
+    let w5_out = init_runtime_mxbean_fields_body(ctx, *obj);
+    *obj = ctx.read_native_pin(w5_pin, *obj);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
 }
 
 /// Populate the 10 synthetic `RuntimeMXBean` slots the getters below read by
@@ -4013,7 +4028,7 @@ fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Method
 /// `<init>` native, so a bean carries the same state however it was built —
 /// without this, a directly-constructed bean answers `getName() == null` and
 /// hands back an untyped default slot for the `long` getters.
-fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<(), MethodCallFailed> {
+fn init_runtime_mxbean_fields_body(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<(), MethodCallFailed> {
     let pid = std::process::id();
     // `RuntimeMXBean.getName()` is specified only as "a name representing the
     // running VM", but every JDK implements it as `pid + "@" + hostname`
@@ -4110,8 +4125,8 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
     // index-based getters below cannot read. Establish the same state the
     // factory does.
     r.register(cls, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        init_runtime_mxbean_fields(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        init_runtime_mxbean_fields(ctx, &mut this)?;
         Ok(None)
     });
 

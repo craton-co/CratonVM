@@ -1566,11 +1566,26 @@ fn bc_provider_get_public_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     out.map_err(|e| bc_public_key_contract(ctx, e))
 }
 
+/// Pins `key` across [`register_rsa_pub_verify_material_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `key` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn register_rsa_pub_verify_material(ctx: &mut dyn NativeContext, key: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*key);
+    let w5_out = register_rsa_pub_verify_material_body(ctx, *key);
+    *key = ctx.read_native_pin(w5_pin, *key);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Register a real imported RSA public key's verify material via its own X.509
 /// encoding, so `Signature.verify` stays on the fast crypto_impl path (the real
 /// key carries no synthetic `key_id` slot). Used by the `generatePublic` import
 /// path which may receive an `RSAPublicKeySpec` (not a DER we can pre-parse).
-pub(crate) fn register_rsa_pub_verify_material(ctx: &mut dyn NativeContext, key: ObjectRef) {
+pub(crate) fn register_rsa_pub_verify_material_body(ctx: &mut dyn NativeContext, key: ObjectRef) {
     let pin = ctx.pin_native_root(key);
     let key = ctx.read_native_pin(pin, key);
     let enc = ctx.invoke_virtual(key, "getEncoded", "()[B", &[]);
@@ -1656,13 +1671,28 @@ fn read_biginteger_magnitude(
     bytes
 }
 
+/// Pins `key` across [`register_rsa_priv_sign_material_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `key` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn register_rsa_priv_sign_material(ctx: &mut dyn NativeContext, key: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*key);
+    let w5_out = register_rsa_priv_sign_material_body(ctx, *key);
+    *key = ctx.read_native_pin(w5_pin, *key);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Bridge a real *imported* RSA private key (`RSAPrivate{Crt}KeyImpl`) to a
 /// `crypto_impl` key_id by reading its modulus/exponents, so signing through
 /// CratonVM's `Signature` natives uses the fast Rust path. Without this an
 /// imported private key carries no synthetic `key_id` and `rsa_sign(0)` yields
 /// a garbage signature — keycloak's `KeyPairVerifier` (sign "content" then
 /// verify) then reports "Keys don't match".
-pub(crate) fn register_rsa_priv_sign_material(ctx: &mut dyn NativeContext, key: ObjectRef) {
+pub(crate) fn register_rsa_priv_sign_material_body(ctx: &mut dyn NativeContext, key: ObjectRef) {
     let pin = ctx.pin_native_root(key);
     let k = ctx.read_native_pin(pin, key);
     let n = read_biginteger_magnitude(ctx, k, "getModulus");
@@ -3093,13 +3123,13 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // RSAKeyFactory$Legacy driven below — see ALGO_RSASSA_PSS's doc comment.
     if algo == ALGO_RSASSA_PSS && crate::route_rsa_to_real() {
         if let Some(Value::Object(Some(spec))) = args.get(1) {
-            if let Ok(Some(Value::Object(Some(key)))) = drive_real_rsa_pss_keyfactory(
+            if let Ok(Some(Value::Object(Some(mut key)))) = drive_real_rsa_pss_keyfactory(
                 ctx,
                 *spec,
                 "engineGeneratePublic",
                 "Ljava/security/PublicKey;",
             ) {
-                register_rsa_pub_verify_material(ctx, key);
+                register_rsa_pub_verify_material(ctx, &mut key);
                 return Ok(Some(Value::Object(Some(key))));
             }
         }
@@ -3154,13 +3184,13 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // key is then bridged for fast verify via its own X.509 encoding.
     if algo == ALGO_RSA && crate::route_rsa_to_real() {
         if let Some(Value::Object(Some(spec))) = args.get(1) {
-            if let Ok(Some(Value::Object(Some(key)))) = drive_real_rsa_keyfactory(
+            if let Ok(Some(Value::Object(Some(mut key)))) = drive_real_rsa_keyfactory(
                 ctx,
                 *spec,
                 "engineGeneratePublic",
                 "Ljava/security/PublicKey;",
             ) {
-                register_rsa_pub_verify_material(ctx, key);
+                register_rsa_pub_verify_material(ctx, &mut key);
                 return Ok(Some(Value::Object(Some(key))));
             }
         }
@@ -3381,8 +3411,8 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 "engineGeneratePrivate",
                 "Ljava/security/PrivateKey;",
             ) {
-                if let Some(Value::Object(Some(key))) = r {
-                    register_rsa_priv_sign_material(ctx, key);
+                if let Some(Value::Object(Some(mut key))) = r {
+                    register_rsa_priv_sign_material(ctx, &mut key);
                     return Ok(Some(Value::Object(Some(key))));
                 }
             }
@@ -3468,8 +3498,8 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 "engineGeneratePrivate",
                 "Ljava/security/PrivateKey;",
             ) {
-                if let Some(Value::Object(Some(key))) = r {
-                    register_rsa_priv_sign_material(ctx, key);
+                if let Some(Value::Object(Some(mut key))) = r {
+                    register_rsa_priv_sign_material(ctx, &mut key);
                     return Ok(Some(Value::Object(Some(key))));
                 }
                 // r was None (real SPI unavailable / produced no key) — do NOT
@@ -3500,8 +3530,8 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                         "engineGeneratePrivate",
                         "Ljava/security/PrivateKey;",
                     ) {
-                        if let Some(Value::Object(Some(key))) = r {
-                            register_rsa_priv_sign_material(ctx, key);
+                        if let Some(Value::Object(Some(mut key))) = r {
+                            register_rsa_priv_sign_material(ctx, &mut key);
                             return Ok(Some(Value::Object(Some(key))));
                         }
                         // None — fall through to InvalidKeySpecException below.

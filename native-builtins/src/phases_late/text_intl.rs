@@ -1624,8 +1624,23 @@ pub(crate) fn put_str(
     .ok();
 }
 
+/// Pins `map` across [`populate_format_data_en_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `map` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn populate_format_data_en(ctx: &mut dyn NativeContext, map: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*map);
+    let w5_out = populate_format_data_en_body(ctx, *map);
+    *map = ctx.read_native_pin(w5_pin, *map);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Populate a synthetic English-US `sun.text.resources.FormatData` bundle map.
-pub(crate) fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
+pub(crate) fn populate_format_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // Pin across the per-entry allocations below — a moving young GC there
     // would relocate `map` (native stale-local family); `put_arr`/`put_str`
     // re-read the current ref from this pin before each put.
@@ -1881,8 +1896,23 @@ pub(crate) fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRe
     ctx.unpin_native_roots(map_pin);
 }
 
+/// Pins `map` across [`populate_locale_names_en_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `map` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*map);
+    let w5_out = populate_locale_names_en_body(ctx, *map);
+    *map = ctx.read_native_pin(w5_pin, *map);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Populate a synthetic `sun.util.resources.LocaleNames` (English) bundle map.
-pub(crate) fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
+pub(crate) fn populate_locale_names_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // Minimal language/country names that cover the common queries; for any
     // missing key callers fall back to the locale code via getDisplayName
     // overrides we register elsewhere.
@@ -1935,8 +1965,23 @@ pub(crate) fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectR
     ctx.unpin_native_roots(map_pin);
 }
 
+/// Pins `map` across [`populate_calendar_data_en_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `map` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn populate_calendar_data_en(ctx: &mut dyn NativeContext, map: &mut ObjectRef) {
+    let w5_pin = ctx.pin_native_root(*map);
+    let w5_out = populate_calendar_data_en_body(ctx, *map);
+    *map = ctx.read_native_pin(w5_pin, *map);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// Populate a synthetic `sun.util.resources.CalendarData` (English) bundle map.
-pub(crate) fn populate_calendar_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
+pub(crate) fn populate_calendar_data_en_body(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // Pin across the per-entry allocations below — a moving young GC there
     // would relocate `map` (native stale-local family).
     let map_pin = ctx.pin_native_root(map);
@@ -2031,21 +2076,21 @@ pub(crate) fn resource_bundle_get_bundle(
     // minimum.
     if !populated_from_props {
         let bn = bundle_name.as_str();
-        let map = ctx.read_native_pin(map_pin, map);
+        let mut map = ctx.read_native_pin(map_pin, map);
         if bn.starts_with("sun.text.resources.FormatData")
             || bn.starts_with("sun.text.resources.cldr.FormatData")
             || bn.starts_with("sun.text.resources.ext.FormatData")
         {
-            populate_format_data_en(ctx, map);
+            populate_format_data_en(ctx, &mut map);
         } else if bn.starts_with("sun.util.resources.LocaleNames")
             || bn.starts_with("sun.util.resources.cldr.LocaleNames")
             || bn.starts_with("sun.util.resources.ext.LocaleNames")
         {
-            populate_locale_names_en(ctx, map);
+            populate_locale_names_en(ctx, &mut map);
         } else if bn.starts_with("sun.util.resources.CalendarData")
             || bn.starts_with("sun.util.resources.cldr.CalendarData")
         {
-            populate_calendar_data_en(ctx, map);
+            populate_calendar_data_en(ctx, &mut map);
         } else if bn.starts_with("sun.util.resources.CurrencyNames")
             || bn.starts_with("sun.util.resources.cldr.CurrencyNames")
         {

@@ -204,8 +204,11 @@ fn maybe_dump_shutdown_reports() {
         // VM is still producing (the G30-1 species); the guard only stops them
         // becoming wild pointers in compiled code.
         eprintln!(
-            "[cratonvm] getfield reference loads that contained a primitive slot: {}",
-            cratonvm_vm::jit::helpers::jit_getfield_primitive_in_ref_slot()
+            "[cratonvm] getfield reference loads that contained a primitive slot: {} \
+             (of which the payload word was NON-ZERO, i.e. would have been \
+             dereferenced: {})",
+            cratonvm_vm::jit::helpers::jit_getfield_primitive_in_ref_slot(),
+            cratonvm_vm::jit::helpers::jit_getfield_punned_ref_nonzero()
         );
         // The `validate_code_ptr` memo's engagement, on the same switch and for
         // the same reason as every counter above it. The memo replaced a global

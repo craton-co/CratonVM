@@ -1243,6 +1243,21 @@ pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
     *huc_default_tm_ctx_key_slot().lock()
 }
 
+/// Pins `ctx_obj` across [`capture_huc_key_managers_ctx_key_body`] and hands the refreshed reference back.
+///
+/// The receiver is `&mut` on purpose. The body ALLOCATES and returns no
+/// reference, so a moving collector could relocate `ctx_obj` inside the call and
+/// every caller was left holding a pre-move address -- the shape
+/// `WORKER-5-NOTE-10` traced `TreeMap.size()` returning 0 to. `&mut` makes
+/// forgetting the refresh a COMPILE ERROR instead of an audit finding.
+pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: &mut ObjectRef) -> Result<(), MethodCallFailed> {
+    let w5_pin = ctx.pin_native_root(*ctx_obj);
+    let w5_out = capture_huc_key_managers_ctx_key_body(ctx, *ctx_obj);
+    *ctx_obj = ctx.read_native_pin(w5_pin, *ctx_obj);
+    ctx.unpin_native_roots(w5_pin);
+    w5_out
+}
+
 /// `SSLContext.getSocketFactory()` calls this alongside
 /// `set_huc_default_client_identity` (same reliable per-context capture
 /// point — see that call site's doc). Clears the slot when this context has
@@ -1250,7 +1265,7 @@ pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
 /// whose `SSLContext.init` passed a null/empty `KeyManager[]`) keeps falling
 /// back to `client_identity`/no-client-auth instead of spuriously trying (and
 /// failing) to consult an empty resolver.
-pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
+pub(crate) fn capture_huc_key_managers_ctx_key_body(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
     let key = ctx_obj_key(ctx, ctx_obj)?;
     let has_kms = ctx_key_managers_table().lock().contains_key(&key);
     if crate::nbflags().dbg_tls_auth_ok {
@@ -1267,10 +1282,10 @@ pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_
 /// This also runs for anonymous clients: `ctx_identity` transfers scoped trust
 /// roots even when it returns no client certificate, and every context needs a
 /// stable ClientConfig to retain TLS 1.3 tickets across URL requests.
-pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
+pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, mut ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
     let ident = ctx_identity(ctx, ctx_obj)?;
     set_huc_default_client_identity(ident);
-    capture_huc_key_managers_ctx_key(ctx, ctx_obj)?;
+    capture_huc_key_managers_ctx_key(ctx, &mut ctx_obj)?;
     capture_huc_trust_managers_ctx_key(ctx, ctx_obj)?;
 
     let ident = huc_default_client_identity();
