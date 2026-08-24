@@ -83,12 +83,24 @@ OFF  credits_created=0   credits_consumed=0   taken_unsignalled=0 condvar_signal
 accounting balances exactly, so no credit leaks and none is invented. OFF
 creates none, which is the switch doing what it says.
 
-`taken_unsignalled=0` on that run is the honest shape of this fix: **in a
-healthy run the condvar delivers every time and the credit is pure insurance.**
-The stall is the rare case where it does not, which is why the rate matters more
-here than any per-run counter — and why `taken_unsignalled` is worth having: a
-run where it is non-zero is a run that would have been one poll away from the
-stall.
+`taken_unsignalled=0` on that run is the ordinary shape: in a healthy run the
+condvar delivers every time and the credit is pure insurance. **The rescue was
+then caught in the act.** Fourteen ON-arm runs with the census:
+
+```
+runs 1-13   credits_created ~985  credits_consumed ~985  taken_unsignalled=0
+run   14    credits_created=989   credits_consumed=989   taken_unsignalled=1
+```
+
+One run in fourteen — **~7%** — took a notification from state on a wakeup the
+condvar did NOT signal, and that run PASSED. Without the condition, that
+notification would have had to be picked up on some later poll, and the OFF-arm
+dumps are what happens when no later poll ever sees it: `polls` in the
+60 000-79 000 range, `signalled=0` throughout.
+
+That closes the chain by arithmetic rather than by argument. ~7% of ON runs need
+the rescue; 4 of 25 OFF runs (**16%**) stall with exactly the event the rescue
+handles. Same order of magnitude, same mechanism, opposite outcomes.
 
 (`credits_consumed` exceeds `condvar_signalled` because `condvar_signalled` is
 only instrumented in the UNTIMED branch, while credits are consumed in all
