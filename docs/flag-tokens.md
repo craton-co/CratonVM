@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-487 tokens.
+488 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -118,6 +118,7 @@ export inherited from a parent shell.
 | `census-exact-invocations` | `CRATONVM_CENSUS_EXACT_INVOCATIONS` |
 | `cce` | `CRATONVM_DBG_CCE` |
 | `cce-bt` | `CRATONVM_DBG_CCE_BT` |
+| `coll-refresh` | `CRATONVM_DBG_COLL_REFRESH` |
 | `corrupt-cell` | `CRATONVM_DBG_CORRUPT_CELL` |
 | `corrupt-cell-selftest` | `CRATONVM_DBG_CORRUPT_CELL_SELFTEST` |
 | `ccecache` | `CRATONVM_DBG_CCECACHE` |

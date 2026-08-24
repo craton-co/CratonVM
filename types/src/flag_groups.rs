@@ -306,6 +306,7 @@ pub const INVENTORY: &[E] = &[
     // `corrupt-value-cell-is-fatal-on-three-of-four-collectors` stayed open for
     // two days. Costs one relaxed load per `NativeContext::get_field` while
     // armed and nothing at all while it is not.
+    E { group: Group::DBG, token: "coll-refresh", on_key: Some("CRATONVM_DBG_COLL_REFRESH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "corrupt-cell", on_key: Some("CRATONVM_DBG_CORRUPT_CELL"), off_key: None, off_word: None },
     // Declared 2026-08-23 with the widening it verifies. Fabricates one
     // corrupt-cell hit at a site that HAS a read door and one at a site that
