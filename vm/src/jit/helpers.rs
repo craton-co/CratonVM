@@ -3076,9 +3076,32 @@ unsafe fn route_implicit_exc_through_callee(
         }
     }
     // Did the callee raise an *implicit* runtime exception?
+    //
+    // THREE flags, not two. `/ by zero` is stashed by the same machinery as
+    // the other two (`stash_jit_pending_arithmetic`, from the compiled `idiv`
+    // /`irem` guard and from `handle_compiled_callee_deopt_sentinel`'s
+    // fall-through), and this function used to consult only AIOOBE and NPE:
+    // an ArithmeticException fell into the `aioobe.is_none() && !npe` branch
+    // below, found no *general* pending exception either (the flag is not one),
+    // and left through the bare `return rc` — the callee's own exception table
+    // never consulted, the sentinel handed to the next frame out.
+    //
+    // Measured on `probes/EscapeStaticProbe.java`: from the iteration where the
+    // caller is compiled to the end of the loop, 198 000 of 200 000 `catch
+    // (ArithmeticException)` in the CALLER were skipped and the throw surfaced
+    // one frame too high. `route_implicit_exc_through_callee ENTER … pending_exc
+    // =false has_last_deopt=false` was printed 198 000 times, which is this
+    // function being handed a signal it had no arm for. The sibling door
+    // (`handle_compiled_callee_deopt_sentinel`) has always had the arm; the two
+    // doors simply disagreed.
     let aioobe = take_jit_pending_aioobe();
     let npe = if aioobe.is_none() {
         take_jit_pending_npe()
+    } else {
+        false
+    };
+    let arithmetic = if aioobe.is_none() && !npe {
+        take_jit_pending_arithmetic()
     } else {
         false
     };
@@ -3090,10 +3113,12 @@ unsafe fn route_implicit_exc_through_callee(
             stash_jit_pending_aioobe(idx, len);
         } else if npe {
             stash_jit_pending_npe();
+        } else if arithmetic {
+            stash_jit_pending_arithmetic();
         }
         rc
     };
-    if aioobe.is_none() && !npe {
+    if aioobe.is_none() && !npe && !arithmetic {
         // KCFULL-13 — *general* pending exception (an explicit `athrow`, or a
         // native-raised throwable, originating in this compiled callee's own
         // callee chain). The original bug-H assumption — "methods-with-tables
@@ -3269,8 +3294,12 @@ unsafe fn route_implicit_exc_through_callee(
         // path where the compiled attempt is FINISHED or ABANDONED, so its
         // frame can never be legitimately claimed and must not be left for a
         // later drain to mis-match.
-        let exc = match (aioobe, npe) {
-            (Some((index, length)), _) => {
+        // The message text matches `handle_compiled_callee_deopt_sentinel`'s
+        // arm for the same signal, and the interpreter's own `idiv` — a
+        // `getMessage()` that changed with the dispatch route would be its own
+        // wrong answer.
+        let exc = match (aioobe, npe, arithmetic) {
+            (Some((index, length)), _, _) => {
                 let msg = format!("Index {index} out of bounds for length {length}");
                 crate::runtime::exceptions::create_exception_object(
                     vm,
@@ -3280,14 +3309,21 @@ unsafe fn route_implicit_exc_through_callee(
                 )
                 .ok()
             }
-            (None, true) => crate::runtime::exceptions::create_exception_object(
+            (None, true, _) => crate::runtime::exceptions::create_exception_object(
                 vm,
                 thread,
                 "java/lang/NullPointerException",
                 None,
             )
             .ok(),
-            (None, false) => None,
+            (None, false, true) => crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/ArithmeticException",
+                Some("/ by zero"),
+            )
+            .ok(),
+            (None, false, false) => None,
         };
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
@@ -14105,6 +14141,11 @@ impl DirectNativeShadow {
 
     /// The Rust item name, so a refusal and the source witness can both name
     /// the same symbol the ladders name.
+    /// Test-only: every caller is in this file's `#[cfg(test)]` module, where
+    /// it names the `extern "C"` item each shadow is supposed to point at so
+    /// the string and the item cannot drift apart. Nothing in production asks
+    /// a shadow for its symbol NAME -- the doors take `entry_addr()`.
+    #[cfg(test)]
     pub const fn helper_symbol(self) -> &'static str {
         match self {
             DirectNativeShadow::ThreadCurrentThread => "jit_thread_current_thread_direct",
