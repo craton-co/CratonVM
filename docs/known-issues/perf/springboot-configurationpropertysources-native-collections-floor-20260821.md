@@ -1,6 +1,10 @@
 # `ConfigurationPropertySourcesTests` — decomposed, Term 1 fixed, ~23× HotSpot
 
-**Status: OPEN — Term 1 CLOSED and RE-MEASURED 2026-08-24; Terms 2 and 3 open.**
+**Status: OPEN — Terms 1 and 3 CLOSED, Term 2 RE-TAKEN and re-scoped, all on
+2026-08-24. Term 3's fix is real but measured NOT to move this class**, so what
+is left of the gap here is Term 2 alone. What is left is one precisely-named next step (`ArrayList.get`,
+worth ~6×) and one open question (why `ArrayList$Itr` bytecode is SLOWER than
+its native), both in Term 2 below.
 Rewritten from the 2026-08-21 first cut, which called this "the
 native-collections floor, no leaf over ~8%, no dominant term to attack" and left
 it there. That reading was **wrong in the way that matters**: a flat profile does
@@ -130,7 +134,190 @@ Measured on a 1000-entry map (`KeySetBench`), µs per call:
 `HashMap` behaves the same as `LinkedHashMap` (2852 µs). Spring calls this
 101 910 times per test run.
 
-## Term 2 — the per-element constant is ~2 µs, and it is linear
+## Term 2 — RE-TAKEN 2026-08-24: it is not one constant, it is three doors
+
+**The section below is the ORIGINAL 2026-08-22 reading and it is now
+misleading in two ways.** Both were found by re-taking it on a post-Term-1
+binary, which is the only reason they are visible: the old profile was of the
+`keySet()` CONSTRUCTION rung, and Term 1 deleted that rung's cost (415 builds
+per run instead of 101 910). Kept below rather than deleted, because the O(n)
+scaling table is still valid and the profile is still the right profile of the
+thing it profiled.
+
+**(a) Spring does not take the door this term measured.** The `hoisted` /
+`perCall` rungs iterate. `getPropertyNames()` is
+`StringUtils.toStringArray(map.keySet())`, i.e. `Collection.toArray(T[])`.
+Those are different natives with different costs. LinkedHashMap, width 1000,
+µs per call, so 1000 elements per row:
+
+| door | CratonVM | HotSpot | ratio |
+|---|---:|---:|---:|
+| `keySet()` iterator (`hoisted`) | 1035-1350 | 6.5-9.0 | ~150× |
+| `keySet().toArray(new String[0])` — **what Spring does** | **99-133** | 8.0-9.5 | **~13×** |
+| `keySet().toArray()` untyped | 106-137 | 6.5 | ~18× |
+
+So the per-element cost on the workload is **~0.11 µs, not ~2 µs**. The ~2 µs
+number describes the iterator, which this test does not use.
+
+**(b) It is not the map view, and it is not "the natives" as a class.** The
+same loop over a plain `ArrayList` and a plain `HashSet` — no view, no
+resync, no live-view machinery — costs the same order. The raw array is the
+floor that says so:
+
+| rung | CratonVM | HotSpot | vs raw array |
+|---|---:|---:|---:|
+| `String[]` by index (**floor**) | 18.5-24.5 | 3.5 | 1× |
+| `String[]` for-each | 19.5-20.0 | 3.5 | ~1× |
+| `ArrayList.get(i)` in a loop | 777-958 | 5.5-7.0 | **~37×** |
+| `ArrayList` iterator | 930-1068 | 7.0-7.5 | **~45×** |
+| `HashSet` iterator | 781-788 | 8.5 | ~35× |
+| `keySet()` view iterator | 1022-1350 | 6.5-9.0 | ~50× |
+
+A raw array loop runs at 20 ns/element, so the JIT compiles the loop fine and
+the interpreter is not the problem. The gap is entirely in the **collection
+accessor natives**, and the map view adds only ~10-25% on top of what a plain
+`ArrayList` already costs.
+
+### The lever, and why it has two signs
+
+`java/util/ArrayList.get(I)Ljava/lang/Object;` is registered
+`NativeKind::Bridge`, and `Bridge` is exactly what
+`jdk_only_dial_yields_to_bytecode` yields to — under `--jdk-only`. Scoping the
+dial to ONE class with `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/ArrayList`
+isolates it from everything else that mode changes:
+
+| rung | default | `--jdk-only` (all) | `--jdk-only`, ArrayList only |
+|---|---:|---:|---:|
+| `ArrayList.get(i)` | 958 | 145.5 | **152.5** |
+| `ArrayList` iterator | 937 | 1288.5 | **4785.0** |
+| view iterator | 1139.5 | 1645.5 | 1642.5 |
+| view `toArray` | 99.0 | 94.0 | 122.0 |
+
+**`ArrayList.get`'s native costs 6.3× its own JDK bytecode** — and the
+ArrayList-only column matching the all-classes column is what says `get` is the
+whole of that effect rather than a side effect of the mode.
+
+**The iterator moves the other way**, and hard: arming ArrayList *alone* makes
+the iterator 5× worse than default, worse than arming everything. So the JDK's
+`ArrayList$Itr.next()` is slower here than the native it replaces, while
+`ArrayList.get` is 6.3× faster than the one it replaces. That opposite sign is
+why "the per-element constant" reads as one flat number and why no
+whole-subsystem switch moved it: two effects of comparable size cancelling.
+Each door has to be armed on its own evidence.
+
+### The Term 3 treatment was ATTEMPTED for `ArrayList.get` and REVERTED
+
+It is behaviourally viable and mechanically inert, and it broke something else.
+All three parts matter to whoever picks this up.
+
+**Behaviourally it is fine.** `probes/ListYieldProbe` (new, 44 rows) covers the
+receivers that are ArrayList-SHAPED but are not plain ArrayLists, which is where
+real JDK bytecode reading `elementData`/`size` straight through would diverge: a
+live `values()` view across put and remove, `subList` (whose indices are offset
+from the backing) including write-through, `Collections.unmodifiableList`
+refusing writes, `Arrays.asList` allowing `set` but refusing `add`, iterator
+order, fail-fast, bounds and null. **44/44 byte-identical to HotSpot 25.0.3+9
+both on the default policy and under `--jdk-only` with the dial scoped to
+`java/util/ArrayList`** — so the real bytecode does drive CratonVM's ArrayList
+correctly.
+
+**Mechanically it did not engage, and the retag half was a no-op from the
+start.** The census says `java/util/ArrayList.get` is **ALREADY**
+`kind: synthetic-stub` on plain dev, with `kind_stated: true` — even though
+`register_arraylist_natives` sets an ambient `set_category(Bridge)` around it.
+`NativeMethodRegistry::register` adjudicates the kind itself (its "two drop arms
+and the `keep_real_*` heuristics"), so **the ambient category is not what
+lands**, and reading the registrar to learn a triple's kind is unreliable. Use
+the census.
+
+So the only effective half was the allow-list entry, and with it in place every
+precondition is satisfied and it STILL does not yield:
+
+* `kind` is `synthetic-stub` ✓
+* `real_protected_stub_class("java/util/ArrayList")` ✓ (arms C and D)
+* all five terms of the yield predicate ✓ — the census's own
+  `real_declaring_method` block reads
+  `{loaded: true, declared: true, acc_native: false, has_code: true}`
+
+and `invocations` stays at 127 in every arm and every mode. The refusal is
+therefore in the **dispatch path**, not in the registration, the allow-list or
+the predicate — and not in the JIT, since `--nojit` refuses identically.
+
+**The next probe is named:** `dispatch_virtual` has three doors that could serve
+`ArrayList.get` — `execute_invokevirtual_vtable_fast`'s
+`registered_native_will_run` (line ~150), the population filter on
+`resolve_cached_native_registration` (line ~3261), and `revalidate_cached_native`
+on cache hits. All three spell the same three-term test. Put one trace line in
+each, run `probes/ListYieldProbe`, and the door that never prints is the answer.
+Do not add another allow-list entry before doing that; two attempts have now
+been spent assuming the arbitration is reached.
+
+**~~And it silently disabled the Objects yield.~~ RETRACTED 2026-08-24 — that
+claim was wrong.** It was published off one paired reading (`Objects.equals`
+50.6 → 155.6 ns, `isNull` 28.0 → 117.0, with two local-twin controls flat) and
+it does not reproduce. Bisected properly, four binaries from the same commit:
+
+| arm | change | `Objects.equals` invocations | `ArrayList.get` invocations |
+|---|---|---:|---:|
+| A | dev, control | 0 | 127 |
+| B | the `SyntheticStub` retag only | 0 | 127 |
+| C | the allow-list entry only | 0 | 127 |
+| D | **both** — exactly the reverted attempt | 0 | 127 |
+
+Timings agree: `Objects.equals` reads 56.8-66.8 ns on D against 57.0-60.2 on A,
+i.e. noise. **No arm regresses anything.** The controls being flat is what made
+the original reading persuasive, and it should not have been — two rungs moving
+3× with two controls flat is a coincidence, not a mechanism, and "adding one arm
+to a `matches!` cannot remove another" was reason enough to withhold the claim
+until it was bisected. What the original reading actually was is not known; it
+was taken against a binary built at an earlier dev commit, which was not
+re-tested.
+
+**`invocations` is the instrument that settles this, not ns/call.**
+`--dump-native-registry` writes a row per registered triple carrying
+`invocations`, `kind`, `owns_slot`, `registered_by`, `overwrote` and a
+`real_declaring_method` block. `java/util/Objects.equals` reading
+**`invocations: 0`** is a far better proof that Term 3 works than any timing:
+the native is never entered at all. Every question on this page that is really
+"did the native run?" should be asked this way.
+
+**What DID survive the bisect is the engagement failure**, and it is sharper
+than first stated. `ArrayList.get` runs its native 127 times in all four arms,
+under `--nojit` as well as compiled — so it is not the JIT site cache, and the
+interpreter refuses it too.
+
+**Still open, unchanged:** ~6× is available on indexed list access if the
+engagement problem is solved. Do NOT extend it to the iterator family on the
+same reasoning; the number above says that would be a pessimisation, and it
+needs its own investigation into why `ArrayList$Itr` bytecode is slow (the first
+question being whether it is compiled at all).
+
+### The leaf fast path is engaged and is not the lever
+
+`native-collections` registers nothing as leaf, so the obvious next idea is to
+mark the pure accessors leaf and drop the funnel's pinning, STW probe,
+transitions and unwind bookkeeping. The numbers say do not bother.
+`probes/NativeFunnelFloorProbe`, this host, from compiled code:
+
+```text
+control: plain Java call         10.8 ns
+LEAF   AtomicInteger.get        383-417 ns
+FUNNEL AtomicInteger.CAS            482 ns
+FUNNEL MessageDigest.update         156 ns
+FUNNEL identityHashCode             127 ns
+FUNNEL System.nanoTime               90 ns
+```
+
+`CRATONVM_DBG=intrinsic-stats` confirms engagement — `compiled leaf-native
+dispatches: 3918000`, so the leaf arm is running, not skipped. Yet the LEAF rung
+costs 2.5-4× the full-funnel rungs beneath it. Leafness buys ~100 ns against its
+own non-leaf twin (383 vs 482, same receiver and call-site shape) and that is
+real, but it lands nowhere near `System.nanoTime`'s 90 ns. So the funnel is not
+what makes `AtomicInteger.get` expensive, and marking collection accessors leaf
+would not close a 37× gap. **Why a leaf native costs 4× a full-funnel one is its
+own question**, and a better one than anything on this page.
+
+## Term 2 (ORIGINAL 2026-08-22 reading) — the per-element constant is ~2 µs, and it is linear
 
 The obvious next guess is a quadratic iterator. It is not. Holding total
 elements fixed and scaling the map width:
@@ -161,7 +348,78 @@ heap API**, and pay that per field touch. No existing switch moves it much —
 worth ~6 %), `CRATONVM_COMPACT_REF_FIELDS=0` gains 6.8 %, and the Generational
 collector is 33 % faster than ZGC on the same code.
 
-## Term 3 — a static with a registered native can never be JIT-compiled
+## Term 3 — FIXED 2026-08-24 — a static with a registered native could never be JIT-compiled
+
+**The diagnosis below is right about the symptom and wrong about the door, and
+the wrong door is why the first fix attempt measured nothing.** `dispatch_static`
+does arbitrate native-vs-bytecode — on `NativeKind`, before any of this page's
+reasoning about `force_native_over_real_jdk_bytecode` applies. The question was
+never "which gate does it consult", it was "what kind are these natives".
+
+`java/util/Objects` is registered **twice**. `register_synthetic_overrides`
+installs it `Intrinsic`, which is right: on a synthetic image those bodies ARE
+the implementation. But `register_annotation_overrides` — reached from
+`register_essential_natives_with_shims`, i.e. the REAL-JDK path — installs the
+same bodies as a partial-stub-boot FALLBACK, and that one was `Intrinsic` too,
+so it won unconditionally. The three stubs registered immediately above it
+(`StringJoiner`, `EnumSet`, `Instant`) are all `SyntheticStub` with comments
+saying real bytecode must win once the real class loads. Objects was the one
+that was not.
+
+Fixed by giving the registrar its caller's kind and adding `java/util/Objects`
+to `real_protected_stub_class_common`, which arms the existing five-term yield
+predicate — class loaded, not itself a compatibility stub, method resolves to a
+non-native non-abstract body with Code decoded. MEASURED, 10M calls, ns/call,
+interleaved, against a byte-identical local static as the control:
+
+| rung | before | after | local twin (control) |
+|---|---:|---:|---:|
+| `Objects.equals` | 159 | **45.4** | 46 → 46 |
+| `Objects.hashCode` | 180 | **51.3** | 50 → 50 |
+| `Objects.requireNonNull` | 129 | **47.8** | 47 → 46 |
+| `Objects.isNull` | 105 | **29.4** | 24.7 → 25.3 |
+
+2.7-3.6×, each landing ON its local twin, and the four control rungs do not
+move. `CRATONVM_DBG_STUB_YIELD` prints `yield=true — real bytecode wins` on the
+fix and nothing on the base; `CRATONVM_DBG_JIT_COMPILED` counts 0
+`java/util/Objects` entries before and 6 after — which is the engagement
+evidence this page asked the next session to get before trusting any flag.
+
+**AND IT DOES NOT MOVE THIS CLASS.** Measured end to end after landing it, same
+harness and same CPU-time instrument as the Term 1 measurement at the top:
+
+| | HotSpot | CratonVM |
+|---|---:|---:|
+| Term 1 only (earlier window) | 8.3 / 6.6 / 8.4 s | 186.2 / 187.3 / **191.2** s |
+| Term 1 + Term 3 | 10.0 / 8.3 / 8.4 s | 201.2 / 189.9 / **189.4** s |
+
+189.9 against 187.3, with each arm's own spread being 186-191 and 189-201. That
+is a null result, and the HotSpot control is what licenses reading the two
+windows against each other at all: its median is 8.4 s here and 8.3 s there, so
+the windows cost the same in CPU terms even though the box was at load 33-51 for
+one and 17-37 for the other. (It is still a CROSS-BINARY comparison — Term 3 is
+a registration KIND and has no kill switch — so it is weaker than the
+one-binary A/B above it, and is quoted only to bound the effect, not to price
+it.)
+
+**So the term table below is wrong about this term.** It priced
+`Objects.equals` at ~21 s of ~475 s and called it "~4%". Making those methods
+3.4x faster should then have been worth ~8% of the post-Term-1 187 s, and
+nothing of the kind shows up. Either `Objects` is not a meaningful share of what
+remains after Term 1, or the ~215 ns/call the estimate was built on was measuring
+the pre-Term-1 profile's `Arrays.equals` path rather than these statics. The
+useful conclusion is the general one: **Term 3 is a real VM-wide win and a
+correctness fix, and it is NOT a fix for this class.** `requireNonNull` being
+among the most-called methods in the JDK is what justifies it, not this page.
+
+**It also fixed three wrong answers.** `probes/ObjectsYieldProbe` (50 rows,
+diffed against HotSpot 25.0.3+9) is byte-identical after the fix; before it, the
+native invented its own NPE messages — `"defaultObj must not be null"` where the
+JDK says `"defaultObj"`, and likewise for `supplier` and `supplier.get()`. A
+throughput fix that also removes three behavioural divergences is the sign the
+native should not have been winning in the first place.
+
+## Term 3 (ORIGINAL 2026-08-22 reading) — a static with a registered native can never be JIT-compiled
 
 `java.util.Objects.equals` is registered as a `NativeKind::Intrinsic` native.
 `java/util/Arrays.equals(Object[],Object[])` is **not** a native — it is

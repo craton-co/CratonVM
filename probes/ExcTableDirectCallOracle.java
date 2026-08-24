@@ -17,15 +17,24 @@
 //
 // All three must print byte-for-byte the same output.
 //
-// # The frame in the middle is load-bearing
+// # Two frames in the middle, because there are two doors
 //
-// `driver` is not a wrapper for tidiness. The gate only applies to callees
-// reached through `callee_compiler`, i.e. from an ORDINARY compiled frame — an
-// OSR body emits its own invokes and never consults it
-// (`direct callee binds: 0 bound, 0 left`). A probe whose hot loop called these
-// methods directly would run entirely on the dispatch helper and pass without
-// ever baking the direct `CALL` it claims to test. The loop calls `driver`;
-// `driver` calls the guarded callees.
+// `driver` is not a wrapper for tidiness. Until 2026-08-24 the gate applied
+// only to callees reached through `callee_compiler`, i.e. from an ORDINARY
+// compiled frame; the OSR door ran its own ladder and refused every
+// exception-table callee unconditionally, so a probe whose hot loop called
+// these methods directly ran entirely on the dispatch helper and passed
+// without ever baking the direct `CALL` it claims to test. The loop calls
+// `driver`; `driver` calls the guarded callees.
+//
+// `osrSelfCatch` and `osrPropagate` are the other half, added when the OSR
+// ladder was taught to ask the same gate. Each is invoked ONCE and does its
+// work in a hot loop, which is the shape that can only leave the interpreter
+// through OSR — so its calls are decided by the OSR ladder, and the sentinel
+// that leaves a directly-bound callee lands in an OSR frame rather than an
+// ordinary one. `osrPropagate` is the sharper of the two: the exception is
+// NOT caught inside the callee, so it has to cross the baked `CALL` and reach
+// a handler in the OSR body itself.
 //
 // Confirm the path is live rather than assuming it, with
 // `CRATONVM_DBG=intrinsic-stats`:
@@ -33,8 +42,11 @@
 //   ban lifted:  bind refused, callee-exception-table  ABSENT or unchanged
 //   ban kept:    bind refused, callee-exception-table: N   (N > 0)
 //
-// A run where that counter does not move between arms is a run where this
-// probe proved nothing.
+// and read the `of which the OSR door: N bound, M left` sub-line for the OSR
+// arm specifically — that door reported neither number until 2026-08-24, which
+// is how a ladder that was binding and refusing all along read as a door that
+// never ran. A run where those counters do not move between arms is a run
+// where this probe proved nothing.
 public final class ExcTableDirectCallOracle {
 
     static final int[] ARR = { 11, 22, 33 };
@@ -118,6 +130,58 @@ public final class ExcTableDirectCallOracle {
     }
 
     /**
+     * The OSR arm, self-catching half. Invoked ONCE, so the only door out of
+     * the interpreter for its loop is OSR, and the calls inside it are bound
+     * by the OSR ladder rather than by `callee_compiler`.
+     *
+     * No `try` in this method on purpose: an empty exception table keeps it
+     * clear of RBC.6/RBC.6b, so a refusal here would be about the direct bind
+     * and nothing else. Every exception is caught by the CALLEE, which is the
+     * case the ban's stated reason is about.
+     */
+    static long osrSelfCatch(int iters) {
+        long acc = 0;
+        for (int i = 0; i < iters; i++) {
+            acc += selfCatchExplicit(i).length();
+            acc += selfCatchAioobe(ARR, i & 7).length();
+            acc += selfCatchNpe(((i & 1) == 0) ? null : ARR).length();
+            acc += selfCatchDivZero(100, i & 1).length();
+            acc += nestedCatch(i).length();
+        }
+        return acc;
+    }
+
+    /**
+     * The OSR arm, propagating half — the one that actually crosses the baked
+     * `CALL` with a live throwable.
+     *
+     * The callee's `finally` must run, the callee's WRONG-type handler must not
+     * catch, and the handler that does catch is in THIS frame, which is an OSR
+     * frame. Also invoked once.
+     */
+    static long osrPropagate(int iters, int[] counter) {
+        long acc = 0;
+        for (int i = 0; i < iters; i++) {
+            try {
+                acc += finallyThenPropagate(counter, i);
+            } catch (RuntimeException e) {
+                acc += e.getMessage().length();
+            }
+            try {
+                acc += wrongHandlerType(i);
+            } catch (ArithmeticException e) {
+                acc += 7;
+            }
+            try {
+                acc += rethrowDifferent(i).length();
+            } catch (IllegalStateException e) {
+                acc += e.getMessage().length();
+            }
+        }
+        return acc;
+    }
+
+    /**
      * The ordinary compiled frame the gate needs. Every guarded callee above is
      * reached from HERE, never from the loop in {@link #main}.
      */
@@ -155,6 +219,11 @@ public final class ExcTableDirectCallOracle {
         for (int i = 0; i < iters; i++) {
             sink += driver(i, counter);
         }
+
+        // The OSR arms. Each is called once; its loop is what compiles.
+        int[] osrCounter = new int[1];
+        long osrSelf = osrSelfCatch(iters);
+        long osrProp = osrPropagate(iters, osrCounter);
 
         System.out.println("== the callee's own handler ==");
         System.out.println("explicit    = " + selfCatchExplicit(5));
@@ -195,6 +264,11 @@ public final class ExcTableDirectCallOracle {
             rethrown = e.getMessage();
         }
         System.out.println("rethrow     = " + rethrown);
+
+        System.out.println("== the OSR arms ==");
+        System.out.println("osrSelf     = " + osrSelf);
+        System.out.println("osrProp     = " + osrProp);
+        System.out.println("osrFinally  = " + (osrCounter[0] == iters));
 
         System.out.println("== totals ==");
         System.out.println("counter     = " + counter[0]);

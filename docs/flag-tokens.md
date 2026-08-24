@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-483 tokens.
+488 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -118,6 +118,7 @@ export inherited from a parent shell.
 | `census-exact-invocations` | `CRATONVM_CENSUS_EXACT_INVOCATIONS` |
 | `cce` | `CRATONVM_DBG_CCE` |
 | `cce-bt` | `CRATONVM_DBG_CCE_BT` |
+| `coll-refresh` | `CRATONVM_DBG_COLL_REFRESH` |
 | `corrupt-cell` | `CRATONVM_DBG_CORRUPT_CELL` |
 | `corrupt-cell-selftest` | `CRATONVM_DBG_CORRUPT_CELL_SELFTEST` |
 | `ccecache` | `CRATONVM_DBG_CCECACHE` |
@@ -283,6 +284,8 @@ export inherited from a parent shell.
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
 | `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
 | `jit-rootscan` | `CRATONVM_DBG_JIT_ROOTSCAN` |
+| `oopcov` | `CRATONVM_DBG_OOPCOV` |
+| `xt-coverage` | `CRATONVM_DBG_XT_COVERAGE` |
 | `jit-stale-after-remap` | `CRATONVM_DBG_JIT_STALE_AFTER_REMAP` |
 | `jit-stale-below-rbp` | `CRATONVM_DBG_JIT_STALE_BELOW_RBP` |
 | `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
@@ -415,6 +418,8 @@ export inherited from a parent shell.
 | `promo-seed` | `CRATONVM_DBG_PROMO_SEED` |
 | `proxy` | `CRATONVM_DBG_PROXY` |
 | `prune` | `CRATONVM_DBG_NO_PRUNE` |
+| `punned-ref` | `CRATONVM_DBG_PUNNED_REF` |
+| `view-comod` | `CRATONVM_DBG_VIEW_COMOD` |
 | `quarkus-staticinit` | `CRATONVM_DBG_QUARKUS_STATICINIT` |
 | `quicken-stats` | `CRATONVM_QUICKEN_STATS` |
 | `quiet-env-fallback` | `CRATONVM_QUIET_ENV_FALLBACK` |
@@ -549,7 +554,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-219 tokens.
+221 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -649,6 +654,7 @@ export inherited from a parent shell.
 | `long-intrinsics` | `CRATONVM_JIT_NO_LONG_INTRINSICS` |
 | `long-box-direct-helpers` | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` |
 | `varhandle-read-direct-helpers` | `CRATONVM_JIT_VARHANDLE_READ_DIRECT_HELPERS` |
+| `varhandle-write-direct-helpers` | `CRATONVM_JIT_VARHANDLE_WRITE_DIRECT_HELPERS` |
 | `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
 | `main-inline` | `CRATONVM_JIT_MAIN_INLINE` |
 | `matrix-dot` | `CRATONVM_JIT_MATRIX_DOT` |
@@ -776,7 +782,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-71 tokens.
+73 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -837,6 +843,8 @@ export inherited from a parent shell.
 | `zgc-parmark` | `CRATONVM_ZGC_PARMARK` |
 | `zgc-relocate` | `CRATONVM_ZGC_RELOCATE` |
 | `zgc-relocate-proven-jit` | `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` |
+| `xt-jit-coverage-handshake` | `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE` |
+| `osr-coverage-shadow` | `CRATONVM_OSR_COVERAGE_SHADOW` |
 | `zgc-jit-read-bounds` | `CRATONVM_ZGC_NO_JIT_READ_BOUNDS` |
 | `zgc-conc-start` | `CRATONVM_ZGC_CONC_START` |
 | `zgc-conc-workers` | `CRATONVM_ZGC_CONC_WORKERS` |
