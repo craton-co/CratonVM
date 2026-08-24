@@ -118,9 +118,22 @@ things changed:
 
    Four stalls in twenty is well above the 6.25% this page recorded (5/80), and
    the binary that produced them also carries this session's two perf changes.
-   **That rate is not yet attributable** — `/tmp/mjnab.sh` interleaves
+   **ANSWERED: they are not the cause.** `/tmp/mjnab.sh` interleaved
    `CRATONVM_MAP_VIEW_CACHE=0 CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0` against
-   both-on, ON ONE BINARY, which is the only comparison that can answer it.
+   both-on, run by run, ON ONE BINARY:
+
+   ```
+   ON  (both perf features)   15 runs   0 stalls
+   OFF (both disabled)        15 runs   1 stall
+   ```
+
+   The one stall in that A/B is in the arm with the perf changes turned OFF.
+
+   What the rate DOES track is host load: 4/20 while the host sat at load
+   12–84, 1/30 once it dropped to 6–13. That is worth stating because this page
+   has quoted rates from three different sessions as if they were comparable,
+   and they are not — which is also why the fix below ships with a kill switch
+   rather than being validated against a remembered baseline.
 
 3. **The plain wait/notify handshake does NOT reproduce in isolation.**
    `probes/PromiseWaitProbe.java` is `DefaultPromise`'s handshake reduced to
