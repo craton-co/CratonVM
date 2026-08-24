@@ -2111,7 +2111,20 @@ pub(super) fn compile_osr_artifact(
                 code_len,
                 param_slots,
                 max_locals, // Widening: u16 to usize (OSR target's max_locals, frame-free)
-                scan.needs_heap,
+                // A BRIDGED indy site calls a helper, and every helper call in
+                // this backend loads the hidden `SharedVm` pointer out of the
+                // frame slot `heap_local_offset` names — a slot that only
+                // EXISTS when `needs_heap` is set. `scan.needs_heap` does not
+                // know about it: an `invokedynamic` used to lower to a trap
+                // that calls nothing. Same hazard, same one-line remedy, as the
+                // spliced-call site records at `needs_heap = has_field_ops ||
+                // …` below; an OSR body has usually asked for the slot for some
+                // other reason, which is precisely why this was invisible for
+                // as long as the concat bridge was OSR-only.
+                scan.needs_heap
+                    || indy_info
+                        .iter()
+                        .any(|&(_, _, _, _, bridge_site)| bridge_site != 0),
                 mna_info,
                 field_info,
                 typecheck_info,

@@ -21693,6 +21693,28 @@ fn try_compile_inner(
             // an uncommon trap. This used to be an unconditional 0 here, so the
             // WHOLE-METHOD door trapped even on the `StringConcatFactory` sites
             // the OSR door had been bridging since that fix landed.
+            //
+            // A BRIDGED site CALLS A HELPER, and every helper call in this
+            // backend loads the hidden `SharedVm` pointer out of the frame slot
+            // `heap_local_offset` names — a slot that only EXISTS when
+            // `needs_heap` is set. Nothing else in a method like
+            //
+            //     static String f(int i) { return "v=" + i; }
+            //
+            // asks for it: there is no `new`, no field access, no ordinary
+            // invoke, and the indy used to lower to a trap that calls nothing.
+            // So `heap_local_offset` stayed 0, the bridge call loaded `[rbp-0]`
+            // — the saved RBP — as its VM pointer, and the helper answered
+            // with a null String from a garbage `SharedVm`.
+            //
+            // It reproduced ONLY through the whole-method door: an OSR compile
+            // sets `needs_heap` for its own entry stub, which is why the concat
+            // bridge ran correctly for the months it was OSR-only, and why
+            // `probes/IndyBridgeProbe.java`'s loop-shaped arms all passed while
+            // a three-instruction method returned null.
+            if bridge_site != 0 {
+                needs_heap = true;
+            }
             indy_info.push((pc, arg_slots, ret_type, arg_type_tags, bridge_site));
         }
     }
