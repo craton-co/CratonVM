@@ -1103,7 +1103,7 @@ cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 // boundary at which the callee's own handler can be resumed. The same commit
 // gated exactly that on the MIC/PIC route
 // (`mic_callee_has_exception_table`), the OSR direct-call route
-// (`osr_callee_declares_handlers`) and the inline-compile route
+// (`osr_callee_bars_direct_call`) and the inline-compile route
 // (`try_jit_upgrade_with_gate`) — but MISSED the `bg_compile` route, which is
 // the default one: the background worker publishes and
 // `execute_invokevirtual_cached`'s `jit_cache` probe promotes the site without

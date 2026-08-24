@@ -24293,7 +24293,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     register_enum_natives(registry);
 
     // --- java.util.Objects ---
-    register_objects_natives(registry);
+    register_objects_natives(registry, cratonvm_native_api::NativeKind::Intrinsic);
 
     // --- sun.misc.Unsafe ---
     register_unsafe_natives(registry);
@@ -30048,11 +30048,33 @@ fn native_timezone_get_gmt_offset_id(
 // java.util.Objects
 // ===========================================================================
 
-fn register_objects_natives(r: &mut NativeMethodRegistry) {
+fn register_objects_natives(r: &mut NativeMethodRegistry, kind: cratonvm_native_api::NativeKind) {
     // census-tag: java.util.Objects.* fast-paths replicate real JDK bytecode
     // with spec-exact semantics → Intrinsic.
+    //
+    // The KIND is the caller's, because the same bodies mean two different
+    // things depending on which registrar installed them:
+    //
+    //   * `register_synthetic_overrides` → `Intrinsic`. On a synthetic-JDK
+    //     image there is no `java/util/Objects` bytecode at all, so these ARE
+    //     the implementation and must always win.
+    //   * `register_annotation_overrides` (reached from
+    //     `register_essential_natives_with_shims`, i.e. the REAL-JDK path)
+    //     → `SyntheticStub`. There they exist only so `requireNonNull` and
+    //     friends still link when java.base stubs are partial. When the real
+    //     class IS loaded they must yield, exactly like the `StringJoiner`,
+    //     `EnumSet` and `Instant` stubs registered beside them.
+    //
+    // Registering the real-JDK path as `Intrinsic` made every one of these win
+    // unconditionally on `invokestatic`, because `dispatch_static` arbitrates
+    // on `NativeKind` alone -- so the real bytecode was never used, the method
+    // was never JIT-compiled, and every call paid the full native funnel:
+    // `Objects.equals` 203.5 ns against 47.2 ns for a byte-identical local
+    // static, on 10M calls. See
+    // `springboot-configurationpropertysources-native-collections-floor`
+    // Term 3.
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    r.set_category(kind);
     let o = "java/util/Objects";
     r.register(
         o,
