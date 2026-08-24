@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-481 tokens.
+482 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -317,6 +317,7 @@ export inherited from a parent shell.
 | `longroot` | `CRATONVM_DBG_LONGROOT` |
 | `lookup` | `CRATONVM_DBG_LOOKUP` |
 | `map-miss-audit` | `CRATONVM_DBG_MAP_MISS_AUDIT` |
+| `map-view-cache` | `CRATONVM_DBG_MAP_VIEW_CACHE` |
 | `mapper` | `CRATONVM_DBG_MAPPER` |
 | `mcl` | `CRATONVM_DBG_MCL` |
 | `memwatch` | `CRATONVM_DBG_MEMWATCH` |
@@ -547,7 +548,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-220 tokens.
+219 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -736,7 +737,6 @@ export inherited from a parent shell.
 | `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
 | `static-bytecode-callee` | `CRATONVM_JIT_STATIC_BYTECODE_CALLEE` |
 | `virtual-bytecode-callee` | `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` |
-| `special-bytecode-callee` | `CRATONVM_JIT_SPECIAL_BYTECODE_CALLEE` |
 | `statics-index` | `CRATONVM_NO_STATICS_INDEX` |
 | `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
 | `vector-templates` | `CRATONVM_VECTOR_TEMPLATES` |
@@ -971,11 +971,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_COMPAT`
 
-14 tokens.
+16 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `map-iterator-failfast` | `CRATONVM_NO_MAP_ITERATOR_FAILFAST` |
+| `map-view-cache` | `CRATONVM_MAP_VIEW_CACHE` |
+| `verify-map-view-cache` | `CRATONVM_VERIFY_MAP_VIEW_CACHE` |
 | `eager-streams` | `CRATONVM_EAGER_STREAMS` |
 | `foreign-attach` | `CRATONVM_FOREIGN_ATTACH` |
 | `jboss-boot-log-file` | `CRATONVM_JBOSS_BOOT_LOG_FILE` |

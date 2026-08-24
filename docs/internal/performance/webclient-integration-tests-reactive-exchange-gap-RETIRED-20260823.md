@@ -27,10 +27,12 @@ The page's §1 "ruled out" entry read:
 > `performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`).
 
 That separate page is now fully fixed — all four dispatch kinds, `invokestatic`
-on 2026-08-22 and `invokevirtual`/`invokeinterface`/`invokespecial` here, with
-the isolated transition measured **2 044 -> 440 ns/op** and now cheaper than
-not compiling the caller at all
+on 2026-08-22 and `invokevirtual`/`invokeinterface`/`invokespecial` on
+2026-08-23, with the isolated transition measured **1 902 -> ~420 ns/op** and
+now cheaper than not compiling the caller at all
 (`performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`).
+That page asked for exactly the measurement below, and did not have a host that
+could take it.
 
 **It does not move this class, and the reason is a count, not a hypothesis.**
 `CRATONVM_DBG=mic-prof` over 300 `ExchangeProbe` exchanges on Azure host 2:

@@ -158,6 +158,12 @@ fn maybe_dump_shutdown_reports() {
     // `runtime::interpreter::report_lambda_census_at_exit`.
     cratonvm_vm::runtime::interpreter::report_lambda_census_at_exit();
 
+    // The map-view rebuild-elision census, on `CRATONVM_DBG=map-view-cache`.
+    // `resync_skipped` is the ENGAGEMENT counter for the keySet-view fast path:
+    // a wall-clock number quoted without it cannot say whether the fast path
+    // ran at all.
+    cratonvm_vm::report_map_view_cache_at_exit();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The

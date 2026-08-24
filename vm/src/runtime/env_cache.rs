@@ -1279,7 +1279,8 @@ pub fn jit_lambda_const_probe_strict() -> bool {
 /// `CRATONVM_DBG=mic-prof` on `probes/ReactorProbe.java` reports
 /// `kind_static=2_986_402` of `disp_calls=3_356_461` — **89%**.
 ///
-/// See `performance/jit-compiled-caller-to-interpreted-callee-FIXED-20260823.md`.
+/// The virtual/interface/special half followed on 2026-08-23; see
+/// [`jit_virtual_bytecode_callee`].
 ///
 /// Default ON. `CRATONVM_JIT_STATIC_BYTECODE_CALLEE=0` restores the by-name
 /// path, which is the A/B a same-binary bisection needs.
@@ -1294,22 +1295,28 @@ pub fn jit_static_bytecode_callee() -> bool {
     })
 }
 
-/// `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` — the `invokevirtual` /
-/// `invokeinterface` half of the interpreted-callee memo
-/// (`jit::helpers::try_jit_virtual_bytecode_callee`).
+/// `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE` — the invokevirtual / invokeinterface
+/// twin of [`jit_static_bytecode_callee`].
 ///
-/// Same defect and same shape as [`jit_static_bytecode_callee`] above: a
-/// compiled caller entering a callee the JIT did not compile fell into the
-/// fully name-keyed `invoke_or_native` path and re-derived a constant on every
-/// call. The static half landed first because that is where the volume is on
-/// `probes/ReactorProbe.java` (89% of `jit_invoke_dispatch`'s calls); this is
-/// the rest, and on the SAME probe it is the majority of what is left —
-/// `out_static_bc=98_201` of `out_tail=342_867`, so 71% of the tail is kinds
-/// 0 and 2, plus the 1.95 M `mic_hit_noentry` dispatches that found a receiver
-/// and had no compiled callee to enter.
+/// The static half left 71% of a reactive workload's dispatch tail on the
+/// by-name path, because real application code is overwhelmingly virtual and
+/// interface. This is that half.
 ///
-/// Default ON. `CRATONVM_JIT_VIRTUAL_BYTECODE_CALLEE=0` restores the by-name
-/// path, which is the A/B a same-binary bisection needs.
+/// # What it is worth
+///
+/// MEASURED 2026-08-23 on this tree, `probes/XferProbe2.java`, one binary:
+///
+/// | arm | compiled -> compiled | compiled -> INTERPRETED | both interpreted |
+/// |---|---:|---:|---:|
+/// | `invokevirtual` | 33.4 ns | **2031.4 ns** | 535.4 ns |
+/// | `invokeinterface` | 36.0 ns | **2298.9 ns** | 839.8 ns |
+///
+/// i.e. compiling the caller and not the callee was 3.8x (virtual) and 2.7x
+/// (interface) SLOWER than compiling neither — the same shape the static half
+/// was fixed for, at the invoke kinds where the volume actually is.
+///
+/// Default ON. Set to `0` to restore the by-name `invoke_or_native` tail, which
+/// is the A/B a same-binary bisection needs.
 #[inline]
 pub fn jit_virtual_bytecode_callee() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
@@ -1321,29 +1328,6 @@ pub fn jit_virtual_bytecode_callee() -> bool {
     })
 }
 
-/// `CRATONVM_JIT_SPECIAL_BYTECODE_CALLEE` — the `invokespecial` third of the
-/// interpreted-callee memo (`jit::helpers::try_jit_special_bytecode_callee`).
-///
-/// Last of the four dispatch kinds and the smallest by volume
-/// (`kind_special=5_475_486` against `kind_static=107_874_082` on
-/// `BigEndianHeapByteBufTest`), smaller still because the shared
-/// `site_name_is_special_cased` gate excludes `<init>`/`<clinit>`. It is here
-/// for completeness of `jit-compiled-caller-to-interpreted-callee-costs-1900ns`
-/// rather than for a headline number, and it is switched separately so that is
-/// measurable rather than assumed.
-///
-/// Default ON. `CRATONVM_JIT_SPECIAL_BYTECODE_CALLEE=0` restores the by-name
-/// path.
-#[inline]
-pub fn jit_special_bytecode_callee() -> bool {
-    static CACHE: MemoSlot = MemoSlot::new();
-    slot_bool(&CACHE, || {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SPECIAL_BYTECODE_CALLEE") {
-            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-            Err(_) => true,
-        }
-    })
-}
 /// `CRATONVM_JIT_LAMBDA_SITE` — the JIT-side half of the lambda tier-up: a
 /// compiled caller's SAM call served straight from the call site's own cached
 /// target (`jit::helpers::try_lambda_site_direct_call`).
