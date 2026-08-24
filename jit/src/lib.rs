@@ -9901,6 +9901,53 @@ pub static DIRECT_CALLEE_BIND_HITS: std::sync::atomic::AtomicU64 =
 pub static DIRECT_CALLEE_BIND_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The OSR door's share of the two counters above — a SUBSET, not a third
+/// total: `compile_osr_artifact`'s ladder bumps the shared pair and these.
+///
+/// The reason this split exists is a measurement that read as a working
+/// feature. `static-exception-table-callee-pays-the-funnel-20260821.md` flipped
+/// `CRATONVM_JIT_DIRECT_EXC_TABLE_PUBLISH` on and the OSR rung of
+/// `probes/NativeFunnelFloorProbe.java` did not move (102.68 -> 100.26 ns/op),
+/// while the census printed `direct callee binds: 0 bound, 0 left on the
+/// dispatch helper` in BOTH arms. Zero sites examined and zero refusals tallied
+/// is not "the gate is off", it is "this door never reported": the OSR ladder
+/// bound and refused callees without touching either counter, so the one
+/// instrument that could have named the gap said nothing. Splitting the door
+/// out makes "the OSR ladder examined N sites" a readable number instead of an
+/// inference from a flat timing.
+pub static DIRECT_CALLEE_BIND_HITS_OSR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static DIRECT_CALLEE_BIND_MISSES_OSR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Tally one statically bound OSR call site that DID get a direct `CALL`.
+///
+/// Bumps the shared pair too, so the census total stays "every site any ladder
+/// asked about" rather than acquiring a third door nobody sums in.
+#[inline]
+pub fn note_osr_direct_callee_bind_hit() {
+    DIRECT_CALLEE_BIND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DIRECT_CALLEE_BIND_HITS_OSR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Tally one statically bound OSR call site left on the dispatch helper, with
+/// the reason, into the same table the other two doors use.
+#[inline]
+pub fn note_osr_direct_callee_bind_miss(reason: DirectBindRefusal) {
+    DIRECT_CALLEE_BIND_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DIRECT_CALLEE_BIND_MISSES_OSR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    note_direct_callee_bind_refusal(reason);
+}
+
+/// `(bound, unbound)` for the OSR door alone — a subset of
+/// [`direct_callee_bind_counts`].
+pub fn osr_direct_callee_bind_counts() -> (u64, u64) {
+    (
+        DIRECT_CALLEE_BIND_HITS_OSR.load(std::sync::atomic::Ordering::Relaxed),
+        DIRECT_CALLEE_BIND_MISSES_OSR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Why a statically bound site was NOT offered a direct `CALL`, one counter per
 /// refusal reason.
 ///

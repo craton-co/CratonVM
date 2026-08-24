@@ -5233,6 +5233,21 @@ fn run() -> Result<()> {
         eprintln!(
             "[cratonvm] direct callee binds: {bind_hits} bound, {bind_misses} left on the dispatch helper (statically bound sites where a ladder asked for a direct target)"
         );
+        // The OSR door's share of that pair. It is a SUBSET of the line above,
+        // not a third total.
+        //
+        // Printed separately because its absence was mistaken for its answer:
+        // `static-exception-table-callee-pays-the-funnel-20260821.md` read
+        // `0 bound, 0 left` in both arms of a gate flip and concluded the gate
+        // is unreachable from an OSR body. The conclusion was right and the
+        // instrument was not -- the OSR ladder was binding and refusing all
+        // along and reporting neither, so a door that reported nothing and a
+        // door that did nothing printed the same line. A hot loop is always an
+        // OSR body, so a zero HERE is the one worth noticing.
+        let (osr_hits, osr_misses) = cratonvm_jit::osr_direct_callee_bind_counts();
+        eprintln!(
+            "[cratonvm]   of which the OSR door: {osr_hits} bound, {osr_misses} left on the dispatch helper"
+        );
         // WHICH gate refused. A bare miss total cannot separate a compile-ORDER
         // accident (the callee simply was not compiled yet — repairable by
         // re-binding) from a standing policy refusal (an exception table, a
