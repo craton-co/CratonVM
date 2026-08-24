@@ -176,7 +176,30 @@ was already associated with this persistence context for entity [World with id
 its grep could not see it. (§9.2 of that page warns about exactly this class of
 grep artifact, in the other direction.)
 
-## 8. Related
+## 8. A pointer for the multithreaded-insertion page
+
+`hib-reactive-multithreaded-insertion-lazy-connection-20260822.md` is on a
+DIFFERENT workload and is not retired by this. But its 2026-08-24 update reports
+`NonUniqueObject` among its first errors and names the ID GENERATOR as the first
+failure in line order — and the 2026-08-22 binary's TechEmpower failures include
+that same shape, in 2 of 6:
+
+```
+org.hibernate.NonUniqueObjectException: A different object with the same
+identifier value was already associated with this persistence context for
+entity [org.hibernate.reactive.it.techempower.World with id '252']
+    at AbstractReactiveSaveEventListener.generateEntityKey(...:278)
+```
+
+On TechEmpower that shape is produced by the pre-bridge indy trap and vanishes
+with the bridge on — 6/6 against 6/6. That does not make it the same defect on
+the other workload, and it should not be assumed to be. It does mean the cheap
+check is available there too: run that workload with `CRATONVM_JIT_INDY_BRIDGE=0`
+against a default control on the CURRENT binary. If the OFF arm reproduces and
+the control does not, the id-generator chain is downstream of the same trap; if
+both arms fail alike, the flag is exonerated for one run's cost.
+
+## 9. Related
 
 * `techempower-jit-wrong-answer-20260822.md` — the page this retires.
 * `hibernate/hib-reactive-3gc-run-regressions-20260820.md` §7.3 — where the 500
