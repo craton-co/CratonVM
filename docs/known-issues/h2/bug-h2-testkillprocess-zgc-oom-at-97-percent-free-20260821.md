@@ -21,6 +21,39 @@ Still open, and now on a different obligation entirely: `TestMVStoreTool` and
 `org.h2.test.jdbc.TestCachedQueryResults` reach the same fragmentation wall
 because their collections refuse on `ACTIVE_FRAME_MAP` — the innermost compiled
 frame cannot be *located*, not disbelieved. See §"Still open".
+
+> ### Read this before quoting the "FIXED" above
+>
+> **The class passes on the tree this work was developed against
+> (`3ed73bf89` + these fixes) and FAILS again after merging the `dev` of
+> 2026-08-24 (`d2db39944`), for a reason that is not this one.** Two reps per
+> arm, same class, same host, same day, the two binaries interleaved:
+>
+> | arm | rc | oom | collections | compactions | `none` (proven) | `compiled-frame-oop-not-published` |
+> |---|---|---:|---:|---:|---:|---:|
+> | pre-merge ×2 | **0 PASS** | 0 | 76 / 79 | 24 / 24 | 24 | 6 |
+> | post-merge ×2 | 1 FAIL | 4 | 234 / 1039 | 9 / 8 | 9 | 82 |
+>
+> Causal, not a consequence of the death spiral: over the **same first 76
+> cycles** of each run, `none` goes 24 → 9 and
+> `compiled-frame-oop-not-published` goes 6 → 28.
+>
+> The two fixes below are still doing their job on the merged tree — with
+> `CRATONVM_OSR_COVERAGE_SHADOW=0` the OSR disjunct fires 750 times, with it on
+> it fires **0** — so this is a NEW blocker stacked on top, not a regression of
+> them. It is `UNPUBLISHED_FRAME_OOP`: the band verifier finding a
+> movable-resident word in a compiled frame's spill band that the shadow stack
+> never published. Ruled out as its cause, on one binary:
+> `CRATONVM_REGISTER_IMAGE_REMAP=0` (dev's own kill switch for the register-image
+> repair that landed in the same window) leaves it at `unpub=264/855` and
+> `unpub=149/515`, still failing.
+>
+> 91 commits landed on `dev` in that window, including a generic
+> `invokedynamic` bridge, an `UNREWRITABLE_JIT_ROOTS` veto, array-receiver
+> screens at the reference-processing shape guards, and several changes to what
+> a compiled frame holds live. Which of them raised `UNPUBLISHED_FRAME_OOP` is
+> the next question, and the counter to bisect it with is on the `[jitroots]`
+> line.
 ## Symptom
 
 `org.h2.test.store.TestKillProcessWhileWriting`, default configuration
@@ -717,6 +750,15 @@ Two hypotheses were tested and **both failed**, which is the useful part:
 
 Ordered by what a next session should pick up first.
 
+* **`UNPUBLISHED_FRAME_OOP` became the dominant refusal on the 2026-08-24 `dev`
+  tip.** See the box under §Status: 24 proven cycles in 76 before the merge, 9
+  in 76 after, with `compiled-frame-oop-not-published` going 6 → 28 over the
+  same window. `CRATONVM_REGISTER_IMAGE_REMAP=0` does not restore it, so it is
+  not the register-image repair that landed in the same window. This is the
+  first thing to bisect — the 91-commit range is `3ed73bf89..d2db39944`, the
+  counter is on the `[jitroots]` line, and each arm is one 4-minute run of this
+  class. Until it is found, this class fails on `dev` for a reason that has
+  nothing to do with the coverage proof.
 * **`TestMVStoreTool` and `TestCachedQueryResults` — the innermost frame cannot
   be LOCATED.** Fully characterised in §"Follow-up 2026-08-24" §7, with two
   hypotheses already ruled out by measurement. The lever is
