@@ -14,6 +14,10 @@ rounds, 2 000 000 iterations, `probes/XferProbe2.java`:**
 | `invokeinterface` | 27 | 501-572 | **2148-2733** | **440-493** | **4.9-5.5x** |
 | `invokespecial` | — | 634-639 | **2643** | **458** | **5.8x** |
 
+Re-measured on the final binary, three further interleaved rounds on a busier
+window (absolute values inflated on BOTH arms, ratios unchanged): virtual
+2724-4058 -> 319-521, interface 3815-5408 -> 587-706.
+
 **Every kind is now BELOW its both-interpreted control, so compiling the caller
 is no longer a pessimisation for any of them.** That is the number that
 mattered: before this, compiling the caller and not the callee was 4.9x slower
@@ -181,6 +185,11 @@ kept in the probe because the pair is the evidence that the name, not the
 shape, decides.
 
 ## Correctness
+
+* `cargo test -p cratonvm-vm --lib`: **2600 passed, 0 failed**, including
+  `a_jit_generation_change_clears_every_site_keyed_memo`.
+* `regression-suite/run.sh`: **69 of 69 scheduled vectors passed, 0 failed.**
+
 
 * The memo joins `site_keyed_memos!`, so the JIT-generation and
   class-identity flushes drop it like every other dispatch memo, and

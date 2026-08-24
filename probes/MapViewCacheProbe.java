@@ -32,6 +32,12 @@ public class MapViewCacheProbe {
         System.out.println("MVC " + name + "=" + v);
     }
 
+    static int addAllSize(Collection<?> c) {
+        List<Object> t = new ArrayList<>();
+        t.addAll(c);
+        return t.size();
+    }
+
     static String sorted(Collection<?> c) {
         List<String> l = new ArrayList<>();
         for (Object o : c) { l.add(String.valueOf(o)); }
@@ -145,6 +151,18 @@ public class MapViewCacheProbe {
         m.remove("b");
         row(tag + ".values.afterRemove", sorted(vs));
         row(tag + ".values.contains", vs.contains("3"));
+        // The COPY-CONSTRUCTOR direction, which does not go through the same
+        // door as `size()`/`toString()`: `new ArrayList<>(c)` reaches
+        // `collect_collection_elements`, and for a synchronized wrapper
+        // (Hashtable) that unwraps to the ArrayList-SHAPED values carrier and
+        // reads its element array directly. That read had no resync, so a
+        // CACHED values view answered from a stale array while `size()` on the
+        // same object was right -- see `ht.copyList.size` in
+        // MapViewBehaviourProbe.
+        row(tag + ".values.copyList", new ArrayList<>(vs).size());
+        row(tag + ".values.copySet", new HashSet<>(vs).size());
+        row(tag + ".values.toArrayLen", vs.toArray().length);
+        row(tag + ".values.addAllTarget", addAllSize(vs));
 
         // --- keySet of an EMPTY map, then filled ----------------------------
         Map<String, String> fresh = m instanceof LinkedHashMap

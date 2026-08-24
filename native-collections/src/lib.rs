@@ -16519,10 +16519,18 @@ fn verify_view_matches_source(
          does not bump the invalidation generation.",
         keys.len()
     );
-    let (base, key_pins) = pin_value_slice(ctx, &keys);
+    // `native_map_contains_key` runs the key's own `equals`, which re-enters
+    // Java and can allocate — so `backing` is a pre-move address after the
+    // first iteration. Pinned FIRST so the single `unpin_native_roots` at the
+    // end releases it and every key handle above it: `unpin_native_roots`
+    // TRUNCATES the pin stack, so releasing the key range separately would
+    // drop this one too.
+    let backing_pin = ctx.pin_native_root(backing);
+    let (_key_base, key_pins) = pin_value_slice(ctx, &keys);
     let mut missing: Option<String> = None;
     for (k, key_pin) in keys.into_iter().zip(key_pins) {
         let k = read_pinned_elem(ctx, key_pin, k);
+        let backing = ctx.read_native_pin(backing_pin, backing);
         let present = matches!(
             native_map_contains_key(ctx, &[Value::Object(Some(backing)), k]),
             Ok(Some(Value::Int(1)))
@@ -16532,9 +16540,7 @@ fn verify_view_matches_source(
             break;
         }
     }
-    if base != usize::MAX {
-        ctx.unpin_native_roots(base);
-    }
+    ctx.unpin_native_roots(backing_pin);
     if let Some(k) = missing {
         panic!(
             "CRATONVM_VERIFY_MAP_VIEW_CACHE: the map-view generation guard said \
@@ -45136,6 +45142,31 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // each probe returns a benign null, and a downstream invariant eventually
     // segfaults the VM.  We compute `n_fields` once and use it to short-circuit
     // any layout probe whose required slot is past the receiver's actual layout.
+    // A `values()` view is ArrayList-SHAPED, and the layout probe below reads
+    // its `elementData`/`size` slots DIRECTLY. This is one of the sites the
+    // lazy-map-views plan page named as "the accessor is nearly, but not quite,
+    // a chokepoint", and it was harmless only while every `values()` call
+    // minted a fresh view -- a fresh view is never stale. With the view cached
+    // on the source (see the "Live map views" note) it can be, and it was:
+    // `new ArrayList<>(hashtable.values())` after two removals answered 2 where
+    // HotSpot answers 1 (`probes/MapViewBehaviourProbe` `ht.copyList.size`).
+    //
+    // ONLY a `Hashtable` reproduced it, and the asymmetry is the diagnosis: its
+    // `Collections$SynchronizedCollection` wrapper is unwrapped a few lines
+    // above and RECURSES into here, where nothing resyncs, while a bare
+    // `HashMap$Values` receiver reaches `native_al_to_array` instead and
+    // resyncs there. `v2.size()` and `v2.toString()` were correct throughout;
+    // only `toArray()` was wrong.
+    //
+    // The keySet/entrySet carriers need nothing here: their branch below hands
+    // the BACKING to `collect_view_snapshot_ordered`, which reads the SOURCE
+    // map and is therefore live whatever the backing happens to hold.
+    let coll = match ctx.class_name_arc_of_id(cid).as_deref() {
+        Some(n) if is_map_view_carrier(n) && values_view_source(ctx, coll).is_some() => {
+            resync_values_view(ctx, coll)?
+        }
+        _ => coll,
+    };
     let n_fields = ctx.object_num_fields(coll);
     // S111r-bug-fix (peaceful-sammet): Try ArrayList layout via the
     // field-index resolver so we honour the real-JDK layout

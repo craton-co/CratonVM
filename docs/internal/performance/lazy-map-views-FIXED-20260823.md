@@ -32,25 +32,34 @@ O(n)-per-read instead of O(1).
 ## Measured
 
 `probes/KeySetBench`, width=1000, µs per call, **one binary, A/B by
-`CRATONVM_MAP_VIEW_CACHE`**:
+`CRATONVM_MAP_VIEW_CACHE`, interleaved**. LinkedHashMap, three rounds each
+(HotSpot column for scale):
 
-| rung | LinkedHashMap OFF | ON | HashMap OFF | ON |
+| rung | HotSpot | OFF | ON | ratio |
 |---|---:|---:|---:|---:|
-| `viewOnly`  (`map.keySet()` alone) | 1284.0 | **1.5** | 1330.0 | **2.5** |
-| `sizeOnly`  (`keySet().size()`)    | 3132.0 | **5.0** | 3422.5 | **4.0** |
-| `perCall`   (what Spring does)     | 5206.5 | **1192.5** | 5506.0 | **1246.5** |
-| `hoisted`   (one view, read in a loop) | 2974.5 | **1217.5** | 3079.5 | **1197.5** |
-| `mapSize`   (control)              | 2.0 | 2.0 | 3.0 | 3.0 |
+| `viewOnly`  (`map.keySet()` alone) | ~0 | 1177-1258 | **1.5** | **~800x** |
+| `sizeOnly`  (`keySet().size()`)    | 0.5 | 2856-3967 | **4.0-5.0** | **~700x** |
+| `entryOnly` (`map.entrySet()` alone) | ~0 | 848-919 | **1.5-2.5** | **~450x** |
+| `valuesOnly` (`map.values()` alone) | ~0 | 67-88 | **1.0-1.5** | **~60x** |
+| `perCall`   (what Spring does)     | 18.0 | 4717-4940 | **1120-1330** | **3.9x** |
+| `hoisted`   (one view, read in a loop) | 9.0 | 2914-3718 | **1143-1274** | **2.5x** |
+| `mapSize`   (control)              | — | 2.0 | 2.0 | — |
 
-`viewOnly` is **~600-850x**; `sizeOnly` **~630-850x**; `perCall` **4.4x**;
-`hoisted` **2.4x**.
+The `hoisted` row is ten interleaved rounds across both map families
+(LinkedHashMap and HashMap): OFF 2824-3718, ON 1134-1825, a win in every one.
+**One earlier reading of that cell came back at 10 313 µs ON against 4691 OFF**
+— an apparent 2.2x regression — and was a background-process spike, not a
+result: its OFF control was itself 1.6x the idle value, which is the tell.
+Re-running the cell alone gave the ten consistent rounds above. Numbers taken
+while a `cargo` build was running are inflated ~2.5x on both arms and are not
+quoted here.
 
 `hoisted` was the row that proved iteration was the bigger half — the view was
-built once and reading through it still cost 2.8 ms against 2 µs for
-`map.size()`. What remains of it after the fix (~1200 µs for 1000 elements,
-i.e. ~1.2 µs per element) is the per-element ITERATOR cost, which is a
-different subject with its own page (the five-doors iteration note); the
-rebuild is gone, which is what `perCall` converging on `hoisted` says.
+built once and reading through it still cost ~3 ms against 2 µs for
+`map.size()`. What remains after the fix (~1200 µs for 1000 elements, i.e.
+~1.2 µs per element against HotSpot's 9 ns) is the per-element ITERATOR and
+native-access cost, which is a different subject; the rebuild is gone, which is
+what `perCall` converging on `hoisted` says.
 
 ## The fix, and what makes it sound
 
@@ -144,9 +153,47 @@ was stale or named a cache that had moved. **It was stale**: no cache of that
 name exists anywhere in `native-collections`. The sentence now has a real
 referent again and says so.
 
-**Blockers 2 and 3 — "the backing escapes to JDK bytecode" and "the accessor is
-nearly, but not quite, a chokepoint" — block design B, not design A, and both
-remain true.** They are the reason B was not taken:
+**Blocker 3 bit anyway, and caching the view is what exposed it.** The plan page
+framed "the accessor is nearly, but not quite, a chokepoint" as a design-B
+problem. It is not: the direct read it names was *harmless only because every
+`values()` call minted a fresh view*, and a fresh view is never stale. Caching
+the view removed that accident.
+
+`collect_collection_elements` — the helper behind `new ArrayList<>(c)`,
+`new HashSet<>(c)`, `addAll` and `toArray` on an arbitrary collection — probes
+the receiver for an ArrayList layout and reads `elementData`/`size` DIRECTLY. A
+`values()` view is ArrayList-SHAPED, so the probe matched it and read a stale
+array. MEASURED, `probes/MapViewBehaviourProbe`:
+
+```text
+ht.copyList.size   HotSpot 1   cache OFF 1   cache ON 2
+ht.copySet.size    HotSpot 1   cache OFF 1   cache ON 2
+```
+
+**Only `Hashtable` reproduced it, and that asymmetry is the whole diagnosis.**
+`probes/MapViewCacheProbe`'s isolation of it:
+
+```text
+ht  v2.size=1   v2.toString=[b]   v2.toArray.len=2
+```
+
+`size()` and `toString()` on the very same object were right; only `toArray()`
+was wrong. A `Hashtable` view is handed out inside a
+`Collections$SynchronizedCollection`, which `collect_collection_elements`
+unwraps and then RECURSES into — landing on the carrier at the layout probe,
+where nothing resyncs. A bare `HashMap$Values` receiver never gets there: it
+reaches `native_al_to_array`, which does resync. The keySet/entrySet carriers
+were never at risk either, because their branch hands the BACKING to
+`collect_view_snapshot_ordered`, which reads the SOURCE map and is live whatever
+the backing holds.
+
+The fix is one resync at the top of that helper, and the probe gained
+`values.copyList` / `values.copySet` / `values.toArrayLen` /
+`values.addAllTarget` rows so the copy-constructor door is now a gate rather
+than a door nobody was watching.
+
+**Blockers 2 and 3 also still block design B**, for the reasons the plan page
+gave, and they are why B was not taken:
 
 * `alloc_view_backing` deliberately gives the backing a real
   `java/util/HashMap` field layout because JDK bytecode reads it directly:
@@ -166,24 +213,33 @@ both.
 
 ## How it was checked
 
-* `probes/MapViewCacheProbe` (new, this change): 138 rows over `HashMap`,
+* `probes/MapViewCacheProbe` (new, this change): 150 rows over `HashMap`,
   `LinkedHashMap` and `Hashtable`, covering view identity, liveness of a
   hoisted view across put / value-replace / remove / clear / a size-invariant
   `remove+put` pair, `toArray` / `stream` / `iterator` / `isEmpty`,
   write-through by `remove` and by `iterator().remove()`, entrySet value
   freshness and `setValue` write-through, values-view liveness, and a view
-  taken from an EMPTY map and then read after a put. **All 138 rows byte-identical
-  to HotSpot 25.0.3+9** — including the six identity rows that were wrong
-  before this change — and identical between `CRATONVM_MAP_VIEW_CACHE=1` and
-  `=0`.
+  taken from an EMPTY map and then read after a put, and the copy-constructor /
+  `toArray` / `addAll` door that Blocker 3 hides behind. **All 150 rows
+  byte-identical to HotSpot 25.0.3+9** — including the nine identity rows that
+  were wrong before this change — and identical between
+  `CRATONVM_MAP_VIEW_CACHE=1` and `=0` except for exactly those nine, which is
+  the point: with the cache off they revert to the old, wrong answer.
 * `probes/MapViewBehaviourProbe` (the pre-existing gate, the one that caught
   `Properties` views being live in the write direction only): identical on
   cache-ON, cache-OFF and HotSpot.
-* Under `CRATONVM_VERIFY_MAP_VIEW_CACHE=1` the behavioural probe produces the
-  same 138 rows with no divergence panic.
+* Under `CRATONVM_VERIFY_MAP_VIEW_CACHE=1`, and again under
+  `--Xmx 64m --XX:UseGc ZGC`, the same 150 rows with no divergence panic.
+* The same 150 rows under ZGC, G1 and Generational at `--Xmx 64m`, identical to
+  the default-heap run — the view is now a new GC edge (source -> view ->
+  backing -> source, a cycle a tracing collector handles) and this is what says
+  so.
 * The `native-collections` unit tests: 136 + 9 + 12 + 8 + 15 + 3 + 4 + 6 + 8 +
   8 passed, 0 failed.
-* `regression-suite/run.sh`.
+* `regression-suite/run.sh`: **69 of 69 scheduled vectors passed, 0 failed** —
+  including `RJdkViews`, `RChmKeySetView`, `RMapResizeGc`, `RTreeRangeGc`,
+  `RPriorityQueueGc` and `RForeignLayoutCollections`.
+* `cargo test -p cratonvm-vm --lib`: 2600 passed, 0 failed.
 
 ## Files
 
@@ -194,5 +250,7 @@ both.
   `view_backing_is_in_sync`, `view_backing_marker_slots_are_free`,
   `cached_map_view` / `cached_values_view`, `verify_view_matches_source`, and
   the guard in `resync_view_set_inner`.
+  Plus the one resync in `collect_collection_elements`, which is Blocker 3's
+  actual site.
 * `probes/MapViewCacheProbe.java`, `probes/KeySetBench.java` (new
   `valuesOnly` / `entryOnly` rungs).
