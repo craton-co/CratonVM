@@ -251,12 +251,12 @@ const MAX_BLIND_SITES: usize = 1_000;
 /// forwarded verbatim. There is one body; last-write-wins picks between three
 /// pointers to it. See `jca/ssl_context_spi.rs` for why the guarded
 /// `SSLContext` surface is deliberately registered three times over.
-const BASELINE_TOTAL_DRIFT: usize = 1214;
+const BASELINE_TOTAL_DRIFT: usize = 1237;
 
 /// `(synthetic-only pass, triple)` PAIRS in [`DRIFT_TRIPLES`] -- larger than
 /// [`BASELINE_TOTAL_DRIFT`] because one triple can be registered by several
 /// synthetic-only passes (`AtomicBoolean.get` has two).
-const BASELINE_TOTAL_PAIRS: usize = 1347;
+const BASELINE_TOTAL_PAIRS: usize = 1370;
 
 /// Two triples that pin BOTH answers.
 ///
@@ -1252,6 +1252,14 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/lang/management/RuntimeMXBean", "getUptime", "()J"),
             ("java/lang/management/RuntimeMXBean", "getVmName", "()Ljava/lang/String;"),
             ("java/lang/management/RuntimeMXBean", "getVmVersion", "()Ljava/lang/String;"),
+            ("java/lang/management/ThreadMXBean", "getAllThreadIds", "()[J"),
+            ("java/lang/management/ThreadMXBean", "getDaemonThreadCount", "()I"),
+            ("java/lang/management/ThreadMXBean", "getPeakThreadCount", "()I"),
+            ("java/lang/management/ThreadMXBean", "getThreadCount", "()I"),
+            ("java/lang/management/ThreadMXBean", "getTotalStartedThreadCount", "()J"),
+            ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringEnabled", "()Z"),
+            ("java/lang/management/ThreadMXBean", "isThreadContentionMonitoringSupported", "()Z"),
+            ("java/lang/management/ThreadMXBean", "isThreadCpuTimeSupported", "()Z"),
         ],
     ),
     (
@@ -1645,6 +1653,15 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
         ],
     ),
     (
+        "register_pe2_string_marshaling_on",
+        &[
+            ("cratonvm/internal/foreign/MemorySegmentImpl", "getUtf8String", "(J)Ljava/lang/String;"),
+            ("cratonvm/internal/foreign/MemorySegmentImpl", "reinterpret", "(J)Ljava/lang/foreign/MemorySegment;"),
+            ("java/lang/foreign/MemorySegment", "getUtf8String", "(J)Ljava/lang/String;"),
+            ("java/lang/foreign/MemorySegment", "reinterpret", "(J)Ljava/lang/foreign/MemorySegment;"),
+        ],
+    ),
+    (
         "register_pe_arena",
         &[
             ("java/lang/foreign/Arena", "allocate", "(J)Ljava/lang/foreign/MemorySegment;"),
@@ -1871,10 +1888,21 @@ const DRIFT_TRIPLES: &[(&str, &[(&str, &str, &str)])] = &[
             ("java/net/HttpURLConnection", "connect", "()V"),
             ("java/net/HttpURLConnection", "disconnect", "()V"),
             ("java/net/HttpURLConnection", "getContentLength", "()I"),
+            ("java/net/HttpURLConnection", "getContentLengthLong", "()J"),
+            ("java/net/HttpURLConnection", "getErrorStream", "()Ljava/io/InputStream;"),
             ("java/net/HttpURLConnection", "getHeaderField", "(Ljava/lang/String;)Ljava/lang/String;"),
             ("java/net/HttpURLConnection", "getInputStream", "()Ljava/io/InputStream;"),
+            ("java/net/HttpURLConnection", "getInstanceFollowRedirects", "()Z"),
+            ("java/net/HttpURLConnection", "getOutputStream", "()Ljava/io/OutputStream;"),
+            ("java/net/HttpURLConnection", "getResponseMessage", "()Ljava/lang/String;"),
+            ("java/net/HttpURLConnection", "setChunkedStreamingMode", "(I)V"),
+            ("java/net/HttpURLConnection", "setConnectTimeout", "(I)V"),
             ("java/net/HttpURLConnection", "setDoInput", "(Z)V"),
             ("java/net/HttpURLConnection", "setDoOutput", "(Z)V"),
+            ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(I)V"),
+            ("java/net/HttpURLConnection", "setFixedLengthStreamingMode", "(J)V"),
+            ("java/net/HttpURLConnection", "setInstanceFollowRedirects", "(Z)V"),
+            ("java/net/HttpURLConnection", "setReadTimeout", "(I)V"),
             ("java/net/InetAddress", "getHostAddress", "()Ljava/lang/String;"),
             ("java/net/InetAddress", "getHostName", "()Ljava/lang/String;"),
             ("java/net/InetAddress", "toString", "()Ljava/lang/String;"),
@@ -2541,6 +2569,12 @@ mod scan {
         pub syn_gated: bool,
         pub testish: bool,
         pub parent: Option<usize>,
+        /// Parameter names, in declaration order.
+        ///
+        /// Needed only by the one-level call-site binding in the resolver: a
+        /// registrar helper takes the class as a PARAMETER, so the name is
+        /// unbound inside its own body and the value lives at the call site.
+        pub params: Vec<String>,
     }
 
     #[inline]
@@ -2828,6 +2862,72 @@ type Triple = (String, String, String);
 
 /// Split a comma-separated argument list at depth 0. Returns `(full, nc)`
 /// slices as owned, trimmed strings — parallel views of the same bytes.
+/// Parameter names of a `fn` signature, in declaration order.
+///
+/// Deliberately conservative: anything that is not a plain `name: Type` pair
+/// yields an EMPTY name in that position, so the slot still counts for
+/// arity — a caller's Nth argument has to line up with the Nth parameter —
+/// while never binding a name the resolver could then trust wrongly. `self`
+/// is kept as a slot for the same reason.
+fn param_names(sig: &str) -> Vec<String> {
+    let Some(o) = sig.find('(') else {
+        return Vec::new();
+    };
+    let bytes = sig.as_bytes();
+    let mut depth = 0i64;
+    let mut close = None;
+    for (i, b) in bytes.iter().enumerate().skip(o) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(c) = close else {
+        return Vec::new();
+    };
+    let inner = &sig[o + 1..c];
+    let ib = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut d = 0i64;
+    let mut start = 0usize;
+    let mut push = |a: usize, b: usize, out: &mut Vec<String>| {
+        let piece = inner[a..b].trim();
+        if piece.is_empty() {
+            return;
+        }
+        let name = match piece.split_once(':') {
+            Some((n, _)) => n.trim(),
+            None => piece,
+        };
+        let name = name.trim_start_matches("mut ").trim();
+        if !name.is_empty() && name.bytes().all(|x| is_ident(x)) && !name.starts_with(|ch: char| ch.is_ascii_digit()) {
+            out.push(name.to_string());
+        } else {
+            out.push(String::new());
+        }
+    };
+    for (i, b) in ib.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'<' => d += 1,
+            b')' | b']' | b'>' => d -= 1,
+            b',' if d == 0 => {
+                push(start, i, &mut out);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    push(start, inner.len(), &mut out);
+    out
+}
+
 fn split_args(full: &[u8], nc: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut depth = 0i64;
@@ -2968,6 +3068,9 @@ struct Analysis {
     resolved_sites: usize,
     loop_expanded_sites: usize,
     unresolved: BTreeMap<String, usize>,
+    /// `reason|file|enclosing-fn` -> count, so the blind region can NAME
+    /// the registrars to teach the resolver about next.
+    unresolved_where: BTreeMap<String, usize>,
     triples: usize,
     shipping: usize,
     synthetic_only: BTreeSet<String>,
@@ -3109,6 +3212,7 @@ fn parse_file(idx: usize, src: &FileSrc, raw: &str) -> (Vec<FnDef>, bool) {
             syn_gated,
             testish,
             parent: None,
+            params: param_names(&sig),
         });
         i = body + 1;
     }
@@ -3669,6 +3773,8 @@ fn build_analysis() -> Analysis {
     let mut register_sites = 0usize;
     let mut resolved_sites = 0usize;
     let mut loop_expanded_sites = 0usize;
+let mut param_bound_sites = 0usize;
+    let mut unresolved_where: BTreeMap<String, usize> = BTreeMap::new();
     let bump = |m: &mut BTreeMap<String, usize>, k: &str| {
         *m.entry(k.to_string()).or_insert(0) += 1;
     };
@@ -3687,6 +3793,64 @@ fn build_analysis() -> Analysis {
         for (bi, &b) in t.iter().enumerate() {
             if b == b'\n' {
                 line_starts.push(bi + 1);
+            }
+        }
+
+        // ---- one level of call-site parameter binding -------------------
+        //
+        // A registrar helper takes the class as a PARAMETER:
+        //
+        //     for ms in [PE_SEGMENT_INTERFACE, CRATON_SEGMENT_CLASS] {
+        //         register_pe2_string_marshaling_on(r, ms);
+        //     }
+        //     fn register_pe2_string_marshaling_on(r: &mut .., ms: &str) {
+        //         r.register(ms, "getUtf8String", ..)
+        //
+        // The loop expansion below only sees loops whose span CONTAINS the
+        // register site, so `ms` was `unbound-identifier` and every row in such
+        // a helper fell into the blind region this file's vacuity control
+        // measures. That is the form `panama.rs` introduced on 2026-08-22 and
+        // the reason three gates went red at once.
+        //
+        // SAME-FILE callers only, and that is a real limit rather than an
+        // oversight: a cross-file caller needs a whole-tree call graph, and the
+        // conservative direction here is to leave such a site UNRESOLVED (in
+        // the blind region, where the ceiling can see it) rather than to bind
+        // it from a caller this pass cannot prove is the only one.
+        let mut callsites: BTreeMap<String, Vec<(usize, Vec<(String, String)>)>> = BTreeMap::new();
+        {
+            let mut j = 0usize;
+            while j < n {
+                if !is_ident_start(t[j]) || (j > 0 && is_ident(t[j - 1])) {
+                    j += 1;
+                    continue;
+                }
+                let mut k = j;
+                while k < n && is_ident(t[k]) {
+                    k += 1;
+                }
+                let name = String::from_utf8_lossy(&t[j..k]).into_owned();
+                let paren = skip_ws(t, k);
+                // NOT the definition. `fn name(r: &mut .., c: &str)` matches
+                // `name(` just as a call does, and its "arguments" are the
+                // PARAMETER LIST, which never resolves — so including it made
+                // the all-sites-must-resolve rule refuse every real binding.
+                // Measured: this alone was 41 sites on
+                // `register_al_sublist_natives_on` and 41 more on
+                // `register_pe_memory_segment_on`.
+                let mut b = j;
+                while b > 0 && (t[b - 1] == b' ' || t[b - 1] == b'\t') {
+                    b -= 1;
+                }
+                let is_def = b >= 2 && &t[b - 2..b] == b"fn";
+                if paren < n && t[paren] == b'(' && !is_def && name.starts_with("register") {
+                    let cend = match_paren(t, paren);
+                    if cend > paren + 1 {
+                        let a = split_args(&t[paren + 1..cend - 1], &nc[paren + 1..cend - 1]);
+                        callsites.entry(name).or_default().push((paren, a));
+                    }
+                }
+                j = k;
             }
         }
 
@@ -3803,6 +3967,71 @@ fn build_analysis() -> Analysis {
                     }
                 }
             }
+            // Bind this helper's own parameters from its same-file call
+            // sites, one level deep. A parameter is bound only when EVERY call
+            // site resolves it; one unresolvable caller leaves the name unbound
+            // and the site stays in the blind region, which is the direction
+            // that keeps the ceiling meaningful.
+            if !fns[encl].params.is_empty() {
+                if let Some(sites) = callsites.get(&fns[encl].name) {
+                    for (pi, pname) in fns[encl].params.iter().enumerate() {
+                        if pname.is_empty() {
+                            continue;
+                        }
+                        let mut vals: BTreeSet<String> = BTreeSet::new();
+                        let mut all = !sites.is_empty();
+                        for (coff, cargs) in sites {
+                            let Some((af, an)) = cargs.get(pi) else {
+                                all = false;
+                                break;
+                            };
+                            // the CALLER's loops, not the callee's
+                            let mut cvals: Vec<String> = Vec::new();
+                            if let Some(v) =
+                                resolve_simple(af, an, &per_file_consts[fi], &global, &ambiguous)
+                            {
+                                cvals.push(v);
+                            } else {
+                                let (sf, sn) = strip_adaptors(af, an);
+                                let key: Option<&str> = if is_plain_ident(&sf) {
+                                    Some(sf.as_str())
+                                } else {
+                                    path_tail(&sf)
+                                };
+                                if let Some(key) = key {
+                                    for l in loops.iter() {
+                                        if l.var == key && l.body <= *coff && *coff < l.end {
+                                            if let Some(vs) = &l.values {
+                                                cvals.extend(vs.iter().cloned());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if cvals.is_empty() {
+                                all = false;
+                                break;
+                            }
+                            vals.extend(cvals);
+                        }
+                        if all && !vals.is_empty() && vals.len() <= 32 {
+                            let mut next: Vec<BTreeMap<String, String>> = Vec::new();
+                            for e in &envs {
+                                for v in &vals {
+                                    let mut d = e.clone();
+                                    d.insert(pname.clone(), v.clone());
+                                    next.push(d);
+                                }
+                            }
+                            if next.len() <= 512 {
+                                envs = next;
+                                param_bound_sites += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
             if envs.len() > 1 {
                 loop_expanded_sites += 1;
             }
@@ -3875,6 +4104,13 @@ fn build_analysis() -> Analysis {
                 resolved_sites += 1;
             } else {
                 bump(&mut unresolved, &why);
+                // WHERE, not just how many. The category alone says a form is
+                // unresolvable; it does not say which registrar to teach the
+                // resolver about next, and this gate's remedy is explicitly to
+                // teach a form rather than to raise the ceiling.
+                *unresolved_where
+                    .entry(format!("{why}|{}|{}", f.rel, fns[encl].name))
+                    .or_insert(0usize) += 1;
             }
         }
     }
@@ -3902,6 +4138,7 @@ fn build_analysis() -> Analysis {
         resolved_sites,
         loop_expanded_sites,
         unresolved,
+        unresolved_where,
         triples: registrants.len(),
         shipping: shipping.len(),
         synthetic_only,
@@ -4090,8 +4327,31 @@ fn the_drift_scanner_is_not_vacuous() {
          INVISIBLE to `no_new_mode_drift`. This assertion cannot see that drift either; \
          all it says is that the region where it could hide has not grown. If a change \
          needs to grow it, the honest move is to teach the resolver the new form, not to \
-         raise this number.",
-        a.unresolved
+         raise this number.
+
+\n         WHERE THE BLIND REGION IS, worst first -- the registrars to teach it \n         about next:
+{}",
+        a.unresolved,
+        {
+            let mut v: Vec<(&String, &usize)> = a
+                .unresolved_where
+                .iter()
+                .filter(|(k, _)| !k.starts_with("arity<4|"))
+                .collect();
+            v.sort_by(|x, y| y.1.cmp(x.1).then(x.0.cmp(y.0)));
+            v.into_iter()
+                .take(15)
+                .map(|(k, n)| {
+                    let mut it = k.split('|');
+                    let why = it.next().unwrap_or("");
+                    let file = it.next().unwrap_or("");
+                    let f = it.next().unwrap_or("");
+                    format!("           {n:>5}  {why:<20} {f}  ({file})")
+                })
+                .collect::<Vec<_>>()
+                .join("
+")
+        }
     );
 
     // --- the analysis's own two views of drift must agree ------------------

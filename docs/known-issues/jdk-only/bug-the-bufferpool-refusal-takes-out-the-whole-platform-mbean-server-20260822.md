@@ -1,6 +1,36 @@
 # The `BufferPool` refusal is correctly loud and wrongly SCOPED — strict mode loses the whole platform MBean server
 
-**Status: OPEN, MEASURED, on pristine `dev`.** 2026-08-22.
+**Status: FIXED 2026-08-24, and NOT by the fix this record asked for.**
+Opened 2026-08-22.
+
+```text
+CRATONVM_ARGS=--jdk-only  regression-suite  111 passed, 0 failed
+  RJdkJmx        PASS
+```
+
+Measured on `e910c5bb0`, release build 2026-08-24 15:02, against HotSpot
+25.0.3+9. This record asked for the refusal to be SCOPED per call path. What
+actually closed it was **retiring `JavaNioAccess.getDirectBufferPool`**
+(`ba798eca7`): `javap -c` shows the real method is two instructions returning
+`Bits.BUFFER_POOL`, so `VM$BufferPoolsHolder.<clinit>` now runs the JDK's own
+bytecode and never reaches a CratonVM fabrication at all.
+
+The refusal is now unreachable from every caller, which is worth stating
+precisely because it is stronger than "the vector is green":
+`alloc_buffer_pool` is called from exactly one place, `alloc_all_buffer_pools`,
+and that function pre-checks `try_ensure_synthetic_class` and returns an empty
+`Vec` on refusal (`697754cb6`) before any per-pool call can throw. The
+single-pool caller this record's trace went through no longer exists.
+
+**So the trade this record framed was never taken, and does not need to be.**
+The argument in §"What would fix it" -- keep the throwable on the direct query,
+return empty on the SharedSecrets path -- was a choice between a loud refusal
+and a constant-zero reading. Retiring the shim removed the fabrication instead,
+so the direct query now reads real `Bits.BUFFER_POOL` state and nothing
+answers zero. Left below unedited: the blast-radius measurement is what made
+the scope of the problem legible, and it is still the reason a refusal thrown
+from inside a `<clinit>` is not scoped to the feature it refuses.
+
 
 ## What is failing
 

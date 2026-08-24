@@ -759,7 +759,17 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
     // Real-JDK boot can still resolve `java/util/Objects` through a synthetic
     // fallback when java.base stubs are partial. Install the existing spec
     // natives in essentials so `requireNonNull` and friends link in those paths.
-    register_objects_natives(registry);
+    //
+    // `SyntheticStub`, not `Intrinsic`, and for the same reason as the
+    // `StringJoiner` / `EnumSet` / `Instant` stubs registered just above: this
+    // is a FALLBACK for a partial-stub boot, so a loaded real `java/util/Objects`
+    // must win. As `Intrinsic` it won unconditionally on `invokestatic` --
+    // `dispatch_static` arbitrates on `NativeKind` alone -- which meant the real
+    // bytecode was never used and never JIT-compiled. `java/util/Objects` is on
+    // `real_protected_stub_class_common` so the yield is armed; the five-term
+    // predicate behind it still refuses whenever the real body is not actually
+    // there, and `invoke_or_native` finds the native anyway if it is not.
+    register_objects_natives(registry, cratonvm_native_api::NativeKind::SyntheticStub);
 
     // `Throwable.initCause` / `ExceptionInInitializerError.initCause` — vm_util
     // wraps failed `<clinit>` in EIIE and calls `initCause`; linkage must not
