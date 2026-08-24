@@ -2,18 +2,25 @@
 
 ## Status
 
-**STILL OPEN 2026-08-22, two of the three obligations now lifted.** ZGC
-compacts under live compiled frames for the first time (21 cycles, 203 007
-objects, on a run that used to compact zero times), and the disjunct that
-blocked 89% of collections — `osr-shadow-coverage-unproven` — is traced to a
-one-line gap (the optimizing tier never computed `fully_oop_covered`) and
-fixed, verified via unit tests, a runtime oracle differential, and a
-corruption canary. Two of the five classes this defect touches no longer
-crash at all. `TestKillProcessWhileWriting` and `TestMVStoreTool` still fail:
-a third, separate obligation (`CROSS_THREAD_JIT_PEER`) still blocks most
-cycles on this heavily multi-threaded workload. See §"Follow-up 2026-08-22"
-and §"Still open".
+**FIXED for this class 2026-08-24. Two classes remain, on a DIFFERENT
+obligation.** `TestKillProcessWhileWriting` passes in the default configuration
+— `rc=0`, zero `OutOfMemoryError`, zero `arena allocation failed` — on three
+runs interleaved with three failures of the kill-switch arm of the **same
+binary**. The `osr-shadow-coverage-unproven` disjunct that refused relocation
+on **725 of 759** collections is now **0 of 54**, and the whole workload needs
+54 collections instead of 759.
 
+**The blocker was not the one §"Still open" (2026-08-22) predicted.** That
+section named `CROSS_THREAD_JIT_PEER` as what was left. Measured on this class
+at the 2026-08-23 `dev` tip: `cross-thread-jit-peer` fires **0 times in 759
+collections**. What actually blocked it was two defects one level below, both
+found by counting what the aggregate `map_coverage=N` counter would not say —
+see §"Follow-up 2026-08-24".
+
+Still open, and now on a different obligation entirely: `TestMVStoreTool` and
+`org.h2.test.jdbc.TestCachedQueryResults` reach the same fragmentation wall
+because their collections refuse on `ACTIVE_FRAME_MAP` — the innermost compiled
+frame cannot be *located*, not disbelieved. See §"Still open".
 ## Symptom
 
 `org.h2.test.store.TestKillProcessWhileWriting`, default configuration
@@ -279,6 +286,26 @@ diagnosis: `grep -c 'arena allocation failed'` and `grep 'zgc frag:'`. The
 `[GC] zgc-features:` line's `relocation_skipped_jit` is the count of cycles
 that declined.
 
+**As of 2026-08-24 the first command PASSES.** To see the old failure on the
+same binary — the only A/B worth taking — use the kill switch:
+
+```bash
+# fails: restores the frame-slot reading of the OSR coverage check
+CRATONVM_OSR_COVERAGE_SHADOW=0 <cratonvm-bin> --java-home /data/toolchain/jdk-25 \
+    --Xmx 1g -c "$CP" org.h2.test.store.TestKillProcessWhileWriting
+```
+
+The instruments the 2026-08-24 work rests on, all additive, all off by default:
+
+| flag | what it prints |
+|---|---|
+| `CRATONVM_DBG_JIT_ROOTSCAN=1` | the per-cycle `[jitroots]` line: `reason=`, `osr_reason=(…)`, and now `frame_cov=(no_slot= misaligned= no_map= incomplete= ok=)` and `xt_cov=(accepted= refused= deposits=)` |
+| `CRATONVM_DBG_OOPCOV=1` | per compiled method, both coverage notions side by side with the safepoints each is missing, plus the six frame-slot causes and the seven shadow causes |
+| `CRATONVM_DBG_XT_COVERAGE=1` | the cross-thread handshake's per-cycle `peer_depth`/`proven` arithmetic and each peer's deposit |
+
+`frame_cov` and `osr_reason` are CUMULATIVE process counters: take the
+difference between two lines, or the tail line before exit.
+
 ## Regression cover left behind
 
 * `gc/src/zgc.rs::a_live_compiled_frame_forbids_relocation_whatever_the_coverage_verdict_says`
@@ -304,6 +331,31 @@ that declined.
   to be taken.
 * `cargo test --lib -p cratonvm-gc -p cratonvm-types -p cratonvm-vm`:
   1685 + 573 + 2578 pass, 0 fail.
+
+Added 2026-08-24:
+
+* `jit/src/x64/tests.rs::the_method_entry_poll_knows_its_own_live_oop_locals` —
+  the entry pc answers with the SEEDED mask (not zero, and not
+  `local_oop_masks[0]`, which a back edge can have narrowed), a reached bci
+  answers with its own, and an unreached bci still answers `None`. Three
+  directions, so the fix cannot be mistaken for "everything is covered now".
+* `conservative_roots::the_osr_coverage_check_reads_the_shadow_aggregate_not_the_frame_slot_subset`
+  — built on the shape the fast tier actually emits for an OSR method with a
+  direct call taking a reference argument (shadow complete, frame-slot
+  incomplete), and the kill switch flips the answer on the SAME fixture, so it
+  pins which field is read rather than riding on a fixture that would pass
+  either way. Its pair,
+  `…_still_refuses_an_incomplete_shadow_claim`, is the inverse fixture.
+* `conservative_roots::peer_coverage_is_accepted_only_when_every_peer_entry_is_accounted_for`
+  — the handshake's arithmetic, with both shortfall shapes (one short, and
+  nothing deposited) asserted, since the shortfall is the whole soundness
+  argument.
+* `conservative_roots::beginning_a_coverage_cycle_clears_the_peer_ledger` —
+  a stale carry-over is the ledger's only unsound state, and the test deposits
+  first so the clear is proving something.
+* `conservative_roots::a_thread_with_no_jit_frames_deposits_nothing`.
+* `cargo test --release --lib -p cratonvm-jit -p cratonvm-gc -p cratonvm-types
+  -p cratonvm-vm`: 2105 + 1685 + 581 + 2610 pass, 0 fail.
 
 ## Also confirmed, 2026-08-21: four more classes hit the identical signature
 
@@ -366,10 +418,21 @@ single OSR-fallback firing read `osr_reason=(shadow=0 debug=0 map_coverage=N
 exact_rbp=0)` — the blocker is **exclusively** imprecise map coverage, never
 the shadow-stack layout and never a missing exact RBP.
 
+> **Corrected 2026-08-24.** The paragraph below asserts that the optimizing
+> tier "actually compiles H2's hot OSR loops". It does not compile any OSR body
+> at all: the OSR door
+> (`jit_bridge.rs`, right before `cm.compiled_via_osr = true`) calls
+> `x64::compile_with_param_slots`, the FAST tier, and `ir_lower.rs`'s own
+> finalize asserts that "this backend publishes no `osr_pc_to_native`, so
+> `osr_enter` refuses at its first `?`". The one-line fix below is still right
+> and still landed, but it cannot have been what this class was hitting — which
+> is consistent with `map_coverage` still being the sole nonzero disjunct on the
+> 2026-08-23 tip. See §"Follow-up 2026-08-24" for what was.
+
 Tracing `fully_oop_covered` (the field that feeds `map_coverage`) found the
 mechanism: `x64/driver.rs` (the fast tier) computes it from a real bytecode-PC
-subset check; `ir_lower.rs` (the **optimizing** tier — the one that actually
-compiles H2's hot OSR loops, per `plan_inline`'s type-guarded virtual
+subset check; `ir_lower.rs` (the **optimizing** tier — believed at the time to
+compile H2's hot OSR loops, per `plan_inline`'s type-guarded virtual
 inlining) never computed it at all. It stayed at the `CompiledMethod` struct
 default of `false` for every method this tier ever compiled, unconditionally,
 OSR or not. `moving_young_osr_method_needs_fallback` reads `false` as
@@ -431,36 +494,280 @@ obligation — see `roots.rs`'s own comment on the cross-thread coverage
 handshake `arch-2026-07-26/moving-young-precise-roots.md` specifies and
 nobody has built) still blocks the majority of cycles.
 
+
+## Follow-up 2026-08-24: the blocker, twice one level down
+
+Everything below is on one host, one class (`TestKillProcessWhileWriting`,
+`--Xmx 1g`, default ZGC + JIT, real JDK 25), and every comparison is against a
+kill switch on the SAME binary.
+
+### 1. The measurement that redirected the search
+
+`CRATONVM_DBG_JIT_ROOTSCAN=1` on the 2026-08-23 `dev` tip, full run:
+
+| reason | cycles |
+|---|---:|
+| `osr-shadow-coverage-unproven` | **725** |
+| `none` (proven) | 25 |
+| `compiled-frame-oop-not-published` | 4 |
+| `xt-helper-window-conservative-scan` | 4 |
+| `active-safepoint-map-incomplete` | 1 |
+| **`cross-thread-jit-peer`** | **0** |
+
+`compaction_cycles=25`, `relocation_skipped_jit=734`, 4 `OutOfMemoryError`, 10
+`arena allocation failed`, `rc=1`. The `osr_reason` breakdown put every one of
+the 725 on `map_coverage` — the disjunct the 2026-08-22 follow-up believed it
+had fixed — and none on the shadow layout or a missing exact RBP.
+
+The cross-thread handshake this page asked for **was** built (a peer proves its
+own frames at its own park and deposits the proven depth; the initiator accepts
+only when the deposits account for every peer JIT entry in the process;
+`CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` restores the blanket refusal). On this
+workload it decides nothing: `xt_cov=(accepted=0 refused=0 deposits=0)`. That
+is the honest report — it removes a blanket refusal this class was not hitting.
+
+### 2. `CRATONVM_DBG_OOPCOV` — the method, and which term said no
+
+`fully_oop_covered` going false is reported to the runtime as one counter, and
+six conditions produce it. Counted separately, on the same run:
+
+```
+causes(marks_inexact=10 oop_in_reg=0 stack_deep=0 local_deep=0
+       staged_deep=0 staged_unmappable=439)
+```
+
+**439 of 449 are one shape.** All three direct JIT-to-JIT call arms raise
+`pending_staged_args_unmapped` when any argument is a reference: the argument is
+popped off the operand stack and marshalled into the outgoing-ABI area, which
+no frame-slot map can name, so the safepoint's pc is withheld from
+`mapped_safepoint_pcs` and the method's coverage bit goes false permanently.
+
+That is a correct answer to the wrong question.
+`moving_young_osr_shadow_fallback_needed` is about **rewritable shadow
+coverage**, and `fully_oop_covered` on the fast tier — the only tier that
+produces OSR artifacts, since `ir_lower` publishes no `osr_pc_to_native` — means
+`safepoint_pcs` being a subset of `mapped_safepoint_pcs`, i.e. every live oop
+named by a FRAME SLOT. The staged argument is not the caller's live value any
+more; it is the CALLEE's parameter, covered by the callee's own locals map, and
+the caller never re-reads the outgoing area after the call.
+
+`CompiledMethod::fully_shadow_covered` is the aggregate that asks the shadow
+question (has maps AND every one claims `moving_young_coverage_complete`),
+computed by **both** backends, and the OSR check reads it.
+`CRATONVM_OSR_COVERAGE_SHADOW=0` restores the frame-slot reading.
+
+Narrowing that term does not weaken the proof. The OSR fallback
+SHORT-CIRCUITS PAST `refresh_moving_young_coverage_for_collection`, so the
+effect of the change is that the strictly sharper per-frame checks get to run
+at all: `moving_young_frame_coverage_complete` on the active frame and every
+parent (the same flag, resolved through the *live safepoint id*, so per-frame
+rather than per-method) and the band verifier's empirical walk for
+young-resident unpublished words.
+
+### 3. The entry poll made every method's shadow bit false
+
+Moving the OSR check onto `fully_shadow_covered` changed nothing on its own —
+359 of 392 collections still refused. Same problem one level over, and seven
+counters later:
+
+```
+scauses(gate=0 desync=0 marks=10 scratch=0 locals64=0 dataflow=800 nopush=0)
+```
+
+with every uncovered method reporting exactly `shadow_missing_pcs=[4294967295]`.
+
+`emit_safepoint_poll_prologue` stamps `cur_bc_pc` with `u32::MAX` so the
+method-entry poll's map cannot collide with a genuine bci-0 safepoint in the
+sp-id-keyed lookup. That is right, and nothing then answered for that pc:
+`local_oop_reached.get(u32::MAX)` is `None`, so
+`moving_young_safepoint_coverage_complete` read the entry poll as "the dataflow
+never reached here" and pushed its `OopMapEntry` with
+`moving_young_coverage_complete: false`. A method-wide AND over the maps
+therefore read **false for every method the fast tier ever compiled**.
+
+The entry state is knowable and is not a guess: the poll is emitted from the
+END of `emit_prologue`, so every argument is homed; the operand stack is empty;
+and `emit_pre_safepoint_spill` flushes every register-homed local to its
+canonical frame slot before the call. The live oops are exactly the reference
+parameters — `param_oop_mask`, the same value that seeds the dataflow at bci 0.
+It is kept as its own field rather than read back out of `local_oop_masks[0]`,
+because when bci 0 is also a branch target that entry has been intersected with
+the back edge, which is a SUBSET, and publishing a subset under a completeness
+claim is the unsound direction. One accessor, `local_oop_mask_at_current_pc`,
+now serves all five readers, so the map, the push and the reload cannot
+disagree about what the entry poll covers.
+
+### 4. Measured, on the class this page is about
+
+| | `dev` (2026-08-23) | with the fixes |
+|---|---:|---:|
+| `rc` | **1 FAIL** | **0 PASS** |
+| `OutOfMemoryError` | 4 | **0** |
+| `arena allocation failed` | 10 | **0** |
+| collections | 759 | **54** |
+| `osr-shadow-coverage-unproven` | 725 | **0** |
+| `relocation_skipped_jit` | 734 | **29** |
+| `relocation_on_proven_jit` | 23 | 25 |
+| `objects_relocated` | 197 834 | 318 490 |
+
+The compaction COUNT barely moves (25 to 25). What moves is the rate: the same
+number of compactions now happens across 54 collections instead of 759, i.e.
+early enough that the heap never enters the death spiral of hundreds of
+unproductive cycles. Reading `compaction_cycles` alone would have missed the
+fix entirely.
+
+The remaining refusals are honest per-frame ones:
+`active-safepoint-map-incomplete` 21, `compiled-frame-oop-not-published` 8,
+`none` (proven) 25.
+
+### 5. Verification
+
+* **ABBA A/B, three reps, one binary, interleaved.** `on` = default,
+  `off` = `CRATONVM_OSR_COVERAGE_SHADOW=0`:
+
+  | rep | on | off |
+  |---|---|---|
+  | 1 | `rc=0 oom=0` | `rc=1 oom=4` |
+  | 2 | `rc=0 oom=0` | `rc=1 oom=4` |
+  | 3 | `rc=0 oom=0` | `rc=1 oom=4` |
+
+  Against a same-day base rate of 3 failures in 3 runs of the unmodified `dev`
+  binary: 6 failures on the old behaviour, 3 passes on the new, no crossovers.
+* **Corruption canary.** `org.h2.test.db.TestMultiThread` times 6 on the fixed
+  binary, clean directory per rep: 6/6 `rc=0`, zero SIGSEGV, zero
+  `ClassCastException`. Note what this canary can and cannot see — it records
+  `compaction_cycles=0` on five of the six reps, so the class barely exercises
+  relocation. The runs that actually compact under this change are the passing
+  `TestKillProcessWhileWriting` arms above (22–25 compactions, 288–318 k objects
+  relocated, no SIGSEGV, no wrong answer), and those are the real exposure.
+* **Other collectors.** Generational: `rc=0`, no OOM, no arena failure —
+  unchanged. G1: fails this class before and after, and was A/B'd against the
+  kill switch on `TestRandomMapOps` as well (5 interleaved arms, identical in
+  every column) because this change also decides whether G1 publishes shadow
+  oops pinned or movable. See
+  `bug-h2-testrandommapops-classcastexception-20260821.md`.
+* `cargo test --release --lib -p cratonvm-jit -p cratonvm-gc -p cratonvm-types
+  -p cratonvm-vm`: 2105 + 1685 + 581 + 2610 pass, 0 fail. (One run, on a host at
+  load 234, flaked
+  `threading::monitor::tests::a_timed_waiter_returns_as_soon_as_it_is_notified`
+  on its 5 s budget; it passes on an idle host and touches nothing here.)
+
+### 6. Effect on the other four classes this page names
+
+All five re-run on the fixed binary, `--Xmx 1g`, default config. HotSpot 25 at
+`-Xmx1g` passes every one of them (26 s / 25 s / 39 s / 10 s), so each remaining
+failure is a real CratonVM defect.
+
+| class | before | after |
+|---|---|---|
+| `TestKillProcessWhileWriting` | OOM, `rc=1` | **`rc=0`** |
+| `TestMVStoreTool` | OOM, `rc=1` | OOM, `rc=1` — `compaction_cycles=0`, see *Still open* |
+| `TestOpenClose` | arena failures + the `java/lang/Object` exception | **no OOM**; fails only on that separate, pre-existing exception defect |
+| `TestMVStoreCachePerformance` | OOM | **no OOM, no arena failure at all**; now fails on `NoSuchMethodError: 'boolean org.h2.mvstore.Page$PageReference.isPersistent()'` — a different defect |
+| `TestCachedQueryResults` | livelock, 23 468 `native_oom` | still a livelock, 7 761–15 522 `native_oom` |
+
+Two of the five are off this defect entirely; a third is fixed; two remain.
+
+### 7. `TestMVStoreTool`'s residual, named
+
+Same wall — `request=262160`, `free_list_bytes=1010924832` (94 % free),
+`largest_free_block=65440`, `free_spans=77928` — reached in only **8
+collections**, all of which refused, `compaction_cycles=0`. The per-cause split
+of `ACTIVE_FRAME_MAP` (added 2026-08-24) is unambiguous:
+
+```
+frame_cov=(no_slot=0 misaligned=0 no_map=9 incomplete=0 ok=48)
+```
+
+**No map ever refuses on its own claim.** Nine frames simply cannot be located:
+the word in the innermost frame's safepoint-id slot matches no `OopMapEntry` of
+the method the frame record names. `[frame-cov]` prints each one, and the shape
+is the finding:
+
+```
+method=org/h2/mvstore/RootReference.isLocked:()Z maps=0 sp_id_slot_off=24
+  rbp=0x...3a00 own_ret=0x...353e own_ret_ok=true
+  own_caller=org/h2/test/store/TestMVStoreTool.testCompact:()V
+  decoded_callee=None
+```
+
+One `rbp`, one saved return address, and across collections **four different
+methods** claiming it — `RootReference.isLocked` (which has **zero** oop maps,
+so it can never be the frame at a safepoint), `MVMap.getRoot`,
+`MVMap$DecisionMaker.decide`, `MVMap.replacePage`. At most one can be right.
+`decoded_callee=None` on every occurrence: the calls are indirect (`CALL R11`),
+which is why the `(rbp, compile-id)` mirror exists and why the stack cannot
+corroborate it.
+
+Two hypotheses were tested and **both failed**, which is the useful part:
+
+* **Not the spliced-call path.** With `CRATONVM_JIT_INLINE_CALLS`,
+  `CRATONVM_JIT_INLINE_NEST` and `CRATONVM_JIT_INLINE_SPLICE_DEVIRT` all `0`,
+  the identical shape appears — same four methods, same rbp.
+* **Not a missing post-call republish.** Publishing the mirror at every
+  GC-capable safepoint (where the GC reads it) was implemented, confirmed
+  engaged (`[INLINE-FR] inline frame-record ENABLED: storing RBP via mov
+  fs:[0xffffdd20]`), and moved nothing: `no_map` 7 to 5, `ok` 64 to 70,
+  `rc=1 oom=4 compaction_cycles=0` in both arms. It was reverted — two stores
+  per safepoint with no workload behind them do not stay in the hot path — and
+  the negative result is recorded here so the next attempt starts after it
+  rather than before it.
+
 ## Still open
 
-* **The residual itself.** `TestKillProcessWhileWriting` and `TestMVStoreTool`
-  still fail on `dev` — the `osr-shadow-coverage-unproven` disjunct that
-  blocked them is fixed (see above), but `CROSS_THREAD_JIT_PEER` — a
-  many-threaded workload having a peer thread in compiled code at the
-  collection's safepoint — is a separate, still-unbuilt obligation. Next step
-  is the cross-thread coverage handshake `roots.rs` already names.
-* **A pre-existing, unrelated correctness gap the OSR fix's own verification
-  surfaced.** `CRATONVM_DBG_VERIFY_OOP_MAPS`'s `never_mapped (while_covered=N)`
-  counter is nonzero on `dev` **with or without** the OSR fix (1192 vs 1410 on
-  the same class, same host) — some frame is claiming `fully_oop_covered=true`
-  while an in-band live oop goes unmapped, on the fast tier's own bytecode-PC
-  subset check (`x64/driver.rs`'s `safepoint_pcs.is_subset(&mapped_safepoint_pcs)`),
-  independent of everything this page fixes. Only 23 distinct
-  `code+offset` sites produce the 1410 baseline occurrences, so this is a
-  small number of specific compiled methods, not a systemic failure. Not
-  investigated further here — it needs its own page and its own
-  differential, the way this one got one.
-* **The two small objects in the large-object region.** The fragmentation
-  report placed an 80-byte `String` and a 24-byte `Object` above `high_cursor`,
-  where `ZGC_LARGE_OBJECT_MIN`'s design says only large objects should live —
-  and they are what caps `high_max` below the request. The tripwire added to
+Ordered by what a next session should pick up first.
+
+* **`TestMVStoreTool` and `TestCachedQueryResults` — the innermost frame cannot
+  be LOCATED.** Fully characterised in §"Follow-up 2026-08-24" §7, with two
+  hypotheses already ruled out by measurement. The lever is
+  `frame_cov=(… no_map=N …)` on the `[jitroots]` line and the `[frame-cov]`
+  lines under `CRATONVM_DBG_JIT_ROOTSCAN=1`; the question is why one `rbp` with
+  one saved return address is claimed by four different methods across
+  collections, when the calls are indirect and the stack cannot decide. This is
+  a frame-record defect, not a coverage one, and it deserves its own page.
+* **`TestOpenClose`: `Exception in thread "main" java/lang/Object`, no captured
+  frames.** Now the ONLY thing failing this class — the fragmentation OOM is
+  gone. Already confirmed pre-existing and unrelated by the kill-switch
+  differential on 2026-08-21, and it reproduces on the fixed binary with zero
+  `OutOfMemoryError` and four `arena allocation failed`, which is as clean a
+  separation as this defect will ever get. Its own page, and now cheap to
+  reproduce.
+* **`TestMVStoreCachePerformance`: `NoSuchMethodError: 'boolean
+  org.h2.mvstore.Page$PageReference.isPersistent()'`.** Also now the only thing
+  failing that class — no OOM and no arena failure at all. A method-resolution
+  defect with nothing to do with this page; filed here only because this page
+  is what was watching the class.
+* **`-XX:+UseG1GC` fails `TestKillProcessWhileWriting`**, identically before and
+  after this work (13 `OutOfMemoryError` and a 1500 s cap on the fixed binary,
+  2 `OutOfMemoryError` in 31–43 s when this page first measured it). The face
+  varies between runs, so reproduce it several times before believing any
+  single one. Not this defect: no `arena allocation failed` in either era.
+* **A pre-existing, unrelated correctness gap the 2026-08-22 OSR fix's own
+  verification surfaced.** `CRATONVM_DBG_VERIFY_OOP_MAPS`'s
+  `never_mapped (while_covered=N)` counter is nonzero on `dev` with or without
+  that fix (1192 vs 1410 on the same class, same host) — some frame claims
+  `fully_oop_covered=true` while an in-band live oop goes unmapped, on the fast
+  tier's own bytecode-PC subset check. **Read that in the light of §"Follow-up
+  2026-08-24" §2 before re-opening it**: `fully_oop_covered` is the FRAME-SLOT
+  notion, and the direct-call staged-argument shape means it is routinely false
+  for reasons that are not a bug — so the interesting number is now the same
+  oracle measured against `fully_shadow_covered`, which nobody has taken. Only
+  23 distinct `code+offset` sites produce the 1410 baseline occurrences.
+* **The two small objects in the large-object region.** The fragmentation report
+  placed an 80-byte `String` and a 24-byte `Object` above `high_cursor`, where
+  `ZGC_LARGE_OBJECT_MIN`'s design says only large objects should live, and they
+  are what caps `high_max` below the request. The tripwire added to
   `Arena::alloc` fired **zero** times across a full failing run, so the low-end
   allocation paths are not the producer. Note its reach before trusting that
   zero: it covers the three free-list exits of `Arena::alloc` and
   `push_block_routed`, not the TLAB fast path (whose chunks are carved from the
   low end) and not the bump path (which cannot cross `high_cursor`). It has
   never been seen to fire, so it is an untriggered instrument, not evidence.
-* **`-XX:+UseG1GC` fails this class**, in 31–43 s, no arena allocation failure,
-  with a face that varies between runs. The null in a reference slot is the
-  shape `G30-1-the-silent-reference-slot-coercion-20260817.md` describes.
-  Reproduce it several times before believing any single face.
+  Less urgent than it was: the class this page is about no longer reaches the
+  wall at all.
+* **The cross-thread coverage handshake decides nothing yet.** It is built,
+  default-ON, and `xt_cov=(accepted=0 refused=0 deposits=0)` on this workload —
+  no peer was ever in compiled code at a collection here. It removes a blanket
+  refusal that a genuinely many-threaded workload would hit; that claim is
+  untested because this class does not produce the condition. The engagement
+  counter is on the `[jitroots]` line precisely so nobody reads a win into it.
